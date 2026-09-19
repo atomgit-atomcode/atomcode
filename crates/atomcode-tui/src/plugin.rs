@@ -1891,7 +1891,21 @@ impl Tui {
             }
             AgentEvent::Described { description } => {
                 self.client.describe(&description);
-                false
+                // Keep the status row's context window in step with the screen
+                // agent's mounted model. Read it back off the screen agent's
+                // description (not the one that just arrived, which may be a team
+                // member's), so switching models moves the denominator the row
+                // shows the used tokens against. A change is stale — the footer
+                // must repaint to show the new window.
+                let window = self
+                    .client
+                    .described()
+                    .and_then(|d| d.context_window)
+                    .unwrap_or(0);
+                let mut moment = self.host.moment.write().expect("moment poisoned");
+                let changed = moment.ctx_window != window;
+                moment.ctx_window = window;
+                changed
             }
             AgentEvent::Accepted { command, .. } => {
                 self.client.answered(&command);

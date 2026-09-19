@@ -41,6 +41,11 @@ struct Open {
     /// replay and resume cannot disagree about what a turn cost — the same
     /// reason every other block is built here.
     stats: TurnStats,
+    /// When the turn opened, on the log's own clock (`LoggedEvent::at`, in ms).
+    /// The difference to the `TurnEnd` reading is the turn's duration — the log
+    /// records no elapsed of its own, so it is folded from the two timestamps
+    /// the same way the two front ends do it. `None` between turns.
+    started_at: Option<u64>,
 }
 
 /// Turns session facts into what a person reads.
@@ -50,6 +55,11 @@ pub struct Transcript {
     /// Which turn each `TurnStart` opened, by its sequence number: what an undo
     /// names the turn it went back to by (`docs/adr/0024` §17).
     turns: Mutex<Vec<(atomcode_harness::session::SeqNo, u64)>>,
+    /// How many turns have ended cleanly, so far — the index into `DONE_LABELS`
+    /// the next clean stop uses. Advanced only on a clean stop and only here, so
+    /// the rotation is the same on live, replay and resume (it re-folds the same
+    /// facts in the same order). Reset with the stream.
+    done_seq: Mutex<usize>,
 }
 
 /// The card a question draws, before or after it is answered.
@@ -125,6 +135,7 @@ impl Producer for Transcript {
     fn reset(&self) {
         *self.open.lock().expect("transcript poisoned") = Open::default();
         self.turns.lock().expect("transcript poisoned").clear();
+        *self.done_seq.lock().expect("transcript poisoned") = 0;
     }
 
     fn absorb(&self, logged: &atomcode_harness::session::LoggedEvent, out: &mut StreamWriter<'_>) {
@@ -139,6 +150,10 @@ impl Producer for Transcript {
                     .lock()
                     .expect("transcript poisoned")
                     .push((logged.seq, *turn));
+                // Where the turn's clock starts, for the duration its summary
+                // reports. Read off the fact rather than a clock, so replay is
+                // deterministic.
+                open.started_at = Some(logged.at);
             }
             SessionEvent::Rewound { to, scope, .. } => {
                 let to_turn = self
@@ -457,10 +472,27 @@ impl Producer for Transcript {
                     out.amend(id, Arc::new(block.with(Outcome::Interrupted)));
                     out.settle(id);
                 }
+                // The turn's duration: the gap between this reading and the one
+                // stamped at `TurnStart`, both on the log's own clock. A turn
+                // with no recorded start (a log that predates the stamp) reports
+                // none rather than a nonsense figure.
+                let start = open.started_at.take();
                 // Taken, not read: a turn's cost is spent when the turn ends,
                 // and the next `TurnStart` would otherwise be the only thing
                 // standing between one turn's figures and the next turn's line.
-                let stats = std::mem::take(&mut open.stats);
+                let mut stats = std::mem::take(&mut open.stats);
+                stats.elapsed_ms = start.map(|s| logged.at.saturating_sub(s)).unwrap_or(0);
+                // A clean stop takes the next rotation slot and advances it; every
+                // other outcome leaves the rotation where it is (its label is
+                // ignored) so the celebratory verbs are not burned on failures.
+                let done_index = {
+                    let mut seq = self.done_seq.lock().expect("transcript poisoned");
+                    let idx = *seq;
+                    if matches!(stop, atomcode_harness::seams::StopReason::Stopped) {
+                        *seq += 1;
+                    }
+                    idx
+                };
                 out.emit(
                     at,
                     Arc::new(TurnEndBlock {
@@ -471,6 +503,7 @@ impl Producer for Transcript {
                         stop: *stop,
                         error: error.clone(),
                         stats,
+                        done_index,
                     }),
                 );
             }
@@ -478,7 +511,15 @@ impl Producer for Transcript {
             // What the turn cost, in the two facts that carry it. `step` and
             // `round` are one counter in the loop, so the steps are read off
             // the same number the requests are numbered with.
-            SessionEvent::StepEnd { step, .. } => open.stats.steps = *step,
+            SessionEvent::StepEnd {
+                step, tool_calls, ..
+            } => {
+                open.stats.steps = *step;
+                // Each step reports the calls it ran; the turn's tool count is
+                // their sum. Unlike `steps` (a running counter read verbatim),
+                // this one adds up across the turn.
+                open.stats.tools += *tool_calls;
+            }
 
             // A round's usage, merged by the loop into one figure per round.
             SessionEvent::Usage { usage, .. } => {
@@ -842,8 +883,10 @@ mod tests {
 
     #[test]
     fn a_turn_that_reported_usage_closes_with_what_it_cost() {
-        // The corpus' turn 1: one step, one request reporting 1200 tokens of
-        // context of which 400 were cached, and 80 tokens out.
+        // The corpus' turn 1: one step, two tool calls, one request reporting
+        // 1200 tokens of context of which 400 were cached, and 80 tokens out —
+        // so a billable cost of `80 + (1200 - 400) = 880` tokens and a 33% hit
+        // rate, in tuix's `轮 · 工具 · dur · tokens · cached` shape.
         let s = fold(&conformance::facts());
         let ends: Vec<String> = s
             .slots()
@@ -852,13 +895,13 @@ mod tests {
             .map(|x| x.block().content.lines(&crate::block::RenderCtx::bare(60))[0].plain())
             .collect();
         assert_eq!(ends.len(), 2, "two turns end in the corpus: {ends:?}");
-        for want in ["1 步", "入 1200", "出 80", "缓存 33.33%"] {
+        for want in ["1 轮", "2 工具", "880 tokens", "33% cached"] {
             assert!(ends[0].contains(want), "{want} missing from {:?}", ends[0]);
         }
         // Turn 2 reported nothing, so its line is the outcome alone — not a row
         // of zeroes.
-        assert!(!ends[1].contains("步"), "{:?}", ends[1]);
-        assert!(!ends[1].contains("入"), "{:?}", ends[1]);
+        assert!(!ends[1].contains("轮"), "{:?}", ends[1]);
+        assert!(!ends[1].contains("tokens"), "{:?}", ends[1]);
     }
 
     /// A turn's cost belongs to that turn. The corpus ends turn 1 and then
@@ -881,8 +924,10 @@ mod tests {
             .map(|x| x.block().content.lines(&crate::block::RenderCtx::bare(60))[0].plain())
             .collect();
         let last = ends.last().expect("turn 2 ends");
-        assert!(last.contains("完成"), "{last:?}");
-        for leaked in ["1200", "80", "缓存", "步"] {
+        // Turn 1 took `DONE_LABELS[0]` (`Done`); turn 2's Cancelled end did not
+        // advance the rotation, so this clean turn-2 end is `DONE_LABELS[1]`.
+        assert!(last.contains("Nailed it"), "{last:?}");
+        for leaked in ["1200", "880", "tokens", "轮", "cached"] {
             assert!(!last.contains(leaked), "{leaked} leaked into {last:?}");
         }
     }

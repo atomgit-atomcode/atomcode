@@ -281,7 +281,14 @@ impl View for Input {
             // past it had no prompt anywhere — ten rows of bare text between
             // two rules, which does not read as somewhere you can type.
             let lead = if i == 0 { prompt.clone() } else { "  ".into() };
-            let mut row = vec![El::styled(lead, arrow), El::raw(piece.clone())];
+            // The typed text is drawn muted, the same recessed grey the rules and
+            // the ghost completion use: the composer reads as a quiet place to
+            // type rather than as another bright column competing with the
+            // transcript above it. `atomcode-tuix` dims the composer the same way.
+            let mut row = vec![
+                El::styled(lead, arrow),
+                El::styled(piece.clone(), theme::fg(Role::Muted)),
+            ];
             // The rest of something already said, dim, on the last row of what
             // is typed — pressing right takes it. Only there, because that is
             // where the caret is when a completion means anything.
@@ -443,6 +450,23 @@ mod tests {
             colour(&vp_busy),
             "a busy prompt must look different from an idle one"
         );
+    }
+
+    /// The typed text is drawn in the recessed muted grey, not the terminal's
+    /// bright default — the composer is a quiet place to type, matching how
+    /// `atomcode-tuix` dims the composer rather than letting it compete with the
+    /// transcript above.
+    #[test]
+    fn the_typed_text_is_muted() {
+        let m = Moment::default().typing("hello");
+        let row = &Input::render(&State::default(), &Viewport::new(Rect::sized(40, 3), &m))[1];
+        // spans[0] is the prompt marker; the typed text follows it.
+        let text = row
+            .spans
+            .iter()
+            .find(|s| s.text.contains("hello"))
+            .expect("the typed text is on the first body row");
+        assert_eq!(text.style.fg, theme::fg(Role::Muted).fg, "{row:?}");
     }
 
     #[test]

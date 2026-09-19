@@ -676,6 +676,7 @@ mod tests {
                 role: "explorer".into(),
             }),
             model: Some("glm-5".into()),
+            context_window: Some(131_072),
             supports_vision: true,
             reasoning_effort: Some(ReasoningEffort::Low),
             compaction: true,

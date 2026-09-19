@@ -216,6 +216,12 @@ pub struct Moment {
     /// Where the agent is working. Not derivable from the log, which is
     /// exactly what this struct is for.
     pub cwd: String,
+    /// The mounted model's context window, in tokens — the denominator the
+    /// status row shows the used-token count against (`49.0k/512k tok`). `0` when
+    /// unknown (no model, or a provider that reports none), which the row draws as
+    /// a bare `49.0k tok`. Injected from the agent's description, not folded from
+    /// the log: the window is the agent's, not a fact the conversation records.
+    pub ctx_window: u32,
     /// The agents running under this one, as the registry has them now.
     /// Empty for a screen that never delegates, which is most of them.
     pub members: Vec<MemberNow>,

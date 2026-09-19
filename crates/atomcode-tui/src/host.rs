@@ -290,7 +290,7 @@ type RowOwner = Option<(BlockId, &'static str)>;
 /// screen of six calls separated by five gaps is a screen that no longer shows
 /// what was done in one glance.
 ///
-/// The turn's closing rule is a separator — `──── ✓ 完成 · 3 步 ────` — and gets
+/// The turn's closing rule is a separator — `──── ✓ Done · 3 轮 · 2 工具 ────` — and gets
 /// a row of air on both sides unconditionally. It is the one row that is *about*
 /// the transcript rather than part of it, and pressed against the prose above
 /// and the next question below it stops reading as a boundary and starts
@@ -6282,7 +6282,9 @@ mod tests {
             .collect();
         let rule = rows
             .iter()
-            .position(|r| r.contains("完成") && r.contains('─'))
+            // The first clean turn's closing rule: its outcome rotates through
+            // `DONE_LABELS`, and index 0 is `Done`.
+            .position(|r| r.contains("Done") && r.contains('─'))
             .expect("the first turn's closing rule");
         // The prose it closes, a blank, the rule, a blank, the next question.
         assert!(

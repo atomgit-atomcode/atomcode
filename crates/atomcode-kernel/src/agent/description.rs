@@ -50,6 +50,12 @@ pub struct AgentDescription {
     /// The model id the agent's requests go to, when one is mounted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The mounted model's context window, in tokens. A front end shows it beside
+    /// the used-token count in the status row (`49.0k/512k tok`). `None` when no
+    /// model is mounted or the provider does not report one — additive on the
+    /// wire, so an older reader ignores it and an older log reads as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
     /// Whether an image attached to a message reaches the model. A front end
     /// asks before it attaches one.
     #[serde(default)]

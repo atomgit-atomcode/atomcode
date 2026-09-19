@@ -798,7 +798,8 @@ mod tests {
             "the table was not drawn: {out:?}"
         );
         assert!(
-            out.iter().any(|l| l.contains('─')),
+            // The header rule is heavy (`━`), the way tuix draws it.
+            out.iter().any(|l| l.contains('━')),
             "no rule under the header: {out:?}"
         );
     }
