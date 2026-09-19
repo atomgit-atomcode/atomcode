@@ -368,6 +368,13 @@ impl Moment {
         self.members = members;
         self
     }
+    /// Set the session this screen follows. Separate from [`Moment::viewing`],
+    /// which is which of them is drawn: a team panel has a lead whether or not
+    /// the lead is the one on screen.
+    pub fn with_lead(mut self, lead: impl Into<String>) -> Self {
+        self.lead = lead.into();
+        self
+    }
     pub fn at_tick(mut self, tick: u64) -> Self {
         self.tick = tick;
         self

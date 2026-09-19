@@ -87,6 +87,15 @@ pub enum Action {
     /// key is bound to it later are one implementation, and the panel is
     /// screen state, which only the screen may write.
     ToggleSettings,
+    /// Put this session — the lead, or a member of its team — on screen.
+    ///
+    /// An action, and the only one carrying a value, for the reason
+    /// [`Action::ToggleSettings`] is: which session a screen is drawn from is
+    /// screen state, so a command may ask for it but never do it. The team
+    /// strip asks for this on a click and `Enter`; `/agents` asks for it for a
+    /// member the strip no longer has a row for (`docs/adr/0023` §5), and both
+    /// land in the same place.
+    LookAt(String),
 }
 
 /// A set of bindings contributed by one row.

@@ -626,6 +626,7 @@ enum Wake {
 struct Row {}
 
 /// A member of the session on screen, as its events have told it.
+#[derive(Clone)]
 struct Member {
     name: String,
     status: AgentStatus,
@@ -633,6 +634,124 @@ struct Member {
     turns: u64,
     /// Stopped and gone from the registry: kept, so it can still be looked at.
     gone: bool,
+}
+
+/// Every member this screen has heard of, stopped ones included.
+///
+/// A trait, and a seam, because `/agents` lists them: a command reaches the
+/// tree's services rather than the screen (`docs/adr/0021`), and the roster is
+/// the screen's, so the screen is what hands it over. The lead is not one of
+/// them — it is the session itself.
+pub trait TeamRoster: Send + Sync {
+    /// Name, session id, and whether it has stopped, in name order.
+    fn members(&self) -> Vec<(String, String, bool)>;
+}
+
+plexus_service!(TeamRosterSvc => dyn TeamRoster, "tui-team-roster", Seam, "Every member this screen has heard of, stopped ones included");
+
+/// The members, by session id, as the connection's events described them.
+///
+/// Shared behind a lock rather than folded into the `Moment`, because the panel
+/// and `/agents` ask different questions of it: the panel wants what is running
+/// *now*, and this wants everything that has ever been on the team. The moment
+/// holds the first — see `refresh_members` — and this holds both.
+#[derive(Default)]
+pub struct Roster(Mutex<BTreeMap<String, Member>>);
+
+impl Roster {
+    fn note(&self, session: &str, member: Member) {
+        self.0
+            .lock()
+            .expect("roster poisoned")
+            .insert(session.to_string(), member);
+    }
+    /// It stopped. The entry stays: its log is still there to read, and
+    /// `/agents` is how a person reaches it (`docs/adr/0023` §5).
+    fn mark_gone(&self, session: &str) -> bool {
+        self.0
+            .lock()
+            .expect("roster poisoned")
+            .get_mut(session)
+            .map(|member| member.gone = true)
+            .is_some()
+    }
+    /// Running a turn right now — and not stopped, since a member that has
+    /// stopped runs nothing.
+    fn is_working(&self, session: &str) -> bool {
+        self.0
+            .lock()
+            .expect("roster poisoned")
+            .get(session)
+            .is_some_and(|member| member.status != AgentStatus::Idle && !member.gone)
+    }
+    /// Its status moved. A member that goes to working has opened a turn.
+    /// `true` when there was such a member.
+    fn set_status(&self, session: &str, status: AgentStatus) -> bool {
+        match self.0.lock().expect("roster poisoned").get_mut(session) {
+            Some(member) => {
+                if status == AgentStatus::Working && member.status != AgentStatus::Working {
+                    member.turns += 1;
+                }
+                member.status = status;
+                true
+            }
+            None => false,
+        }
+    }
+    /// Every member, as `MemberNow` — what the team panel is drawn from.
+    fn moment_members(&self) -> Vec<crate::moment::MemberNow> {
+        use crate::moment::{Activity, MemberNow};
+        let mut out: Vec<MemberNow> = self
+            .0
+            .lock()
+            .expect("roster poisoned")
+            .iter()
+            .map(|(session, member)| MemberNow {
+                name: member.name.clone(),
+                activity: match member.status {
+                    AgentStatus::Idle => Activity::Idle,
+                    AgentStatus::Working => Activity::Working,
+                    AgentStatus::Stopping => Activity::Stopping,
+                },
+                turn: member.turns,
+                session: session.clone(),
+                gone: member.gone,
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+    fn clear(&self) {
+        self.0.lock().expect("roster poisoned").clear();
+    }
+    /// A member, for a test that wants one without driving a whole connection
+    /// through `AgentAdded`.
+    #[cfg(test)]
+    pub(crate) fn note_for_test(&self, session: &str, name: &str, gone: bool) {
+        self.note(
+            session,
+            Member {
+                name: name.to_string(),
+                status: AgentStatus::Idle,
+                turns: 0,
+                gone,
+            },
+        );
+    }
+}
+
+impl TeamRoster for Roster {
+    fn members(&self) -> Vec<(String, String, bool)> {
+        let mut out: Vec<(String, String, bool)> = self
+            .0
+            .lock()
+            .expect("roster poisoned")
+            .iter()
+            .map(|(session, member)| (member.name.clone(), session.clone(), member.gone))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
 }
 
 /// The assembled UI. Public so a test can drive exactly what ships.
@@ -647,8 +766,10 @@ pub struct Tui {
     wake: Mutex<Option<mpsc::UnboundedSender<Wake>>>,
     /// Where the button went down, so a release can tell a click from a drag.
     pressed_at: Mutex<Option<(u16, u16)>>,
-    /// The session's members, by session id.
-    members: Mutex<BTreeMap<String, Member>>,
+    /// The session's members, by session id — stopped ones included, so
+    /// `/agents` can still reach their logs. Shared with the tree as an
+    /// `Arc`, because that seam is how a command reads it.
+    members: Arc<Roster>,
     /// What this screen last told the terminal the window is called, so a
     /// frame that changes nothing writes nothing.
     named: Mutex<Option<String>>,
@@ -977,7 +1098,7 @@ impl UserInterface for Tui {
                 // one, from its first fact, in a stream of its own.
                 Wake::Host(HostEvent::SessionChanged { session, .. }) => {
                     if session != client.root() {
-                        self.members.lock().expect("members poisoned").clear();
+                        self.members.clear();
                         self.host.switch_session();
                         client.follow(&session);
                         {
@@ -1526,25 +1647,7 @@ impl Tui {
     }
 
     fn refresh_members(&self) {
-        use crate::moment::{Activity, MemberNow};
-        let mut members: Vec<MemberNow> = self
-            .members
-            .lock()
-            .expect("members poisoned")
-            .iter()
-            .map(|(session, member)| MemberNow {
-                name: member.name.clone(),
-                activity: match member.status {
-                    AgentStatus::Idle => Activity::Idle,
-                    AgentStatus::Working => Activity::Working,
-                    AgentStatus::Stopping => Activity::Stopping,
-                },
-                turn: member.turns,
-                session: session.clone(),
-                gone: member.gone,
-            })
-            .collect();
-        members.sort_by(|a, b| a.name.cmp(&b.name));
+        let members = self.members.moment_members();
         let mut moment = self.host.moment.write().expect("moment poisoned");
         if moment.members != members {
             moment.members = members;
@@ -1571,12 +1674,7 @@ impl Tui {
             self.host.absorb_logged(logged);
         }
         self.mark_undone();
-        let working = self
-            .members
-            .lock()
-            .expect("members poisoned")
-            .get(session)
-            .is_some_and(|m| m.status != AgentStatus::Idle && !m.gone);
+        let working = self.members.is_working(session);
         let mut m = self.host.moment.write().expect("moment poisoned");
         m.viewing = session.to_string();
         if working {
@@ -1798,19 +1896,7 @@ impl Tui {
             // member's is the member strip's.
             AgentEvent::StatusChanged { session, status } => {
                 let on_screen = self.client.status(&session, status);
-                let mut changed = false;
-                if let Some(member) = self
-                    .members
-                    .lock()
-                    .expect("members poisoned")
-                    .get_mut(&session)
-                {
-                    if status == AgentStatus::Working && member.status != AgentStatus::Working {
-                        member.turns += 1;
-                    }
-                    member.status = status;
-                    changed = true;
-                }
+                let mut changed = self.members.set_status(&session, status);
                 // A member on screen has no turn events on this connection —
                 // those are the root's — so its status is what moves the line.
                 if on_screen && session != self.client.root() {
@@ -1840,8 +1926,8 @@ impl Tui {
                             .unwrap_or(&description.session)
                             .to_string()
                     });
-                self.members.lock().expect("members poisoned").insert(
-                    description.session.clone(),
+                self.members.note(
+                    &description.session,
                     Member {
                         name,
                         status: AgentStatus::Idle,
@@ -1853,14 +1939,19 @@ impl Tui {
             }
             AgentEvent::AgentRemoved { session } => {
                 self.client.member(&session, false);
-                // Kept on the panel: a stopped member's log is still there to
-                // look at (`docs/adr/0023` §5).
-                self.members
-                    .lock()
-                    .expect("members poisoned")
-                    .get_mut(&session)
-                    .map(|member| member.gone = true)
-                    .is_some()
+                // Not on the panel any more — a stopped member is not one of
+                // the rows — but its log is kept for `/agents`, which lists
+                // every member and switches to any of them (`docs/adr/0023` §5).
+                let kept = self.members.mark_gone(&session);
+                // And if the screen was on it, the lead takes the screen back.
+                // The panel has no row for a stopped member to switch back
+                // from, so without this the person would be left reading a
+                // conversation with nothing on screen offering a way out.
+                if self.client.session() == session && session != self.client.root() {
+                    let root = self.client.root();
+                    self.switch_to(&root);
+                }
+                kept
             }
             // The turn events on this connection are the root's: a member on
             // screen is moved by its status instead.
@@ -2224,6 +2315,14 @@ impl Tui {
                 if self.host.settings_open() {
                     self.refresh_settings();
                 }
+                return false;
+            }
+            // Put another session on screen. The lock goes first: `switch_to`
+            // draws that session and writes the moment, which is a lock this
+            // guard still holds.
+            Action::LookAt(session) => {
+                drop(m);
+                self.switch_to(&session);
                 return false;
             }
 
@@ -3006,7 +3105,7 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
             ctx: Mutex::new(None),
             wake: Mutex::new(None),
             pressed_at: Mutex::new(None),
-            members: Mutex::new(BTreeMap::new()),
+            members: Arc::new(Roster::default()),
             named: Mutex::new(None),
         },
     )
@@ -3071,6 +3170,11 @@ impl Plugin for TuiUiPlugin {
             .map_err(|e| e.to_string())?;
         let _ = ctx
             .provide::<AgentClientSvc>(tui.client.clone())
+            .map_err(|e| e.to_string())?;
+        // The same roster the screen keeps, handed to the tree so `/agents` can
+        // list a member the team panel no longer has a row for.
+        let _ = ctx
+            .provide::<TeamRosterSvc>(tui.members.clone())
             .map_err(|e| e.to_string())?;
         let _ = ctx
             .provide::<UiSvc>(Arc::new(tui))

@@ -285,6 +285,10 @@ const SESSION: &[Command] = &[
         "停下这个会话与每个团队成员正在跑的回合;成员留在团队里",
     ),
     Command::new("context", "这次会话用掉了多少"),
+    Command::new(
+        "agents",
+        "这个会话底下有过的 agent:主与每个成员,含已停的;选一个切过去看它的对话",
+    ),
     Command::new("transcript", "把对话按模型看到的样子列出来"),
     Command::new("clear", "开一个新会话:这段对话放下,换一条干净的"),
     Command::taking("resume", "[会话 id]", "回到一个存下的会话;不带 id 则挑一个"),
@@ -377,10 +381,24 @@ impl CommandSet for SessionCommands {
     fn commands(&self) -> Vec<Command> {
         SESSION.to_vec()
     }
+    /// What `/agents` dispatches when a row is picked. Not listed: nobody types
+    /// it, and a session id in the menu would be noise (`CommandSet::hidden`).
+    fn hidden(&self) -> Vec<Command> {
+        vec![Command::taking("look", "<会话 id>", "把屏幕切到那个 agent")]
+    }
     async fn run(&self, name: &str, args: &str, ctx: &Context) -> Outcome {
         let Some(client) = ctx.service::<crate::plugin::AgentClientSvc>() else {
             return Outcome::Refused("这块屏幕没接上 agent".into());
         };
+        // Asking is all a command may do here: which session is on screen is
+        // screen state, and the loop writes it (`Action::LookAt`).
+        if name == "look" {
+            let session = args.trim();
+            if session.is_empty() {
+                return Outcome::Refused("要切到哪个会话?".into());
+            }
+            return Outcome::Do(Action::LookAt(session.to_string()));
+        }
         let control = client.control();
         // What host control acts on is the session this screen follows, whoever
         // is on screen.
@@ -483,6 +501,55 @@ impl CommandSet for SessionCommands {
                     Ok(_) => Outcome::Quiet,
                     Err(error) => Outcome::Refused(refusal(error)),
                 }
+            }
+            // Who has been on this team, and the way to look at any of them.
+            //
+            // The team strip draws what is running now, so a stopped member has
+            // no row there — but its log is kept, and `docs/adr/0023` §5 wants
+            // it readable. This is that way in: the lead first, then every
+            // member this screen has heard of, stopped ones included. The pick
+            // is an [`Action::LookAt`] rather than a switch done here, because
+            // which session is on screen is screen state (`docs/adr/0021`).
+            "agents" => {
+                let Some(roster) = ctx.service::<crate::plugin::TeamRosterSvc>() else {
+                    return Outcome::Refused(
+                        "这块屏幕没有 agent 名册:启动器没有提供 `tui-team-roster`".into(),
+                    );
+                };
+                let mut choices: Vec<crate::overlay::Choice> = Vec::new();
+                if !root.is_empty() {
+                    choices.push(
+                        crate::overlay::Choice::new(
+                            format!("/look {root}"),
+                            "主 · 这个会话本身".to_string(),
+                        )
+                        .about(root.clone()),
+                    );
+                }
+                for (name, session, gone) in roster.members() {
+                    choices.push(
+                        crate::overlay::Choice::new(
+                            format!("/look {session}"),
+                            // Where it stands is part of what the row is: a
+                            // stopped member's conversation is still there and
+                            // is not something to talk to.
+                            if gone {
+                                format!("{name} · 已停,日志还在")
+                            } else {
+                                name.clone()
+                            },
+                        )
+                        .about(session.clone()),
+                    );
+                }
+                if choices.is_empty() {
+                    return Outcome::Said("这个会话底下还没有别的 agent".into());
+                }
+                Outcome::Open(crate::overlay::Picker::new(
+                    "agents",
+                    "看谁 · enter 切过去",
+                    choices,
+                ))
             }
             "resume" => {
                 let Some(control) = control else {
@@ -2513,6 +2580,62 @@ mod tests {
                 other => panic!("{line} should refuse, got {other:?}"),
             }
         }
+    }
+
+    /// `/agents` is how a person reaches a member the team strip no longer has a
+    /// row for: the roster it reads keeps the stopped ones (`docs/adr/0023` §5),
+    /// and picking one asks the screen to look at it rather than switching from
+    /// inside the command.
+    #[tokio::test]
+    async fn agents_lists_stopped_members_and_picking_one_asks_the_screen() {
+        let c = builtin_for_test();
+        let app = bare();
+        let roster = Arc::new(crate::plugin::Roster::default());
+        // One member running, one stopped.
+        roster.note_for_test("lead/scout", "scout", false);
+        roster.note_for_test("lead/lib", "lib", true);
+        let _ = app
+            .context()
+            .provide::<crate::plugin::TeamRosterSvc>(roster.clone());
+        let client = Arc::new(crate::plugin::AgentClient::default());
+        client.follow("lead");
+        let _ = app
+            .context()
+            .provide::<crate::plugin::AgentClientSvc>(client);
+
+        let picker = match c.dispatch("/agents", &app.context()).await {
+            Outcome::Open(picker) => picker,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(picker.id(), "agents", "the picker says what it is");
+
+        // The lead is a row, and so is every member — the stopped one included,
+        // saying that it has stopped so nobody wonders why the strip is bare.
+        let moment = crate::moment::Moment::default();
+        let vp = crate::moment::Viewport::new(crate::frame::Rect::sized(70, 12), &moment);
+        let said = picker
+            .render(&vp)
+            .iter()
+            .map(|line| line.plain())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(said.contains('主'), "the lead is a row:\n{said}");
+        assert!(said.contains("scout"), "the running one:\n{said}");
+        assert!(
+            said.contains("lib") && said.contains("已停"),
+            "the stopped one is listed, and says so:\n{said}"
+        );
+
+        // And the pick is an action, not a switch done here.
+        assert_eq!(
+            c.dispatch("/look lead/lib", &app.context()).await,
+            Outcome::Do(Action::LookAt("lead/lib".into()))
+        );
+        // Not listed: it is what a pick dispatches, not something anyone types.
+        assert!(
+            c.all().iter().all(|x| x.name != "look"),
+            "`/look` is hidden"
+        );
     }
 
     #[tokio::test]

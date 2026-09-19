@@ -22,15 +22,25 @@
 //! The answer is not a filtered copy of someone else's screen — it is a
 //! summary of what the lead knows, which is what a lead has.
 //!
+//! Nor does it show a member that has stopped. A stopped member is not on the
+//! team any more — it does not come back, it takes no room in the next
+//! delegation, and a row for it would be a line that says nothing and does
+//! nothing. The panel is what this agent is *running*; the way to read what a
+//! stopped member said is `/agents`, which lists every member the registry has
+//! announced, stopped ones included, and switches to any of them
+//! (`docs/adr/0023` §5).
+//!
 //! # A way in
 //!
 //! It is also where the person switches the screen to one of them and back
-//! (`docs/adr/0023` §3): the lead is its first row, `主`, and each member
-//! follows. Which rows can be switched to is [`targets`] — the lead and every
-//! member the registry announced, gone ones included — and the panel lights the
-//! row [`Moment::team_cursor`] points at and marks the one on screen. Both are
-//! the moment's, so the row the arrows are on, the row under the pointer and the
-//! row a press takes are one row.
+//! (`docs/adr/0023` §3): the lead is its first row, `主`, and each member still
+//! running follows. Which rows can be switched to is [`targets`] — the lead and
+//! the members that are not gone — and the panel lights the row
+//! [`Moment::team_cursor`] points at and marks the one on screen. Both are the
+//! moment's, so the row the arrows are on, the row under the pointer and the row
+//! a press takes are one row. [`targets`] and [`rows`] filter on the same
+//! predicate for that reason: the *n*th drawn row and the *n*th target must be
+//! the same agent, or a click would take the one below it.
 
 use std::collections::HashMap;
 
@@ -78,15 +88,41 @@ const ROLE_CAP: usize = 12;
 
 pub struct Team;
 
+/// Whether any member is still on the team — the panel's own condition for
+/// being on screen at all.
+///
+/// A stopped member is not one: it left the panel ([`rows`]), so a team whose
+/// every member has stopped is not a team to draw. The panel is up while there
+/// is something running under this agent, and gone when there is not.
+///
+/// Here rather than folded into [`targets`] alone because the keyboard and the
+/// pointer ask the same question through `targets`: an empty answer is what
+/// keeps `Tab` from giving the keyboard to a panel nobody drew.
+fn running(moment: &Moment) -> bool {
+    moment.members.iter().any(|m| !m.gone)
+}
+
 /// The sessions the panel's selectable rows switch to, in the order they are
-/// drawn: the lead, then each member the registry announced. Empty with no
-/// team — there is nothing to switch between.
+/// drawn: the lead, then each member still running. Empty when the panel is not
+/// on screen — there is nothing to switch between, and nothing for the arrows
+/// to point at.
+///
+/// A stopped member is not one of them: it is not on the panel, so a target for
+/// it would be a row nothing drew. [`rows`] drops exactly the same members, and
+/// the two must agree or a press would land on the agent below the one it hit.
+/// Reading a stopped member is `/agents`.
 pub fn targets(moment: &Moment) -> Vec<String> {
-    if moment.members.is_empty() || moment.lead.is_empty() {
+    if moment.lead.is_empty() || !running(moment) {
         return Vec::new();
     }
     std::iter::once(moment.lead.clone())
-        .chain(moment.members.iter().map(|m| m.session.clone()))
+        .chain(
+            moment
+                .members
+                .iter()
+                .filter(|m| !m.gone)
+                .map(|m| m.session.clone()),
+        )
         .collect()
 }
 
@@ -214,6 +250,11 @@ impl View for Team {
             return Vec::new();
         }
         let rows = rows(state, vp.moment);
+        // Nobody on the team is no panel: not a header, not a blank row. The
+        // predicate is `height`'s, so the row this asks for is the row it draws.
+        if rows.is_empty() {
+            return Vec::new();
+        }
         let caps = vp.moment.caps;
         let muted = theme::fg(Role::Muted);
 
@@ -221,9 +262,7 @@ impl View for Team {
         let focused = vp.moment.team_cursor.is_some() && !switchable.is_empty();
         let mut out = vec![Line::styled(
             width::take_width(
-                &if rows.is_empty() {
-                    "团队 · 还没有成员".to_string()
-                } else if focused {
+                &if focused {
                     format!(
                         "团队 · {} 名成员 · ↑↓ 选 · Enter 切换 · Esc 返回",
                         rows.len()
@@ -305,15 +344,10 @@ impl View for Team {
                     theme::fg(Role::Warning),
                 ),
                 Shown::Idle => (caps.g(Glyph::Ok).to_string(), theme::fg(Role::Success)),
-                Shown::Stopped => (
-                    caps.g(Glyph::Interrupted).to_string(),
-                    theme::fg(Role::Muted),
-                ),
             };
             let said = match row.state {
                 Shown::Working => format!("第 {} 轮", row.turn.max(1)),
                 Shown::Idle => "空闲".to_string(),
-                Shown::Stopped => "已结束".to_string(),
             };
             let mut line: Vec<El> = Vec::new();
             if !switchable.is_empty() {
@@ -348,12 +382,22 @@ impl View for Team {
         out
     }
 
-    /// A header plus a line each. `Hug`, so a team of one does not reserve
-    /// room for six — and the host still caps it, because a module requests
-    /// and never seizes.
+    /// A header plus a line each — and nothing at all for a team with no one on
+    /// it. `Hug`, so a team of one does not reserve room for six; `Hug(0)`, so a
+    /// screen that has not delegated, or whose every member has stopped, keeps
+    /// the row instead of showing a strip of chrome. The host still caps it,
+    /// because a module requests and never seizes.
+    ///
+    /// `render` draws from the same predicate, which is what makes the two one
+    /// decision rather than two that agree by luck: a header with no rows under
+    /// it would be a line saying nothing, and it would take the conversation's
+    /// row to say it.
     fn height(state: &State, moment: &Moment, _: u16) -> Height {
-        let lead = u16::from(!targets(moment).is_empty());
-        Height::Hug(1 + lead + rows(state, moment).len().min(u16::MAX as usize) as u16)
+        if !running(moment) {
+            return Height::Hug(0);
+        }
+        let rows = rows(state, moment).len();
+        Height::Hug(1 + u16::from(!targets(moment).is_empty()) + rows.min(u16::MAX as usize) as u16)
     }
 
     /// The spinner needs frames. The same cadence as the status line, for the
@@ -363,12 +407,14 @@ impl View for Team {
     }
 }
 
-/// What a member's mark says.
+/// What a member's mark says: whether it is running a turn right now.
+///
+/// There is no third state. A stopped member is not drawn at all (`rows`), so
+/// "stopped" is the absence of a row rather than a kind of one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Shown {
     Working,
     Idle,
-    Stopped,
 }
 
 struct Row {
@@ -385,6 +431,12 @@ struct Row {
 /// anything the registry knows about that this log never mentioned: a
 /// subagent the `task` tool created, or a member delegated before this panel
 /// was mounted. Live state wins over folded state, because it is now.
+///
+/// What is stopped is not here at all, on either source: a member the registry
+/// still has but has marked gone, and a member only this log remembers because
+/// it was stopped before this screen opened. That is the same decision
+/// [`targets`] makes, and the two have to match — a drawn row with no target,
+/// or a target with no row, would put the pointer on the wrong agent.
 fn rows(state: &State, moment: &Moment) -> Vec<Row> {
     // The registry's first, in the order `targets` switches between them, so
     // the drawn rows and the selectable ones agree; what the log adds — a role,
@@ -392,30 +444,31 @@ fn rows(state: &State, moment: &Moment) -> Vec<Row> {
     let mut out: Vec<Row> = Vec::new();
     for live in &moment.members {
         let logged = state.members.iter().find(|m| m.name == live.name);
-        let stopped = live.gone || logged.is_some_and(|m| m.stopped);
+        if live.gone || logged.is_some_and(|m| m.stopped) {
+            continue;
+        }
         out.push(Row {
             member: logged.cloned().unwrap_or_else(|| Member {
                 name: live.name.clone(),
                 ..Member::default()
             }),
-            state: match (stopped, live.activity) {
-                (true, _) => Shown::Stopped,
-                (false, Activity::Idle) => Shown::Idle,
-                (false, _) => Shown::Working,
+            state: match live.activity {
+                Activity::Idle => Shown::Idle,
+                _ => Shown::Working,
             },
             turn: live.turn,
             session: live.session.clone(),
         });
     }
     // Then what only this log remembers — a member stopped before this screen
-    // was opened: shown, not switched to.
+    // was opened: stopped, so not drawn, and not switchable either.
     for member in &state.members {
-        if moment.members.iter().any(|m| m.name == member.name) {
+        if member.stopped || moment.members.iter().any(|m| m.name == member.name) {
             continue;
         }
         out.push(Row {
             member: member.clone(),
-            state: Shown::Stopped,
+            state: Shown::Working,
             turn: 0,
             session: String::new(),
         });
@@ -490,8 +543,8 @@ mod tests {
     fn a_delegation_appears_only_once_its_call_came_back() {
         let mut state = fold(&[delegate("c1", "scout", "explorer")]);
         assert!(
-            drew(&state, &Moment::default()).contains("还没有成员"),
-            "a call in flight is not a member yet"
+            drew(&state, &Moment::default()).is_empty(),
+            "a call in flight is not a member yet, and no member is no panel"
         );
         Team::absorb(&mut state, &result("c1", false));
         assert!(drew(&state, &Moment::default()).contains("scout"));
@@ -502,8 +555,8 @@ mod tests {
         let state = fold(&[delegate("c1", "scout", "explorer"), result("c1", true)]);
         let screen = drew(&state, &Moment::default());
         assert!(
-            !screen.contains("scout") && screen.contains("还没有成员"),
-            "{screen}"
+            !screen.contains("scout") && screen.is_empty(),
+            "a refused delegation leaves nobody, so there is nothing to draw: {screen}"
         );
     }
 
@@ -525,23 +578,121 @@ mod tests {
         assert_eq!(screen.matches("scout").count(), 1, "{screen}");
     }
 
+    /// A member that stopped is not a kind of row — it is not a row. It cannot
+    /// come back, it takes no room in the next delegation, and the panel is
+    /// what this agent is running. Reading what it said is `/agents`.
     #[test]
-    fn a_member_the_registry_still_has_is_working_a_member_it_lost_is_done() {
+    fn a_member_the_registry_lost_leaves_the_panel_with_the_row() {
         let state = fold(&[delegate("c1", "scout", "explorer"), result("c1", false)]);
-        let live = Moment::default().with_members(vec![MemberNow {
-            name: "scout".into(),
-            activity: Activity::Working,
-            turn: 2,
-            ..MemberNow::default()
-        }]);
+        let live = Moment::default()
+            .with_lead("lead-1")
+            .with_members(vec![MemberNow {
+                name: "scout".into(),
+                activity: Activity::Working,
+                turn: 2,
+                session: "lead-1/scout".into(),
+                ..MemberNow::default()
+            }]);
         assert!(
             drew(&state, &live).contains("第 2 轮"),
             "{}",
             drew(&state, &live)
         );
+        assert_eq!(targets(&live), vec!["lead-1", "lead-1/scout"]);
+
+        // The registry still has it and says it is gone: the row goes, and so
+        // does the target — the panel must not draw one of the two.
+        let stopped = Moment::default()
+            .with_lead("lead-1")
+            .with_members(vec![MemberNow {
+                name: "scout".into(),
+                activity: Activity::Idle,
+                turn: 2,
+                session: "lead-1/scout".into(),
+                gone: true,
+            }]);
+        let screen = drew(&state, &stopped);
         assert!(
-            drew(&state, &Moment::default()).contains("已结束"),
-            "gone from the registry is gone"
+            !screen.contains("scout"),
+            "a stopped member is not drawn:\n{screen}"
+        );
+        assert!(
+            !screen.contains("已结束"),
+            "there is no such state on a row:\n{screen}"
+        );
+        // Nobody is running, so there is no panel and nothing to point at.
+        // What keeps this from stranding a person who was reading the member is
+        // not a spare row here — it is the lead coming back on screen, which the
+        // host does when the agent on screen goes (`host::switch_view` callers).
+        assert_eq!(targets(&stopped), Vec::<String>::new());
+
+        // And the log alone — no registry — is the same answer, which is the
+        // half a resumed screen sees: the stop is a fact in this log.
+        let stopped_folded = fold(&[
+            delegate("c1", "scout", "explorer"),
+            result("c1", false),
+            SessionEvent::AssistantMessage {
+                turn: 2,
+                round: 1,
+                text: String::new(),
+                reasoning: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "c2".into(),
+                    name: "team".into(),
+                    arguments: r#"{"action":"stop","name":"scout"}"#.into(),
+                }],
+                reasoning_blocks: Vec::new(),
+                meta: None,
+            },
+            result("c2", false),
+        ]);
+        let screen = drew(&stopped_folded, &Moment::default().with_lead("lead-1"));
+        assert!(
+            !screen.contains("scout"),
+            "a member this log stopped is not drawn either:\n{screen}"
+        );
+    }
+
+    /// A team whose every member has stopped is no team on screen: the panel
+    /// goes, and with it the rows the arrows and the pointer work on.
+    ///
+    /// This is the half that is easy to get wrong. Leaving the lead as a lone
+    /// row would draw a panel with one line in it whose only content is "back to
+    /// the lead" — a strip of chrome for a session that has nobody left to look
+    /// at — and it would hand `Tab` a row to focus on a screen with no panel.
+    #[test]
+    fn a_team_of_nothing_but_stopped_members_is_no_panel_at_all() {
+        let state = fold(&[
+            delegate("c1", "scout", "explorer"),
+            result("c1", false),
+            SessionEvent::AssistantMessage {
+                turn: 2,
+                round: 1,
+                text: String::new(),
+                reasoning: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "c2".into(),
+                    name: "team".into(),
+                    arguments: r#"{"action":"stop"}"#.into(),
+                }],
+                reasoning_blocks: Vec::new(),
+                meta: None,
+            },
+            result("c2", false),
+        ]);
+        let live = Moment::default()
+            .with_lead("lead-1")
+            .with_members(vec![MemberNow {
+                name: "scout".into(),
+                session: "lead-1/scout".into(),
+                gone: true,
+                ..MemberNow::default()
+            }]);
+        assert!(drew(&state, &live).is_empty(), "no member, no panel");
+        assert_eq!(Team::height(&state, &live, 60), Height::Hug(0));
+        assert!(
+            targets(&live).is_empty(),
+            "and nothing for Tab or a press to land on"
         );
     }
 
@@ -612,10 +763,36 @@ mod tests {
             delegate("c2", "lib", "docs_writer"),
             result("c2", false),
         ]);
-        assert_eq!(Team::height(&state, &Moment::default(), 60), Height::Hug(3));
+        // Two members down there, and the lead is a row too, so two header-row
+        // plus two. Asked for with no team at all — the row is mounted and the
+        // panel still takes nothing.
+        let live = Moment::default().with_lead("lead-1").with_members(vec![
+            MemberNow {
+                name: "scout".into(),
+                session: "lead-1/scout".into(),
+                ..MemberNow::default()
+            },
+            MemberNow {
+                name: "lib".into(),
+                session: "lead-1/lib".into(),
+                ..MemberNow::default()
+            },
+        ]);
+        assert_eq!(Team::height(&state, &live, 60), Height::Hug(4));
         assert_eq!(
             Team::height(&State::default(), &Moment::default(), 60),
-            Height::Hug(1)
+            Height::Hug(0),
+            "no members is no panel, not a header saying so"
         );
+    }
+
+    /// A member's own row is only ever asked for when there is one to draw, at
+    /// every height the panel is handed.
+    #[test]
+    fn an_empty_team_is_drawn_as_nothing_rather_than_a_header() {
+        let state = State::default();
+        let moment = Moment::default();
+        assert!(Team::render(&state, &Viewport::new(Rect::sized(60, 10), &moment)).is_empty());
+        assert_eq!(Team::height(&state, &moment, 60), Height::Hug(0));
     }
 }

@@ -2573,15 +2573,14 @@ async fn the_team_panel_says_who_is_on_the_team_and_what_each_last_said() {
     let s = start(tree(&dir, &script, &[&team])).await;
     let task = s.open().await;
 
-    // Before anyone is delegated to, the panel is one line and says so.
-    let empty = s
-        .term
-        .last()
-        .unwrap()
-        .part("team")
-        .expect("the team panel is on screen")
-        .clone();
-    assert_eq!(empty.rect.h, 1, "an empty team takes one line");
+    // Before anyone is delegated to there is no panel at all: the row is
+    // mounted, the panel asks for no rows, and the host places nothing — so the
+    // conversation keeps the row rather than a blank line of chrome. A strip
+    // saying "no members" would be the chrome this panel exists to avoid.
+    assert!(
+        s.term.last().unwrap().part("team").is_none(),
+        "a session with no team has no team panel"
+    );
 
     s.term.type_line("have someone look around");
     s.quiet().await;
