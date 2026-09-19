@@ -108,32 +108,34 @@ pub const CODING_DEFAULTS: &str = r#"
 # `RoundCap::call` guards with `max_rounds > 0` so `0` means "no limit" rather
 # than "stop before the first request".
 #
-# NOT mapped, and worth knowing: `[coding].max_rounds` /
-# `ATOMCODE_TURN_MAX_ROUNDS` do not reach this row. Those are read where the
-# engine builds its loop (`config.rs`), which a config *layer* cannot do — a
-# layer is data. Bridging them means a plugin that reads the environment and
-# patches this row, which does not exist yet; until it does, a deployment that
-# sets them gets the engine's cap on the chain path and none here.
+# NOT stated here, and worth knowing: `[coding].max_rounds` /
+# `ATOMCODE_TURN_MAX_ROUNDS` do not reach this const. Nothing in a config *layer*
+# can read them — a layer is data, and the environment is not in it. The bridge
+# is one row down the stack: `config_rows` is built in Rust from the resolved
+# `CodingAgentConfig` (which is where `config.rs` already merged the env), and it
+# patches this row back to the configured budget when that budget is not `0`.
+# So in the shipped runtime this `0` is the default, not the last word.
 #
-# ALSO NOT mapped, deliberately, and this one is a divergence rather than a gap:
-# `agent-loop` carries a second, coarser stop — `infra` sets
-# `config = { max_rounds = 100 }`, and `agent_loop.rs` ends the turn with
-# `StopReason::RunawayFuse` at that round. The engine's counterpart is
-# `cfg.max_rounds` → the kernel fuse, whose comment reads "`0` leaves the
-# neutral kernel fuse unwired" — i.e. the engine ships it **off** and relies on
-# the repetition guards, which is what this assembly's `tool-loop-guard` +
-# `repeat-fuse` rows are.
+# ALSO worth knowing, and this one is a divergence: `agent-loop` carries a
+# second, coarser stop — `infra` sets `config = { max_rounds = 100 }`, and
+# `agent_loop.rs` ends the turn with `StopReason::RunawayFuse` at that round.
+# The engine's counterpart is `cfg.max_rounds` → the kernel fuse, whose comment
+# reads "`0` leaves the neutral kernel fuse unwired" — i.e. the engine ships it
+# **off** and relies on the repetition guards, which is what this assembly's
+# `tool-loop-guard` + `repeat-fuse` rows are.
 #
-# Matching that here means setting the fuse to `0`, and that is two changes, not
-# one: `agent_loop.rs` compares `step >= self.max_rounds`, so a bare `0` stops
-# the turn before its first request (the same trap `round-cap` had), and
-# `Op::Patch` **replaces a row's whole config** — so a host that patches
-# `agent-loop` with just its `working_dir` (both hosts do) would drop the field
-# straight back to the default of 100. Doing it half-way would produce a fuse
-# that reads 0 in a `--dump-config` whose host has already reverted it.
+# Matching that here would mean setting the fuse to `0`, and that is not one
+# change: `agent_loop.rs` compares `step >= self.max_rounds`, so a bare `0` stops
+# the turn before its first request (the same trap `round-cap` had). The
+# corresponding statement in that direction is [`RUNAWAY_FUSE_ROUNDS`].
 #
-# Left as is on purpose: the fuse is a safety net, removing one is its own
-# decision, and the divergence is documented here rather than silently made.
+# The fuse stays ON — a turn that nothing else is watching must still end — but
+# its number is this product's, not `infra`'s 100 and not a serde default:
+# [`RUNAWAY_FUSE_ROUNDS`]. Every patch this crate aims at `agent-loop` carries
+# the field, because `Op::Patch` **replaces a row's whole config**: a patch that
+# says only `working_dir` does not leave the fuse alone, it drops it back to
+# `LoopRow::default()` — which is how a `--dump-config` reading 100 came to mean
+# nothing in particular.
 [[patch]]
 id = "round-cap"
 config = { max_rounds = 0 }
@@ -360,6 +362,28 @@ name = "telemetry"
 disabled = true
 "#;
 
+/// The coarse fuse `agent-loop` ends a turn on, in rounds.
+///
+/// Not `infra`'s 100 and not `LoopRow::default()`: the number a person reads in
+/// `--dump-config` has to be the number in force. The row's own default lives in
+/// `harness/plugins/agent_loop.rs`, and a `[[patch]]` replaces a row's whole
+/// config, so a patch carrying only `working_dir` silently reverts this to that
+/// default. Both of this crate's `agent-loop` patches therefore state it:
+/// `AgentLoopOptionsPatch` (the runtime's own option rows) and `AgentLoopPatch`
+/// (the layer `mount_hosted` scopes, which is the last word on the
+/// `mount_swappable` path, where no runtime option rows exist).
+///
+/// It is the *fuse*, not the budget: `round-cap` owns the turn's round budget,
+/// and the fuse exists so a turn terminates even when no `turn-stopping`
+/// listener does. Raising it moves the round at which a tree with no stopping
+/// policy gives up; it does not by itself make a turn run longer than the budget
+/// allows.
+///
+/// Public for the reason [`CODING_DEFAULTS`] is: a host that stacks that list and
+/// then patches `agent-loop` itself has to state the same number, or the value
+/// it reverts to is `LoopRow::default()` and nobody chose it.
+pub const RUNAWAY_FUSE_ROUNDS: u32 = 300;
+
 // ---- the shapes this product patches rows with ------------------------------
 //
 // One struct per config this crate computes, serialized by the layer builder
@@ -379,6 +403,8 @@ disabled = true
 #[derive(serde::Serialize)]
 struct AgentLoopPatch<'a> {
     working_dir: &'a std::path::Path,
+    /// Carried, not left to the row's default — see [`RUNAWAY_FUSE_ROUNDS`].
+    max_rounds: u32,
 }
 
 #[derive(serde::Serialize)]
@@ -1581,7 +1607,13 @@ pub async fn mount_hosted(
             layer.enable("models-host").enable("llm-utility-selected")
         })
         .then(boundary)
-        .patch("agent-loop", AgentLoopPatch { working_dir })
+        .patch(
+            "agent-loop",
+            AgentLoopPatch {
+                working_dir,
+                max_rounds: RUNAWAY_FUSE_ROUNDS,
+            },
+        )
         .map_err(|e| e.to_string())?
         .swap("llm", "llm-injected")
         .patch(
