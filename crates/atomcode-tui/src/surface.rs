@@ -931,10 +931,18 @@ fn read_clipboard_image() -> Option<atomcode_kernel::message::ImageContent> {
     let mut clipboard = arboard::Clipboard::new().ok()?;
     let img = clipboard.get_image().ok()?;
     let png = encode_rgba_png(img.width, img.height, &img.bytes)?;
-    Some(atomcode_kernel::message::ImageContent {
-        media_type: "image/png".into(),
-        data: base64::engine::general_purpose::STANDARD.encode(png),
-    })
+    // Downscale/re-encode an oversized paste (longest edge > 1568px or > ~1.5 MB) so a
+    // big screenshot can't blow the per-request body — the image is re-sent every turn.
+    // Falls back to the original PNG on any decode failure. See image_normalize.
+    let (media_type, data) =
+        match atomcode_capabilities::image_normalize::normalize_image_raw(&png) {
+            Some((mt, out)) => (mt, base64::engine::general_purpose::STANDARD.encode(out)),
+            None => (
+                "image/png".to_string(),
+                base64::engine::general_purpose::STANDARD.encode(png),
+            ),
+        };
+    Some(atomcode_kernel::message::ImageContent { media_type, data })
 }
 
 /// RGBA bytes into a PNG stream, or `None` if the buffer does not describe the
