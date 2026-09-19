@@ -586,6 +586,15 @@ pub trait UserInterface: Send + Sync {
     /// the end of a login) asks the screen to open the session that work made
     /// possible.
     fn run_slash(&self, _line: &str) {}
+
+    /// Put a line of the front end's own into what the person is reading.
+    ///
+    /// Default: nothing — a front end with no scrollback has nowhere to put it.
+    /// The one that has one appends it to the conversation, which is how a row
+    /// says something *while it works* rather than only when it returns: a
+    /// login shows a QR code, a URL and each step it is on, and a modal would
+    /// make that a frame the person has to read before it goes away.
+    fn say(&self, _text: &str) {}
 }
 
 /// Naming a session. A seam because the cheap answer (the first prompt) and the

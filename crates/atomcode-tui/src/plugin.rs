@@ -790,6 +790,24 @@ impl UserInterface for Tui {
         self.run_command(line);
     }
 
+    /// A line the person should read, into the conversation.
+    ///
+    /// The same block a command's answer becomes (`CommandSaid`), so it scrolls,
+    /// folds and is dumped on exit with everything else. That is what lets a row
+    /// talk *while* it works — a login's QR code, URL and each step — instead of
+    /// holding it all for a modal the person has to read before it closes.
+    fn say(&self, text: &str) {
+        Tui::say(self, text);
+        // Written from off the loop, so ask for the frame the same way anything
+        // else outside it does (`deliver` does the same after a command
+        // answers): without this the line sits there unpainted until the next
+        // keystroke.
+        let sender = self.wake.lock().expect("wake poisoned").clone();
+        if let Some(sender) = sender {
+            let _ = sender.send(Wake::Fact);
+        }
+    }
+
     async fn run(&self, ctx: &Context, initial: Option<String>) -> Result<(), String> {
         let HostConnection {
             session,

@@ -46,6 +46,18 @@ const WHITE: crate::theme::Rgb = (255, 255, 255);
 /// it here. The first draft did check both, and the criterion for it stayed
 /// green when this file's check was deleted — which is what a rule with two
 /// implementations looks like from the outside.
+pub fn text_code(data: &str) -> Option<String> {
+    use qrcode::render::unicode::Dense1x2;
+    let code = QrCode::new(data.as_bytes()).ok()?;
+    Some(
+        code.render::<Dense1x2>()
+            .dark_color(Dense1x2::Dark)
+            .light_color(Dense1x2::Light)
+            .quiet_zone(true)
+            .build(),
+    )
+}
+
 pub fn code(data: &str) -> Option<Raster> {
     let code = QrCode::new(data.as_bytes()).ok()?;
     let side = code.width() + QUIET_ZONE * 2;
