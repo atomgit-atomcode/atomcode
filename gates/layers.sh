@@ -107,6 +107,35 @@ else
     "coding 依赖了:$out —— 前端契约与宿主装配都在它上面(§2.3)"
 fi
 
+# The split of 2026-09-19 (决策 7): signing in is a protocol, storing what came
+# back is a file with a mode on it. They were one crate, so everything that only
+# wanted to know who is logged in pulled in an HTTP client and an OAuth flow.
+#
+# Checked rather than intended, because the edge that would undo it is one line
+# in a manifest and compiles: the store asking the protocol to refresh something
+# is exactly the direction this forbids, and it reads perfectly naturally at the
+# call site.
+say "凭据只往一个方向走:协议依赖存储,存储不认协议"
+creds_bad=0
+if ! out="$(forbid atomcode-credentials atomcode-auth atomcode-codingplan atomcode-coding atomcode)"; then
+  bad "凭据只往一个方向走" \
+    "credentials 依赖了:$out —— 存放凭据的那半不许认识取得它们的那半"
+  creds_bad=1
+fi
+# And it stays a file, not a client: a store that could talk to a server would
+# grow a refresh of its own, and then there would be two.
+if grep -qE '^(reqwest|hyper|ureq) *=' crates/atomcode-credentials/Cargo.toml 2>/dev/null; then
+  bad "凭据只往一个方向走" \
+    "credentials 里有 HTTP 客户端 —— 存储那半不该能自己去跟服务器说话"
+  creds_bad=1
+fi
+if ! printf '%s\n' "$(deps atomcode-auth)" | grep -qx atomcode-credentials; then
+  bad "凭据只往一个方向走" \
+    "auth 不依赖 credentials —— 那这两半要么又合回去了,要么各存了一份"
+  creds_bad=1
+fi
+[ "$creds_bad" = 0 ] && ok "凭据只往一个方向走:协议依赖存储,存储不认协议"
+
 say "契约零实现:host-api 只依赖 kernel"
 have="$(deps atomcode-host-api | grep -v '^__' || true)"
 if [ "$have" = "atomcode-kernel" ]; then

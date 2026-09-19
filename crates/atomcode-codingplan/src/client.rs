@@ -157,7 +157,7 @@ impl Client {
     /// the token if expired. Errors with a user-facing message if the
     /// user isn't logged in.
     pub fn from_stored_auth() -> Result<Self> {
-        if !auth::is_logged_in() {
+        if !atomcode_credentials::is_logged_in() {
             return Err(anyhow!(
                 "not logged in — run `atomcode login` (or the codingplan flow) first"
             ));

@@ -254,7 +254,7 @@ pub mod tui_front {
         /// The name and the email, never the token — this answer is printed on
         /// a screen and kept in a log.
         fn identity(&self) -> Option<crate::host::Identity> {
-            let auth = atomcode_auth::get_stored_auth()?;
+            let auth = atomcode_credentials::get_stored_auth()?;
             Some(crate::host::Identity {
                 who: auth.user.name.unwrap_or(auth.user.username),
                 detail: auth.user.email,

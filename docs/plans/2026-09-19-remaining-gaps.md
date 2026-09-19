@@ -59,23 +59,37 @@ G 类七条**刻意排在翻默认之后**：自用会告诉我们哪几条是�
 判据规矩不变（0019）：**先写判据、摘掉被测代码证伪一次**，反证写进 commit；
 `gates/tui-test-count.baseline` 随判据上抬。
 
-### A. 引导（挡住翻默认）
+### A. 引导（挡住翻默认）——**已完成，2026-09-19**
 
-- [ ] **A1 tui 出通用 `Wizard` overlay**（决策 5）。今天只有三种浮层：`SecretPrompt`
-      (`secret.rs:76`)、`Reading`、`Picker`（`overlay.rs:220/300`），没有多步形态。
-      要的是：步骤列表、进度、前进 / 后退、每步的结果回传。**步骤内容不进 tui。**
-- [ ] **A2 tui 出 QR 渲染**（决策 6）。纯函数，输入 URL + code，输出字符点阵。tui 今天无 QR 代码。
-- [ ] **A3 cli 侧的 auth 行**（决策 2）：实现 Wizard 端口，持 `atomcode-auth`，跑 OAuth 轮询，
-      喂四步定义（Intro / Language / Setup / Confirm）。装配点在 `main.rs:2241` 那条
-      `FrontEnd::new` 旁边。
-- [ ] **A4 触发判定在 cli**：「无可用 provider 且无本地 OAuth」要读凭据文件，tui 只接受
-      「开不开向导」这一个答案。
-- [ ] **A5 顺势拆 `atomcode-auth`**（决策 7）：Product 的那半 / Host 的那半。
-- [ ] **A6 提交前预检**。这是「首启无引导」的根因：新桥只有提交后报错
-      （`cli/host.rs:1149` 把 `RuntimeError::ProviderUnavailable` 映射成
-      `HostError::ProviderUnavailable`，理由一个不丢），旧桥有 `accepts` /
-      `provider_unavailable_reason` / `is_stopped` 三个预检方法，`RuntimeControl` 一个都没接。
-      *判据：没配 provider 时不提交也能看到状态。*
+六条都落地了，顺序与当初写的不同：A6 先做，因为它是 A2 的触发时机。
+
+- [x] **A1 tui 的通用 `Wizard` overlay**（决策 5）。步骤是数据：id、标题、已排好的
+      body 行、四种要法（读一段 / 选一个 / 打一段 / 等宿主）。这个文件里没有
+      onboarding、没有语言、也不知道屏上那个码是用来扫的。等待是它比 `Picker` 多
+      出来的那件事：宿主留着 `Arc`，进行中 `say()`、落地 `resolve()`。
+      顺带给 `Overlays` 开了 `finish(id, value)`——按名字关，因为登录迟到而人已经
+      打开了别的东西时，按「当前开着的那个」关会关错。
+- [x] **A2 tui 的 QR 渲染**（决策 6）。一张位图不是一串转义：颜色不走角色（扫码器
+      要的是浅底深块），一格用 `▀` 装上下两个模块（否则码是宽高比 2:1，扫不出来）。
+      终端不画单元格背景时一张都不画——半张码比没有更坏。
+- [x] **A3 cli 侧的 auth 行**（决策 2）：`tui_onboarding`，四步（说清现状 / 语言 /
+      扫码登录 / 看一眼结果），登录那步做的是 `atomcode login` 浏览器回来后的同样
+      三件事减去打印。**这里一行都不能往 stdout 打。**
+- [x] **A4 触发判定在 cli**：readiness 对 `NotConfigured` 点名 `onboarding`；行无
+      条件挂上，跑不跑由启动时问宿主的那一答决定。
+- [x] **A5 拆 `atomcode-auth`**（决策 7）：新 crate `atomcode-credentials` 拿走凭据
+      文件、它的锁和文件里那点东西的形状；`atomcode-auth` 只剩协议（URL、轮询、
+      换 token、gateway_crypto、openrouter）。方向由 `gates/layers.sh` 守着，三条都
+      摘掉证伪过：存储反过来依赖协议、存储自己长出 HTTP 客户端、两半又合回去。
+      **没有留 `pub use` 兼容面**——留了这拆就只是个 facade。
+- [x] **A6 提交前预检**：`HostCommand::Readiness` 一问一答。这是「首启没引导」的
+      根因：新桥只有提交后报错，旧 driver 协议的三个预检一个都没接。
+
+**这一节顺带补的机制**（不在原计划里，是做的过程中缺的）：
+- tui 的 `Repaint` 缝：循环外的活改了屏幕要能让它重画；登录轮询正是这种活，而恰恰
+  在「等它」的那一步，下一次按键可能永远不来。
+- `deliver()`：命令被「选中」和被「打出来」原本走两条路，选中那条把 `Outcome::Open`
+  静默丢掉——选中项若要再开一个浮层，什么都不会发生。
 
 ### B. 解开 6.3 的尾巴（6.3 今天不能算完成）
 
@@ -137,6 +151,13 @@ G 类七条**刻意排在翻默认之后**：自用会告诉我们哪几条是�
 - [ ] **H2 追并发红**：`coding::mount_wiring::the_configured_datalog_records_the_turn`，
       线索在 `capabilities/src/datalog.rs:290`。「偶尔红一下」会训练所有人无视闸门
 - [ ] H3 `atomcode-updater` 的版本号 `-N` 修订后缀被 `split('-').next()` 丢掉（`lib.rs:1107`）
+- [ ] **H4 `atomcode-capabilities` 的测试编译在本分支上是红的**，且**不是本线改出来的**：
+      `session/manager.rs:4769` 的一条测试调 `mgr.append_jsonl_line(…)`，而这个方法
+      在 HEAD 的同一文件里根本没有定义（0 处定义、1 处调用）。也就是说
+      `cargo nextest run -p atomcode-capabilities` 在这条分支上跑不起来，已经有一阵
+      子没人跑过它了。多半是 0024 事件日志迁移时删了方法、漏了这条测试。
+      2026-09-19 发现于 A5，未修——不在那条线的范围里，但**别让它继续烂着**：
+      一个跑不起来的 crate 等于没有判据。
 
 ---
 

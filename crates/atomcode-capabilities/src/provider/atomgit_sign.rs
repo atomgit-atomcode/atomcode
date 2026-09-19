@@ -2,9 +2,10 @@ use std::sync::Arc;
 
 use atomcode_auth::gateway_crypto::{self, SignInput};
 use atomcode_auth::oauth::{
-    classify_auth_recovery_error, get_stored_auth, get_valid_auth_session,
-    recover_auth_after_unauthorized, AuthRecoveryFailureKind,
+    classify_auth_recovery_error, get_valid_auth_session, recover_auth_after_unauthorized,
+    AuthRecoveryFailureKind,
 };
+use atomcode_credentials::get_stored_auth;
 
 use super::{RequestSigner, RequestSigningError, SignedAuth};
 
@@ -99,7 +100,7 @@ pub use gateway_crypto::{is_atomgit_gateway, signer_available};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atomcode_auth::oauth::{logout, save_auth, AuthInfo, UserInfo};
+    use atomcode_credentials::{logout, save_auth, AuthInfo, UserInfo};
 
     fn auth(user_id: &str, token: &str) -> AuthInfo {
         AuthInfo {

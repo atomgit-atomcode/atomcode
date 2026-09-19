@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use atomcode_auth::{AuthInfo, UserInfo};
+use atomcode_credentials::{AuthInfo, UserInfo};
 
 pub(crate) const LOGIN_TTL: Duration = Duration::from_secs(600);
 pub(crate) const TERMINAL_RETENTION: Duration = Duration::from_secs(60);

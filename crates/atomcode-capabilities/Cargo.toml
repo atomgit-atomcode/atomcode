@@ -20,6 +20,7 @@ tar = "0.4"
 # L0 only. NEVER add atomcode-core or any L2/L3 crate here (layering is compile-enforced).
 atomcode-kernel = { path = "../atomcode-kernel" }
 atomcode-auth = { path = "../atomcode-auth", optional = true }
+atomcode-credentials = { path = "../atomcode-credentials" }
 # Leaf config crate (sits below core). The `notify` capability reads NotificationConfig;
 # the config crate is explicitly designed so every stack layer can read config without an
 # atomcode-core dep. Optional + behind the `notify` feature so a provider-only / lean

@@ -106,10 +106,10 @@ bash gates/tui.sh && bash gates/layers.sh
    卡点只有 `cli/src/acp/commands.rs:21` 一行。**动手前要先拍板**
    `TurnCompletion::SnapshotUnavailable` 在契约里的去处——三条路写在
    `docs/tui-replaces-tuix-plan.md` 的 6.3 测绘里，tui 今天已经在丢这个信息。
-2. **分层债三笔**：`atomcode-harness` 应当零 atomcode 依赖（现在 6 个，18 个文件
+2. **分层债三笔**：`atomcode-harness` 应当零 atomcode 依赖（现在 5 个，18 个文件
    引用 `capabilities`）；`atomcode-daemon` 该是 cli 的一个 `[[bin]]`；
-   `atomcode-auth` 该拆成 Product 的那半（gateway_crypto / oauth / openrouter）和
-   Host 的那半（凭据文件读写）。
+   ~~`atomcode-auth` 该拆成两半~~ —— **2026-09-19 拆完**：凭据文件那半成了
+   `atomcode-credentials`，方向由 `gates/layers.sh` 守着。
 3. ~~**两条契约缺口**~~ **已做**（2026-09-18 晚）：用量/额度、goal/loop 推送通道。
    见上面 P2。
 4. **M6.5** 删不再挂载的代码：runtime 驱动协议、coding `team/`、

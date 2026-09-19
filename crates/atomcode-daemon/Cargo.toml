@@ -21,6 +21,7 @@ atomcode-codingplan = { path = "../atomcode-codingplan" }
 # Config system used directly by the daemon.
 atomcode-config = { path = "../atomcode-config" }
 atomcode-auth = { path = "../atomcode-auth" }
+atomcode-credentials = { path = "../atomcode-credentials" }
 # `tools` is required directly by the `/fs/search` handler (the `file_index`
 # module is gated on it). It also arrives transitively via `atomgit`, but declare
 # it so the dependency is explicit rather than relying on feature unification.

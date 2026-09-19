@@ -1,0 +1,22 @@
+[package]
+name = "atomcode-credentials"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+description = "Where atomcode's credentials live: the chmod-600 auth file, its lock, and the shape of what is in it. No network, no OAuth — see atomcode-auth for how they are got."
+publish = false
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+tracing = "0.1"
+fs2 = "0.4"
+atomcode-config = { path = "../atomcode-config" }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Same-directory atomic credential replacement on Windows.
+tempfile = "3"
+
+[dev-dependencies]
+tempfile = "3"

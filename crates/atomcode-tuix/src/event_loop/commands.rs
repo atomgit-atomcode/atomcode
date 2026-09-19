@@ -2464,7 +2464,7 @@ fn execute_slash_command_impl(
                     None => "用法：/app（默认连官方中继），或 /app <中继地址> 覆盖".to_string(),
                     Some(relay) => {
                         // 1) 检查登录态：未登录不允许开启远程访问。
-                        if atomcode_auth::oauth::get_stored_auth().is_none() {
+                        if atomcode_credentials::get_stored_auth().is_none() {
                             renderer.render(UiLine::CommandOutput(
                                 "远程访问需要先登录。输入 /login 完成登录后，再执行 /app。"
                                     .to_string(),
@@ -2479,7 +2479,7 @@ fn execute_slash_command_impl(
                         atomcode_daemon::stop_app_server();
                         //    传入当前登录 user_id 启用双向校验。
                         let app_user_id =
-                            atomcode_auth::oauth::get_stored_auth().map(|a| a.user.id);
+                            atomcode_credentials::get_stored_auth().map(|a| a.user.id);
                         let started = tokio::task::block_in_place(|| {
                             tokio::runtime::Handle::current().block_on(
                                 atomcode_daemon::ensure_app_server(
@@ -2494,7 +2494,7 @@ fn execute_slash_command_impl(
                             Ok((_h, port)) => {
                                 // 3) route token（中继路由 key + 凭证）+ 中继 URL。
                                 // token = user_id.随机hex，App 端扫码后校验 user_id 是否一致。
-                                let token = match atomcode_auth::oauth::get_stored_auth() {
+                                let token = match atomcode_credentials::get_stored_auth() {
                                     Some(auth) => format!(
                                         "{}.{}",
                                         auth.user.id,
@@ -2628,7 +2628,7 @@ fn execute_slash_command_impl(
                 let _ = ctx.app_relay_child.take();
             }
             atomcode_daemon::stop_app_server();
-            match atomcode_auth::logout() {
+            match atomcode_credentials::logout() {
                 Ok(()) => {
                     match deactivate_runtime_provider_after_logout(ctx) {
                         Ok(true) => {
@@ -5091,7 +5091,7 @@ fn format_login_identity(name: Option<&str>, username: &str) -> String {
 /// name. Shared by both `/status` renderers so the interactive and remote
 /// outputs can't drift.
 fn render_login_line_from_stored_auth() -> String {
-    match atomcode_auth::get_stored_auth() {
+    match atomcode_credentials::get_stored_auth() {
         Some(a) => {
             let identity = format_login_identity(a.user.name.as_deref(), &a.user.username);
             render_login_line(Some(&identity))
@@ -5410,7 +5410,7 @@ pub(super) fn build_status_text(ctx: &LoopCtx, proxy: Option<&str>) -> String {
 
 /// `/whoami` 的账号信息文本。TUI arm 与手机远程执行共用。
 pub(super) fn build_whoami_text() -> String {
-    if let Some(auth) = atomcode_auth::get_stored_auth() {
+    if let Some(auth) = atomcode_credentials::get_stored_auth() {
         let email = auth.user.email.as_deref().unwrap_or("—");
         let name = auth.user.name.as_deref().unwrap_or(&auth.user.username);
         format!(
@@ -5418,7 +5418,7 @@ pub(super) fn build_whoami_text() -> String {
             name,
             auth.user.username,
             email,
-            atomcode_auth::auth_file_path().display(),
+            atomcode_credentials::auth_file_path().display(),
         )
     } else {
         t(Msg::CmdWhoamiNotSignedIn).into_owned()
@@ -7153,7 +7153,7 @@ mod compose_login_chrome_tests {
 fn run_oauth_with_renderer(
     renderer: &mut dyn Renderer,
     ctx: &mut LoopCtx,
-) -> Result<atomcode_auth::AuthInfo> {
+) -> Result<atomcode_credentials::AuthInfo> {
     use crossterm::event::KeyCode;
     use std::time::Duration;
     use tokio::sync::mpsc::error::TryRecvError;
@@ -7286,9 +7286,9 @@ fn run_coding_plan_blocking(
 /// path — that path prints to stdout and is reserved for CLI callers.
 pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> Result<()> {
     // Phase 1: pre-flight login if needed.
-    if !atomcode_auth::is_logged_in() {
+    if !atomcode_credentials::is_logged_in() {
         if let Err(e) = run_oauth_with_renderer(renderer, ctx)
-            .and_then(|auth| atomcode_auth::save_auth(&auth).map(|_| auth))
+            .and_then(|auth| atomcode_credentials::save_auth(&auth).map(|_| auth))
         {
             // Login failed/cancelled. Surface as a top-level error;
             // skip the rest of setup since claim/models/status all
@@ -7337,7 +7337,7 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
         renderer.render(UiLine::CommandOutput(t(Msg::CpReauthAfter401).into_owned()));
         renderer.flush();
         match run_oauth_with_renderer(renderer, ctx)
-            .and_then(|auth| atomcode_auth::save_auth(&auth).map(|_| auth))
+            .and_then(|auth| atomcode_credentials::save_auth(&auth).map(|_| auth))
         {
             Ok(_) => {
                 let (cfg_after2, r2) =

@@ -3841,13 +3841,13 @@ pub(crate) struct AuthObservation {
 impl AuthObservation {
     fn read() -> Self {
         Self {
-            user_id: atomcode_auth::get_stored_auth().map(|auth| auth.user.id),
+            user_id: atomcode_credentials::get_stored_auth().map(|auth| auth.user.id),
         }
     }
 
     fn read_checked() -> anyhow::Result<Self> {
         Ok(Self {
-            user_id: atomcode_auth::get_stored_auth_checked()?.map(|auth| auth.user.id),
+            user_id: atomcode_credentials::get_stored_auth_checked()?.map(|auth| auth.user.id),
         })
     }
 
@@ -17693,7 +17693,10 @@ pub(crate) fn should_auto_show_onboarding(ctx: &LoopCtx) -> bool {
     if ctx.is_plain_renderer {
         return false;
     }
-    provider_configuration_missing(&ctx.config, atomcode_auth::get_stored_auth().is_some())
+    provider_configuration_missing(
+        &ctx.config,
+        atomcode_credentials::get_stored_auth().is_some(),
+    )
 }
 
 fn provider_configuration_missing(config: &Config, has_stored_auth: bool) -> bool {
@@ -29277,7 +29280,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     let no_provider = status_provider_unconfigured(
         unavailable_reason,
         &ctx.config,
-        atomcode_auth::get_stored_auth().is_some(),
+        atomcode_credentials::get_stored_auth().is_some(),
     );
     let provider_waiting = matches!(
         runtime_availability,
