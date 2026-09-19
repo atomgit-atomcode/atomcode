@@ -4751,6 +4751,7 @@ mod tests {
         // Missing transcript → empty, not an error.
         assert!(mgr.load_transcript_records("missing").unwrap().is_empty());
 
+        let mut lines: Vec<String> = Vec::new();
         for turn in 1..=3u64 {
             let line = serde_json::json!({
                 "v": 1,
@@ -4764,10 +4765,16 @@ mod tests {
                 "tools": [],
                 "usage": { "prompt": 1, "completion": 2, "cached": 0 }
             });
-            let mut bytes = serde_json::to_vec(&line).unwrap();
-            bytes.push(b'\n');
-            mgr.append_jsonl_line("s1", &bytes).unwrap();
+            lines.push(serde_json::to_string(&line).unwrap());
         }
+        // Written straight to the file rather than through a writer: the one
+        // that used to be here went with `TranscriptHook` (513e7567, the move
+        // to the event log), and this test kept calling it — so the whole
+        // crate's tests stopped compiling, quietly, for as long as nobody ran
+        // them. What is still live is the *reader*, which the daemon's
+        // transcript endpoint serves (`atomcode-daemon/src/lib.rs:2303`), and
+        // the reader is what this is about.
+        std::fs::write(mgr.jsonl_path("s1").unwrap(), lines.join("\n") + "\n").unwrap();
 
         // The FULL trajectory comes back — every turn with its raw bodies, including
         // the early turns a snapshot compaction would have dropped. This is the read

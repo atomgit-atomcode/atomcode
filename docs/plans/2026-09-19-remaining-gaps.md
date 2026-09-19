@@ -235,14 +235,23 @@ G 类七条**刻意排在翻默认之后**：自用会告诉我们哪几条是�
 - [ ] **H1 更新 `2026-09-18-tui-panels-and-commands-inventory.md`** —— 三处报高，见第四节
 - [ ] **H2 追并发红**：`coding::mount_wiring::the_configured_datalog_records_the_turn`，
       线索在 `capabilities/src/datalog.rs:290`。「偶尔红一下」会训练所有人无视闸门
-- [ ] H3 `atomcode-updater` 的版本号 `-N` 修订后缀被 `split('-').next()` 丢掉（`lib.rs:1107`）
-- [ ] **H4 `atomcode-capabilities` 的测试编译在本分支上是红的**，且**不是本线改出来的**：
+- [~] **H3 不做**（2026-09-20 核实）。`parse_version`（`updater/lib.rs:1102`）剥掉
+      `-` 之后的部分是**为 `-beta.1` / `-rc.2` 刻意做的**（Issue #596），而上游从
+      没发过带 `-N` 的版本——tag 全是 `vX.Y.Z`，`latest.json` 也是。这条是下游 fork
+      报的：他们若用 `-N` 当修订号，要先决定 `v5.1.0-3` 该排在 `v5.1.0` 之上还是
+      之下（semver 说 pre-release 在正式版之前，而「修订」的直觉相反）——那是他们
+      的产品决定，不是这里能替他们拍的。上游照当前行为是对的。
+- [x] **H4 已修**（2026-09-20）。`atomcode-capabilities` 的测试编译在本分支上是红的，且**不是本线改出来的**：
       `session/manager.rs:4769` 的一条测试调 `mgr.append_jsonl_line(…)`，而这个方法
       在 HEAD 的同一文件里根本没有定义（0 处定义、1 处调用）。也就是说
       `cargo nextest run -p atomcode-capabilities` 在这条分支上跑不起来，已经有一阵
       子没人跑过它了。多半是 0024 事件日志迁移时删了方法、漏了这条测试。
-      2026-09-19 发现于 A5，未修——不在那条线的范围里，但**别让它继续烂着**：
-      一个跑不起来的 crate 等于没有判据。
+      2026-09-19 发现于 A5，2026-09-20 修掉：写那一半的 `append_jsonl_line` 随
+      `513e7567`（删 TranscriptHook、转事件日志）一起没了，而**读**那一半还活着——
+      daemon 的 transcript 端点就在用（`daemon/lib.rs:2303`）。所以测试改成直接
+      把 jsonl 写进文件，测的仍是那个读法。修完 `cargo nextest run -p
+      atomcode-capabilities` **930 条全过**，也就是说这批判据从那次提交起一直是
+      跑不起来的状态，而没有人发现。
 
 ---
 
