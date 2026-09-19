@@ -1117,6 +1117,21 @@ impl HostControl for RuntimeControl {
                 *self.config.lock().expect("config poisoned") = next;
                 Ok(HostReply::Done)
             }
+            HostCommand::Readiness { session } => {
+                self.addressed(&session)?;
+                // Three checks the old driver protocol exposed separately and
+                // the new bridge never carried over, asked once and answered
+                // with what to do. Order matters: a stopped runtime cannot be
+                // fixed by signing in, so it is reported first.
+                if self.handle.is_stopped() {
+                    return Ok(HostReply::Readiness {
+                        ready: false,
+                        why: Some("这个会话的运行时已经停了".into()),
+                        fix: None,
+                    });
+                }
+                Ok(readiness_for(self.handle.provider_unavailable_reason()))
+            }
             _ => Err(HostError::Failed {
                 message: "this host does not do that yet".into(),
             }),
@@ -1137,6 +1152,45 @@ impl HostControl for RuntimeControl {
 /// are foreign to this crate now that the adapter lives here, and the orphan
 /// rule is right to stop it — the conversion is this host's opinion, not
 /// something either crate should carry for everyone.
+/// What a provider that cannot serve means for a person about to type.
+///
+/// A table rather than a condition at the call site, for the same reason
+/// [`refused`] is one (`docs/adr/0021` §8): every cause gets an answer, and a
+/// new cause cannot be added without deciding what the screen says about it.
+///
+/// `fix` names a command this build has. `None` where nothing this screen can
+/// run would help — naming a command that does nothing would be worse than
+/// saying nothing, because the person would run it.
+pub fn readiness_for(reason: Option<ProviderUnavailableReason>) -> HostReply {
+    let (why, fix) = match reason {
+        None => {
+            return HostReply::Readiness {
+                ready: true,
+                why: None,
+                fix: None,
+            }
+        }
+        Some(ProviderUnavailableReason::NotConfigured) => {
+            // No `fix` yet: signing in again cannot help a machine that has no
+            // provider at all. The wizard that can is A2/A3 of
+            // `docs/plans/2026-09-19-remaining-gaps.md`, and this is where it
+            // will be named.
+            ("还没有配置任何 provider——先加一个才能开始", None)
+        }
+        Some(ProviderUnavailableReason::AuthenticationRequired) => {
+            ("登录已经失效，需要重新登录", Some("login"))
+        }
+        Some(ProviderUnavailableReason::UnsupportedBuild) => {
+            ("这个构建不支持所配置的 provider", None)
+        }
+    };
+    HostReply::Readiness {
+        ready: false,
+        why: Some(why.into()),
+        fix: fix.map(str::to_string),
+    }
+}
+
 pub fn refused(error: RuntimeError) -> HostError {
     {
         match error {

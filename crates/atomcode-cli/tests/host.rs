@@ -1837,3 +1837,50 @@ async fn mcp_and_a_reload_are_host_controls_on_the_live_session() {
     connection.commands.send(message("still here")).unwrap();
     through_turn(&mut connection).await;
 }
+
+/// Every reason a provider cannot serve has an answer for the person, and only
+/// a cause this build can actually fix names a command.
+///
+/// The table exists so a new reason cannot be added without deciding what the
+/// screen says about it — the same rule the error table above follows. The
+/// `None` arms are the point: a command named here is one the person will run,
+/// so naming one that cannot help is worse than saying nothing.
+#[test]
+fn every_reason_a_provider_cannot_serve_says_something_and_only_some_name_a_fix() {
+    use atomcode::host::readiness_for;
+
+    assert_eq!(
+        readiness_for(None),
+        HostReply::Readiness {
+            ready: true,
+            why: None,
+            fix: None
+        }
+    );
+
+    let cases = [
+        (ProviderUnavailableReason::NotConfigured, None),
+        (
+            ProviderUnavailableReason::AuthenticationRequired,
+            Some("login"),
+        ),
+        (ProviderUnavailableReason::UnsupportedBuild, None),
+    ];
+    for (reason, fix) in cases {
+        match readiness_for(Some(reason.clone())) {
+            HostReply::Readiness {
+                ready,
+                why,
+                fix: named,
+            } => {
+                assert!(!ready, "{reason:?}");
+                assert!(
+                    why.is_some_and(|w| !w.trim().is_empty()),
+                    "{reason:?} owes the person a reason"
+                );
+                assert_eq!(named.as_deref(), fix, "{reason:?}");
+            }
+            other => panic!("{reason:?} answered with {other:?}"),
+        }
+    }
+}

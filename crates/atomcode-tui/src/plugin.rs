@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use atomcode_harness::seams::{UiSvc, UserInterface};
-use atomcode_host_api::{HostConnection, HostControl, HostEvent};
+use atomcode_host_api::{HostCommand, HostConnection, HostControl, HostEvent, HostReply};
 use atomcode_kernel::agent::{AgentDescription, AgentStatus};
 use atomcode_kernel::event::{AgentCommand, AgentEvent, CommandId, RequestId};
 use atomcode_kernel::session::{Committed, LoggedEvent, SeqNo};
@@ -669,6 +669,9 @@ impl UserInterface for Tui {
             .ok_or("no connection to an agent: the launcher provides `agent-connection`")?;
         let client = self.client.clone();
         let mut host_events = control.subscribe();
+        // Kept before the connection takes it: the one question asked of the
+        // host before a person has typed anything.
+        let readiness = control.clone();
         client.connect(commands, control);
 
         let (wake_tx, mut wake) = mpsc::unbounded_channel::<Wake>();
@@ -772,6 +775,46 @@ impl UserInterface for Tui {
             }),
             None => tokio::spawn(async move { read_input(keys_tx).await }),
         };
+
+        // Before anything is typed: would a turn be taken at all?
+        //
+        // The gap this closes: this front end used to find out that there is no
+        // provider by submitting a turn and getting an error back — which tells
+        // the person after they have written one. The old driver protocol had
+        // three pre-flight checks for exactly this and the bridge to this
+        // screen never carried them over; the contract asks once instead, and
+        // the answer carries what to do about it.
+        {
+            let session = session.clone();
+            let host = self.host.clone();
+            let keys = wake_tx.clone();
+            tokio::spawn(async move {
+                let Ok(HostReply::Readiness {
+                    ready: false,
+                    why,
+                    fix,
+                }) = readiness.call(HostCommand::Readiness { session }).await
+                else {
+                    return;
+                };
+                if let Some(why) = why {
+                    let mut stream = host.stream.write().expect("stream poisoned");
+                    let mut w = stream.writer("commands");
+                    w.emit(
+                        crate::block::Coord::default(),
+                        Arc::new(crate::content::NoticeBlock { detail: why }),
+                    );
+                    drop(stream);
+                    let _ = keys.send(Wake::Fact);
+                }
+                // Dispatched the way a modal's pick is: the host names one of
+                // this screen's own commands, and naming it is as far as its
+                // say goes.
+                if let Some(fix) = fix {
+                    let _ = keys.send(Wake::Chose(Some(fix)));
+                }
+            });
+        }
 
         if let Some(text) = initial {
             // A start-up prompt is text by construction — there is no composer
@@ -2715,38 +2758,7 @@ impl Tui {
         let line = line.to_string();
         tokio::spawn(async move {
             let outcome = commands.dispatch(&line, &ctx).await;
-            let said = match outcome {
-                crate::command::Outcome::Said(text) => Some((text, false)),
-                crate::command::Outcome::Refused(why) => Some((why, true)),
-                crate::command::Outcome::Quiet => None,
-                crate::command::Outcome::Open(modal) => {
-                    let keys2 = keys.clone();
-                    host.overlays.open(
-                        modal,
-                        Box::new(move |chosen| {
-                            let _ = keys2.send(Wake::Chose(chosen));
-                        }),
-                    );
-                    let _ = keys.send(Wake::Fact);
-                    None
-                }
-                crate::command::Outcome::Do(action) => {
-                    // A command and a key share one implementation, so this is
-                    // the same path a keystroke takes.
-                    let _ = keys.send(Wake::Act(action));
-                    None
-                }
-            };
-            if let Some((text, refused)) = said {
-                let mut stream = host.stream.write().expect("stream poisoned");
-                let mut w = stream.writer("commands");
-                w.emit(
-                    crate::block::Coord::default(),
-                    Arc::new(crate::content::CommandSaid { text, refused }),
-                );
-                drop(stream);
-                let _ = keys.send(Wake::Fact);
-            }
+            deliver(&host, &keys, outcome);
         });
     }
 
@@ -2761,25 +2773,57 @@ impl Tui {
         let host = self.host.clone();
         // A pick is expressed as a command, so a modal and a typed command
         // reach the same implementation — the same rule keys already follow.
+        let Some(keys) = keys else { return };
         tokio::spawn(async move {
             let outcome = host.commands.dispatch(&value, &ctx).await;
-            let said = match outcome {
-                crate::command::Outcome::Said(t) => Some((t, false)),
-                crate::command::Outcome::Refused(w) => Some((w, true)),
-                _ => None,
-            };
-            if let Some((text, refused)) = said {
-                let mut stream = host.stream.write().expect("stream poisoned");
-                let mut w = stream.writer("commands");
-                w.emit(
-                    crate::block::Coord::default(),
-                    Arc::new(crate::content::CommandSaid { text, refused }),
-                );
-            }
-            if let Some(k) = keys {
-                let _ = k.send(Wake::Fact);
-            }
+            deliver(&host, &keys, outcome);
         });
+    }
+}
+
+/// Do what a command answered with.
+///
+/// One implementation for the two ways a command is reached — typed, and picked
+/// out of a modal — because they drifted: the picked path handled `Said` and
+/// `Refused` and **dropped the rest**, so a modal whose pick opened another
+/// modal did nothing at all, silently. A wizard's last step is exactly that
+/// shape, which is how this was found.
+fn deliver(
+    host: &Arc<crate::host::Host>,
+    keys: &mpsc::UnboundedSender<Wake>,
+    outcome: crate::command::Outcome,
+) {
+    let said = match outcome {
+        crate::command::Outcome::Said(text) => Some((text, false)),
+        crate::command::Outcome::Refused(why) => Some((why, true)),
+        crate::command::Outcome::Quiet => None,
+        crate::command::Outcome::Open(modal) => {
+            let keys2 = keys.clone();
+            host.overlays.open(
+                modal,
+                Box::new(move |chosen| {
+                    let _ = keys2.send(Wake::Chose(chosen));
+                }),
+            );
+            let _ = keys.send(Wake::Fact);
+            None
+        }
+        crate::command::Outcome::Do(action) => {
+            // A command and a key share one implementation, so this is the same
+            // path a keystroke takes.
+            let _ = keys.send(Wake::Act(action));
+            None
+        }
+    };
+    if let Some((text, refused)) = said {
+        let mut stream = host.stream.write().expect("stream poisoned");
+        let mut w = stream.writer("commands");
+        w.emit(
+            crate::block::Coord::default(),
+            Arc::new(crate::content::CommandSaid { text, refused }),
+        );
+        drop(stream);
+        let _ = keys.send(Wake::Fact);
     }
 }
 

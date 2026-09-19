@@ -230,6 +230,20 @@ struct Session {
 }
 
 async fn start(setup: Setup) -> Session {
+    start_with_host(setup, |control| control).await
+}
+
+/// The same, with the host's control wrapped on the way to the screen.
+///
+/// For the questions the screen asks the host that no fixture answers by
+/// itself — readiness, for one. The wrapper sits where the real host's does, so
+/// what is under test is the screen's half of the exchange.
+async fn start_with_host(
+    setup: Setup,
+    wrap: impl FnOnce(
+        Arc<dyn atomcode_host_api::HostControl>,
+    ) -> Arc<dyn atomcode_host_api::HostControl>,
+) -> Session {
     let agent_layers = setup.agent.clone();
     let registry: Registry = Arc::new(agent_catalog);
     let trees: Trees = Arc::new(move |opening: &Opening| {
@@ -246,6 +260,20 @@ async fn start(setup: Setup) -> Session {
     let connection = open(registry, trees, Opening::Fresh)
         .await
         .expect("the agent's tree must mount");
+    let connection = {
+        let atomcode_host_api::HostConnection {
+            session,
+            commands,
+            events,
+            control,
+        } = connection;
+        atomcode_host_api::HostConnection {
+            session,
+            commands,
+            events,
+            control: wrap(control),
+        }
+    };
     let screen = Screen {
         headless: Some((80, 24)),
         ..Screen::default()
@@ -3929,4 +3957,141 @@ async fn the_screen_moves_between_sessions_without_repeating_or_freezing() {
 
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+/// A host that says a turn would not be taken, and names what to run about it.
+struct NotReady {
+    inner: Arc<dyn atomcode_host_api::HostControl>,
+    why: String,
+    fix: Option<String>,
+}
+
+#[async_trait]
+impl atomcode_host_api::HostControl for NotReady {
+    async fn call(
+        &self,
+        command: atomcode_host_api::HostCommand,
+    ) -> Result<atomcode_host_api::HostReply, atomcode_host_api::HostError> {
+        if matches!(command, atomcode_host_api::HostCommand::Readiness { .. }) {
+            return Ok(atomcode_host_api::HostReply::Readiness {
+                ready: false,
+                why: Some(self.why.clone()),
+                fix: self.fix.clone(),
+            });
+        }
+        self.inner.call(command).await
+    }
+
+    fn subscribe(&self) -> tokio::sync::mpsc::UnboundedReceiver<atomcode_host_api::HostEvent> {
+        self.inner.subscribe()
+    }
+}
+
+/// The screen finds out that a turn would not be taken **before** anyone types.
+///
+/// What this is for: the front end used to learn that there is no provider by
+/// submitting a turn and getting an error back — which tells a person after
+/// they have written one, and on a new machine leaves the UI looking broken
+/// rather than unconfigured. The old driver protocol had pre-flight checks for
+/// this (`is_stopped`, `provider_unavailable_reason`, `accepts`); the bridge to
+/// this screen never carried them over.
+///
+/// The host's words reach the screen as they stand — this front end does not
+/// have the set of causes and must not paraphrase one.
+#[tokio::test]
+async fn the_screen_says_before_anyone_types_that_a_turn_would_not_be_taken() {
+    let dir = scratch("readiness");
+    let setup = tree(&dir, &replay(r#"{ text = "ok" }"#), &[]);
+    let s = start_with_host(setup, |inner| {
+        Arc::new(NotReady {
+            inner,
+            why: "还没有配置任何 provider——先加一个才能开始".into(),
+            // Nothing to run about it: a host that has no answer says so, and
+            // nothing is dispatched.
+            fix: None,
+        })
+    })
+    .await;
+    let task = s.open().await;
+    s.quiet().await;
+
+    let screen = s.screen();
+    assert!(
+        screen.contains("还没有配置任何 provider"),
+        "the host's own words, before a key was pressed:\n{screen}"
+    );
+    task.abort();
+}
+
+/// And the command the host names for it actually runs.
+///
+/// Separate from the half above because `/help` fills the screen and would push
+/// the notice off it — which is a real property of a 24-row terminal, not a
+/// test artefact. Each half is pinned where it can be seen.
+#[tokio::test]
+async fn the_command_a_host_names_for_an_unready_session_is_the_one_that_runs() {
+    let dir = scratch("readiness-fix");
+    let setup = tree(&dir, &replay(r#"{ text = "ok" }"#), &[]);
+    let s = start_with_host(setup, |inner| {
+        Arc::new(NotReady {
+            inner,
+            why: "登录已经失效".into(),
+            // A command this build has and whose output nothing else produces,
+            // so seeing it is proof the host's name was dispatched.
+            fix: Some("help".into()),
+        })
+    })
+    .await;
+    let task = s.open().await;
+    s.quiet().await;
+
+    let screen = s.screen();
+    // The end of the list rather than the start: `/help` is longer than 24
+    // rows, so what is on screen is its tail.
+    assert!(
+        screen.contains("/whoami"),
+        "the command the host named ran — this is `/help`'s output:\n{screen}"
+    );
+    task.abort();
+}
+
+/// And when that command opens a modal, the modal opens.
+///
+/// The bug this pins: a command reached by *picking* went down a different path
+/// from a command reached by *typing*, and that path handled what a command
+/// said and dropped everything else — so a pick whose command opened a modal
+/// did nothing at all, silently. Readiness dispatches its `fix` the way a pick
+/// is dispatched, which is how it was found; a wizard's last step is the same
+/// shape.
+///
+/// `/view` and not `/model`: the first draft named `/model`, this fixture's
+/// host refuses it, and the test passed on the word "模型" being in the
+/// refusal. A criterion that green with the code under test removed is not a
+/// criterion — so the command here is one the screen answers by itself.
+#[tokio::test]
+async fn a_command_a_host_names_that_opens_a_modal_opens_it() {
+    let dir = scratch("readiness-modal");
+    let note = dir.join("note.txt");
+    std::fs::write(&note, "MODAL-CONTENT-ONLY-A-READER-SHOWS\n").expect("the file to look at");
+    let setup = tree(&dir, &replay(r#"{ text = "ok" }"#), &[]);
+    let shown = format!("view {}", note.display());
+    let s = start_with_host(setup, move |inner| {
+        Arc::new(NotReady {
+            inner,
+            why: "看看这个".into(),
+            // Opens a reader rather than saying something, and the screen
+            // answers it without the host — so what is on screen is the modal.
+            fix: Some(shown),
+        })
+    })
+    .await;
+    let task = s.open().await;
+    s.quiet().await;
+
+    let screen = s.screen();
+    assert!(
+        screen.contains("MODAL-CONTENT-ONLY-A-READER-SHOWS"),
+        "the modal the host's command opens is on screen:\n{screen}"
+    );
+    task.abort();
 }

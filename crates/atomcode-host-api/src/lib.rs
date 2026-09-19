@@ -159,6 +159,15 @@ pub enum HostCommand {
     /// says whether the model thinks before it answers, the other how hard. A
     /// host whose models have no such switch may refuse it.
     SetThinking { session: String, on: bool },
+    /// Whether a turn would be accepted right now, and what to do if not.
+    ///
+    /// Asked before anything is typed, which is the whole point: a front end
+    /// that only learns a provider is missing by submitting a turn tells the
+    /// person after they have written one. What the old driver protocol did
+    /// with three separate pre-flight checks (`is_stopped`,
+    /// `provider_unavailable_reason`, `accepts`), the contract does with one
+    /// question — and unlike those, the answer carries what to do about it.
+    Readiness { session: String },
 }
 
 impl HostCommand {
@@ -191,7 +200,8 @@ impl HostCommand {
             | Self::Context { session }
             | Self::Usage { session }
             | Self::Thinking { session }
-            | Self::SetThinking { session, .. } => Some(session),
+            | Self::SetThinking { session, .. }
+            | Self::Readiness { session } => Some(session),
             Self::ListSessions { .. } => None,
         }
     }
@@ -302,6 +312,27 @@ pub enum HostReply {
         /// Anything worth showing beside the name — an email, an organisation.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
+    },
+    /// The answer to [`HostCommand::Readiness`].
+    Readiness {
+        /// Whether a turn submitted now would be taken.
+        ready: bool,
+        /// Why not, in words the screen shows as they stand.
+        ///
+        /// The host's own words because only the host knows what went wrong;
+        /// a front end that phrased this itself would be guessing at a set of
+        /// causes it does not have.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        why: Option<String>,
+        /// A command the screen can run to put it right, without the leading
+        /// slash.
+        ///
+        /// The host names it rather than describing it, because what puts it
+        /// right is the host's own command — this front end dispatches it the
+        /// way it dispatches a typed one, and a host with nothing to offer
+        /// says `None` rather than a name that does nothing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fix: Option<String>,
     },
 }
 
@@ -708,6 +739,9 @@ mod tests {
                 session: "a".into(),
                 on: true,
             },
+            HostCommand::Readiness {
+                session: "a".into(),
+            },
         ];
         for c in &all {
             match c {
@@ -738,7 +772,8 @@ mod tests {
                 | HostCommand::Providers { .. }
                 | HostCommand::Autonomy { .. }
                 | HostCommand::Thinking { .. }
-                | HostCommand::SetThinking { .. } => {}
+                | HostCommand::SetThinking { .. }
+                | HostCommand::Readiness { .. } => {}
             }
         }
         all
@@ -857,6 +892,11 @@ mod tests {
                 who: Some("lichao".into()),
                 detail: Some("atomgit".into()),
             },
+            HostReply::Readiness {
+                ready: false,
+                why: Some("还没有配置任何 provider".into()),
+                fix: Some("login".into()),
+            },
             HostReply::Context {
                 window: 200_000,
                 used: 48_000,
@@ -889,7 +929,8 @@ mod tests {
                 | HostReply::Autonomy { .. }
                 | HostReply::Usage { .. }
                 | HostReply::Context { .. }
-                | HostReply::Identity { .. } => {}
+                | HostReply::Identity { .. }
+                | HostReply::Readiness { .. } => {}
             }
         }
         all
