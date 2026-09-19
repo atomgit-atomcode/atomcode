@@ -475,6 +475,26 @@ impl Overlays {
         }
     }
 
+    /// Close the modal with `id`, if it is still the one that is open.
+    ///
+    /// For a modal the *host* ends rather than the person: a step that was
+    /// waiting on work that has now landed, a prompt for something that no
+    /// longer needs asking. `false` when it was not open any more — which is
+    /// the case this exists to get right, because work finishing late must not
+    /// close whatever the person opened in the meantime.
+    pub fn finish(&self, id: &str, value: Option<String>) -> bool {
+        let is_it = self
+            .active
+            .lock()
+            .expect("overlays poisoned")
+            .as_ref()
+            .is_some_and(|a| a.overlay.id() == id);
+        if is_it {
+            self.close(value);
+        }
+        is_it
+    }
+
     fn close(&self, result: Option<String>) {
         let taken = self.active.lock().expect("overlays poisoned").take();
         if let Some(Active { done: Some(cb), .. }) = taken {
@@ -576,6 +596,52 @@ mod tests {
                 Choice::new("c", "gamma").about("third"),
             ],
         )
+    }
+
+    /// Work that lands late closes the modal it was about, and no other.
+    ///
+    /// The case this is here for: a wizard step waiting on a login, the person
+    /// gives up and opens something else, and only then does the login land.
+    /// Closing by "whatever is open" would close the wrong thing and hand its
+    /// waiter an answer meant for someone else.
+    #[test]
+    fn a_modal_is_finished_by_name_so_late_work_cannot_close_the_next_one() {
+        let overlays = Overlays::new();
+        let heard: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let to = heard.clone();
+        overlays.open(
+            Picker::new("first", "一", vec![Choice::new("a", "a")]),
+            Box::new(move |v| to.lock().expect("heard poisoned").push(v)),
+        );
+        assert!(
+            overlays.finish("first", Some("done".into())),
+            "the one that is open closes"
+        );
+        assert_eq!(
+            *heard.lock().expect("heard poisoned"),
+            vec![Some("done".to_string())]
+        );
+        assert!(!overlays.is_open());
+
+        let to = heard.clone();
+        overlays.open(
+            Picker::new("second", "二", vec![Choice::new("b", "b")]),
+            Box::new(move |v| to.lock().expect("heard poisoned").push(v)),
+        );
+        assert!(
+            !overlays.finish("first", Some("late".into())),
+            "the modal it was about is gone"
+        );
+        assert!(
+            overlays.is_open(),
+            "and the one that replaced it is untouched"
+        );
+        assert_eq!(
+            heard.lock().expect("heard poisoned").len(),
+            1,
+            "nobody was handed an answer meant for the modal that closed"
+        );
     }
 
     /// A file can be looked at without spending a turn on it, and looking

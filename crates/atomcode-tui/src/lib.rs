@@ -74,6 +74,7 @@ pub mod text;
 pub mod theme;
 pub mod widget;
 pub mod width;
+pub mod wizard;
 
 pub use block::{Block, BlockId, Content, ContentHash, Coord, Slot, Stream, StreamWriter};
 pub use frame::{Color, Frame, Line, Placed, Rect, Span, Style};
