@@ -158,7 +158,7 @@ serde 往返 + adapter 行为判据。
 |---|---|---|
 | 5.6a | **P0** | 接上 askpass(`sudo` / `ssh` 要密码时现在会干等);首启没有 provider 时的登录引导 |
 | 5.6b | **A** | 13 条能力面缺口:模式切换、`/cd`、`/config`、会话改名、5 种事实上屏、轮次上限、`/mcp tools`,以及两条契约缺口(列模型、用量额度) |
-| 5.6c | **B1** | 6 组由**能力行自己登记目录命令**(`/review`、记忆三条、`/skills`、`/init`、`/worklog`、`/setup` 与 `/guide`)——tui 侧零改动,可与 5.6b 并行 |
+| 5.6c | **B1**（⚠️ 2026-09-19 核实：`/init`、`/setup`、`/guide` 三条**从未落地**，把本行计进「已完」是报高的） | 6 组由**能力行自己登记目录命令**(`/review`、记忆三条、`/skills`、`/init`、`/worklog`、`/setup` 与 `/guide`)——tui 侧零改动,可与 5.6b 并行 |
 | 5.6d | **B2** | 16 条屏幕自己的活:`/diff` 浏览器、多会话、`/model` 选择器、`/provider`、`/copy` / `/save` / `/view`、`/think on\|off`、`/paste`、上沿 rule、goal / loop 状态行、@ 与 $ 补全、ghost 提示、终端标题等 |
 | 5.6e | **O** | 开放性:把「一切都是插件」补齐到 tui 最后几处硬编码。清单见 [`docs/plans/2026-09-18-tui-openness-inventory.md`](plans/2026-09-18-tui-openness-inventory.md) |
 
@@ -169,7 +169,7 @@ serde 往返 + adapter 行为判据。
 **判据**:每条一行或一条命令登记(0019),先写判据、摘掉被测代码证伪一次;
 `gates/tui-test-count.baseline` 随判据上抬。
 
-**5.6 的进度**(2026-09-18 晚,收口)。a / b / c / e 已完;d(B2)逐条有了结论:
+**5.6 的进度**(2026-09-18 晚,收口)。a / b / c / e 已完(**c 有例外**,见上表);d(B2)逐条有了结论:
 
 | 做完的 | |
 |---|---|
@@ -204,6 +204,11 @@ serde 往返 + adapter 行为判据。
 tuix 的老毛病——现在改是十几行,等下游移植完再改就是他们再扫一遍 165 处字符串。
 
 ### M6 翻默认、迁移、删 tuix
+
+> **🔴 2026-09-19：本节的顺序与待办已移交**
+> [`docs/plans/2026-09-19-remaining-gaps.md`](plans/2026-09-19-remaining-gaps.md)。
+> 那份文档记了当天拍的九条决策，其中 **决策 3「向导做不完就不翻」把首启引导插到了
+> 6.2 翻默认之前**，所以下表的 6.1 / 6.2 顺序已经不是当前顺序。
 
 | # | 内容 |
 |---|---|
@@ -314,7 +319,10 @@ tuix 的老毛病——现在改是十几行,等下游移植完再改就是他�
   无从陈旧、放行;**喂过但现在没有** = 宿主正在换 App、无法核对、拒绝。
   提成 `without_a_log()` 并带判据
 
-**6.3 完成。** ACP 现在一个产品句柄都不持有:`SessionState` 里只有契约的命令通道、
+**6.3 完成,但有一个例外。** ACP 广播的命令表仍是 `acp/commands.rs:52` 的 15 条硬编码常量,
+没有改成从 `AgentDescription` 的命令目录投影(见上面那条 ✅ 自己写的"只做了一半")——
+ACP 客户端今天拿不到 goal / loop / cd / team / worktree / review 等约 30 条。
+剩下的部分确实完成:ACP 现在一个产品句柄都不持有:`SessionState` 里只有契约的命令通道、
 宿主控制与 `AgentEvent` 流。顺带把 `SessionModelResolver` 整条注入链拆干净了 ——
 `AcpChains` 两个字段、`AcpServeOptions.session_effort_resolver`、main.rs 里 36 行
 构造、五个文件的参数穿透,全没了;思考强度那个"重建整份配置"的闭包不需要,
