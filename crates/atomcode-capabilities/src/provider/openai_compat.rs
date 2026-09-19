@@ -1262,6 +1262,16 @@ fn normalize_openai_tool_schema_in_place(schema: &mut Value) {
     if allows_object && !map.contains_key("properties") {
         map.insert("properties".into(), Value::Object(Map::new()));
     }
+    // Some strict OpenAI-compatible validators (observed on a self-hosted DeepSeek
+    // gateway) require an object schema's `required` to be an ARRAY and reject its
+    // ABSENCE with "Invalid schema … null is not of type array" — which 400'd every
+    // turn as soon as an all-optional-param tool (`code_review`, `list_directory`, …)
+    // was in the tool list. An empty `[]` is semantically identical (no required
+    // properties) and satisfies them. Wire-boundary only; the neutral kernel schema
+    // stays untouched. Recurses, so nested objects + MCP/plugin schemas get it too.
+    if allows_object && !map.contains_key("required") {
+        map.insert("required".into(), Value::Array(Vec::new()));
+    }
 
     // Traverse only values that are themselves JSON Schemas. Literal-bearing
     // keywords such as `const`, `enum`, `default`, and `examples` must remain
@@ -2674,11 +2684,11 @@ mod tests {
 
         assert_eq!(
             body["tools"][0]["function"]["parameters"],
-            json!({"type":"object","properties":{}})
+            json!({"type":"object","properties":{},"required":[]})
         );
         assert_eq!(
             body["tools"][1]["function"]["parameters"]["properties"]["options"],
-            json!({"type":["object","null"],"properties":{}})
+            json!({"type":["object","null"],"properties":{},"required":[]})
         );
         assert_eq!(
             body["tools"][1]["function"]["parameters"]["properties"]["query"],
@@ -2703,12 +2713,35 @@ mod tests {
         );
         assert_eq!(
             external["properties"]["labels"]["additionalProperties"],
-            json!({"type":"object","properties":{}})
+            json!({"type":"object","properties":{},"required":[]})
         );
         assert_eq!(
             external["$defs"]["record"],
-            json!({"type":"object","properties":{}})
+            json!({"type":"object","properties":{},"required":[]})
         );
+    }
+
+    #[test]
+    fn normalizer_injects_empty_required_for_all_optional_object_schemas() {
+        // A strict gateway (self-hosted DeepSeek) 400'd with "null is not of type
+        // array" when a tool's parameters object omitted `required` (all-optional
+        // params, e.g. `code_review`). The wire boundary must add an empty `[]`.
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "scope": { "type": "object", "properties": { "kind": { "type": "string" } }, "required": ["kind"] },
+                "paths": { "type": "array", "items": { "type": "string" } },
+                "depth": { "type": "string", "enum": ["a", "b"] }
+            }
+        });
+        let out = shared_normalize_tool_schema(&schema);
+        // Top-level (was missing) gets an empty required array.
+        assert_eq!(out["required"], json!([]), "top-level required must be []");
+        // A nested object that ALREADY declares required is left intact.
+        assert_eq!(out["properties"]["scope"]["required"], json!(["kind"]));
+        // Non-object property schemas are untouched (no spurious required).
+        assert!(out["properties"]["paths"].get("required").is_none());
+        assert!(out["properties"]["depth"].get("required").is_none());
     }
 
     #[test]
