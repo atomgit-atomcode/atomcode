@@ -1229,13 +1229,22 @@ impl Host {
     ///
     /// `true` when a block was emitted, which is the caller's cue that a frame is
     /// owed.
+    ///
+    /// "Empty" for this purpose is "no conversational block yet": a reply a
+    /// slash command left behind (the `commands` channel) is not a turn — the
+    /// wizard's closing line arrives through it, and a machine that finished
+    /// onboarding still owes its first word.
     pub fn open_conversation(
         &self,
         at: crate::block::Coord,
         open: &crate::module::Opening,
     ) -> bool {
         let mut stream = self.stream.write().expect("stream poisoned");
-        if !stream.is_empty() {
+        if stream
+            .slots()
+            .iter()
+            .any(|slot| slot.block().producer != "commands")
+        {
             return false;
         }
         for producer in self.modules.producers() {

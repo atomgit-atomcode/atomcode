@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use atomcode_plexus::{Context, Plugin};
 use atomcode_tui::command::{Command, CommandSet, Outcome};
 use atomcode_tui::overlay::Choice;
-use atomcode_tui::plugin::{CommandsSvc, Repaint, RepaintSvc};
+use atomcode_tui::plugin::{AgentClientSvc, CommandsSvc, Repaint, RepaintSvc};
 use atomcode_tui::wizard::{StepDef, StepKind, Wizard};
 use serde_json::Value;
 
@@ -64,10 +64,14 @@ impl Plugin for OnboardingRow {
         let commands = ctx.require::<CommandsSvc>().map_err(|e| e.to_string())?;
         let telemetry = self.telemetry.clone();
         let path = self.config_path.clone();
+        // The runtime's end of the connection, so the wizard can hand it a
+        // reload once the login has written the configuration: writing the file
+        // is not making it so (see `apply_setting` in `atomcode-tui`).
+        let client = ctx.require::<AgentClientSvc>().map_err(|e| e.to_string())?;
         let set = Arc::new(Onboarding {
             config_path: self.config_path.clone(),
             start_sign_in: Arc::new(move |wizard, repaint| {
-                sign_in(wizard, repaint, telemetry.clone(), path.clone());
+                sign_in(wizard, repaint, telemetry.clone(), path.clone(), client.clone());
             }),
             live: Mutex::new(None),
         });
@@ -198,6 +202,7 @@ fn sign_in(
     repaint: Option<Arc<dyn Repaint>>,
     telemetry: Option<Arc<atomcode_telemetry::Telemetry>>,
     config_path: PathBuf,
+    client: std::sync::Arc<atomcode_tui::plugin::AgentClient>,
 ) {
     let painted = move || {
         if let Some(repaint) = repaint.as_ref() {
@@ -254,6 +259,24 @@ fn sign_in(
                 return;
             }
         };
+        // The configuration is on disk, but the running graph was assembled
+        // before it existed — the same "wrote the file is not making it so"
+        // gap the settings panel closes with `HostCommand::Reload`. The
+        // command is a rebuild of what changed, not a restart, and the session
+        // stays. On its own task, like every other host command from off the
+        // loop; a failure is said out loud rather than swallowed.
+        if let Some(control) = client.control() {
+            let root = client.root();
+            let wizard = wizard.clone();
+            tokio::spawn(async move {
+                if let Err(error) = control
+                    .call(atomcode_host_api::HostCommand::Reload { session: root })
+                    .await
+                {
+                    wizard.say(vec![format!("配置已写入，但重新加载失败：{error:?}")]);
+                }
+            });
+        }
         wizard.resolve(detail);
         painted();
     });
