@@ -2105,6 +2105,102 @@ fn git_out(root: &std::path::Path, args: &[&str]) -> Result<String, String> {
 /// [`MessageOrigin::User`], so the turn it starts appears in the transcript the
 /// way everything they typed does, and `undo` reaches it
 /// (`docs/adr/0024` — the log is the authority, and this must be in it).
+/// `init`: write (or improve) the instruction file this project's agents read.
+///
+/// **A catalog command, and here for the reason `/worklog` is.** The substance
+/// already existed — [`crate::build_init_prompt`] picks the built-in prompt for
+/// the configured language and appends the person's own requirements from
+/// `init_prompt_file` — and what was missing was a registration: the classic
+/// front end carried this command in its own table, and the row-assembled
+/// screen reads the command catalog, so on that screen `/init` had simply never
+/// existed (`docs/plans/2026-09-18-tui-panels-and-commands-inventory.md` B1-4).
+///
+/// The configuration is read **when the command runs**, not when the row
+/// mounts, for the reason the settings panel holds a path rather than a loaded
+/// `Config`: a file edited behind the screen's back is whatever the file says.
+pub(crate) struct InitPlugin {
+    pub(crate) language: Option<atomcode_config::locale::Locale>,
+    /// The settings file this runtime was configured from, when it was. `None`
+    /// means there is nothing to read, so the built-in prompt stands.
+    pub(crate) config_file: Option<std::path::PathBuf>,
+}
+
+#[async_trait]
+impl Plugin for InitPlugin {
+    fn name(&self) -> &'static str {
+        "init"
+    }
+    fn uses(&self) -> &'static [&'static str] {
+        &["commands"]
+    }
+    fn description(&self) -> &'static str {
+        "`/init`: have the model read this repository and write the instruction file its agents load"
+    }
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        atomcode_harness::commands::register(
+            ctx,
+            Arc::new(InitCommand {
+                language: self.language,
+                config_file: self.config_file.clone(),
+            }),
+        )
+    }
+}
+
+struct InitCommand {
+    language: Option<atomcode_config::locale::Locale>,
+    config_file: Option<std::path::PathBuf>,
+}
+
+/// The prompt `/init` hands the model, from the configuration as it is now.
+///
+/// Split out so the whole decision is testable without a tree or a model. A
+/// configuration that will not parse is not an error: the built-in prompt is
+/// what this command is for, and refusing to run because an unrelated key is
+/// malformed would be refusing the thing that works.
+fn init_prompt_from(
+    language: Option<atomcode_config::locale::Locale>,
+    config_file: Option<&std::path::Path>,
+) -> Result<String, String> {
+    use atomcode_config::locale::Locale;
+    let locale = language.unwrap_or(Locale::En);
+    let custom = config_file
+        .and_then(|path| atomcode_config::config::Config::load(path).ok())
+        .and_then(|config| config.init_prompt_file);
+    crate::build_init_prompt(locale, custom.as_deref())
+}
+
+#[async_trait]
+impl atomcode_harness::commands::CatalogCommand for InitCommand {
+    fn describe(&self) -> CommandDescription {
+        on_the_session(
+            "init",
+            None,
+            "让模型读一遍这个仓库,把 AGENTS.md 写出来或改好",
+        )
+    }
+    fn offered_for(&self, agent: &atomcode_harness::agent::Agent) -> bool {
+        the_conversation_itself(agent)
+    }
+    async fn run(
+        &self,
+        agent: Arc<atomcode_harness::agent::Agent>,
+        _args: &str,
+    ) -> Result<String, String> {
+        let prompt = init_prompt_from(self.language, self.config_file.as_deref())?;
+        let english = matches!(
+            self.language,
+            Some(atomcode_config::locale::Locale::En) | None
+        );
+        agent.send(prompt);
+        Ok(if english {
+            "Reading the repository to write its instruction file.".to_string()
+        } else {
+            "正在读这个仓库,准备写它的说明文件。".to_string()
+        })
+    }
+}
+
 pub(crate) struct WorklogPlugin {
     /// The locale the template is written in. Carried in rather than read from
     /// the process-wide i18n cache: a command is registered by a row, and a row
@@ -2385,6 +2481,53 @@ impl atomcode_harness::commands::CatalogCommand for PolicyCommand {
 
 #[cfg(test)]
 mod tests {
+
+    /// What a person wrote themselves reaches the model, and a configuration
+    /// that will not parse still gets them the built-in prompt.
+    ///
+    /// The second half is the one worth pinning: refusing to run `/init`
+    /// because some unrelated key in the file is malformed would refuse the
+    /// thing that works, and the thing that works is most of what this command
+    /// is for.
+    #[test]
+    fn the_init_prompt_carries_what_this_machine_was_configured_with() {
+        use atomcode_config::locale::Locale;
+        let dir = tempfile::tempdir().unwrap();
+
+        let builtin = super::init_prompt_from(Some(Locale::En), None).expect("the built-in one");
+        assert!(builtin.contains("AGENTS.md"), "{builtin}");
+
+        let mine = dir.path().join("mine.md");
+        std::fs::write(&mine, "ALWAYS-MENTION-THE-NPU-QUANTIZER\n").unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(
+            &config,
+            format!("init_prompt_file = {:?}\n", mine.to_string_lossy()),
+        )
+        .unwrap();
+        let with_mine =
+            super::init_prompt_from(Some(Locale::En), Some(&config)).expect("with the extra");
+        assert!(
+            with_mine.contains("ALWAYS-MENTION-THE-NPU-QUANTIZER"),
+            "{with_mine}"
+        );
+        assert!(
+            with_mine.contains("AGENTS.md"),
+            "and still the built-in one"
+        );
+
+        let broken = dir.path().join("broken.toml");
+        std::fs::write(&broken, "this is not toml =\n").unwrap();
+        assert_eq!(
+            super::init_prompt_from(Some(Locale::En), Some(&broken)).expect("still answers"),
+            builtin,
+            "an unreadable configuration leaves the built-in prompt standing"
+        );
+
+        // The language is the row's, not the process's.
+        let zh = super::init_prompt_from(Some(Locale::ZhCn), None).expect("zh");
+        assert_ne!(zh, builtin);
+    }
     use super::worktree;
     use super::{worklog_prompt_at, WorklogPrompt};
 

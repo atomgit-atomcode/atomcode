@@ -799,10 +799,6 @@ impl UserInterface for Tui {
         client.connect(commands, control);
 
         let (wake_tx, mut wake) = mpsc::unbounded_channel::<Wake>();
-        // Now there is a loop to wake, anything working outside it can ask for
-        // a frame. Provided here rather than at mount: before this line there
-        // is nothing to ring.
-        let _ = ctx.provide::<RepaintSvc>(Arc::new(Waker(wake_tx.clone())));
         // Started before anything can commit a fact, so the first turn's
         // opening reading is measured on the same clock as every later one.
         let clock = Clock::start();
@@ -1996,6 +1992,16 @@ impl Tui {
                 }
                 true
             }
+            // The other half of `Compacted`, and it used to fall through to
+            // `_ => false`: a `/compact` that could not write its checkpoint
+            // said nothing at all, so what a person saw was a command that did
+            // not answer. Nothing else reports it — there is no notice kind for
+            // it, and the runtime's own event is this one.
+            AgentEvent::CompactionFailed { error, .. } => {
+                self.set_activity(Activity::Idle);
+                self.say_refused(&format!("没压缩成：{error}"));
+                true
+            }
             AgentEvent::Error { message, .. } => {
                 self.set_activity(Activity::Idle);
                 self.say_refused(&message);
@@ -2939,12 +2945,20 @@ pub trait Repaint: Send + Sync {
     fn now(&self);
 }
 
-/// The screen's own.
-struct Waker(mpsc::UnboundedSender<Wake>);
+/// The screen's own: the same slot the loop fills when it starts.
+///
+/// Holding the slot rather than a sender is what lets this be provided when the
+/// row mounts, which is when a capability map can see it. Before the loop is
+/// up, asking for a frame does nothing — which is the honest answer: there is
+/// no frame yet, and the first one is owed anyway.
+struct Waker(Arc<Tui>);
 
 impl Repaint for Waker {
     fn now(&self) {
-        let _ = self.0.send(Wake::Fact);
+        let sender = self.0.wake.lock().expect("wake poisoned").clone();
+        if let Some(sender) = sender {
+            let _ = sender.send(Wake::Fact);
+        }
     }
 }
 
@@ -3171,6 +3185,12 @@ impl Plugin for TuiUiPlugin {
             "tui-commands",
             "tui-keys",
             "tui-layout",
+            // Both are provided by this row and were not declared: the roster
+            // in `apply`, the repaint seam once the loop exists. An undeclared
+            // provide is invisible to the capability map, which is what the
+            // launcher's audit is for.
+            "tui-team-roster",
+            "tui-repaint",
         ]
     }
     fn description(&self) -> &'static str {
@@ -3214,9 +3234,15 @@ impl Plugin for TuiUiPlugin {
         let _ = ctx
             .provide::<TeamRosterSvc>(tui.members.clone())
             .map_err(|e| e.to_string())?;
+        let tui = Arc::new(tui);
+        // The seam anything outside the loop asks for a frame through. Provided
+        // here, with the screen itself behind it, so the slot is full from the
+        // moment this row mounts; what it rings is filled in when the loop
+        // starts.
         let _ = ctx
-            .provide::<UiSvc>(Arc::new(tui))
+            .provide::<RepaintSvc>(Arc::new(Waker(tui.clone())) as Arc<dyn Repaint>)
             .map_err(|e| e.to_string())?;
+        let _ = ctx.provide::<UiSvc>(tui).map_err(|e| e.to_string())?;
         Ok(())
     }
 }

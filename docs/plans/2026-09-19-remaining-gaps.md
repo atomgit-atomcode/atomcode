@@ -122,12 +122,32 @@ G 类七条**刻意排在翻默认之后**：自用会告诉我们哪几条是�
 
 ### C. 便宜且独立（各 30 分钟量级，随时插队）
 
-- [ ] **C1 `/init`、`/setup`、`/guide` 三条登记** —— B1 里最便宜的三条，一直被记成已完成
-- [ ] **C2 `CompactionFailed` 补 `NoticeKind`**：`kernel/src/session.rs:74` 加一种、
-      `harness/plugins/handle.rs` 补映射，tui 走通用 NoticeBlock。今天
-      `engine.rs:1368` 发出 → `cli/host.rs:504` 转成 `AgentEvent::CompactionFailed`
-      → tui 只认 `Compacted`（`plugin.rs:1844`），失败那支掉进 wildcard，**全链路静默**
-- [ ] **C3 删 `CodingRuntimeHandle::reprepare`**（`coding/runtime.rs:1627`，全仓 0 调用）
+- [x] **C1 `/init` 登记**（2026-09-19）。`/worklog` 的同一个形状：`InitPlugin` 在
+      `coding/host_rows.rs`，提示词由 `build_init_prompt` 按语言取，人自己的
+      `init_prompt_file` 在**命令运行时**读——配置被改过就该生效，理由同设置面板
+      持路径而不持已加载的 `Config`。
+- [ ] **C1 余下的 `/setup` 与 `/guide` —— 清单写错了，摸完的事实如下**：
+      - `/setup` **不需要新写一条命令**。种子 skill
+        `assets/setup-seeds/skills/atomcode-automation-recommender/SKILL.md` 的
+        frontmatter 就是 `name: setup` + `user_invocable: true`，而
+        `harness/plugins/capabilities.rs:132` 把每个 user_invocable skill 自动
+        登记成一条命令。**装过种子的机器上，新前端已经有 `/setup` 了。**
+        真正的缺口只剩「全新机器上第一次输 `/setup` 时自动装种子」这一件，而
+        CLI 的 `atomcode setup` 已经能装。**收益小，待定。**
+      - `/guide` 在旧前端是**一张写死的 i18n 菜单**（13 个 `Msg::Guide*` 串）
+        加上带参数时展开一个叫 `ask` 的 skill——清单写的「都是展开一个 skill」
+        对 `/guide` 不成立。新前端已经有 `/help` 列命令；再搬一套 13 条文案的
+        第二份帮助，**收益存疑，建议不做**（真要做，`ask` skill 装上以后自己
+        就是一条命令）。
+- [x] **C2 失败的压缩会说话**（2026-09-19）。**没有**按原计划加 `NoticeKind`：手动
+      压缩走的是 coding runtime 的 `CompactionFinished`，不经 harness 的 notice
+      那条路，加一种反而是第二条路。改成屏幕认 `AgentEvent::CompactionFailed`
+      （原来只认 `Compacted`，失败那支掉进 wildcard，全链路静默）。
+      为它给 e2e 补了一条事件注入缝（`start_with_agent_events`）——"agent 说了 X
+      屏幕怎么办"这类判据都用得上，而 fixture 造不出这种事件。
+- [x] **C3 删 `CodingRuntimeHandle::reprepare`**（2026-09-19）。连带摘掉
+      `ReprepareTarget::Exact`（唯一构造者就是它）、它的 match 臂，以及
+      `ReprepareInput` 的公开再导出——少一个公开 API、一个枚举变体、一处分支。
 
 ### D. `/config` 收尾（只剩两样）
 

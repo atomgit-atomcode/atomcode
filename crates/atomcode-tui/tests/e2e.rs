@@ -244,6 +244,75 @@ async fn start_with_host(
         Arc<dyn atomcode_host_api::HostControl>,
     ) -> Arc<dyn atomcode_host_api::HostControl>,
 ) -> Session {
+    start_with_connection(setup, move |connection| {
+        let atomcode_host_api::HostConnection {
+            session,
+            commands,
+            events,
+            control,
+        } = connection;
+        atomcode_host_api::HostConnection {
+            session,
+            commands,
+            events,
+            control: wrap(control),
+        }
+    })
+    .await
+}
+
+/// The same, plus a way to say something to the screen as if the agent had.
+///
+/// The connection's event stream is a channel, so a test can sit in it: what
+/// the agent sends still arrives, and the test can add to it. For the events a
+/// fixture cannot produce on demand — a compaction that failed to write its
+/// checkpoint, a provider giving up — where what is worth judging is what the
+/// screen does about it rather than how it came to happen.
+async fn start_with_agent_events(
+    setup: Setup,
+) -> (
+    Session,
+    tokio::sync::mpsc::UnboundedSender<atomcode_kernel::event::AgentEvent>,
+) {
+    let carried: Arc<std::sync::Mutex<Option<_>>> = Arc::new(std::sync::Mutex::new(None));
+    let slot = carried.clone();
+    let session = start_with_connection(setup, move |connection| {
+        let atomcode_host_api::HostConnection {
+            session,
+            commands,
+            mut events,
+            control,
+        } = connection;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *slot.lock().expect("injector poisoned") = Some(tx.clone());
+        tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                if tx.send(event).is_err() {
+                    break;
+                }
+            }
+        });
+        atomcode_host_api::HostConnection {
+            session,
+            commands,
+            events: rx,
+            control,
+        }
+    })
+    .await;
+    let tx = carried
+        .lock()
+        .expect("injector poisoned")
+        .clone()
+        .expect("the wrapper ran");
+    (session, tx)
+}
+
+/// The screen, with the connection the host hands it put through `wrap` first.
+async fn start_with_connection(
+    setup: Setup,
+    wrap: impl FnOnce(atomcode_host_api::HostConnection) -> atomcode_host_api::HostConnection,
+) -> Session {
     let agent_layers = setup.agent.clone();
     let registry: Registry = Arc::new(agent_catalog);
     let trees: Trees = Arc::new(move |opening: &Opening| {
@@ -260,20 +329,7 @@ async fn start_with_host(
     let connection = open(registry, trees, Opening::Fresh)
         .await
         .expect("the agent's tree must mount");
-    let connection = {
-        let atomcode_host_api::HostConnection {
-            session,
-            commands,
-            events,
-            control,
-        } = connection;
-        atomcode_host_api::HostConnection {
-            session,
-            commands,
-            events,
-            control: wrap(control),
-        }
-    };
+    let connection = wrap(connection);
     let screen = Screen {
         headless: Some((80, 24)),
         ..Screen::default()
@@ -4244,31 +4300,66 @@ async fn a_command_a_host_names_that_opens_a_modal_opens_it() {
 /// there unpainted until the next keystroke — which, on the step that is
 /// *waiting* for it, may never come.
 ///
-/// Provided by the loop and not at mount: before the loop exists there is
-/// nothing to ring, and a row that took one then would hold a handle to
-/// nothing.
+/// Provided when the row mounts, not when the loop starts: an undeclared or
+/// late-filled slot is invisible to the capability map, and the launcher's
+/// audit says so. What it rings is filled in when the loop comes up — so
+/// asking before that is a no-op rather than a panic, which is the honest
+/// answer (there is no frame yet, and the first one is owed anyway).
 #[tokio::test]
 async fn something_working_outside_the_loop_can_ask_for_a_frame() {
     let dir = scratch("repaint");
     let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
-    assert!(
-        s.app
-            .service::<atomcode_tui::plugin::RepaintSvc>()
-            .is_none(),
-        "not before it runs: there is no loop yet"
-    );
-
-    let task = s.open().await;
     let repaint = s
         .app
         .service::<atomcode_tui::plugin::RepaintSvc>()
-        .expect("the loop provides it once it is running");
+        .expect("the row provides it when it mounts");
+    // Nothing to ring yet, and that is not an error.
+    repaint.now();
+
+    let task = s.open().await;
     repaint.now();
     assert!(
         s.term
             .settle(Duration::from_millis(40), Duration::from_secs(5))
             .await,
         "and the screen is still painting after being rung"
+    );
+    task.abort();
+}
+
+/// A compaction that failed says so.
+///
+/// It used to fall through to "nothing on screen": `Compacted` had an arm and
+/// `CompactionFailed` did not, so a `/compact` whose checkpoint could not be
+/// written looked exactly like a command that never answered. Nothing else
+/// reports it either — there is no notice kind for it, and the runtime's own
+/// event is this one.
+#[tokio::test]
+async fn a_compaction_that_could_not_be_written_says_so() {
+    let dir = scratch("compact-failed");
+    let (s, agent) = start_with_agent_events(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    let task = s.open().await;
+    s.quiet().await;
+
+    agent
+        .send(atomcode_kernel::event::AgentEvent::CompactionFailed {
+            trigger: atomcode_kernel::message::CompactTrigger::Manual { focus: None },
+            error: atomcode_kernel::checkpoint::CompactionCheckpointError::new(
+                "checkpoint 写不进去",
+            ),
+        })
+        .expect("the screen is listening");
+    for _ in 0..100 {
+        if s.screen().contains("checkpoint 写不进去") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let screen = s.screen();
+    assert!(
+        screen.contains("没压缩成") && screen.contains("checkpoint 写不进去"),
+        "the person is told, and told why:\n{screen}"
     );
     task.abort();
 }

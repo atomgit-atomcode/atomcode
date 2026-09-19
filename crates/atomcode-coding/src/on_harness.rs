@@ -1649,6 +1649,9 @@ pub async fn mount_hosted(
         .when(host.session.stored.is_some(), |layer| {
             layer.insert(Entry::named("worklog"))
         })
+        // Unconditional, unlike the recap: writing the instruction file needs a
+        // repository and a model, which any assembly that gets this far has.
+        .insert(Entry::named("init"))
         .when(host.mcp.is_some(), |layer| {
             layer.swap("mcp", "mcp-host").enable("mcp")
         })
@@ -1726,6 +1729,13 @@ pub async fn mount_hosted(
             language: host.language,
         }));
     }
+    // Unconditional, unlike `/worklog`: writing the instruction file needs a
+    // repository and a model, both of which any assembly that gets this far
+    // has, and nothing it reads is kept by this runtime.
+    registry.register(Arc::new(crate::host_rows::InitPlugin {
+        language: host.language,
+        config_file: host.config_file.clone(),
+    }));
     registry.register(Arc::new(crate::host_rows::KernelHooksPlugin(
         host.hooks.unwrap_or_default(),
     )));

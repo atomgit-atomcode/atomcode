@@ -1624,10 +1624,6 @@ impl CodingRuntimeHandle {
         result.await.map_err(|_| RuntimeError::Unavailable)?
     }
 
-    pub async fn reprepare(&self, input: ReprepareInput) -> Result<SessionChanged, RuntimeError> {
-        self.reprepare_target(ReprepareTarget::Exact(input)).await
-    }
-
     pub async fn fresh_session(&self) -> Result<SessionChanged, RuntimeError> {
         self.reprepare_target(ReprepareTarget::Fresh).await
     }
@@ -2541,7 +2537,6 @@ pub enum RewindFinalization {
 #[doc(hidden)]
 #[derive(Clone)]
 pub enum ReprepareTarget {
-    Exact(ReprepareInput),
     Reload {
         plugin_skill_dirs: Option<Vec<(std::path::PathBuf, String)>>,
     },
@@ -7584,7 +7579,6 @@ fn resolve_reprepare_input(
     RuntimeError,
 > {
     match target {
-        ReprepareTarget::Exact(input) => Ok(Some((input, None, None))),
         ReprepareTarget::Reload { plugin_skill_dirs } => {
             let mut prepare = runtime.prepare.clone();
             if let Some(plugin_skill_dirs) = plugin_skill_dirs {

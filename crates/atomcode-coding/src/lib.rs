@@ -103,11 +103,11 @@ pub use runtime::{
     CodingRuntime, CodingRuntimeEvent, CodingRuntimeEvents, CodingRuntimeHandle,
     CodingRuntimeStart, DeferredRuntimeState, DriverCommand, ImagePreprocessor, LocalContextInput,
     McpStatusSnapshot, McpToolsSnapshot, ProviderBootstrap, ProviderUnavailableReason,
-    ReconfigureKind, ReprepareInput, RewindCatalog, RewindResult, RewindScope, RuntimeContextStats,
-    RuntimeError, RuntimeExit, RuntimeExitReason, RuntimeGeneration, RuntimeMode, RuntimePhase,
-    RuntimeRequest, RuntimeSessionInfo, RuntimeSnapshotError, RuntimeStartError, RuntimeStatus,
-    RuntimeTurnStats, RuntimeUnavailable, SequencedRuntimeEvent, SessionChanged, SubmitReceipt,
-    TurnCompletion, UndoResult, UserInput, VisionNotice,
+    ReconfigureKind, RewindCatalog, RewindResult, RewindScope, RuntimeContextStats, RuntimeError,
+    RuntimeExit, RuntimeExitReason, RuntimeGeneration, RuntimeMode, RuntimePhase, RuntimeRequest,
+    RuntimeSessionInfo, RuntimeSnapshotError, RuntimeStartError, RuntimeStatus, RuntimeTurnStats,
+    RuntimeUnavailable, SequencedRuntimeEvent, SessionChanged, SubmitReceipt, TurnCompletion,
+    UndoResult, UserInput, VisionNotice,
 };
 pub use telemetry::{TelemetryHook, ToolTelemetryMiddleware};
 pub use todo::TodoHook;
