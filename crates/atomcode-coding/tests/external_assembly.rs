@@ -210,6 +210,42 @@ async fn the_one_call_mount_takes_rows_written_elsewhere() {
     assert!(said.contains("4 words"), "{said:?}");
 }
 
+/// The other host's path carries the fuse too.
+///
+/// `mount_swappable` has no runtime option rows: the only patch it aims at
+/// `agent-loop` is the layer `mount_hosted` scopes for `working_dir`. That layer
+/// used to drop `max_rounds` on the floor, so the fuse became the row's serde
+/// default — a number nobody chose. Both of this crate's patches carry it now,
+/// which is why `RUNAWAY_FUSE_ROUNDS` exists as a constant rather than as a
+/// literal written twice.
+#[tokio::test]
+async fn the_scoped_layer_carries_the_fuse_too() {
+    let dir = scratch("fuse");
+    let (_handle, app, _slots) = on_harness::mount_hosted(
+        &dir,
+        Presence::Headless,
+        Arc::new(AlwaysStopProvider::new("unused")),
+        None,
+        on_harness::HostState::default(),
+        &[],
+    )
+    .await
+    .expect("the host-less assembly must mount");
+
+    let fuse = app
+        .tree()
+        .active()
+        .find(|entry| entry.id == "agent-loop")
+        .and_then(|entry| entry.config.get("max_rounds"))
+        .and_then(Value::as_u64);
+    assert_eq!(
+        fuse,
+        Some(u64::from(on_harness::RUNAWAY_FUSE_ROUNDS)),
+        "a host with no runtime option rows still gets the product's fuse, not \
+         `LoopRow::default()`"
+    );
+}
+
 /// Claims the name of one of coding's own rows.
 struct Impostor;
 

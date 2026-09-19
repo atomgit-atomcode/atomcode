@@ -143,9 +143,12 @@ async fn the_permission_gate_is_mounted_once() {
 /// you are reading was chosen or defaulted.
 ///
 /// Two real bugs came out of exactly this and nothing would have caught either:
-/// `llm-retry` lost `attempts` on a `/model` swap, and `agent-loop` loses
-/// `max_rounds` (the base sets 100, the runtime patches three other fields, and
-/// the fuse quietly becomes the serde default — which happens to also be 100).
+/// `llm-retry` lost `attempts` on a `/model` swap, and `agent-loop` lost
+/// `max_rounds` — the base sets 100, the runtime patches three other fields, and
+/// the fuse quietly became the serde default. That second one used to be excused
+/// here as an intended drop; it is now carried instead, in both patches this
+/// crate aims at the row, because "100" was never a decision anyone made (see
+/// `RUNAWAY_FUSE_ROUNDS`).
 ///
 /// A drop that is meant lives in the allowlist below, WITH its reason. That is
 /// the point: an intentional one is a sentence someone wrote, an accidental one
@@ -157,14 +160,7 @@ async fn no_row_silently_loses_a_configured_field() {
     // `session-persistence-jsonl` used to need an entry here for `resume`. It
     // turned out base was setting a key that row has never read — see
     // `bundle.rs` — so the answer was to delete it there, not to excuse it here.
-    const INTENDED: &[(&str, &str, &str)] = &[(
-        "agent-loop",
-        "max_rounds",
-        "The coarse runaway fuse is base's, and this product keeps it while carrying \
-         its own budget on `round-cap`. Documented at length above the `round-cap` \
-         patch in CODING_DEFAULTS, including that a host patching `agent-loop` \
-         reverts this field — which is what makes it a decision rather than a slip.",
-    )];
+    const INTENDED: &[(&str, &str, &str)] = &[];
 
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("ATOMCODE_HOME", home.path());
@@ -216,6 +212,36 @@ async fn no_row_silently_loses_a_configured_field() {
         lost.is_empty(),
         "a patch replaced a row's config and dropped a field the layer below set \
          (carry it in the patch, or add it to INTENDED with a reason): {lost:?}"
+    );
+}
+
+/// The fuse a turn ends on is the product's number, on the mounted tree.
+///
+/// The value used to be nobody's: `infra` declared 100 in the row's config, the
+/// runtime's own patch dropped the field, and the serde default happened to also
+/// be 100 — so the number in force was a coincidence of two files agreeing. This
+/// reads the mounted row's config the way `--dump-config` would and pins it to
+/// the constant the product states.
+#[tokio::test]
+#[serial_test::serial(atomcode_home)]
+async fn the_runaway_fuse_is_the_products_number() {
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("ATOMCODE_HOME", home.path());
+    let project = tempfile::tempdir().unwrap();
+    let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
+    let mounted = support::mount(&cfg, support::quiet_options(), Arc::new(Silent)).await;
+
+    let fuse = mounted
+        .row_configs()
+        .into_iter()
+        .find_map(|(id, config)| (id == "agent-loop").then_some(config))
+        .and_then(|config| config.get("max_rounds").and_then(|v| v.as_u64()));
+    mounted.stop();
+    assert_eq!(
+        fuse,
+        Some(u64::from(atomcode_coding::on_harness::RUNAWAY_FUSE_ROUNDS)),
+        "the mounted `agent-loop` must carry the product's fuse, not a serde \
+         default that happens to look reasonable"
     );
 }
 
