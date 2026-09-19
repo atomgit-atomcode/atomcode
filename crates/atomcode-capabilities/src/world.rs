@@ -595,6 +595,21 @@ pub struct LocalFs {
     /// chooses a different world.
     root: Option<PathBuf>,
     read_only: bool,
+    /// Fence the **write** side only ([`Self::writes_fenced`]).
+    ///
+    /// Reads are the world's own business: an agent told to work inside one
+    /// checkout still has to read its dependency cache, a sibling repository, a
+    /// file under `~`. What it must not do is *change* anything out there, and
+    /// that is a boundary about writes. Fencing reads instead would refuse the
+    /// lookup long before any question could be asked about the change, which
+    /// is the wrong question at the wrong moment.
+    writes_only: bool,
+    /// Places outside `root` this world may still write to.
+    ///
+    /// The machine's temp directory first: "isolated to my checkout" is not
+    /// "unable to make a scratch file", and a world that broke that would break
+    /// the toolchain rather than the boundary.
+    also_writable: Vec<PathBuf>,
 }
 
 impl LocalFs {
@@ -607,6 +622,8 @@ impl LocalFs {
         Self {
             root: None,
             read_only: false,
+            writes_only: false,
+            also_writable: Vec::new(),
         }
     }
 
@@ -615,6 +632,8 @@ impl LocalFs {
         Self {
             root: Some(root.into()),
             read_only: false,
+            writes_only: false,
+            also_writable: Vec::new(),
         }
     }
 
@@ -626,6 +645,8 @@ impl LocalFs {
         Self {
             root: Some(root.into()),
             read_only: true,
+            writes_only: false,
+            also_writable: Vec::new(),
         }
     }
 
@@ -634,7 +655,32 @@ impl LocalFs {
         Self {
             root: None,
             read_only: true,
+            writes_only: false,
+            also_writable: Vec::new(),
         }
+    }
+
+    /// **Writes fenced to `root`, reads unfenced.**
+    ///
+    /// For a checkout a person deliberately stepped into: the point is that
+    /// nothing outside it gets changed, not that nothing outside it may be
+    /// looked at. Reads keep whatever reach the unfenced world had, so the
+    /// only difference a caller can observe is a refused mutation — and a
+    /// mutation outside the fence is exactly what they asked to be stopped.
+    pub fn writes_fenced(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: Some(root.into()),
+            read_only: false,
+            writes_only: true,
+            also_writable: Vec::new(),
+        }
+    }
+
+    /// Also allow writes under `dir`, outside the fence (see
+    /// [`Self::also_writable`]).
+    pub fn also_writable(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.also_writable.push(dir.into());
+        self
     }
 
     /// Resolve a model-supplied path inside the root, refusing anything that
@@ -642,8 +688,53 @@ impl LocalFs {
     /// the tree is caught rather than followed.
     ///
     /// With no root, the path is returned untouched: an unfenced world performs
-    /// I/O and nothing else.
+    /// I/O and nothing else. A **writes-only** world ([`Self::writes_fenced`])
+    /// takes this path too — its fence is applied by [`Self::resolve_write`],
+    /// which is the only door a mutation comes through.
     fn resolve(&self, path: &Path) -> Result<PathBuf, FsError> {
+        let Some(root_dir) = self.root.as_ref() else {
+            return Ok(path.to_path_buf());
+        };
+        if self.writes_only {
+            // Reads are not this world's business, and neither is containment
+            // for them. What still applies is the *root's* meaning for a
+            // relative path: a tool hands over `src/main.rs` and means it under
+            // the working directory, fence or no fence.
+            return Ok(if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                root_dir.join(path)
+            });
+        }
+        let joined = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            root_dir.join(path)
+        };
+        let full = Self::real_path(&joined)?;
+        let root = root_dir.canonicalize().unwrap_or_else(|_| root_dir.clone());
+        if !full.starts_with(&root) {
+            return Err(FsError::denied(format!(
+                "{} is outside the world's root {}",
+                full.display(),
+                root.display()
+            )));
+        }
+        Ok(full)
+    }
+
+    /// Where a mutation to `path` may land, or why it may not.
+    ///
+    /// Two rules, and the second is not an exception to the first: the fence
+    /// itself (mutations stay inside it), and the few places outside it this
+    /// world was still told it may write ([`Self::also_writable`] — the
+    /// machine's temp directory, in practice). Refused otherwise, whatever the
+    /// path is and whoever asked.
+    ///
+    /// Only ever reached for a write: reads go through [`Self::resolve`], which
+    /// for a writes-only world imposes nothing.
+    fn resolve_write(&self, path: &Path) -> Result<PathBuf, FsError> {
+        self.deny_write()?;
         let Some(root_dir) = self.root.as_ref() else {
             return Ok(path.to_path_buf());
         };
@@ -652,9 +743,29 @@ impl LocalFs {
         } else {
             root_dir.join(path)
         };
-        // Canonicalize the deepest existing ancestor, then re-attach the rest, so
-        // a write to a not-yet-existing file still gets a real-path check.
-        let mut existing = joined.as_path();
+        let full = Self::real_path(&joined)?;
+        let root = root_dir.canonicalize().unwrap_or_else(|_| root_dir.clone());
+        let inside = full.starts_with(&root)
+            || self.also_writable.iter().any(|allow| {
+                let allow = allow.canonicalize().unwrap_or_else(|_| allow.clone());
+                full.starts_with(&allow)
+            });
+        if !inside {
+            return Err(FsError::denied(format!(
+                "{} is outside the world's root {}",
+                full.display(),
+                root.display()
+            )));
+        }
+        Ok(full)
+    }
+
+    /// The real path of something that may not exist yet: the deepest existing
+    /// ancestor is canonicalized (so a symlink out of the tree is caught) and
+    /// the rest is re-attached, so a write to a not-yet-existing file still gets
+    /// a real-path check.
+    fn real_path(joined: &Path) -> Result<PathBuf, FsError> {
+        let mut existing = joined;
         let mut trailing = PathBuf::new();
         loop {
             if existing.exists() {
@@ -674,20 +785,11 @@ impl LocalFs {
             existing = parent;
         }
         let real = existing.canonicalize().map_err(FsError::io)?;
-        let root = root_dir.canonicalize().unwrap_or_else(|_| root_dir.clone());
-        let full = if trailing.as_os_str().is_empty() {
+        Ok(if trailing.as_os_str().is_empty() {
             real
         } else {
             real.join(&trailing)
-        };
-        if !full.starts_with(&root) {
-            return Err(FsError::denied(format!(
-                "{} is outside the world's root {}",
-                full.display(),
-                root.display()
-            )));
-        }
-        Ok(full)
+        })
     }
 
     fn deny_write(&self) -> Result<(), FsError> {
@@ -701,8 +803,13 @@ impl LocalFs {
 #[async_trait]
 impl FileSystem for LocalFs {
     fn describe(&self) -> String {
+        // The write boundary is stated, because it is the one a reader of this
+        // line needs to know about: "local at /x" would leave the reach of a
+        // mutation to be guessed.
         let access = if self.read_only {
             "local (read-only)"
+        } else if self.writes_only {
+            "local (writes fenced)"
         } else {
             "local"
         };
@@ -729,8 +836,9 @@ impl FileSystem for LocalFs {
     }
 
     async fn write_bytes(&self, path: &Path, bytes: &[u8]) -> Result<(), FsError> {
-        self.deny_write()?;
-        let path = self.resolve(path)?;
+        // `resolve_write`, not `resolve`: this is a mutation, and a write is the
+        // only thing a writes-only world fences.
+        let path = self.resolve_write(path)?;
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -740,8 +848,7 @@ impl FileSystem for LocalFs {
     }
 
     async fn create_dir_all(&self, path: &Path) -> Result<(), FsError> {
-        self.deny_write()?;
-        let path = self.resolve(path)?;
+        let path = self.resolve_write(path)?;
         tokio::fs::create_dir_all(&path).await.map_err(FsError::io)
     }
 
@@ -987,6 +1094,91 @@ mod tests {
         plain.write_text(&outside, "written").await.unwrap();
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "written");
         assert_eq!(plain.canonicalize(&outside).await.unwrap(), outside);
+    }
+
+    /// A writes-only world fences mutations and nothing else.
+    ///
+    /// The two halves are one criterion on purpose: a world that refused the
+    /// read too would pass an assertion about the write while being a different
+    /// world from the one asked for, and "I can still look at my dependency
+    /// cache" is the half a person actually feels.
+    #[tokio::test]
+    async fn a_writes_only_world_fences_the_write_and_not_the_read() {
+        let dir = scratch("writes-only");
+        let inside = dir.join("checkout");
+        let outside = dir.join("elsewhere");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("seen.txt"), "readable").unwrap();
+
+        let fs = LocalFs::writes_fenced(&inside);
+
+        // Writable inside the fence, file and directory alike.
+        fs.write_text(Path::new("made.txt"), "mine").await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(inside.join("made.txt")).unwrap(),
+            "mine"
+        );
+        fs.create_dir_all(Path::new("sub/dir")).await.unwrap();
+        assert!(inside.join("sub").join("dir").is_dir());
+
+        // Readable outside it — that is the whole point of "writes only".
+        assert_eq!(
+            fs.read_text(&outside.join("seen.txt")).await.unwrap(),
+            "readable",
+            "a path outside the fence is still readable"
+        );
+        assert!(
+            fs.list(&outside).await.is_ok(),
+            "and so is a directory outside it"
+        );
+        assert!(fs.info(&outside.join("seen.txt")).await.unwrap().exists);
+
+        // And a mutation outside it is refused, with the file untouched.
+        for target in [outside.join("seen.txt"), outside.join("new.txt")] {
+            let err = fs.write_text(&target, "changed").await.unwrap_err();
+            assert!(err.is_denied(), "{target:?}: {err}");
+        }
+        let err = fs
+            .create_dir_all(&outside.join("made-dir"))
+            .await
+            .unwrap_err();
+        assert!(err.is_denied(), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(outside.join("seen.txt")).unwrap(),
+            "readable",
+            "the refused write changed nothing"
+        );
+        assert!(!outside.join("made-dir").exists());
+    }
+
+    /// The temp directory is the one place outside the fence a write may land:
+    /// a checkout that cannot make a scratch file breaks the toolchain without
+    /// protecting anything.
+    #[tokio::test]
+    async fn a_writes_only_world_still_writes_where_it_was_told_it_may() {
+        let dir = scratch("writes-only-allowed");
+        let inside = dir.join("checkout");
+        let scratch_pad = dir.join("scratch-pad");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir_all(&scratch_pad).unwrap();
+
+        let fs = LocalFs::writes_fenced(&inside).also_writable(&scratch_pad);
+
+        fs.write_text(&scratch_pad.join("temp.txt"), "ok")
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(scratch_pad.join("temp.txt")).unwrap(),
+            "ok"
+        );
+
+        // Everything not named is still refused.
+        let err = fs
+            .write_text(&dir.join("neighbour.txt"), "no")
+            .await
+            .unwrap_err();
+        assert!(err.is_denied(), "{err}");
     }
 
     #[tokio::test]

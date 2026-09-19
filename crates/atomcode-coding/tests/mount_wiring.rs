@@ -8,6 +8,7 @@
 
 mod support;
 
+use std::path::Path;
 use std::sync::Arc;
 
 use atomcode_coding::{prepare, CodingAgentConfig, PrepareOptions, SessionMode};
@@ -265,4 +266,116 @@ async fn a_configured_credential_never_enters_the_config_tree() {
         );
     }
     mounted.shutdown().await;
+}
+
+/// A checkout a person stepped into bounds **changes**, not reading.
+///
+/// `/worktree` is already a deliberate step into a tree of one's own, so a
+/// mutation outside that tree is refused whether or not anyone is there to ask.
+/// The other half is the point of the shape: reads stay open, because a
+/// dependency cache, a sibling repository and `~` are things a checkout has to
+/// be able to look at — a fence on the read side would refuse the lookup long
+/// before anyone could be asked about the change.
+///
+/// Read here through the mounted `fs` service rather than through a tool call,
+/// because this is a property of the world the mount built: it holds whatever
+/// path a tool hands over, so it is the boundary itself being asserted.
+#[tokio::test]
+#[serial_test::serial(atomcode_home)]
+async fn a_checkout_bounds_the_write_and_leaves_the_read_alone() {
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("ATOMCODE_HOME", home.path());
+
+    // A real repository: `.git` as a FILE is what a linked worktree has, and
+    // that is the fact the mount reads to decide it is one.
+    let repo = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(args)
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@example.com"]);
+    git(&["config", "user.name", "t"]);
+    std::fs::write(repo.path().join("a.txt"), "a").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "first"]);
+    let checkout = repo.path().join("checkout");
+    git(&[
+        "worktree",
+        "add",
+        "-b",
+        "here",
+        checkout.to_str().expect("path"),
+    ]);
+    assert!(
+        checkout.join(".git").is_file(),
+        "the fixture is a linked worktree, which is what the rule keys on"
+    );
+
+    // Outside the checkout. NOT under the temp dir: that is deliberately still
+    // writable, so a sample there would pass while proving the opposite.
+    let sibling = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/checkout-fence")
+        .join(format!("{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&sibling);
+    std::fs::create_dir_all(&sibling).unwrap();
+    std::fs::write(sibling.join("seen.txt"), "readable").unwrap();
+
+    let cfg = atomcode_coding::CodingRuntimeConfig::from_config(
+        &atomcode_config::config::Config::default(),
+        &checkout,
+        None,
+        None,
+        false,
+        true,
+    )
+    .agent_config();
+    let opts = PrepareOptions {
+        tools: true,
+        ..quiet_options()
+    };
+    let mounted = support::mount(&cfg, opts, Arc::new(CannedProvider)).await;
+    let world = mounted
+        .context()
+        .service::<atomcode_harness::seams::FsSvc>()
+        .expect("an fs world is mounted");
+    let _ = std::fs::create_dir_all(checkout.join("src"));
+
+    // Writes inside the checkout land.
+    world
+        .write_text(Path::new("src/made.txt"), "mine")
+        .await
+        .expect("a write inside the checkout");
+
+    // Reads outside it still work — the half that makes this livable.
+    assert_eq!(
+        world
+            .read_text(&sibling.join("seen.txt"))
+            .await
+            .expect("reading outside the checkout"),
+        "readable"
+    );
+
+    // And a change outside it is refused, with the file untouched.
+    for target in [sibling.join("seen.txt"), sibling.join("new.txt")] {
+        let refused = world.write_text(&target, "changed").await;
+        assert!(
+            refused.as_ref().is_err_and(|e| e.is_denied()),
+            "{target:?} must be refused: {refused:?}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(sibling.join("seen.txt")).unwrap(),
+        "readable",
+        "the refused write changed nothing"
+    );
+    assert!(!sibling.join("new.txt").exists());
+
+    mounted.shutdown().await;
+    let _ = std::fs::remove_dir_all(&sibling);
 }

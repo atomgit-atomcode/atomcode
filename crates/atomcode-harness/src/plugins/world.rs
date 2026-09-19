@@ -32,6 +32,19 @@ struct FsRow {
     root: Option<String>,
     #[serde(default)]
     read_only: bool,
+    /// Fence mutations to `root` and leave reads alone.
+    ///
+    /// The boundary a checkout a person stepped into wants: nothing outside it
+    /// gets changed, and everything outside it is still readable. Not a second
+    /// kind of `root` — the same root with the fence applied on one side only.
+    #[serde(default)]
+    writes_only: bool,
+    /// Places outside `root` a mutation may still land.
+    ///
+    /// The machine's temp directory, in practice: a checkout that cannot make a
+    /// scratch file breaks the toolchain without protecting anything.
+    #[serde(default)]
+    also_writable: Vec<String>,
 }
 
 pub struct FsLocalPlugin;
@@ -45,7 +58,7 @@ impl Plugin for FsLocalPlugin {
         &["fs"]
     }
     fn description(&self) -> &'static str {
-        "the local disk; fenced to a root only when one is given"
+        "the local disk; fenced to a root only when one is given, and on the write side alone when asked"
     }
     async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
         let row: FsRow = parse(config)?;
@@ -56,8 +69,18 @@ impl Plugin for FsLocalPlugin {
         // delegated member's worktree, a read-only audit or a sandbox wants,
         // and what a person's main agent, reaching into ~/.cargo or a sibling
         // repository, does not.
+        //
+        // `writes_only` is the middle case, and the one a checkout wants: the
+        // same root, applied to mutations alone.
         let world: Arc<dyn FileSystem> = match (row.root.map(PathBuf::from), row.read_only) {
             (Some(root), true) => Arc::new(LocalFs::read_only(root)),
+            (Some(root), false) if row.writes_only => {
+                let mut world = LocalFs::writes_fenced(root);
+                for dir in &row.also_writable {
+                    world = world.also_writable(dir);
+                }
+                Arc::new(world)
+            }
             (Some(root), false) => Arc::new(LocalFs::new(root)),
             (None, true) => Arc::new(LocalFs::read_only_unfenced()),
             (None, false) => Arc::new(LocalFs::unfenced()),

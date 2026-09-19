@@ -391,6 +391,42 @@ struct FsWorldPatch<'a> {
     /// `None` is the attended world: no fence, because there is someone to ask.
     #[serde(skip_serializing_if = "Option::is_none")]
     root: Option<&'a std::path::Path>,
+    /// Fence mutations to `root` and leave reads alone.
+    #[serde(skip_serializing_if = "is_false")]
+    writes_only: bool,
+    /// Places outside `root` a mutation may still land.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    also_writable: Vec<&'a std::path::Path>,
+}
+
+/// For `skip_serializing_if`, which hands the field over by reference.
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Whether `dir` is a **linked worktree** — a checkout git added beside the tree
+/// it belongs to.
+///
+/// `.git` being a file is what such a checkout has (the main one has a
+/// directory), but that alone is not enough to conclude it: a **submodule** has
+/// a `.git` file too, and a submodule is a nested repository somebody chose to
+/// have, not a checkout they just stepped into. Fencing it would silently
+/// forbid a legitimate layout.
+///
+/// The file is a `gitdir:` pointer either way, and the pointer's own location
+/// separates them: a worktree's lives under `<common>/worktrees/<name>`, a
+/// submodule's under `<super>/.git/modules/<name>`. Read the pointer rather
+/// than the shape.
+fn is_a_linked_worktree(dir: &std::path::Path) -> bool {
+    let Ok(pointer) = std::fs::read_to_string(dir.join(".git")) else {
+        return false;
+    };
+    let Some(target) = pointer.trim().strip_prefix("gitdir:") else {
+        return false;
+    };
+    target
+        .split(['/', '\\'])
+        .any(|component| component == "worktrees")
 }
 
 #[derive(serde::Serialize)]
@@ -1470,18 +1506,67 @@ pub async fn mount_hosted(
     // is settled once, in `CODING_DEFAULTS`: base's never-asks row is off in both
     // modes because `ui-handle` claims that seam and round-trips the driver, and
     // mounting `ui-handle` at all means a driver is present.
-    let boundary = match presence {
-        Presence::Attended => Layer::new()
-            .patch("fs", FsWorldPatch { root: None })
-            .map_err(|e| e.to_string())?,
-        Presence::Headless => Layer::new()
+    //
+    // A checkout a person stepped into is the third case, and the reason this
+    // is not `match presence` alone: `/worktree` is already a deliberate step
+    // into a tree of one's own, so **mutations** stop at that tree whether or
+    // not somebody is there to ask. Reads stay open, which is what makes the
+    // boundary livable — a dependency cache, a sibling repository and `~` are
+    // still readable, and the only thing a person can notice is a refused
+    // change. The toolchain's scratch space is not a change to the checkout, so
+    // the machine's temp directory stays writable.
+    //
+    // Which checkout that is, is [`is_a_linked_worktree`]'s question, and it is
+    // asked about the directory rather than of the person: the runtime rebuilds
+    // a tree on every reprepare, including the `/cd` that follows `/worktree`,
+    // so the rule has to hold for the directory it is handed and not for an
+    // event that has already been and gone.
+    let boundary = if is_a_linked_worktree(working_dir) {
+        let mut writable = vec![std::env::temp_dir()];
+        // Windows spells the same place twice, and a build that picked the
+        // other spelling would find its scratch pad refused.
+        for var in ["TEMP", "TMP"] {
+            if let Some(dir) = std::env::var_os(var) {
+                let dir = std::path::PathBuf::from(dir);
+                if !writable.iter().any(|known| known == &dir) {
+                    writable.push(dir);
+                }
+            }
+        }
+        let extra: Vec<&std::path::Path> = writable.iter().map(|dir| dir.as_path()).collect();
+        Layer::new()
             .patch(
                 "fs",
                 FsWorldPatch {
                     root: Some(working_dir),
+                    writes_only: true,
+                    also_writable: extra,
                 },
             )
-            .map_err(|e| e.to_string())?,
+            .map_err(|e| e.to_string())?
+    } else {
+        match presence {
+            Presence::Attended => Layer::new()
+                .patch(
+                    "fs",
+                    FsWorldPatch {
+                        root: None,
+                        writes_only: false,
+                        also_writable: Vec::new(),
+                    },
+                )
+                .map_err(|e| e.to_string())?,
+            Presence::Headless => Layer::new()
+                .patch(
+                    "fs",
+                    FsWorldPatch {
+                        root: Some(working_dir),
+                        writes_only: false,
+                        also_writable: Vec::new(),
+                    },
+                )
+                .map_err(|e| e.to_string())?,
+        }
     };
     // Built, not formatted. A working directory is whatever the person made, and
     // a `{:?}` of it writes a control character as `\u{7f}` — which is not TOML,
@@ -2776,6 +2861,56 @@ impl Plugin for DelegatedLlmPlugin {
             .provide::<atomcode_harness::seams::DelegatedLlmSvc>(self.0.clone())
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod linked_worktree_tests {
+    use super::is_a_linked_worktree;
+
+    /// Only a checkout git added BESIDE a tree counts — a submodule has a
+    /// `.git` file too, and fencing a layout somebody chose on purpose would
+    /// quietly forbid it.
+    #[test]
+    fn only_a_checkout_beside_its_tree_is_a_linked_worktree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+
+        // A plain directory is not one at all.
+        let plain = root.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert!(!is_a_linked_worktree(&plain));
+
+        // The main checkout: `.git` is a directory.
+        let main = root.join("main");
+        std::fs::create_dir_all(main.join(".git")).unwrap();
+        assert!(!is_a_linked_worktree(&main));
+
+        // A linked worktree: the pointer lives under `<common>/worktrees/<name>`.
+        let linked = root.join("linked");
+        std::fs::create_dir_all(&linked).unwrap();
+        std::fs::write(
+            linked.join(".git"),
+            "gitdir: /somewhere/.git/worktrees/linked\n",
+        )
+        .unwrap();
+        assert!(is_a_linked_worktree(&linked));
+
+        // A submodule: a `.git` FILE as well, pointing at `.git/modules/<name>`
+        // instead. This is the false positive the pointer's own path rules out.
+        let submodule = root.join("submodule");
+        std::fs::create_dir_all(&submodule).unwrap();
+        std::fs::write(submodule.join(".git"), "gitdir: ../.git/modules/inner\n").unwrap();
+        assert!(
+            !is_a_linked_worktree(&submodule),
+            "a submodule is a nested repository somebody chose, not a checkout to fence"
+        );
+
+        // A `.git` file that is not a pointer at all: nothing is concluded.
+        let junk = root.join("junk");
+        std::fs::create_dir_all(&junk).unwrap();
+        std::fs::write(junk.join(".git"), "not a pointer").unwrap();
+        assert!(!is_a_linked_worktree(&junk));
     }
 }
 
