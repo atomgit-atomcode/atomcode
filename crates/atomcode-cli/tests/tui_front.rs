@@ -143,9 +143,32 @@ async fn a_session_the_product_wrote_comes_back_on_the_row_assembled_screen() {
     let config_path = home.path().join("config.toml");
     // `None` for the host configuration: this criterion is about mounting the
     // screen, and a host that resolves nothing is the honest stand-in.
-    let mounted = tui_front::mount(second, front_end, config, None, &screen, config_path)
+    let mounted = tui_front::mount(second, front_end, config, None, &screen, config_path, None)
         .await
         .expect("the screen mounts");
+
+    // The row that gets an unconfigured machine working is mounted here, and
+    // not behind a condition: what it contributes is a command, and whether it
+    // runs is readiness's answer when the screen starts. A build that mounted
+    // it only when it was needed would have to decide that before the host has
+    // been asked.
+    {
+        let commands = mounted
+            .app
+            .context()
+            .service::<atomcode_tui::plugin::CommandsSvc>()
+            .expect("the screen provides its commands");
+        let named = match atomcode::host::readiness_for(Some(
+            atomcode_coding::ProviderUnavailableReason::NotConfigured,
+        )) {
+            atomcode_host_api::HostReply::Readiness { fix: Some(fix), .. } => fix,
+            other => panic!("nothing named for a machine with no provider: {other:?}"),
+        };
+        assert!(
+            commands.find(&named).is_some(),
+            "the command readiness names is one this screen can run: {named}"
+        );
+    }
     let term = mounted
         .app
         .context()

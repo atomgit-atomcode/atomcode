@@ -1859,7 +1859,11 @@ fn every_reason_a_provider_cannot_serve_says_something_and_only_some_name_a_fix(
     );
 
     let cases = [
-        (ProviderUnavailableReason::NotConfigured, None),
+        // The wizard that can put it right; `tui_onboarding` contributes it.
+        (
+            ProviderUnavailableReason::NotConfigured,
+            Some(atomcode::tui_onboarding::COMMAND),
+        ),
         (
             ProviderUnavailableReason::AuthenticationRequired,
             Some("login"),

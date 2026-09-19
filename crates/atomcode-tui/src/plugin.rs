@@ -41,6 +41,9 @@ plexus_service!(AgentClientSvc => AgentClient, "tui-agent-client", Core, "The sc
 // Declared here, by the one that consumes it (`docs/adr/0021` §6): whoever
 // launches the screen fills it with what its host handed over.
 plexus_service!(ConnectionSvc => Connection, "agent-connection", Seam, "What the host handed this screen: its agent and host control");
+// Provided by the loop once it exists, so whatever is working outside it can
+// say that what is on screen changed.
+plexus_service!(RepaintSvc => dyn Repaint, "tui-repaint", Seam, "Ask for a frame from outside the loop");
 
 /// The connection a launcher hands the screen, taken once when it runs.
 pub struct Connection(Mutex<Option<HostConnection>>);
@@ -675,6 +678,10 @@ impl UserInterface for Tui {
         client.connect(commands, control);
 
         let (wake_tx, mut wake) = mpsc::unbounded_channel::<Wake>();
+        // Now there is a loop to wake, anything working outside it can ask for
+        // a frame. Provided here rather than at mount: before this line there
+        // is nothing to ring.
+        let _ = ctx.provide::<RepaintSvc>(Arc::new(Waker(wake_tx.clone())));
         // Started before anything can commit a fact, so the first turn's
         // opening reading is measured on the same clock as every later one.
         let clock = Clock::start();
@@ -2778,6 +2785,29 @@ impl Tui {
             let outcome = host.commands.dispatch(&value, &ctx).await;
             deliver(&host, &keys, outcome);
         });
+    }
+}
+
+/// Ask for a frame.
+///
+/// The loop paints when something wakes it, and everything that wakes it today
+/// is either a key or the connection. Work that changes what is on screen from
+/// somewhere else — a login being polled behind a modal, a file being watched —
+/// has nothing to ring, and its change sits there unpainted until the next
+/// keystroke.
+///
+/// A seam rather than the wake channel itself: what is outside the loop needs
+/// to say "this changed", not to reach into how the loop is built.
+pub trait Repaint: Send + Sync {
+    fn now(&self);
+}
+
+/// The screen's own.
+struct Waker(mpsc::UnboundedSender<Wake>);
+
+impl Repaint for Waker {
+    fn now(&self) {
+        let _ = self.0.send(Wake::Fact);
     }
 }
 

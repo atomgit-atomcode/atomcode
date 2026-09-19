@@ -4095,3 +4095,40 @@ async fn a_command_a_host_names_that_opens_a_modal_opens_it() {
     );
     task.abort();
 }
+
+/// Work outside the loop has something to ring.
+///
+/// Everything that wakes this screen today is a key or the connection. A login
+/// being polled behind a modal is neither: it changes what is on screen from a
+/// thread the loop knows nothing about, and without this seam its change sits
+/// there unpainted until the next keystroke — which, on the step that is
+/// *waiting* for it, may never come.
+///
+/// Provided by the loop and not at mount: before the loop exists there is
+/// nothing to ring, and a row that took one then would hold a handle to
+/// nothing.
+#[tokio::test]
+async fn something_working_outside_the_loop_can_ask_for_a_frame() {
+    let dir = scratch("repaint");
+    let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    assert!(
+        s.app
+            .service::<atomcode_tui::plugin::RepaintSvc>()
+            .is_none(),
+        "not before it runs: there is no loop yet"
+    );
+
+    let task = s.open().await;
+    let repaint = s
+        .app
+        .service::<atomcode_tui::plugin::RepaintSvc>()
+        .expect("the loop provides it once it is running");
+    repaint.now();
+    assert!(
+        s.term
+            .settle(Duration::from_millis(40), Duration::from_secs(5))
+            .await,
+        "and the screen is still painting after being rung"
+    );
+    task.abort();
+}

@@ -2519,6 +2519,7 @@ async fn run() -> Result<i32> {
                     Some(host_config),
                     &screen,
                     config_path.clone(),
+                    Some(telemetry.clone()),
                 )
                 .await
                 .map(|()| 0)

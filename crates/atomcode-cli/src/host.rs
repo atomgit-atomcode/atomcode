@@ -1171,11 +1171,13 @@ pub fn readiness_for(reason: Option<ProviderUnavailableReason>) -> HostReply {
             }
         }
         Some(ProviderUnavailableReason::NotConfigured) => {
-            // No `fix` yet: signing in again cannot help a machine that has no
-            // provider at all. The wizard that can is A2/A3 of
-            // `docs/plans/2026-09-19-remaining-gaps.md`, and this is where it
-            // will be named.
-            ("还没有配置任何 provider——先加一个才能开始", None)
+            // Signing in again cannot help a machine that has no provider at
+            // all; the wizard that can is `tui_onboarding`, and naming it is
+            // as far as this host's say goes.
+            (
+                "还没有配置任何 provider——先加一个才能开始",
+                Some(crate::tui_onboarding::COMMAND),
+            )
         }
         Some(ProviderUnavailableReason::AuthenticationRequired) => {
             ("登录已经失效，需要重新登录", Some("login"))

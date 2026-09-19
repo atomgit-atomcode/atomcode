@@ -14,6 +14,7 @@ fn _isolate_atomcode_home() {
 
 #[cfg(unix)]
 pub mod askpass;
+pub mod tui_onboarding;
 pub mod tui_settings;
 pub mod uninstall;
 
@@ -56,17 +57,31 @@ pub mod tui_front {
         host_config: Option<Arc<dyn crate::host::HostConfig>>,
         screen: &Screen,
         config_path: std::path::PathBuf,
+        telemetry: Option<Arc<atomcode_telemetry::Telemetry>>,
     ) -> Result<launch::Mounted, String> {
         // Both additions belong: the host configuration is what makes
         // `HostCommand::Settings`/`SwitchModel` answerable, and the settings row
         // is the panel `/config` pulls up. They are not alternatives — one is
         // what a host can be asked, the other is what this screen can show.
         let connection = connect(runtime, front_end, config, host_config)?;
-        let layer = crate::tui_settings::row_layer();
+        // Two rows and one port. The onboarding row is here rather than behind
+        // a condition because what it contributes is a command: whether it runs
+        // is readiness's answer, asked when the screen starts, and a machine
+        // that is already set up simply never names it.
+        let layers = [
+            crate::tui_settings::row_layer(),
+            crate::tui_onboarding::row_layer(),
+        ];
         launch::mount_with(
             screen,
-            &[&layer],
-            &[Arc::new(crate::tui_settings::SettingsRow)],
+            &[&layers[0], &layers[1]],
+            &[
+                Arc::new(crate::tui_settings::SettingsRow),
+                Arc::new(crate::tui_onboarding::OnboardingRow {
+                    config_path: config_path.clone(),
+                    telemetry,
+                }),
+            ],
             Some(crate::tui_settings::ConfigSettings::new(config_path)),
             connection,
         )
@@ -460,8 +475,18 @@ model = "vendor-b"
         host_config: Option<Arc<dyn crate::host::HostConfig>>,
         screen: &Screen,
         config_path: std::path::PathBuf,
+        telemetry: Option<Arc<atomcode_telemetry::Telemetry>>,
     ) -> Result<(), String> {
-        let mounted = mount(runtime, front_end, config, host_config, screen, config_path).await?;
+        let mounted = mount(
+            runtime,
+            front_end,
+            config,
+            host_config,
+            screen,
+            config_path,
+            telemetry,
+        )
+        .await?;
         let ctx = mounted.app.context();
         mounted.ui.run(&ctx, None).await
     }

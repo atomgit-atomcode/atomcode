@@ -113,30 +113,33 @@ pub struct Wizard {
     typed: RwLock<String>,
     cursor: RwLock<usize>,
     on_step: OnStep,
+    finished_with: String,
 }
 
 impl Wizard {
-    /// What the modal closes with when every step is done.
-    ///
-    /// A wizard's result is its [`answers`](Wizard::answers), which are several
-    /// and are read from the `Arc` the host kept; the closing value says only
-    /// that it reached the end. `None` from the host's callback is the person
-    /// giving up — those are the two outcomes, and they must not be confused.
-    pub const DONE: &'static str = "done";
-
     /// `on_step` is called with the id of every step as it opens, starting with
     /// the first, before this returns. It is how the host learns there is work
     /// to start — the wizard itself starts nothing.
+    ///
+    /// `finished_with` is the command line this closes with when the last step
+    /// is answered, which the screen dispatches the way it dispatches a pick.
+    /// The host names it because the host is the only one who can do anything
+    /// with the [`answers`](Wizard::answers) — they are several, they are read
+    /// from the `Arc` the host kept, and a modal closes with one value. `None`
+    /// from the screen's callback is the person giving up; those are the two
+    /// outcomes and they must not be confused.
     pub fn new(
         id: &'static str,
         title: impl Into<String>,
         steps: Vec<StepDef>,
         on_step: OnStep,
+        finished_with: impl Into<String>,
     ) -> Arc<Self> {
         let first = steps.first().map(|s| s.id.clone());
         let me = Arc::new(Self {
             id,
             title: title.into(),
+            finished_with: finished_with.into(),
             steps: RwLock::new(steps),
             at: RwLock::new(0),
             answers: RwLock::new(Vec::new()),
@@ -180,6 +183,18 @@ impl Wizard {
         }
     }
 
+    /// Put a picture on the current step, or take one away.
+    ///
+    /// Paired with [`say`](Wizard::say) for the same reason: what a step is
+    /// waiting for may only become drawable once the work has started — a
+    /// login's code is not known until the login exists.
+    pub fn show(&self, picture: Option<Raster>) {
+        let at = self.at();
+        if let Some(step) = self.steps.write().expect("wizard poisoned").get_mut(at) {
+            step.picture = picture;
+        }
+    }
+
     /// The host finished what the current step was waiting for.
     ///
     /// Answers with `Some(answer)` and moves on. `true` when that was the last
@@ -209,7 +224,7 @@ impl Wizard {
         }
         let last = self.total().saturating_sub(1);
         if self.at() >= last {
-            return Step::Chose(Self::DONE.to_string());
+            return Step::Chose(self.finished_with.clone());
         }
         let next = {
             let mut at = self.at.write().expect("wizard poisoned");
@@ -528,6 +543,7 @@ mod tests {
             "设置",
             steps,
             Box::new(move |id| to.lock().expect("seen poisoned").push(id.to_string())),
+            "wizard-finished",
         );
         (w, seen)
     }
@@ -677,7 +693,7 @@ mod tests {
         assert_eq!(w.key(KeyPress::plain(Key::Enter)), Step::Stay);
         assert_eq!(
             w.key(KeyPress::plain(Key::Enter)),
-            Step::Chose(Wizard::DONE.to_string())
+            Step::Chose("wizard-finished".to_string())
         );
         assert_eq!(
             w.answers(),
