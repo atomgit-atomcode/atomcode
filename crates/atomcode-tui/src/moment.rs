@@ -279,12 +279,22 @@ pub struct Moment {
     /// (`docs/adr/0024` §17). What they said stays on screen — the stream is not
     /// reversible — drawn as one dim line each.
     pub undone: std::collections::BTreeSet<u64>,
-    /// The team panel's pointed-at row, while the panel has the keyboard.
+    /// The team panel's pointed-at row: which row the arrows are on while the
+    /// panel has the keyboard, and which row the pointer is over regardless.
     ///
-    /// One owner for the reason [`Ask::cursor`] has one: the row the arrows are
-    /// on and the row the pointer is over are the same row. An index into
-    /// `modules::team::targets`.
+    /// An index into `modules::team::targets`. Pointing at a row is what a
+    /// pointer does merely by being there, so this is **not** the keyboard: an
+    /// ordinary move of the mouse across a panel that is always on screen would
+    /// then take the composer's keys away, and the person would be typing into
+    /// nothing. Who has the keyboard is [`Moment::team_keyboard`].
     pub team_cursor: Option<usize>,
+    /// Whether the team panel has the keyboard (`docs/adr/0023` §3).
+    ///
+    /// Its own field rather than "there is a cursor", because only one thing
+    /// hands the panel the keys — `Tab`, pressed on purpose. The pointer lights
+    /// a row and stops there; a stored fact (a question waiting, below) can take
+    /// the keyboard without being asked for, but a mouse move is not that.
+    pub team_keyboard: bool,
     /// The settings, **as of the frame this moment was taken for**.
     ///
     /// A snapshot rather than a handle, for the reason [`Moment::rasters`] is

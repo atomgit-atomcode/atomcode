@@ -37,10 +37,19 @@
 //! running follows. Which rows can be switched to is [`targets`] — the lead and
 //! the members that are not gone — and the panel lights the row
 //! [`Moment::team_cursor`] points at and marks the one on screen. Both are the
-//! moment's, so the row the arrows are on, the row under the pointer and the row
-//! a press takes are one row. [`targets`] and [`rows`] filter on the same
-//! predicate for that reason: the *n*th drawn row and the *n*th target must be
-//! the same agent, or a click would take the one below it.
+//! moment's, so the row under the pointer and the row a press takes are one row.
+//! [`targets`] and [`rows`] filter on the same predicate for that reason: the
+//! *n*th drawn row and the *n*th target must be the same agent, or a click would
+//! take the one below it.
+//!
+//! The **keyboard** is a separate question from where the pointer is
+//! ([`Moment::team_keyboard`]), and the panel is deliberate about which of the
+//! two each thing follows. The lit row follows the pointer, because pointing at
+//! a row is what a pointer does by being there. The legend — the line naming
+//! `↑↓` / `Enter` / `Esc` — follows the keyboard, because there are no keys to
+//! name until `Tab` hands them over. A mouse crossing a panel that is always on
+//! screen must not become a keyboard grab: the composer keeps what is being
+//! typed, and a person who never presses `Tab` never loses a keystroke.
 
 use std::collections::HashMap;
 
@@ -259,7 +268,12 @@ impl View for Team {
         let muted = theme::fg(Role::Muted);
 
         let switchable = targets(vp.moment);
-        let focused = vp.moment.team_cursor.is_some() && !switchable.is_empty();
+        // Both of these are true while the panel has the keyboard, and one of
+        // them can hold without it: a pointer lights a row merely by being over
+        // it. The legend follows the keyboard — it is a list of keys, and there
+        // are no keys to list until `Tab` hands them over.
+        let focused = vp.moment.team_keyboard && !switchable.is_empty();
+        let pointing = vp.moment.team_cursor.is_some() && !switchable.is_empty();
         let mut out = vec![Line::styled(
             width::take_width(
                 &if focused {
@@ -274,8 +288,11 @@ impl View for Team {
             ),
             muted,
         )];
-        // Where the person is, and where the keyboard or the pointer is.
-        let lit = |i: usize| focused && vp.moment.team_cursor == Some(i);
+        // Where the person is, and where the keyboard or the pointer is. The lit
+        // row is the pointed-at one: with the keyboard it is where the arrows
+        // are, without it it is where the pointer is, and either way it is the
+        // row a press or `Enter` would take.
+        let lit = |i: usize| pointing && vp.moment.team_cursor == Some(i);
         let here = |session: &str| !vp.moment.viewing.is_empty() && vp.moment.viewing == session;
         let band = |line: Vec<El>, lit: bool| -> Vec<Line> {
             let lines = El::row(line).lay(w);

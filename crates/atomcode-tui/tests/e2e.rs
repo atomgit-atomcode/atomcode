@@ -3400,6 +3400,81 @@ async fn a_press_on_a_team_row_switches_to_that_agent() {
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
 
+/// Moving the mouse over the team panel does not take the keyboard
+/// (`docs/adr/0023` §3).
+///
+/// The panel is up whenever there is a team, so a pointer that grabbed the
+/// keyboard by crossing it would eat whatever the person was typing — every
+/// keystroke routed to a panel that only eats `↑↓`, `Enter` and `Esc`. Only
+/// `Tab`, pressed on purpose, hands it over.
+#[tokio::test]
+async fn hovering_the_team_panel_leaves_the_keyboard_where_it_was() {
+    use atomcode_tui::surface::Click;
+
+    let dir = scratch("team-hover-keeps-keys");
+    let (script, team) = team_with_a_talking_member(&dir);
+    let s = start(tree(&dir, &script, &[&team])).await;
+    let task = s.open().await;
+    s.term.type_line("have someone look around");
+    until(&s, "scout reporting in").await;
+    s.quiet().await;
+
+    let part = s.term.last().unwrap().part("team").unwrap().clone();
+    let scout_row = part
+        .lines
+        .iter()
+        .position(|l| l.plain().contains("scout"))
+        .expect("a row for the member") as u16;
+    let (x, y) = (part.rect.x + 2, part.rect.y + scout_row);
+
+    s.term.pointer(Click::Hover, x, y);
+    // The row lights, which is what the pointer means — and the legend, which
+    // is a list of keys, does not appear, because no keys have been handed over.
+    for _ in 0..100 {
+        let lit = s
+            .term
+            .last()
+            .and_then(|frame| frame.part("team").cloned())
+            .is_some_and(|part| {
+                part.lines
+                    .get(scout_row as usize)
+                    .is_some_and(|line| line.spans.iter().any(|span| span.style.bg.is_some()))
+            });
+        if lit {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        s.term
+            .last()
+            .and_then(|frame| frame.part("team").cloned())
+            .is_some_and(|part| part.lines[scout_row as usize]
+                .spans
+                .iter()
+                .any(|span| span.style.bg.is_some())),
+        "the row under the pointer is lit"
+    );
+    assert!(
+        !s.screen().contains("Enter 切换"),
+        "the panel has no keyboard, so it names no keys:\n{}",
+        s.screen()
+    );
+
+    // And the keyboard is still the composer's: what is typed goes into the
+    // field and reaches the agent on screen, which is still the lead.
+    s.term.type_line("still typing here");
+    until(&s, "still typing here").await;
+    assert!(
+        !s.screen().contains("正在看 scout"),
+        "the pointer did not switch the screen either:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
 /// A command a row of the agent's tree puts in its catalog, for a person to run.
 struct EchoCommand;
 

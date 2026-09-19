@@ -1068,6 +1068,10 @@ impl Host {
         let mut m = self.moment.write().expect("moment poisoned");
         m.members.clear();
         m.team_cursor = None;
+        // The keyboard went with the panel: the new session's team is not up
+        // yet, and a leftover `true` here would route the first keys of the new
+        // conversation into a panel that is not drawn.
+        m.team_keyboard = false;
         // A name belongs to the session that was named. Left behind it would be
         // the previous conversation's name over the new one's composer — and
         // over the window, which is worse, because a window is what a person
@@ -1118,12 +1122,12 @@ impl Host {
     }
 
     /// Whether the team panel has the keyboard.
+    ///
+    /// Not "is a row lit": the pointer lights a row by being over it, and a
+    /// panel that takes the keyboard because a mouse crossed it would eat what
+    /// the person is typing. Only `Tab` sets this.
     pub fn team_focused(&self) -> bool {
-        self.moment
-            .read()
-            .expect("moment poisoned")
-            .team_cursor
-            .is_some()
+        self.moment.read().expect("moment poisoned").team_keyboard
     }
 
     /// Give the team panel the keyboard, pointing at the agent on screen. `false`
@@ -1136,12 +1140,14 @@ impl Host {
         }
         let here = targets.iter().position(|s| *s == m.viewing).unwrap_or(0);
         m.team_cursor = Some(here);
+        m.team_keyboard = true;
         true
     }
 
-    /// Point at `row` of the team panel, clamped to the rows there are; with the
-    /// keyboard elsewhere this also lights it, which is what a pointer over it
-    /// means.
+    /// Point at `row` of the team panel, clamped to the rows there are.
+    ///
+    /// Says which row would be taken, and nothing more: a pointer that moves
+    /// across the panel does not take the keyboard with it.
     pub fn point_team_at(&self, row: usize) -> bool {
         let mut m = self.moment.write().expect("moment poisoned");
         let last = crate::modules::team::targets(&m).len().saturating_sub(1);
@@ -1151,6 +1157,15 @@ impl Host {
         }
         m.team_cursor = Some(row);
         true
+    }
+
+    /// The session the panel is pointing at: the row the arrows are on while it
+    /// has the keyboard, the row under the pointer otherwise. `None` when it is
+    /// pointing at nothing.
+    pub fn team_target(&self) -> Option<String> {
+        let m = self.moment.read().expect("moment poisoned");
+        let cursor = m.team_cursor?;
+        crate::modules::team::targets(&m).get(cursor).cloned()
     }
 
     /// Move the team panel's pointer by `delta` rows, clamped.
@@ -1164,11 +1179,10 @@ impl Host {
         self.point_team_at((cur + delta).max(0) as usize)
     }
 
-    /// Hand the keyboard back to the composer. What was pointed at, if anything.
-    pub fn unfocus_team(&self) -> Option<String> {
-        let mut m = self.moment.write().expect("moment poisoned");
-        let cursor = m.team_cursor.take()?;
-        crate::modules::team::targets(&m).get(cursor).cloned()
+    /// Hand the keyboard back to the composer. The row it was on stays lit if
+    /// the pointer is still over it — pointing and typing are different things.
+    pub fn unfocus_team(&self) {
+        self.moment.write().expect("moment poisoned").team_keyboard = false;
     }
 
     /// Which turns the screen draws as taken back. `true` when that changed, so

@@ -1259,11 +1259,16 @@ impl UserInterface for Tui {
                                 }
                             }
                             // A press on a team row is a switch to that agent.
+                            // The row is what the press took — not "whatever
+                            // was focused" — so the pointer's own row is read
+                            // here, and the keyboard is handed back either way:
+                            // the press has been answered.
                             if let Some(row) = self.host.team_row_at(x, y) {
                                 let _ = self.host.point_team_at(row);
-                                if let Some(session) = self.host.unfocus_team() {
+                                if let Some(session) = self.host.team_target() {
                                     self.switch_to(&session);
                                 }
+                                self.host.unfocus_team();
                                 stale = true;
                                 continue;
                             }
@@ -1702,12 +1707,13 @@ impl Tui {
                 self.host.move_team_by(1);
             }
             (Key::Enter, _) => {
-                if let Some(session) = self.host.unfocus_team() {
+                if let Some(session) = self.host.team_target() {
                     self.switch_to(&session);
                 }
+                self.host.unfocus_team();
             }
             (Key::Esc, _) | (Key::Tab, _) | (Key::BackTab, _) => {
-                let _ = self.host.unfocus_team();
+                self.host.unfocus_team();
             }
             (Key::Char('d'), Mods::CTRL) => return true,
             _ => {}
