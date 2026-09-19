@@ -1808,7 +1808,7 @@ impl Plugin for CapabilityCommandsPlugin {
             Arc::new(LoopCommand(self.0.clone())),
             Arc::new(QueueCommand(self.0.clone())),
             Arc::new(PolicyCommand(self.0.clone())),
-            Arc::new(WorktreeCommand),
+            Arc::new(WorktreeCommand(self.0.clone())),
         ] {
             atomcode_harness::commands::register(ctx, command)?;
         }
@@ -1834,25 +1834,32 @@ fn the_conversation_itself(agent: &atomcode_harness::agent::Agent) -> bool {
     agent.parent().is_none()
 }
 
-/// `worktree <name>`: a branch of one's own with a checkout of its own.
+/// `worktree <名字> [基准] | list | done | cleanup <名字> [--force]`: a branch of
+/// one's own with a checkout of its own, and the step that takes you into it.
 ///
 /// **A catalog command rather than a host command** (`docs/adr/0021` §3, the
 /// same place goal and loop live). Host control is a *neutral* contract — a
 /// front end asks it for things that mean something to any host, a coding
 /// runtime or a daemon or a test — and `git worktree` means nothing to a host
-/// that is not driving a repository. `ChangeDirectory` is the neutral verb and
-/// stays in the contract; this is the product-specific way of producing a
-/// directory to point it at, so it says where it made one and lets the person
-/// take the neutral step.
-struct WorktreeCommand;
+/// that is not driving a repository.
+///
+/// **Making the checkout and going into it are one gesture**, which is the
+/// thing this command got wrong the first time: it said where it had made one
+/// and left the person to type `/cd`. The step into a quieter tree is the whole
+/// point of asking, and the runtime already owns that transition
+/// ([`crate::runtime::RuntimeCommands::change_directory`], `docs/adr/0001`) —
+/// so `done` is not a remembered path either, it is the repository's own main
+/// checkout, which survives restarts where a slot in a front end's memory does
+/// not.
+struct WorktreeCommand(Arc<dyn crate::runtime::RuntimeCommands>);
 
 #[async_trait]
 impl atomcode_harness::commands::CatalogCommand for WorktreeCommand {
     fn describe(&self) -> CommandDescription {
         on_the_session(
             "worktree",
-            Some("<名字>"),
-            "开一个同名分支的 worktree;开好告诉你怎么过去。已经有就直接说在哪",
+            Some("<名字> [基准] | list | done | cleanup <名字> [--force]"),
+            "开一个自己的分支与 checkout 并进去干活;`list` 看有哪些,`done` 回主检出,`cleanup` 清掉",
         )
     }
     fn offered_for(&self, agent: &atomcode_harness::agent::Agent) -> bool {
@@ -1863,22 +1870,198 @@ impl atomcode_harness::commands::CatalogCommand for WorktreeCommand {
         agent: Arc<atomcode_harness::agent::Agent>,
         args: &str,
     ) -> Result<String, String> {
-        let name = args.trim();
-        if name.is_empty() {
-            return Err("要一个名字:`/worktree 试一下`".into());
-        }
         let root = agent
             .ctx()
             .service::<atomcode_harness::seams::FsSvc>()
             .map(|fs| fs.root())
             .ok_or_else(|| "这个会话没有工作区".to_string())?;
-        let at = worktree(&root, name)?;
-        Ok(format!(
-            "worktree `{name}` 在 {} —— `/cd {}` 过去",
-            at.display(),
-            at.display()
-        ))
+        run_worktree(&root, args, &self.0).await
     }
+}
+
+/// The command's own body, apart from the agent it is reached through.
+///
+/// Split out because what it does is about a **repository and the runtime**, and
+/// neither is the agent: the tests below drive it against a real repository and
+/// a runtime that records where it was sent, which is the only way to tell
+/// "made a worktree and went there" from "made a worktree and said so".
+async fn run_worktree(
+    root: &std::path::Path,
+    args: &str,
+    runtime: &Arc<dyn crate::runtime::RuntimeCommands>,
+) -> Result<String, String> {
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    // The three words a person types instead of a name. A branch named `list`
+    // is therefore unreachable — tuix read it the same way, and the alternative
+    // is a command whose subcommands depend on the repository.
+    match parts.first().copied() {
+        None => Err(WORKTREE_USAGE.into()),
+        Some("list") => list_worktrees(root),
+        Some("done") => {
+            let at = main_checkout(root)?;
+            runtime.change_directory(at.clone()).await?;
+            Ok(format!("回到 {} 干活", at.display()))
+        }
+        Some("cleanup") => {
+            let name = parts
+                .get(1)
+                .ok_or_else(|| "要一个名字:`/worktree cleanup 试一下`".to_string())?;
+            let force = parts
+                .get(2)
+                .is_some_and(|flag| matches!(*flag, "--force" | "-f"));
+            cleanup(root, name, force, runtime).await
+        }
+        Some(name) => {
+            let at = worktree(root, name, parts.get(1).copied())?;
+            runtime.change_directory(at.clone()).await?;
+            Ok(format!("在 worktree `{name}` 里干活:{}", at.display()))
+        }
+    }
+}
+
+const WORKTREE_USAGE: &str = "用法:`/worktree <名字> [基准]` 开一个自己的 checkout 并进去 · \
+     `/worktree list` 看有哪些 · `/worktree done` 回主检出 · \
+     `/worktree cleanup <名字> [--force]` 清掉";
+
+/// What `list` answers: every worktree git has, the person's own place marked.
+///
+/// Read from git rather than from disk, and for the reason `worktree` itself
+/// reads registration: a directory git has forgotten is not somewhere anyone can
+/// work.
+fn list_worktrees(root: &std::path::Path) -> Result<String, String> {
+    let here = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut text = String::new();
+    for checkout in git_worktrees(root)? {
+        let same = std::fs::canonicalize(&checkout.path)
+            .map(|at| at == here)
+            .unwrap_or(false);
+        text.push_str(&format!(
+            "  {} {:<16} {}{}\n",
+            if same { "●" } else { "○" },
+            checkout.branch.as_deref().unwrap_or("(detached)"),
+            checkout.path.display(),
+            if same { " ← 当前" } else { "" },
+        ));
+    }
+    if text.is_empty() {
+        return Ok("这个仓库没有 worktree".into());
+    }
+    Ok(format!("worktree:\n{text}"))
+}
+
+/// Remove the checkout `name` git has, and say where the person ended up when it
+/// was the one they were standing in.
+///
+/// Standing in the directory being removed is the case that needs care: git
+/// refuses to remove the worktree it is run from, so the person is moved to the
+/// main checkout through the runtime *first*, and only then is the checkout
+/// taken away. Doing it in the other order answers "cleaned up" about a
+/// checkout that is still there.
+async fn cleanup(
+    root: &std::path::Path,
+    name: &str,
+    force: bool,
+    runtime: &Arc<dyn crate::runtime::RuntimeCommands>,
+) -> Result<String, String> {
+    let checkout = git_worktree_path(root, name)?
+        .ok_or_else(|| format!("git 没有 `{name}` 这个 worktree;`/worktree list` 看有哪些"))?;
+    let here = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let removing_this_one = std::fs::canonicalize(&checkout)
+        .map(|at| at == here)
+        .unwrap_or(false);
+    let mut moved = None;
+    if removing_this_one {
+        let main = main_checkout(root)?;
+        runtime.change_directory(main.clone()).await?;
+        moved = Some(main);
+    }
+    remove_worktree(root, name, force)?;
+    Ok(match moved {
+        Some(main) => format!("清掉 worktree `{name}`,回到 {} 干活", main.display()),
+        None => format!("清掉 worktree `{name}`"),
+    })
+}
+
+/// Take the checkout `name` away, or say why not.
+///
+/// A checkout with uncommitted work is refused by git unless forced, and that
+/// refusal is the answer rather than a failure: the person is told what is in
+/// the way and how to say otherwise, instead of losing work to a tidy-up.
+fn remove_worktree(root: &std::path::Path, name: &str, force: bool) -> Result<(), String> {
+    let checkout = git_worktree_path(root, name)?
+        .ok_or_else(|| format!("git 没有 `{name}` 这个 worktree;`/worktree list` 看有哪些"))?;
+    let path_arg = checkout.display().to_string();
+    let mut args = vec!["worktree", "remove"];
+    if force {
+        args.push("--force");
+    }
+    args.push(&path_arg);
+    // Run from the repository, never from the checkout being removed: git
+    // refuses to remove the one it is standing in, and a person cleaning up
+    // the checkout they are *in* has already been moved out by `cleanup`.
+    let repository = main_checkout(root).unwrap_or_else(|_| root.to_path_buf());
+    if let Err(error) = git_out(&repository, &args) {
+        let dirty = !force
+            && ["untracked", "modified", "changes"]
+                .iter()
+                .any(|word| error.contains(word));
+        return Err(if dirty {
+            format!("`{name}` 里还有没提交的改动;要清掉就 `/worktree cleanup {name} --force`")
+        } else {
+            format!("清不掉 `{name}`:{error}")
+        });
+    }
+    Ok(())
+}
+
+/// One worktree git has registered: what branch is checked out there, and where.
+struct Checkout {
+    path: std::path::PathBuf,
+    branch: Option<String>,
+}
+
+/// Every worktree git has, in git's own order — the main checkout first.
+///
+/// The order is load-bearing rather than incidental: it is what makes
+/// [`main_checkout`] a fact from the repository instead of a path this file
+/// guessed, and the main checkout is the one place `/worktree done` can always
+/// go back to.
+fn git_worktrees(root: &std::path::Path) -> Result<Vec<Checkout>, String> {
+    let listing = git_out(root, &["worktree", "list", "--porcelain"])?;
+    let mut out: Vec<Checkout> = Vec::new();
+    let mut path: Option<std::path::PathBuf> = None;
+    let mut branch: Option<String> = None;
+    let flush = |path: &mut Option<std::path::PathBuf>,
+                 branch: &mut Option<String>,
+                 out: &mut Vec<Checkout>| {
+        if let Some(path) = path.take() {
+            out.push(Checkout {
+                path,
+                branch: branch.take(),
+            });
+        }
+    };
+    for line in listing.lines() {
+        if let Some(at) = line.strip_prefix("worktree ") {
+            flush(&mut path, &mut branch, &mut out);
+            path = Some(std::path::PathBuf::from(at));
+        } else if let Some(name) = line.strip_prefix("branch refs/heads/") {
+            branch = Some(name.trim().to_string());
+        } else if line.is_empty() {
+            flush(&mut path, &mut branch, &mut out);
+        }
+    }
+    flush(&mut path, &mut branch, &mut out);
+    Ok(out)
+}
+
+/// The repository's own main checkout — where `done` goes back to.
+fn main_checkout(root: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    git_worktrees(root)?
+        .into_iter()
+        .next()
+        .map(|checkout| checkout.path)
+        .ok_or_else(|| "git 没说主检出在哪".to_string())
 }
 
 /// Make (or find) the worktree `name` under `root`, and say where it is.
@@ -1906,7 +2089,11 @@ impl atomcode_harness::commands::CatalogCommand for WorktreeCommand {
 /// pointing at, which for a name a person already used is their work. Without
 /// a branch switch an existing one is checked out where it stands, and only a
 /// name nobody has used gets `-b`.
-fn worktree(root: &std::path::Path, name: &str) -> Result<std::path::PathBuf, String> {
+fn worktree(
+    root: &std::path::Path,
+    name: &str,
+    base: Option<&str>,
+) -> Result<std::path::PathBuf, String> {
     // A name, not a path: it becomes both a directory under `.worktrees` and a
     // branch, and a `..` in it would put the checkout outside the repository.
     if name.is_empty()
@@ -1942,10 +2129,15 @@ fn worktree(root: &std::path::Path, name: &str) -> Result<std::path::PathBuf, St
     }
 
     // Two shapes, because `-b` takes the branch name as its own argument:
-    // `git worktree add -b <name> <path>` for a name nobody has used, and
-    // `git worktree add <path> <name>` to check out an existing branch where it
-    // stands. One ordering for both reads the path as a branch (or a branch as
-    // the start-point) and git refuses it, which is what it did here.
+    // `git worktree add -b <name> <path> [<base>]` for a name nobody has used,
+    // and `git worktree add <path> <name>` to check out an existing branch
+    // where it stands. One ordering for both reads the path as a branch (or a
+    // branch as the start-point) and git refuses it, which is what it did here.
+    //
+    // `base` is where a *new* branch starts, and it is only meaningful there: an
+    // existing branch is checked out where it already points, which is the
+    // "taken over, never reset" rule above. A base named for an existing branch
+    // is therefore ignored rather than silently moving it.
     let at_arg = at.display().to_string();
     let mut args = vec!["worktree", "add"];
     let branch_exists = git_out(
@@ -1961,6 +2153,9 @@ fn worktree(root: &std::path::Path, name: &str) -> Result<std::path::PathBuf, St
         args.push("-b");
         args.push(name);
         args.push(&at_arg);
+        if let Some(base) = base.filter(|b| !b.trim().is_empty()) {
+            args.push(base);
+        }
     }
     git_out(&root, &args).map_err(|e| format!("git 拒绝了:{e}"))?;
 
@@ -2481,6 +2676,8 @@ impl atomcode_harness::commands::CatalogCommand for PolicyCommand {
 
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
+    use std::sync::Arc;
 
     /// What a person wrote themselves reaches the model, and a configuration
     /// that will not parse still gets them the built-in prompt.
@@ -2578,7 +2775,7 @@ mod tests {
     fn a_worktree_is_made_under_the_repository_and_only_under_it() {
         let (_dir, root) = a_repository();
 
-        let at = worktree(&root, "try-it").expect("a worktree");
+        let at = worktree(&root, "try-it", None).expect("a worktree");
         assert_eq!(at, root.join(".worktrees").join("try-it"));
         assert!(at.join("a.txt").is_file(), "git checked the tree out");
         assert!(
@@ -2588,10 +2785,10 @@ mod tests {
 
         // Asking again finds the one that is there rather than refusing: going
         // back to what you opened must not depend on remembering that you did.
-        assert_eq!(worktree(&root, "try-it").expect("again"), at);
+        assert_eq!(worktree(&root, "try-it", None).expect("again"), at);
 
         for bad in ["", "../escape", "a/b", "-x", ".hidden"] {
-            let refused = worktree(&root, bad);
+            let refused = worktree(&root, bad, None);
             assert!(refused.is_err(), "`{bad}` must be refused: {refused:?}");
         }
         assert!(
@@ -2612,7 +2809,7 @@ mod tests {
         let nested = root.join("crates").join("inside");
         std::fs::create_dir_all(&nested).expect("mkdir");
 
-        let at = worktree(&nested, "from-here").expect("a worktree");
+        let at = worktree(&nested, "from-here", None).expect("a worktree");
         assert_eq!(at, root.join(".worktrees").join("from-here"));
         assert!(
             !nested.join(".worktrees").exists(),
@@ -2643,7 +2840,7 @@ mod tests {
             "the fixture has a base the branch is ahead of"
         );
 
-        let at = worktree(&root, "mine").expect("the branch is taken over");
+        let at = worktree(&root, "mine", None).expect("the branch is taken over");
         assert_eq!(
             git(&at, &["rev-parse", "HEAD"]),
             theirs,
@@ -2672,7 +2869,7 @@ mod tests {
         std::fs::create_dir_all(leftover.join("junk")).expect("mkdir");
         std::fs::write(leftover.join("junk").join("x"), "x").expect("write");
 
-        let at = worktree(&root, "ghost").expect("a worktree, not the leftover");
+        let at = worktree(&root, "ghost", None).expect("a worktree, not the leftover");
         assert_eq!(at, leftover);
         assert!(at.join("a.txt").is_file(), "git checked the tree out");
         assert!(
@@ -2693,11 +2890,283 @@ mod tests {
         let (_dir, root) = a_repository();
         assert_eq!(git(&root, &["status", "--porcelain"]), "");
 
-        worktree(&root, "tidy").expect("a worktree");
+        worktree(&root, "tidy", None).expect("a worktree");
         assert_eq!(
             git(&root, &["status", "--porcelain"]),
             "",
             "the person's checkout is as clean as it was"
+        );
+    }
+
+    /// The main checkout is the repository's own first answer, not a path this
+    /// file keeps in a slot — a front end that remembered the way back would
+    /// lose it on the next restart, and the way back is a fact about the
+    /// repository that outlives the process.
+    #[test]
+    fn the_way_back_is_the_repositorys_own_main_checkout() {
+        let (_dir, root) = a_repository();
+        assert_eq!(
+            super::main_checkout(&root).expect("a main checkout"),
+            root,
+            "with no worktrees, the main checkout is the repository itself"
+        );
+
+        // Made from inside a worktree rather than from the root: `done` has to
+        // work from wherever the person is, which is the case that would break
+        // if the answer were `root` as it was passed in.
+        let at = worktree(&root, "out-there", None).expect("a worktree");
+        assert_eq!(
+            super::main_checkout(&at).expect("a main checkout"),
+            root,
+            "asked from the worktree, the answer is still the main checkout"
+        );
+    }
+
+    /// `list` is what git has, and it marks the one the person is standing in.
+    ///
+    /// Read from git rather than from disk: a directory a person left behind is
+    /// not a place anyone can work, and listing it would offer them a `/cd` into
+    /// something git does not have.
+    #[test]
+    fn list_shows_what_git_has_and_where_the_person_is() {
+        let (_dir, root) = a_repository();
+        let at = worktree(&root, "over-here", None).expect("a worktree");
+
+        let from_root = super::list_worktrees(&root).expect("the list");
+        assert!(
+            from_root.contains("over-here") && from_root.contains("← 当前"),
+            "the main checkout is marked: {from_root}"
+        );
+
+        let from_inside = super::list_worktrees(&at).expect("the list");
+        let current = from_inside
+            .lines()
+            .find(|line| line.contains("← 当前"))
+            .unwrap_or_else(|| panic!("a current one: {from_inside}"));
+        assert!(
+            current.contains("over-here") && current.contains(&at.display().to_string()),
+            "the worktree the person is in is the marked one: {from_inside}"
+        );
+    }
+
+    /// A base names where a *new* branch starts — and only there.
+    ///
+    /// An existing branch is checked out where it stands (the rule
+    /// [`worktree`] states above), so a base pointing at one must not move it:
+    /// that is the same "taken over, never reset" failure in a different
+    /// spelling, and it would drop the commits the branch was carrying.
+    #[test]
+    fn a_base_is_where_a_new_branch_starts_and_nowhere_else() {
+        let (_dir, root) = a_repository();
+        git(&root, &["checkout", "-q", "-b", "elsewhere"]);
+        std::fs::write(root.join("b.txt"), "b").expect("write");
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-qm", "work on elsewhere"]);
+        let tip = git(&root, &["rev-parse", "elsewhere"]);
+        let main = git(&root, &["rev-parse", "HEAD~1"]);
+
+        // A new name with a base: the branch starts at the base.
+        let fresh = worktree(&root, "sprout", Some("HEAD~1")).expect("a worktree");
+        assert_eq!(
+            git(&fresh, &["rev-parse", "HEAD"]),
+            main,
+            "the new branch starts where the base says"
+        );
+
+        // An existing branch with a base: the branch is where it stands, and
+        // the base is not a way to move it.
+        let taken = worktree(&root, "elsewhere", Some("HEAD~1")).expect("taken over");
+        assert_eq!(
+            git(&taken, &["rev-parse", "HEAD"]),
+            tip,
+            "the existing branch was not reset to the base"
+        );
+        assert_eq!(
+            git(&root, &["rev-parse", "elsewhere"]),
+            tip,
+            "and it still points at its own work"
+        );
+    }
+
+    /// A checkout with uncommitted work is refused, and the person is told how
+    /// to say otherwise — rather than losing it to a tidy-up they asked for.
+    #[test]
+    fn a_dirty_checkout_is_refused_until_forced() {
+        let (_dir, root) = a_repository();
+        let at = worktree(&root, "busy", None).expect("a worktree");
+        std::fs::write(at.join("scratch.txt"), "not committed").expect("write");
+
+        let refused = super::remove_worktree(&root, "busy", false)
+            .expect_err("a dirty checkout is not removed");
+        assert!(
+            refused.contains("busy") && refused.contains("--force"),
+            "it says what is in the way and how to say otherwise: {refused}"
+        );
+        assert!(at.is_dir(), "and the checkout is still there");
+
+        super::remove_worktree(&root, "busy", true).expect("forced");
+        assert!(!at.exists(), "forced, it is gone");
+    }
+
+    /// A runtime that only remembers where it was pointed.
+    ///
+    /// The whole claim of `/worktree` is that it *goes* somewhere, and where it
+    /// went is exactly what a real runtime's generation and working directory
+    /// would say — but reaching a real one means the whole driver loop, which
+    /// these claims are not about. What a stub can settle is the part that was
+    /// broken: whether the command asked to be moved at all.
+    #[derive(Default)]
+    struct Pointed {
+        at: std::sync::Mutex<Vec<std::path::PathBuf>>,
+    }
+
+    #[async_trait]
+    impl crate::runtime::RuntimeCommands for Pointed {
+        async fn start_goal(&self, _: String) -> Result<(), String> {
+            unreachable!("not this command")
+        }
+        async fn stop_goal(&self) -> Result<(), String> {
+            unreachable!("not this command")
+        }
+        async fn pause_goal(&self) -> Result<(), String> {
+            unreachable!("not this command")
+        }
+        async fn start_loop(&self, _: String) -> Result<(), String> {
+            unreachable!("not this command")
+        }
+        async fn stop_loop(&self) -> Result<(), String> {
+            unreachable!("not this command")
+        }
+        async fn queue_local_context(&self, _: String) -> Result<(), String> {
+            unreachable!("not this command")
+        }
+        async fn pending_policy(&self) -> Option<atomcode_kernel::event::PolicyIntervention> {
+            None
+        }
+        async fn resolve_policy(
+            &self,
+            _: u64,
+            _: atomcode_kernel::event::PolicyRecoveryAction,
+        ) -> Result<(), String> {
+            unreachable!("not this command")
+        }
+        async fn change_directory(&self, directory: std::path::PathBuf) -> Result<(), String> {
+            self.at.lock().unwrap().push(directory);
+            Ok(())
+        }
+    }
+
+    fn pointed() -> std::sync::Arc<Pointed> {
+        std::sync::Arc::new(Pointed::default())
+    }
+
+    fn where_it_went(runtime: &std::sync::Arc<Pointed>) -> Vec<std::path::PathBuf> {
+        runtime.at.lock().unwrap().clone()
+    }
+
+    /// **Making a checkout and going into it is one gesture.** The command used
+    /// to say where it had made one and leave the person to type `/cd`, so what
+    /// is pinned here is the step: a name makes the worktree *and* asks the
+    /// runtime to move there.
+    #[tokio::test]
+    async fn a_name_makes_a_worktree_and_goes_there() {
+        let (_dir, root) = a_repository();
+        let runtime = pointed();
+        let runtime_dyn: Arc<dyn crate::runtime::RuntimeCommands> = runtime.clone();
+
+        let said = super::run_worktree(&root, "scratch-box", &runtime_dyn)
+            .await
+            .expect("making one");
+
+        let at = root.join(".worktrees").join("scratch-box");
+        assert_eq!(
+            where_it_went(&runtime),
+            vec![at.clone()],
+            "it asked to be moved into the checkout it made"
+        );
+        assert!(
+            at.join("a.txt").is_file(),
+            "and the checkout is a real one: git put the tree in it"
+        );
+        assert!(said.contains("scratch-box"), "it says which one: {said}");
+    }
+
+    /// `done` goes back to the repository's own main checkout — asked of git,
+    /// not remembered, so it still works after a restart.
+    #[tokio::test]
+    async fn done_goes_back_to_the_main_checkout() {
+        let (_dir, root) = a_repository();
+        let at = worktree(&root, "somewhere-else", None).expect("a worktree");
+        let runtime = pointed();
+        let runtime_dyn: Arc<dyn crate::runtime::RuntimeCommands> = runtime.clone();
+
+        super::run_worktree(&at, "done", &runtime_dyn)
+            .await
+            .expect("going back");
+
+        assert_eq!(
+            where_it_went(&runtime),
+            vec![root.clone()],
+            "asked from inside a worktree, `done` still points at the main checkout"
+        );
+    }
+
+    /// `cleanup` of the checkout the person is standing in moves them out
+    /// **first**: git refuses to remove the worktree it is run from, so doing it
+    /// in the other order would answer "cleaned up" about a checkout still there.
+    #[tokio::test]
+    async fn cleaning_up_the_current_checkout_moves_out_first() {
+        let (_dir, root) = a_repository();
+        let at = worktree(&root, "from-here", None).expect("a worktree");
+        let runtime = pointed();
+        let runtime_dyn: Arc<dyn crate::runtime::RuntimeCommands> = runtime.clone();
+
+        let said = super::run_worktree(&at, "cleanup from-here", &runtime_dyn)
+            .await
+            .expect("cleaning up");
+
+        assert_eq!(
+            where_it_went(&runtime).first(),
+            Some(&root),
+            "it moved out to the main checkout"
+        );
+        assert!(!at.exists(), "and only then was the checkout gone: {said}");
+    }
+
+    /// A checkout nobody is standing in is removed where it is, and the person
+    /// is not moved for it.
+    #[tokio::test]
+    async fn cleaning_up_another_checkout_moves_nobody() {
+        let (_dir, root) = a_repository();
+        let at = worktree(&root, "over-there", None).expect("a worktree");
+        let runtime = pointed();
+        let runtime_dyn: Arc<dyn crate::runtime::RuntimeCommands> = runtime.clone();
+
+        super::run_worktree(&root, "cleanup over-there", &runtime_dyn)
+            .await
+            .expect("cleaning up");
+
+        assert!(
+            where_it_went(&runtime).is_empty(),
+            "where the person is did not change"
+        );
+        assert!(!at.exists(), "and the checkout is gone");
+    }
+
+    /// No argument says how to ask, rather than guessing a name — the same
+    /// shape every other catalog command answers with.
+    #[tokio::test]
+    async fn no_argument_says_how_to_ask() {
+        let (_dir, root) = a_repository();
+        let runtime: Arc<dyn crate::runtime::RuntimeCommands> = pointed();
+
+        let refused = super::run_worktree(&root, "", &runtime)
+            .await
+            .expect_err("nothing to do without a name");
+
+        assert!(
+            refused.contains("worktree"),
+            "it names the command: {refused}"
         );
     }
 
@@ -2715,7 +3184,7 @@ mod tests {
         };
         let before = exclude();
 
-        worktree(&root, "already").expect("a worktree");
+        worktree(&root, "already", None).expect("a worktree");
 
         assert_eq!(exclude(), before, "the local exclude was not touched");
         assert_eq!(

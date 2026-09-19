@@ -640,6 +640,14 @@ pub trait RuntimeCommands: Send + Sync {
     async fn pending_policy(&self) -> Option<PolicyIntervention>;
     /// Go on from the intervention `id` the way `action` says.
     async fn resolve_policy(&self, id: u64, action: PolicyRecoveryAction) -> Result<(), String>;
+    /// Point the runtime at `directory` — a new session in the same place, with
+    /// everything that belonged to where it ran rebuilt for there.
+    ///
+    /// The runtime's own transition (`docs/adr/0001`), awaited rather than
+    /// raced: a row that had to *make* the directory first (`/worktree`) cannot
+    /// answer a person honestly without knowing whether they got there, and a
+    /// driver-side optimistic `cd` is the thing that ADR refuses.
+    async fn change_directory(&self, directory: std::path::PathBuf) -> Result<(), String>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -8489,6 +8497,12 @@ impl RuntimeCommands for CodingRuntimeHandle {
     async fn resolve_policy(&self, id: u64, action: PolicyRecoveryAction) -> Result<(), String> {
         self.resolve_policy_intervention(id, action)
             .await
+            .map_err(|error| error.to_string())
+    }
+    async fn change_directory(&self, directory: std::path::PathBuf) -> Result<(), String> {
+        CodingRuntimeHandle::change_directory(self, directory)
+            .await
+            .map(|_| ())
             .map_err(|error| error.to_string())
     }
 }
