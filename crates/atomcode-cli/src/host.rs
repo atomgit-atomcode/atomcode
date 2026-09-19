@@ -75,6 +75,17 @@ pub trait HostConfig: Send + Sync {
         Err("这个宿主的配置不能从屏幕上改".into())
     }
 
+    /// Put one back to what this build does when nobody has said.
+    ///
+    /// Removing the key, not writing today's default into it: a setting that
+    /// was reset follows the build from then on, and one written with the
+    /// default's current value stops following. Only the first is what a person
+    /// asking for "default" means.
+    fn reset_setting(&self, id: &str) -> Result<(), String> {
+        let _ = id;
+        Err("这个宿主的配置不能从屏幕上改".into())
+    }
+
     /// The providers this host is configured with, for a person to pick between.
     ///
     /// Never a credential: see [`atomcode_host_api::ProviderChoice`]. Empty
@@ -837,6 +848,16 @@ impl HostControl for RuntimeControl {
                 })?;
                 source
                     .set_setting(&id, &value)
+                    .map_err(|message| HostError::Failed { message })?;
+                Ok(HostReply::Done)
+            }
+            HostCommand::ResetSetting { session, id } => {
+                self.addressed(&session)?;
+                let source = self.host_config.clone().ok_or_else(|| HostError::Failed {
+                    message: "这个宿主没有可改的配置".into(),
+                })?;
+                source
+                    .reset_setting(&id)
                     .map_err(|message| HostError::Failed { message })?;
                 Ok(HostReply::Done)
             }

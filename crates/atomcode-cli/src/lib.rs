@@ -230,6 +230,26 @@ pub mod tui_front {
             std::fs::write(&self.path, document.to_string()).map_err(|e| e.to_string())
         }
 
+        /// Take the key out, so the setting follows this build again.
+        ///
+        /// A file that is not there is already in that state, which is why a
+        /// missing file is not an error: what was asked for is the outcome, and
+        /// the outcome holds.
+        fn reset_setting(&self, id: &str) -> Result<(), String> {
+            use atomcode_config::settings::SETTINGS;
+            let spec = SETTINGS
+                .iter()
+                .find(|spec| spec.id == id)
+                .ok_or_else(|| format!("没有 `{id}` 这一项"))?;
+            let Ok(text) = std::fs::read_to_string(&self.path) else {
+                return Ok(());
+            };
+            let mut document: toml_edit::DocumentMut =
+                text.parse().map_err(|e| format!("配置文件读不动:{e}"))?;
+            spec.reset(&mut document);
+            std::fs::write(&self.path, document.to_string()).map_err(|e| e.to_string())
+        }
+
         /// The configured providers, as choices — id, kind, model.
         ///
         /// **The key is not read.** A `ProviderConfig` carries an `api_key`, and
@@ -368,6 +388,23 @@ model = "vendor-b"
             assert!(std::fs::read_to_string(&path)
                 .unwrap()
                 .contains("\"light\""));
+
+            // Restoring the default **takes the key out**, rather than writing
+            // today's default into it. The difference does not show the day it
+            // is done and shows every day after: a key that is gone follows
+            // this build, and one holding the value the default happens to have
+            // now has stopped following it.
+            file.reset_setting("ui.theme").unwrap();
+            let unset = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                !unset.contains("theme"),
+                "the key is gone, not rewritten: {unset}"
+            );
+            assert!(
+                unset.contains("# 我自己写的注释"),
+                "and the person's own file survived that too: {unset}"
+            );
+            assert!(file.reset_setting("no.such.setting").is_err());
         }
 
         /// Which screen opens: the flag beats the setting, the setting beats the

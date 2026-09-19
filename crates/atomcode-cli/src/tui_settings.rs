@@ -114,9 +114,62 @@ impl ConfigSettings {
                     kind: kind_of(spec.kind),
                     applies: applies_of(spec.apply),
                 })
+                .chain(retry_row(&config))
                 .collect(),
         )
     }
+}
+
+/// The id of the one setting that is not in the static catalog.
+///
+/// It cannot be: what it reads and writes lives under the *current selection* —
+/// `[models.<id>]` or `[providers.<id>]` — and which one that is changes with
+/// `/model`. A static spec would have to name a path, and there is no one path.
+const RETRY: &str = "model.retry_max_attempts";
+
+/// How many times the current model's requests are retried, when it says.
+///
+/// Built here rather than in the catalog for the reason above, and read through
+/// `selection_retry_max_attempts` rather than off the provider table, because a
+/// provider entry carries an `api_key` and nothing that ends up on a screen may
+/// go near one (`docs/plans/2026-09-19-remaining-gaps.md`, and the same rule
+/// `ProviderChoice::about` follows).
+///
+/// Absent when nothing is selected: a row about "the current model" with no
+/// current model is a row whose value nobody can explain.
+fn retry_row(config: &atomcode_config::config::Config) -> Option<SettingRow> {
+    let selection = config.default_model.clone()?;
+    let value = atomcode_config::settings::selection_retry_max_attempts(config, &selection)
+        .map(|n| n.to_string())
+        .unwrap_or_default();
+    Some(SettingRow {
+        id: RETRY.to_string(),
+        label: format!("{selection} 的重试次数"),
+        value,
+        kind: SettingKind::Integer { min: 0, max: 10 },
+        applies: Applies::Reprepare,
+    })
+}
+
+/// Write the current selection's retry override, or take it away.
+///
+/// `None` is the reset: `patch_selection_retry_max_attempts` removes the key so
+/// the per-layer defaults stand again, which is the same meaning
+/// [`Settings::reset`] has everywhere else.
+fn write_retry(path: &PathBuf, value: Option<&str>) -> Result<(), String> {
+    use atomcode_config::config::Config;
+    let config = Config::load(path).map_err(|error| format!("{error:#}"))?;
+    let Some(selection) = config.default_model.clone() else {
+        return Err("现在没有选中的模型,这一项无处可写".into());
+    };
+    atomcode_config::ConfigStore::new(path.clone())
+        .update_document(|document| {
+            atomcode_config::settings::patch_selection_retry_max_attempts(
+                document, &selection, value,
+            )
+        })
+        .map_err(|error| format!("{error:#}"))?;
+    Ok(())
 }
 
 impl Settings for ConfigSettings {
@@ -133,6 +186,10 @@ impl Settings for ConfigSettings {
     /// — which is why its refusal is passed through verbatim instead of being
     /// second-guessed here.
     fn set(&self, id: &str, value: &str) -> Result<SettingsView, String> {
+        if id == RETRY {
+            write_retry(&self.path, Some(value))?;
+            return Ok(self.read());
+        }
         let Some(spec) = atomcode_config::settings::SETTINGS
             .iter()
             .find(|spec| spec.id == id)
@@ -142,6 +199,33 @@ impl Settings for ConfigSettings {
         let store = atomcode_config::ConfigStore::new(self.path.clone());
         store
             .update_document(|document| spec.patch(document, value))
+            .map_err(|error| format!("{error:#}"))?;
+        Ok(self.read())
+    }
+
+    /// Take the key out of the file, so this build's own answer stands again.
+    ///
+    /// `SettingSpec::reset` removes it rather than writing today's default in:
+    /// a setting that was unset follows the build from then on, and one written
+    /// with the default's current value stops following. Only the first is what
+    /// "restore the default" means, and the two look identical on screen the
+    /// day it is done.
+    fn reset(&self, id: &str) -> Result<SettingsView, String> {
+        if id == RETRY {
+            write_retry(&self.path, None)?;
+            return Ok(self.read());
+        }
+        let Some(spec) = atomcode_config::settings::SETTINGS
+            .iter()
+            .find(|spec| spec.id == id)
+        else {
+            return Err(format!("没有叫 `{id}` 的设置"));
+        };
+        atomcode_config::ConfigStore::new(self.path.clone())
+            .update_document(|document| {
+                spec.reset(document);
+                Ok(())
+            })
             .map_err(|error| format!("{error:#}"))?;
         Ok(self.read())
     }
@@ -200,7 +284,6 @@ mod tests {
         let path = scratch("all");
         let port = ConfigSettings::new(path);
         let rows = port.rows();
-        assert_eq!(rows.len(), atomcode_config::settings::SETTINGS.len());
         for spec in atomcode_config::settings::SETTINGS {
             assert!(
                 rows.rows().iter().any(|row| row.id == spec.id),
@@ -208,6 +291,93 @@ mod tests {
                 spec.id
             );
         }
+        // Every catalog setting and **only** rows this file knows why it added:
+        // the count is not `SETTINGS.len()` any more, because one row cannot be
+        // in the catalog at all (see `RETRY`). An assertion on the count alone
+        // would either forbid that row or say nothing.
+        let extra: Vec<&str> = rows
+            .rows()
+            .iter()
+            .map(|row| row.id.as_str())
+            .filter(|id| {
+                !atomcode_config::settings::SETTINGS
+                    .iter()
+                    .any(|spec| spec.id == *id)
+            })
+            .collect();
+        assert!(
+            extra.iter().all(|id| *id == RETRY),
+            "a row from nowhere: {extra:?}"
+        );
+    }
+
+    /// The one setting the catalog cannot hold: the current model's retries.
+    ///
+    /// It has no static path — what it writes lives under `[models.<id>]` or
+    /// `[providers.<id>]`, and which one that is changes with `/model`. So it
+    /// is built from the selection, and the panel must show it, write it and
+    /// unset it like any other row.
+    ///
+    /// **And the file must come back without a credential in it**: the value is
+    /// read through `selection_retry_max_attempts` rather than off the provider
+    /// table for the same reason `ProviderChoice::about` is built field by
+    /// field — a provider entry carries an `api_key`.
+    #[test]
+    fn the_current_model_s_retries_are_a_row_even_though_the_catalog_cannot_hold_one() {
+        let path = scratch("retry");
+        std::fs::write(
+            &path,
+            "default_model = \"glm\"\n\n[providers.glm]\ntype = \"openai_compat\"\nmodel = \"glm-5\"\napi_key = \"sk-SECRET\"\n",
+        )
+        .unwrap();
+        let port = ConfigSettings::new(path.clone());
+
+        let row = port
+            .rows()
+            .rows()
+            .iter()
+            .find(|row| row.id == RETRY)
+            .cloned()
+            .expect("the selection's retries are on the panel");
+        assert!(row.label.contains("glm"), "it says which model: {row:?}");
+        assert_eq!(row.value, "", "nothing written yet is nothing shown");
+        assert!(
+            !format!("{row:?}").contains("sk-SECRET"),
+            "the key never goes near the screen: {row:?}"
+        );
+
+        port.set(RETRY, "7").expect("writing it");
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("retry_max_attempts"), "{written}");
+        assert_eq!(
+            port.rows()
+                .rows()
+                .iter()
+                .find(|row| row.id == RETRY)
+                .map(|row| row.value.clone()),
+            Some("7".into()),
+            "and reading it back says so"
+        );
+
+        port.reset(RETRY).expect("unsetting it");
+        let unset = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !unset.contains("retry_max_attempts"),
+            "the key is gone: {unset}"
+        );
+        assert!(
+            unset.contains("sk-SECRET"),
+            "and the rest of the person's file is untouched: {unset}"
+        );
+    }
+
+    /// With nothing selected there is nothing to say.
+    #[test]
+    fn with_no_model_selected_the_retry_row_is_not_invented() {
+        let path = scratch("retry-none");
+        std::fs::write(&path, "# 什么也没选\n").unwrap();
+        let port = ConfigSettings::new(path);
+        assert!(port.rows().rows().iter().all(|row| row.id != RETRY));
     }
 
     #[test]

@@ -88,6 +88,14 @@ pub enum HostCommand {
         id: String,
         value: String,
     },
+    /// Put one setting back to what this build would do if nobody had said.
+    ///
+    /// A separate command from `SetSetting` with the default's value, because
+    /// the two write different things: this **removes** the key, so the setting
+    /// follows the build from then on, while writing today's default pins it to
+    /// a value that stops following. A person who asks for "default" means the
+    /// first.
+    ResetSetting { session: String, id: String },
     /// The models a person may pick from, as the host resolves them now.
     ///
     /// The catalog is the host's: only it knows what is configured, and a
@@ -183,6 +191,7 @@ impl HostCommand {
             | Self::SwitchModel { session, .. }
             | Self::Settings { session }
             | Self::SetSetting { session, .. }
+            | Self::ResetSetting { session, .. }
             | Self::SetMode { session, .. }
             | Self::ChangeDirectory { session, .. }
             | Self::Models { session }
@@ -742,6 +751,10 @@ mod tests {
             HostCommand::Readiness {
                 session: "a".into(),
             },
+            HostCommand::ResetSetting {
+                session: "a".into(),
+                id: "theme".into(),
+            },
         ];
         for c in &all {
             match c {
@@ -773,7 +786,8 @@ mod tests {
                 | HostCommand::Autonomy { .. }
                 | HostCommand::Thinking { .. }
                 | HostCommand::SetThinking { .. }
-                | HostCommand::Readiness { .. } => {}
+                | HostCommand::Readiness { .. }
+                | HostCommand::ResetSetting { .. } => {}
             }
         }
         all

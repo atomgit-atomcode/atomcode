@@ -1525,10 +1525,13 @@ impl Host {
     /// Returns the change to send over the seam, when the key was one that
     /// changes a setting. The caller owns the write: only it can reach the
     /// [`crate::settings::Settings`] port, and this type may not.
+    /// Only [`crate::settings::Step::Set`] and
+    /// [`crate::settings::Step::Reset`] ever come back here; the rest is the
+    /// panel's own business and is settled above.
     pub fn settings_key(
         &self,
         press: crate::surface::KeyPress,
-    ) -> (bool, Option<(String, String)>) {
+    ) -> (bool, Option<crate::settings::Step>) {
         let mut m = self.moment.write().expect("moment poisoned");
         let view = m.settings.clone();
         let Some(panel) = m.settings_panel.as_mut() else {
@@ -1538,11 +1541,11 @@ impl Host {
         let step = crate::settings::key(&view, panel, press);
         let changed = *panel != before;
         match step {
-            crate::settings::Step::Set { id, value } => {
-                // The edit closes here rather than in the caller, so the panel
-                // that is drawn is never one still holding a value that has
-                // already been sent.
-                (true, Some((id, value)))
+            // The edit closes here rather than in the caller, so the panel that
+            // is drawn is never one still holding a value that has already been
+            // sent.
+            step @ (crate::settings::Step::Set { .. } | crate::settings::Step::Reset { .. }) => {
+                (true, Some(step))
             }
             crate::settings::Step::Close => {
                 m.settings_panel = None;

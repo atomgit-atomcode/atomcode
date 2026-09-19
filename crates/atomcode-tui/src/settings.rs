@@ -273,6 +273,14 @@ pub struct Panel {
     pub query_caret: usize,
     /// The row being typed into, when one is.
     pub editing: Option<Edit>,
+    /// The setting one more Delete would put back to the build's answer.
+    ///
+    /// Two presses, not one: unsetting is the one gesture here that throws
+    /// something away, and a single key that does it is a key somebody hits by
+    /// accident on the way to Backspace. Cleared by anything else, including
+    /// moving off the row — a confirmation that outlived what it was about
+    /// would reset whatever the cursor landed on.
+    pub pending_reset: Option<String>,
 }
 
 impl Panel {
@@ -380,6 +388,8 @@ pub enum Step {
     /// Send this change over the seam. The caller owns the write, because only
     /// it can reach the [`Settings`] port.
     Set { id: String, value: String },
+    /// Put this one back to the build's own answer, over the same seam.
+    Reset { id: String },
 }
 
 /// Run one key against the panel.
@@ -429,7 +439,23 @@ pub fn key(view: &SettingsView, panel: &mut Panel, press: crate::surface::KeyPre
 
     let shown = view.matching(&panel.query);
     let on_settings = panel.tab == Tab::Config;
+    // Taken, not read: a confirmation is about the key that was just pressed,
+    // so anything other than a second Delete ends it. Leaving it standing is
+    // how a Delete pressed two rows later resets the wrong setting.
+    let armed = panel.pending_reset.take();
     match (press.key, press.mods) {
+        // Unset, on two presses. The first arms the row it is on; the second
+        // puts that setting back to what this build does when nobody has said.
+        (Key::Delete, _) if on_settings => {
+            let Some(row) = shown.get(panel.cursor) else {
+                return Step::Stay;
+            };
+            if armed.as_deref() == Some(row.id.as_str()) {
+                return Step::Reset { id: row.id.clone() };
+            }
+            panel.pending_reset = Some(row.id.clone());
+            Step::Stay
+        }
         // The tab row. Tab forward, shift-tab back — the keys every other tabbed
         // thing on a terminal uses, so nothing has to be learned. Left and right
         // do the same, because the row is drawn horizontally and a person who
@@ -551,6 +577,14 @@ pub trait Settings: Send + Sync {
     /// rather than `()` is not politeness: a change may take effect by rebuilding
     /// the agent, and re-reading is what tells the panel whether it did.
     fn set(&self, id: &str, value: &str) -> Result<SettingsView, String>;
+
+    /// Put `id` back to what this build does when nobody has said.
+    ///
+    /// Not `set` with the default's current value: this **unsets** it, so the
+    /// setting follows the build from then on, while writing today's default
+    /// pins it to a value that stops following. A person who asks for "default"
+    /// means the first, and only the launcher can tell the two apart.
+    fn reset(&self, id: &str) -> Result<SettingsView, String>;
 }
 
 #[cfg(test)]
@@ -667,6 +701,49 @@ mod tests {
                 SettingKind::Choice(vec!["auto".into(), "dark".into()]),
             ),
         ])
+    }
+
+    /// Unsetting takes two presses, and the confirmation does not outlive the
+    /// row it was about.
+    ///
+    /// Both halves are the criterion. The first: this is the one gesture in the
+    /// panel that throws something away, and a single key that does it is a key
+    /// somebody hits on the way to Backspace. The second is the bug the first
+    /// draft of this would have had — an armed confirmation that survived an
+    /// arrow press would reset whatever the cursor landed on, which is the
+    /// worst possible version of "restore the default".
+    #[test]
+    fn unsetting_takes_two_presses_and_the_confirmation_dies_with_the_row() {
+        let view = view();
+        let mut panel = Panel::new();
+
+        assert_eq!(
+            key(&view, &mut panel, KeyPress::plain(Key::Delete)),
+            Step::Stay,
+            "the first press only arms it"
+        );
+        assert_eq!(panel.pending_reset.as_deref(), Some("a.first"));
+        assert_eq!(
+            key(&view, &mut panel, KeyPress::plain(Key::Delete)),
+            Step::Reset {
+                id: "a.first".into()
+            },
+            "the second does it"
+        );
+        assert!(panel.pending_reset.is_none(), "and it is spent");
+
+        // Armed, then the cursor moves: the confirmation is gone, and the next
+        // Delete arms the row that is now under it rather than resetting it.
+        key(&view, &mut panel, KeyPress::plain(Key::Delete));
+        assert_eq!(panel.pending_reset.as_deref(), Some("a.first"));
+        key(&view, &mut panel, KeyPress::plain(Key::Down));
+        assert!(panel.pending_reset.is_none(), "moving off ends it");
+        assert_eq!(
+            key(&view, &mut panel, KeyPress::plain(Key::Delete)),
+            Step::Stay,
+            "so this arms the new row rather than unsetting it"
+        );
+        assert_eq!(panel.pending_reset.as_deref(), Some("b.second"));
     }
 
     #[test]

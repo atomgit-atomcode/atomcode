@@ -678,7 +678,13 @@ fn legend(panel: &Panel) -> Vec<(&'static str, &'static str)> {
     if panel.editing.is_some() {
         return vec![("⏎", "保存"), ("esc", "取消")];
     }
-    let mut out = vec![("↑↓", "选择"), ("⏎", "修改")];
+    if panel.pending_reset.is_some() {
+        // Says what the next press does, because that is the only thing about
+        // this state a person has to know — and it is the press that throws
+        // something away.
+        return vec![("del", "再按一次恢复默认"), ("其它键", "取消")];
+    }
+    let mut out = vec![("↑↓", "选择"), ("⏎", "修改"), ("del", "恢复默认")];
     if !panel.query.is_empty() {
         out.push(("esc", "清空搜索"));
     }

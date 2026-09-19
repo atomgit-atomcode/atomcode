@@ -183,10 +183,21 @@ G 类七条**刻意排在翻默认之后**：自用会告诉我们哪几条是�
 
 ### D. `/config` 收尾（只剩两样）
 
-- [ ] **D1 恢复默认**：要动契约 —— `host-api` 加 `ResetSetting`、`HostConfig` 加
-      `reset_setting`、cli 调 `SettingSpec::reset`（`config/settings.rs:502` 机制已在）
-- [ ] **D2 按 provider 变的动态 retry 项**：`config/settings.rs:566` 的
-      `selection_retry_max_attempts` 在静态目录外，`settings()` 映射只认静态表
+- [x] **D1 恢复默认**（2026-09-20）。契约加 `HostCommand::ResetSetting`，宿主加
+      `reset_setting`，端口加 `Settings::reset`，面板给**两次 Delete**：这是这个
+      面板里唯一会扔掉东西的手势，一按就生效的键是有人去按 Backspace 路上会误触
+      的键。确认随行消失——armed 是 `take()` 不是 `clone()`，否则移到别的行再按
+      Delete 会把那一行恢复掉。
+      **是删键，不是写当前默认值**：删掉的键从此跟着这个构建走，写成今天的默认值
+      就不跟了；人说「恢复默认」指的是前者，而两者当天看起来一模一样。
+- [x] **D2 按 provider 变的动态 retry 项**（2026-09-20）。它进不了静态目录是因为
+      它读写的位置在**当前选中项**底下（`[models.<id>]` 或 `[providers.<id>]`），
+      而那随 `/model` 变，没有哪一条静态路径能指到它。所以由 `tui_settings` 按
+      选中项现造一行，走 `patch_selection_retry_max_attempts`（那个函数自带重置，
+      且刻意不碰凭据）。没选模型就不造这一行——一条讲「当前模型」而没有当前模型
+      的行，值是谁也解释不了的。
+      顺带修了一条判据的表述：原来断言「行数 == 目录条数」，现在有一行本来就
+      进不了目录，只断言条数会变成**禁止**那一行或什么也没说。
 
 ### E. 自用与翻默认
 

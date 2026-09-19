@@ -1578,9 +1578,17 @@ impl Tui {
     ///
     /// **True when a frame is owed.**
     fn run_settings_key(&self, press: crate::surface::KeyPress) -> bool {
-        let (changed, set) = self.host.settings_key(press);
-        if let Some((id, value)) = set {
-            match self.apply_setting(&id, &value) {
+        let (changed, asked) = self.host.settings_key(press);
+        if let Some(step) = asked {
+            let done = match &step {
+                crate::settings::Step::Set { id, value } => self.apply_setting(id, value),
+                // Unsetting goes over the same seam and through the same
+                // reload: what the running graph has to be told is that the
+                // configuration changed, not which way.
+                crate::settings::Step::Reset { id } => self.reset_setting(id),
+                _ => Ok(()),
+            };
+            match done {
                 Ok(()) => {
                     self.refresh_settings();
                 }
@@ -1613,6 +1621,22 @@ impl Tui {
             return Err("这个屏幕没有接设置:启动器没有提供 `tui-settings`".into());
         };
         port.set(id, value)?;
+        self.reload_if_a_change_needs_it(id)
+    }
+
+    /// The same, for putting one back to the build's own answer.
+    ///
+    /// Everything after the write is identical, which is why it is the same
+    /// call: what the running graph has to be told is that the configuration
+    /// changed, and it reads the file again either way.
+    fn reset_setting(&self, id: &str) -> Result<(), String> {
+        let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
+            return Err("屏幕还没接上,改不了设置".into());
+        };
+        let Some(port) = ctx.service::<crate::plugin::SettingsSvc>() else {
+            return Err("这个屏幕没有接设置:启动器没有提供 `tui-settings`".into());
+        };
+        port.reset(id)?;
         self.reload_if_a_change_needs_it(id)
     }
 
