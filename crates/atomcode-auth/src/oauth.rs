@@ -4,16 +4,11 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use atomcode_telemetry::{Event, Telemetry};
 
 use atomcode_config::config::Config;
-// The store half. One-way: this crate puts away what it got and reads what it
-// has to refresh; nothing over there knows a server exists.
-use atomcode_credentials::{
-    get_stored_auth, save_auth_unlocked, with_auth_lock, AuthInfo, UserInfo,
-};
 
 /// Sanitize a user-supplied base URL: add `http://` if no scheme is present,
 /// and strip trailing `/` so path concatenation never produces `//`.
@@ -147,6 +142,28 @@ fn pending_invite_for_login() -> (Option<String>, Option<uuid::Uuid>) {
         Some(invite) => (Some(invite.invite_code), Some(invite.install_uuid)),
         None => (None, None),
     }
+}
+
+/// Stored authentication data
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthInfo {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub token_type: String,
+    pub expires_in: Option<i64>,
+    /// Unix timestamp (seconds) when this token was obtained
+    #[serde(default)]
+    pub created_at: i64,
+    pub user: UserInfo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserInfo {
+    pub id: String,
+    pub username: String,
+    pub name: Option<String>,
+    pub email: Option<String>,
+    pub avatar_url: Option<String>,
 }
 
 /// Minimal, internally coherent credentials needed to authenticate one gateway request.
@@ -1069,6 +1086,142 @@ pub fn get_valid_token() -> Result<String> {
     Ok(auth.access_token)
 }
 
+/// Logout - clear stored auth.
+///
+/// Core-layer function: does the filesystem work and returns. User-facing
+/// messaging is the caller's job — this was previously `println!`-ing
+/// "Logged out successfully" directly, which bypassed the TUI renderer
+/// and bled into the input box area on next repaint, and also produced
+/// a duplicate line in CLI mode where `handle_command` prints its own
+/// confirmation. No `Err` distinguishes "file absent" from "file removed" —
+/// both are success from the user's perspective ("you're logged out").
+pub fn logout() -> Result<()> {
+    let auth_path = auth_file_path();
+    // Absent file ⇒ already logged out. Return before touching the lock so a
+    // never-logged-in user's /logout stays a pure no-op — no directory or lock
+    // file created, and no failure on a read-only HOME.
+    if !auth_path.exists() {
+        return Ok(());
+    }
+    with_auth_lock(|| {
+        if auth_path.exists() {
+            std::fs::remove_file(&auth_path).context("Failed to remove auth file")?;
+        }
+        Ok(())
+    })
+}
+
+/// Get stored auth info
+pub fn get_stored_auth() -> Option<AuthInfo> {
+    let auth_path = auth_file_path();
+    read_stored_auth_at(&auth_path).ok().flatten()
+}
+
+/// Read credentials without collapsing transient I/O or parse failures into a
+/// confirmed logout. Credential writers replace the file atomically, so this
+/// remains non-blocking even while a refresh request holds the writer lock.
+pub fn get_stored_auth_checked() -> Result<Option<AuthInfo>> {
+    read_stored_auth_at(&auth_file_path())
+}
+
+fn read_stored_auth_at(auth_path: &std::path::Path) -> Result<Option<AuthInfo>> {
+    let content = match std::fs::read_to_string(auth_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to read auth file at {}", auth_path.display()));
+        }
+    };
+    toml::from_str(&content)
+        .map(Some)
+        .with_context(|| format!("Failed to parse auth file at {}", auth_path.display()))
+}
+
+/// Save auth info to file
+pub fn save_auth(auth: &AuthInfo) -> Result<()> {
+    with_auth_lock(|| save_auth_unlocked(auth))
+}
+
+/// Execute one authentication-store transaction. Every writer uses this seam so
+/// a refresh response cannot overwrite a concurrent login/logout from another
+/// thread or process.
+fn with_auth_lock<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    let auth_path = auth_file_path();
+    let parent = auth_path
+        .parent()
+        .context("Invalid auth file path — please use /login again")?;
+    std::fs::create_dir_all(parent).context("Failed to create auth directory")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Best-effort: a directory we can write to but can't chmod (unusual
+        // mounts, or a dir owned by another user) must not block login / refresh /
+        // logout. The file itself is still written 0600 by write_auth_file_secure.
+        if let Err(error) = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+        {
+            tracing::warn!(%error, "failed to tighten auth directory permissions");
+        }
+    }
+    with_auth_lock_file(&parent.join("auth-refresh.lock"), operation)
+}
+
+fn with_auth_lock_file<T>(
+    lock_path: &std::path::Path,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    use fs2::FileExt;
+    use std::fs::OpenOptions;
+
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .context("Failed to open auth refresh lock")?;
+    lock.lock_exclusive()
+        .context("Failed to acquire auth refresh lock")?;
+    operation()
+}
+
+/// Caller must hold `auth-refresh.lock`.
+fn save_auth_unlocked(auth: &AuthInfo) -> Result<()> {
+    let auth_path = auth_file_path();
+    let content = toml::to_string_pretty(auth).context("Failed to serialize auth info")?;
+    super::write_auth_file_secure(&auth_path, &content).context("Failed to write auth file")?;
+
+    // Set file permissions to 0o600 (owner read/write only) on Unix
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600))
+            .context("Failed to set auth file permissions")?;
+    }
+
+    // No stdout output here. `save_auth` is called from CLI flows, TUI
+    // slash commands, the daemon, AND the silent in-chat 401 → refresh
+    // path. Printing here would corrupt the TUI input box on the silent
+    // refresh path (the cursor sits in the prompt and `println!` bypasses
+    // the renderer). CLI callers print their own user-facing success
+    // message right after calling this.
+    Ok(())
+}
+
+/// Get path to auth file
+pub fn auth_file_path() -> std::path::PathBuf {
+    atomcode_config::config::Config::config_dir().join("auth.toml")
+}
+
+/// Check if user is logged in
+pub fn is_logged_in() -> bool {
+    get_stored_auth().is_some()
+}
+
+/// Get current user info (if logged in)
+pub fn current_user() -> Option<UserInfo> {
+    get_stored_auth().map(|auth| auth.user)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1182,6 +1335,53 @@ mod tests {
             classify_auth_recovery_error(&local),
             AuthRecoveryFailureKind::Local
         );
+    }
+
+    #[test]
+    fn auth_store_lock_serializes_concurrent_writers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        let temp = tempfile::tempdir().unwrap();
+        let lock_path = temp.path().join("auth-refresh.lock");
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+
+        for _ in 0..2 {
+            let lock_path = lock_path.clone();
+            let active = active.clone();
+            let max_active = max_active.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                with_auth_lock_file(&lock_path, || {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active.fetch_max(now, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .unwrap();
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn checked_auth_read_distinguishes_invalid_data_from_logout() {
+        let temp = tempfile::tempdir().unwrap();
+        let auth_path = temp.path().join("auth.toml");
+        assert!(read_stored_auth_at(&auth_path).unwrap().is_none());
+
+        std::fs::write(&auth_path, "").unwrap();
+        assert!(read_stored_auth_at(&auth_path).is_err());
+        assert!(read_stored_auth_at(&auth_path).ok().flatten().is_none());
     }
 
     #[test]

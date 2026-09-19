@@ -4,14 +4,14 @@ use crate::login_state::{
     ApplyPoll, BeginPoll, LoginRecord, LoginStateSnapshot, PollCompletion, TERMINAL_RETENTION,
 };
 
-fn auth_info() -> atomcode_credentials::AuthInfo {
-    atomcode_credentials::AuthInfo {
+fn auth_info() -> atomcode_auth::AuthInfo {
+    atomcode_auth::AuthInfo {
         access_token: "token".to_string(),
         refresh_token: None,
         token_type: "Bearer".to_string(),
         expires_in: Some(3600),
         created_at: 0,
-        user: atomcode_credentials::UserInfo {
+        user: atomcode_auth::UserInfo {
             id: "user".to_string(),
             username: "user".to_string(),
             name: None,

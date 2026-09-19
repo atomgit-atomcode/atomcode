@@ -108,8 +108,10 @@ bash gates/tui.sh && bash gates/layers.sh
    `docs/tui-replaces-tuix-plan.md` 的 6.3 测绘里，tui 今天已经在丢这个信息。
 2. **分层债三笔**：`atomcode-harness` 应当零 atomcode 依赖（现在 5 个，18 个文件
    引用 `capabilities`）；`atomcode-daemon` 该是 cli 的一个 `[[bin]]`；
-   ~~`atomcode-auth` 该拆成两半~~ —— **2026-09-19 拆完**：凭据文件那半成了
-   `atomcode-credentials`，方向由 `gates/layers.sh` 守着。
+   ~~`atomcode-auth` 该拆成两半~~ —— **2026-09-19 判定不做**：拆过一遍又退了
+   （`6ecd9047`）。五个调用方拆完之后**全都仍然同时依赖两半**，一个都没变轻，
+   每个反而多一条 manifest 边。等真出现一个只要存储那半的调用方再说；理由与
+   证据写在 `docs/plans/2026-09-19-remaining-gaps.md` 的「A5 为什么退回去」。
 3. ~~**两条契约缺口**~~ **已做**（2026-09-18 晚）：用量/额度、goal/loop 推送通道。
    见上面 P2。
 4. **M6.5** 删不再挂载的代码：runtime 驱动协议、coding `team/`、

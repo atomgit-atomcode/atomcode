@@ -59,7 +59,6 @@ atomcode-harness = { path = "../atomcode-harness" }
 atomcode-coding = { path = "../atomcode-coding", features = ["atomgit"] }
 atomcode-capabilities = { path = "../atomcode-capabilities", features = ["notify", "setup", "plugin", "mcp", "atomgit", "cc-hooks"] }
 atomcode-auth = { path = "../atomcode-auth" }
-atomcode-credentials = { path = "../atomcode-credentials" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"

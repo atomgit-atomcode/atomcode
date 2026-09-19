@@ -273,7 +273,7 @@ fn finish_login(
 ) -> anyhow::Result<String> {
     let auth = session.finish(telemetry)?;
     let who = auth.user.username.clone();
-    atomcode_credentials::save_auth(&auth)?;
+    atomcode_auth::save_auth(&auth)?;
 
     let mut config = atomcode_config::config::Config::load(path).unwrap_or_default();
     let report = atomcode_codingplan::run(

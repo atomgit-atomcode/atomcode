@@ -25,7 +25,7 @@ const MAX_LOGIN_RECORDS: usize = 64;
 pub(crate) enum LoginPollStep {
     Pending,
     Authorized {
-        user: atomcode_credentials::UserInfo,
+        user: auth::UserInfo,
         newly_authorized: bool,
     },
     Expired,
@@ -71,7 +71,7 @@ struct AuthStatusResponse {
     /// frontend surface a distinct "session expired, re-login" state instead.
     expired: bool,
     auth_path: String,
-    user: Option<atomcode_credentials::UserInfo>,
+    user: Option<auth::UserInfo>,
     token: Option<TokenInfo>,
 }
 
@@ -104,7 +104,7 @@ struct LoginStartResponse {
 #[derive(Debug, Serialize)]
 struct LoginPollResponse {
     status: String,
-    user: Option<atomcode_credentials::UserInfo>,
+    user: Option<auth::UserInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -129,10 +129,10 @@ fn default_true() -> bool {
 
 /// GET /auth/status - Returns whether the user is signed in.
 pub(crate) async fn auth_status() -> impl IntoResponse {
-    let auth_path = atomcode_credentials::auth_file_path();
+    let auth_path = auth::auth_file_path();
     let auth_path_str = auth_path.to_string_lossy().to_string();
 
-    match atomcode_credentials::get_stored_auth() {
+    match auth::get_stored_auth() {
         Some(info) => {
             let has_refresh = info.refresh_token.is_some();
             // Presence of auth.toml is not the same as a usable session: an
@@ -331,11 +331,11 @@ pub(crate) async fn auth_logout(
 ) -> impl IntoResponse {
     let state_inner = state.clone();
     crate::telemetry_scope::daemon_scope(&state, None, client_mode, || async move {
-        match atomcode_credentials::logout() {
+        match auth::logout() {
             Ok(()) => {
                 state_inner.telemetry.set_account_id(None);
                 // Return auth status after logout
-                let auth_path = atomcode_credentials::auth_file_path();
+                let auth_path = auth::auth_file_path();
                 Json(AuthStatusResponse {
                     logged_in: false,
                     expired: false,
@@ -426,26 +426,25 @@ pub(crate) async fn poll_login_session(
             apply_poll_completion(&record, generation, completion).await
         }
         BeginPoll::Persist { generation, auth } => {
-            let completion =
-                tokio::task::spawn_blocking(move || match atomcode_credentials::save_auth(&auth) {
-                    Ok(()) => PollCompletion::Authorized(auth.user),
-                    Err(error) => {
-                        tracing::warn!(error = ?error, "failed to persist OAuth credentials");
-                        PollCompletion::PersistFailed {
-                            auth,
-                            code: "auth_persist_failed".to_string(),
-                            message: "Failed to save login credentials".to_string(),
-                        }
+            let completion = tokio::task::spawn_blocking(move || match auth::save_auth(&auth) {
+                Ok(()) => PollCompletion::Authorized(auth.user),
+                Err(error) => {
+                    tracing::warn!(error = ?error, "failed to persist OAuth credentials");
+                    PollCompletion::PersistFailed {
+                        auth,
+                        code: "auth_persist_failed".to_string(),
+                        message: "Failed to save login credentials".to_string(),
                     }
-                })
-                .await
-                .unwrap_or_else(|error| {
-                    tracing::error!(error = ?error, "OAuth credential persistence task failed");
-                    PollCompletion::Failed {
-                        code: "login_task_failed".to_string(),
-                        message: "Login task failed".to_string(),
-                    }
-                });
+                }
+            })
+            .await
+            .unwrap_or_else(|error| {
+                tracing::error!(error = ?error, "OAuth credential persistence task failed");
+                PollCompletion::Failed {
+                    code: "login_task_failed".to_string(),
+                    message: "Login task failed".to_string(),
+                }
+            });
 
             apply_poll_completion(&record, generation, completion).await
         }
@@ -503,7 +502,7 @@ fn step_from_snapshot(snapshot: LoginStateSnapshot, newly_authorized: bool) -> L
 
 fn login_poll_response(result: LoginPollResult) -> axum::response::Response {
     let response = |status: &str,
-                    user: Option<atomcode_credentials::UserInfo>,
+                    user: Option<auth::UserInfo>,
                     code: Option<String>,
                     message: Option<String>,
                     retry_after_ms: Option<u64>| {
@@ -665,7 +664,7 @@ mod tests {
 
         let authorized = login_poll_response(LoginPollResult {
             step: LoginPollStep::Authorized {
-                user: atomcode_credentials::UserInfo {
+                user: auth::UserInfo {
                     id: "user-id".to_string(),
                     username: "tester".to_string(),
                     name: None,

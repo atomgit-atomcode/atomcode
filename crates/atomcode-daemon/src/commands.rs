@@ -458,7 +458,7 @@ async fn exec_compact(
 }
 
 fn exec_whoami() -> anyhow::Result<CommandResult> {
-    match atomcode_credentials::get_stored_auth() {
+    match atomcode_auth::get_stored_auth() {
         Some(auth) => Ok(CommandResult::Whoami {
             logged_in: true,
             username: Some(auth.user.username),
@@ -578,7 +578,7 @@ fn format_login_identity(name: Option<&str>, username: &str) -> String {
 }
 
 fn render_login_line_from_stored_auth() -> String {
-    match atomcode_credentials::get_stored_auth() {
+    match atomcode_auth::get_stored_auth() {
         Some(a) => {
             let identity = format_login_identity(a.user.name.as_deref(), &a.user.username);
             render_login_line(Some(&identity))
@@ -696,7 +696,7 @@ fn exec_status(
         .and_then(|c| c.provider_config_for_selection(&provider_name))
         .map(|p| p.model)
         .unwrap_or_default();
-    let auth = atomcode_credentials::get_stored_auth();
+    let auth = atomcode_auth::get_stored_auth();
 
     let body = t(Msg::StatusBody {
         model: &model,

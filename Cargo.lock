@@ -325,7 +325,6 @@ dependencies = [
  "atomcode-coding",
  "atomcode-codingplan",
  "atomcode-config",
- "atomcode-credentials",
  "atomcode-daemon",
  "atomcode-harness",
  "atomcode-host-api",
@@ -372,7 +371,6 @@ dependencies = [
  "anyhow",
  "atomcode-codingplan-crypto",
  "atomcode-config",
- "atomcode-credentials",
  "atomcode-telemetry",
  "base64",
  "fs2",
@@ -400,7 +398,6 @@ dependencies = [
  "async-trait",
  "atomcode-auth",
  "atomcode-config",
- "atomcode-credentials",
  "atomcode-kernel",
  "base64",
  "bytes",
@@ -493,7 +490,6 @@ dependencies = [
  "anyhow",
  "atomcode-auth",
  "atomcode-config",
- "atomcode-credentials",
  "atomcode-telemetry",
  "reqwest",
  "serde",
@@ -525,19 +521,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "atomcode-credentials"
-version = "5.1.0"
-dependencies = [
- "anyhow",
- "atomcode-config",
- "fs2",
- "serde",
- "tempfile",
- "toml 0.8.23",
- "tracing",
-]
-
-[[package]]
 name = "atomcode-daemon"
 version = "5.1.0"
 dependencies = [
@@ -548,7 +531,6 @@ dependencies = [
  "atomcode-coding",
  "atomcode-codingplan",
  "atomcode-config",
- "atomcode-credentials",
  "atomcode-kernel",
  "atomcode-telemetry",
  "axum",
@@ -723,7 +705,6 @@ dependencies = [
  "atomcode-coding",
  "atomcode-codingplan",
  "atomcode-config",
- "atomcode-credentials",
  "atomcode-daemon",
  "atomcode-kernel",
  "atomcode-telemetry",

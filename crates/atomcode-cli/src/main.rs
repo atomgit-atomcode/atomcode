@@ -1667,9 +1667,7 @@ async fn run() -> Result<i32> {
                 let repo = atomcode_telemetry::detect_repo_origin(
                     &std::env::current_dir().unwrap_or_default(),
                 );
-                telemetry.set_account_id(
-                    atomcode_credentials::get_stored_auth().map(|a| a.user.id.to_string()),
-                );
+                telemetry.set_account_id(auth::get_stored_auth().map(|a| a.user.id.to_string()));
                 let scope_ctx = CurrentContext {
                     repo_origin: Some(repo),
                     mode: Some(SessionMode::Headless),
@@ -2370,8 +2368,7 @@ async fn run() -> Result<i32> {
     let repo = atomcode_telemetry::detect_repo_origin(
         &std::env::current_dir().unwrap_or_else(|_| working_dir.clone()),
     );
-    telemetry
-        .set_account_id(atomcode_credentials::get_stored_auth().map(|a| a.user.id.to_string()));
+    telemetry.set_account_id(auth::get_stored_auth().map(|a| a.user.id.to_string()));
     let session_mode = if effective_prompt.is_some() {
         SessionMode::Headless
     } else {
@@ -3615,13 +3612,13 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
             unreachable!("Resume is handled inline in run() before handle_command")
         }
         Commands::Logout => {
-            atomcode_credentials::logout()?;
+            auth::logout()?;
             telemetry.set_account_id(None);
             println!("  You have been logged out.");
             Ok(())
         }
         Commands::Status => {
-            if let Some(auth) = atomcode_credentials::get_stored_auth() {
+            if let Some(auth) = auth::get_stored_auth() {
                 println!(
                     "\n  Logged in as: {} ({})",
                     auth.user.username, auth.user.id
@@ -3632,10 +3629,7 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
                 if let Some(email) = auth.user.email {
                     println!("  Email: {}", email);
                 }
-                println!(
-                    "  Auth file: {}\n",
-                    atomcode_credentials::auth_file_path().display()
-                );
+                println!("  Auth file: {}\n", auth::auth_file_path().display());
             } else {
                 println!("\n  Not logged in.");
                 println!("  Run 'atomcode login' to authenticate.\n");
@@ -4429,7 +4423,7 @@ fn run_codingplan_core(
         use atomcode_config::i18n::{t, Msg};
         print!("{}", t(Msg::CpReauthAfter401));
         match atomcode_auth::login(telemetry)
-            .and_then(|auth| atomcode_credentials::save_auth(&auth).map(|_| auth))
+            .and_then(|auth| atomcode_auth::save_auth(&auth).map(|_| auth))
         {
             Ok(_) => {
                 report = atomcode_codingplan::run(

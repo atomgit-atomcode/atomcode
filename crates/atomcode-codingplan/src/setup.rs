@@ -752,12 +752,12 @@ pub fn run(
 const CASCADE_FROM_UPSTREAM_FAIL: &str = "__cascade_upstream_fail__";
 
 fn step_login(tel: Option<&Arc<atomcode_telemetry::Telemetry>>) -> StepResult<LoginInfo> {
-    if atomcode_credentials::is_logged_in() {
+    if auth::is_logged_in() {
         // Already authed — surface the stored identity so the report
         // shows *who* we're running as, not a bare "skipped". When
         // display-name and username differ (the common case), show
         // both so the user can tell them apart: `TheoCui(saulcy)`.
-        if let Some(info) = atomcode_credentials::get_stored_auth() {
+        if let Some(info) = auth::get_stored_auth() {
             let display = match info.user.name.as_deref() {
                 Some(name) if !name.is_empty() && name != info.user.username => {
                     format!("{}({})", name, info.user.username)
@@ -773,7 +773,7 @@ fn step_login(tel: Option<&Arc<atomcode_telemetry::Telemetry>>) -> StepResult<Lo
     // Not logged in — run OAuth. This prints to stdout + opens a browser.
     // Callers in TUI context must have already suspended raw mode before
     // calling `run`.
-    match auth::login(tel).and_then(|a| atomcode_credentials::save_auth(&a).map(|_| a)) {
+    match auth::login(tel).and_then(|a| auth::save_auth(&a).map(|_| a)) {
         Ok(auth_info) => StepResult::Ok(LoginInfo {
             username: auth_info.user.username.clone(),
             display_name: auth_info.user.name.clone(),

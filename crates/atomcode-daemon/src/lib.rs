@@ -6543,7 +6543,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     let repo_origin = detect_repo_origin(&project_state.working_dir);
 
     // Step 6: Seed account_id from stored auth (R4.3)
-    telemetry.set_account_id(atomcode_credentials::get_stored_auth().map(|a| a.user.id));
+    telemetry.set_account_id(auth::get_stored_auth().map(|a| a.user.id));
 
     // Initialize MCP registry from project working directory config
     // This reads both $ATOMCODE_HOME/mcp.json (user-level) and <project>/.mcp.json (project-level)
