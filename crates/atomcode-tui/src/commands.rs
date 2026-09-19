@@ -26,7 +26,6 @@ pub struct ScreenCommands;
 const SCREEN: &[Command] = &[
     Command::new("quit", "退出"),
     Command::new("exit", "退出"),
-    Command::new("clear", "清空输入行"),
     Command::new("reasoning", "思考:一行、全文、收起,循环"),
     Command::new("tools", "展开或折叠工具调用的结果"),
     Command::new(
@@ -56,7 +55,6 @@ impl CommandSet for ScreenCommands {
     async fn run(&self, name: &str, args: &str, ctx: &Context) -> Outcome {
         match name {
             "quit" | "exit" => Outcome::Do(Action::Quit),
-            "clear" => Outcome::Do(Action::Clear),
             "reasoning" => Outcome::Do(Action::ToggleFold("reasoning")),
             "tools" => Outcome::Do(Action::ToggleFold("tool_call")),
             "showinject" => match showinject(&args.to_ascii_lowercase()) {
@@ -288,7 +286,7 @@ const SESSION: &[Command] = &[
     ),
     Command::new("context", "这次会话用掉了多少"),
     Command::new("transcript", "把对话按模型看到的样子列出来"),
-    Command::new("new", "开一个新会话"),
+    Command::new("clear", "开一个新会话:这段对话放下,换一条干净的"),
     Command::taking("resume", "[会话 id]", "回到一个存下的会话;不带 id 则挑一个"),
     Command::taking(
         "effort",
@@ -464,7 +462,15 @@ impl CommandSet for SessionCommands {
             // The switch itself is not done here: the host announces the new
             // session, and the screen moves to it on that — the same way it
             // moves when something else replaced the session.
-            "new" => {
+            //
+            // `/clear` is this and not "empty the composer", which is what it
+            // used to say. Emptying the line is a fact about the composer that
+            // is already false by the time a command runs — `submit` clears the
+            // field before it dispatches, so the old arm cleared nothing. What
+            // people expect from the word (`/clear`, `/session` and Claude
+            // Code's own) is a conversation that starts over, which is what the
+            // host does here; ctrl-u is the gesture for the line.
+            "clear" => {
                 let Some(control) = control else {
                     return Outcome::Refused("这块屏幕没接上宿主".into());
                 };
@@ -2501,7 +2507,7 @@ mod tests {
     async fn a_command_whose_seam_is_missing_says_so_instead_of_panicking() {
         let c = builtin_for_test();
         let app = bare(); // no session, no control, no tools
-        for line in ["/compact", "/context", "/new", "/resume", "/effort high"] {
+        for line in ["/compact", "/context", "/clear", "/resume", "/effort high"] {
             match c.dispatch(line, &app.context()).await {
                 Outcome::Refused(m) => assert!(!m.is_empty(), "{line} refused with nothing"),
                 other => panic!("{line} should refuse, got {other:?}"),

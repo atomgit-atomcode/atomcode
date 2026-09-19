@@ -122,7 +122,7 @@ impl Attachments {
 
     /// Drop everything, markers in the text or not.
     ///
-    /// For "clear the composer" (Ctrl+U / `/clear`), which throws away the text
+    /// For "clear the composer" (Ctrl+U), which throws away the text
     /// and therefore every marker in it. Keeping the images would leave the
     /// composer holding pictures no line accounts for, and the next submit would
     /// have to re-derive that they are gone; dropping them here keeps the state

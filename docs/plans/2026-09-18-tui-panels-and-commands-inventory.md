@@ -153,7 +153,7 @@ tuix 60 个名字，tui 自己 37 个 + 能力行目录 11 个（`goal` `loop` `
 | | `todo` `team` | 两个面板的折叠，转已有的 `ToggleFold` |
 | **归 CLI**（与 `/upgrade` 同一把尺子） | `upgrade` `app` `desktop` `webui` `plugin` `schedule` | CLI 已有，或零屏幕依赖 |
 | **排在 6.3 之后** | `sync` | 碰 daemon 的 live hub |
-| **已经有了，只是名字不同** | `session` → `/new`；`welcome` → 欢迎块是流里的一个块，往上滚就在；`usage` → A13（缺限速缝） | |
+| **已经有了，只是名字不同** | `session` → `/clear`；`welcome` → 欢迎块是流里的一个块，往上滚就在；`usage` → A13（缺限速缝） | |
 | **真缺，但要先开东西** | `bg` `background` | 后台会话槽位；要多会话同时跑，而今天换会话仍重建 App |
 | | `proxy` `openrouter` | 都是写配置文件；`/config` 已经能改扁平设置项，provider 表则故意不给屏幕改（带 `api_key`） |
 

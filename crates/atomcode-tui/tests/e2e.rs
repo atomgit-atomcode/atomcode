@@ -475,7 +475,7 @@ async fn a_resumed_session_does_not_open_with_a_welcome() {
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
 
-/// A session started with `/new` opens with the welcome too.
+/// A session started with `/clear` opens with the welcome too.
 ///
 /// The block is produced by `open_conversation` and by nothing else, and the
 /// loop asks that question through a flag that is *lowered* once it has an
@@ -500,7 +500,7 @@ async fn a_new_session_started_from_the_screen_opens_with_the_welcome_too() {
     );
 
     let first = s.client().session();
-    s.term.type_line("/new");
+    s.term.type_line("/clear");
     moved_from(&s, &first).await;
     s.quiet().await;
 
@@ -3875,7 +3875,7 @@ async fn the_screen_moves_between_sessions_without_repeating_or_freezing() {
     assert!(s.screen().contains("THE-ANSWER"), "{}", s.screen());
     persisted(&home, &first, 4).await;
 
-    s.term.type_line("/new");
+    s.term.type_line("/clear");
     let second = moved_from(&s, &first).await;
     s.quiet().await;
     let fresh = s.screen();

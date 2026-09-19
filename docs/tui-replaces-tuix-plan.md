@@ -174,7 +174,7 @@ serde 往返 + adapter 行为判据。
 | 做完的 | |
 |---|---|
 | B2-1 `/diff` | 两级浏览器,工作区快照出 numstat 与单文件 diff |
-| B2-2 多会话 | 本来就有(`/new` + `/resume`,有端到端判据);realm 化归「换会话不重建 App」那条后续 |
+| B2-2 多会话 | 本来就有(`/clear` + `/resume`,有端到端判据);realm 化归「换会话不重建 App」那条后续 |
 | B2-3 `/model` 选择器 | A12 时做掉 |
 | B2-4 `/provider` | 列表 + 挑一个换过去(就是 `/model <id>`,一个开关) |
 | B2-6 `/copy` `/save` `/view` | |

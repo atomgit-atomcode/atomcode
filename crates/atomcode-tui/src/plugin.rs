@@ -939,7 +939,7 @@ impl UserInterface for Tui {
                         // `switch_session` empties the stream (`host.rs`
                         // `switch_view`), so the question below is live again —
                         // and it is asked, not answered, once per session. Left
-                        // down, a session started with `/new` opened bare: the
+                        // down, a session started with `/clear` opened bare: the
                         // welcome block is produced by `open_conversation` alone,
                         // and nothing else asks.
                         owes_opening = true;
