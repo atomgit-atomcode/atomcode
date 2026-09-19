@@ -1,4 +1,4 @@
-‘个，<div align="center">
+<div align="center">
 <pre>
       _   _                  ____          _
      / \ | |_ ___  _ __ ___ / ___|___   __| | ___
