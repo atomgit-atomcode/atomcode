@@ -577,6 +577,15 @@ pub trait UserInterface: Send + Sync {
     /// a one-shot front end treats as the whole job and an interactive one
     /// treats as the first message.
     async fn run(&self, ctx: &Context, initial: Option<String>) -> Result<(), String>;
+
+    /// Run a slash command the way a person typing it would.
+    ///
+    /// Default: nothing — a front end without a command surface has nothing to
+    /// run. A screen that has one runs it through its own dispatch and shows
+    /// what it said, which is how a row off the loop (onboarding's wizard, at
+    /// the end of a login) asks the screen to open the session that work made
+    /// possible.
+    fn run_slash(&self, _line: &str) {}
 }
 
 /// Naming a session. A seam because the cheap answer (the first prompt) and the

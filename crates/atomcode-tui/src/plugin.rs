@@ -781,6 +781,15 @@ impl UserInterface for Tui {
         format!("full-screen terminal on {}", self.surface.describe())
     }
 
+    /// Run a slash command the way a person typing it would — the screen's own
+    /// dispatch, with its own context and its own delivery of what it said.
+    ///
+    /// A no-op before the loop is up: there is no tree to run against yet,
+    /// which is the honest answer rather than a queued one.
+    fn run_slash(&self, line: &str) {
+        self.run_command(line);
+    }
+
     async fn run(&self, ctx: &Context, initial: Option<String>) -> Result<(), String> {
         let HostConnection {
             session,

@@ -5636,6 +5636,15 @@ fn spawn_runtime_owner_with_optional_agent(
                             .set_event_sender(team_event_tx.clone());
                         runtime.parts.team_manager.begin_generation(generation);
                         agent_available = true;
+                        // The rebuild is what a reason stands for: whatever made
+                        // the provider unavailable (NotConfigured included — an
+                        // onboarding login reloads with a configuration that now
+                        // names one) was addressed by building this one, so a
+                        // readiness read after the reprepare must say so.
+                        provider_unavailable_reason = None;
+                        controls
+                            .provider_unavailable_reason
+                            .store(0, Ordering::Release);
                         observed_tokens = None;
                         snapshot_in_flight = false;
                         compaction_suspended = false;

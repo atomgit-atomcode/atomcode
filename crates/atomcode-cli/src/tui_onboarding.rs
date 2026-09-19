@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use atomcode_harness::seams::UiSvc;
 use atomcode_plexus::{Context, Plugin};
 use atomcode_tui::command::{Command, CommandSet, Outcome};
 use atomcode_tui::overlay::Choice;
@@ -72,6 +73,10 @@ impl Plugin for OnboardingRow {
         // thread, where `tokio::spawn` would panic — the spawn for the reload
         // has to be handed one taken from the runtime itself.
         let runtime_handle = tokio::runtime::Handle::current();
+        // The screen, so the wizard can hand it `/clear` once the reload is
+        // through: opening the session the login made possible is the screen's
+        // own dispatch, the same road a person's `/clear` takes.
+        let ui = ctx.require::<UiSvc>().map_err(|e| e.to_string())?;
         let set = Arc::new(Onboarding {
             config_path: self.config_path.clone(),
             start_sign_in: Arc::new(move |wizard, repaint| {
@@ -81,6 +86,7 @@ impl Plugin for OnboardingRow {
                     telemetry.clone(),
                     path.clone(),
                     client.clone(),
+                    ui.clone(),
                     runtime_handle.clone(),
                 );
             }),
@@ -214,6 +220,7 @@ fn sign_in(
     telemetry: Option<Arc<atomcode_telemetry::Telemetry>>,
     config_path: PathBuf,
     client: std::sync::Arc<atomcode_tui::plugin::AgentClient>,
+    ui: std::sync::Arc<dyn atomcode_harness::seams::UserInterface>,
     runtime_handle: tokio::runtime::Handle,
 ) {
     let painted = move || {
@@ -288,7 +295,13 @@ fn sign_in(
                     .await
                 {
                     wizard.say(vec![format!("配置已写入，但重新加载失败：{error:?}")]);
+                    return;
                 }
+                // The reload rebuilt the runtime; `/clear` is the transition a
+                // person's own hand proves opens the new session — fresh turn,
+                // welcome block and all — so the wizard takes it for them
+                // rather than leaving a screen that still says it cannot work.
+                ui.run_slash("clear");
             });
         }
         wizard.resolve(detail);
