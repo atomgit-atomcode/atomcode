@@ -68,10 +68,21 @@ impl Plugin for OnboardingRow {
         // reload once the login has written the configuration: writing the file
         // is not making it so (see `apply_setting` in `atomcode-tui`).
         let client = ctx.require::<AgentClientSvc>().map_err(|e| e.to_string())?;
+        // The handle now, in an async context: `sign_in` runs on a blocking
+        // thread, where `tokio::spawn` would panic — the spawn for the reload
+        // has to be handed one taken from the runtime itself.
+        let runtime_handle = tokio::runtime::Handle::current();
         let set = Arc::new(Onboarding {
             config_path: self.config_path.clone(),
             start_sign_in: Arc::new(move |wizard, repaint| {
-                sign_in(wizard, repaint, telemetry.clone(), path.clone(), client.clone());
+                sign_in(
+                    wizard,
+                    repaint,
+                    telemetry.clone(),
+                    path.clone(),
+                    client.clone(),
+                    runtime_handle.clone(),
+                );
             }),
             live: Mutex::new(None),
         });
@@ -203,6 +214,7 @@ fn sign_in(
     telemetry: Option<Arc<atomcode_telemetry::Telemetry>>,
     config_path: PathBuf,
     client: std::sync::Arc<atomcode_tui::plugin::AgentClient>,
+    runtime_handle: tokio::runtime::Handle,
 ) {
     let painted = move || {
         if let Some(repaint) = repaint.as_ref() {
@@ -268,7 +280,9 @@ fn sign_in(
         if let Some(control) = client.control() {
             let root = client.root();
             let wizard = wizard.clone();
-            tokio::spawn(async move {
+            // On the runtime's handle, not `tokio::spawn`: this runs on a
+            // blocking thread, which has no runtime context to spawn onto.
+            runtime_handle.spawn(async move {
                 if let Err(error) = control
                     .call(atomcode_host_api::HostCommand::Reload { session: root })
                     .await
