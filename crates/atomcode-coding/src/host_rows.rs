@@ -1891,6 +1891,21 @@ impl atomcode_harness::commands::CatalogCommand for WorktreeCommand {
 /// An existing one is *found*, not an error: `/worktree x` twice is a person
 /// going back to what they opened, and refusing the second would make the
 /// command something you have to remember whether you already ran.
+///
+/// **"Found" means git has it checked out, not that the directory is there**,
+/// and the difference is the whole reason this asks git: a `name` directory
+/// left behind by a `rm -rf` of a checkout git still has registered is not a
+/// worktree, and answering `/cd` with it sends the person somewhere git does
+/// not know about. [`git_worktree_path`] is the registration, and its answer
+/// is the only one taken.
+///
+/// **An existing branch of that name is taken over, never reset** — and that
+/// is why the branch decides the flags rather than a flag deciding the branch.
+/// `git worktree add -B <name>` *moves the branch* to HEAD (git says so:
+/// `resetting branch 'x'; was at <sha>`), quietly dropping whatever it was
+/// pointing at, which for a name a person already used is their work. Without
+/// a branch switch an existing one is checked out where it stands, and only a
+/// name nobody has used gets `-b`.
 fn worktree(root: &std::path::Path, name: &str) -> Result<std::path::PathBuf, String> {
     // A name, not a path: it becomes both a directory under `.worktrees` and a
     // branch, and a `..` in it would put the checkout outside the repository.
@@ -1903,25 +1918,168 @@ fn worktree(root: &std::path::Path, name: &str) -> Result<std::path::PathBuf, St
             "`{name}` 不能当 worktree 的名字:要一个不带路径分隔符的名字"
         ));
     }
+    // `FsSvc::root()` is the working directory when the world is unfenced, so
+    // this can be a subdirectory: `git -C` finds the repository from it, but
+    // `.worktrees` has to hang off the *repository*, or `/worktree x` means
+    // something different depending on where in the tree the person is.
+    let root = match git_out(root, &["rev-parse", "--show-toplevel"]) {
+        Ok(top) if !top.trim().is_empty() => std::path::PathBuf::from(top.trim()),
+        // No repository, or no git. The failure is the next command's to
+        // report, in git's own words, rather than a guess made here.
+        _ => root.to_path_buf(),
+    };
     let at = root.join(".worktrees").join(name);
-    if at.is_dir() {
-        return Ok(at);
+
+    if let Some(existing) = git_worktree_path(&root, name)? {
+        return Ok(existing);
     }
+    // Left over from a checkout git no longer has: `add` would refuse the path
+    // and the person would be told "already exists" about something they
+    // cannot see. Only a directory git has forgotten is cleared.
+    if at.is_dir() {
+        std::fs::remove_dir_all(&at)
+            .map_err(|e| format!("{} 是上次剩下的目录,但清不掉:{e}", at.display()))?;
+    }
+
+    // Two shapes, because `-b` takes the branch name as its own argument:
+    // `git worktree add -b <name> <path>` for a name nobody has used, and
+    // `git worktree add <path> <name>` to check out an existing branch where it
+    // stands. One ordering for both reads the path as a branch (or a branch as
+    // the start-point) and git refuses it, which is what it did here.
+    let at_arg = at.display().to_string();
+    let mut args = vec!["worktree", "add"];
+    let branch_exists = git_out(
+        &root,
+        &["rev-parse", "--verify", &format!("refs/heads/{name}")],
+    )
+    .map(|sha| !sha.trim().is_empty())
+    .unwrap_or(false);
+    if branch_exists {
+        args.push(&at_arg);
+        args.push(name);
+    } else {
+        args.push("-b");
+        args.push(name);
+        args.push(&at_arg);
+    }
+    git_out(&root, &args).map_err(|e| format!("git 拒绝了:{e}"))?;
+
+    // `.worktrees` inside the repository is what shows up in the person's own
+    // `git status` as `?? .worktrees/` the moment this command does its job.
+    // The repository's own ignore rules come first; only when none of them
+    // says anything does the local exclude get the line — local to this
+    // checkout, so it travels with neither the history nor anybody else.
+    let _ = exclude_worktrees_dir(&root);
+
+    match git_worktree_path(&root, name)? {
+        Some(checked_out) => Ok(checked_out),
+        // `add` reported success and git still has no worktree of that name:
+        // say so rather than hand back a path on the strength of an exit
+        // status. Nothing here is allowed to answer with a directory it has
+        // not confirmed.
+        None => Err(format!(
+            "git 说建好了,但 `git worktree list` 里没有 `{name}`:{}",
+            at.display()
+        )),
+    }
+}
+
+/// Where git has `name` checked out, if git has it at all — the registration,
+/// not the directory. `git worktree list --porcelain` is the one that settles
+/// it (a leftover directory keeps its own name registered nowhere).
+///
+/// The path is git's own answer rather than the one this file computed, which
+/// is also what makes it the right one: on macOS a `/var` tempdir and git's
+/// `/private/var` are the same place spelled two ways, and the answer `/cd`
+/// gets should be the spelling git itself resolves.
+fn git_worktree_path(
+    root: &std::path::Path,
+    name: &str,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let listing = git_out(root, &["worktree", "list", "--porcelain"])?;
+    let mut at: Option<std::path::PathBuf> = None;
+    for line in listing.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            at = Some(std::path::PathBuf::from(path));
+        } else if let Some(branch) = line.strip_prefix("branch refs/heads/") {
+            if branch.trim() == name {
+                return Ok(at);
+            }
+        } else if line.is_empty() {
+            // `worktree <path>` always precedes its `branch` line, so a blank
+            // line ends one entry; a worktree with none never matches `name`.
+            at = None;
+        }
+    }
+    Ok(None)
+}
+
+/// Keep `.worktrees/` out of the person's own `git status`, without touching
+/// anyone's tracked files: the local exclude when the ignore rules are silent,
+/// and nothing at all when they are not.
+fn exclude_worktrees_dir(root: &std::path::Path) -> Result<(), String> {
+    // `check-ignore` over the *contents* answers for the directory an entry
+    // would have to name. Exit 0 is "some rule covers it" (the repository's,
+    // the person's, or a line already written below); exit 1 is "no rule
+    // does", and anything else is git being unable to say.
+    let probe = root.join(".worktrees").join(".probe");
+    let covered = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["check-ignore", "-q"])
+        .arg(&probe)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    if matches!(covered.map(|s| s.code()), Ok(Some(0)) | Ok(None)) {
+        return Ok(());
+    }
+
+    let git_path = |arg: &str| -> Result<std::path::PathBuf, String> {
+        let out = git_out(root, &["rev-parse", "--git-path", arg])?;
+        let path = std::path::PathBuf::from(out.trim());
+        Ok(if path.is_absolute() {
+            path
+        } else {
+            root.join(path)
+        })
+    };
+    let exclude = git_path("info/exclude")?;
+    if let Some(parent) = exclude.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return Ok(());
+        }
+    }
+    let mut existing = std::fs::read_to_string(&exclude).unwrap_or_default();
+    if existing
+        .lines()
+        .any(|line| matches!(line.trim(), ".worktrees/" | ".worktrees" | "/.worktrees/"))
+    {
+        return Ok(());
+    }
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        existing.push('\n');
+    }
+    existing.push_str(".worktrees/\n");
+    std::fs::write(&exclude, existing).map_err(|e| format!("写不了 {}:{e}", exclude.display()))
+}
+
+/// Run one git command in `root` and hand back its stdout, or git's own words
+/// on failure. `-C` rather than a directory on the child: the same call works
+/// for the repository root and for the subdirectory `FsSvc::root()` may be.
+fn git_out(root: &std::path::Path, args: &[&str]) -> Result<String, String> {
     let mut git = std::process::Command::new("git");
     git.arg("-C")
         .arg(root)
-        .args(["worktree", "add", "-B", name])
-        .arg(&at)
+        .args(args)
         .stdin(std::process::Stdio::null());
     atomcode_capabilities::process_utils::suppress_console_window_sync(&mut git);
     let out = git.output().map_err(|e| format!("起不了 git:{e}"))?;
     if !out.status.success() {
-        return Err(format!(
-            "git 拒绝了:{}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
-    Ok(at)
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
 /// `worklog [日期]`: the day's work, recapped across every project.
@@ -2230,6 +2388,42 @@ mod tests {
     use super::worktree;
     use super::{worklog_prompt_at, WorklogPrompt};
 
+    /// Run git in `dir` and insist it worked: every claim below is about what
+    /// git did, so a silent failure would make the assertion meaningless.
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "git {args:?} in {}: {}",
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A repository with one commit — what a worktree is made in, and the only
+    /// kind of place these claims are true of.
+    ///
+    /// The root is canonicalized because git's answers are: on macOS a `/var`
+    /// tempdir and git's `/private/var` are one place spelled two ways, and
+    /// every path compared below is one of git's.
+    fn a_repository() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonical root");
+        git(&root, &["init", "-q"]);
+        git(&root, &["config", "user.email", "t@example.com"]);
+        git(&root, &["config", "user.name", "t"]);
+        std::fs::write(root.join("a.txt"), "a").expect("write");
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-qm", "first"]);
+        (dir, root)
+    }
+
     /// A worktree name becomes both a directory and a branch, so it is checked
     /// before either: a name with a separator in it would put the checkout
     /// outside the repository it belongs to.
@@ -2239,33 +2433,22 @@ mod tests {
     /// the command did nothing.
     #[test]
     fn a_worktree_is_made_under_the_repository_and_only_under_it() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path();
-        let git = |args: &[&str]| {
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(root)
-                .args(args)
-                .output()
-                .expect("git")
-        };
-        git(&["init", "-q"]);
-        git(&["config", "user.email", "t@example.com"]);
-        git(&["config", "user.name", "t"]);
-        std::fs::write(root.join("a.txt"), "a").expect("write");
-        git(&["add", "-A"]);
-        git(&["commit", "-qm", "first"]);
+        let (_dir, root) = a_repository();
 
-        let at = worktree(root, "try-it").expect("a worktree");
+        let at = worktree(&root, "try-it").expect("a worktree");
         assert_eq!(at, root.join(".worktrees").join("try-it"));
         assert!(at.join("a.txt").is_file(), "git checked the tree out");
+        assert!(
+            git(&root, &["worktree", "list", "--porcelain"]).contains("branch refs/heads/try-it"),
+            "git has it registered, not just on disk"
+        );
 
         // Asking again finds the one that is there rather than refusing: going
         // back to what you opened must not depend on remembering that you did.
-        assert_eq!(worktree(root, "try-it").expect("again"), at);
+        assert_eq!(worktree(&root, "try-it").expect("again"), at);
 
         for bad in ["", "../escape", "a/b", "-x", ".hidden"] {
-            let refused = worktree(root, bad);
+            let refused = worktree(&root, bad);
             assert!(refused.is_err(), "`{bad}` must be refused: {refused:?}");
         }
         assert!(
@@ -2274,6 +2457,128 @@ mod tests {
                 .map(|p| p.join("escape").exists())
                 .unwrap_or(false),
             "nothing was made outside the repository"
+        );
+    }
+
+    /// The working directory is not always the repository root, and a worktree
+    /// belongs to the repository: asked from a subdirectory, it must still land
+    /// under the root rather than nest itself where the person happens to be.
+    #[test]
+    fn the_repository_owns_the_name_not_the_directory_you_are_in() {
+        let (_dir, root) = a_repository();
+        let nested = root.join("crates").join("inside");
+        std::fs::create_dir_all(&nested).expect("mkdir");
+
+        let at = worktree(&nested, "from-here").expect("a worktree");
+        assert_eq!(at, root.join(".worktrees").join("from-here"));
+        assert!(
+            !nested.join(".worktrees").exists(),
+            "nothing was made around the directory the person was in"
+        );
+    }
+
+    /// A name a person already used is their **work**, not a slot to reclaim.
+    ///
+    /// `git worktree add -B <name>` moves the branch to HEAD (git's own words:
+    /// `resetting branch 'x'; was at <sha>`), which is how this command would
+    /// quietly drop the commits a branch was carrying. The checkout must have
+    /// the branch's own commit, and the branch must still point at it.
+    #[test]
+    fn an_existing_branch_is_taken_over_never_reset() {
+        let (_dir, root) = a_repository();
+        let base = git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]);
+
+        git(&root, &["checkout", "-q", "-b", "mine"]);
+        std::fs::write(root.join("b.txt"), "b").expect("write");
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-qm", "the work on mine"]);
+        let theirs = git(&root, &["rev-parse", "mine"]);
+        git(&root, &["checkout", "-q", &base]);
+        assert_ne!(
+            git(&root, &["rev-parse", "HEAD"]),
+            theirs,
+            "the fixture has a base the branch is ahead of"
+        );
+
+        let at = worktree(&root, "mine").expect("the branch is taken over");
+        assert_eq!(
+            git(&at, &["rev-parse", "HEAD"]),
+            theirs,
+            "the checkout is the branch's own commit, not the base it was reset to"
+        );
+        assert!(
+            at.join("b.txt").is_file(),
+            "the branch's work came with the checkout"
+        );
+        assert_eq!(
+            git(&root, &["rev-parse", "mine"]),
+            theirs,
+            "the branch still points at its own work"
+        );
+    }
+
+    /// A directory git does not know is not a worktree.
+    ///
+    /// "The directory is there" used to be the whole test, and answering `/cd`
+    /// on it sends the person somewhere git has no checkout — the leftover of a
+    /// removed checkout adopted as if it were one. A real worktree gets made.
+    #[test]
+    fn a_directory_git_does_not_know_is_not_a_worktree() {
+        let (_dir, root) = a_repository();
+        let leftover = root.join(".worktrees").join("ghost");
+        std::fs::create_dir_all(leftover.join("junk")).expect("mkdir");
+        std::fs::write(leftover.join("junk").join("x"), "x").expect("write");
+
+        let at = worktree(&root, "ghost").expect("a worktree, not the leftover");
+        assert_eq!(at, leftover);
+        assert!(at.join("a.txt").is_file(), "git checked the tree out");
+        assert!(
+            !at.join("junk").exists(),
+            "the leftover was cleared rather than adopted"
+        );
+        assert!(
+            git(&root, &["worktree", "list", "--porcelain"]).contains("branch refs/heads/ghost"),
+            "and git knows about it"
+        );
+    }
+
+    /// `/worktree x` must not show up in the person's own `git status` — the
+    /// checkout it makes lives inside their repository, and an untracked
+    /// `.worktrees/` is the command dirtying the tree it was asked to isolate.
+    #[test]
+    fn the_persons_own_git_status_is_left_clean() {
+        let (_dir, root) = a_repository();
+        assert_eq!(git(&root, &["status", "--porcelain"]), "");
+
+        worktree(&root, "tidy").expect("a worktree");
+        assert_eq!(
+            git(&root, &["status", "--porcelain"]),
+            "",
+            "the person's checkout is as clean as it was"
+        );
+    }
+
+    /// The repository's own ignore rules come first: when they already cover
+    /// `.worktrees`, nothing is added — least of all to a tracked file.
+    #[test]
+    fn a_repository_that_already_ignores_it_is_left_alone() {
+        let (_dir, root) = a_repository();
+        std::fs::write(root.join(".gitignore"), ".worktrees/\n").expect("write");
+        git(&root, &["add", ".gitignore"]);
+        git(&root, &["commit", "-qm", "ignore the worktrees"]);
+        let exclude = || {
+            std::fs::read_to_string(root.join(".git").join("info").join("exclude"))
+                .unwrap_or_default()
+        };
+        let before = exclude();
+
+        worktree(&root, "already").expect("a worktree");
+
+        assert_eq!(exclude(), before, "the local exclude was not touched");
+        assert_eq!(
+            git(&root, &["status", "--porcelain"]),
+            "",
+            "and the tree is still clean"
         );
     }
 
