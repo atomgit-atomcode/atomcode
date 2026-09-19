@@ -115,6 +115,38 @@ G 类七条**刻意排在翻默认之后**：自用会告诉我们哪几条是�
 
 ### B. 解开 6.3 的尾巴（6.3 今天不能算完成）
 
+> **🔴 2026-09-20 摸到底了，卡在一个契约决定上，没做。** 下面是摸出来的事实，
+> 省得下一个人再摸一遍。
+
+**两半都得做，缺一不可**：只把目录广播出去而不能执行，等于让客户端列出一条跑了
+会被当成提示词发给模型的命令——`acp/commands.rs` 自己那条判据
+（`the_advertised_commands_are_the_ones_acp_can_actually_run`）说的就是这件事。
+
+**广播那半是通的**（已验证可编译，代码没提交）：
+- ACP 会话没有回合之间的事件泵，`AgentEvent::Described` 今天没人接。
+- 解法：会话建的时候有界地等一次 `Described`（订阅时就会推，250ms 够），
+  之后在回合循环里顺手更新——那是这个通道唯一读流的地方。
+
+**执行那半卡住了**：`AgentCommand::Invoke` 走 `handle.rs:1341`，只发
+`AgentEvent::Invoked { id, output }`，**不产生任何回合终态**（`run_catalog_command`
+在 `handle.rs:1010`，`Invoke` 那一支 `continue` 掉了起回合的那段）。而有的目录命令
+会顺带给模型排一条消息（`/worklog`、`/init` 都是 `agent.send(prompt)`），那之后会
+另起一个回合。于是 ACP 不知道这一回合该在哪儿结束：
+
+| 做法 | 问题 |
+|---|---|
+| A. 收到 `Invoked` 就结束本回合 | 排了活的那种，回合事件会漏给下一次 prompt——`turn.rs` 注释里反复警告的 "poisons the NEXT prompt" |
+| B. 收到 `Invoked` 后继续等 `TurnComplete`，超时就结束 | 不挂死，但靠一个时间窗，有竞态 |
+| C. 契约里说清楚：`AgentEvent::Invoked` 多带一个「还排了活」的字段 | **架构上对的那个**：harness 当场就知道（inbox 里有没有东西），而调用方今天只能猜。代价是动 kernel 的事件枚举与所有消费者 |
+
+今天 `Invoked` 全仓只有 tui 一个消费者（`plugin.rs:1918`），它是「facts 来了就画」
+的模型，所以这个边界对它根本不存在；ACP 是一问一答，才撞上。daemon 的
+`/live/command` 走的是另一条路，没有用 `Invoke`。
+
+**我的建议是 C**，但它动公共契约，该由你拍。拍完再做，两半一起。
+
+
+
 - [ ] **B1 ACP 命令改投影**：`acp/commands.rs:52` 的 `ACP_COMMANDS` 15 条硬编码
       → 投影自 `AgentDescription` 的命令目录（tui 侧 `commands.rs:1447` 已是活投影，照抄）。
       `commands.rs:718` 那条把 15 条钉死的判据要一起改。
