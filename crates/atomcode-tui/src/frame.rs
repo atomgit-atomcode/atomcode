@@ -346,6 +346,33 @@ pub struct Placed {
     pub lines: Vec<Line>,
 }
 
+/// A row's characters paired with the cell each starts at — the mapping cell
+/// positions need, since a wide character is one `char` over two cells.
+/// `rows()` has already dropped wide-character continuation cells, so each
+/// entry is a real character.
+fn cells_of(row: &str) -> Vec<(u16, char)> {
+    let mut out = Vec::new();
+    let mut cell = 0u16;
+    for ch in row.chars() {
+        out.push((cell, ch));
+        cell = cell.saturating_add(crate::width::char_width(ch).max(1) as u16);
+    }
+    out
+}
+
+/// The last cell a `(start_cell, char)` covers — its start plus its width, less
+/// one — so a selection's inclusive head lands on the far cell of a wide char.
+fn last_cell((cell, ch): (u16, char)) -> u16 {
+    cell + crate::width::char_width(ch).max(1) as u16 - 1
+}
+
+/// What double-click keeps together: letters, digits, `_`, and any script's
+/// characters — `is_alphanumeric` is true for CJK, so a run of them selects as
+/// one word, while whitespace and punctuation are boundaries.
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
 /// A whole screen, composed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Frame {
@@ -468,6 +495,49 @@ impl Frame {
             out.push(piece.trim_end().to_string());
         }
         out.join("\n")
+    }
+
+    /// The word the pointer is over, as a [`Selection`](crate::moment::Selection),
+    /// or `None` over whitespace / off the row. Double-click reproduces the
+    /// terminal's own word-select, which taking the mouse for drag-select
+    /// disabled. Works in cell space (a wide character is one word-char over two
+    /// cells), same as [`selected_text`](Self::selected_text).
+    pub fn word_at(&self, x: u16, y: u16) -> Option<crate::moment::Selection> {
+        let rows = self.rows();
+        let cells = cells_of(rows.get(y as usize)?);
+        let idx = cells.iter().position(|&(c, ch)| {
+            let w = crate::width::char_width(ch).max(1) as u16;
+            x >= c && x < c + w
+        })?;
+        if !is_word_char(cells[idx].1) {
+            return None;
+        }
+        let mut lo = idx;
+        while lo > 0 && is_word_char(cells[lo - 1].1) {
+            lo -= 1;
+        }
+        let mut hi = idx;
+        while hi + 1 < cells.len() && is_word_char(cells[hi + 1].1) {
+            hi += 1;
+        }
+        Some(crate::moment::Selection {
+            anchor: (cells[lo].0, y),
+            head: (last_cell(cells[hi]), y),
+        })
+    }
+
+    /// The whole row, trimmed to its non-blank span, as a
+    /// [`Selection`](crate::moment::Selection). Triple-click, same reasoning as
+    /// [`word_at`](Self::word_at). `None` on a blank row.
+    pub fn line_at(&self, y: u16) -> Option<crate::moment::Selection> {
+        let rows = self.rows();
+        let cells = cells_of(rows.get(y as usize)?);
+        let first = cells.iter().position(|&(_, ch)| !ch.is_whitespace())?;
+        let last = cells.iter().rposition(|&(_, ch)| !ch.is_whitespace())?;
+        Some(crate::moment::Selection {
+            anchor: (cells[first].0, y),
+            head: (last_cell(cells[last]), y),
+        })
     }
 
     /// Every cell a module drew is inside the rect it was given.
@@ -609,6 +679,40 @@ mod tests {
 two---
 thr"
         );
+    }
+
+    #[test]
+    fn double_click_selects_the_word_triple_the_line() {
+        use crate::moment::Selection;
+        let mut f = Frame::new(20, 1);
+        f.place("t", Rect::new(0, 0, 20, 1), vec![Line::raw("  foo_bar baz  ")]);
+
+        // Over the 'o' of foo_bar (cell 3): the whole `foo_bar` token, copied.
+        let w = f.word_at(3, 0).expect("a word under the pointer");
+        assert_eq!(f.selected_text(&w), "foo_bar");
+        // The head is inclusive and on the last letter, not past it.
+        assert_eq!(w, Selection { anchor: (2, 0), head: (8, 0) });
+
+        // Over a space (cell 9): no word.
+        assert!(f.word_at(9, 0).is_none());
+        // Over the trailing blanks / past the text: no word.
+        assert!(f.word_at(18, 0).is_none());
+
+        // Triple-click: the row's non-blank span (leading/trailing blanks off).
+        let l = f.line_at(0).expect("a non-blank row");
+        assert_eq!(f.selected_text(&l), "foo_bar baz");
+    }
+
+    #[test]
+    fn double_click_on_a_wide_character_covers_both_its_cells() {
+        let mut f = Frame::new(10, 1);
+        // Two CJK characters: 4 cells wide, one word.
+        f.place("t", Rect::new(0, 0, 10, 1), vec![Line::raw("你好 x")]);
+        let w = f.word_at(0, 0).expect("a word");
+        assert_eq!(f.selected_text(&w), "你好");
+        // Anchor on the first cell, head on the LAST cell of the second char.
+        assert_eq!(w.anchor, (0, 0));
+        assert_eq!(w.head, (3, 0));
     }
 
     #[test]

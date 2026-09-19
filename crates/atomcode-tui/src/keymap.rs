@@ -56,6 +56,11 @@ pub enum Action {
     SelectFrom(u16, u16),
     /// Drag it out to here.
     SelectTo(u16, u16),
+    /// A double-click: select the word under this cell and copy it. The
+    /// terminal's own word-select, which taking the mouse for drag disabled.
+    SelectWord(u16, u16),
+    /// A triple-click: select this whole row (its non-blank span) and copy it.
+    SelectLine(u16, u16),
     /// Finish it: copy what it covers, and leave it up so it can be seen.
     CopySelection,
     /// Drop it.

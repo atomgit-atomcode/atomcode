@@ -489,6 +489,11 @@ fn paths_under(cwd: &str, prefix: &str) -> Vec<crate::menu::Item> {
 /// which is exactly when precision beats speed.
 const WHEEL_LINES: i32 = 1;
 
+/// How close two presses on the same cell must be to count as a double- (then
+/// triple-) click. 400ms is the common desktop default — long enough for a
+/// deliberate second tap, short enough that two separate clicks are not fused.
+const MULTI_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
+
 /// The ways out of a policy intervention, as a person reads them.
 ///
 /// The intervention's own list, in its order: the kernel says which apply, and
@@ -766,6 +771,11 @@ pub struct Tui {
     wake: Mutex<Option<mpsc::UnboundedSender<Wake>>>,
     /// Where the button went down, so a release can tell a click from a drag.
     pressed_at: Mutex<Option<(u16, u16)>>,
+    /// The last press's time, cell, and how many presses have landed on that
+    /// cell in a row — so a second press within the window is a double-click
+    /// (word) and a third a triple-click (line). The app reproduces what taking
+    /// the mouse for drag-select took from the terminal.
+    click_streak: Mutex<Option<(std::time::Instant, (u16, u16), u8)>>,
     /// The session's members, by session id — stopped ones included, so
     /// `/agents` can still reach their logs. Shared with the tree as an
     /// `Arc`, because that seam is how a command reads it.
@@ -1268,6 +1278,29 @@ impl UserInterface for Tui {
                         Click::WheelDown => Some(Action::Scroll(WHEEL_LINES)),
                         Click::Press => {
                             *self.pressed_at.lock().expect("press poisoned") = Some((x, y));
+                            // How many presses have landed on this cell in a
+                            // row: a second within the window is a word, a third
+                            // a line. Recorded on every press so the run is
+                            // right even when a press is consumed as chrome below.
+                            let clicks = {
+                                let now = std::time::Instant::now();
+                                let mut streak =
+                                    self.click_streak.lock().expect("streak poisoned");
+                                let n = match *streak {
+                                    Some((at, cell, n))
+                                        if cell == (x, y)
+                                            && now.duration_since(at) <= MULTI_CLICK =>
+                                    {
+                                        // Saturating: a stuck/auto-repeating button
+                                        // must not overflow (panic in debug) — and
+                                        // we only distinguish 1 / 2 / ≥3 anyway.
+                                        n.saturating_add(1)
+                                    }
+                                    _ => 1,
+                                };
+                                *streak = Some((now, (x, y), n));
+                                n
+                            };
                             // A press on an answer is the answer. It is not the
                             // start of a text selection and not a fold: the
                             // panel is a choice, and waiting for the release
@@ -1334,7 +1367,22 @@ impl UserInterface for Tui {
                                     continue;
                                 }
                             }
-                            Some(Action::SelectFrom(x, y))
+                            match clicks {
+                                // Forget the press so the release does not become
+                                // a `ClickAt` — which, not being a selection
+                                // gesture, would clear the word/line we just put
+                                // up. The gesture already copied on this press;
+                                // the highlight stays, like a drag's does.
+                                2 => {
+                                    *self.pressed_at.lock().expect("press poisoned") = None;
+                                    Some(Action::SelectWord(x, y))
+                                }
+                                n if n >= 3 => {
+                                    *self.pressed_at.lock().expect("press poisoned") = None;
+                                    Some(Action::SelectLine(x, y))
+                                }
+                                _ => Some(Action::SelectFrom(x, y)),
+                            }
                         }
                         Click::Drag => Some(Action::SelectTo(x, y)),
                         Click::Release => {
@@ -1342,7 +1390,11 @@ impl UserInterface for Tui {
                             match from {
                                 Some(p) if p == (x, y) => Some(Action::ClickAt(x, y)),
                                 Some(_) => Some(Action::CopySelection),
-                                None => None,
+                                // No press to release against: a multi-click
+                                // cleared it. Copy whatever is selected (a word,
+                                // a line, or a double-click-then-drag extension)
+                                // — a no-op when nothing is. The highlight stays.
+                                None => Some(Action::CopySelection),
                             }
                         }
                         // A move is not a press: it is the one pointer event
@@ -2121,6 +2173,8 @@ impl Tui {
             action,
             Action::SelectFrom(..)
                 | Action::SelectTo(..)
+                | Action::SelectWord(..)
+                | Action::SelectLine(..)
                 | Action::CopySelection
                 | Action::ClearSelection
         ) {
@@ -2419,6 +2473,35 @@ impl Tui {
             Action::SelectTo(x, y) => {
                 if let Some(sel) = m.selection.as_mut() {
                     sel.head = (x, y);
+                }
+                return false;
+            }
+            // Double- and triple-click: put the word (or the line) up as a
+            // selection and copy it in one gesture, the way a terminal does.
+            // `compose` reads the moment, so the guard goes first — then the
+            // selection is set back on it, the same drop/compose dance as
+            // `CopySelection`.
+            Action::SelectWord(x, y) => {
+                drop(m);
+                let frame = self.host.compose(self.surface.size());
+                if let Some(sel) = frame.word_at(x, y) {
+                    let text = frame.selected_text(&sel);
+                    self.host.moment.write().expect("moment poisoned").selection = Some(sel);
+                    if !text.is_empty() {
+                        self.surface.copy(&text);
+                    }
+                }
+                return false;
+            }
+            Action::SelectLine(_x, y) => {
+                drop(m);
+                let frame = self.host.compose(self.surface.size());
+                if let Some(sel) = frame.line_at(y) {
+                    let text = frame.selected_text(&sel);
+                    self.host.moment.write().expect("moment poisoned").selection = Some(sel);
+                    if !text.is_empty() {
+                        self.surface.copy(&text);
+                    }
                 }
                 return false;
             }
@@ -3198,6 +3281,7 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
             ctx: Mutex::new(None),
             wake: Mutex::new(None),
             pressed_at: Mutex::new(None),
+            click_streak: Mutex::new(None),
             members: Arc::new(Roster::default()),
             named: Mutex::new(None),
         },
