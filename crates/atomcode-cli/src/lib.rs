@@ -14,6 +14,7 @@ fn _isolate_atomcode_home() {
 
 #[cfg(unix)]
 pub mod askpass;
+pub mod tui_login;
 pub mod tui_onboarding;
 pub mod tui_settings;
 pub mod uninstall;
@@ -71,13 +72,18 @@ pub mod tui_front {
         let layers = [
             crate::tui_settings::row_layer(),
             crate::tui_onboarding::row_layer(),
+            crate::tui_login::row_layer(),
         ];
         launch::mount_with(
             screen,
-            &[&layers[0], &layers[1]],
+            &[&layers[0], &layers[1], &layers[2]],
             &[
                 Arc::new(crate::tui_settings::SettingsRow),
                 Arc::new(crate::tui_onboarding::OnboardingRow {
+                    config_path: config_path.clone(),
+                    telemetry: telemetry.clone(),
+                }),
+                Arc::new(crate::tui_login::LoginRow {
                     config_path: config_path.clone(),
                     telemetry,
                 }),

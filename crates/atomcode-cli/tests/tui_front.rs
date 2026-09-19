@@ -169,6 +169,31 @@ async fn a_session_the_product_wrote_comes_back_on_the_row_assembled_screen() {
             "the command readiness names is one this screen can run: {named}"
         );
     }
+    // **`/login` is the launcher's, not the screen's shipped one.**
+    //
+    // The shipped one only re-read configuration, so a person who had just run
+    // `/logout` got "AtomGit gateway requires login — run `/login`" from the
+    // very command they ran. Mounting is where that is decided: a row that
+    // declares the override and mounts after the set it takes the name from is
+    // what puts the sign-in flow there; if it mounted *first* the tree would
+    // have refused the clash outright and this test would not get here.
+    //
+    // The description is what tells the two apart without running either: the
+    // shipped one says "用现在配置的凭据重新登录" and this one says what it
+    // actually does.
+    {
+        let commands = mounted
+            .app
+            .context()
+            .service::<atomcode_tui::plugin::CommandsSvc>()
+            .expect("the screen provides its commands");
+        let login = commands.find("login").expect("the screen offers /login");
+        assert!(
+            login.about.contains("codingplan"),
+            "/login is the sign-in flow, not the shipped re-read: {}",
+            login.about
+        );
+    }
     let term = mounted
         .app
         .context()
