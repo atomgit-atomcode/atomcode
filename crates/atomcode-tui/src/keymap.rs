@@ -108,6 +108,11 @@ pub enum Action {
     /// Its own action for the reason [`Action::ToggleProviders`] is one: it has
     /// a port of its own, and a build may mount it without the others.
     TogglePlugins,
+    /// Pull the tools panel up over the composer, or put it away.
+    ///
+    /// Its own action for the same reason: its port is its own, and a build may
+    /// mount it without the others.
+    ToggleTools,
     /// Put this session — the lead, or a member of its team — on screen.
     ///
     /// An action, and the only one carrying a value, for the reason

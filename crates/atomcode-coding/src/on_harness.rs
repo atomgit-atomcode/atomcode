@@ -911,7 +911,10 @@ pub fn config_rows(cfg: &crate::CodingAgentConfig) -> Result<Layer, String> {
 pub fn tools_host_row(
     switches: std::sync::Arc<atomcode_harness::seams::ToolSwitches>,
 ) -> impl atomcode_plexus::Plugin {
-    crate::host_rows::ToolsHostPlugin(switches)
+    crate::host_rows::ToolsHostPlugin {
+        switches,
+        slot: None,
+    }
 }
 
 /// The coding overlay with this working directory substituted in.
@@ -1442,6 +1445,9 @@ pub struct HostState {
     /// tree being rebuilt (`tools-host`). Absent means the catalog's switches
     /// live and die with the tree, which is right for a tree nobody rebuilds.
     pub tool_switches: Option<Arc<atomcode_harness::seams::ToolSwitches>>,
+    /// Where `tools-host` publishes the catalog it built, for a host that has
+    /// to answer a front end about what the model can call.
+    pub tool_catalog_slot: Arc<std::sync::RwLock<Option<Arc<atomcode_harness::seams::ToolBox>>>>,
     /// Tool middleware the host built (telemetry, the AtomGit push label).
     pub middleware: Option<Arc<crate::host_rows::HostMiddleware>>,
     /// The person's `hooks.json` engine, as the host loaded it — plugin hooks,
@@ -1806,7 +1812,10 @@ pub async fn mount_hosted(
         config_file: host.config_file.clone(),
     }));
     if let Some(switches) = host.tool_switches.clone() {
-        registry.register(Arc::new(crate::host_rows::ToolsHostPlugin(switches)));
+        registry.register(Arc::new(crate::host_rows::ToolsHostPlugin {
+            switches,
+            slot: Some(host.tool_catalog_slot.clone()),
+        }));
     }
     registry.register(Arc::new(crate::host_rows::KernelHooksPlugin(
         host.hooks.unwrap_or_default(),

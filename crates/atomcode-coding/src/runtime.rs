@@ -1572,6 +1572,43 @@ impl CodingRuntimeHandle {
         result.await.map_err(|_| RuntimeError::Unavailable)?
     }
 
+    /// What the model can call right now, what the person turned off, and what
+    /// the tree was configured without (`docs/tool-catalog-policy.md`).
+    pub async fn tool_catalog(
+        &self,
+    ) -> Result<Vec<atomcode_harness::seams::ToolListing>, RuntimeError> {
+        let state = self.state.load(Ordering::Acquire);
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::ToolCatalog {
+                generation: runtime_state_generation(state),
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
+    /// Turn `pattern` off or back on for this session, and answer with the
+    /// catalog as it now is — one round trip, so a screen never renders a
+    /// switch it only assumes was thrown.
+    pub async fn switch_tool(
+        &self,
+        pattern: String,
+        on: bool,
+    ) -> Result<Vec<atomcode_harness::seams::ToolListing>, RuntimeError> {
+        let state = self.state.load(Ordering::Acquire);
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::SwitchTool {
+                generation: runtime_state_generation(state),
+                pattern,
+                on,
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
     /// Remove every MCP tool from the model-facing catalog without reading
     /// mutable config, trust, or auth state. Security-reducing mutations must
     /// await this terminal before changing those inputs.
@@ -2436,6 +2473,16 @@ pub enum CodingRuntimeControl {
     WithdrawMcpTools {
         generation: u64,
         done: oneshot::Sender<Result<(), RuntimeError>>,
+    },
+    ToolCatalog {
+        generation: u64,
+        done: oneshot::Sender<Result<Vec<atomcode_harness::seams::ToolListing>, RuntimeError>>,
+    },
+    SwitchTool {
+        generation: u64,
+        pattern: String,
+        on: bool,
+        done: oneshot::Sender<Result<Vec<atomcode_harness::seams::ToolListing>, RuntimeError>>,
     },
     QueueLocalContext {
         generation: u64,
@@ -4535,6 +4582,47 @@ fn spawn_runtime_owner_with_optional_agent(
                             generation: RuntimeGeneration(generation),
                             servers,
                         }));
+                    }
+                    Some(CodingRuntimeControl::ToolCatalog {
+                        generation: request_generation,
+                        done,
+                    }) => {
+                        if request_generation != generation {
+                            let _ = done.send(Err(RuntimeError::Busy));
+                            continue;
+                        }
+                        let listing = resources
+                            .as_ref()
+                            .and_then(|runtime| runtime.parts.tool_catalog())
+                            .map(|catalog| catalog.listing());
+                        // No catalog means no tree is mounted, which is not an
+                        // empty catalog: saying "no tools" would be a lie a
+                        // screen would render.
+                        let _ = done.send(listing.ok_or(RuntimeError::Unavailable));
+                    }
+                    Some(CodingRuntimeControl::SwitchTool {
+                        generation: request_generation,
+                        pattern,
+                        on,
+                        done,
+                    }) => {
+                        if request_generation != generation {
+                            let _ = done.send(Err(RuntimeError::Busy));
+                            continue;
+                        }
+                        let catalog = resources
+                            .as_ref()
+                            .and_then(|runtime| runtime.parts.tool_catalog());
+                        let Some(catalog) = catalog else {
+                            let _ = done.send(Err(RuntimeError::Unavailable));
+                            continue;
+                        };
+                        if on {
+                            catalog.turn_on(&pattern);
+                        } else {
+                            catalog.turn_off(&pattern);
+                        }
+                        let _ = done.send(Ok(catalog.listing()));
                     }
                     Some(CodingRuntimeControl::McpTools {
                         generation: request_generation,
@@ -7373,6 +7461,12 @@ fn reject_runtime_control(
         CodingRuntimeControl::Submit { done, .. } => {
             let _ = done.send(Err(RuntimeError::Unavailable));
         }
+        // A stopping runtime has no catalog to describe or switch. Fail-closed
+        // like every other awaited control.
+        CodingRuntimeControl::ToolCatalog { done, .. }
+        | CodingRuntimeControl::SwitchTool { done, .. } => {
+            let _ = done.send(Err(RuntimeError::Unavailable));
+        }
         CodingRuntimeControl::Respond { done, .. }
         | CodingRuntimeControl::ResolvePolicyIntervention { done, .. }
         | CodingRuntimeControl::Cancel { done, .. }
@@ -8064,6 +8158,7 @@ fn harness_host_state(
         skills: parts.skill_registry(),
         runtime_commands: parts.runtime_commands.clone(),
         tool_switches: Some(parts.tool_switches()),
+        tool_catalog_slot: parts.tool_catalog_slot(),
         mcp,
         rate_limit_source: parts.rate_limit_source().cloned(),
         front_end: prepare.front_end.clone(),

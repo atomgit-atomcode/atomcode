@@ -90,6 +90,10 @@ plexus_service!(ProvidersSvc => dyn crate::providers::Providers, "tui-providers"
 // what they carry is the product's answer, and every change to it is a `git`
 // this crate must not know how to run — see `crate::plugins`.
 plexus_service!(PluginsSvc => dyn crate::plugins::Plugins, "tui-plugins", Seam, "The plugins and marketplaces a launcher can read and change");
+// And the tool catalog, on the same terms: what the model can call right now is
+// a fact of the running tree, which this crate may not reach into
+// (`docs/adr/0022` §3) — so it arrives over a seam like everything else.
+plexus_service!(ToolCatalogSvc => dyn crate::tools::Tools, "tui-tools", Seam, "The tool catalog a person can look at and switch, one tool at a time");
 
 /// The session's clock, and the only place this crate reads one.
 ///
@@ -1324,6 +1328,10 @@ impl UserInterface for Tui {
                             stale = true;
                             continue;
                         }
+                        if self.host.tools_wheel(x, y, by) {
+                            stale = true;
+                            continue;
+                        }
                         if self.host.providers_wheel(x, y, by) {
                             stale = true;
                             continue;
@@ -1422,6 +1430,19 @@ impl UserInterface for Tui {
                                 if let Some(row) = self.host.plugins_row_at(x, y) {
                                     let _ = self.host.point_plugins_at(row);
                                     self.run_plugins_key(crate::surface::KeyPress::plain(
+                                        crate::surface::Key::Enter,
+                                    ));
+                                    stale = true;
+                                    continue;
+                                }
+                            }
+                            // And the tools panel: a click on a row points at
+                            // it and throws its switch, which is the whole of
+                            // what this panel does.
+                            if self.host.tools_open() {
+                                if let Some(row) = self.host.tools_row_at(x, y) {
+                                    let _ = self.host.point_tools_at(row);
+                                    self.run_tools_key(crate::surface::KeyPress::plain(
                                         crate::surface::Key::Enter,
                                     ));
                                     stale = true;
@@ -1556,6 +1577,12 @@ impl UserInterface for Tui {
                                     stale |= self.host.point_plugins_at(row);
                                 }
                             }
+                            // And the tools panel.
+                            if self.host.tools_open() {
+                                if let Some(row) = self.host.tools_row_at(x, y) {
+                                    stale |= self.host.point_tools_at(row);
+                                }
+                            }
                             continue;
                         }
                         // Handled above, and never reached.
@@ -1587,6 +1614,11 @@ impl UserInterface for Tui {
                 // falling through would put it in a composer nobody can see.
                 Wake::Input(Input::Paste(text)) if self.host.plugins_open() => {
                     stale |= self.host.plugins_paste(&text);
+                }
+                // And a paste while the tools panel is up: a tool name is
+                // exactly the thing that arrives by paste.
+                Wake::Input(Input::Paste(text)) if self.host.tools_open() => {
+                    stale |= self.host.tools_paste(&text);
                 }
                 Wake::Input(Input::Paste(text)) => {
                     quit = self.act(Action::Paste(text), &client);
@@ -1638,6 +1670,11 @@ impl UserInterface for Tui {
                 // three is ever up (`Host::toggle_plugins`).
                 Wake::Input(Input::Key(press)) if self.host.plugins_open() => {
                     stale |= self.run_plugins_key(press);
+                }
+                // And the tools panel, on the same terms: at most one of the
+                // four is ever up (`Host::toggle_tools`).
+                Wake::Input(Input::Key(press)) if self.host.tools_open() => {
+                    stale |= self.run_tools_key(press);
                 }
                 // A question on screen gets first refusal on every key. It is a
                 // panel riding the tail now, not a modal, so this is the only
@@ -1972,6 +2009,88 @@ impl Tui {
         };
         let view = port.rows();
         self.host.show_plugins(view)
+    }
+
+    /// Ask the host what the catalog looks like, and put it on screen.
+    ///
+    /// Out on a task rather than awaited here: it is a round trip to the tree,
+    /// and the panel opens now.
+    fn refresh_tools(&self) {
+        let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
+            return;
+        };
+        let Some(port) = ctx.service::<crate::plugin::ToolCatalogSvc>() else {
+            return;
+        };
+        let host = self.host.clone();
+        let keys = self.wake.lock().expect("wake poisoned").clone();
+        tokio::spawn(async move {
+            match port.list().await {
+                Ok(view) => {
+                    host.show_tools(view);
+                }
+                Err(why) => {
+                    host.said(format!("读不到工具目录:{why}"), true);
+                }
+            }
+            if let Some(keys) = keys {
+                let _ = keys.send(Wake::Fact);
+            }
+        });
+    }
+
+    /// Run one key against the tools panel, and act on what it asked for.
+    ///
+    /// **True when a frame is owed.**
+    fn run_tools_key(&self, press: crate::surface::KeyPress) -> bool {
+        let (changed, asked) = self.host.tools_key(press);
+        let Some(step) = asked else {
+            return changed;
+        };
+        self.apply_tools_step(step);
+        true
+    }
+
+    /// Send one switch over the seam.
+    ///
+    /// The port answers with the catalog **after** the switch, so the panel
+    /// draws what happened rather than what it asked for — a tool the config
+    /// excluded, or a pattern that matched nothing, comes back unchanged and
+    /// the screen says so by simply not moving.
+    fn apply_tools_step(&self, step: crate::tools::Step) {
+        use crate::tools::Step;
+        let Step::Switch { pattern, on } = step else {
+            return;
+        };
+        let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
+            self.host.tools_busy(None);
+            self.host.say("屏幕还没接上,开关不了工具", true);
+            return;
+        };
+        let Some(port) = ctx.service::<crate::plugin::ToolCatalogSvc>() else {
+            self.host.tools_busy(None);
+            self.host
+                .say("这个屏幕没有接工具目录:启动器没有提供 `tui-tools`", true);
+            return;
+        };
+        let host = self.host.clone();
+        let keys = self.wake.lock().expect("wake poisoned").clone();
+        tokio::spawn(async move {
+            let done = port.switch(&pattern, on).await;
+            // The panel first: whatever happened, it is over.
+            host.tools_busy(None);
+            match done {
+                Ok(view) => {
+                    host.show_tools(view);
+                }
+                Err(why) => {
+                    host.tools_note(Some(format!("没成:{why}")));
+                }
+            }
+            if let Some(keys) = keys {
+                let _ = keys.send(Wake::Fact);
+            }
+        });
     }
 
     /// Run one key against the plugins panel, and act on what it asked for.
@@ -3190,6 +3309,20 @@ impl Tui {
                 // frozen at launch would quietly lie.
                 if self.host.plugins_open() {
                     self.refresh_plugins();
+                }
+                return false;
+            }
+            Action::ToggleTools => {
+                drop(m);
+                if !self.host.toggle_tools() {
+                    self.say("这个屏幕没有工具面板:启动器没有提供 `tui-panel-tools`");
+                    return false;
+                }
+                // Read when the panel opens, never per frame: what the model can
+                // call is a fact of the running tree, and an MCP server that
+                // finished connecting since last time has changed it.
+                if self.host.tools_open() {
+                    self.refresh_tools();
                 }
                 return false;
             }

@@ -151,6 +151,13 @@ name = "tui-commands-session"
 [[insert]]
 name = "tui-commands-plugin"
 
+# `/tools`: the panel, and the same two switches typed out. Its own row for the
+# same reason `/plugin` has one — the panel it pulls up is the launcher's, and a
+# screen with no `tui-tools` port keeps the command and says where the panel
+# went.
+[[insert]]
+name = "tui-commands-tools"
+
 # Its own row so a downstream build can take the conversation somewhere else:
 # `[[remove]]` this one and mount its own, or override one name and keep the
 # other (`CommandSet::overrides`).
@@ -189,6 +196,7 @@ pub fn catalog() -> Vec<std::sync::Arc<dyn Plugin>> {
         Arc::new(ScreenCommandsRow),
         Arc::new(SessionCommandsRow),
         Arc::new(PluginCommandsRow),
+        Arc::new(ToolCommandsRow),
         Arc::new(TakeAwayCommandsRow),
         Arc::new(AgentCatalogCommandsRow),
         Arc::new(HelpCommandsRow),
@@ -727,6 +735,12 @@ commands!(
     "tui-commands-plugin",
     crate::commands::PluginCommands,
     "/plugin: the panel, and the same jobs from the command line"
+);
+commands!(
+    ToolCommandsRow,
+    "tui-commands-tools",
+    crate::commands::ToolCommands,
+    "/tools: the panel, and the same two switches from the command line"
 );
 commands!(
     TakeAwayCommandsRow,

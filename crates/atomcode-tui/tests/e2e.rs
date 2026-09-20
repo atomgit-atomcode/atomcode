@@ -313,7 +313,7 @@ async fn start_with_connection(
     setup: Setup,
     wrap: impl FnOnce(atomcode_host_api::HostConnection) -> atomcode_host_api::HostConnection,
 ) -> Session {
-    start_full(setup, wrap, None, None).await
+    start_full(setup, wrap, None, None, None).await
 }
 
 /// A settings port that answers one row with `value` and knows nothing else.
@@ -346,7 +346,7 @@ async fn start_with_connection_and_settings(
     setup: Setup,
     settings: Option<Arc<dyn atomcode_tui::settings::Settings>>,
 ) -> Session {
-    start_full(setup, |control| control, settings, None).await
+    start_full(setup, |control| control, settings, None, None).await
 }
 
 /// The layer that puts the test's plugins panel on screen.
@@ -380,7 +380,7 @@ async fn start_with_plugins(
     setup: Setup,
     plugins: Arc<dyn atomcode_tui::plugins::Plugins>,
 ) -> Session {
-    start_full(setup, |control| control, None, Some(plugins)).await
+    start_full(setup, |control| control, None, Some(plugins), None).await
 }
 
 async fn start_full(
@@ -388,6 +388,7 @@ async fn start_full(
     wrap: impl FnOnce(atomcode_host_api::HostConnection) -> atomcode_host_api::HostConnection,
     settings: Option<Arc<dyn atomcode_tui::settings::Settings>>,
     plugins: Option<Arc<dyn atomcode_tui::plugins::Plugins>>,
+    tools: Option<Arc<dyn atomcode_tui::tools::Tools>>,
 ) -> Session {
     let agent_layers = setup.agent.clone();
     let registry: Registry = Arc::new(agent_catalog);
@@ -415,13 +416,20 @@ async fn start_full(
     // (`atomcode::tui_plugins`), so a test that wants the panel on screen brings
     // one of its own — the same bargain the settings and providers panels
     // strike, and the reason a screen with no launcher opens without them.
-    let panel_row: Vec<Arc<dyn Plugin>> = match plugins.is_some() {
+    let mut panel_row: Vec<Arc<dyn Plugin>> = match plugins.is_some() {
         true => {
             extra.push(PLUGINS_PANEL_LAYER);
             vec![Arc::new(PluginsPanelRow)]
         }
         false => Vec::new(),
     };
+    // Same bargain for the tools panel, except that its row carries the port
+    // too — in the shipped product `atomcode::tui_tools` provides
+    // `ToolCatalogSvc` from the same row that mounts the view.
+    if let Some(tools) = tools {
+        extra.push(TOOLS_PANEL_LAYER);
+        panel_row.push(Arc::new(ToolsPanelRow(tools)));
+    }
     let mounted = launch::mount_with(
         &screen,
         &extra,
@@ -1290,6 +1298,18 @@ async fn until(s: &Session, text: &str) {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     panic!("`{text}` never appeared:\n{}", s.screen());
+}
+
+/// Wait for something to *stop* being on screen — the shape a filter needs,
+/// where what is asserted is what is no longer listed.
+async fn until_gone(s: &Session, text: &str) {
+    for _ in 0..400 {
+        if !s.screen().contains(text) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("`{text}` never went away:\n{}", s.screen());
 }
 
 #[tokio::test]
@@ -4719,6 +4739,44 @@ async fn a_resumed_session_remembers_what_was_typed_into_it() {
     task.abort();
 }
 
+/// The layer that puts the test's tools panel on screen.
+const TOOLS_PANEL_LAYER: &str = "[[insert]]\nname = \"tui-panel-tools\"\n";
+
+/// The tools panel's view and its port, mounted the way the launcher's row
+/// mounts them.
+struct ToolsPanelRow(Arc<dyn atomcode_tui::tools::Tools>);
+
+#[async_trait]
+impl Plugin for ToolsPanelRow {
+    fn name(&self) -> &'static str {
+        "tui-panel-tools"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["tui-modules"]
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["tui-tools"]
+    }
+    async fn apply(&self, ctx: &Context, _config: &serde_json::Value) -> Result<(), String> {
+        let mods = ctx
+            .require::<atomcode_tui::plugin::ModulesSvc>()
+            .map_err(|e| e.to_string())?;
+        mods.add_view(Arc::new(atomcode_tui::module::Mounted::<
+            atomcode_tui::modules::tools::Tools,
+        >::new()))?;
+        let _ = ctx
+            .provide::<atomcode_tui::plugin::ToolCatalogSvc>(self.0.clone())
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+/// Start the screen with a tools port behind it — the only way to see the
+/// panel: a screen with no port refuses to open it.
+async fn start_with_tools(setup: Setup, tools: Arc<dyn atomcode_tui::tools::Tools>) -> Session {
+    start_full(setup, |control| control, None, None, Some(tools)).await
+}
+
 // ---- the plugins panel ---------------------------------------------------
 
 /// A plugins port that answers from memory and records what it was asked to do.
@@ -4967,5 +5025,282 @@ async fn a_screen_with_no_plugins_port_says_so() {
 
     s.term.type_line("/plugin list");
     until(&s, "没有接插件").await;
+    task.abort();
+}
+
+// ---- the tools panel ------------------------------------------------------
+
+/// A tools port that answers from memory and records what it was asked to do.
+///
+/// A recording rather than a live catalog, because what these judge is the
+/// screen: that `/tools` opens the panel, that ⏎ on a row leads to the switch
+/// it promises, and that what comes back is what gets drawn. Whether the switch
+/// reaches the model's schema is judged where that happens
+/// (`atomcode-harness/tests/tool_policy.rs`).
+struct FakeTools {
+    tools: std::sync::Mutex<Vec<atomcode_tui::tools::ToolRow>>,
+    did: Arc<std::sync::Mutex<Vec<String>>>,
+    /// Held shut while a test wants to see the panel mid-flight.
+    gate: Option<Arc<tokio::sync::Notify>>,
+}
+
+impl FakeTools {
+    fn new(tools: Vec<atomcode_tui::tools::ToolRow>) -> Arc<Self> {
+        Arc::new(Self {
+            tools: std::sync::Mutex::new(tools),
+            did: Arc::new(std::sync::Mutex::new(Vec::new())),
+            gate: None,
+        })
+    }
+
+    fn gated(
+        tools: Vec<atomcode_tui::tools::ToolRow>,
+        gate: Arc<tokio::sync::Notify>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            tools: std::sync::Mutex::new(tools),
+            did: Arc::new(std::sync::Mutex::new(Vec::new())),
+            gate: Some(gate),
+        })
+    }
+
+    fn view(&self) -> atomcode_tui::tools::ToolsView {
+        atomcode_tui::tools::ToolsView::new(self.tools.lock().expect("tools poisoned").clone())
+    }
+}
+
+fn tool(
+    name: &str,
+    owner: &str,
+    state: atomcode_tui::tools::State,
+) -> atomcode_tui::tools::ToolRow {
+    atomcode_tui::tools::ToolRow {
+        name: name.into(),
+        owner: owner.into(),
+        state,
+    }
+}
+
+#[async_trait]
+impl atomcode_tui::tools::Tools for FakeTools {
+    async fn list(&self) -> Result<atomcode_tui::tools::ToolsView, String> {
+        Ok(self.view())
+    }
+
+    async fn switch(
+        &self,
+        pattern: &str,
+        on: bool,
+    ) -> Result<atomcode_tui::tools::ToolsView, String> {
+        if let Some(gate) = self.gate.as_ref() {
+            gate.notified().await;
+        }
+        self.did
+            .lock()
+            .expect("recording poisoned")
+            .push(format!("{} {pattern}", if on { "on" } else { "off" }));
+        use atomcode_tui::tools::State;
+        let mut tools = self.tools.lock().expect("tools poisoned");
+        for row in tools.iter_mut() {
+            // The port is where the config's answer is final: a switch never
+            // reaches what the tree was built without.
+            if row.name == pattern && row.state != State::Excluded {
+                row.state = if on { State::On } else { State::Off };
+            }
+        }
+        drop(tools);
+        Ok(self.view())
+    }
+}
+
+/// `/tools` pulls the panel up with what the host answered on it.
+#[tokio::test]
+async fn the_tools_panel_lists_what_the_model_can_call() {
+    let dir = scratch("tools-panel");
+    use atomcode_tui::tools::State;
+    let port = FakeTools::new(vec![
+        tool("read_file", "tool-fs-world", State::On),
+        tool("write_file", "tool-fs-world", State::Off),
+        tool("mcp__github__create_issue", "mcp-host", State::On),
+    ]);
+    let s = start_with_tools(tree(&dir, &replay(r#"{ text = "ok" }"#), &[]), port.clone()).await;
+    let task = s.open().await;
+    s.quiet().await;
+
+    s.term.type_line("/toolbox");
+    until(&s, "read_file").await;
+    let open = s.screen();
+    assert!(
+        open.contains("write_file") && open.contains("mcp__github__create_issue"),
+        "every name is on screen, whatever state it is in:\n{open}"
+    );
+    assert!(
+        open.contains("2 个能调") && open.contains("1 个关掉的"),
+        "the header counts what is on and what the person turned off:\n{open}"
+    );
+    assert!(
+        open.contains("本次会话关掉的"),
+        "and the off one says why it is off:\n{open}"
+    );
+    task.abort();
+}
+
+/// ⏎ on a row throws that tool's switch, and the panel draws the answer.
+#[tokio::test]
+async fn enter_on_a_row_turns_that_tool_off_and_the_panel_shows_it() {
+    let dir = scratch("tools-switch");
+    use atomcode_tui::tools::State;
+    let port = FakeTools::new(vec![
+        tool("read_file", "tool-fs-world", State::On),
+        tool("write_file", "tool-fs-world", State::On),
+    ]);
+    let s = start_with_tools(tree(&dir, &replay(r#"{ text = "ok" }"#), &[]), port.clone()).await;
+    let task = s.open().await;
+    s.quiet().await;
+
+    s.term.type_line("/toolbox");
+    until(&s, "2 个能调").await;
+    // The cursor opens on the first row, which is `read_file` — sorted by name.
+    s.term.press(KeyPress::plain(Key::Down));
+    s.term.press(KeyPress::plain(Key::Enter));
+    until(&s, "1 个关掉的").await;
+
+    assert_eq!(
+        port.did.lock().expect("recording poisoned").as_slice(),
+        ["off write_file"],
+        "one switch, for the row the cursor was on"
+    );
+    let after = s.screen();
+    assert!(
+        after.contains("本次会话关掉的"),
+        "and the row now says it is off:\n{after}"
+    );
+    task.abort();
+}
+
+/// A tool the config excluded has no switch to throw, and the panel says so
+/// instead of sending a command that would do nothing.
+#[tokio::test]
+async fn a_tool_the_config_excluded_is_not_switchable_from_the_panel() {
+    let dir = scratch("tools-excluded");
+    use atomcode_tui::tools::State;
+    let port = FakeTools::new(vec![tool("write_file", "tool-fs-world", State::Excluded)]);
+    let s = start_with_tools(tree(&dir, &replay(r#"{ text = "ok" }"#), &[]), port.clone()).await;
+    let task = s.open().await;
+    s.quiet().await;
+
+    s.term.type_line("/toolbox");
+    until(&s, "write_file").await;
+    s.term.press(KeyPress::plain(Key::Enter));
+    until(&s, "改配置才能放回来").await;
+
+    assert!(
+        port.did.lock().expect("recording poisoned").is_empty(),
+        "and nothing was sent: there is no switch for it"
+    );
+    task.abort();
+}
+
+/// Typing filters, so forty MCP tools are a list you can get through.
+#[tokio::test]
+async fn typing_in_the_tools_panel_narrows_it() {
+    let dir = scratch("tools-filter");
+    use atomcode_tui::tools::State;
+    let port = FakeTools::new(vec![
+        tool("read_file", "tool-fs-world", State::On),
+        tool("mcp__github__create_issue", "mcp-host", State::On),
+        tool("mcp__jira__create_issue", "mcp-host", State::On),
+    ]);
+    let s = start_with_tools(tree(&dir, &replay(r#"{ text = "ok" }"#), &[]), port.clone()).await;
+    let task = s.open().await;
+    s.quiet().await;
+
+    s.term.type_line("/toolbox");
+    until(&s, "read_file").await;
+    for c in "github".chars() {
+        s.term.press(KeyPress::plain(Key::Char(c)));
+    }
+    // Waited on the *disappearance*: every name was already on screen, so a
+    // wait for one of them would pass before the first key was even read.
+    until_gone(&s, "read_file").await;
+    let narrowed = s.screen();
+    assert!(
+        !narrowed.contains("mcp__jira__create_issue") && !narrowed.contains("read_file"),
+        "only what matches is listed:\n{narrowed}"
+    );
+    task.abort();
+}
+
+/// While a switch is out there, the panel says so and takes no key but Esc —
+/// otherwise every press sends another switch on top of the first.
+#[tokio::test]
+async fn the_tools_panel_takes_no_key_but_esc_while_a_switch_is_in_flight() {
+    let dir = scratch("tools-busy");
+    use atomcode_tui::tools::State;
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let port = FakeTools::gated(
+        vec![
+            tool("read_file", "tool-fs-world", State::On),
+            tool("write_file", "tool-fs-world", State::On),
+        ],
+        gate.clone(),
+    );
+    let s = start_with_tools(tree(&dir, &replay(r#"{ text = "ok" }"#), &[]), port.clone()).await;
+    let task = s.open().await;
+    s.quiet().await;
+
+    s.term.type_line("/toolbox");
+    until(&s, "2 个能调").await;
+    s.term.press(KeyPress::plain(Key::Enter));
+    until(&s, "正在关掉 read_file").await;
+
+    s.term.press(KeyPress::plain(Key::Enter));
+    s.term.press(KeyPress::plain(Key::Down));
+    s.quiet().await;
+    assert!(
+        port.did.lock().expect("recording poisoned").is_empty(),
+        "nothing else went out: the first switch has not landed yet"
+    );
+
+    gate.notify_waiters();
+    until(&s, "1 个关掉的").await;
+    assert_eq!(
+        port.did.lock().expect("recording poisoned").as_slice(),
+        ["off read_file"],
+        "and exactly one switch was sent"
+    );
+    task.abort();
+}
+
+/// The typed form, for a pattern that would be a lot of ⏎ in a list.
+#[tokio::test]
+async fn tools_off_typed_out_says_what_moved() {
+    let dir = scratch("tools-typed");
+    use atomcode_tui::tools::State;
+    let port = FakeTools::new(vec![tool("write_file", "tool-fs-world", State::On)]);
+    let s = start_with_tools(tree(&dir, &replay(r#"{ text = "ok" }"#), &[]), port.clone()).await;
+    let task = s.open().await;
+    s.quiet().await;
+
+    s.term.type_line("/toolbox off write_file");
+    until(&s, "关掉了:write_file").await;
+    assert_eq!(
+        port.did.lock().expect("recording poisoned").as_slice(),
+        ["off write_file"],
+    );
+    task.abort();
+}
+
+/// A screen whose launcher gave it no port says so, rather than opening a panel
+/// with nothing in it.
+#[tokio::test]
+async fn a_screen_with_no_tools_port_says_so() {
+    let dir = scratch("tools-absent");
+    let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    let task = s.open().await;
+    s.quiet().await;
+
+    s.term.type_line("/toolbox");
+    until(&s, "tui-panel-tools").await;
     task.abort();
 }

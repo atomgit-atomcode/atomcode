@@ -377,6 +377,11 @@ pub struct CodingParts {
     /// over (`adopt_tool_switches`); a new session starts clean, because a new
     /// session is where the config speaks again.
     pub(crate) tool_switches: Arc<atomcode_harness::seams::ToolSwitches>,
+    /// The mounted catalog the `tools-host` row built, so the runtime can
+    /// answer "what can the model call right now" without reaching into the
+    /// App. Filled by the row, cleared when it unloads — the same shape
+    /// `mcp_toolbox` uses, and for the same reason.
+    tool_catalog: Arc<std::sync::RwLock<Option<Arc<atomcode_harness::seams::ToolBox>>>>,
     /// What the `capability-commands` row asks the runtime to do — goal, loop,
     /// the local-context queue, the policy intervention (`docs/adr/0021` §3).
     /// Filled by the runtime before it mounts, and kept across a rebuild:
@@ -888,6 +893,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     Ok(CodingParts {
         runtime_commands: None,
         tool_switches: atomcode_harness::seams::ToolSwitches::new(),
+        tool_catalog: Arc::new(std::sync::RwLock::new(None)),
         shared_cwd: std::sync::Arc::new(std::sync::RwLock::new(cfg.working_dir.clone())),
         plan_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         bypass_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1166,6 +1172,21 @@ impl CodingParts {
     /// The switches this session's catalog answers to.
     pub(crate) fn tool_switches(&self) -> Arc<atomcode_harness::seams::ToolSwitches> {
         self.tool_switches.clone()
+    }
+
+    /// Where the `tools-host` row publishes the catalog it built.
+    pub(crate) fn tool_catalog_slot(
+        &self,
+    ) -> Arc<std::sync::RwLock<Option<Arc<atomcode_harness::seams::ToolBox>>>> {
+        Arc::clone(&self.tool_catalog)
+    }
+
+    /// The live catalog, once a tree carrying `tools-host` has mounted.
+    pub(crate) fn tool_catalog(&self) -> Option<Arc<atomcode_harness::seams::ToolBox>> {
+        self.tool_catalog
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Take over the switches a previous parts held, so a reprepare does not

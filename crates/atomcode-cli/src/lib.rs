@@ -19,6 +19,7 @@ pub mod tui_onboarding;
 pub mod tui_plugins;
 pub mod tui_providers;
 pub mod tui_settings;
+pub mod tui_tools;
 pub mod tui_welcome_words;
 pub mod uninstall;
 
@@ -86,6 +87,7 @@ pub mod tui_front {
             crate::tui_settings::row_layer(),
             crate::tui_providers::row_layer(),
             crate::tui_plugins::row_layer(),
+            crate::tui_tools::row_layer(),
             crate::tui_onboarding::row_layer(),
             crate::tui_login::row_layer(),
             crate::tui_welcome_words::row_layer(),
@@ -93,7 +95,7 @@ pub mod tui_front {
         launch::mount_with(
             screen,
             &[
-                &layers[0], &layers[1], &layers[2], &layers[3], &layers[4], &layers[5],
+                &layers[0], &layers[1], &layers[2], &layers[3], &layers[4], &layers[5], &layers[6],
             ],
             &[
                 Arc::new(crate::tui_settings::SettingsRow),
@@ -101,6 +103,7 @@ pub mod tui_front {
                 Arc::new(crate::tui_plugins::PluginsRow {
                     config_path: config_path.clone(),
                 }),
+                Arc::new(crate::tui_tools::ToolsRow),
                 Arc::new(crate::tui_onboarding::OnboardingRow {
                     config_path: config_path.clone(),
                     telemetry: telemetry.clone(),

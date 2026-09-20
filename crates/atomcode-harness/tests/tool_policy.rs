@@ -451,7 +451,7 @@ async fn a_switch_cannot_put_back_what_the_config_excluded() {
     assert!(!names(&app).contains(&"write_file".to_string()));
 }
 
-/// The person's entry: `/tools`, `/tools off …`, `/tools on …`. Registered by
+/// The person's entry: `/toolbox`, `/toolbox off …`, `/toolbox on …`. Registered by
 /// the row that owns the catalog, and deliberately not a tool — an agent that
 /// can put its own tools back has not been restricted.
 #[tokio::test]
@@ -470,8 +470,8 @@ async fn a_person_works_the_switch_through_the_command() {
         let agent = agent.clone();
         async move {
             catalog
-                .find("tools", &agent)
-                .expect("`/tools` is on offer")
+                .find("toolbox", &agent)
+                .expect("`/toolbox` is on offer")
                 .run(agent.clone(), args)
                 .await
         }
@@ -504,7 +504,7 @@ async fn a_person_works_the_switch_through_the_command() {
             .unwrap()
             .names()
             .iter()
-            .any(|n| n == "tools"),
+            .any(|n| n == "toolbox"),
         "the switch is a command, not a tool the model can call"
     );
 }
@@ -530,7 +530,7 @@ async fn the_tree_says_what_the_person_turned_off() {
     ctx.service::<ToolsSvc>().unwrap().turn_off("write_file");
     let now = said(&ctx);
     assert!(
-        now.contains("write_file") && now.contains("/tools on"),
+        now.contains("write_file") && now.contains("/toolbox on"),
         "it must name the tool and how to put it back:\n{now}"
     );
 }

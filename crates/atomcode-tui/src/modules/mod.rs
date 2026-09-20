@@ -13,5 +13,6 @@ pub mod steering;
 pub mod team;
 pub mod tip;
 pub mod todo;
+pub mod tools;
 pub mod transcript;
 pub mod welcome;

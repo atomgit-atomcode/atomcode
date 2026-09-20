@@ -2702,6 +2702,83 @@ mod tests {
 /// a [`Scope`], the four `marketplace` verbs. That is screen work — the same
 /// kind `/model <id>` does — and it needs no more than the rows the port already
 /// hands over.
+/// `/toolbox` — the panel, and the same two switches from the command line.
+///
+/// Not `/tools`: that one is already how tool *output* is shown.
+///
+/// The panel is for looking: forty MCP tools is a list, not a name you
+/// remember. The typed form is for when you already know the name, and for a
+/// pattern (`/tools off mcp__github__*`) that would be a lot of ⏎ in a list.
+pub struct ToolCommands;
+
+const TOOLS: &[Command] = &[Command::taking(
+    "toolbox",
+    "[off <名字或 mcp__server__*> | on <同上>]",
+    "工具箱:不带参数拉出面板(看有哪些、开关它);带参数直接关掉或放回",
+)];
+
+#[async_trait]
+impl CommandSet for ToolCommands {
+    fn id(&self) -> &'static str {
+        "cmd-tools"
+    }
+    fn commands(&self) -> Vec<Command> {
+        TOOLS.to_vec()
+    }
+    async fn run(&self, _name: &str, args: &str, ctx: &Context) -> Outcome {
+        let args = args.trim();
+        if args.is_empty() {
+            return Outcome::Do(Action::ToggleTools);
+        }
+        let Some(port) = ctx.service::<crate::plugin::ToolCatalogSvc>() else {
+            return Outcome::Refused("这个屏幕没有接工具目录:启动器没有提供 `tui-tools`".into());
+        };
+        let (verb, pattern) = match args.split_once(char::is_whitespace) {
+            Some((verb, rest)) => (verb, rest.trim()),
+            None => (args, ""),
+        };
+        let on = match verb {
+            "on" => true,
+            "off" => false,
+            other => {
+                return Outcome::Refused(format!("不认识 `{other}`,只有 `off` 和 `on`"));
+            }
+        };
+        if pattern.is_empty() {
+            return Outcome::Refused(format!("`{verb}` 要一个名字或模式,例如 `mcp__github__*`"));
+        }
+        // What changed is read off the catalog the port answers with, not
+        // guessed from what was asked: a name the config excluded does not move,
+        // and saying it did would be the one lie this command could tell.
+        let before = port.list().await.unwrap_or_default();
+        match port.switch(pattern, on).await {
+            Ok(after) => {
+                let moved: Vec<String> = after
+                    .tools()
+                    .iter()
+                    .filter(|t| {
+                        before
+                            .tools()
+                            .iter()
+                            .any(|b| b.name == t.name && b.state != t.state)
+                    })
+                    .map(|t| t.name.clone())
+                    .collect();
+                if moved.is_empty() {
+                    return Outcome::Said(format!(
+                        "没有工具因此改变 —— `{pattern}` 要么没匹配上,要么是配置排除掉的"
+                    ));
+                }
+                Outcome::Said(match on {
+                    true => format!("放回来了:{}", moved.join("、")),
+                    false => format!("关掉了:{}", moved.join("、")),
+                })
+            }
+            Err(why) => Outcome::Refused(why),
+        }
+    }
+}
+
 pub struct PluginCommands;
 
 const PLUGIN: &[Command] = &[Command::taking(

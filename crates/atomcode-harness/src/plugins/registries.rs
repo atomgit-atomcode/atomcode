@@ -118,7 +118,7 @@ pub fn mount_catalog(
             if !held.is_empty() {
                 said.push_str(&format!(
                     " Turned off by the person for this session, who can put them back with \
-                     `/tools on`: {}.",
+                     `/toolbox on`: {}.",
                     held.join(", ")
                 ));
             }
@@ -191,8 +191,12 @@ impl Plugin for OperationsPlugin {
     }
 }
 
-/// `/tools` — what the model can call right now, and the person's switch over
+/// `/toolbox` — what the model can call right now, and the person's switch over
 /// it.
+///
+/// Not `/tools`: a front end may already use that for how tool output is
+/// *shown* (the shipped screen does), and two commands one letter apart in
+/// meaning is worse than a name that says "the box the tools are in".
 ///
 /// Registered by the row that owns the catalog, which is the only place that
 /// knows what is in it. Deliberately **not** a tool: an agent that can put its
@@ -204,7 +208,7 @@ struct ToolsCommand(Arc<ToolBox>);
 impl crate::commands::CatalogCommand for ToolsCommand {
     fn describe(&self) -> atomcode_kernel::agent::CommandDescription {
         atomcode_kernel::agent::CommandDescription {
-            name: "tools".into(),
+            name: "toolbox".into(),
             usage: Some("[off|on <名字或 mcp__server__*>]".into()),
             summary: "模型现在能调哪些工具,以及临时关掉/放回其中一些".into(),
             target: atomcode_kernel::agent::CommandTarget::Session,
@@ -259,7 +263,7 @@ impl ToolsCommand {
         let held = self.0.held_back();
         if !held.is_empty() {
             out.push_str(&format!(
-                "本次会话关掉的({}):{} —— `/tools on <名字>` 放回来\n",
+                "本次会话关掉的({}):{} —— `/toolbox on <名字>` 放回来\n",
                 held.len(),
                 held.join("、")
             ));

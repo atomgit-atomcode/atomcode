@@ -867,6 +867,8 @@ pub struct Hits {
     providers: Option<Rect>,
     /// And the plugins panel's, for the same reason.
     plugins: Option<Rect>,
+    /// And the tools panel's.
+    tools: Option<Rect>,
     /// Where the slash menu was drawn, so a press or the pointer on a row finds
     /// the command it is on.
     ///
@@ -2405,6 +2407,176 @@ impl Host {
         }
     }
 
+    // ---- the tools panel ---------------------------------------------------
+    //
+    // The fourth panel, and deliberately the same dozen methods: one way of
+    // opening, one way of routing a key, one way of finding the row a click
+    // landed on. A fourth panel that invented its own would be a fourth place
+    // to fix the next thing any of them gets wrong.
+
+    /// Whether the tools panel is up.
+    pub fn tools_open(&self) -> bool {
+        self.moment
+            .read()
+            .expect("moment poisoned")
+            .tools_panel
+            .is_some()
+    }
+
+    /// Pull the tools panel up, or put it away. True when it changed.
+    pub fn toggle_tools(&self) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        match m.tools_panel.take() {
+            Some(_) => true,
+            None => {
+                if !self.modules.has_view(crate::modules::tools::ID) {
+                    return false;
+                }
+                m.settings_panel = None;
+                m.plugins_panel = None;
+                if m.providers_panel.take().is_some() {
+                    self.providers_secret
+                        .lock()
+                        .expect("provider secret poisoned")
+                        .clear();
+                }
+                m.tools_panel = Some(crate::tools::Panel::new());
+                true
+            }
+        }
+    }
+
+    /// Put the tools panel away. True when it was up.
+    pub fn close_tools(&self) -> bool {
+        self.moment
+            .write()
+            .expect("moment poisoned")
+            .tools_panel
+            .take()
+            .is_some()
+    }
+
+    /// Put what the host answered into the moment. True when it changed.
+    pub fn show_tools(&self, view: crate::tools::ToolsView) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        if m.tools == view {
+            return false;
+        }
+        m.tools = view;
+        true
+    }
+
+    /// Say that a switch is on its way there and back, or that it landed.
+    pub fn tools_busy(&self, busy: Option<crate::tools::Busy>) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let Some(panel) = m.tools_panel.as_mut() else {
+            return false;
+        };
+        if panel.busy == busy {
+            return false;
+        }
+        panel.busy = busy;
+        true
+    }
+
+    /// Say what the last key came to, when it came to something worth reading.
+    pub fn tools_note(&self, note: Option<String>) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let Some(panel) = m.tools_panel.as_mut() else {
+            return false;
+        };
+        if panel.note == note {
+            return false;
+        }
+        panel.note = note;
+        true
+    }
+
+    /// Run one key against the tools panel: the panel it writes back, and the
+    /// work to send over the seam when the key asked for some.
+    pub fn tools_key(&self, press: crate::surface::KeyPress) -> (bool, Option<crate::tools::Step>) {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let view = m.tools.clone();
+        let Some(panel) = m.tools_panel.as_mut() else {
+            return (false, None);
+        };
+        let before = panel.clone();
+        let step = crate::tools::key(&view, panel, press);
+        let changed = *panel != before;
+        match step {
+            crate::tools::Step::Stay => (changed, None),
+            crate::tools::Step::Close => {
+                m.tools_panel = None;
+                (true, None)
+            }
+            step => (true, Some(step)),
+        }
+    }
+
+    /// The wheel over the tools panel walks its list.
+    pub fn tools_wheel(&self, x: u16, y: u16, by: i32) -> bool {
+        let over = self
+            .hits
+            .lock()
+            .expect("hits poisoned")
+            .tools
+            .is_some_and(|rect| rect.contains(x, y));
+        if !over {
+            return false;
+        }
+        let mut m = self.moment.write().expect("moment poisoned");
+        let rows = match m.tools_panel.as_ref() {
+            // A switch in flight has no list to walk, and the wheel is still the
+            // panel's — it must not scroll the conversation behind it.
+            Some(panel) if panel.busy.is_some() => return true,
+            Some(panel) => m.tools.listed(panel).len(),
+            None => return false,
+        };
+        let Some(panel) = m.tools_panel.as_mut() else {
+            return false;
+        };
+        let want = match by < 0 {
+            true => panel.cursor.saturating_sub(by.unsigned_abs() as usize),
+            false => panel.cursor.saturating_add(by as usize),
+        };
+        panel.point_at(want, rows);
+        true
+    }
+
+    /// Put a paste into the tools panel's search box: a tool name is exactly
+    /// the thing that arrives by paste, and the composer is not on screen.
+    pub fn tools_paste(&self, text: &str) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let Some(panel) = m.tools_panel.as_mut() else {
+            return false;
+        };
+        crate::tools::paste(panel, text)
+    }
+
+    /// Which listed row is under the pointer.
+    pub fn tools_row_at(&self, x: u16, y: u16) -> Option<usize> {
+        let rect = *self.hits.lock().expect("hits poisoned").tools.as_ref()?;
+        if !rect.contains(x, y) {
+            return None;
+        }
+        let m = self.moment.read().expect("moment poisoned");
+        let vp = crate::moment::Viewport::new(rect, &m);
+        crate::modules::tools::geometry(&m, &vp).row_at((y - rect.y) as usize)
+    }
+
+    /// Point the panel at a listed row. True when it moved.
+    pub fn point_tools_at(&self, row: usize) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let rows = match m.tools_panel.as_ref() {
+            Some(panel) => m.tools.listed(panel).len(),
+            None => return false,
+        };
+        match m.tools_panel.as_mut() {
+            Some(panel) => panel.point_at(row, rows),
+            None => false,
+        }
+    }
+
     /// Run `change`, keeping the reader's place across whatever it did.
     ///
     /// **Measure, change, measure again** — one shape, because the arithmetic is
@@ -3179,6 +3351,7 @@ impl Host {
                         settings: None,
                         providers: None,
                         plugins: None,
+                        tools: None,
                         menu: None,
                     };
                     *self.last_room.lock().expect("room poisoned") = rect;
@@ -3231,6 +3404,10 @@ impl Host {
                         // And the plugins panel, which rides the same tail.
                         if id == crate::modules::plugins::ID {
                             self.hits.lock().expect("hits poisoned").plugins = Some(*tail_rect);
+                        }
+                        // And the tools panel.
+                        if id == crate::modules::tools::ID {
+                            self.hits.lock().expect("hits poisoned").tools = Some(*tail_rect);
                         }
                         frame.place(id.clone(), *tail_rect, lines);
                     }
@@ -3843,6 +4020,7 @@ pub const TAIL: &[&str] = &[
     crate::modules::settings::ID,
     crate::modules::providers::ID,
     crate::modules::plugins::ID,
+    crate::modules::tools::ID,
     crate::modules::ask::ID,
     crate::modules::steering::ID,
 ];

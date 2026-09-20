@@ -587,7 +587,13 @@ impl Plugin for GrantsHostPlugin {
 /// and the tree is rebuilt for a good many reasons that have nothing to do with
 /// the catalog (`docs/adr/0022` §2). The runtime holds the switches, so the
 /// rebuilt catalog starts where the old one left off.
-pub(crate) struct ToolsHostPlugin(pub(crate) Arc<atomcode_harness::seams::ToolSwitches>);
+pub(crate) struct ToolsHostPlugin {
+    pub(crate) switches: Arc<atomcode_harness::seams::ToolSwitches>,
+    /// Where to publish the catalog once built, for a runtime that has to
+    /// answer a front end about it. `None` for a host that only wants the
+    /// switches to survive.
+    pub(crate) slot: Option<Arc<RwLock<Option<Arc<atomcode_harness::seams::ToolBox>>>>>,
+}
 
 #[async_trait]
 impl Plugin for ToolsHostPlugin {
@@ -604,7 +610,23 @@ impl Plugin for ToolsHostPlugin {
         "the live tool catalog, over the runtime's own on/off switches"
     }
     async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
-        atomcode_harness::plugins::registries::mount_catalog(ctx, config, Some(self.0.clone()))
+        atomcode_harness::plugins::registries::mount_catalog(
+            ctx,
+            config,
+            Some(self.switches.clone()),
+        )?;
+        if let Some(slot) = self.slot.clone() {
+            let catalog = ctx
+                .require::<atomcode_harness::seams::ToolsSvc>()
+                .map_err(|e| e.to_string())?;
+            *slot.write().unwrap_or_else(|e| e.into_inner()) = Some(catalog);
+            // Out with the row: a runtime holding a catalog whose rows have
+            // unloaded would answer about tools nobody can call.
+            let _ = ctx.effect(move || {
+                *slot.write().unwrap_or_else(|e| e.into_inner()) = None;
+            });
+        }
+        Ok(())
     }
 }
 

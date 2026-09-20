@@ -375,6 +375,9 @@ pub enum Glyph {
     Pending,
     Interrupted,
     Bullet,
+    /// Present, but not in force: a tool a person turned off, drawn beside the
+    /// filled [`Glyph::Bullet`] of one that is on.
+    Hollow,
     Pointer,
     /// The prompt marker.
     ///
@@ -468,6 +471,7 @@ pub fn glyph(unicode: bool, glyph: Glyph) -> &'static str {
             Pending => "⋯",
             Interrupted => "—",
             Bullet => "•",
+            Hollow => "○",
             Pointer => "▸",
             Prompt => "❯",
             Separator => "·",
@@ -487,6 +491,7 @@ pub fn glyph(unicode: bool, glyph: Glyph) -> &'static str {
             Pending => ".",
             Interrupted => "-",
             Bullet => "*",
+            Hollow => "o",
             Pointer => ">",
             Prompt => ">",
             Separator => ".",
@@ -581,6 +586,7 @@ mod tests {
             Glyph::Pending,
             Glyph::Interrupted,
             Glyph::Bullet,
+            Glyph::Hollow,
             Glyph::Pointer,
             Glyph::Prompt,
             Glyph::Separator,
@@ -657,6 +663,7 @@ mod tests {
             Glyph::Ok,
             Glyph::Fail,
             Glyph::Bullet,
+            Glyph::Hollow,
             Glyph::Pointer,
             Glyph::Prompt,
             Glyph::Thumb,

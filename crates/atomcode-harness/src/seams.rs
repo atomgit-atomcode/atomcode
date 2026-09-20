@@ -150,6 +150,27 @@ fn glob_matches(pattern: &str, name: &str) -> bool {
     }
 }
 
+/// One name in the catalog, as a screen needs it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolListing {
+    pub name: String,
+    /// The row that offered it, empty when whoever registered it did not say.
+    pub owner: String,
+    pub state: ToolState,
+}
+
+/// Why a tool is or is not on offer to the model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolState {
+    /// The model can call it.
+    On,
+    /// A person turned it off in this session, and can put it back.
+    OffInSession,
+    /// The tree was configured without it. Only editing the config changes
+    /// this — a command must not, or the config's answer is a suggestion.
+    ExcludedByConfig,
+}
+
 /// The live tool catalog.
 ///
 /// Deliberately mutable at runtime rather than a snapshot taken at assembly: a
@@ -164,7 +185,7 @@ pub struct ToolBox {
     /// say what it dropped rather than the model wondering where a tool went.
     /// Config's answer is final for the life of this tree: a row offered it,
     /// this tree does not have it.
-    turned_away: RwLock<BTreeSet<String>>,
+    turned_away: RwLock<BTreeSet<(String, String)>>,
     /// The person's own switches, and the tools they are currently holding
     /// back. Shared with whoever outlives this catalog, so a switch survives
     /// the tree being rebuilt (`ToolSwitches`).
@@ -302,15 +323,10 @@ impl ToolBox {
     pub fn register_from(&self, owner: &str, tool: Arc<dyn Tool>) -> Result<(), String> {
         let name = tool.name().to_string();
         if !self.policy.admits(owner, &name) {
-            let noted = if owner.is_empty() {
-                name
-            } else {
-                format!("{owner}:{name}")
-            };
             self.turned_away
                 .write()
                 .expect("toolbox poisoned")
-                .insert(noted);
+                .insert((owner.to_string(), name));
             return Ok(());
         }
         let mut tools = self.tools.write().expect("toolbox poisoned");
@@ -384,8 +400,48 @@ impl ToolBox {
             .read()
             .expect("toolbox poisoned")
             .iter()
-            .cloned()
+            .map(|(owner, name)| {
+                if owner.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{owner}:{name}")
+                }
+            })
             .collect()
+    }
+
+    /// Every name this catalog knows about and what is true of it, for a screen
+    /// that offers the switch: what the model can call, what a person turned
+    /// off, and what the config kept out (which no command can undo).
+    pub fn listing(&self) -> Vec<ToolListing> {
+        let mut out: Vec<ToolListing> = self
+            .tools
+            .read()
+            .expect("toolbox poisoned")
+            .iter()
+            .map(|(name, m)| ToolListing {
+                name: name.clone(),
+                owner: m.owner.clone(),
+                state: if m.held {
+                    ToolState::OffInSession
+                } else {
+                    ToolState::On
+                },
+            })
+            .collect();
+        out.extend(
+            self.turned_away
+                .read()
+                .expect("toolbox poisoned")
+                .iter()
+                .map(|(owner, name)| ToolListing {
+                    name: name.clone(),
+                    owner: owner.clone(),
+                    state: ToolState::ExcludedByConfig,
+                }),
+        );
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
     }
 
     /// What a switch is holding back right now, by name.

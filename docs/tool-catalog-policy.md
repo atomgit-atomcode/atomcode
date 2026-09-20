@@ -91,14 +91,19 @@ include = ["mcp__jira__*", "read_file", "grep"] # 白名单：只留这些
 上面那套是**配置**，答案在写树的时候定死。会话进行中还要能临时关掉、再放回来——
 尤其是 MCP：一台 server 几十个工具，人想临时只留两个。
 
-入口是一条命令（不是工具，见下）：
+入口有两个:**面板**(`/toolbox`,从底下升起来,和 `/config`、`/provider`、`/plugin`
+一副骨架)和**同一条命令的带参数形式**。都不是工具,见下。
 
 ```
-/tools                          列出能调的、本次会话关掉的、配置排除的
-/tools off write_file           关掉一个
-/tools off mcp__github__*       关掉一整台 server 的工具
-/tools on  mcp__github__create_issue    放回其中一个
+/toolbox                                列出能调的、本次会话关掉的、配置排除的
+                                        (在 TUI 里是面板:↑↓ 选、⏎ 开关、打字筛)
+/toolbox off write_file                 关掉一个
+/toolbox off mcp__github__*             关掉一整台 server 的工具
+/toolbox on  mcp__github__create_issue  放回其中一个
 ```
+
+**名字不是 `/tools`**:那个在新前端里已经是「工具输出怎么显示」(全部/单个摘要/
+成组摘要)。两条一字之差、意思差得远的命令,比一个说得清的名字糟。
 
 代码里是同一套东西：`ToolsSvc` 的 `turn_off(pattern)` / `turn_on(pattern)` /
 `held_back()`，返回实际动了哪些名字。
@@ -111,7 +116,7 @@ include = ["mcp__jira__*", "read_file", "grep"] # 白名单：只留这些
   所以同一回合的下一轮就看不到它了，不用等到下一回合。
 - **后到的工具也挡得住**。`off` 记的是模式本身：MCP server 连上是异步的，人先关、
   server 后连，工具一样进不来（判据 `a_tool_that_arrives_after_the_switch_is_born_hidden`）。
-- **配置的答案不是建议**。`exclude` 掉的工具压根没进过目录，`/tools on` 放不回来——
+- **配置的答案不是建议**。`exclude` 掉的工具压根没进过目录，`/toolbox on` 放不回来——
   要放回去改配置。命令会明说是哪一种。
 - **不碰 MCP 连接**。按你的选择，「禁用某个 MCP」= 藏掉它的工具；连接留着，恢复是
   瞬时的，不用重连、不用重走 OAuth。真要停进程是另一件事，没做。
@@ -126,10 +131,10 @@ include = ["mcp__jira__*", "read_file", "grep"] # 白名单：只留这些
 ### 为什么是命令，不是工具
 
 能把自己的工具放回来的 agent 没有被限制；能把自己的工具关掉的 agent 多了一条没人要的
-静默失败路径。所以 `/tools` 只登记在命令目录里（`docs/adr/0021` §10），模型看不到它。
+静默失败路径。所以 `/toolbox` 只登记在命令目录里（`docs/adr/0021` §10），模型看不到它。
 
 模型看得到的是**结果**：被关掉的工具会出现在 `describe_self` 的 operations 面里，写明
-是人关的、可以用 `/tools on` 放回来——不然模型会继续说自己能干一件它已经干不了的事。
+是人关的、可以用 `/toolbox on` 放回来——不然模型会继续说自己能干一件它已经干不了的事。
 
 ### 下游怎么接
 
@@ -137,3 +142,21 @@ include = ["mcp__jira__*", "read_file", "grep"] # 白名单：只留这些
 会把 `tools` 行 swap 成 `tools-host`。手工建树用
 `atomcode_coding::on_harness::tools_host_row(switches)` 拿到那一行，并把 `tools` 行
 `[[patch]] name = "tools-host"`。判据见 `coding/tests/tool_policy.rs`。
+
+### TUI 面板那一侧
+
+`/toolbox` 不带参数在 TUI 里升起面板:一列工具,行首记号是开(`●`)、关(`○`)、
+配置排除(`✗`),后面跟着是哪一行给的。↑↓ 选,⏎ 开关,打字即筛(名字和给它的行都能
+搜到),esc 收起。
+
+**配置排除的那些不给开关**:按 ⏎ 只会说「改配置才能放回来」,不会发一条什么都不会
+发生的命令。
+
+一次开关是一趟宿主往返,在途中面板说「正在关掉 x…」并且**除 esc 外不收键**——否则
+每一个键都会在第一次还没回来时再派一次。回来的是**开关之后的目录**,所以屏上画的
+是发生过的事,不是自己以为发生了的事。
+
+这一侧的分层:`atomcode-tui` 只有画法和按键(`tui/src/tools.rs`、
+`tui/src/modules/tools.rs`),数据与开关从 `tui-tools` 端口出去;端口的实现在 cli
+(`cli/src/tui_tools.rs`),走宿主控制契约的 `ToolCatalog` / `SwitchTool`
+(`docs/adr/0021` §2、`docs/adr/0022` §3)。判据在 `tui/tests/e2e.rs`(7 条)。

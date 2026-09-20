@@ -987,6 +987,33 @@ impl HostControl for RuntimeControl {
                 let tools = self.handle.mcp_tools(server).await.map_err(refused)?;
                 Ok(HostReply::McpTools { tools: tools.tools })
             }
+            // The catalog is the tree's, read through the runtime that owns it
+            // — the screen may not reach into the agent's App
+            // (`docs/adr/0022` §3).
+            HostCommand::ToolCatalog { session } => {
+                self.addressed(&session)?;
+                let tools = self.handle.tool_catalog().await.map_err(refused)?;
+                Ok(HostReply::ToolCatalog {
+                    tools: tools.into_iter().map(catalog_tool).collect(),
+                })
+            }
+            // Answers with the catalog as it now is, so a screen renders what
+            // happened rather than what it asked for.
+            HostCommand::SwitchTool {
+                session,
+                pattern,
+                on,
+            } => {
+                self.addressed(&session)?;
+                let tools = self
+                    .handle
+                    .switch_tool(pattern, on)
+                    .await
+                    .map_err(refused)?;
+                Ok(HostReply::ToolCatalog {
+                    tools: tools.into_iter().map(catalog_tool).collect(),
+                })
+            }
             HostCommand::WithdrawMcpTools { session } => {
                 self.addressed(&session)?;
                 self.handle.withdraw_mcp_tools().await.map_err(refused)?;
@@ -1526,5 +1553,22 @@ mod completion_tests {
         // The reason the turn stopped is the same in both; what differs is
         // whether anybody will be able to read about it later.
         assert_eq!(persistence_failure(&lost).as_deref(), Some("磁盘满了"));
+    }
+}
+
+/// The runtime's listing in the contract's words. The two say the same thing
+/// and are deliberately separate types: one is this product's, the other is
+/// what any front end reads (`docs/adr/0021` §2).
+fn catalog_tool(listing: atomcode_harness::seams::ToolListing) -> atomcode_host_api::CatalogTool {
+    use atomcode_harness::seams::ToolState as Live;
+    use atomcode_host_api::ToolState as Wire;
+    atomcode_host_api::CatalogTool {
+        name: listing.name,
+        owner: listing.owner,
+        state: match listing.state {
+            Live::On => Wire::On,
+            Live::OffInSession => Wire::OffInSession,
+            Live::ExcludedByConfig => Wire::ExcludedByConfig,
+        },
     }
 }

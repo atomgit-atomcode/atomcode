@@ -396,6 +396,16 @@ pub struct Moment {
     /// search box, the row the arrows are on, the form in progress, and the job
     /// that is still running out there.
     pub plugins_panel: Option<crate::plugins::Panel>,
+    /// The tool catalog, as the host last answered it.
+    ///
+    /// Here for the same reason the two above are: what the model can call is a
+    /// fact of the running tree, not of the log, and `View::render` may not ask
+    /// the tree anything — so it travels this road or none. See `crate::tools`.
+    pub tools: crate::tools::ToolsView,
+    /// The tools panel, while it is up: what is typed in its search box, the
+    /// row the arrows are on, what it has to say about the last key, and the
+    /// switch that is still on its way there and back.
+    pub tools_panel: Option<crate::tools::Panel>,
     /// What the Usage page draws, as the host last answered it.
     ///
     /// Asked for rather than pushed: an allowance window changes on the

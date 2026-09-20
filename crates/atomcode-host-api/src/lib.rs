@@ -110,6 +110,19 @@ pub enum HostCommand {
     McpStatus { session: String },
     /// The tools one MCP server put on `session`'s model (A11).
     McpTools { session: String, server: String },
+    /// Everything in `session`'s tool catalog and what is true of each: on, off
+    /// because the person said so, or absent because the tree was configured
+    /// without it (`docs/tool-catalog-policy.md`).
+    ToolCatalog { session: String },
+    /// Turn one tool off or back on for `session`. `pattern` is a tool name or
+    /// a glob — `mcp__github__*` is one server's tools — so hiding a whole MCP
+    /// server and hiding one of its tools are the same command. The connection
+    /// is untouched either way.
+    SwitchTool {
+        session: String,
+        pattern: String,
+        on: bool,
+    },
     /// Take every MCP tool off `session`'s model now — what has to happen
     /// before anything changes which servers are trusted.
     WithdrawMcpTools { session: String },
@@ -210,6 +223,8 @@ impl HostCommand {
             | Self::Rename { session, .. }
             | Self::McpStatus { session }
             | Self::McpTools { session, .. }
+            | Self::ToolCatalog { session }
+            | Self::SwitchTool { session, .. }
             | Self::WithdrawMcpTools { session }
             | Self::Reload { session }
             | Self::SignOut { session }
@@ -266,6 +281,10 @@ pub enum HostReply {
     /// them by.
     McpTools {
         tools: Vec<String>,
+    },
+    /// The tool catalog, as a screen offering the switch needs it.
+    ToolCatalog {
+        tools: Vec<CatalogTool>,
     },
     /// The settings a person may change, each with what it is set to now.
     Settings {
@@ -622,6 +641,31 @@ pub struct RewindPoint {
     pub code: bool,
 }
 
+/// One name in the tool catalog, as a screen offering the switch needs it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogTool {
+    pub name: String,
+    /// The row that offered it, empty when whoever registered it did not say.
+    /// A person deciding whether to turn `read_file` off wants to know which
+    /// world it reads.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub owner: String,
+    pub state: ToolState,
+}
+
+/// Why a tool is or is not on offer to the model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ToolState {
+    On,
+    /// A person turned it off for this session and can put it back.
+    OffInSession,
+    /// The tree was configured without it: only editing that changes it, so a
+    /// screen offers no switch here.
+    ExcludedByConfig,
+}
+
 /// One MCP server, as a status list shows it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpServer {
@@ -902,6 +946,14 @@ mod tests {
             HostCommand::Sources {
                 session: "a".into(),
             },
+            HostCommand::ToolCatalog {
+                session: "a".into(),
+            },
+            HostCommand::SwitchTool {
+                session: "a".into(),
+                pattern: "mcp__github__*".into(),
+                on: false,
+            },
         ];
         for c in &all {
             match c {
@@ -924,6 +976,8 @@ mod tests {
                 | HostCommand::Rename { .. }
                 | HostCommand::McpStatus { .. }
                 | HostCommand::McpTools { .. }
+                | HostCommand::ToolCatalog { .. }
+                | HostCommand::SwitchTool { .. }
                 | HostCommand::WithdrawMcpTools { .. }
                 | HostCommand::Reload { .. }
                 | HostCommand::SignOut { .. }
@@ -935,7 +989,9 @@ mod tests {
                 | HostCommand::Thinking { .. }
                 | HostCommand::SetThinking { .. }
                 | HostCommand::Readiness { .. }
-                | HostCommand::ResetSetting { .. } => {}
+                | HostCommand::ResetSetting { .. }
+                | HostCommand::ToolCatalog { .. }
+                | HostCommand::SwitchTool { .. } => {}
             }
         }
         all
@@ -1115,6 +1171,13 @@ mod tests {
                     }],
                 }],
             },
+            HostReply::ToolCatalog {
+                tools: vec![CatalogTool {
+                    name: "write_file".into(),
+                    owner: "tool-fs-world".into(),
+                    state: ToolState::OffInSession,
+                }],
+            },
         ];
         for r in &all {
             match r {
@@ -1134,6 +1197,7 @@ mod tests {
                 | HostReply::Context { .. }
                 | HostReply::Identity { .. }
                 | HostReply::Sources { .. }
+                | HostReply::ToolCatalog { .. }
                 | HostReply::Readiness { .. } => {}
             }
         }
