@@ -729,6 +729,7 @@ impl Agent {
                 parent: self.parent.clone(),
                 member: None,
                 model: model.as_ref().map(|m| m.model_name().to_string()),
+                context_window: model.as_ref().map(|m| m.context_window()),
                 supports_vision: model.as_ref().is_some_and(|m| m.supports_vision()),
                 reasoning_effort: None,
                 compaction: self.ctx.service::<CompactionSvc>().is_some(),

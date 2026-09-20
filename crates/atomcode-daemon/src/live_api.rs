@@ -1792,9 +1792,14 @@ pub(crate) async fn live_message(
     let original_images: Vec<ImageContent> = req
         .images
         .into_iter()
-        .map(|image| ImageContent {
-            media_type: image.media_type,
-            data: image.data,
+        .map(|image| {
+            // Downscale/re-encode oversized attachments before they enter the
+            // conversation (a big image is re-sent every turn — see image_normalize).
+            let (media_type, data) = atomcode_capabilities::image_normalize::normalize_image_base64(
+                &image.media_type,
+                &image.data,
+            );
+            ImageContent { media_type, data }
         })
         .collect();
     let runtime_text = preprocess_live_caption(

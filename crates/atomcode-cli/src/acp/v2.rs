@@ -968,10 +968,15 @@ fn prompt_text_v2(req: &PromptRequest) -> (String, Vec<ImageContent>) {
     for block in &req.prompt {
         match block {
             ContentBlock::Text(t) => text.push_str(&t.text),
-            ContentBlock::Image(image) => images.push(ImageContent {
-                media_type: image.mime_type.to_string(),
-                data: image.data.clone(),
-            }),
+            ContentBlock::Image(image) => {
+                // Downscale/re-encode oversized attachments (re-sent every turn).
+                let (media_type, data) =
+                    atomcode_capabilities::image_normalize::normalize_image_base64(
+                        &image.mime_type.to_string(),
+                        &image.data,
+                    );
+                images.push(ImageContent { media_type, data });
+            }
             ContentBlock::ResourceLink(link) => {
                 text.push_str(&format!("[resource: {} ({})]", link.name, link.uri));
             }

@@ -123,6 +123,15 @@ impl Selection {
 /// than another would be a second lifetime nobody chose.
 pub const NOTICE_MS: u64 = 3_000;
 
+/// How long the `再按 Ctrl+C 退出` hint below the box stays up — and, because the
+/// second press only quits while it shows, how long the two-press exit window is.
+///
+/// Shorter than [`NOTICE_MS`]: an exit is armed by an accidental keystroke as
+/// often as a deliberate one, so the window a stray second press could land in is
+/// kept tight. Two seconds is long enough to press again on purpose, short enough
+/// that a wandering hand is not left one keystroke from quitting.
+pub const QUIT_HINT_MS: u64 = 2_000;
+
 /// Something the screen has to say for a moment and then stop saying.
 ///
 /// Transient by construction: the reading it stops at travels with the text, so
@@ -141,6 +150,13 @@ pub struct Notice {
     /// `content::CommandSaid` distinguishes them: "here is your answer" and "I
     /// could not do that" must never look the same.
     pub refused: bool,
+    /// Which side of the input box this belongs to. A copy/paste hint sits in the
+    /// reserved tip row *above* the field (right-aligned); the `再按 Ctrl+C 退出`
+    /// hint sits *below* it, over the status line, the way `atomcode-tuix` and
+    /// Claude Code place their exit prompt. The two never show at once, but they
+    /// are drawn by different modules — so the module reads this rather than the
+    /// wording to decide whether the line is its to draw.
+    pub below: bool,
 }
 
 impl Notice {
@@ -150,7 +166,14 @@ impl Notice {
             text: text.into(),
             until: Timestamp::millis(now.0.saturating_add(for_ms)),
             refused,
+            below: false,
         }
+    }
+
+    /// The same notice, drawn below the box rather than in the tip row above.
+    pub fn below(mut self) -> Self {
+        self.below = true;
+        self
     }
 
     /// Whether it still has something to say at `now`.
@@ -216,6 +239,18 @@ pub struct Moment {
     /// Where the agent is working. Not derivable from the log, which is
     /// exactly what this struct is for.
     pub cwd: String,
+    /// The model the screen agent runs on, from its description — known before
+    /// the first turn (which is when the folded status `model` is still empty).
+    /// The footer prefers the folded model when it has one and falls back to
+    /// this, so a fresh session names the real model instead of the brand. `""`
+    /// until the agent has been described.
+    pub model: String,
+    /// The mounted model's context window, in tokens — the denominator the
+    /// status row shows the used-token count against (`49.0k/512k tok`). `0` when
+    /// unknown (no model, or a provider that reports none), which the row draws as
+    /// a bare `49.0k tok`. Injected from the agent's description, not folded from
+    /// the log: the window is the agent's, not a fact the conversation records.
+    pub ctx_window: u32,
     /// The agents running under this one, as the registry has them now.
     /// Empty for a screen that never delegates, which is most of them.
     pub members: Vec<MemberNow>,
@@ -224,13 +259,23 @@ pub struct Moment {
     /// silently wrong on the user's. The surface detects once; everything above
     /// is handed the answer.
     pub caps: crate::caps::Caps,
-    /// What the row above the field is saying for a moment, if anything.
+    /// What a row by the field is saying for a moment, if anything — the tip row
+    /// above it for a copy/paste hint, or the status line below it for the exit
+    /// hint (see [`Notice::below`]).
     ///
     /// Here rather than in the tip module's folded state because it is exactly
     /// what this struct is for: it is true of *now* and is not a fact — nothing
     /// in the log is a tip, and copying text to the clipboard commits nothing.
     /// It carries its own expiry so the module draws it without a clock.
     pub notice: Option<Notice>,
+    /// Whether Ctrl+C on an idle line has been pressed once and is one more press
+    /// away from quitting. Screen state, not a fact: it is armed by that first
+    /// press (which also clears the line) and disarmed by any other action, so an
+    /// accidental press followed by real work never leaves the terminal a
+    /// keystroke from exit. It only quits while the paired `再按 Ctrl+C 退出` hint
+    /// — a `below` [`Notice`] on [`Moment::notice`] — is still up; see
+    /// [`Moment::cancel_idle`] and [`Moment::exit_hint_live`].
+    pub quit_armed: bool,
     /// The mounted cell-grid bitmaps, **as of the frame this moment was taken
     /// for**.
     ///
@@ -407,6 +452,50 @@ impl Moment {
         self.notice = Some(Notice::for_ms(text, refused, now, NOTICE_MS));
         self
     }
+
+    /// Whether the `再按 Ctrl+C 退出` hint is on screen right now — a below-the-box
+    /// notice that has not yet expired. The status line reads this to know whether
+    /// to give its row to the hint, and [`cancel_idle`](Self::cancel_idle) reads
+    /// it to know whether a second press is the one that quits.
+    pub fn exit_hint_live(&self) -> bool {
+        self.notice
+            .as_ref()
+            .is_some_and(|n| n.below && n.is_live(self.now))
+    }
+
+    /// End a pending two-press exit: drop the latch and, with it, the hint below
+    /// the box. Called for every action other than a repeat Cancel, so an
+    /// accidental first press followed by real work never leaves the terminal one
+    /// keystroke from exit — and never leaves the hint up while the work goes on.
+    /// A copy/paste notice (`below == false`) is left where it is.
+    pub fn disarm_quit(&mut self) {
+        self.quit_armed = false;
+        if self.notice.as_ref().is_some_and(|n| n.below) {
+            self.notice = None;
+        }
+    }
+
+    /// Apply a Ctrl+C on an idle line. Returns `true` when it is the second press
+    /// that quits, `false` when it is the first that arms.
+    ///
+    /// The first press clears the field and shows the hint below the box; a second
+    /// press while that hint is up quits; once the hint has expired the next press
+    /// is a fresh first press again.
+    pub fn cancel_idle(&mut self) -> bool {
+        // A second press quits only while it is still *armed* and the hint is
+        // still up: `quit_armed` is dropped by any other action (in `act`), and
+        // the hint expires on its own, so either an intervening keystroke or a
+        // two-second pause turns the next press back into a fresh first one.
+        if self.quit_armed && self.exit_hint_live() {
+            return true;
+        }
+        self.input.clear();
+        self.caret = 0;
+        self.quit_armed = true;
+        self.notice =
+            Some(Notice::for_ms("再按 Ctrl+C 退出", false, self.now, QUIT_HINT_MS).below());
+        false
+    }
 }
 
 /// What one module is given to draw into.
@@ -444,5 +533,96 @@ mod tests {
         assert_eq!(m.caret, 3);
         assert_eq!(m.tick, 7);
         assert!(m.scroll.is_at_bottom());
+    }
+
+    #[test]
+    fn cancel_when_idle_clears_the_line_and_arms_the_exit_hint() {
+        // The first Ctrl+C on an idle line never quits: it empties the field
+        // (whatever was in it) and puts the "再按退出" hint below the box.
+        let mut m = Moment::default().typing("half a thought");
+        m.now = Timestamp::millis(1_000);
+        let quit = m.cancel_idle();
+        assert!(!quit, "the first press does not quit");
+        assert_eq!(m.input, "", "the line is cleared");
+        assert_eq!(m.caret, 0);
+        assert!(m.quit_armed, "and armed for the next press");
+        assert!(m.exit_hint_live(), "the exit hint is showing");
+    }
+
+    #[test]
+    fn a_second_cancel_while_the_hint_shows_quits() {
+        let mut m = Moment::default().typing("x");
+        m.now = Timestamp::millis(1_000);
+        assert!(!m.cancel_idle());
+        // One reading before the 2s window closes: still armed and hinting.
+        m.now = Timestamp::millis(1_000 + QUIT_HINT_MS - 1);
+        assert!(m.cancel_idle(), "a second press while the hint shows quits");
+    }
+
+    #[test]
+    fn a_second_cancel_after_the_hint_expires_re_arms_rather_than_quitting() {
+        let mut m = Moment {
+            now: Timestamp::millis(1_000),
+            ..Default::default()
+        };
+        assert!(!m.cancel_idle());
+        // The window has closed: two seconds later the hint is gone.
+        m.now = Timestamp::millis(1_000 + QUIT_HINT_MS);
+        let quit = m.cancel_idle();
+        assert!(!quit, "an expired hint is a fresh first press, not an exit");
+        assert!(m.exit_hint_live(), "and the hint shows again");
+    }
+
+    #[test]
+    fn work_between_the_two_presses_cancels_the_pending_exit() {
+        // `act` drops `quit_armed` on any action other than a repeat Cancel; with
+        // it false the still-live hint alone must not be enough to quit.
+        let mut m = Moment {
+            now: Timestamp::millis(1_000),
+            ..Default::default()
+        };
+        assert!(!m.cancel_idle());
+        m.quit_armed = false; // stand-in for "typed something"
+        m.now = Timestamp::millis(1_500); // the hint is still live
+        assert!(
+            !m.cancel_idle(),
+            "real work between presses disarms the exit"
+        );
+    }
+
+    #[test]
+    fn disarming_drops_both_the_latch_and_the_exit_hint() {
+        // Any other action ends the pending exit: the latch clears and the hint
+        // below the box goes with it, rather than hanging on for its two seconds
+        // while the person is already doing something else.
+        let mut m = Moment {
+            now: Timestamp::millis(0),
+            ..Default::default()
+        };
+        m.cancel_idle();
+        assert!(m.exit_hint_live());
+        m.disarm_quit();
+        assert!(!m.quit_armed);
+        assert!(!m.exit_hint_live(), "the hint goes when the latch does");
+    }
+
+    #[test]
+    fn disarming_leaves_a_copy_hint_alone() {
+        // A copy/paste notice is not the exit hint; disarming the quit latch must
+        // not take it off the tip row above the box.
+        let mut m = Moment::default().with_notice("已复制", false, Timestamp::millis(0));
+        m.disarm_quit();
+        assert!(
+            m.notice.is_some(),
+            "the copy hint is not the latch's to clear"
+        );
+    }
+
+    #[test]
+    fn a_plain_notice_is_not_the_exit_hint() {
+        // The copy/paste hint rides the same field but belongs above the box; it
+        // must never read as one press from exit.
+        let m = Moment::default().with_notice("已复制", false, Timestamp::millis(0));
+        assert!(!m.exit_hint_live(), "a copy hint is not the exit hint");
     }
 }

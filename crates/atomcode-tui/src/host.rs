@@ -102,7 +102,11 @@ impl Presentation {
     pub fn default_folds() -> Self {
         let mut by_kind: Vec<(&'static str, Showing)> = vec![
             ("reasoning", Showing::Hidden),
-            ("tool_call", Showing::Folded),
+            // Tool calls open by default, each shown in full (`● ReadFile(name)`
+            // over `⎿ …`), the way the reference does it: expanding a call is how
+            // a reader sees what actually ran, and a folded lid over a single call
+            // hid its result behind a clip. A run can still be folded by hand.
+            ("tool_call", Showing::Open),
         ];
         by_kind.extend(
             crate::content::ENVIRONMENTAL_INJECTIONS
@@ -247,7 +251,7 @@ impl Presentation {
 /// prose stays a no-op.
 ///
 /// A thought and a tool call are in. Both are drawn as a one-line lid over a
-/// detail — `· 思考 3 行`, `● read_file(a.rs) · ok` — and a click on a lid has
+/// detail — `· 思考 3 行`, `● ReadFile(a.rs) · ok` — and a click on a lid has
 /// exactly one meaning. Folding a thought was reachable only by ctrl-r, which
 /// moves *every* thought in the transcript; the row itself answered nothing, so
 /// pointing at a lid opens that lid and costs no other gesture. A press that
@@ -290,7 +294,7 @@ type RowOwner = Option<(BlockId, &'static str)>;
 /// screen of six calls separated by five gaps is a screen that no longer shows
 /// what was done in one glance.
 ///
-/// The turn's closing rule is a separator — `──── ✓ 完成 · 3 步 ────` — and gets
+/// The turn's closing rule is a separator — `──── ✓ Done · 3 轮 · 2 工具 ────` — and gets
 /// a row of air on both sides unconditionally. It is the one row that is *about*
 /// the transcript rather than part of it, and pressed against the prose above
 /// and the next question below it stops reading as a boundary and starts
@@ -4468,12 +4472,14 @@ mod tests {
         // pushes its own header off the top. The person pointed at that row; it
         // is the one that has to stay.
         let h = host_with_a_long_call();
+        // Tool calls open by default now; fold so the click under test *opens* one.
+        h.presentation.write().unwrap().toggle("tool_call");
         let size = (80, 24);
         h.moment.write().unwrap().scroll = crate::moment::ScrollPos::BOTTOM;
         let _ = h.compose(size);
 
         let frame = h.compose(size);
-        let y_before = anchor_row(&frame, "read_file(anchor-line)");
+        let y_before = anchor_row(&frame, "ReadFile(anchor-line)");
         let (id, kind) = h
             .block_at(10, y_before)
             .expect("the call's header is a fold target");
@@ -4502,7 +4508,7 @@ mod tests {
             "nothing was pinned: the reading never moved, so the row had to"
         );
         assert_eq!(
-            anchor_row(&after, "read_file(anchor-line)"),
+            anchor_row(&after, "ReadFile(anchor-line)"),
             y_before,
             "the row that was clicked moved, so the pin did not hold it"
         );
@@ -5829,7 +5835,7 @@ mod tests {
         let text = f.rows().join("\n");
         assert!(text.contains("fix the build"), "the user's words:\n{text}");
         assert!(text.contains("Fixed it"), "the model's answer");
-        assert!(text.contains("read_file"), "the tools it used");
+        assert!(text.contains("ReadFile"), "the tools it used");
     }
 
     #[test]
@@ -5874,6 +5880,8 @@ mod tests {
         // nothing goes between them — not a blank row, and now not a row of their
         // own each either. The run is drawn as one lid whose rows are adjacent.
         let h = fed();
+        // Tool calls open by default now; fold them to exercise the merge lid.
+        h.presentation.write().unwrap().toggle("tool_call");
         let rows: Vec<String> = h
             .compose((80, 40))
             .part("stream")
@@ -5894,7 +5902,7 @@ mod tests {
             );
         }
         assert!(
-            rows[count + 1].contains("read_file(b.rs)"),
+            rows[count + 1].contains("ReadFile(b.rs)"),
             "the last call is not the row under the count: {:?}",
             &rows[count..count + 3]
         );
@@ -5907,6 +5915,8 @@ mod tests {
         // were, and shows the *last* command and its result — the run ends with
         // the thing that was being looked for.
         let h = fed();
+        // Tool calls open by default now; fold them to exercise the merge lid.
+        h.presentation.write().unwrap().toggle("tool_call");
         let rows: Vec<String> = h
             .compose((80, 40))
             .part("stream")
@@ -5920,13 +5930,13 @@ mod tests {
             .position(|r| r.contains("2 个工具"))
             .expect("the lid does not say how many calls there were");
         assert!(
-            !rows.iter().any(|r| r.contains("read_file(a.rs)")),
+            !rows.iter().any(|r| r.contains("ReadFile(a.rs)")),
             "the first call is still on the screen, so nothing merged:\n{rows:#?}"
         );
         // The last call, on the rows under the count: the command, then what it
         // returned — the same two rows a single folded call draws.
         assert!(
-            rows[count + 1].contains("read_file(b.rs)"),
+            rows[count + 1].contains("ReadFile(b.rs)"),
             "the last command is not under the count: {:?}",
             &rows[count..count + 3]
         );
@@ -5944,6 +5954,8 @@ mod tests {
         // one of them would be a lid that answered a click by keeping the rest
         // of what it was covering.
         let h = fed();
+        // Tool calls open by default now; fold them to exercise the merge lid.
+        h.presentation.write().unwrap().toggle("tool_call");
         let size = (80, 40);
         let before = h.compose(size).rows().join("\n");
         assert!(before.contains("2 个工具"), "nothing merged:\n{before}");
@@ -5975,8 +5987,8 @@ mod tests {
         // the reason a weaker assertion here would pass while one of the two
         // calls was still behind a lid.
         for (name, result) in [
-            ("read_file(a.rs)", "fn main() {}"),
-            ("read_file(b.rs)", "no such file"),
+            ("ReadFile(a.rs)", "fn main() {}"),
+            ("ReadFile(b.rs)", "no such file"),
         ] {
             let head = open
                 .iter()
@@ -6031,6 +6043,8 @@ mod tests {
     #[test]
     fn a_hidden_thought_between_two_calls_does_not_break_the_run() {
         let h = host();
+        // Tool calls open by default now; fold them to exercise the merge lid.
+        h.presentation.write().unwrap().toggle("tool_call");
         let call = |round: u32, id: &str| SessionEvent::AssistantMessage {
             turn: 1,
             round,
@@ -6476,7 +6490,9 @@ mod tests {
             .collect();
         let rule = rows
             .iter()
-            .position(|r| r.contains("完成") && r.contains('─'))
+            // The first clean turn's closing rule: its outcome rotates through
+            // `DONE_LABELS`, and index 0 is `Done`.
+            .position(|r| r.contains("Done") && r.contains('─'))
             .expect("the first turn's closing rule");
         // The prose it closes, a blank, the rule, a blank, the next question.
         assert!(

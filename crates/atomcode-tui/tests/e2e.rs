@@ -484,6 +484,59 @@ async fn a_new_session_opens_with_the_welcome_and_it_then_scrolls_away() {
     task.abort();
 }
 
+/// Two Ctrl+C on an idle empty line exits — the reflex people reach for. A single
+/// one only arms it (and hints), so a stray press never quits from under you.
+#[tokio::test]
+async fn two_ctrl_c_on_an_idle_line_exits() {
+    let dir = scratch("ctrlc-quit");
+    let s = start(tree(&dir, &replay(r#"{ text = "hi" }"#), &[])).await;
+    let task = s.open().await;
+
+    // First Ctrl+C arms and hints — it must NOT exit.
+    s.term.press(KeyPress::ctrl('c'));
+    s.term
+        .settle(Duration::from_millis(60), Duration::from_secs(5))
+        .await;
+    assert!(!task.is_finished(), "one Ctrl+C must not quit");
+    assert!(
+        s.screen().contains("再按 Ctrl+C 退出"),
+        "the first press shows the confirm hint:\n{}",
+        s.screen()
+    );
+
+    // Second Ctrl+C quits: the run loop returns, so awaiting the task completes.
+    s.term.press(KeyPress::ctrl('c'));
+    let quit = tokio::time::timeout(Duration::from_secs(5), task).await;
+    assert!(quit.is_ok(), "two Ctrl+C must exit");
+}
+
+/// A single Ctrl+C is disarmed by any other key, so it takes a fresh pair to
+/// quit — a stray press followed by real typing never leaves the terminal one
+/// keystroke from exit.
+#[tokio::test]
+async fn a_ctrl_c_is_disarmed_by_other_input() {
+    let dir = scratch("ctrlc-disarm");
+    let s = start(tree(&dir, &replay(r#"{ text = "hi" }"#), &[])).await;
+    let task = s.open().await;
+
+    s.term.press(KeyPress::ctrl('c')); // arm
+    s.term.type_text("x"); // any other input disarms
+    s.term
+        .settle(Duration::from_millis(60), Duration::from_secs(5))
+        .await;
+    // This Ctrl+C is a fresh first press (re-arms), not a quit.
+    s.term.press(KeyPress::ctrl('c'));
+    s.term
+        .settle(Duration::from_millis(60), Duration::from_secs(5))
+        .await;
+    assert!(
+        !task.is_finished(),
+        "a Ctrl+C after other input must re-arm, not quit"
+    );
+
+    task.abort();
+}
+
 #[tokio::test]
 async fn a_resumed_session_does_not_open_with_a_welcome() {
     // The judgement behind "the stream is empty is the whole test for a new
@@ -629,7 +682,7 @@ async fn a_person_types_a_question_and_reads_the_answer() {
         screen.contains("what is in a.rs?"),
         "the question:\n{screen}"
     );
-    assert!(screen.contains("read_file"), "the tool it used:\n{screen}");
+    assert!(screen.contains("ReadFile"), "the tool it used:\n{screen}");
     assert!(
         screen.contains("It is an empty main"),
         "the answer:\n{screen}"
@@ -810,10 +863,10 @@ async fn typing_during_a_turn_is_folded_into_it_rather_than_queued() {
     let screen = s.screen();
     assert!(screen.contains("first"), "{screen}");
     assert!(screen.contains("and also this"), "{screen}");
-    // The turn-end caption, which is what the person reads: `✓ 完成`. Counted by
-    // that caption rather than by a variant name, which the screen no longer
-    // shows at all.
-    let turn_ends = screen.matches("✓ 完成").count();
+    // The turn-end caption, which is what the person reads: a clean stop's
+    // rotating `DONE_LABELS` verb, `Done` for the first turn. Counted by that
+    // caption rather than by a variant name, which the screen no longer shows.
+    let turn_ends = screen.matches("✓ Done").count();
     assert_eq!(turn_ends, 1, "one turn, not two:\n{screen}");
 
     s.term.press(KeyPress::ctrl('d'));
@@ -2599,7 +2652,7 @@ async fn a_command_and_a_key_share_one_implementation() {
     let stream_of = |screen: &str| {
         screen
             .lines()
-            .filter(|l| l.contains("read_file"))
+            .filter(|l| l.contains("ReadFile"))
             .map(str::trim_end)
             .map(str::to_string)
             .collect::<Vec<_>>()
@@ -2610,7 +2663,7 @@ async fn a_command_and_a_key_share_one_implementation() {
         "a key and a command must fold the same way"
     );
     assert!(
-        by_command.contains("/tools") || by_command.contains("read_file"),
+        by_command.contains("/tools") || by_command.contains("ReadFile"),
         "the command ran:\n{by_command}"
     );
 
@@ -4416,17 +4469,19 @@ async fn a_resumed_session_remembers_what_was_typed_into_it() {
     // that pressing Up puts a *second* copy of it in the composer.
     let count = |screen: &str| screen.matches("port the quantizer to the NPU").count();
     let before = s.screen();
-    // Twice already, and neither is the composer: the transcript shows what
-    // was said, and the rule above the composer carries the session's name,
-    // which this session was named after.
-    assert_eq!(count(&before), 2, "transcript and title, so far:\n{before}");
+    // Already on screen at least once — the resumed transcript shows it — and
+    // the count is taken rather than assumed: what else carries the text is
+    // the rest of the screen's business and has changed before. What is judged
+    // is the **difference** one press makes.
+    let seen = count(&before);
+    assert!(seen > 0, "the resumed transcript has it:\n{before}");
 
     s.term.press(KeyPress::plain(Key::Up));
     s.quiet().await;
     let after = s.screen();
     assert_eq!(
         count(&after),
-        3,
+        seen + 1,
         "the up-arrow put it in the composer as well:\n{after}"
     );
     task.abort();

@@ -272,10 +272,12 @@ impl Content for WelcomeBlock {
             .chain(std::iter::once(self.model.as_deref()))
             .flatten()
         {
+            // The cwd and model read at full strength — they are the two facts a
+            // person most wants at a glance when a session opens, not chrome.
             below.extend(wrapped(
                 text,
                 content_w as u16,
-                muted(),
+                Style::default(),
                 &format!("{bullet} "),
             ));
         }
@@ -620,7 +622,7 @@ pub enum Outcome {
 /// The column a tool call's result hangs in from the left edge of the stream.
 ///
 /// The `●` opens a call at the margin and what came back hangs under it, two
-/// cells in — `● read_file(a.rs)` over `  ⎿ 20 行`. An answer is set in by the
+/// cells in — `● ReadFile(a.rs)` over `  ⎿ 20 行`. An answer is set in by the
 /// same amount, and it reads this number rather than naming one of its own, so
 /// that "the reply lines up with the work that produced it" is one fact instead
 /// of two that happen to agree today. See `host::inset`.
@@ -698,7 +700,7 @@ impl ToolCallBlock {
         let subject = subject_of(&self.name, &self.args);
         let name = match look.verb {
             Some(verb) => verb.to_string(),
-            None => self.name.clone(),
+            None => display_tool_name(&self.name),
         };
         let mut spans = vec![Span::styled(name, name_style)];
         if !subject.is_empty() {
@@ -855,6 +857,25 @@ pub fn look(tool: &str) -> Look {
 /// expanding a call is a request to see what actually ran. The folded summary
 /// abbreviates separately, against the width it has — see [`ToolCallBlock`]'s
 /// `summary`.
+/// A tool's snake_case name as a display word: `read_file` → `ReadFile`, the way
+/// the reference names a call. Used when the tool has no hand-written verb, so
+/// `● ReadFile(a.rs)` reads as a name rather than a raw wire identifier.
+pub fn display_tool_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for word in name.split('_').filter(|w| !w.is_empty()) {
+        let mut chars = word.chars();
+        if let Some(first) = chars.next() {
+            out.extend(first.to_uppercase());
+            out.push_str(chars.as_str());
+        }
+    }
+    if out.is_empty() {
+        name.to_string()
+    } else {
+        out
+    }
+}
+
 pub fn subject_of(tool: &str, args: &str) -> String {
     let look = look(tool);
     let parsed: Option<serde_json::Value> = serde_json::from_str(args).ok();
@@ -934,7 +955,7 @@ impl Content for ToolCallBlock {
     /// are two products:
     ///
     /// ```text
-    /// ● read_file(README.md)
+    /// ● ReadFile(README.md)
     ///   ⎿ 20 行
     ///      1  <div align="center">
     /// ```
@@ -956,19 +977,44 @@ impl Content for ToolCallBlock {
         let caps = Caps::default();
         let lead = format!("{} ", caps.g(Glyph::ToolMark));
         let mut out = self.head(w, &lead, self.mark().1, self.name_style());
-        out.push(self.note_line(w));
 
         let body = match &self.outcome {
             Outcome::Ok(s) | Outcome::Failed(s) => s.as_str(),
             _ => "",
         };
-        if !body.is_empty() && body.lines().filter(|l| !l.trim().is_empty()).count() > 1 {
-            let detail = if matches!(self.outcome, Outcome::Failed(_)) {
-                bad()
-            } else {
-                Style::new()
-            };
-            out.extend(wrapped(body, w, detail, "     "));
+        let non_empty = body.lines().filter(|l| !l.trim().is_empty()).count();
+        let gutter = format!("{}{} ", " ".repeat(GUTTER), caps.g(Glyph::Gutter));
+        match non_empty {
+            // Pending / interrupted / a call that returned nothing: the short
+            // status note (`运行中` / `已中断` / `完成`) is all there is to say.
+            0 => out.push(self.note_line(w)),
+            // A single-line result rides one gutter line, shown WHOLE and wrapped
+            // rather than clipped — an image-attachment note or a one-line message
+            // is never cut off at the edge. A failure keeps its `失败 ·` word and
+            // the alarm colour; a clean result shows its own text.
+            1 => {
+                let line = body
+                    .lines()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("")
+                    .trim();
+                let (text, style) = if matches!(self.outcome, Outcome::Failed(_)) {
+                    (format!("失败 · {line}"), bad())
+                } else {
+                    (line.to_string(), muted())
+                };
+                out.extend(wrapped(&text, w, style, &gutter));
+            }
+            // A multi-line result: the `⎿ N 行` count, then the whole body under it.
+            _ => {
+                out.push(self.note_line(w));
+                let detail = if matches!(self.outcome, Outcome::Failed(_)) {
+                    bad()
+                } else {
+                    Style::new()
+                };
+                out.extend(wrapped(body, w, detail, "     "));
+            }
         }
         out
     }
@@ -997,7 +1043,7 @@ impl Content for ToolCallBlock {
         let look = look(&self.name);
         let name = match look.verb {
             Some(verb) => verb.to_string(),
-            None => self.name.clone(),
+            None => display_tool_name(&self.name),
         };
         let (note, note_style) = outcome_note(&self.outcome);
         // The note is capped to a share of the line. It is the secondary half —
@@ -1357,6 +1403,10 @@ pub struct TurnEndBlock {
     /// nothing — a turn cut before its first request — and then the rule says
     /// only how it ended, because a zero is noise pretending to be information.
     pub stats: TurnStats,
+    /// Which `DONE_LABELS` verb a clean stop uses, advanced once per completed
+    /// turn by the producer so consecutive turns vary. Ignored for every stop
+    /// but [`StopReason::Stopped`].
+    pub done_index: usize,
 }
 
 /// What one turn cost, as its own facts recorded it.
@@ -1382,32 +1432,115 @@ pub struct TurnStats {
     pub completion: u32,
     /// The cached part of `prompt`, from that same last request.
     pub cached: u32,
+    /// Tool calls the turn ran, summed over its steps.
+    pub tools: u32,
+    /// Wall-clock the turn took, in milliseconds. `0` when the log carried no
+    /// timing — a turn cut before it opened, or a replay of a log old enough not
+    /// to have stamped one.
+    pub elapsed_ms: u64,
 }
 
 impl TurnStats {
-    /// The figures worth printing, or `None` when there is nothing to say.
-    fn caption(&self) -> Option<String> {
-        let mut parts: Vec<String> = Vec::new();
-        if self.steps > 0 {
-            parts.push(format!("{} 步", self.steps));
+    /// The figures worth printing, in `atomcode-tuix`'s turn-summary shape
+    /// (`2 轮 · 2 工具 · 32.7s · 2.60K tokens · 97% cached`), or `None` when the
+    /// turn was cut before it ran and the rule should say only how it ended.
+    ///
+    /// `with_cached` is off for an interrupted turn: tuix drops the cache ratio
+    /// from anything but a clean stop, and a hit rate beside a failure reads as a
+    /// figure about the failure.
+    fn caption(&self, with_cached: bool) -> Option<String> {
+        // A turn that never reached its first request has no rounds and no
+        // tokens; the rule then carries only the outcome.
+        if self.steps == 0 && self.prompt == 0 && self.completion == 0 {
+            return None;
         }
-        if self.prompt > 0 {
-            parts.push(format!("入 {}", token_count(self.prompt)));
+        // What the turn actually cost: its output plus the part of the context
+        // that was NOT served from cache. Re-reading the cached prefix each round
+        // is near-free, so this is the figure tuix reports rather than the gross
+        // prompt+completion.
+        let billable =
+            self.completion as usize + (self.prompt as usize).saturating_sub(self.cached as usize);
+        let mut parts = vec![
+            format!("{} 轮", self.steps),
+            format!("{} 工具", self.tools),
+            fmt_dur(self.elapsed_ms),
+            format!("{} tokens", fmt_tokens(billable)),
+        ];
+        if with_cached {
+            if let Some(pct) = self.cache_pct() {
+                parts.push(format!("{pct}% cached"));
+            }
         }
-        if self.completion > 0 {
-            parts.push(format!("出 {}", token_count(self.completion)));
-        }
-        if let Some(hit) = self.cache_hit() {
-            parts.push(format!("缓存 {hit}"));
-        }
-        (!parts.is_empty()).then(|| parts.join(" · "))
+        Some(parts.join(" · "))
     }
 
-    /// The cached share of the context, or `None` if the provider said nothing.
-    fn cache_hit(&self) -> Option<String> {
-        cache_hit_rate(self.cached, self.prompt)
+    /// The cached share of the last request's context as a whole percent, or
+    /// `None` when the provider reported no caching (so a misleading `0% cached`
+    /// never appears — the same rule as [`cache_hit_rate`], to the integer tuix's
+    /// summary shows).
+    fn cache_pct(&self) -> Option<u8> {
+        (self.cached > 0 && self.prompt > 0)
+            .then(|| ((self.cached as u64 * 100 / self.prompt as u64).min(100)) as u8)
     }
 }
+
+/// A token count in `atomcode-tuix`'s two-decimal thousands — the shape a turn's
+/// summary reports it in (`2.60K`, `152.00K`, `1.05M`). Distinct from
+/// [`token_count`], which the live line uses at one decimal: the two lines
+/// answer different questions, and tuix draws them differently on purpose.
+fn fmt_tokens(n: usize) -> String {
+    if n >= 1_000_000 {
+        format!("{:.2}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.2}K", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// A turn's duration as `atomcode-tuix` writes it: `340ms` under a second,
+/// `32.7s` under a minute, then `2m3s` / `1h2m3s`.
+fn fmt_dur(ms: u64) -> String {
+    if ms < 1000 {
+        return format!("{ms}ms");
+    }
+    let total = ms / 1000;
+    if total < 60 {
+        return format!("{:.1}s", ms as f64 / 1000.0);
+    }
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    if h == 0 {
+        format!("{m}m{s}s")
+    } else {
+        format!("{h}h{m}m{s}s")
+    }
+}
+
+/// The rotating turn-completion verbs, `atomcode-tuix`'s pool ported verbatim.
+/// Kept English in every locale, exactly as tuix keeps them: a translated cute
+/// verb reads awkward, while the structural words around it (`轮`/`工具`) localise.
+pub const DONE_LABELS: &[&str] = &[
+    "Done",
+    "Nailed it",
+    "Wrapped",
+    "Shipped",
+    "Baked",
+    "Plated",
+    "Served",
+    "Bagged",
+    "Handled",
+    "Dialed in",
+    "Locked in",
+    "Sealed",
+    "Stuck the landing",
+    "Buttoned up",
+    "Squared away",
+    "Cooked",
+    "Dusted",
+    "Called it",
+    "Delivered",
+    "Tied off",
+];
 
 /// The cached share of one request's context, as a percentage to two decimals.
 ///
@@ -1472,12 +1605,18 @@ pub fn token_count_u64(n: u64) -> String {
 /// vocabulary is the product's rather than new. What is added is the cause,
 /// where a person can do something about it: a turn that ran out of rounds says
 /// so, in words, instead of showing them a variant name or nothing at all.
-fn turn_end_note(stop: StopReason) -> (Glyph, String, Style) {
+fn turn_end_note(stop: StopReason, done_index: usize) -> (Glyph, String, Style) {
     use StopReason::*;
     let warn = Style::new().fg(Color::role(Role::Warning));
     match stop {
-        // The only clean end: the model answered and asked for nothing.
-        Stopped => (Glyph::Ok, "完成".to_string(), muted()),
+        // The only clean end: the model answered and asked for nothing. The word
+        // rotates through `DONE_LABELS` the way tuix's does, so consecutive turns
+        // read a little differently instead of the same `完成` every time.
+        Stopped => (
+            Glyph::Ok,
+            DONE_LABELS[done_index % DONE_LABELS.len()].to_string(),
+            muted(),
+        ),
         // The person's own doing, so it is stated without alarm.
         Cancelled => (Glyph::Interrupted, "已中断".to_string(), muted()),
         // Three ways to be cut short, and they were one sentence here until a
@@ -1569,14 +1708,20 @@ impl Content for TurnEndBlock {
             &format!("{:?}", self.stop),
             self.error.as_deref().unwrap_or(""),
             &format!(
-                "{}:{}:{}:{}",
-                self.stats.steps, self.stats.prompt, self.stats.completion, self.stats.cached
+                "{}:{}:{}:{}:{}:{}:{}",
+                self.stats.steps,
+                self.stats.prompt,
+                self.stats.completion,
+                self.stats.cached,
+                self.stats.tools,
+                self.stats.elapsed_ms,
+                self.done_index,
             ),
         ])
     }
     /// A divider with the turn's outcome set into it, the way tuix closes a
-    /// turn: `───── ✓ 完成 · 4 步 · 入 90.7k · 出 4200 · 缓存 99.82% ─────`. A bare
-    /// line of text at the left margin reads as something that was said; a
+    /// turn: `───── ✓ Nailed it · 2 轮 · 2 工具 · 32.7s · 2.60K tokens · 97% cached ─────`.
+    /// A bare line of text at the left margin reads as something that was said; a
     /// captioned rule reads as a boundary.
     ///
     /// What the turn cost is set into that same rule, because the boundary is
@@ -1589,14 +1734,16 @@ impl Content for TurnEndBlock {
     fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
         let w = ctx.width;
         let caps = Caps::default();
-        let (mark, said, style) = turn_end_note(self.stop);
+        let (mark, said, style) = turn_end_note(self.stop, self.done_index);
         let short = format!("{} {said}", caps.g(mark));
 
         // Under the rule, in the order they are worth reading: the cost first
-        // (it is about this turn), then the cause of a failure.
+        // (it is about this turn), then the cause of a failure. The cache ratio
+        // rides only a clean stop, the way tuix drops it from a failed turn.
         let mut under: Vec<String> = Vec::new();
         let mut caption = short;
-        if let Some(stats) = self.stats.caption() {
+        let with_cached = matches!(self.stop, StopReason::Stopped);
+        if let Some(stats) = self.stats.caption(with_cached) {
             let wider = format!("{caption} · {stats}");
             if crate::el::caption_fits(&wider, w as usize) {
                 caption = wider;
@@ -2038,6 +2185,7 @@ mod tests {
             stop: StopReason::ProviderError,
             error: Some(error.into()),
             stats: TurnStats::default(),
+            done_index: 0,
         };
         let lines = block.lines(&crate::block::RenderCtx::bare(100));
         let text: String = lines
@@ -2063,6 +2211,7 @@ mod tests {
             stop: StopReason::Cancelled,
             error: Some("by the user".into()),
             stats: TurnStats::default(),
+            done_index: 0,
         };
         let lines = short.lines(&crate::block::RenderCtx::bare(100));
         assert_eq!(lines.len(), 1);
@@ -2080,6 +2229,7 @@ mod tests {
                 stop,
                 error: None,
                 stats: TurnStats::default(),
+                done_index: 0,
             }
             .lines(&crate::block::RenderCtx::bare(80))
             .iter()
@@ -2134,7 +2284,8 @@ mod tests {
 
         let clean = drawn(StopReason::Stopped);
         assert!(
-            clean.contains("完成") && !clean.contains("Stopped"),
+            // The clean end rotates through `DONE_LABELS`; index 0 is `Done`.
+            clean.contains("Done") && !clean.contains("Stopped"),
             "{clean}"
         );
 
@@ -2148,7 +2299,7 @@ mod tests {
         assert!(failed.contains("已中断"), "{failed}");
 
         // Every reason is one of two outcomes, and the mark says which.
-        let mark = |stop| turn_end_note(stop).0;
+        let mark = |stop| turn_end_note(stop, 0).0;
         assert_eq!(mark(StopReason::Stopped), Glyph::Ok);
         for cut in [
             StopReason::Cancelled,
@@ -2164,11 +2315,13 @@ mod tests {
         }
     }
 
-    /// What a turn cost, on the line that closes it.
+    /// What a turn cost, on the line that closes it, in tuix's shape:
+    /// `✓ Done · 4 轮 · 2 工具 · 32.7s · 4.36K tokens · 99% cached`.
     ///
     /// The figures are a real reading, not invented: a four-round turn whose
     /// last request carried 90659 tokens of context, 90496 of them served from
-    /// cache, and which produced 4200 tokens of output.
+    /// cache, and which produced 4200 tokens of output — so the turn's billable
+    /// cost is `4200 + (90659 - 90496) = 4363` tokens.
     #[test]
     fn the_end_of_a_turn_says_what_it_cost() {
         let block = TurnEndBlock {
@@ -2179,10 +2332,20 @@ mod tests {
                 prompt: 90_659,
                 completion: 4_200,
                 cached: 90_496,
+                tools: 2,
+                elapsed_ms: 32_700,
             },
+            done_index: 0,
         };
         let text = drawn(&block, 100);
-        for want in ["完成", "4 步", "入 90.7k", "出 4200", "缓存 99.82%"] {
+        for want in [
+            "Done",
+            "4 轮",
+            "2 工具",
+            "32.7s",
+            "4.36K tokens",
+            "99% cached",
+        ] {
             assert!(text.contains(want), "{want} missing from {text:?}");
         }
         assert_eq!(
@@ -2205,11 +2368,19 @@ mod tests {
                 prompt: 6_223,
                 completion: 28,
                 cached: 0,
+                tools: 0,
+                elapsed_ms: 1_200,
             },
+            done_index: 0,
         };
         let text = drawn(&block, 80);
-        assert!(!text.contains("缓存"), "{text:?}");
-        assert!(text.contains("入 6223"), "the rest is still said: {text:?}");
+        assert!(!text.contains("cached"), "{text:?}");
+        // Billable with nothing cached is the whole request plus its output:
+        // `28 + 6223 = 6251` → `6.25K`.
+        assert!(
+            text.contains("6.25K tokens"),
+            "the rest is still said: {text:?}"
+        );
     }
 
     /// A turn the log recorded nothing about — cut before its first request —
@@ -2220,12 +2391,13 @@ mod tests {
             stop: StopReason::Cancelled,
             error: None,
             stats: TurnStats::default(),
+            done_index: 0,
         };
         let lines = block.lines(&crate::block::RenderCtx::bare(80));
         assert_eq!(lines.len(), 1, "nothing to say means no extra row");
         let text = drawn(&block, 80);
         assert!(text.contains("已中断"), "{text:?}");
-        for absent in ["步", "入", "出", "缓存", "%"] {
+        for absent in ["轮", "工具", "tokens", "cached"] {
             assert!(!text.contains(absent), "{absent} in {text:?}");
         }
     }
@@ -2243,20 +2415,23 @@ mod tests {
                 prompt: 90_659,
                 completion: 4_200,
                 cached: 90_496,
+                tools: 2,
+                elapsed_ms: 32_700,
             },
+            done_index: 0,
         };
-        let outcome = format!("{} 完成", Caps::default().g(Glyph::Ok));
+        let outcome = format!("{} Done", Caps::default().g(Glyph::Ok));
         let first = (0..200u16)
             .find(|w| crate::el::caption_fits(&outcome, *w as usize))
             .expect("the outcome fits on some screen");
         for w in first..=120 {
             let text = drawn(&block, w);
-            assert!(text.contains("完成"), "w={w}: {text:?}");
+            assert!(text.contains("Done"), "w={w}: {text:?}");
             // Read with the whitespace taken out: a narrow rule moves the
             // figures under itself, where they are wrapped mid-phrase — they
             // are all still said, which is the property.
             let flat: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-            for want in ["4步", "入90.7k", "出4200", "缓存99.82%"] {
+            for want in ["4轮", "2工具", "32.7s", "4.36Ktokens", "99%cached"] {
                 assert!(flat.contains(want), "w={w}: {want} lost from {text:?}");
             }
             for line in block.lines(&crate::block::RenderCtx::bare(w)) {
@@ -2277,7 +2452,10 @@ mod tests {
                 prompt: 1_048_576,
                 completion: 123_456,
                 cached: 1_000_000,
+                tools: 87,
+                elapsed_ms: 3_725_000,
             },
+            done_index: 0,
         };
         for w in 0..160u16 {
             for line in block.lines(&crate::block::RenderCtx::bare(w)) {
@@ -2341,11 +2519,13 @@ mod tests {
                 stop: StopReason::RunawayFuse,
                 error: None,
                 stats: TurnStats::default(),
+                done_index: 0,
             }),
             Box::new(TurnEndBlock {
                 stop: StopReason::Cancelled,
                 error: Some("by the user".into()),
                 stats: TurnStats::default(),
+                done_index: 0,
             }),
             // With figures, and with figures plus a cause: the caption is
             // longest here, so this is the case that would run off the edge.
@@ -2357,7 +2537,10 @@ mod tests {
                     prompt: 128_456,
                     completion: 9_876,
                     cached: 120_000,
+                    tools: 15,
+                    elapsed_ms: 92_400,
                 },
+                done_index: 1,
             }),
             Box::new(TurnEndBlock {
                 stop: StopReason::ProviderError,
@@ -2367,7 +2550,10 @@ mod tests {
                     prompt: 62_120,
                     completion: 812,
                     cached: 0,
+                    tools: 4,
+                    elapsed_ms: 15_000,
                 },
+                done_index: 0,
             }),
         ];
         for item in &items {
@@ -2423,7 +2609,7 @@ mod tests {
         let named = head
             .spans
             .iter()
-            .find(|s| s.text.contains("read_file"))
+            .find(|s| s.text.contains("ReadFile"))
             .expect("the tool's name");
         assert_eq!(named.style.fg, warn, "the name is not in flight: {head:?}");
 
@@ -2443,7 +2629,7 @@ mod tests {
             let named = head
                 .spans
                 .iter()
-                .find(|s| s.text.contains("read_file"))
+                .find(|s| s.text.contains("ReadFile"))
                 .expect("the tool's name");
             assert_ne!(
                 named.style.fg, warn,
@@ -2474,7 +2660,7 @@ mod tests {
         let named = folded
             .spans
             .iter()
-            .find(|s| s.text.contains("read_file"))
+            .find(|s| s.text.contains("ReadFile"))
             .expect("the tool's name");
         assert_eq!(named.style.fg, heading, "the folded name is not receding");
         let subject = folded
@@ -2509,12 +2695,12 @@ mod tests {
 
         // A run behind one lid is the same drawing, so it recedes too.
         let lid = ToolCallBlock::group_lines(&failed, 3, 80);
-        let head = lid.iter().find(|l| l.plain().contains("read_file"));
+        let head = lid.iter().find(|l| l.plain().contains("ReadFile"));
         let head = head.expect("the last call under the lid");
         let named = head
             .spans
             .iter()
-            .find(|s| s.text.contains("read_file"))
+            .find(|s| s.text.contains("ReadFile"))
             .expect("the tool's name");
         assert_eq!(
             named.style.fg, heading,
@@ -2535,14 +2721,14 @@ mod tests {
     fn arguments_are_shown_in_the_form_a_person_scans() {
         // `brief` used to render `file_path=a.rs`, which reads like a debug
         // dump. `subject_of` picks the argument that names the thing acted on,
-        // so the line reads `read_file(a.rs)` — and it has a fallback, so a
+        // so the line reads `ReadFile(a.rs)` — and it has a fallback, so a
         // tool nobody wrote a rule for still says something.
         let c = ToolCallBlock::pending("c", "read_file", r#"{"file_path":"a.rs"}"#);
         assert_eq!(subject_of(&c.name, &c.args), "a.rs");
         assert!(c
             .summary(&crate::block::RenderCtx::bare(40))
             .plain()
-            .contains("read_file(a.rs)"));
+            .contains("ReadFile(a.rs)"));
 
         let unknown = ToolCallBlock::pending("d", "some_new_tool", r#"{"thing":"x.rs"}"#);
         assert!(

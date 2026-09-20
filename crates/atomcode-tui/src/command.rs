@@ -247,9 +247,61 @@ impl Commands {
     }
 }
 
+/// Whether a submitted line is a slash *command* and not a filesystem path or
+/// URL that merely begins with `/`.
+///
+/// A command is `/name` — `name` being letters, digits, `_`, `-`, or `:` (the
+/// last for namespaced skills like `/skills:brainstorming`) — optionally
+/// followed by whitespace and arguments. A **non-whitespace** character right
+/// after the name (the next `/` of `/Users/me/x`, the `.` of `/x.png`) means the
+/// leading `/` was literal: the line is a path the user is sending to the model,
+/// not a command, and must NOT be dispatched (which would answer "没有 /Users/…
+/// 这条命令"). Arguments that are themselves paths (`/cd /Users/me`) are fine —
+/// only the first token is inspected.
+pub fn looks_like_command(line: &str) -> bool {
+    let Some(rest) = line.trim_start().strip_prefix('/') else {
+        return false;
+    };
+    let name_end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == ':'))
+        .unwrap_or(rest.len());
+    if name_end == 0 {
+        return false; // "/" alone, or "//…" — no command name
+    }
+    match rest[name_end..].chars().next() {
+        None => true,                         // "/help"
+        Some(c) if c.is_whitespace() => true, // "/cd ~/x"
+        _ => false,                           // "/Users/…", "/x.png", "/a@b"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_path_that_begins_with_slash_is_not_a_command() {
+        // The reported bug: pasting a path must reach the model untouched, not
+        // dispatch to "没有 /Users/… 这条命令".
+        assert!(!looks_like_command(
+            "/Users/theo/Desktop/企业微信20260919-160158@2x.png"
+        ));
+        assert!(!looks_like_command("/tmp/x"));
+        assert!(!looks_like_command("/path/with/中文/pic.png"));
+        assert!(!looks_like_command("/x.png")); // a bare filename with a dot
+        assert!(!looks_like_command("/")); // slash alone is not a command name
+        assert!(!looks_like_command("hello")); // no leading slash
+    }
+
+    #[test]
+    fn a_real_command_shape_is_a_command() {
+        assert!(looks_like_command("/help"));
+        assert!(looks_like_command("/cd ~/projects")); // path lives in the args
+        assert!(looks_like_command("/model glm5.3"));
+        assert!(looks_like_command("/skills:brainstorming")); // namespaced skill
+        assert!(looks_like_command("  /clear")); // leading spaces are fine
+        assert!(looks_like_command("/reset")); // unknown-but-command-shaped still dispatches (→ "did you mean")
+    }
 
     struct Fake(&'static str, &'static [Command]);
 

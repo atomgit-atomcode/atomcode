@@ -449,17 +449,26 @@ impl Tool for ReadFileTool {
             // size; anything else keeps the existing binary-text + recovery hint.
             if self.vision && meta.len <= MAX_IMAGE_BYTES {
                 if let Some(media_type) = image_media_type(&path) {
-                    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                    // Downscale/re-encode oversized images so a huge screenshot doesn't
+                    // blow the per-request body (this image is re-sent on every turn).
+                    // Falls back to the original bytes/type on any decode failure.
+                    let (media_type, data) =
+                        match crate::image_normalize::normalize_image_raw(&bytes) {
+                            Some((mt, out)) => {
+                                (mt, base64::engine::general_purpose::STANDARD.encode(out))
+                            }
+                            None => (
+                                media_type.to_string(),
+                                base64::engine::general_purpose::STANDARD.encode(&bytes),
+                            ),
+                        };
                     return ok_with_images(
                         format!(
                             "[Image: {} ({} bytes) — attached below for the vision model]",
                             a.file_path,
                             bytes.len()
                         ),
-                        vec![ImageContent {
-                            media_type: media_type.to_string(),
-                            data,
-                        }],
+                        vec![ImageContent { media_type, data }],
                     );
                 }
             }

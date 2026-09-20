@@ -8,11 +8,11 @@
 //! box-drawing tables, CJK that shifts every border after it), and this row is
 //! the same problem, so they are worth keeping.
 //!
-//! One decision is deliberately not tuix's. tuix separated *every* pair of rows
-//! with a rule, and told the header apart by drawing its rule heavy (`━`) and
-//! the rest light (`─`). This tree has a single rule character, so repeating it
-//! between rows left the header looking like one more body row with a line under
-//! it. The rule is drawn once, under the header, and the body is left alone.
+//! The row rules are tuix's too: a heavy rule (`━`) under the header and a light
+//! rule (`─`) between every pair of body rows, each segmented per column. The
+//! two weights are what tell the header apart from the body — a light rule under
+//! the header, with light rules between the body rows as well, would read as one
+//! more body separator rather than the boundary it is.
 //!
 //! What is not ported is the exit. tuix emits ANSI strings and therefore has to
 //! measure a cell by *re-parsing* it with a strip function that must mirror the
@@ -39,6 +39,14 @@ const GAP: usize = 2;
 /// cramped, a line that exactly touches the right edge is the one a terminal is
 /// most likely to wrap on its own.
 const RIGHT_GUARD: usize = 1;
+
+/// The heavy rule drawn under the header, `atomcode-tuix`'s `━`. The header is
+/// told apart from the body by weight rather than by being the only row with a
+/// rule beneath it: with a light rule between every body row (the shape tuix
+/// draws), a light rule under the header too would read as one more body
+/// separator. Both weights are width-1 box-drawing glyphs, so the column maths
+/// is identical either way. See [`RULE`] for the light one.
+const HEAVY_RULE: &str = "━";
 
 /// Is this line a table row? Returns its canonical `|` form when it is.
 ///
@@ -422,18 +430,29 @@ fn too_starved(parsed: &[Vec<String>], col_widths: &[usize], base: Style) -> boo
     affected >= threshold
 }
 
-/// A segmented rule: one run per column, joined by the gap, mirroring the column
-/// layout (`───  ───`) without drawing vertical borders.
-fn rule_line(col_widths: &[usize]) -> Line {
+/// A segmented rule in `ch`: one run per column, joined by the gap, mirroring
+/// the column layout (`━━━  ━━━`) without drawing vertical borders. The weight
+/// is the caller's — [`HEAVY_RULE`] under the header, [`RULE`] between body rows.
+fn rule_line(col_widths: &[usize], ch: &str) -> Line {
     let Some((&first, rest)) = col_widths.split_first() else {
         return Line::empty();
     };
-    let mut spans = vec![Span::styled(RULE.repeat(first + PAD * 2), fence())];
+    let mut spans = vec![Span::styled(ch.repeat(first + PAD * 2), fence())];
     for &cw in rest {
         spans.push(Span::styled(" ".repeat(GAP), fence()));
-        spans.push(Span::styled(RULE.repeat(cw + PAD * 2), fence()));
+        spans.push(Span::styled(ch.repeat(cw + PAD * 2), fence()));
     }
     Line::from_spans(spans)
+}
+
+/// The rule between rows `i` and `i+1` of a `rows`-row table, or `None` when
+/// there is no next row. `atomcode-tuix`'s shape: a heavy rule under the header
+/// (row 0), a light one between every pair of body rows.
+fn row_separator(i: usize, rows: usize, col_widths: &[usize]) -> Option<Line> {
+    (i + 1 < rows).then(|| {
+        let ch = if i == 0 { HEAVY_RULE } else { RULE };
+        rule_line(col_widths, ch)
+    })
 }
 
 /// Rows of a table that are not delimiter rows.
@@ -442,7 +461,8 @@ fn data_rows(parsed: &[Vec<String>]) -> Vec<&Vec<String>> {
 }
 
 /// The natural grid: every row drawn at the columns' natural widths, the header
-/// row styled as a heading, a rule under the header and nowhere else.
+/// row styled as a heading, a heavy rule under the header and a light rule
+/// between every pair of body rows — `atomcode-tuix`'s shape.
 fn aligned(parsed: &[Vec<String>], col_widths: &[usize], base: Style) -> Vec<Line> {
     let ncols = col_widths.len();
     let rows = data_rows(parsed);
@@ -464,9 +484,7 @@ fn aligned(parsed: &[Vec<String>], col_widths: &[usize], base: Style) -> Vec<Lin
             }
         }
         out.push(Line::from_spans(spans));
-        if i == 0 && rows.len() > 1 {
-            out.push(rule_line(col_widths));
-        }
+        out.extend(row_separator(i, rows.len(), col_widths));
     }
     out
 }
@@ -509,9 +527,7 @@ fn wrapped_grid(parsed: &[Vec<String>], col_widths: &[usize], base: Style) -> Ve
             }
             out.push(Line::from_spans(spans));
         }
-        if i == 0 && rows.len() > 1 {
-            out.push(rule_line(col_widths));
-        }
+        out.extend(row_separator(i, rows.len(), col_widths));
     }
     out
 }
@@ -587,10 +603,14 @@ mod tests {
         .collect()
     }
 
-    /// A rule is drawn under the header, so not every drawn line is a row.
+    /// Rules are drawn under the header (heavy) and between body rows (light), so
+    /// not every drawn line is a row — both weights are filtered out here.
     fn rows_of(out: &[String]) -> Vec<String> {
         out.iter()
-            .filter(|l| !l.trim_start().starts_with('─'))
+            .filter(|l| {
+                let head = l.trim_start().chars().next();
+                head != Some('─') && head != Some('━')
+            })
             .cloned()
             .collect()
     }
@@ -781,10 +801,11 @@ mod tests {
 
     // ─── the shape of the grid ───
 
-    /// The rule marks the header and only the header. Both grid tiers draw it,
-    /// so both are exercised here: the natural one and the folded one.
+    /// A heavy rule under the header and a light rule between the two body rows,
+    /// `atomcode-tuix`'s shape. Both grid tiers draw them, so both are exercised
+    /// here: the natural one and the folded one.
     #[test]
-    fn the_rule_is_drawn_under_the_header_and_nowhere_else() {
+    fn a_heavy_rule_marks_the_header_and_light_rules_separate_the_body() {
         let parsed: Vec<Vec<String>> = ["| h1 | h2 |", "|---|---|", "| a | b |", "| c | d |"]
             .iter()
             .map(|r| split_row(r))
@@ -796,16 +817,24 @@ mod tests {
         ];
         for (tier, lines) in tiers {
             let plain: Vec<String> = lines.iter().map(Line::plain).collect();
-            let rules: Vec<usize> = plain
-                .iter()
-                .enumerate()
-                .filter(|(_, l)| l.trim_start().starts_with('─'))
-                .map(|(i, _)| i)
-                .collect();
-            assert_eq!(rules, [1], "{tier}: not exactly one rule: {plain:?}");
+            // header, heavy rule, body1, light rule, body2.
             assert!(
                 plain[0].contains("h1"),
-                "{tier}: the header is not above the rule: {plain:?}"
+                "{tier}: the header is not first: {plain:?}"
+            );
+            assert!(
+                plain[1].trim_start().starts_with('━'),
+                "{tier}: the header rule is not heavy: {plain:?}"
+            );
+            assert!(
+                plain[3].trim_start().starts_with('─'),
+                "{tier}: the body rows are not separated by a light rule: {plain:?}"
+            );
+            // The header rule is heavy and the body rule light — the two weights
+            // are what tell the header apart from the body.
+            assert!(
+                !plain[3].contains('━'),
+                "{tier}: a body separator must not be heavy: {plain:?}"
             );
         }
     }

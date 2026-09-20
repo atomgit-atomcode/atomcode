@@ -8,6 +8,13 @@
 //! the new session (`docs/adr/0022` §6).
 
 use std::collections::{BTreeMap, HashSet};
+
+/// When a press landed, where, and how many in a row — the three facts a
+/// double- or triple-click is made of.
+///
+/// A name rather than a tuple in the field: three anonymous parts, two of them
+/// numbers, is a type whose meaning lives in a comment somewhere else.
+type ClickStreak = (std::time::Instant, (u16, u16), u8);
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -489,6 +496,11 @@ fn paths_under(cwd: &str, prefix: &str) -> Vec<crate::menu::Item> {
 /// which is exactly when precision beats speed.
 const WHEEL_LINES: i32 = 1;
 
+/// How close two presses on the same cell must be to count as a double- (then
+/// triple-) click. 400ms is the common desktop default — long enough for a
+/// deliberate second tap, short enough that two separate clicks are not fused.
+const MULTI_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
+
 /// The ways out of a policy intervention, as a person reads them.
 ///
 /// The intervention's own list, in its order: the kernel says which apply, and
@@ -766,6 +778,11 @@ pub struct Tui {
     wake: Mutex<Option<mpsc::UnboundedSender<Wake>>>,
     /// Where the button went down, so a release can tell a click from a drag.
     pressed_at: Mutex<Option<(u16, u16)>>,
+    /// The last press's time, cell, and how many presses have landed on that
+    /// cell in a row — so a second press within the window is a double-click
+    /// (word) and a third a triple-click (line). The app reproduces what taking
+    /// the mouse for drag-select took from the terminal.
+    click_streak: Mutex<Option<ClickStreak>>,
     /// The session's members, by session id — stopped ones included, so
     /// `/agents` can still reach their logs. Shared with the tree as an
     /// `Arc`, because that seam is how a command reads it.
@@ -1282,6 +1299,28 @@ impl UserInterface for Tui {
                         Click::WheelDown => Some(Action::Scroll(WHEEL_LINES)),
                         Click::Press => {
                             *self.pressed_at.lock().expect("press poisoned") = Some((x, y));
+                            // How many presses have landed on this cell in a
+                            // row: a second within the window is a word, a third
+                            // a line. Recorded on every press so the run is
+                            // right even when a press is consumed as chrome below.
+                            let clicks = {
+                                let now = std::time::Instant::now();
+                                let mut streak = self.click_streak.lock().expect("streak poisoned");
+                                let n = match *streak {
+                                    Some((at, cell, n))
+                                        if cell == (x, y)
+                                            && now.duration_since(at) <= MULTI_CLICK =>
+                                    {
+                                        // Saturating: a stuck/auto-repeating button
+                                        // must not overflow (panic in debug) — and
+                                        // we only distinguish 1 / 2 / ≥3 anyway.
+                                        n.saturating_add(1)
+                                    }
+                                    _ => 1,
+                                };
+                                *streak = Some((now, (x, y), n));
+                                n
+                            };
                             // A press on an answer is the answer. It is not the
                             // start of a text selection and not a fold: the
                             // panel is a choice, and waiting for the release
@@ -1358,7 +1397,22 @@ impl UserInterface for Tui {
                                     continue;
                                 }
                             }
-                            Some(Action::SelectFrom(x, y))
+                            match clicks {
+                                // Forget the press so the release does not become
+                                // a `ClickAt` — which, not being a selection
+                                // gesture, would clear the word/line we just put
+                                // up. The gesture already copied on this press;
+                                // the highlight stays, like a drag's does.
+                                2 => {
+                                    *self.pressed_at.lock().expect("press poisoned") = None;
+                                    Some(Action::SelectWord(x, y))
+                                }
+                                n if n >= 3 => {
+                                    *self.pressed_at.lock().expect("press poisoned") = None;
+                                    Some(Action::SelectLine(x, y))
+                                }
+                                _ => Some(Action::SelectFrom(x, y)),
+                            }
                         }
                         Click::Drag => Some(Action::SelectTo(x, y)),
                         Click::Release => {
@@ -1366,7 +1420,11 @@ impl UserInterface for Tui {
                             match from {
                                 Some(p) if p == (x, y) => Some(Action::ClickAt(x, y)),
                                 Some(_) => Some(Action::CopySelection),
-                                None => None,
+                                // No press to release against: a multi-click
+                                // cleared it. Copy whatever is selected (a word,
+                                // a line, or a double-click-then-drag extension)
+                                // — a no-op when nothing is. The highlight stays.
+                                None => Some(Action::CopySelection),
                             }
                         }
                         // A move is not a press: it is the one pointer event
@@ -2088,7 +2146,26 @@ impl Tui {
             }
             AgentEvent::Described { description } => {
                 self.client.describe(&description);
-                false
+                // Keep the status row's context window in step with the screen
+                // agent's mounted model. Read it back off the screen agent's
+                // description (not the one that just arrived, which may be a team
+                // member's), so switching models moves the denominator the row
+                // shows the used tokens against. A change is stale — the footer
+                // must repaint to show the new window.
+                let described = self.client.described();
+                let window = described
+                    .as_ref()
+                    .and_then(|d| d.context_window)
+                    .unwrap_or(0);
+                let model = described
+                    .as_ref()
+                    .and_then(|d| d.model.clone())
+                    .unwrap_or_default();
+                let mut moment = self.host.moment.write().expect("moment poisoned");
+                let changed = moment.ctx_window != window || moment.model != model;
+                moment.ctx_window = window;
+                moment.model = model;
+                changed
             }
             AgentEvent::Accepted { command, .. } => {
                 self.client.answered(&command);
@@ -2296,6 +2373,15 @@ impl Tui {
     /// Apply one action. Returns `true` to quit.
     fn act(&self, action: Action, client: &AgentClient) -> bool {
         let mut m = self.host.moment.write().expect("moment poisoned");
+        // Any action other than a repeat Ctrl+C disarms the "press again to quit"
+        // latch, and takes the exit hint below the box down with it: an accidental
+        // first press followed by real work must never leave the terminal one
+        // keystroke from exit, nor the hint up while that work goes on. First,
+        // before any early return below (e.g. Escape clearing a selection) can
+        // skip it.
+        if !matches!(action, Action::Cancel) {
+            m.disarm_quit();
+        }
         // A highlight is a rectangle of screen cells. Anything that repaints
         // those cells with different text leaves it pointing at the wrong
         // words, so it is dropped by everything except the gestures that are
@@ -2304,6 +2390,8 @@ impl Tui {
             action,
             Action::SelectFrom(..)
                 | Action::SelectTo(..)
+                | Action::SelectWord(..)
+                | Action::SelectLine(..)
                 | Action::CopySelection
                 | Action::ClearSelection
         ) {
@@ -2344,9 +2432,12 @@ impl Tui {
                 if text.is_empty() {
                     return false;
                 }
-                // A slash goes to the command surface, everything else to the
-                // model. The one place the two are told apart.
-                if text.starts_with('/') {
+                // A slash *command* goes to the command surface, everything else
+                // to the model. The one place the two are told apart — and a
+                // filesystem path that merely begins with `/` (`/Users/me/x.png`)
+                // is NOT a command: it reaches the model untouched instead of
+                // erroring with "没有 /Users/… 这条命令".
+                if crate::command::looks_like_command(&text) {
                     self.run_command(&text);
                     return false;
                 }
@@ -2497,12 +2588,21 @@ impl Tui {
                 m.caret = at + inserted.len();
             }
             Action::Cancel => {
-                // Through the host, so the live line's appearance is pinned the
-                // same way a turn's start is: this is the third route that moves
-                // that row, and a pin on two of three jumps on the third.
-                drop(m);
-                self.stop_turn(client);
-                return false;
+                // A turn in flight: Ctrl+C stops it and clears any pending quit —
+                // the same live-line pin a turn's start gets (this is the third
+                // route that moves that row). Stopping counts as in-flight too. The
+                // line is left alone: cancelling the model's answer is not the same
+                // gesture as clearing what you were about to say next.
+                if m.activity != crate::moment::Activity::Idle {
+                    m.disarm_quit();
+                    drop(m);
+                    self.stop_turn(client);
+                    return false;
+                }
+                // Idle: the two-press exit. The first Ctrl+C clears the line and
+                // shows `再按 Ctrl+C 退出` below the box; a second press while it is
+                // up quits; once it has expired the next press is a fresh first one.
+                return m.cancel_idle();
             }
             Action::Scroll(by) => {
                 // Bounded by what is left to read, not by how much there is:
@@ -2604,6 +2704,35 @@ impl Tui {
             Action::SelectTo(x, y) => {
                 if let Some(sel) = m.selection.as_mut() {
                     sel.head = (x, y);
+                }
+                return false;
+            }
+            // Double- and triple-click: put the word (or the line) up as a
+            // selection and copy it in one gesture, the way a terminal does.
+            // `compose` reads the moment, so the guard goes first — then the
+            // selection is set back on it, the same drop/compose dance as
+            // `CopySelection`.
+            Action::SelectWord(x, y) => {
+                drop(m);
+                let frame = self.host.compose(self.surface.size());
+                if let Some(sel) = frame.word_at(x, y) {
+                    let text = frame.selected_text(&sel);
+                    self.host.moment.write().expect("moment poisoned").selection = Some(sel);
+                    if !text.is_empty() {
+                        self.surface.copy(&text);
+                    }
+                }
+                return false;
+            }
+            Action::SelectLine(_x, y) => {
+                drop(m);
+                let frame = self.host.compose(self.surface.size());
+                if let Some(sel) = frame.line_at(y) {
+                    let text = frame.selected_text(&sel);
+                    self.host.moment.write().expect("moment poisoned").selection = Some(sel);
+                    if !text.is_empty() {
+                        self.surface.copy(&text);
+                    }
                 }
                 return false;
             }
@@ -3383,6 +3512,7 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
             ctx: Mutex::new(None),
             wake: Mutex::new(None),
             pressed_at: Mutex::new(None),
+            click_streak: Mutex::new(None),
             members: Arc::new(Roster::default()),
             named: Mutex::new(None),
         },

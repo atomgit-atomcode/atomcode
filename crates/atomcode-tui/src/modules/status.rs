@@ -19,6 +19,10 @@ pub struct State {
     pub model: String,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
+    /// The cached part of the last request's context. Read off the same reading
+    /// as `prompt_tokens` so the hit rate the row shows (`cache 96%`) is a share
+    /// of the request it came from, not two figures from different requests.
+    pub cached_tokens: u32,
     pub tool_calls: u32,
     pub last_stop: Option<String>,
 }
@@ -44,6 +48,10 @@ impl View for Status {
                 // cumulative figure, and summing would double-count it.
                 state.prompt_tokens = state.prompt_tokens.max(usage.prompt);
                 state.completion_tokens += usage.completion;
+                // The cached share belongs to one request, so it is the last
+                // reading rather than a max: a hit rate is only meaningful against
+                // the context it was measured on.
+                state.cached_tokens = usage.cached;
             }
             SessionEvent::StepEnd { tool_calls, .. } => state.tool_calls += tool_calls,
             SessionEvent::TurnEnd { stop, .. } => state.last_stop = Some(format!("{stop:?}")),
@@ -51,80 +59,155 @@ impl View for Status {
         }
     }
 
-    /// The bottom line: what model, where, how much context.
+    /// The bottom line: what model, where, how full the context is, how much of
+    /// it was cached — `model │ cwd │ 49.0k/512k tok (10%) │ cache 96%`, with the
+    /// home directory collapsed to `~`.
     ///
-    /// `atomcode-tuix` puts this last and dims it — it is the thing you glance
-    /// at, not the thing you read. A reverse-video bar across the top is what
-    /// an editor does; a coding agent's screen belongs to the conversation.
+    /// Each part carries its own colour: the model in the theme accent, the cwd
+    /// muted grey, the context usage green (shifting to yellow then red as the
+    /// window fills toward the auto-compaction threshold), the cache ratio gold,
+    /// the separators muted. It puts this last and lets it end where its text ends
+    /// — the thing you glance at, not the thing you read. A reverse-video bar
+    /// across the top is what an editor does; a coding agent's screen belongs to
+    /// the conversation.
+    ///
+    /// On a narrow terminal the parts drop in tuix's order rather than the whole
+    /// row truncating: the cwd shrinks to its project name, then the usage goes,
+    /// then the cache, so the model — the one thing you always need — is the last
+    /// to be squeezed.
     fn render(state: &State, vp: &Viewport<'_>) -> Vec<Line> {
-        use crate::caps::Glyph;
         use crate::el::El;
 
         let w = vp.rect.w;
         if w == 0 || vp.rect.h == 0 {
             return Vec::new();
         }
+        // The `再按 Ctrl+C 退出` hint takes the whole row while it is up — this is
+        // the footer below the box, where tuix and Claude Code put their exit
+        // prompt. It rides `notice.below` rather than a flag of its own so its
+        // expiry (the two-second exit window) is the one thing that decides both
+        // that it shows and that a second Ctrl+C quits. Left-aligned and muted:
+        // it is a prompt, not a report, and it is gone in two seconds.
+        if let Some(hint) = vp
+            .moment
+            .notice
+            .as_ref()
+            .filter(|n| n.below && n.is_live(vp.moment.now))
+        {
+            return El::styled(hint.text.clone(), theme::fg(Role::Muted)).lay(w);
+        }
         let caps = vp.moment.caps;
         let dim = theme::fg(Role::Muted);
-        let sep = || El::styled(format!(" {} ", caps.g(Glyph::Separator)), dim);
+        // The status row separates its fields with a vertical bar the way tuix's
+        // does (`model │ cwd │ …`), not the middle dot the rest of the screen uses
+        // between inline figures — so the fields read as columns. ASCII `|` where
+        // the terminal cannot draw box-drawing. Its measured width feeds
+        // `fit_status_segments`, so the fitting counts the same gaps the row draws.
+        let sep_text = format!(" {} ", caps.g(crate::caps::Glyph::Vertical));
+        let sep_w = width::str_width(&sep_text);
 
         let mut row: Vec<El> = Vec::new();
+        // Width already spoken for by the parts that sit outside the fitted info
+        // group: the member prefix ahead of it and the activity indicator after.
+        let mut reserved = 0usize;
+
         // Whose screen this is, when it is a team member's rather than the
         // lead's: everything below and everything typed is that member's.
         let viewing = &vp.moment.viewing;
         if !viewing.is_empty() && *viewing != vp.moment.lead {
-            row.push(El::styled(
-                format!("成员 {}", viewing.rsplit('/').next().unwrap_or(viewing)),
-                theme::fg(Role::Accent),
-            ));
-            row.push(sep());
+            let member = format!("成员 {}", viewing.rsplit('/').next().unwrap_or(viewing));
+            reserved += width::str_width(&member) + sep_w;
+            row.push(El::styled(member, theme::fg(Role::Accent)));
+            row.push(El::styled(sep_text.clone(), dim));
         }
-        row.push(El::styled(
-            if state.model.is_empty() {
-                "atomcode".to_string()
-            } else {
-                state.model.clone()
-            },
-            dim,
-        ));
-        if !vp.moment.cwd.is_empty() {
-            row.push(sep());
-            row.push(El::styled(vp.moment.cwd.clone(), dim));
-        }
-        // Only what means something. A counter reading zero is noise pretending
-        // to be information.
-        if state.prompt_tokens > 0 {
-            row.push(sep());
-            row.push(El::styled(
-                format!("{} tok", crate::content::token_count(state.prompt_tokens)),
-                dim,
-            ));
+
+        // The activity indicator is appended after the info group, but its width
+        // is reserved now so the group degrades to leave room for it rather than
+        // shoving it off the edge. The phase comes from the injected tick, never
+        // a clock (docs/adr/0008).
+        let activity: Option<(String, Style)> = match vp.moment.activity {
+            Activity::Working => Some((working_indicator(vp.moment), theme::fg(Role::Warning))),
+            Activity::Stopping => Some(("停止中".to_string(), theme::fg(Role::Error))),
+            Activity::Idle => None,
+        };
+        if let Some((text, _)) = &activity {
+            reserved += width::str_width(text) + sep_w;
         }
         // A session working towards something on its own says so for as long as
-        // it is. Here rather than on a row of its own: a line that is empty
+        // it is. On this row rather than one of its own: a line that is empty
         // whenever nothing is running costs a row of the conversation to say
         // nothing, and what this is for is the glance — "it is still going, it
         // is on round 4". `/autonomy` answers the same thing when asked; this
         // is the part that does not have to be asked.
-        if let Some(running) = vp.moment.autonomy.as_ref() {
-            row.push(sep());
-            row.push(El::styled(autonomy_badge(running), theme::fg(Role::Accent)));
+        //
+        // Reserved beside the activity indicator and for the same reason: it
+        // sits outside the fitted group, so the group has to degrade to leave
+        // room for it rather than shove it off the edge.
+        let autonomy = vp.moment.autonomy.as_ref().map(autonomy_badge);
+        if let Some(text) = &autonomy {
+            reserved += width::str_width(text) + sep_w;
         }
-        match vp.moment.activity {
-            // The phase comes from the injected tick, never a clock
-            // (docs/adr/0008).
-            Activity::Working => {
-                row.push(sep());
-                row.push(El::styled(
-                    working_indicator(vp.moment),
-                    theme::fg(Role::Warning),
-                ));
+
+        // Prefer the folded model (what a request actually ran on); before the
+        // first turn that is empty, so fall back to the description's model — the
+        // real name the welcome already shows — and only then to the brand.
+        let model_str = if !state.model.is_empty() {
+            state.model.clone()
+        } else if !vp.moment.model.is_empty() {
+            vp.moment.model.clone()
+        } else {
+            "atomcode".to_string()
+        };
+        // Home collapsed to `~` for display — the same optimisation the welcome
+        // banner and `/cd`/`/resume` apply at their own display sites. `Moment.cwd`
+        // itself stays absolute (the `@`-path completion in `plugin.rs` reads it as
+        // a real filesystem path), so the collapse happens here, not at the source.
+        let cwd_full = crate::text::collapse_home(&vp.moment.cwd);
+        let cwd_base = path_basename(&cwd_full).to_string();
+        // Only what means something: a context usage segment appears once there
+        // are tokens or a window to report, never as a bare zero.
+        let ctx_str = if state.prompt_tokens > 0 || vp.moment.ctx_window > 0 {
+            format_ctx_usage(state.prompt_tokens as usize, vp.moment.ctx_window as usize)
+        } else {
+            String::new()
+        };
+        let cache_str =
+            cache_indicator(state.cached_tokens, state.prompt_tokens).unwrap_or_default();
+
+        let budget = (w as usize).saturating_sub(reserved);
+        let segs = fit_status_segments(
+            &model_str, &cwd_full, &cwd_base, &ctx_str, &cache_str, budget, sep_w,
+        );
+
+        // Each part carries its own colour: the model in the theme accent, the cwd
+        // muted grey, the cache ratio gold, and the context usage green — shifting
+        // to yellow then red as the window fills toward the auto-compaction
+        // threshold. Separators stay muted.
+        let ctx_style = match ctx_fill_pct(state.prompt_tokens, vp.moment.ctx_window) {
+            p if p >= 90 => theme::fg(Role::Error),
+            p if p >= 70 => theme::fg(Role::Warning),
+            _ => theme::fg(Role::Success),
+        };
+        let style_for = |seg: StatusSeg| match seg {
+            StatusSeg::Model => theme::fg(Role::Accent),
+            StatusSeg::Cwd => dim,
+            StatusSeg::Ctx => ctx_style,
+            StatusSeg::Cache => theme::fg(Role::Warning),
+        };
+        for (i, (seg, text)) in segs.iter().enumerate() {
+            if i > 0 {
+                row.push(El::styled(sep_text.clone(), dim));
             }
-            Activity::Stopping => {
-                row.push(sep());
-                row.push(El::styled("停止中", theme::fg(Role::Error)));
-            }
-            Activity::Idle => {}
+            row.push(El::styled(text.clone(), style_for(*seg)));
+        }
+
+        if let Some(text) = autonomy {
+            row.push(El::styled(sep_text.clone(), dim));
+            row.push(El::styled(text, theme::fg(Role::Accent)));
+        }
+        if let Some((text, style)) = activity {
+            row.push(El::styled(sep_text.clone(), dim));
+            row.push(El::styled(text, style));
         }
         El::row(row).lay(w)
     }
@@ -141,16 +224,143 @@ impl View for Status {
     }
 }
 
+/// One colour-differentiated part of the status row's info group.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StatusSeg {
+    Model,
+    Cwd,
+    Ctx,
+    Cache,
+}
+
+/// Last non-empty path segment — the project name shown when a narrow row cannot
+/// fit the whole cwd. Splits on both `/` and `\` so a Windows path outside the
+/// home dir (which arrives with backslashes) still shrinks to its last segment.
+fn path_basename(path: &str) -> &str {
+    path.rsplit(['/', '\\'])
+        .find(|seg| !seg.is_empty())
+        .unwrap_or(path)
+}
+
+/// A token count in the status row's units, `atomcode-tuix`'s `format_tok_count`:
+/// `k` below a million and `m` at/above it. `round_clean` keeps a round value
+/// clean (`512k`, `1m`) for the window; the used count keeps one decimal
+/// (`49.0k`) so it is visibly moving.
+fn format_tok_count(n: usize, round_clean: bool) -> String {
+    if n >= 1_000_000 {
+        if round_clean && n.is_multiple_of(1_000_000) {
+            format!("{}m", n / 1_000_000)
+        } else {
+            format!("{:.1}m", n as f64 / 1_000_000.0)
+        }
+    } else if n >= 1000 {
+        if round_clean && n.is_multiple_of(1000) {
+            format!("{}k", n / 1000)
+        } else if round_clean {
+            format!("{:.0}k", n as f64 / 1000.0)
+        } else {
+            format!("{:.1}k", n as f64 / 1000.0)
+        }
+    } else {
+        format!("{n}")
+    }
+}
+
+/// Context usage as `49.0k/512k tok (10%)` when the window is known, or a bare
+/// `49.0k tok` when the provider has not reported one yet.
+fn format_ctx_usage(used: usize, window: usize) -> String {
+    let used_label = format_tok_count(used, false);
+    if window == 0 {
+        format!("{used_label} tok")
+    } else {
+        let window_label = format_tok_count(window, true);
+        let pct = (used as f64 / window as f64 * 100.0).round() as u64;
+        format!("{used_label}/{window_label} tok ({pct}%)")
+    }
+}
+
+/// How full the window is, as a whole percent, or `0` when the window is unknown.
+fn ctx_fill_pct(used: u32, window: u32) -> u64 {
+    if window == 0 {
+        0
+    } else {
+        (used as u64).saturating_mul(100) / window as u64
+    }
+}
+
+/// The cache-hit segment (`cache 96%`), or `None` when the provider reported no
+/// caching — a `cache 0%` would state a fact we do not have, the same rule the
+/// zero token counter follows.
+fn cache_indicator(cached: u32, prompt: u32) -> Option<String> {
+    (cached > 0 && prompt > 0).then(|| {
+        let pct = (cached as u64 * 100 / prompt as u64).min(100);
+        format!("cache {pct}%")
+    })
+}
+
+/// Joined display width of a segment list, counting the separators (` │ `) drawn
+/// between adjacent parts.
+fn status_segments_width(segs: &[(StatusSeg, String)], sep_w: usize) -> usize {
+    if segs.is_empty() {
+        return 0;
+    }
+    let text: usize = segs.iter().map(|(_, t)| width::str_width(t)).sum();
+    text + sep_w * (segs.len() - 1)
+}
+
+/// Choose which info-group parts fit within `budget`, degrading in tuix's order
+/// for a narrow terminal: shorten the cwd to its project name, then drop the
+/// context usage, then drop the cache ratio. The model is always kept; the caller
+/// lets `El` truncate it only as an absolute last resort. `sep_w` is the width of
+/// the separator `render` draws between parts, so the fitting counts the same
+/// gaps the row will.
+fn fit_status_segments(
+    model: &str,
+    cwd_full: &str,
+    cwd_base: &str,
+    ctx: &str,
+    cache: &str,
+    budget: usize,
+    sep_w: usize,
+) -> Vec<(StatusSeg, String)> {
+    let build = |cwd: &str, ctx_on: bool, cache_on: bool| {
+        let mut v: Vec<(StatusSeg, String)> = Vec::with_capacity(4);
+        if !model.is_empty() {
+            v.push((StatusSeg::Model, model.to_string()));
+        }
+        if !cwd.is_empty() {
+            v.push((StatusSeg::Cwd, cwd.to_string()));
+        }
+        if ctx_on && !ctx.is_empty() {
+            v.push((StatusSeg::Ctx, ctx.to_string()));
+        }
+        if cache_on && !cache.is_empty() {
+            v.push((StatusSeg::Cache, cache.to_string()));
+        }
+        v
+    };
+    let stages = [
+        build(cwd_full, true, true),
+        build(cwd_base, true, true),   // 1. cwd → project name
+        build(cwd_base, false, true),  // 2. drop the usage
+        build(cwd_base, false, false), // 3. drop the cache
+    ];
+    for stage in &stages {
+        if status_segments_width(stage, sep_w) <= budget {
+            return stage.clone();
+        }
+    }
+    // Nothing fits cleanly — hand back the leanest set; `El` truncates it.
+    build(cwd_base, false, false)
+}
+
 /// What the status line says about a session running on its own.
 ///
 /// Short on purpose — it shares a row with the model, the directory and the
-/// token count, and the long form is what `/autonomy` is for. The kind is
+/// context figure, and the long form is what `/autonomy` is for. The kind is
 /// named rather than assumed (`goal` vs `loop`), because which one is running
 /// is the first thing a person wants to know and the host is free to add a
 /// third.
-///
-/// A paused one still says so: "registered but not running" is exactly the
-/// state somebody would otherwise sit and wait through.
 fn autonomy_badge(running: &atomcode_host_api::Running) -> String {
     let kind = if running.kind == "goal" {
         "目标"
@@ -162,6 +372,8 @@ fn autonomy_badge(running: &atomcode_host_api::Running) -> String {
         None => running.round.to_string(),
     };
     match running.paused.as_deref() {
+        // Registered but not moving is the state a person would otherwise sit
+        // and wait through, so it is said rather than drawn as "running".
         Some(why) => format!("{kind} 第 {rounds} 轮 · 停着:{why}"),
         None => format!("{kind} 第 {rounds} 轮"),
     }
@@ -444,16 +656,251 @@ mod tests {
         );
     }
 
+    /// While the `再按 Ctrl+C 退出` hint is up it takes the whole status row,
+    /// left-aligned — the same footer `atomcode-tuix` and Claude Code put their
+    /// exit prompt in. The model/cwd/usage step aside for the two seconds it shows.
+    #[test]
+    fn a_live_exit_hint_takes_the_status_row() {
+        let st = State {
+            model: "glm5.3-flash-pro".into(),
+            ..Default::default()
+        };
+        let mut m = Moment {
+            model: "glm5.3-flash-pro".into(),
+            ..Default::default()
+        };
+        m.now = crate::moment::Timestamp::millis(0);
+        m.notice = Some(
+            crate::moment::Notice::for_ms(
+                "再按 Ctrl+C 退出",
+                false,
+                crate::moment::Timestamp::millis(0),
+                crate::moment::QUIT_HINT_MS,
+            )
+            .below(),
+        );
+        let line = Status::render(&st, &Viewport::new(Rect::sized(120, 1), &m))[0].plain();
+        assert!(
+            line.trim_start().starts_with("再按 Ctrl+C 退出"),
+            "{line:?}"
+        );
+        assert!(
+            !line.contains("glm5.3-flash-pro"),
+            "the model steps aside while the hint shows: {line:?}"
+        );
+    }
+
+    /// Once the hint's two seconds are up the status row is itself again — the
+    /// model comes back, the hint is gone.
+    #[test]
+    fn an_expired_exit_hint_leaves_the_status_row_alone() {
+        let st = State {
+            model: "glm5.3-flash-pro".into(),
+            ..Default::default()
+        };
+        let m = Moment {
+            now: crate::moment::Timestamp::millis(crate::moment::QUIT_HINT_MS),
+            notice: Some(
+                crate::moment::Notice::for_ms(
+                    "再按 Ctrl+C 退出",
+                    false,
+                    crate::moment::Timestamp::millis(0),
+                    crate::moment::QUIT_HINT_MS,
+                )
+                .below(),
+            ),
+            ..Default::default()
+        };
+        let line = Status::render(&st, &Viewport::new(Rect::sized(120, 1), &m))[0].plain();
+        assert!(
+            line.contains("glm5.3-flash-pro"),
+            "the row is itself again: {line:?}"
+        );
+        assert!(!line.contains("再按"), "the hint is gone: {line:?}");
+    }
+
+    /// Before the first turn the folded model is empty, so the footer names the
+    /// model from the description (what the welcome shows) rather than falling
+    /// back to the brand `atomcode`.
+    #[test]
+    fn a_fresh_session_names_the_real_model_not_the_brand() {
+        let m = Moment {
+            model: "glm5.3-flash-pro".into(),
+            ..Default::default()
+        };
+        // `State::default()` has no folded model yet — the pre-first-turn case.
+        let line =
+            Status::render(&State::default(), &Viewport::new(Rect::sized(80, 1), &m))[0].plain();
+        assert!(line.contains("glm5.3-flash-pro"), "{line:?}");
+        assert!(
+            !line.contains("atomcode"),
+            "the brand is only the last resort: {line:?}"
+        );
+    }
+
+    /// The reference footer: usage against the window and the cache ratio, in
+    /// tuix's `49.0k/512k tok (10%)` / `cache 96%` shape.
+    #[test]
+    fn the_row_shows_usage_against_the_window_and_the_cache_ratio() {
+        let st = State {
+            model: "glm5.3-flash-pro".into(),
+            prompt_tokens: 49_000,
+            cached_tokens: 47_040, // 96% of 49_000
+            ..Default::default()
+        };
+        let m = Moment {
+            cwd: "~/Documents/workspace/atomcode".into(),
+            ctx_window: 512_000,
+            ..Default::default()
+        };
+        let line = Status::render(&st, &Viewport::new(Rect::sized(120, 1), &m))[0].plain();
+        assert!(line.contains("glm5.3-flash-pro"), "{line:?}");
+        assert!(line.contains("~/Documents/workspace/atomcode"), "{line:?}");
+        // 49000/512000 ≈ 9.57% → 10%.
+        assert!(line.contains("49.0k/512k tok (10%)"), "{line:?}");
+        assert!(line.contains("cache 96%"), "{line:?}");
+    }
+
+    /// The footer collapses the home directory to `~`, the space-saving
+    /// optimisation the welcome banner and `/cd` also apply — the row shows
+    /// `~/proj`, never the absolute `/Users/…/proj`.
+    #[test]
+    fn the_cwd_collapses_the_home_directory_to_a_tilde() {
+        let Some(home) = crate::text::home_dir() else {
+            return; // No home to collapse against on this runner.
+        };
+        let cwd = home.join("proj").display().to_string();
+        let m = Moment {
+            cwd: cwd.clone(),
+            ..Default::default()
+        };
+        let line =
+            Status::render(&State::default(), &Viewport::new(Rect::sized(120, 1), &m))[0].plain();
+        assert!(line.contains("~/proj"), "{line:?}");
+        assert!(
+            !line.contains(&cwd),
+            "the absolute path must not appear: {line:?}"
+        );
+    }
+
+    /// With no window reported the usage is a bare count, not `x/0`.
+    #[test]
+    fn without_a_window_the_usage_is_a_bare_count() {
+        let st = State {
+            prompt_tokens: 49_000,
+            ..Default::default()
+        };
+        let line =
+            Status::render(&st, &Viewport::new(Rect::sized(120, 1), &Moment::default()))[0].plain();
+        assert!(line.contains("49.0k tok"), "{line:?}");
+        assert!(
+            !line.contains('/'),
+            "no window means no denominator: {line:?}"
+        );
+    }
+
+    /// A narrow row shrinks the cwd to its project name and then drops the
+    /// figures, in that order — the model is the one thing it never takes away.
+    #[test]
+    fn a_narrow_row_shrinks_the_cwd_then_drops_the_figures() {
+        let st = State {
+            model: "glm5.3-flash-pro".into(),
+            prompt_tokens: 49_000,
+            cached_tokens: 47_040,
+            ..Default::default()
+        };
+        let m = Moment {
+            cwd: "~/Documents/workspace/atomcode".into(),
+            ctx_window: 512_000,
+            ..Default::default()
+        };
+        let line = Status::render(&st, &Viewport::new(Rect::sized(40, 1), &m))[0].plain();
+        assert!(
+            line.contains("glm5.3-flash-pro"),
+            "the model is never dropped: {line:?}"
+        );
+        assert!(
+            line.contains("atomcode") && !line.contains("workspace"),
+            "the cwd shrank to its project name: {line:?}"
+        );
+    }
+
+    /// Each part carries its own colour: model accent, cwd muted grey, the usage
+    /// green while the window is far from full, the cache ratio gold.
+    #[test]
+    fn each_part_of_the_row_carries_its_own_colour() {
+        let st = State {
+            model: "glm".into(),
+            prompt_tokens: 100, // 10% of the window — well below the warn threshold
+            cached_tokens: 50,
+            ..Default::default()
+        };
+        let m = Moment {
+            cwd: "/w".into(),
+            ctx_window: 1000,
+            ..Default::default()
+        };
+        let line = &Status::render(&st, &Viewport::new(Rect::sized(120, 1), &m))[0];
+        let colour = |needle: &str| {
+            line.spans
+                .iter()
+                .find(|s| s.text.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} not on the row: {:?}", line.plain()))
+                .style
+                .fg
+        };
+        assert_eq!(colour("glm"), theme::fg(Role::Accent).fg, "model is accent");
+        assert_eq!(colour("/w"), theme::fg(Role::Muted).fg, "cwd is muted grey");
+        // 100/1000 = 10% < 70, so the usage is green.
+        assert_eq!(colour("tok"), theme::fg(Role::Success).fg, "usage is green");
+        assert_eq!(
+            colour("cache"),
+            theme::fg(Role::Warning).fg,
+            "cache is gold"
+        );
+    }
+
+    /// The usage is green, shifting to yellow then red as the window fills past
+    /// the auto-compaction threshold.
+    #[test]
+    fn the_usage_colour_warns_as_the_window_fills() {
+        let colour_at = |pct_used: u32| {
+            let st = State {
+                model: "m".into(),
+                prompt_tokens: pct_used * 10, // out of a 1000-token window
+                ..Default::default()
+            };
+            let m = Moment {
+                ctx_window: 1000,
+                ..Default::default()
+            };
+            Status::render(&st, &Viewport::new(Rect::sized(120, 1), &m))[0]
+                .spans
+                .iter()
+                .find(|s| s.text.contains("tok"))
+                .expect("the usage segment")
+                .style
+                .fg
+        };
+        assert_eq!(colour_at(10), theme::fg(Role::Success).fg, "10% is green");
+        assert_eq!(colour_at(75), theme::fg(Role::Warning).fg, "75% is yellow");
+        assert_eq!(colour_at(95), theme::fg(Role::Error).fg, "95% is red");
+    }
+
     #[test]
     fn nothing_it_draws_is_wider_than_the_screen() {
         let m = Moment {
             cwd: "/a/very/long/path/that/keeps/going/and/going/and/going".into(),
+            // A known window and a running turn too: the fullest the row gets,
+            // which is the case that would run off a narrow edge.
+            ctx_window: 512_000,
             ..Default::default()
         }
         .working();
         let st = State {
             model: "some-extremely-long-model-name-v2.5-preview".into(),
             prompt_tokens: 123_456,
+            cached_tokens: 120_000,
             ..Default::default()
         };
         for w in 1u16..80 {
