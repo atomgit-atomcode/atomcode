@@ -919,6 +919,14 @@ impl HostControl for RuntimeControl {
             // Written to the host's file. Whether it takes effect now or at the
             // next start is the setting's own business — said in the listing, so
             // a person knows before they change it.
+            //
+            // `language` is the one that has to take effect here: it is declared
+            // `ImmediateUi`, and what "immediately" means for it is the process's
+            // locale table — the same table this screen's welcome block reads its
+            // heading and tip descriptions from. Without this hop the file says
+            // one language and everything drawn from the table keeps saying the
+            // other until the next start, which is exactly what the setting's own
+            // `applies` field promises does not happen.
             HostCommand::SetSetting { session, id, value } => {
                 self.addressed(&session)?;
                 let source = self.host_config.clone().ok_or_else(|| HostError::Failed {
@@ -927,6 +935,9 @@ impl HostControl for RuntimeControl {
                 source
                     .set_setting(&id, &value)
                     .map_err(|message| HostError::Failed { message })?;
+                if id == "language" {
+                    crate::tui_settings::apply_language(&value);
+                }
                 Ok(HostReply::Done)
             }
             HostCommand::ResetSetting { session, id } => {
@@ -937,6 +948,9 @@ impl HostControl for RuntimeControl {
                 source
                     .reset_setting(&id)
                     .map_err(|message| HostError::Failed { message })?;
+                if id == "language" {
+                    crate::tui_settings::apply_language("auto");
+                }
                 Ok(HostReply::Done)
             }
             // The four a person means, onto the four this runtime has. `Ask` is

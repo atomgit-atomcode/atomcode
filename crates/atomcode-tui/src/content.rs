@@ -106,12 +106,43 @@ pub struct WelcomeBlock {
     pub cwd: String,
     pub model: Option<String>,
     pub version: &'static str,
+    /// The heading above the tips, as the words in force wrote it.
+    ///
+    /// Settled here rather than read from a constant in `lines`, for the same
+    /// reason the tips are: `lines` runs every frame, and the heading is one of
+    /// the things the block *says* — so it belongs to the block, not to the
+    /// layout.
+    pub heading: String,
     /// The tips to show, as `(command, what it does)`.
     pub tips: Vec<(String, String)>,
     /// What this build calls itself. Handed in by the row that mounts the
     /// producer, so a downstream build changes it in the config tree rather
     /// than in this file.
     pub brand: std::sync::Arc<Brand>,
+}
+
+/// What the welcome block says, in the language in force.
+///
+/// **A seam, not a table.** A build that ships one language writes the words in
+/// its own rows (see `modules::welcome`'s shipped set); a product that already
+/// has a localisation — this one keeps its in `atomcode-config` — hands an
+/// implementation in and the block follows `/language` with the rest of the
+/// product rather than growing a second, hand-kept copy of the same sentences.
+///
+/// That copy is the thing this trait exists to prevent: a second list of
+/// descriptions is how the welcome screen comes to describe a command
+/// differently from the command's own help, and it is the reason `about` is
+/// asked by name instead of the block owning a list.
+///
+/// A command this build has no words for gets `None`, and the tip falls back to
+/// the command's own description — never a blank one, and never a translation
+/// invented at the call site.
+pub trait WelcomeWords: Send + Sync + 'static {
+    /// The heading above the tips.
+    fn heading(&self) -> String;
+
+    /// One short line for `command`, without the leading slash.
+    fn about(&self, command: &str) -> Option<String>;
 }
 
 /// What this build calls itself, as data rather than as constants.
@@ -229,7 +260,7 @@ impl Content for WelcomeBlock {
         // Shape is not in the hash — same class as width. `Content` promises the
         // hash covers what the block *says* and never the bytes it renders, and
         // "did the cat get drawn" is rendered bytes.
-        let mut parts: Vec<&str> = vec!["welcome", self.version, &self.cwd];
+        let mut parts: Vec<&str> = vec!["welcome", self.version, &self.cwd, &self.heading];
         if let Some(model) = &self.model {
             parts.push(model);
         }
@@ -286,7 +317,7 @@ impl Content for WelcomeBlock {
         let mut right: Vec<Line> = Vec::new();
         if !self.tips.is_empty() {
             right.push(Line::styled(
-                width::take_width("快速上手", content_w),
+                width::take_width(&self.heading, content_w),
                 muted(),
             ));
             let command_w = self
@@ -1786,6 +1817,7 @@ mod tests {
             cwd: "~/proj".into(),
             model: Some("a-model".into()),
             version: "9.9.9",
+            heading: "上手提示".into(),
             tips: vec![
                 ("/resume".into(), "接着上次".into()),
                 ("/help".into(), "列出所有命令".into()),
@@ -2139,7 +2171,7 @@ mod tests {
             ..welcome()
         };
         let all = lines_of(&bare, 80, true).join("\n");
-        assert!(!all.contains("快速上手"), "{all}");
+        assert!(!all.contains("上手提示"), "{all}");
         assert!(all.contains("~/proj"), "the rest is still there: {all}");
     }
 

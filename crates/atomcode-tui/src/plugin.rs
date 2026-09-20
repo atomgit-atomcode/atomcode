@@ -44,6 +44,11 @@ plexus_service!(LayoutSvc => crate::layout::Layout, "tui-layout", Core, "The reg
 plexus_service!(CommandsSvc => crate::command::Commands, "tui-commands", Core, "Slash commands contributed by rows");
 plexus_service!(KeysSvc => crate::keymap::Keys, "tui-keys", Core, "Key bindings contributed by rows");
 plexus_service!(BrandSvc => crate::content::Brand, "tui-brand", Seam, "What this build calls itself: its name, its licence, its mascot");
+// The welcome block's words, as a seam: a product that already has a
+// localisation provides one and the block follows `/language` with the rest of
+// the product. Left unfilled, the row uses the sentences this build ships
+// (`modules::welcome::ShippedWords`), so a screen with no launcher still opens.
+plexus_service!(WelcomeWordsSvc => dyn crate::content::WelcomeWords, "tui-welcome-words", Seam, "The welcome block's heading and tip descriptions, in the language in force");
 plexus_service!(AgentClientSvc => AgentClient, "tui-agent-client", Core, "The screen's end of its connection to the agent");
 // Declared here, by the one that consumes it (`docs/adr/0021` §6): whoever
 // launches the screen fills it with what its host handed over.
@@ -1046,20 +1051,29 @@ impl UserInterface for Tui {
                             .expect("moment poisoned")
                             .cwd
                             .clone();
-                        let open = crate::module::Opening {
-                            // Folded upstream: reading the environment is this
-                            // function's business, and a module may not.
-                            cwd: crate::text::collapse_home(&cwd),
-                            // From the agent's own description, not from a
-                            // service of the agent: this screen is a separate App
-                            // (`docs/adr/0022`), and reading into the agent's tree
-                            // is what `tests/guards.rs`
-                            // (`the_screen_reads_no_service_of_the_agents`)
-                            // forbids.
-                            model: described.model.clone(),
-                            version: env!("CARGO_PKG_VERSION"),
-                            commands: self.host.commands.all(),
-                        };
+                        let open =
+                            crate::module::Opening {
+                                // Folded upstream: reading the environment is this
+                                // function's business, and a module may not.
+                                cwd: crate::text::collapse_home(&cwd),
+                                // From the agent's own description, not from a
+                                // service of the agent: this screen is a separate App
+                                // (`docs/adr/0022`), and reading into the agent's tree
+                                // is what `tests/guards.rs`
+                                // (`the_screen_reads_no_service_of_the_agents`)
+                                // forbids.
+                                model: described.model.clone(),
+                                version: env!("CARGO_PKG_VERSION"),
+                                commands: self.host.commands.all(),
+                                // Resolved **here**, not when the welcome producer
+                                // mounted: the launcher's rows mount after the
+                                // screen's, so a lookup at mount time would be empty
+                                // for the one launcher that has words to provide.
+                                // This runs after the whole tree is up.
+                                words: self.ctx.lock().expect("ctx poisoned").as_ref().and_then(
+                                    |ctx| ctx.service::<crate::plugin::WelcomeWordsSvc>(),
+                                ),
+                            };
                         stale |= self
                             .host
                             .open_conversation(crate::block::Coord::default(), &open);

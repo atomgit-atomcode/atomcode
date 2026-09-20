@@ -427,7 +427,7 @@ async fn a_new_session_opens_with_the_welcome_and_it_then_scrolls_away() {
     // 1. It is there at the start, at the top of the conversation.
     let opening = s.screen();
     assert!(opening.contains("AtomCode"), "the brand row:\n{opening}");
-    assert!(opening.contains("快速上手"), "the tips heading:\n{opening}");
+    assert!(opening.contains("上手提示"), "the tips heading:\n{opening}");
     // Where we are, as the block writes it: the same folding the welcome does, so
     // the assertion does not depend on where the scratch directory happens to be.
     let here =
@@ -598,7 +598,7 @@ async fn a_resumed_session_does_not_open_with_a_welcome() {
     s.quiet().await;
     let top = s.screen();
     assert_eq!(
-        top.matches("快速上手").count(),
+        top.matches("上手提示").count(),
         0,
         "a resumed session must not open again, and its opening was never a log \
          fact to begin with:\n{top}"
@@ -631,7 +631,7 @@ async fn a_new_session_started_from_the_screen_opens_with_the_welcome_too() {
     // The first session opens with it — the property that already held.
     s.quiet().await;
     assert!(
-        s.screen().contains("快速上手"),
+        s.screen().contains("上手提示"),
         "the session it started with:\n{}",
         s.screen()
     );
@@ -651,7 +651,7 @@ async fn a_new_session_started_from_the_screen_opens_with_the_welcome_too() {
     // criterion looks at the glyph rather than only at the heading, since the
     // block's *text* would survive a mascot that stopped being drawn.
     assert!(
-        fresh.contains("快速上手"),
+        fresh.contains("上手提示"),
         "the session it moved to owes its own first word:\n{fresh}"
     );
     assert!(

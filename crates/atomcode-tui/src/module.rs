@@ -162,7 +162,7 @@ pub trait Producer: Send + Sync {
 /// to reach the host could do anything, including putting a block into a stream
 /// somebody is already talking in. This is the list of what drawing an opening
 /// block actually needs.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct Opening {
     /// The working directory, **already a display string** (home collapsed).
     ///
@@ -180,6 +180,36 @@ pub struct Opening {
     /// [`Commands::all`](crate::command::Commands::all) returns. A tip naming a
     /// command that is not there is worse than no tip.
     pub commands: Vec<crate::command::Command>,
+    /// What the welcome block should say, in the language in force.
+    ///
+    /// **Handed in per opening, not read when the producer mounted.** The
+    /// producer mounts with the tree while the launcher's own rows mount after
+    /// it (`launch::mount_with` appends them), so a `WelcomeWordsSvc` looked up
+    /// in `Welcome::apply` would be there for the screen-only case and absent
+    /// for the product — the one case where a product's own language matters.
+    /// The loop, which builds this, runs *after* the whole tree is up, and
+    /// resolves the seam then.
+    ///
+    /// `None` means a launcher that provides none, and the producer falls back
+    /// to the sentences this crate ships.
+    pub words: Option<Arc<dyn crate::content::WelcomeWords>>,
+}
+
+/// Hand-written because `words` is a trait object and the trait is deliberately
+/// not `Debug`: a launcher's implementation is a language table, and making
+/// every one of them write a `Debug` impl to satisfy a derive here would be the
+/// wrong trade. What a reader of this needs is which language it is, and that is
+/// not knowable from the object.
+impl std::fmt::Debug for Opening {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Opening")
+            .field("cwd", &self.cwd)
+            .field("model", &self.model)
+            .field("version", &self.version)
+            .field("commands", &self.commands)
+            .field("words", &self.words.as_ref().map(|_| "<provided>"))
+            .finish()
+    }
 }
 
 /// Everything mounted, found by id.

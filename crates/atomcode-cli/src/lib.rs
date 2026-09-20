@@ -17,6 +17,7 @@ pub mod askpass;
 pub mod tui_login;
 pub mod tui_onboarding;
 pub mod tui_settings;
+pub mod tui_welcome_words;
 pub mod uninstall;
 
 /// ACP (Agent Client Protocol) stdio server — lets atomcode be driven by Zed /
@@ -65,18 +66,24 @@ pub mod tui_front {
         // is the panel `/config` pulls up. They are not alternatives — one is
         // what a host can be asked, the other is what this screen can show.
         let connection = connect(runtime, front_end, config, host_config)?;
-        // Two rows and one port. The onboarding row is here rather than behind
+        // Three rows and one port. The onboarding row is here rather than behind
         // a condition because what it contributes is a command: whether it runs
         // is readiness's answer, asked when the screen starts, and a machine
         // that is already set up simply never names it.
+        //
+        // The welcome-words row is the same shape as the settings one: the
+        // screen owns the opening block, this launcher owns the sentences in it
+        // (they live in `atomcode-config`, which the screen must not depend on),
+        // and the row is how the second reaches the first.
         let layers = [
             crate::tui_settings::row_layer(),
             crate::tui_onboarding::row_layer(),
             crate::tui_login::row_layer(),
+            crate::tui_welcome_words::row_layer(),
         ];
         launch::mount_with(
             screen,
-            &[&layers[0], &layers[1], &layers[2]],
+            &[&layers[0], &layers[1], &layers[2], &layers[3]],
             &[
                 Arc::new(crate::tui_settings::SettingsRow),
                 Arc::new(crate::tui_onboarding::OnboardingRow {
@@ -87,6 +94,7 @@ pub mod tui_front {
                     config_path: config_path.clone(),
                     telemetry,
                 }),
+                Arc::new(crate::tui_welcome_words::WelcomeWordsRow),
             ],
             Some(crate::tui_settings::ConfigSettings::new(config_path)),
             connection,

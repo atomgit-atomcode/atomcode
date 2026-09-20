@@ -200,6 +200,9 @@ impl Settings for ConfigSettings {
         store
             .update_document(|document| spec.patch(document, value))
             .map_err(|error| format!("{error:#}"))?;
+        if id == "language" {
+            apply_language(value);
+        }
         Ok(self.read())
     }
 
@@ -227,8 +230,33 @@ impl Settings for ConfigSettings {
                 Ok(())
             })
             .map_err(|error| format!("{error:#}"))?;
+        if id == "language" {
+            // Cleared means the build's own answer stands again, and for this key
+            // that answer is "ask the environment".
+            apply_language("auto");
+        }
         Ok(self.read())
     }
+}
+
+/// The one setting whose change is not only a file edit.
+///
+/// `language` is declared `ImmediateUi`, and "immediately" for it means the
+/// process's i18n table — what `/config language zh_CN` promises is the screen
+/// changing language now, not at the next start. Writing the file and stopping
+/// there leaves the file saying one thing and every string drawn from the table
+/// saying another until the process restarts.
+///
+/// Called from both the settings panel and host control, because both write this
+/// key: one implementation, so the two paths cannot come to mean different
+/// things by the same command.
+pub fn apply_language(value: &str) {
+    // `auto` means "follow the environment again" — the resolver re-reads
+    // `LC_ALL`/`LANG` rather than pinning today's answer.
+    let wanted = (value != "auto")
+        .then(|| value.parse::<atomcode_config::locale::Locale>().ok())
+        .flatten();
+    atomcode_config::i18n::set_locale(atomcode_config::i18n::resolve_initial_locale(None, wanted));
 }
 
 /// The catalog's kind, as the gesture that edits it.

@@ -222,3 +222,91 @@ async fn a_session_the_product_wrote_comes_back_on_the_row_assembled_screen() {
     term.press(atomcode_tui::surface::KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), running).await;
 }
+
+/// The welcome block reads the language the *launcher* knows, not the one the
+/// screen ships.
+///
+/// **This is the property the seam was built for, and it is not verifiable from
+/// inside `atomcode-tui`.** The words come from `atomcode-config`, which the
+/// screen must not depend on; they reach it through a row the launcher mounts,
+/// and that row mounts *after* every row of the screen's own tree
+/// (`launch::mount_with` appends the launcher's rows). A block that resolved the
+/// seam when its producer mounted — rather than per opening, after the whole
+/// tree is up — would silently fall back to this crate's shipped Chinese
+/// sentences and nothing in the screen's own tests would notice, because there
+/// the shipped sentences *are* the answer.
+///
+/// So the assertion is deliberately about a language the screen does not ship:
+/// with `/language en` written to the configuration, the heading on screen is
+/// the English one.
+#[tokio::test]
+async fn the_welcome_block_reads_the_language_the_launcher_knows() {
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("ATOMCODE_HOME", home.path());
+    let project = tempfile::tempdir().unwrap();
+    let count = Arc::new(Count::default());
+
+    // The language is a fact about the host's file, which is what the launcher's
+    // settings row reads. `en` rather than `zh_CN`: the screen's own fallback is
+    // Chinese, so only a non-Chinese answer proves the seam was followed.
+    let config_path = home.path().join("config.toml");
+    std::fs::write(&config_path, "language = \"en\"\n").unwrap();
+    // And the process locale, which is what `t()` answers from. Settle it the
+    // way startup does, from that same file — under the lock the config crate
+    // hands out for exactly this, so a sibling test never sees a locale neither
+    // of them asked for.
+    let _locale = atomcode_config::i18n::test_lock();
+    atomcode_config::i18n::set_locale(atomcode_config::i18n::resolve_initial_locale(
+        None,
+        Some(atomcode_config::locale::Locale::En),
+    ));
+
+    let front_end = FrontEnd::new();
+    let (start, config) = start(
+        project.path(),
+        &count,
+        SessionMode::Fresh,
+        Some(front_end.clone()),
+    );
+    let runtime = CodingRuntime::start(start).await.expect("starts");
+    let screen = Screen {
+        headless: Some((100, 30)),
+        ..Screen::default()
+    };
+    let mounted = tui_front::mount(runtime, front_end, config, None, &screen, config_path, None)
+        .await
+        .expect("the screen mounts");
+
+    let term = mounted
+        .app
+        .context()
+        .service::<atomcode_tui::plugin::SurfaceSvc>()
+        .and_then(|surface| surface.as_any_headless())
+        .expect("a headless surface");
+    let ui = mounted.ui.clone();
+    let ctx = mounted.app.context();
+    let running = tokio::spawn(async move {
+        let _ = ui.run(&ctx, None).await;
+    });
+
+    let mut screen_text = String::new();
+    for _ in 0..200 {
+        screen_text = term.text();
+        if screen_text.contains("Tips for getting started") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        screen_text.contains("Tips for getting started"),
+        "the launcher's language reached the block, rather than the screen's own \
+         fallback:\n{screen_text}"
+    );
+    assert!(
+        !screen_text.contains("上手提示"),
+        "and the shipped heading is not what was drawn:\n{screen_text}"
+    );
+
+    term.press(atomcode_tui::surface::KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), running).await;
+}

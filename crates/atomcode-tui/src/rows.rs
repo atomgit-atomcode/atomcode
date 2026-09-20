@@ -286,6 +286,10 @@ impl Plugin for WelcomePanel {
         let mods = ctx.require::<ModulesSvc>().map_err(|e| e.to_string())?;
         // Whatever this build calls itself, or the shipped identity when no row
         // provides one: a screen with no brand row still opens.
+        //
+        // The brand is read here; the *words* deliberately are not — they are
+        // resolved per opening by the loop, because the launcher's own rows
+        // (which provide them) mount after this one (`Opening::words`).
         let brand = ctx
             .service::<crate::plugin::BrandSvc>()
             .unwrap_or_else(|| Arc::new(crate::content::Brand::default()));
