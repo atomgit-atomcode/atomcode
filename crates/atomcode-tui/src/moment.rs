@@ -530,17 +530,23 @@ impl Moment {
 
     /// Whether this screen is allowed to put a light in the window title.
     ///
-    /// Two gates, and both have to be open. The person's: the setting, read from
-    /// the rows this frame was taken with — an absent row is this build's
-    /// default, which is on, so a launcher that never provided a settings port
-    /// still gets the light. The terminal's: `caps.unicode`, because a dot a
-    /// terminal draws as a tofu box is worse than no dot — and that check has to
-    /// happen above the surface, since a title is written whether or not anyone
-    /// is watching the screen.
+    /// **One gate, and it is the person's.** An earlier draft also required
+    /// `caps.unicode`, on the reasoning that a dot a terminal draws as a tofu
+    /// box is worse than no dot. That was the wrong bit: `Caps::unicode`
+    /// answers "can this terminal draw *decorative* Unicode" — box drawing,
+    /// `✓`, `▸` — which is a question about the cell grid. A title is not
+    /// drawn on the grid at all; the tab bar and the window manager draw it,
+    /// and whether *they* have an emoji font is something this program is
+    /// never told.
+    ///
+    /// Warp is where that conflation showed: it sets `TERM=dumb` for its shell
+    /// integration, so `Caps::detect` reads the terminal as ASCII — while the
+    /// very same terminal draws `┏━┓` panels and renders the dot perfectly.
+    /// The light was configured on and silently withheld.
+    ///
+    /// The escape hatch for a tab bar that really does show tofu is the
+    /// setting itself, which is what it is documented for.
     pub fn status_dot_on(&self) -> bool {
-        if !self.caps.unicode {
-            return false;
-        }
         self.settings
             .rows()
             .iter()
@@ -658,19 +664,31 @@ mod tests {
         );
     }
 
-    /// Both gates: a terminal that cannot draw the dot gets no dot whatever the
-    /// setting says, and the setting says off regardless of the terminal.
+    /// The setting is the gate, and the terminal's `unicode` bit is not.
+    ///
+    /// The regression this pins: an earlier draft also required
+    /// `caps.unicode`, which reads "can this terminal draw *decorative*
+    /// Unicode" off `TERM`. Warp sets `TERM=dumb`, so the light was withheld on
+    /// the one terminal it was reported missing on — while that same terminal
+    /// drew box-drawing panels fine. A title is drawn by the tab bar, not on
+    /// the cell grid, so the grid's capability bit has no say in it.
     #[test]
-    fn a_light_needs_both_the_setting_and_a_terminal_that_can_draw_it() {
+    fn the_light_is_governed_by_the_setting_and_not_by_the_terminals_grid() {
         use crate::settings::STATUS_DOT;
         use crate::text::Light;
         let mut m = Moment::default().working();
-        assert_eq!(m.status_dot(), Some(Light::Busy), "both gates open");
+        assert_eq!(m.status_dot(), Some(Light::Busy), "on by default");
 
+        // A terminal the grid says is ASCII — Warp, `TERM=dumb` — still gets
+        // the light, because the tab bar is not the grid.
         m.caps.unicode = false;
-        assert!(!m.status_dot_on(), "an ASCII terminal gets no dot");
-        assert_eq!(m.status_dot(), None);
+        assert!(
+            m.status_dot_on(),
+            "an ASCII-grid terminal must not lose the title light"
+        );
+        assert_eq!(m.status_dot(), Some(Light::Busy));
 
+        // The person's answer is the one that counts, both ways.
         m.caps.unicode = true;
         m.settings = crate::settings::SettingsView::new(vec![crate::settings::SettingRow {
             id: STATUS_DOT.to_string(),
