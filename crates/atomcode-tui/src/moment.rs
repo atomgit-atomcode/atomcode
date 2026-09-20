@@ -386,6 +386,16 @@ pub struct Moment {
     /// [`Moment::secret`] gives — this struct is cloned once a frame and every
     /// module can read it.
     pub providers_panel: Option<crate::providers::Panel>,
+    /// The plugins and marketplaces, as the launcher last read them.
+    ///
+    /// Here for the reason [`Moment::providers`] is: what is on disk under
+    /// `plugins/` is not a fact in the log, and `View::render` may not read a
+    /// file — so the list travels this road or none. See `crate::plugins`.
+    pub plugins: crate::plugins::PluginsView,
+    /// The plugins panel, while it is up: which page, what is typed in its
+    /// search box, the row the arrows are on, the form in progress, and the job
+    /// that is still running out there.
+    pub plugins_panel: Option<crate::plugins::Panel>,
     /// What the Usage page draws, as the host last answered it.
     ///
     /// Asked for rather than pushed: an allowance window changes on the

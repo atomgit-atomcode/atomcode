@@ -103,6 +103,11 @@ pub enum Action {
     /// they are two panels with two ports behind them, and a build may mount
     /// either without the other.
     ToggleProviders,
+    /// Pull the plugins panel up over the composer, or put it away.
+    ///
+    /// Its own action for the reason [`Action::ToggleProviders`] is one: it has
+    /// a port of its own, and a build may mount it without the others.
+    TogglePlugins,
     /// Put this session — the lead, or a member of its team — on screen.
     ///
     /// An action, and the only one carrying a value, for the reason

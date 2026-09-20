@@ -313,7 +313,7 @@ async fn start_with_connection(
     setup: Setup,
     wrap: impl FnOnce(atomcode_host_api::HostConnection) -> atomcode_host_api::HostConnection,
 ) -> Session {
-    start_full(setup, wrap, None).await
+    start_full(setup, wrap, None, None).await
 }
 
 /// A settings port that answers one row with `value` and knows nothing else.
@@ -346,13 +346,48 @@ async fn start_with_connection_and_settings(
     setup: Setup,
     settings: Option<Arc<dyn atomcode_tui::settings::Settings>>,
 ) -> Session {
-    start_full(setup, |control| control, settings).await
+    start_full(setup, |control| control, settings, None).await
+}
+
+/// The layer that puts the test's plugins panel on screen.
+const PLUGINS_PANEL_LAYER: &str = "[[insert]]\nname = \"tui-panel-plugins\"\n";
+
+/// The plugins panel's view, mounted the way the launcher's row mounts it.
+struct PluginsPanelRow;
+
+#[async_trait]
+impl Plugin for PluginsPanelRow {
+    fn name(&self) -> &'static str {
+        "tui-panel-plugins"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["tui-modules"]
+    }
+    async fn apply(&self, ctx: &Context, _config: &serde_json::Value) -> Result<(), String> {
+        let mods = ctx
+            .require::<atomcode_tui::plugin::ModulesSvc>()
+            .map_err(|e| e.to_string())?;
+        mods.add_view(Arc::new(atomcode_tui::module::Mounted::<
+            atomcode_tui::modules::plugins::Plugins,
+        >::new()))?;
+        Ok(())
+    }
+}
+
+/// Start the screen with a plugins port behind it, which is the only way to
+/// see the panel at all: a screen with no port refuses to open it.
+async fn start_with_plugins(
+    setup: Setup,
+    plugins: Arc<dyn atomcode_tui::plugins::Plugins>,
+) -> Session {
+    start_full(setup, |control| control, None, Some(plugins)).await
 }
 
 async fn start_full(
     setup: Setup,
     wrap: impl FnOnce(atomcode_host_api::HostConnection) -> atomcode_host_api::HostConnection,
     settings: Option<Arc<dyn atomcode_tui::settings::Settings>>,
+    plugins: Option<Arc<dyn atomcode_tui::plugins::Plugins>>,
 ) -> Session {
     let agent_layers = setup.agent.clone();
     let registry: Registry = Arc::new(agent_catalog);
@@ -375,14 +410,26 @@ async fn start_full(
         headless: Some((80, 24)),
         ..Screen::default()
     };
-    let extra: Vec<&str> = setup.screen.iter().map(String::as_str).collect();
+    let mut extra: Vec<&str> = setup.screen.iter().map(String::as_str).collect();
+    // The panel's *view* is the launcher's row in the shipped product
+    // (`atomcode::tui_plugins`), so a test that wants the panel on screen brings
+    // one of its own — the same bargain the settings and providers panels
+    // strike, and the reason a screen with no launcher opens without them.
+    let panel_row: Vec<Arc<dyn Plugin>> = match plugins.is_some() {
+        true => {
+            extra.push(PLUGINS_PANEL_LAYER);
+            vec![Arc::new(PluginsPanelRow)]
+        }
+        false => Vec::new(),
+    };
     let mounted = launch::mount_with(
         &screen,
         &extra,
-        &[],
+        &panel_row,
         launch::Ports {
             settings,
             providers: None,
+            plugins,
         },
         connection,
     )
@@ -4669,5 +4716,256 @@ async fn a_resumed_session_remembers_what_was_typed_into_it() {
         seen + 1,
         "the up-arrow put it in the composer as well:\n{after}"
     );
+    task.abort();
+}
+
+// ---- the plugins panel ---------------------------------------------------
+
+/// A plugins port that answers from memory and records what it was asked to do.
+///
+/// A recording rather than a real marketplace, because what these judge is the
+/// screen: that `/plugin` opens the panel, that a row leads to the job it
+/// promises, and that the job's answer reaches the conversation. Whether `git`
+/// can clone is `atomcode-capabilities`' business and is tested there.
+#[derive(Default)]
+struct Recorded {
+    did: std::sync::Mutex<Vec<String>>,
+    /// Set while a job is meant to be in flight, so the panel can be caught
+    /// saying so.
+    hold: Option<Duration>,
+}
+
+impl Recorded {
+    fn rows(&self) -> atomcode_tui::plugins::PluginsView {
+        use atomcode_tui::plugins::{MarketRow, PluginRow, Scope};
+        let installed = self
+            .did
+            .lock()
+            .expect("recording poisoned")
+            .iter()
+            .any(|line| line == "install tidy@official user");
+        atomcode_tui::plugins::PluginsView::new(
+            vec![
+                PluginRow {
+                    name: "tidy".into(),
+                    marketplace: "official".into(),
+                    description: "把代码排整齐".into(),
+                    installed: installed.then_some(Scope::User),
+                },
+                PluginRow {
+                    name: "lens".into(),
+                    marketplace: "official".into(),
+                    description: "看一眼改了什么".into(),
+                    installed: None,
+                },
+            ],
+            vec![MarketRow {
+                name: "official".into(),
+                source: "https://example.com/official.git".into(),
+                plugins: 2,
+                installed: usize::from(installed),
+                updated: "今天更新".into(),
+                official: true,
+            }],
+        )
+    }
+
+    fn note(&self, line: String) {
+        self.did.lock().expect("recording poisoned").push(line);
+    }
+}
+
+#[async_trait]
+impl atomcode_tui::plugins::Plugins for Recorded {
+    fn rows(&self) -> atomcode_tui::plugins::PluginsView {
+        Recorded::rows(self)
+    }
+    async fn install(
+        &self,
+        plugin: &str,
+        market: &str,
+        scope: atomcode_tui::plugins::Scope,
+    ) -> Result<String, String> {
+        if let Some(hold) = self.hold {
+            tokio::time::sleep(hold).await;
+        }
+        self.note(format!("install {plugin}@{market} {}", scope_word(scope)));
+        Ok(format!("装好了 {plugin}@{market}"))
+    }
+    async fn update(
+        &self,
+        plugin: &str,
+        market: &str,
+        _scope: atomcode_tui::plugins::Scope,
+    ) -> Result<String, String> {
+        self.note(format!("update {plugin}@{market}"));
+        Ok(format!("更新好了 {plugin}@{market}"))
+    }
+    async fn uninstall(
+        &self,
+        plugin: &str,
+        market: &str,
+        _scope: atomcode_tui::plugins::Scope,
+    ) -> Result<String, String> {
+        self.note(format!("uninstall {plugin}@{market}"));
+        Ok(format!("卸掉了 {plugin}@{market}"))
+    }
+    async fn add_market(&self, url: &str) -> Result<String, String> {
+        self.note(format!("add {url}"));
+        Ok(format!("加上了市场 {url}"))
+    }
+    async fn update_market(&self, name: &str) -> Result<String, String> {
+        self.note(format!("update-market {name}"));
+        Ok(format!("市场 {name} 更新了"))
+    }
+    async fn remove_market(&self, name: &str) -> Result<String, String> {
+        self.note(format!("remove-market {name}"));
+        Ok(format!("删掉了市场 {name}"))
+    }
+    fn cancel(&self, job: &str) {
+        self.note(format!("cancel {job}"));
+    }
+}
+
+fn scope_word(scope: atomcode_tui::plugins::Scope) -> &'static str {
+    match scope {
+        atomcode_tui::plugins::Scope::User => "user",
+        atomcode_tui::plugins::Scope::Project => "project",
+        atomcode_tui::plugins::Scope::Local => "local",
+    }
+}
+
+/// `/plugin` puts the panel up, a row leads to the install, and what the port
+/// answered lands in the conversation.
+///
+/// The whole gesture end to end, because that is the thing that was missing:
+/// the classic front end had this panel and the new screen had no way to reach
+/// a plugin at all.
+#[tokio::test]
+async fn the_plugins_panel_opens_and_installs_what_was_picked() {
+    let dir = scratch("plugins-install");
+    let port = Arc::new(Recorded::default());
+    let s = start_with_plugins(tree(&dir, &replay(r#"{ text = "ok" }"#), &[]), port.clone()).await;
+    let task = s.open().await;
+    s.quiet().await;
+
+    s.term.type_line("/plugin");
+    until(&s, "把代码排整齐").await;
+    let open = s.screen();
+    assert!(open.contains("全部"), "the pages are on screen:\n{open}");
+    assert!(open.contains("市场"), "including the marketplaces:\n{open}");
+
+    // The cursor opens on the first row, which is `lens` — sorted by name. Walk
+    // to `tidy` and pick it: the form asks where it should go.
+    s.term.press(KeyPress::plain(Key::Down));
+    s.term.press(KeyPress::plain(Key::Enter));
+    until(&s, "装到哪儿").await;
+    let asked = s.screen();
+    assert!(asked.contains("这台机器"), "the three scopes:\n{asked}");
+    assert!(asked.contains("这个项目"), "{asked}");
+    assert!(asked.contains("只有自己"), "{asked}");
+
+    s.term.press(KeyPress::plain(Key::Enter));
+    until(&s, "装好了 tidy@official").await;
+    assert_eq!(
+        port.did.lock().expect("recording poisoned").as_slice(),
+        ["install tidy@official user"],
+        "one install, with the scope that was picked"
+    );
+    task.abort();
+}
+
+/// While the job is out there the panel says so, and Esc gives up on it.
+///
+/// Both halves matter: a panel that swallowed every key without saying why
+/// looks broken, and a person who walks away from a ten-second clone has to be
+/// able to — with the port told, because only the port can undo what lands.
+#[tokio::test]
+async fn a_slow_install_can_be_waited_on_or_given_up_on() {
+    let dir = scratch("plugins-slow");
+    let port = Arc::new(Recorded {
+        hold: Some(Duration::from_secs(30)),
+        ..Recorded::default()
+    });
+    let s = start_with_plugins(tree(&dir, &replay(r#"{ text = "ok" }"#), &[]), port.clone()).await;
+    let task = s.open().await;
+    s.quiet().await;
+
+    s.term.type_line("/plugin");
+    until(&s, "把代码排整齐").await;
+    s.term.press(KeyPress::plain(Key::Down));
+    s.term.press(KeyPress::plain(Key::Enter));
+    until(&s, "装到哪儿").await;
+    s.term.press(KeyPress::plain(Key::Enter));
+    until(&s, "正在装 tidy@official").await;
+
+    // Every key but Esc is swallowed while it runs.
+    s.term.press(KeyPress::plain(Key::Enter));
+    s.term.press(KeyPress::plain(Key::Down));
+    assert!(
+        s.screen().contains("正在装 tidy@official"),
+        "still the one job:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::plain(Key::Esc));
+    // The sentence the *answer* carries, not the one the legend does: while the
+    // job runs the legend already says `esc 不等了`, so waiting for that would
+    // be waiting for a frame that was already on screen.
+    until(&s, "它落地之后会自己收拾干净").await;
+    assert!(
+        port.did
+            .lock()
+            .expect("recording poisoned")
+            .iter()
+            .any(|line| line == "cancel tidy@official"),
+        "the port is told, because only it can undo what lands: {:?}",
+        port.did.lock().expect("recording poisoned")
+    );
+    task.abort();
+}
+
+/// The same jobs, typed out — and a bare name that two marketplaces carry is
+/// never guessed at.
+#[tokio::test]
+async fn plugin_subcommands_do_the_same_jobs_from_the_line() {
+    let dir = scratch("plugins-typed");
+    let port = Arc::new(Recorded::default());
+    let s = start_with_plugins(tree(&dir, &replay(r#"{ text = "ok" }"#), &[]), port.clone()).await;
+    let task = s.open().await;
+    s.quiet().await;
+
+    s.term.type_line("/plugin marketplace list");
+    until(&s, "在册的市场").await;
+
+    s.term.type_line("/plugin install tidy --scope project");
+    until(&s, "装好了 tidy@official").await;
+    assert_eq!(
+        port.did.lock().expect("recording poisoned").as_slice(),
+        ["install tidy@official project"],
+        "`--scope project` is read as the scope, not as part of the name"
+    );
+
+    s.term.type_line("/plugin list");
+    until(&s, "tidy@official").await;
+
+    s.term.type_line("/plugin install nothing-by-that-name");
+    until(&s, "没有叫 nothing-by-that-name 的插件").await;
+    task.abort();
+}
+
+/// A screen with no plugins port says so rather than opening an empty panel.
+#[tokio::test]
+async fn a_screen_with_no_plugins_port_says_so() {
+    let dir = scratch("plugins-absent");
+    let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    let task = s.open().await;
+    s.quiet().await;
+
+    s.term.type_line("/plugin");
+    until(&s, "没有插件面板").await;
+
+    s.term.type_line("/plugin list");
+    until(&s, "没有接插件").await;
     task.abort();
 }

@@ -64,6 +64,7 @@ pub mod modules;
 pub mod moment;
 pub mod overlay;
 pub mod plugin;
+pub mod plugins;
 pub mod providers;
 pub mod qr;
 pub mod raster;

@@ -2686,3 +2686,393 @@ mod tests {
         }
     }
 }
+
+/// `/plugin`: the panel, and the same jobs from the command line.
+///
+/// A set of its own rather than a line in [`ScreenCommands`], because this one
+/// command is two things: with nothing after it, it pulls the panel up — the
+/// same gesture `/config` and `/provider` are — and with something after it, it
+/// does the job the panel would have done, without the panel. The classic front
+/// end offered both and people type both.
+///
+/// Everything here goes over [`crate::plugins::Plugins`]. What a marketplace is,
+/// where a plugin lands on disk, what `git` has to be run — none of it is here
+/// (`docs/adr/0022` §3). What *is* here is reading what a person typed: a bare
+/// plugin name resolved against what the marketplaces carry, `--scope` read into
+/// a [`Scope`], the four `marketplace` verbs. That is screen work — the same
+/// kind `/model <id>` does — and it needs no more than the rows the port already
+/// hands over.
+pub struct PluginCommands;
+
+const PLUGIN: &[Command] = &[Command::taking(
+    "plugin",
+    "[list | install <名字> | uninstall <名字> | update <名字> | marketplace …]",
+    "插件:不带参数拉出面板(装、卸、加市场);带参数直接做",
+)];
+
+/// What `--scope` was set to, and everything that was not that.
+///
+/// Returns the words with the flag taken out, so the caller reads a plugin name
+/// out of what is left rather than having to skip over a flag that may be
+/// written three ways.
+fn scope_from(args: &str) -> (crate::plugins::Scope, Vec<String>) {
+    use crate::plugins::Scope;
+    let mut scope = Scope::User;
+    let mut rest: Vec<String> = Vec::new();
+    let mut expecting = false;
+    for word in args.split_whitespace() {
+        if expecting {
+            expecting = false;
+            scope = match word.to_lowercase().as_str() {
+                "project" => Scope::Project,
+                "local" => Scope::Local,
+                _ => Scope::User,
+            };
+            continue;
+        }
+        // Three spellings, because all three get typed: `--scope project`,
+        // `--scope=project`, and the bare word after `--scope`.
+        if let Some(value) = word.strip_prefix("--scope=") {
+            scope = match value.to_lowercase().as_str() {
+                "project" => Scope::Project,
+                "local" => Scope::Local,
+                _ => Scope::User,
+            };
+            continue;
+        }
+        if word == "--scope" {
+            expecting = true;
+            continue;
+        }
+        rest.push(word.to_string());
+    }
+    (scope, rest)
+}
+
+/// A `<名字>` or a `<名字>@<市场>`, matched against what is on offer.
+///
+/// `Err` is the sentence to show: nothing by that name, or several and here are
+/// the commands that say which. Ambiguity is never resolved by picking one —
+/// two marketplaces carrying a plugin with one name is exactly the case where
+/// guessing installs the wrong thing.
+fn pick<'a>(
+    rows: &'a [crate::plugins::PluginRow],
+    typed: &str,
+    verb: &str,
+) -> Result<&'a crate::plugins::PluginRow, String> {
+    let (name, market) = match typed.split_once('@') {
+        Some((name, market)) if !name.is_empty() && !market.is_empty() => (name, Some(market)),
+        _ => (typed, None),
+    };
+    let hits: Vec<&crate::plugins::PluginRow> = rows
+        .iter()
+        .filter(|row| row.name == name && market.is_none_or(|m| row.marketplace == m))
+        .collect();
+    match hits.len() {
+        0 => Err(format!("没有叫 {typed} 的插件")),
+        1 => Ok(hits[0]),
+        _ => {
+            let lines: Vec<String> = hits
+                .iter()
+                .map(|row| format!("  /plugin {verb} {}@{}", row.name, row.marketplace))
+                .collect();
+            Err(format!(
+                "有好几个叫 {name} 的,说清是哪个:\n{}",
+                lines.join("\n")
+            ))
+        }
+    }
+}
+
+#[async_trait]
+impl CommandSet for PluginCommands {
+    fn id(&self) -> &'static str {
+        "cmd-plugin"
+    }
+    fn commands(&self) -> Vec<Command> {
+        PLUGIN.to_vec()
+    }
+    async fn run(&self, _name: &str, args: &str, ctx: &Context) -> Outcome {
+        let args = args.trim();
+        // Nothing after it is the panel. Everything below needs the port; this
+        // does not, because a screen with no port still has to say so with the
+        // sentence the action carries rather than one invented here.
+        if args.is_empty() {
+            return Outcome::Do(Action::TogglePlugins);
+        }
+        let Some(port) = ctx.service::<crate::plugin::PluginsSvc>() else {
+            return Outcome::Refused("这个屏幕没有接插件:启动器没有提供 `tui-plugins`".into());
+        };
+        // Said as the job goes out, not after: a clone takes seconds, and a
+        // command that printed nothing until it was over looks like a command
+        // that did nothing.
+        let ui = ctx.service::<atomcode_harness::seams::UiSvc>();
+        let announce = |line: String| {
+            if let Some(ui) = ui.as_ref() {
+                ui.say(&line);
+            }
+        };
+        let (verb, rest) = match args.split_once(char::is_whitespace) {
+            Some((verb, rest)) => (verb, rest.trim()),
+            None => (args, ""),
+        };
+        let view = port.rows();
+        match verb {
+            "list" => {
+                let installed: Vec<String> = view
+                    .plugins()
+                    .iter()
+                    .filter_map(|row| {
+                        row.installed
+                            .map(|scope| format!("  {} ({})", row.id(), scope.label()))
+                    })
+                    .collect();
+                if installed.is_empty() {
+                    return Outcome::Said("还什么都没装".into());
+                }
+                Outcome::Said(format!("装着这些:\n{}", installed.join("\n")))
+            }
+            "install" => {
+                let (scope, rest) = scope_from(rest);
+                let Some(typed) = rest.first() else {
+                    return Outcome::Refused("要装哪个?`/plugin install <名字>`".into());
+                };
+                let row = match pick(view.plugins(), typed, "install") {
+                    Ok(row) => row,
+                    Err(why) => return Outcome::Refused(why),
+                };
+                if row.installed.is_some() {
+                    return Outcome::Refused(format!(
+                        "{} 已经装着了。要重装先 `/plugin uninstall {}`",
+                        row.id(),
+                        row.id()
+                    ));
+                }
+                let (plugin, market) = (row.name.clone(), row.marketplace.clone());
+                announce(format!("正在装 {plugin}@{market} …"));
+                match port.install(&plugin, &market, scope).await {
+                    Ok(said) => reload_then(ctx, said).await,
+                    Err(why) => Outcome::Refused(why),
+                }
+            }
+            "uninstall" => {
+                let Some(typed) = rest.split_whitespace().next() else {
+                    return Outcome::Refused("要卸哪个?`/plugin uninstall <名字>`".into());
+                };
+                let installed: Vec<crate::plugins::PluginRow> = view
+                    .plugins()
+                    .iter()
+                    .filter(|row| row.installed.is_some())
+                    .cloned()
+                    .collect();
+                let row = match pick(&installed, typed, "uninstall") {
+                    Ok(row) => row.clone(),
+                    Err(_) => return Outcome::Refused(format!("没装着叫 {typed} 的插件")),
+                };
+                let scope = row.installed.unwrap_or(crate::plugins::Scope::User);
+                announce(format!("正在卸 {} …", row.id()));
+                match port.uninstall(&row.name, &row.marketplace, scope).await {
+                    Ok(said) => reload_then(ctx, said).await,
+                    Err(why) => Outcome::Refused(why),
+                }
+            }
+            "update" => {
+                let Some(typed) = rest.split_whitespace().next() else {
+                    return Outcome::Refused("要更新哪个?`/plugin update <名字>`".into());
+                };
+                let installed: Vec<crate::plugins::PluginRow> = view
+                    .plugins()
+                    .iter()
+                    .filter(|row| row.installed.is_some())
+                    .cloned()
+                    .collect();
+                let row = match pick(&installed, typed, "update") {
+                    Ok(row) => row.clone(),
+                    Err(_) => return Outcome::Refused(format!("没装着叫 {typed} 的插件")),
+                };
+                let scope = row.installed.unwrap_or(crate::plugins::Scope::User);
+                announce(format!("正在更新 {} …", row.id()));
+                match port.update(&row.name, &row.marketplace, scope).await {
+                    Ok(said) => reload_then(ctx, said).await,
+                    Err(why) => Outcome::Refused(why),
+                }
+            }
+            "marketplace" | "market" => {
+                let (action, rest) = match rest.split_once(char::is_whitespace) {
+                    Some((action, rest)) => (action, rest.trim()),
+                    None => (rest, ""),
+                };
+                match action {
+                    "list" | "" => {
+                        if view.markets().is_empty() {
+                            return Outcome::Said("一个市场都还没有".into());
+                        }
+                        let lines: Vec<String> = view
+                            .markets()
+                            .iter()
+                            .map(|m| {
+                                format!(
+                                    "  {}  {}  {} 个插件,装了 {}",
+                                    m.name, m.source, m.plugins, m.installed
+                                )
+                            })
+                            .collect();
+                        Outcome::Said(format!("在册的市场:\n{}", lines.join("\n")))
+                    }
+                    "add" => {
+                        if rest.is_empty() {
+                            return Outcome::Refused(
+                                "要加哪个?`/plugin marketplace add <地址>`".into(),
+                            );
+                        }
+                        announce(format!("正在取 {rest} …"));
+                        match port.add_market(rest).await {
+                            Ok(said) => reload_then(ctx, said).await,
+                            Err(why) => Outcome::Refused(why),
+                        }
+                    }
+                    "remove" | "rm" => {
+                        if rest.is_empty() {
+                            return Outcome::Refused(
+                                "要删哪个?`/plugin marketplace remove <名字>`".into(),
+                            );
+                        }
+                        announce(format!("正在删市场 {rest} …"));
+                        match port.remove_market(rest).await {
+                            Ok(said) => reload_then(ctx, said).await,
+                            Err(why) => Outcome::Refused(why),
+                        }
+                    }
+                    "update" => {
+                        if rest.is_empty() {
+                            return Outcome::Refused(
+                                "要更新哪个?`/plugin marketplace update <名字>`".into(),
+                            );
+                        }
+                        announce(format!("正在更新市场 {rest} …"));
+                        match port.update_market(rest).await {
+                            Ok(said) => reload_then(ctx, said).await,
+                            Err(why) => Outcome::Refused(why),
+                        }
+                    }
+                    other => Outcome::Refused(format!(
+                        "`/plugin marketplace` 没有 {other} 这个动作;有 list、add、remove、update"
+                    )),
+                }
+            }
+            // The same reload `/reload` is, spelled the way the classic front
+            // end spelled it: people who learned `/plugin reload` there keep it.
+            "reload" => match reload(ctx).await {
+                Ok(()) => Outcome::Said("已重新读取 skills、MCP 与配置".into()),
+                Err(why) => Outcome::Refused(why),
+            },
+            other => Outcome::Refused(format!(
+                "`/plugin` 没有 {other} 这个动作;有 list、install、uninstall、update、marketplace、reload,或者不带参数拉出面板"
+            )),
+        }
+    }
+}
+
+/// Say what landed, then build the graph again.
+///
+/// Writing to disk is not making it so: a plugin brings skills, commands and
+/// hooks, and none of them reach the running agent until it is reloaded. A
+/// reload that fails is said *with* the success, not instead of it — the files
+/// really are on disk, and a person told only about the failure would install
+/// the same thing twice.
+async fn reload_then(ctx: &Context, said: String) -> Outcome {
+    match reload(ctx).await {
+        Ok(()) => Outcome::Said(said),
+        Err(why) => Outcome::Said(format!(
+            "{said}\n但会话没能重新加载,新东西要等下次启动才生效:{why}"
+        )),
+    }
+}
+
+async fn reload(ctx: &Context) -> Result<(), String> {
+    let Some(client) = ctx.service::<crate::plugin::AgentClientSvc>() else {
+        return Err("这块屏幕没接上 agent".into());
+    };
+    let Some(control) = client.control() else {
+        return Err("这块屏幕没接上宿主".into());
+    };
+    control
+        .call(HostCommand::Reload {
+            session: client.root(),
+        })
+        .await
+        .map(|_| ())
+        .map_err(refusal)
+}
+
+#[cfg(test)]
+mod plugin_tests {
+    use super::*;
+    use crate::plugins::{PluginRow, Scope};
+
+    fn row(name: &str, market: &str) -> PluginRow {
+        PluginRow {
+            name: name.into(),
+            marketplace: market.into(),
+            description: String::new(),
+            installed: None,
+        }
+    }
+
+    /// `--scope` is read out of the words, whichever of the three ways it was
+    /// written, and what is left is the name.
+    ///
+    /// The spaced form is the one that broke in the classic front end: the
+    /// parser stripped `--scope=` only, so `--scope project` installed into the
+    /// user scope and said nothing.
+    #[test]
+    fn the_scope_is_read_out_of_the_words_and_never_left_in_the_name() {
+        for written in [
+            "tidy --scope project",
+            "tidy --scope=project",
+            "--scope project tidy",
+        ] {
+            let (scope, rest) = scope_from(written);
+            assert_eq!(scope, Scope::Project, "`{written}`");
+            assert_eq!(rest, ["tidy"], "`{written}` leaves only the name");
+        }
+        let (scope, rest) = scope_from("tidy");
+        assert_eq!(scope, Scope::User, "nothing said is this machine");
+        assert_eq!(rest, ["tidy"]);
+        let (scope, _) = scope_from("tidy --scope local");
+        assert_eq!(scope, Scope::Local);
+    }
+
+    /// A name two marketplaces carry is never guessed at.
+    ///
+    /// Guessing here installs the wrong thing under the right name, which is
+    /// the one outcome nobody can debug afterwards.
+    #[test]
+    fn an_ambiguous_name_is_refused_with_the_commands_that_settle_it() {
+        let rows = vec![
+            row("lens", "official"),
+            row("lens", "mine"),
+            row("tidy", "official"),
+        ];
+        let Err(why) = pick(&rows, "lens", "install") else {
+            panic!("two marketplaces carrying one name is not a pick");
+        };
+        assert!(why.contains("/plugin install lens@official"), "{why}");
+        assert!(why.contains("/plugin install lens@mine"), "{why}");
+
+        // Said in full, it resolves.
+        let picked = pick(&rows, "lens@mine", "install").expect("a qualified name is unambiguous");
+        assert_eq!(picked.marketplace, "mine");
+
+        // And a name nobody carries is a refusal, not a silent no-op.
+        assert!(pick(&rows, "nope", "install").is_err());
+
+        // One carrier needs no qualifying.
+        assert_eq!(
+            pick(&rows, "tidy", "install")
+                .expect("one carrier")
+                .marketplace,
+            "official"
+        );
+    }
+}

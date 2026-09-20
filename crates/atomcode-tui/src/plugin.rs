@@ -86,6 +86,10 @@ plexus_service!(SettingsSvc => dyn crate::settings::Settings, "tui-settings", Se
 // configuration means are the product's answers. This one carries a credential
 // on its way *in* and never on its way out — see `crate::providers`.
 plexus_service!(ProvidersSvc => dyn crate::providers::Providers, "tui-providers", Seam, "The provider accounts and models a launcher can read and change");
+// And the plugins, on the same terms: which marketplaces are registered and
+// what they carry is the product's answer, and every change to it is a `git`
+// this crate must not know how to run — see `crate::plugins`.
+plexus_service!(PluginsSvc => dyn crate::plugins::Plugins, "tui-plugins", Seam, "The plugins and marketplaces a launcher can read and change");
 
 /// The session's clock, and the only place this crate reads one.
 ///
@@ -1316,6 +1320,10 @@ impl UserInterface for Tui {
                         }
                         // And over the providers panel, which is a list longer
                         // than the rows it is given.
+                        if self.host.plugins_wheel(x, y, by) {
+                            stale = true;
+                            continue;
+                        }
                         if self.host.providers_wheel(x, y, by) {
                             stale = true;
                             continue;
@@ -1398,6 +1406,24 @@ impl UserInterface for Tui {
                                 // would hand it to whatever the list put there.
                                 if let Some(page) = self.host.settings_stats_page_at(x, y) {
                                     let _ = self.host.show_stats_page(page);
+                                    stale = true;
+                                    continue;
+                                }
+                            }
+                            // The plugins panel's header and rows, on the same
+                            // terms: chrome first, so a stray row cannot answer a
+                            // press aimed at a tab.
+                            if self.host.plugins_open() {
+                                if let Some(tab) = self.host.plugins_tab_at(x, y) {
+                                    let _ = self.host.show_plugins_tab(tab);
+                                    stale = true;
+                                    continue;
+                                }
+                                if let Some(row) = self.host.plugins_row_at(x, y) {
+                                    let _ = self.host.point_plugins_at(row);
+                                    self.run_plugins_key(crate::surface::KeyPress::plain(
+                                        crate::surface::Key::Enter,
+                                    ));
                                     stale = true;
                                     continue;
                                 }
@@ -1524,6 +1550,12 @@ impl UserInterface for Tui {
                                     stale |= self.host.point_providers_at(row);
                                 }
                             }
+                            // And the plugins panel.
+                            if self.host.plugins_open() {
+                                if let Some(row) = self.host.plugins_row_at(x, y) {
+                                    stale |= self.host.point_plugins_at(row);
+                                }
+                            }
                             continue;
                         }
                         // Handled above, and never reached.
@@ -1549,6 +1581,12 @@ impl UserInterface for Tui {
                 // through would be typing into something nobody can see.
                 Wake::Input(Input::Paste(text)) if self.host.providers_open() => {
                     stale |= self.host.providers_paste(&text);
+                }
+                // And a paste while the plugins panel is up: a marketplace
+                // address is exactly the thing that arrives by paste, and
+                // falling through would put it in a composer nobody can see.
+                Wake::Input(Input::Paste(text)) if self.host.plugins_open() => {
+                    stale |= self.host.plugins_paste(&text);
                 }
                 Wake::Input(Input::Paste(text)) => {
                     quit = self.act(Action::Paste(text), &client);
@@ -1595,6 +1633,11 @@ impl UserInterface for Tui {
                 // both match.
                 Wake::Input(Input::Key(press)) if self.host.providers_open() => {
                     stale |= self.run_providers_key(press);
+                }
+                // And the plugins panel, on the same terms: at most one of the
+                // three is ever up (`Host::toggle_plugins`).
+                Wake::Input(Input::Key(press)) if self.host.plugins_open() => {
+                    stale |= self.run_plugins_key(press);
                 }
                 // A question on screen gets first refusal on every key. It is a
                 // panel riding the tail now, not a modal, so this is the only
@@ -1910,6 +1953,168 @@ impl Tui {
                 if let Some(keys) = keys {
                     let _ = keys.send(Wake::Fact);
                 }
+            }
+        });
+    }
+
+    /// Bring `Moment::plugins` in step with what the launcher reads.
+    ///
+    /// Asked when the panel opens and after every job lands, never per frame,
+    /// for the reason [`Tui::refresh_providers`] is: the port reads files, and a
+    /// `render` that did filesystem work would break the purity this crate rests
+    /// on. **True when the rows changed.**
+    fn refresh_plugins(&self) -> bool {
+        let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
+            return false;
+        };
+        let Some(port) = ctx.service::<crate::plugin::PluginsSvc>() else {
+            return false;
+        };
+        let view = port.rows();
+        self.host.show_plugins(view)
+    }
+
+    /// Run one key against the plugins panel, and act on what it asked for.
+    ///
+    /// **True when a frame is owed.**
+    fn run_plugins_key(&self, press: crate::surface::KeyPress) -> bool {
+        let (changed, asked) = self.host.plugins_key(press);
+        let Some(step) = asked else {
+            return changed;
+        };
+        self.apply_plugins_step(step);
+        true
+    }
+
+    /// Send one plugin change over the seam.
+    ///
+    /// **Unlike the providers panel, this does not block on the write.** Every
+    /// one of these is a `git` — a clone, a pull, a copy of a tree — and the
+    /// difference between one second and ten is the network. So the panel is
+    /// told a job started, the work goes out on its own task, and what comes
+    /// back is said into the conversation. Until it lands the panel takes no key
+    /// but Esc (`crate::plugins::key`), because every other key would start a
+    /// second job while the first is still cloning.
+    ///
+    /// **Writing to disk is not making it so.** A plugin brings skills, commands
+    /// and hooks, and none of them reach the running agent until the graph is
+    /// built again — so every job that landed is followed by
+    /// `HostCommand::Reload`, the same road the settings and providers panels
+    /// take.
+    fn apply_plugins_step(&self, step: crate::plugins::Step) {
+        use crate::plugins::Step;
+        let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
+            self.host.say("屏幕还没接上,改不了插件", true);
+            return;
+        };
+        let Some(port) = ctx.service::<crate::plugin::PluginsSvc>() else {
+            self.host
+                .say("这个屏幕没有接插件:启动器没有提供 `tui-plugins`", true);
+            return;
+        };
+        // Giving up on a job is not a job of its own: the work is still out
+        // there, and what this does is tell the port that whatever lands is no
+        // longer wanted. The port is the only one that can undo it.
+        if let Step::Cancel { job } = &step {
+            port.cancel(job);
+            self.host.said("不等了。它落地之后会自己收拾干净", false);
+            self.refresh_plugins();
+            return;
+        }
+        let (what, job) = match &step {
+            Step::Install {
+                plugin,
+                marketplace,
+                ..
+            } => (
+                format!("正在装 {plugin}@{marketplace} …"),
+                format!("{plugin}@{marketplace}"),
+            ),
+            Step::Update {
+                plugin,
+                marketplace,
+                ..
+            } => (
+                format!("正在更新 {plugin}@{marketplace} …"),
+                format!("{plugin}@{marketplace}"),
+            ),
+            Step::Uninstall {
+                plugin,
+                marketplace,
+                ..
+            } => (
+                format!("正在卸 {plugin}@{marketplace} …"),
+                format!("{plugin}@{marketplace}"),
+            ),
+            Step::AddMarket { url } => (format!("正在取 {url} …"), format!("market:{url}")),
+            Step::UpdateMarket { name } => {
+                (format!("正在更新市场 {name} …"), format!("market:{name}"))
+            }
+            Step::RemoveMarket { name } => {
+                (format!("正在删市场 {name} …"), format!("market:{name}"))
+            }
+            Step::Stay | Step::Close | Step::Cancel { .. } => return,
+        };
+        self.host
+            .plugins_busy(Some(crate::plugins::Busy { what, job }));
+        let host = self.host.clone();
+        let keys = self.wake.lock().expect("wake poisoned").clone();
+        let control = self.client.control();
+        let root = self.client.root();
+        tokio::spawn(async move {
+            let done = match step {
+                Step::Install {
+                    plugin,
+                    marketplace,
+                    scope,
+                } => port.install(&plugin, &marketplace, scope).await,
+                Step::Update {
+                    plugin,
+                    marketplace,
+                    scope,
+                } => port.update(&plugin, &marketplace, scope).await,
+                Step::Uninstall {
+                    plugin,
+                    marketplace,
+                    scope,
+                } => port.uninstall(&plugin, &marketplace, scope).await,
+                Step::AddMarket { url } => port.add_market(&url).await,
+                Step::UpdateMarket { name } => port.update_market(&name).await,
+                Step::RemoveMarket { name } => port.remove_market(&name).await,
+                Step::Stay | Step::Close | Step::Cancel { .. } => return,
+            };
+            // The panel first: whatever happened, it is over, and a panel still
+            // saying "installing…" after the line that says it failed is a panel
+            // that has to be closed to be believed.
+            host.plugins_busy(None);
+            host.show_plugins(port.rows());
+            match done {
+                Ok(said) => {
+                    host.said(said, false);
+                    // What is on disk is not what the agent is running until the
+                    // graph is built again.
+                    if let Some(control) = control {
+                        if let Err(error) = control
+                            .call(atomcode_host_api::HostCommand::Reload { session: root })
+                            .await
+                        {
+                            // Not "installed, but…": the line above already
+                            // said what happened, and this one runs after an
+                            // uninstall and a marketplace change too.
+                            host.said(
+                                format!(
+                                    "但会话没能重新加载,新东西要等下次启动才生效:{}",
+                                    crate::commands::refusal(error)
+                                ),
+                                true,
+                            );
+                        }
+                    }
+                }
+                Err(why) => host.said(why, true),
+            }
+            if let Some(keys) = keys {
+                let _ = keys.send(Wake::Fact);
             }
         });
     }
@@ -2969,6 +3174,22 @@ impl Tui {
                 // frozen at launch would quietly lie.
                 if self.host.providers_open() {
                     self.refresh_providers();
+                }
+                return false;
+            }
+            Action::TogglePlugins => {
+                drop(m);
+                // Refused rather than silently opening a panel with no module to
+                // draw it, the same as the providers one.
+                if !self.host.toggle_plugins() {
+                    self.say("这个屏幕没有插件面板:启动器没有提供 `tui-panel-plugins`");
+                    return false;
+                }
+                // Read when the panel opens: what is under `plugins/` can be
+                // changed by `atomcode plugin` in another terminal, and a list
+                // frozen at launch would quietly lie.
+                if self.host.plugins_open() {
+                    self.refresh_plugins();
                 }
                 return false;
             }

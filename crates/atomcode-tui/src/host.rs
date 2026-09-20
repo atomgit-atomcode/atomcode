@@ -865,6 +865,8 @@ pub struct Hits {
     settings: Option<Rect>,
     /// And the providers panel's, for the same reason.
     providers: Option<Rect>,
+    /// And the plugins panel's, for the same reason.
+    plugins: Option<Rect>,
     /// Where the slash menu was drawn, so a press or the pointer on a row finds
     /// the command it is on.
     ///
@@ -1722,6 +1724,7 @@ impl Host {
                         .expect("provider secret poisoned")
                         .clear();
                 }
+                m.plugins_panel = None;
                 m.settings_panel = Some(crate::settings::Panel::new());
                 true
             }
@@ -1994,6 +1997,7 @@ impl Host {
                     return false;
                 }
                 m.settings_panel = None;
+                m.plugins_panel = None;
                 m.providers_panel = Some(crate::providers::Panel::new());
                 true
             }
@@ -2203,6 +2207,204 @@ impl Host {
         }
     }
 
+    // ---- the plugins panel -------------------------------------------------
+    //
+    // The same dozen methods the providers panel has, and deliberately the same
+    // shape: three panels a person works in, one way of opening them, one way of
+    // routing a key into them, one way of finding the row a click landed on. A
+    // third panel that invented its own would be a third place to fix the next
+    // thing any of them gets wrong.
+
+    /// Whether the plugins panel is up.
+    pub fn plugins_open(&self) -> bool {
+        self.moment
+            .read()
+            .expect("moment poisoned")
+            .plugins_panel
+            .is_some()
+    }
+
+    /// Pull the plugins panel up, or put it away. True when it changed.
+    ///
+    /// Opening it puts the other two away, for the reason
+    /// [`Host::toggle_providers`] gives, and is idempotent: a `/plugin` typed
+    /// while it is open keeps what was typed into it.
+    pub fn toggle_plugins(&self) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        match m.plugins_panel.take() {
+            Some(_) => true,
+            None => {
+                // Nothing to draw it with is a refusal, not an empty panel — the
+                // same bargain `toggle_providers` strikes.
+                if !self.modules.has_view(crate::modules::plugins::ID) {
+                    return false;
+                }
+                m.settings_panel = None;
+                if m.providers_panel.take().is_some() {
+                    self.providers_secret
+                        .lock()
+                        .expect("provider secret poisoned")
+                        .clear();
+                }
+                m.plugins_panel = Some(crate::plugins::Panel::new());
+                true
+            }
+        }
+    }
+
+    /// Put the plugins panel away. True when it was up.
+    pub fn close_plugins(&self) -> bool {
+        self.moment
+            .write()
+            .expect("moment poisoned")
+            .plugins_panel
+            .take()
+            .is_some()
+    }
+
+    /// Put what the launcher read into the moment. True when it changed.
+    pub fn show_plugins(&self, view: crate::plugins::PluginsView) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        if m.plugins == view {
+            return false;
+        }
+        m.plugins = view;
+        true
+    }
+
+    /// Say that a job is running, or that it is over.
+    ///
+    /// Set before the work is sent out and cleared when it lands, so the panel
+    /// has something true to draw for the seconds a `git clone` takes — and so
+    /// the keys that would start a second one are swallowed while the first is
+    /// still going (`crate::plugins::key`).
+    pub fn plugins_busy(&self, busy: Option<crate::plugins::Busy>) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let Some(panel) = m.plugins_panel.as_mut() else {
+            return false;
+        };
+        if panel.busy == busy {
+            return false;
+        }
+        panel.busy = busy;
+        true
+    }
+
+    /// Run one key against the plugins panel: the panel it writes back, and the
+    /// work to send over the seam when the key asked for some.
+    pub fn plugins_key(
+        &self,
+        press: crate::surface::KeyPress,
+    ) -> (bool, Option<crate::plugins::Step>) {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let view = m.plugins.clone();
+        let Some(panel) = m.plugins_panel.as_mut() else {
+            return (false, None);
+        };
+        let before = panel.clone();
+        let step = crate::plugins::key(&view, panel, press);
+        let changed = *panel != before;
+        match step {
+            crate::plugins::Step::Stay => (changed, None),
+            crate::plugins::Step::Close => {
+                m.plugins_panel = None;
+                (true, None)
+            }
+            step => (true, Some(step)),
+        }
+    }
+
+    /// The wheel over the plugins panel walks its list.
+    pub fn plugins_wheel(&self, x: u16, y: u16, by: i32) -> bool {
+        let over = self
+            .hits
+            .lock()
+            .expect("hits poisoned")
+            .plugins
+            .is_some_and(|rect| rect.contains(x, y));
+        if !over {
+            return false;
+        }
+        let mut m = self.moment.write().expect("moment poisoned");
+        let rows = match m.plugins_panel.as_ref() {
+            // A form or a running job has no list to walk, and the wheel is
+            // still the panel's — it must not scroll the conversation behind it.
+            Some(panel) if panel.form.is_some() || panel.busy.is_some() => return true,
+            Some(panel) => m.plugins.listed(panel).len(),
+            None => return false,
+        };
+        let Some(panel) = m.plugins_panel.as_mut() else {
+            return false;
+        };
+        let want = match by < 0 {
+            true => panel.cursor.saturating_sub(by.unsigned_abs() as usize),
+            false => panel.cursor.saturating_add(by as usize),
+        };
+        panel.point_at(want, rows);
+        true
+    }
+
+    /// Put a paste into whatever the plugins panel has the keyboard on.
+    ///
+    /// The composer is not on screen while the panel is up, so a paste that fell
+    /// through to it would be text typed into a field nobody can see — and a
+    /// marketplace URL is exactly the thing people paste.
+    pub fn plugins_paste(&self, text: &str) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let Some(panel) = m.plugins_panel.as_mut() else {
+            return false;
+        };
+        crate::plugins::paste(panel, text)
+    }
+
+    /// Show a page, by index. True when it moved.
+    pub fn show_plugins_tab(&self, tab: crate::plugins::Tab) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        match m.plugins_panel.as_mut() {
+            Some(panel) => panel.show(tab),
+            None => false,
+        }
+    }
+
+    /// Which page is under the pointer, when it is on the header row.
+    pub fn plugins_tab_at(&self, x: u16, y: u16) -> Option<crate::plugins::Tab> {
+        let rect = *self.hits.lock().expect("hits poisoned").plugins.as_ref()?;
+        if !rect.contains(x, y) {
+            return None;
+        }
+        let m = self.moment.read().expect("moment poisoned");
+        let vp = crate::moment::Viewport::new(rect, &m);
+        let header = crate::modules::plugins::geometry(&m, &vp).header_row()?;
+        if (y - rect.y) as usize != header {
+            return None;
+        }
+        crate::modules::plugins::tab_at(&m, (x - rect.x) as usize)
+    }
+
+    /// Which listed row is under the pointer.
+    pub fn plugins_row_at(&self, x: u16, y: u16) -> Option<usize> {
+        let rect = *self.hits.lock().expect("hits poisoned").plugins.as_ref()?;
+        if !rect.contains(x, y) {
+            return None;
+        }
+        let m = self.moment.read().expect("moment poisoned");
+        let vp = crate::moment::Viewport::new(rect, &m);
+        crate::modules::plugins::geometry(&m, &vp).listed_at((y - rect.y) as usize)
+    }
+
+    /// Point the panel at a listed row. True when it moved.
+    pub fn point_plugins_at(&self, row: usize) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let rows = match m.plugins_panel.as_ref() {
+            Some(panel) => m.plugins.listed(panel).len(),
+            None => return false,
+        };
+        match m.plugins_panel.as_mut() {
+            Some(panel) => panel.point_at(row, rows),
+            None => false,
+        }
+    }
+
     /// Run `change`, keeping the reader's place across whatever it did.
     ///
     /// **Measure, change, measure again** — one shape, because the arithmetic is
@@ -2405,6 +2607,25 @@ impl Host {
         let mut m = self.moment.write().expect("moment poisoned");
         let now = m.now;
         m.notice = Some(Notice::for_ms(text, refused, now, crate::moment::NOTICE_MS));
+    }
+
+    /// Put a line in the conversation, the way a command's answer lands there.
+    ///
+    /// Not [`Host::say`], which is the tip row: that one fades after a few
+    /// seconds, which is right for "saved" and wrong for the answer to something
+    /// that took ten seconds and changed what this build can do. A person who
+    /// looked away while a plugin installed has to be able to look back and read
+    /// what happened.
+    pub fn said(&self, text: impl Into<String>, refused: bool) {
+        let mut stream = self.stream.write().expect("stream poisoned");
+        let mut w = stream.writer("commands");
+        w.emit(
+            crate::block::Coord::default(),
+            std::sync::Arc::new(crate::content::CommandSaid {
+                text: text.into(),
+                refused,
+            }),
+        );
     }
 
     /// Run a key against the open menu, returning the step it produced. `None`
@@ -2957,6 +3178,7 @@ impl Host {
                         team: None,
                         settings: None,
                         providers: None,
+                        plugins: None,
                         menu: None,
                     };
                     *self.last_room.lock().expect("room poisoned") = rect;
@@ -3005,6 +3227,10 @@ impl Host {
                         // is worked with the same pointer.
                         if id == crate::modules::providers::ID {
                             self.hits.lock().expect("hits poisoned").providers = Some(*tail_rect);
+                        }
+                        // And the plugins panel, which rides the same tail.
+                        if id == crate::modules::plugins::ID {
+                            self.hits.lock().expect("hits poisoned").plugins = Some(*tail_rect);
                         }
                         frame.place(id.clone(), *tail_rect, lines);
                     }
@@ -3616,6 +3842,7 @@ pub const TAIL: &[&str] = &[
     crate::modules::live::ID,
     crate::modules::settings::ID,
     crate::modules::providers::ID,
+    crate::modules::plugins::ID,
     crate::modules::ask::ID,
     crate::modules::steering::ID,
 ];
