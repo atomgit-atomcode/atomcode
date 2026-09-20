@@ -158,7 +158,7 @@ serde 往返 + adapter 行为判据。
 |---|---|---|
 | 5.6a | **P0** | 接上 askpass(`sudo` / `ssh` 要密码时现在会干等);首启没有 provider 时的登录引导 |
 | 5.6b | **A** | 13 条能力面缺口:模式切换、`/cd`、`/config`、会话改名、5 种事实上屏、轮次上限、`/mcp tools`,以及两条契约缺口(列模型、用量额度) |
-| 5.6c | **B1**（⚠️ 2026-09-19 核实：`/init`、`/setup`、`/guide` 三条**从未落地**，把本行计进「已完」是报高的） | 6 组由**能力行自己登记目录命令**(`/review`、记忆三条、`/skills`、`/init`、`/worklog`、`/setup` 与 `/guide`)——tui 侧零改动,可与 5.6b 并行 |
+| 5.6c | **B1**（⚠️ 2026-09-19 核实：`/init`、`/setup`、`/guide` 三条**从未落地**，把本行计进「已完」是报高的。2026-09-20 结清：`/init` 已落地〔C1〕；`/setup` **不用新写命令**，种子 skill 的 frontmatter 本身就是 `name: setup` + `user_invocable: true`，`harness/plugins/capabilities.rs:132` 会自动把它登记成命令；`/guide` 在旧前端是一张写死的 13 条 i18n 菜单、不是展开 skill，新前端已有 `/help`，**判定不做**） | 6 组由**能力行自己登记目录命令**(`/review`、记忆三条、`/skills`、`/init`、`/worklog`、`/setup` 与 `/guide`)——tui 侧零改动,可与 5.6b 并行 |
 | 5.6d | **B2** | 16 条屏幕自己的活:`/diff` 浏览器、多会话、`/model` 选择器、`/provider`、`/copy` / `/save` / `/view`、`/think on\|off`、`/paste`、上沿 rule、goal / loop 状态行、@ 与 $ 补全、ghost 提示、终端标题等 |
 | 5.6e | **O** | 开放性:把「一切都是插件」补齐到 tui 最后几处硬编码。清单见 [`docs/plans/2026-09-18-tui-openness-inventory.md`](plans/2026-09-18-tui-openness-inventory.md) |
 
@@ -319,9 +319,17 @@ tuix 的老毛病——现在改是十几行,等下游移植完再改就是他�
   无从陈旧、放行;**喂过但现在没有** = 宿主正在换 App、无法核对、拒绝。
   提成 `without_a_log()` 并带判据
 
-**6.3 完成,但有一个例外。** ACP 广播的命令表仍是 `acp/commands.rs:52` 的 15 条硬编码常量,
-没有改成从 `AgentDescription` 的命令目录投影(见上面那条 ✅ 自己写的"只做了一半")——
-ACP 客户端今天拿不到 goal / loop / cd / team / worktree / review 等约 30 条。
+**6.3 完成,但有一个例外——该例外已于 2026-09-20 结清(B1)。** 当时 ACP 广播的命令表
+仍是 `acp/commands.rs:52` 的 15 条硬编码常量,没有改成从 `AgentDescription` 的命令目录
+投影(见上面那条 ✅ 自己写的"只做了一半")——ACP 客户端那时拿不到 goal / loop / cd /
+team / worktree / review 等约 30 条。
+**现在是投影的,而卡住它的从来不是那两个"设计决定",是一处接线漏了**:ACP 起运行时时
+`PrepareOptions.front_end` 是 `None`,它的 `FrontEnd` 是运行时起好之后才建的,于是
+`front-end-feed` 那条行根本没挂,每一次 `Subscribe` 都被拒,`Described` 永远不来。
+修法是 `spawn_session` 自己建 FrontEnd、传进 prepare、连同运行时一起返回。执行那半走
+`AgentEvent::Invoked { queued }`:只答的命令收到 `Invoked` 就收口,排了活的等那个回合的
+`TurnComplete`。判据 `the_commands_the_agent_registered_are_advertised_here_too` 与
+`an_agent_command_runs_in_the_agent_and_ends_where_it_ends`。
 剩下的部分确实完成:ACP 现在一个产品句柄都不持有:`SessionState` 里只有契约的命令通道、
 宿主控制与 `AgentEvent` 流。顺带把 `SessionModelResolver` 整条注入链拆干净了 ——
 `AcpChains` 两个字段、`AcpServeOptions.session_effort_resolver`、main.rs 里 36 行

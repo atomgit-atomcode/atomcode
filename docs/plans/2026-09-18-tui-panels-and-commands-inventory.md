@@ -62,9 +62,9 @@ withdraw、reload、cancel-all。**加目录投影 5**:goal、loop、queue、pol
 | B1-1 | `/review` | `tool-code-review` 行 |
 | B1-2 | `/memory`、`/remember`、`/forget` | `memory` 行 |
 | B1-3 | `/skills` | skills 行 |
-| B1-4 | `/init` | 生成 `AGENTS.md`(skill) |
+| B1-4 | `/init` | 生成 `AGENTS.md`(skill) ✅ 2026-09-19 落地(`coding/host_rows.rs` 的 `InitPlugin`) |
 | B1-5 | `/worklog` | 扫会话日志算日报,天然跨项目 |
-| B1-6 | `/setup`、`/guide` | 都是展开一个 skill |
+| B1-6 | `/setup`、`/guide` | **这一格当时写错了。** `/setup` 不用新写命令:种子 skill 的 frontmatter 就是 `name: setup` + `user_invocable: true`,而 `harness/plugins/capabilities.rs:132` 把每个 user_invocable skill 自动登记成命令——装过种子的机器上已经有了。`/guide` 在旧前端**不是**展开 skill,是一张写死的 13 条 i18n 菜单;新前端已有 `/help`,再搬第二份帮助收益存疑,建议不做 |
 
 ### B2 屏幕自己的活
 
@@ -103,11 +103,11 @@ tuix 的富交互全在 `modals/`，**16,824 行**。逐个对：
 | `onboarding_wizard` | 2336 | **无** | P0-2 首启登录引导，一直挂着 |
 | `session_picker` | 2185 | `/resume` Picker（已补时间与目录） | 没搜索、没删除、没预览 |
 | `plugin_manager` | 2102 | 判「归 CLI」 | 判定可辩，但确实没有 |
-| `usage` + `usage_render` | 1782 | `/usage` 一条命令 | 缝已开（`UsageWindow`），**图没画** |
+| `usage` + `usage_render` | 1782 | 设置面板的「用量」页签 | ✅ 2026-09-20（G1）画了额度窗口条 + 每日火花线 + 各模型占比；顺带补回 daemon 手抄映射漏掉的 `usage_percent` / `calls_used` |
 | `dir_picker` | 981 | `/cd` 已改成可浏览 | 没搜索、没书签 |
 | `file_viewer` | 869 | `/view` 的 `Reading`，约 60 行 | 没搜索、没语法色 |
 | `model_picker` | 735 | `/model` Picker | 没分组、没能力标注 |
-| `config_panel` | 565 | `/config` 三级（项 → 值 → 写） | **仍差四样**，逐条见下 |
+| `config_panel` | 565 | `/config` 三级（项 → 值 → 写） | ✅ 四样在 2026-09-19/20 补齐，逐条见下 |
 | `diff_viewer` | 539 | `/diff` 两级 | 接近 |
 | `rewind` | 404 | `/rewind` Picker | 接近 |
 | `password` | 294 | `secret.rs` | ✅ |
@@ -115,23 +115,34 @@ tuix 的富交互全在 `modals/`，**16,824 行**。逐个对：
 | `language_picker` | 155 | `/language` 已改成走 `/config` 的值选择器 | ✅ |
 | `proxy_picker` | 103 | 无 | `/proxy`，写配置 |
 
-### `/config` 差的四样（2026-09-18 逐行读完 565 行后列的）
+### `/config` 差的四样（2026-09-18 逐行读完 565 行后列的）—— **四样都补齐了**
 
 「三级选择器」不等于「编辑器」。把对面的 key 处理与渲染读完，缺的是：
 
 1. **恢复默认**——对面是 Delete 两次确认（`pending_reset`），调 `SettingSpec::reset`。
    我这边没有任何入口，契约里也没有 `ResetSetting`，宿主侧 `HostConfig` 也没有
    `reset_setting`。**这条要动契约，不只是屏幕。**
+   ✅ **2026-09-20（D1）**：契约加 `HostCommand::ResetSetting`、宿主加
+   `reset_setting`、端口加 `Settings::reset`，面板两次 Delete。做的是**删键**而
+   不是写当前默认值——删掉的键从此跟着构建走，写成今天的默认值就不跟了，而两者
+   当天看起来一模一样。
 2. **文本/数字项预填当前值**——对面 Enter 进入行内编辑，把当前值填进去、首次按键
    整体替换（`replace_edit_value_on_input`）。我这边只说了一句「要 1–200」，人得
    从头敲 `/config coding.max_rounds 40`。tui 的对应物应该是**把命令连当前值填进
    composer**，即 `Action` 需要一个 `Compose(String)`（今天只有 `Insert(char)`）。
+   ✅ 已补（`cli/tui_settings.rs:100-135`），09-18 晚写这张清单之后的提交做的。
 3. **写完不关**——对面写完面板还在，可以连改几项，只渲染一行 `✓ id = value`。
    我这边写完就关，改三项进三次。
+   ✅ 已补（`cli/tui_settings.rs:132-140`），同上。
 4. **按模型的 retry 项**——`model.retry_max_attempts` 是随当前 provider 变的动态
    设置（`selection_retry_max_attempts` / `patch_selection_retry_max_attempts`），
    不在静态 `SETTINGS` 里。`cli/src/lib.rs` 的 `settings()` 只映射了静态目录，所以
    这一项在 tui 上根本不存在。
+   ✅ **2026-09-20（D2）**：由 `tui_settings` 按当前选中项现造一行，走
+   `patch_selection_retry_max_attempts`。它进不了静态目录是因为读写位置在
+   `[models.<id>]` / `[providers.<id>]` 底下，而那随 `/model` 变——没有哪条静态
+   路径能指到它。没选模型就不造这一行：一条讲「当前模型」而没有当前模型的行，
+   值是谁也解释不了的。
 
 另外两样我这边**已经有**，不用重做：搜索（`Picker` 的过滤同时匹配 label 与 about，
 所以「主题」「retry」都能命中）、生效时机（`applies` 已经显示在每行 about 上）。
