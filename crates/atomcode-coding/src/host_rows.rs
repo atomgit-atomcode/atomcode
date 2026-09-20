@@ -374,7 +374,14 @@ impl Bridge {
         TurnCtx {
             session_id: Some(Arc::from(session.id())),
             turn_id: turn,
-            request_id,
+            // THIS request, which is one past the highest already logged —
+            // `TurnCtx::request_id` is documented as "the id of THIS LLM
+            // request, 1-based". It used to be the highest logged id, so a hook
+            // reading it got the PREVIOUS request's id, and `0` on the first
+            // round of a session. The response meta below then wrote
+            // `ctx.request_id + 1` to get the right number, which is how the
+            // two disagreed: one place computed it, the other compensated.
+            request_id: request_id + 1,
             round,
             ..TurnCtx::default()
         }
@@ -493,7 +500,8 @@ impl Waterfall<AgentRequest> for Bridge {
                     },
                     round: req.round,
                     turn_id: req.turn,
-                    request_id: ctx.request_id + 1,
+                    // Already this request's id; see `turn_ctx`.
+                    request_id: ctx.request_id,
                     session_id: ctx.session_id.as_deref().map(str::to_string),
                     ..MessageMeta::default()
                 });

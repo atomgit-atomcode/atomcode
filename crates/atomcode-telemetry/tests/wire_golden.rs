@@ -92,7 +92,9 @@ fn envelope() -> Envelope {
         launch_id: Uuid::nil(),
         account_id: None,
         session_id: Uuid::nil(),
-        turn_id: None,
+        turn: None,
+        round: None,
+        request: None,
         ts: 0,
         schema_version: atomcode_telemetry::SCHEMA_VERSION,
         app_version: "0.0.0".into(),
@@ -116,7 +118,11 @@ fn envelope() -> Envelope {
 fn envelope_full() -> Envelope {
     Envelope {
         account_id: Some("42".into()),
-        turn_id: Some(Uuid::nil()),
+        // The correlation chain, all of it: which person, which machine, which
+        // launch, which session, which turn, which round of it, which request.
+        turn: Some(3),
+        round: Some(2),
+        request: Some(7),
         provider: Some("openai".into()),
         provider_host: Some("api.openai.com".into()),
         model: Some("gpt-4o".into()),

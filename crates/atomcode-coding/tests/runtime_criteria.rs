@@ -3834,6 +3834,185 @@ async fn sink_is_live(captured: &Arc<tokio::sync::Mutex<Vec<atomcode_telemetry::
     false
 }
 
+/// Every metered event says where in the conversation it happened.
+///
+/// The envelope carries a correlation chain — device -> launch -> session ->
+/// turn -> round -> request — and until now it stopped at the session: there
+/// was a `turn_id: Option<Uuid>` that nothing ever set (`grep "turn_id: Some"`
+/// found nothing in the whole tree), and no round or request at all. So the
+/// data could count model calls and could not divide them by anything: "how
+/// many rounds does one request from a person cost" had no answer.
+///
+/// What this pins:
+///   - a turn's rounds are 1, 2, … and the turn number is the same across them;
+///   - a second turn starts its rounds over at 1 with a higher turn number;
+///   - `request` does NOT reset — it orders every call the session made;
+///   - a `tool_call` is filed under the round that ASKED for it, which is the
+///     one thing the tool middleware cannot read for itself (`RequestCtx` says
+///     nothing about position) and the reason `Position` is shared.
+async fn every_metered_event_says_which_turn_and_round_it_was() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let (telemetry, captured) = atomcode_telemetry::Telemetry::in_memory("test".into());
+    let mut start = start(env.project.path(), &recorder, SessionMode::Fresh);
+    start.agent.telemetry = Some(telemetry);
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+
+    // `describe_self …` makes the Recorder answer with a tool call, so the
+    // first turn is two rounds with a tool between them. The second is one.
+    turn(&mut runtime, "describe self session").await;
+    turn(&mut runtime, "hello").await;
+
+    let mut seen: Vec<(String, Option<u64>, Option<u32>, Option<u64>)> = Vec::new();
+    for _ in 0..200 {
+        seen = captured
+            .lock()
+            .await
+            .iter()
+            .filter_map(|record| {
+                let what = match &record.event {
+                    atomcode_telemetry::Event::LlmChat { .. } => "llm_chat",
+                    atomcode_telemetry::Event::ToolCall { .. } => "tool_call",
+                    _ => return None,
+                };
+                Some((
+                    what.to_string(),
+                    record.envelope.turn,
+                    record.envelope.round,
+                    record.envelope.request,
+                ))
+            })
+            .collect();
+        if seen.len() >= 4 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    runtime.handle.shutdown().await.unwrap();
+
+    assert!(
+        seen.len() >= 4,
+        "expected two turns' worth of metered events; got {seen:?}"
+    );
+    // Nothing metered may be unplaceable.
+    assert!(
+        seen.iter().all(|(_, turn, round, request)| turn.is_some()
+            && round.is_some()
+            && request.is_some()),
+        "an event with no place in the conversation: {seen:?}"
+    );
+
+    let rounds_of = |n: u64| -> Vec<u32> {
+        seen.iter()
+            .filter(|(what, turn, ..)| what == "llm_chat" && *turn == Some(n))
+            .filter_map(|(_, _, round, _)| *round)
+            .collect()
+    };
+    assert_eq!(rounds_of(1), vec![1, 2], "turn 1's rounds: {seen:?}");
+    assert_eq!(rounds_of(2), vec![1], "turn 2 starts over: {seen:?}");
+
+    // The tool ran in turn 1 and was asked for by round 1 — NOT by round 2,
+    // which is the round its result was then shown to.
+    let tool = seen
+        .iter()
+        .find(|(what, ..)| what == "tool_call")
+        .expect("the tool call was metered");
+    assert_eq!(
+        (tool.1, tool.2),
+        (Some(1), Some(1)),
+        "tool filed at {tool:?}"
+    );
+
+    // `request` never resets, so it strictly orders the session's LLM calls.
+    let requests: Vec<u64> = seen
+        .iter()
+        .filter(|(what, ..)| what == "llm_chat")
+        .filter_map(|(_, _, _, request)| *request)
+        .collect();
+    assert!(
+        requests.windows(2).all(|w| w[0] < w[1]),
+        "request ids must increase across turns: {requests:?}"
+    );
+}
+
+/// What telemetry says happened and what the session log says happened are the
+/// same numbers.
+///
+/// They come from different places and could drift without anything failing:
+/// the log's `turn` / `round` / `request_id` are written by the turn driver
+/// (`harness/plugins/agent_loop.rs`) from its own loop counters, while the
+/// envelope's come from the `TurnCtx` the coding runtime's hook bridge builds
+/// (`coding/src/host_rows.rs::turn_ctx`). That bridge has already been wrong
+/// twice — it filled `elapsed_ms` from `Default` (every reported duration was
+/// `0`) and computed `request_id` as the highest id ALREADY logged rather than
+/// this one (every hook saw the previous request's id). Both compiled, both
+/// passed, and neither was visible from either side alone.
+///
+/// So the criterion is the join: for every assistant message in the log there
+/// is a metered round with the same place in the conversation, and nothing is
+/// metered that the log does not know about.
+async fn telemetry_and_the_session_log_agree_on_where_they_are() {
+    use atomcode_kernel::session::SessionEvent;
+
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let (telemetry, captured) = atomcode_telemetry::Telemetry::in_memory("test".into());
+    let mut start = start(env.project.path(), &recorder, SessionMode::Fresh);
+    start.agent.telemetry = Some(telemetry);
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+    let id = runtime.session.clone().unwrap().id;
+
+    // Two turns, the first of which uses a tool, so there are three rounds
+    // across two turns and the two sequences have something to disagree about.
+    turn(&mut runtime, "describe self session").await;
+    turn(&mut runtime, "hello").await;
+
+    let mut metered: Vec<(u64, u32, u64)> = Vec::new();
+    for _ in 0..200 {
+        metered = captured
+            .lock()
+            .await
+            .iter()
+            .filter_map(|record| match &record.event {
+                atomcode_telemetry::Event::LlmChat {
+                    had_error: false, ..
+                } => Some((
+                    record.envelope.turn?,
+                    record.envelope.round?,
+                    record.envelope.request?,
+                )),
+                _ => None,
+            })
+            .collect();
+        if metered.len() >= 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    runtime.handle.shutdown().await.unwrap();
+
+    let logged: Vec<(u64, u32, u64)> = SessionManager::for_project(env.project.path())
+        .load_events(&id)
+        .expect("the session log is readable")
+        .iter()
+        .filter_map(|entry| match &entry.event {
+            SessionEvent::AssistantMessage {
+                turn,
+                round,
+                meta: Some(meta),
+                ..
+            } => Some((*turn, *round, meta.request_id)),
+            _ => None,
+        })
+        .collect();
+
+    assert!(!logged.is_empty(), "the log recorded no assistant message");
+    assert_eq!(
+        metered, logged,
+        "telemetry and the log disagree about where the session went\n         metered: {metered:?}\n logged:  {logged:?}"
+    );
+}
+
 /// A model round reports how long it took.
 ///
 /// `llm_chat.duration_ms` is the only latency the product reports, and on this
@@ -4087,6 +4266,8 @@ mod criteria {
         withdrawing_mcp_takes_the_tools_off_the_model,
         a_failed_mcp_connection_is_metered,
         a_model_round_reports_how_long_it_took,
+        every_metered_event_says_which_turn_and_round_it_was,
+        telemetry_and_the_session_log_agree_on_where_they_are,
         a_written_task_list_outlives_the_messages_it_came_from,
         the_retry_budget_follows_a_model_switch,
         a_meaningless_temperature_is_ignored_rather_than_breaking_a_model_switch,

@@ -368,11 +368,20 @@ VOLATILE_EVENT = {
 #   tool_calls_count    — the length of what the model was scripted to call
 
 
+# Keys the NEW build is expected to carry and the old one cannot: dropped from
+# the comparison, because their whole point is that they did not exist before.
+# Listed rather than ignored silently, so this stays a short, reviewable list
+# and not a place divergence can hide.
+#   turn / round / request — the correlation chain below `session_id`, added
+#   deliberately (the envelope's `turn_id` was declared and never once set).
+ADDED_SINCE_OLD = {"turn", "round", "request"}
+
+
 def shape(record):
     """What must be identical: which event, and every non-volatile field."""
     out = {}
     for key, value in sorted(record.items()):
-        if key in VOLATILE_ENVELOPE:
+        if key in VOLATILE_ENVELOPE or key in ADDED_SINCE_OLD:
             continue
         if key in MAGNITUDE_EVENT and isinstance(value, (int, float)):
             out[key] = f"{10 ** len(str(int(value)).lstrip('-')) // 10}ms+" if value else "0ms"

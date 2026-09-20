@@ -8054,6 +8054,10 @@ fn harness_host_state(
     }
     let middleware = crate::host_rows::HostMiddleware::new();
     if let Some(telemetry) = &config.telemetry {
+        // One per mounted tree, shared by the two adapters: the hook is the only
+        // one the kernel tells where it is, and the tool middleware reads it
+        // from here (`telemetry::Position`).
+        let position = Arc::new(crate::telemetry::Position::default());
         hooks.insert(
             "telemetry",
             Arc::new(crate::telemetry::TelemetryHook::new(
@@ -8062,6 +8066,7 @@ fn harness_host_state(
                 &config.base_url,
                 &config.model,
                 session_id,
+                Arc::clone(&position),
             )),
         );
         middleware.insert(
@@ -8072,6 +8077,7 @@ fn harness_host_state(
                 &config.base_url,
                 &config.model,
                 session_id,
+                position,
             )),
         );
     }

@@ -128,6 +128,46 @@ fn classify_llm_error(reason: &str) -> LlmErrorKind {
     }
 }
 
+/// Where in the conversation the adapters currently are.
+///
+/// The correlation chain the envelope carries is
+/// `device -> launch -> session -> turn -> round -> request`, and the first
+/// three are fixed at assembly while the last three change every request. Only
+/// [`TelemetryHook`] is handed a [`TurnCtx`], so it is the one that knows; the
+/// tool middleware is given nothing that says which round it is in
+/// ([`RequestCtx`] carries the event channel and the pending map, and no
+/// position). This is how the second learns it from the first.
+///
+/// Shared by `Arc` between the two, set up together in `runtime::mount` so
+/// there is exactly one of these per mounted tree.
+#[derive(Default)]
+pub struct Position {
+    turn: std::sync::atomic::AtomicU64,
+    round: AtomicU32,
+    request: std::sync::atomic::AtomicU64,
+}
+
+impl Position {
+    /// `0` means "not in a round", which is what `None` on the wire says.
+    fn get(&self) -> (Option<u64>, Option<u32>, Option<u64>) {
+        let zero_is_none = |n: u64| (n != 0).then_some(n);
+        (
+            zero_is_none(self.turn.load(Ordering::Relaxed)),
+            match self.round.load(Ordering::Relaxed) {
+                0 => None,
+                round => Some(round),
+            },
+            zero_is_none(self.request.load(Ordering::Relaxed)),
+        )
+    }
+
+    fn set(&self, ctx: &TurnCtx) {
+        self.turn.store(ctx.turn_id, Ordering::Relaxed);
+        self.round.store(ctx.round, Ordering::Relaxed);
+        self.request.store(ctx.request_id, Ordering::Relaxed);
+    }
+}
+
 /// Shared attribution + emit path for the telemetry adapters. Fixes the
 /// provider/host/model envelope at assembly; both adapters track within its scope.
 #[derive(Clone)]
@@ -179,9 +219,22 @@ impl Attribution {
         }
     }
 
+    /// Emit with no position: the caller is not a round of the main loop.
     async fn emit(&self, event: Event) {
+        self.emit_at(event, (None, None, None)).await;
+    }
+
+    /// Emit from a known place in the conversation.
+    async fn emit_at(&self, event: Event, at: (Option<u64>, Option<u32>, Option<u64>)) {
+        let (turn, round, request) = at;
         let tel = self.telemetry.clone();
-        CurrentContext::scope(self.scope_ctx(), || async move {
+        let ctx = CurrentContext {
+            turn,
+            round,
+            request,
+            ..self.scope_ctx()
+        };
+        CurrentContext::scope(ctx, || async move {
             tel.track(event);
         })
         .await;
@@ -208,6 +261,8 @@ pub struct TelemetryHook {
     last_anchored_tokens: AtomicU32,
     last_tool_result_tokens: AtomicU32,
     last_tool_def_tokens: AtomicU32,
+    /// Where the conversation is, shared with the tool middleware.
+    position: Arc<Position>,
     /// Last error observed via `on_error`, consumed by `turn_complete` to classify a
     /// failed turn. (`on_error` also fires for tool errors, but `turn_complete` only
     /// reads it on a PROVIDER terminal reason — so tool errors never become LlmChat.)
@@ -221,9 +276,11 @@ impl TelemetryHook {
         base_url: &str,
         model: impl Into<String>,
         session_id: Option<&str>,
+        position: Arc<Position>,
     ) -> Self {
         Self {
             attr: Attribution::new(telemetry, vendor, base_url, model, session_id),
+            position,
             last_messages_count: AtomicU32::new(0),
             last_system_tokens: AtomicU32::new(0),
             last_message_tokens: AtomicU32::new(0),
@@ -242,9 +299,13 @@ impl LifecycleHooks for TelemetryHook {
         messages: &[Message],
         tools: &[ToolDef],
         _options: &ChatOptions,
-        _ctx: &TurnCtx,
+        ctx: &TurnCtx,
     ) {
         use atomcode_kernel::message::Role;
+        // The one place either adapter is told where it is. Recorded before the
+        // request goes out, so a tool the response asks for is stamped with the
+        // round that asked for it.
+        self.position.set(ctx);
         self.last_messages_count
             .store(messages.len() as u32, Ordering::Relaxed);
 
@@ -329,7 +390,7 @@ impl LifecycleHooks for TelemetryHook {
             error_kind: None,
             error_data: None,
         };
-        self.attr.emit(event).await;
+        self.attr.emit_at(event, self.position.get()).await;
     }
 
     async fn on_error(&self, error: &str) {
@@ -340,7 +401,7 @@ impl LifecycleHooks for TelemetryHook {
         }
     }
 
-    async fn turn_complete(&self, _convo: &Conversation, reason: &StopReason, _ctx: &TurnCtx) {
+    async fn turn_complete(&self, _convo: &Conversation, reason: &StopReason, ctx: &TurnCtx) {
         let last = self.last_error.lock().ok().and_then(|mut g| g.take());
         // A round that produced a model response already emitted its LlmChat. Emit an
         // extra had_error one ONLY for an LLM/provider terminal failure — not normal
@@ -369,7 +430,15 @@ impl LifecycleHooks for TelemetryHook {
             error_kind: Some(kind),
             error_data: last.map(|e| e.chars().take(200).collect()),
         };
-        self.attr.emit(event).await;
+        // The round the turn died on, from the terminal's own context rather
+        // than the shared position: a turn can fail before any request went out,
+        // and then the position still holds the previous turn's.
+        self.attr
+            .emit_at(
+                event,
+                (Some(ctx.turn_id), Some(ctx.round), Some(ctx.request_id)),
+            )
+            .await;
     }
 }
 
@@ -379,9 +448,14 @@ impl LifecycleHooks for TelemetryHook {
 /// approval middleware without touching the approve-what-runs contract.
 pub struct ToolTelemetryMiddleware {
     attr: Attribution,
-    /// call_id → (tool name, start). `ToolResult` carries no name, so it's stamped
-    /// in `before` and looked up in `after`.
-    inflight: StdMutex<HashMap<String, (String, Instant)>>,
+    /// Where the conversation is, written by [`TelemetryHook`] on each request.
+    position: Arc<Position>,
+    /// call_id → (tool name, start, where). `ToolResult` carries no name, so it
+    /// is stamped in `before` and looked up in `after`. The POSITION is stamped
+    /// there too rather than read in `after`: a slow tool can still be running
+    /// when the next round's request goes out, and reading it late would file
+    /// the call under the round that came after the one that asked for it.
+    inflight: StdMutex<HashMap<String, (String, Instant, (Option<u64>, Option<u32>, Option<u64>))>>,
 }
 
 impl ToolTelemetryMiddleware {
@@ -391,9 +465,11 @@ impl ToolTelemetryMiddleware {
         base_url: &str,
         model: impl Into<String>,
         session_id: Option<&str>,
+        position: Arc<Position>,
     ) -> Self {
         Self {
             attr: Attribution::new(telemetry, vendor, base_url, model, session_id),
+            position,
             inflight: StdMutex::new(HashMap::new()),
         }
     }
@@ -408,7 +484,10 @@ impl ToolMiddleware for ToolTelemetryMiddleware {
         _rt: &RequestCtx,
     ) -> BeforeOutcome {
         if let Ok(mut m) = self.inflight.lock() {
-            m.insert(call.id.clone(), (call.name.clone(), Instant::now()));
+            m.insert(
+                call.id.clone(),
+                (call.name.clone(), Instant::now(), self.position.get()),
+            );
         }
         BeforeOutcome::Proceed
     }
@@ -420,7 +499,7 @@ impl ToolMiddleware for ToolTelemetryMiddleware {
     ) -> AfterOutcome {
         // No stamp ⇒ this middleware's `before` never ran (a prior middleware blocked
         // the call); nothing to attribute.
-        let Some((name, started)) = self
+        let Some((name, started, at)) = self
             .inflight
             .lock()
             .ok()
@@ -447,7 +526,7 @@ impl ToolMiddleware for ToolTelemetryMiddleware {
             error_kind,
             error_data: None,
         };
-        self.attr.emit(event).await;
+        self.attr.emit_at(event, at).await;
         AfterOutcome::Proceed
     }
 }
@@ -768,6 +847,7 @@ mod tests {
             "https://api.example.com/v1",
             "deepseek-v4",
             None,
+            Default::default(),
         );
 
         hook.on_request(
@@ -821,7 +901,7 @@ mod tests {
     async fn breaks_down_prompt_zones() {
         use atomcode_kernel::message::Role;
         let (tel, captured) = Telemetry::in_memory("test".into());
-        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m", None);
+        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m", None, Default::default());
 
         let mut sys = Message::user("you are a helpful coding agent");
         sys.role = Role::System;
@@ -904,7 +984,7 @@ mod tests {
     async fn anchors_real_assistant_tokens_in_breakdown() {
         use atomcode_kernel::message::Role;
         let (tel, captured) = Telemetry::in_memory("test".into());
-        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m", None);
+        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m", None, Default::default());
 
         let mut sys = Message::user("system persona");
         sys.role = Role::System;
@@ -969,7 +1049,7 @@ mod tests {
     #[tokio::test]
     async fn no_meta_emits_nothing() {
         let (tel, captured) = Telemetry::in_memory("test".into());
-        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m", None);
+        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m", None, Default::default());
         let mut resp = Message::assistant("hi", vec![]); // meta = None
         hook.on_model_response(&mut resp).await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -979,7 +1059,7 @@ mod tests {
     #[tokio::test]
     async fn provider_error_turn_emits_had_error_llm_chat() {
         let (tel, captured) = Telemetry::in_memory("test".into());
-        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m", None);
+        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m", None, Default::default());
 
         hook.on_error("HTTP 429: rate limited").await;
         hook.turn_complete(
@@ -1008,7 +1088,7 @@ mod tests {
     #[tokio::test]
     async fn normal_stop_emits_no_extra_llm_chat() {
         let (tel, captured) = Telemetry::in_memory("test".into());
-        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m", None);
+        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m", None, Default::default());
         // A tool error fired on_error, but the turn stopped normally → no LlmChat.
         hook.on_error("tool failed").await;
         hook.turn_complete(
@@ -1025,7 +1105,14 @@ mod tests {
     async fn denied_tool_emits_tool_call_denied() {
         use atomcode_kernel::testkit::EchoTool;
         let (tel, captured) = Telemetry::in_memory("test".into());
-        let mw = ToolTelemetryMiddleware::new(tel, "openai", "https://x/v1", "m", None);
+        let mw = ToolTelemetryMiddleware::new(
+            tel,
+            "openai",
+            "https://x/v1",
+            "m",
+            None,
+            Default::default(),
+        );
 
         let tool: Arc<dyn Tool> = Arc::new(EchoTool);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1067,7 +1154,14 @@ mod tests {
     async fn tool_middleware_emits_tool_call() {
         use atomcode_kernel::testkit::EchoTool;
         let (tel, captured) = Telemetry::in_memory("test".into());
-        let mw = ToolTelemetryMiddleware::new(tel, "openai", "https://x/v1", "m", None);
+        let mw = ToolTelemetryMiddleware::new(
+            tel,
+            "openai",
+            "https://x/v1",
+            "m",
+            None,
+            Default::default(),
+        );
 
         let tool: Arc<dyn Tool> = Arc::new(EchoTool);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();

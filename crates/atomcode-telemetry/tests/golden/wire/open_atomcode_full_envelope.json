@@ -16,9 +16,11 @@
     "has_git": true,
     "host": "gitcode"
   },
+  "request": 7,
+  "round": 2,
   "schema_version": 1,
   "session_id": "00000000-0000-0000-0000-000000000000",
   "surface": "code_review",
   "ts": 0,
-  "turn_id": "00000000-0000-0000-0000-000000000000"
+  "turn": 3
 }
