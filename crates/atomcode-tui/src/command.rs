@@ -153,15 +153,46 @@ pub trait CommandSet: Send + Sync {
     async fn run(&self, name: &str, args: &str, ctx: &Context) -> Outcome;
 }
 
+/// One command a person ran, as the registry resolved it.
+pub struct CommandRun<'a> {
+    /// What to call it: an alias resolved to its canonical name, the slash
+    /// gone, case folded. For a name nothing answers to, what was typed.
+    pub name: &'a str,
+    /// Whether any set owned the name. `false` means nothing ran.
+    pub found: bool,
+}
+
+/// Told about every command a person ran.
+///
+/// A port rather than a dependency. Whether a command is counted, logged or
+/// ignored is the launcher's decision, and this layer may know neither the
+/// host nor what it counts with (`gates/layers.sh`, "UI 不认 Host,也不认
+/// Product"). The registry states the fact; a launcher decides what it is for.
+pub trait CommandObserver: Send + Sync {
+    fn ran(&self, run: &CommandRun<'_>);
+}
+
 /// Every command mounted, with conflicts refused at mount time.
 #[derive(Default)]
 pub struct Commands {
     sets: RwLock<Vec<Arc<dyn CommandSet>>>,
+    /// Filled by the launcher, if it has a use for it. Unset: dispatch is
+    /// exactly as it was.
+    observer: RwLock<Option<Arc<dyn CommandObserver>>>,
 }
 
 impl Commands {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Watch what a person runs.
+    ///
+    /// One observer, not a list: two of them would be two answers to "what
+    /// does this front end report", and the launcher is the one place that
+    /// knows. A second call replaces the first.
+    pub fn observe(&self, observer: Arc<dyn CommandObserver>) {
+        *self.observer.write().expect("commands poisoned") = Some(observer);
     }
 
     /// Two rows claiming one name is an error: the user would get whichever
@@ -277,8 +308,20 @@ impl Commands {
         // the set's `run` sees the one name it matches on. A name that is not an
         // alias resolves to itself.
         let canonical = self.find(name).map(|c| c.name.to_string());
-        let name = canonical.as_deref().unwrap_or(name);
-        match self.owner(name) {
+        // Case folded for a name nothing answers to, so `/Nope` and `/nope`
+        // are one miss and not two. A name that resolved is already canonical.
+        let typed = name.to_ascii_lowercase();
+        let name = canonical.as_deref().unwrap_or(&typed);
+        let owner = self.owner(name);
+        // Before running it, so a command that then fails is still one the
+        // person ran — what `atomcode-tuix` has always reported.
+        if let Some(observer) = self.observer.read().expect("commands poisoned").clone() {
+            observer.ran(&CommandRun {
+                name,
+                found: owner.is_some(),
+            });
+        }
+        match owner {
             Some(set) => set.run(name, args, ctx).await,
             None => {
                 let near = self.matching(name);
@@ -479,6 +522,75 @@ mod tests {
             vec!["alpha", "also"]
         );
         assert!(c.matching("zz").is_empty());
+    }
+
+    /// Every command a person runs is told to the observer, under the name it
+    /// will be counted by.
+    ///
+    /// The name is the contract, not a detail: `atomcode-tuix` has always
+    /// reported the canonical, case-folded, slash-less name
+    /// (`src/event_loop/commands.rs:1615` + `canonical_command_name`), so
+    /// `/new` and `/session` are one series and `/QUIT` is not a second
+    /// `quit`. A front end that reported what was typed would split every
+    /// aliased command in two, with nothing anywhere saying so.
+    #[tokio::test]
+    async fn every_command_a_person_runs_is_told_under_its_canonical_name() {
+        #[derive(Default)]
+        struct Seen(std::sync::Mutex<Vec<(String, bool)>>);
+        impl CommandObserver for Seen {
+            fn ran(&self, run: &CommandRun<'_>) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((run.name.to_string(), run.found));
+            }
+        }
+
+        let c = Commands::new();
+        c.add(Arc::new(Fake("row", ALIASED))).unwrap();
+        let seen = Arc::new(Seen::default());
+        c.observe(seen.clone());
+        let app = atomcode_plexus::App::new(
+            atomcode_plexus::PluginRegistry::new(),
+            atomcode_plexus::ConfigTree::default(),
+        );
+        let ctx = app.context();
+
+        c.dispatch("/session", &ctx).await;
+        c.dispatch("/new", &ctx).await; // the alias
+        c.dispatch("/SESSION", &ctx).await; // shouting
+        c.dispatch("/Nope", &ctx).await; // nothing answers to it
+
+        assert_eq!(
+            *seen.0.lock().unwrap(),
+            vec![
+                ("session".to_string(), true),
+                ("session".to_string(), true),
+                ("session".to_string(), true),
+                // Reported as typed, folded — which is what makes the miss
+                // worth reporting: it names what the person reached for.
+                ("nope".to_string(), false),
+            ]
+        );
+    }
+
+    /// Nothing is told when nobody is listening, and dispatch is unchanged.
+    ///
+    /// The port is optional on purpose — a launcher with no use for it should
+    /// not have to supply a no-op — so the unobserved path is the one that has
+    /// to keep working.
+    #[tokio::test]
+    async fn an_unobserved_registry_still_dispatches() {
+        let c = registry();
+        let app = atomcode_plexus::App::new(
+            atomcode_plexus::PluginRegistry::new(),
+            atomcode_plexus::ConfigTree::default(),
+        );
+        let ctx = app.context();
+        assert_eq!(
+            c.dispatch("/alpha", &ctx).await,
+            Outcome::Said("alpha()".into())
+        );
     }
 
     #[tokio::test]

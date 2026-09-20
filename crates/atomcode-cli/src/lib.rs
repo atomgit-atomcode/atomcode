@@ -14,6 +14,7 @@ fn _isolate_atomcode_home() {
 
 #[cfg(unix)]
 pub mod askpass;
+pub mod tui_command_meter;
 pub mod tui_login;
 pub mod tui_onboarding;
 pub mod tui_plugins;
@@ -83,7 +84,7 @@ pub mod tui_front {
         // configuration file.
         let working_dir = config.working_dir.clone();
         let connection = connect(runtime, front_end, config, host_config)?;
-        let layers = [
+        let mut layers = vec![
             crate::tui_settings::row_layer(),
             crate::tui_providers::row_layer(),
             crate::tui_plugins::row_layer(),
@@ -92,28 +93,37 @@ pub mod tui_front {
             crate::tui_login::row_layer(),
             crate::tui_welcome_words::row_layer(),
         ];
+        let mut rows: Vec<Arc<dyn atomcode_plexus::Plugin>> = vec![
+            Arc::new(crate::tui_settings::SettingsRow),
+            Arc::new(crate::tui_providers::ProvidersRow),
+            Arc::new(crate::tui_plugins::PluginsRow {
+                config_path: config_path.clone(),
+            }),
+            Arc::new(crate::tui_tools::ToolsRow),
+            Arc::new(crate::tui_onboarding::OnboardingRow {
+                config_path: config_path.clone(),
+                telemetry: telemetry.clone(),
+            }),
+            Arc::new(crate::tui_login::LoginRow {
+                config_path: config_path.clone(),
+                telemetry: telemetry.clone(),
+            }),
+            Arc::new(crate::tui_welcome_words::WelcomeWordsRow),
+        ];
+        // The eighth row, and only when there is something to count into:
+        // a launch with telemetry off has no such row at all, which is what
+        // `--dump-config` should show rather than a row that does nothing.
+        if let Some(telemetry) = telemetry {
+            layers.push(crate::tui_command_meter::row_layer());
+            rows.push(Arc::new(crate::tui_command_meter::CommandMeterRow {
+                telemetry,
+            }));
+        }
+        let layer_refs: Vec<&str> = layers.iter().map(String::as_str).collect();
         launch::mount_with(
             screen,
-            &[
-                &layers[0], &layers[1], &layers[2], &layers[3], &layers[4], &layers[5], &layers[6],
-            ],
-            &[
-                Arc::new(crate::tui_settings::SettingsRow),
-                Arc::new(crate::tui_providers::ProvidersRow),
-                Arc::new(crate::tui_plugins::PluginsRow {
-                    config_path: config_path.clone(),
-                }),
-                Arc::new(crate::tui_tools::ToolsRow),
-                Arc::new(crate::tui_onboarding::OnboardingRow {
-                    config_path: config_path.clone(),
-                    telemetry: telemetry.clone(),
-                }),
-                Arc::new(crate::tui_login::LoginRow {
-                    config_path: config_path.clone(),
-                    telemetry,
-                }),
-                Arc::new(crate::tui_welcome_words::WelcomeWordsRow),
-            ],
+            &layer_refs,
+            &rows,
             launch::Ports {
                 settings: Some(crate::tui_settings::ConfigSettings::new(
                     config_path.clone(),
