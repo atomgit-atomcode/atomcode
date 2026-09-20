@@ -281,6 +281,16 @@ pub struct Panel {
     /// moving off the row — a confirmation that outlived what it was about
     /// would reset whatever the cursor landed on.
     pub pending_reset: Option<String>,
+    /// How far the page is scrolled, for the pages that are read rather than
+    /// filtered.
+    ///
+    /// The settings page does not use it: it is narrowed by typing, and a list
+    /// you can both filter and scroll has two ways to lose the row you were
+    /// looking at. The other pages have no filter and can be longer than the
+    /// panel, which is the case this exists for — the Usage page grew past it
+    /// the day the calendar went in, and the panel silently dropped its own
+    /// closing rule to make room.
+    pub scroll: usize,
 }
 
 impl Panel {
@@ -303,6 +313,10 @@ impl Panel {
         }
         self.tab = tab;
         self.editing = None;
+        // A new page starts at its top. Carrying the offset over would open a
+        // short page part-way down, at an offset that was about a different
+        // page's rows.
+        self.scroll = 0;
         true
     }
 
@@ -516,26 +530,49 @@ pub fn key(view: &SettingsView, panel: &mut Panel, press: crate::surface::KeyPre
             }
         }
         (Key::Up, _) | (Key::Char('k'), Mods::CTRL) => {
-            if on_settings {
-                panel.move_by(-1, shown.len());
+            match on_settings {
+                true => {
+                    panel.move_by(-1, shown.len());
+                }
+                // Clamped at the top here and at the bottom where the rows are
+                // counted: this side does not know how long the page is, and a
+                // scroll offset past the end is an empty panel.
+                false => {
+                    panel.scroll = panel.scroll.saturating_sub(1);
+                }
             }
             Step::Stay
         }
         (Key::Down, _) | (Key::Char('j'), Mods::CTRL) => {
-            if on_settings {
-                panel.move_by(1, shown.len());
+            match on_settings {
+                true => {
+                    panel.move_by(1, shown.len());
+                }
+                false => {
+                    panel.scroll = panel.scroll.saturating_add(1);
+                }
             }
             Step::Stay
         }
         (Key::PageUp, _) => {
-            if on_settings {
-                panel.move_by(-10, shown.len());
+            match on_settings {
+                true => {
+                    panel.move_by(-10, shown.len());
+                }
+                false => {
+                    panel.scroll = panel.scroll.saturating_sub(10);
+                }
             }
             Step::Stay
         }
         (Key::PageDown, _) => {
-            if on_settings {
-                panel.move_by(10, shown.len());
+            match on_settings {
+                true => {
+                    panel.move_by(10, shown.len());
+                }
+                false => {
+                    panel.scroll = panel.scroll.saturating_add(10);
+                }
             }
             Step::Stay
         }

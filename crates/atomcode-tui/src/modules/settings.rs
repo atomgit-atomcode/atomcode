@@ -105,6 +105,7 @@ impl View for Settings {
                     theme::fg(Role::Muted),
                 ),
                 Row::Blank => Line::empty(),
+                Row::Scroll { above, below } => scroll_note(above, below, w, vp.moment.caps),
                 Row::BoxTop => box_edge(w, vp.moment.caps, true),
                 Row::Search { caret } => search_line(&panel.query, caret, w, vp.moment.caps),
                 Row::BoxBottom => box_edge(w, vp.moment.caps, false),
@@ -193,6 +194,19 @@ enum Row {
         line: UsageLine,
     },
     /// A margin row, above the box or above the list.
+    /// How much of a scrolled page is out of sight, above and below.
+    ///
+    /// A row of its own rather than a mark on the rule, because it is the only
+    /// thing on this panel that is *about* the panel rather than about what is
+    /// in it, and it has to be able to say a number. The panel used to answer
+    /// this by silently dropping rows — including its own closing rule, which
+    /// is how a page that overflowed came to look like a page that had no
+    /// bottom.
+    Scroll {
+        above: usize,
+        below: usize,
+    },
+
     Blank,
     /// The search box's top edge.
     BoxTop,
@@ -253,6 +267,14 @@ fn layout(
         return Vec::new();
     }
     let mut rows = rows_for(settings, panel, usage);
+    // A page that is read rather than filtered can be longer than the panel.
+    // Windowed here, with both rules kept: [`fit`] makes room by deleting rules
+    // and blanks, which is right for a list that is a row or two over and wrong
+    // for a page that is twenty over — it eats the panel's own edges first and
+    // then cuts the tail off whatever is left.
+    if panel.tab != Tab::Config {
+        return window(rows, panel.scroll, h);
+    }
     // A shorter list is a shorter list inside the same box, not a shorter box.
     //
     // The height is anchored when the panel opens ([`anchor`]), so the rows a
@@ -383,6 +405,63 @@ fn rows_for(
 /// the same bargain the question panel strikes; what changed with the frame is
 /// which rows *are* furniture, so the search box and its two edges are never
 /// sacrificed: they are where the typing goes.
+/// What is out of sight, said in rows and pointed at.
+///
+/// Both directions on one line, because "there is more below" and "you are part
+/// way down" are the same question asked from two ends, and a reader who has
+/// scrolled needs to know they can go back.
+fn scroll_note(above: usize, below: usize, w: usize, caps: crate::caps::Caps) -> Line {
+    use crate::caps::Glyph;
+    let mut parts = Vec::new();
+    if above > 0 {
+        parts.push(format!("上面还有 {above} 行"));
+    }
+    if below > 0 {
+        parts.push(format!("下面还有 {below} 行 {}", caps.g(Glyph::Down)));
+    }
+    if parts.is_empty() {
+        return Line::empty();
+    }
+    Line::styled(
+        width::take_width(&format!("  {}", parts.join(" · ")), w),
+        theme::fg(Role::Muted),
+    )
+}
+
+/// A page too long for the panel, shown from `scroll`, with its edges kept.
+///
+/// The head is the tab row and the rule under it and the foot is the rule that
+/// closes the panel; neither is ever given up, because between them is what
+/// tells a person where the panel ends. What gives way is the body, and when it
+/// does, one row of it goes to saying so — a page that quietly showed two
+/// thirds of itself is a page that lies by omission.
+fn window(rows: Vec<Row>, scroll: usize, h: usize) -> Vec<Row> {
+    // Head is `Header` + `Rule`, foot is the closing `Rule`. Below this there is
+    // no room for a body at all, so the panel is its own edges and nothing else.
+    const EDGES: usize = 3;
+    if rows.len() <= h {
+        return rows;
+    }
+    if h <= EDGES {
+        return rows.into_iter().take(h).collect();
+    }
+    let body = rows.len() - EDGES;
+    // One row of the body goes to the note that says how much is out of sight.
+    let room = h - EDGES - 1;
+    // Clamped to the last full window: scrolling past the end would answer a
+    // key with a blank panel, and the key that did it is the one a person holds
+    // down.
+    let at = scroll.min(body.saturating_sub(room));
+    let mut out: Vec<Row> = rows.iter().take(2).cloned().collect();
+    out.extend(rows.iter().skip(2 + at).take(room).cloned());
+    out.push(Row::Scroll {
+        above: at,
+        below: body - at - room,
+    });
+    out.push(Row::Rule);
+    out
+}
+
 fn fit(mut rows: Vec<Row>, h: usize) -> Vec<Row> {
     if rows.len() <= h {
         return rows;
@@ -2410,6 +2489,138 @@ mod tests {
             filled.style,
             theme::fg(Role::Error),
             "a spent window's bar is a warning, not the page's own ink"
+        );
+    }
+
+    /// A page longer than the panel keeps the panel's own edges, says how much
+    /// is out of sight, and can be scrolled to its last row.
+    ///
+    /// All three failed together the day the calendar went in. The panel made
+    /// room the way it does for a list a row or two over — by deleting rules
+    /// and blanks — so a page twenty rows over gave up **both** of its rules
+    /// first and then had its tail cut off. On screen that is a page with no
+    /// bottom edge that simply stops, and nothing said so or could be scrolled.
+    #[test]
+    fn a_page_taller_than_the_panel_keeps_its_edges_and_scrolls() {
+        use atomcode_host_api::{DayUse, ModelUse, UsageStats};
+        let daily: Vec<DayUse> = (0..60)
+            .map(|d| DayUse {
+                date: format!("2026-{:02}-{:02}", 7 + d / 28, 1 + d % 28),
+                tokens: (d as u64 % 5) * 1000,
+                requests: 1,
+            })
+            .collect();
+        let page = crate::settings::UsagePage {
+            context: None,
+            plan: None,
+            windows: Vec::new(),
+            stats: Some(UsageStats {
+                from: "2026-07-01".into(),
+                to: "2026-08-27".into(),
+                // Two, because the overview names the biggest one at the top
+                // of the page — so the *second* is the one that appears only in
+                // the table, at the very bottom. A criterion that asserted on
+                // the first would have found it above the fold and passed for
+                // the wrong reason.
+                models: vec![
+                    ModelUse {
+                        name: "the-biggest".into(),
+                        tokens: 100_000,
+                        requests: 50,
+                    },
+                    ModelUse {
+                        name: "the-last-row".into(),
+                        tokens: 20_000,
+                        requests: 10,
+                    },
+                ],
+                daily,
+                series: Vec::new(),
+                total_tokens: 120_000,
+                total_requests: 60,
+            }),
+        };
+        let at = |scroll: usize| -> Vec<String> {
+            let mut panel = Panel::new();
+            panel.show(crate::settings::Tab::Usage);
+            panel.scroll = scroll;
+            let moment = Moment {
+                settings: two(),
+                settings_panel: Some(panel),
+                usage: Some(page.clone()),
+                ..Moment::default()
+            };
+            drawn(&moment, 92, 24)
+        };
+
+        let top = at(0);
+        // Both edges. The closing one is the claim: it is the row that says
+        // where the panel ends, and it was the first thing given up.
+        let rules = |shown: &[String]| -> usize {
+            shown.iter().filter(|line| line.starts_with('─')).count()
+        };
+        assert_eq!(rules(&top), 2, "the panel keeps both rules: {top:#?}");
+        assert!(
+            top.iter().any(|line| line.contains("下面还有")),
+            "and says how much it is not showing: {top:#?}"
+        );
+        assert!(
+            !top.iter().any(|line| line.contains("the-last-row")),
+            "the table really is past the fold at the top: {top:#?}"
+        );
+
+        // Far enough down to reach the end, and no further: the offset is
+        // clamped where the rows are counted, so holding the key down lands on
+        // the last full window rather than on an empty panel.
+        let bottom = at(9_999);
+        assert_eq!(rules(&bottom), 2, "still both rules: {bottom:#?}");
+        assert!(
+            bottom.iter().any(|line| line.contains("the-last-row")),
+            "scrolling reaches the last row of the page: {bottom:#?}"
+        );
+        assert!(
+            bottom.iter().any(|line| line.contains("上面还有")),
+            "and says what is behind it: {bottom:#?}"
+        );
+        assert_eq!(
+            bottom.len(),
+            24,
+            "a panel scrolled past its end is not a shorter panel: {bottom:#?}"
+        );
+    }
+
+    /// The arrows scroll the pages that are read and move the cursor on the
+    /// page that is filtered, and changing page starts at the top.
+    #[test]
+    fn the_arrows_scroll_a_read_page_and_point_on_the_settings_page() {
+        use crate::surface::{Key, KeyPress, Mods};
+        let view = two();
+        let press = |key| KeyPress {
+            key,
+            mods: Mods::NONE,
+        };
+
+        let mut panel = Panel::new();
+        panel.show(crate::settings::Tab::Usage);
+        crate::settings::key(&view, &mut panel, press(Key::Down));
+        crate::settings::key(&view, &mut panel, press(Key::Down));
+        assert_eq!(panel.scroll, 2, "down scrolls a page that is read");
+        assert_eq!(panel.cursor, 0, "and does not move a cursor it is not on");
+        crate::settings::key(&view, &mut panel, press(Key::Up));
+        assert_eq!(panel.scroll, 1, "and up comes back");
+
+        // A page that is not this page was not scrolled to row one — the offset
+        // was about rows this page does not have.
+        panel.show(crate::settings::Tab::Stats);
+        assert_eq!(panel.scroll, 0, "a new page starts at its top");
+
+        let mut settings = Panel::new();
+        crate::settings::key(&view, &mut settings, press(Key::Down));
+        assert_eq!(settings.cursor, 1, "on the settings page the arrows point");
+        assert_eq!(
+            settings.scroll, 0,
+            "and leave the offset alone: a list that both filters and scrolls \
+             has two ways to lose the row you were looking at"
         );
     }
 
