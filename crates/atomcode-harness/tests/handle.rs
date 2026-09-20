@@ -1773,3 +1773,51 @@ async fn a_command_the_catalog_does_not_have_is_not_found_under_its_own_id() {
         "{events:#?}"
     );
 }
+
+/// A turn the person did NOT open — a `/goal` round the runtime continued, a
+/// `/loop` wake — still folds a message typed into it, and the driver has to be
+/// told: a screen's steering panel is up from the keypress until `Steered` says
+/// the model has been handed it.
+///
+/// The projection's rule is "the first user message of a turn is what the
+/// driver just sent, so say nothing". That holds only for a turn a user message
+/// opened. In a continuation-opened turn the first user message is a fold, and
+/// staying silent leaves the panel up over a transcript that is already drawing
+/// the same sentence.
+#[tokio::test]
+async fn a_message_folded_into_a_turn_the_harness_opened_is_announced_as_steering() {
+    let dir = scratch("steer-continuation");
+    let app = start(tree(
+        &dir,
+        &replay(r#"{ text = "first" }, { text = "second" }"#),
+        &[],
+    ))
+    .await;
+    let mut handle = handle_of(&app);
+    let _guard = app
+        .context()
+        .on_waterfall::<atomcode_harness::events::AgentRequest>(
+            std::sync::Arc::new(SendsThroughHandleMidTurn {
+                commands: handle.commands.clone(),
+                command: std::sync::Mutex::new(Some(tagged("b", message("also this")))),
+            }),
+            false,
+        );
+
+    // Opened by the harness, the way a goal continuation opens one.
+    handle
+        .commands
+        .send(AgentCommand::SendSyntheticMessage {
+            text: "keep working toward the goal".into(),
+        })
+        .unwrap();
+    let events = drain_turn(&mut handle).await;
+
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Steered { inputs, .. }
+                if inputs.iter().any(|i| i.text == "also this"))),
+        "a fold into a continuation-opened turn must be announced: {events:#?}"
+    );
+}

@@ -80,9 +80,10 @@ struct Projector {
     ctx_window: u32,
     batch: Option<OpenBatch>,
     last_prompt_tokens: u32,
-    /// How many user messages this turn has taken. The second and later ones
-    /// are steering.
-    said_this_turn: u32,
+    /// Whether this turn has already asked the model something. What opened
+    /// the turn arrives before that; anything the person says after it was
+    /// folded into a turn already running, which is steering.
+    stepped_this_turn: bool,
     /// The round now running answers a nudge the harness wrote. What the model
     /// says back is not shown: it is answering a note the person never sent. What
     /// it DOES still is — the calls it makes and their results project as always.
@@ -180,7 +181,7 @@ impl Projector {
     ) -> Vec<AgentEvent> {
         match event {
             SessionEvent::TurnStart { turn } => {
-                self.said_this_turn = 0;
+                self.stepped_this_turn = false;
                 vec![AgentEvent::TurnStarted { turn: Some(*turn) }]
             }
 
@@ -454,18 +455,24 @@ impl Projector {
             // be able to become invisible to every driver by default. Adding
             // one stops compiling here until someone decides what it looks
             // like on a screen.
-            // A second user message inside one turn is steering: the person
-            // typed while the model was answering and the loop folded it in.
-            // The behaviour was already right — one turn, not two — but the
-            // driver was never told, so a UI could not say "your message was
-            // folded into this turn". The reference engine announces it; a
-            // differential run showed this as the only difference on that path.
+            // A user message that arrives once the turn has already asked the
+            // model something is steering: the person typed while the model was
+            // answering and the loop folded it in. The behaviour was already
+            // right — one turn, not two — but the driver was never told, so a UI
+            // could not say "your message was folded into this turn".
+            //
+            // The test is the step, not the count. "The first user message of a
+            // turn is what the driver just sent" holds only for a turn a user
+            // message opened; a turn opened by the HARNESS — a `/goal` round's
+            // continuation, a `/loop` wake — takes the person's first word
+            // mid-flight, and calling that one the opener left every driver
+            // silent about a fold it could see in the log. The opener is
+            // committed before this turn's first `StepStart`; a fold lands
+            // between one step and the next.
             SessionEvent::UserMessage { turn, text, images } => {
-                if self.said_this_turn == 0 {
-                    self.said_this_turn = 1;
+                if !self.stepped_this_turn {
                     Vec::new()
                 } else {
-                    self.said_this_turn += 1;
                     vec![AgentEvent::Steered {
                         turn: Some(*turn),
                         count: 1,
@@ -504,8 +511,12 @@ impl Projector {
                 }]
             }
 
-            SessionEvent::StepStart { .. }
-            | SessionEvent::RequestHeader { .. }
+            SessionEvent::StepStart { .. } => {
+                self.stepped_this_turn = true;
+                Vec::new()
+            }
+
+            SessionEvent::RequestHeader { .. }
             | SessionEvent::Titled { .. }
             // The ladder that stubbed says so itself, as a notice; the fact is
             // for the log and the next request, not for the screen.
@@ -1689,7 +1700,7 @@ fn attach(
             .unwrap_or(0),
         batch: None,
         last_prompt_tokens: 0,
-        said_this_turn: 0,
+        stepped_this_turn: false,
         answering_a_nudge: false,
         usage_round: None,
         manual_compaction: manual_compaction.clone(),
@@ -1945,7 +1956,7 @@ pub fn replay(events: &[SessionEvent], ctx_window: u32) -> Vec<AgentEvent> {
         ctx_window,
         batch: None,
         last_prompt_tokens: 0,
-        said_this_turn: 0,
+        stepped_this_turn: false,
         answering_a_nudge: false,
         usage_round: None,
         manual_compaction: Default::default(),
