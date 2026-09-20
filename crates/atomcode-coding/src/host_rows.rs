@@ -1271,7 +1271,15 @@ async fn publish_mcp(
     for adapter in adapters {
         let name = adapter.name().to_string();
         toolbox.unregister(&name);
-        if toolbox.register(adapter).is_ok() && !names.contains(&name) {
+        // Under this row's name, so a host narrowing the catalog can write
+        // either `mcp__github__*` or `mcp-host:mcp__github__*`
+        // (`atomcode_harness::seams::ToolPolicy`). A tool the policy keeps out
+        // is not in the catalog afterwards, so it does not go on the published
+        // list either — `names` is what this row will withdraw later.
+        if toolbox.register_from("mcp-host", adapter).is_ok()
+            && toolbox.get(&name).is_some()
+            && !names.contains(&name)
+        {
             names.push(name);
         }
     }

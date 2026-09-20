@@ -64,9 +64,13 @@ fn mount_into(
     toolbox: &Arc<ToolBox>,
     tools: Vec<Arc<dyn Tool>>,
 ) -> Result<(), String> {
+    let owner = ctx.entry();
     for tool in tools {
         let name = tool.name().to_string();
-        toolbox.register(tool)?;
+        // The row's own id travels with the tool: a host narrowing the catalog
+        // can then say `tool-fs-world:read_file` and leave everyone else's
+        // `read_file` alone (`ToolPolicy`).
+        toolbox.register_from(&owner, tool)?;
         let toolbox = toolbox.clone();
         let _ = ctx.effect(move || toolbox.unregister(&name));
     }

@@ -5,7 +5,7 @@
 //! consumer names an implementation, which is why swapping a provider changes the
 //! product without touching anything that uses it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
@@ -61,6 +61,94 @@ plexus_service!(DelegatedLlmSvc => dyn LlmProvider, "llm-delegated", Seam, "The 
 plexus_service!(DelegationLaneSvc => DelegationLane, "delegation-lane", Core, "Where a delegated agent may write: the scopes it was given, on its own realm");
 plexus_service!(GrantsSvc => dyn atomcode_capabilities::tools::PermissionStore, "grants", Core, "The session's remembered always-allow answers, kept by a host that outlives the tree");
 
+/// Which names the catalog admits, as the `tools` row was configured.
+///
+/// The switch a config tree has is the **row**, and a row usually mounts
+/// several tools — `tool-fs-world` alone brings five. So "drop `write_file`,
+/// keep `read_file`" had no expression, and neither did "let this MCP server
+/// offer two of its forty tools": an MCP server's tools are published at
+/// runtime by one row, long after any row list was written.
+///
+/// Hence a policy on the **aggregate** rather than a switch on each
+/// contributor: one implementation, and it covers contributors that do not
+/// exist yet when the tree is written.
+///
+/// A pattern is either a tool name (`write_file`, `mcp__github__*`) or a row
+/// and a tool (`tool-fs-world:read_file`). The qualified form is what makes
+/// **replacing** one tool out of a row possible: exclude the incumbent row's
+/// `read_file` and the name is free, so the host's own row registers under it.
+/// The bare form excludes that name from everyone, which is what you want for
+/// "this tree has no `write_file`, whoever offers one".
+///
+/// `include` empty means "everything not excluded". A name matching both is
+/// excluded — the narrower statement wins, and a host that wrote both meant to
+/// carve something out.
+#[derive(Default, Clone, Debug)]
+pub struct ToolPolicy {
+    include: Vec<String>,
+    exclude: Vec<String>,
+}
+
+impl ToolPolicy {
+    pub fn new(include: Vec<String>, exclude: Vec<String>) -> Self {
+        Self { include, exclude }
+    }
+
+    /// Nothing named, nothing to enforce — the ordinary case, and worth asking
+    /// about before a caller pays for a match.
+    pub fn is_open(&self) -> bool {
+        self.include.is_empty() && self.exclude.is_empty()
+    }
+
+    /// `owner` is the row offering the tool, as the config tree names it.
+    pub fn admits(&self, owner: &str, name: &str) -> bool {
+        if self.exclude.iter().any(|p| names(p, owner, name)) {
+            return false;
+        }
+        self.include.is_empty() || self.include.iter().any(|p| names(p, owner, name))
+    }
+}
+
+/// Does `pattern` name this tool? Qualified patterns match `owner:name`, bare
+/// ones match the name alone.
+fn names(pattern: &str, owner: &str, name: &str) -> bool {
+    match pattern.split_once(':') {
+        Some((row, tool)) => glob_matches(row, owner) && glob_matches(tool, name),
+        None => glob_matches(pattern, name),
+    }
+}
+
+/// `*` stands for any run of characters, anywhere in the pattern. Enough for
+/// `mcp__github__*` and `*_file`, and small enough to read — a tool name is an
+/// identifier, not a path, so there is nothing for a `?` or a class to do.
+fn glob_matches(pattern: &str, name: &str) -> bool {
+    let mut rest = name;
+    let mut parts = pattern.split('*');
+    let Some(first) = parts.next() else {
+        return pattern == name;
+    };
+    let Some(stripped) = rest.strip_prefix(first) else {
+        return false;
+    };
+    rest = stripped;
+    let mut last: Option<&str> = None;
+    for part in parts {
+        if let Some(previous) = last.replace(part) {
+            // A middle segment: find it anywhere ahead.
+            match rest.find(previous) {
+                Some(at) => rest = &rest[at + previous.len()..],
+                None => return false,
+            }
+        }
+    }
+    match last {
+        // The pattern had no `*`: it must have consumed the whole name.
+        None => rest.is_empty(),
+        // The tail after the final `*`.
+        Some(tail) => rest.len() >= tail.len() && rest.ends_with(tail),
+    }
+}
+
 /// The live tool catalog.
 ///
 /// Deliberately mutable at runtime rather than a snapshot taken at assembly: a
@@ -70,11 +158,23 @@ plexus_service!(GrantsSvc => dyn atomcode_capabilities::tools::PermissionStore, 
 #[derive(Default)]
 pub struct ToolBox {
     tools: RwLock<BTreeMap<String, Arc<dyn Tool>>>,
+    policy: ToolPolicy,
+    /// Names actually turned away, so the tree can say what it dropped rather
+    /// than the model wondering where a tool went.
+    turned_away: RwLock<BTreeSet<String>>,
 }
 
 impl ToolBox {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The catalog the `tools` row builds when a host narrowed it.
+    pub fn with_policy(policy: ToolPolicy) -> Self {
+        Self {
+            policy,
+            ..Self::default()
+        }
     }
 
     /// Add a tool. Pair every call with a `ctx.effect(.. unregister ..)` so the
@@ -83,8 +183,33 @@ impl ToolBox {
     /// A duplicate name is an error, not last-write-wins: two rows claiming
     /// `read_file` means the config is ambiguous about which execution world the
     /// model is talking to, and silently picking one would be the worst answer.
+    /// A name the policy excludes is **not** an error: the row that offered it
+    /// mounts as it always did, and the name stays free for whoever the host
+    /// meant to have it. That is what makes replacing one tool out of a row
+    /// possible at all — the incumbent never takes the name, so a second row
+    /// can register under it without colliding.
     pub fn register(&self, tool: Arc<dyn Tool>) -> Result<(), String> {
+        self.register_from("", tool)
+    }
+
+    /// [`register`](Self::register), saying which row is offering the tool, so
+    /// a policy can name one row's copy of a name without excluding the name
+    /// itself. The door (`plugins::tools::mount`) passes `ctx.entry()`; there
+    /// is nowhere else a row's identity is known.
+    pub fn register_from(&self, owner: &str, tool: Arc<dyn Tool>) -> Result<(), String> {
         let name = tool.name().to_string();
+        if !self.policy.admits(owner, &name) {
+            let noted = if owner.is_empty() {
+                name
+            } else {
+                format!("{owner}:{name}")
+            };
+            self.turned_away
+                .write()
+                .expect("toolbox poisoned")
+                .insert(noted);
+            return Ok(());
+        }
         let mut tools = self.tools.write().expect("toolbox poisoned");
         if tools.contains_key(&name) {
             return Err(format!(
@@ -97,6 +222,16 @@ impl ToolBox {
 
     pub fn unregister(&self, name: &str) {
         self.tools.write().expect("toolbox poisoned").remove(name);
+    }
+
+    /// What the policy kept out, by the name whoever offered it used.
+    pub fn turned_away(&self) -> Vec<String> {
+        self.turned_away
+            .read()
+            .expect("toolbox poisoned")
+            .iter()
+            .cloned()
+            .collect()
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
@@ -788,4 +923,61 @@ pub trait ToolDriver: Send + Sync {
 #[derive(Clone, Debug)]
 pub struct DelegationLane {
     pub scopes: Vec<String>,
+}
+
+#[cfg(test)]
+mod tool_policy_tests {
+    use super::ToolPolicy;
+
+    fn policy(exclude: &[&str]) -> ToolPolicy {
+        ToolPolicy::new(vec![], exclude.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn a_pattern_without_a_star_is_the_whole_name() {
+        let p = policy(&["read_file"]);
+        assert!(!p.admits("tool-fs", "read_file"));
+        assert!(p.admits("tool-fs", "read_file_2"));
+        assert!(p.admits("tool-fs", "my_read_file"));
+    }
+
+    #[test]
+    fn a_star_stands_for_any_run_including_none() {
+        let p = policy(&["mcp__github__*"]);
+        assert!(!p.admits("mcp-host", "mcp__github__create_issue"));
+        assert!(!p.admits("mcp-host", "mcp__github__"));
+        assert!(p.admits("mcp-host", "mcp__gitlab__create_issue"));
+
+        let tail = policy(&["*_file"]);
+        assert!(!tail.admits("tool-fs", "read_file"));
+        assert!(tail.admits("tool-fs", "read_file_range"));
+
+        let middle = policy(&["mcp__*__delete_*"]);
+        assert!(!middle.admits("mcp-host", "mcp__github__delete_repo"));
+        assert!(middle.admits("mcp-host", "mcp__github__create_repo"));
+
+        assert!(!policy(&["*"]).admits("anything", "at_all"));
+    }
+
+    #[test]
+    fn a_qualified_pattern_names_one_rows_copy() {
+        let p = policy(&["tool-fs-world:read_file"]);
+        assert!(!p.admits("tool-fs-world", "read_file"));
+        assert!(
+            p.admits("my-read-file", "read_file"),
+            "which is what leaves the name free for a replacement"
+        );
+    }
+
+    #[test]
+    fn an_empty_include_admits_everything_the_exclude_leaves() {
+        let open = ToolPolicy::new(vec![], vec![]);
+        assert!(open.is_open());
+        assert!(open.admits("any-row", "any_tool"));
+
+        let only = ToolPolicy::new(vec!["read_file".into(), "grep".into()], vec!["grep".into()]);
+        assert!(only.admits("tool-fs", "read_file"));
+        assert!(!only.admits("tool-search", "glob"), "not on the list");
+        assert!(!only.admits("tool-search", "grep"), "exclude beats include");
+    }
 }
