@@ -328,6 +328,7 @@ dependencies = [
  "atomcode-daemon",
  "atomcode-harness",
  "atomcode-host-api",
+ "atomcode-i18n",
  "atomcode-kernel",
  "atomcode-plexus",
  "atomcode-review",
@@ -507,6 +508,7 @@ name = "atomcode-config"
 version = "5.1.0"
 dependencies = [
  "anyhow",
+ "atomcode-i18n",
  "atomcode-telemetry",
  "dirs",
  "fs2",
@@ -586,6 +588,14 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "atomcode-i18n"
+version = "5.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -675,6 +685,7 @@ dependencies = [
  "atomcode-capabilities",
  "atomcode-harness",
  "atomcode-host-api",
+ "atomcode-i18n",
  "atomcode-kernel",
  "atomcode-plexus",
  "atomcode-tree-host",

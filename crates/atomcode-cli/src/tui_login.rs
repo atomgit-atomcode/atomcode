@@ -22,6 +22,7 @@
 //!    OAuth，重跑 setup；
 //! 4. 配置要落盘才写盘（半途而废的 setup 不写），并给活着的东西发 reload。
 
+use atomcode_i18n::screen::{t as tr, Msg as SMsg};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -114,10 +115,7 @@ impl CommandSet for LoginCommands {
         "cmd-tui-login"
     }
     fn commands(&self) -> Vec<Command> {
-        vec![Command::new(
-            COMMAND,
-            "登录并配好 provider；已登录则刷新 codingplan 配置",
-        )]
+        vec![Command::said(COMMAND, tr(SMsg::CmdAboutTuiLogin))]
     }
     /// Takes the screen's shipped `/login` over rather than colliding with it:
     /// that one only re-read configuration, so a person who had just logged out
@@ -232,7 +230,7 @@ impl World {
                 (cfg, report)
             })
             .join()
-            .map_err(|_| "codingplan setup 线程崩了".to_string())
+            .map_err(|_| tr(SMsg::SetupThreadDied).into_owned())
             .and_then(|(cfg, report)| report.map(|r| (cfg, r)).map_err(|e| format!("{e:#}")))
         });
 
@@ -275,7 +273,9 @@ impl World {
                     .call(atomcode_host_api::HostCommand::Reload { session: root })
                     .await
                 {
-                    screen.say(&format!("配置已写入，但重新加载失败：{error:?}"));
+                    screen.say(&tr(SMsg::ConfigWrittenReloadFailedCli {
+                        error: &format!("{error:?}"),
+                    }));
                     if let Some(repaint) = repaint.as_ref() {
                         repaint.now();
                     }
@@ -310,21 +310,21 @@ fn run_login_flow_with(world: &World, ui: &Arc<dyn UserInterface>, painted: &dyn
     // codingplan 配置刷新一遍 —— 再弹一次登录是要人重做已经做过的事。
     if !world.logged_in {
         match (world.login)(&sink) {
-            Ok(()) => say("登录成了，正在配 provider…".into()),
+            Ok(()) => say(tr(SMsg::SignedInSettingUpProvider).into_owned()),
             Err(error) => {
                 say(error);
                 return;
             }
         }
     } else {
-        say("已登录，正在刷新 codingplan 配置…".into());
+        say(tr(SMsg::AlreadySignedInRefreshing).into_owned());
     }
 
     // Phase 2: claim/models/status。
     let (mut prepared_config, mut report) = match (world.setup)((world.load)()) {
         Ok(pair) => pair,
         Err(error) => {
-            say(format!("internal error：{error}"));
+            say(tr(SMsg::InternalError { error: &error }).into_owned());
             return;
         }
     };
@@ -332,19 +332,19 @@ fn run_login_flow_with(world: &World, ui: &Arc<dyn UserInterface>, painted: &dyn
     // Phase 3: auth_expired —— 本地 token 还没过期但服务端拒了（被吊销、
     // refresh 死了）。再走一次 OAuth，重跑 setup。只有一次，不循环。
     if report.auth_expired {
-        say("服务端不认这个 token 了，重新登录一次…".into());
+        say(tr(SMsg::TokenRejectedSigningInAgain).into_owned());
         if let Err(error) = (world.login)(&sink) {
             say(error);
             return;
         }
-        say("重新登录成了，重跑 setup…".into());
+        say(tr(SMsg::SignedInAgainRerunningSetup).into_owned());
         match (world.setup)(prepared_config.clone()) {
             Ok((cfg, r)) => {
                 prepared_config = cfg;
                 report = r;
             }
             Err(error) => {
-                say(format!("internal error：{error}"));
+                say(tr(SMsg::InternalError { error: &error }).into_owned());
                 return;
             }
         }
@@ -353,7 +353,7 @@ fn run_login_flow_with(world: &World, ui: &Arc<dyn UserInterface>, painted: &dyn
     // Phase 4: 配置要落盘才写盘 —— 半途而废的 setup 不写。
     if report.should_persist_config() {
         if let Err(error) = (world.save)(&prepared_config, &report) {
-            say(format!("配置没写成：{error}"));
+            say(tr(SMsg::ConfigNotWritten { error: &error }).into_owned());
             return;
         }
     }
@@ -384,8 +384,12 @@ fn run_oauth(
     say: &dyn Say,
     telemetry: &Option<Arc<atomcode_telemetry::Telemetry>>,
 ) -> Result<(), String> {
-    let session =
-        atomcode_auth::oauth::start_login().map_err(|error| format!("登录起不来：{error:#}"))?;
+    let session = atomcode_auth::oauth::start_login().map_err(|error| {
+        tr(SMsg::LoginCouldNotStart {
+            error: &format!("{error:#}"),
+        })
+        .into_owned()
+    })?;
     say.say(&login_chrome(session.url()));
 
     let ticks = session.spawn_poller(Duration::from_secs(2));
@@ -393,14 +397,22 @@ fn run_oauth(
         match ticks.recv() {
             Ok(Ok(atomcode_auth::oauth::PollOutcome::Authorized)) => break,
             Ok(Ok(atomcode_auth::oauth::PollOutcome::Pending)) => continue,
-            Ok(Err(error)) => return Err(format!("登录没成：{error:#}")),
-            Err(_) => return Err("登录没了回音".into()),
+            Ok(Err(error)) => {
+                return Err(tr(SMsg::LoginFailed {
+                    error: &format!("{error:#}"),
+                })
+                .into_owned())
+            }
+            Err(_) => return Err(tr(SMsg::LoginNoAnswer).into_owned()),
         }
     }
 
-    let auth = session
-        .finish(telemetry.as_ref())
-        .map_err(|error| format!("换 token 没成：{error:#}"))?;
+    let auth = session.finish(telemetry.as_ref()).map_err(|error| {
+        tr(SMsg::TokenExchangeFailed {
+            error: &format!("{error:#}"),
+        })
+        .into_owned()
+    })?;
     keep_credentials(&auth)
 }
 
@@ -412,7 +424,12 @@ fn run_oauth(
 /// next thing that wants a token goes and asks for another login. Naming it and
 /// testing it is what keeps that from being a silent gap again.
 fn keep_credentials(auth: &atomcode_auth::AuthInfo) -> Result<(), String> {
-    atomcode_auth::save_auth(auth).map_err(|error| format!("登录成了，但凭据没写成：{error:#}"))
+    atomcode_auth::save_auth(auth).map_err(|error| {
+        tr(SMsg::SignedInCredentialsNotSaved {
+            error: &format!("{error:#}"),
+        })
+        .into_owned()
+    })
 }
 
 /// What the person reads while they reach for their phone: the code, then the
@@ -423,7 +440,7 @@ fn login_chrome(url: &str) -> String {
         chrome.push_str(&qr);
         chrome.push('\n');
     }
-    chrome.push_str("用手机扫码，或在浏览器里打开：");
+    chrome.push_str(&tr(SMsg::ScanOrOpen));
     chrome.push('\n');
     chrome.push_str(url);
     chrome
@@ -623,6 +640,13 @@ mod tests {
     /// report was scrollback, like any other command's output.
     #[test]
     fn the_report_is_said_into_the_conversation_not_held_in_a_frame() {
+        // Asserted in English, because the lines it looks for are the setup
+        // report's English ones. The crate's tests otherwise assert in Chinese
+        // (`_tests_assert_in_chinese`), so this one says which language it
+        // means and puts the other back when it is done.
+        let _guard = atomcode_config::i18n::test_lock();
+        atomcode_config::i18n::set_locale(atomcode_config::locale::Locale::En);
+
         let world = World2::new(true, false);
         let recorder = Arc::new(Recording::default());
         run_login_flow_with(&world.world(), &sink_with(recorder.clone()), &|| {});

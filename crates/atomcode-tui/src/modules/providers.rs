@@ -21,6 +21,8 @@
 //! is *not* in there, which is the key.
 
 use crate::frame::{Line, Span, Style};
+use crate::i18n::product::{t as pt, Msg as PMsg};
+use crate::i18n::{t, Msg};
 use crate::module::{Height, View};
 use crate::modules::chrome::{
     self, box_edge, edit_line, pad_to, panel_edge, search_line, LABEL_MAX, LABEL_MIN, LEAD,
@@ -207,7 +209,8 @@ fn draw(view: &ProvidersView, panel: &Panel, row: Row, w: usize, caps: crate::ca
     match row {
         Row::Rule => panel_edge(w, caps),
         Row::Header => {
-            let labels: Vec<&str> = Tab::ALL.iter().map(|t| t.label()).collect();
+            let labels: Vec<String> = Tab::ALL.iter().map(|t| t.label()).collect();
+            let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
             let at = Tab::ALL.iter().position(|t| *t == panel.tab).unwrap_or(0);
             Line::from_spans(chrome::header_parts(NAME, &labels, at).0).truncate(w)
         }
@@ -216,7 +219,7 @@ fn draw(view: &ProvidersView, panel: &Panel, row: Row, w: usize, caps: crate::ca
         Row::BoxBottom => box_edge(w, caps, false),
         Row::Blank => Line::empty(),
         Row::Nothing => Line::styled(
-            width::take_width("  没有匹配的 provider", w),
+            width::take_width(&t(Msg::ProvidersNoMatch), w),
             theme::fg(Role::Muted),
         ),
         Row::Scroll { above, below } => Line::styled(
@@ -240,12 +243,15 @@ fn draw(view: &ProvidersView, panel: &Panel, row: Row, w: usize, caps: crate::ca
 fn form_title(panel: &Panel) -> String {
     match &panel.form {
         Some(Form::Account(form)) => match &form.editing {
-            Some(id) => format!("改 {id}"),
-            None => "添加 provider".to_string(),
+            Some(id) => t(Msg::ProviderFormEdit { id }).into_owned(),
+            None => t(Msg::ProviderFormAddAccount).into_owned(),
         },
         Some(Form::Model(form)) => match &form.editing {
-            Some(id) => format!("改 {id}"),
-            None => format!("给 {} 添加模型", form.account_id()),
+            Some(id) => t(Msg::ProviderFormEdit { id }).into_owned(),
+            None => t(Msg::ProviderFormAddModelTo {
+                account: form.account_id(),
+            })
+            .into_owned(),
         },
         None => String::new(),
     }
@@ -278,9 +284,10 @@ fn listed_line(
         Listed::Add => (
             " ".to_string(),
             match panel.tab {
-                Tab::Accounts => "添加 provider".to_string(),
-                Tab::Models => "添加模型".to_string(),
-            },
+                Tab::Accounts => t(Msg::ProviderFormAddAccount),
+                Tab::Models => t(Msg::ProviderFormAddModel),
+            }
+            .into_owned(),
             "^a".to_string(),
             true,
         ),
@@ -290,17 +297,20 @@ fn listed_line(
             };
             let mut about = vec![row.protocol.clone()];
             if row.configured {
-                about.push(format!("{} 个模型", row.models));
-                about.push(if row.has_key {
-                    "有密钥".to_string()
-                } else {
-                    "没有密钥".to_string()
-                });
+                about.push(t(Msg::ProviderModelCount { n: row.models }).into_owned());
+                about.push(
+                    if row.has_key {
+                        t(Msg::ProviderHasKey)
+                    } else {
+                        t(Msg::ProviderNoKey)
+                    }
+                    .into_owned(),
+                );
                 if row.managed {
-                    about.push("登录管理".to_string());
+                    about.push(t(Msg::ProviderManaged).into_owned());
                 }
             } else {
-                about.push("未配置".to_string());
+                about.push(t(Msg::ProviderUnconfigured).into_owned());
             }
             let on = view
                 .models()
@@ -325,10 +335,10 @@ fn listed_line(
                 about.push(effort.clone());
             }
             if row.vision == Some(true) {
-                about.push("视觉".to_string());
+                about.push(t(Msg::ProviderVision).into_owned());
             }
             if row.managed {
-                about.push("登录管理".to_string());
+                about.push(t(Msg::ProviderManaged).into_owned());
             }
             (
                 mark_for(row.current, caps),
@@ -365,7 +375,7 @@ fn listed_line(
         base.under(theme::fg(Role::Muted))
     };
     let about = if armed {
-        "再按一次 ^d 删除".to_string()
+        t(Msg::ArmedDelete).into_owned()
     } else {
         about
     };
@@ -453,23 +463,29 @@ fn account_field(
     caps: crate::caps::Caps,
 ) -> (String, String, bool, bool, usize) {
     match field {
-        AccountField::Name => ("名字".into(), form.name.clone(), focused, true, form.caret),
+        AccountField::Name => (
+            t(Msg::FieldName).into_owned(),
+            form.name.clone(),
+            focused,
+            true,
+            form.caret,
+        ),
         AccountField::Protocol => (
-            "协议".into(),
+            t(Msg::FieldProtocol).into_owned(),
             cycled(&form.protocol_label(view), focused),
             focused,
             false,
             0,
         ),
         AccountField::Endpoint => (
-            "地址".into(),
+            t(Msg::FieldAddress).into_owned(),
             form.endpoint.clone(),
             focused,
             true,
             form.caret,
         ),
         AccountField::Key => (
-            "密钥".into(),
+            t(Msg::FieldKey).into_owned(),
             dots(form.key_len, form.editing.is_some(), caps),
             focused,
             false,
@@ -494,20 +510,26 @@ fn model_field(
             0,
         ),
         ModelField::Key => (
-            "密钥".into(),
+            t(Msg::FieldKey).into_owned(),
             dots(form.key_len, false, caps),
             focused,
             false,
             0,
         ),
-        ModelField::Model => ("模型".into(), form.model.clone(), focused, true, form.caret),
+        ModelField::Model => (
+            pt(PMsg::ProviderPanelFieldModel).into_owned(),
+            form.model.clone(),
+            focused,
+            true,
+            form.caret,
+        ),
         ModelField::Vision => (
-            "看图".into(),
+            t(Msg::FieldVision).into_owned(),
             cycled(
-                match form.vision {
-                    None => "自动",
-                    Some(true) => "能",
-                    Some(false) => "不能",
+                &match form.vision {
+                    None => pt(PMsg::ProviderPanelVisionAuto),
+                    Some(true) => t(Msg::VisionYes),
+                    Some(false) => t(Msg::VisionNo),
                 },
                 focused,
             ),
@@ -516,29 +538,42 @@ fn model_field(
             0,
         ),
         ModelField::Effort => (
-            "思考强度".into(),
-            cycled(form.effort.as_deref().unwrap_or("不支持"), focused),
+            t(Msg::FieldEffort).into_owned(),
+            cycled(
+                &match form.effort.as_deref() {
+                    Some(effort) => effort.into(),
+                    None => t(Msg::EffortUnsupported),
+                },
+                focused,
+            ),
             focused,
             false,
             0,
         ),
         ModelField::Levels => (
-            "可选强度".into(),
+            t(Msg::FieldLevels).into_owned(),
             levels_text(view, form, focused, caps),
             focused,
             false,
             0,
         ),
         ModelField::Window => (
-            "上下文".into(),
+            t(Msg::FieldWindow).into_owned(),
             form.window.clone(),
             focused,
             true,
             form.caret,
         ),
         ModelField::Default => (
-            "存完就用".into(),
-            cycled(if form.default { "是" } else { "否" }, focused),
+            t(Msg::FieldUseAfterSaving).into_owned(),
+            cycled(
+                &if form.default {
+                    t(Msg::YesWord)
+                } else {
+                    t(Msg::NoWord)
+                },
+                focused,
+            ),
             focused,
             false,
             0,
@@ -562,7 +597,7 @@ fn cycled(value: &str, focused: bool) -> String {
 fn dots(len: usize, editing: bool, caps: crate::caps::Caps) -> String {
     if len == 0 {
         return match editing {
-            true => "（留空则不改）".to_string(),
+            true => t(Msg::KeyLeaveBlankToKeep).into_owned(),
             false => String::new(),
         };
     }
@@ -601,14 +636,15 @@ fn levels_text(
         .join("")
 }
 
-fn legend(panel: &Panel) -> Vec<(&'static str, &'static str)> {
+fn legend(panel: &Panel) -> Vec<(String, String)> {
+    let key = |k: &str, msg: Msg<'_>| (k.to_string(), t(msg).into_owned());
     match &panel.form {
         Some(Form::Account(_)) | Some(Form::Model(_)) => {
             vec![
-                ("⇥", "下一项"),
-                ("←→", "改"),
-                ("⏎", "保存"),
-                ("esc", "取消"),
+                key("⇥", Msg::LegendNextField),
+                key("←→", Msg::LegendChangeValue),
+                key("⏎", Msg::LegendSave),
+                key("esc", Msg::LegendCancel),
             ]
         }
         None => {
@@ -616,18 +652,24 @@ fn legend(panel: &Panel) -> Vec<(&'static str, &'static str)> {
                 // Says what the next press does, because that is the only thing
                 // about this state a person has to know — and it is the press
                 // that throws something away.
-                return vec![("^d", "再按一次删除"), ("其它键", "取消")];
+                return vec![
+                    key("^d", Msg::LegendPressAgainToDelete),
+                    (
+                        t(Msg::LegendAnyOtherKey).into_owned(),
+                        t(Msg::LegendCancel).into_owned(),
+                    ),
+                ];
             }
-            let mut out = vec![("↑↓", "选择")];
+            let mut out = vec![key("↑↓", Msg::LegendSelect)];
             out.push(match panel.tab {
-                Tab::Accounts => ("⏎", "看它的模型"),
-                Tab::Models => ("⏎", "换过去"),
+                Tab::Accounts => key("⏎", Msg::LegendSeeItsModels),
+                Tab::Models => key("⏎", Msg::LegendSwitchToIt),
             });
-            out.push(("^a", "添加"));
-            out.push(("^e", "修改"));
-            out.push(("^d", "删除"));
-            out.push(("⇥", "换页"));
-            out.push(("esc", "关闭"));
+            out.push(("^a".to_string(), pt(PMsg::ProviderMenuAdd).into_owned()));
+            out.push(key("^e", Msg::LegendChange));
+            out.push(("^d".to_string(), pt(PMsg::ProviderMenuDelete).into_owned()));
+            out.push(key("⇥", Msg::LegendChangePage));
+            out.push(key("esc", Msg::LegendClose));
             out
         }
     }
@@ -683,7 +725,8 @@ pub fn geometry(moment: &Moment, vp: &Viewport<'_>) -> Geometry {
 
 /// Which list is under this cell of the header row.
 pub fn tab_at(col: usize) -> Option<Tab> {
-    let labels: Vec<&str> = Tab::ALL.iter().map(|t| t.label()).collect();
+    let labels: Vec<String> = Tab::ALL.iter().map(|t| t.label()).collect();
+    let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
     chrome::tab_at(NAME, &labels, col).map(|at| Tab::ALL[at])
 }
 

@@ -14,6 +14,7 @@
 //! 什么」该待的地方。
 
 use crate::frame::{Line, Span, Style};
+use crate::i18n::{t, Msg};
 use crate::module::{Height, View};
 use crate::modules::chrome::{
     self, box_edge, caret_spans, pad_to, panel_edge, search_line, LABEL_MAX, LABEL_MIN, LEAD,
@@ -121,7 +122,12 @@ enum Row {
     /// 加市场那张表单唯一的字段。
     Url,
     /// 表单底下的一段说明。
-    Note(&'static str),
+    /// One line of the note under the add-a-marketplace form.
+    ///
+    /// The message rather than the text: `Row` is `Copy` and built afresh every
+    /// frame, and `Msg` is `Copy` too — so the words are looked up when the row
+    /// is drawn, in whatever language is in force then.
+    Note(Msg<'static>),
     Legend,
 }
 
@@ -204,11 +210,11 @@ fn layout(view: &PluginsView, panel: &Panel, h: usize) -> Vec<Row> {
 ///
 /// 三种写法各一行,因为人手里拿的多半是其中一种,而「支持哪几种」这件事,只有把
 /// 它们摆出来才说得清。
-const ADD_MARKET_NOTES: [&str; 4] = [
-    "可以是:",
-    "  · https://atomgit.com/某某/某仓库.git",
-    "  · git@atomgit.com:某某/某仓库.git",
-    "  · ./本地/某个目录",
+const ADD_MARKET_NOTES: [Msg<'static>; 4] = [
+    Msg::AddMarketNotesHead,
+    Msg::AddMarketNoteHttps,
+    Msg::AddMarketNoteSsh,
+    Msg::AddMarketNoteLocal,
 ];
 
 /// `len` 行里让 `cursor` 留在视野里的那一段,一次 `room` 行。
@@ -245,14 +251,12 @@ fn draw(view: &PluginsView, panel: &Panel, row: Row, w: usize, caps: crate::caps
         Row::Blank => Line::empty(),
         Row::Nothing => Line::styled(
             width::take_width(
-                match panel.tab {
-                    Tab::All if view.plugins().is_empty() => {
-                        "  一个市场都还没有 —— 到「市场」页加一个"
-                    }
-                    Tab::All => "  没有匹配的插件",
-                    Tab::Installed if panel.query.is_empty() => "  还什么都没装",
-                    Tab::Installed => "  装上的里头没有匹配的",
-                    Tab::Markets => "  没有匹配的市场",
+                &match panel.tab {
+                    Tab::All if view.plugins().is_empty() => t(Msg::PluginsNoMarketsYet),
+                    Tab::All => t(Msg::PluginsNoMatch),
+                    Tab::Installed if panel.query.is_empty() => t(Msg::PluginsNothingInstalled),
+                    Tab::Installed => t(Msg::PluginsNoMatchInstalled),
+                    Tab::Markets => t(Msg::PluginsNoMatchMarkets),
                 },
                 w,
             ),
@@ -280,7 +284,7 @@ fn draw(view: &PluginsView, panel: &Panel, row: Row, w: usize, caps: crate::caps
         ),
         Row::Choice(at) => choice_line(panel, at, w, caps),
         Row::Url => url_line(panel, w, caps),
-        Row::Note(text) => Line::styled(width::take_width(text, w), theme::fg(Role::Muted)),
+        Row::Note(msg) => Line::styled(width::take_width(&t(msg), w), theme::fg(Role::Muted)),
         Row::Legend => Line::styled(
             format!("  {}", crate::widget::keys(&legend(panel), caps)),
             theme::fg(Role::Muted),
@@ -291,10 +295,14 @@ fn draw(view: &PluginsView, panel: &Panel, row: Row, w: usize, caps: crate::caps
 
 fn form_title(panel: &Panel) -> String {
     match &panel.form {
-        Some(Form::Scope(f)) => format!("装 {}@{} —— 装到哪儿", f.plugin, f.marketplace),
+        Some(Form::Scope(f)) => t(Msg::PluginFormScopeTitle {
+            plugin: &f.plugin,
+            marketplace: &f.marketplace,
+        })
+        .into_owned(),
         Some(Form::Plugin(f)) => format!("{}@{}", f.plugin, f.marketplace),
         Some(Form::Market(f)) => f.name.clone(),
-        Some(Form::AddMarket(_)) => "加一个市场".to_string(),
+        Some(Form::AddMarket(_)) => t(Msg::PluginFormAddMarketTitle).into_owned(),
         None => String::new(),
     }
 }
@@ -325,7 +333,7 @@ fn listed_line(
     let (mark, label, about, dim) = match what {
         Listed::AddMarket => (
             " ".to_string(),
-            "加一个市场".to_string(),
+            t(Msg::PluginFormAddMarketTitle).into_owned(),
             "^a".to_string(),
             true,
         ),
@@ -353,9 +361,9 @@ fn listed_line(
             let Some(row) = view.markets().get(i) else {
                 return Line::empty();
             };
-            let mut about = vec![format!("{} 个插件", row.plugins)];
+            let mut about = vec![t(Msg::MarketPluginCount { n: row.plugins }).into_owned()];
             if row.installed > 0 {
-                about.push(format!("装了 {}", row.installed));
+                about.push(t(Msg::MarketInstalledCount { n: row.installed }).into_owned());
             }
             if !row.updated.is_empty() {
                 about.push(row.updated.clone());
@@ -403,10 +411,10 @@ fn listed_line(
             // 删一个市场连带卸掉从它装的插件——这件事只在这里说得出口,而且必须
             // 在按下去之前说。
             Listed::Market(i) => match view.markets().get(i).map(|m| m.installed).unwrap_or(0) {
-                0 => "再按一次 ^d 删掉这个市场".to_string(),
-                n => format!("再按一次 ^d 删掉它,连同从它装的 {n} 个插件"),
+                0 => t(Msg::ArmedRemoveMarket).into_owned(),
+                n => t(Msg::ArmedRemoveMarketWithPlugins { n }).into_owned(),
             },
-            _ => "再按一次 ^d 卸载".to_string(),
+            _ => t(Msg::ArmedUninstall).into_owned(),
         }
     } else {
         about
@@ -496,9 +504,9 @@ fn url_line(panel: &Panel, w: usize, caps: crate::caps::Caps) -> Line {
     };
     let base = theme::bg(Role::PanelSelBg).under(theme::fg(Role::PanelFg));
     let pointer = format!("{} ", caps.g(crate::caps::Glyph::Pointer));
-    let label = "地址";
+    let label = t(Msg::FieldAddress);
     let label_room = w.saturating_sub(LEAD + 2).clamp(LABEL_MIN, LABEL_MAX);
-    let shown = width::take_width(label, label_room);
+    let shown = width::take_width(&label, label_room);
     let pad = label_room.saturating_sub(width::str_width(&shown));
     let room = w.saturating_sub(LEAD + label_room + 2);
     let mut spans = vec![
@@ -510,29 +518,42 @@ fn url_line(panel: &Panel, w: usize, caps: crate::caps::Caps) -> Line {
     pad_to(Line::from_spans(spans), w, base)
 }
 
-fn legend(panel: &Panel) -> Vec<(&'static str, &'static str)> {
+fn legend(panel: &Panel) -> Vec<(String, String)> {
+    let key = |k: &str, msg: Msg<'_>| (k.to_string(), t(msg).into_owned());
     if panel.busy.is_some() {
-        return vec![("esc", "不等了")];
+        return vec![key("esc", Msg::LegendStopWaiting)];
     }
     match &panel.form {
-        Some(Form::AddMarket(_)) => vec![("⏎", "加上"), ("esc", "取消")],
-        Some(_) => vec![("↑↓", "选择"), ("⏎", "就这个"), ("esc", "返回")],
+        Some(Form::AddMarket(_)) => {
+            vec![key("⏎", Msg::LegendAdd), key("esc", Msg::LegendCancel)]
+        }
+        Some(_) => vec![
+            key("↑↓", Msg::LegendSelect),
+            key("⏎", Msg::LegendThisOne),
+            key("esc", Msg::LegendBack),
+        ],
         None => {
             if panel.pending_delete.is_some() {
-                return vec![("^d", "再按一次"), ("其它键", "取消")];
+                return vec![
+                    key("^d", Msg::LegendPressAgain),
+                    (
+                        t(Msg::LegendAnyOtherKey).into_owned(),
+                        t(Msg::LegendCancel).into_owned(),
+                    ),
+                ];
             }
-            let mut out = vec![("↑↓", "选择")];
+            let mut out = vec![key("↑↓", Msg::LegendSelect)];
             out.push(match panel.tab {
-                Tab::All => ("⏎", "装它 / 看它"),
-                Tab::Installed => ("⏎", "更新或卸载"),
-                Tab::Markets => ("⏎", "打开"),
+                Tab::All => key("⏎", Msg::LegendInstallOrOpen),
+                Tab::Installed => key("⏎", Msg::LegendUpdateOrRemove),
+                Tab::Markets => key("⏎", Msg::LegendOpen),
             });
             if panel.tab == Tab::Markets {
-                out.push(("^a", "加市场"));
+                out.push(key("^a", Msg::LegendAddMarket));
             }
-            out.push(("^d", "拿掉"));
-            out.push(("⇥", "换页"));
-            out.push(("esc", "关闭"));
+            out.push(key("^d", Msg::LegendTakeAway));
+            out.push(key("⇥", Msg::LegendChangePage));
+            out.push(key("esc", Msg::LegendClose));
             out
         }
     }
@@ -757,7 +778,7 @@ mod tests {
         let text = drawn(&m, 80, 20);
         assert!(text.contains("lens"));
         assert!(
-            text.contains(Scope::Project.short()),
+            text.contains(&Scope::Project.short()),
             "the scope is on the row, because `/plugin uninstall` needs it and a \
              person reading the list is deciding whether to run it"
         );

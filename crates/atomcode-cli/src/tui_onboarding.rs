@@ -13,6 +13,7 @@
 //! the middle of the frame. Everything this flow has to say goes into the step
 //! it is on.
 
+use atomcode_i18n::screen::{t as tr, Msg as SMsg};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
@@ -116,23 +117,31 @@ struct Onboarding {
 /// What each step asks. Four, as decided (决策 4).
 fn steps() -> Vec<StepDef> {
     vec![
-        StepDef::new("intro", "先把这台机器配好", StepKind::Note).saying(vec![
-            "还没有可用的 provider，所以现在还不能开始干活。".into(),
-            "这里三步：选界面语言、登录、看一眼配好了什么。".into(),
-            "任何一步都可以按 esc 退出，之后 /onboarding 再来。".into(),
+        StepDef::new("intro", tr(SMsg::OnboardIntroTitle), StepKind::Note).saying(vec![
+            tr(SMsg::OnboardIntroLine1).into_owned(),
+            tr(SMsg::OnboardIntroLine2).into_owned(),
+            tr(SMsg::OnboardIntroLine3).into_owned(),
         ]),
         StepDef::new(
             "language",
-            "界面语言",
+            tr(SMsg::OnboardLanguageTitle),
             StepKind::Choose(vec![
-                Choice::new("zh_CN", "中文"),
+                // The two language names are each written in their own
+                // language: a person looking for English is looking for the
+                // word "English", whichever language the screen is in.
+                Choice::new("zh_CN", tr(SMsg::OnboardLanguageChinese)),
                 Choice::new("en", "English"),
-                Choice::new("auto", "跟随系统").about("按环境变量判断"),
+                Choice::new("auto", tr(SMsg::OnboardLanguageFollowSystem))
+                    .about(tr(SMsg::OnboardLanguageFollowSystemAbout)),
             ]),
         ),
-        StepDef::new("login", "登录", StepKind::Wait { skippable: true })
-            .saying(vec!["正在取登录地址…".into()]),
-        StepDef::new("confirm", "配好了", StepKind::Note),
+        StepDef::new(
+            "login",
+            tr(SMsg::OnboardLoginTitle),
+            StepKind::Wait { skippable: true },
+        )
+        .saying(vec![tr(SMsg::OnboardFetchingLoginUrl).into_owned()]),
+        StepDef::new("confirm", tr(SMsg::OnboardConfirmTitle), StepKind::Note),
     ]
 }
 
@@ -148,7 +157,7 @@ impl Onboarding {
         let start = self.start_sign_in.clone();
         let wizard = Wizard::new(
             MODAL,
-            "开始之前",
+            tr(SMsg::OnboardModalTitle),
             steps(),
             Box::new(move |id| {
                 if id != "login" {
@@ -169,7 +178,7 @@ impl Onboarding {
     /// What the answers add up to, once the last step is done.
     fn finish(&self) -> String {
         let Some(wizard) = self.live.lock().expect("onboarding poisoned").take() else {
-            return "引导已经结束了".into();
+            return tr(SMsg::OnboardAlreadyFinished).into_owned();
         };
         let answers = wizard.answers();
         let answer = |id: &str| {
@@ -182,15 +191,22 @@ impl Onboarding {
         let mut said = Vec::new();
         if let Some(language) = answer("language") {
             match set_setting(&self.config_path, "language", &language) {
-                Ok(()) => said.push(format!("界面语言：{language}")),
-                Err(error) => said.push(format!("界面语言没写进去：{error}")),
+                Ok(()) => said.push(
+                    tr(SMsg::OnboardLanguageSet {
+                        language: &language,
+                    })
+                    .into_owned(),
+                ),
+                Err(error) => {
+                    said.push(tr(SMsg::OnboardLanguageNotWritten { error: &error }).into_owned())
+                }
             }
         }
         match answer("login") {
             Some(detail) => said.push(detail),
             // A skip is the absence of an answer, which is why it is worth
             // saying out loud: the machine is still not ready.
-            None => said.push("跳过了登录——还是没有 provider，/onboarding 可以再来".into()),
+            None => said.push(tr(SMsg::OnboardLoginSkipped).into_owned()),
         }
         said.join("\n")
     }
@@ -201,7 +217,7 @@ fn set_setting(path: &PathBuf, id: &str, value: &str) -> Result<(), String> {
     let spec = atomcode_config::settings::SETTINGS
         .iter()
         .find(|spec| spec.id == id)
-        .ok_or_else(|| format!("没有叫 `{id}` 的设置"))?;
+        .ok_or_else(|| tr(SMsg::NoSuchSetting { id }).into_owned())?;
     atomcode_config::ConfigStore::new(path.clone())
         .update_document(|document| spec.patch(document, value))
         .map_err(|error| format!("{error:#}"))?;
@@ -232,17 +248,23 @@ fn sign_in(
         let session = match atomcode_auth::oauth::start_login() {
             Ok(session) => session,
             Err(error) => {
-                wizard.say(vec![format!("登录起不来：{error:#}"), SKIP.into()]);
+                wizard.say(vec![
+                    tr(SMsg::LoginCouldNotStart {
+                        error: &format!("{error:#}"),
+                    })
+                    .into_owned(),
+                    skip_hint(),
+                ]);
                 painted();
                 return;
             }
         };
         let url = session.url().to_string();
         wizard.say(vec![
-            "用手机扫码，或在浏览器里打开：".into(),
+            tr(SMsg::ScanOrOpen).into_owned(),
             url.clone(),
             String::new(),
-            SKIP.into(),
+            skip_hint(),
         ]);
         wizard.show(atomcode_tui::qr::code(&url));
         painted();
@@ -253,27 +275,36 @@ fn sign_in(
                 Ok(Ok(atomcode_auth::oauth::PollOutcome::Authorized)) => break,
                 Ok(Ok(atomcode_auth::oauth::PollOutcome::Pending)) => continue,
                 Ok(Err(error)) => {
-                    wizard.say(vec![format!("登录没成：{error:#}"), SKIP.into()]);
+                    wizard.say(vec![
+                        tr(SMsg::LoginFailed {
+                            error: &format!("{error:#}"),
+                        })
+                        .into_owned(),
+                        skip_hint(),
+                    ]);
                     painted();
                     return;
                 }
                 // The poller stopped without an answer.
                 Err(_) => {
-                    wizard.say(vec!["登录没了回音".into(), SKIP.into()]);
+                    wizard.say(vec![tr(SMsg::LoginNoAnswer).into_owned(), skip_hint()]);
                     painted();
                     return;
                 }
             }
         }
 
-        wizard.say(vec!["登录成了，正在配 provider…".into()]);
+        wizard.say(vec![tr(SMsg::SignedInSettingUpProvider).into_owned()]);
         wizard.show(None);
         painted();
 
         let detail = match finish_login(session, telemetry.as_ref(), &config_path) {
             Ok(detail) => detail,
             Err(error) => {
-                wizard.say(vec![format!("登录成了，但配置没写成：{error:#}")]);
+                wizard.say(vec![tr(SMsg::OnboardSignedInConfigNotWritten {
+                    error: &format!("{error:#}"),
+                })
+                .into_owned()]);
                 painted();
                 return;
             }
@@ -294,7 +325,10 @@ fn sign_in(
                     .call(atomcode_host_api::HostCommand::Reload { session: root })
                     .await
                 {
-                    wizard.say(vec![format!("配置已写入，但重新加载失败：{error:?}")]);
+                    wizard.say(vec![tr(SMsg::ConfigWrittenReloadFailedCli {
+                        error: &format!("{error:?}"),
+                    })
+                    .into_owned()]);
                     return;
                 }
                 // The reload rebuilt the runtime; `/clear` is the transition a
@@ -309,7 +343,11 @@ fn sign_in(
     });
 }
 
-const SKIP: &str = "不想现在弄的话，回车跳过。";
+/// The line under every step that can be left: read from the table at the
+/// moment it is shown, which is why it is a function and not a `const`.
+fn skip_hint() -> String {
+    tr(SMsg::OnboardSkipHint).into_owned()
+}
 
 /// Exchange the token, save it, and set up whatever the account is entitled to.
 ///
@@ -355,14 +393,14 @@ impl CommandSet for Onboarding {
     }
 
     fn commands(&self) -> Vec<Command> {
-        vec![Command::new(
-            COMMAND,
-            "把这台机器配到能干活：语言、登录、看一眼结果",
-        )]
+        vec![Command::said(COMMAND, tr(SMsg::CmdAboutOnboarding))]
     }
 
     fn hidden(&self) -> Vec<Command> {
-        vec![Command::new(FINISHED, "引导走完了")]
+        vec![Command::said(
+            FINISHED,
+            tr(SMsg::CmdAboutOnboardingFinished),
+        )]
     }
 
     async fn run(&self, name: &str, _args: &str, ctx: &Context) -> Outcome {

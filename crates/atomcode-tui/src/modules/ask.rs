@@ -21,6 +21,8 @@
 //! approval row's business; what an answer *means* is [`crate::ask`]'s. This
 //! draws a question and says which row is pointed at.
 
+use crate::i18n::product::{t as pt, Msg as PMsg};
+use crate::i18n::{t, Msg};
 use atomcode_harness::seams::{Question, ANSWER_ALWAYS};
 
 use crate::frame::{Line, Span, Style};
@@ -71,7 +73,7 @@ impl View for Ask {
             .map(|row| match row {
                 Row::Blank => Line::empty(),
                 Row::Legend => Line::styled(
-                    format!("  {}", crate::widget::keys(LEGEND, caps)),
+                    format!("  {}", crate::widget::keys(&legend(), caps)),
                     theme::fg(Role::Muted),
                 )
                 .truncate(w),
@@ -109,7 +111,13 @@ impl View for Ask {
 /// keys are the screen's business and they do not change with the question. What
 /// an answer *means* is not in here — that is the harness's, and the wording of
 /// each answer comes from the answerer.
-const LEGEND: &[(&str, &str)] = &[("↑↓", "选择"), ("⏎", "确认"), ("esc", "拒绝")];
+fn legend() -> [(&'static str, String); 3] {
+    [
+        ("↑↓", t(Msg::AskLegendChoose).into_owned()),
+        ("⏎", t(Msg::AskLegendConfirm).into_owned()),
+        ("esc", pt(PMsg::ApprovalDeny).into_owned()),
+    ]
+}
 
 /// One row of the panel, before it is drawn.
 ///
@@ -121,7 +129,7 @@ const LEGEND: &[(&str, &str)] = &[("↑↓", "选择"), ("⏎", "确认"), ("esc
 enum Row {
     Blank,
     /// The key legend. Its words are not in the row because they are not a
-    /// property of the question — see [`LEGEND`].
+    /// property of the question — see [`legend`].
     Legend,
     /// A line of prose: who is asking, the tool, the call's arguments, the
     /// question itself.
@@ -153,7 +161,7 @@ fn layout(question: &Question, w: usize, h: usize) -> Vec<Row> {
     // one thing that decides whether an answer is honest.
     if let Some(who) = &question.asker {
         rows.push(Row::Text {
-            text: format!("来自成员 {who}"),
+            text: t(Msg::AskFromMember { who }).into_owned(),
             role: Role::Warning,
         });
     }
@@ -256,8 +264,11 @@ fn answer_line(question: &Question, i: usize, here: bool, pointer: &str, w: usiz
     if answer.value == ANSWER_ALWAYS {
         if let Some(grant) = question.about.as_ref().and_then(|a| a.grant.as_deref()) {
             let covers = match grant.trim().is_empty() {
-                true => "这个工具的全部调用".to_string(),
-                false => format!("仅限 {}", crate::ask::one_line(grant)),
+                true => t(Msg::AskGrantWholeTool).into_owned(),
+                false => t(Msg::AskGrantOnly {
+                    what: &crate::ask::one_line(grant),
+                })
+                .into_owned(),
             };
             spans.push(Span::styled(
                 format!("  {covers}"),

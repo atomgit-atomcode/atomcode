@@ -3401,7 +3401,7 @@ impl Host {
                     // Muted text on the panel ground: a seam in the call, not
                     // output — and quiet enough to read past.
                     let note = Span::styled(
-                        format!("⋯ 已折叠 {hidden} 行，点击展开"),
+                        crate::i18n::t(crate::i18n::Msg::FoldedLines { hidden }).into_owned(),
                         crate::theme::fg(crate::theme::Role::Muted)
                             .bg(crate::frame::Color::role(crate::theme::Role::PanelBg)),
                     );
@@ -3656,11 +3656,11 @@ impl Host {
         // and only those.
         if let (Some(rect), true) = (stream_rect, moment.scroll.0 > 0) {
             let caps = moment.caps;
-            let label = format!(
-                " {} 还有 {} 行 · 点击回到底部 ",
-                caps.g(crate::caps::Glyph::Down),
-                moment.scroll.0
-            );
+            let label = crate::i18n::t(crate::i18n::Msg::MoreBelow {
+                arrow: caps.g(crate::caps::Glyph::Down),
+                lines: moment.scroll.0,
+            })
+            .into_owned();
             let want = crate::width::str_width(&label);
             if rect.h > 0 && want <= rect.w as usize {
                 let badge = Rect::new(

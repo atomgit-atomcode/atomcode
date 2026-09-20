@@ -12,6 +12,7 @@
 //! [`atomcode_host_api::HostConnection`] and never learns whose runtime is
 //! behind it.
 
+use atomcode_i18n::screen::{t as tr, Msg as SMsg};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -72,7 +73,7 @@ pub trait HostConfig: Send + Sync {
     /// id nobody offers, or a value the setting does not accept.
     fn set_setting(&self, id: &str, value: &str) -> Result<(), String> {
         let _ = (id, value);
-        Err("这个宿主的配置不能从屏幕上改".into())
+        Err(tr(SMsg::HostConfigNotEditable).into_owned())
     }
 
     /// Put one back to what this build does when nobody has said.
@@ -83,7 +84,7 @@ pub trait HostConfig: Send + Sync {
     /// asking for "default" means.
     fn reset_setting(&self, id: &str) -> Result<(), String> {
         let _ = id;
-        Err("这个宿主的配置不能从屏幕上改".into())
+        Err(tr(SMsg::HostConfigNotEditable).into_owned())
     }
 
     /// The providers this host is configured with, for a person to pick between.
@@ -479,7 +480,7 @@ fn running_of_loop(looping: atomcode_coding::LoopProgress) -> atomcode_host_api:
         round: looping.round,
         of: None,
         elapsed_secs: looping.elapsed_secs,
-        paused: (!looping.active).then(|| "停着".to_string()),
+        paused: (!looping.active).then(|| tr(SMsg::HostHeld).into_owned()),
     }
 }
 
@@ -697,22 +698,31 @@ fn source_groups(working_dir: &std::path::Path) -> Vec<atomcode_host_api::Source
     let instructions = LayeredInstructions::load(working_dir);
     vec![
         SourceGroup {
-            label: "配置文件".into(),
+            label: tr(SMsg::SourceConfigFile).into_owned(),
             files: vec![file(
-                "设置",
+                &tr(SMsg::SourceSettings),
                 atomcode_config::config::Config::default_path(),
             )],
         },
         SourceGroup {
-            label: "指令文件".into(),
+            label: tr(SMsg::SourceInstructionFiles).into_owned(),
             files: instructions
                 .status_lines(working_dir)
                 .into_iter()
                 .map(|line| SourceFile {
                     label: match line.level {
-                        InstructionLevel::Global => "用户全局".into(),
-                        InstructionLevel::Project => "项目共享".into(),
-                        InstructionLevel::User => "用户项目覆盖".into(),
+                        InstructionLevel::Global => atomcode_config::i18n::t(
+                            atomcode_config::i18n::Msg::StatusInstructionScopeGlobal,
+                        )
+                        .into_owned(),
+                        InstructionLevel::Project => atomcode_config::i18n::t(
+                            atomcode_config::i18n::Msg::StatusInstructionScopeProject,
+                        )
+                        .into_owned(),
+                        InstructionLevel::User => atomcode_config::i18n::t(
+                            atomcode_config::i18n::Msg::StatusInstructionScopeUser,
+                        )
+                        .into_owned(),
                     },
                     // The loader's own answer, not a second `is_file` here: it
                     // is the one that decided whether this file is in play, and
@@ -724,15 +734,18 @@ fn source_groups(working_dir: &std::path::Path) -> Vec<atomcode_host_api::Source
                 .collect(),
         },
         SourceGroup {
-            label: "记忆文件".into(),
+            label: tr(SMsg::SourceMemoryFiles).into_owned(),
             files: vec![
-                file("用户全局", MemoryStore::global().path().to_path_buf()),
                 file(
-                    "项目记忆",
+                    &atomcode_config::i18n::t(atomcode_config::i18n::Msg::StatusMemoryScopeGlobal),
+                    MemoryStore::global().path().to_path_buf(),
+                ),
+                file(
+                    &atomcode_config::i18n::t(atomcode_config::i18n::Msg::StatusMemoryScopeProject),
                     MemoryStore::project(working_dir).path().to_path_buf(),
                 ),
                 file(
-                    "本机记忆",
+                    &atomcode_config::i18n::t(atomcode_config::i18n::Msg::StatusMemoryScopeLocal),
                     MemoryStore::local(working_dir).path().to_path_buf(),
                 ),
             ],
@@ -930,7 +943,7 @@ impl HostControl for RuntimeControl {
             HostCommand::SetSetting { session, id, value } => {
                 self.addressed(&session)?;
                 let source = self.host_config.clone().ok_or_else(|| HostError::Failed {
-                    message: "这个宿主没有可改的配置".into(),
+                    message: tr(SMsg::HostNoEditableConfig).into_owned(),
                 })?;
                 source
                     .set_setting(&id, &value)
@@ -943,7 +956,7 @@ impl HostControl for RuntimeControl {
             HostCommand::ResetSetting { session, id } => {
                 self.addressed(&session)?;
                 let source = self.host_config.clone().ok_or_else(|| HostError::Failed {
-                    message: "这个宿主没有可改的配置".into(),
+                    message: tr(SMsg::HostNoEditableConfig).into_owned(),
                 })?;
                 source
                     .reset_setting(&id)
@@ -1029,7 +1042,7 @@ impl HostControl for RuntimeControl {
                 let models = app
                     .service::<atomcode_harness::seams::ModelsSvc>()
                     .ok_or_else(|| HostError::Failed {
-                        message: "这个宿主没有模型目录".into(),
+                        message: tr(SMsg::HostNoModelCatalog).into_owned(),
                     })?;
                 let current = models.current();
                 Ok(HostReply::Models {
@@ -1054,7 +1067,7 @@ impl HostControl for RuntimeControl {
                 let title = title.trim().to_string();
                 if title.is_empty() {
                     return Err(HostError::Failed {
-                        message: "名字不能是空的".into(),
+                        message: tr(SMsg::NameCannotBeEmpty).into_owned(),
                     });
                 }
                 let app = self.front_end.app().ok_or(HostError::Unavailable)?;
@@ -1288,10 +1301,13 @@ impl HostControl for RuntimeControl {
                 Ok(HostReply::Settings {
                     settings: vec![atomcode_host_api::Setting {
                         id: "thinking".into(),
-                        label: "思考".into(),
+                        label: tr(SMsg::SettingThinking).into_owned(),
                         value: if on { "on".into() } else { "off".into() },
                         accepts: "on | off".into(),
-                        applies: "下一回合".into(),
+                        applies: atomcode_config::i18n::t(
+                            atomcode_config::i18n::Msg::AppliesNextTurnCli,
+                        )
+                        .into_owned(),
                     }],
                 })
             }
@@ -1317,7 +1333,7 @@ impl HostControl for RuntimeControl {
                 if self.handle.is_stopped() {
                     return Ok(HostReply::Readiness {
                         ready: false,
-                        why: Some("这个会话的运行时已经停了".into()),
+                        why: Some(tr(SMsg::RuntimeAlreadyStopped).into_owned()),
                         fix: None,
                     });
                 }
@@ -1366,15 +1382,15 @@ pub fn readiness_for(reason: Option<ProviderUnavailableReason>) -> HostReply {
             // all; the wizard that can is `tui_onboarding`, and naming it is
             // as far as this host's say goes.
             (
-                "还没有配置任何 provider——先加一个才能开始",
+                tr(SMsg::NoProviderConfigured),
                 Some(crate::tui_onboarding::COMMAND),
             )
         }
         Some(ProviderUnavailableReason::AuthenticationRequired) => {
-            ("登录已经失效，需要重新登录", Some("login"))
+            (tr(SMsg::LoginExpired), Some("login"))
         }
         Some(ProviderUnavailableReason::UnsupportedBuild) => {
-            ("这个构建不支持所配置的 provider", None)
+            (tr(SMsg::ProviderUnsupportedByBuild), None)
         }
     };
     HostReply::Readiness {
@@ -1438,6 +1454,7 @@ pub fn refused(error: RuntimeError) -> HostError {
 #[cfg(test)]
 mod source_tests {
     use super::source_groups;
+    use atomcode_i18n::screen::{t as tr, Msg as SMsg};
 
     /// Every file the session is configured from is reported, and the ones that
     /// are not there are reported as not there.
@@ -1453,8 +1470,17 @@ mod source_tests {
         std::fs::write(project.path().join("AGENTS.md"), "# 项目").expect("write");
 
         let groups = source_groups(project.path());
+        // Read from the table rather than spelled out, so this asserts *which
+        // three groups* there are and not one language's words for them.
         let labels: Vec<&str> = groups.iter().map(|group| group.label.as_str()).collect();
-        assert_eq!(labels, ["配置文件", "指令文件", "记忆文件"]);
+        assert_eq!(
+            labels,
+            [
+                tr(SMsg::SourceConfigFile),
+                tr(SMsg::SourceInstructionFiles),
+                tr(SMsg::SourceMemoryFiles),
+            ]
+        );
 
         let all: Vec<&atomcode_host_api::SourceFile> =
             groups.iter().flat_map(|group| group.files.iter()).collect();

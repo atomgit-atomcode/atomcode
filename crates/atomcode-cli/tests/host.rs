@@ -1737,8 +1737,15 @@ async fn the_model_catalog_a_rename_and_one_servers_tools_are_host_controls() {
             assert_eq!(current.as_deref(), Some("scripted"));
         }
         // A host with no catalog says so rather than pretending to have none.
+        // Asserted against the table, not one language's words: this binary
+        // does not set a locale, so it draws in whichever this build defaults
+        // to (`atomcode-i18n`'s `Locale::En`).
         Err(HostError::Failed { message }) => {
-            assert!(message.contains("模型目录"), "{message}");
+            assert_eq!(
+                message,
+                atomcode_i18n::screen::t(atomcode_i18n::screen::Msg::HostNoModelCatalog),
+                "{message}"
+            );
         }
         other => panic!("unexpected: {other:?}"),
     }

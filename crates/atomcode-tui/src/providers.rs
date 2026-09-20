@@ -250,10 +250,14 @@ pub enum Tab {
 impl Tab {
     pub const ALL: [Tab; 2] = [Tab::Accounts, Tab::Models];
 
-    pub fn label(self) -> &'static str {
+    /// The word on the tab. The other front end has a providers panel too, and
+    /// it is the same two words — so this reaches for its entry rather than
+    /// opening a second one that could drift.
+    pub fn label(self) -> String {
+        use crate::i18n::product::{t, Msg};
         match self {
-            Tab::Accounts => "账号",
-            Tab::Models => "模型",
+            Tab::Accounts => t(Msg::ProviderPanelTabAccounts).into_owned(),
+            Tab::Models => t(Msg::ProviderPanelTabModels).into_owned(),
         }
     }
 

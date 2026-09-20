@@ -8,6 +8,8 @@
 use crate::block::{hash_of, Content, ContentHash, RenderCtx};
 use crate::caps::{Caps, Glyph};
 use crate::frame::{Color, Line, Span, Style};
+use crate::i18n::product::{t as pt, Msg as PMsg};
+use crate::i18n::{t, Msg};
 use crate::theme::Role;
 use crate::width;
 use atomcode_harness::seams::StopReason;
@@ -631,7 +633,10 @@ impl Content for ModelThought {
         let n = self.0.lines().count().max(1);
         Line::styled(
             width::take_width(
-                &format!("{} 思考 {n} 行", Caps::default().g(Glyph::Gutter)),
+                &t(Msg::ThoughtLines {
+                    gutter: Caps::default().g(Glyph::Gutter),
+                    n,
+                }),
                 w as usize,
             ),
             muted(),
@@ -736,7 +741,7 @@ impl ToolCallBlock {
         let look = look(&self.name);
         let subject = subject_of(&self.name, &self.args);
         let name = match look.verb {
-            Some(verb) => verb.to_string(),
+            Some(verb) => verb.say(),
             None => display_tool_name(&self.name),
         };
         let mut spans = vec![Span::styled(name, name_style)];
@@ -805,10 +810,13 @@ impl ToolCallBlock {
         let caps = Caps::default();
         let mut spans = vec![
             Span::styled(format!("{} ", caps.g(Glyph::ToolMark)), fold()),
-            Span::styled(format!("已执行了 {count} 个工具"), muted()),
+            Span::styled(t(Msg::ToolsRun { count }).into_owned(), muted()),
         ];
         if failed > 0 {
-            spans.push(Span::styled(format!(" · {failed} 失败"), bad()));
+            spans.push(Span::styled(
+                t(Msg::ToolsFailed { failed }).into_owned(),
+                bad(),
+            ));
         }
         vec![Line::from_spans(spans).truncate(w as usize)]
     }
@@ -822,10 +830,38 @@ impl ToolCallBlock {
 /// this table has never heard of still gets its subject picked out, which is
 /// what stops this from becoming a list that has to be maintained in lockstep
 /// with the catalog.
+/// The one word a call reads as, for the handful of tools the screen knows.
+///
+/// A variant rather than the word itself: the table this file's `look` is
+/// (`GENERIC` included) is a `const`, and a `const` cannot hold a sentence that
+/// depends on the language in force. The word is asked for at render time by
+/// [`Verb::say`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verb {
+    Skill,
+    /// Not a word in any language: the shell's own prompt character.
+    Shell,
+    DescribeSelf,
+    Memory,
+    Plan,
+}
+
+impl Verb {
+    fn say(self) -> String {
+        match self {
+            Verb::Skill => t(Msg::VerbSkill).into_owned(),
+            Verb::Shell => "$".to_string(),
+            Verb::DescribeSelf => t(Msg::VerbDescribeSelf).into_owned(),
+            Verb::Memory => t(Msg::VerbMemory).into_owned(),
+            Verb::Plan => pt(PMsg::TodoPanelTitle).into_owned(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Look {
     /// What this call *is*, in one word, when the tool name alone is not it.
-    pub verb: Option<&'static str>,
+    pub verb: Option<Verb>,
     /// Argument names that hold the thing acted on, best first.
     pub subject: &'static [&'static str],
     /// Never fold this one.
@@ -857,17 +893,17 @@ const GENERIC: Look = Look {
 pub fn look(tool: &str) -> Look {
     match tool {
         "use_skill" => Look {
-            verb: Some("技能"),
+            verb: Some(Verb::Skill),
             subject: &["name", "skill"],
             always_open: true,
         },
         "list_skills" => Look {
-            verb: Some("技能"),
+            verb: Some(Verb::Skill),
             subject: &[],
             always_open: false,
         },
         "bash" => Look {
-            verb: Some("$"),
+            verb: Some(Verb::Shell),
             subject: &["command"],
             always_open: false,
         },
@@ -884,17 +920,17 @@ pub fn look(tool: &str) -> Look {
             ..GENERIC
         },
         "describe_self" => Look {
-            verb: Some("自省"),
+            verb: Some(Verb::DescribeSelf),
             subject: &["aspect"],
             ..GENERIC
         },
         "memory" => Look {
-            verb: Some("记忆"),
+            verb: Some(Verb::Memory),
             subject: &["action", "content"],
             ..GENERIC
         },
         "todowrite" => Look {
-            verb: Some("计划"),
+            verb: Some(Verb::Plan),
             subject: &[],
             ..GENERIC
         },
@@ -958,17 +994,29 @@ pub fn subject_of(tool: &str, args: &str) -> String {
 /// What came back, in a few words.
 fn outcome_note(outcome: &Outcome) -> (String, Style) {
     match outcome {
-        Outcome::Pending => ("运行中".into(), muted()),
-        Outcome::Interrupted => ("已中断".into(), muted()),
+        Outcome::Pending => (pt(PMsg::BgStateRunning).into_owned(), muted()),
+        Outcome::Interrupted => (t(Msg::OutcomeInterrupted).into_owned(), muted()),
         Outcome::Failed(s) => {
-            let first = s.lines().find(|l| !l.trim().is_empty()).unwrap_or("失败");
-            (format!("失败 · {}", clip(first, 60)), bad())
+            let fallback = pt(PMsg::SubagentStatusFailed).into_owned();
+            let first = s
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or(&fallback);
+            (
+                t(Msg::OutcomeFailedWith {
+                    first: &clip(first, 60),
+                })
+                .into_owned(),
+                bad(),
+            )
         }
-        Outcome::Ok(s) if s.trim().is_empty() => ("完成".into(), muted()),
+        Outcome::Ok(s) if s.trim().is_empty() => {
+            (pt(PMsg::SubagentStatusDone).into_owned(), muted())
+        }
         Outcome::Ok(s) => {
             let lines = s.lines().filter(|l| !l.trim().is_empty()).count();
             if lines > 1 {
-                (format!("{lines} 行"), muted())
+                (t(Msg::OutcomeLines { lines }).into_owned(), muted())
             } else {
                 (clip(s.trim(), 60), muted())
             }
@@ -1054,7 +1102,10 @@ impl Content for ToolCallBlock {
                     .unwrap_or("")
                     .trim();
                 let (text, style) = if matches!(self.outcome, Outcome::Failed(_)) {
-                    (format!("失败 · {line}"), bad())
+                    (
+                        t(Msg::OutcomeFailedWith { first: line }).into_owned(),
+                        bad(),
+                    )
                 } else {
                     (line.to_string(), muted())
                 };
@@ -1097,7 +1148,7 @@ impl Content for ToolCallBlock {
         let style = fold();
         let look = look(&self.name);
         let name = match look.verb {
-            Some(verb) => verb.to_string(),
+            Some(verb) => verb.say(),
             None => display_tool_name(&self.name),
         };
         let (note, note_style) = outcome_note(&self.outcome);
@@ -1270,14 +1321,15 @@ impl Content for RewoundBlock {
         use atomcode_harness::session::RewindScope;
         let width = ctx.width;
         let what = match self.scope {
-            RewindScope::Conversation => "对话",
-            RewindScope::Code => "工作区",
-            RewindScope::Both => "对话与工作区",
+            RewindScope::Conversation => t(Msg::RewindScopeConversation),
+            RewindScope::Code => t(Msg::RewindScopeCode),
+            RewindScope::Both => t(Msg::RewindScopeBoth),
         };
         let text = match self.to_turn {
-            Some(turn) => format!("↶ 已把{what}撤回到第 {turn} 轮之前"),
-            None => format!("↶ 已把{what}撤回到更早的一轮之前"),
-        };
+            Some(turn) => t(Msg::RewoundToTurn { what: &what, turn }),
+            None => t(Msg::RewoundEarlier { what: &what }),
+        }
+        .into_owned();
         vec![Line::styled(
             crate::width::take_width(&text, width as usize),
             crate::theme::fg(Role::Warning),
@@ -1379,7 +1431,10 @@ impl Content for ChoiceBlock {
                     .collect::<Vec<_>>()
                     .join("   ");
                 out.push(Line::styled(
-                    width::take_width(&format!("  {choices}   esc) 拒绝"), w as usize),
+                    width::take_width(
+                        &format!("  {choices}   esc) {}", t(Msg::AskRefuseChoice)),
+                        w as usize,
+                    ),
                     ask,
                 ));
                 out
@@ -1516,8 +1571,8 @@ impl TurnStats {
         let billable =
             self.completion as usize + (self.prompt as usize).saturating_sub(self.cached as usize);
         let mut parts = vec![
-            format!("{} 轮", self.steps),
-            format!("{} 工具", self.tools),
+            t(Msg::TurnRounds { steps: self.steps }).into_owned(),
+            t(Msg::TurnTools { tools: self.tools }).into_owned(),
             fmt_dur(self.elapsed_ms),
             format!("{} tokens", fmt_tokens(billable)),
         ];
@@ -1673,7 +1728,11 @@ fn turn_end_note(stop: StopReason, done_index: usize) -> (Glyph, String, Style) 
             muted(),
         ),
         // The person's own doing, so it is stated without alarm.
-        Cancelled => (Glyph::Interrupted, "已中断".to_string(), muted()),
+        Cancelled => (
+            Glyph::Interrupted,
+            t(Msg::StopCancelled).into_owned(),
+            muted(),
+        ),
         // Three ways to be cut short, and they were one sentence here until a
         // person went looking for a round budget that was not the thing that
         // stopped them. `StopReason`'s own docs are the authority:
@@ -1686,63 +1745,55 @@ fn turn_end_note(stop: StopReason, done_index: usize) -> (Glyph, String, Style) 
         // * `RunawayFuse` — "not a policy: the fuse exists so a tree with no
         //   stopping policy at all still terminates". Calling it a limit hides
         //   the one actionable fact, which is that nothing was watching.
-        MaxRounds => (Glyph::Interrupted, "已中断 · 轮数用完了".to_string(), warn),
-        StoppedByPolicy => (
-            Glyph::Interrupted,
-            "已中断 · 一条停止策略叫停(时限或预算)".to_string(),
-            warn,
-        ),
+        MaxRounds => (Glyph::Interrupted, t(Msg::StopMaxRounds).into_owned(), warn),
+        StoppedByPolicy => (Glyph::Interrupted, t(Msg::StopByPolicy).into_owned(), warn),
         RunawayFuse => (
             Glyph::Interrupted,
-            "已中断 · 兜底熔断,这棵树没挂停止策略".to_string(),
+            t(Msg::StopRunawayFuse).into_owned(),
             warn,
         ),
-        ToolLoopDetected => (
+        ToolLoopDetected => (Glyph::Interrupted, t(Msg::StopToolLoop).into_owned(), warn),
+        PromptRejected => (
             Glyph::Interrupted,
-            "已中断 · 检测到重复循环".to_string(),
+            t(Msg::StopPromptRejected).into_owned(),
             warn,
         ),
-        PromptRejected => (Glyph::Interrupted, "已中断 · 输入被拒绝".to_string(), warn),
         // A hard boundary refused a call; the refusal itself is the tool's result.
         PolicyDenied => (
             Glyph::Interrupted,
-            "已中断 · 安全策略拦下了这一步".to_string(),
+            t(Msg::StopPolicyDenied).into_owned(),
             warn,
         ),
         // A pause, not a failure: the reset time is on the notice above it.
-        RateLimited => (Glyph::Interrupted, "已暂停 · 触发限流".to_string(), warn),
-        // A failure: the stream went silent and retrying did not bring it back.
-        Timeout => (
-            Glyph::Fail,
-            "已中断 · 模型长时间没有回应".to_string(),
-            bad(),
+        RateLimited => (
+            Glyph::Interrupted,
+            t(Msg::StopRateLimited).into_owned(),
+            warn,
         ),
+        // A failure: the stream went silent and retrying did not bring it back.
+        Timeout => (Glyph::Fail, t(Msg::StopTimeout).into_owned(), bad()),
         // A failure, with the provider's own sentence folded in below.
-        ProviderError => (Glyph::Fail, "已中断".to_string(), bad()),
+        ProviderError => (Glyph::Fail, t(Msg::StopCancelled).into_owned(), bad()),
         // Not a failed request: the log cannot explain what reached the model,
         // and from here resume, fork and compaction are unsound. A person is
         // owed that in words rather than sharing a sentence with a dead
         // network — what they do next is start a new session, not retry.
         InvariantViolated => (
             Glyph::Fail,
-            "已中断 · 内部不变量被破坏,这条会话不宜再续".to_string(),
+            t(Msg::StopInvariantViolated).into_owned(),
             bad(),
         ),
         // The kernel's two fuses. One `StopReason` now serves the log and the
         // handle (`docs/adr/0021` §6), so these can reach a screen too.
         MaxContinuations => (
             Glyph::Interrupted,
-            "已中断 · 自动续跑次数用完了".to_string(),
+            t(Msg::StopMaxContinuations).into_owned(),
             warn,
         ),
-        RepeatLoop => (
-            Glyph::Interrupted,
-            "已中断 · 检测到重复循环".to_string(),
-            warn,
-        ),
+        RepeatLoop => (Glyph::Interrupted, t(Msg::StopToolLoop).into_owned(), warn),
         // `StopReason` is `non_exhaustive`: a cause added later still ends the
         // turn visibly rather than failing to compile a screen.
-        _ => (Glyph::Interrupted, "已中断".to_string(), warn),
+        _ => (Glyph::Interrupted, t(Msg::StopCancelled).into_owned(), warn),
     }
 }
 

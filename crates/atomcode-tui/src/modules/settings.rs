@@ -18,6 +18,7 @@
 //! [`crate::moment::Moment`], where "what this screen is doing now" belongs.
 
 use crate::frame::{Line, Span, Style};
+use crate::i18n::{t, Msg};
 use crate::module::{Height, View};
 use crate::modules::chrome::{self, box_edge, edit_line, pad_to, panel_edge, search_line};
 use crate::moment::{Moment, Viewport};
@@ -120,7 +121,7 @@ impl View for Settings {
                     caret,
                 } => edit_line(&label, &value, caret, w, vp.moment.caps),
                 Row::Nothing => Line::styled(
-                    width::take_width("  没有匹配的设置", w),
+                    width::take_width(&t(Msg::SettingsNoMatch), w),
                     theme::fg(Role::Muted),
                 ),
                 Row::Legend => Line::styled(
@@ -431,10 +432,16 @@ fn scroll_note(above: usize, below: usize, w: usize, caps: crate::caps::Caps) ->
     use crate::caps::Glyph;
     let mut parts = Vec::new();
     if above > 0 {
-        parts.push(format!("上面还有 {above} 行"));
+        parts.push(t(Msg::SettingsAbove { above }).into_owned());
     }
     if below > 0 {
-        parts.push(format!("下面还有 {below} 行 {}", caps.g(Glyph::Down)));
+        parts.push(
+            t(Msg::SettingsBelow {
+                below,
+                arrow: caps.g(Glyph::Down),
+            })
+            .into_owned(),
+        );
     }
     if parts.is_empty() {
         return Line::empty();
@@ -556,7 +563,7 @@ fn header_parts(
         .iter()
         .position(|t| *t == tab)
         .unwrap_or(0);
-    let (spans, ranges) = chrome::header_parts("设置", &labels, at);
+    let (spans, ranges) = chrome::header_parts(&t(Msg::SettingsTitle), &labels, at);
     (
         spans,
         ranges
@@ -691,12 +698,12 @@ enum UsageLine {
 ///   used", and not knowing is a different thing from zero.
 fn allowance_lines(page: Option<&crate::settings::UsagePage>) -> Vec<UsageLine> {
     let Some(page) = page else {
-        return vec![UsageLine::Note("正在问宿主…".into())];
+        return vec![UsageLine::Note(t(Msg::AskingHost).into_owned())];
     };
     let mut out = Vec::new();
 
     if let Some(context) = page.context.as_ref() {
-        out.push(UsageLine::Head("本会话".into()));
+        out.push(UsageLine::Head(t(Msg::UsageThisSession).into_owned()));
         let share = if context.window == 0 {
             0.0
         } else {
@@ -704,23 +711,28 @@ fn allowance_lines(page: Option<&crate::settings::UsagePage>) -> Vec<UsageLine> 
         };
         out.push(UsageLine::Bar {
             share,
-            about: format!(
-                "上下文已用 {:.0}% · {} / {}",
-                share * 100.0,
-                crate::content::token_count(context.used),
-                crate::content::token_count(context.window)
-            ),
+            about: t(Msg::UsageContextBar {
+                percent: &format!("{:.0}", share * 100.0),
+                used: &crate::content::token_count(context.used),
+                window: &crate::content::token_count(context.window),
+            })
+            .into_owned(),
             spent: false,
         });
-        out.push(UsageLine::Note(format!("模型 {}", context.model)));
+        out.push(UsageLine::Note(
+            t(Msg::UsageModelNote {
+                model: &context.model,
+            })
+            .into_owned(),
+        ));
         out.push(UsageLine::Gap);
     }
 
     // Said, not returned on: an account with no metered windows may still have
     // a plan, and the first version of this bailed out here.
     if page.windows.is_empty() {
-        out.push(UsageLine::Head("额度".into()));
-        out.push(UsageLine::Note("这个宿主不计额度".into()));
+        out.push(UsageLine::Head(t(Msg::UsageAllowanceHead).into_owned()));
+        out.push(UsageLine::Note(t(Msg::UsageNotCounted).into_owned()));
         out.push(UsageLine::Gap);
     }
 
@@ -731,32 +743,47 @@ fn allowance_lines(page: Option<&crate::settings::UsagePage>) -> Vec<UsageLine> 
             // which is the thing a person opened this page to see.
             Some(percent) => {
                 let counted = match (window.calls_used, window.call_limit) {
-                    (Some(used), Some(limit)) => format!(" · {used} / {limit} 次"),
-                    (None, Some(limit)) => format!(" · 上限 {limit} 次"),
+                    (Some(used), Some(limit)) => {
+                        t(Msg::UsageCallsUsedOfLimit { used, limit }).into_owned()
+                    }
+                    (None, Some(limit)) => t(Msg::UsageCallLimit { n: limit }).into_owned(),
                     _ => String::new(),
                 };
                 out.push(UsageLine::Bar {
                     share: f32::from(percent) / 100.0,
-                    about: format!("用掉 {percent}%{counted}"),
+                    about: t(Msg::UsageSpentPercent {
+                        percent,
+                        counted: &counted,
+                    })
+                    .into_owned(),
                     spent: window.exhausted || percent >= 100,
                 });
             }
             // No bar at all rather than an empty one: an empty track reads as
             // "none used", and not knowing is a different thing from zero.
-            None => out.push(UsageLine::Note("这个窗口没报用量".into())),
+            None => out.push(UsageLine::Note(t(Msg::UsageWindowNotReported).into_owned())),
         }
         let mut tail = Vec::new();
         if window.exhausted {
-            tail.push("用完了".to_string());
+            tail.push(t(Msg::UsageSpent).into_owned());
         }
         if window.resets_in_seconds > 0 {
-            tail.push(format!(
-                "剩余重置时间 {}",
-                countdown(window.resets_in_seconds)
-            ));
+            // The other front end's usage panel says this, so it is read from
+            // its entry rather than written a second time.
+            tail.push(
+                crate::i18n::product::t(crate::i18n::product::Msg::UsageResetsIn {
+                    hms: &countdown(window.resets_in_seconds),
+                })
+                .into_owned(),
+            );
         }
         if !window.resets_at.is_empty() {
-            tail.push(format!("{} 重置", window.resets_at));
+            tail.push(
+                t(Msg::UsageResetsAtNote {
+                    at: &window.resets_at,
+                })
+                .into_owned(),
+            );
         }
         if !tail.is_empty() {
             out.push(UsageLine::Note(tail.join(" · ")));
@@ -768,26 +795,36 @@ fn allowance_lines(page: Option<&crate::settings::UsagePage>) -> Vec<UsageLine> 
     // whose plan lapsed needs to be told that, and drawing nothing looks like
     // never having had one.
     if let Some(plan) = page.plan.as_ref() {
-        out.push(UsageLine::Head(format!(
-            "{} · {}",
-            plan.plan,
-            match plan.active {
-                true => "生效中",
-                false => "已过期",
-            }
-        )));
+        // Plan, dates and days left are the other front end's own usage panel,
+        // word for word — read from its entries rather than restated here.
+        use crate::i18n::product::{t as pt, Msg as PMsg};
+        out.push(UsageLine::Head(
+            t(Msg::UsagePlanHead {
+                plan: &plan.plan,
+                state: &match plan.active {
+                    true => pt(PMsg::UsagePlanActive),
+                    false => pt(PMsg::UsagePlanExpired),
+                },
+            })
+            .into_owned(),
+        ));
         if !plan.claimed_at.is_empty() || !plan.expires_at.is_empty() {
-            out.push(UsageLine::Note(format!(
-                "领取 {} · 到期 {}",
-                blank_as_unknown(&plan.claimed_at),
-                blank_as_unknown(&plan.expires_at)
-            )));
+            out.push(UsageLine::Note(
+                pt(PMsg::UsagePlanClaimedExpires {
+                    claimed: &blank_as_unknown(&plan.claimed_at),
+                    expires: &blank_as_unknown(&plan.expires_at),
+                })
+                .into_owned(),
+            ));
         }
         if plan.total_days > 0 {
-            out.push(UsageLine::Note(format!(
-                "剩余 {}/{} 天",
-                plan.remaining_days, plan.total_days
-            )));
+            out.push(UsageLine::Note(
+                pt(PMsg::UsagePlanRemaining {
+                    remaining: plan.remaining_days,
+                    total: plan.total_days,
+                })
+                .into_owned(),
+            ));
             // Of the plan's whole term, how much is gone. The bar fills as the
             // plan is used up, like the allowance bars above it — two bars on
             // one page that filled in opposite directions would be two bars a
@@ -796,7 +833,10 @@ fn allowance_lines(page: Option<&crate::settings::UsagePage>) -> Vec<UsageLine> 
                 (plan.total_days - plan.remaining_days).max(0) as f32 / plan.total_days as f32;
             out.push(UsageLine::Bar {
                 share: gone,
-                about: format!("{:.1}%", gone * 100.0),
+                about: t(Msg::UsagePlanTermPercent {
+                    percent: &format!("{:.1}", gone * 100.0),
+                })
+                .into_owned(),
                 spent: plan.remaining_days <= 0,
             });
         }
@@ -817,70 +857,79 @@ fn allowance_lines(page: Option<&crate::settings::UsagePage>) -> Vec<UsageLine> 
 /// front end answered the first in one command and the second in another, and
 /// the second is the half that gets asked when something is wrong.
 fn status_lines(page: Option<&crate::settings::StatusPage>) -> Vec<UsageLine> {
+    use crate::i18n::product::{t as pt, Msg as PMsg};
     let Some(page) = page else {
-        return vec![UsageLine::Note("正在问宿主…".into())];
+        return vec![UsageLine::Note(t(Msg::AskingHost).into_owned())];
     };
-    let mut rows: Vec<(String, String)> = vec![("版本".into(), page.version.clone())];
+    let mut rows: Vec<(String, String)> =
+        vec![(t(Msg::StatusRowVersion).into_owned(), page.version.clone())];
     if let Some(title) = page.title.as_ref().filter(|title| !title.is_empty()) {
-        rows.push(("会话".into(), title.clone()));
-    }
-    rows.push(("会话 id".into(), page.session.clone()));
-    if !page.cwd.is_empty() {
-        rows.push(("目录".into(), crate::text::collapse_home(&page.cwd)));
+        rows.push((t(Msg::StatusRowSession).into_owned(), title.clone()));
     }
     rows.push((
-        "登录".into(),
+        t(Msg::StatusRowSessionId).into_owned(),
+        page.session.clone(),
+    ));
+    if !page.cwd.is_empty() {
+        rows.push((
+            t(Msg::StatusRowDirectory).into_owned(),
+            crate::text::collapse_home(&page.cwd),
+        ));
+    }
+    rows.push((
+        t(Msg::StatusRowSignedIn).into_owned(),
         match page.who.as_ref() {
             // Said rather than left out: a build that runs on a key in a file
             // has nobody signed in and works fine, and a blank row reads as a
             // question the host failed to answer.
-            None => "没有账号(用配置里的凭据)".to_string(),
+            None => t(Msg::StatusNoAccount).into_owned(),
             Some((who, None)) => who.clone(),
-            Some((who, Some(detail))) => format!("{who} · {detail}"),
+            Some((who, Some(detail))) => t(Msg::StatusWhoDetail { who, detail }).into_owned(),
         },
     ));
     rows.push((
-        "模型".into(),
+        pt(PMsg::ProviderPanelFieldModel).into_owned(),
         match (page.model.as_ref(), page.effort.as_ref()) {
-            (None, _) => "没有挂模型".to_string(),
+            (None, _) => t(Msg::StatusNoModel).into_owned(),
             (Some(model), None) => model.clone(),
-            (Some(model), Some(effort)) => format!("{model} · 思考强度 {effort}"),
+            (Some(model), Some(effort)) => t(Msg::StatusModelEffort { model, effort }).into_owned(),
         },
     ));
     if let Some(plan) = page.plan.as_ref() {
-        let mut said = format!(
-            "{} · {}",
-            plan.plan,
-            match plan.active {
-                true => "生效中",
-                false => "已过期",
-            }
-        );
+        let mut said = t(Msg::UsagePlanHead {
+            plan: &plan.plan,
+            state: &match plan.active {
+                true => pt(PMsg::UsagePlanActive),
+                false => pt(PMsg::UsagePlanExpired),
+            },
+        })
+        .into_owned();
         if !plan.expires_at.is_empty() {
-            said.push_str(&format!(" · 到期 {}", plan.expires_at));
+            said.push_str(&t(Msg::StatusPlanExpires {
+                at: &plan.expires_at,
+            }));
         }
         if plan.total_days > 0 {
-            said.push_str(&format!(
-                "（剩 {}/{} 天）",
-                plan.remaining_days, plan.total_days
-            ));
+            said.push_str(&t(Msg::StatusPlanDaysLeft {
+                remaining: plan.remaining_days,
+                total: plan.total_days,
+            }));
         }
-        rows.push(("订阅".into(), said));
+        rows.push((t(Msg::StatusRowPlan).into_owned(), said));
     }
     if let Some(window) = page.window.as_ref() {
         // A summary, not the bars: the Usage page draws those, and two places
         // drawing the same thing differently is two answers to one question.
         let mut said = match window.used_percent {
-            Some(percent) => format!("当前窗口用掉 {percent}%"),
-            None => "当前窗口没报用量".to_string(),
+            Some(percent) => t(Msg::StatusWindowSpent { percent }).into_owned(),
+            None => t(Msg::StatusWindowNotReported).into_owned(),
         };
         if window.resets_in_seconds > 0 {
-            said.push_str(&format!(
-                " · {}后重置",
-                crate::text::spoken_duration(window.resets_in_seconds as u64)
-            ));
+            said.push_str(&t(Msg::StatusWindowResetsIn {
+                duration: &crate::text::spoken_duration(window.resets_in_seconds as u64),
+            }));
         }
-        rows.push(("用量".into(), said));
+        rows.push((t(Msg::StatusRowUsage).into_owned(), said));
     }
     if !page.mcp.is_empty() {
         rows.push(("MCP".into(), mcp_tally(&page.mcp)));
@@ -928,19 +977,19 @@ fn mcp_tally(servers: &[atomcode_host_api::McpServer]) -> String {
     let mut parts = Vec::new();
     // What needs doing first, because that is what the count is for.
     if failed > 0 {
-        parts.push(format!("{failed} 个连不上"));
+        parts.push(t(Msg::McpTallyFailed { n: failed }).into_owned());
     }
     if untrusted > 0 {
-        parts.push(format!("{untrusted} 个等信任"));
+        parts.push(t(Msg::McpTallyUntrusted { n: untrusted }).into_owned());
     }
     if connecting > 0 {
-        parts.push(format!("{connecting} 个连接中"));
+        parts.push(t(Msg::McpTallyConnecting { n: connecting }).into_owned());
     }
     if connected > 0 {
-        parts.push(format!("{connected} 个已连接"));
+        parts.push(t(Msg::McpTallyConnected { n: connected }).into_owned());
     }
     if off > 0 {
-        parts.push(format!("{off} 个没连"));
+        parts.push(t(Msg::McpTallyOff { n: off }).into_owned());
     }
     format!("{} · /mcp", parts.join(" · "))
 }
@@ -952,10 +1001,13 @@ fn stats_lines(
 ) -> Vec<UsageLine> {
     use crate::settings::StatsPage;
     let Some(stats) = page.and_then(|page| page.stats.as_ref()) else {
-        return vec![UsageLine::Note(match page {
-            None => "正在问宿主…".into(),
-            Some(_) => "这个宿主不记账".to_string(),
-        })];
+        return vec![UsageLine::Note(
+            match page {
+                None => t(Msg::AskingHost),
+                Some(_) => t(Msg::StatsNotKept),
+            }
+            .into_owned(),
+        )];
     };
     let mut out = Vec::new();
     match which {
@@ -968,16 +1020,20 @@ fn stats_lines(
         }
         StatsPage::Models => {
             if stats.daily.is_empty() {
-                out.push(UsageLine::Note("没有按天的记录".into()));
+                out.push(UsageLine::Note(t(Msg::StatsNoDaily).into_owned()));
             } else {
-                out.push(UsageLine::Head("每天用掉多少".into()));
+                out.push(UsageLine::Head(t(Msg::StatsDailyHead).into_owned()));
                 out.extend(day_chart(&stats.daily, &stats.series));
                 out.push(UsageLine::Gap);
             }
             if stats.models.is_empty() {
-                out.push(UsageLine::Note("没有按模型的记录".into()));
+                out.push(UsageLine::Note(t(Msg::StatsNoModels).into_owned()));
             } else {
-                out.push(UsageLine::Head("各模型用量".into()));
+                // The other front end's usage panel has this heading already.
+                out.push(UsageLine::Head(
+                    crate::i18n::product::t(crate::i18n::product::Msg::UsageModelsTitle)
+                        .into_owned(),
+                ));
                 out.extend(model_table(&stats.models, stats.total_tokens));
             }
         }
@@ -1007,7 +1063,13 @@ fn overview_figures(stats: &atomcode_host_api::UsageStats) -> Vec<UsageLine> {
 
     let mut out = Vec::new();
     if !stats.from.is_empty() && !stats.to.is_empty() {
-        out.push(UsageLine::Note(format!("{} 到 {}", stats.from, stats.to)));
+        out.push(UsageLine::Note(
+            t(Msg::StatsRange {
+                from: &stats.from,
+                to: &stats.to,
+            })
+            .into_owned(),
+        ));
         out.push(UsageLine::Gap);
     }
     // Biggest first is how the host sends them, so the head of the list is the
@@ -1017,21 +1079,27 @@ fn overview_figures(stats: &atomcode_host_api::UsageStats) -> Vec<UsageLine> {
         .first()
         .map(|model| model.name.clone())
         .unwrap_or_else(|| "—".to_string());
+    // Every label here is one the other front end's usage panel already has,
+    // so they are read from its entries rather than written a second time.
+    use crate::i18n::product::{t as pt, Msg as PMsg};
     let mut rows = vec![
         (
-            ("最常用模型".to_string(), favourite),
+            (pt(PMsg::UsageStatFavorite).into_owned(), favourite),
             (
-                "总 Token 数".to_string(),
+                pt(PMsg::UsageStatTotal).into_owned(),
                 crate::content::token_count_u64(stats.total_tokens),
             ),
         ),
         (
-            ("请求次数".to_string(), stats.total_requests.to_string()),
             (
-                "最长连续天数".to_string(),
+                pt(PMsg::UsageStatRequests).into_owned(),
+                stats.total_requests.to_string(),
+            ),
+            (
+                pt(PMsg::UsageStatLongestStreak).into_owned(),
                 match stats.daily.is_empty() {
                     true => "—".to_string(),
-                    false => format!("{longest} 天"),
+                    false => t(Msg::StatsDays { n: longest }).into_owned(),
                 },
             ),
         ),
@@ -1039,14 +1107,17 @@ fn overview_figures(stats: &atomcode_host_api::UsageStats) -> Vec<UsageLine> {
     if !stats.daily.is_empty() {
         rows.push((
             (
-                "活跃天数".to_string(),
+                pt(PMsg::UsageStatActiveDays).into_owned(),
                 format!("{active} / {}", stats.daily.len()),
             ),
-            ("当前连续天数".to_string(), format!("{current} 天")),
+            (
+                pt(PMsg::UsageStatCurrentStreak).into_owned(),
+                t(Msg::StatsDays { n: current }).into_owned(),
+            ),
         ));
         rows.push((
             (
-                "最活跃日期".to_string(),
+                pt(PMsg::UsageStatMostActive).into_owned(),
                 busiest.unwrap_or_else(|| "—".to_string()),
             ),
             (String::new(), String::new()),
@@ -1196,7 +1267,7 @@ fn day_chart(
         .max()
         .unwrap_or(0);
     if peak == 0 {
-        return vec![UsageLine::Note("这段时间没有用量".into())];
+        return vec![UsageLine::Note(t(Msg::StatsNoneInPeriod).into_owned())];
     }
     let dots_wide = CHART_CELLS * DOT_COLS;
     let dots_tall = CHART_ROWS * DOT_ROWS;
@@ -1417,8 +1488,8 @@ fn heat_calendar(daily: &[atomcode_host_api::DayUse]) -> Vec<UsageLine> {
     }));
     out.push(UsageLine::Gap);
     out.push(UsageLine::HeatKey {
-        less: "少".into(),
-        more: "多".into(),
+        less: crate::i18n::product::t(crate::i18n::product::Msg::UsageHeatLess).into_owned(),
+        more: crate::i18n::product::t(crate::i18n::product::Msg::UsageHeatMore).into_owned(),
     });
     out
 }
@@ -1534,7 +1605,10 @@ fn file_line(present: bool, label: &str, path: &str, w: usize, caps: crate::caps
         Span::raw(crate::text::collapse_home(path)),
     ];
     if !present {
-        spans.push(Span::styled(" 未找到".to_string(), theme::fg(Role::Muted)));
+        spans.push(Span::styled(
+            t(Msg::SettingsNotFound).into_owned(),
+            theme::fg(Role::Muted),
+        ));
     }
     Line::from_spans(spans).truncate(w)
 }
@@ -1659,7 +1733,12 @@ fn model_table(models: &[atomcode_host_api::ModelUse], total: u64) -> Vec<UsageL
         )
     };
     let mut out = vec![UsageLine::Cols {
-        text: lay("模型", "tokens", "请求", "占比"),
+        text: lay(
+            &crate::i18n::product::t(crate::i18n::product::Msg::ProviderPanelFieldModel),
+            &t(Msg::StatsColTokens),
+            &t(Msg::StatsColRequests),
+            &t(Msg::StatsColShare),
+        ),
         head: true,
         mark: None,
     }];
@@ -1835,7 +1914,7 @@ fn value_text(row: &crate::settings::SettingRow) -> String {
     if row.value.is_empty() {
         match row.kind {
             SettingKind::OptionalBoolean => "auto".to_string(),
-            _ => "（未设置）".to_string(),
+            _ => t(Msg::SettingUnset).into_owned(),
         }
     } else {
         row.value.clone()
@@ -1849,12 +1928,15 @@ fn value_text(row: &crate::settings::SettingRow) -> String {
 /// switch pages, it would name a key that does something else. A hint is a
 /// promise about what a key does, and the only key that changes a value here is
 /// the return key.
-fn kind_hint(kind: &SettingKind) -> Option<&'static str> {
-    match kind {
-        SettingKind::Boolean => Some("回车 切换"),
-        SettingKind::OptionalBoolean | SettingKind::Choice(_) => Some("回车 切换"),
-        SettingKind::Integer { .. } | SettingKind::Text => Some("回车 编辑"),
-    }
+fn kind_hint(kind: &SettingKind) -> Option<String> {
+    Some(
+        match kind {
+            SettingKind::Boolean => t(Msg::SettingHintToggle),
+            SettingKind::OptionalBoolean | SettingKind::Choice(_) => t(Msg::SettingHintToggle),
+            SettingKind::Integer { .. } | SettingKind::Text => t(Msg::SettingHintEdit),
+        }
+        .into_owned(),
+    )
 }
 
 /// What the legend says, which depends on what the keys would do right now.
@@ -1862,9 +1944,12 @@ fn kind_hint(kind: &SettingKind) -> Option<&'static str> {
 /// No longer brands a key for the search box: there is none. Typing goes to the
 /// box, so the legend says what Escape would do *instead* — the only thing about
 /// the box a person has to be told.
-fn legend(panel: &Panel) -> Vec<(&'static str, &'static str)> {
+fn legend(panel: &Panel) -> Vec<(String, String)> {
     if panel.editing.is_some() {
-        return vec![("⏎", "保存"), ("esc", "取消")];
+        return vec![
+            ("⏎".into(), t(Msg::LegendSave).into_owned()),
+            ("esc".into(), t(Msg::LegendCancel).into_owned()),
+        ];
     }
     // The pages that are read rather than filtered say how to leave them.
     //
@@ -1874,27 +1959,43 @@ fn legend(panel: &Panel) -> Vec<(&'static str, &'static str)> {
     // put back, and the way out is now on the screen — which is the part that
     // would have made the dead end survivable while it lasted.
     if panel.tab != crate::settings::Tab::Config {
-        let mut out = vec![("←→", "换页")];
+        let mut out = vec![("←→".into(), t(Msg::LegendChangePage).into_owned())];
         if panel.tab.pages().is_some() {
-            out.push(("↑↓", "这页的分页"));
-            out.push(("翻页键", "滚动"));
+            out.push(("↑↓".into(), t(Msg::LegendPagesHere).into_owned()));
+            out.push((
+                // A key named in words rather than drawn: there is no one glyph
+                // for pgup/pgdn that every terminal has — so the *name* is a
+                // line in the table too.
+                t(Msg::LegendPageKeys).into_owned(),
+                t(Msg::LegendScroll).into_owned(),
+            ));
         } else {
-            out.push(("↑↓", "滚动"));
+            out.push(("↑↓".into(), t(Msg::LegendScroll).into_owned()));
         }
-        out.push(("esc", "关闭"));
+        out.push(("esc".into(), t(Msg::LegendClose).into_owned()));
         return out;
     }
     if panel.pending_reset.is_some() {
         // Says what the next press does, because that is the only thing about
         // this state a person has to know — and it is the press that throws
         // something away.
-        return vec![("del", "再按一次恢复默认"), ("其它键", "取消")];
+        return vec![
+            ("del".into(), t(Msg::LegendPressAgainToReset).into_owned()),
+            (
+                t(Msg::LegendAnyOtherKey).into_owned(),
+                t(Msg::LegendCancel).into_owned(),
+            ),
+        ];
     }
-    let mut out = vec![("↑↓", "选择"), ("⏎", "修改"), ("del", "恢复默认")];
+    let mut out = vec![
+        ("↑↓".into(), t(Msg::LegendSelect).into_owned()),
+        ("⏎".into(), t(Msg::LegendEdit).into_owned()),
+        ("del".into(), t(Msg::LegendRestoreDefault).into_owned()),
+    ];
     if !panel.query.is_empty() {
-        out.push(("esc", "清空搜索"));
+        out.push(("esc".into(), t(Msg::LegendClearSearch).into_owned()));
     }
-    out.push(("esc", "关闭"));
+    out.push(("esc".into(), t(Msg::LegendClose).into_owned()));
     out
 }
 

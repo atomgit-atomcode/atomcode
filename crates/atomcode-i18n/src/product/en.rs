@@ -477,6 +477,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SessionTimeMinAgo { n } => format!("{n}m ago").into(),
         Msg::SessionTimeHourAgo { n } => format!("{n}h ago").into(),
         Msg::SessionTimeDayAgo { n } => format!("{n}d ago").into(),
+        Msg::SessionTimeMonthAgo { n } => format!("{n}mo ago").into(),
         Msg::SessionMsgCount { count } =>
             format!("{count} msgs").into(),
         Msg::SessionNameEmpty =>
@@ -1494,13 +1495,31 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             "Tip: the classic Windows console is limited — no scroll-back while a task runs, \
              and glyphs/the mascot render degraded. \x1b[1;96mWindows Terminal\x1b[0m gives the full experience."
                 .into(),
+
+        // ── the new front end's launcher (`atomcode-cli`) ──
+        Msg::SettingAcceptsOptionalBool => "true | false | unset".into(),
+        Msg::AppliesNow => "now".into(),
+        Msg::AppliesNextTurnCli => "next turn".into(),
+        Msg::AppliesAgentReassemble => "after the agent is reassembled".into(),
+        Msg::AppliesCapabilityReprepare => "after the capabilities are rebuilt".into(),
+        Msg::AppliesNextStartup => "at the next start".into(),
+        Msg::NoSuchSettingCli { id } => format!("there is no `{id}`").into(),
+        Msg::ConfigFileUnreadable { error } => format!("the config file cannot be read: {error}").into(),
+        Msg::SettingValueRejected { value, error } => format!("`{value}` will not do: {error}").into(),
+        Msg::ApiErrorRetrying { reason, seconds, attempt, max } => format!("API error {reason}; retrying in {seconds}s ({attempt}/{max})...").into(),
+        Msg::VisionRecognised { model, text } => format!("[what is in the picture, read by {model}]\n{text}").into(),
+        Msg::VisionFailed => "[the picture could not be read]".into(),
+        Msg::TurnNotStoredCli { why } => format!("this turn could not be stored: {why}").into(),
+
+        // ── resuming from the shell (`atomcode-cli`) ──
+        Msg::ResumeHint { cmd } => format!("To resume this session, run: {cmd}").into(),
     }
 }
 
 #[cfg(test)]
 mod codingplan_crypto_tests {
     use super::*;
-    use crate::i18n::Msg;
+    use crate::product::Msg;
 
     #[test]
     fn en_official_build_required_mentions_releases() {

@@ -3,6 +3,7 @@
 //! The text itself lives in `Moment`, not here — it is not a fact until it is
 //! sent, and a module that kept its own copy would be a second home for it.
 
+use crate::i18n::{t, Msg};
 use atomcode_harness::session::SessionEvent;
 
 use crate::frame::Line;
@@ -36,7 +37,7 @@ fn caption(moment: &crate::moment::Moment) -> Option<String> {
     // one place the two ways out are written down: the prompt itself is the
     // asking program's words and says nothing about esc.
     if moment.secret.is_some() {
-        return Some("enter 送出 · esc 不给".into());
+        return Some(t(Msg::InputAnswerKeys).into_owned());
     }
     // The session title is deliberately NOT shown above the field: it clutters
     // the composer, and it lives in the terminal's own title bar instead. Only
@@ -47,7 +48,7 @@ fn caption(moment: &crate::moment::Moment) -> Option<String> {
     let total = moment.history.len();
     moment.history_at.map(|at| {
         let nth = total.saturating_sub(at);
-        format!("历史 {nth}/{total}")
+        t(Msg::InputHistoryNth { nth, total }).into_owned()
     })
 }
 

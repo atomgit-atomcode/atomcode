@@ -5,10 +5,16 @@
 //! `docs/superpowers/plans/2026-07-11-extract-atomcode-config.md`.
 
 /// UI language selection (`Config.language`).
-pub mod locale;
+///
+/// Lives in `atomcode-i18n` and is re-exported here: the language is one
+/// choice for the whole process, and a screen that may not depend on this
+/// crate still has to read it (`docs/adr/0022` §3). Every `atomcode_config::locale::…`
+/// and `atomcode_config::i18n::…` path a caller already writes keeps working.
+pub use atomcode_i18n::locale;
 
-/// Localization message tables + `t()`/`Msg`.
-pub mod i18n;
+/// Localization message tables + `t()`/`Msg` — the product's table.
+/// The screen's own table is `atomcode_i18n::screen`.
+pub use atomcode_i18n::product as i18n;
 
 /// Vendored leaf helpers (home-dir resolution, vision heuristic) config needs.
 pub mod util;

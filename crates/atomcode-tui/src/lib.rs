@@ -54,6 +54,8 @@ pub mod content;
 pub mod el;
 pub mod frame;
 pub mod host;
+
+pub mod i18n;
 pub mod keymap;
 pub mod launch;
 pub mod layout;
@@ -88,3 +90,21 @@ pub use module::{Height, Modules, Mounted, Producer, View, ViewObject};
 pub use moment::{Moment, Timestamp, Viewport};
 pub use region::{Constraint, Dir, Region};
 pub use surface::{Headless, Input, Key, KeyPress, Mods, Surface, Terminal};
+
+/// Which language this crate's own tests assert in.
+///
+/// Every assertion in here was written against the Chinese wording, because
+/// that is what the screen said when they were written — they mean "in Chinese,
+/// this row reads …", which is a property worth keeping. So the test binary
+/// says once, here, which language it is asserting in, rather than 900 tests
+/// each restating it.
+///
+/// The other language is not left unchecked. `tests/language.rs` draws the same
+/// surfaces in English and asserts they came out different, and the tables'
+/// `match` is exhaustive, so a missing translation is a compile error rather
+/// than a quiet fallback to the other language.
+#[cfg(test)]
+#[ctor::ctor]
+fn _tests_assert_in_chinese() {
+    crate::i18n::set_locale(crate::i18n::Locale::ZhCn);
+}

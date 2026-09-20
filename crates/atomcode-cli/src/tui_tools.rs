@@ -9,6 +9,7 @@
 //!
 //! 语义、开关活多久、MCP 怎么按台算,见 `docs/tool-catalog-policy.md`。
 
+use atomcode_i18n::screen::{t as tr, Msg as SMsg};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -69,8 +70,10 @@ impl ToolsPort {
         let client = self
             .ctx
             .service::<AgentClientSvc>()
-            .ok_or("屏幕还没接上 agent")?;
-        let control = client.control().ok_or("这个宿主没有控制面")?;
+            .ok_or_else(|| tr(SMsg::ScreenNotConnectedAgent).into_owned())?;
+        let control = client
+            .control()
+            .ok_or_else(|| tr(SMsg::HostHasNoControl).into_owned())?;
         Ok((control, client.root()))
     }
 
@@ -78,7 +81,10 @@ impl ToolsPort {
         let (control, _) = self.link()?;
         match control.call(command).await {
             Ok(HostReply::ToolCatalog { tools }) => Ok(view(tools)),
-            Ok(other) => Err(format!("宿主答了别的:{other:?}")),
+            Ok(other) => Err(tr(SMsg::HostSaidSomethingElse {
+                reply: &format!("{other:?}"),
+            })
+            .into_owned()),
             Err(error) => Err(said(error)),
         }
     }
@@ -107,9 +113,9 @@ impl Tools for ToolsPort {
 fn said(error: atomcode_host_api::HostError) -> String {
     use atomcode_host_api::HostError;
     match error {
-        HostError::Busy { reason } => format!("现在不行:{reason}"),
-        HostError::Unavailable => "宿主现在不可用".into(),
-        HostError::NotFound => "找不到:会话已经换过了".into(),
+        HostError::Busy { reason } => tr(SMsg::HostBusy { reason: &reason }).into_owned(),
+        HostError::Unavailable => tr(SMsg::HostUnavailable).into_owned(),
+        HostError::NotFound => tr(SMsg::HostNotFoundShort).into_owned(),
         HostError::Failed { message } => message,
         other => format!("{other:?}"),
     }

@@ -8,6 +8,7 @@
 //! agent is in the host's App, and what a person may change about it is what
 //! host control offers (`docs/adr/0022` §7).
 
+use crate::i18n::{t, Msg};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -24,34 +25,28 @@ use crate::keymap::Action;
 /// Quit, clear, fold — things the screen itself owns.
 pub struct ScreenCommands;
 
-const SCREEN: &[Command] = &[
-    // `/exit` keeps working as an alias — one row, not two.
-    Command::new("quit", "退出").with_aliases(&["exit"]),
-    Command::new("reasoning", "思考:一行、全文、收起,循环"),
-    Command::taking(
-        "tools",
-        "[full|head|each|group]",
-        "工具输出:全部、单个摘要、成组摘要;不带参数则循环",
-    ),
-    Command::new(
-        "showinject",
-        "环境注入:收起、只留标签、全文,循环;不带名字则全部",
-    ),
-    Command::new("mouse", "把鼠标交还终端,或收回来"),
-    Command::new("keys", "列出快捷键"),
-    Command::new("todo", "展开或折叠计划清单"),
-    Command::new("team", "展开或折叠团队面板"),
-    Command::taking(
-        "paste",
-        "[路径]",
-        "把剪贴板(或一个文件)的内容放进输入框;Ctrl+V 被终端或系统拦下时用它",
-    ),
-    Command::new("config", "拉出设置面板:搜索、改值;esc 关"),
-    Command::new(
-        "provider",
-        "拉出 provider 面板:账号与模型,增改删;⏎ 换过去,esc 关",
-    ),
-];
+/// Built per call rather than held in a `const`, because what each line says
+/// depends on the language in force and `/language` changes that mid-session.
+fn screen_catalogue() -> Vec<Command> {
+    vec![
+        // `/exit` keeps working as an alias — one row, not two.
+        Command::said("quit", t(Msg::CmdAboutQuit)).with_aliases(&["exit"]),
+        Command::said("reasoning", t(Msg::CmdAboutReasoning)),
+        Command::said_taking(
+            "tools",
+            "[full|head|each|group]".into(),
+            t(Msg::CmdAboutTools),
+        ),
+        Command::said("showinject", t(Msg::CmdAboutShowInject)),
+        Command::said("mouse", t(Msg::CmdAboutMouse)),
+        Command::said("keys", t(Msg::CmdAboutKeys)),
+        Command::said("todo", t(Msg::CmdAboutTodo)),
+        Command::said("team", t(Msg::CmdAboutTeam)),
+        Command::said_taking("paste", t(Msg::CmdTakesPath), t(Msg::CmdAboutPaste)),
+        Command::said("config", t(Msg::CmdAboutConfig)),
+        Command::said("provider", t(Msg::CmdAboutProviderPanel)),
+    ]
+}
 
 #[async_trait]
 impl CommandSet for ScreenCommands {
@@ -59,7 +54,7 @@ impl CommandSet for ScreenCommands {
         "cmd-screen"
     }
     fn commands(&self) -> Vec<Command> {
-        SCREEN.to_vec()
+        screen_catalogue()
     }
     async fn run(&self, name: &str, args: &str, ctx: &Context) -> Outcome {
         match name {
@@ -85,36 +80,32 @@ impl CommandSet for ScreenCommands {
             "paste" => match args.trim() {
                 "" => {
                     let Some(surface) = ctx.service::<crate::plugin::SurfaceSvc>() else {
-                        return Outcome::Refused("这块屏幕没有剪贴板".into());
+                        return Outcome::Refused(t(Msg::NoClipboard).into_owned());
                     };
                     match surface.clipboard_text() {
                         Some(text) if !text.is_empty() => Outcome::Do(Action::Paste(text)),
                         // Not an error. "There is nothing in it" is how a person
                         // finds out there is nothing in it.
-                        _ => {
-                            Outcome::Refused("剪贴板里没有文字;`/paste 路径` 可以贴一个文件".into())
-                        }
+                        _ => Outcome::Refused(t(Msg::ClipboardHasNoText).into_owned()),
                     }
                 }
                 path => match std::fs::read_to_string(path) {
-                    Ok(text) if text.is_empty() => Outcome::Refused(format!("{path} 是空的")),
+                    Ok(text) if text.is_empty() => {
+                        Outcome::Refused(t(Msg::FileIsEmpty { path }).into_owned())
+                    }
                     Ok(text) => Outcome::Do(Action::Paste(text)),
-                    Err(error) => Outcome::Refused(format!("读不了 {path}:{error}")),
+                    Err(error) => Outcome::Refused(
+                        t(Msg::FileUnreadable {
+                            path,
+                            error: &error.to_string(),
+                        })
+                        .into_owned(),
+                    ),
                 },
             },
             "config" => Outcome::Do(Action::ToggleSettings),
             "provider" => Outcome::Do(Action::ToggleProviders),
-            "keys" => Outcome::Said(
-                "enter 发送 · shift+enter 换行(或 ctrl-j) · ctrl-d 退出 · ctrl-w 删词\n\
-                 esc 依次:取消选中 -> 清空输入 -> 停止当轮 · ctrl-c 直接停止当轮\n\
-                 上/下 在输入里移动游标,到头则翻历史 · 点击输入框定位游标\n\
-                 pgup/pgdn 与滚轮滚动对话\n\
-                 ctrl-r 思考(一行/全文/收起,循环) · ctrl-t 工具输出(全部/单个摘要/成组摘要,循环) · ctrl-l 重画屏幕\n\
-                 /showinject [名字] 环境注入(默认不显示;不带名字则全部,all 含同伴报告)\n\
-                 拖动选中并复制 · esc 取消选中 · 点击思考或工具调用折叠展开那一个\n\
-                 ctrl-o 把鼠标交还终端(改用终端自己的框选)"
-                    .into(),
-            ),
+            "keys" => Outcome::Said(t(Msg::KeysHelp).into_owned()),
             _ => Outcome::Quiet,
         }
     }
@@ -143,9 +134,7 @@ fn tool_output(what: &str) -> Result<Action, String> {
         "head" | "preview" => Ok(Action::SetToolOutput(ToolOutput::Head)),
         "each" | "one" => Ok(Action::SetToolOutput(ToolOutput::Each)),
         "group" | "run" => Ok(Action::SetToolOutput(ToolOutput::Group)),
-        _ => Err(format!(
-            "没有 `{what}` 这种工具输出形态;可以写 full(全部)/head(前后各20行)/each(单个摘要)/group(成组摘要)"
-        )),
+        _ => Err(t(Msg::ToolOutputUnknown { what }).into_owned()),
     }
 }
 
@@ -168,14 +157,15 @@ fn showinject(what: &str) -> Result<Action, String> {
     }
     match crate::content::injected_kind(what) {
         Some(kind) => Ok(Action::ToggleFold(kind)),
-        None => Err(format!(
-            "没有 `{what}` 这种注入;可以写 {} 或 all",
-            crate::content::INJECTIONS
+        None => Err(t(Msg::InjectionUnknown {
+            what,
+            names: &crate::content::INJECTIONS
                 .iter()
                 .map(|(name, _)| *name)
                 .collect::<Vec<_>>()
-                .join(" / ")
-        )),
+                .join(" / "),
+        })
+        .into_owned()),
     }
 }
 
@@ -188,19 +178,13 @@ fn showinject(what: &str) -> Result<Action, String> {
 /// ([`CommandSet::overrides`]).
 pub struct TakeAwayCommands;
 
-const TAKE_AWAY: &[Command] = &[
-    Command::taking(
-        "copy",
-        "[N|all]",
-        "复制模型最后一条回复里的代码块;N 指定第几块,all 全要",
-    ),
-    Command::taking("save", "[文件名]", "把这段对话存成 markdown"),
-    Command::taking(
-        "view",
-        "<路径>",
-        "开一个只读浮层看文件;不花一个回合,也不进对话",
-    ),
-];
+fn take_away_catalogue() -> Vec<Command> {
+    vec![
+        Command::said_taking("copy", "[N|all]".into(), t(Msg::CmdAboutCopy)),
+        Command::said_taking("save", t(Msg::CmdTakesFilename), t(Msg::CmdAboutSave)),
+        Command::said_taking("view", t(Msg::CmdTakesPathRequired), t(Msg::CmdAboutView)),
+    ]
+}
 
 #[async_trait]
 impl CommandSet for TakeAwayCommands {
@@ -208,11 +192,11 @@ impl CommandSet for TakeAwayCommands {
         "cmd-take-away"
     }
     fn commands(&self) -> Vec<Command> {
-        TAKE_AWAY.to_vec()
+        take_away_catalogue()
     }
     async fn run(&self, name: &str, args: &str, ctx: &Context) -> Outcome {
         let Some(client) = ctx.service::<crate::plugin::AgentClientSvc>() else {
-            return Outcome::Refused("这块屏幕没接上 agent".into());
+            return Outcome::Refused(t(Msg::NoAgent).into_owned());
         };
         match name {
             // Copying a code block is the one thing people do with an answer
@@ -222,33 +206,38 @@ impl CommandSet for TakeAwayCommands {
             "copy" => {
                 let blocks = code_blocks(&last_answer(&client.events()));
                 if blocks.is_empty() {
-                    return Outcome::Refused("最后一条回复里没有代码块".into());
+                    return Outcome::Refused(t(Msg::CopyNoBlocks).into_owned());
                 }
                 let text = match args.trim() {
                     "" if blocks.len() == 1 => blocks[0].clone(),
                     "" => {
-                        return Outcome::Refused(format!(
-                            "有 {} 块;`/copy N` 指定哪一块,`/copy all` 全要",
-                            blocks.len()
-                        ))
+                        return Outcome::Refused(
+                            t(Msg::CopyWhichBlock {
+                                count: blocks.len(),
+                            })
+                            .into_owned(),
+                        )
                     }
                     "all" => blocks.join("\n\n"),
                     n => match n.parse::<usize>().ok().filter(|n| *n >= 1) {
                         Some(n) if n <= blocks.len() => blocks[n - 1].clone(),
                         _ => {
-                            return Outcome::Refused(format!(
-                                "只有 {} 块,没有第 {n} 块",
-                                blocks.len()
-                            ))
+                            return Outcome::Refused(
+                                t(Msg::CopyNoSuchBlock {
+                                    count: blocks.len(),
+                                    asked: n,
+                                })
+                                .into_owned(),
+                            )
                         }
                     },
                 };
                 let Some(surface) = ctx.service::<crate::plugin::SurfaceSvc>() else {
-                    return Outcome::Refused("这块屏幕没有剪贴板".into());
+                    return Outcome::Refused(t(Msg::NoClipboard).into_owned());
                 };
                 let lines = text.lines().count();
                 surface.copy(&text);
-                Outcome::Said(format!("复制了 {lines} 行"))
+                Outcome::Said(t(Msg::CopiedLines { lines }).into_owned())
             }
             // Markdown rather than the screen's own rendering: what is saved is
             // read elsewhere — in an editor, in a review, in an issue — and the
@@ -256,7 +245,7 @@ impl CommandSet for TakeAwayCommands {
             "save" => {
                 let text = as_markdown(&client.events());
                 if text.trim().is_empty() {
-                    return Outcome::Refused("这段对话还没有内容可存".into());
+                    return Outcome::Refused(t(Msg::SaveNothingYet).into_owned());
                 }
                 let name = match args.trim() {
                     "" => format!("atomcode-{}.md", client.session().replace('/', "-")),
@@ -272,8 +261,18 @@ impl CommandSet for TakeAwayCommands {
                     std::path::Path::new(&client.root()).join(path)
                 };
                 match std::fs::write(&path, text) {
-                    Ok(()) => Outcome::Said(format!("存到 {}", path.display())),
-                    Err(error) => Outcome::Refused(format!("存不下:{error}")),
+                    Ok(()) => Outcome::Said(
+                        t(Msg::SavedTo {
+                            path: &path.display().to_string(),
+                        })
+                        .into_owned(),
+                    ),
+                    Err(error) => Outcome::Refused(
+                        t(Msg::SaveFailed {
+                            error: &error.to_string(),
+                        })
+                        .into_owned(),
+                    ),
                 }
             }
             // Looking at a file costs a turn otherwise — and puts the whole
@@ -282,7 +281,7 @@ impl CommandSet for TakeAwayCommands {
             "view" => {
                 let path = args.trim();
                 if path.is_empty() {
-                    return Outcome::Refused("要看哪个文件?`/view 路径`".into());
+                    return Outcome::Refused(t(Msg::ViewWhichFile).into_owned());
                 }
                 let full = std::path::Path::new(path);
                 let full = if full.is_absolute() {
@@ -297,7 +296,13 @@ impl CommandSet for TakeAwayCommands {
                         crate::text::collapse_home(&full.display().to_string()),
                         &text,
                     )),
-                    Err(error) => Outcome::Refused(format!("读不了 {path}:{error}")),
+                    Err(error) => Outcome::Refused(
+                        t(Msg::FileUnreadable {
+                            path,
+                            error: &error.to_string(),
+                        })
+                        .into_owned(),
+                    ),
                 }
             }
             _ => Outcome::Quiet,
@@ -308,84 +313,52 @@ impl CommandSet for TakeAwayCommands {
 /// The conversation: what is in it, what to do with it, and which one it is.
 pub struct SessionCommands;
 
-const SESSION: &[Command] = &[
-    Command::new("compact", "压缩历史,给上下文腾地方"),
-    Command::new(
-        "cancel-all",
-        "停下这个会话与每个团队成员正在跑的回合;成员留在团队里",
-    ),
-    Command::new("context", "这次会话用掉了多少"),
-    Command::new(
-        "agents",
-        "这个会话底下有过的 agent:主与每个成员,含已停的;选一个切过去看它的对话",
-    ),
-    Command::new("transcript", "把对话按模型看到的样子列出来"),
-    Command::new("clear", "开一个新会话:这段对话放下,换一条干净的"),
-    // `/session` is the same fresh start, named the way the reference does, with
-    // `/new` as its memorable alias — one row, not two.
-    Command::new("session", "开一个新会话(等于 /clear)").with_aliases(&["new"]),
-    Command::taking("resume", "[会话 id]", "回到一个存下的会话;不带 id 则挑一个"),
-    Command::taking(
-        "effort",
-        "<low|medium|high|xhigh|max|default>",
-        "改这个会话的思考强度(与模型无关)",
-    ),
-    Command::taking(
-        "undo",
-        "[回合]",
-        "撤回最后一句话(或某一回合)及其后的一切,那句话放回输入框",
-    ),
-    Command::taking(
-        "rewind",
-        "[回合 [对话|代码|全部]]",
-        "回到某一回合之前:对话、工作区或两者;不带参数则挑一个",
-    ),
-    Command::taking(
-        "model",
-        "[模型 id]",
-        "这个会话从现在起用哪个模型;不带 id 则挑一个",
-    ),
-    Command::new("autonomy", "现在有没有在自己干(goal / loop),跑到第几轮、用了多久"),
-    Command::taking("rename", "<名字>", "给这个会话改个名字"),
-    Command::taking(
-        "diff",
-        "[文件]",
-        "这个会话把工作区改成了什么样;不带文件则列出改过的文件,选一个看它的改动",
-    ),
-    Command::taking(
-        "mode",
-        "[plan|ask|edits|auto]",
-        "改要不要问:plan 只看不动、ask 动手前问、edits 改文件不问、auto 全不问;不带参数则说现在是哪个",
-    ),
-    Command::taking("cd", "<目录>", "换到另一个目录干活;会开一条新会话"),
-    // The three modes people reach for by name. `/mode` is the one
-    // implementation; these are the words tuix taught everyone to type.
-    Command::new("plan", "只看不动(等于 /mode plan)"),
-    Command::new("build", "动手前问一句(等于 /mode ask)"),
-    Command::new("auto", "全不问(等于 /mode auto)"),
-    Command::new("status", "这次会话现在是什么状况:模型、模式、在哪、跑到第几回合"),
-    Command::new("cost", "这次会话用掉多少 token(等于 /context)"),
-    Command::new("usage", "账号还剩多少额度,哪个窗口用完了、什么时候回来"),
-    Command::taking(
-        "mcp",
-        "[tools <服务器>|withdraw]",
-        "MCP 服务器的状态;tools 列某个服务器挂上来的工具;withdraw 立刻撤下全部 MCP 工具",
-    ),
-    Command::taking(
-        "language",
-        "[语言]",
-        "模型用哪种语言回答;不带参数则说现在是哪个,以及可选哪些",
-    ),
-    Command::new("reload", "重新读取 skills、MCP 与配置,会话不变"),
-    Command::new("logout", "把凭据拿出进程;会话留着"),
-    Command::new("login", "用现在配置的凭据重新登录"),
-    Command::new("whoami", "现在是谁登录着"),
-    Command::taking(
-        "think",
-        "[on|off]",
-        "要不要思考(与 /effort「思考多狠」是两个旋钮);不带参数则说现在是哪个",
-    ),
-];
+fn session_catalogue() -> Vec<Command> {
+    vec![
+        Command::said("compact", t(Msg::CmdAboutCompact)),
+        Command::said("cancel-all", t(Msg::CmdAboutCancelAll)),
+        Command::said("context", t(Msg::CmdAboutContext)),
+        Command::said("agents", t(Msg::CmdAboutAgents)),
+        Command::said("transcript", t(Msg::CmdAboutTranscript)),
+        Command::said("clear", t(Msg::CmdAboutClear)),
+        // `/session` is the same fresh start, named the way the reference does,
+        // with `/new` as its memorable alias — one row, not two.
+        Command::said("session", t(Msg::CmdAboutSession)).with_aliases(&["new"]),
+        Command::said_taking("resume", t(Msg::CmdTakesSessionId), t(Msg::CmdAboutResume)),
+        Command::said_taking(
+            "effort",
+            "<low|medium|high|xhigh|max|default>".into(),
+            t(Msg::CmdAboutEffort),
+        ),
+        Command::said_taking("undo", t(Msg::CmdTakesTurn), t(Msg::CmdAboutUndo)),
+        Command::said_taking("rewind", t(Msg::CmdTakesTurnScope), t(Msg::CmdAboutRewind)),
+        Command::said_taking("model", t(Msg::CmdTakesModelId), t(Msg::CmdAboutModel)),
+        Command::said("autonomy", t(Msg::CmdAboutAutonomy)),
+        Command::said_taking("rename", t(Msg::CmdTakesName), t(Msg::CmdAboutRename)),
+        Command::said_taking("diff", t(Msg::CmdTakesFile), t(Msg::CmdAboutDiff)),
+        Command::said_taking("mode", "[plan|ask|edits|auto]".into(), t(Msg::CmdAboutMode)),
+        Command::said_taking("cd", t(Msg::CmdTakesDirectory), t(Msg::CmdAboutCd)),
+        // The three modes people reach for by name. `/mode` is the one
+        // implementation; these are the words tuix taught everyone to type.
+        Command::said("plan", t(Msg::CmdAboutPlan)),
+        Command::said("build", t(Msg::CmdAboutBuild)),
+        Command::said("auto", t(Msg::CmdAboutAuto)),
+        Command::said("status", t(Msg::CmdAboutStatus)),
+        Command::said("cost", t(Msg::CmdAboutCost)),
+        Command::said("usage", t(Msg::CmdAboutUsage)),
+        Command::said_taking("mcp", t(Msg::CmdTakesMcp), t(Msg::CmdAboutMcp)),
+        Command::said_taking(
+            "language",
+            t(Msg::CmdTakesLanguage),
+            t(Msg::CmdAboutLanguage),
+        ),
+        Command::said("reload", t(Msg::CmdAboutReload)),
+        Command::said("logout", t(Msg::CmdAboutLogout)),
+        Command::said("login", t(Msg::CmdAboutLogin)),
+        Command::said("whoami", t(Msg::CmdAboutWhoami)),
+        Command::said_taking("think", "[on|off]".into(), t(Msg::CmdAboutThink)),
+    ]
+}
 
 /// A host's refusal, in words a person can act on.
 ///
@@ -395,11 +368,14 @@ const SESSION: &[Command] = &[
 /// does not get two wordings depending on which path it came back along.
 pub(crate) fn refusal(error: HostError) -> String {
     match error {
-        HostError::Busy { reason } => format!("现在不行:{reason}"),
-        HostError::NotFound => "找不到:会话已经换过,或者没有这个会话".into(),
-        HostError::SessionInUse { id } => format!("会话 {id} 正在别处用着"),
-        HostError::Unavailable => "宿主现在不可用".into(),
-        HostError::ProviderUnavailable { reason } => format!("没有可用的模型:{reason:?}"),
+        HostError::Busy { reason } => t(Msg::HostBusy { reason: &reason }).into_owned(),
+        HostError::NotFound => t(Msg::HostNotFound).into_owned(),
+        HostError::SessionInUse { id } => t(Msg::HostSessionInUse { id: &id }).into_owned(),
+        HostError::Unavailable => t(Msg::HostUnavailable).into_owned(),
+        HostError::ProviderUnavailable { reason } => t(Msg::HostNoProvider {
+            reason: &format!("{reason:?}"),
+        })
+        .into_owned(),
         HostError::Failed { message } => message,
         other => format!("{other:?}"),
     }
@@ -411,23 +387,27 @@ impl CommandSet for SessionCommands {
         "cmd-session"
     }
     fn commands(&self) -> Vec<Command> {
-        SESSION.to_vec()
+        session_catalogue()
     }
     /// What `/agents` dispatches when a row is picked. Not listed: nobody types
     /// it, and a session id in the menu would be noise (`CommandSet::hidden`).
     fn hidden(&self) -> Vec<Command> {
-        vec![Command::taking("look", "<会话 id>", "把屏幕切到那个 agent")]
+        vec![Command::said_taking(
+            "look",
+            t(Msg::CmdTakesSessionIdRequired),
+            t(Msg::CmdAboutLook),
+        )]
     }
     async fn run(&self, name: &str, args: &str, ctx: &Context) -> Outcome {
         let Some(client) = ctx.service::<crate::plugin::AgentClientSvc>() else {
-            return Outcome::Refused("这块屏幕没接上 agent".into());
+            return Outcome::Refused(t(Msg::NoAgent).into_owned());
         };
         // Asking is all a command may do here: which session is on screen is
         // screen state, and the loop writes it (`Action::LookAt`).
         if name == "look" {
             let session = args.trim();
             if session.is_empty() {
-                return Outcome::Refused("要切到哪个会话?".into());
+                return Outcome::Refused(t(Msg::LookWhichSession).into_owned());
             }
             return Outcome::Do(Action::LookAt(session.to_string()));
         }
@@ -436,20 +416,23 @@ impl CommandSet for SessionCommands {
         // is on screen.
         let root = client.root();
         let host = |control: Option<std::sync::Arc<dyn atomcode_host_api::HostControl>>| {
-            control.ok_or_else(|| Outcome::Refused("这块屏幕没接上宿主".into()))
+            control.ok_or_else(|| Outcome::Refused(t(Msg::NoHost).into_owned()))
         };
         match name {
             "cancel-all" => {
                 let members = client.cancel_all();
-                Outcome::Said(if members == 0 {
-                    "已停下当前回合".into()
-                } else {
-                    format!("已停下当前回合,以及 {members} 个成员的")
-                })
+                Outcome::Said(
+                    if members == 0 {
+                        t(Msg::CancelledTurn)
+                    } else {
+                        t(Msg::CancelledTurnAndMembers { members })
+                    }
+                    .into_owned(),
+                )
             }
             "compact" => {
                 if !client.described().is_some_and(|d| d.compaction) {
-                    return Outcome::Refused("这个 agent 没有压缩策略".into());
+                    return Outcome::Refused(t(Msg::NoCompaction).into_owned());
                 }
                 // Over the handle, so it waits behind a running turn like every
                 // other driver's `/compact`. The outcome comes back as an event
@@ -469,11 +452,12 @@ impl CommandSet for SessionCommands {
                     })
                     .max()
                     .unwrap_or(0);
-                let mut said = format!(
-                    "{turn} 轮 · {} 条模型可见消息 · {} 条事实",
-                    derive_messages(&events).len(),
-                    events.len()
-                );
+                let mut said = t(Msg::ContextCounts {
+                    turn,
+                    messages: derive_messages(&events).len(),
+                    facts: events.len(),
+                })
+                .into_owned();
                 // What the screen counted is not the budget: the host packs a
                 // system prompt, instructions and tool definitions nobody here
                 // ever saw. Ask it, and say both — the counts answer "what is
@@ -504,7 +488,7 @@ impl CommandSet for SessionCommands {
                     .collect::<Vec<_>>()
                     .join("\n");
                 Outcome::Said(if text.is_empty() {
-                    "还没有对话".into()
+                    t(Msg::NothingSaidYet).into_owned()
                 } else {
                     text
                 })
@@ -522,7 +506,7 @@ impl CommandSet for SessionCommands {
             // host does here; ctrl-u is the gesture for the line.
             "clear" | "session" => {
                 let Some(control) = control else {
-                    return Outcome::Refused("这块屏幕没接上宿主".into());
+                    return Outcome::Refused(t(Msg::NoHost).into_owned());
                 };
                 match control
                     .call(HostCommand::NewSession {
@@ -544,16 +528,14 @@ impl CommandSet for SessionCommands {
             // which session is on screen is screen state (`docs/adr/0021`).
             "agents" => {
                 let Some(roster) = ctx.service::<crate::plugin::TeamRosterSvc>() else {
-                    return Outcome::Refused(
-                        "这块屏幕没有 agent 名册:启动器没有提供 `tui-team-roster`".into(),
-                    );
+                    return Outcome::Refused(t(Msg::NoRoster).into_owned());
                 };
                 let mut choices: Vec<crate::overlay::Choice> = Vec::new();
                 if !root.is_empty() {
                     choices.push(
                         crate::overlay::Choice::new(
                             format!("/look {root}"),
-                            "主 · 这个会话本身".to_string(),
+                            t(Msg::AgentsLead).into_owned(),
                         )
                         .about(root.clone()),
                     );
@@ -566,7 +548,7 @@ impl CommandSet for SessionCommands {
                             // stopped member's conversation is still there and
                             // is not something to talk to.
                             if gone {
-                                format!("{name} · 已停,日志还在")
+                                t(Msg::AgentsStopped { name: &name }).into_owned()
                             } else {
                                 name.clone()
                             },
@@ -575,17 +557,17 @@ impl CommandSet for SessionCommands {
                     );
                 }
                 if choices.is_empty() {
-                    return Outcome::Said("这个会话底下还没有别的 agent".into());
+                    return Outcome::Said(t(Msg::AgentsNoneYet).into_owned());
                 }
                 Outcome::Open(crate::overlay::Picker::new(
                     "agents",
-                    "看谁 · enter 切过去",
+                    t(Msg::AgentsPickerHint),
                     choices,
                 ))
             }
             "resume" => {
                 let Some(control) = control else {
-                    return Outcome::Refused("这块屏幕没接上宿主".into());
+                    return Outcome::Refused(t(Msg::NoHost).into_owned());
                 };
                 let target = args.trim();
                 if target.is_empty() {
@@ -608,7 +590,8 @@ impl CommandSet for SessionCommands {
                                     )
                                     .about(
                                         if stored.needs_newer_version {
-                                            format!("需要更新版本才能打开 · {}", stored.id)
+                                            t(Msg::SessionNeedsNewerVersion { id: &stored.id })
+                                                .into_owned()
                                         } else {
                                             // When, and where — the two things a
                                             // person sorts by when several sessions
@@ -616,23 +599,28 @@ impl CommandSet for SessionCommands {
                                             // `StoredSession` and neither was shown.
                                             let when = crate::text::when(stored.updated_at);
                                             match &stored.working_dir {
-                                                Some(dir) => format!(
-                                                    "{} 轮 · {when} · {}",
-                                                    stored.turns,
-                                                    crate::text::collapse_home(dir)
-                                                ),
-                                                None => format!("{} 轮 · {when}", stored.turns),
+                                                Some(dir) => t(Msg::SessionTurnsWhenWhere {
+                                                    turns: stored.turns,
+                                                    when: &when,
+                                                    dir: &crate::text::collapse_home(dir),
+                                                })
+                                                .into_owned(),
+                                                None => t(Msg::SessionTurnsWhen {
+                                                    turns: stored.turns,
+                                                    when: &when,
+                                                })
+                                                .into_owned(),
                                             }
                                         },
                                     )
                                 })
                                 .collect();
                             if choices.is_empty() {
-                                Outcome::Said("没有别的存下的会话".into())
+                                Outcome::Said(t(Msg::ResumeNoOthers).into_owned())
                             } else {
                                 Outcome::Open(crate::overlay::Picker::new(
                                     "resume",
-                                    "回到哪个会话 · enter 打开",
+                                    t(Msg::ResumePickerHint),
                                     choices,
                                 ))
                             }
@@ -676,18 +664,18 @@ impl CommandSet for SessionCommands {
                                 format!("/effort {level}"),
                                 (*level).to_string(),
                             )
-                            .about("这个会话的思考强度")
+                            .about(t(Msg::EffortAbout))
                             .marked(current.as_deref() == Some(*level))
                         })
                         .collect();
                     choices.push(
                         crate::overlay::Choice::new("/effort default", "default")
-                            .about("交给端点决定")
+                            .about(t(Msg::EffortDefaultAbout))
                             .marked(current.is_none()),
                     );
                     let title = match &current {
-                        Some(level) => format!("思考强度 · 现在 {level} · enter 改"),
-                        None => "思考强度 · 现在交给端点 · enter 改".to_string(),
+                        Some(level) => t(Msg::EffortPickerTitle { level }),
+                        None => t(Msg::EffortPickerTitleDefault),
                     };
                     return Outcome::Open(crate::overlay::Picker::new("effort", title, choices));
                 }
@@ -696,13 +684,16 @@ impl CommandSet for SessionCommands {
                 } else if levels.contains(&wanted) {
                     ReasoningEffort::from_config(Some(wanted))
                 } else {
-                    return Outcome::Refused(format!(
-                        "未知强度 `{wanted}`;可选:{}, default",
-                        levels.join(", ")
-                    ));
+                    return Outcome::Refused(
+                        t(Msg::EffortUnknown {
+                            wanted,
+                            levels: &levels.join(", "),
+                        })
+                        .into_owned(),
+                    );
                 };
                 let Some(control) = control else {
-                    return Outcome::Refused("这块屏幕没接上宿主".into());
+                    return Outcome::Refused(t(Msg::NoHost).into_owned());
                 };
                 match control
                     .call(HostCommand::SetReasoningEffort {
@@ -713,7 +704,7 @@ impl CommandSet for SessionCommands {
                 {
                     Ok(_) => {
                         client.chose_effort(level);
-                        Outcome::Said(format!("思考强度 → {wanted}"))
+                        Outcome::Said(t(Msg::EffortSet { wanted }).into_owned())
                     }
                     Err(error) => Outcome::Refused(refusal(error)),
                 }
@@ -726,14 +717,16 @@ impl CommandSet for SessionCommands {
                     Err(refused) => return refused,
                 };
                 if client.session() != root {
-                    return Outcome::Refused("撤销只对主会话:先切回「主」".into());
+                    return Outcome::Refused(t(Msg::UndoLeadOnly).into_owned());
                 }
                 let mut words = args.split_whitespace();
                 let turn = match words.next().map(str::parse::<u64>) {
                     None => None,
                     Some(Ok(turn)) => Some(turn),
                     Some(Err(_)) => {
-                        return Outcome::Refused(format!("`{}` 不是回合号", args.trim()))
+                        return Outcome::Refused(
+                            t(Msg::NotATurnNumber { what: args.trim() }).into_owned(),
+                        )
                     }
                 };
                 let based_on = client.root_high();
@@ -758,8 +751,14 @@ impl CommandSet for SessionCommands {
                                 let choices = points
                                     .into_iter()
                                     .map(|point| {
+                                        // The word the parser takes, not the one
+                                        // on screen: this string is dispatched as
+                                        // a command, and a command spelled in
+                                        // whichever language was in force when the
+                                        // menu opened is a command that stops
+                                        // parsing when the language changes.
                                         let scope = if point.code && code_unavailable.is_none() {
-                                            " 全部"
+                                            " both"
                                         } else {
                                             ""
                                         };
@@ -767,26 +766,32 @@ impl CommandSet for SessionCommands {
                                             format!("/rewind {}{scope}", point.turn),
                                             point.prompt.clone(),
                                         )
-                                        .about(format!(
-                                            "回合 {} · {} 个文件改动",
-                                            point.turn, point.files
+                                        .about(t(
+                                            Msg::RewindPointAbout {
+                                                turn: point.turn,
+                                                files: point.files,
+                                            },
                                         ))
                                     })
                                     .collect();
                                 Outcome::Open(crate::overlay::Picker::new(
                                     "rewind",
-                                    "回到哪一回合之前 · enter 回去",
+                                    t(Msg::RewindPickerHint),
                                     choices,
                                 ))
                             }
                             Ok(HostReply::RewindPoints { .. }) => {
-                                Outcome::Said("还没有可以回去的回合".into())
+                                Outcome::Said(t(Msg::RewindNoPoints).into_owned())
                             }
                             Ok(other) => Outcome::Refused(format!("{other:?}")),
                             Err(error) => Outcome::Refused(refusal(error)),
                         };
                     };
                     let scope = match words.next() {
+                        // Both spellings of each scope are taken, in either
+                        // language: what a person typed last month must keep
+                        // parsing after `/language`, and a menu pick dispatches
+                        // the English one (see the picker above).
                         None | Some("对话") | Some("conversation") => {
                             atomcode_kernel::session::RewindScope::Conversation
                         }
@@ -797,9 +802,9 @@ impl CommandSet for SessionCommands {
                             atomcode_kernel::session::RewindScope::Both
                         }
                         Some(other) => {
-                            return Outcome::Refused(format!(
-                                "`{other}` 不是范围;可选:对话、代码、全部"
-                            ))
+                            return Outcome::Refused(
+                                t(Msg::RewindScopeUnknown { what: other }).into_owned(),
+                            )
                         }
                     };
                     control
@@ -816,9 +821,12 @@ impl CommandSet for SessionCommands {
                         prompt: Some(prompt),
                         ..
                     }) => Outcome::Do(Action::Paste(prompt)),
-                    Ok(HostReply::Undone { restored_files, .. }) => {
-                        Outcome::Said(format!("已还原 {} 个文件", restored_files.len()))
-                    }
+                    Ok(HostReply::Undone { restored_files, .. }) => Outcome::Said(
+                        t(Msg::RewindRestored {
+                            files: restored_files.len(),
+                        })
+                        .into_owned(),
+                    ),
                     Ok(other) => Outcome::Refused(format!("{other:?}")),
                     Err(error) => Outcome::Refused(refusal(error)),
                 }
@@ -836,10 +844,13 @@ impl CommandSet for SessionCommands {
                     };
                     return match control.call(HostCommand::Models { session: root }).await {
                         Ok(HostReply::Models { models, current }) if models.is_empty() => {
-                            Outcome::Said(match current {
-                                Some(current) => format!("当前模型:{current};没有别的可选"),
-                                None => "没有配置可选的模型".into(),
-                            })
+                            Outcome::Said(
+                                match current {
+                                    Some(current) => t(Msg::ModelOnlyCurrent { current: &current }),
+                                    None => t(Msg::ModelNoneConfigured),
+                                }
+                                .into_owned(),
+                            )
                         }
                         Ok(HostReply::Models { models, current }) => {
                             let choices: Vec<crate::overlay::Choice> = models
@@ -856,7 +867,7 @@ impl CommandSet for SessionCommands {
                                 .collect();
                             Outcome::Open(crate::overlay::Picker::new(
                                 "model",
-                                "换成哪个模型 · enter 换过去",
+                                t(Msg::ModelPickerHint),
                                 choices,
                             ))
                         }
@@ -875,26 +886,20 @@ impl CommandSet for SessionCommands {
                     })
                     .await
                 {
-                    Ok(_) => Outcome::Said(format!("模型 → {wanted}")),
+                    Ok(_) => Outcome::Said(t(Msg::ModelSet { wanted }).into_owned()),
                     Err(error) => Outcome::Refused(refusal(error)),
                 }
             }
             "mode" => {
                 use atomcode_host_api::Mode;
                 let wanted = match args.trim() {
-                    "" => {
-                        return Outcome::Said(
-                            "plan 只看不动 · ask 动手前问 · edits 改文件不问 · auto 全不问".into(),
-                        )
-                    }
+                    "" => return Outcome::Said(t(Msg::ModeWhatEachDoes).into_owned()),
                     "plan" => Mode::Plan,
                     "ask" => Mode::Ask,
                     "edits" | "accept-edits" => Mode::AcceptEdits,
                     "auto" => Mode::Auto,
                     other => {
-                        return Outcome::Refused(format!(
-                            "`{other}` 不是一档;可选:plan、ask、edits、auto"
-                        ))
+                        return Outcome::Refused(t(Msg::ModeUnknown { what: other }).into_owned())
                     }
                 };
                 let control = match host(control) {
@@ -908,7 +913,7 @@ impl CommandSet for SessionCommands {
                     })
                     .await
                 {
-                    Ok(_) => Outcome::Said(format!("现在是 {}", args.trim())),
+                    Ok(_) => Outcome::Said(t(Msg::ModeSet { mode: args.trim() }).into_owned()),
                     Err(error) => Outcome::Refused(refusal(error)),
                 }
             }
@@ -950,7 +955,7 @@ impl CommandSet for SessionCommands {
                                 format!("/cd {}/", up.display()),
                                 "..".to_string(),
                             )
-                            .about("上一层".to_string()),
+                            .about(t(Msg::CdUpOneLevel)),
                         );
                     }
                     match std::fs::read_dir(&from) {
@@ -969,11 +974,19 @@ impl CommandSet for SessionCommands {
                                         format!("/cd {}/", at.display()),
                                         name,
                                     )
-                                    .about("进去看看".to_string()),
+                                    .about(t(Msg::CdStepInto)),
                                 );
                             }
                         }
-                        Err(error) => return Outcome::Refused(format!("读不了 {from}:{error}")),
+                        Err(error) => {
+                            return Outcome::Refused(
+                                t(Msg::FileUnreadable {
+                                    path: &from,
+                                    error: &error.to_string(),
+                                })
+                                .into_owned(),
+                            )
+                        }
                     }
                     // Staying is a choice too — and the only way to say "this
                     // one" once you have stepped into it.
@@ -981,16 +994,15 @@ impl CommandSet for SessionCommands {
                         0,
                         crate::overlay::Choice::new(
                             format!("/cd {from}"),
-                            "就在这儿干活".to_string(),
+                            t(Msg::CdStayHere).into_owned(),
                         )
                         .about(crate::text::collapse_home(&from)),
                     );
                     return Outcome::Open(crate::overlay::Picker::new(
                         "cd",
-                        format!(
-                            "换到哪个目录 · 现在在 {}",
-                            crate::text::collapse_home(&from)
-                        ),
+                        t(Msg::CdPickerHint {
+                            here: &crate::text::collapse_home(&from),
+                        }),
                         choices,
                     ));
                 }
@@ -1007,10 +1019,14 @@ impl CommandSet for SessionCommands {
                 {
                     // A new session: what was read and written belongs to where
                     // it ran, so the screen follows the new stream.
-                    Ok(HostReply::SessionChanged { session }) => {
-                        Outcome::Said(format!("现在在 {directory} 里干活 · 新会话 {session}"))
-                    }
-                    Ok(_) => Outcome::Said(format!("现在在 {directory} 里干活")),
+                    Ok(HostReply::SessionChanged { session }) => Outcome::Said(
+                        t(Msg::CdMovedNewSession {
+                            directory,
+                            session: &session,
+                        })
+                        .into_owned(),
+                    ),
+                    Ok(_) => Outcome::Said(t(Msg::CdMoved { directory }).into_owned()),
                     Err(error) => Outcome::Refused(refusal(error)),
                 }
             }
@@ -1046,12 +1062,14 @@ impl CommandSet for SessionCommands {
                     }) => {
                         let what = file.unwrap_or_default();
                         if text.trim().is_empty() {
-                            return Outcome::Said(format!("{what} 没有改动"));
+                            return Outcome::Said(
+                                t(Msg::DiffNoChangeIn { what: &what }).into_owned(),
+                            );
                         }
                         Outcome::Open(crate::overlay::Reading::diff(what, &text))
                     }
                     Ok(HostReply::Changes { files, .. }) if files.is_empty() => {
-                        Outcome::Said("这个会话还没有改过工作区里的文件".into())
+                        Outcome::Said(t(Msg::DiffNothingChanged).into_owned())
                     }
                     Ok(HostReply::Changes { files, .. }) => {
                         let count = files.len();
@@ -1062,7 +1080,7 @@ impl CommandSet for SessionCommands {
                             .into_iter()
                             .map(|f| {
                                 let about = if f.binary {
-                                    "二进制".to_string()
+                                    t(Msg::DiffBinary).into_owned()
                                 } else {
                                     format!("+{} -{}", f.added, f.removed)
                                 };
@@ -1078,11 +1096,20 @@ impl CommandSet for SessionCommands {
                             .collect();
                         Outcome::Open(crate::overlay::Picker::new(
                             "diff",
-                            format!("改过 {count} 个文件 · +{added} -{removed} · enter 看改动"),
+                            t(Msg::DiffPickerHint {
+                                count,
+                                added,
+                                removed,
+                            }),
                             choices,
                         ))
                     }
-                    Ok(other) => Outcome::Refused(format!("宿主答了别的:{other:?}")),
+                    Ok(other) => Outcome::Refused(
+                        t(Msg::HostSaidSomethingElse {
+                            reply: &format!("{other:?}"),
+                        })
+                        .into_owned(),
+                    ),
                     Err(error) => Outcome::Refused(refusal(error)),
                 }
             }
@@ -1101,11 +1128,18 @@ impl CommandSet for SessionCommands {
                     .await
                 {
                     Ok(HostReply::Settings { settings }) => settings,
-                    Ok(other) => return Outcome::Refused(format!("宿主答了别的:{other:?}")),
+                    Ok(other) => {
+                        return Outcome::Refused(
+                            t(Msg::HostSaidSomethingElse {
+                                reply: &format!("{other:?}"),
+                            })
+                            .into_owned(),
+                        )
+                    }
                     Err(error) => return Outcome::Refused(refusal(error)),
                 };
                 let Some(setting) = settings.into_iter().find(|s| s.id == "language") else {
-                    return Outcome::Refused("这个宿主没有语言这一项".into());
+                    return Outcome::Refused(t(Msg::NoLanguageSetting).into_owned());
                 };
                 let wanted = args.trim();
                 // With nothing after it, say what it is and what it takes.
@@ -1113,10 +1147,13 @@ impl CommandSet for SessionCommands {
                 // its own search and editing — and a session command cannot
                 // open it for one row, so this names the row instead.
                 if wanted.is_empty() {
-                    return Outcome::Said(format!(
-                        "语言:{} · 可选 {} · `/language <值>` 改它",
-                        setting.value, setting.accepts
-                    ));
+                    return Outcome::Said(
+                        t(Msg::LanguageNow {
+                            value: &setting.value,
+                            accepts: &setting.accepts,
+                        })
+                        .into_owned(),
+                    );
                 }
                 match control
                     .call(HostCommand::SetSetting {
@@ -1126,7 +1163,13 @@ impl CommandSet for SessionCommands {
                     })
                     .await
                 {
-                    Ok(_) => Outcome::Said(format!("语言:{wanted}({}生效)", setting.applies)),
+                    Ok(_) => Outcome::Said(
+                        t(Msg::LanguageSet {
+                            wanted,
+                            applies: &setting.applies,
+                        })
+                        .into_owned(),
+                    ),
                     Err(error) => Outcome::Refused(refusal(error)),
                 }
             }
@@ -1153,7 +1196,7 @@ impl CommandSet for SessionCommands {
                 };
                 match control.call(HostCommand::Usage { session: root }).await {
                     Ok(HostReply::Usage { windows, .. }) if windows.is_empty() => {
-                        Outcome::Said("这个宿主不计额度".into())
+                        Outcome::Said(t(Msg::UsageNotCounted).into_owned())
                     }
                     Ok(HostReply::Usage { windows, .. }) => Outcome::Said(
                         windows
@@ -1161,31 +1204,43 @@ impl CommandSet for SessionCommands {
                             .map(|w| {
                                 let cap = w
                                     .call_limit
-                                    .map(|n| format!(" · 上限 {n} 次"))
+                                    .map(|n| t(Msg::UsageCallLimit { n }).into_owned())
                                     .unwrap_or_default();
                                 if w.exhausted {
                                     // The one line a person actually needs, and
                                     // the reason this is not `/cost`.
-                                    format!(
-                                        "{} 用完了 · {}回来{}",
-                                        w.label,
-                                        if w.resets_at.is_empty() {
-                                            crate::text::spoken_duration(
-                                                w.resets_in_seconds.max(0) as u64
-                                            ) + "后"
-                                        } else {
-                                            format!("{} ", w.resets_at)
-                                        },
-                                        cap
-                                    )
+                                    let when = if w.resets_at.is_empty() {
+                                        t(Msg::UsageResetsIn {
+                                            duration: &crate::text::spoken_duration(
+                                                w.resets_in_seconds.max(0) as u64,
+                                            ),
+                                        })
+                                    } else {
+                                        t(Msg::UsageResetsAt { at: &w.resets_at })
+                                    };
+                                    t(Msg::UsageExhausted {
+                                        label: &w.label,
+                                        when: &when,
+                                        cap: &cap,
+                                    })
+                                    .into_owned()
                                 } else {
-                                    format!("{} 还有{cap}", w.label)
+                                    t(Msg::UsageLeft {
+                                        label: &w.label,
+                                        cap: &cap,
+                                    })
+                                    .into_owned()
                                 }
                             })
                             .collect::<Vec<_>>()
                             .join("\n"),
                     ),
-                    Ok(other) => Outcome::Refused(format!("宿主答了别的:{other:?}")),
+                    Ok(other) => Outcome::Refused(
+                        t(Msg::HostSaidSomethingElse {
+                            reply: &format!("{other:?}"),
+                        })
+                        .into_owned(),
+                    ),
                     Err(error) => Outcome::Refused(refusal(error)),
                 }
             }
@@ -1201,28 +1256,51 @@ impl CommandSet for SessionCommands {
                     .await
                 {
                     Ok(HostReply::Autonomy { running: None }) => {
-                        Outcome::Said("现在没有在自己干".into())
+                        Outcome::Said(t(Msg::AutonomyIdle).into_owned())
                     }
                     Ok(HostReply::Autonomy {
                         running: Some(running),
                     }) => {
                         let what = if running.kind == "goal" {
-                            format!("目标:{}", running.what)
+                            t(Msg::AutonomyGoal {
+                                what: &running.what,
+                            })
                         } else {
-                            format!("循环:{}", running.what)
+                            t(Msg::AutonomyLoop {
+                                what: &running.what,
+                            })
                         };
                         let rounds = match running.of {
-                            Some(of) => format!("第 {}/{of} 轮", running.round),
-                            None => format!("第 {} 轮", running.round),
+                            Some(of) => t(Msg::AutonomyRoundOf {
+                                round: running.round,
+                                of,
+                            }),
+                            None => t(Msg::AutonomyRound {
+                                round: running.round,
+                            }),
                         };
                         let took = crate::text::spoken_duration(running.elapsed_secs);
-                        let line = format!("{what} · {rounds} · 已跑 {took}");
+                        let line = t(Msg::AutonomyLine {
+                            what: &what,
+                            rounds: &rounds,
+                            took: &took,
+                        })
+                        .into_owned();
                         Outcome::Said(match running.paused {
-                            Some(why) => format!("{line} · 停着:{why}"),
+                            Some(why) => t(Msg::AutonomyHeld {
+                                line: &line,
+                                why: &why,
+                            })
+                            .into_owned(),
                             None => line,
                         })
                     }
-                    Ok(other) => Outcome::Refused(format!("宿主答了别的:{other:?}")),
+                    Ok(other) => Outcome::Refused(
+                        t(Msg::HostSaidSomethingElse {
+                            reply: &format!("{other:?}"),
+                        })
+                        .into_owned(),
+                    ),
                     Err(error) => Outcome::Refused(refusal(error)),
                 }
             }
@@ -1247,16 +1325,26 @@ impl CommandSet for SessionCommands {
                 let model = described
                     .as_ref()
                     .and_then(|d| d.model.clone())
-                    .unwrap_or_else(|| "没有挂模型".into());
+                    .unwrap_or_else(|| t(Msg::StatusNoModel).into_owned());
                 let effort = described
                     .as_ref()
                     .and_then(|d| d.reasoning_effort)
                     .map(|level| level.as_str().to_string())
-                    .unwrap_or_else(|| "端点默认".into());
+                    .unwrap_or_else(|| t(Msg::StatusEffortDefault).into_owned());
                 let mut lines = vec![
-                    format!("会话 {}", client.session()),
-                    format!("模型 {model} · 思考强度 {effort}"),
-                    format!("在 {}", crate::text::collapse_home(&client.root())),
+                    t(Msg::StatusSessionLine {
+                        session: &client.session(),
+                    })
+                    .into_owned(),
+                    t(Msg::StatusModelLine {
+                        model: &model,
+                        effort: &effort,
+                    })
+                    .into_owned(),
+                    t(Msg::StatusWhereLine {
+                        where_: &crate::text::collapse_home(&client.root()),
+                    })
+                    .into_owned(),
                 ];
                 if let Some(control) = control {
                     if let Ok(HostReply::Autonomy {
@@ -1267,12 +1355,14 @@ impl CommandSet for SessionCommands {
                         })
                         .await
                     {
-                        lines.push(format!(
-                            "在自己干:{} · 第 {} 轮 · 已跑 {}",
-                            running.what,
-                            running.round,
-                            crate::text::spoken_duration(running.elapsed_secs)
-                        ));
+                        lines.push(
+                            t(Msg::StatusAutonomyLine {
+                                what: &running.what,
+                                round: running.round,
+                                took: &crate::text::spoken_duration(running.elapsed_secs),
+                            })
+                            .into_owned(),
+                        );
                     }
                 }
                 Outcome::Said(lines.join("\n"))
@@ -1293,16 +1383,21 @@ impl CommandSet for SessionCommands {
                         who,
                         detail,
                     }) => {
-                        let who = who.unwrap_or_else(|| "登录着,但宿主没说是谁".into());
+                        let who = who.unwrap_or_else(|| t(Msg::WhoAmIUnnamed).into_owned());
                         Outcome::Said(match detail {
                             Some(detail) => format!("{who} · {detail}"),
                             None => who,
                         })
                     }
                     Ok(HostReply::Identity { .. }) => {
-                        Outcome::Said("没有人登录;这份配置用的是自带的凭据".into())
+                        Outcome::Said(t(Msg::WhoAmINobody).into_owned())
                     }
-                    Ok(other) => Outcome::Refused(format!("宿主答了别的:{other:?}")),
+                    Ok(other) => Outcome::Refused(
+                        t(Msg::HostSaidSomethingElse {
+                            reply: &format!("{other:?}"),
+                        })
+                        .into_owned(),
+                    ),
                     Err(error) => Outcome::Refused(refusal(error)),
                 }
             }
@@ -1322,20 +1417,27 @@ impl CommandSet for SessionCommands {
                             .await
                         {
                             Ok(HostReply::Settings { settings }) => match settings.first() {
-                                Some(setting) => Outcome::Said(format!(
-                                    "思考:{};改用 /think on 或 /think off",
-                                    setting.value
-                                )),
-                                None => Outcome::Refused("这个宿主没有思考开关".into()),
+                                Some(setting) => Outcome::Said(
+                                    t(Msg::ThinkingNow {
+                                        value: &setting.value,
+                                    })
+                                    .into_owned(),
+                                ),
+                                None => Outcome::Refused(t(Msg::NoThinkingSwitch).into_owned()),
                             },
-                            Ok(other) => Outcome::Refused(format!("宿主答了别的:{other:?}")),
+                            Ok(other) => Outcome::Refused(
+                                t(Msg::HostSaidSomethingElse {
+                                    reply: &format!("{other:?}"),
+                                })
+                                .into_owned(),
+                            ),
                             Err(error) => Outcome::Refused(refusal(error)),
                         }
                     }
                     "on" | "true" => true,
                     "off" | "false" => false,
                     other => {
-                        return Outcome::Refused(format!("`{other}` 不是 on 或 off"));
+                        return Outcome::Refused(t(Msg::NotOnOrOff { what: other }).into_owned());
                     }
                 };
                 match control
@@ -1345,14 +1447,19 @@ impl CommandSet for SessionCommands {
                     })
                     .await
                 {
-                    Ok(_) => Outcome::Said(format!("思考:{}", if on { "on" } else { "off" })),
+                    Ok(_) => Outcome::Said(
+                        t(Msg::ThinkingSet {
+                            value: if on { "on" } else { "off" },
+                        })
+                        .into_owned(),
+                    ),
                     Err(error) => Outcome::Refused(refusal(error)),
                 }
             }
             "rename" => {
                 let title = args.trim();
                 if title.is_empty() {
-                    return Outcome::Refused("要一个名字:/rename <名字>".into());
+                    return Outcome::Refused(t(Msg::RenameNeedsName).into_owned());
                 }
                 let control = match host(control) {
                     Ok(control) => control,
@@ -1365,7 +1472,7 @@ impl CommandSet for SessionCommands {
                     })
                     .await
                 {
-                    Ok(_) => Outcome::Said(format!("这个会话现在叫「{title}」")),
+                    Ok(_) => Outcome::Said(t(Msg::RenamedTo { title }).into_owned()),
                     Err(error) => Outcome::Refused(refusal(error)),
                 }
             }
@@ -1377,7 +1484,7 @@ impl CommandSet for SessionCommands {
                 match args.trim() {
                     "" => match control.call(HostCommand::McpStatus { session: root }).await {
                         Ok(HostReply::McpServers { servers }) if servers.is_empty() => {
-                            Outcome::Said("没有配置 MCP 服务器".into())
+                            Outcome::Said(t(Msg::McpNoneConfigured).into_owned())
                         }
                         Ok(HostReply::McpServers { servers }) => Outcome::Said(
                             servers
@@ -1385,12 +1492,14 @@ impl CommandSet for SessionCommands {
                                 .map(|server| {
                                     use atomcode_host_api::McpServerState as S;
                                     let state = match server.state {
-                                        S::Connecting => "连接中".to_string(),
-                                        S::Connected => "已连接".to_string(),
-                                        S::Untrusted => "未信任项目,未启动".to_string(),
-                                        S::Failed { message } => format!("失败:{message}"),
-                                        S::Disconnected => "已断开".to_string(),
-                                        _ => "未知".to_string(),
+                                        S::Connecting => t(Msg::McpConnecting),
+                                        S::Connected => t(Msg::McpConnected),
+                                        S::Untrusted => t(Msg::McpUntrusted),
+                                        S::Failed { message } => {
+                                            t(Msg::McpFailed { message: &message })
+                                        }
+                                        S::Disconnected => t(Msg::McpDisconnected),
+                                        _ => t(Msg::McpUnknownState),
                                     };
                                     format!("{} · {state}", server.name)
                                 })
@@ -1404,7 +1513,7 @@ impl CommandSet for SessionCommands {
                         .call(HostCommand::WithdrawMcpTools { session: root })
                         .await
                     {
-                        Ok(_) => Outcome::Said("已撤下全部 MCP 工具".into()),
+                        Ok(_) => Outcome::Said(t(Msg::McpWithdrawn).into_owned()),
                         Err(error) => Outcome::Refused(refusal(error)),
                     },
                     // `tools <server>`: which tools that server actually put on
@@ -1413,7 +1522,7 @@ impl CommandSet for SessionCommands {
                     rest if rest.starts_with("tools") => {
                         let server = rest.trim_start_matches("tools").trim();
                         if server.is_empty() {
-                            return Outcome::Refused("要一个服务器名:/mcp tools <服务器>".into());
+                            return Outcome::Refused(t(Msg::McpNeedsServerName).into_owned());
                         }
                         match control
                             .call(HostCommand::McpTools {
@@ -1423,16 +1532,16 @@ impl CommandSet for SessionCommands {
                             .await
                         {
                             Ok(HostReply::McpTools { tools }) if tools.is_empty() => {
-                                Outcome::Said(format!("{server} 没有挂上任何工具"))
+                                Outcome::Said(t(Msg::McpServerHasNoTools { server }).into_owned())
                             }
                             Ok(HostReply::McpTools { tools }) => Outcome::Said(tools.join("\n")),
                             Ok(other) => Outcome::Refused(format!("{other:?}")),
                             Err(error) => Outcome::Refused(refusal(error)),
                         }
                     }
-                    other => Outcome::Refused(format!(
-                        "`/mcp {other}` 不认识;可用:/mcp、/mcp tools <服务器>、/mcp withdraw"
-                    )),
+                    other => {
+                        Outcome::Refused(t(Msg::McpUnknownSubcommand { what: other }).into_owned())
+                    }
                 }
             }
             "reload" | "logout" | "login" => {
@@ -1441,18 +1550,12 @@ impl CommandSet for SessionCommands {
                     Err(refused) => return refused,
                 };
                 let (command, done) = match name {
-                    "reload" => (
-                        HostCommand::Reload { session: root },
-                        "已重新读取 skills、MCP 与配置",
-                    ),
-                    "logout" => (
-                        HostCommand::SignOut { session: root },
-                        "已登出;/login 重新登录",
-                    ),
-                    _ => (HostCommand::SignIn { session: root }, "已登录"),
+                    "reload" => (HostCommand::Reload { session: root }, t(Msg::Reloaded)),
+                    "logout" => (HostCommand::SignOut { session: root }, t(Msg::SignedOut)),
+                    _ => (HostCommand::SignIn { session: root }, t(Msg::SignedIn)),
                 };
                 match control.call(command).await {
-                    Ok(_) => Outcome::Said(done.into()),
+                    Ok(_) => Outcome::Said(done.into_owned()),
                     Err(error) => Outcome::Refused(refusal(error)),
                 }
             }
@@ -1466,7 +1569,9 @@ pub struct HelpCommands {
     pub all: Arc<Commands>,
 }
 
-const HELP: &[Command] = &[Command::new("help", "列出所有命令")];
+fn help_catalogue() -> Vec<Command> {
+    vec![Command::said("help", t(Msg::CmdAboutHelp))]
+}
 
 #[async_trait]
 impl CommandSet for HelpCommands {
@@ -1474,7 +1579,7 @@ impl CommandSet for HelpCommands {
         "cmd-help"
     }
     fn commands(&self) -> Vec<Command> {
-        HELP.to_vec()
+        help_catalogue()
     }
     async fn run(&self, _name: &str, _args: &str, _ctx: &Context) -> Outcome {
         let width = self
@@ -1586,14 +1691,14 @@ fn as_markdown(events: &[atomcode_kernel::session::LoggedEvent]) -> String {
     let mut out = String::new();
     for message in derive_messages(events) {
         let who = match message.role {
-            Role::User => "## 我",
-            Role::Assistant => "## 模型",
+            Role::User => t(Msg::MarkdownUser),
+            Role::Assistant => t(Msg::MarkdownAssistant),
             Role::System | Role::Tool => continue,
         };
         if message.text.trim().is_empty() {
             continue;
         }
-        out.push_str(who);
+        out.push_str(&who);
         out.push_str("\n\n");
         out.push_str(message.text.trim_end());
         out.push_str("\n\n");
@@ -2712,11 +2817,13 @@ mod tests {
 /// pattern (`/tools off mcp__github__*`) that would be a lot of ⏎ in a list.
 pub struct ToolCommands;
 
-const TOOLS: &[Command] = &[Command::taking(
-    "toolbox",
-    "[off <名字或 mcp__server__*> | on <同上>]",
-    "工具箱:不带参数拉出面板(看有哪些、开关它);带参数直接关掉或放回",
-)];
+fn tools_catalogue() -> Vec<Command> {
+    vec![Command::said_taking(
+        "toolbox",
+        t(Msg::CmdTakesToolbox),
+        t(Msg::CmdAboutToolbox),
+    )]
+}
 
 #[async_trait]
 impl CommandSet for ToolCommands {
@@ -2724,7 +2831,7 @@ impl CommandSet for ToolCommands {
         "cmd-tools"
     }
     fn commands(&self) -> Vec<Command> {
-        TOOLS.to_vec()
+        tools_catalogue()
     }
     async fn run(&self, _name: &str, args: &str, ctx: &Context) -> Outcome {
         let args = args.trim();
@@ -2732,7 +2839,7 @@ impl CommandSet for ToolCommands {
             return Outcome::Do(Action::ToggleTools);
         }
         let Some(port) = ctx.service::<crate::plugin::ToolCatalogSvc>() else {
-            return Outcome::Refused("这个屏幕没有接工具目录:启动器没有提供 `tui-tools`".into());
+            return Outcome::Refused(t(Msg::NoToolCatalog).into_owned());
         };
         let (verb, pattern) = match args.split_once(char::is_whitespace) {
             Some((verb, rest)) => (verb, rest.trim()),
@@ -2742,11 +2849,11 @@ impl CommandSet for ToolCommands {
             "on" => true,
             "off" => false,
             other => {
-                return Outcome::Refused(format!("不认识 `{other}`,只有 `off` 和 `on`"));
+                return Outcome::Refused(t(Msg::ToolboxUnknownVerb { what: other }).into_owned());
             }
         };
         if pattern.is_empty() {
-            return Outcome::Refused(format!("`{verb}` 要一个名字或模式,例如 `mcp__github__*`"));
+            return Outcome::Refused(t(Msg::ToolboxNeedsPattern { verb }).into_owned());
         }
         // What changed is read off the catalog the port answers with, not
         // guessed from what was asked: a name the config excluded does not move,
@@ -2766,14 +2873,16 @@ impl CommandSet for ToolCommands {
                     .map(|t| t.name.clone())
                     .collect();
                 if moved.is_empty() {
-                    return Outcome::Said(format!(
-                        "没有工具因此改变 —— `{pattern}` 要么没匹配上,要么是配置排除掉的"
-                    ));
+                    return Outcome::Said(t(Msg::ToolboxNothingMoved { pattern }).into_owned());
                 }
-                Outcome::Said(match on {
-                    true => format!("放回来了:{}", moved.join("、")),
-                    false => format!("关掉了:{}", moved.join("、")),
-                })
+                let names = moved.join(&t(Msg::ToolboxNameJoiner));
+                Outcome::Said(
+                    match on {
+                        true => t(Msg::ToolboxPutBack { names: &names }),
+                        false => t(Msg::ToolboxTurnedOff { names: &names }),
+                    }
+                    .into_owned(),
+                )
             }
             Err(why) => Outcome::Refused(why),
         }
@@ -2782,11 +2891,13 @@ impl CommandSet for ToolCommands {
 
 pub struct PluginCommands;
 
-const PLUGIN: &[Command] = &[Command::taking(
-    "plugin",
-    "[list | install <名字> | uninstall <名字> | update <名字> | marketplace …]",
-    "插件:不带参数拉出面板(装、卸、加市场);带参数直接做",
-)];
+fn plugin_catalogue() -> Vec<Command> {
+    vec![Command::said_taking(
+        "plugin",
+        t(Msg::CmdTakesPlugin),
+        t(Msg::CmdAboutPlugin),
+    )]
+}
 
 /// What `--scope` was set to, and everything that was not that.
 ///
@@ -2847,17 +2958,18 @@ fn pick<'a>(
         .filter(|row| row.name == name && market.is_none_or(|m| row.marketplace == m))
         .collect();
     match hits.len() {
-        0 => Err(format!("没有叫 {typed} 的插件")),
+        0 => Err(t(Msg::PluginNoSuch { typed }).into_owned()),
         1 => Ok(hits[0]),
         _ => {
             let lines: Vec<String> = hits
                 .iter()
                 .map(|row| format!("  /plugin {verb} {}@{}", row.name, row.marketplace))
                 .collect();
-            Err(format!(
-                "有好几个叫 {name} 的,说清是哪个:\n{}",
-                lines.join("\n")
-            ))
+            Err(t(Msg::PluginAmbiguous {
+                name,
+                lines: &lines.join("\n"),
+            })
+            .into_owned())
         }
     }
 }
@@ -2868,7 +2980,7 @@ impl CommandSet for PluginCommands {
         "cmd-plugin"
     }
     fn commands(&self) -> Vec<Command> {
-        PLUGIN.to_vec()
+        plugin_catalogue()
     }
     async fn run(&self, _name: &str, args: &str, ctx: &Context) -> Outcome {
         let args = args.trim();
@@ -2879,7 +2991,7 @@ impl CommandSet for PluginCommands {
             return Outcome::Do(Action::TogglePlugins);
         }
         let Some(port) = ctx.service::<crate::plugin::PluginsSvc>() else {
-            return Outcome::Refused("这个屏幕没有接插件:启动器没有提供 `tui-plugins`".into());
+            return Outcome::Refused(t(Msg::NoPluginPort).into_owned());
         };
         // Said as the job goes out, not after: a clone takes seconds, and a
         // command that printed nothing until it was over looks like a command
@@ -2906,28 +3018,37 @@ impl CommandSet for PluginCommands {
                     })
                     .collect();
                 if installed.is_empty() {
-                    return Outcome::Said("还什么都没装".into());
+                    return Outcome::Said(t(Msg::PluginNothingInstalled).into_owned());
                 }
-                Outcome::Said(format!("装着这些:\n{}", installed.join("\n")))
+                Outcome::Said(
+                    t(Msg::PluginInstalledList {
+                        lines: &installed.join("\n"),
+                    })
+                    .into_owned(),
+                )
             }
             "install" => {
                 let (scope, rest) = scope_from(rest);
                 let Some(typed) = rest.first() else {
-                    return Outcome::Refused("要装哪个?`/plugin install <名字>`".into());
+                    return Outcome::Refused(t(Msg::PluginInstallWhich).into_owned());
                 };
                 let row = match pick(view.plugins(), typed, "install") {
                     Ok(row) => row,
                     Err(why) => return Outcome::Refused(why),
                 };
                 if row.installed.is_some() {
-                    return Outcome::Refused(format!(
-                        "{} 已经装着了。要重装先 `/plugin uninstall {}`",
-                        row.id(),
-                        row.id()
-                    ));
+                    return Outcome::Refused(
+                        t(Msg::PluginAlreadyInstalled { id: &row.id() }).into_owned(),
+                    );
                 }
                 let (plugin, market) = (row.name.clone(), row.marketplace.clone());
-                announce(format!("正在装 {plugin}@{market} …"));
+                announce(
+                    t(Msg::PluginInstalling {
+                        plugin: &plugin,
+                        market: &market,
+                    })
+                    .into_owned(),
+                );
                 match port.install(&plugin, &market, scope).await {
                     Ok(said) => reload_then(ctx, said).await,
                     Err(why) => Outcome::Refused(why),
@@ -2935,7 +3056,7 @@ impl CommandSet for PluginCommands {
             }
             "uninstall" => {
                 let Some(typed) = rest.split_whitespace().next() else {
-                    return Outcome::Refused("要卸哪个?`/plugin uninstall <名字>`".into());
+                    return Outcome::Refused(t(Msg::PluginUninstallWhich).into_owned());
                 };
                 let installed: Vec<crate::plugins::PluginRow> = view
                     .plugins()
@@ -2945,10 +3066,12 @@ impl CommandSet for PluginCommands {
                     .collect();
                 let row = match pick(&installed, typed, "uninstall") {
                     Ok(row) => row.clone(),
-                    Err(_) => return Outcome::Refused(format!("没装着叫 {typed} 的插件")),
+                    Err(_) => {
+                        return Outcome::Refused(t(Msg::PluginNotInstalled { typed }).into_owned())
+                    }
                 };
                 let scope = row.installed.unwrap_or(crate::plugins::Scope::User);
-                announce(format!("正在卸 {} …", row.id()));
+                announce(t(Msg::PluginUninstalling { id: &row.id() }).into_owned());
                 match port.uninstall(&row.name, &row.marketplace, scope).await {
                     Ok(said) => reload_then(ctx, said).await,
                     Err(why) => Outcome::Refused(why),
@@ -2956,7 +3079,7 @@ impl CommandSet for PluginCommands {
             }
             "update" => {
                 let Some(typed) = rest.split_whitespace().next() else {
-                    return Outcome::Refused("要更新哪个?`/plugin update <名字>`".into());
+                    return Outcome::Refused(t(Msg::PluginUpdateWhich).into_owned());
                 };
                 let installed: Vec<crate::plugins::PluginRow> = view
                     .plugins()
@@ -2966,10 +3089,12 @@ impl CommandSet for PluginCommands {
                     .collect();
                 let row = match pick(&installed, typed, "update") {
                     Ok(row) => row.clone(),
-                    Err(_) => return Outcome::Refused(format!("没装着叫 {typed} 的插件")),
+                    Err(_) => {
+                        return Outcome::Refused(t(Msg::PluginNotInstalled { typed }).into_owned())
+                    }
                 };
                 let scope = row.installed.unwrap_or(crate::plugins::Scope::User);
-                announce(format!("正在更新 {} …", row.id()));
+                announce(t(Msg::PluginUpdating { id: &row.id() }).into_owned());
                 match port.update(&row.name, &row.marketplace, scope).await {
                     Ok(said) => reload_then(ctx, said).await,
                     Err(why) => Outcome::Refused(why),
@@ -2983,27 +3108,33 @@ impl CommandSet for PluginCommands {
                 match action {
                     "list" | "" => {
                         if view.markets().is_empty() {
-                            return Outcome::Said("一个市场都还没有".into());
+                            return Outcome::Said(t(Msg::MarketNoneYet).into_owned());
                         }
                         let lines: Vec<String> = view
                             .markets()
                             .iter()
                             .map(|m| {
-                                format!(
-                                    "  {}  {}  {} 个插件,装了 {}",
-                                    m.name, m.source, m.plugins, m.installed
-                                )
+                                t(Msg::MarketRow {
+                                    name: &m.name,
+                                    source: &m.source,
+                                    plugins: m.plugins,
+                                    installed: m.installed,
+                                })
+                                .into_owned()
                             })
                             .collect();
-                        Outcome::Said(format!("在册的市场:\n{}", lines.join("\n")))
+                        Outcome::Said(
+                            t(Msg::MarketList {
+                                lines: &lines.join("\n"),
+                            })
+                            .into_owned(),
+                        )
                     }
                     "add" => {
                         if rest.is_empty() {
-                            return Outcome::Refused(
-                                "要加哪个?`/plugin marketplace add <地址>`".into(),
-                            );
+                            return Outcome::Refused(t(Msg::MarketAddWhich).into_owned());
                         }
-                        announce(format!("正在取 {rest} …"));
+                        announce(t(Msg::MarketFetching { what: rest }).into_owned());
                         match port.add_market(rest).await {
                             Ok(said) => reload_then(ctx, said).await,
                             Err(why) => Outcome::Refused(why),
@@ -3011,11 +3142,9 @@ impl CommandSet for PluginCommands {
                     }
                     "remove" | "rm" => {
                         if rest.is_empty() {
-                            return Outcome::Refused(
-                                "要删哪个?`/plugin marketplace remove <名字>`".into(),
-                            );
+                            return Outcome::Refused(t(Msg::MarketRemoveWhich).into_owned());
                         }
-                        announce(format!("正在删市场 {rest} …"));
+                        announce(t(Msg::MarketRemoving { what: rest }).into_owned());
                         match port.remove_market(rest).await {
                             Ok(said) => reload_then(ctx, said).await,
                             Err(why) => Outcome::Refused(why),
@@ -3023,30 +3152,26 @@ impl CommandSet for PluginCommands {
                     }
                     "update" => {
                         if rest.is_empty() {
-                            return Outcome::Refused(
-                                "要更新哪个?`/plugin marketplace update <名字>`".into(),
-                            );
+                            return Outcome::Refused(t(Msg::MarketUpdateWhich).into_owned());
                         }
-                        announce(format!("正在更新市场 {rest} …"));
+                        announce(t(Msg::MarketUpdating { what: rest }).into_owned());
                         match port.update_market(rest).await {
                             Ok(said) => reload_then(ctx, said).await,
                             Err(why) => Outcome::Refused(why),
                         }
                     }
-                    other => Outcome::Refused(format!(
-                        "`/plugin marketplace` 没有 {other} 这个动作;有 list、add、remove、update"
-                    )),
+                    other => {
+                        Outcome::Refused(t(Msg::MarketUnknownAction { what: other }).into_owned())
+                    }
                 }
             }
             // The same reload `/reload` is, spelled the way the classic front
             // end spelled it: people who learned `/plugin reload` there keep it.
             "reload" => match reload(ctx).await {
-                Ok(()) => Outcome::Said("已重新读取 skills、MCP 与配置".into()),
+                Ok(()) => Outcome::Said(t(Msg::Reloaded).into_owned()),
                 Err(why) => Outcome::Refused(why),
             },
-            other => Outcome::Refused(format!(
-                "`/plugin` 没有 {other} 这个动作;有 list、install、uninstall、update、marketplace、reload,或者不带参数拉出面板"
-            )),
+            other => Outcome::Refused(t(Msg::PluginUnknownAction { what: other }).into_owned()),
         }
     }
 }
@@ -3061,18 +3186,22 @@ impl CommandSet for PluginCommands {
 async fn reload_then(ctx: &Context, said: String) -> Outcome {
     match reload(ctx).await {
         Ok(()) => Outcome::Said(said),
-        Err(why) => Outcome::Said(format!(
-            "{said}\n但会话没能重新加载,新东西要等下次启动才生效:{why}"
-        )),
+        Err(why) => Outcome::Said(
+            t(Msg::ReloadFailedAfter {
+                said: &said,
+                why: &why,
+            })
+            .into_owned(),
+        ),
     }
 }
 
 async fn reload(ctx: &Context) -> Result<(), String> {
     let Some(client) = ctx.service::<crate::plugin::AgentClientSvc>() else {
-        return Err("这块屏幕没接上 agent".into());
+        return Err(t(Msg::NoAgent).into_owned());
     };
     let Some(control) = client.control() else {
-        return Err("这块屏幕没接上宿主".into());
+        return Err(t(Msg::NoHost).into_owned());
     };
     control
         .call(HostCommand::Reload {

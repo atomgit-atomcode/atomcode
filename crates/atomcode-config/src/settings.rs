@@ -41,6 +41,21 @@ pub struct SettingSpec {
     pub apply: ApplyPolicy,
 }
 
+impl SettingSpec {
+    /// The label, in the language in force.
+    ///
+    /// Both labels were here from the start and every caller reached for
+    /// `label_zh`, so an English session read a settings panel in Chinese. One
+    /// accessor rather than three `if` at three call sites: the front ends and
+    /// the host contract all ask the same question.
+    pub fn label(&self) -> &'static str {
+        match crate::i18n::current_locale() {
+            crate::locale::Locale::ZhCn => self.label_zh,
+            crate::locale::Locale::En => self.label_en,
+        }
+    }
+}
+
 /// The catalog as an agent reads it: which file, what each setting accepts, and
 /// when a change takes effect.
 ///

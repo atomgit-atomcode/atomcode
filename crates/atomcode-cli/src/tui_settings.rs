@@ -17,6 +17,7 @@
 //!   the configuration again and rebuilds only what changed
 //!   (`atomcode-coding/src/front_end.rs`).
 
+use atomcode_i18n::screen::{t as tr, Msg as SMsg};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -109,7 +110,7 @@ impl ConfigSettings {
                     id: spec.id.to_string(),
                     // The screen speaks Chinese; the catalog carries both, for
                     // the same reason it carries both for the agent's answer.
-                    label: spec.label_zh.to_string(),
+                    label: spec.label().to_string(),
                     value: spec.value(&config),
                     kind: kind_of(spec.kind),
                     applies: applies_of(spec.apply),
@@ -144,7 +145,10 @@ fn retry_row(config: &atomcode_config::config::Config) -> Option<SettingRow> {
         .unwrap_or_default();
     Some(SettingRow {
         id: RETRY.to_string(),
-        label: format!("{selection} 的重试次数"),
+        label: tr(SMsg::RetryCountFor {
+            selection: &selection,
+        })
+        .into_owned(),
         value,
         kind: SettingKind::Integer { min: 0, max: 10 },
         applies: Applies::Reprepare,
@@ -160,7 +164,7 @@ fn write_retry(path: &PathBuf, value: Option<&str>) -> Result<(), String> {
     use atomcode_config::config::Config;
     let config = Config::load(path).map_err(|error| format!("{error:#}"))?;
     let Some(selection) = config.default_model.clone() else {
-        return Err("现在没有选中的模型,这一项无处可写".into());
+        return Err(tr(SMsg::NoModelSelected).into_owned());
     };
     atomcode_config::ConfigStore::new(path.clone())
         .update_document(|document| {
@@ -194,7 +198,7 @@ impl Settings for ConfigSettings {
             .iter()
             .find(|spec| spec.id == id)
         else {
-            return Err(format!("没有叫 `{id}` 的设置"));
+            return Err(tr(SMsg::NoSuchSetting { id }).into_owned());
         };
         let store = atomcode_config::ConfigStore::new(self.path.clone());
         store
@@ -222,7 +226,7 @@ impl Settings for ConfigSettings {
             .iter()
             .find(|spec| spec.id == id)
         else {
-            return Err(format!("没有叫 `{id}` 的设置"));
+            return Err(tr(SMsg::NoSuchSetting { id }).into_owned());
         };
         atomcode_config::ConfigStore::new(self.path.clone())
             .update_document(|document| {

@@ -480,10 +480,15 @@ fn fold_persistence_failure(
 ) -> Option<String> {
     match persisted {
         None => last_error,
-        Some(why) => Some(match last_error {
-            Some(had) => format!("{had}\n这一回合没能存下来:{why}"),
-            None => format!("这一回合没能存下来:{why}"),
-        }),
+        Some(why) => {
+            let said = atomcode_config::i18n::t(atomcode_config::i18n::Msg::TurnNotStoredCli {
+                why: &why,
+            });
+            Some(match last_error {
+                Some(had) => format!("{had}\n{said}"),
+                None => said.into_owned(),
+            })
+        }
     }
 }
 
@@ -499,18 +504,24 @@ mod tests {
     /// wrong, never instead of it.
     #[test]
     fn a_turn_that_was_not_written_down_still_finished() {
+        use atomcode_config::i18n::{t, Msg};
+        // The sentence comes from the table, so this asserts the *composition*
+        // and not one language's wording — the same test then holds whichever
+        // language the process is in.
+        let said = t(Msg::TurnNotStoredCli {
+            why: "磁盘满了"
+        })
+        .into_owned();
+
         assert_eq!(fold_persistence_failure(None, None), None);
         // Nothing else went wrong: the person still hears about the store.
         assert_eq!(
             fold_persistence_failure(None, Some("磁盘满了".into())).as_deref(),
-            Some("这一回合没能存下来:磁盘满了")
+            Some(said.as_str())
         );
         // Something else did: both, in that order — the turn's own trouble
         // first, because that is what the person was watching.
         let both = fold_persistence_failure(Some("模型断了".into()), Some("磁盘满了".into()));
-        assert_eq!(
-            both.as_deref(),
-            Some("模型断了\n这一回合没能存下来:磁盘满了")
-        );
+        assert_eq!(both.as_deref(), Some(format!("模型断了\n{said}").as_str()));
     }
 }

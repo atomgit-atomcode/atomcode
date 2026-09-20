@@ -12,6 +12,19 @@ fn _isolate_atomcode_home() {
     atomcode_kernel::test_support::isolate_home();
 }
 
+/// Which language this crate's tests assert in.
+///
+/// The same reason `atomcode-tui` says it once (`_tests_assert_in_chinese`):
+/// the assertions were written against the Chinese wording and mean "in
+/// Chinese, this reads …". Tests that care about *both* languages set the
+/// locale themselves — `resume_hint_line` is asserted in each — and the screen
+/// side is covered by `atomcode-tui/tests/language.rs`.
+#[cfg(test)]
+#[ctor::ctor]
+fn _tests_assert_in_chinese() {
+    atomcode_config::i18n::set_locale(atomcode_config::locale::Locale::ZhCn);
+}
+
 #[cfg(unix)]
 pub mod askpass;
 pub mod tui_command_meter;
@@ -220,6 +233,7 @@ pub mod tui_front {
         /// editable.
         fn settings(&self) -> Vec<atomcode_host_api::Setting> {
             use atomcode_config::config::Config;
+            use atomcode_config::i18n::{t as pt, Msg as PMsg};
             use atomcode_config::settings::{ApplyPolicy, SettingKind, SETTINGS};
             let config = if self.path.exists() {
                 Config::load(&self.path).unwrap_or_default()
@@ -230,21 +244,27 @@ pub mod tui_front {
                 .iter()
                 .map(|spec| atomcode_host_api::Setting {
                     id: spec.id.to_string(),
-                    label: spec.label_zh.to_string(),
+                    label: spec.label().to_string(),
                     value: spec.value(&config),
                     accepts: match spec.kind {
                         SettingKind::Boolean => "true | false".into(),
-                        SettingKind::OptionalBoolean => "true | false | 不设".into(),
+                        SettingKind::OptionalBoolean => {
+                            pt(PMsg::SettingAcceptsOptionalBool).into_owned()
+                        }
                         SettingKind::Integer { min, max } => format!("{min}–{max}"),
                         SettingKind::Choice(values) => values.join(" | "),
                         SettingKind::Text => String::new(),
                     },
                     applies: match spec.apply {
-                        ApplyPolicy::ImmediateUi => "立刻".into(),
-                        ApplyPolicy::NextTurn => "下一回合".into(),
-                        ApplyPolicy::AgentReassemble => "重装 agent 之后".into(),
-                        ApplyPolicy::CapabilityReprepare => "重载能力之后".into(),
-                        ApplyPolicy::NextStartup => "下次启动".into(),
+                        ApplyPolicy::ImmediateUi => pt(PMsg::AppliesNow).into_owned(),
+                        ApplyPolicy::NextTurn => pt(PMsg::AppliesNextTurnCli).into_owned(),
+                        ApplyPolicy::AgentReassemble => {
+                            pt(PMsg::AppliesAgentReassemble).into_owned()
+                        }
+                        ApplyPolicy::CapabilityReprepare => {
+                            pt(PMsg::AppliesCapabilityReprepare).into_owned()
+                        }
+                        ApplyPolicy::NextStartup => pt(PMsg::AppliesNextStartup).into_owned(),
                     },
                 })
                 .collect()
@@ -256,16 +276,27 @@ pub mod tui_front {
         /// has their comments and their ordering in it, and rewriting it whole
         /// would quietly throw both away.
         fn set_setting(&self, id: &str, value: &str) -> Result<(), String> {
+            use atomcode_config::i18n::{t as pt, Msg as PMsg};
             use atomcode_config::settings::SETTINGS;
             let spec = SETTINGS
                 .iter()
                 .find(|spec| spec.id == id)
-                .ok_or_else(|| format!("没有 `{id}` 这一项"))?;
+                .ok_or_else(|| pt(PMsg::NoSuchSettingCli { id }).into_owned())?;
             let text = std::fs::read_to_string(&self.path).unwrap_or_default();
             let mut document: toml_edit::DocumentMut =
-                text.parse().map_err(|e| format!("配置文件读不动:{e}"))?;
-            spec.patch(&mut document, value)
-                .map_err(|e| format!("`{value}` 不合适:{e}"))?;
+                text.parse().map_err(|e: toml_edit::TomlError| {
+                    pt(PMsg::ConfigFileUnreadable {
+                        error: &e.to_string(),
+                    })
+                    .into_owned()
+                })?;
+            spec.patch(&mut document, value).map_err(|e| {
+                pt(PMsg::SettingValueRejected {
+                    value,
+                    error: &e.to_string(),
+                })
+                .into_owned()
+            })?;
             if let Some(dir) = self.path.parent() {
                 std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
             }
@@ -278,16 +309,22 @@ pub mod tui_front {
         /// missing file is not an error: what was asked for is the outcome, and
         /// the outcome holds.
         fn reset_setting(&self, id: &str) -> Result<(), String> {
+            use atomcode_config::i18n::{t as pt, Msg as PMsg};
             use atomcode_config::settings::SETTINGS;
             let spec = SETTINGS
                 .iter()
                 .find(|spec| spec.id == id)
-                .ok_or_else(|| format!("没有 `{id}` 这一项"))?;
+                .ok_or_else(|| pt(PMsg::NoSuchSettingCli { id }).into_owned())?;
             let Ok(text) = std::fs::read_to_string(&self.path) else {
                 return Ok(());
             };
             let mut document: toml_edit::DocumentMut =
-                text.parse().map_err(|e| format!("配置文件读不动:{e}"))?;
+                text.parse().map_err(|e: toml_edit::TomlError| {
+                    pt(PMsg::ConfigFileUnreadable {
+                        error: &e.to_string(),
+                    })
+                    .into_owned()
+                })?;
             spec.reset(&mut document);
             std::fs::write(&self.path, document.to_string()).map_err(|e| e.to_string())
         }

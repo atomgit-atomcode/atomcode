@@ -14,6 +14,7 @@
 //! is why the calls are kept in order and folded in `render` instead of being
 //! applied as they arrive.
 
+use crate::i18n::{t, Msg};
 use atomcode_capabilities::tools::todo::{
     is_todo_call, reduce_todos, todo_counts, todo_glyph, TodoItem, TodoStatus,
 };
@@ -212,9 +213,23 @@ impl View for Todo {
 
         out.extend(
             El::row(vec![
-                El::styled("任务 ", label),
+                // The header word is the product's — the other front end's todo
+                // panel is titled with it, and one panel in two wordings is two
+                // panels to a person.
                 El::styled(
-                    format!("({completed} 已完成, {in_progress} 进行中, {open} 待办)"),
+                    format!(
+                        "{} ",
+                        crate::i18n::product::t(crate::i18n::product::Msg::TodoPanelTitle)
+                    ),
+                    label,
+                ),
+                El::styled(
+                    t(Msg::TodoCounts {
+                        completed,
+                        in_progress,
+                        open,
+                    })
+                    .into_owned(),
                     counts,
                 ),
             ])
@@ -249,7 +264,12 @@ impl View for Todo {
                 // mistaken for an item, but it does say that items are missing.
                 Row::More { hidden } => out.extend(
                     El::row(vec![El::styled(
-                        format!("   +{hidden} 更多"),
+                        format!(
+                            "   {}",
+                            crate::i18n::product::t(crate::i18n::product::Msg::TodoPanelMore {
+                                n: hidden
+                            })
+                        ),
                         theme::fg(Role::Muted),
                     )])
                     .lay(w),

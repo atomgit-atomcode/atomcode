@@ -6,6 +6,7 @@
 //! siblings. Correlating them by `call_id` is what keeps the transcript one
 //! row per call instead of two.
 
+use crate::i18n::{t, Msg};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -329,7 +330,7 @@ impl Producer for Transcript {
                 out.emit(
                     at,
                     Arc::new(NoticeBlock {
-                        detail: format!("已把这里之前的对话压成一段摘要(到 #{through})"),
+                        detail: t(Msg::TranscriptCompacted { through: *through }).into_owned(),
                     }),
                 );
             }
@@ -337,10 +338,7 @@ impl Producer for Transcript {
                 out.emit(
                     at,
                     Arc::new(NoticeBlock {
-                        detail: format!(
-                            "模型看到的 {} 处工具输出被就地换短了;这里显示的仍是原文",
-                            texts.len()
-                        ),
+                        detail: t(Msg::TranscriptShortened { count: texts.len() }).into_owned(),
                     }),
                 );
             }
@@ -348,12 +346,15 @@ impl Producer for Transcript {
                 out.emit(
                     at,
                     Arc::new(NoticeBlock {
-                        detail: format!("到 #{through} 为止的工具结果没有再发给模型"),
+                        detail: t(Msg::TranscriptDropped { through: *through }).into_owned(),
                     }),
                 );
             }
             SessionEvent::RateLimitPaused { pause, .. } => {
-                let mut detail = format!("被限速,等到 {}", pause.reset_at_display);
+                let mut detail = t(Msg::TranscriptRateLimited {
+                    until: &pause.reset_at_display,
+                })
+                .into_owned();
                 if let Some(message) = &pause.server_message {
                     detail.push_str(&format!(" · {message}"));
                 }
@@ -367,7 +368,7 @@ impl Producer for Transcript {
                 out.emit(
                     at,
                     Arc::new(NoticeBlock {
-                        detail: "这个成员已经结束,不会再说话了".into(),
+                        detail: t(Msg::TranscriptMemberEnded).into_owned(),
                     }),
                 );
             }

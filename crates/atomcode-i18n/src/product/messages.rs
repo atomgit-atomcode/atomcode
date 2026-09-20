@@ -532,6 +532,13 @@ pub enum Msg<'a> {
     SessionTimeDayAgo {
         n: u64,
     },
+    /// Older than a month. Added for the new front end's session list, which
+    /// shows sessions further back than the picker tuix has — kept in this
+    /// family rather than in the screen's own table so "how long ago" is one
+    /// vocabulary and not two.
+    SessionTimeMonthAgo {
+        n: u64,
+    },
     SessionMsgCount {
         count: usize,
     },
@@ -2003,4 +2010,41 @@ pub enum Msg<'a> {
     /// user that scrolling resumes when the task finishes, and that Windows
     /// Terminal has no such limitation.
     ConhostScrollHint,
+
+    // ── the new front end's launcher (`atomcode-cli`) ──
+    SettingAcceptsOptionalBool,
+    AppliesNow,
+    AppliesNextTurnCli,
+    AppliesAgentReassemble,
+    AppliesCapabilityReprepare,
+    AppliesNextStartup,
+    NoSuchSettingCli {
+        id: &'a str,
+    },
+    ConfigFileUnreadable {
+        error: &'a str,
+    },
+    SettingValueRejected {
+        value: &'a str,
+        error: &'a str,
+    },
+    ApiErrorRetrying {
+        reason: &'a str,
+        seconds: u64,
+        attempt: u32,
+        max: u32,
+    },
+    VisionRecognised {
+        model: &'a str,
+        text: &'a str,
+    },
+    VisionFailed,
+    TurnNotStoredCli {
+        why: &'a str,
+    },
+
+    // ── resuming from the shell (`atomcode-cli`) ──
+    ResumeHint {
+        cmd: &'a str,
+    },
 }

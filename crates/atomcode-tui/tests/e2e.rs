@@ -30,6 +30,13 @@ fn _isolate_atomcode_home() {
     atomcode_kernel::test_support::isolate_home();
 }
 
+/// These frames are asserted in Chinese, for the reason the lib's own
+/// `_tests_assert_in_chinese` gives. `tests/language.rs` holds the other half.
+#[ctor::ctor]
+fn _frames_are_asserted_in_chinese() {
+    atomcode_tui::i18n::set_locale(atomcode_tui::i18n::Locale::ZhCn);
+}
+
 fn scratch(tag: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU32, Ordering};
     static N: AtomicU32 = AtomicU32::new(0);
@@ -3099,7 +3106,10 @@ async fn the_todo_panel_shows_the_plan_the_model_sent() {
     // The plan, then one incremental patch to it: `#1` is completed by the
     // second call, so the header must read that plan's counts — the `update`
     // was applied against the list in force, not accumulated beside it.
-    assert!(panel.contains("任务"), "the header:\n{panel}");
+    // 「待办」, not 「任务」: the header is the other front end's own word for this
+    // panel now (`product::Msg::TodoPanelTitle`), so the two screens call it the
+    // same thing — see `gates/tui-i18n.sh`'s second rule.
+    assert!(panel.contains("待办"), "the header:\n{panel}");
     assert!(panel.contains("1 已完成"), "the patched count:\n{panel}");
     assert!(panel.contains("1 待办"), "{panel}");
     assert!(panel.contains("#1") && panel.contains("读代码"), "{panel}");
@@ -3112,7 +3122,7 @@ async fn the_todo_panel_shows_the_plan_the_model_sent() {
     // flattened grid — the same one a screenshot and the exit dump come from —
     // says the row reached the screen.
     assert!(
-        s.term.last().unwrap().rows().join("\n").contains("任务"),
+        s.term.last().unwrap().rows().join("\n").contains("待办"),
         "the panel is on screen, not just in the parts list"
     );
 

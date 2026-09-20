@@ -21,6 +21,7 @@
 //! need a repaint afterwards (`Wake::Fact`), because nothing about them came
 //! from a keystroke.
 
+use crate::i18n::{t, Msg};
 use std::sync::{Arc, RwLock};
 
 use crate::caps::Glyph;
@@ -320,14 +321,19 @@ impl Wizard {
 
     /// The last line: which keys do what, for the step that is open.
     fn hint(&self, kind: &StepKind, at: usize) -> String {
-        let back = if at > 0 { " · ← 上一步" } else { "" };
+        let back = if at > 0 {
+            t(Msg::WizardBack).into_owned()
+        } else {
+            String::new()
+        };
         match kind {
-            StepKind::Note => format!("enter 继续{back} · esc 放弃"),
-            StepKind::Choose(_) => format!("↑↓ 选 · enter 确定{back} · esc 放弃"),
-            StepKind::Type { .. } => format!("enter 确定{back} · esc 放弃"),
-            StepKind::Wait { skippable: true } => "enter 跳过 · esc 放弃".to_string(),
-            StepKind::Wait { skippable: false } => "esc 放弃".to_string(),
+            StepKind::Note => t(Msg::WizardNoteKeys { back: &back }),
+            StepKind::Choose(_) => t(Msg::WizardChooseKeys { back: &back }),
+            StepKind::Type { .. } => t(Msg::WizardTypeKeys { back: &back }),
+            StepKind::Wait { skippable: true } => t(Msg::WizardWaitSkippableKeys),
+            StepKind::Wait { skippable: false } => t(Msg::WizardWaitKeys),
         }
+        .into_owned()
     }
 }
 
@@ -426,7 +432,10 @@ impl Overlay for Wizard {
                 out.push(Line::raw(String::new()));
                 out.push(
                     Line::styled(
-                        format!("  {} 等待中", caps.spinner(vp.moment.tick)),
+                        t(Msg::WizardWaiting {
+                            spinner: caps.spinner(vp.moment.tick),
+                        })
+                        .into_owned(),
                         Style::new().fg(Color::role(Role::Muted)),
                     )
                     .truncate(w),

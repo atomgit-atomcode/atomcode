@@ -32,6 +32,14 @@ fn _isolate_atomcode_home() {
     atomcode_kernel::test_support::isolate_home();
 }
 
+/// Which language this binary's own tests assert in — the same reason the lib
+/// says it once (`_tests_assert_in_chinese` in `lib.rs`).
+#[cfg(test)]
+#[ctor::ctor]
+fn _tests_assert_in_chinese() {
+    atomcode_config::i18n::set_locale(atomcode_config::locale::Locale::ZhCn);
+}
+
 use atomcode_capabilities::mcp::{
     load_mcp_config, login_mcp_oauth, merge_http_oauth_mcp_server_into_json_file,
     merge_stdio_mcp_server_into_json_file, McpHttpAuthConfig, McpOAuthLoginOptions, McpTokenStore,
@@ -159,11 +167,13 @@ fn resume_hint_line(session_id: &str, headless: bool, zh: bool) -> String {
     } else {
         format!("{BIN_NAME} resume {session_id}")
     };
-    if zh {
-        format!("继续此会话，运行：{cmd}")
-    } else {
-        format!("To resume this session, run: {cmd}")
-    }
+    // The wording lives in the table with everything else; `zh` stays a
+    // parameter rather than a read of the global locale because this function
+    // is pure and its two forms are unit-tested side by side.
+    use atomcode_config::i18n::{t_with, Msg};
+    use atomcode_config::locale::Locale;
+    let locale = if zh { Locale::ZhCn } else { Locale::En };
+    t_with(locale, Msg::ResumeHint { cmd: &cmd }).into_owned()
 }
 
 /// What session to resume at launch, unified across `--continue`, `--resume`,
@@ -3362,7 +3372,13 @@ pub(crate) async fn run_native_headless(
                     })?;
                 } else {
                     eprintln!(
-                        "API error {reason}，{backoff_secs} 秒后重试({attempt}/{max_attempts})..."
+                        "{}",
+                        atomcode_config::i18n::t(atomcode_config::i18n::Msg::ApiErrorRetrying {
+                            reason: &reason,
+                            seconds: backoff_secs,
+                            attempt,
+                            max: max_attempts,
+                        })
                     );
                 }
             }

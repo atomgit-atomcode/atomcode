@@ -9,6 +9,7 @@
 //! cursor through — so [`Picker`] is that shape once, and the specific ones
 //! differ only in what they list and what picking means.
 
+use crate::i18n::{t, Msg};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::frame::{Color, Line, Rect, Span, Style};
@@ -233,7 +234,7 @@ impl Overlay for Reading {
         }
         if self.lines.is_empty() {
             return vec![Line::styled(
-                "  (空文件)".to_string(),
+                t(Msg::OverlayEmptyFile).into_owned(),
                 Style::new().fg(Color::role(Role::Muted)),
             )];
         }
@@ -318,7 +319,7 @@ impl Overlay for Picker {
                 Span::styled("  ", Style::new()),
                 Span::styled(
                     if filter.is_empty() {
-                        "输入以筛选".to_string()
+                        t(Msg::OverlayFilterHint).into_owned()
                     } else {
                         filter.clone()
                     },
@@ -363,7 +364,7 @@ impl Overlay for Picker {
         }
         if items.is_empty() {
             out.push(Line::styled(
-                width::take_width("  没有匹配的", w),
+                width::take_width(&t(Msg::OverlayNoMatch), w),
                 Style::new().fg(Color::role(Role::Muted)),
             ));
         }

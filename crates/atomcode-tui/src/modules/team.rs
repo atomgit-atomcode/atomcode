@@ -51,6 +51,8 @@
 //! screen must not become a keyboard grab: the composer keeps what is being
 //! typed, and a person who never presses `Tab` never loses a keystroke.
 
+use crate::i18n::product::{t as pt, Msg as PMsg};
+use crate::i18n::{t, Msg};
 use std::collections::HashMap;
 
 use atomcode_harness::session::{InjectionOrigin, SessionEvent};
@@ -277,12 +279,9 @@ impl View for Team {
         let mut out = vec![Line::styled(
             width::take_width(
                 &if focused {
-                    format!(
-                        "团队 · {} 名成员 · ↑↓ 选 · Enter 切换 · Esc 返回",
-                        rows.len()
-                    )
+                    t(Msg::TeamHeaderFocused { count: rows.len() })
                 } else {
-                    format!("团队 · {} 名成员 · Tab 切换查看", rows.len())
+                    t(Msg::TeamHeader { count: rows.len() })
                 },
                 w as usize,
             ),
@@ -326,10 +325,10 @@ impl View for Team {
             out.extend(band(
                 vec![
                     El::styled(mark.to_string(), theme::fg(Role::Accent)),
-                    El::styled("主".to_string(), theme::fg(Role::Secondary)),
+                    El::styled(t(Msg::TeamLead).into_owned(), theme::fg(Role::Secondary)),
                     El::styled(
                         if here(&vp.moment.lead) {
-                            " 正在看".to_string()
+                            t(Msg::TeamViewing).into_owned()
                         } else {
                             String::new()
                         },
@@ -363,8 +362,11 @@ impl View for Team {
                 Shown::Idle => (caps.g(Glyph::Ok).to_string(), theme::fg(Role::Success)),
             };
             let said = match row.state {
-                Shown::Working => format!("第 {} 轮", row.turn.max(1)),
-                Shown::Idle => "空闲".to_string(),
+                Shown::Working => t(Msg::TeamWorkingRound {
+                    round: row.turn.max(1),
+                })
+                .into_owned(),
+                Shown::Idle => pt(PMsg::BgStateIdle).into_owned(),
             };
             let mut line: Vec<El> = Vec::new();
             if !switchable.is_empty() {
@@ -386,7 +388,7 @@ impl View for Team {
             }
             line.push(El::styled(format!(" {said}"), muted));
             if here(&row.session) {
-                line.push(El::styled(" 正在看".to_string(), muted));
+                line.push(El::styled(t(Msg::TeamViewing).into_owned(), muted));
             }
             if !row.member.last.is_empty() {
                 line.push(El::styled(

@@ -10,6 +10,7 @@
 //! 干什么」该待的地方。
 
 use crate::frame::{Line, Style};
+use crate::i18n::{t, Msg};
 use crate::module::{Height, View};
 use crate::modules::chrome::{self, box_edge, pad_to, panel_edge, search_line};
 use crate::moment::{Moment, Viewport};
@@ -148,7 +149,11 @@ fn draw(view: &ToolsView, panel: &Panel, row: Row, w: usize, caps: crate::caps::
         Row::Rule => panel_edge(w, caps),
         Row::Header => {
             // 一块没有页签的面板,表头上说的是这份目录此刻的账:开着几个、关掉几个。
-            let label = format!("{} 个能调 · {} 个关掉的", view.on_count(), view.off_count());
+            let label = t(Msg::ToolsPanelCounts {
+                on: view.on_count(),
+                off: view.off_count(),
+            })
+            .into_owned();
             let labels = [label.as_str()];
             Line::from_spans(chrome::header_parts(NAME, &labels, usize::MAX).0).truncate(w)
         }
@@ -158,10 +163,10 @@ fn draw(view: &ToolsView, panel: &Panel, row: Row, w: usize, caps: crate::caps::
         Row::Blank => Line::empty(),
         Row::Nothing => Line::styled(
             width::take_width(
-                if view.tools().is_empty() {
-                    "  这棵树一个工具都没挂"
+                &if view.tools().is_empty() {
+                    t(Msg::ToolsPanelNoneMounted)
                 } else {
-                    "  没有匹配的工具"
+                    t(Msg::ToolsPanelNoMatch)
                 },
                 w,
             ),
@@ -247,15 +252,21 @@ fn listed_line(
     pad_to(line, w, base)
 }
 
-fn legend(panel: &Panel) -> Vec<(&'static str, &'static str)> {
+fn legend(panel: &Panel) -> Vec<(String, String)> {
     if panel.busy.is_some() {
-        return vec![("esc", "不等了")];
+        return vec![(
+            "esc".to_string(),
+            t(Msg::ToolsPanelStopWaiting).into_owned(),
+        )];
     }
     vec![
-        ("↑↓", "选择"),
-        ("⏎", "开 / 关"),
-        ("打字", "筛"),
-        ("esc", "收起"),
+        ("↑↓".to_string(), t(Msg::ToolsLegendChoose).into_owned()),
+        ("⏎".to_string(), t(Msg::ToolsLegendToggle).into_owned()),
+        (
+            t(Msg::ToolsLegendTyping).into_owned(),
+            t(Msg::ToolsLegendFilter).into_owned(),
+        ),
+        ("esc".to_string(), t(Msg::ToolsLegendClose).into_owned()),
     ]
 }
 

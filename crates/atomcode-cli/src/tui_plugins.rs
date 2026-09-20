@@ -18,6 +18,7 @@
 //! 是记下这件活,等它落地之后把它卸掉——否则磁盘上会留下一个人已经放弃、却装好了
 //! 的插件。老前端在模态里做的也是这件事（`cancelled_installs`）。
 
+use atomcode_i18n::screen::{t as tr, Msg as SMsg};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -127,14 +128,20 @@ fn startup_lines(events: &[atomcode_capabilities::plugin::PluginJobEvent]) -> Ve
     let mut out = Vec::new();
     for event in events {
         match event {
-            Ev::MarketplaceAdded(info) => out.push(format!(
-                "取下了自带的插件市场 {}（{} 个插件）",
-                info.name,
-                info.plugins.len()
-            )),
-            Ev::PluginInstalled(info) => {
-                out.push(format!("装上了 {}@{}", info.plugin, info.marketplace))
-            }
+            Ev::MarketplaceAdded(info) => out.push(
+                tr(SMsg::SeedMarketFetched {
+                    name: &info.name,
+                    plugins: info.plugins.len(),
+                })
+                .into_owned(),
+            ),
+            Ev::PluginInstalled(info) => out.push(
+                tr(SMsg::SeedPluginInstalled {
+                    plugin: &info.plugin,
+                    marketplace: &info.marketplace,
+                })
+                .into_owned(),
+            ),
             Ev::MarketplaceUpdated(_)
             | Ev::PluginUpdated(_)
             | Ev::PluginAlreadyInstalled { .. }
@@ -248,9 +255,9 @@ fn updated(name: &str) -> String {
         return String::new();
     };
     match ago.as_secs() / 86_400 {
-        0 => "今天更新".into(),
-        1 => "昨天更新".into(),
-        days => format!("{days} 天前更新"),
+        0 => tr(SMsg::UpdatedToday).into_owned(),
+        1 => tr(SMsg::UpdatedYesterday).into_owned(),
+        days => tr(SMsg::UpdatedDaysAgo { days }).into_owned(),
     }
 }
 
@@ -349,7 +356,7 @@ impl Plugins for DiskPlugins {
         let (plugin, market) = (plugin.to_string(), market.to_string());
         let scope = scope_in(scope);
         let done = spawn(move || installer::install(&plugin, &market, scope)).await?;
-        self.settle(job, done, "装好了")
+        self.settle(job, done, &tr(SMsg::PluginInstalledVerb))
     }
 
     async fn update(&self, plugin: &str, market: &str, scope: Scope) -> Result<String, String> {
@@ -364,7 +371,7 @@ impl Plugins for DiskPlugins {
             installer::install(&plugin, &market, scope)
         })
         .await?;
-        self.settle(job, done, "更新好了")
+        self.settle(job, done, &tr(SMsg::PluginUpdatedVerb))
     }
 
     async fn uninstall(&self, plugin: &str, market: &str, scope: Scope) -> Result<String, String> {
@@ -373,8 +380,13 @@ impl Plugins for DiskPlugins {
         let scope = scope_in(scope);
         spawn(move || installer::uninstall(&p, &m, scope))
             .await?
-            .map_err(|e| format!("卸不掉:{e:#}"))?;
-        Ok(format!("卸掉了 {id}"))
+            .map_err(|e| {
+                tr(SMsg::UninstallFailed {
+                    error: &format!("{e:#}"),
+                })
+                .into_owned()
+            })?;
+        Ok(tr(SMsg::Uninstalled { id: &id }).into_owned())
     }
 
     async fn add_market(&self, url: &str) -> Result<String, String> {
@@ -382,24 +394,39 @@ impl Plugins for DiskPlugins {
         let url = url.to_string();
         let added = spawn(move || marketplace::add_marketplace(&url))
             .await?
-            .map_err(|e| format!("加不上:{e:#}"))?;
+            .map_err(|e| {
+                tr(SMsg::MarketAddFailed {
+                    error: &format!("{e:#}"),
+                })
+                .into_owned()
+            })?;
         if !self.wanted(&job) {
             let name = added.name.clone();
             let _ = spawn(move || marketplace::remove_marketplace(&name)).await;
-            return Ok(format!("取消了,{} 没有留下", added.name));
+            return Ok(tr(SMsg::CancelledNothingLeft { what: &added.name }).into_owned());
         }
         // **加市场不等于装插件**,这是这句话存在的理由:老前端反复见到人加完市场就去
         // 用插件带的命令,然后以为坏了。所以把它带了什么、下一步怎么装,一起说出来。
+        let joiner = tr(SMsg::ListJoiner);
         let names = match added.plugins.len() {
-            0 => "它没带插件".to_string(),
-            n if n > 5 => format!("它带着 {n} 个插件:{} …", added.plugins[..5].join("、")),
-            n => format!("它带着 {n} 个插件:{}", added.plugins.join("、")),
+            0 => tr(SMsg::MarketCarriesNothing).into_owned(),
+            n if n > 5 => tr(SMsg::MarketCarriesSome {
+                n,
+                names: &added.plugins[..5].join(&joiner),
+            })
+            .into_owned(),
+            n => tr(SMsg::MarketCarriesAll {
+                n,
+                names: &added.plugins.join(&joiner),
+            })
+            .into_owned(),
         };
-        Ok(format!(
-            "加上了市场 {}（{}）。{names}。装还是要一个个装:`/plugin install <名字>`,或者在面板里按 ⏎",
-            added.name,
-            short(&added.git_commit),
-        ))
+        Ok(tr(SMsg::MarketAdded {
+            name: &added.name,
+            source: short(&added.git_commit),
+            carries: &names,
+        })
+        .into_owned())
     }
 
     async fn update_market(&self, name: &str) -> Result<String, String> {
@@ -407,14 +434,19 @@ impl Plugins for DiskPlugins {
         let name = name.to_string();
         let info: MarketplaceInfo = spawn(move || marketplace::update_marketplace(&name))
             .await?
-            .map_err(|e| format!("更新不了:{e:#}"))?;
+            .map_err(|e| {
+                tr(SMsg::MarketUpdateFailed {
+                    error: &format!("{e:#}"),
+                })
+                .into_owned()
+            })?;
         let _ = self.wanted(&job);
-        Ok(format!(
-            "市场 {} 更新到 {},带着 {} 个插件",
-            info.name,
-            short(&info.git_commit),
-            info.plugins.len()
-        ))
+        Ok(tr(SMsg::MarketUpdated {
+            name: &info.name,
+            commit: short(&info.git_commit),
+            plugins: info.plugins.len(),
+        })
+        .into_owned())
     }
 
     async fn remove_market(&self, name: &str) -> Result<String, String> {
@@ -436,13 +468,22 @@ impl Plugins for DiskPlugins {
             }
             marketplace::remove_marketplace(&name)
                 .map(|()| (name, failed))
-                .map_err(|e| format!("删不掉:{e:#}"))
+                .map_err(|e| {
+                    tr(SMsg::MarketRemoveFailed {
+                        error: &format!("{e:#}"),
+                    })
+                    .into_owned()
+                })
         })
         .await?
         .map(|(name, failed)| match failed.is_empty() {
-            true => format!("删掉了市场 {name},连同从它装的插件"),
+            true => tr(SMsg::MarketRemoved { name: &name }).into_owned(),
             // 说出来而不是吞掉:剩在磁盘上的那几个,人下次在「已装」那一页还会看见。
-            false => format!("删掉了市场 {name},但这几个没卸干净:{}", failed.join("、")),
+            false => tr(SMsg::MarketRemovedWithLeftovers {
+                name: &name,
+                failed: &failed.join(&tr(SMsg::ListJoiner)),
+            })
+            .into_owned(),
         })
     }
 
@@ -470,19 +511,19 @@ impl DiskPlugins {
             Err(e) => {
                 let _ = self.wanted(&job);
                 if let Some(already) = e.downcast_ref::<installer::AlreadyInstalledError>() {
-                    return Err(format!(
-                        "{} 已经装着了。要重装先 `/plugin uninstall {}`",
-                        already.id, already.id
-                    ));
+                    return Err(tr(SMsg::PluginAlreadyInstalled { id: &already.id }).into_owned());
                 }
-                return Err(format!("没装上:{e:#}"));
+                return Err(tr(SMsg::PluginInstallFailed {
+                    error: &format!("{e:#}"),
+                })
+                .into_owned());
             }
         };
         let id = format!("{}@{}", info.plugin, info.marketplace);
         if !self.wanted(&job) {
             let (p, m, s) = (info.plugin, info.marketplace, info.scope);
             let _ = installer::uninstall(&p, &m, s);
-            return Ok(format!("取消了,{id} 没有留下"));
+            return Ok(tr(SMsg::CancelledNothingLeft { what: &id }).into_owned());
         }
         Ok(format!(
             "{verb} {id}{}",
@@ -555,17 +596,20 @@ fn count_in(dir: &std::path::Path, matches: fn(&std::path::Path) -> bool) -> usi
 fn tally(skills: usize, commands: usize, hooks: bool) -> String {
     let mut parts = Vec::new();
     if skills > 0 {
-        parts.push(format!("{skills} 个技能"));
+        parts.push(tr(SMsg::TallySkills { n: skills }).into_owned());
     }
     if commands > 0 {
-        parts.push(format!("{commands} 条命令"));
+        parts.push(tr(SMsg::TallyCommands { n: commands }).into_owned());
     }
     if hooks {
-        parts.push("钩子".to_string());
+        parts.push(tr(SMsg::TallyHooks).into_owned());
     }
     match parts.is_empty() {
         true => String::new(),
-        false => format!(",带来 {}", parts.join("、")),
+        false => tr(SMsg::TallyBrought {
+            what: &parts.join(&tr(SMsg::ListJoiner)),
+        })
+        .into_owned(),
     }
 }
 
@@ -578,9 +622,12 @@ fn short(commit: &str) -> &str {
 ///
 /// 每一件都要跑 `git`,而这个 future 是在画屏幕的那个运行时上被 await 的。
 async fn spawn<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Result<T, String> {
-    tokio::task::spawn_blocking(work)
-        .await
-        .map_err(|e| format!("这件活没跑起来:{e}"))
+    tokio::task::spawn_blocking(work).await.map_err(|e| {
+        tr(SMsg::JobDidNotStart {
+            error: &e.to_string(),
+        })
+        .into_owned()
+    })
 }
 
 /// 市场带的 + 已经装上的 → 面板要列的那些行。

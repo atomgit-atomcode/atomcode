@@ -444,6 +444,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SessionTimeMinAgo { n } => format!("{n}分钟前").into(),
         Msg::SessionTimeHourAgo { n } => format!("{n}小时前").into(),
         Msg::SessionTimeDayAgo { n } => format!("{n}天前").into(),
+        Msg::SessionTimeMonthAgo { n } => format!("{n}个月前").into(),
         Msg::SessionMsgCount { count } =>
             format!("{count} 条消息").into(),
         Msg::SessionNameEmpty =>
@@ -1445,13 +1446,31 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             "提示：经典 Windows 控制台功能受限——任务执行中无法上滚查看历史，字符与吉祥物也会降级显示。\
              换用 \x1b[1;96mWindows Terminal\x1b[0m 体验更佳。"
                 .into(),
+
+        // ── the new front end's launcher (`atomcode-cli`) ──
+        Msg::SettingAcceptsOptionalBool => "true | false | 不设".into(),
+        Msg::AppliesNow => "立刻".into(),
+        Msg::AppliesNextTurnCli => "下一回合".into(),
+        Msg::AppliesAgentReassemble => "重装 agent 之后".into(),
+        Msg::AppliesCapabilityReprepare => "重载能力之后".into(),
+        Msg::AppliesNextStartup => "下次启动".into(),
+        Msg::NoSuchSettingCli { id } => format!("没有 `{id}` 这一项").into(),
+        Msg::ConfigFileUnreadable { error } => format!("配置文件读不动:{error}").into(),
+        Msg::SettingValueRejected { value, error } => format!("`{value}` 不合适:{error}").into(),
+        Msg::ApiErrorRetrying { reason, seconds, attempt, max } => format!("API error {reason}，{seconds} 秒后重试({attempt}/{max})...").into(),
+        Msg::VisionRecognised { model, text } => format!("[图片内容（由 {model} 识别）]\n{text}").into(),
+        Msg::VisionFailed => "[图片识别失败]".into(),
+        Msg::TurnNotStoredCli { why } => format!("这一回合没能存下来:{why}").into(),
+
+        // ── resuming from the shell (`atomcode-cli`) ──
+        Msg::ResumeHint { cmd } => format!("继续此会话，运行：{cmd}").into(),
     }
 }
 
 #[cfg(test)]
 mod codingplan_crypto_tests {
     use super::*;
-    use crate::i18n::Msg;
+    use crate::product::Msg;
 
     #[test]
     fn zh_official_build_required_mentions_official_and_releases() {

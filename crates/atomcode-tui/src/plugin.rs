@@ -7,6 +7,8 @@
 //! replaces the session, the screen keeps its connection and starts drawing
 //! the new session (`docs/adr/0022` §6).
 
+use crate::i18n::product::{t as pt, Msg as PMsg};
+use crate::i18n::{t, Msg};
 use std::collections::{BTreeMap, HashSet};
 
 /// When a press landed, where, and how many in a row — the three facts a
@@ -496,7 +498,7 @@ fn paths_under(cwd: &str, prefix: &str) -> Vec<crate::menu::Item> {
         };
         let item = crate::menu::Item::new(value.clone(), value);
         out.push(if folder {
-            item.about("目录".to_string())
+            item.about(t(Msg::MenuFolder).into_owned())
         } else {
             item
         });
@@ -534,10 +536,13 @@ fn policy_options(
         .actions
         .iter()
         .filter_map(|action| match action {
-            A::CompleteExternally => Some(("done", "我自己在外面做完")),
-            A::SkipStep => Some(("skip", "跳过这一步")),
-            A::ViewSafeInstructions => Some(("how", "看看安全的做法")),
-            A::EndTask => Some(("end", "到此为止")),
+            // The four words are the product's: the other front end offers the
+            // same four ways out of the same intervention, and two wordings for
+            // one choice is how a person comes to think they are two choices.
+            A::CompleteExternally => Some(("done", pt(PMsg::PolicyRecoveryComplete))),
+            A::SkipStep => Some(("skip", pt(PMsg::PolicyRecoverySkip))),
+            A::ViewSafeInstructions => Some(("how", pt(PMsg::PolicyRecoveryInstructions))),
+            A::EndTask => Some(("end", pt(PMsg::PolicyRecoveryEnd))),
             // A way out added since this screen was written: left out rather
             // than guessed at — an unlabelled row is one nobody can choose on
             // purpose.
@@ -1183,7 +1188,10 @@ impl UserInterface for Tui {
                         // welcome block is produced by `open_conversation` alone,
                         // and nothing else asks.
                         owes_opening = true;
-                        self.host.say(format!("已切换到会话 {session}"), false);
+                        self.host.say(
+                            t(Msg::SwitchedToSession { session: &session }).into_owned(),
+                            false,
+                        );
                     }
                     stale = true;
                 }
@@ -1199,7 +1207,10 @@ impl UserInterface for Tui {
                 // (`docs/adr/0024`), so a person who is not told now will find
                 // out by resuming tomorrow into a conversation missing a turn.
                 Wake::Host(HostEvent::PersistenceFailed { message, .. }) => {
-                    self.host.say(format!("这一回合没能存下来:{message}"), true);
+                    self.host.say(
+                        t(Msg::TurnNotStored { message: &message }).into_owned(),
+                        true,
+                    );
                     stale = true;
                 }
                 Wake::Host(_) => {}
@@ -1253,10 +1264,8 @@ impl UserInterface for Tui {
                         && !self.team_on_screen() =>
                 {
                     self.surface.heal_mouse();
-                    self.host.say(
-                        "鼠标被终端收回了,已自动要回;若再次发生,ctrl-o 可手动切换",
-                        false,
-                    );
+                    self.host
+                        .say(t(Msg::MouseTakenBackAuto).into_owned(), false);
                     stale = true;
                 }
                 Wake::Input(Input::Resize(..)) => {
@@ -1921,10 +1930,10 @@ impl Tui {
             return Ok(None);
         }
         let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
-            return Err("屏幕还没接上,改不了 provider".into());
+            return Err(t(Msg::ScreenNotConnectedProviders).into_owned());
         };
         let Some(port) = ctx.service::<crate::plugin::ProvidersSvc>() else {
-            return Err("这个屏幕没有接 provider:启动器没有提供 `tui-providers`".into());
+            return Err(t(Msg::NoProviderPort).into_owned());
         };
         let said = match step {
             Step::Use { .. } | Step::Stay | Step::Close => None,
@@ -1933,7 +1942,7 @@ impl Tui {
                 draft,
             } => {
                 port.edit_account(&id, &draft)?;
-                Some(format!("改好了 {id}"))
+                Some(t(Msg::ProviderEdited { id: &id }).into_owned())
             }
             Step::SaveAccount { id: None, draft } => {
                 let id = port.add_account(&draft)?;
@@ -1942,26 +1951,26 @@ impl Tui {
                 // the one thing left to do.
                 self.host.show_providers(port.rows());
                 self.host.walk_into_provider(&id);
-                Some(format!("加好了 {id},给它添一个模型"))
+                Some(t(Msg::ProviderAddedAddModel { id: &id }).into_owned())
             }
             Step::SaveModel {
                 id: Some(id),
                 draft,
             } => {
                 port.edit_model(&id, &draft)?;
-                Some(format!("改好了 {id}"))
+                Some(t(Msg::ProviderEdited { id: &id }).into_owned())
             }
             Step::SaveModel { id: None, draft } => {
                 let id = port.add_model(&draft)?;
-                Some(format!("加好了 {id}"))
+                Some(t(Msg::ProviderAdded { id: &id }).into_owned())
             }
             Step::DeleteAccount { id } => {
                 port.delete_account(&id)?;
-                Some(format!("删了 {id},连同它下面的模型"))
+                Some(t(Msg::ProviderDeletedWithModels { id: &id }).into_owned())
             }
             Step::DeleteModel { id } => {
                 port.delete_model(&id)?;
-                Some(format!("删了 {id}"))
+                Some(t(Msg::ProviderDeleted { id: &id }).into_owned())
             }
         };
         self.reload_after_provider_change();
@@ -1986,7 +1995,13 @@ impl Tui {
                 .call(atomcode_host_api::HostCommand::Reload { session: root })
                 .await;
             if let Err(error) = outcome {
-                host.say(format!("配置写下了,但会话没能重新加载:{error:?}"), true);
+                host.say(
+                    t(Msg::ConfigWrittenReloadFailed {
+                        error: &format!("{error:?}"),
+                    })
+                    .into_owned(),
+                    true,
+                );
                 if let Some(keys) = keys {
                     let _ = keys.send(Wake::Fact);
                 }
@@ -2030,7 +2045,10 @@ impl Tui {
                     host.show_tools(view);
                 }
                 Err(why) => {
-                    host.said(format!("读不到工具目录:{why}"), true);
+                    host.said(
+                        t(Msg::ToolCatalogUnreadable { why: &why }).into_owned(),
+                        true,
+                    );
                 }
             }
             if let Some(keys) = keys {
@@ -2064,13 +2082,13 @@ impl Tui {
         };
         let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
             self.host.tools_busy(None);
-            self.host.say("屏幕还没接上,开关不了工具", true);
+            self.host
+                .say(t(Msg::ScreenNotConnectedTools).into_owned(), true);
             return;
         };
         let Some(port) = ctx.service::<crate::plugin::ToolCatalogSvc>() else {
             self.host.tools_busy(None);
-            self.host
-                .say("这个屏幕没有接工具目录:启动器没有提供 `tui-tools`", true);
+            self.host.say(t(Msg::NoToolCatalog).into_owned(), true);
             return;
         };
         let host = self.host.clone();
@@ -2084,7 +2102,7 @@ impl Tui {
                     host.show_tools(view);
                 }
                 Err(why) => {
-                    host.tools_note(Some(format!("没成:{why}")));
+                    host.tools_note(Some(t(Msg::SwitchFailed { why: &why }).into_owned()));
                 }
             }
             if let Some(keys) = keys {
@@ -2123,12 +2141,12 @@ impl Tui {
     fn apply_plugins_step(&self, step: crate::plugins::Step) {
         use crate::plugins::Step;
         let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
-            self.host.say("屏幕还没接上,改不了插件", true);
+            self.host
+                .say(t(Msg::ScreenNotConnectedPlugins).into_owned(), true);
             return;
         };
         let Some(port) = ctx.service::<crate::plugin::PluginsSvc>() else {
-            self.host
-                .say("这个屏幕没有接插件:启动器没有提供 `tui-plugins`", true);
+            self.host.say(t(Msg::NoPluginPort).into_owned(), true);
             return;
         };
         // Giving up on a job is not a job of its own: the work is still out
@@ -2136,7 +2154,8 @@ impl Tui {
         // longer wanted. The port is the only one that can undo it.
         if let Step::Cancel { job } = &step {
             port.cancel(job);
-            self.host.said("不等了。它落地之后会自己收拾干净", false);
+            self.host
+                .said(t(Msg::PluginJobCancelled).into_owned(), false);
             self.refresh_plugins();
             return;
         }
@@ -2146,7 +2165,11 @@ impl Tui {
                 marketplace,
                 ..
             } => (
-                format!("正在装 {plugin}@{marketplace} …"),
+                t(Msg::PluginInstallingAt {
+                    plugin,
+                    marketplace,
+                })
+                .into_owned(),
                 format!("{plugin}@{marketplace}"),
             ),
             Step::Update {
@@ -2154,7 +2177,11 @@ impl Tui {
                 marketplace,
                 ..
             } => (
-                format!("正在更新 {plugin}@{marketplace} …"),
+                t(Msg::PluginUpdatingAt {
+                    plugin,
+                    marketplace,
+                })
+                .into_owned(),
                 format!("{plugin}@{marketplace}"),
             ),
             Step::Uninstall {
@@ -2162,16 +2189,25 @@ impl Tui {
                 marketplace,
                 ..
             } => (
-                format!("正在卸 {plugin}@{marketplace} …"),
+                t(Msg::PluginUninstallingAt {
+                    plugin,
+                    marketplace,
+                })
+                .into_owned(),
                 format!("{plugin}@{marketplace}"),
             ),
-            Step::AddMarket { url } => (format!("正在取 {url} …"), format!("market:{url}")),
-            Step::UpdateMarket { name } => {
-                (format!("正在更新市场 {name} …"), format!("market:{name}"))
-            }
-            Step::RemoveMarket { name } => {
-                (format!("正在删市场 {name} …"), format!("market:{name}"))
-            }
+            Step::AddMarket { url } => (
+                t(Msg::MarketFetching { what: url }).into_owned(),
+                format!("market:{url}"),
+            ),
+            Step::UpdateMarket { name } => (
+                t(Msg::MarketUpdating { what: name }).into_owned(),
+                format!("market:{name}"),
+            ),
+            Step::RemoveMarket { name } => (
+                t(Msg::MarketRemoving { what: name }).into_owned(),
+                format!("market:{name}"),
+            ),
             Step::Stay | Step::Close | Step::Cancel { .. } => return,
         };
         self.host
@@ -2221,10 +2257,10 @@ impl Tui {
                             // said what happened, and this one runs after an
                             // uninstall and a marketplace change too.
                             host.said(
-                                format!(
-                                    "但会话没能重新加载,新东西要等下次启动才生效:{}",
-                                    crate::commands::refusal(error)
-                                ),
+                                t(Msg::ReloadFailedAfterPlugin {
+                                    why: &crate::commands::refusal(error),
+                                })
+                                .into_owned(),
                                 true,
                             );
                         }
@@ -2434,10 +2470,10 @@ impl Tui {
     /// asking is skipped rather than answered with a lie.
     fn apply_setting(&self, id: &str, value: &str) -> Result<(), String> {
         let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
-            return Err("屏幕还没接上,改不了设置".into());
+            return Err(t(Msg::ScreenNotConnectedSettings).into_owned());
         };
         let Some(port) = ctx.service::<crate::plugin::SettingsSvc>() else {
-            return Err("这个屏幕没有接设置:启动器没有提供 `tui-settings`".into());
+            return Err(t(Msg::NoSettingsPort).into_owned());
         };
         port.set(id, value)?;
         self.reload_if_a_change_needs_it(id)
@@ -2450,10 +2486,10 @@ impl Tui {
     /// changed, and it reads the file again either way.
     fn reset_setting(&self, id: &str) -> Result<(), String> {
         let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
-            return Err("屏幕还没接上,改不了设置".into());
+            return Err(t(Msg::ScreenNotConnectedSettings).into_owned());
         };
         let Some(port) = ctx.service::<crate::plugin::SettingsSvc>() else {
-            return Err("这个屏幕没有接设置:启动器没有提供 `tui-settings`".into());
+            return Err(t(Msg::NoSettingsPort).into_owned());
         };
         port.reset(id)?;
         self.reload_if_a_change_needs_it(id)
@@ -2503,10 +2539,10 @@ impl Tui {
                 // Rendered by the same function the commands use, so one host
                 // error reads the same wherever it surfaces.
                 host.say(
-                    format!(
-                        "设置已写入,但重新加载失败:{}",
-                        crate::commands::refusal(error)
-                    ),
+                    t(Msg::SettingWrittenReloadFailed {
+                        why: &crate::commands::refusal(error),
+                    })
+                    .into_owned(),
                     true,
                 );
                 if let Some(keys) = keys {
@@ -2591,11 +2627,12 @@ impl Tui {
     fn switch_to(&self, session: &str) {
         if self.look_at(session) {
             let name = if session == self.client.root() {
-                "主".to_string()
+                t(Msg::TeamLead).into_owned()
             } else {
                 session.rsplit('/').next().unwrap_or(session).to_string()
             };
-            self.host.say(format!("正在看 {name}"), false);
+            self.host
+                .say(t(Msg::NowViewing { name: &name }).into_owned(), false);
         }
     }
 
@@ -2661,13 +2698,13 @@ impl Tui {
         if options.is_empty() {
             // Nothing to offer is not a question. Say what happened instead, so
             // the turn ending has a reason on screen.
-            self.say("策略边界挡下了这一步,而这次没有给出可选的走法");
+            self.say(&t(Msg::PolicyBlockedNoWayOut));
             return;
         }
         let question = atomcode_harness::seams::Question {
-            prompt: "这一步被策略挡下了。接下来怎么走?".into(),
+            prompt: t(Msg::PolicyQuestion).into_owned(),
             options,
-            asker: Some("策略".into()),
+            asker: Some(t(Msg::PolicyAsker).into_owned()),
             about: None,
         };
         let answer = self.host.asks.push(question);
@@ -2761,7 +2798,9 @@ impl Tui {
             }
             AgentEvent::Rejected { command, error } => {
                 self.client.answered(&command);
-                self.say_refused(&format!("没有送达:{error:?}"));
+                self.say_refused(&t(Msg::NotDelivered {
+                    error: &format!("{error:?}"),
+                }));
                 true
             }
             AgentEvent::Request { id, kind, payload } => {
@@ -2875,9 +2914,9 @@ impl Tui {
             }
             AgentEvent::Compacted { committed, .. } => {
                 if committed {
-                    self.say("已压缩");
+                    self.say(&t(Msg::Compacted));
                 } else {
-                    self.say("暂时没有值得压缩的");
+                    self.say(&t(Msg::NothingWorthCompacting));
                 }
                 true
             }
@@ -2888,7 +2927,9 @@ impl Tui {
             // it, and the runtime's own event is this one.
             AgentEvent::CompactionFailed { error, .. } => {
                 self.set_activity(Activity::Idle);
-                self.say_refused(&format!("没压缩成：{error}"));
+                self.say_refused(&t(Msg::CompactFailed {
+                    error: &error.to_string(),
+                }));
                 true
             }
             AgentEvent::Error { message, .. } => {
@@ -3151,7 +3192,7 @@ impl Tui {
                 // was" is easier to keep true when nothing was touched yet.
                 let Some(image) = self.surface.clipboard_image() else {
                     drop(m);
-                    self.say_refused("剪贴板里没有图片");
+                    self.say_refused(&t(Msg::ClipboardHasNoImage));
                     return false;
                 };
                 let label = m.attachments.add(image);
@@ -3254,11 +3295,9 @@ impl Tui {
                 let on = !self.surface.mouse();
                 self.surface.set_mouse(on);
                 let text = if on {
-                    "鼠标已收回:拖动选中并复制,点击思考或工具调用折叠展开那一个,滚轮滚动,esc 取消选中"
-                        .to_string()
+                    t(Msg::MouseTaken).into_owned()
                 } else {
-                    "鼠标已交还终端:改用终端自己的框选(可跨 scrollback)。折叠用 ctrl-t,思考用 ctrl-r(默认不显示),滚动用 pgup/pgdn,ctrl-o 收回鼠标"
-                        .to_string()
+                    t(Msg::MouseHandedBack).into_owned()
                 };
                 self.say(&text);
                 return false;
@@ -3285,7 +3324,7 @@ impl Tui {
                 // to draw it: a panel that is "up" but unmounted would take the
                 // composer's rows and every key, and show nothing for either.
                 if !self.host.toggle_providers() {
-                    self.say("这个屏幕没有 provider 面板:启动器没有提供 `tui-panel-providers`");
+                    self.say(&t(Msg::NoProviderPanel));
                     return false;
                 }
                 // Read when the panel opens, not once at start-up: a file edited
@@ -3301,7 +3340,7 @@ impl Tui {
                 // Refused rather than silently opening a panel with no module to
                 // draw it, the same as the providers one.
                 if !self.host.toggle_plugins() {
-                    self.say("这个屏幕没有插件面板:启动器没有提供 `tui-panel-plugins`");
+                    self.say(&t(Msg::NoPluginPanel));
                     return false;
                 }
                 // Read when the panel opens: what is under `plugins/` can be
@@ -3315,7 +3354,7 @@ impl Tui {
             Action::ToggleTools => {
                 drop(m);
                 if !self.host.toggle_tools() {
-                    self.say("这个屏幕没有工具面板:启动器没有提供 `tui-panel-tools`");
+                    self.say(&t(Msg::NoToolPanel));
                     return false;
                 }
                 // Read when the panel opens, never per frame: what the model can
@@ -3389,7 +3428,7 @@ impl Tui {
                     // item does — the auto-copy of a drag-release is still a copy,
                     // and it must say so on the gesture itself rather than leave
                     // the person to copy a second time to learn it worked.
-                    self.host.say("已复制选中的内容", false);
+                    self.host.say(t(Msg::CopiedSelection).into_owned(), false);
                 }
                 return false;
             }
@@ -3798,9 +3837,10 @@ impl Tui {
             m.selection.is_some_and(|s| !s.is_empty())
         };
         let copy = if selected {
-            crate::menu::Item::new("copy", "复制选中").about("把选中的文字写到剪贴板")
+            crate::menu::Item::new("copy", t(Msg::MenuCopySelection))
+                .about(t(Msg::MenuCopySelectionAbout))
         } else {
-            crate::menu::Item::new("copy", "复制全文").about("把输入框写到剪贴板")
+            crate::menu::Item::new("copy", t(Msg::MenuCopyAll)).about(t(Msg::MenuCopyAllAbout))
         };
         let in_composer = self
             .host
@@ -3809,9 +3849,9 @@ impl Tui {
         let items = if in_composer {
             vec![
                 copy,
-                crate::menu::Item::new("paste", "粘贴").about("从剪贴板插入"),
-                crate::menu::Item::new("clear", "清空").about("丢掉草稿和附件"),
-                crate::menu::Item::new("send", "发送").about("把这一条交给模型"),
+                crate::menu::Item::new("paste", t(Msg::MenuPaste)).about(t(Msg::MenuPasteAbout)),
+                crate::menu::Item::new("clear", t(Msg::MenuClear)).about(t(Msg::MenuClearAbout)),
+                crate::menu::Item::new("send", t(Msg::MenuSend)).about(t(Msg::MenuSendAbout)),
             ]
         } else if selected {
             // Over the conversation with something selected: the press is about
@@ -3853,7 +3893,7 @@ impl Tui {
                         // is true of *now*, and a block for it would push the
                         // conversation up a row for a sentence nobody reads
                         // twice.
-                        self.host.say("已复制选中的内容", false);
+                        self.host.say(t(Msg::CopiedSelection).into_owned(), false);
                         return false;
                     }
                 }
@@ -3871,23 +3911,29 @@ impl Tui {
                     // nothing happened and nothing belongs in the conversation.
                     self.host.say(
                         if selected.is_some() {
-                            "选中的内容没有可复制的文字"
+                            t(Msg::SelectionHasNoText)
                         } else {
-                            "没有可复制的内容"
-                        },
+                            t(Msg::NothingToCopy)
+                        }
+                        .into_owned(),
                         true,
                     );
                     return false;
                 }
                 self.surface.copy(&text);
-                self.host.say("已复制到剪贴板", false);
+                // The other front end's usage panel already says this.
+                self.host.say(
+                    crate::i18n::product::t(crate::i18n::product::Msg::UsageCopied).into_owned(),
+                    false,
+                );
                 false
             }
             "paste" => {
                 let Some(text) = self.surface.clipboard_text() else {
                     // The menu's own refusal, so it belongs on the tip row with
                     // the rest of them rather than in the conversation.
-                    self.host.say("剪贴板里没有文本", true);
+                    self.host
+                        .say(t(Msg::ClipboardHasNoTextShort).into_owned(), true);
                     return false;
                 };
                 self.act(Action::Paste(text), client)
@@ -4109,12 +4155,11 @@ fn recall_forward(m: &mut crate::moment::Moment) {
 fn images_reach_the_model(client: &AgentClient) -> Result<(), String> {
     match client.described() {
         Some(described) if described.supports_vision => Ok(()),
-        Some(described) => Err(format!(
-            "当前模型 `{}` 看不了图片:贴进去也只会在发出去时被丢掉,所以没贴。\n\
-             换成能看图的模型再贴。",
-            described.model.unwrap_or_default()
-        )),
-        None => Err("还不知道这个 agent 用的是什么模型,图片没有去处,所以没贴。".to_string()),
+        Some(described) => Err(t(Msg::ModelCannotSeeImages {
+            model: &described.model.unwrap_or_default(),
+        })
+        .into_owned()),
+        None => Err(t(Msg::ModelUnknownForImages).into_owned()),
     }
 }
 

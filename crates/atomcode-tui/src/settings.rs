@@ -22,6 +22,7 @@
 //! config enum would have handed this crate the product's schema, and the screen
 //! would have to be edited every time a setting was added.
 
+use crate::i18n::{t, Msg};
 use std::sync::Arc;
 
 /// The id of the setting that decides whether the window title carries a light.
@@ -122,14 +123,15 @@ pub enum Applies {
 }
 
 impl Applies {
-    pub fn say(self) -> &'static str {
+    pub fn say(self) -> String {
         match self {
-            Self::Immediately => "立即",
-            Self::NextTurn => "下一轮",
-            Self::Reload => "重新加载",
-            Self::Reprepare => "重建能力",
-            Self::Restart => "重启后",
+            Self::Immediately => t(Msg::AppliesImmediately),
+            Self::NextTurn => t(Msg::AppliesNextTurn),
+            Self::Reload => t(Msg::AppliesReload),
+            Self::Reprepare => t(Msg::AppliesReprepare),
+            Self::Restart => t(Msg::AppliesRestart),
         }
+        .into_owned()
     }
 }
 

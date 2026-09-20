@@ -49,38 +49,46 @@ const CANDIDATES: &[&str] = &[
 
 /// The words this build ships when no launcher provides any.
 ///
-/// The same sentences `atomcode-config`'s Chinese table carries, so a screen
-/// mounted without a localisation (a test, `--audit`, a screen-only build) reads
-/// the same as the product does. A product with an i18n table provides its own
-/// and this one is not consulted — that override is the seam
-/// (`crate::plugin::WelcomeWordsSvc`).
+/// **Read from the product's table, not copied out of it.** These are the
+/// sentences the other front end's welcome block shows for the same commands,
+/// so a screen mounted without a localisation (a test, `--audit`, a screen-only
+/// build) says exactly what the product says — in whichever language is in
+/// force. It used to be a second copy in Chinese, which is how the same tip
+/// comes to read two ways.
+///
+/// The seam stays: a launcher that has its own words provides
+/// `crate::plugin::WelcomeWordsSvc` and this is not consulted.
 pub struct ShippedWords;
 
 impl WelcomeWords for ShippedWords {
     fn heading(&self) -> String {
-        "上手提示".to_string()
+        use crate::i18n::product::{t, Msg};
+        t(Msg::WelcomeTipsHeading).into_owned()
     }
     fn about(&self, command: &str) -> Option<String> {
-        let text = match command {
-            "login" => "领取免费额度",
-            "provider" => "添加自定义模型",
-            "model" => "设置默认模型",
-            "resume" => "恢复上次会话",
-            "setup" => "一键推荐配置",
-            "skills" => "浏览可用技能",
-            "plugin" => "安装技能/命令插件",
-            "webui" => "在浏览器打开同步会话",
-            "mcp" => "接入 MCP 工具",
-            "plan" => "只读规划模式",
-            "session" => "管理与切换会话",
-            "loop" => "循环执行提示词",
-            "goal" => "为本次会话设定目标",
-            "init" => "扫描代码库生成 AGENTS.md",
-            "language" => "切换界面语言",
-            "usage" => "查看用量与额度",
+        use crate::i18n::product::{t, Msg};
+        // One arm per command the block can suggest. A name that is not here
+        // gets `None`, and the tip falls back to the command's own description.
+        let msg = match command {
+            "login" => Msg::WelcomeTipLogin,
+            "provider" => Msg::WelcomeTipProvider,
+            "model" => Msg::WelcomeTipModel,
+            "resume" => Msg::WelcomeTipResume,
+            "setup" => Msg::WelcomeTipSetup,
+            "skills" => Msg::WelcomeTipSkills,
+            "plugin" => Msg::WelcomeTipPlugin,
+            "webui" => Msg::WelcomeTipWebui,
+            "mcp" => Msg::WelcomeTipMcp,
+            "plan" => Msg::WelcomeTipPlan,
+            "session" => Msg::WelcomeTipSession,
+            "loop" => Msg::WelcomeTipLoop,
+            "goal" => Msg::WelcomeTipGoal,
+            "init" => Msg::WelcomeTipInit,
+            "language" => Msg::WelcomeTipLanguage,
+            "usage" => Msg::WelcomeTipUsage,
             _ => return None,
         };
-        Some(text.to_string())
+        Some(t(msg).into_owned())
     }
 }
 

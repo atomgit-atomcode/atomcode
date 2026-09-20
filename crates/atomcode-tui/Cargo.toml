@@ -11,6 +11,13 @@ atomcode-plexus = { path = "../atomcode-plexus" }
 atomcode-harness = { path = "../atomcode-harness" }
 # Value types only: SessionEvent carries kernel messages and tool calls.
 atomcode-kernel = { path = "../atomcode-kernel" }
+# What this screen says to a person, in the language they chose. A leaf with no
+# atomcode dependency of its own — which is the whole reason the table lives
+# there and not in `atomcode-config`: the screen is an App apart and may not
+# depend on the product's config crate (`docs/adr/0022` §3), but it still has to
+# read the *same* locale the product reads, or `/language` would move one of
+# them and not the other.
+atomcode-i18n = { path = "../atomcode-i18n" }
 atomcode-host-api = { path = "../atomcode-host-api" }
 # The `tools` feature only, and only for the todo fold: the panel must derive the
 # list the *same* way the tool does (`reduce_todos`), or live, replay and resumed

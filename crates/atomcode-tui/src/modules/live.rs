@@ -42,6 +42,7 @@
 //! comes back at the bottom — which is where it is read from anyway, because that
 //! is where the turn's output arrives.
 
+use crate::i18n::{t, Msg};
 use atomcode_harness::session::SessionEvent;
 
 use crate::caps::Glyph;
@@ -321,16 +322,21 @@ fn doing(state: &State, moment: &Moment) -> Option<String> {
     state.turn?;
     match moment.activity {
         Activity::Idle => None,
-        Activity::Stopping => Some("正在停止".to_string()),
-        Activity::Working => Some(match state.phase {
-            Phase::Waiting => "正在等待模型".to_string(),
-            Phase::Thinking => "正在思考".to_string(),
-            Phase::Writing => "正在回复".to_string(),
-            // `max(1)`: `Tools` is only set with calls outstanding, so a zero
-            // here would be a fold that lost one — and "正在运行 0 个工具" is a
-            // sentence with no meaning.
-            Phase::Tools => format!("正在运行 {} 个工具", state.running.max(1)),
-        }),
+        Activity::Stopping => Some(t(Msg::LiveStopping).into_owned()),
+        Activity::Working => Some(
+            match state.phase {
+                Phase::Waiting => t(Msg::LiveWaiting),
+                Phase::Thinking => t(Msg::LiveThinking),
+                Phase::Writing => t(Msg::LiveWriting),
+                // `max(1)`: `Tools` is only set with calls outstanding, so a
+                // zero here would be a fold that lost one — and "running 0
+                // tools" is a sentence with no meaning.
+                Phase::Tools => t(Msg::LiveRunningTools {
+                    n: state.running.max(1),
+                }),
+            }
+            .into_owned(),
+        ),
     }
 }
 
@@ -356,19 +362,29 @@ fn doing(state: &State, moment: &Moment) -> Option<String> {
 fn parts(state: &State, moment: &Moment) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     if let Some(ms) = elapsed(state, moment) {
-        out.push(format!("耗时 {}", short(ms)));
+        out.push(t(Msg::LiveElapsed { took: &short(ms) }).into_owned());
     }
     if state.prompt > 0 {
-        out.push(format!("入 {}", crate::content::token_count(state.prompt)));
+        out.push(
+            t(Msg::LiveIn {
+                tokens: &crate::content::token_count(state.prompt),
+            })
+            .into_owned(),
+        );
     }
     if state.output > 0 {
-        out.push(format!("出 {}", crate::content::token_count(state.output)));
+        out.push(
+            t(Msg::LiveOut {
+                tokens: &crate::content::token_count(state.output),
+            })
+            .into_owned(),
+        );
     }
     if let Some(hit) = crate::content::cache_hit_rate(state.cached, state.prompt) {
-        out.push(format!("缓存 {hit}"));
+        out.push(t(Msg::LiveCached { hit: &hit }).into_owned());
     }
     if state.step > 1 {
-        out.push(format!("第 {} 步", state.step));
+        out.push(t(Msg::LiveStep { step: state.step }).into_owned());
     }
     out
 }

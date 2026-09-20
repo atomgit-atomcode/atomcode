@@ -6,6 +6,7 @@
 //! three-role convention the seams use, applied to the command surface, and it
 //! is why adding a capability adds its command without touching this file.
 
+use crate::i18n::{t, Msg};
 use std::borrow::Cow;
 use std::sync::{Arc, RwLock};
 
@@ -49,6 +50,36 @@ impl Command {
             aliases: &[],
         }
     }
+    /// The same, described by the language table.
+    ///
+    /// [`new`](Self::new) and [`taking`](Self::taking) stay `const` because a
+    /// catalogue that says the same thing in every language can be a `const`
+    /// array. One that reads its words from the table cannot: what it says
+    /// depends on the language in force when it is asked for, and `/language`
+    /// changes that mid-session. So a described catalogue is a function, and
+    /// this is what its entries are built with.
+    pub fn said(name: &'static str, about: Cow<'static, str>) -> Self {
+        Self {
+            name: Cow::Borrowed(name),
+            about,
+            takes: None,
+            aliases: &[],
+        }
+    }
+    /// [`said`](Self::said) for a command that takes something.
+    pub fn said_taking(
+        name: &'static str,
+        takes: Cow<'static, str>,
+        about: Cow<'static, str>,
+    ) -> Self {
+        Self {
+            name: Cow::Borrowed(name),
+            about,
+            takes: Some(takes),
+            aliases: &[],
+        }
+    }
+
     /// The same command, reachable by these extra names.
     pub const fn with_aliases(mut self, aliases: &'static [&'static str]) -> Self {
         self.aliases = aliases;
@@ -326,15 +357,14 @@ impl Commands {
             None => {
                 let near = self.matching(name);
                 if near.is_empty() {
-                    Outcome::Refused(format!("没有 /{name} 这条命令,输入 /help 看有哪些"))
+                    Outcome::Refused(t(Msg::CmdNoSuch { name }).into_owned())
                 } else {
-                    Outcome::Refused(format!(
-                        "没有 /{name};你是指 {}?",
-                        near.iter()
-                            .map(|c| format!("/{}", c.name))
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    ))
+                    let near = near
+                        .iter()
+                        .map(|c| format!("/{}", c.name))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    Outcome::Refused(t(Msg::CmdNoSuchDidYouMean { name, near: &near }).into_owned())
                 }
             }
         }

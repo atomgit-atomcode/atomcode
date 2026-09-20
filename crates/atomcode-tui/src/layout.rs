@@ -7,6 +7,7 @@
 //! and the commands and keys that reached them — was taken out until it is
 //! thought through (`docs/adr/0022` §8; `docs/adr/0007` is void).
 
+use crate::i18n::{t, Msg};
 use std::sync::RwLock;
 
 use crate::region::{Constraint, Dir, Region};
@@ -64,12 +65,24 @@ impl std::fmt::Display for LayoutError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LayoutError::NoSuchModule { name, available } => {
-                write!(f, "没有叫 `{name}` 的模块;现有的是:{}", available.join(" "))
+                let available = available.join(" ");
+                write!(
+                    f,
+                    "{}",
+                    t(Msg::LayoutNoSuchModule {
+                        name,
+                        available: &available
+                    })
+                )
             }
-            LayoutError::NotOnScreen(m) => write!(f, "`{m}` 本来就不在屏幕上"),
-            LayoutError::AlreadyOnScreen(m) => write!(f, "`{m}` 已经在屏幕上了"),
+            LayoutError::NotOnScreen(m) => {
+                write!(f, "{}", t(Msg::LayoutNotOnScreen { module: m }))
+            }
+            LayoutError::AlreadyOnScreen(m) => {
+                write!(f, "{}", t(Msg::LayoutAlreadyOnScreen { module: m }))
+            }
             LayoutError::NamedTwice(m) => {
-                write!(f, "`{m}` 被写了两遍:既在流尾部、又是独立面板,会被画两次")
+                write!(f, "{}", t(Msg::LayoutDrawnTwice { module: m }))
             }
         }
     }

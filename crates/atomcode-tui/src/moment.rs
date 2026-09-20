@@ -7,6 +7,7 @@
 //! non-derivable state from growing quietly: adding a field here is a visible
 //! act, and every one of them has to be settable by a test.
 
+use crate::i18n::{t, Msg};
 use atomcode_harness::seams::Question;
 
 use crate::frame::Rect;
@@ -610,7 +611,7 @@ impl Moment {
         self.caret = 0;
         self.quit_armed = true;
         self.notice =
-            Some(Notice::for_ms("再按 Ctrl+C 退出", false, self.now, QUIT_HINT_MS).below());
+            Some(Notice::for_ms(t(Msg::MomentQuitAgain), false, self.now, QUIT_HINT_MS).below());
         false
     }
 }

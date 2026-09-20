@@ -10,6 +10,7 @@
 //! 一件要紧的事:**配置排除掉的工具不给开关**。它压根没进过目录,命令放不回来,
 //! 屏幕上给一个按下去什么都不会发生的开关,比不给还糟。
 
+use crate::i18n::{t, Msg};
 use crate::surface::{Key, KeyPress, Mods};
 
 /// 一个工具此刻是什么状态。与 `atomcode_host_api::ToolState` 同形,分开一份是因为
@@ -35,12 +36,13 @@ impl State {
         }
     }
 
-    pub fn about(self) -> &'static str {
+    pub fn about(self) -> String {
         match self {
-            Self::On => "模型能调",
-            Self::Off => "本次会话关掉的",
-            Self::Excluded => "配置排除的",
+            Self::On => t(Msg::ToolsStateOn),
+            Self::Off => t(Msg::ToolsStateOff),
+            Self::Excluded => t(Msg::ToolsStateExcluded),
         }
+        .into_owned()
     }
 }
 
@@ -173,15 +175,13 @@ pub fn key(view: &ToolsView, panel: &mut Panel, press: KeyPress) -> Step {
                 // 没有开关可给:配置里没有它,命令也放不回来。说出来,而不是给一个
                 // 按下去什么都不发生的键。
                 State::Excluded => {
-                    panel.note = Some(format!(
-                        "`{}` 是这棵树的配置排除掉的 —— 改配置才能放回来",
-                        row.name
-                    ));
+                    panel.note =
+                        Some(t(Msg::ToolsExcludedByConfig { name: &row.name }).into_owned());
                     Step::Stay
                 }
                 State::On => {
                     panel.busy = Some(Busy {
-                        what: format!("正在关掉 {}…", row.name),
+                        what: t(Msg::ToolsTurningOff { name: &row.name }).into_owned(),
                     });
                     Step::Switch {
                         pattern: row.name,
@@ -190,7 +190,7 @@ pub fn key(view: &ToolsView, panel: &mut Panel, press: KeyPress) -> Step {
                 }
                 State::Off => {
                     panel.busy = Some(Busy {
-                        what: format!("正在放回 {}…", row.name),
+                        what: t(Msg::ToolsTurningOn { name: &row.name }).into_owned(),
                     });
                     Step::Switch {
                         pattern: row.name,

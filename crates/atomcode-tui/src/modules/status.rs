@@ -1,5 +1,6 @@
 //! The one-line header: what is running, on what, at what cost.
 
+use crate::i18n::{t, Msg};
 use atomcode_harness::session::SessionEvent;
 
 // One frame per tick, shared with the live line above the composer: two panels
@@ -115,7 +116,10 @@ impl View for Status {
         // lead's: everything below and everything typed is that member's.
         let viewing = &vp.moment.viewing;
         if !viewing.is_empty() && *viewing != vp.moment.lead {
-            let member = format!("成员 {}", viewing.rsplit('/').next().unwrap_or(viewing));
+            let member = t(Msg::StatusMember {
+                name: viewing.rsplit('/').next().unwrap_or(viewing),
+            })
+            .into_owned();
             reserved += width::str_width(&member) + sep_w;
             row.push(El::styled(member, theme::fg(Role::Accent)));
             row.push(El::styled(sep_text.clone(), dim));
@@ -127,7 +131,9 @@ impl View for Status {
         // a clock (docs/adr/0008).
         let activity: Option<(String, Style)> = match vp.moment.activity {
             Activity::Working => Some((working_indicator(vp.moment), theme::fg(Role::Warning))),
-            Activity::Stopping => Some(("停止中".to_string(), theme::fg(Role::Error))),
+            Activity::Stopping => {
+                Some((t(Msg::StatusStopping).into_owned(), theme::fg(Role::Error)))
+            }
             Activity::Idle => None,
         };
         if let Some((text, _)) = &activity {
@@ -363,9 +369,9 @@ fn fit_status_segments(
 /// third.
 fn autonomy_badge(running: &atomcode_host_api::Running) -> String {
     let kind = if running.kind == "goal" {
-        "目标"
+        t(Msg::StatusGoal)
     } else {
-        "循环"
+        t(Msg::StatusLoop)
     };
     let rounds = match running.of {
         Some(of) => format!("{}/{of}", running.round),
@@ -374,8 +380,17 @@ fn autonomy_badge(running: &atomcode_host_api::Running) -> String {
     match running.paused.as_deref() {
         // Registered but not moving is the state a person would otherwise sit
         // and wait through, so it is said rather than drawn as "running".
-        Some(why) => format!("{kind} 第 {rounds} 轮 · 停着:{why}"),
-        None => format!("{kind} 第 {rounds} 轮"),
+        Some(why) => t(Msg::StatusRoundsHeld {
+            kind: &kind,
+            rounds: &rounds,
+            why,
+        })
+        .into_owned(),
+        None => t(Msg::StatusRounds {
+            kind: &kind,
+            rounds: &rounds,
+        })
+        .into_owned(),
     }
 }
 
@@ -408,7 +423,13 @@ fn working_indicator(m: &Moment) -> String {
     if m.caps.unicode {
         working_frame(m.tick).to_string()
     } else {
-        format!("{} 运行中", m.caps.spinner(m.tick))
+        // The word is the product's — the other front end says "running" about
+        // a subagent with the same meaning, so this reaches for that entry.
+        format!(
+            "{} {}",
+            m.caps.spinner(m.tick),
+            crate::i18n::product::t(crate::i18n::product::Msg::SubagentStatusRunning)
+        )
     }
 }
 

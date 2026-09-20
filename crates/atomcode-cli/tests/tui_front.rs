@@ -189,7 +189,10 @@ async fn a_session_the_product_wrote_comes_back_on_the_row_assembled_screen() {
             .expect("the screen provides its commands");
         let login = commands.find("login").expect("the screen offers /login");
         assert!(
-            login.about.contains("codingplan"),
+            // Case-folded: the word is `CodingPlan` in the English table and
+            // `codingplan` in the Chinese one, and which language this binary
+            // draws in is not what is being asserted here.
+            login.about.to_lowercase().contains("codingplan"),
             "/login is the sign-in flow, not the shipped re-read: {}",
             login.about
         );

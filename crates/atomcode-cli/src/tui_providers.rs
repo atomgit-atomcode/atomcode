@@ -22,6 +22,7 @@
 //!   and `HostConfig::identity` follow, for the same reason — these answers are
 //!   drawn on a screen and kept in a log (`docs/adr/0021`).
 
+use atomcode_i18n::screen::{t as tr, Msg as SMsg};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -369,7 +370,7 @@ impl Providers for ConfigProviders {
     fn add_account(&self, draft: &AccountDraft) -> Result<String, String> {
         let base = sanitize(&draft.name);
         if base.is_empty() {
-            return Err("给它起个名字:字母、数字、`-`、`_`、`.`".into());
+            return Err(tr(SMsg::ProviderNameRules).into_owned());
         }
         // Not into the gateway's namespace, or it would be taken for a managed
         // account: undeletable here, and never asked for a key.
@@ -384,7 +385,7 @@ impl Providers for ConfigProviders {
         });
         let preset = provider_preset::preset_or_compatible(&draft.protocol);
         if draft.endpoint.trim().is_empty() && preset.default_base_url.is_none() {
-            return Err("这个协议没有默认地址,得填一个".into());
+            return Err(tr(SMsg::ProtocolNeedsEndpoint).into_owned());
         }
         let endpoint = endpoint_override(&draft.endpoint, &draft.protocol);
         let key = written_key(draft.key.as_deref());
@@ -407,7 +408,7 @@ impl Providers for ConfigProviders {
     fn edit_account(&self, id: &str, draft: &AccountDraft) -> Result<(), String> {
         let config = self.load();
         if config.account_is_codingplan_managed(id) {
-            return Err(format!("{id} 归登录管理,这儿改不了;用 /login"));
+            return Err(tr(SMsg::ManagedCannotEditUseLogin { id }).into_owned());
         }
         let wanted = provider_preset::preset_or_compatible(&draft.protocol);
         let legacy =
@@ -474,10 +475,10 @@ impl Providers for ConfigProviders {
     fn delete_account(&self, id: &str) -> Result<(), String> {
         let config = self.load();
         if config.account_is_codingplan_managed(id) {
-            return Err(format!("{id} 归登录管理,这儿删不了;用 /logout"));
+            return Err(tr(SMsg::ManagedCannotDeleteUseLogout { id }).into_owned());
         }
         if !config.provider_accounts.contains_key(id) && !config.providers.contains_key(id) {
-            return Err(format!("配置里没有 {id}"));
+            return Err(tr(SMsg::NotInConfig { id }).into_owned());
         }
         // Its models go with it: a model profile pointing at an account that is
         // gone is a selection that cannot resolve, and leaving those behind
@@ -503,11 +504,14 @@ impl Providers for ConfigProviders {
     fn add_model(&self, draft: &ModelDraft) -> Result<String, String> {
         let config = self.load();
         if config.account_is_codingplan_managed(&draft.account) {
-            return Err(format!("{} 的模型归登录管理", draft.account));
+            return Err(tr(SMsg::AccountModelsManaged {
+                account: &draft.account,
+            })
+            .into_owned());
         }
         let model = draft.model.trim().to_string();
         if model.is_empty() {
-            return Err("模型名不能是空的".into());
+            return Err(tr(SMsg::ModelNameCannotBeEmpty).into_owned());
         }
         // An offer picked off the account list has no account in the file yet.
         // Adding a model to it is what configures it, which is the one gesture
@@ -585,15 +589,15 @@ impl Providers for ConfigProviders {
     fn edit_model(&self, id: &str, draft: &ModelDraft) -> Result<(), String> {
         let config = self.load();
         if config.selection_is_codingplan_managed(id) {
-            return Err(format!("{id} 归登录管理,这儿改不了"));
+            return Err(tr(SMsg::ManagedCannotEdit { id }).into_owned());
         }
         let model = draft.model.trim().to_string();
         if model.is_empty() {
-            return Err("模型名不能是空的".into());
+            return Err(tr(SMsg::ModelNameCannotBeEmpty).into_owned());
         }
         let legacy = !config.models.contains_key(id) && config.providers.contains_key(id);
         if !legacy && !config.models.contains_key(id) {
-            return Err(format!("配置里没有 {id}"));
+            return Err(tr(SMsg::NotInConfig { id }).into_owned());
         }
         let window = draft.window.unwrap_or_else(|| {
             config
@@ -631,10 +635,10 @@ impl Providers for ConfigProviders {
     fn delete_model(&self, id: &str) -> Result<(), String> {
         let config = self.load();
         if config.selection_is_codingplan_managed(id) {
-            return Err(format!("{id} 归登录管理,这儿删不了"));
+            return Err(tr(SMsg::ManagedCannotDelete { id }).into_owned());
         }
         if !config.models.contains_key(id) && !config.providers.contains_key(id) {
-            return Err(format!("配置里没有 {id}"));
+            return Err(tr(SMsg::NotInConfig { id }).into_owned());
         }
         let gone = id.to_string();
         self.write(move |document| {

@@ -17,6 +17,8 @@
 //! 姊妹一样从底下升起来占住输入框的位置，于是「人在里面干活的三块面板」是同一个
 //! 形状、同一套键。
 
+use crate::i18n::product::{t as pt, Msg as PMsg};
+use crate::i18n::{t, Msg};
 use std::sync::Arc;
 
 use crate::surface::{Key, KeyPress, Mods};
@@ -39,29 +41,32 @@ impl Scope {
     /// 三个去处，画出来的顺序。
     pub const ALL: [Scope; 3] = [Scope::User, Scope::Project, Scope::Local];
 
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> String {
         match self {
-            Scope::User => "这台机器",
-            Scope::Project => "这个项目",
-            Scope::Local => "只有自己",
+            Scope::User => t(Msg::ScopeUserName),
+            Scope::Project => t(Msg::ScopeProjectName),
+            Scope::Local => t(Msg::ScopeLocalName),
         }
+        .into_owned()
     }
 
-    pub fn about(self) -> &'static str {
+    pub fn about(self) -> String {
         match self {
-            Scope::User => "装进 ~/.atomcode/plugins,哪个项目都能用",
-            Scope::Project => "装进 .atomcode/plugins,跟着仓库走、同事也有",
-            Scope::Local => "装进 .atomcode/plugins/local,不进 git,只有自己有",
+            Scope::User => t(Msg::ScopeUserAbout),
+            Scope::Project => t(Msg::ScopeProjectAbout),
+            Scope::Local => t(Msg::ScopeLocalAbout),
         }
+        .into_owned()
     }
 
     /// 已装行后面那个短标。
-    pub fn short(self) -> &'static str {
+    pub fn short(self) -> String {
         match self {
-            Scope::User => "机器",
-            Scope::Project => "项目",
-            Scope::Local => "自己",
+            Scope::User => t(Msg::ScopeUserShort),
+            Scope::Project => pt(PMsg::HelpSourceProject),
+            Scope::Local => t(Msg::ScopeLocalShort),
         }
+        .into_owned()
     }
 }
 
@@ -238,12 +243,13 @@ pub enum Tab {
 impl Tab {
     pub const ALL: [Tab; 3] = [Tab::All, Tab::Installed, Tab::Markets];
 
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> String {
         match self {
-            Tab::All => "全部",
-            Tab::Installed => "已装",
-            Tab::Markets => "市场",
+            Tab::All => t(Msg::PluginTabAll),
+            Tab::Installed => t(Msg::PluginTabInstalled),
+            Tab::Markets => t(Msg::PluginTabMarkets),
         }
+        .into_owned()
     }
 
     fn at(self) -> usize {
@@ -281,18 +287,20 @@ pub enum PluginAction {
 impl PluginAction {
     pub const ALL: [PluginAction; 2] = [PluginAction::Update, PluginAction::Uninstall];
 
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> String {
         match self {
-            PluginAction::Update => "更新",
-            PluginAction::Uninstall => "卸载",
+            PluginAction::Update => pt(PMsg::PluginActionUpdate),
+            PluginAction::Uninstall => pt(PMsg::PluginActionUninstall),
         }
+        .into_owned()
     }
 
-    pub fn about(self) -> &'static str {
+    pub fn about(self) -> String {
         match self {
-            PluginAction::Update => "从市场再取一遍,卸掉旧的装上新的",
-            PluginAction::Uninstall => "拿掉它,它带来的技能和钩子一并没有",
+            PluginAction::Update => t(Msg::PluginActionUpdateAbout),
+            PluginAction::Uninstall => t(Msg::PluginActionUninstallAbout),
         }
+        .into_owned()
     }
 }
 
@@ -316,20 +324,22 @@ pub enum MarketAction {
 }
 
 impl MarketAction {
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> String {
         match self {
-            MarketAction::Browse => "看它带的插件",
-            MarketAction::Update => "更新",
-            MarketAction::Remove => "删掉这个市场",
+            MarketAction::Browse => t(Msg::MarketActionBrowse),
+            MarketAction::Update => pt(PMsg::PluginActionUpdate),
+            MarketAction::Remove => t(Msg::MarketActionRemove),
         }
+        .into_owned()
     }
 
-    pub fn about(self) -> &'static str {
+    pub fn about(self) -> String {
         match self {
-            MarketAction::Browse => "回到全部页,只留它的",
-            MarketAction::Update => "再拉一次,看它有没有新插件",
-            MarketAction::Remove => "连同从它装的插件一起拿掉",
+            MarketAction::Browse => t(Msg::MarketActionBrowseAbout),
+            MarketAction::Update => t(Msg::MarketActionUpdateAbout),
+            MarketAction::Remove => t(Msg::MarketActionRemoveAbout),
         }
+        .into_owned()
     }
 }
 

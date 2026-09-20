@@ -29,6 +29,10 @@ async-trait = "0.1"
 atomcode-codingplan = { path = "../atomcode-codingplan" }
 # Config system used directly by the final binary.
 atomcode-config = { path = "../atomcode-config" }
+# The screen's own table, for the glue rows that speak *on* the screen
+# (`tui_*.rs`, the host control). The product's table reaches this crate through
+# `atomcode_config::i18n`, which is the same leaf re-exported.
+atomcode-i18n = { path = "../atomcode-i18n" }
 # Self-update mechanics (leaf crate, extracted from core).
 atomcode-updater = { path = "../atomcode-updater" }
 atomcode-tuix = { path = "../atomcode-tuix" }

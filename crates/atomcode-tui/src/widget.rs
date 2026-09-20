@@ -26,6 +26,7 @@
 use crate::caps::{Caps, Glyph};
 use crate::el::El;
 use crate::frame::{Line, Span, Style};
+use crate::i18n::{t, Msg};
 use crate::theme::{self, Role};
 use crate::width;
 
@@ -85,7 +86,7 @@ pub fn window(len: usize, selected: usize, height: usize) -> (usize, usize) {
 /// hides most of itself is worse than one that scrolls.
 pub fn list(items: &[Choice], selected: usize, height: u16, caps: Caps) -> El {
     if items.is_empty() {
-        return El::styled("（空）", dim(caps));
+        return El::styled(t(Msg::ListEmpty), dim(caps));
     }
     let h = height as usize;
     let (start, end) = window(items.len(), selected.min(items.len() - 1), h.max(1));
@@ -114,7 +115,7 @@ pub fn list(items: &[Choice], selected: usize, height: u16, caps: Caps) -> El {
     }
     let off = items.len() - (end - start);
     if off > 0 {
-        rows.push(El::styled(format!("  …还有 {off} 项"), dim(caps)));
+        rows.push(El::styled(t(Msg::ListMore { count: off }), dim(caps)));
     }
     El::col(rows)
 }
@@ -238,10 +239,10 @@ pub fn form(fields: &[Field], focused: usize, caps: Caps) -> El {
 /// A string rather than an `El` because that is where it goes: `El::footer`
 /// takes text, and a legend rendered as its own line reads as something the
 /// program said rather than as what it is.
-pub fn keys(pairs: &[(&str, &str)], caps: Caps) -> String {
+pub fn keys<K: AsRef<str>, V: AsRef<str>>(pairs: &[(K, V)], caps: Caps) -> String {
     pairs
         .iter()
-        .map(|(k, what)| format!("{k} {what}"))
+        .map(|(k, what)| format!("{} {}", k.as_ref(), what.as_ref()))
         .collect::<Vec<_>>()
         .join(&format!(" {} ", caps.g(Glyph::Separator)))
 }

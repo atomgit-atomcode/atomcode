@@ -32,6 +32,7 @@
 //!   frame: every control character goes, and a tab becomes the spaces it is
 //!   drawn as.
 
+use crate::i18n::{t, Msg};
 use std::borrow::Cow;
 use std::iter::Peekable;
 use std::str::Chars;
@@ -197,13 +198,17 @@ pub fn when(at_ms: u64) -> String {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(at_ms);
     let ago = now.saturating_sub(at_ms) / 1000;
+    // The other front end's session picker says these four words already, so
+    // this reads its entry instead of opening a second "how long ago" table.
+    use crate::i18n::product::{t, Msg};
     match ago {
-        0..=59 => "刚刚".into(),
-        60..=3599 => format!("{} 分钟前", ago / 60),
-        3600..=86_399 => format!("{} 小时前", ago / 3600),
-        86_400..=2_591_999 => format!("{} 天前", ago / 86_400),
-        _ => format!("{} 个月前", ago / 2_592_000),
+        0..=59 => t(Msg::SessionTimeJustNow),
+        60..=3599 => t(Msg::SessionTimeMinAgo { n: ago / 60 }),
+        3600..=86_399 => t(Msg::SessionTimeHourAgo { n: ago / 3600 }),
+        86_400..=2_591_999 => t(Msg::SessionTimeDayAgo { n: ago / 86_400 }),
+        _ => t(Msg::SessionTimeMonthAgo { n: ago / 2_592_000 }),
     }
+    .into_owned()
 }
 
 /// Seconds, as a person would say them.
@@ -214,12 +219,13 @@ pub fn when(at_ms: u64) -> String {
 pub fn spoken_duration(secs: u64) -> String {
     let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
     match (h, m, s) {
-        (0, 0, s) => format!("{s} 秒"),
-        (0, m, 0) => format!("{m} 分"),
-        (0, m, s) => format!("{m} 分 {s} 秒"),
-        (h, 0, _) => format!("{h} 小时"),
-        (h, m, _) => format!("{h} 小时 {m} 分"),
+        (0, 0, s) => t(Msg::LastedSeconds { s }),
+        (0, m, 0) => t(Msg::LastedMinutes { m }),
+        (0, m, s) => t(Msg::LastedMinutesSeconds { m, s }),
+        (h, 0, _) => t(Msg::LastedHours { h }),
+        (h, m, _) => t(Msg::LastedHoursMinutes { h, m }),
     }
+    .into_owned()
 }
 
 /// The terminal window/tab title: an optional status dot, then the session's

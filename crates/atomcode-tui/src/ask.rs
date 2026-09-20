@@ -17,6 +17,8 @@
 //! approval row's business; this only knows how to put a question on a screen
 //! and wait.
 
+use crate::i18n::product::{t as pt, Msg as PMsg};
+use crate::i18n::{t, Msg};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -220,15 +222,15 @@ pub fn question_for(kind: &str, payload: &Value, events: &[LoggedEvent]) -> Opti
         atomcode_kernel::event::ROUND_CAP_CHECKPOINT_KIND
         | atomcode_kernel::event::OUTPUT_TRUNCATION_CHECKPOINT_KIND => {
             let (prompt, asker) = if kind == atomcode_kernel::event::ROUND_CAP_CHECKPOINT_KIND {
-                ("这一轮已经跑了很多步。继续吗?", "步数上限")
+                (t(Msg::AskStepLimitQuestion), t(Msg::AskStepLimitTitle))
             } else {
-                ("回答一直被截断,自动接续已经用尽。继续吗?", "输出截断")
+                (t(Msg::AskTruncatedQuestion), t(Msg::AskTruncatedTitle))
             };
             Some(Question {
                 prompt: prompt.into(),
                 options: vec![
-                    Answer::labelled(CONTINUE.to_string(), "继续".to_string()),
-                    Answer::labelled(STOP.to_string(), "停下".to_string()),
+                    Answer::labelled(CONTINUE.to_string(), t(Msg::AskContinue).into_owned()),
+                    Answer::labelled(STOP.to_string(), t(Msg::AskStop).into_owned()),
                 ],
                 asker: Some(asker.into()),
                 about: None,
@@ -272,8 +274,8 @@ fn generic(kind: &str, payload: &Value) -> Option<Question> {
         // on screen is a question nobody can answer.
         options: if offered.is_empty() {
             vec![
-                Answer::labelled(YES.to_string(), "好".to_string()),
-                Answer::labelled(NO.to_string(), "不了".to_string()),
+                Answer::labelled(YES.to_string(), t(Msg::AskYes).into_owned()),
+                Answer::labelled(NO.to_string(), t(Msg::AskNo).into_owned()),
             ]
         } else {
             offered
@@ -391,10 +393,14 @@ pub fn response_for(kind: &str, _question: &Question, answer: Option<String>) ->
 /// the transcript keeps, so the word a person picked is the word they see
 /// afterwards.
 pub fn answer_label(value: &str, fallback: &str) -> String {
+    // Two of the three are the product's own words — the other front end's
+    // approval panel offers them — so they are read from its table rather than
+    // restated. "Always" is this screen's: the product's entry names the tool
+    // it covers, and this row has the scope on a line of its own.
     match value {
-        ANSWER_ALLOW => "允许一次".into(),
-        ANSWER_ALWAYS => "总是允许".into(),
-        ANSWER_DENY => "拒绝".into(),
+        ANSWER_ALLOW => pt(PMsg::ApprovalAllowOnce).into_owned(),
+        ANSWER_ALWAYS => t(Msg::AskAlwaysAllow).into_owned(),
+        ANSWER_DENY => pt(PMsg::ApprovalDeny).into_owned(),
         _ => fallback.to_string(),
     }
 }
@@ -409,7 +415,7 @@ pub fn recorded(question: &Question) -> String {
         return question.prompt.clone();
     };
     let who = match &question.asker {
-        Some(name) => format!("成员 {name} 请求 "),
+        Some(name) => t(Msg::AskMemberRequests { name }).into_owned(),
         None => String::new(),
     };
     let what = highlights(&about.arguments)
@@ -455,11 +461,11 @@ pub fn highlights(arguments: &str) -> Vec<(String, String)> {
         if let Some(found) = object.get(key).and_then(|v| v.as_str()) {
             out.push((
                 key.to_string(),
-                format!(
-                    "{} 行 · {} 字",
-                    found.lines().count(),
-                    found.chars().count()
-                ),
+                t(Msg::AskLinesChars {
+                    lines: found.lines().count(),
+                    chars: found.chars().count(),
+                })
+                .into_owned(),
             ));
         }
     }
