@@ -151,3 +151,38 @@ async fn a_row_that_uses_the_door_takes_its_fragment_away() {
         "the door's second half should have withdrawn it:\n{after}"
     );
 }
+
+/// Two rows must not write one fragment id.
+///
+/// Overwriting by id used to be how this product replaced the harness's generic
+/// advertisement and persona. It reads like a replacement and behaves like a
+/// race: the text depends on mount order, and whichever row unloads first takes
+/// the other's fragment with it — `remove` is by id and does not know who wrote
+/// what. So the replacement is a decision in the row list instead, where
+/// `--dump-config` shows it.
+#[test]
+fn the_rows_this_product_replaces_are_not_in_its_tree() {
+    let dir = scratch("assembly");
+    let tree = tree(&dir);
+    let active: Vec<&str> = tree.active().map(|e| e.id.as_str()).collect();
+
+    assert!(
+        active.contains(&"persona-atomcode"),
+        "the product persona should be mounted: {active:?}"
+    );
+    assert!(
+        !active.contains(&"persona-coding"),
+        "the generic persona row is still mounted, so two rows write one \
+         identity and the last to unload wins: {active:?}"
+    );
+
+    assert!(
+        active.contains(&"skill-catalog-inline"),
+        "the catalog row should be mounted: {active:?}"
+    );
+    assert!(
+        !active.contains(&"skills-advert"),
+        "the generic advertisement row is still mounted alongside the catalog \
+         that replaces it: {active:?}"
+    );
+}

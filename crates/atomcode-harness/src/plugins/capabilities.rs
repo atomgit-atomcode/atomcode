@@ -55,6 +55,50 @@ struct SkillsRow {
     home: Option<String>,
 }
 
+/// `skills-advert`: the one sentence that tells the model skills exist.
+///
+/// Its own row rather than a paragraph inside [`SkillsPlugin`], because a
+/// product that says something better — coding lists the whole catalog — has to
+/// be able to turn this off, and the only honest way to turn a fragment off is
+/// to not mount the row that writes it. Contributing under a shared id instead
+/// made the override invisible in the row list and, worse, tied the two rows'
+/// lifetimes together: whichever left first took the other's text with it
+/// (`docs/adr/0019`, `atomcode-coding/tests/prompt_fragments.rs`).
+pub struct SkillsAdvertPlugin;
+
+#[async_trait]
+impl Plugin for SkillsAdvertPlugin {
+    fn name(&self) -> &'static str {
+        "skills-advert"
+    }
+    fn uses(&self) -> &'static [&'static str] {
+        &["skills", "system-prompt"]
+    }
+    fn description(&self) -> &'static str {
+        "tell the model how many skills are installed and how to load one"
+    }
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        let Some(skills) = ctx.service::<SkillsSvc>() else {
+            return Ok(());
+        };
+        // Only advertise skills when some exist: a catalog line promising
+        // capabilities that resolve to nothing is worse than no line.
+        let count = skills.len();
+        if count > 0 {
+            contribute_prompt(
+                ctx,
+                "skills-advert",
+                60,
+                &format!(
+                    "{count} skill(s) are available. Call `list_skills` to see them and \
+                     `use_skill` to load one before doing work it covers."
+                ),
+            );
+        }
+        Ok(())
+    }
+}
+
 pub struct SkillsPlugin;
 
 #[async_trait]
@@ -130,19 +174,6 @@ impl Plugin for SkillsPlugin {
                 continue;
             }
             crate::commands::register(ctx, Arc::new(RunSkill(skill)))?;
-        }
-        // Only advertise skills when some exist: a catalog line promising
-        // capabilities that resolve to nothing is worse than no line.
-        if count > 0 {
-            contribute_prompt(
-                ctx,
-                "skills",
-                60,
-                &format!(
-                    "{count} skill(s) are available. Call `list_skills` to see them and \
-                     `use_skill` to load one before doing work it covers."
-                ),
-            );
         }
         crate::plugins::self_knowledge::describes(
             ctx,

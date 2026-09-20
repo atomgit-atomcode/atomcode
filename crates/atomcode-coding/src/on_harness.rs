@@ -188,6 +188,12 @@ disabled = true
 [[insert]]
 name = "skills"
 
+# The generic one-sentence advertisement. `CODING_ROWS` removes it, because this
+# product lists the whole catalog instead — see `skill-catalog-inline`. A tree
+# built from these defaults alone keeps it.
+[[insert]]
+name = "skills-advert"
+
 [[insert]]
 name = "codeintel"
 
@@ -545,9 +551,15 @@ config = { working_dir = {working_dir} }
 name = "tool-output-artifact"
 config = { dir = {artifacts} }
 
-# How the model is told about skills. The generic `skills` row advertises a
+# How the model is told about skills. The generic `skills-advert` row offers a
 # count and a pointer; coding lists the catalog, because every other piece of
-# its skill steering refers to that catalog by name.
+# its skill steering refers to that catalog by name. The generic row goes
+# rather than being overwritten: two rows writing one fragment id is a lifetime
+# they do not share (`docs/adr/0019`). `[[remove]]` is tolerant, so this is a
+# no-op in a tree that never inserted it.
+[[remove]]
+id = "skills-advert"
+
 [[insert]]
 name = "skill-catalog-inline"
 
@@ -571,8 +583,16 @@ name = "opener-local"
 [[insert]]
 name = "tool-open-file"
 
-# Coding's own persona, in place of the harness's generic one. `{model}` is
-# rewritten by a `/model` patch so this row remounts with it.
+# Coding's own persona, in place of the harness's generic one. "In place of" is
+# this removal, not a shared fragment id: a tree that mounts both rows and lets
+# one overwrite the other has two personas whose text depends on mount order,
+# and whichever row leaves first takes the other's identity with it
+# (`docs/adr/0019`). `[[remove]]` is tolerant, so this is a no-op in a tree that
+# never inserted the generic row — which is every tree the runtime builds.
+[[remove]]
+id = "persona-coding"
+
+# `{model}` is rewritten by a `/model` patch so this row remounts with it.
 [[insert]]
 name = "persona-atomcode"
 config = { model = {model} }
@@ -2184,7 +2204,7 @@ impl Plugin for ExecutionPolicyPlugin {
 /// Fragment id and rank of the generic `skills` advertisement, which this
 /// replaces. Same id is the mechanism (`PromptRegistry::contribute` retains by
 /// id), and it is deliberate rather than incidental.
-pub(crate) const SKILLS_FRAGMENT: (&str, i32) = ("skills", 60);
+pub(crate) const SKILLS_FRAGMENT: (&str, i32) = ("skills-catalog", 60);
 
 /// Puts the full skill catalog in the system prompt.
 pub struct SkillCatalogPlugin;
@@ -2788,9 +2808,10 @@ impl Plugin for CodingPersonaPlugin {
         // chain reads, which cannot see a tree that failed to mount the tool. See
         // `coding_persona_rows`.
         let text = crate::persona::coding_persona_rows(&model, row.language, &has);
-        // Rank 0 and the generic row's id: the identity line goes first, and
-        // there is only ever one of it.
-        atomcode_harness::plugins::tools::contribute_prompt(ctx, "persona-coding", 0, &text);
+        // Rank 0, and an id of this row's own: the identity line goes first,
+        // and the generic row it replaces is removed by `CODING_ROWS` rather
+        // than overwritten here.
+        atomcode_harness::plugins::tools::contribute_prompt(ctx, "persona-atomcode", 0, &text);
         Ok(())
     }
 }

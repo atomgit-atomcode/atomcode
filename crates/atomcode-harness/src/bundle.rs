@@ -235,6 +235,11 @@ disabled = true
 [[insert]]
 name = "skills"
 
+# The sentence that says skills exist. A separate row so a product with a better
+# answer removes it instead of overwriting it (`skills-advert`).
+[[insert]]
+name = "skills-advert"
+
 [[insert]]
 name = "codeintel"
 
