@@ -194,6 +194,35 @@ async fn a_session_the_product_wrote_comes_back_on_the_row_assembled_screen() {
             login.about
         );
     }
+    // **The plugins panel is this launcher's too**, and both halves have to be
+    // here or the command is a dead end: the port, which knows what a
+    // marketplace is, and the row that draws it. A screen with the command and
+    // neither would answer `/plugin` with "this screen has no plugins panel" —
+    // which is what the new screen did before this existed.
+    {
+        let ctx = mounted.app.context();
+        let commands = ctx
+            .service::<atomcode_tui::plugin::CommandsSvc>()
+            .expect("the screen provides its commands");
+        assert!(
+            commands.find("plugin").is_some(),
+            "the screen offers /plugin"
+        );
+        let port = ctx
+            .service::<atomcode_tui::plugin::PluginsSvc>()
+            .expect("this launcher fills the plugins port");
+        // It answers from this machine rather than panicking on an empty one: a
+        // fresh machine has no marketplaces, and the panel opens on a list that
+        // says so.
+        let _ = atomcode_tui::plugins::Plugins::rows(port.as_ref());
+        let modules = ctx
+            .service::<atomcode_tui::plugin::ModulesSvc>()
+            .expect("the screen provides its modules");
+        assert!(
+            modules.has_view(atomcode_tui::modules::plugins::ID),
+            "and the row that draws the panel is mounted, or the command opens nothing"
+        );
+    }
     let term = mounted
         .app
         .context()

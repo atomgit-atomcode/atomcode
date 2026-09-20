@@ -16,6 +16,7 @@ fn _isolate_atomcode_home() {
 pub mod askpass;
 pub mod tui_login;
 pub mod tui_onboarding;
+pub mod tui_plugins;
 pub mod tui_providers;
 pub mod tui_settings;
 pub mod tui_welcome_words;
@@ -66,29 +67,40 @@ pub mod tui_front {
         // `HostCommand::Settings`/`SwitchModel` answerable, and the settings row
         // is the panel `/config` pulls up. They are not alternatives — one is
         // what a host can be asked, the other is what this screen can show.
-        let connection = connect(runtime, front_end, config, host_config)?;
-        // Four rows and two ports. The onboarding row is here rather than behind
-        // a condition because what it contributes is a command: whether it runs
-        // is readiness's answer, asked when the screen starts, and a machine
-        // that is already set up simply never names it.
+        // Six rows and three ports. The onboarding row is here rather than
+        // behind a condition because what it contributes is a command: whether
+        // it runs is readiness's answer, asked when the screen starts, and a
+        // machine that is already set up simply never names it.
         //
         // The welcome-words row is the same shape as the settings one: the
         // screen owns the opening block, this launcher owns the sentences in it
         // (they live in `atomcode-config`, which the screen must not depend on),
         // and the row is how the second reaches the first.
+        // Taken before the config is moved into `connect`: the plugins port
+        // resolves project-scoped installs against it, and it is the one thing
+        // here that is about *where this session is* rather than about the
+        // configuration file.
+        let working_dir = config.working_dir.clone();
+        let connection = connect(runtime, front_end, config, host_config)?;
         let layers = [
             crate::tui_settings::row_layer(),
             crate::tui_providers::row_layer(),
+            crate::tui_plugins::row_layer(),
             crate::tui_onboarding::row_layer(),
             crate::tui_login::row_layer(),
             crate::tui_welcome_words::row_layer(),
         ];
         launch::mount_with(
             screen,
-            &[&layers[0], &layers[1], &layers[2], &layers[3], &layers[4]],
+            &[
+                &layers[0], &layers[1], &layers[2], &layers[3], &layers[4], &layers[5],
+            ],
             &[
                 Arc::new(crate::tui_settings::SettingsRow),
                 Arc::new(crate::tui_providers::ProvidersRow),
+                Arc::new(crate::tui_plugins::PluginsRow {
+                    config_path: config_path.clone(),
+                }),
                 Arc::new(crate::tui_onboarding::OnboardingRow {
                     config_path: config_path.clone(),
                     telemetry: telemetry.clone(),
@@ -104,6 +116,7 @@ pub mod tui_front {
                     config_path.clone(),
                 )),
                 providers: Some(crate::tui_providers::ConfigProviders::new(config_path)),
+                plugins: Some(crate::tui_plugins::DiskPlugins::new(working_dir)),
             },
             connection,
         )
