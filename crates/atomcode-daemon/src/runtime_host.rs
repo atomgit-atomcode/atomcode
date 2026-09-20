@@ -3,7 +3,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use atomcode_coding::cc_hooks::HookConfig;
 use atomcode_coding::{
-    AccountUsage, DayUse, ModelUse, PluginHookSource, RateLimitWindow, RateLimitWindowSource,
+    AccountUsage, DayUse, ModelSeries, ModelUse, PluginHookSource, RateLimitWindow,
+    RateLimitWindowSource,
 };
 
 #[derive(Debug, Default)]
@@ -79,35 +80,62 @@ impl RateLimitWindowSource for CodingPlanRateLimitSource {
             let client = atomcode_codingplan::client::Client::from_stored_auth()
                 .map_err(|error| error.to_string())?;
             let usage = client.usage().map_err(|error| error.to_string())?;
-            let mut models: Vec<ModelUse> = usage
-                .model_tokens
-                .iter()
-                .map(|(name, tokens)| ModelUse {
-                    name: name.clone(),
-                    tokens: *tokens,
-                    requests: usage.model_counts.get(name).copied().unwrap_or(0),
-                })
-                .collect();
-            models.sort_by(|a, b| b.tokens.cmp(&a.tokens).then_with(|| a.name.cmp(&b.name)));
-            Ok(Some(AccountUsage {
-                from: usage.start_date,
-                to: usage.end_date,
-                models,
-                daily: usage
-                    .rows
-                    .into_iter()
-                    .map(|row| DayUse {
-                        date: row.date,
-                        tokens: row.total_tokens,
-                        requests: row.total_counts,
-                    })
-                    .collect(),
-                total_tokens: usage.total_tokens,
-                total_requests: usage.total_counts,
-            }))
+            Ok(Some(usage_from(usage)))
         })
         .await
         .map_err(|error| error.to_string())?
+    }
+}
+
+/// What the account has spent, in the runtime's own words.
+///
+/// A named function rather than a closure inside the fetch, for the reason
+/// [`window_from`] is one: what a mapping carries has to be judgeable without a
+/// network, and a field-by-field map is the shape that loses a field without
+/// anything going red. This one has lost one already — `model_tokens` on each
+/// row, which is the whole per-model breakdown a chart draws its lines from.
+fn usage_from(usage: atomcode_codingplan::usage::UsageResponse) -> AccountUsage {
+    let mut models: Vec<ModelUse> = usage
+        .model_tokens
+        .iter()
+        .map(|(name, tokens)| ModelUse {
+            name: name.clone(),
+            tokens: *tokens,
+            requests: usage.model_counts.get(name).copied().unwrap_or(0),
+        })
+        .collect();
+    models.sort_by(|a, b| b.tokens.cmp(&a.tokens).then_with(|| a.name.cmp(&b.name)));
+    // The service breaks every day down by model, and a chart wants it that way
+    // round: one line per model across every day. Taken in the order `models`
+    // is already in, so the nth series and the nth row of the table are the
+    // same model — which is what lets a colour stand in for a name.
+    let series: Vec<ModelSeries> = models
+        .iter()
+        .map(|model| ModelSeries {
+            name: model.name.clone(),
+            daily: usage
+                .rows
+                .iter()
+                .map(|row| row.model_tokens.get(&model.name).copied().unwrap_or(0))
+                .collect(),
+        })
+        .collect();
+    AccountUsage {
+        from: usage.start_date,
+        to: usage.end_date,
+        models,
+        daily: usage
+            .rows
+            .into_iter()
+            .map(|row| DayUse {
+                date: row.date,
+                tokens: row.total_tokens,
+                requests: row.total_counts,
+            })
+            .collect(),
+        series,
+        total_tokens: usage.total_tokens,
+        total_requests: usage.total_counts,
     }
 }
 
@@ -142,6 +170,70 @@ pub fn coding_provider_factory() -> Arc<dyn atomcode_coding::CodingProviderFacto
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The per-model breakdown of each day reaches the runtime too.
+    ///
+    /// The same mapping as the windows, and the same failure: `UsageRow` says
+    /// what every model spent on that day, and the first version of this map
+    /// kept only the row's total — so a chart could draw one line and never
+    /// say whose. Asserted on the shape a chart reads it in: one series per
+    /// model, in the table's own order, each as long as the days.
+    #[test]
+    fn every_model_keeps_its_own_day_by_day_figures() {
+        let day = |date: &str, small: u64, big: u64| atomcode_codingplan::usage::UsageRow {
+            date: date.into(),
+            model_counts: [("small".to_string(), 1), ("big".to_string(), 2)]
+                .into_iter()
+                .collect(),
+            model_tokens: [("small".to_string(), small), ("big".to_string(), big)]
+                .into_iter()
+                .collect(),
+            total_counts: 3,
+            total_tokens: small + big,
+        };
+        let upstream = atomcode_codingplan::usage::UsageResponse {
+            days: 2,
+            start_date: "2026-09-19".into(),
+            end_date: "2026-09-20".into(),
+            models: vec!["big".into(), "small".into()],
+            rows: vec![day("2026-09-19", 1, 10), day("2026-09-20", 2, 20)],
+            model_tokens: [("small".to_string(), 3), ("big".to_string(), 30)]
+                .into_iter()
+                .collect(),
+            model_counts: [("small".to_string(), 2), ("big".to_string(), 4)]
+                .into_iter()
+                .collect(),
+            total_tokens: 33,
+            total_counts: 6,
+        };
+        let crossed = usage_from(upstream);
+        // Biggest first, and the series in the same order — a colour can only
+        // stand in for a name while the nth line and the nth row agree.
+        assert_eq!(
+            crossed
+                .models
+                .iter()
+                .map(|m| m.name.as_str())
+                .collect::<Vec<_>>(),
+            ["big", "small"]
+        );
+        assert_eq!(
+            crossed
+                .series
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            ["big", "small"]
+        );
+        assert_eq!(crossed.series[0].daily, vec![10, 20], "big, day by day");
+        assert_eq!(crossed.series[1].daily, vec![1, 2], "small, day by day");
+        assert_eq!(
+            crossed.daily.iter().map(|d| d.tokens).collect::<Vec<_>>(),
+            [11, 22]
+        );
+        assert_eq!(crossed.total_tokens, 33);
+        assert_eq!(crossed.total_requests, 6);
+    }
 
     /// Everything the account service says about a window reaches the runtime.
     ///

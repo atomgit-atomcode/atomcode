@@ -79,12 +79,14 @@ impl View for Settings {
                         width::take_width(&format!("  {text}"), w),
                         theme::fg(Role::Muted),
                     ),
-                    UsageLine::Spark {
-                        values,
-                        from,
-                        to,
-                        peak,
-                    } => usage_spark(&values, &from, &to, peak, w, vp.moment.caps),
+                    UsageLine::ChartRow { axis, dots, ink } => {
+                        chart_row(&axis, &dots, &ink, w, vp.moment.caps)
+                    }
+                    UsageLine::ChartDates { gutter, text } => Line::styled(
+                        width::take_width(&format!("  {} {text}", " ".repeat(gutter)), w),
+                        theme::fg(Role::Muted),
+                    ),
+                    UsageLine::Cols { text, head, mark } => table_row(&text, head, mark, w),
                     UsageLine::Gap => Line::empty(),
                 },
                 Row::Elsewhere { tab } => Line::styled(
@@ -507,18 +509,41 @@ enum UsageLine {
     Bar { share: f32, about: String },
     /// An ordinary line, dimmed.
     Note(String),
-    /// A day-by-day series, drawn as one row of blocks with its span under it.
+    /// One plot row of the day chart: what the gutter says at this height, and
+    /// which of the row's sub-cells the line passes through.
     ///
-    /// One row rather than the classic front end's four-row plot: this page is
-    /// a panel that shares the screen with a conversation, and the question it
-    /// answers — "is it climbing, and when was the spike" — is answered by the
-    /// shape alone. The peak is said in words beside it, because a block row
-    /// has no axis to read a number off.
-    Spark {
-        values: Vec<u64>,
-        from: String,
-        to: String,
-        peak: u64,
+    /// A bitmask per cell rather than a glyph, because which glyph a set of
+    /// sub-cells is depends on what the terminal can draw, and that is only
+    /// known at render time. The dots are the data; braille is one rendering of
+    /// them and `:` is another.
+    ChartRow {
+        axis: String,
+        dots: Vec<u8>,
+        /// Which series owns each cell — the index the colour comes from, or
+        /// [`NO_SERIES`] for a chart that is not split by model.
+        ///
+        /// Per cell and not per row, because the lines cross: at a cell two of
+        /// them pass through, the dots merge and one of them has to be the one
+        /// that names the colour. Taking the biggest is arbitrary but stable,
+        /// which is what a legend needs.
+        ink: Vec<u8>,
+    },
+    /// The dates under the plot, already laid out into the plot's own columns.
+    ///
+    /// Laid out here rather than at render for the reason [`UsageLine::Cols`]
+    /// is: where a tick goes depends on which day it names and how wide the
+    /// plot is, and both of those are the chart's, not the screen's.
+    ChartDates { gutter: usize, text: String },
+    /// A row of an aligned table, already padded. `head` draws the column names,
+    /// and `mark` is the series dot that ties the row to a line on the chart.
+    ///
+    /// Padded here rather than at render: column widths come from what is *in*
+    /// the columns, not from how wide the screen is, so they are the same at
+    /// every width — which is the only reason a column of numbers is readable.
+    Cols {
+        text: String,
+        head: bool,
+        mark: Option<u8>,
     },
     /// A blank line inside the page.
     Gap,
@@ -639,46 +664,13 @@ fn usage_lines(page: Option<&crate::settings::UsagePage>) -> Vec<UsageLine> {
 
         if !stats.daily.is_empty() {
             out.push(UsageLine::Head("每天用掉多少".into()));
-            out.push(UsageLine::Spark {
-                values: stats.daily.iter().map(|d| d.tokens).collect(),
-                from: stats
-                    .daily
-                    .first()
-                    .map(|d| d.date.clone())
-                    .unwrap_or_default(),
-                to: stats
-                    .daily
-                    .last()
-                    .map(|d| d.date.clone())
-                    .unwrap_or_default(),
-                peak: stats.daily.iter().map(|d| d.tokens).max().unwrap_or(0),
-            });
+            out.extend(day_chart(&stats.daily, &stats.series));
             out.push(UsageLine::Gap);
         }
 
         if !stats.models.is_empty() {
             out.push(UsageLine::Head("各模型用量".into()));
-            let biggest = stats.models.first().map(|m| m.tokens).unwrap_or(0).max(1);
-            for model in &stats.models {
-                let share = if stats.total_tokens == 0 {
-                    0.0
-                } else {
-                    model.tokens as f32 / stats.total_tokens as f32
-                };
-                out.push(UsageLine::Bar {
-                    // Against the biggest, not against the total: the bars are
-                    // there to be compared with each other, and a set where the
-                    // top one is a quarter of the track wastes the track.
-                    share: model.tokens as f32 / biggest as f32,
-                    about: format!(
-                        "{} · {} tokens · {} 次 · {:.0}%",
-                        model.name,
-                        crate::content::token_count_u64(model.tokens),
-                        model.requests,
-                        share * 100.0
-                    ),
-                });
-            }
+            out.extend(model_table(&stats.models, stats.total_tokens));
             out.push(UsageLine::Gap);
         }
     }
@@ -724,59 +716,338 @@ fn usage_bar(share: f32, about: &str, w: usize, caps: crate::caps::Caps) -> Line
     Line::from_spans(spans).truncate(w)
 }
 
-/// A day-by-day series as one row of blocks, with its span beside it.
+/// How many rows tall the day chart's plot is, and how many columns wide.
 ///
-/// Eight heights from the braille-free block set, so it draws on a terminal
-/// with no Unicode as well — the shape survives the downgrade even when the
-/// resolution does not. Scaled to the peak, which is said in words: a row of
-/// blocks has no axis, and "it doubled" is unreadable without knowing what the
-/// tallest one is.
+/// Both fixed, for the reason [`BAR_CELLS`] is: a chart that changed width with
+/// the panel could not be compared with the one you looked at yesterday, and
+/// every row this panel draws is truncated to its rect rather than reflowed
+/// into it — so the width is a property of the chart, not of the screen. It
+/// also keeps [`rows_for`] width-free, which is what lets the panel's height be
+/// computed once.
+const CHART_ROWS: usize = 6;
+const CHART_CELLS: usize = 52;
+/// How wide the gutter of y-axis labels is, in cells. The classic front end's
+/// figure: wide enough for `216.6m`, and the same on every row — a gutter that
+/// changed width between a labelled row and a blank one would make the plot
+/// jitter sideways as the eye went down it.
+const AXIS_CELLS: usize = 7;
+
+/// How many dots a cell holds, and which bit each one is.
 ///
-/// Values beyond the width are **averaged into** the columns rather than
-/// dropped, so a month of days on a narrow panel is still a month — a chart
-/// that silently showed the last 28 of 90 days would be answering a different
-/// question.
-fn usage_spark(
-    values: &[u64],
-    from: &str,
-    to: &str,
-    peak: u64,
-    w: usize,
-    caps: crate::caps::Caps,
-) -> Line {
-    const LEVELS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
-    const ASCII: [&str; 8] = [".", ".", ":", ":", "-", "=", "#", "#"];
-    if values.is_empty() || w == 0 {
-        return Line::empty();
+/// Braille is the only cell in a terminal font that addresses more than one
+/// point, which is what a line chart needs: a block can say "this row is
+/// filled", it cannot say "the line passes a quarter of the way down". Eight
+/// dots to a cell puts the plot at 88 × 24 where blocks would give 44 × 6.
+///
+/// The bit layout is the one Unicode fixed, not one chosen here: the fourth row
+/// of dots was added to the standard after the first three, so its bits sit
+/// above the others instead of continuing the run.
+const DOT_ROWS: usize = 4;
+const DOT_COLS: usize = 2;
+const DOTS: [[u8; DOT_COLS]; DOT_ROWS] = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]];
+
+/// The day series as a plot with an axis to read numbers off.
+///
+/// The first version of this page drew one row of blocks and said the peak in
+/// words beside it. That answers "is it climbing"; it does not answer "how much
+/// was that spike" or "when", which is what the classic front end's plot
+/// answered and what this is here to carry over. An axis is the difference
+/// between a shape and a measurement.
+///
+/// **More days than columns are averaged into the columns, not dropped.** A
+/// chart that silently showed the last 44 of 90 days would answer a different
+/// question from the one the heading asks, and it would answer it without
+/// saying so. The dates under the floor are taken from the columns themselves,
+/// so a tick always sits over the day it names.
+fn day_chart(
+    daily: &[atomcode_host_api::DayUse],
+    series: &[atomcode_host_api::ModelSeries],
+) -> Vec<UsageLine> {
+    // One line per model when the service broke the days down, and one line for
+    // the total when it did not. Not both: two answers to "how much on the
+    // 19th" drawn over each other is a chart a reader has to be told how to
+    // read, and the total is the sum of the lines already there.
+    let lines: Vec<&[u64]> = match series.is_empty() {
+        false => series.iter().map(|s| s.daily.as_slice()).collect(),
+        true => Vec::new(),
+    };
+    let totals: Vec<u64> = daily.iter().map(|d| d.tokens).collect();
+    let lines: Vec<&[u64]> = match lines.is_empty() {
+        true => vec![totals.as_slice()],
+        false => lines,
+    };
+    let split = !series.is_empty();
+
+    // One scale for every line, or they cannot be compared — which is the whole
+    // reason to draw them on one chart.
+    let peak = lines
+        .iter()
+        .flat_map(|line| line.iter().copied())
+        .max()
+        .unwrap_or(0);
+    if peak == 0 {
+        return vec![UsageLine::Note("这段时间没有用量".into())];
     }
-    let cells = SPARK_CELLS.min(values.len());
-    let per = values.len().div_ceil(cells);
-    let levels: &[&str; 8] = if caps.unicode { &LEVELS } else { &ASCII };
-    let mut bar = String::new();
-    for chunk in values.chunks(per) {
-        let mean = chunk.iter().sum::<u64>() / chunk.len() as u64;
-        let level = if peak == 0 {
-            0
-        } else {
-            (((mean as f64 / peak as f64) * (levels.len() - 1) as f64).round() as usize)
-                .min(levels.len() - 1)
+    let dots_wide = CHART_CELLS * DOT_COLS;
+    let dots_tall = CHART_ROWS * DOT_ROWS;
+
+    let mut dots = vec![0u8; CHART_CELLS * CHART_ROWS];
+    let mut ink = vec![NO_SERIES; CHART_CELLS * CHART_ROWS];
+    for (which, line) in lines.iter().enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        // Sampled at the dot, not at the day: the plot is 104 dots across and
+        // the series is however long it is, so each dot asks the series what it
+        // was at that point. Nearest rather than averaged, which is what the
+        // classic front end does — a line chart draws where the series *was*,
+        // and an average of three days is a value it never had.
+        let sample = |dx: usize| -> usize {
+            let at = match line.len() {
+                1 => 0,
+                n => dx * (n - 1) / (dots_wide - 1).max(1),
+            };
+            let filled = ((line[at] as u128 * (dots_tall - 1) as u128) / peak as u128) as usize;
+            (dots_tall - 1).saturating_sub(filled)
         };
-        bar.push_str(levels[level]);
+        let owner = match split {
+            true => u8::try_from(which).unwrap_or(NO_SERIES),
+            false => NO_SERIES,
+        };
+        // A connected line, not a scatter: every dot column is joined to the one
+        // before it, so a climb is a stroke. Drawing only the points leaves a
+        // rise as two marks with a gap between them, which at this width reads
+        // as noise.
+        let mut previous = sample(0);
+        let mark = |dx: usize, dy: usize, dots: &mut Vec<u8>, ink: &mut Vec<u8>| {
+            let cell = (dy / DOT_ROWS) * CHART_CELLS + dx / DOT_COLS;
+            dots[cell] |= DOTS[dy % DOT_ROWS][dx % DOT_COLS];
+            // First one to reach a cell keeps it. The lines are in size order,
+            // so the colour of a crossing is the bigger model's — stable, which
+            // is what a legend needs, rather than whichever was drawn last.
+            if ink[cell] == NO_SERIES {
+                ink[cell] = owner;
+            }
+        };
+        mark(0, previous, &mut dots, &mut ink);
+        for dx in 1..dots_wide {
+            let here = sample(dx);
+            for dy in previous.min(here)..=previous.max(here) {
+                mark(dx, dy, &mut dots, &mut ink);
+            }
+            previous = here;
+        }
     }
-    let about = format!(
-        "  峰值 {} · {from} → {to}",
-        crate::content::token_count_u64(peak)
-    );
+
+    let mut out = Vec::new();
+    for row in 0..CHART_ROWS {
+        // The bottom row *is* the floor: the flat run of dots along it is the
+        // line at zero, not a rule drawn under the chart. Labelled every other
+        // row above it, at the fraction of the peak that row stands for.
+        let label = match (row + 1 == CHART_ROWS, row % 2) {
+            (true, _) => "0".to_string(),
+            (false, 0) => crate::content::token_count_u64(
+                (peak as u128 * (CHART_ROWS - 1 - row) as u128 / (CHART_ROWS - 1) as u128) as u64,
+            ),
+            _ => String::new(),
+        };
+        let span = row * CHART_CELLS..(row + 1) * CHART_CELLS;
+        out.push(UsageLine::ChartRow {
+            axis: pad_left(&label, AXIS_CELLS),
+            dots: dots[span.clone()].to_vec(),
+            ink: ink[span].to_vec(),
+        });
+    }
+    out.push(UsageLine::ChartDates {
+        gutter: AXIS_CELLS,
+        text: date_ticks(daily),
+    });
+    out
+}
+
+/// A cell no series claimed — drawn in the ordinary chart ink.
+const NO_SERIES: u8 = u8::MAX;
+
+/// The dates under the plot, laid into the plot's own columns.
+///
+/// Up to five ticks. The ends carry the full date because the year is context
+/// the rest of the page does not repeat; the ones between carry `MM-DD`, which
+/// is what fits. A tick that would land on the one before it is **pushed right**
+/// rather than dropped — it still points at a later day than its neighbour,
+/// which is the ordering a reader actually uses the axis for.
+fn date_ticks(daily: &[atomcode_host_api::DayUse]) -> String {
+    let n = daily.len();
+    if n == 1 {
+        return daily[0].date.clone();
+    }
+    let mut buf: Vec<char> = vec![' '; CHART_CELLS];
+    let mut used = 0usize;
+    let ticks = n.clamp(2, 5);
+    for k in 0..ticks {
+        let at = k * (n - 1) / (ticks - 1);
+        let date = daily[at].date.as_str();
+        let last = k + 1 == ticks;
+        let label: String = match k == 0 || last {
+            true => date.to_string(),
+            false => date.get(5..).unwrap_or(date).to_string(),
+        };
+        let cells = label.chars().count();
+        let start = if k == 0 {
+            0
+        } else if last {
+            CHART_CELLS.saturating_sub(cells)
+        } else {
+            (at * CHART_CELLS.saturating_sub(1) / (n - 1))
+                .saturating_sub(cells / 2)
+                .min(CHART_CELLS.saturating_sub(cells))
+                .max(used)
+        };
+        for (j, c) in label.chars().enumerate() {
+            if start + j < CHART_CELLS {
+                buf[start + j] = c;
+            }
+        }
+        used = (start + cells + 1).min(CHART_CELLS);
+    }
+    buf.into_iter().collect::<String>().trim_end().to_string()
+}
+
+/// Per-model spend as an aligned table — the classic front end's, column for
+/// column: name, tokens, requests, share.
+///
+/// Columns rather than a bar each: the numbers are what this section is for,
+/// and four numbers read off a column are four comparisons where four bars are
+/// one. The day chart above carries the picture.
+///
+/// The widths are fixed rather than measured from the names, so the columns sit
+/// where they sat yesterday. A name too long for its column is elided in the
+/// middle — the tail of a model name is where its version is, and that is the
+/// half a person is telling two of them apart by.
+fn model_table(models: &[atomcode_host_api::ModelUse], total: u64) -> Vec<UsageLine> {
+    const NAME_CELLS: usize = 26;
+    const TOKEN_CELLS: usize = 10;
+    const CALL_CELLS: usize = 9;
+    const SHARE_CELLS: usize = 7;
+    let lay = |name: &str, tokens: &str, calls: &str, share: &str| {
+        format!(
+            "{}{}{}{}",
+            pad_right(name, NAME_CELLS),
+            pad_left(tokens, TOKEN_CELLS),
+            pad_left(calls, CALL_CELLS),
+            pad_left(share, SHARE_CELLS),
+        )
+    };
+    let mut out = vec![UsageLine::Cols {
+        text: lay("模型", "tokens", "请求", "占比"),
+        head: true,
+        mark: None,
+    }];
+    out.extend(models.iter().enumerate().map(|(which, model)| {
+        let share = match total {
+            0 => 0.0,
+            t => model.tokens as f64 / t as f64 * 100.0,
+        };
+        UsageLine::Cols {
+            text: lay(
+                &width::elide_middle(&model.name, NAME_CELLS - 1),
+                &crate::content::token_count_u64(model.tokens),
+                &model.requests.to_string(),
+                &format!("{share:.0}%"),
+            ),
+            head: false,
+            // The dot is the legend. It is the same index the chart coloured
+            // the line by, which is the whole reason the series arrive in the
+            // order the table is in.
+            mark: Some(u8::try_from(which).unwrap_or(NO_SERIES)),
+        }
+    }));
+    out
+}
+
+/// Pad to `cells` display columns, text at the left.
+fn pad_right(text: &str, cells: usize) -> String {
+    let have = width::str_width(text);
+    format!("{text}{}", " ".repeat(cells.saturating_sub(have)))
+}
+
+/// Pad to `cells` display columns, text at the right — for a column of numbers,
+/// where the digits have to line up or the column is decoration.
+fn pad_left(text: &str, cells: usize) -> String {
+    let have = width::str_width(text);
+    format!("{}{text}", " ".repeat(cells.saturating_sub(have)))
+}
+
+/// One plot row: the gutter, then the line where it passes through this row.
+///
+/// Braille when the terminal has it, and `'` / `:` / `.` when it does not —
+/// three ASCII cells for "high in this row", "through it" and "low in it",
+/// which keeps the line readable as a line at one eighth the resolution. The
+/// axis beside it is what makes even that much readable: the shape degrades,
+/// the numbers do not.
+///
+/// Runs of one colour become one span rather than one span per cell: the same
+/// picture, a fifth of the spans, and a diff of the frame that reads.
+fn chart_row(axis: &str, dots: &[u8], ink: &[u8], w: usize, caps: crate::caps::Caps) -> Line {
+    let mut spans = vec![Span::styled(format!("  {axis} "), theme::fg(Role::Muted))];
+    let mut run = String::new();
+    let mut run_ink = NO_SERIES;
+    for (cell, mask) in dots.iter().enumerate() {
+        let here = ink.get(cell).copied().unwrap_or(NO_SERIES);
+        if here != run_ink && !run.is_empty() {
+            spans.push(Span::styled(std::mem::take(&mut run), series_ink(run_ink)));
+        }
+        run_ink = here;
+        run.push(dot_cell(*mask, caps));
+    }
+    if !run.is_empty() {
+        spans.push(Span::styled(run, series_ink(run_ink)));
+    }
+    Line::from_spans(spans).truncate(w)
+}
+
+/// The ink a chart cell is drawn in: its series' colour, or the page's accent
+/// when the chart is not split by model.
+fn series_ink(which: u8) -> Style {
+    match which {
+        NO_SERIES => theme::fg(Role::Accent),
+        n => theme::fg(Role::Series(n % crate::theme::SERIES)),
+    }
+}
+
+/// One cell of the plot, at whatever resolution the terminal has.
+fn dot_cell(mask: u8, caps: crate::caps::Caps) -> char {
+    if mask == 0 {
+        return ' ';
+    }
+    if caps.unicode {
+        return char::from_u32(0x2800 + u32::from(mask)).unwrap_or(' ');
+    }
+    // Which half of the cell the line is in, as one ASCII character.
+    let high = mask & (DOTS[0][0] | DOTS[0][1] | DOTS[1][0] | DOTS[1][1]) != 0;
+    let low = mask & (DOTS[2][0] | DOTS[2][1] | DOTS[3][0] | DOTS[3][1]) != 0;
+    match (high, low) {
+        (true, true) => ':',
+        (true, false) => '\'',
+        _ => '.',
+    }
+}
+
+/// One row of the per-model table, with the dot that ties it to its line.
+fn table_row(text: &str, head: bool, mark: Option<u8>, w: usize) -> Line {
+    let (dot, ink) = match mark {
+        Some(which) => ("● ", series_ink(which)),
+        None => ("  ", Style::new()),
+    };
+    let rest = match head {
+        true => theme::fg(Role::Muted),
+        false => Style::new(),
+    };
     Line::from_spans(vec![
-        Span::styled("  ".to_string(), Style::new()),
-        Span::styled(bar, theme::fg(Role::Accent)),
-        Span::styled(about, theme::fg(Role::Muted)),
+        Span::styled(format!("  {dot}"), ink),
+        Span::styled(text.to_string(), rest),
     ])
     .truncate(w)
 }
-
-/// How many columns the day series is drawn in. See [`BAR_CELLS`].
-const SPARK_CELLS: usize = 28;
 
 /// One edge of the search box: `┌───┐` above, `└───┘` below.
 ///
@@ -1204,6 +1475,29 @@ mod tests {
         );
         assert!(shown.contains('█'), "with a bar: {shown}");
 
+        // Two windows at different shares draw bars of different lengths. This
+        // is the assertion that catches a track drawn in the *same* glyph as
+        // its fill — which is what the first version did, so every bar looked
+        // full to anything that does not read colour: a terminal without it,
+        // and this test. It lived on the per-model bars until those became a
+        // table; the protection belongs wherever a bar still is.
+        let pair = usage_page(crate::settings::UsagePage {
+            context: None,
+            windows: vec![window("5 小时", Some(90)), window("每周", Some(10))],
+            stats: None,
+        });
+        let shown = drawn(&pair, 80, 24).join("\n");
+        let bars: Vec<usize> = shown
+            .lines()
+            .filter(|line| line.contains('█'))
+            .map(|line| line.matches('█').count())
+            .collect();
+        assert_eq!(bars.len(), 2, "one bar per window: {shown}");
+        assert!(
+            bars[0] > bars[1],
+            "the fuller window has the longer bar: {bars:?}\n{shown}"
+        );
+
         let uncounted = usage_page(crate::settings::UsagePage {
             context: None,
             windows: vec![window("每周", None)],
@@ -1225,7 +1519,7 @@ mod tests {
     /// across the contract at all.
     #[test]
     fn the_usage_page_shows_what_went_through_per_model_and_per_day() {
-        use atomcode_host_api::{DayUse, ModelUse, UsageStats};
+        use atomcode_host_api::{DayUse, ModelSeries, ModelUse, UsageStats};
         let page = usage_page(crate::settings::UsagePage {
             context: None,
             windows: Vec::new(),
@@ -1256,40 +1550,238 @@ mod tests {
                         requests: 1600,
                     },
                 ],
+                series: vec![
+                    ModelSeries {
+                        name: "deepseek-flash".into(),
+                        daily: vec![4_500_000, 216_600_000],
+                    },
+                    ModelSeries {
+                        name: "glm5.3-flash-pro".into(),
+                        daily: vec![0, 59_700_000],
+                    },
+                ],
                 total_tokens: 280_800_000,
                 total_requests: 2450,
             }),
         });
-        let shown = drawn(&page, 80, 40).join("\n");
+        let shown = drawn(&page, 96, 60).join("\n");
         assert!(shown.contains("deepseek-flash"), "{shown}");
         assert!(
             shown.contains("221.1m"),
             "tokens as a person reads them: {shown}"
         );
         assert!(shown.contains("1604"), "and requests: {shown}");
-        assert!(
-            shown.contains("峰值 216.6m"),
-            "the chart says its peak: {shown}"
-        );
+        assert!(shown.contains("2450"), "the overview totals: {shown}");
         assert!(
             shown.contains("2026-08-21") && shown.contains("2026-09-20"),
             "and the span it covers: {shown}"
         );
-        assert!(shown.contains("2450"), "the overview totals: {shown}");
-        // The bars are of different lengths, which is the only reason to draw
-        // two of them. Caught here: the first version drew the track in the
-        // same block as the fill, so every bar looked full to anything that
-        // does not read colour — a terminal without it, and this assertion.
-        let bars: Vec<usize> = shown
-            .lines()
-            .filter(|line| line.contains('█'))
-            .map(|line| line.matches('█').count())
-            .collect();
-        assert_eq!(bars.len(), 3, "two models and the day series: {shown}");
+
+        // The chart has an axis, which is the whole difference between a shape
+        // and a measurement. The first version of this page drew one row of
+        // blocks and put the peak in words beside it — that says "it spiked",
+        // not "how much". The fractions are the classic front end's: the peak
+        // at the top, then the row's share of the way down to zero.
+        assert!(shown.contains("216.6m"), "the top of the axis: {shown}");
         assert!(
-            bars[1] > bars[2],
-            "the bigger model has the longer bar: {bars:?}\n{shown}"
+            shown.contains("130m") && shown.contains("43.3m"),
+            "and the heights between it and zero: {shown}"
         );
+        // The bottom row is the floor *and* a row of the plot: the flat run
+        // along it is the line at zero. A chart that drew a rule there instead
+        // would be claiming a baseline it had not measured.
+        let floor = shown
+            .lines()
+            .position(|line| line.trim_start().starts_with("0 "))
+            .unwrap_or_else(|| panic!("a row labelled zero: {shown}"));
+        let rows: Vec<&str> = shown.lines().collect();
+        assert!(
+            rows[floor].chars().any(is_plot_ink),
+            "with the line drawn along it: {:?}",
+            rows[floor]
+        );
+        assert!(
+            rows[floor + 1].contains("2026-09-19") && rows[floor + 1].contains("2026-09-20"),
+            "and both ends of the series directly under it: {shown}"
+        );
+
+        // The per-model figures are a table, and a table whose columns do not
+        // line up is four numbers in a row. Asserted on where the numbers
+        // *end*, because that is what right-aligning them is for.
+        assert!(
+            shown.contains("模型") && shown.contains("请求") && shown.contains("占比"),
+            "the columns are named: {shown}"
+        );
+        let ends = |needle: &str| -> usize {
+            let line = shown
+                .lines()
+                .find(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} is on the page: {shown}"));
+            line.find(needle).expect("just found it") + needle.len()
+        };
+        assert_eq!(
+            ends("221.1m"),
+            ends("59.7m"),
+            "the token column lines up: {shown}"
+        );
+        assert_eq!(
+            ends("1604"),
+            ends(" 846"),
+            "and the request column: {shown}"
+        );
+    }
+
+    /// The dot beside a model is the chart's legend, so it has to be that
+    /// model's line's colour — and two models' lines have to differ.
+    ///
+    /// The colours are the point of drawing several lines at all: without them
+    /// the chart is one shape with no way to say whose. Asserted on the styles
+    /// rather than the text, because this is the one thing about this page that
+    /// the characters cannot show.
+    #[test]
+    fn each_model_is_drawn_in_its_own_colour_and_its_row_carries_it() {
+        use atomcode_host_api::{DayUse, ModelSeries, ModelUse, UsageStats};
+        let page = usage_page(crate::settings::UsagePage {
+            context: None,
+            windows: Vec::new(),
+            stats: Some(UsageStats {
+                from: "2026-09-19".into(),
+                to: "2026-09-20".into(),
+                models: vec![
+                    ModelUse {
+                        name: "big".into(),
+                        tokens: 200,
+                        requests: 2,
+                    },
+                    ModelUse {
+                        name: "small".into(),
+                        tokens: 100,
+                        requests: 1,
+                    },
+                ],
+                daily: vec![
+                    DayUse {
+                        date: "2026-09-19".into(),
+                        tokens: 300,
+                        requests: 3,
+                    },
+                    DayUse {
+                        date: "2026-09-20".into(),
+                        tokens: 0,
+                        requests: 0,
+                    },
+                ],
+                // Different heights, so the two lines cannot land on the same
+                // cells and the colours are actually being told apart.
+                series: vec![
+                    ModelSeries {
+                        name: "big".into(),
+                        daily: vec![200, 0],
+                    },
+                    ModelSeries {
+                        name: "small".into(),
+                        daily: vec![100, 0],
+                    },
+                ],
+                total_tokens: 300,
+                total_requests: 3,
+            }),
+        });
+        let rows = lines(&page, 96, 60);
+        let ink_of = |needle: &str| -> crate::frame::Style {
+            let row = rows
+                .iter()
+                .find(|row| row.plain().contains(needle))
+                .unwrap_or_else(|| panic!("{needle} is on the page"));
+            row.spans
+                .iter()
+                .find(|span| span.text.contains('●'))
+                .unwrap_or_else(|| panic!("{needle}'s row carries a legend dot: {row:?}"))
+                .style
+        };
+        let big = ink_of("big");
+        let small = ink_of("small");
+        assert_ne!(
+            big, small,
+            "two models, two colours — one colour is no legend"
+        );
+
+        // And each dot's colour is drawn somewhere in the plot, which is what
+        // makes it a legend rather than a decoration beside a name.
+        let plotted: Vec<crate::frame::Style> = rows
+            .iter()
+            .filter(|row| row.plain().chars().any(is_plot_ink))
+            .flat_map(|row| row.spans.iter())
+            .filter(|span| span.text.chars().any(is_plot_ink))
+            .map(|span| span.style)
+            .collect();
+        for (name, ink) in [("big", big), ("small", small)] {
+            assert!(
+                plotted.contains(&ink),
+                "{name}'s colour is on the chart: {plotted:?}"
+            );
+        }
+    }
+
+    /// Every day is on the chart, wherever in the span it fell.
+    ///
+    /// A chart that quietly showed the last 52 of 90 days would answer a
+    /// different question from the one its heading asks, and it would answer it
+    /// without saying so — the shape would look reasonable either way, which is
+    /// why this is a criterion and not something to eyeball. The spending is
+    /// put at the very *start* of the span on purpose: that is the end such a
+    /// chart would drop.
+    #[test]
+    fn a_long_run_of_days_keeps_the_days_at_both_ends() {
+        use atomcode_host_api::{DayUse, UsageStats};
+        let daily: Vec<DayUse> = (0..90)
+            .map(|d| DayUse {
+                date: format!("2026-{:02}-{:02}", 6 + d / 30, 1 + d % 30),
+                tokens: if d < 3 { 9_000_000 } else { 0 },
+                requests: if d < 3 { 30 } else { 0 },
+            })
+            .collect();
+        let first = daily[0].date.clone();
+        let last = daily[89].date.clone();
+        let page = usage_page(crate::settings::UsagePage {
+            context: None,
+            windows: Vec::new(),
+            stats: Some(UsageStats {
+                from: first.clone(),
+                to: last.clone(),
+                models: Vec::new(),
+                daily,
+                // Not broken down by model: this host counts days only, and the
+                // chart still has to draw. One line, in the page's own ink.
+                series: Vec::new(),
+                total_tokens: 27_000_000,
+                total_requests: 90,
+            }),
+        });
+        let shown = drawn(&page, 96, 60).join("\n");
+        assert!(
+            shown.contains("9m"),
+            "the peak is on the axis even though it is at the far left: {shown}"
+        );
+        let top = shown
+            .lines()
+            .find(|line| line.contains("9m") && line.chars().any(is_plot_ink))
+            .unwrap_or_else(|| panic!("the top row of the plot has the line on it: {shown}"));
+        let ink = top.chars().position(is_plot_ink).expect("just found it");
+        let axis = top.find("9m").expect("the label") + 2;
+        assert!(
+            ink - axis < CHART_CELLS / 4,
+            "and it is drawn at the left, where those days are: {top:?}"
+        );
+        assert!(
+            shown.contains(&first) && shown.contains(&last),
+            "both ends of ninety days are named: {shown}"
+        );
+    }
+
+    /// A braille cell with anything in it — the ink the plot is drawn with.
+    fn is_plot_ink(c: char) -> bool {
+        ('\u{2801}'..='\u{28FF}').contains(&c)
     }
 
     /// Before the host has answered, the page says so rather than showing zero.

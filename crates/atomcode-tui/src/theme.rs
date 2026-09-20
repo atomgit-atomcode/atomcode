@@ -94,10 +94,27 @@ pub enum Role {
     /// mark in this file that was a guess about how a terminal paints instead of
     /// a measurement against it.
     PanelSelBg,
+    /// One line of a chart, by its position in the series.
+    ///
+    /// Data ink, and the only role here whose *meaning is difference*: nothing
+    /// is being said about a series by giving it slot 14 rather than slot 11,
+    /// except that it is not the other one. That is why it is a role with an
+    /// index rather than six roles with names — a name would claim the colour
+    /// meant something.
+    ///
+    /// Indexed into the same slots a scheme already has, so a chart reads in
+    /// the person's own colours and follows them into light mode. The classic
+    /// front end wrote the 256-colour indices straight into the escape
+    /// (`[75, 214, 208, 154, 183, 81]`), which assumed a dark terminal and
+    /// disagreed with this front end about every one of them.
+    Series(u8),
 }
 
+/// How many lines a chart can tell apart before it starts round-tripping.
+pub const SERIES: u8 = 6;
+
 /// Every role, so a check can walk them instead of keeping a list in step.
-pub const ROLES: [Role; 15] = [
+pub const ROLES: [Role; 21] = [
     Role::Brand,
     Role::Accent,
     Role::Border,
@@ -113,6 +130,12 @@ pub const ROLES: [Role; 15] = [
     Role::PanelFg,
     Role::PanelBg,
     Role::PanelSelBg,
+    Role::Series(0),
+    Role::Series(1),
+    Role::Series(2),
+    Role::Series(3),
+    Role::Series(4),
+    Role::Series(5),
 ];
 
 /// xterm's sixteen, the fallback for a terminal that will not say what its own
@@ -349,7 +372,9 @@ fn lift(base: Rgb, bg: Rgb, need: f32) -> Rgb {
 fn floor(role: Role) -> f32 {
     match role {
         Role::Border => 3.0,
-        Role::Mode => 4.5,
+        // Chart ink: it has to read, but it is not prose and it is not asked to
+        // carry a sentence. The same floor a mode badge gets.
+        Role::Mode | Role::Series(_) => 4.5,
         Role::Muted => 6.0,
         _ => 7.0,
     }
@@ -406,6 +431,18 @@ fn candidates(role: Role) -> &'static [u8] {
         Role::Success | Role::DiffAdd => &[10, 2],
         Role::Mode => &[12, 4, 13, 5],
         Role::Secondary | Role::ToolName | Role::PanelFg | Role::PanelBg | Role::PanelSelBg => &[],
+        // Six hues a scheme is near certain to have set apart from each other,
+        // bright first and the dim twin behind it. Round-tripped rather than
+        // extended past six: a seventh line a reader cannot name is worse than
+        // a seventh line that shares a colour with the first.
+        Role::Series(n) => match n % SERIES {
+            0 => &[14, 6],
+            1 => &[11, 3],
+            2 => &[13, 5],
+            3 => &[10, 2],
+            4 => &[12, 4],
+            _ => &[9, 1],
+        },
     }
 }
 

@@ -1068,6 +1068,14 @@ impl HostControl for RuntimeControl {
                                 requests: d.requests,
                             })
                             .collect(),
+                        series: spent
+                            .series
+                            .into_iter()
+                            .map(|s| atomcode_host_api::ModelSeries {
+                                name: s.name,
+                                daily: s.daily,
+                            })
+                            .collect(),
                         total_tokens: spent.total_tokens,
                         total_requests: spent.total_requests,
                     }),

@@ -70,8 +70,18 @@ pub struct AccountUsage {
     pub models: Vec<ModelUse>,
     /// One per day, oldest first.
     pub daily: Vec<DayUse>,
+    /// The same days split by model — one per entry of `models`, same order,
+    /// each as long as `daily`. Empty when the service does not break them out.
+    pub series: Vec<ModelSeries>,
     pub total_tokens: u64,
     pub total_requests: u64,
+}
+
+/// One model's day-by-day tokens, aligned with [`AccountUsage::daily`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelSeries {
+    pub name: String,
+    pub daily: Vec<u64>,
 }
 
 /// One model's share of an account's spend.

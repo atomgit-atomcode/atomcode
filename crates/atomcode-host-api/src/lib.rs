@@ -439,8 +439,24 @@ pub struct UsageStats {
     pub models: Vec<ModelUse>,
     /// One per day, oldest first.
     pub daily: Vec<DayUse>,
+    /// The same days again, split by model — one entry per model in `models`
+    /// and in the same order, each as long as `daily`.
+    ///
+    /// Separate from `daily` rather than nested inside it because a chart reads
+    /// it the other way round: one line per model across every day, not one day
+    /// at a time. Empty when the service does not break the days down, which is
+    /// a thing a reader can be told rather than guessed at.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub series: Vec<ModelSeries>,
     pub total_tokens: u64,
     pub total_requests: u64,
+}
+
+/// One model's day-by-day tokens, aligned with [`UsageStats::daily`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelSeries {
+    pub name: String,
+    pub daily: Vec<u64>,
 }
 
 /// One model's share of it.
@@ -1008,6 +1024,10 @@ mod tests {
                         date: "2026-09-20".into(),
                         tokens: 216_600_000,
                         requests: 1600,
+                    }],
+                    series: vec![ModelSeries {
+                        name: "glm-5".into(),
+                        daily: vec![216_600_000],
                     }],
                     total_tokens: 221_100_000,
                     total_requests: 1604,
