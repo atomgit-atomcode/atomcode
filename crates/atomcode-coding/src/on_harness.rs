@@ -2207,11 +2207,8 @@ impl Plugin for SkillCatalogPlugin {
         let Some(catalog) = skills.render_catalog() else {
             return Ok(());
         };
-        let Some(prompts) = ctx.service::<atomcode_harness::seams::SystemPromptSvc>() else {
-            return Ok(());
-        };
         let (id, rank) = SKILLS_FRAGMENT;
-        prompts.contribute(id, rank, catalog);
+        atomcode_harness::plugins::tools::contribute_prompt(ctx, id, rank, &catalog);
         Ok(())
     }
 }
@@ -2791,12 +2788,9 @@ impl Plugin for CodingPersonaPlugin {
         // chain reads, which cannot see a tree that failed to mount the tool. See
         // `coding_persona_rows`.
         let text = crate::persona::coding_persona_rows(&model, row.language, &has);
-        let Some(prompts) = ctx.service::<atomcode_harness::seams::SystemPromptSvc>() else {
-            return Ok(());
-        };
         // Rank 0 and the generic row's id: the identity line goes first, and
         // there is only ever one of it.
-        prompts.contribute("persona-coding", 0, text);
+        atomcode_harness::plugins::tools::contribute_prompt(ctx, "persona-coding", 0, &text);
         Ok(())
     }
 }

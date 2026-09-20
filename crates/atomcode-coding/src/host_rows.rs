@@ -850,13 +850,9 @@ impl Plugin for SkillsHostPlugin {
                 )),
             ],
         )?;
-        if let (Some(catalog), Some(prompts)) = (
-            catalog.as_ref().filter(|c| !c.trim().is_empty()),
-            ctx.service::<SystemPromptSvc>(),
-        ) {
+        if let Some(catalog) = catalog.as_ref().filter(|c| !c.trim().is_empty()) {
             let (id, rank) = crate::on_harness::SKILLS_FRAGMENT;
-            prompts.contribute(id, rank, catalog.clone());
-            let _ = ctx.effect(move || prompts.remove(id));
+            atomcode_harness::plugins::tools::contribute_prompt(ctx, id, rank, catalog);
         }
         Ok(())
     }
@@ -931,12 +927,9 @@ impl Plugin for HostToolsPlugin {
     }
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
         atomcode_harness::plugins::tools::mount(ctx, self.0.clone())?;
-        let prompts = ctx.service::<SystemPromptSvc>();
         let mut guided = std::collections::BTreeSet::new();
         for tool in &self.0 {
-            if let (Some(prompts), Some((key, text))) =
-                (&prompts, crate::persona::host_tool_guidance(tool.name()))
-            {
+            if let Some((key, text)) = crate::persona::host_tool_guidance(tool.name()) {
                 if guided.insert(key) {
                     let id = format!("host-tool-{key}");
                     // Beside the rows that describe their own tools.
@@ -945,9 +938,7 @@ impl Plugin for HostToolsPlugin {
                         "code-review" => 58,
                         _ => 57,
                     };
-                    prompts.contribute(&id, rank, text);
-                    let prompts = prompts.clone();
-                    let _ = ctx.effect(move || prompts.remove(&id));
+                    atomcode_harness::plugins::tools::contribute_prompt(ctx, &id, rank, text);
                 }
             }
         }
@@ -1204,12 +1195,8 @@ impl Plugin for SessionContextPlugin {
     }
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
         let block = self.hook.block(self.stored.as_deref());
-        let Some(prompts) = ctx.service::<SystemPromptSvc>() else {
-            return Ok(());
-        };
         // Withdrawn with the row, like every other fragment.
-        prompts.contribute("project-instructions", 1, block);
-        let _ = ctx.effect(move || prompts.remove("project-instructions"));
+        atomcode_harness::plugins::tools::contribute_prompt(ctx, "project-instructions", 1, &block);
         Ok(())
     }
 }

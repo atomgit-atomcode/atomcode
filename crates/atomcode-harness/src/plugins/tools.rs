@@ -74,7 +74,21 @@ fn mount_into(
 }
 
 /// Contribute a prompt fragment that disappears with its plugin.
-pub(super) fn contribute_prompt(ctx: &Context, id: &str, rank: i32, text: &str) {
+///
+/// Two halves again, and the second one is the whole point: `PromptRegistry`
+/// keys by id and has no idea who contributed what, so the `ctx.effect` filed
+/// here is the only thing that takes a row's text out of the prompt when the
+/// row goes. A row that writes the halves by hand can write one and stop —
+/// two product rows had, and a live patch that disabled them left their text
+/// in front of the model (`atomcode-coding/tests/prompt_fragments.rs`).
+///
+/// **Public across crates**, for the same reason [`mount`] is.
+///
+/// The exception, as with [`mount`]: `reload_skills_live` in `atomcode-coding`
+/// re-contributes under a live row's id and removes it by hand when the catalog
+/// empties. It is not mounting anything, so there is no row for it to leave
+/// with.
+pub fn contribute_prompt(ctx: &Context, id: &str, rank: i32, text: &str) {
     let Some(prompts) = ctx.service::<SystemPromptSvc>() else {
         return;
     };

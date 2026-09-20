@@ -1,3 +1,5 @@
+//! What a row puts into a shared registry, it takes back when it goes.
+//!
 //! A tool mount is two halves — put it in the catalog, and file the removal
 //! that takes it out when the row leaves — so there is one door that does both
 //! (`plugins::tools::mount`, and `mount_optional` for a row whose catalog may
@@ -14,8 +16,16 @@
 //! `ToolsSvc` and flags a `register` on any of them, so a new hand-rolled mount
 //! goes red the day it is written.
 //!
-//! **What it does not catch**: a row that binds the catalog and hands it to a
-//! helper that registers. That shape is `publish_mcp`'s, and it is named below
+//! The prompt registry is the same story with sharper teeth: it keys fragments
+//! by id and has no idea who contributed one, so the removal half is the only
+//! thing that takes a row's text out of the prompt. Two product rows had
+//! written the first half and stopped, and a live patch that disabled them left
+//! their text in front of the model — see
+//! `atomcode-coding/tests/prompt_fragments.rs`, which is the behavioural half of
+//! this guard.
+//!
+//! **What these do not catch**: a row that binds a registry and hands it to a
+//! helper that writes. That shape is `publish_mcp`'s, and it is named below
 //! rather than guessed at — a guard that pretends to catch everything is worse
 //! than one that says where it stops.
 
@@ -117,9 +127,17 @@ fn enclosing_fn(lines: &[&str], at: usize) -> String {
 
 /// Where a tool may be put into the tree's catalog: the door, and the one
 /// republisher that files a single removal for a whole server's tools.
-const DOORS: &[(&str, &str)] = &[
+const TOOL_DOORS: &[(&str, &str)] = &[
     ("atomcode-harness/src/plugins/tools.rs", "mount_into"),
     ("atomcode-coding/src/host_rows.rs", "publish_mcp"),
+];
+
+/// Where a fragment may be put into the prompt: the door, and the live reload
+/// that re-contributes under a mounted row's id (it mounts nothing, so it has
+/// no row to leave with).
+const PROMPT_DOORS: &[(&str, &str)] = &[
+    ("atomcode-harness/src/plugins/tools.rs", "contribute_prompt"),
+    ("atomcode-coding/src/runtime.rs", "reload_skills_live"),
 ];
 
 #[test]
@@ -148,7 +166,7 @@ fn every_tool_mount_goes_through_the_door() {
                 continue;
             }
             let owner = enclosing_fn(&lines, no);
-            if DOORS
+            if TOOL_DOORS
                 .iter()
                 .any(|(file, func)| relative == *file && owner == *func)
             {
@@ -161,6 +179,72 @@ fn every_tool_mount_goes_through_the_door() {
         strays.is_empty(),
         "these register a tool without the door's second half — call \
          `plugins::tools::mount` (or `mount_optional`) instead:\n{}",
+        strays.join("\n")
+    );
+}
+
+/// Names bound from the tree's shared prompt registry in this file. A child's
+/// own registry (`PromptRegistry::new()`) is not one — composing a prompt for a
+/// delegated agent is building one, not contributing to the tree's.
+fn prompt_bindings(text: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for (idx, _) in text.match_indices("SystemPromptSvc>()") {
+        let head = &text[..idx];
+        let Some(let_at) = head.rfind("let ") else {
+            continue;
+        };
+        let rest = head[let_at + 4..].trim_start();
+        let rest = rest.strip_prefix("Some(").unwrap_or(rest);
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() && !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+#[test]
+fn every_prompt_fragment_goes_through_the_door() {
+    let root = crates_dir();
+    let mut strays: Vec<String> = Vec::new();
+    for path in workspace_sources() {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let names = prompt_bindings(&text);
+        if names.is_empty() {
+            continue;
+        }
+        let lines: Vec<&str> = text.lines().collect();
+        let relative = path
+            .strip_prefix(&root)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        for (no, line) in lines.iter().enumerate() {
+            if !names
+                .iter()
+                .any(|n| line.contains(&format!("{n}.contribute(")))
+            {
+                continue;
+            }
+            let owner = enclosing_fn(&lines, no);
+            if PROMPT_DOORS
+                .iter()
+                .any(|(file, func)| relative == *file && owner == *func)
+            {
+                continue;
+            }
+            strays.push(format!("{relative}:{}  in `{owner}`", no + 1));
+        }
+    }
+    assert!(
+        strays.is_empty(),
+        "these put a fragment in the prompt without the door's second half — \
+         call `plugins::tools::contribute_prompt` instead:\n{}",
         strays.join("\n")
     );
 }
