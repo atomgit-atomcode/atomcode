@@ -22,7 +22,7 @@
 | 6 | 二维码谁画 | **tui 画**。cli 给 URL + code | 二维码是 presentation，归屏幕；URL / 轮询 / token 归 cli |
 | 7 | `atomcode-auth` 拆两半这笔债 | **顺势拆**：Product 的那半（gateway_crypto / oauth / openrouter）与 Host 的那半（凭据文件读写） | 接的时候不拆，以后就是拆两遍 |
 | 8 | `coding/src/team/`（1466 行）的去向 | **随 6.4 删 tuix 一起摘掉**，团队能力只留 harness 的 realm 版 | 新 tui 零消费团队事件；旧 team 面板是 0023 之前的形态 |
-| 9 | `/plugin` 市场面板归 CLI 的判定 | **维持归 CLI** | 为它给 coding 开 capabilities 的 `plugin` feature，等于把市场/git 那套拉进 agent 进程，只为重复 CLI 已有的动作 |
+| 9 | `/plugin` 市场面板归 CLI 的判定 | ~~**维持归 CLI**~~ → **2026-09-20 用户推翻了一半**：面板要做，做在新 TUI 里；实现仍归 cli（端口 + 行），coding 仍不开 `plugin` feature | 原判定把「不给 coding 开 feature」和「新前端不做这块」当成了一件事。前者成立且照办了，后者不成立：`atomcode plugin` 子命令替代不了面板，而新前端连 `/plugin` 这条命令都没有。落点见下面的「J」节 |
 
 **决策 2 + 决策 6 合起来划的那条线**：凭据、认证状态判定（有没有可用 provider、有没有本地
 OAuth）、OAuth 轮询、步骤定义 —— 全在 cli；浮层机制、二维码渲染、按键 —— 全在 tui。
@@ -380,6 +380,29 @@ FrontEnd 再传进 prepare 的，所以它一直是对的。
       **做它本身越了序**：G 节按决策排在翻默认之后、按自用暴露的顺序做，这条是
       在那个顺序之外做的（小、已验证、不挡任何东西）。不认可就 revert。
 - [ ] G5 `/view` 搜索 + 语法色 ｜ G6 `/model` 分组与能力标注 ｜ G7 `/cd` 书签
+
+### J. `/plugin`（2026-09-20，推翻决策 9 的后半）
+
+用户的话是「plugin 命令完全没接进来，要按 tuix 的功能完全实现」，随后指定形状：
+「别在 overlay 里实现，要跟 provider 和 setting 类似」。
+
+做成了第三块面板，和那两块同一副骨架：
+
+- `tui/src/plugins.rs` —— 数据（`PluginsView` / `PluginRow` / `MarketRow` / `Scope`）、
+  面板状态（`Panel`，住在 `Moment` 里）、纯的 `key()` 与 `Step`、端口 `trait Plugins`。
+- `tui/src/modules/plugins.rs` —— 画，进 `host::TAIL`，和另两块从同一处升起来。
+- `cli/src/tui_plugins.rs` —— 端口实现（`capabilities::plugin`）+ 挂 view 的行 +
+  开机那一下（`bootstrap::run_startup_hooks`，此前**只有 tuix 调**，所以新前端在
+  新机器上一个市场都没有）。
+- `/plugin` 的子命令（`install` / `uninstall` / `update` / `list` / `marketplace …` /
+  `reload`）在 `tui/src/commands.rs` 的 `PluginCommands` 里，和面板共用同一个端口。
+
+与那两块唯一不同的一件事：**这里的写是慢的**（每一次都是 `git`），所以端口是 async
+的，面板多一个 `busy`，跑着的时候只收 Esc，取消由端口在活落地时回滚。
+
+判据 33 条（tui 26 + cli 7），每条都摘掉被测代码证伪过一次。其中一条是真机跑出来的：
+`merge` 第一版按「这个市场里已经有装上的插件吗」查重，于是一个已从市场下架、却还装着
+的插件整个消失——本机实测漏掉 `clawsweeper`。
 
 ### H. 记账与既有的债
 

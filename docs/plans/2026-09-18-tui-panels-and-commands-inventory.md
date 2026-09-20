@@ -76,7 +76,7 @@ withdraw、reload、cancel-all。**加目录投影 5**:goal、loop、queue、pol
 | B2-2 | 多会话:人自己开一条、切回来 | 按 0022 §6 + 0023 realm 做,**不照搬** tuix 的槽位号。**依赖**:计划页「后续」的「换会话不重建 App」——今天换会话仍重建 App(0022 §2 允许),所以这条先做「能开、能切回」,realm 化留给那条后续,别当成顺带做掉了 |
 | B2-3 | `/model` 选择器(依赖 A12) | 现在要打全名 |
 | B2-4 | `/provider` 管理面板 | 增改删 provider;现在只能改配置文件  ✅ 列表+切换已做(`/provider` → 挑一个就是 `/model <id>`,一个开关)。**增改删留给配置文件**:provider 条目带 `api_key`,让屏幕编辑那张表就是让屏幕碰凭据 |
-| B2-5 | `/plugin` 市场面板 | 装/卸插件(CLI 已有,面板是体验)  ❌ **判归 CLI**:coding 没开 capabilities 的 `plugin` feature,为它开等于把市场/git 那套拉进 agent 进程,只为重复 CLI 已有的动作 —— 与 `/upgrade`、`/webui` 同一把尺子 |
+| B2-5 | `/plugin` 市场面板 | ✅ **2026-09-20 做了**(用户推翻了原判定的后半)。第三块面板,与 `/config`、`/provider` 同一副骨架:`tui/plugins.rs` + `tui/modules/plugins.rs` 画,`cli/tui_plugins.rs` 是端口和开机那一下。coding 仍**没有**开 `plugin` feature —— 原判定里成立的那一半照办了 |
 | B2-6 | `/copy`、`/save`、`/view` | 复制代码块、存 markdown、看文件浮层  —— `/copy` `/save` ✅(c7f87718,自成一行 `tui-commands-take-away`);`/view` 未做  `/view` 亦 ✅ 722fb501 |
 | B2-7 | `/language` | 设置键的一种(可并进 A3)  ✅ 下一个提交(是 `/config language` 的具名入口,同一段实现) |
 | B2-8 | `/whoami`、`/worktree` | 当前登录用户;worktree 隔离  —— `/whoami` ✅(c7f87718,宿主契约 `WhoAmI` + `HostConfig::identity`);`/worktree` 未做 |
@@ -102,7 +102,7 @@ tuix 的富交互全在 `modals/`，**16,824 行**。逐个对：
 | `provider_panel` | 3234 | `/provider` 列表+切换 | 增改删判了「归配置文件」（带 `api_key`），但 3234 行里不止 CRUD，**没逐行核过** |
 | `onboarding_wizard` | 2336 | **无** | P0-2 首启登录引导，一直挂着 |
 | `session_picker` | 2185 | `/resume` Picker（已补时间与目录） | 没搜索、没删除、没预览 |
-| `plugin_manager` | 2102 | 判「归 CLI」 | 判定可辩，但确实没有 |
+| `plugin_manager` | 2102 | ✅ 2026-09-20 做了 | 形状换了:不是屏幕中央的九屏模态,是从底下升起来的三页签面板 |
 | `usage` + `usage_render` | 1782 | 设置面板的「用量」页签 | ✅ 2026-09-20（G1）画了额度窗口条 + 每日火花线 + 各模型占比；顺带补回 daemon 手抄映射漏掉的 `usage_percent` / `calls_used` |
 | `dir_picker` | 981 | `/cd` 已改成可浏览 | 没搜索、没书签 |
 | `file_viewer` | 869 | `/view` 的 `Reading`，约 60 行 | 没搜索、没语法色 |
@@ -162,7 +162,7 @@ tuix 60 个名字，tui 自己 37 个 + 能力行目录 11 个（`goal` `loop` `
 | | `status` | 一次说完：会话、模型、思考强度、在哪、在不在自己干 |
 | | `cost` | 转 `/context`（同一个实现） |
 | | `todo` `team` | 两个面板的折叠，转已有的 `ToggleFold` |
-| **归 CLI**（与 `/upgrade` 同一把尺子） | `upgrade` `app` `desktop` `webui` `plugin` `schedule` | CLI 已有，或零屏幕依赖 |
+| **归 CLI**（与 `/upgrade` 同一把尺子） | `upgrade` `app` `desktop` `webui` `schedule`（`plugin` 已于 2026-09-20 做成面板，见 B2-5） | CLI 已有，或零屏幕依赖 |
 | **排在 6.3 之后** | `sync` | 碰 daemon 的 live hub |
 | **已经有了，只是名字不同** | `session` → `/clear`；`welcome` → 欢迎块是流里的一个块，往上滚就在；`usage` → A13（缺限速缝） | |
 | **真缺，但要先开东西** | `bg` `background` | 后台会话槽位；要多会话同时跑，而今天换会话仍重建 App |
