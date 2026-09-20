@@ -91,6 +91,19 @@ else
   ok "harness 欠的混层债只能变小($harness_debt ≤ $harness_budget)"
 fi
 
+# The message tables. Both the product's config crate and the screen depend on
+# them, which is only sound while they depend on nothing: a leaf that grew an
+# `atomcode-*` edge would drag that crate into `atomcode-tui` behind everyone's
+# back, and the UI rule below would still pass because the edge is transitive.
+say "词表是叶子:零 atomcode 依赖"
+have="$(deps atomcode-i18n | grep -v '^__' || true)"
+if [ -z "$have" ]; then
+  ok "词表是叶子:零 atomcode 依赖"
+else
+  bad "词表是叶子:零 atomcode 依赖" \
+    "atomcode-i18n 依赖了:$(echo $have) —— 屏幕与产品都读它,它必须什么都不读"
+fi
+
 say "UI 不认 Host,也不认 Product"
 if out="$(forbid atomcode-tui atomcode-coding atomcode)"; then
   ok "UI 不认 Host,也不认 Product"
