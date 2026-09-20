@@ -1592,6 +1592,96 @@ impl Tui {
         true
     }
 
+    /// Ask the host what the Status page shows, and repaint when it answers.
+    ///
+    /// Five questions, asked at once rather than one after another: they are
+    /// five round trips about one screen, and a page that took five times as
+    /// long to appear is a page that feels broken. Each stands on its own —
+    /// a host that will not say who is signed in is not a reason to leave the
+    /// working directory blank.
+    fn fetch_status(&self) {
+        let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
+            return;
+        };
+        let Some(control) = self.client.control() else {
+            return;
+        };
+        let session = self.client.session();
+        let described = self.client.described();
+        let host = self.host.clone();
+        let repaint = ctx.service::<RepaintSvc>();
+        tokio::spawn(async move {
+            let ask = |command| {
+                let control = control.clone();
+                async move { control.call(command).await.ok() }
+            };
+            let (context, who, mcp, usage, sources) = tokio::join!(
+                ask(HostCommand::Context {
+                    session: session.clone()
+                }),
+                ask(HostCommand::WhoAmI {
+                    session: session.clone()
+                }),
+                ask(HostCommand::McpStatus {
+                    session: session.clone()
+                }),
+                ask(HostCommand::Usage {
+                    session: session.clone()
+                }),
+                ask(HostCommand::Sources {
+                    session: session.clone()
+                }),
+            );
+            let cwd = match context {
+                Some(HostReply::Context { working_dir, .. }) => working_dir,
+                _ => String::new(),
+            };
+            let who = match who {
+                Some(HostReply::Identity {
+                    signed_in: true,
+                    who: Some(who),
+                    detail,
+                }) => Some((who, detail)),
+                _ => None,
+            };
+            let mcp = match mcp {
+                Some(HostReply::McpServers { servers }) => servers,
+                _ => Vec::new(),
+            };
+            let (plan, window) = match usage {
+                Some(HostReply::Usage { plan, windows, .. }) => (plan, windows.into_iter().next()),
+                _ => (None, None),
+            };
+            let sources = match sources {
+                Some(HostReply::Sources { groups }) => groups,
+                _ => Vec::new(),
+            };
+            {
+                let mut moment = host.moment.write().expect("moment poisoned");
+                let title = moment.title.clone();
+                moment.status = Some(crate::settings::StatusPage {
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    session,
+                    title,
+                    cwd,
+                    who,
+                    model: described.as_ref().and_then(|d| d.model.clone()),
+                    effort: described
+                        .as_ref()
+                        .and_then(|d| d.reasoning_effort)
+                        .map(|level| level.as_str().to_string()),
+                    plan,
+                    window,
+                    mcp,
+                    sources,
+                });
+            }
+            if let Some(repaint) = repaint {
+                repaint.now();
+            }
+        });
+    }
+
     /// Ask the host what the Usage page shows, and repaint when it answers.
     ///
     /// Asked rather than waited for: an allowance window moves on the server's
@@ -2494,6 +2584,7 @@ impl Tui {
                 if self.host.settings_open() {
                     self.refresh_settings();
                     self.fetch_usage();
+                    self.fetch_status();
                 }
                 return false;
             }

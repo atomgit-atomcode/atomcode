@@ -672,6 +672,74 @@ impl RuntimeControl {
     }
 }
 
+/// The files a coding session is configured from, grouped the way a person
+/// looks for them.
+///
+/// **A file that is not there is reported as not there.** That is the answer
+/// this question is usually asked for: "my instructions are being ignored" is
+/// almost always "that file is not where you thought it was", and a list that
+/// showed only what it found would answer a different question — one whose
+/// answer is always "everything is fine".
+///
+/// A named function rather than inline in the handler so it can be judged
+/// without a runtime: what this carries is a list of paths, and a list of paths
+/// is exactly the kind of thing that goes quietly wrong.
+fn source_groups(working_dir: &std::path::Path) -> Vec<atomcode_host_api::SourceGroup> {
+    use atomcode_capabilities::memory::MemoryStore;
+    use atomcode_config::config::instructions::{InstructionLevel, LayeredInstructions};
+    use atomcode_host_api::{SourceFile, SourceGroup};
+
+    let file = |label: &str, path: std::path::PathBuf| SourceFile {
+        label: label.to_string(),
+        present: path.is_file(),
+        path: path.display().to_string(),
+    };
+    let instructions = LayeredInstructions::load(working_dir);
+    vec![
+        SourceGroup {
+            label: "配置文件".into(),
+            files: vec![file(
+                "设置",
+                atomcode_config::config::Config::default_path(),
+            )],
+        },
+        SourceGroup {
+            label: "指令文件".into(),
+            files: instructions
+                .status_lines(working_dir)
+                .into_iter()
+                .map(|line| SourceFile {
+                    label: match line.level {
+                        InstructionLevel::Global => "用户全局".into(),
+                        InstructionLevel::Project => "项目共享".into(),
+                        InstructionLevel::User => "用户项目覆盖".into(),
+                    },
+                    // The loader's own answer, not a second `is_file` here: it
+                    // is the one that decided whether this file is in play, and
+                    // a page that disagreed with it would be reporting on a
+                    // different run than the one that is happening.
+                    present: line.found,
+                    path: line.path.display().to_string(),
+                })
+                .collect(),
+        },
+        SourceGroup {
+            label: "记忆文件".into(),
+            files: vec![
+                file("用户全局", MemoryStore::global().path().to_path_buf()),
+                file(
+                    "项目记忆",
+                    MemoryStore::project(working_dir).path().to_path_buf(),
+                ),
+                file(
+                    "本机记忆",
+                    MemoryStore::local(working_dir).path().to_path_buf(),
+                ),
+            ],
+        },
+    ]
+}
+
 #[async_trait]
 impl HostControl for RuntimeControl {
     async fn call(&self, command: HostCommand) -> Result<HostReply, HostError> {
@@ -713,6 +781,16 @@ impl HostControl for RuntimeControl {
                     .map_err(refused)?;
                 *self.config.lock().expect("config poisoned") = next;
                 Ok(HostReply::Done)
+            }
+            HostCommand::Sources { session } => {
+                self.addressed(&session)?;
+                // The runtime's own working directory, not the process's: a
+                // session that has been `cd`-ed reads a different project's
+                // files, and the page is about the session.
+                let now = self.handle.context_stats().await.map_err(refused)?;
+                Ok(HostReply::Sources {
+                    groups: source_groups(&now.working_dir),
+                })
             }
             HostCommand::ListSessions { working_dir } => Ok(HostReply::Sessions {
                 sessions: self.list(working_dir),
@@ -1313,6 +1391,67 @@ pub fn refused(error: RuntimeError) -> HostError {
                 message: other.to_string(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::source_groups;
+
+    /// Every file the session is configured from is reported, and the ones that
+    /// are not there are reported as not there.
+    ///
+    /// The missing half is the point. A person opens this page because the
+    /// agent is not doing what their files say, and the usual answer is that
+    /// the file is somewhere else — a list that showed only what it found
+    /// would be a list that can never say that.
+    #[test]
+    fn a_configuration_file_that_is_not_there_is_still_reported() {
+        let project = tempfile::tempdir().expect("a temp dir");
+        // One instruction file present, the rest of the layers absent.
+        std::fs::write(project.path().join("AGENTS.md"), "# 项目").expect("write");
+
+        let groups = source_groups(project.path());
+        let labels: Vec<&str> = groups.iter().map(|group| group.label.as_str()).collect();
+        assert_eq!(labels, ["配置文件", "指令文件", "记忆文件"]);
+
+        let all: Vec<&atomcode_host_api::SourceFile> =
+            groups.iter().flat_map(|group| group.files.iter()).collect();
+        assert!(
+            all.iter().any(|file| file.present),
+            "the one that is there is marked found: {all:#?}"
+        );
+        // Both halves of the list, because they are found two different ways:
+        // the instruction layers come from the loader's own answer and
+        // everything else from asking the filesystem. A criterion satisfied by
+        // one of them would leave the other free to say whatever it liked.
+        let by_path = |ends: &str| -> &atomcode_host_api::SourceFile {
+            all.iter()
+                .find(|file| file.path.ends_with(ends))
+                .unwrap_or_else(|| panic!("{ends}: {all:#?}"))
+        };
+        assert!(
+            by_path("AGENTS.md").present,
+            "the loader found the project's instructions"
+        );
+        assert!(
+            !by_path("ATOMCODE.md").present,
+            "and says the global layer is absent"
+        );
+        assert!(
+            !by_path(".atomcode/memory.md").present,
+            "the filesystem half answers too: this project has no memory file"
+        );
+        // Every entry carries a path, whether or not it was found — the path is
+        // the answer to "then where should it be".
+        assert!(
+            all.iter().all(|file| !file.path.is_empty()),
+            "every entry says where it would be: {all:#?}"
+        );
+        assert!(
+            all.iter().any(|file| file.path.ends_with("AGENTS.md")),
+            "the project's own instructions are among them: {all:#?}"
+        );
     }
 }
 

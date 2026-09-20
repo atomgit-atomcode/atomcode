@@ -482,6 +482,34 @@ pub struct UsagePage {
     pub stats: Option<atomcode_host_api::UsageStats>,
 }
 
+/// What the Status page draws: where this session came from and what it runs
+/// on.
+///
+/// Every field is something the host answered, not something the screen worked
+/// out. The one exception is `version`, which is this build's own — the screen
+/// *is* the build, and asking the host what version it is would be asking a
+/// question whose answer is already in the binary doing the asking.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StatusPage {
+    pub version: String,
+    pub session: String,
+    pub title: Option<String>,
+    pub cwd: String,
+    /// Who is signed in, and what is worth showing beside the name. `None` for
+    /// a build that runs on a key in a file — which is an answer, not a gap.
+    pub who: Option<(String, Option<String>)>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    /// The plan and the window, when the host meters them. Shown here as one
+    /// line each: the Usage page is where they are drawn properly.
+    pub plan: Option<atomcode_host_api::Entitlement>,
+    pub window: Option<atomcode_host_api::UsageWindow>,
+    /// The MCP servers, as they are right now.
+    pub mcp: Vec<atomcode_host_api::McpServer>,
+    /// The files the session was configured from.
+    pub sources: Vec<atomcode_host_api::SourceGroup>,
+}
+
 /// What this session is using of the model's context window.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContextUse {

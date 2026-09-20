@@ -62,6 +62,7 @@ impl View for Settings {
             &vp.moment.settings,
             panel,
             vp.moment.usage.as_ref(),
+            vp.moment.status.as_ref(),
             w,
             vp.rect.h as usize,
         );
@@ -81,6 +82,11 @@ impl View for Settings {
                     } => usage_bar(share, &about, spent, w, vp.moment.caps),
                     UsageLine::Heat { label, cells } => heat_row(&label, &cells, w),
                     UsageLine::HeatKey { less, more } => heat_key(&less, &more, w),
+                    UsageLine::File {
+                        present,
+                        label,
+                        path,
+                    } => file_line(present, &label, &path, w, vp.moment.caps),
                     UsageLine::Columns { text } => {
                         Line::styled(width::take_width(&format!("  {text}"), w), Style::new())
                     }
@@ -98,10 +104,6 @@ impl View for Settings {
                     UsageLine::Cols { text, head, mark } => table_row(&text, head, mark, w),
                     UsageLine::Gap => Line::empty(),
                 },
-                Row::Elsewhere { tab } => Line::styled(
-                    width::take_width(&format!("  {}", elsewhere(tab)), w),
-                    theme::fg(Role::Muted),
-                ),
                 Row::Blank => Line::empty(),
                 Row::Scroll { above, below } => scroll_note(above, below, w, vp.moment.caps),
                 Row::Pages { at } => pages_line(at, w),
@@ -173,22 +175,11 @@ enum Row {
     Header,
     /// A straight rule across the panel.
     Rule,
-    /// A page other than the settings, and everything it has to say.
-    ///
-    /// Carries its own lines rather than an index, because a page that is not
-    /// the settings list has nothing in common with it: no cursor, no filter, no
-    /// row to edit. One row per line is what [`fit`] already understands, so a
-    /// page of prose costs nothing to add.
-    Elsewhere {
-        tab: crate::settings::Tab,
-    },
     /// One line of the Usage page, already worded and measured.
     ///
-    /// Carries the text rather than an index for the reason [`Elsewhere`] does:
-    /// the page is prose and bars, with no cursor and nothing to filter, and one
-    /// row per line is what [`fit`] already understands.
-    ///
-    /// [`Elsewhere`]: Row::Elsewhere
+    /// Carries the text rather than an index: these pages are prose, marks and
+    /// bars, with no cursor and nothing to filter, and one row per line is what
+    /// [`window`] and [`fit`] already understand.
     Usage {
         line: UsageLine,
     },
@@ -263,13 +254,14 @@ fn layout(
     settings: &SettingsView,
     panel: &Panel,
     usage: Option<&crate::settings::UsagePage>,
+    status: Option<&crate::settings::StatusPage>,
     w: usize,
     h: usize,
 ) -> Vec<Row> {
     if w == 0 || h == 0 {
         return Vec::new();
     }
-    let mut rows = rows_for(settings, panel, usage);
+    let mut rows = rows_for(settings, panel, usage, status);
     // A page that is read rather than filtered can be longer than the panel.
     // Windowed here, with both rules kept: [`fit`] makes room by deleting rules
     // and blanks, which is right for a list that is a row or two over and wrong
@@ -312,7 +304,7 @@ fn layout(
 /// not given a second row. One row per setting, always — which is also what
 /// makes the anchor a number that can be computed once.
 fn anchor(settings: &SettingsView) -> usize {
-    rows_for(settings, &Panel::new(), None).len()
+    rows_for(settings, &Panel::new(), None, None).len()
 }
 
 /// The panel's rows as the query leaves them, before any padding or cutting.
@@ -325,6 +317,7 @@ fn rows_for(
     settings: &SettingsView,
     panel: &Panel,
     usage: Option<&crate::settings::UsagePage>,
+    status: Option<&crate::settings::StatusPage>,
 ) -> Vec<Row> {
     let shown = settings.matching(&panel.query);
     // The name and the pages on one row, then the rule that closes the header —
@@ -349,6 +342,16 @@ fn rows_for(
         rows.extend([Row::Blank, Row::Legend, Row::Rule]);
         return rows;
     }
+    if panel.tab == Tab::Status {
+        rows.push(Row::Blank);
+        rows.extend(
+            status_lines(status)
+                .into_iter()
+                .map(|line| Row::Usage { line }),
+        );
+        rows.extend([Row::Blank, Row::Legend, Row::Rule]);
+        return rows;
+    }
     if panel.tab == Tab::Stats {
         rows.push(Row::Blank);
         rows.push(Row::Pages { at: panel.stats });
@@ -361,15 +364,6 @@ fn rows_for(
         rows.extend([Row::Blank, Row::Legend, Row::Rule]);
         return rows;
     }
-    if panel.tab != Tab::Config {
-        rows.push(Row::Blank);
-        rows.push(Row::Elsewhere { tab: panel.tab });
-        // Even a page that is one line says how to leave it: the way out is not
-        // a property of how much a page has to say.
-        rows.extend([Row::Blank, Row::Legend, Row::Rule]);
-        return rows;
-    }
-
     // The box is three rows — two edges and the text — because that is what
     // says "keys go here" without a caption saying it. The caret is drawn unless
     // a row's own field has the keyboard: two carets would be two answers to
@@ -612,36 +606,6 @@ pub fn tab_at(col: usize) -> Option<crate::settings::Tab> {
 /// panel has somewhere to grow, and a page that invented content it does not
 /// have would be worse than one that says what it is waiting for. Each names
 /// the thing that would fill it, so the next person knows where to look.
-/// Whether a page draws itself from what the host answered, rather than saying
-/// in a line what it will one day be.
-///
-/// One answer, read by [`elsewhere`] and by the criteria that walk the pages:
-/// two lists of "which pages are real yet" would agree until a page was
-/// finished, and then a criterion would be asserting a placeholder that is no
-/// longer drawn.
-fn draws_itself(tab: crate::settings::Tab) -> bool {
-    use crate::settings::Tab;
-    matches!(tab, Tab::Config | Tab::Usage | Tab::Stats)
-}
-
-fn elsewhere(tab: crate::settings::Tab) -> &'static str {
-    // A page that draws itself has nothing for this to say. Asked rather than
-    // listed a second time, so the two cannot come apart: the day a page is
-    // finished, moving it into `draws_itself` is the whole edit.
-    if draws_itself(tab) {
-        return "";
-    }
-    match tab {
-        crate::settings::Tab::Status => {
-            "这个会话跑在什么上面(模型、推理档、压缩,来自 agent 的描述)"
-        }
-        // Total for the day someone adds a page: an unfinished page with no
-        // line of its own is caught by `every_other_page_says_something_different`
-        // rather than by a `panic!` in front of a person.
-        _ => "",
-    }
-}
-
 /// A line of the Usage page.
 #[derive(Clone, Debug, PartialEq)]
 enum UsageLine {
@@ -718,6 +682,18 @@ enum UsageLine {
     /// is: where a column starts comes from what is in the columns, not from
     /// how wide the screen is.
     Columns { text: String },
+    /// One file the session was configured from: whether it is there, what it
+    /// is for, and where it is.
+    ///
+    /// The mark is the point. A list of paths answers "where would it be"; the
+    /// mark answers "and is it", which is the question a person opens this page
+    /// with — "my instructions are being ignored" is almost always "that file
+    /// is not where you thought".
+    File {
+        present: bool,
+        label: String,
+        path: String,
+    },
     /// A blank line inside the page.
     Gap,
 }
@@ -853,6 +829,142 @@ fn allowance_lines(page: Option<&crate::settings::UsagePage>) -> Vec<UsageLine> 
         out.pop();
     }
     out
+}
+
+/// Where this session came from and what it runs on.
+///
+/// Two questions merged onto one page, because a person asking either is
+/// holding the other: "what am I running as" (version, session, who, model,
+/// plan) and "where did that come from" (the files, found or not). The classic
+/// front end answered the first in one command and the second in another, and
+/// the second is the half that gets asked when something is wrong.
+fn status_lines(page: Option<&crate::settings::StatusPage>) -> Vec<UsageLine> {
+    let Some(page) = page else {
+        return vec![UsageLine::Note("正在问宿主…".into())];
+    };
+    let mut rows: Vec<(String, String)> = vec![("版本".into(), page.version.clone())];
+    if let Some(title) = page.title.as_ref().filter(|title| !title.is_empty()) {
+        rows.push(("会话".into(), title.clone()));
+    }
+    rows.push(("会话 id".into(), page.session.clone()));
+    if !page.cwd.is_empty() {
+        rows.push(("目录".into(), crate::text::collapse_home(&page.cwd)));
+    }
+    rows.push((
+        "登录".into(),
+        match page.who.as_ref() {
+            // Said rather than left out: a build that runs on a key in a file
+            // has nobody signed in and works fine, and a blank row reads as a
+            // question the host failed to answer.
+            None => "没有账号(用配置里的凭据)".to_string(),
+            Some((who, None)) => who.clone(),
+            Some((who, Some(detail))) => format!("{who} · {detail}"),
+        },
+    ));
+    rows.push((
+        "模型".into(),
+        match (page.model.as_ref(), page.effort.as_ref()) {
+            (None, _) => "没有挂模型".to_string(),
+            (Some(model), None) => model.clone(),
+            (Some(model), Some(effort)) => format!("{model} · 思考强度 {effort}"),
+        },
+    ));
+    if let Some(plan) = page.plan.as_ref() {
+        let mut said = format!(
+            "{} · {}",
+            plan.plan,
+            match plan.active {
+                true => "生效中",
+                false => "已过期",
+            }
+        );
+        if !plan.expires_at.is_empty() {
+            said.push_str(&format!(" · 到期 {}", plan.expires_at));
+        }
+        if plan.total_days > 0 {
+            said.push_str(&format!(
+                "（剩 {}/{} 天）",
+                plan.remaining_days, plan.total_days
+            ));
+        }
+        rows.push(("订阅".into(), said));
+    }
+    if let Some(window) = page.window.as_ref() {
+        // A summary, not the bars: the Usage page draws those, and two places
+        // drawing the same thing differently is two answers to one question.
+        let mut said = match window.used_percent {
+            Some(percent) => format!("当前窗口用掉 {percent}%"),
+            None => "当前窗口没报用量".to_string(),
+        };
+        if window.resets_in_seconds > 0 {
+            said.push_str(&format!(
+                " · {}后重置",
+                crate::text::spoken_duration(window.resets_in_seconds as u64)
+            ));
+        }
+        rows.push(("用量".into(), said));
+    }
+    if !page.mcp.is_empty() {
+        rows.push(("MCP".into(), mcp_tally(&page.mcp)));
+    }
+
+    let widest = rows
+        .iter()
+        .map(|(label, _)| width::str_width(label))
+        .max()
+        .unwrap_or(0);
+    let mut out: Vec<UsageLine> = rows
+        .into_iter()
+        .map(|(label, value)| UsageLine::Columns {
+            text: format!("{}{value}", pad_right(&label, widest + 2)),
+        })
+        .collect();
+
+    for group in &page.sources {
+        out.push(UsageLine::Gap);
+        out.push(UsageLine::Head(group.label.clone()));
+        out.extend(group.files.iter().map(|file| UsageLine::File {
+            present: file.present,
+            label: file.label.clone(),
+            path: file.path.clone(),
+        }));
+    }
+    out
+}
+
+/// The MCP servers counted by what they are doing, worst first.
+///
+/// Counted rather than listed: a person on this page wants to know whether
+/// anything needs their attention, and a list of eight names does not say that
+/// at a glance. `/mcp` is where the names are.
+fn mcp_tally(servers: &[atomcode_host_api::McpServer]) -> String {
+    use atomcode_host_api::McpServerState;
+    let count = |want: fn(&McpServerState) -> bool| {
+        servers.iter().filter(|server| want(&server.state)).count()
+    };
+    let failed = count(|state| matches!(state, McpServerState::Failed { .. }));
+    let untrusted = count(|state| matches!(state, McpServerState::Untrusted));
+    let connecting = count(|state| matches!(state, McpServerState::Connecting));
+    let connected = count(|state| matches!(state, McpServerState::Connected));
+    let off = count(|state| matches!(state, McpServerState::Disconnected));
+    let mut parts = Vec::new();
+    // What needs doing first, because that is what the count is for.
+    if failed > 0 {
+        parts.push(format!("{failed} 个连不上"));
+    }
+    if untrusted > 0 {
+        parts.push(format!("{untrusted} 个等信任"));
+    }
+    if connecting > 0 {
+        parts.push(format!("{connecting} 个连接中"));
+    }
+    if connected > 0 {
+        parts.push(format!("{connected} 个已连接"));
+    }
+    if off > 0 {
+        parts.push(format!("{off} 个没连"));
+    }
+    format!("{} · /mcp", parts.join(" · "))
 }
 
 /// What the account has done: the calendar and the figures, or the models.
@@ -1426,6 +1538,29 @@ pub fn stats_page_at(col: usize) -> Option<crate::settings::StatsPage> {
         .map(|(page, _, _)| page)
 }
 
+/// One configuration file: found or not, what it is for, and where.
+///
+/// The tick and the cross come through [`Caps`] like every other mark, so a
+/// terminal without them gets `ok` and `--` rather than two boxes — and the
+/// colour is the second answer, not the only one: a person reading a
+/// transcript of this page has no colour and still has to be able to tell.
+fn file_line(present: bool, label: &str, path: &str, w: usize, caps: crate::caps::Caps) -> Line {
+    use crate::caps::Glyph;
+    let (mark, ink) = match present {
+        true => (caps.g(Glyph::Ok), theme::fg(Role::Success)),
+        false => (caps.g(Glyph::Fail), theme::fg(Role::Muted)),
+    };
+    let mut spans = vec![
+        Span::styled(format!("    {mark} "), ink),
+        Span::styled(pad_right(label, 14), theme::fg(Role::Muted)),
+        Span::raw(crate::text::collapse_home(path)),
+    ];
+    if !present {
+        spans.push(Span::styled(" 未找到".to_string(), theme::fg(Role::Muted)));
+    }
+    Line::from_spans(spans).truncate(w)
+}
+
 /// One figure: what it is called, and what it says.
 type Figure = (String, String);
 
@@ -1984,6 +2119,7 @@ pub fn geometry(moment: &Moment, vp: &Viewport<'_>) -> Geometry {
             &moment.settings,
             panel,
             moment.usage.as_ref(),
+            moment.status.as_ref(),
             vp.rect.w as usize,
             vp.rect.h as usize,
         )
@@ -2065,6 +2201,18 @@ mod tests {
         Arc::new(Mounted::<Settings>::new())
     }
     use std::sync::Arc;
+
+    /// The Status tab.
+    fn status_page(page: crate::settings::StatusPage) -> Moment {
+        let mut panel = Panel::new();
+        panel.show(crate::settings::Tab::Status);
+        Moment {
+            settings: two(),
+            settings_panel: Some(panel),
+            status: Some(page),
+            ..Moment::default()
+        }
+    }
 
     /// The Usage tab: the allowance and the plan behind it.
     fn usage_page(page: crate::settings::UsagePage) -> Moment {
@@ -3121,6 +3269,140 @@ mod tests {
         }
     }
 
+    /// A file the session was configured from is listed **whether or not it is
+    /// there**, and says which.
+    ///
+    /// This is the whole reason the page has a file list. "My instructions are
+    /// being ignored" is almost always "that file is not where you thought it
+    /// was", and a list that showed only what it found would answer a different
+    /// question — one whose answer is always "everything is fine".
+    ///
+    /// The mark is asserted as a *character*, not as a colour: a person reading
+    /// a transcript of this page has no colour and still has to be able to tell
+    /// the two apart.
+    #[test]
+    fn the_status_page_lists_a_missing_file_as_missing() {
+        use atomcode_host_api::{SourceFile, SourceGroup};
+        let page = status_page(crate::settings::StatusPage {
+            version: "5.1.0".into(),
+            session: "abc".into(),
+            cwd: "/w".into(),
+            sources: vec![SourceGroup {
+                label: "指令文件".into(),
+                files: vec![
+                    SourceFile {
+                        label: "项目共享".into(),
+                        path: "/w/AGENTS.md".into(),
+                        present: true,
+                    },
+                    SourceFile {
+                        label: "用户全局".into(),
+                        path: "/w/ATOMCODE.md".into(),
+                        present: false,
+                    },
+                ],
+            }],
+            ..Default::default()
+        });
+        let shown = drawn(&page, 92, 30).join("\n");
+        assert!(shown.contains("指令文件"), "the group is named: {shown}");
+        let row = |needle: &str| -> &str {
+            shown
+                .lines()
+                .find(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("{needle}: {shown}"))
+        };
+        assert!(
+            row("AGENTS.md").contains('✓'),
+            "the one that is there: {:?}",
+            row("AGENTS.md")
+        );
+        assert!(
+            row("ATOMCODE.md").contains('✗') && row("ATOMCODE.md").contains("未找到"),
+            "and the one that is not, said twice — mark and words: {:?}",
+            row("ATOMCODE.md")
+        );
+    }
+
+    /// The page says what the session is running as, from what the host
+    /// answered — and says so when the host answered nothing.
+    #[test]
+    fn the_status_page_says_what_this_session_runs_as() {
+        use atomcode_host_api::{Entitlement, McpServer, McpServerState};
+        let page = status_page(crate::settings::StatusPage {
+            version: "5.1.0".into(),
+            session: "6d7ae169".into(),
+            title: Some("一个会话".into()),
+            cwd: "/w/project".into(),
+            who: Some(("li4".into(), Some("li4@example.com".into()))),
+            model: Some("deepseek-flash".into()),
+            effort: Some("high".into()),
+            plan: Some(Entitlement {
+                plan: "CodingPlan Pro".into(),
+                active: true,
+                expires_at: "2036-07-30".into(),
+                remaining_days: 3601,
+                total_days: 3653,
+                ..Default::default()
+            }),
+            window: None,
+            // Counted worst-first, because the count is there to say whether
+            // anything needs doing.
+            mcp: vec![
+                McpServer {
+                    name: "a".into(),
+                    state: McpServerState::Connected,
+                },
+                McpServer {
+                    name: "b".into(),
+                    state: McpServerState::Failed {
+                        message: "x".into(),
+                    },
+                },
+            ],
+            sources: Vec::new(),
+        });
+        let shown = drawn(&page, 92, 30).join("\n");
+        for wanted in [
+            "5.1.0",
+            "一个会话",
+            "6d7ae169",
+            "li4",
+            "li4@example.com",
+            "deepseek-flash",
+            "CodingPlan Pro",
+            "剩 3601/3653 天",
+        ] {
+            assert!(shown.contains(wanted), "{wanted}: {shown}");
+        }
+        let mcp = shown
+            .lines()
+            .find(|line| line.contains("MCP"))
+            .unwrap_or_else(|| panic!("{shown}"));
+        assert!(
+            mcp.find("连不上").unwrap() < mcp.find("已连接").unwrap(),
+            "what needs doing comes first: {mcp:?}"
+        );
+
+        // Nobody signed in is an answer, not a gap: a build that runs on a key
+        // in a file works fine, and a blank row reads as a question the host
+        // failed to answer.
+        let anonymous = status_page(crate::settings::StatusPage {
+            version: "5.1.0".into(),
+            session: "abc".into(),
+            ..Default::default()
+        });
+        let shown = drawn(&anonymous, 92, 30).join("\n");
+        assert!(
+            shown.contains("没有账号"),
+            "says there is no account: {shown}"
+        );
+        assert!(
+            shown.contains("没有挂模型"),
+            "and that nothing is mounted: {shown}"
+        );
+    }
+
     /// A braille cell with anything in it — the ink the plot is drawn with.
     fn is_plot_ink(c: char) -> bool {
         ('\u{2801}'..='\u{28FF}').contains(&c)
@@ -3836,47 +4118,22 @@ mod tests {
                 !joined.contains('┌'),
                 "{tab:?} draws no search box — it has nothing to filter:\n{joined}"
             );
-            if draws_itself(tab) {
-                // These pages draw themselves now, from what the host answered.
-                // With no answer yet that is one line saying so — which is
-                // still a page that is not blank, the thing this criterion is
-                // about.
-                assert!(
-                    joined.contains("正在问宿主"),
-                    "{tab:?} draws what it has:\n{joined}"
-                );
-                continue;
-            }
-            let words = elsewhere(tab);
-            assert!(!words.is_empty(), "{tab:?} has something to say");
+            // Every page draws itself now, from what the host answered. With
+            // no answer yet that is one line saying so — which is still a page
+            // that is not blank, the thing this criterion is about.
+            //
+            // There used to be a second shape here: a page could instead carry
+            // one line of prose naming what would one day fill it, and two
+            // criteria walked the pages checking that each had one and that no
+            // two shared it. The last such page was finished on 2026-09-20 and
+            // the whole path went with it — a placeholder mechanism with no
+            // placeholders is a second way to draw a page, kept alive by its
+            // own tests.
             assert!(
-                joined.contains(words),
-                "{tab:?} draws its own line:\n{joined}"
+                joined.contains("正在问宿主"),
+                "{tab:?} draws what it has:\n{joined}"
             );
         }
-    }
-
-    #[test]
-    fn every_other_page_says_something_different() {
-        // A page that repeated another page's line would be a page with no
-        // content of its own, drawn as though it had.
-        let mut said: Vec<&str> = Vec::new();
-        for tab in Tab::ALL {
-            if draws_itself(tab) {
-                continue;
-            }
-            let words = elsewhere(tab);
-            assert!(!words.is_empty(), "{tab:?} has something to say");
-            assert!(!said.contains(&words), "{tab:?} repeats another page");
-            said.push(words);
-        }
-        // Every page either draws itself or has a line of its own. The count is
-        // asserted so that a page finished tomorrow has to be moved into
-        // `draws_itself` rather than left claiming a placeholder nobody draws.
-        assert_eq!(
-            said.len(),
-            Tab::ALL.iter().filter(|tab| !draws_itself(**tab)).count()
-        );
     }
 
     // ---- clicking the tabs ------------------------------------------------

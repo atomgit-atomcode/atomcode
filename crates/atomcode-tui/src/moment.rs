@@ -321,6 +321,9 @@ pub struct Moment {
     /// "not asked yet" and draws as such — an empty list means the host does
     /// not meter, which is a different thing and says so.
     pub usage: Option<crate::settings::UsagePage>,
+    /// What the Status page draws. `None` until the host has answered — which
+    /// the page says, rather than drawing an empty form.
+    pub status: Option<crate::settings::StatusPage>,
 }
 
 /// A question on screen, with the row that is pointed at.

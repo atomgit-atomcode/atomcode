@@ -121,6 +121,18 @@ pub enum HostCommand {
     SignIn { session: String },
     /// Who is signed in, as the host knows it.
     WhoAmI { session: String },
+    /// The files this session was configured from, and whether each was there.
+    ///
+    /// Neutral by the rule this contract is kept to: every host reads *some*
+    /// set of files to make a session what it is, and "which ones, and did you
+    /// find them" is the question a person asks when the agent is not behaving
+    /// the way their files say it should. What the groups are called is the
+    /// host's — only it knows what its files mean.
+    ///
+    /// A file that is **not** there is still reported. That is the answer the
+    /// question is usually asked for: "my instructions are being ignored" is
+    /// almost always "that file is not where you think it is".
+    Sources { session: String },
     /// Whether the session is driving itself — a goal or a loop — and how far
     /// it has got.
     ///
@@ -203,6 +215,7 @@ impl HostCommand {
             | Self::SignOut { session }
             | Self::SignIn { session }
             | Self::WhoAmI { session }
+            | Self::Sources { session }
             | Self::Changes { session, .. }
             | Self::Providers { session }
             | Self::Autonomy { session }
@@ -293,6 +306,10 @@ pub enum HostReply {
         /// What went through, when the host meters it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stats: Option<UsageStats>,
+    },
+    /// The files the session was configured from, in the host's own grouping.
+    Sources {
+        groups: Vec<SourceGroup>,
     },
     /// The providers a person may switch between. `current` is the one this
     /// conversation runs on, when the host knows it.
@@ -453,6 +470,23 @@ pub struct UsageStats {
     pub series: Vec<ModelSeries>,
     pub total_tokens: u64,
     pub total_requests: u64,
+}
+
+/// One group of configuration files — what the host calls them, and what is in
+/// it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceGroup {
+    pub label: String,
+    pub files: Vec<SourceFile>,
+}
+
+/// One file the host reads, and whether it found it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceFile {
+    /// What this one is for, in the host's words — the scope, usually.
+    pub label: String,
+    pub path: String,
+    pub present: bool,
 }
 
 /// What the account is subscribed to.
@@ -865,6 +899,9 @@ mod tests {
                 session: "a".into(),
                 id: "theme".into(),
             },
+            HostCommand::Sources {
+                session: "a".into(),
+            },
         ];
         for c in &all {
             match c {
@@ -881,6 +918,7 @@ mod tests {
                 | HostCommand::SetMode { .. }
                 | HostCommand::ChangeDirectory { .. }
                 | HostCommand::Models { .. }
+                | HostCommand::Sources { .. }
                 | HostCommand::Usage { .. }
                 | HostCommand::Context { .. }
                 | HostCommand::Rename { .. }
@@ -1067,6 +1105,16 @@ mod tests {
                     total_requests: 1604,
                 }),
             },
+            HostReply::Sources {
+                groups: vec![SourceGroup {
+                    label: "指令文件".into(),
+                    files: vec![SourceFile {
+                        label: "项目共享".into(),
+                        path: "/w/AGENTS.md".into(),
+                        present: true,
+                    }],
+                }],
+            },
         ];
         for r in &all {
             match r {
@@ -1085,6 +1133,7 @@ mod tests {
                 | HostReply::Usage { .. }
                 | HostReply::Context { .. }
                 | HostReply::Identity { .. }
+                | HostReply::Sources { .. }
                 | HostReply::Readiness { .. } => {}
             }
         }
