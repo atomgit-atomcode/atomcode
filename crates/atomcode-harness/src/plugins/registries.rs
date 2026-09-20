@@ -12,7 +12,7 @@ use serde::Deserialize;
 
 use crate::seams::{
     CommandsSvc, Descriptions, OperationsSvc, PromptRegistry, SystemPromptSvc, ToolBox, ToolPolicy,
-    ToolSwitchesSvc, ToolsSvc,
+    ToolsSvc,
 };
 
 pub struct ToolsPlugin;

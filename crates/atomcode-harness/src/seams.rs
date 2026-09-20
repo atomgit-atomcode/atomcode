@@ -59,7 +59,6 @@ plexus_service!(ModesSvc => Modes, "modes", Core, "Switches a person flips mid-s
 plexus_service!(ToolDriverSvc => dyn ToolDriver, "tool-driver", Seam, "What a running tool reaches of the person's front end: a progress line, a structured question");
 plexus_service!(DelegatedLlmSvc => dyn LlmProvider, "llm-delegated", Seam, "The model a delegated agent runs on when it inherits the conversation's, for a host that keeps a child's spend apart");
 plexus_service!(DelegationLaneSvc => DelegationLane, "delegation-lane", Core, "Where a delegated agent may write: the scopes it was given, on its own realm");
-plexus_service!(ToolSwitchesSvc => ToolSwitches, "tool-switches", Core, "The person's live on/off over individual tools, kept by a host so it survives the tree being rebuilt");
 plexus_service!(GrantsSvc => dyn atomcode_capabilities::tools::PermissionStore, "grants", Core, "The session's remembered always-allow answers, kept by a host that outlives the tree");
 
 /// Which names the catalog admits, as the `tools` row was configured.
