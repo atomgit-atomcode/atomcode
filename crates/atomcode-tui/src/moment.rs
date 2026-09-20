@@ -501,6 +501,59 @@ impl Moment {
             .is_some_and(|n| n.below && n.is_live(self.now))
     }
 
+    /// What this session is doing, as the light the window title carries.
+    ///
+    /// Folded from the fields that already say what a turn is doing, rather than
+    /// from a counter of its own: a second "is this busy" that can disagree with
+    /// the live line is worse than no light at all.
+    ///
+    /// **A question outranks a turn.** They can both be true — the model asked
+    /// and is waiting — and the one worth a red dot is the one a person can do
+    /// something about. What is here is what a *module* can see of that: the
+    /// question on screen and the password being typed. The ask queue itself is
+    /// [`crate::host::Host`]'s, and a question that has not been drawn yet is
+    /// folded in by [`crate::host::Host::light`], which is the one the title
+    /// uses.
+    pub fn light(&self) -> crate::text::Light {
+        use crate::text::Light;
+        if self.asking.is_some() || self.secret.is_some() {
+            return Light::Waiting;
+        }
+        // `Stopping` is a turn still in flight — the flag it is landing. Busy,
+        // so the dot does not go quiet while the thing it is stopping is still
+        // running.
+        match self.activity {
+            Activity::Working | Activity::Stopping => Light::Busy,
+            Activity::Idle => Light::Idle,
+        }
+    }
+
+    /// Whether this screen is allowed to put a light in the window title.
+    ///
+    /// Two gates, and both have to be open. The person's: the setting, read from
+    /// the rows this frame was taken with — an absent row is this build's
+    /// default, which is on, so a launcher that never provided a settings port
+    /// still gets the light. The terminal's: `caps.unicode`, because a dot a
+    /// terminal draws as a tofu box is worse than no dot — and that check has to
+    /// happen above the surface, since a title is written whether or not anyone
+    /// is watching the screen.
+    pub fn status_dot_on(&self) -> bool {
+        if !self.caps.unicode {
+            return false;
+        }
+        self.settings
+            .rows()
+            .iter()
+            .find(|row| row.id == crate::settings::STATUS_DOT)
+            .is_none_or(|row| row.value == "true")
+    }
+
+    /// The light for the window title: what is happening, or `None` when the
+    /// person or the terminal has said not to show one.
+    pub fn status_dot(&self) -> Option<crate::text::Light> {
+        self.status_dot_on().then(|| self.light())
+    }
+
     /// End a pending two-press exit: drop the latch and, with it, the hint below
     /// the box. Called for every action other than a repeat Cancel, so an
     /// accidental first press followed by real work never leaves the terminal one
@@ -571,6 +624,69 @@ mod tests {
         assert_eq!(m.caret, 3);
         assert_eq!(m.tick, 7);
         assert!(m.scroll.is_at_bottom());
+    }
+
+    /// The light follows what the turn is doing, and a stop still counts as a
+    /// turn: the flag has landed on something that is still running.
+    #[test]
+    fn the_light_follows_the_turn() {
+        use crate::text::Light;
+        assert_eq!(Moment::default().light(), Light::Idle);
+        assert_eq!(Moment::default().working().light(), Light::Busy);
+        let stopping = Moment {
+            activity: Activity::Stopping,
+            ..Moment::default()
+        };
+        assert_eq!(stopping.light(), Light::Busy);
+    }
+
+    /// A question outranks a turn, because it is the one a person can act on —
+    /// and every kind of question counts, including a password a process is
+    /// blocked on.
+    #[test]
+    fn a_question_outranks_a_turn_in_flight() {
+        use crate::text::Light;
+        let mut asking = Moment::default().working();
+        asking.asking = Some(Ask::new(Question::plain("which one", &["a", "b"])));
+        assert_eq!(asking.light(), Light::Waiting);
+        assert_eq!(
+            Moment::default()
+                .working()
+                .asking_password("sudo password", 0)
+                .light(),
+            Light::Waiting
+        );
+    }
+
+    /// Both gates: a terminal that cannot draw the dot gets no dot whatever the
+    /// setting says, and the setting says off regardless of the terminal.
+    #[test]
+    fn a_light_needs_both_the_setting_and_a_terminal_that_can_draw_it() {
+        use crate::settings::STATUS_DOT;
+        use crate::text::Light;
+        let mut m = Moment::default().working();
+        assert_eq!(m.status_dot(), Some(Light::Busy), "both gates open");
+
+        m.caps.unicode = false;
+        assert!(!m.status_dot_on(), "an ASCII terminal gets no dot");
+        assert_eq!(m.status_dot(), None);
+
+        m.caps.unicode = true;
+        m.settings = crate::settings::SettingsView::new(vec![crate::settings::SettingRow {
+            id: STATUS_DOT.to_string(),
+            label: "终端状态图标".to_string(),
+            value: "false".to_string(),
+            kind: crate::settings::SettingKind::Boolean,
+            applies: crate::settings::Applies::Immediately,
+        }]);
+        assert!(!m.status_dot_on(), "the person turned it off");
+        assert_eq!(m.status_dot(), None);
+
+        // A launcher that provided no settings port at all is not a "no": the
+        // row is absent, so this build's default (on) stands.
+        let mut bare = Moment::default().working();
+        bare.settings = crate::settings::SettingsView::default();
+        assert!(bare.status_dot_on());
     }
 
     #[test]

@@ -869,6 +869,14 @@ impl UserInterface for Tui {
         *self.ctx.lock().expect("ctx poisoned") = Some(ctx.clone());
         *self.wake.lock().expect("wake poisoned") = Some(wake_tx.clone());
 
+        // The settings rows, read once here: the title is written from
+        // `name_the_window`, which runs every frame, and a row read per frame
+        // would be a configuration file read per frame. Once at the start, and
+        // again after every change the panel makes (`run_settings_key`), is
+        // enough for the light — unlike the per-frame read, which would be
+        // paying for a file nobody has necessarily touched.
+        self.refresh_settings();
+
         // A question can arrive mid-turn, when nothing else is waking the loop.
         let (ask_tx, mut ask_rx) = mpsc::unbounded_channel::<()>();
         self.host.asks.notify_on(ask_tx);
@@ -1681,24 +1689,31 @@ impl Tui {
     /// nothing in the ordinary case.
     ///
     /// The title carries a status dot — `🟢` idle, `🟡` working, `🔴` waiting on
-    /// the person (a question or approval) — then the session's name, or the app
-    /// and version for a window not yet named. The dot is the "红绿灯" the
+    /// the person (a question or approval) — then the session's name, or the
+    /// project directory for a window not yet named. The dot is the "红绿灯" the
     /// reference and Claude Code put in the tab so a glance at the strip says
     /// which session wants you.
+    ///
+    /// **What the dot is comes from [`Host::light`], not from a test written
+    /// here.** Two answers to "what is this session doing" is one too many, and
+    /// the one over there is the one a person can turn off
+    /// (`crate::settings::STATUS_DOT`) and the one the criteria are written
+    /// against. This end composes the string.
+    ///
+    /// The light is read every frame rather than folded into a fact: it is true
+    /// of *now* — a question arrives, a turn starts, a stop lands — and a title
+    /// that only moved when the session was renamed would be a dot that lies
+    /// about the one thing it is for. The compare below keeps that free: the
+    /// light joins the string, so a frame that changed nothing writes nothing.
     fn name_the_window(&self) {
-        let (title, activity, cwd) = {
+        // The light first, then the moment: asking it under the moment's own
+        // read guard would take that lock twice on one thread, and an `RwLock`
+        // with a writer queued between the two reads is a deadlock, not a
+        // slowdown.
+        let light = self.host.light();
+        let (title, cwd) = {
             let m = self.host.moment.read().expect("moment poisoned");
-            (m.title.clone(), m.activity, m.cwd.clone())
-        };
-        let dot = if self.host.asks.is_waiting() {
-            "🔴"
-        } else if matches!(
-            activity,
-            crate::moment::Activity::Working | crate::moment::Activity::Stopping
-        ) {
-            "🟡"
-        } else {
-            "🟢"
+            (m.title.clone(), m.cwd.clone())
         };
         // The project directory is the fallback for a window not yet named —
         // which checkout this is, when the session has no title of its own. At
@@ -1706,7 +1721,11 @@ impl Tui {
         // app rather than a bare dot.
         let base = crate::text::basename(&cwd);
         let fallback = if base.is_empty() { "AtomCode" } else { base };
-        let wanted = crate::text::terminal_title(title.as_deref(), fallback, Some(dot));
+        let wanted = crate::text::terminal_title(
+            title.as_deref(),
+            fallback,
+            light.map(crate::text::Light::dot),
+        );
         if wanted.is_empty() {
             return;
         }

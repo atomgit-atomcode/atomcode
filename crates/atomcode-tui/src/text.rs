@@ -275,6 +275,43 @@ fn terminal_title_name(name: Option<&str>, fallback: &str) -> String {
     cleaned
 }
 
+/// What the session is doing, as one character in front of the window's name.
+///
+/// The screen already says this — the status line, the live line, the question
+/// on it — but all of that is behind the window you are not looking at. Four
+/// tabs open on four sessions and "which one wants me" is the question the
+/// tab strip cannot currently answer. A coloured dot answers it without a
+/// pixel of the screen being spent: the terminal has somewhere to put a
+/// title, and this is the smallest true thing to put in it.
+///
+/// Three states, not four: "stopping" reads as busy, because the turn it is
+/// stopping is still the turn in flight, and a person who has just pressed
+/// escape does not need the tab to argue with them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Light {
+    /// Nothing running and nothing asked of the person.
+    Idle,
+    /// A turn is in flight — the model talking, a tool running, a stop landing.
+    Busy,
+    /// Something is waiting on the person: a question, an approval, a password.
+    ///
+    /// This is the one the light exists for: it is the only state where the
+    /// session cannot get on without somebody, and the only one worth looking
+    /// across a room for.
+    Waiting,
+}
+
+impl Light {
+    /// The dot itself.
+    pub fn dot(self) -> &'static str {
+        match self {
+            Self::Idle => "🟢",
+            Self::Busy => "🟡",
+            Self::Waiting => "🔴",
+        }
+    }
+}
+
 /// The implementation, with home explicit. See [`collapse_home`].
 pub fn collapse_home_with(path: &str, home: Option<&std::path::Path>) -> String {
     let Some(home) = home else {
@@ -428,7 +465,10 @@ mod tests {
         );
         // Only a missing / blank title falls back to the app.
         assert_eq!(terminal_title(None, FB, Some("🟡")), "🟡 AtomCode v9.9.9");
-        assert_eq!(terminal_title(Some("   "), FB, Some("🔴")), "🔴 AtomCode v9.9.9");
+        assert_eq!(
+            terminal_title(Some("   "), FB, Some("🔴")),
+            "🔴 AtomCode v9.9.9"
+        );
         // A real title that happens to start with `[` is shown, not hidden.
         assert_eq!(
             terminal_title(Some("[WIP] fix login"), FB, None),
@@ -444,6 +484,48 @@ mod tests {
         let title = terminal_title(Some(&long), FB, Some("🟢"));
         assert!(title.starts_with("🟢 "));
         assert!(title.ends_with('…'));
+    }
+
+    /// Each state has its own dot, and the three are distinct — a light that
+    /// could not be told apart from another is a light that says nothing.
+    #[test]
+    fn each_state_has_a_dot_of_its_own() {
+        use super::Light;
+        assert_eq!(Light::Idle.dot(), "🟢");
+        assert_eq!(Light::Busy.dot(), "🟡");
+        assert_eq!(Light::Waiting.dot(), "🔴");
+        assert_ne!(Light::Idle.dot(), Light::Busy.dot());
+        assert_ne!(Light::Busy.dot(), Light::Waiting.dot());
+    }
+
+    /// The dot goes in front of the name, with a space, and the name underneath
+    /// is untouched — so the truncation and scrubbing budget of the name do not
+    /// change when a light is added.
+    #[test]
+    fn the_dot_is_prefixed_and_the_name_is_left_alone() {
+        use super::{terminal_title, Light};
+        assert_eq!(
+            terminal_title(Some("修解析器"), "atomcode", Some(Light::Waiting.dot())),
+            format!("🔴 {}", terminal_title(Some("修解析器"), "atomcode", None)),
+        );
+        // The fallback carries a light too: a fresh session is exactly the one
+        // somebody may be waiting on.
+        assert_eq!(
+            terminal_title(None, "atomcode", Some(Light::Idle.dot())),
+            "🟢 atomcode"
+        );
+    }
+
+    /// No light is no prefix at all — the title is byte-for-byte what it was
+    /// before this feature, which is what turning the setting off has to mean.
+    #[test]
+    fn no_light_is_the_plain_title_unchanged() {
+        use super::terminal_title;
+        assert_eq!(
+            terminal_title(Some("修解析器"), "atomcode", None),
+            "修解析器"
+        );
+        assert_eq!(terminal_title(None, "atomcode", None), "atomcode");
     }
 
     /// A window title says which project, not the whole path to it.

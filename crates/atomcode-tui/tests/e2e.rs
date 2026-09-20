@@ -313,6 +313,47 @@ async fn start_with_connection(
     setup: Setup,
     wrap: impl FnOnce(atomcode_host_api::HostConnection) -> atomcode_host_api::HostConnection,
 ) -> Session {
+    start_full(setup, wrap, None).await
+}
+
+/// A settings port that answers one row with `value` and knows nothing else.
+///
+/// A stand-in for the launcher's, and deliberately a *port* rather than a
+/// fixture written into the moment: the whole question of the light is whether
+/// the screen reads the configuration it is handed, so the test has to hand it
+/// one the way the product does.
+struct OneSetting(&'static str, &'static str);
+
+impl atomcode_tui::settings::Settings for OneSetting {
+    fn rows(&self) -> atomcode_tui::settings::SettingsView {
+        atomcode_tui::settings::SettingsView::new(vec![atomcode_tui::settings::SettingRow {
+            id: self.0.to_string(),
+            label: self.0.to_string(),
+            value: self.1.to_string(),
+            kind: atomcode_tui::settings::SettingKind::Boolean,
+            applies: atomcode_tui::settings::Applies::Immediately,
+        }])
+    }
+    fn set(&self, _id: &str, _value: &str) -> Result<atomcode_tui::settings::SettingsView, String> {
+        Err("this port cannot write".into())
+    }
+    fn reset(&self, _id: &str) -> Result<atomcode_tui::settings::SettingsView, String> {
+        Err("this port cannot write".into())
+    }
+}
+
+async fn start_with_connection_and_settings(
+    setup: Setup,
+    settings: Option<Arc<dyn atomcode_tui::settings::Settings>>,
+) -> Session {
+    start_full(setup, |control| control, settings).await
+}
+
+async fn start_full(
+    setup: Setup,
+    wrap: impl FnOnce(atomcode_host_api::HostConnection) -> atomcode_host_api::HostConnection,
+    settings: Option<Arc<dyn atomcode_tui::settings::Settings>>,
+) -> Session {
     let agent_layers = setup.agent.clone();
     let registry: Registry = Arc::new(agent_catalog);
     let trees: Trees = Arc::new(move |opening: &Opening| {
@@ -335,9 +376,18 @@ async fn start_with_connection(
         ..Screen::default()
     };
     let extra: Vec<&str> = setup.screen.iter().map(String::as_str).collect();
-    let mounted = launch::mount(&screen, &extra, connection)
-        .await
-        .expect("the screen's tree must mount");
+    let mounted = launch::mount_with(
+        &screen,
+        &extra,
+        &[],
+        launch::Ports {
+            settings,
+            providers: None,
+        },
+        connection,
+    )
+    .await
+    .expect("the screen's tree must mount");
     let surface = mounted
         .app
         .context()
@@ -1319,7 +1369,7 @@ async fn esc_declines_and_the_model_is_told_rather_than_the_turn_dying() {
 
 // ---- the command surface --------------------------------------------------
 
-/// The window says which project this is.
+/// The window says which project this is, and what it is doing.
 ///
 /// Four terminals open on four checkouts all say `atomcode` otherwise, and the
 /// one thing a person needs from across the room is which is which. The
@@ -1345,6 +1395,87 @@ async fn the_window_says_which_project_this_is() {
         "the window is a status dot then where the session is working"
     );
     task.abort();
+}
+
+/// The light goes out when the person says so, and that is the whole setting.
+///
+/// The other half of the same judgement: `the_window_says_which_project_this_is`
+/// is the on state, and this is the off one reading the configuration the
+/// launcher hands over — `ui.terminal_status_glyph = false` leaves the title
+/// exactly as it was before the light existed.
+#[tokio::test]
+async fn the_window_can_be_named_without_the_light() {
+    let dir = scratch("title-off");
+    let s = start_with_connection_and_settings(
+        tree(&dir, &replay(r#"{ text = "ok" }"#), &[]),
+        Some(Arc::new(OneSetting(
+            atomcode_tui::settings::STATUS_DOT,
+            "false",
+        ))),
+    )
+    .await;
+    let task = s.open().await;
+    s.quiet().await;
+    let cwd = std::env::current_dir().expect("a working directory");
+    let here = cwd
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("a directory name");
+    assert_eq!(
+        s.term.title().as_deref(),
+        Some(here),
+        "turned off is the plain name, byte for byte"
+    );
+    task.abort();
+}
+
+/// And the light follows what the session is doing, which is the only reason it
+/// exists: a tab strip that says "busy" and "wants you" without being read.
+#[tokio::test]
+async fn the_light_turns_green_yellow_and_red() {
+    let dir = scratch("light");
+    // A turn that stays in flight long enough to be looked at, then a risky call
+    // that stops and waits for a person — the two states that are not idle.
+    let script = replay(
+        r#"{ text = "Reading.", calls = [ { name = "bash", args = { command = "sleep 0.5" } } ] },
+           { text = "Writing.", calls = [ { name = "write_file", args = { file_path = "out.txt", content = "written" } } ] }"#,
+    );
+    let s = start(asking(&dir, &script)).await;
+    let task = s.open().await;
+    s.quiet().await;
+    assert!(
+        s.term.title().is_some_and(|t| t.starts_with('🟢')),
+        "idle before anything is asked of it: {:?}",
+        s.term.title()
+    );
+
+    s.term.type_line("go");
+    until(&s, "正在运行 1 个工具").await;
+    assert!(
+        s.term.title().is_some_and(|t| t.starts_with('🟡')),
+        "a turn in flight is a yellow light: {:?}",
+        s.term.title()
+    );
+
+    // The risky call stops the turn on a question, and that is the state a
+    // person is actually wanted in.
+    until(&s, "esc 拒绝").await;
+    assert!(
+        s.term.title().is_some_and(|t| t.starts_with('🔴')),
+        "a question waiting is a red light: {:?}",
+        s.term.title()
+    );
+
+    s.term.press(KeyPress::ch('1'));
+    s.quiet().await;
+    assert!(
+        s.term.title().is_some_and(|t| t.starts_with('🟢')),
+        "and back to idle once it is answered: {:?}",
+        s.term.title()
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
 
 #[tokio::test]
@@ -2188,9 +2319,7 @@ async fn a_drag_selection_confirms_the_copy_right_away() {
     s.quiet().await;
 
     assert!(
-        s.term
-            .clipboard_text()
-            .is_some_and(|t| t.contains("spoke")),
+        s.term.clipboard_text().is_some_and(|t| t.contains("spoke")),
         "the drag copied the answer"
     );
     assert!(

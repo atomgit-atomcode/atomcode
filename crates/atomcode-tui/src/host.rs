@@ -1435,6 +1435,26 @@ impl Host {
         self.modules.view(crate::modules::ask::ID).is_some()
     }
 
+    /// The light the window title carries: what is happening, or `None` when
+    /// the person or the terminal has said not to show one.
+    ///
+    /// Here and not on [`crate::moment::Moment`] for one reason: the ask queue
+    /// is this struct's, and a question is at its most urgent in the window
+    /// between arriving and being drawn — which is exactly the window a light
+    /// exists for. Everything else is folded off the moment, so the two cannot
+    /// disagree about the turn.
+    pub fn light(&self) -> Option<crate::text::Light> {
+        let m = self.moment.read().expect("moment poisoned");
+        if !m.status_dot_on() {
+            return None;
+        }
+        Some(if self.asks.is_waiting() {
+            crate::text::Light::Waiting
+        } else {
+            m.light()
+        })
+    }
+
     /// Bring `Moment::asking` in step with the queue, keeping the pointed-at row.
     ///
     /// The queue is the truth about whether a question is waiting; the moment is

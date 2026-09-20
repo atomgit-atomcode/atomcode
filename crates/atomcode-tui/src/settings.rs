@@ -24,6 +24,15 @@
 
 use std::sync::Arc;
 
+/// The id of the setting that decides whether the window title carries a light.
+///
+/// Here, next to the panel, because this crate is the one that reads a row by
+/// id: the launcher fills the rows and the product's catalog names the setting,
+/// so the two would drift silently if the string were typed twice. A row that
+/// is not in the list at all is this build's default (`Moment::status_dot_on`),
+/// which is why a launcher with no settings port still gets a light.
+pub const STATUS_DOT: &str = "ui.terminal_status_glyph";
+
 /// What a value is, as far as editing it goes.
 ///
 /// Not a type system for settings — a description of the *gesture*. Three
