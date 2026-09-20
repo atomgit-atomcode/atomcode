@@ -693,6 +693,12 @@ impl ToolCallBlock {
         }
     }
 
+    /// Whether this call failed. For the run lid, which shows the last call's
+    /// result and would otherwise be silent about a failure earlier in it.
+    pub fn is_failed(&self) -> bool {
+        matches!(self.outcome, Outcome::Failed(_))
+    }
+
     pub fn pending(
         call_id: impl Into<String>,
         name: impl Into<String>,
@@ -774,13 +780,25 @@ impl ToolCallBlock {
     /// the count is a figure *about* the work rather than the work, and it was
     /// already the quieter of the two — painting it in the heading role would
     /// have made the folded line louder than the open one it replaces.
-    pub fn group_lines(last: &ToolCallBlock, count: usize, w: u16) -> Vec<Line> {
+    ///
+    /// A failure anywhere in the run is said on the count's own row, in the
+    /// alarm colour. The lid shows the *last* call's result and nothing else,
+    /// so without this a run whose third call failed and whose fourth
+    /// succeeded reads exactly like a run that never failed — and the red on a
+    /// failed call is the one thing a fold has to keep. The count stays the
+    /// headline; the failures ride it rather than taking a row of their own,
+    /// because *how much ran* is what the row is for and *what broke* is the
+    /// qualifier on it.
+    pub fn group_lines(last: &ToolCallBlock, count: usize, failed: usize, w: u16) -> Vec<Line> {
         let caps = Caps::default();
-        let mut out = vec![Line::from_spans(vec![
+        let mut spans = vec![
             Span::styled(format!("{} ", caps.g(Glyph::ToolMark)), fold()),
             Span::styled(format!("{count} 个工具"), muted()),
-        ])
-        .truncate(w as usize)];
+        ];
+        if failed > 0 {
+            spans.push(Span::styled(format!(" · {failed} 失败"), bad()));
+        }
+        let mut out = vec![Line::from_spans(spans).truncate(w as usize)];
         let lead = format!("{}{} ", " ".repeat(GUTTER), caps.g(Glyph::Gutter));
         out.extend(last.head(w, &lead, muted(), fold()));
         out.push(last.note_line(w));
@@ -2726,7 +2744,7 @@ mod tests {
         );
 
         // A run behind one lid is the same drawing, so it recedes too.
-        let lid = ToolCallBlock::group_lines(&failed, 3, 80);
+        let lid = ToolCallBlock::group_lines(&failed, 3, 0, 80);
         let head = lid.iter().find(|l| l.plain().contains("ReadFile"));
         let head = head.expect("the last call under the lid");
         let named = head

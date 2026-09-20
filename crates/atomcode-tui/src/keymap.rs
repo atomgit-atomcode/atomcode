@@ -69,6 +69,11 @@ pub enum Action {
     /// lid, then the whole thing, then — for a kind that may be hidden — off
     /// the screen.
     ToggleFold(&'static str),
+    /// Set a tool call's output mode by name, rather than stepping to the next
+    /// one. `/tools group` has to mean the same thing wherever it is typed;
+    /// [`ToggleFold`](Self::ToggleFold) on `tool_call` means "the next one",
+    /// which is not a thing a typed command can say.
+    SetToolOutput(crate::host::ToolOutput),
     /// The same over several kinds at once, which is what `/showinject` with no
     /// argument is: one gesture over the environment's injections. The group is
     /// the unit a person has an opinion about — nobody wants to be told they may

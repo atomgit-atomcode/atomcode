@@ -2819,12 +2819,16 @@ async fn a_command_and_a_key_share_one_implementation() {
     s.quiet().await;
 
     // Fold with the key, then unfold and fold again with the command. If they
-    // were two implementations these two screens would differ.
+    // were two implementations these two screens would differ. The cycle is
+    // three states now (`full → each → group → full`), so the key is pressed
+    // back round to the start before the command takes its one step.
     s.term.press(KeyPress::ctrl('t'));
     s.quiet().await;
     let by_key = s.screen();
 
-    s.term.press(KeyPress::ctrl('t')); // back to open
+    s.term.press(KeyPress::ctrl('t')); // each -> group
+    s.quiet().await;
+    s.term.press(KeyPress::ctrl('t')); // group -> full, back to the start
     s.quiet().await;
     s.term.type_line("/tools");
     s.quiet().await;

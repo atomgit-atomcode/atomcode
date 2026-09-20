@@ -18,6 +18,7 @@ use atomcode_kernel::session::{derive_messages, SessionEvent};
 use atomcode_plexus::Context;
 
 use crate::command::{Command, CommandSet, Commands, Outcome};
+use crate::host::ToolOutput;
 use crate::keymap::Action;
 
 /// Quit, clear, fold — things the screen itself owns.
@@ -27,7 +28,11 @@ const SCREEN: &[Command] = &[
     // `/exit` keeps working as an alias — one row, not two.
     Command::new("quit", "退出").with_aliases(&["exit"]),
     Command::new("reasoning", "思考:一行、全文、收起,循环"),
-    Command::new("tools", "展开或折叠工具调用的结果"),
+    Command::taking(
+        "tools",
+        "[full|each|group]",
+        "工具输出:全部、单个摘要、成组摘要;不带参数则循环",
+    ),
     Command::new(
         "showinject",
         "环境注入:收起、只留标签、全文,循环;不带名字则全部",
@@ -60,7 +65,10 @@ impl CommandSet for ScreenCommands {
         match name {
             "quit" | "exit" => Outcome::Do(Action::Quit),
             "reasoning" => Outcome::Do(Action::ToggleFold("reasoning")),
-            "tools" => Outcome::Do(Action::ToggleFold("tool_call")),
+            "tools" => match tool_output(&args.to_ascii_lowercase()) {
+                Ok(action) => Outcome::Do(action),
+                Err(why) => Outcome::Refused(why),
+            },
             "showinject" => match showinject(&args.to_ascii_lowercase()) {
                 Ok(action) => Outcome::Do(action),
                 Err(why) => Outcome::Refused(why),
@@ -101,7 +109,7 @@ impl CommandSet for ScreenCommands {
                  esc 依次:取消选中 -> 清空输入 -> 停止当轮 · ctrl-c 直接停止当轮\n\
                  上/下 在输入里移动游标,到头则翻历史 · 点击输入框定位游标\n\
                  pgup/pgdn 与滚轮滚动对话\n\
-                 ctrl-r 思考(一行/全文/收起,循环) · ctrl-t 折叠工具 · ctrl-l 重画屏幕\n\
+                 ctrl-r 思考(一行/全文/收起,循环) · ctrl-t 工具输出(全部/单个摘要/成组摘要,循环) · ctrl-l 重画屏幕\n\
                  /showinject [名字] 环境注入(默认不显示;不带名字则全部,all 含同伴报告)\n\
                  拖动选中并复制 · esc 取消选中 · 点击思考或工具调用折叠展开那一个\n\
                  ctrl-o 把鼠标交还终端(改用终端自己的框选)"
@@ -124,6 +132,22 @@ impl CommandSet for ScreenCommands {
 /// is, with `Folded` standing in the label `[reminder]` alone: the useful middle
 /// state for something that is off the screen because it is noise but is not
 /// hidden from anybody who goes looking.
+fn tool_output(what: &str) -> Result<Action, String> {
+    // Bare: the cycle, which is what the key does too. One gesture, one
+    // implementation — a press of ctrl-t and a bare `/tools` are the same act.
+    if what.is_empty() {
+        return Ok(Action::ToggleFold("tool_call"));
+    }
+    match what {
+        "full" | "all" => Ok(Action::SetToolOutput(ToolOutput::Full)),
+        "each" | "one" => Ok(Action::SetToolOutput(ToolOutput::Each)),
+        "group" | "run" => Ok(Action::SetToolOutput(ToolOutput::Group)),
+        _ => Err(format!(
+            "没有 `{what}` 这种工具输出形态;可以写 full(全部)/each(单个摘要)/group(成组摘要)"
+        )),
+    }
+}
+
 fn showinject(what: &str) -> Result<Action, String> {
     if what.is_empty() {
         return Ok(Action::ToggleFolds(

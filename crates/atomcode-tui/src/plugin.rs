@@ -3076,6 +3076,15 @@ impl Tui {
                     .toggle(kind);
                 return false;
             }
+            Action::SetToolOutput(mode) => {
+                drop(m);
+                self.host
+                    .presentation
+                    .write()
+                    .expect("presentation poisoned")
+                    .set_tool_output(mode);
+                return false;
+            }
             Action::ToggleFolds(kinds) => {
                 drop(m);
                 self.host
