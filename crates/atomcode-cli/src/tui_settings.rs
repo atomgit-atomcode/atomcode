@@ -108,8 +108,10 @@ impl ConfigSettings {
                 .iter()
                 .map(|spec| SettingRow {
                     id: spec.id.to_string(),
-                    // The screen speaks Chinese; the catalog carries both, for
-                    // the same reason it carries both for the agent's answer.
+                    // The catalog carries both languages and `label()` picks
+                    // the one in force. Every caller used to reach for
+                    // `label_zh` directly, so an English session read this
+                    // panel in Chinese.
                     label: spec.label().to_string(),
                     value: spec.value(&config),
                     kind: kind_of(spec.kind),
@@ -295,6 +297,41 @@ fn applies_of(policy: atomcode_config::settings::ApplyPolicy) -> Applies {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one the whole thing is for: `/language` moves the **screen**.
+    ///
+    /// It used to move only the product's table, because the screen had a
+    /// table of its own that nothing here could reach — so a person who
+    /// switched to English got an English welcome block and a Chinese status
+    /// bar. Both tables read one locale now, and this is the call that sets it
+    /// (`/language <x>` and the settings panel both land here).
+    #[test]
+    fn setting_the_language_moves_the_screen_and_not_only_the_product() {
+        use atomcode_i18n::screen::{t as tr, Msg as SMsg};
+        let _guard = atomcode_config::i18n::test_lock();
+
+        apply_language("zh_CN");
+        let zh = (
+            tr(SMsg::StatusStopping).into_owned(),
+            atomcode_config::i18n::t(atomcode_config::i18n::Msg::ApprovalDeny).into_owned(),
+        );
+
+        apply_language("en");
+        let en = (
+            tr(SMsg::StatusStopping).into_owned(),
+            atomcode_config::i18n::t(atomcode_config::i18n::Msg::ApprovalDeny).into_owned(),
+        );
+
+        let cjk = |s: &str| s.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c));
+        assert!(
+            cjk(&zh.0) && !cjk(&en.0),
+            "the screen did not move: {zh:?} → {en:?}"
+        );
+        assert!(
+            cjk(&zh.1) && !cjk(&en.1),
+            "the product did not move: {zh:?} → {en:?}"
+        );
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
