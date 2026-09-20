@@ -100,6 +100,16 @@ impl View for Status {
                 dim,
             ));
         }
+        // A session working towards something on its own says so for as long as
+        // it is. Here rather than on a row of its own: a line that is empty
+        // whenever nothing is running costs a row of the conversation to say
+        // nothing, and what this is for is the glance — "it is still going, it
+        // is on round 4". `/autonomy` answers the same thing when asked; this
+        // is the part that does not have to be asked.
+        if let Some(running) = vp.moment.autonomy.as_ref() {
+            row.push(sep());
+            row.push(El::styled(autonomy_badge(running), theme::fg(Role::Accent)));
+        }
         match vp.moment.activity {
             // The phase comes from the injected tick, never a clock
             // (docs/adr/0008).
@@ -128,6 +138,32 @@ impl View for Status {
     /// what changed, and nothing changed.
     fn tick() -> Option<std::time::Duration> {
         Some(std::time::Duration::from_millis(110))
+    }
+}
+
+/// What the status line says about a session running on its own.
+///
+/// Short on purpose — it shares a row with the model, the directory and the
+/// token count, and the long form is what `/autonomy` is for. The kind is
+/// named rather than assumed (`goal` vs `loop`), because which one is running
+/// is the first thing a person wants to know and the host is free to add a
+/// third.
+///
+/// A paused one still says so: "registered but not running" is exactly the
+/// state somebody would otherwise sit and wait through.
+fn autonomy_badge(running: &atomcode_host_api::Running) -> String {
+    let kind = if running.kind == "goal" {
+        "目标"
+    } else {
+        "循环"
+    };
+    let rounds = match running.of {
+        Some(of) => format!("{}/{of}", running.round),
+        None => running.round.to_string(),
+    };
+    match running.paused.as_deref() {
+        Some(why) => format!("{kind} 第 {rounds} 轮 · 停着:{why}"),
+        None => format!("{kind} 第 {rounds} 轮"),
     }
 }
 
@@ -238,6 +274,54 @@ mod tests {
             .first()
             .map(|l| l.plain())
             .unwrap_or_default()
+    }
+
+    /// A session running on its own says so without being asked.
+    ///
+    /// The gap this closes: the fact was already kept (`Moment::autonomy`, fed
+    /// by `HostEvent::Autonomy` every round) and **nothing drew it** — a person
+    /// could only find out by typing `/autonomy`, which is the one thing you
+    /// cannot do while wondering whether it is still going.
+    ///
+    /// Both halves are the criterion. It costs nothing when nothing is running:
+    /// a badge that took a slot on every idle screen would be a permanent
+    /// reminder of a thing that is not happening.
+    #[test]
+    fn a_session_running_on_its_own_says_so_and_costs_nothing_when_it_is_not() {
+        let st = State::default();
+        let mut m = Moment::default();
+
+        let idle = draw::<Status>(&st, 80, &m);
+        assert!(!idle.contains("轮"), "nothing is running: {idle:?}");
+
+        m.autonomy = Some(atomcode_host_api::Running {
+            kind: "goal".into(),
+            what: "把量化器搬到 NPU".into(),
+            round: 4,
+            of: Some(12),
+            elapsed_secs: 930,
+            paused: None,
+        });
+        let running = draw::<Status>(&st, 80, &m);
+        assert!(running.contains("目标"), "which kind: {running:?}");
+        assert!(running.contains("4/12"), "and how far: {running:?}");
+
+        // Registered but not running is the state somebody would otherwise sit
+        // and wait through, so it is said.
+        m.autonomy = Some(atomcode_host_api::Running {
+            kind: "loop".into(),
+            what: "跑测试".into(),
+            round: 2,
+            of: None,
+            elapsed_secs: 5,
+            paused: Some("等审批".into()),
+        });
+        let paused = draw::<Status>(&st, 80, &m);
+        assert!(paused.contains("循环"), "{paused:?}");
+        assert!(
+            paused.contains("等审批"),
+            "why it is not moving: {paused:?}"
+        );
     }
 
     #[test]
