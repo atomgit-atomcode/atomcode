@@ -52,7 +52,7 @@ import sys
 import tempfile
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -94,6 +94,14 @@ class Scenario:
     name: str
     why: str
     script: list
+    # The same session, spelled for the OLD build when a tool it is scripted to
+    # call takes different arguments there. What is being compared is the
+    # telemetry, not the tool schemas, so an unrelated schema change is
+    # normalised like a uuid is — otherwise the diff reports "the old build
+    # never metered this" when what actually happened is that the old build
+    # rejected the arguments and never ran the tool at all. (It did. That is how
+    # this field came to exist.)
+    script_old: list = None
     args: list = field(default_factory=list)
     prompt: str = "do the thing"
     delay_s: float = MODEL_DELAY_S
@@ -158,6 +166,47 @@ SCENARIOS = [
         ),
         script=[call("definitely_not_a_tool", {"x": 1}), text("done")],
         args=["-y"],
+    ),
+    Scenario(
+        name="subagent",
+        why=(
+            "a `task` child, which runs its OWN kernel loop with no telemetry "
+            "hooks of its own. Its rounds are metered by a provider DECORATOR "
+            "instead (`coding/src/parts.rs` fills the subagent slot with a "
+            "`MeteredProvider` tagged `surface=\"subagent\"`), so what the "
+            "child reports — and whether its tool calls report at all — comes "
+            "from a different mechanism than the parent's. The fake model "
+            "answers the parent and the child alike, in order: parent asks for "
+            "a task, child answers, parent wraps up."
+        ),
+        script=[
+            call("task", {"task": "say hello and stop"}),
+            text("child done"),
+            text("done"),
+        ],
+        # 5.1.0's `task` takes a BATCH (`tasks: [{description, prompt, …}]`);
+        # HEAD's takes one `task` string. Read off each build's own tool
+        # definitions rather than guessed.
+        script_old=[
+            call(
+                "task",
+                {
+                    "tasks": [
+                        {
+                            "description": "say hello",
+                            "prompt": "say hello and stop",
+                            # `explore`, not `worker`: 5.1.0 refuses a worker
+                            # that declares no `scope` (its writable lane).
+                            "subagent_type": "explore",
+                        }
+                    ]
+                },
+            ),
+            text("child done"),
+            text("done"),
+        ],
+        args=["-y"],
+        timeout_s=120,
     ),
     Scenario(
         name="provider-error",
@@ -396,6 +445,21 @@ def shape(record):
     return out
 
 
+def new_only(record):
+    """Records the new build reports and the old one never did.
+
+    Measured, not assumed: with a `task` child that both builds actually run
+    (same 4 requests to the model, request 1 being the child's), 5.1.0 emits 2
+    `llm_chat` and HEAD emits 3. The child runs its own kernel loop with no
+    telemetry hooks, so its rounds are metered by a provider decorator
+    (`coding/src/parts.rs`, `MeteredProvider` tagged `surface="subagent"`) —
+    which 5.1.0 did not have wired. The child's token spend was invisible.
+
+    Only `subagent` is listed, because only `subagent` was measured.
+    """
+    return record.get("surface") == "subagent"
+
+
 def summarise(records):
     return [json.dumps(shape(r), sort_keys=True, ensure_ascii=False) for r in records]
 
@@ -447,8 +511,13 @@ def read_queue(queue_dir):
     return out
 
 
-def run_one(binary, port, scenario, keep):
-    Handler.scenario = scenario
+def run_one(binary, port, scenario, keep, which="new"):
+    # The old build gets its own spelling of the session when one was given.
+    Handler.scenario = (
+        replace(scenario, script=scenario.script_old)
+        if which == "old" and scenario.script_old
+        else scenario
+    )
     Handler.collected.clear()
     Handler.requests.clear()
     Handler.round_index[0] = 0
@@ -586,7 +655,7 @@ def main():
         print(f"-- {scenario.name}")
         runs = {}
         for which, path in (("old", args.old), ("new", args.new)):
-            run = runs[which] = run_one(path, port, scenario, args.keep)
+            run = runs[which] = run_one(path, port, scenario, args.keep, which)
             ids = [r.get("event_id") for r in run["records"]]
             flags = ("  TIMEOUT" if run["timed_out"] else "") + (
                 "  SIGINT" if run["interrupted"] else ""
@@ -609,7 +678,13 @@ def main():
                     print(f"      request {n}: {len(roles)} message(s)  {' '.join(roles)}")
 
         old = summarise(runs["old"]["records"])
-        new = summarise(runs["new"]["records"])
+        extra = [r for r in runs["new"]["records"] if new_only(r)]
+        new = summarise([r for r in runs["new"]["records"] if not new_only(r)])
+        if extra:
+            # Said out loud rather than dropped quietly: "the new build reports
+            # more" is a result, and a silent exemption is how it stops being one.
+            kinds = sorted({f"{r.get('event_id')}/{r.get('surface')}" for r in extra})
+            print(f"   +  {len(extra)} record(s) only the new build reports: {kinds}")
         if not old and not new:
             if scenario.expect_silence:
                 print("   ok both silent, as this scenario expects")
