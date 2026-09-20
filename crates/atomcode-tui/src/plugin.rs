@@ -2226,9 +2226,12 @@ impl Tui {
                 if text.is_empty() {
                     return false;
                 }
-                // A slash goes to the command surface, everything else to the
-                // model. The one place the two are told apart.
-                if text.starts_with('/') {
+                // A slash *command* goes to the command surface, everything else
+                // to the model. The one place the two are told apart — and a
+                // filesystem path that merely begins with `/` (`/Users/me/x.png`)
+                // is NOT a command: it reaches the model untouched instead of
+                // erroring with "没有 /Users/… 这条命令".
+                if crate::command::looks_like_command(&text) {
                     self.run_command(&text);
                     return false;
                 }
