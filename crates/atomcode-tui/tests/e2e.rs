@@ -4363,3 +4363,71 @@ async fn a_compaction_that_could_not_be_written_says_so() {
     );
     task.abort();
 }
+
+/// A resumed session remembers what was typed into it.
+///
+/// Written to settle a claim rather than to add a feature: the remaining-gaps
+/// page had this down as "input history is in memory only, so it is lost on
+/// restart", from a survey that read the push site and not where it is pushed
+/// **from**. What an up-arrow walks is folded out of the log
+/// (`Host::fold`, on `SessionEvent::UserMessage`), and a resume replays the
+/// log — so the question is not what the code looks like, it is what comes
+/// back. This answers it.
+#[tokio::test]
+async fn a_resumed_session_remembers_what_was_typed_into_it() {
+    let home = scratch("history-home");
+    let root = scratch("history-work");
+    let id = "typed-into-twice";
+
+    {
+        let s = start(tree_resumable(
+            &root,
+            &home,
+            id,
+            false,
+            &replay(r#"{ text = "ok" }"#),
+            &[],
+        ))
+        .await;
+        let task = s.open().await;
+        s.term.type_line("port the quantizer to the NPU");
+        s.quiet().await;
+        persisted(&home, id, 6).await;
+        s.term.press(KeyPress::ctrl('d'));
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    let s = start(tree_resumable(
+        &root,
+        &home,
+        id,
+        true,
+        &replay(r#"{ text = "ok" }"#),
+        &[],
+    ))
+    .await;
+    let task = s.open().await;
+    s.quiet().await;
+
+    // Counted, not searched for: the line is **already** on screen — the
+    // resumed transcript shows it — so "is it there" passes whether or not an
+    // up-arrow does anything. The first draft of this asserted exactly that and
+    // stayed green with the fold under test deleted. What is being judged is
+    // that pressing Up puts a *second* copy of it in the composer.
+    let count = |screen: &str| screen.matches("port the quantizer to the NPU").count();
+    let before = s.screen();
+    // Twice already, and neither is the composer: the transcript shows what
+    // was said, and the rule above the composer carries the session's name,
+    // which this session was named after.
+    assert_eq!(count(&before), 2, "transcript and title, so far:\n{before}");
+
+    s.term.press(KeyPress::plain(Key::Up));
+    s.quiet().await;
+    let after = s.screen();
+    assert_eq!(
+        count(&after),
+        3,
+        "the up-arrow put it in the composer as well:\n{after}"
+    );
+    task.abort();
+}
