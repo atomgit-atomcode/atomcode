@@ -11,3 +11,34 @@ rustflags = ["-C", "target-feature=+crt-static"]
 
 [target.aarch64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# 关掉 workspace 的增量编译。dev profile 默认开它,但在本仓库成本远超收益:
+#
+# 1. `target/debug/incremental/` 里 per-unit × per-session 的 dep-graph.bin +
+#    query-cache.bin 实测 22.8GB(2560 个文件,capabilities 一个 session 就是
+#    dep-graph 111MB + query-cache 60MB)。
+# 2. 开增量会把 dev 的 codegen-units 顶到 256(关掉是 16),而 macOS 默认的
+#    `split-debuginfo = "unpacked"` 要求那些 .rcgu.o 永久保留——链出来的二进制
+#    用绝对路径的 OSO 条目指过去(实测一个 test binary 2308 条,横跨 231 个
+#    session),删了就没调试信息。于是每次 rebuild 往 deps/ 加一批 .o 且旧的不能
+#    删,实测堆到 32 万个文件 / 9.7GB。
+#
+# 两项合计 33GB:target/ 从 55GB 降到约 22GB。
+#
+# 代价:改一行后的重编变慢 2.2–2.5s(2026-09-20 三组 A/B,独立 target dir 顺序跑:
+# kernel --lib 0.64s→1.86s、capabilities --lib 0.91s→3.41s、kernel --tests
+# 2.70s→4.66s)。冷编译反而快 12–18%(少写一遍缓存)。CI 是纯赚:那里每次冷跑,
+# 缓存写完就扔。
+#
+# 注意这里必须用 `[build] incremental`,不能用 `[env] CARGO_INCREMENTAL = "0"`:
+# `[env]` 只给 cargo 派生的子进程设环境变量,而 incremental 与否是 cargo 自己
+# 在调 rustc 之前决定的,它读的是真实环境,不看 `[env]`——那样写会静默失效
+# (2026-09-20 实测:全新 target dir 下 rustc 仍带 `-C incremental=`)。
+#
+# cargo 的优先级是 环境变量 > 配置文件,所以临时要增量仍可:
+# `CARGO_INCREMENTAL=1 cargo build`。
+#
+# 此项一改,所有 workspace crate 的既有产物(codegen-units 从 256 变 16)会失效,
+# 下一次编译是全量。
+[build]
+incremental = false
