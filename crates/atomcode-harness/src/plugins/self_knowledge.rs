@@ -375,14 +375,12 @@ that is running.";
 
         // The tool half is optional so this row can mount in a tree with no
         // catalog — an eval harness, say — and still say who it is.
-        if let Some(toolbox) = ctx.service::<ToolsSvc>() {
-            let tool = Arc::new(DescribeSelf {
+        super::tools::mount_optional(
+            ctx,
+            vec![Arc::new(DescribeSelf {
                 inner: Introspect { ctx: ctx.clone() },
-            });
-            toolbox.register(tool)?;
-            let toolbox = toolbox.clone();
-            let _ = ctx.effect(move || toolbox.unregister("describe_self"));
-        }
+            })],
+        )?;
         Ok(())
     }
 }

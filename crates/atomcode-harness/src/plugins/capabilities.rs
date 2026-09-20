@@ -724,13 +724,12 @@ impl Plugin for MemoryPlugin {
         // never add to it, which made "remember that I prefer X" a request only
         // a human could carry out — in a system whose whole point is that the
         // agent carries things out.
-        if let Some(toolbox) = ctx.service::<crate::seams::ToolsSvc>() {
-            toolbox.register(Arc::new(
+        super::tools::mount_optional(
+            ctx,
+            vec![Arc::new(
                 atomcode_capabilities::tools::MemoryTool::with_global(global.clone()),
-            ))?;
-            let toolbox = toolbox.clone();
-            let _ = ctx.effect(move || toolbox.unregister("memory"));
-        }
+            )],
+        )?;
 
         // The same three actions as commands a person runs. Through the tool
         // rather than beside it: what "remember" means — which tier it writes,

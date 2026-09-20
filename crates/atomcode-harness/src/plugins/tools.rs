@@ -23,13 +23,47 @@ use atomcode_plexus::{Context, Plugin};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::seams::{SystemPromptSvc, ToolsSvc};
+use crate::seams::{SystemPromptSvc, ToolBox, ToolsSvc};
 
 /// Register `tools` into the catalog and file the matching removal with the
 /// fiber. Shared by every tool plugin — the one place that knows a tool mount
 /// is two halves.
-pub(super) fn mount(ctx: &Context, tools: Vec<Arc<dyn Tool>>) -> Result<(), String> {
+///
+/// **Public across crates on purpose.** Rows live outside this crate too — the
+/// coding runtime mounts its own tools from `atomcode-coding` — and a door a
+/// caller cannot reach is a door that gets copied. Every copy is a chance to
+/// forget the second half and leave a tool in the catalog after its row is
+/// gone; five rows had copied it by hand before this was public — `docs/adr/0019`
+/// counted four of them in 2026-09-14, and the fifth arrived after.
+///
+/// One caller is deliberately not here: `publish_mcp` in `atomcode-coding`
+/// republishes a server's tools many times over one row's life and files a
+/// single removal for the lot when the row leaves, so a per-tool effect each
+/// time would pile up. That shape is the exception the guard in
+/// `tests/tool_mounts.rs` names.
+pub fn mount(ctx: &Context, tools: Vec<Arc<dyn Tool>>) -> Result<(), String> {
     let toolbox = ctx.require::<ToolsSvc>().map_err(|e| e.to_string())?;
+    mount_into(ctx, &toolbox, tools)
+}
+
+/// [`mount`] for a row whose tool half is optional: no catalog is not an error,
+/// it is one less half to do.
+///
+/// The rows that say who the agent is mount this way — they must still answer
+/// in a tree that mounts no tools at all, an eval harness say.
+pub fn mount_optional(ctx: &Context, tools: Vec<Arc<dyn Tool>>) -> Result<(), String> {
+    let Some(toolbox) = ctx.service::<ToolsSvc>() else {
+        return Ok(());
+    };
+    mount_into(ctx, &toolbox, tools)
+}
+
+/// The two halves themselves, so the two doors cannot drift apart.
+fn mount_into(
+    ctx: &Context,
+    toolbox: &Arc<ToolBox>,
+    tools: Vec<Arc<dyn Tool>>,
+) -> Result<(), String> {
     for tool in tools {
         let name = tool.name().to_string();
         toolbox.register(tool)?;

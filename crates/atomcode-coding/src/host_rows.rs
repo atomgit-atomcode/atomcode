@@ -839,22 +839,17 @@ impl Plugin for SkillsHostPlugin {
         let _ = ctx
             .provide::<atomcode_harness::seams::SkillsSvc>(registry.clone())
             .map_err(|e| e.to_string())?;
-        let toolbox = ctx
-            .require::<atomcode_harness::seams::ToolsSvc>()
-            .map_err(|e| e.to_string())?;
-        for tool in [
-            Arc::new(atomcode_capabilities::skills::UseSkillTool::new(
-                registry.clone(),
-            )) as Arc<dyn atomcode_kernel::tool::Tool>,
-            Arc::new(atomcode_capabilities::skills::ListSkillsTool::new(
-                registry.clone(),
-            )),
-        ] {
-            let name = tool.name().to_string();
-            toolbox.register(tool)?;
-            let toolbox = toolbox.clone();
-            let _ = ctx.effect(move || toolbox.unregister(&name));
-        }
+        atomcode_harness::plugins::tools::mount(
+            ctx,
+            vec![
+                Arc::new(atomcode_capabilities::skills::UseSkillTool::new(
+                    registry.clone(),
+                )) as Arc<dyn atomcode_kernel::tool::Tool>,
+                Arc::new(atomcode_capabilities::skills::ListSkillsTool::new(
+                    registry.clone(),
+                )),
+            ],
+        )?;
         if let (Some(catalog), Some(prompts)) = (
             catalog.as_ref().filter(|c| !c.trim().is_empty()),
             ctx.service::<SystemPromptSvc>(),
@@ -935,16 +930,12 @@ impl Plugin for HostToolsPlugin {
         "tools the coding runtime built itself: its controllers' and its capability graph's"
     }
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
-        let toolbox = ctx
-            .require::<atomcode_harness::seams::ToolsSvc>()
-            .map_err(|e| e.to_string())?;
+        atomcode_harness::plugins::tools::mount(ctx, self.0.clone())?;
         let prompts = ctx.service::<SystemPromptSvc>();
         let mut guided = std::collections::BTreeSet::new();
         for tool in &self.0 {
-            let name = tool.name().to_string();
-            toolbox.register(tool.clone())?;
             if let (Some(prompts), Some((key, text))) =
-                (&prompts, crate::persona::host_tool_guidance(&name))
+                (&prompts, crate::persona::host_tool_guidance(tool.name()))
             {
                 if guided.insert(key) {
                     let id = format!("host-tool-{key}");
@@ -959,8 +950,6 @@ impl Plugin for HostToolsPlugin {
                     let _ = ctx.effect(move || prompts.remove(&id));
                 }
             }
-            let toolbox = toolbox.clone();
-            let _ = ctx.effect(move || toolbox.unregister(&name));
         }
         Ok(())
     }

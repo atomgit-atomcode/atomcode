@@ -370,12 +370,7 @@ impl Plugin for RecallPlugin {
         "search this project's past sessions through the persistence seam"
     }
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
-        let toolbox = ctx
-            .require::<crate::seams::ToolsSvc>()
-            .map_err(|e| e.to_string())?;
-        toolbox.register(Arc::new(RecallTool { ctx: ctx.clone() }))?;
-        let toolbox = toolbox.clone();
-        let _ = ctx.effect(move || toolbox.unregister("recall"));
+        super::tools::mount(ctx, vec![Arc::new(RecallTool { ctx: ctx.clone() })])?;
         crate::plugins::self_knowledge::describes(
             ctx,
             "recall",
