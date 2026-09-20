@@ -24,6 +24,12 @@ pub struct Command {
     pub about: Cow<'static, str>,
     /// Shown after the name when it takes something, e.g. `<id>`.
     pub takes: Option<Cow<'static, str>>,
+    /// Other names that reach this same command — muscle memory that must keep
+    /// working (`/exit` for `/quit`, `/new` for `/session`). An alias is not a
+    /// second row: it shares this one entry, is searchable by its own prefix in
+    /// the slash menu, resolves to `name` on dispatch, and renders as
+    /// `name (alias)`. Empty for the agent's own commands, which have none.
+    pub aliases: &'static [&'static str],
 }
 
 impl Command {
@@ -32,6 +38,7 @@ impl Command {
             name: Cow::Borrowed(name),
             about: Cow::Borrowed(about),
             takes: None,
+            aliases: &[],
         }
     }
     pub const fn taking(name: &'static str, takes: &'static str, about: &'static str) -> Self {
@@ -39,6 +46,38 @@ impl Command {
             name: Cow::Borrowed(name),
             about: Cow::Borrowed(about),
             takes: Some(Cow::Borrowed(takes)),
+            aliases: &[],
+        }
+    }
+    /// The same command, reachable by these extra names.
+    pub const fn with_aliases(mut self, aliases: &'static [&'static str]) -> Self {
+        self.aliases = aliases;
+        self
+    }
+
+    /// True when `typed_lower` (already lowercased by the caller) is a prefix of
+    /// this command's name or of any of its aliases — what the slash menu filters
+    /// on. Case-insensitive, like [`answers_to`](Self::answers_to): an agent
+    /// command named `MySkill` still surfaces for `/my`.
+    pub fn matches_prefix(&self, typed_lower: &str) -> bool {
+        let has_prefix = |s: &str| s.to_lowercase().starts_with(typed_lower);
+        has_prefix(&self.name) || self.aliases.iter().any(|a| has_prefix(a))
+    }
+
+    /// True when `typed` is this command's name or one of its aliases (exact,
+    /// ASCII case-insensitive) — what dispatch resolves on.
+    pub fn answers_to(&self, typed: &str) -> bool {
+        self.name.eq_ignore_ascii_case(typed)
+            || self.aliases.iter().any(|a| a.eq_ignore_ascii_case(typed))
+    }
+
+    /// The slash-menu label: `name (alias1, alias2)` when it has aliases, else
+    /// just the name. The inserted/dispatched value stays the canonical `name`.
+    pub fn display_name(&self) -> String {
+        if self.aliases.is_empty() {
+            self.name.to_string()
+        } else {
+            format!("{} ({})", self.name, self.aliases.join(", "))
         }
     }
 }
@@ -183,12 +222,13 @@ impl Commands {
         out
     }
 
-    /// Matches for what has been typed after the slash.
+    /// Matches for what has been typed after the slash — by command name or by
+    /// any alias, so `/ne` surfaces the `session` command while it stays one row.
     pub fn matching(&self, prefix: &str) -> Vec<Command> {
         let p = prefix.to_lowercase();
         self.all()
             .into_iter()
-            .filter(|c| c.name.starts_with(&p))
+            .filter(|c| c.matches_prefix(&p))
             .collect()
     }
 
@@ -200,7 +240,13 @@ impl Commands {
     /// place. The registry is the only thing that knows, and `all` is where the
     /// menu already reads it from.
     pub fn find(&self, name: &str) -> Option<Command> {
-        self.all().into_iter().find(|c| c.name == name)
+        let all = self.all();
+        // A real command name beats an alias: an alias is only a fallback way in,
+        // so a command literally named `new` wins over `session`'s `new` alias.
+        all.iter()
+            .find(|c| c.name.eq_ignore_ascii_case(name))
+            .or_else(|| all.iter().find(|c| c.answers_to(name)))
+            .cloned()
     }
 
     fn owner(&self, name: &str) -> Option<Arc<dyn CommandSet>> {
@@ -212,7 +258,7 @@ impl Commands {
                 s.commands()
                     .iter()
                     .chain(s.hidden().iter())
-                    .any(|c| c.name == name)
+                    .any(|c| c.answers_to(name))
             })
             .cloned()
     }
@@ -227,6 +273,11 @@ impl Commands {
         if name.is_empty() {
             return Outcome::Quiet;
         }
+        // Resolve an alias (`/exit`, `/new`) to the canonical command it names, so
+        // the set's `run` sees the one name it matches on. A name that is not an
+        // alias resolves to itself.
+        let canonical = self.find(name).map(|c| c.name.to_string());
+        let name = canonical.as_deref().unwrap_or(name);
         match self.owner(name) {
             Some(set) => set.run(name, args, ctx).await,
             None => {
@@ -340,12 +391,37 @@ mod tests {
     const A: &[Command] = &[Command::new("alpha", "a"), Command::new("also", "b")];
     const B: &[Command] = &[Command::new("beta", "c")];
     const CLASH: &[Command] = &[Command::new("alpha", "mine now")];
+    const ALIASED: &[Command] = &[Command::new("session", "fresh start").with_aliases(&["new"])];
 
     fn registry() -> Commands {
         let c = Commands::new();
         c.add(Arc::new(Fake("row-a", A))).unwrap();
         c.add(Arc::new(Fake("row-b", B))).unwrap();
         c
+    }
+
+    /// An alias shares its command's single row: it is searchable by its own
+    /// prefix, `find` resolves it to the canonical command, and the label names
+    /// it — `session (new)` — but there is only one entry, not two.
+    #[test]
+    fn an_alias_is_one_annotated_row_that_resolves_to_its_command() {
+        let c = Commands::new();
+        c.add(Arc::new(Fake("row", ALIASED))).unwrap();
+        // Searchable by the alias's own prefix AND the canonical prefix.
+        assert!(c.matching("ne").iter().any(|c| c.name == "session"));
+        assert!(c.matching("ses").iter().any(|c| c.name == "session"));
+        // Exactly one row, however it was reached.
+        assert_eq!(c.all().iter().filter(|c| c.name == "session").count(), 1);
+        // The alias resolves to the canonical command, which labels itself.
+        let cmd = c.find("new").expect("the alias resolves");
+        assert_eq!(cmd.name, "session");
+        assert_eq!(cmd.display_name(), "session (new)");
+        // A command with no aliases labels itself plainly.
+        assert_eq!(Command::new("alpha", "a").display_name(), "alpha");
+        // Prefix matching is case-insensitive, like `answers_to`: a mixed-case
+        // command name still surfaces for a lowercased prefix.
+        assert!(Command::new("MySkill", "x").matches_prefix("my"));
+        assert!(!Command::new("MySkill", "x").matches_prefix("zz"));
     }
 
     #[test]

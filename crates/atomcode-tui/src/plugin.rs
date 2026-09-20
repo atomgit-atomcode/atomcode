@@ -3003,11 +3003,13 @@ impl Tui {
                 .matching(&rest)
                 .into_iter()
                 .map(|c| {
-                    let name = match &c.takes {
-                        Some(t) => format!("{} {t}", c.name),
-                        None => c.name.to_string(),
+                    // The label shows the aliases (`session (new)`); the value
+                    // inserted / dispatched stays the canonical name.
+                    let label = match &c.takes {
+                        Some(t) => format!("{} {t}", c.display_name()),
+                        None => c.display_name(),
                     };
-                    crate::menu::Item::new(c.name.to_string(), name).about(c.about.to_string())
+                    crate::menu::Item::new(c.name.to_string(), label).about(c.about.to_string())
                 })
                 .collect(),
             // Not a command being named. It may still be a path being typed

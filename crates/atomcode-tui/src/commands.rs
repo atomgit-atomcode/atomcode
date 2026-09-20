@@ -24,8 +24,8 @@ use crate::keymap::Action;
 pub struct ScreenCommands;
 
 const SCREEN: &[Command] = &[
-    Command::new("quit", "退出"),
-    Command::new("exit", "退出"),
+    // `/exit` keeps working as an alias — one row, not two.
+    Command::new("quit", "退出").with_aliases(&["exit"]),
     Command::new("reasoning", "思考:一行、全文、收起,循环"),
     Command::new("tools", "展开或折叠工具调用的结果"),
     Command::new(
@@ -291,6 +291,9 @@ const SESSION: &[Command] = &[
     ),
     Command::new("transcript", "把对话按模型看到的样子列出来"),
     Command::new("clear", "开一个新会话:这段对话放下,换一条干净的"),
+    // `/session` is the same fresh start, named the way the reference does, with
+    // `/new` as its memorable alias — one row, not two.
+    Command::new("session", "开一个新会话(等于 /clear)").with_aliases(&["new"]),
     Command::taking("resume", "[会话 id]", "回到一个存下的会话;不带 id 则挑一个"),
     Command::taking(
         "effort",
@@ -488,7 +491,7 @@ impl CommandSet for SessionCommands {
             // people expect from the word (`/clear`, `/session` and Claude
             // Code's own) is a conversation that starts over, which is what the
             // host does here; ctrl-u is the gesture for the line.
-            "clear" => {
+            "clear" | "session" => {
                 let Some(control) = control else {
                     return Outcome::Refused("这块屏幕没接上宿主".into());
                 };
@@ -1486,7 +1489,7 @@ impl CommandSet for HelpCommands {
             .all
             .all()
             .iter()
-            .map(|c| c.name.len() + c.takes.as_ref().map(|t| t.len() + 1).unwrap_or(0))
+            .map(|c| c.display_name().len() + c.takes.as_ref().map(|t| t.len() + 1).unwrap_or(0))
             .max()
             .unwrap_or(8);
         Outcome::Said(
@@ -1494,9 +1497,11 @@ impl CommandSet for HelpCommands {
                 .all()
                 .iter()
                 .map(|c| {
+                    // Aliases are shown here too (`/session (new)`), so `/help`
+                    // and the slash menu name a command the same way.
                     let head = match &c.takes {
-                        Some(t) => format!("/{} {t}", c.name),
-                        None => format!("/{}", c.name),
+                        Some(t) => format!("/{} {t}", c.display_name()),
+                        None => format!("/{}", c.display_name()),
                     };
                     format!("{head:<w$}  {}", c.about, w = width + 2)
                 })
@@ -1531,6 +1536,8 @@ impl CommandSet for AgentCatalogCommands {
                 name: c.name.into(),
                 about: c.summary.into(),
                 takes: c.usage.map(Into::into),
+                // The agent's own commands carry no aliases.
+                aliases: &[],
             })
             .collect()
     }
@@ -2654,6 +2661,12 @@ mod tests {
         let app = bare();
         assert_eq!(
             c.dispatch("/quit", &app.context()).await,
+            Outcome::Do(Action::Quit)
+        );
+        // `/exit` is an alias of `/quit`, not a second command: it resolves to the
+        // same action.
+        assert_eq!(
+            c.dispatch("/exit", &app.context()).await,
             Outcome::Do(Action::Quit)
         );
         assert_eq!(
