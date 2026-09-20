@@ -19,6 +19,7 @@
 
 use crate::frame::{Line, Span, Style};
 use crate::module::{Height, View};
+use crate::modules::chrome::{self, box_edge, edit_line, pad_to, panel_edge, search_line};
 use crate::moment::{Moment, Viewport};
 use crate::settings::{Panel, SettingKind, SettingsView, Tab};
 use crate::theme::{self, Role};
@@ -27,13 +28,13 @@ use crate::width;
 pub const ID: &str = "settings";
 
 /// Cells a row's own furniture takes: the pointer and its gap.
-const LEAD: usize = 2;
+use chrome::LEAD;
 
 /// The narrowest the label column is drawn before a value is put right after it.
-const LABEL_MIN: usize = 8;
+use chrome::LABEL_MIN;
 
 /// The widest, so one long label does not push every value off the edge.
-const LABEL_MAX: usize = 30;
+use chrome::LABEL_MAX;
 
 /// Nothing folds — see this module's own doc for why.
 #[derive(Default)]
@@ -243,7 +244,8 @@ enum Row {
 /// the `│` under it is the misalignment this constant exists to make impossible.
 /// Content therefore starts at [`LEAD`], which is one cell of wall and one of
 /// air.
-const BORDER_COL: usize = 0;
+#[cfg(test)]
+use chrome::BORDER_COL;
 
 /// The rows this panel makes at this width, cut down to `h`.
 ///
@@ -546,46 +548,22 @@ fn header_line(tab: crate::settings::Tab, w: usize, caps: crate::caps::Caps) -> 
 fn header_parts(
     tab: crate::settings::Tab,
 ) -> (Vec<Span>, Vec<(crate::settings::Tab, usize, usize)>) {
-    // (text, style, the tab this cell belongs to — the padding included, so a
-    // click on the space beside a label takes that label's tab rather than the
-    // one it abuts).
-    let mut pieces: Vec<(String, Style, Option<crate::settings::Tab>)> = vec![
-        // Two cells in, which is where every other thing the panel says starts:
-        // the box's text sits after its `│ ` and a setting's label after its
-        // pointer. A title one cell further left than everything under it reads
-        // as a mistake — and it was one, found by
-        // `the_boxs_corners_line_up_with_its_walls_and_the_labels_below`.
-        ("  ".to_string(), Style::new(), None),
-        ("设置".to_string(), theme::fg(Role::Brand).bold(), None),
-        ("   ".to_string(), Style::new(), None),
-    ];
-    for (i, t) in crate::settings::Tab::ALL.iter().enumerate() {
-        if i > 0 {
-            pieces.push(("  ".to_string(), Style::new(), None));
-        }
-        let here = *t == tab;
-        let style = if here {
-            theme::bg(Role::PanelSelBg).under(theme::fg(Role::PanelFg))
-        } else {
-            theme::fg(Role::Muted)
-        };
-        // The pad goes *inside* the highlight, so the lit tab is a band rather
-        // than a patch behind its letters — the same choice the answer rows make.
-        pieces.push((format!(" {} ", t.label()), style, Some(*t)));
-    }
-
-    let mut spans = Vec::with_capacity(pieces.len());
-    let mut ranges: Vec<(crate::settings::Tab, usize, usize)> = Vec::new();
-    let mut col = 0usize;
-    for (text, style, owner) in pieces {
-        let w = width::str_width(&text);
-        if let Some(t) = owner {
-            ranges.push((t, col, col + w));
-        }
-        col += w;
-        spans.push(Span::styled(text, style));
-    }
-    (spans, ranges)
+    let labels: Vec<&str> = crate::settings::Tab::ALL
+        .iter()
+        .map(|t| t.label())
+        .collect();
+    let at = crate::settings::Tab::ALL
+        .iter()
+        .position(|t| *t == tab)
+        .unwrap_or(0);
+    let (spans, ranges) = chrome::header_parts("设置", &labels, at);
+    (
+        spans,
+        ranges
+            .into_iter()
+            .map(|(page, from, to)| (crate::settings::Tab::ALL[page], from, to))
+            .collect(),
+    )
 }
 
 /// Which tab is under this cell of the header row.
@@ -1792,151 +1770,6 @@ fn table_row(text: &str, head: bool, mark: Option<u8>, w: usize) -> Line {
     .truncate(w)
 }
 
-/// One edge of the search box: `┌───┐` above, `└───┘` below.
-///
-/// Drawn through [`Caps`] rather than with literal box characters, so a terminal
-/// that cannot show them gets `+---+` instead of a row of question marks. The
-/// panel is a frame in the shape it draws, not a claim about the font.
-///
-/// The corners stand in [`BORDER_COL`] and the run carries out to the last cell,
-/// which is what makes them line up with the walls of the rows between them.
-/// They used to be pushed one cell right by a leading space, so the top-left
-/// corner sat over the `│` under it by exactly that cell — the misalignment the
-/// `BORDER_COL` constant is here to stop happening again.
-fn box_edge(w: usize, caps: crate::caps::Caps, top: bool) -> Line {
-    use crate::caps::Glyph;
-    if w == 0 {
-        return Line::empty();
-    }
-    // Narrower than a frame is not a frame: below this there is no room for two
-    // corners and a run between them, and half a box reads as damage. A plain
-    // rule instead, which still reads as "a box is here, it just does not fit".
-    if w < 4 {
-        return Line::styled(caps.g(Glyph::Horizontal).repeat(w), theme::fg(Role::Border))
-            .truncate(w);
-    }
-    let (left, right) = match top {
-        true => (Glyph::TopLeft, Glyph::TopRight),
-        false => (Glyph::BottomLeft, Glyph::BottomRight),
-    };
-    let run = w.saturating_sub(2 + BORDER_COL);
-    let mut spans = vec![Span::styled(" ".repeat(BORDER_COL), Style::new())];
-    spans.push(Span::styled(
-        format!("{}{}", caps.g(left), caps.g(Glyph::Horizontal).repeat(run)),
-        theme::fg(Role::Border),
-    ));
-    spans.push(Span::styled(
-        caps.g(right).to_string(),
-        theme::fg(Role::Border),
-    ));
-    Line::from_spans(spans).truncate(w)
-}
-
-/// The panel's own top or bottom rule: a straight line, all the way across.
-///
-/// **No corners.** The frame it draws had them, and on a terminal the pair of
-/// them at the left read as a second box around the panel — a `┌` over a `┌`,
-/// which says "here is another container" when what it means is "the panel
-/// starts here". A rule is enough to say that, and it does not compete with the
-/// one box the panel actually has: the search field's.
-///
-/// Drawn through [`Caps`], so an ASCII terminal gets `-` rather than `─`.
-fn panel_edge(w: usize, caps: crate::caps::Caps) -> Line {
-    use crate::caps::Glyph;
-    if w == 0 {
-        return Line::empty();
-    }
-    Line::styled(caps.g(Glyph::Horizontal).repeat(w), theme::fg(Role::Border)).truncate(w)
-}
-
-/// The search box's text, with a caret while the box has the keyboard.
-///
-/// No placeholder caption. The box is drawn as a box and the caret is in it,
-/// which says "type here" better than a sentence about a key — and the key that
-/// sentence used to name is gone: it was the character it ate.
-fn search_line(query: &str, caret: Option<usize>, w: usize, caps: crate::caps::Caps) -> Line {
-    use crate::caps::Glyph;
-    if w == 0 {
-        return Line::empty();
-    }
-    // Too narrow for a frame: the text stands alone rather than behind a
-    // one-cell wall that would eat it.
-    let (lead, base) = if w < 4 {
-        (String::new(), theme::fg(Role::Muted))
-    } else {
-        (
-            format!("{} ", caps.g(Glyph::Vertical)),
-            theme::fg(Role::Warning),
-        )
-    };
-    let mut spans = vec![Span::styled(lead, theme::fg(Role::Border))];
-    match caret {
-        Some(at) => spans.extend(caret_spans(query, at, base, w.saturating_sub(2))),
-        None => spans.push(Span::styled(query.to_string(), base)),
-    }
-    Line::from_spans(spans).truncate(w)
-}
-
-/// The text being typed into a row, with its caret.
-///
-/// The label stays on the left, so the value being typed is still named: a field
-/// that took the whole row would leave the person looking at a number with
-/// nothing saying what it is a number *of*.
-fn edit_line(label: &str, value: &str, caret: usize, w: usize, caps: crate::caps::Caps) -> Line {
-    let base = theme::fg(Role::Warning);
-    let label_room = w
-        .saturating_sub(LEAD)
-        .saturating_sub(2)
-        .clamp(LABEL_MIN, LABEL_MAX);
-    let label = width::take_width(label, label_room);
-    let pad = label_room.saturating_sub(width::str_width(&label));
-    let mut spans = vec![
-        Span::styled(format!("{} ", caps.g(crate::caps::Glyph::Pointer)), base),
-        Span::styled(label, base),
-        Span::styled(" ".repeat(pad + 2), base),
-    ];
-    // The field gets what is left after the label, and the caret is drawn inside
-    // that — a value longer than the room scrolls off the end rather than
-    // wrapping, which is what every field on a terminal does.
-    let room = w.saturating_sub(LEAD + label_room + 2);
-    spans.extend(caret_spans(value, caret, base, room));
-    Line::from_spans(spans).truncate(w)
-}
-
-/// `text` split around `at`, with a block where the next character goes.
-///
-/// The caret is drawn *over* the character at `at` rather than before it, which
-/// is what a terminal caret does and what makes the end of a line work: there is
-/// no character to sit on, so a block is appended instead and both cases read
-/// the same.
-fn caret_spans(text: &str, at: usize, base: Style, room: usize) -> Vec<Span> {
-    let at = at.min(text.len());
-    // Snap to a character boundary: a byte offset from the middle of a
-    // multi-byte character would panic on the slice, and every path that moves
-    // the caret already keeps it on a boundary — this is the belt to that
-    // braces, on the one function that slices.
-    let at = (0..=at)
-        .rev()
-        .find(|i| text.is_char_boundary(*i))
-        .unwrap_or(0);
-    let before = &text[..at];
-    let rest = &text[at..];
-    let mut slots = rest.chars();
-    let on = slots.next();
-    let after: String = slots.collect();
-    let caret = Style::new().reverse();
-    let mut spans = vec![Span::styled(before.to_string(), base)];
-    match on {
-        Some(c) => spans.push(Span::styled(c.to_string(), caret)),
-        None => spans.push(Span::styled(" ", caret)),
-    }
-    spans.push(Span::styled(after, base));
-    // The caret's own cell comes out of the room, so a full-width line still
-    // has somewhere to put it.
-    let _ = room;
-    spans
-}
-
 /// One setting's row: the label, then the value, then when a change lands.
 fn setting_line(
     settings: &SettingsView,
@@ -2063,16 +1896,6 @@ fn legend(panel: &Panel) -> Vec<(&'static str, &'static str)> {
     }
     out.push(("esc", "关闭"));
     out
-}
-
-fn pad_to(line: Line, w: usize, style: Style) -> Line {
-    let used = line.width();
-    if used >= w {
-        return line.truncate(w);
-    }
-    let mut spans = line.spans;
-    spans.push(Span::styled(" ".repeat(w - used), style));
-    Line::from_spans(spans).truncate(w)
 }
 
 /// Which screen row each setting is on, for a click to read.
