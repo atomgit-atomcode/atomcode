@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Two builds, one scripted session, the same telemetry — or a diff that says why.
+"""Two builds, one set of scripted sessions, the same telemetry — or a diff.
 
 The wire goldens (`crates/atomcode-telemetry/tests/golden/wire/`) pin the SHAPE
 of each event, and the criteria in `atomcode-coding`, `atomcode-tui` and
@@ -7,11 +7,17 @@ of each event, and the criteria in `atomcode-coding`, `atomcode-tui` and
 process actually puts on the wire after a real session: which events fire, how
 many, in what order, with what envelope. That is what this is for.
 
-It runs two binaries against the same fake model and the same prompt, collects
-what each POSTs to a local telemetry endpoint, normalises away the parts that
-must differ (ids, timestamps, durations, paths), and diffs.
+It runs two binaries through the same scripted scenarios against the same fake
+model, collects what each POSTs to a local telemetry endpoint, normalises away
+the parts that must differ (ids, timestamps, exact token counts), and diffs.
 
-    scripts/telemetry-parity.py --old ~/.local/bin/atomcode --new target/release/atomcode
+    scripts/telemetry-parity.py --new target/debug/atomcode
+    scripts/telemetry-parity.py --only approval-denied --raw
+    scripts/telemetry-parity.py --list
+
+It found `llm_chat.duration_ms` reporting `0` on every round (fixed in
+`5fe755a2`) on its first run, which is the kind of thing it is for: the field
+was present, well-typed and legal, and every test was green.
 
 Nothing leaves the machine: both the model and the telemetry endpoint are
 sockets on 127.0.0.1, and `ATOMCODE_HOME` points at a scratch directory, so
@@ -21,54 +27,183 @@ neither run can see the real config, sessions or queue.
 
 `mcp_connect` was dropped from the product in `f296e6e2` (2026-07-24) and no
 release since emits it, so no shipped binary can be its oracle — it is covered
-by the wire golden and by `a_failed_mcp_connection_is_metered` instead. Every
-other event is fair game.
+by the wire golden and by `a_failed_mcp_connection_is_metered` instead.
 
 `use_command` needs a terminal: it is reported by a front end, not by a
-headless run, so `--headless-only` (the default) will not see it. That half is
-pinned by `atomcode-tui/src/command.rs`, `atomcode-cli/src/tui_command_meter.rs`
-and `atomcode-tuix/tests/use_command_oracle.rs`.
+headless run. That half is pinned by `atomcode-tui/src/command.rs`,
+`atomcode-cli/src/tui_command_meter.rs` and
+`atomcode-tuix/tests/use_command_oracle.rs`.
+
+Compaction is deliberately NOT a scenario. It would be reachable (a tiny
+`context_window` plus a large tool result), but what it measures is not parity:
+the compaction strategy changed on purpose between these builds, so the round
+counts differ by design and the diff would report a decision as a defect.
 """
 
 import argparse
+import difflib
 import gzip
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-# ---- the fake model --------------------------------------------------------
-
-# One scripted session: a round that calls a tool, then a round that answers.
-# Rich enough that `llm_chat` carries usage and `tool_call` fires at all, and
-# short enough that a run is a couple of seconds.
 # How long the fake model takes to answer. An instant model is not a realistic
 # input: `duration_ms` is milliseconds, `as_millis()` truncates, and a
 # sub-millisecond round trip reports `0` on one build and `2` on another purely
 # because they start their clocks a few instructions apart. That difference is
 # noise for any real model and unreadable as a signal. Answering slowly enough
-# to be measurable turns `duration_ms` back into something the diff can judge:
-# both builds must report a duration in the same ballpark as this.
+# to be measurable turns `duration_ms` back into something the diff can judge.
 MODEL_DELAY_S = 0.05
 
-SCRIPT = [
-    {
+
+# ---- scenarios -------------------------------------------------------------
+
+
+def text(body):
+    return {"content": body}
+
+
+def call(name, args):
+    return {
         "tool_calls": [
             {
                 "id": "call_1",
                 "type": "function",
-                "function": {"name": "bash", "arguments": '{"command":"echo parity"}'},
+                "function": {"name": name, "arguments": json.dumps(args)},
             }
         ]
-    },
-    {"content": "done"},
+    }
+
+
+def status(code, headers=None):
+    """Answer with an HTTP status instead of a completion."""
+    return {"status": code, "headers": headers or {}}
+
+
+@dataclass
+class Scenario:
+    name: str
+    why: str
+    script: list
+    args: list = field(default_factory=list)
+    prompt: str = "do the thing"
+    delay_s: float = MODEL_DELAY_S
+    # Send SIGINT this many seconds in, for the scenario about cancelling.
+    interrupt_after: float = None
+    timeout_s: int = 180
+    # Reporting nothing is this scenario's ANSWER, not a hole in it. Anywhere
+    # else, silence means the scenario reached no metered path (or the harness
+    # broke) and the run says so instead of calling it parity.
+    expect_silence: bool = False
+
+
+SCENARIOS = [
+    Scenario(
+        name="plain",
+        why="the floor: one round, no tools. Everything else is this plus something.",
+        script=[text("done")],
+        args=["-y"],
+    ),
+    Scenario(
+        name="tool-call",
+        why="a tool runs and is reported. The `tool_call` success shape.",
+        script=[call("bash", {"command": "echo parity"}), text("done")],
+        args=["-y"],
+    ),
+    Scenario(
+        name="tool-refused",
+        why=(
+            "a tool call that does not get to run, and how the refusal is "
+            "classified. The single most valuable comparison here: the new "
+            "engine decides `error_kind` by a substring test on the result "
+            "(`coding/src/telemetry.rs`: `blocked:` prefix -> DeniedByUser, "
+            "anything else -> ExecutionFailed), and whether that lands on the "
+            "same bucket the retired engine used is not readable from either "
+            "source.\n"
+            "    A sensitive path, which is the documented hard floor and the "
+            "trigger `coding/tests/sensitive_path.rs` itself uses. Three "
+            "cheaper-looking triggers do NOT work, and each one quietly "
+            "reported `success: true` until it was run:\n"
+            "      - dropping `-y`: headless FENCES rather than asks "
+            "(`on_harness.rs`, Presence::Headless patches `fs` with "
+            "`root: Some(working_dir)`), so there is no prompt to refuse;\n"
+            "      - `echo`: `RiskLevel::Safe`, straight through the gate;\n"
+            "      - `rm -rf <relative>`: Risky, but inside the fence, so it "
+            "runs.\n"
+            "    Reading a key is also the one trigger that cannot destroy "
+            "anything if some build decides to allow it."
+        ),
+        script=[
+            call("read_file", {"file_path": "/home/u/.ssh/id_rsa"}),
+            text("cannot read it"),
+        ],
+        args=["-y"],
+    ),
+    Scenario(
+        name="unknown-tool",
+        why=(
+            "a name no tool answers to. The new engine builds the error result "
+            "in the kernel, BEFORE the middleware chain — so its meter never "
+            "sees the call, and the old engine may well have reported one. A "
+            "missing record here is a real difference, not a flake."
+        ),
+        script=[call("definitely_not_a_tool", {"x": 1}), text("done")],
+        args=["-y"],
+    ),
+    Scenario(
+        name="provider-error",
+        why=(
+            "the model is down for the whole turn. Pins `had_error`, the "
+            "`error_kind` classification, and how many `llm_chat` records a "
+            "retried-then-abandoned turn produces."
+        ),
+        script=[status(500)],
+        args=["-y"],
+        timeout_s=120,
+    ),
+    Scenario(
+        name="rate-limited",
+        why=(
+            "429 with a `Retry-After` the whole way. Separately classified from "
+            "a plain server error, and the one error path with a deliberate "
+            "wait in it."
+        ),
+        script=[status(429, {"retry-after": "1"})],
+        args=["-y"],
+        timeout_s=120,
+    ),
+    Scenario(
+        name="cancelled",
+        why=(
+            "the person gives up mid-round. A slow model plus SIGINT.\n"
+            "    The answer, on BOTH builds, is that it reports nothing at all — "
+            "not even the `open_atomcode` from startup. `track` hands the record "
+            "to a writer task behind a `BufWriter`, and SIGINT takes the process "
+            "before anything rolls, so the queue on disk is empty too (this "
+            "harness reads it, so that is a finding and not a blind spot). Kept "
+            "because it is the answer, and because a build that started "
+            "flushing — or stopped — would change it."
+        ),
+        script=[text("this answer never arrives in time")],
+        args=["-y"],
+        delay_s=6.0,
+        interrupt_after=1.5,
+        timeout_s=60,
+        expect_silence=True,
+    ),
 ]
+
+
+# ---- the fake model + the collector ----------------------------------------
 
 
 def sse(obj):
@@ -76,13 +211,22 @@ def sse(obj):
 
 
 class Handler(BaseHTTPRequestHandler):
-    # Shared across both runs; reset between them by the driver.
+    # Set by the driver before each run.
+    scenario = SCENARIOS[0]
     collected = []
     round_index = [0]
     lock = threading.Lock()
 
     def log_message(self, *_):
         pass  # the driver prints what matters
+
+    def handle_one_request(self):
+        # A cancelled run kills the client mid-stream. That is the scenario,
+        # not an error, and the default handler prints a traceback per socket.
+        try:
+            super().handle_one_request()
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
 
     def _read_body(self):
         length = int(self.headers.get("content-length", 0))
@@ -91,6 +235,13 @@ class Handler(BaseHTTPRequestHandler):
             raw = gzip.decompress(raw)
         return raw
 
+    def _empty(self, code, headers=None):
+        self.send_response(code)
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
+        self.send_header("content-length", "0")
+        self.end_headers()
+
     def do_POST(self):
         if self.path.startswith("/telemetry"):
             body = self._read_body()
@@ -98,21 +249,22 @@ class Handler(BaseHTTPRequestHandler):
                 for line in body.decode("utf-8", "replace").splitlines():
                     if line.strip():
                         Handler.collected.append(json.loads(line))
-            self.send_response(200)
-            self.send_header("content-length", "0")
-            self.end_headers()
+            self._empty(200)
             return
 
-        # The model. Answer with whichever scripted round is next; repeat the
-        # last one if the agent asks for more than the script has, so a build
-        # that takes an extra round cannot hang the run.
         self._read_body()
+        scenario = Handler.scenario
         with Handler.lock:
-            i = min(Handler.round_index[0], len(SCRIPT) - 1)
+            i = min(Handler.round_index[0], len(scenario.script) - 1)
             Handler.round_index[0] += 1
-        step = SCRIPT[i]
+        step = scenario.script[i]
 
-        time.sleep(MODEL_DELAY_S)
+        time.sleep(scenario.delay_s)
+
+        if "status" in step:
+            self._empty(step["status"], step["headers"])
+            return
+
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
         self.end_headers()
@@ -124,8 +276,8 @@ class Handler(BaseHTTPRequestHandler):
         }
         if "tool_calls" in step:
             delta = {"role": "assistant", "tool_calls": []}
-            for n, call in enumerate(step["tool_calls"]):
-                delta["tool_calls"].append({"index": n, **call})
+            for n, tc in enumerate(step["tool_calls"]):
+                delta["tool_calls"].append({"index": n, **tc})
             self.wfile.write(sse({**base, "choices": [{"index": 0, "delta": delta}]}))
             finish = "tool_calls"
         else:
@@ -134,7 +286,10 @@ class Handler(BaseHTTPRequestHandler):
                     {
                         **base,
                         "choices": [
-                            {"index": 0, "delta": {"role": "assistant", "content": step["content"]}}
+                            {
+                                "index": 0,
+                                "delta": {"role": "assistant", "content": step["content"]},
+                            }
                         ],
                     }
                 )
@@ -174,16 +329,19 @@ VOLATILE_ENVELOPE = {
     "account_id",  # whoever is signed in
     "repo_origin",  # the scratch dir is not a repo; kept out to be sure
 }
+
 # Compared by order of magnitude rather than dropped: with a model that takes
-# `MODEL_DELAY_S` to answer, "both report tens of milliseconds" is a real
-# assertion, and "one of them reports zero" is a real finding.
+# `delay_s` to answer, "both report tens of milliseconds" is a real assertion,
+# and "one of them reports zero" is a real finding.
 MAGNITUDE_EVENT = {"duration_ms"}
 
 VOLATILE_EVENT = {
-    "error_data",  # carries paths, messages and durations
+    # Carries paths, wall-clock durations and the provider's own words. Its
+    # PRESENCE is compared; its content cannot be.
+    "error_data",
     # Token accounting: the two builds send different prompts (the system
-    # prompt is not the thing under test), so the exact numbers cannot match.
-    # Their PRESENCE is what matters, and `shape()` keeps that.
+    # prompt is not the thing under test), so exact numbers cannot match.
+    # Presence and non-zero-ness are what `shape()` keeps.
     "input_tokens",
     "output_tokens",
     "cached_tokens",
@@ -198,19 +356,12 @@ VOLATILE_EVENT = {
 
 
 def shape(record):
-    """What must be identical: which event, and every non-volatile field.
-
-    A dropped numeric field is replaced by whether it was present and whether
-    it was non-zero, so "stopped reporting tokens" is still a diff even though
-    "reported 1013 instead of 1007" is not.
-    """
+    """What must be identical: which event, and every non-volatile field."""
     out = {}
     for key, value in sorted(record.items()):
         if key in VOLATILE_ENVELOPE:
             continue
         if key in MAGNITUDE_EVENT and isinstance(value, (int, float)):
-            # 0, 1-9ms, 10-99ms, … — same bucket means the two builds measure
-            # the same span; a build that stopped measuring drops to `0ms`.
             out[key] = f"{10 ** len(str(int(value)).lstrip('-')) // 10}ms+" if value else "0ms"
             continue
         if key in VOLATILE_EVENT:
@@ -224,13 +375,10 @@ def shape(record):
 
 
 def summarise(records):
-    lines = []
-    for record in records:
-        lines.append(json.dumps(shape(record), sort_keys=True, ensure_ascii=False))
-    return lines
+    return [json.dumps(shape(r), sort_keys=True, ensure_ascii=False) for r in records]
 
 
-# ---- running one build -----------------------------------------------------
+# ---- running one scenario against one build --------------------------------
 
 CONFIG = """\
 default_provider = "parity"
@@ -248,11 +396,41 @@ endpoint = "http://127.0.0.1:{port}/telemetry"
 """
 
 
-def run_one(binary, port, prompt, keep):
+def read_queue(queue_dir):
+    """Whatever is still sitting in the on-disk queue, oldest first.
+
+    The sender claims a segment by renaming it, so a run interrupted mid-send
+    can leave one under either name; both are read, because what is being
+    asked is "what did this process decide to report", not "what reached the
+    endpoint".
+    """
+    if not queue_dir.exists():
+        return []
+    out = []
+    for path in sorted(queue_dir.iterdir()):
+        if path.suffix in {".marker", ".lock"} or path.is_dir():
+            continue
+        try:
+            body = path.read_text("utf-8")
+        except OSError:
+            continue
+        for line in body.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass  # a half-written last line in an interrupted segment
+    return out
+
+
+def run_one(binary, port, scenario, keep):
+    Handler.scenario = scenario
     Handler.collected.clear()
     Handler.round_index[0] = 0
 
-    work = Path(tempfile.mkdtemp(prefix="atomcode-parity-"))
+    work = Path(tempfile.mkdtemp(prefix=f"atomcode-parity-{scenario.name}-"))
     home = work / "home"
     project = work / "project"
     home.mkdir()
@@ -274,16 +452,29 @@ def run_one(binary, port, prompt, keep):
     cmd = [
         str(binary),
         "-p",
-        prompt,
+        scenario.prompt,
         "-C",
         str(project),
-        "-y",  # the scripted tool call must not stop on an approval prompt
         "--dev",  # no self-update in the middle of a measurement
         "--config",
         str(config),
+        *scenario.args,
     ]
     started = time.time()
-    proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=180)
+    timed_out = False
+    interrupted = False
+    proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        if scenario.interrupt_after is not None:
+            time.sleep(scenario.interrupt_after)
+            if proc.poll() is None:
+                proc.send_signal(signal.SIGINT)
+                interrupted = True
+        _out, err = proc.communicate(timeout=scenario.timeout_s)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        proc.kill()
+        _out, err = proc.communicate()
     elapsed = time.time() - started
 
     # The shutdown drain is bounded; give the collector a moment to see it.
@@ -293,21 +484,27 @@ def run_one(binary, port, prompt, keep):
             if Handler.collected:
                 break
         time.sleep(0.1)
-    time.sleep(0.5)
+    time.sleep(0.6)
 
     with Handler.lock:
         records = list(Handler.collected)
+    # A run that was killed never got to drain, but the queue is on disk and
+    # the next launch would have sent it. Reading it is what makes a cancelled
+    # run measurable at all — otherwise the scenario compares nothing to
+    # nothing and calls it parity.
+    records += read_queue(home / "telemetry/queue")
 
     if keep:
-        print(f"  scratch kept at {work}")
+        print(f"      scratch kept at {work}")
     else:
         shutil.rmtree(work, ignore_errors=True)
     return {
         "records": records,
         "exit": proc.returncode,
         "elapsed": elapsed,
-        "stderr": proc.stderr[-2000:],
-        "stdout": proc.stdout[-2000:],
+        "timed_out": timed_out,
+        "interrupted": interrupted,
+        "stderr": (err or "")[-1500:],
     }
 
 
@@ -315,15 +512,25 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--old", default=str(Path.home() / ".local/bin/atomcode"))
     ap.add_argument("--new", default="target/release/atomcode")
-    ap.add_argument("--prompt", default="Run the bash tool once, then say done.")
+    ap.add_argument("--only", action="append", help="run only these scenarios (repeatable)")
+    ap.add_argument("--list", action="store_true", help="print the scenarios and why each exists")
     ap.add_argument("--keep", action="store_true", help="keep the scratch dirs")
-    ap.add_argument(
-        "--raw",
-        action="store_true",
-        help="also print every record unnormalised, for reading a diff that "
-        "normalisation reduced to `<zero>` vs `<nonzero>`",
-    )
+    ap.add_argument("--raw", action="store_true", help="also print every record unnormalised")
     args = ap.parse_args()
+
+    if args.list:
+        for s in SCENARIOS:
+            print(f"{s.name}\n    {s.why}\n")
+        return 0
+
+    chosen = SCENARIOS
+    if args.only:
+        names = {n for spec in args.only for n in spec.split(",")}
+        unknown = names - {s.name for s in SCENARIOS}
+        if unknown:
+            print(f"no such scenario: {sorted(unknown)}", file=sys.stderr)
+            return 2
+        chosen = [s for s in SCENARIOS if s.name in names]
 
     for which, path in (("old", args.old), ("new", args.new)):
         if not Path(path).exists():
@@ -333,42 +540,68 @@ def main():
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     port = server.server_address[1]
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    print(f"fake model + telemetry collector on 127.0.0.1:{port}\n")
 
-    runs = {}
+    versions = {}
     for which, path in (("old", args.old), ("new", args.new)):
-        version = subprocess.run(
+        versions[which] = subprocess.run(
             [path, "--version"], capture_output=True, text=True
         ).stdout.strip()
-        print(f"{which}: {path}  ({version})")
-        runs[which] = run_one(path, port, args.prompt, args.keep)
-        run = runs[which]
-        ids = [r.get("event_id") for r in run["records"]]
-        print(f"  exit {run['exit']} in {run['elapsed']:.1f}s, {len(ids)} event(s): {ids}")
-        if run["exit"] != 0:
-            print(f"  stderr tail:\n{run['stderr']}")
-        if args.raw:
-            for record in run["records"]:
-                print(f"    {json.dumps(record, sort_keys=True, ensure_ascii=False)}")
+    print(f"old  {args.old}  ({versions['old']})")
+    print(f"new  {args.new}  ({versions['new']})")
+    print(f"fake model + telemetry collector on 127.0.0.1:{port}\n")
+
+    diverged, empty = [], []
+    for scenario in chosen:
+        print(f"-- {scenario.name}")
+        runs = {}
+        for which, path in (("old", args.old), ("new", args.new)):
+            run = runs[which] = run_one(path, port, scenario, args.keep)
+            ids = [r.get("event_id") for r in run["records"]]
+            flags = ("  TIMEOUT" if run["timed_out"] else "") + (
+                "  SIGINT" if run["interrupted"] else ""
+            )
+            print(
+                f"   {which}: exit {run['exit']} in {run['elapsed']:.1f}s{flags}"
+                f"  -> {len(ids)} event(s) {ids}"
+            )
+            if args.raw:
+                for record in run["records"]:
+                    print(f"      {json.dumps(record, sort_keys=True, ensure_ascii=False)}")
+
+        old = summarise(runs["old"]["records"])
+        new = summarise(runs["new"]["records"])
+        if not old and not new:
+            if scenario.expect_silence:
+                print("   ok both silent, as this scenario expects")
+            else:
+                print("   ! neither build reported anything - nothing was compared")
+                empty.append(scenario.name)
+            continue
+        if scenario.expect_silence:
+            # The interesting direction: something started reporting where
+            # nothing used to, which is a change in behaviour either way.
+            print(f"   ! expected silence, got {len(old)} old / {len(new)} new")
+            diverged.append(scenario.name)
+        delta = list(difflib.unified_diff(old, new, "old", "new", lineterm="", n=0))
+        if not delta:
+            print(f"   ok identical ({len(old)} record(s))")
+            continue
+        diverged.append(scenario.name)
+        print("   XX diverged:")
+        for line in delta:
+            print(f"     {line}")
     server.shutdown()
 
-    old = summarise(runs["old"]["records"])
-    new = summarise(runs["new"]["records"])
-
-    print("\n--- diff (old → new), volatile fields normalised ---")
-    if not old and not new:
-        print("NEITHER build reported anything — the collector saw no POST at all.")
-        print("That is a broken harness, not parity. Check the run output above.")
-        return 2
-    import difflib
-
-    delta = list(difflib.unified_diff(old, new, "old", "new", lineterm="", n=1))
-    if not delta:
-        print(f"identical: {len(old)} record(s) match shape for shape")
-        return 0
-    for line in delta:
-        print(line)
-    return 1
+    print("\n-- summary")
+    ran = [s.name for s in chosen]
+    print(f"   {len(ran) - len(diverged) - len(empty)}/{len(ran)} identical")
+    if empty:
+        print(f"   {len(empty)} reported nothing on either build: {empty}")
+        print("     (not parity - the scenario reached no metered path, or the harness is broken)")
+    if diverged:
+        print(f"   {len(diverged)} diverged: {diverged}")
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
