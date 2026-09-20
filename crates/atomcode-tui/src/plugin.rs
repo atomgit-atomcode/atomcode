@@ -1325,6 +1325,16 @@ impl UserInterface for Tui {
                                     stale = true;
                                     continue;
                                 }
+                                // And on the inner row, when the page has one.
+                                // Tried here for the same reason the outer row
+                                // is: it is chrome on a row of its own, and a
+                                // hit test that ran the settings rows first
+                                // would hand it to whatever the list put there.
+                                if let Some(page) = self.host.settings_stats_page_at(x, y) {
+                                    let _ = self.host.show_stats_page(page);
+                                    stale = true;
+                                    continue;
+                                }
                             }
                             // A press on a settings row arms it and takes it,
                             // which is the rule the question and team panels

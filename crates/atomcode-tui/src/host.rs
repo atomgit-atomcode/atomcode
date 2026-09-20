@@ -1598,6 +1598,42 @@ impl Host {
         crate::modules::settings::tab_at((x - rect.x) as usize)
     }
 
+    /// Which inner page is under the pointer, when the pointer is on the row
+    /// that carries them.
+    ///
+    /// Read off the same layout the frame drew with, the way every other hit
+    /// test on this panel is: the inner row moves with the page's chrome, and a
+    /// hit test that assumed a fixed screen row would answer for whatever
+    /// happened to be there instead.
+    pub fn settings_stats_page_at(&self, x: u16, y: u16) -> Option<crate::settings::StatsPage> {
+        let rect = *self.hits.lock().expect("hits poisoned").settings.as_ref()?;
+        if !rect.contains(x, y) {
+            return None;
+        }
+        let m = self.moment.read().expect("moment poisoned");
+        let vp = crate::moment::Viewport::new(rect, &m);
+        let row = crate::modules::settings::geometry(&m, &vp).pages_row()?;
+        if (y - rect.y) as usize != row {
+            return None;
+        }
+        crate::modules::settings::stats_page_at((x - rect.x) as usize)
+    }
+
+    /// Show one of a page's inner pages. True when it changed.
+    pub fn show_stats_page(&self, page: crate::settings::StatsPage) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let Some(panel) = m.settings_panel.as_mut() else {
+            return false;
+        };
+        if panel.stats == page {
+            return false;
+        }
+        panel.stats = page;
+        // A different page, read from its top — the same rule the arrows follow.
+        panel.scroll = 0;
+        true
+    }
+
     /// Show a page. True when it changed.
     ///
     /// The same `Panel::show` the keyboard reaches, so a click and a tab press
@@ -3830,6 +3866,71 @@ mod tests {
             ]);
         }
         h
+    }
+
+    /// A press on the inner row of tabs shows the page under the pointer, and
+    /// a press anywhere else on the panel does not.
+    ///
+    /// Read off the same layout the frame drew with, which is the rule every
+    /// hit test on this panel keeps: the inner row moves with the page's
+    /// chrome, so a test that assumed a fixed screen row would answer for
+    /// whatever happened to be drawn there instead.
+    #[test]
+    fn a_press_on_the_inner_tabs_shows_the_page_under_the_pointer() {
+        let h = host_with_settings();
+        h.toggle_settings();
+        {
+            let mut m = h.moment.write().expect("moment poisoned");
+            m.settings_panel
+                .as_mut()
+                .expect("a panel")
+                .show(crate::settings::Tab::Stats);
+        }
+        let frame = h.compose((60, 30));
+        let part = frame
+            .part(crate::modules::settings::ID)
+            .expect("the panel is drawn");
+        let rect = part.rect;
+        let drawn: Vec<String> = part.lines.iter().map(|l| l.plain()).collect();
+        let row = drawn
+            .iter()
+            .position(|line| line.contains("Models"))
+            .expect("the inner row is drawn");
+
+        // Every cell of a label answers with that label's page, and the gaps
+        // between them answer with nothing.
+        let at = drawn[row].find("Models").expect("just found it");
+        assert_eq!(
+            h.settings_stats_page_at(rect.x + at as u16, rect.y + row as u16),
+            Some(crate::settings::StatsPage::Models),
+            "the cell under the pointer: {:?}",
+            drawn[row]
+        );
+        assert!(
+            h.settings_stats_page_at(rect.x, rect.y + row as u16)
+                .is_none(),
+            "and the indent before them is not a tab: {:?}",
+            drawn[row]
+        );
+        // A row that is not the inner row is not the inner row, whatever column
+        // the pointer is in.
+        assert!(
+            h.settings_stats_page_at(rect.x + at as u16, rect.y + row as u16 + 1)
+                .is_none(),
+            "the row below it is content"
+        );
+
+        assert!(h.show_stats_page(crate::settings::StatsPage::Models));
+        assert_eq!(
+            h.moment
+                .read()
+                .expect("moment poisoned")
+                .settings_panel
+                .as_ref()
+                .expect("a panel")
+                .stats,
+            crate::settings::StatsPage::Models
+        );
     }
 
     /// The wheel over a page that is read scrolls that page, and the wheel

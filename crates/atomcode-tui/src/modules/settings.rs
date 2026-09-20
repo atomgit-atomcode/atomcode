@@ -346,7 +346,7 @@ fn rows_for(
                 .into_iter()
                 .map(|line| Row::Usage { line }),
         );
-        rows.extend([Row::Blank, Row::Rule]);
+        rows.extend([Row::Blank, Row::Legend, Row::Rule]);
         return rows;
     }
     if panel.tab == Tab::Stats {
@@ -358,13 +358,15 @@ fn rows_for(
                 .into_iter()
                 .map(|line| Row::Usage { line }),
         );
-        rows.extend([Row::Blank, Row::Rule]);
+        rows.extend([Row::Blank, Row::Legend, Row::Rule]);
         return rows;
     }
     if panel.tab != Tab::Config {
         rows.push(Row::Blank);
         rows.push(Row::Elsewhere { tab: panel.tab });
-        rows.extend([Row::Blank, Row::Rule]);
+        // Even a page that is one line says how to leave it: the way out is not
+        // a property of how much a page has to say.
+        rows.extend([Row::Blank, Row::Legend, Row::Rule]);
         return rows;
     }
 
@@ -455,29 +457,50 @@ fn scroll_note(above: usize, below: usize, w: usize, caps: crate::caps::Caps) ->
 /// does, one row of it goes to saying so — a page that quietly showed two
 /// thirds of itself is a page that lies by omission.
 fn window(rows: Vec<Row>, scroll: usize, h: usize) -> Vec<Row> {
-    // Head is `Header` + `Rule`, foot is the closing `Rule`. Below this there is
-    // no room for a body at all, so the panel is its own edges and nothing else.
-    const EDGES: usize = 3;
     if rows.len() <= h {
         return rows;
     }
-    if h <= EDGES {
+    // The head is every row of chrome the page opens with — the tab row, the
+    // rule, and the inner row of tabs when the page has one. **Chrome does not
+    // scroll**: an inner row of tabs that slid off the top would be a row of
+    // tabs a person cannot reach on the page it belongs to, which is the same
+    // dead end the arrows made.
+    let head = rows
+        .iter()
+        .take_while(|row| {
+            matches!(
+                row,
+                Row::Header | Row::Rule | Row::Pages { .. } | Row::Blank
+            )
+        })
+        .count();
+    // The foot is every row of chrome the page closes with — the keys and the
+    // rule — and it is kept for the reason the head is: it is the row that says
+    // how to leave, and a page that gave it up to make room would be hiding the
+    // way out at exactly the moment it got long enough to need one.
+    let foot = rows
+        .iter()
+        .rev()
+        .take_while(|row| matches!(row, Row::Rule | Row::Legend | Row::Blank))
+        .count();
+    // Head, foot, and one row for the note that says how much is out of sight.
+    let edges = head + foot + 1;
+    if h <= edges {
         return rows.into_iter().take(h).collect();
     }
-    let body = rows.len() - EDGES;
-    // One row of the body goes to the note that says how much is out of sight.
-    let room = h - EDGES - 1;
+    let body = rows.len() - head - foot;
+    let room = h - edges;
     // Clamped to the last full window: scrolling past the end would answer a
     // key with a blank panel, and the key that did it is the one a person holds
     // down.
     let at = scroll.min(body.saturating_sub(room));
-    let mut out: Vec<Row> = rows.iter().take(2).cloned().collect();
-    out.extend(rows.iter().skip(2 + at).take(room).cloned());
+    let mut out: Vec<Row> = rows.iter().take(head).cloned().collect();
+    out.extend(rows.iter().skip(head + at).take(room).cloned());
     out.push(Row::Scroll {
         above: at,
         below: body - at - room,
     });
-    out.push(Row::Rule);
+    out.extend(rows.iter().skip(rows.len() - foot).cloned());
     out
 }
 
@@ -1360,18 +1383,47 @@ fn heat_key(less: &str, more: &str, w: usize) -> Line {
 /// is the one showing — and a panel with two ways of saying "selected" is a
 /// panel a person has to learn twice.
 fn pages_line(at: crate::settings::StatsPage, w: usize) -> Line {
+    Line::from_spans(pages_parts(at).0).truncate(w)
+}
+
+/// The inner row's spans **and** where each page sits in columns.
+///
+/// One function for both, for the reason [`header_parts`] is one: a hit test
+/// with its own arithmetic is a click that lands on the page beside the one
+/// under the pointer, the first time a label changes length. The ranges do not
+/// depend on which page is showing — lighting one changes its style, not its
+/// width.
+fn pages_parts(
+    at: crate::settings::StatsPage,
+) -> (Vec<Span>, Vec<(crate::settings::StatsPage, usize, usize)>) {
     let mut spans = vec![Span::raw("    ")];
+    let mut ranges = Vec::new();
+    let mut col = 4;
     for (i, page) in crate::settings::StatsPage::ALL.iter().enumerate() {
         if i > 0 {
             spans.push(Span::raw("  "));
+            col += 2;
         }
         let style = match *page == at {
             true => theme::bg(Role::PanelSelBg).under(theme::fg(Role::PanelFg)),
             false => theme::fg(Role::Muted),
         };
-        spans.push(Span::styled(format!(" {} ", page.label()), style));
+        let text = format!(" {} ", page.label());
+        let cells = width::str_width(&text);
+        ranges.push((*page, col, col + cells));
+        col += cells;
+        spans.push(Span::styled(text, style));
     }
-    Line::from_spans(spans).truncate(w)
+    (spans, ranges)
+}
+
+/// Which inner page is under this cell of the inner tab row.
+pub fn stats_page_at(col: usize) -> Option<crate::settings::StatsPage> {
+    pages_parts(crate::settings::StatsPage::ALL[0])
+        .1
+        .into_iter()
+        .find(|(_, from, to)| (*from..*to).contains(&col))
+        .map(|(page, _, _)| page)
 }
 
 /// One figure: what it is called, and what it says.
@@ -1846,6 +1898,24 @@ fn legend(panel: &Panel) -> Vec<(&'static str, &'static str)> {
     if panel.editing.is_some() {
         return vec![("⏎", "保存"), ("esc", "取消")];
     }
+    // The pages that are read rather than filtered say how to leave them.
+    //
+    // Written because leaving one stopped working: the arrows walked the inner
+    // row of tabs for a day and a person who had been moving along the pages
+    // with them arrived at Stats and could only cycle its two. The keys were
+    // put back, and the way out is now on the screen — which is the part that
+    // would have made the dead end survivable while it lasted.
+    if panel.tab != crate::settings::Tab::Config {
+        let mut out = vec![("←→", "换页")];
+        if panel.tab.pages().is_some() {
+            out.push(("↑↓", "这页的分页"));
+            out.push(("翻页键", "滚动"));
+        } else {
+            out.push(("↑↓", "滚动"));
+        }
+        out.push(("esc", "关闭"));
+        return out;
+    }
     if panel.pending_reset.is_some() {
         // Says what the next press does, because that is the only thing about
         // this state a person has to know — and it is the press that throws
@@ -1876,6 +1946,12 @@ fn pad_to(line: Line, w: usize, style: Style) -> Line {
 /// up cannot come from two different arrangements of one panel.
 pub struct Geometry {
     rows: Vec<Option<usize>>,
+    /// Which screen row the inner tab row was drawn on, when one was.
+    ///
+    /// Read off the laid-out rows rather than counted from the top: the panel
+    /// pads and windows, so where that row lands is a fact about this layout
+    /// and not a constant.
+    pages: Option<usize>,
 }
 
 impl Geometry {
@@ -1886,12 +1962,20 @@ impl Geometry {
     pub fn setting_at(&self, row: usize) -> Option<usize> {
         self.rows.get(row).copied().flatten()
     }
+
+    /// Which screen row carries the inner tabs, when the page has them.
+    pub fn pages_row(&self) -> Option<usize> {
+        self.pages
+    }
 }
 
 /// The layout the panel drew, for the host to read a click against.
 pub fn geometry(moment: &Moment, vp: &Viewport<'_>) -> Geometry {
     let Some(panel) = moment.settings_panel.as_ref() else {
-        return Geometry { rows: Vec::new() };
+        return Geometry {
+            rows: Vec::new(),
+            pages: None,
+        };
     };
     let rows = if vp.rect.w == 0 || vp.rect.h == 0 {
         Vec::new()
@@ -1905,6 +1989,7 @@ pub fn geometry(moment: &Moment, vp: &Viewport<'_>) -> Geometry {
         )
     };
     Geometry {
+        pages: rows.iter().position(|row| matches!(row, Row::Pages { .. })),
         rows: rows
             .iter()
             .map(|r| match r {
@@ -2902,31 +2987,138 @@ mod tests {
             "both pages are named: {shown}"
         );
 
-        // Right walks the row the eye is on — the second one, here.
-        crate::settings::key(&view, &mut panel, press(Key::Right));
-        assert_eq!(panel.stats, StatsPage::Models, "right walks the inner row");
-        assert_eq!(panel.tab, Tab::Stats, "and leaves the outer one alone");
-        crate::settings::key(&view, &mut panel, press(Key::Left));
-        assert_eq!(panel.stats, StatsPage::Overview, "and left comes back");
-
-        // Tab always means the panel's own pages, so the outer row is never
-        // unreachable from a page that has an inner one.
-        crate::settings::key(&view, &mut panel, press(Key::Right));
-        crate::settings::key(
-            &view,
-            &mut panel,
-            KeyPress {
-                key: Key::Tab,
-                mods: Mods::NONE,
+        // And they stay named however far the page is scrolled: the inner row
+        // is chrome, and a row of tabs that slid off the top would be a row of
+        // tabs a person cannot reach on the page it belongs to.
+        let mut scrolled = panel.clone();
+        scrolled.stats = StatsPage::Models;
+        scrolled.scroll = 9_999;
+        let down = drawn(
+            &Moment {
+                settings: two(),
+                settings_panel: Some(scrolled),
+                usage: Some(crate::settings::UsagePage {
+                    context: None,
+                    plan: None,
+                    windows: Vec::new(),
+                    stats: Some(atomcode_host_api::UsageStats {
+                        from: "2026-07-01".into(),
+                        to: "2026-08-29".into(),
+                        models: (0..12)
+                            .map(|i| atomcode_host_api::ModelUse {
+                                name: format!("model-{i}"),
+                                tokens: 100,
+                                requests: 1,
+                            })
+                            .collect(),
+                        daily: (0..60)
+                            .map(|d| atomcode_host_api::DayUse {
+                                date: format!("2026-{:02}-{:02}", 7 + d / 30, 1 + d % 30),
+                                tokens: 100,
+                                requests: 1,
+                            })
+                            .collect(),
+                        series: Vec::new(),
+                        total_tokens: 1200,
+                        total_requests: 12,
+                    }),
+                }),
+                ..Moment::default()
             },
+            92,
+            16,
+        )
+        .join("\n");
+        assert!(
+            down.contains("Overview") && down.contains("Models"),
+            "scrolled to the end, the inner row is still there: {down}"
         );
-        assert_ne!(panel.tab, Tab::Stats, "tab leaves the page");
+
+        // Down walks the inner row; left and right stay with the pages, which
+        // is what makes Stats somewhere a person can leave. It was the other
+        // way round for a day and Stats became a dead end: the arrows a person
+        // had been moving along the pages with only cycled its two.
+        crate::settings::key(&view, &mut panel, press(Key::Down));
+        assert_eq!(panel.stats, StatsPage::Models, "down walks the inner row");
+        assert_eq!(panel.tab, Tab::Stats, "and leaves the pages alone");
+        crate::settings::key(&view, &mut panel, press(Key::Up));
+        assert_eq!(panel.stats, StatsPage::Overview, "and up comes back");
+
+        crate::settings::key(&view, &mut panel, press(Key::Down));
+        crate::settings::key(&view, &mut panel, press(Key::Right));
+        assert_ne!(panel.tab, Tab::Stats, "right leaves the page");
+        let _ = KeyPress {
+            key: Key::Tab,
+            mods: Mods::NONE,
+        };
         panel.show(Tab::Stats);
         assert_eq!(
             panel.stats,
             StatsPage::Models,
             "and coming back lands on the page that was being read"
         );
+    }
+
+    /// Every page can be left with the key that got you there, and says so.
+    ///
+    /// Written because one could not. The arrows walked the inner row of tabs
+    /// on the page that had one, so a person moving along the pages with them
+    /// arrived at Stats and could only cycle its two for ever — the panel had
+    /// one page you could enter and not leave, and nothing on the screen said
+    /// which key would do it. The keys are back on the outer row and the way
+    /// out is drawn; this asserts both, and asserts it of **every** page rather
+    /// than of the one that broke.
+    #[test]
+    fn no_page_is_a_dead_end() {
+        use crate::settings::Tab;
+        use crate::surface::{Key, KeyPress, Mods};
+        let view = two();
+        for tab in Tab::ALL {
+            let mut panel = Panel::new();
+            panel.show(tab);
+            // Right, then left, and the arrows have walked the whole row: from
+            // any page, both neighbours are one press away.
+            crate::settings::key(
+                &view,
+                &mut panel,
+                KeyPress {
+                    key: Key::Right,
+                    mods: Mods::NONE,
+                },
+            );
+            assert_ne!(panel.tab, tab, "{tab:?} can be left going right");
+            panel.show(tab);
+            crate::settings::key(
+                &view,
+                &mut panel,
+                KeyPress {
+                    key: Key::Left,
+                    mods: Mods::NONE,
+                },
+            );
+            assert_ne!(panel.tab, tab, "{tab:?} can be left going left");
+
+            // And the panel says so, on the pages that are read — the ones a
+            // person lands on without having typed anything to get there.
+            if tab == Tab::Config {
+                continue;
+            }
+            panel.show(tab);
+            let shown = drawn(
+                &Moment {
+                    settings: two(),
+                    settings_panel: Some(panel),
+                    ..Moment::default()
+                },
+                92,
+                24,
+            )
+            .join("\n");
+            assert!(
+                shown.contains("换页"),
+                "{tab:?} says how to leave it: {shown}"
+            );
+        }
     }
 
     /// A braille cell with anything in it — the ink the plot is drawn with.

@@ -253,6 +253,19 @@ impl Tab {
     /// Every page, in the order they are drawn.
     pub const ALL: [Tab; 4] = [Tab::Config, Tab::Status, Tab::Usage, Tab::Stats];
 
+    /// The inner row of pages this tab has, when it has one.
+    ///
+    /// Asked rather than matched on at each of the places that care — the
+    /// arrows, the click, the layout — because "does this page have an inner
+    /// row" is one fact, and three copies of it would disagree the first time a
+    /// second page grew one.
+    pub fn pages(self) -> Option<&'static [StatsPage]> {
+        match self {
+            Tab::Stats => Some(&StatsPage::ALL),
+            _ => None,
+        }
+    }
+
     /// What the tab row says on it.
     ///
     /// English, and the same word the command is: `config` is what a person
@@ -487,6 +500,31 @@ pub struct ContextUse {
 /// **While a field is being edited, nothing else takes a key.** An arrow that
 /// walked the list under the text being typed would change which setting the
 /// text is for, and the person would not find out until they saved.
+/// What one press of an arrow does, by what the page has under it.
+///
+/// One function because the two arrows are the same decision with a sign, and
+/// two copies of it would disagree the first time a page grew an inner row.
+fn step_arrow(panel: &mut Panel, rows: usize, by: i32) {
+    if panel.tab == Tab::Config {
+        panel.move_by(by, rows);
+        return;
+    }
+    if panel.tab.pages().is_some() {
+        panel.stats = panel.stats.cycled(by);
+        // A different page, read from its top: the offset was about rows this
+        // page does not have.
+        panel.scroll = 0;
+        return;
+    }
+    // Clamped at the top here and at the bottom where the rows are counted:
+    // this side does not know how long the page is, and an offset past the end
+    // would be an empty panel.
+    panel.scroll = match by < 0 {
+        true => panel.scroll.saturating_sub(by.unsigned_abs() as usize),
+        false => panel.scroll.saturating_add(by as usize),
+    };
+}
+
 pub fn key(view: &SettingsView, panel: &mut Panel, press: crate::surface::KeyPress) -> Step {
     use crate::surface::{Key, Mods};
 
@@ -545,38 +583,21 @@ pub fn key(view: &SettingsView, panel: &mut Panel, press: crate::surface::KeyPre
         // thing on a terminal uses, so nothing has to be learned. Left and right
         // do the same, because the row is drawn horizontally and a person who
         // sees `Config | Status | Usage | Stats` will reach for them.
-        (Key::Tab, Mods::NONE) => {
+        // Left and right are **always** the page tabs, and Tab does the same.
+        //
+        // They were the inner row on a page that had one, for a day, and that
+        // made Stats a dead end: a person who had been moving along the tabs
+        // with the arrows arrived there and could only cycle its two inner
+        // pages for ever. One key, one row — and the row it walks is the one a
+        // person has been walking all along.
+        (Key::Tab, Mods::NONE) | (Key::Right, _) => {
             let next = panel.tab.cycled(1);
             panel.show(next);
             Step::Stay
         }
-        (Key::BackTab, _) | (Key::Tab, Mods::SHIFT) => {
+        (Key::BackTab, _) | (Key::Tab, Mods::SHIFT) | (Key::Left, _) => {
             let next = panel.tab.cycled(-1);
             panel.show(next);
-            Step::Stay
-        }
-        // Left and right walk the row the eye is on. On a page with a second
-        // row of tabs that is the second row — it is the one drawn right where
-        // the arrows are pointing — and everywhere else it is the page tabs.
-        // Tab and shift-tab always mean the page tabs, so the outer row is
-        // never unreachable.
-        (Key::Right, _) | (Key::Left, _) => {
-            let by = match press.key {
-                Key::Right => 1,
-                _ => -1,
-            };
-            match panel.tab {
-                Tab::Stats => {
-                    panel.stats = panel.stats.cycled(by);
-                    // A different page, read from its top: the offset was about
-                    // rows this page does not have.
-                    panel.scroll = 0;
-                }
-                _ => {
-                    let next = panel.tab.cycled(by);
-                    panel.show(next);
-                }
-            }
             Step::Stay
         }
         // Escape does the innermost thing, the same rule the composer's Escape
@@ -592,31 +613,22 @@ pub fn key(view: &SettingsView, panel: &mut Panel, press: crate::surface::KeyPre
                 Step::Close
             }
         }
+        // Up and down walk whatever the page puts under the arrows: the
+        // highlight on the settings list, the inner row of tabs on a page that
+        // has one, and the page itself on a page that has neither. A page with
+        // an inner row still scrolls — with the page keys and the wheel, which
+        // is what they are for.
         (Key::Up, _) | (Key::Char('k'), Mods::CTRL) => {
-            match on_settings {
-                true => {
-                    panel.move_by(-1, shown.len());
-                }
-                // Clamped at the top here and at the bottom where the rows are
-                // counted: this side does not know how long the page is, and a
-                // scroll offset past the end is an empty panel.
-                false => {
-                    panel.scroll = panel.scroll.saturating_sub(1);
-                }
-            }
+            step_arrow(panel, shown.len(), -1);
             Step::Stay
         }
         (Key::Down, _) | (Key::Char('j'), Mods::CTRL) => {
-            match on_settings {
-                true => {
-                    panel.move_by(1, shown.len());
-                }
-                false => {
-                    panel.scroll = panel.scroll.saturating_add(1);
-                }
-            }
+            step_arrow(panel, shown.len(), 1);
             Step::Stay
         }
+        // The page keys always move the page, on every page that has one to
+        // move. They are the way to scroll a page whose arrows are walking its
+        // inner row of tabs.
         (Key::PageUp, _) => {
             match on_settings {
                 true => {
