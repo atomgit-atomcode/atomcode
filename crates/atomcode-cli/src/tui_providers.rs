@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use atomcode_config::config::{provider_preset, Config};
-use atomcode_config::provider_edit::{self, AccountPatch, ModelPatch};
+use atomcode_config::provider_edit::{self, AccountPatch, KeyWrite, ModelPatch};
 use atomcode_plexus::{Context, Plugin};
 use atomcode_tui::module::{Modules, Mounted};
 use atomcode_tui::plugin::ModulesSvc;
@@ -275,6 +275,20 @@ fn protocol_label(ty: provider_preset::ProviderType) -> String {
     .to_string()
 }
 
+/// What a typed key field means for the file.
+///
+/// Empty is **keep**, not clear: the stored credential is not readable from the
+/// panel, so there is nothing to prefill the field with — and a person who
+/// opened a form to change an endpoint has not asked for their key to be thrown
+/// away. Clearing one is what moving to a keyless protocol does, and that is
+/// decided from the protocol rather than from an empty field.
+fn written_key(typed: Option<&str>) -> KeyWrite<'_> {
+    match typed.map(str::trim).filter(|key| !key.is_empty()) {
+        Some(key) => KeyWrite::Set(key),
+        None => KeyWrite::Keep,
+    }
+}
+
 /// Whether a credential is stored for this account.
 ///
 /// A bool, and only a bool: this is the whole of what the screen is told about a
@@ -373,11 +387,7 @@ impl Providers for ConfigProviders {
             return Err("这个协议没有默认地址,得填一个".into());
         }
         let endpoint = endpoint_override(&draft.endpoint, &draft.protocol);
-        let key = draft
-            .key
-            .as_deref()
-            .map(str::trim)
-            .filter(|k| !k.is_empty());
+        let key = written_key(draft.key.as_deref());
         let written = id.clone();
         self.write(move |document| {
             provider_edit::put_account(
@@ -422,14 +432,16 @@ impl Providers for ConfigProviders {
         // `vendor_changed`.
         let moved =
             provider_preset::preset_or_compatible(&stored).provider_type != wanted.provider_type;
-        let key = draft
-            .key
-            .as_deref()
-            .map(str::trim)
-            .filter(|k| !k.is_empty());
+        let key = written_key(draft.key.as_deref());
         let endpoint = draft.endpoint.trim();
         if legacy {
             let wire = moved.then(|| wanted.provider_type.wire());
+            // The flat table's writer takes what to set, or nothing: there is no
+            // keyless legacy protocol to clear one for.
+            let key = match key {
+                KeyWrite::Set(key) => Some(key),
+                KeyWrite::Keep | KeyWrite::Clear => None,
+            };
             let endpoint = (!endpoint.is_empty()).then_some(endpoint);
             let id = id.to_string();
             return self
@@ -452,7 +464,7 @@ impl Providers for ConfigProviders {
                 &AccountPatch {
                     provider: &provider,
                     base_url: endpoint.as_deref(),
-                    api_key: if clears { Some("") } else { key },
+                    api_key: if clears { KeyWrite::Clear } else { key },
                     display_name: None,
                 },
             )
@@ -517,11 +529,7 @@ impl Providers for ConfigProviders {
         let id = free_id(&base, |candidate| {
             config.models.contains_key(candidate) || config.providers.contains_key(candidate)
         });
-        let key = draft
-            .key
-            .as_deref()
-            .map(str::trim)
-            .filter(|k| !k.is_empty());
+        let key = written_key(draft.key.as_deref());
         let account = draft.account.clone();
         let levels = draft.levels.clone();
         let effort = draft.effort.clone();
@@ -542,14 +550,14 @@ impl Providers for ConfigProviders {
                         display_name: None,
                     },
                 )?;
-            } else if let Some(key) = key {
+            } else if matches!(key, KeyWrite::Set(_)) {
                 provider_edit::put_account(
                     document,
                     &account,
                     &AccountPatch {
                         provider: &provider_of(document, &account, provider),
                         base_url: None,
-                        api_key: Some(key),
+                        api_key: key,
                         display_name: None,
                     },
                 )?;
@@ -889,6 +897,33 @@ context_window = 64000
         let out = text(&path);
         assert!(out.contains(r#"type = "openai""#), "the wire stays: {out}");
         assert!(out.contains("https://api.deepseek.com/v2"), "{out}");
+    }
+
+    /// Moving an account to a protocol that has no credential of its own takes
+    /// the old key **out** of the file. An `api_key = ""` left behind is not
+    /// "no credential": it is one whose value is empty, which is what would go
+    /// out on the wire.
+    #[test]
+    fn moving_to_a_keyless_protocol_takes_the_credential_out() {
+        let (port, path) = port("keyless");
+        port.edit_account(
+            "mine",
+            &AccountDraft {
+                name: String::new(),
+                protocol: "ollama".into(),
+                endpoint: "http://localhost:11434".into(),
+                key: None,
+            },
+        )
+        .expect("it writes");
+        let out = text(&path);
+        assert!(out.contains(r#"provider = "ollama""#), "{out}");
+        assert!(
+            !out.contains(r#"api_key = "sk-one""#) && !out.contains(r#"api_key = """#),
+            "gone, not blanked: {out}"
+        );
+        // And the other account's is untouched.
+        assert!(out.contains(r#"api_key = "sk-legacy""#), "{out}");
     }
 
     #[test]

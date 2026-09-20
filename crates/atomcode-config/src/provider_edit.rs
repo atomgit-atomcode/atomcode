@@ -41,11 +41,28 @@ pub struct AccountPatch<'a> {
     pub provider: &'a str,
     /// `None` takes the key out of the file, so the preset's own default stands.
     pub base_url: Option<&'a str>,
-    /// `None` leaves whatever credential is stored alone — which is what an
-    /// empty key field means, and why this is not an empty string.
-    pub api_key: Option<&'a str>,
+    pub api_key: KeyWrite<'a>,
     /// `None` leaves the name alone.
     pub display_name: Option<&'a str>,
+}
+
+/// What a write does to the stored credential.
+///
+/// Three states rather than an `Option<&str>`, because there are three things
+/// to say and an option carries the wrong two: an empty field means *keep* what
+/// is stored, and taking a credential away has to **remove the key** rather
+/// than write an empty one. `api_key = ""` is not "no credential" — it is a
+/// credential whose value is the empty string, which stops the env-var fallback
+/// and sends an empty header.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KeyWrite<'a> {
+    /// Leave whatever is in the file alone.
+    #[default]
+    Keep,
+    /// Store this one.
+    Set(&'a str),
+    /// Take it out of the file.
+    Clear,
 }
 
 /// The keys a model row owns.
@@ -73,8 +90,12 @@ pub fn put_account(document: &mut DocumentMut, id: &str, patch: &AccountPatch<'_
             table.remove("base_url");
         }
     }
-    if let Some(key) = patch.api_key {
-        set_key(table, "api_key", value(key));
+    match patch.api_key {
+        KeyWrite::Keep => {}
+        KeyWrite::Set(key) => set_key(table, "api_key", value(key)),
+        KeyWrite::Clear => {
+            table.remove("api_key");
+        }
     }
     if let Some(name) = patch.display_name {
         set_key(table, "display_name", value(name));
@@ -320,7 +341,7 @@ note = "hand-written"
             &AccountPatch {
                 provider: "openai-compatible",
                 base_url: Some("https://two.example.com/v1"),
-                api_key: None,
+                api_key: KeyWrite::Keep,
                 display_name: None,
             },
         )
@@ -348,7 +369,7 @@ note = "hand-written"
             &AccountPatch {
                 provider: "ollama",
                 base_url: None,
-                api_key: None,
+                api_key: KeyWrite::Keep,
                 display_name: None,
             },
         )
@@ -369,7 +390,7 @@ note = "hand-written"
             &AccountPatch {
                 provider: "openai-compatible",
                 base_url: Some("https://fresh.example.com/v1"),
-                api_key: Some("sk-fresh"),
+                api_key: KeyWrite::Set("sk-fresh"),
                 display_name: None,
             },
         )
@@ -441,6 +462,33 @@ note = "hand-written"
         let out = document.to_string();
         assert!(!out.contains("supports_vision"), "{out}");
         assert!(!out.contains("reasoning_effort"), "{out}");
+    }
+
+    /// Taking a credential away removes the key. An empty string left behind is
+    /// a credential whose value is "", which is not the same as none.
+    #[test]
+    fn clearing_a_credential_removes_the_key_rather_than_emptying_it() {
+        let mut document = doc();
+        put_account(
+            &mut document,
+            "mine",
+            &AccountPatch {
+                provider: "ollama",
+                base_url: None,
+                api_key: KeyWrite::Clear,
+                display_name: None,
+            },
+        )
+        .unwrap();
+        let out = document.to_string();
+        assert!(
+            !out.contains(r#"api_key = "sk-one""#) && !out.contains(r#"api_key = """#),
+            "this account's key is gone, not blanked: {out}"
+        );
+        assert!(
+            out.contains(r#"api_key = "sk-legacy""#),
+            "and only this account's: {out}"
+        );
     }
 
     #[test]
