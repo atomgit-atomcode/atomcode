@@ -30,7 +30,7 @@ const SCREEN: &[Command] = &[
     Command::new("reasoning", "思考:一行、全文、收起,循环"),
     Command::taking(
         "tools",
-        "[full|each|group]",
+        "[full|head|each|group]",
         "工具输出:全部、单个摘要、成组摘要;不带参数则循环",
     ),
     Command::new(
@@ -140,10 +140,11 @@ fn tool_output(what: &str) -> Result<Action, String> {
     }
     match what {
         "full" | "all" => Ok(Action::SetToolOutput(ToolOutput::Full)),
+        "head" | "preview" => Ok(Action::SetToolOutput(ToolOutput::Head)),
         "each" | "one" => Ok(Action::SetToolOutput(ToolOutput::Each)),
         "group" | "run" => Ok(Action::SetToolOutput(ToolOutput::Group)),
         _ => Err(format!(
-            "没有 `{what}` 这种工具输出形态;可以写 full(全部)/each(单个摘要)/group(成组摘要)"
+            "没有 `{what}` 这种工具输出形态;可以写 full(全部)/head(前后各20行)/each(单个摘要)/group(成组摘要)"
         )),
     }
 }

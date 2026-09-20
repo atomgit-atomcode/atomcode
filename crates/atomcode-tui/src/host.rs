@@ -74,6 +74,11 @@ pub enum ToolOutput {
     /// Every call in full — the default, and what `b5006d77` settled on.
     #[default]
     Full,
+    /// Expanded, but only just: the first and last twenty rows of each call,
+    /// a muted `已折叠 N 行，点击展开` between them. A call that fits is
+    /// drawn whole; one that does not is previewed, and clicking it opens it
+    /// in full.
+    Head,
     /// One summary row per call, no merging. A run of four is four rows.
     Each,
     /// One lid for a run of consecutive calls, however many there are.
@@ -83,6 +88,33 @@ pub enum ToolOutput {
     /// that; the screen does not second-guess them with a threshold, which
     /// would make the count on the lid depend on the count in it.
     Group,
+}
+
+/// How many rows of an expanded call [`ToolOutput::Head`] keeps at each end.
+const HEAD_ROWS: usize = 20;
+
+/// The row-count an expanded call draws in [`ToolOutput::Head`] once it is
+/// long enough to fold: the head rows, the fold note, the tail rows.
+const HEAD_TOTAL: usize = HEAD_ROWS * 2 + 1;
+
+/// How many rows a call previewed at [`ToolOutput::Head`] draws.
+fn head_rows(full: usize) -> usize {
+    if full <= HEAD_TOTAL {
+        full
+    } else {
+        HEAD_TOTAL
+    }
+}
+
+/// The shape one tool call is drawn in. See [`Presentation::tool_show`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolShow {
+    /// The whole call, commands and results.
+    Full,
+    /// The first and last [`HEAD_ROWS`] rows with a muted fold note between.
+    Preview,
+    /// One summary row.
+    Folded,
 }
 
 /// Which blocks are shown how. Kept here, keyed by kind, rather than on the
@@ -102,6 +134,12 @@ pub struct Presentation {
     /// and it already has a key (ctrl-t) — a click that did it would be a click
     /// that changed six other things the person was looking at.
     by_block: std::collections::HashMap<BlockId, bool>,
+    /// Tool calls hand-opened to the full drawing while the mode is
+    /// [`ToolOutput::Head`]. Head previews every call; this is the set that
+    /// said "but this one, whole". Cleared with the rest of the per-block
+    /// state on a mode change — a statement about one call does not survive
+    /// into a mode that decides for every call.
+    full_open: std::collections::HashSet<BlockId>,
     /// The turns that were taken back: their blocks are drawn as one dim line
     /// (`docs/adr/0024` §17). Here rather than only on the moment because the
     /// row count keys on this struct's revision, and folding a turn changes
@@ -155,6 +193,7 @@ impl Presentation {
             by_kind,
             tool_output: ToolOutput::default(),
             by_block: std::collections::HashMap::new(),
+            full_open: std::collections::HashSet::new(),
             undone: std::collections::BTreeSet::new(),
             revision: 0,
         }
@@ -211,10 +250,45 @@ impl Presentation {
         // A tool call's fold state is the mode's, not `by_kind`'s: the two
         // states of `Showing` cannot spell "one row each" apart from "one lid
         // for the run", and that distinction is the whole of [`ToolOutput`].
+        // Head is not folded either — a preview is most of the drawing — so
+        // only the two summary modes fold by default.
         if kind == "tool_call" {
-            return self.tool_output != ToolOutput::Full;
+            return matches!(self.tool_output, ToolOutput::Each | ToolOutput::Group);
         }
         self.showing(kind) == Showing::Folded
+    }
+
+    /// How much of one tool call the screen draws, the three shapes a call
+    /// can take: whole, previewed at [`ToolOutput::Head`], or a one-row
+    /// summary. `Full` and `Each`/`Group` spell two of these from the mode
+    /// alone; Head spells its third per call, because the whole point of the
+    /// mode is that most calls are previewed and one the reader opens is
+    /// whole.
+    ///
+    /// A hand fold (`by_block`) wins over everything: it is what a click said
+    /// about *this* call.
+    fn tool_show(&self, id: BlockId) -> ToolShow {
+        if self.by_block.get(&id).copied().unwrap_or(false) {
+            return ToolShow::Folded;
+        }
+        match self.tool_output {
+            ToolOutput::Full => ToolShow::Full,
+            ToolOutput::Head => {
+                if self.full_open.contains(&id) {
+                    ToolShow::Full
+                } else {
+                    ToolShow::Preview
+                }
+            }
+            ToolOutput::Each | ToolOutput::Group => ToolShow::Folded,
+        }
+    }
+
+    /// Whether this call draws as a Head preview — the clipped form with the
+    /// fold note — rather than whole or summarised. The row index and the
+    /// painter both ask, so the count and the picture agree.
+    fn previews(&self, id: BlockId, kind: &str) -> bool {
+        kind == "tool_call" && self.tool_show(id) == ToolShow::Preview
     }
 
     /// How a run of tool calls is drawn. See [`ToolOutput`].
@@ -260,14 +334,15 @@ impl Presentation {
     /// Per-block choices are dropped, because otherwise "unfold everything"
     /// would visibly not unfold everything.
     ///
-    /// A tool call is the one kind with three states to step through rather
-    /// than two, and it is a different three: `Full → Each → Group → Full`. The
+    /// A tool call is the one kind with four states to step through rather
+    /// than two, and they are its own: `Full → Head → Each → Group → Full`. The
     /// order runs from most detail to least and then back, so a press always
     /// answers "less of this, please" until there is no less to show.
     pub fn toggle(&mut self, kind: &'static str) {
         if kind == "tool_call" {
             self.set_tool_output(match self.tool_output {
-                ToolOutput::Full => ToolOutput::Each,
+                ToolOutput::Full => ToolOutput::Head,
+                ToolOutput::Head => ToolOutput::Each,
                 ToolOutput::Each => ToolOutput::Group,
                 ToolOutput::Group => ToolOutput::Full,
             });
@@ -295,8 +370,10 @@ impl Presentation {
         self.tool_output = to;
         // The per-block choices go with it: a call folded by hand is a
         // statement about *that* call, and it would survive into a mode whose
-        // whole point is to decide how every call is drawn.
+        // whole point is to decide how every call is drawn. The Head mode's
+        // hand-opened calls go too, for the same reason.
         self.by_block.clear();
+        self.full_open.clear();
         self.bump();
     }
 
@@ -566,13 +643,19 @@ fn drawn_call(slots: &[crate::block::Slot], i: usize, pres: &Presentation) -> bo
 
 /// The run of drawn calls starting at `start`, and the slot the scan stopped on.
 ///
-/// A hidden block is stepped over, not stopped at. A reader cannot see one — it
-/// draws no rows — so it is not a seam in what was done: two calls with a
+/// A block the reader cannot see is stepped over, not stopped at — a hidden
+/// slot draws no rows, so it is not a seam in what was done: two calls with a
 /// thought between them ran back to back, and the thought is not a reason to
 /// spend a second `●` on them. Counting a hidden slot as the end of a run put
 /// every call of a working session behind a lid of its own, because the model
 /// thinks between calls — four calls that ran back to back, drawn as four rows
 /// that each said `1`.
+///
+/// Anything the reader *can* see ends the run, and the model's own words
+/// between two calls are the common one. A lid is drawn at the run's last
+/// call, so a run drawn over its prose would put those words above the lid —
+/// said, to all appearances, before any of the work the lid stands for. The
+/// prose breaks the run precisely so it stays in the order it happened in.
 fn run_from(
     slots: &[crate::block::Slot],
     start: usize,
@@ -609,6 +692,12 @@ struct Run {
     /// where the lid is drawn: the lid only has the last call in hand, and the
     /// failures it has to report may all be in the calls before it.
     failed: usize,
+    /// Whether the run is still the newest thing on screen: nothing visible
+    /// follows its last call. A run followed by prose or a further turn is
+    /// history and collapses to the count; a run at the visible end of the
+    /// stream keeps drawing its last call, finished or not — the collapse is
+    /// for history, and history begins when something visible comes after.
+    live: bool,
 }
 
 /// Which slots a lid answers for.
@@ -648,7 +737,11 @@ impl Lids {
     }
 }
 
-fn lids(slots: &[crate::block::Slot], pres: &Presentation) -> Lids {
+fn lids(
+    slots: &[crate::block::Slot],
+    pres: &Presentation,
+    activity: crate::moment::Activity,
+) -> Lids {
     let mut runs: Vec<Option<Run>> = vec![None; slots.len()];
     let mut i = 0usize;
     while i < slots.len() {
@@ -674,10 +767,27 @@ fn lids(slots: &[crate::block::Slot], pres: &Presentation) -> Lids {
                         .is_some_and(|c| c.is_failed())
                 })
                 .count();
+            // Live while the turn is still running and nothing visible follows
+            // the run's last call. The turn ending collapses the lid even with
+            // nothing after it: the count is the settled form, and a turn that
+            // stopped leaves nothing in flight to keep drawing. A hidden slot
+            // contributes no rows, so it does not end the run's tenure as the
+            // newest thing on screen. `run_from` ended the run at `next`, so
+            // everything from there on is what follows it.
+            let live = activity == crate::moment::Activity::Working
+                && !slots[next..].iter().any(|s| {
+                    let b = s.block();
+                    !pres.is_hidden(b.kind())
+                        && !b
+                            .content
+                            .lines(&crate::block::RenderCtx::bare(1))
+                            .is_empty()
+                });
             let run = Run {
                 last: *members.last().expect("a run has a first member"),
                 count: members.len(),
                 failed,
+                live,
             };
             for m in members {
                 runs[m] = Some(run);
@@ -716,6 +826,8 @@ fn lid_row(
             kind,
             lid: None,
             lid_failed: 0,
+            lid_live: false,
+            preview: false,
             folded: true,
             undone: true,
         });
@@ -724,21 +836,41 @@ fn lid_row(
         // The last member of a merged run draws the lid, which stands for the
         // whole run.
         Some(run) => Some(SlotRows {
-            rows: lid_lines(slots, i, run.count, run.failed, room).len(),
+            rows: lid_lines(slots, i, run.count, run.failed, run.live, room).len(),
             kind,
             lid: Some(run.count),
             lid_failed: run.failed,
+            lid_live: run.live,
+            preview: false,
             folded: false,
             undone: false,
         }),
         // An earlier member of a run: the lid at the end of it already drew.
         None if lids.covers(i) => None,
+        // A call the Head mode previews: the full row count clipped to the
+        // two ends plus the fold note. Measured through `rows_at` so the
+        // clip and the painter's own drawing agree on where the ends fall.
+        None if pres.previews(b.id, kind) => {
+            let full = slots[i].rows_at(ctx).0;
+            Some(SlotRows {
+                rows: head_rows(full),
+                kind,
+                lid: None,
+                lid_failed: 0,
+                lid_live: false,
+                folded: false,
+                preview: full > HEAD_TOTAL,
+                undone: false,
+            })
+        }
         None if !b.content.always_open() && pres.is_block_folded(b.id, kind) => Some(SlotRows {
             rows: 1,
             kind,
             lid: None,
             lid_failed: 0,
+            lid_live: false,
             folded: true,
+            preview: false,
             undone: false,
         }),
         None => Some(SlotRows {
@@ -746,7 +878,9 @@ fn lid_row(
             kind,
             lid: None,
             lid_failed: 0,
+            lid_live: false,
             folded: false,
+            preview: false,
             undone: false,
         }),
     }
@@ -757,15 +891,18 @@ fn lid_row(
 /// `failed` is counted over the whole run, not read off the last call: the lid
 /// draws the last call's result and nothing else, so a run whose third call
 /// failed and whose fourth succeeded would otherwise read as one that did not.
+/// `live` is whether the run is still the newest thing on screen: a live lid
+/// draws the call in flight, a settled one the count.
 fn lid_lines(
     slots: &[crate::block::Slot],
     last: usize,
     count: usize,
     failed: usize,
+    live: bool,
     w: u16,
 ) -> Vec<crate::frame::Line> {
     match slots[last].block().content.as_tool_call() {
-        Some(call) => crate::content::ToolCallBlock::group_lines(call, count, failed, w),
+        Some(call) => crate::content::ToolCallBlock::group_lines(call, count, failed, live, w),
         // Unreachable while `behind_a_lid` and `as_tool_call` agree; a row of
         // nothing is what keeps a disagreement from taking the screen down.
         None => Vec::new(),
@@ -777,8 +914,9 @@ fn lid_lines(
 /// The same run `lids` would merge, asked from a block instead of from the
 /// stream: one call alone for anything that is not a call, so a click on prose
 /// or on a thought folds exactly what it landed on. Same membership rule — a
-/// hidden block is stepped over — because a lid that says `4 个工具` and then
-/// hands over three of them is a lie about what was behind it.
+/// visible block stops the run, a hidden one is stepped over — because a lid
+/// that says `4 个工具` and then hands over three of them is a lie about what
+/// was behind it.
 fn run_around(
     slots: &[crate::block::Slot],
     pres: &Presentation,
@@ -1032,6 +1170,12 @@ struct RowIndex {
     /// table exists to avoid. See [`crate::block::ShapeCaps`].
     caps: crate::block::ShapeCaps,
     presentation: u64,
+    /// Whether the turn was still running when this index was built. It is
+    /// part of the key for the same reason the presentation revision is: a
+    /// live run's lid draws the call in flight (two rows), and the turn
+    /// ending collapses it to the count (one row) — an answer that changes
+    /// for every slot at once, without any block or fold changing.
+    activity: crate::moment::Activity,
     /// One entry per slot measured so far, in slot order. May be shorter than
     /// the stream while entries are being added at the end.
     measured: Vec<Measured>,
@@ -1100,6 +1244,14 @@ struct SlotRows {
     /// reason: the walk redraws the lid from this table, and the count it puts
     /// on the row has to be the one the measurement was taken with.
     lid_failed: usize,
+    /// Whether that run was still the newest thing on screen when measured —
+    /// the lid drawn as the call in flight rather than the count. Carried for
+    /// the same reason: the walk redraws from this table, not from the run.
+    lid_live: bool,
+    /// Whether this slot is drawn as a Head preview — `rows` is the clipped
+    /// count and the painter has to clip the drawing the same way. `false`
+    /// when the whole call fits, so no note is drawn for it.
+    preview: bool,
     /// Whether it is drawn as a one-row summary.
     folded: bool,
 }
@@ -1188,6 +1340,7 @@ impl Host {
                 width: 0,
                 caps: crate::block::ShapeCaps::of(&crate::caps::Caps::default()),
                 presentation: 0,
+                activity: crate::moment::Activity::default(),
                 measured: Vec::new(),
                 rows: Vec::new(),
                 skip_from: Vec::new(),
@@ -1234,6 +1387,7 @@ impl Host {
             width: 0,
             caps: crate::block::ShapeCaps::of(&crate::caps::Caps::default()),
             presentation: 0,
+            activity: crate::moment::Activity::default(),
             measured: Vec::new(),
             rows: Vec::new(),
             skip_from: Vec::new(),
@@ -3051,6 +3205,7 @@ impl Host {
         rect: Rect,
         scroll: usize,
         caps: crate::block::ShapeCaps,
+        activity: crate::moment::Activity,
     ) -> (Vec<Line>, Vec<RowOwner>) {
         let stream = self.stream.read().expect("stream poisoned");
         let pres = self.presentation.read().expect("presentation poisoned");
@@ -3106,6 +3261,7 @@ impl Host {
             },
             stream.slots(),
             &pres,
+            activity,
         );
 
         // **Start where the window starts.** Everything newer than this is
@@ -3171,7 +3327,14 @@ impl Host {
                 // the last call, so a click anywhere on the lid folds the run
                 // that drew it — which is the only thing that click could mean.
                 own = Some((block.id, kind));
-                Arc::new(lid_lines(stream.slots(), i, count, entry.lid_failed, room))
+                Arc::new(lid_lines(
+                    stream.slots(),
+                    i,
+                    count,
+                    entry.lid_failed,
+                    entry.lid_live,
+                    room,
+                ))
             } else if entry.undone {
                 // Dimmed as well as folded: it is still there to read, and it
                 // is no longer what the model sees.
@@ -3222,9 +3385,31 @@ impl Host {
                 // can see this block — and rendering is the one part of this walk
                 // that cannot come from a table. Still through `rows_at`, so a
                 // growing answer extends its live cache in place.
-                match slot.rows_at(&ctx).1 {
+                let lines = match slot.rows_at(&ctx).1 {
                     Some(lines) => lines,
                     None => Arc::new(block.content.lines(&ctx)),
+                };
+                // A Head preview clips the drawing to the two ends, with the
+                // muted fold note between them — the row the index counted as
+                // one of `head_rows`, so the count and the picture agree. The
+                // note belongs to the block (a click on it opens the call in
+                // full), and its pale background is what makes it read as a
+                // seam in the call rather than as output.
+                if entry.preview {
+                    let mut clipped: Vec<Line> = lines[..HEAD_ROWS.min(lines.len())].to_vec();
+                    let hidden = lines.len() - 2 * HEAD_ROWS;
+                    // Muted text on the panel ground: a seam in the call, not
+                    // output — and quiet enough to read past.
+                    let note = Span::styled(
+                        format!("⋯ 已折叠 {hidden} 行，点击展开"),
+                        crate::theme::fg(crate::theme::Role::Muted)
+                            .bg(crate::frame::Color::role(crate::theme::Role::PanelBg)),
+                    );
+                    clipped.push(Line::from_spans(vec![note]).truncate(room as usize));
+                    clipped.extend(lines[lines.len() - HEAD_ROWS..].to_vec());
+                    Arc::new(clipped)
+                } else {
+                    lines
                 }
             };
             if lines.is_empty() {
@@ -3339,8 +3524,12 @@ impl Host {
                     // frame it did before the split existed.
                     let heights = self.tail_heights_of(&tail, rect.w, &moment);
                     let pane = Self::pane_geometry(rect, moment.scroll.0, &heights);
-                    let (lines, owners) =
-                        self.stream_lines(pane.block_rect, pane.block_scroll, caps);
+                    let (lines, owners) = self.stream_lines(
+                        pane.block_rect,
+                        pane.block_scroll,
+                        caps,
+                        moment.activity,
+                    );
                     *self.hits.lock().expect("hits poisoned") = Hits {
                         rect: pane.block_rect,
                         rows: owners,
@@ -3633,7 +3822,7 @@ impl Host {
         slots: &[crate::block::Slot],
         pres: &Presentation,
     ) -> Vec<Option<SlotRows>> {
-        let lids = lids(slots, pres);
+        let lids = lids(slots, pres, crate::moment::Activity::Working);
         (0..slots.len())
             .map(|i| {
                 let b = slots[i].block();
@@ -3679,16 +3868,22 @@ impl Host {
         ctx: &crate::block::RenderCtx,
         slots: &[crate::block::Slot],
         pres: &Presentation,
+        activity: crate::moment::Activity,
     ) -> std::sync::MutexGuard<'a, RowIndex> {
         let mut idx = self.row_index.lock().expect("row index poisoned");
-        if idx.width != ctx.width || idx.caps != ctx.caps || idx.presentation != pres.revision() {
+        if idx.width != ctx.width
+            || idx.caps != ctx.caps
+            || idx.presentation != pres.revision()
+            || idx.activity != activity
+        {
             idx.measured.clear();
             idx.rows.clear();
             idx.width = ctx.width;
             idx.caps = ctx.caps;
             idx.presentation = pres.revision();
+            idx.activity = activity;
         }
-        let lids = lids(slots, pres);
+        let lids = lids(slots, pres, activity);
         for i in 0..slots.len() {
             let slot = &slots[i];
             let b = slot.block();
@@ -3696,7 +3891,18 @@ impl Host {
             // Reuse only what settling froze at this exact width. A live block
             // can have grown since, and that is the whole reason it is not
             // cached.
+            //
+            // A slot of a tool run is never reused, settled or not: whether it
+            // draws a lid, and how many calls that lid names, is a fact about
+            // the *run* — and the run changes shape when a call lands in it
+            // without this slot's id changing at all. The lid the run used to
+            // draw here would ride its cached entry past the new lid drawn at
+            // the run's new last call, and the screen would show both. Tool
+            // slots are a small fraction of the stream; the prose this table
+            // exists to skip is untouched.
+            let in_a_run = lids.runs.get(i).copied().flatten().is_some();
             let reusable = settled
+                && !in_a_run
                 && idx
                     .measured
                     .get(i)
@@ -3780,6 +3986,7 @@ impl Host {
                 &crate::block::RenderCtx { width, caps },
                 stream.slots(),
                 &pres,
+                moment.activity,
             )
             .total;
         // The tail is content too, so it counts towards what there is to read:
@@ -3871,19 +4078,52 @@ impl Host {
     /// where the lid is drawn, so the same call answers the same way whether it
     /// is behind a lid or open on its own.
     ///
+    /// Fold or unfold what a click landed on.
+    ///
+    /// A run of calls is drawn as one lid, so a click on it opens the whole run:
+    /// a lid that says `4 个工具` and then hands over one of them would be a lie
+    /// about what was behind it. The run is found by the block clicked, not by
+    /// where the lid is drawn, so the same call answers the same way whether it
+    /// is behind a lid or open on its own.
+    ///
     /// One state for the whole run, both ways: folding any call of an open run
     /// puts the run away. Keeping them in step is what makes the merged form a
     /// consequence of the fold state rather than a second thing to maintain.
+    ///
+    /// In the Head mode a call has three shapes rather than two, and the click
+    /// walks them: preview → full → folded → preview. The two per-call maps
+    /// (`by_block`, `full_open`) are written so the next shape follows from the
+    /// current one — a previewed call opens whole, a whole one folds, a folded
+    /// one comes back as the preview the mode draws by default.
     pub fn toggle_block(&self, id: BlockId, kind: &str) {
         let stream = self.stream.read().expect("stream poisoned");
         let slots = stream.slots();
         // Read first and let the guard go: the run is asked of the state a click
         // was answered against, and the write below needs the lock to itself.
-        let run = {
+        let (run, show) = {
             let pres = self.presentation.read().expect("presentation poisoned");
-            run_around(slots, &pres, id)
+            (run_around(slots, &pres, id), pres.tool_show(id))
         };
         let mut pres = self.presentation.write().expect("presentation poisoned");
+        if kind == "tool_call" && pres.tool_output == ToolOutput::Head {
+            for block in run {
+                match show {
+                    ToolShow::Preview => {
+                        pres.by_block.remove(&block);
+                        pres.full_open.insert(block);
+                    }
+                    ToolShow::Full => {
+                        pres.full_open.remove(&block);
+                        pres.by_block.insert(block, true);
+                    }
+                    ToolShow::Folded => {
+                        pres.by_block.remove(&block);
+                    }
+                }
+            }
+            pres.bump();
+            return;
+        }
         // `is_block_folded` and not the raw choice: a call nobody has spoken
         // about follows its kind, and every kind but reasoning defaults to
         // folded.
@@ -5903,9 +6143,15 @@ mod tests {
             let pres = h.presentation.read().unwrap();
             let slots = stream.slots();
             let walk = h.rows_by_walk(&ctx, slots, &pres);
-            let kept = h.row_index(&ctx, slots, &pres).rows.clone();
+            let kept = h
+                .row_index(&ctx, slots, &pres, crate::moment::Activity::Working)
+                .rows
+                .clone();
             h.forget_row_index();
-            let fresh = h.row_index(&ctx, slots, &pres).rows.clone();
+            let fresh = h
+                .row_index(&ctx, slots, &pres, crate::moment::Activity::Working)
+                .rows
+                .clone();
             assert_eq!(
                 kept, walk,
                 "{label}: the kept index disagrees with a fresh walk — a reuse \
@@ -5989,7 +6235,15 @@ mod tests {
         let narrow = 40u16;
         let narrow_ctx = crate::block::RenderCtx::bare(narrow);
         let walk = h.rows_by_walk(&narrow_ctx, stream.slots(), &pres);
-        let kept = h.row_index(&narrow_ctx, stream.slots(), &pres).rows.clone();
+        let kept = h
+            .row_index(
+                &narrow_ctx,
+                stream.slots(),
+                &pres,
+                crate::moment::Activity::Working,
+            )
+            .rows
+            .clone();
         assert_eq!(kept, walk, "resize: the index was not re-measured");
     }
 
@@ -6868,7 +7122,7 @@ mod tests {
     fn two_calls_in_a_row_stay_one_stretch_of_work() {
         // The other half of the same decision: a run of tools is one thought, so
         // nothing goes between them — not a blank row, and now not a row of their
-        // own each either. The run is drawn as one lid whose rows are adjacent.
+        // own each either. The run is drawn as one lid, one row once it is over.
         let h = fed();
         // Tool calls open by default now; ask for the merge lid explicitly, so
         // this test says which of the three modes it is about.
@@ -6886,18 +7140,13 @@ mod tests {
             .collect();
         let count = rows
             .iter()
-            .position(|r| r.contains("2 个工具"))
+            .position(|r| r.contains("已执行了 2 个工具"))
             .expect("the run's lid");
-        for row in &rows[count..count + 3] {
-            assert!(
-                !row.trim().is_empty(),
-                "a blank row was put inside the run: {:?}",
-                &rows[count..count + 3]
-            );
-        }
         assert!(
-            rows[count + 1].contains("ReadFile(b.rs)"),
-            "the last call is not the row under the count: {:?}",
+            !rows[count + 1..count + 3]
+                .iter()
+                .any(|r| r.contains("ReadFile")),
+            "a call of the run is still drawn under the lid: {:?}",
             &rows[count..count + 3]
         );
     }
@@ -6905,9 +7154,10 @@ mod tests {
     #[test]
     fn a_run_of_folded_calls_is_one_lid_that_says_how_many() {
         // 「合并工具块」. A run of calls is one piece of work, and four rows that
-        // each said nothing are four rows of noise. The lid says how many there
-        // were, and shows the *last* command and its result — the run ends with
-        // the thing that was being looked for.
+        // each said nothing are four rows of noise. Once the run is over the lid
+        // says how many there were — and nothing else: the commands were on
+        // screen while they ran, and the folded form is how much work there
+        // was, not the last command a second time.
         let h = fed();
         // Tool calls open by default now; ask for the merge lid explicitly, so
         // this test says which of the three modes it is about.
@@ -6925,22 +7175,19 @@ mod tests {
             .collect();
         let count = rows
             .iter()
-            .position(|r| r.contains("2 个工具"))
+            .position(|r| r.contains("已执行了 2 个工具"))
             .expect("the lid does not say how many calls there were");
         assert!(
             !rows.iter().any(|r| r.contains("ReadFile(a.rs)")),
             "the first call is still on the screen, so nothing merged:\n{rows:#?}"
         );
-        // The last call, on the rows under the count: the command, then what it
-        // returned — the same two rows a single folded call draws.
+        // The lid is one row, and it is the count's: no command and no result
+        // of the last call ride under it.
         assert!(
-            rows[count + 1].contains("ReadFile(b.rs)"),
-            "the last command is not under the count: {:?}",
-            &rows[count..count + 3]
-        );
-        assert!(
-            rows[count + 2].contains("失败"),
-            "the last call's result is not under it: {:?}",
+            !rows[count + 1..count + 3]
+                .iter()
+                .any(|r| r.contains("ReadFile(b.rs)") || r.contains("失败")),
+            "the last call is drawn under the count: {:?}",
             &rows[count..count + 3]
         );
     }
@@ -6960,7 +7207,10 @@ mod tests {
             .set_tool_output(crate::host::ToolOutput::Group);
         let size = (80, 40);
         let before = h.compose(size).rows().join("\n");
-        assert!(before.contains("2 个工具"), "nothing merged:\n{before}");
+        assert!(
+            before.contains("已执行了 2 个工具"),
+            "nothing merged:\n{before}"
+        );
 
         let rect = h.compose(size).part("stream").unwrap().rect;
         // The count row is the lid's, and a click on it lands on the last call.
@@ -6970,6 +7220,16 @@ mod tests {
             .expect("the lid answers a click");
         h.toggle_block(id, kind);
 
+        let after = h.compose(size).rows().join("\n");
+        assert!(
+            !after.contains("已执行了 2 个工具"),
+            "the lid is still drawn after the click:\n{after}"
+        );
+        // Every call of the run is open: its command on one row and its result on
+        // the next. A call left folded would have put the result on the command's
+        // own row — which is exactly the difference this click has to make, and
+        // the reason a weaker assertion here would pass while one of the two
+        // calls was still behind a lid.
         let open = h
             .compose(size)
             .part("stream")
@@ -6978,16 +7238,6 @@ mod tests {
             .iter()
             .map(|l| l.plain())
             .collect::<Vec<_>>();
-        let text = open.join("\n");
-        assert!(
-            !text.contains("2 个工具"),
-            "the lid is still drawn after the click:\n{text}"
-        );
-        // Every call of the run is open: its command on one row and its result on
-        // the next. A call left folded would have put the result on the command's
-        // own row — which is exactly the difference this click has to make, and
-        // the reason a weaker assertion here would pass while one of the two
-        // calls was still behind a lid.
         for (name, result) in [
             ("ReadFile(a.rs)", "fn main() {}"),
             ("ReadFile(b.rs)", "no such file"),
@@ -6995,7 +7245,7 @@ mod tests {
             let head = open
                 .iter()
                 .position(|r| r.contains(name))
-                .unwrap_or_else(|| panic!("{name} never appeared:\n{text}"));
+                .unwrap_or_else(|| panic!("{name} never appeared:\n{after}"));
             assert!(
                 !open[head].contains(result),
                 "{name} is still a one-line lid: {:?}",
@@ -7011,10 +7261,14 @@ mod tests {
 
     #[test]
     fn only_consecutive_calls_share_a_lid() {
-        // The corpus has a second call after a notice and an injection. A lid
-        // that swallowed it would report `3 个工具` over three things that did not
-        // happen together.
+        // The corpus's turns are the seam: turn 1's two calls are one lid, and
+        // turn 2's lone call is drawn as itself — a lid that swallowed it would
+        // report `3 个工具` over two turns' work.
         let h = fed();
+        h.presentation
+            .write()
+            .unwrap()
+            .set_tool_output(crate::host::ToolOutput::Group);
         let rows: Vec<String> = h
             .compose((80, 40))
             .part("stream")
@@ -7024,13 +7278,199 @@ mod tests {
             .map(|l| l.plain())
             .collect();
         assert!(
+            rows.iter().any(|r| r.contains("已执行了 2 个工具")),
+            "turn 1's two calls are not one lid:\n{rows:#?}"
+        );
+        assert!(
             !rows.iter().any(|r| r.contains("3 个工具")),
-            "a lid swallowed a call from another run:\n{rows:#?}"
+            "a lid swallowed a call from another turn:\n{rows:#?}"
         );
         // The lone call is drawn as itself, with no count over it.
         assert!(
             rows.iter().any(|r| r.contains("看看那个目录")),
             "the second turn's call is missing:\n{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn prose_between_calls_ends_the_run_and_keeps_its_place() {
+        // A lid is drawn at the run's last call, so a run drawn across the
+        // model's own words would lift them above the lid — said, to all
+        // appearances, before any of the work around them. The prose ends the
+        // run precisely so it stays in the order it happened in: call, words,
+        // call — each side its own lid.
+        let h = fed();
+        h.presentation
+            .write()
+            .unwrap()
+            .set_tool_output(crate::host::ToolOutput::Group);
+        let rows: Vec<String> = h
+            .compose((80, 40))
+            .part("stream")
+            .expect("the conversation")
+            .lines
+            .iter()
+            .map(|l| l.plain())
+            .collect();
+        let prose = rows
+            .iter()
+            .position(|r| r.contains("Fixed it. 中文也要能画"))
+            .expect("the model's words are on screen");
+        let lids_before = rows[..prose]
+            .iter()
+            .filter(|r| r.contains("个工具"))
+            .count();
+        let lids_after = rows[prose..]
+            .iter()
+            .filter(|r| r.contains("个工具"))
+            .count();
+        assert!(
+            lids_before > 0 && lids_after == 0,
+            "the prose does not sit after the turn's only run: before={lids_before} \
+             after={lids_after}\n{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn the_run_stays_live_until_the_turn_ends_not_until_the_call_does() {
+        // 折叠成一行是为了展示简洁的历史；还在跑的东西不是历史。所以收敛
+        // 的判据是回合是否还在进行、run 后面有没有可见块，而不是最后一个
+        // 调用自己完成没有——A 完成、B 还没开始时，A 的执行仍应两行展示，
+        // 直到回合结束才收敛成计数。
+        let h = host();
+        h.set_activity(crate::moment::Activity::Working);
+        h.presentation
+            .write()
+            .unwrap()
+            .set_tool_output(crate::host::ToolOutput::Group);
+        let call = |id: &str| SessionEvent::AssistantMessage {
+            turn: 1,
+            round: 1,
+            text: String::new(),
+            reasoning: String::new(),
+            tool_calls: vec![atomcode_kernel::tool::ToolCall {
+                id: id.into(),
+                name: "read_file".into(),
+                arguments: format!(r#"{{"file_path":"{id}.rs"}}"#),
+            }],
+            reasoning_blocks: Vec::new(),
+            meta: None,
+        };
+        let result = |id: &str, text: &str| SessionEvent::ToolResultLogged {
+            turn: 1,
+            round: 1,
+            call_id: id.into(),
+            content: text.into(),
+            is_error: false,
+            images: Vec::new(),
+        };
+        // Two calls, both finished: the last call's result is on screen and
+        // no count anywhere — the turn is still going, so the run is not
+        // history yet.
+        h.absorb(&call("c1"));
+        h.absorb(&result("c1", "one"));
+        h.absorb(&call("c2"));
+        h.absorb(&result("c2", "two"));
+        let rows: Vec<String> = h
+            .compose((80, 40))
+            .part("stream")
+            .expect("the conversation")
+            .lines
+            .iter()
+            .map(|l| l.plain())
+            .collect();
+        assert!(
+            rows.iter().any(|r| r.contains("ReadFile(c2.rs)")),
+            "the finished call is not shown while the turn is still going:\n{rows:#?}"
+        );
+        assert!(
+            !rows.iter().any(|r| r.contains("个工具")),
+            "the run collapsed to history while the turn is still going:\n{rows:#?}"
+        );
+
+        // The turn ends: nothing is in flight any more, and the run is
+        // history — the count.
+        h.set_activity(crate::moment::Activity::Idle);
+        let rows: Vec<String> = h
+            .compose((80, 40))
+            .part("stream")
+            .expect("the conversation")
+            .lines
+            .iter()
+            .map(|l| l.plain())
+            .collect();
+        assert!(
+            rows.iter().any(|r| r.contains("已执行了 2 个工具")),
+            "the finished turn did not collapse to the count:\n{rows:#?}"
+        );
+        assert!(
+            !rows.iter().any(|r| r.contains("ReadFile(c2.rs)")),
+            "the last call is still drawn after the turn ended:\n{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn a_call_added_to_a_run_takes_the_lid_with_it() {
+        // The row index keeps a settled slot's measurement across frames —
+        // that is what makes scrolling cheap — and a lid's slot used to ride
+        // that cache: the run grew, the lid moved to the new last call, and
+        // the old slot kept drawing the lid it had been measured with. The
+        // screen showed `2 个工具` and then `3 个工具` over one run. The index
+        // now never reuses a run's slots, so the lid must land on the new last
+        // call alone — after a compose has already drawn the shorter run.
+        let h = host();
+        h.presentation
+            .write()
+            .unwrap()
+            .set_tool_output(crate::host::ToolOutput::Group);
+        let call = |id: &str| SessionEvent::AssistantMessage {
+            turn: 1,
+            round: 1,
+            text: String::new(),
+            reasoning: String::new(),
+            tool_calls: vec![atomcode_kernel::tool::ToolCall {
+                id: id.into(),
+                name: "read_file".into(),
+                arguments: format!(r#"{{"file_path":"{id}.rs"}}"#),
+            }],
+            reasoning_blocks: Vec::new(),
+            meta: None,
+        };
+        let result = |id: &str| SessionEvent::ToolResultLogged {
+            turn: 1,
+            round: 1,
+            call_id: id.into(),
+            content: "ok".into(),
+            is_error: false,
+            images: Vec::new(),
+        };
+        h.absorb(&call("c1"));
+        h.absorb(&result("c1"));
+        h.absorb(&call("c2"));
+        h.absorb(&result("c2"));
+        let _ = h.compose((80, 40));
+
+        // The run grows by one call — the exact mutation the reuse missed.
+        h.absorb(&call("c3"));
+        h.absorb(&result("c3"));
+
+        let rows: Vec<String> = h
+            .compose((80, 40))
+            .part("stream")
+            .expect("the conversation")
+            .lines
+            .iter()
+            .map(|l| l.plain())
+            .collect();
+        let lids: Vec<&String> = rows.iter().filter(|r| r.contains("个工具")).collect();
+        assert_eq!(
+            lids.len(),
+            1,
+            "the old lid outlived the run it stood for:\n{rows:#?}"
+        );
+        assert!(
+            lids[0].contains("3 个工具"),
+            "the lid is not the run's new shape: {rows:?}"
         );
     }
 
@@ -7115,20 +7555,142 @@ mod tests {
     }
 
     #[test]
-    fn the_tool_output_modes_step_in_a_cycle_of_three() {
-        // `Full → Each → Group → Full`. The order runs from most detail to
-        // least, so every press but the last answers "less of this" — and the
-        // last has to come back round, or a person who overshot could not get
-        // back without restarting the screen.
+    fn the_tool_output_modes_step_in_a_cycle_of_four() {
+        // `Full → Head → Each → Group → Full`. The order runs from most detail
+        // to least, so every press but the last answers "less of this" — and
+        // the last has to come back round, or a person who overshot could not
+        // get back without restarting the screen.
         let h = fed();
         let mode = |h: &Host| h.presentation.read().unwrap().tool_output();
         assert_eq!(mode(&h), crate::host::ToolOutput::Full, "the default");
+        h.presentation.write().unwrap().toggle("tool_call");
+        assert_eq!(mode(&h), crate::host::ToolOutput::Head);
         h.presentation.write().unwrap().toggle("tool_call");
         assert_eq!(mode(&h), crate::host::ToolOutput::Each);
         h.presentation.write().unwrap().toggle("tool_call");
         assert_eq!(mode(&h), crate::host::ToolOutput::Group);
         h.presentation.write().unwrap().toggle("tool_call");
         assert_eq!(mode(&h), crate::host::ToolOutput::Full, "back to the start");
+    }
+
+    #[test]
+    fn head_previews_a_long_call_and_clicks_walk_the_three_shapes() {
+        // The Head mode keeps most of a long call on screen — the first and
+        // last twenty rows with a muted fold note between — and the click
+        // walks preview → full → folded → preview, so a reader who opened a
+        // call can still get back to the summary a further click away.
+        let h = host();
+        h.presentation
+            .write()
+            .unwrap()
+            .set_tool_output(crate::host::ToolOutput::Head);
+        let call = SessionEvent::AssistantMessage {
+            turn: 1,
+            round: 1,
+            text: String::new(),
+            reasoning: String::new(),
+            tool_calls: vec![atomcode_kernel::tool::ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                arguments: r#"{"command":"seq 1 60"}"#.into(),
+            }],
+            reasoning_blocks: Vec::new(),
+            meta: None,
+        };
+        let result = SessionEvent::ToolResultLogged {
+            turn: 1,
+            round: 1,
+            call_id: "c1".into(),
+            content: (1..=60)
+                .map(|n| format!("row {n}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            is_error: false,
+            images: Vec::new(),
+        };
+        h.absorb(&call);
+        h.absorb(&result);
+
+        let rows: Vec<String> = h
+            .compose((80, 80))
+            .part("stream")
+            .expect("the conversation")
+            .lines
+            .iter()
+            .map(|l| l.plain())
+            .collect();
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("已折叠") && r.contains("点击展开")),
+            "the fold note is not on screen:\n{rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("row 60")),
+            "the tail rows are not shown:\n{rows:#?}"
+        );
+        let clipped = rows.iter().filter(|r| r.contains("row ")).count();
+        assert!(
+            clipped < 60,
+            "the call is drawn whole, not previewed: {clipped} rows"
+        );
+
+        // Click: preview → full. `row 40` — mid-body, folded away before —
+        // appears.
+        let id = {
+            let stream = h.stream.read().unwrap();
+            stream.slots()[0].block().id
+        };
+        h.toggle_block(id, "tool_call");
+        let rows: Vec<String> = h
+            .compose((80, 80))
+            .part("stream")
+            .expect("the conversation")
+            .lines
+            .iter()
+            .map(|l| l.plain())
+            .collect();
+        assert!(
+            rows.iter().any(|r| r.contains("row 40")),
+            "the call did not open whole on the click:\n{rows:#?}"
+        );
+        assert!(
+            !rows.iter().any(|r| r.contains("已折叠")),
+            "the fold note outlived the opened call:\n{rows:#?}"
+        );
+
+        // Click again: full → folded (one summary row).
+        h.toggle_block(id, "tool_call");
+        let rows: Vec<String> = h
+            .compose((80, 80))
+            .part("stream")
+            .expect("the conversation")
+            .lines
+            .iter()
+            .map(|l| l.plain())
+            .collect();
+        assert!(
+            rows.iter().any(|r| r.contains("seq 1 60")),
+            "the summary row is gone:\n{rows:#?}"
+        );
+        assert!(
+            !rows.iter().any(|r| r.contains("row 40")),
+            "the call is still whole after the second click:\n{rows:#?}"
+        );
+
+        // Click a third time: folded → preview, the mode's default shape.
+        h.toggle_block(id, "tool_call");
+        let rows: Vec<String> = h
+            .compose((80, 80))
+            .part("stream")
+            .expect("the conversation")
+            .lines
+            .iter()
+            .map(|l| l.plain())
+            .collect();
+        assert!(
+            rows.iter().any(|r| r.contains("已折叠")),
+            "the call did not come back as a preview:\n{rows:#?}"
+        );
     }
 
     #[test]
@@ -7209,7 +7771,7 @@ mod tests {
             .collect();
         let count = rows
             .iter()
-            .position(|r| r.contains("2 个工具"))
+            .position(|r| r.contains("已执行了 2 个工具"))
             .expect("the lid does not say how many calls there were");
         assert!(
             rows[count].contains("1 失败"),

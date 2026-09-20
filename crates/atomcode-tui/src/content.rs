@@ -765,48 +765,54 @@ impl ToolCallBlock {
 
     /// A run of calls behind one lid.
     ///
-    /// The count is the headline: a run of calls is one piece of work, and what
-    /// a reader wants from a folded transcript is how much of it there was —
-    /// four calls that all said nothing are four rows of noise. The *last*
-    /// command is the one shown, because a run ends with the thing that was
-    /// being looked for, and it is that command whose result is on the line
-    /// under it.
+    /// While the run is still the newest thing on screen — `live`, decided by
+    /// the caller: nothing visible has followed it and the turn has not ended
+    /// — the lid *is* the call in flight: its command and its note, the same
+    /// two rows a single folded call draws. The reader is watching work
+    /// happen, and the rows have to keep up with the tools — when the next
+    /// call starts, the same two rows are redrawn for it, in place. A call
+    /// that merely finished does not collapse the lid: the collapse is for
+    /// *history*, and history begins when something visible comes after the
+    /// run.
     ///
-    /// Both of the last call's rows are its own, so the lid is the same two rows
-    /// a single folded call draws, with the count above them — folding a run
-    /// changes how many rows there are, not what the rows are.
+    /// Once the run has been followed, it is the count alone: `已执行了 N 个
+    /// 工具`. The commands were on screen while they ran, and a transcript
+    /// read after the fact wants how much work there was, not the last
+    /// command a second time — which is also why the count is the headline
+    /// and the failures ride it rather than taking a row of their own: *how
+    /// much ran* is what the row is for and *what broke* is the qualifier on
+    /// it.
     ///
-    /// The whole lid is at [`fold`]'s volume, and the count stays [`muted`]:
-    /// the count is a figure *about* the work rather than the work, and it was
-    /// already the quieter of the two — painting it in the heading role would
-    /// have made the folded line louder than the open one it replaces.
-    ///
-    /// A failure anywhere in the run is said on the count's own row, in the
-    /// alarm colour. The lid shows the *last* call's result and nothing else,
-    /// so without this a run whose third call failed and whose fourth
-    /// succeeded reads exactly like a run that never failed — and the red on a
-    /// failed call is the one thing a fold has to keep. The count stays the
-    /// headline; the failures ride it rather than taking a row of their own,
-    /// because *how much ran* is what the row is for and *what broke* is the
-    /// qualifier on it.
-    pub fn group_lines(last: &ToolCallBlock, count: usize, failed: usize, w: u16) -> Vec<Line> {
+    /// The failure suffix is in the alarm colour. The lid draws the *last*
+    /// call's outcome and nothing else of the members, so without this a run
+    /// whose third call failed and whose fourth succeeded reads exactly like
+    /// a run that never failed — and the red on a failed call is the one
+    /// thing a fold has to keep.
+    pub fn group_lines(
+        last: &ToolCallBlock,
+        count: usize,
+        failed: usize,
+        live: bool,
+        w: u16,
+    ) -> Vec<Line> {
+        if live {
+            let caps = Caps::default();
+            let lead = format!("{}{} ", " ".repeat(GUTTER), caps.g(Glyph::Gutter));
+            let mut out = last.head(w, &lead, muted(), fold());
+            out.push(last.note_line(w));
+            return out;
+        }
         let caps = Caps::default();
         let mut spans = vec![
             Span::styled(format!("{} ", caps.g(Glyph::ToolMark)), fold()),
-            Span::styled(format!("{count} 个工具"), muted()),
+            Span::styled(format!("已执行了 {count} 个工具"), muted()),
         ];
         if failed > 0 {
             spans.push(Span::styled(format!(" · {failed} 失败"), bad()));
         }
-        let mut out = vec![Line::from_spans(spans).truncate(w as usize)];
-        let lead = format!("{}{} ", " ".repeat(GUTTER), caps.g(Glyph::Gutter));
-        out.extend(last.head(w, &lead, muted(), fold()));
-        out.push(last.note_line(w));
-        out
+        vec![Line::from_spans(spans).truncate(w as usize)]
     }
 }
-
-// ---- what kind of tool call this is -------------------------------------
 
 /// How a tool call reads in the transcript.
 ///
@@ -2743,18 +2749,27 @@ mod tests {
             "a fold swallowed the one thing that had to survive it: {line:?}"
         );
 
-        // A run behind one lid is the same drawing, so it recedes too.
-        let lid = ToolCallBlock::group_lines(&failed, 3, 0, 80);
-        let head = lid.iter().find(|l| l.plain().contains("ReadFile"));
-        let head = head.expect("the last call under the lid");
-        let named = head
-            .spans
-            .iter()
-            .find(|s| s.text.contains("ReadFile"))
-            .expect("the tool's name");
+        // A run still at the visible end of the stream draws the call in
+        // flight — the same two rows a single folded call draws, finished or
+        // not; once something visible has followed it, the lid is the count
+        // alone. The receding volume is the folded call's question
+        // (`summary`), so here it is only asserted that the two forms stay
+        // the two forms.
+        let running = ToolCallBlock::group_lines(&pending, 3, 0, true, 80);
+        assert!(
+            running.iter().any(|l| l.plain().contains("ReadFile")),
+            "a live run does not show the call in it: {running:?}"
+        );
+        assert!(running.len() >= 2, "the call in flight lost its note");
+        let done = ToolCallBlock::group_lines(&failed, 3, 0, false, 80);
         assert_eq!(
-            named.style.fg, heading,
-            "a merged run is not folded like a single one: {head:?}"
+            done.len(),
+            1,
+            "a followed run is the count and nothing else: {done:?}"
+        );
+        assert!(
+            done[0].plain().contains("已执行了 3 个工具"),
+            "the settled lid does not say how much ran: {done:?}"
         );
     }
 

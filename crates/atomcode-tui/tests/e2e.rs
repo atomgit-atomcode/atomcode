@@ -1134,6 +1134,11 @@ async fn folding_changes_what_is_shown_and_not_what_was_said() {
     s.quiet().await;
 
     let before = s.screen();
+    // The cycle is `Full → Head → Each → Group`; the first press previews
+    // (identical on screen for a call this short), the second summarises
+    // each call to one row.
+    s.term.press(KeyPress::ctrl('t'));
+    s.quiet().await;
     s.term.press(KeyPress::ctrl('t')); // fold tool calls
     s.quiet().await;
     let after = s.screen();
