@@ -459,6 +459,11 @@ impl Waterfall<AgentRequest> for Bridge {
             .on_request(&req.messages, &req.tools, &req.options, &ctx)
             .await;
 
+        // The span a `MessageMeta` calls `elapsed_ms`: the request, from handing
+        // it on to getting an answer back. The same one `agent_loop`'s
+        // `response_meta` measures for the session log — measured again here
+        // because the meta that reaches a hook is built here, not there.
+        let started = std::time::Instant::now();
         match next.run(req).await {
             Ok(response) => {
                 let mut message =
@@ -476,6 +481,16 @@ impl Waterfall<AgentRequest> for Bridge {
                     tokens,
                     used_tokens: tokens.prompt,
                     ctx_window,
+                    // Both were `..default()` — that is, zero — until the
+                    // telemetry parity harness caught it: every `llm_chat` the
+                    // product reported carried `duration_ms = 0`, so the whole
+                    // latency series was flat. Nothing failed; the field was
+                    // simply never filled in on this path.
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                    utilization: match ctx_window {
+                        0 => 0.0,
+                        window => tokens.prompt as f32 / window as f32,
+                    },
                     round: req.round,
                     turn_id: req.turn,
                     request_id: ctx.request_id + 1,

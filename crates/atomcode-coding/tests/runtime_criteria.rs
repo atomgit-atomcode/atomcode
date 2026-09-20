@@ -44,6 +44,11 @@ struct Recorder {
     window: std::sync::atomic::AtomicU32,
     /// Prompt tokens every answer reports. `0` reports the usual 10.
     prompt_tokens: std::sync::atomic::AtomicU32,
+    /// How long an answer takes. `0`, instantly, which is what every scenario
+    /// but the one about measuring wants. A REAL sleep: what is under test is
+    /// whether the elapsed time was measured at all, and a virtual clock would
+    /// make that assertion vacuous (AGENTS.md,「下界断言…这种测试不要转」).
+    answer_delay_ms: std::sync::atomic::AtomicU64,
 }
 
 impl Recorder {
@@ -376,6 +381,10 @@ impl LlmProvider for RecordingProvider {
             Some(m) if m.role == Role::Tool => StreamEvent::TextDelta(format!("saw: {}", m.text)),
             _ => StreamEvent::TextDelta(format!("answer {n}")),
         };
+        let delay = self.0.answer_delay_ms.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
         Ok(Box::pin(futures::stream::iter(vec![
             first,
             StreamEvent::Usage(TokenUsage {
@@ -3825,6 +3834,61 @@ async fn sink_is_live(captured: &Arc<tokio::sync::Mutex<Vec<atomcode_telemetry::
     false
 }
 
+/// A model round reports how long it took.
+///
+/// `llm_chat.duration_ms` is the only latency the product reports, and on this
+/// build it was `0` for every round: the meta a hook is handed is built in
+/// `host_rows.rs`, separately from the one `agent_loop` builds for the session
+/// log, and it filled the field from `MessageMeta::default()`. Nothing failed —
+/// the number was simply always zero, which a dashboard reads as "instant".
+///
+/// Found by `scripts/telemetry-parity.py`, which ran this build and 5.1.0
+/// against a model that takes 50ms and got `0` from one and `50` from the
+/// other. Pinned here so it cannot come back quietly.
+///
+/// A real sleep, not a virtual clock: this is a LOWER bound — "it must have
+/// actually measured something" — and under `start_paused` a `std::Instant`
+/// barely moves, which would make the assertion vacuous.
+async fn a_model_round_reports_how_long_it_took() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    recorder
+        .answer_delay_ms
+        .store(60, std::sync::atomic::Ordering::SeqCst);
+    let (telemetry, captured) = atomcode_telemetry::Telemetry::in_memory("test".into());
+    let mut start = start(env.project.path(), &recorder, SessionMode::Fresh);
+    start.agent.telemetry = Some(telemetry);
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+
+    turn(&mut runtime, "hello").await;
+
+    let mut durations = Vec::new();
+    for _ in 0..200 {
+        durations = captured
+            .lock()
+            .await
+            .iter()
+            .filter_map(|record| match &record.event {
+                atomcode_telemetry::Event::LlmChat { duration_ms, .. } => Some(*duration_ms),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if !durations.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    runtime.handle.shutdown().await.unwrap();
+
+    assert!(!durations.is_empty(), "no model round was metered at all");
+    // Comfortably under the 60ms the provider slept, so a slow machine cannot
+    // make this flaky, and comfortably over zero, which is what it reported.
+    assert!(
+        durations.iter().all(|ms| *ms >= 30),
+        "a round that took 60ms was reported as {durations:?}ms"
+    );
+}
+
 /// A server that could not be started is reported.
 ///
 /// The retired core engine reported every connection attempt, success or
@@ -4022,6 +4086,7 @@ mod criteria {
         an_mcp_servers_tools_are_offered_and_run,
         withdrawing_mcp_takes_the_tools_off_the_model,
         a_failed_mcp_connection_is_metered,
+        a_model_round_reports_how_long_it_took,
         a_written_task_list_outlives_the_messages_it_came_from,
         the_retry_budget_follows_a_model_switch,
         a_meaningless_temperature_is_ignored_rather_than_breaking_a_model_switch,
