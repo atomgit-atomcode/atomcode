@@ -58,11 +58,35 @@ impl View for Settings {
         if w == 0 || vp.rect.h == 0 {
             return Vec::new();
         }
-        let rows = layout(&vp.moment.settings, panel, w, vp.rect.h as usize);
+        let rows = layout(
+            &vp.moment.settings,
+            panel,
+            vp.moment.usage.as_ref(),
+            w,
+            vp.rect.h as usize,
+        );
         rows.into_iter()
             .map(|row| match row {
                 Row::Header => header_line(panel.tab, w, vp.moment.caps),
                 Row::Rule => panel_edge(w, vp.moment.caps),
+                Row::Usage { line } => match line {
+                    UsageLine::Head(text) => Line::styled(
+                        width::take_width(&format!("  {text}"), w),
+                        theme::fg(Role::Brand).bold(),
+                    ),
+                    UsageLine::Bar { share, about } => usage_bar(share, &about, w, vp.moment.caps),
+                    UsageLine::Note(text) => Line::styled(
+                        width::take_width(&format!("  {text}"), w),
+                        theme::fg(Role::Muted),
+                    ),
+                    UsageLine::Spark {
+                        values,
+                        from,
+                        to,
+                        peak,
+                    } => usage_spark(&values, &from, &to, peak, w, vp.moment.caps),
+                    UsageLine::Gap => Line::empty(),
+                },
                 Row::Elsewhere { tab } => Line::styled(
                     width::take_width(&format!("  {}", elsewhere(tab)), w),
                     theme::fg(Role::Muted),
@@ -126,7 +150,7 @@ impl View for Settings {
 /// that landed on one setting and a highlight drawn on another is the failure
 /// this shape rules out by construction rather than by keeping two formulas in
 /// step.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 enum Row {
     /// The panel's name and its pages, on one row: `设置  Config  Status …`.
     ///
@@ -144,6 +168,16 @@ enum Row {
     /// page of prose costs nothing to add.
     Elsewhere {
         tab: crate::settings::Tab,
+    },
+    /// One line of the Usage page, already worded and measured.
+    ///
+    /// Carries the text rather than an index for the reason [`Elsewhere`] does:
+    /// the page is prose and bars, with no cursor and nothing to filter, and one
+    /// row per line is what [`fit`] already understands.
+    ///
+    /// [`Elsewhere`]: Row::Elsewhere
+    Usage {
+        line: UsageLine,
     },
     /// A margin row, above the box or above the list.
     Blank,
@@ -195,11 +229,17 @@ const BORDER_COL: usize = 0;
 /// `h` of `usize::MAX` is "how many would it take", which is what `height` asks;
 /// the cut only matters once the tail has been rationed and the panel has less
 /// room than it asked for.
-fn layout(settings: &SettingsView, panel: &Panel, w: usize, h: usize) -> Vec<Row> {
+fn layout(
+    settings: &SettingsView,
+    panel: &Panel,
+    usage: Option<&crate::settings::UsagePage>,
+    w: usize,
+    h: usize,
+) -> Vec<Row> {
     if w == 0 || h == 0 {
         return Vec::new();
     }
-    let mut rows = rows_for(settings, panel);
+    let mut rows = rows_for(settings, panel, usage);
     // A shorter list is a shorter list inside the same box, not a shorter box.
     //
     // The height is anchored when the panel opens ([`anchor`]), so the rows a
@@ -234,7 +274,7 @@ fn layout(settings: &SettingsView, panel: &Panel, w: usize, h: usize) -> Vec<Row
 /// not given a second row. One row per setting, always — which is also what
 /// makes the anchor a number that can be computed once.
 fn anchor(settings: &SettingsView) -> usize {
-    rows_for(settings, &Panel::new()).len()
+    rows_for(settings, &Panel::new(), None).len()
 }
 
 /// The panel's rows as the query leaves them, before any padding or cutting.
@@ -243,7 +283,11 @@ fn anchor(settings: &SettingsView) -> usize {
 /// each of them is at a given width is the caller's business — [`anchor`] counts
 /// them for a width it is given. A width parameter here would be accepted and
 /// ignored, which is the shape of a bug waiting for someone to rely on it.
-fn rows_for(settings: &SettingsView, panel: &Panel) -> Vec<Row> {
+fn rows_for(
+    settings: &SettingsView,
+    panel: &Panel,
+    usage: Option<&crate::settings::UsagePage>,
+) -> Vec<Row> {
     let shown = settings.matching(&panel.query);
     // The name and the pages on one row, then the rule that closes the header —
     // what the panel is, and which page of it, before anything it has to say.
@@ -253,6 +297,16 @@ fn rows_for(settings: &SettingsView, panel: &Panel) -> Vec<Row> {
     // The other pages are not the settings list, so the search box goes with
     // them: a filter with nothing to filter would be a box that collects
     // characters and changes nothing.
+    if panel.tab == Tab::Usage {
+        rows.push(Row::Blank);
+        rows.extend(
+            usage_lines(usage)
+                .into_iter()
+                .map(|line| Row::Usage { line }),
+        );
+        rows.extend([Row::Blank, Row::Rule]);
+        return rows;
+    }
     if panel.tab != Tab::Config {
         rows.push(Row::Blank);
         rows.push(Row::Elsewhere { tab: panel.tab });
@@ -432,10 +486,297 @@ fn elsewhere(tab: crate::settings::Tab) -> &'static str {
         crate::settings::Tab::Status => {
             "这个会话跑在什么上面(模型、推理档、压缩,来自 agent 的描述)"
         }
-        crate::settings::Tab::Usage => "本会话用掉的 token(来自会话日志里的事实)",
+        // Unreachable now: the Usage page draws itself. Kept total for the same
+        // reason `Config` is — and the wording corrected, because what this page
+        // turned out to be is the account's allowance, not this session's tokens.
+        crate::settings::Tab::Usage => "",
         crate::settings::Tab::Stats => "这次会话干了什么(回合数、工具调用、耗时,从日志折出来)",
     }
 }
+
+/// A line of the Usage page.
+#[derive(Clone, Debug, PartialEq)]
+enum UsageLine {
+    /// A section's name, in the panel's own heading style.
+    Head(String),
+    /// A bar, how much of it is filled, and what that measures.
+    ///
+    /// `share` is 0..=1. `about` is the words beside it — and they carry what
+    /// the bar is *of*, because two bars on this page measure different things
+    /// and a reader cannot tell them apart from the bar alone.
+    Bar { share: f32, about: String },
+    /// An ordinary line, dimmed.
+    Note(String),
+    /// A day-by-day series, drawn as one row of blocks with its span under it.
+    ///
+    /// One row rather than the classic front end's four-row plot: this page is
+    /// a panel that shares the screen with a conversation, and the question it
+    /// answers — "is it climbing, and when was the spike" — is answered by the
+    /// shape alone. The peak is said in words beside it, because a block row
+    /// has no axis to read a number off.
+    Spark {
+        values: Vec<u64>,
+        from: String,
+        to: String,
+        peak: u64,
+    },
+    /// A blank line inside the page.
+    Gap,
+}
+
+/// The Usage page, as lines.
+///
+/// **The two bars are not the same measurement**, and the wording is where that
+/// is kept honest:
+///
+/// * the context bar is a real proportion — the host says how many tokens of the
+///   window this session is using;
+/// * an allowance bar is what the **account service** counted — `used_percent`,
+///   which travels from `status_v2` through the host. It was being dropped on
+///   the way (`daemon/runtime_host.rs`), which is why the first version of this
+///   page drew time through the window instead and had to say so. A bar with no
+///   percentage behind it is not drawn at all: an empty track reads as "none
+///   used", and not knowing is a different thing from zero.
+fn usage_lines(page: Option<&crate::settings::UsagePage>) -> Vec<UsageLine> {
+    let Some(page) = page else {
+        return vec![UsageLine::Note("正在问宿主…".into())];
+    };
+    let mut out = Vec::new();
+
+    if let Some(context) = page.context.as_ref() {
+        out.push(UsageLine::Head("本会话".into()));
+        let share = if context.window == 0 {
+            0.0
+        } else {
+            context.used as f32 / context.window as f32
+        };
+        out.push(UsageLine::Bar {
+            share,
+            about: format!(
+                "上下文已用 {:.0}% · {} / {}",
+                share * 100.0,
+                crate::content::token_count(context.used),
+                crate::content::token_count(context.window)
+            ),
+        });
+        out.push(UsageLine::Note(format!("模型 {}", context.model)));
+        out.push(UsageLine::Gap);
+    }
+
+    // Said, not returned on: an account with no metered windows may still have
+    // spent something, and the first version of this bailed out here — so a
+    // host that reported per-model figures and no windows drew none of them.
+    if page.windows.is_empty() {
+        out.push(UsageLine::Head("额度".into()));
+        out.push(UsageLine::Note("这个宿主不计额度".into()));
+        out.push(UsageLine::Gap);
+    }
+
+    for window in &page.windows {
+        out.push(UsageLine::Head(window.label.clone()));
+        match window.used_percent {
+            // What the account service counted. The bar is *of the allowance*,
+            // which is the thing a person opened this page to see.
+            Some(percent) => {
+                let counted = match (window.calls_used, window.call_limit) {
+                    (Some(used), Some(limit)) => format!(" · {used} / {limit} 次"),
+                    (None, Some(limit)) => format!(" · 上限 {limit} 次"),
+                    _ => String::new(),
+                };
+                out.push(UsageLine::Bar {
+                    share: f32::from(percent) / 100.0,
+                    about: format!("用掉 {percent}%{counted}"),
+                });
+            }
+            // No bar at all rather than an empty one: an empty track reads as
+            // "none used", and not knowing is a different thing from zero.
+            None => out.push(UsageLine::Note("这个窗口没报用量".into())),
+        }
+        let mut tail = Vec::new();
+        if window.exhausted {
+            tail.push("用完了".to_string());
+        }
+        if !window.resets_at.is_empty() {
+            tail.push(format!("{} 重置", window.resets_at));
+        }
+        if window.resets_in_seconds > 0 {
+            tail.push(format!(
+                "还有 {}",
+                crate::text::spoken_duration(window.resets_in_seconds as u64)
+            ));
+        }
+        if !tail.is_empty() {
+            out.push(UsageLine::Note(tail.join(" · ")));
+        }
+        out.push(UsageLine::Gap);
+    }
+
+    if let Some(stats) = page.stats.as_ref() {
+        out.push(UsageLine::Head("总览".into()));
+        let span = match (stats.from.is_empty(), stats.to.is_empty()) {
+            (false, false) => format!("{} 到 {}", stats.from, stats.to),
+            _ => String::new(),
+        };
+        let mut overview = format!(
+            "{} tokens · {} 次请求",
+            crate::content::token_count_u64(stats.total_tokens),
+            stats.total_requests
+        );
+        if !span.is_empty() {
+            overview.push_str(&format!(" · {span}"));
+        }
+        out.push(UsageLine::Note(overview));
+        // Days with anything on them, out of the days the span covers: the one
+        // figure the series says that the totals do not.
+        let active = stats.daily.iter().filter(|d| d.tokens > 0).count();
+        if !stats.daily.is_empty() {
+            out.push(UsageLine::Note(format!(
+                "{active} / {} 天有用量",
+                stats.daily.len()
+            )));
+        }
+        out.push(UsageLine::Gap);
+
+        if !stats.daily.is_empty() {
+            out.push(UsageLine::Head("每天用掉多少".into()));
+            out.push(UsageLine::Spark {
+                values: stats.daily.iter().map(|d| d.tokens).collect(),
+                from: stats
+                    .daily
+                    .first()
+                    .map(|d| d.date.clone())
+                    .unwrap_or_default(),
+                to: stats
+                    .daily
+                    .last()
+                    .map(|d| d.date.clone())
+                    .unwrap_or_default(),
+                peak: stats.daily.iter().map(|d| d.tokens).max().unwrap_or(0),
+            });
+            out.push(UsageLine::Gap);
+        }
+
+        if !stats.models.is_empty() {
+            out.push(UsageLine::Head("各模型用量".into()));
+            let biggest = stats.models.first().map(|m| m.tokens).unwrap_or(0).max(1);
+            for model in &stats.models {
+                let share = if stats.total_tokens == 0 {
+                    0.0
+                } else {
+                    model.tokens as f32 / stats.total_tokens as f32
+                };
+                out.push(UsageLine::Bar {
+                    // Against the biggest, not against the total: the bars are
+                    // there to be compared with each other, and a set where the
+                    // top one is a quarter of the track wastes the track.
+                    share: model.tokens as f32 / biggest as f32,
+                    about: format!(
+                        "{} · {} tokens · {} 次 · {:.0}%",
+                        model.name,
+                        crate::content::token_count_u64(model.tokens),
+                        model.requests,
+                        share * 100.0
+                    ),
+                });
+            }
+            out.push(UsageLine::Gap);
+        }
+    }
+
+    if matches!(out.last(), Some(UsageLine::Gap)) {
+        out.pop();
+    }
+    out
+}
+
+/// How wide the bar itself is drawn, in cells.
+///
+/// Fixed rather than a share of the panel: two bars of different widths cannot
+/// be compared by eye, and comparing them is the only reason to draw two.
+const BAR_CELLS: usize = 28;
+
+/// One bar and the words beside it.
+///
+/// Filled with a block and unfilled with the same block in the muted colour, so
+/// the pair reads as one track at any terminal that draws colour, and as a
+/// solid run at one that does not. The share is clamped and rounded down: a bar
+/// that showed a full track at 99% would say the thing it is there to warn about
+/// has already happened.
+fn usage_bar(share: f32, about: &str, w: usize, caps: crate::caps::Caps) -> Line {
+    use crate::caps::Glyph;
+    let filled = ((share.clamp(0.0, 1.0) * BAR_CELLS as f32) as usize).min(BAR_CELLS);
+    // Two characters, not one character in two colours. A track drawn in the
+    // same block as its fill says nothing on a terminal with no colour — and
+    // says nothing in a transcript either, which is where this was caught.
+    let full = caps.g(Glyph::Thumb);
+    let empty = if caps.unicode { "░" } else { "-" };
+    let mut spans = vec![Span::styled("  ".to_string(), Style::new())];
+    if filled > 0 {
+        spans.push(Span::styled(full.repeat(filled), theme::fg(Role::Accent)));
+    }
+    if filled < BAR_CELLS {
+        spans.push(Span::styled(
+            empty.repeat(BAR_CELLS - filled),
+            theme::fg(Role::Border),
+        ));
+    }
+    spans.push(Span::styled(format!("  {about}"), theme::fg(Role::Muted)));
+    Line::from_spans(spans).truncate(w)
+}
+
+/// A day-by-day series as one row of blocks, with its span beside it.
+///
+/// Eight heights from the braille-free block set, so it draws on a terminal
+/// with no Unicode as well — the shape survives the downgrade even when the
+/// resolution does not. Scaled to the peak, which is said in words: a row of
+/// blocks has no axis, and "it doubled" is unreadable without knowing what the
+/// tallest one is.
+///
+/// Values beyond the width are **averaged into** the columns rather than
+/// dropped, so a month of days on a narrow panel is still a month — a chart
+/// that silently showed the last 28 of 90 days would be answering a different
+/// question.
+fn usage_spark(
+    values: &[u64],
+    from: &str,
+    to: &str,
+    peak: u64,
+    w: usize,
+    caps: crate::caps::Caps,
+) -> Line {
+    const LEVELS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+    const ASCII: [&str; 8] = [".", ".", ":", ":", "-", "=", "#", "#"];
+    if values.is_empty() || w == 0 {
+        return Line::empty();
+    }
+    let cells = SPARK_CELLS.min(values.len());
+    let per = values.len().div_ceil(cells);
+    let levels: &[&str; 8] = if caps.unicode { &LEVELS } else { &ASCII };
+    let mut bar = String::new();
+    for chunk in values.chunks(per) {
+        let mean = chunk.iter().sum::<u64>() / chunk.len() as u64;
+        let level = if peak == 0 {
+            0
+        } else {
+            (((mean as f64 / peak as f64) * (levels.len() - 1) as f64).round() as usize)
+                .min(levels.len() - 1)
+        };
+        bar.push_str(levels[level]);
+    }
+    let about = format!(
+        "  峰值 {} · {from} → {to}",
+        crate::content::token_count_u64(peak)
+    );
+    Line::from_spans(vec![
+        Span::styled("  ".to_string(), Style::new()),
+        Span::styled(bar, theme::fg(Role::Accent)),
+        Span::styled(about, theme::fg(Role::Muted)),
+    ])
+    .truncate(w)
+}
+
+/// How many columns the day series is drawn in. See [`BAR_CELLS`].
+const SPARK_CELLS: usize = 28;
 
 /// One edge of the search box: `┌───┐` above, `└───┘` below.
 ///
@@ -731,6 +1072,7 @@ pub fn geometry(moment: &Moment, vp: &Viewport<'_>) -> Geometry {
         layout(
             &moment.settings,
             panel,
+            moment.usage.as_ref(),
             vp.rect.w as usize,
             vp.rect.h as usize,
         )
@@ -811,6 +1153,163 @@ mod tests {
         Arc::new(Mounted::<Settings>::new())
     }
     use std::sync::Arc;
+
+    fn usage_page(page: crate::settings::UsagePage) -> Moment {
+        let mut panel = Panel::new();
+        panel.show(crate::settings::Tab::Usage);
+        Moment {
+            settings: two(),
+            settings_panel: Some(panel),
+            usage: Some(page),
+            ..Moment::default()
+        }
+    }
+
+    fn window(label: &str, used: Option<u8>) -> atomcode_host_api::UsageWindow {
+        atomcode_host_api::UsageWindow {
+            label: label.into(),
+            exhausted: false,
+            resets_at: "14:30".into(),
+            resets_in_seconds: 3600,
+            window_seconds: 18_000,
+            used_percent: used,
+            calls_used: used.map(|_| 420),
+            call_limit: Some(1000),
+        }
+    }
+
+    /// The Usage page draws what the account service counted, and says when it
+    /// counted nothing.
+    ///
+    /// The second half is the criterion that matters. A bar is read as a
+    /// proportion of the thing it is named after, so a window whose percentage
+    /// the host did not report must not get an empty track — that reads as
+    /// "none used", which is a claim, and the honest answer is that nobody
+    /// said. The first version of this page had no percentage to draw at all
+    /// (`usage_percent` was being dropped in `daemon/runtime_host.rs`) and drew
+    /// time through the window instead; this pins the fixed behaviour.
+    #[test]
+    fn the_usage_page_draws_what_was_counted_and_no_bar_for_what_was_not() {
+        let counted = usage_page(crate::settings::UsagePage {
+            context: None,
+            windows: vec![window("5 小时", Some(42))],
+            stats: None,
+        });
+        let shown = drawn(&counted, 80, 20).join("\n");
+        assert!(shown.contains("5 小时"), "{shown}");
+        assert!(shown.contains("用掉 42%"), "the counted share: {shown}");
+        assert!(
+            shown.contains("420 / 1000 次"),
+            "and what it counted: {shown}"
+        );
+        assert!(shown.contains('█'), "with a bar: {shown}");
+
+        let uncounted = usage_page(crate::settings::UsagePage {
+            context: None,
+            windows: vec![window("每周", None)],
+            stats: None,
+        });
+        let shown = drawn(&uncounted, 80, 20).join("\n");
+        assert!(shown.contains("没报用量"), "says nobody said: {shown}");
+        assert!(
+            !shown.contains('█'),
+            "and draws no bar, because an empty one would claim zero: {shown}"
+        );
+    }
+
+    /// Per-model spend and the day series reach the page.
+    ///
+    /// These are the figures the classic front end's `/usage` showed and the
+    /// row-assembled screen could not: they come from the account service
+    /// (`UsageStats`), not from the allowance windows, and they had no way
+    /// across the contract at all.
+    #[test]
+    fn the_usage_page_shows_what_went_through_per_model_and_per_day() {
+        use atomcode_host_api::{DayUse, ModelUse, UsageStats};
+        let page = usage_page(crate::settings::UsagePage {
+            context: None,
+            windows: Vec::new(),
+            stats: Some(UsageStats {
+                from: "2026-08-21".into(),
+                to: "2026-09-20".into(),
+                models: vec![
+                    ModelUse {
+                        name: "deepseek-flash".into(),
+                        tokens: 221_100_000,
+                        requests: 1604,
+                    },
+                    ModelUse {
+                        name: "glm5.3-flash-pro".into(),
+                        tokens: 59_700_000,
+                        requests: 846,
+                    },
+                ],
+                daily: vec![
+                    DayUse {
+                        date: "2026-09-19".into(),
+                        tokens: 4_500_000,
+                        requests: 40,
+                    },
+                    DayUse {
+                        date: "2026-09-20".into(),
+                        tokens: 216_600_000,
+                        requests: 1600,
+                    },
+                ],
+                total_tokens: 280_800_000,
+                total_requests: 2450,
+            }),
+        });
+        let shown = drawn(&page, 80, 40).join("\n");
+        assert!(shown.contains("deepseek-flash"), "{shown}");
+        assert!(
+            shown.contains("221.1m"),
+            "tokens as a person reads them: {shown}"
+        );
+        assert!(shown.contains("1604"), "and requests: {shown}");
+        assert!(
+            shown.contains("峰值 216.6m"),
+            "the chart says its peak: {shown}"
+        );
+        assert!(
+            shown.contains("2026-08-21") && shown.contains("2026-09-20"),
+            "and the span it covers: {shown}"
+        );
+        assert!(shown.contains("2450"), "the overview totals: {shown}");
+        // The bars are of different lengths, which is the only reason to draw
+        // two of them. Caught here: the first version drew the track in the
+        // same block as the fill, so every bar looked full to anything that
+        // does not read colour — a terminal without it, and this assertion.
+        let bars: Vec<usize> = shown
+            .lines()
+            .filter(|line| line.contains('█'))
+            .map(|line| line.matches('█').count())
+            .collect();
+        assert_eq!(bars.len(), 3, "two models and the day series: {shown}");
+        assert!(
+            bars[1] > bars[2],
+            "the bigger model has the longer bar: {bars:?}\n{shown}"
+        );
+    }
+
+    /// Before the host has answered, the page says so rather than showing zero.
+    #[test]
+    fn the_usage_page_says_it_is_asking_before_it_has_an_answer() {
+        let mut panel = Panel::new();
+        panel.show(crate::settings::Tab::Usage);
+        let waiting = Moment {
+            settings: two(),
+            settings_panel: Some(panel),
+            usage: None,
+            ..Moment::default()
+        };
+        let shown = drawn(&waiting, 80, 20).join("\n");
+        assert!(shown.contains("正在问宿主"), "{shown}");
+        assert!(
+            !shown.contains('█'),
+            "and nothing that looks like data: {shown}"
+        );
+    }
 
     /// Whether a row is one of the panel's rules: a run of `─` and nothing else.
     ///
@@ -1497,18 +1996,28 @@ mod tests {
             if tab == Tab::Config {
                 assert!(joined.contains("主题"), "the settings are drawn:\n{joined}");
                 assert!(joined.contains('┌'), "and the search box:\n{joined}");
-            } else {
-                let words = elsewhere(tab);
-                assert!(!words.is_empty(), "{tab:?} has something to say");
-                assert!(
-                    joined.contains(words),
-                    "{tab:?} draws its own line:\n{joined}"
-                );
-                assert!(
-                    !joined.contains('┌'),
-                    "{tab:?} draws no search box — it has nothing to filter:\n{joined}"
-                );
+                continue;
             }
+            assert!(
+                !joined.contains('┌'),
+                "{tab:?} draws no search box — it has nothing to filter:\n{joined}"
+            );
+            if tab == Tab::Usage {
+                // This page draws itself now, from what the host answered. With
+                // no answer yet that is one line saying so — which is still a
+                // page that is not blank, the thing this criterion is about.
+                assert!(
+                    joined.contains("正在问宿主"),
+                    "{tab:?} draws what it has:\n{joined}"
+                );
+                continue;
+            }
+            let words = elsewhere(tab);
+            assert!(!words.is_empty(), "{tab:?} has something to say");
+            assert!(
+                joined.contains(words),
+                "{tab:?} draws its own line:\n{joined}"
+            );
         }
     }
 

@@ -392,6 +392,35 @@ pub enum Step {
     Reset { id: String },
 }
 
+/// What the Usage page shows, as the host answered it.
+///
+/// Two different things, and the difference is the point. The **context** is a
+/// real proportion: the host says how many tokens of the window this session is
+/// using, so a bar of it means what a bar looks like it means. The **allowance
+/// windows** are not: nothing in this stack knows how much of an allowance has
+/// been spent — the host's own type carries a size, an exhausted flag and a
+/// reset time, and no count (see `UsageWindow`'s doc). So the bar drawn for one
+/// is **time through the window**, and it is labelled as that.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UsagePage {
+    /// Tokens of the context window this session is using, and how big it is.
+    /// `None` when the host would not say.
+    pub context: Option<ContextUse>,
+    /// The account's rolling windows. Empty means the host does not meter.
+    pub windows: Vec<atomcode_host_api::UsageWindow>,
+    /// What went through — per model and per day. `None` when the host does not
+    /// count it.
+    pub stats: Option<atomcode_host_api::UsageStats>,
+}
+
+/// What this session is using of the model's context window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContextUse {
+    pub model: String,
+    pub used: u32,
+    pub window: u32,
+}
+
 /// Run one key against the panel.
 ///
 /// Free-standing and pure so it can be tested against a `Panel` and a

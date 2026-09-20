@@ -29,6 +29,15 @@ pub struct RateLimitWindow {
     /// Max model requests allowed in this rolling window (`0`/negative = unknown).
     /// Used to size the `/goal` round budget as a share of the tightest window.
     pub call_limit: i64,
+    /// How many of them are gone, and what share that is (0..=100). `0` when
+    /// the account service did not say.
+    ///
+    /// Carried because a screen cannot work it out: the countdown says when the
+    /// window resets, not how much of it has been spent, and only the account
+    /// service counts requests. It was being dropped here, which is why the
+    /// row-assembled screen could not draw the bar the classic one draws.
+    pub calls_used: i64,
+    pub usage_percent: f64,
 }
 
 /// The most-constraining rolling-window request budget, used to size a single
@@ -46,6 +55,42 @@ pub fn binding_window_call_limit(windows: &[RateLimitWindow]) -> Option<i64> {
         .min()
 }
 
+/// What an account has spent, as the account service counts it.
+///
+/// Neutral of the service that reported it: a span, per-model totals and one
+/// figure per day. The day series is what a chart is drawn from, and it is
+/// carried rather than summarised because summarising it here would fix the
+/// chart's shape in the wrong crate.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AccountUsage {
+    /// The span these figures cover, as the service words it (`YYYY-MM-DD`).
+    pub from: String,
+    pub to: String,
+    /// Per model, biggest first.
+    pub models: Vec<ModelUse>,
+    /// One per day, oldest first.
+    pub daily: Vec<DayUse>,
+    pub total_tokens: u64,
+    pub total_requests: u64,
+}
+
+/// One model's share of an account's spend.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ModelUse {
+    pub name: String,
+    pub tokens: u64,
+    pub requests: u64,
+}
+
+/// One day of it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DayUse {
+    /// `YYYY-MM-DD`.
+    pub date: String,
+    pub tokens: u64,
+    pub requests: u64,
+}
+
 /// Host-owned source for provider-specific quota windows.
 ///
 /// `applies_to` is deliberately part of the source: only the host knows which endpoints carry
@@ -54,6 +99,15 @@ pub fn binding_window_call_limit(windows: &[RateLimitWindow]) -> Option<i64> {
 pub trait RateLimitWindowSource: Send + Sync + std::fmt::Debug {
     fn applies_to(&self, base_url: &str) -> bool;
     async fn fetch_windows(&self) -> Result<Vec<RateLimitWindow>, String>;
+
+    /// What the account has spent, when the service reports it.
+    ///
+    /// Defaulted to "nothing to say" so a source that only knows about windows
+    /// stays valid: this is an account-service feature, not something every
+    /// provider has.
+    async fn fetch_usage(&self) -> Result<Option<AccountUsage>, String> {
+        Ok(None)
+    }
 }
 
 /// Skip the network entirely when the last successful fetch is younger than this —
@@ -349,6 +403,8 @@ mod tests {
             seconds_until_reset: secs_until_reset,
             reset_label: "当前窗口结束即重置额度（每 5 小时一个窗口）".into(),
             call_limit: 1000,
+            calls_used: 420,
+            usage_percent: 42.0,
         }
     }
 

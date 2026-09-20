@@ -1440,6 +1440,31 @@ pub fn token_count(n: u32) -> String {
     format!("{trimmed}k")
 }
 
+/// The same, for a figure an account service reports.
+///
+/// A separate entry point rather than a widened [`token_count`]: a session's
+/// tokens fit in a `u32` and an account's months do not, and the account's
+/// figures run to millions, where thousands stop being readable. Same rule
+/// though — exact while it can be read, rounded once it cannot.
+pub fn token_count_u64(n: u64) -> String {
+    const K: f64 = 1_000.0;
+    const M: f64 = 1_000_000.0;
+    const B: f64 = 1_000_000_000.0;
+    let f = n as f64;
+    let (scaled, suffix) = if f < 10_000.0 {
+        return n.to_string();
+    } else if f < M {
+        (f / K, "k")
+    } else if f < B {
+        (f / M, "m")
+    } else {
+        (f / B, "b")
+    };
+    let text = format!("{scaled:.1}");
+    let trimmed = text.strip_suffix(".0").unwrap_or(&text);
+    format!("{trimmed}{suffix}")
+}
+
 /// The mark and the words for one stop reason.
 ///
 /// `完成` / `已中断` are `atomcode-tuix`'s two words for these two outcomes, and

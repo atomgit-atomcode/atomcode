@@ -1568,6 +1568,60 @@ impl Tui {
         true
     }
 
+    /// Ask the host what the Usage page shows, and repaint when it answers.
+    ///
+    /// Asked rather than waited for: an allowance window moves on the server's
+    /// clock, so there is nothing to subscribe to — it is fetched when the page
+    /// is opened. On its own task because both questions are round trips and a
+    /// screen that blocked on them would stop painting; the repaint seam is how
+    /// the answer gets drawn, since nothing about it came from a keystroke.
+    fn fetch_usage(&self) {
+        let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
+            return;
+        };
+        let Some(control) = self.client.control() else {
+            return;
+        };
+        let session = self.client.session();
+        let host = self.host.clone();
+        let repaint = ctx.service::<RepaintSvc>();
+        tokio::spawn(async move {
+            let context = match control
+                .call(HostCommand::Context {
+                    session: session.clone(),
+                })
+                .await
+            {
+                Ok(HostReply::Context {
+                    window,
+                    used,
+                    model,
+                    ..
+                }) if window > 0 => Some(crate::settings::ContextUse {
+                    model,
+                    used,
+                    window,
+                }),
+                _ => None,
+            };
+            let (windows, stats) = match control.call(HostCommand::Usage { session }).await {
+                Ok(HostReply::Usage { windows, stats }) => (windows, stats),
+                // A host that will not say is a host with nothing to draw; the
+                // page says so rather than showing an error where a chart goes.
+                _ => (Vec::new(), None),
+            };
+            host.moment.write().expect("moment poisoned").usage =
+                Some(crate::settings::UsagePage {
+                    context,
+                    windows,
+                    stats,
+                });
+            if let Some(repaint) = repaint {
+                repaint.now();
+            }
+        });
+    }
+
     /// Run one key against the settings panel, and act on what it asked for.
     ///
     /// One implementation for two callers, which is the point: the keyboard path
@@ -2410,6 +2464,7 @@ impl Tui {
                 // says, and a list frozen at launch would quietly lie.
                 if self.host.settings_open() {
                     self.refresh_settings();
+                    self.fetch_usage();
                 }
                 return false;
             }

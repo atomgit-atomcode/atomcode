@@ -1045,8 +1045,32 @@ impl HostControl for RuntimeControl {
             // the one command that breaks when the network hiccups.
             HostCommand::Usage { session } => {
                 self.addressed(&session)?;
-                let windows = self.handle.usage().await.map_err(refused)?;
+                let (windows, spent) = self.handle.usage().await.map_err(refused)?;
                 Ok(HostReply::Usage {
+                    stats: spent.map(|spent| atomcode_host_api::UsageStats {
+                        from: spent.from,
+                        to: spent.to,
+                        models: spent
+                            .models
+                            .into_iter()
+                            .map(|m| atomcode_host_api::ModelUse {
+                                name: m.name,
+                                tokens: m.tokens,
+                                requests: m.requests,
+                            })
+                            .collect(),
+                        daily: spent
+                            .daily
+                            .into_iter()
+                            .map(|d| atomcode_host_api::DayUse {
+                                date: d.date,
+                                tokens: d.tokens,
+                                requests: d.requests,
+                            })
+                            .collect(),
+                        total_tokens: spent.total_tokens,
+                        total_requests: spent.total_requests,
+                    }),
                     windows: windows
                         .into_iter()
                         .map(|w| atomcode_host_api::UsageWindow {
@@ -1054,6 +1078,11 @@ impl HostControl for RuntimeControl {
                             exhausted: w.quota_exhausted,
                             resets_at: w.reset_at_display,
                             resets_in_seconds: w.seconds_until_reset,
+                            window_seconds: w.window_size_seconds.max(0),
+                            // Whole percent, clamped: it is read off a bar.
+                            used_percent: (w.usage_percent > 0.0)
+                                .then(|| w.usage_percent.clamp(0.0, 100.0).round() as u8),
+                            calls_used: (w.calls_used > 0).then_some(w.calls_used),
                             call_limit: (w.call_limit > 0).then_some(w.call_limit),
                         })
                         .collect(),

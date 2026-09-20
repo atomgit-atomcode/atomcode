@@ -287,6 +287,9 @@ pub enum HostReply {
     /// meters nothing.
     Usage {
         windows: Vec<UsageWindow>,
+        /// What went through, when the host meters it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stats: Option<UsageStats>,
     },
     /// The providers a person may switch between. `current` is the one this
     /// conversation runs on, when the host knows it.
@@ -387,9 +390,74 @@ pub struct UsageWindow {
     /// Seconds until then, so a screen can count down without agreeing with the
     /// host about what time it is (`docs/adr/0008`). `0` when nothing is waiting.
     pub resets_in_seconds: i64,
+    /// How long the whole rolling window is, in seconds. `0` when the host does
+    /// not know.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub window_seconds: i64,
+    /// How much of the allowance is gone, as whole percent (0..=100). `None`
+    /// when the host does not know — and a screen must then say nothing rather
+    /// than draw an empty bar, which reads as "none used".
+    ///
+    /// Whole percent rather than a float: this is a number a person reads off a
+    /// bar, the extra digits are noise, and a wire type that can be compared
+    /// for equality is worth more here than the last decimal.
+    ///
+    /// This is the number a bar on this page is *of*. It comes from the account
+    /// service, which is the only thing that counts requests; a front end that
+    /// derived one from the reset countdown would be drawing time and calling
+    /// it allowance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_percent: Option<u8>,
+    /// How many requests of the window are gone, when the host knows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calls_used: Option<i64>,
     /// How many model requests the window allows, when the host knows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call_limit: Option<i64>,
+}
+
+fn is_zero_i64(value: &i64) -> bool {
+    *value == 0
+}
+
+/// What an account has spent, as the service that meters it counts.
+///
+/// Separate from [`UsageWindow`]: a window is an allowance and its reset, this
+/// is what went through. A front end that shows both shows them on one page,
+/// which is why one reply carries both.
+///
+/// The day series is carried rather than summarised, because summarising it
+/// would fix the shape of a chart in a crate that draws nothing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageStats {
+    /// The span, as the service words it (`YYYY-MM-DD`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub from: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub to: String,
+    /// Per model, biggest first.
+    pub models: Vec<ModelUse>,
+    /// One per day, oldest first.
+    pub daily: Vec<DayUse>,
+    pub total_tokens: u64,
+    pub total_requests: u64,
+}
+
+/// One model's share of it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelUse {
+    pub name: String,
+    pub tokens: u64,
+    pub requests: u64,
+}
+
+/// One day of it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DayUse {
+    /// `YYYY-MM-DD`.
+    pub date: String,
+    pub tokens: u64,
+    pub requests: u64,
 }
 
 /// One provider a person may switch to.
@@ -923,8 +991,27 @@ mod tests {
                     exhausted: true,
                     resets_at: "14:30".into(),
                     resets_in_seconds: 3600,
+                    window_seconds: 18_000,
+                    used_percent: Some(42),
+                    calls_used: Some(420),
                     call_limit: Some(1000),
                 }],
+                stats: Some(UsageStats {
+                    from: "2026-08-21".into(),
+                    to: "2026-09-20".into(),
+                    models: vec![ModelUse {
+                        name: "glm-5".into(),
+                        tokens: 221_100_000,
+                        requests: 1604,
+                    }],
+                    daily: vec![DayUse {
+                        date: "2026-09-20".into(),
+                        tokens: 216_600_000,
+                        requests: 1600,
+                    }],
+                    total_tokens: 221_100_000,
+                    total_requests: 1604,
+                }),
             },
         ];
         for r in &all {

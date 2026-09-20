@@ -1157,10 +1157,10 @@ impl CommandSet for SessionCommands {
                     Err(refusal) => return refusal,
                 };
                 match control.call(HostCommand::Usage { session: root }).await {
-                    Ok(HostReply::Usage { windows }) if windows.is_empty() => {
+                    Ok(HostReply::Usage { windows, .. }) if windows.is_empty() => {
                         Outcome::Said("这个宿主不计额度".into())
                     }
-                    Ok(HostReply::Usage { windows }) => Outcome::Said(
+                    Ok(HostReply::Usage { windows, .. }) => Outcome::Said(
                         windows
                             .into_iter()
                             .map(|w| {
@@ -1869,6 +1869,7 @@ mod tests {
         let host = Arc::new(Recording::default());
         host.replies.lock().unwrap().extend([
             Ok(HostReply::Usage {
+                stats: None,
                 windows: vec![
                     atomcode_host_api::UsageWindow {
                         label: "5 小时".into(),
@@ -1876,6 +1877,9 @@ mod tests {
                         resets_at: "14:30".into(),
                         resets_in_seconds: 3600,
                         call_limit: Some(1000),
+                        window_seconds: 0,
+                        used_percent: None,
+                        calls_used: None,
                     },
                     atomcode_host_api::UsageWindow {
                         label: "每周".into(),
@@ -1883,10 +1887,14 @@ mod tests {
                         resets_at: String::new(),
                         resets_in_seconds: 0,
                         call_limit: None,
+                        window_seconds: 0,
+                        used_percent: None,
+                        calls_used: None,
                     },
                 ],
             }),
             Ok(HostReply::Usage {
+                stats: None,
                 windows: Vec::new(),
             }),
         ]);

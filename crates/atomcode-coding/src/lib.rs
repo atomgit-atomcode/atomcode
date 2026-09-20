@@ -98,7 +98,7 @@ pub use provider_factory::{
     resolve_subagent_tier_thunks, tier_provider_builder, AtomGitProviderAuthenticator,
     CodingProviderFactory, DefaultCodingProviderFactory, ProviderAuthenticator, ProviderBuildError,
 };
-pub use rate_limit::{RateLimitWindow, RateLimitWindowSource};
+pub use rate_limit::{AccountUsage, DayUse, ModelUse, RateLimitWindow, RateLimitWindowSource};
 pub use runtime::{
     CodingRuntime, CodingRuntimeEvent, CodingRuntimeEvents, CodingRuntimeHandle,
     CodingRuntimeStart, DeferredRuntimeState, DriverCommand, ImagePreprocessor, LocalContextInput,

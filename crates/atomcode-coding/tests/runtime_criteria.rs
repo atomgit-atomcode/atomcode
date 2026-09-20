@@ -2155,6 +2155,8 @@ impl atomcode_coding::RateLimitWindowSource for ExhaustedWindow {
             seconds_until_reset: 5_400,
             reset_label: "5h".into(),
             call_limit: 100,
+            calls_used: 0,
+            usage_percent: 0.0,
         }])
     }
 }

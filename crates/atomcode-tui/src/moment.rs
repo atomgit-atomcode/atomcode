@@ -313,6 +313,14 @@ pub struct Moment {
     /// up — the open flag and the state in one field, so a panel that is drawn
     /// and a panel that takes keys cannot disagree.
     pub settings_panel: Option<crate::settings::Panel>,
+    /// What the Usage page draws, as the host last answered it.
+    ///
+    /// Asked for rather than pushed: an allowance window changes on the
+    /// server's clock, not on anything this screen does, so it is fetched when
+    /// the page is opened and left alone until it is opened again. `None` is
+    /// "not asked yet" and draws as such — an empty list means the host does
+    /// not meter, which is a different thing and says so.
+    pub usage: Option<crate::settings::UsagePage>,
 }
 
 /// A question on screen, with the row that is pointed at.

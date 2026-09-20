@@ -1787,7 +1787,21 @@ impl CodingRuntimeHandle {
     /// asking "how much have I got left" must not be made to wait on it. No
     /// source, a slow one or a failing one all answer with an empty list, which
     /// says "this host does not meter" in the only way a front end can act on.
-    pub async fn usage(&self) -> Result<Vec<crate::rate_limit::RateLimitWindow>, RuntimeError> {
+    /// The account's windows **and** what it has spent, in one round trip.
+    ///
+    /// Together because a screen that shows them shows them on one page, and
+    /// two trips would be two chances for one of them to be a moment stale
+    /// against the other.
+    #[allow(clippy::type_complexity)]
+    pub async fn usage(
+        &self,
+    ) -> Result<
+        (
+            Vec<crate::rate_limit::RateLimitWindow>,
+            Option<crate::rate_limit::AccountUsage>,
+        ),
+        RuntimeError,
+    > {
         let state = self.state.load(Ordering::Acquire);
         let (done, result) = oneshot::channel();
         self.tx
@@ -2473,7 +2487,16 @@ pub enum CodingRuntimeControl {
     /// The account's remaining allowance, as rolling windows.
     Usage {
         generation: u64,
-        done: oneshot::Sender<Result<Vec<crate::rate_limit::RateLimitWindow>, RuntimeError>>,
+        #[allow(clippy::type_complexity)]
+        done: oneshot::Sender<
+            Result<
+                (
+                    Vec<crate::rate_limit::RateLimitWindow>,
+                    Option<crate::rate_limit::AccountUsage>,
+                ),
+                RuntimeError,
+            >,
+        >,
     },
     /// What this session has changed in the workspace. `file` asks for one
     /// file's diff text instead of the summary of all of them.
@@ -3980,18 +4003,30 @@ fn spawn_runtime_owner_with_optional_agent(
                             .as_ref()
                             .and_then(|runtime| runtime.parts.rate_limit_source().cloned());
                         tokio::spawn(async move {
-                            let windows: Vec<crate::rate_limit::RateLimitWindow> = match source {
-                                Some(source) => tokio::time::timeout(
-                                    std::time::Duration::from_secs(3),
-                                    source.fetch_windows(),
-                                )
-                                .await
-                                .ok()
-                                .and_then(|fetched| fetched.ok())
-                                .unwrap_or_default(),
-                                None => Vec::new(),
+                            let Some(source) = source else {
+                                let _ = done.send(Ok((Vec::new(), None)));
+                                return;
                             };
-                            let _ = done.send(Ok(windows));
+                            // One budget for both: a page that waited twice as
+                            // long to show the same thing is a page that feels
+                            // broken.
+                            let windows = tokio::time::timeout(
+                                std::time::Duration::from_secs(3),
+                                source.fetch_windows(),
+                            )
+                            .await
+                            .ok()
+                            .and_then(|fetched| fetched.ok())
+                            .unwrap_or_default();
+                            let spent = tokio::time::timeout(
+                                std::time::Duration::from_secs(3),
+                                source.fetch_usage(),
+                            )
+                            .await
+                            .ok()
+                            .and_then(|fetched| fetched.ok())
+                            .flatten();
+                            let _ = done.send(Ok((windows, spent)));
                         });
                     }
                     // Reading only: unlike the rewind catalog this does not
@@ -9731,6 +9766,8 @@ mod tests {
             seconds_until_reset: 7200,
             reset_label: "5h".into(),
             call_limit,
+            calls_used: 0,
+            usage_percent: 0.0,
         }
     }
 
