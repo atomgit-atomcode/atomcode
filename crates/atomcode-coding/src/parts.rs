@@ -354,6 +354,10 @@ pub struct CodingParts {
     /// Connection events for whoever publishes this registry's tools: the chain's
     /// catalog task, or a tree's `mcp-host` row. Taken once.
     mcp_connect_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<McpConnectEvent>>>,
+    /// The same events again, for the `mcp-telemetry` row. `None` when nothing
+    /// is metering, which is also when no fan-out was started. Taken once.
+    mcp_telemetry_rx:
+        std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<McpConnectEvent>>>,
     mcp_publish_lock: Arc<tokio::sync::Mutex<()>>,
     mcp_publication_enabled: Arc<std::sync::atomic::AtomicBool>,
     /// The mounted catalog the `mcp-host` row publishes into, once it is up.
@@ -714,8 +718,35 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // the session candidate path. `mount()` publishes each connected server's tools
     // atomically for the next turn, then publishes once more when the initial pass
     // reaches its bounded terminal state.
-    let (mcp_registry, mcp_connect_rx) = if opts.tools && opts.mcp {
-        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (mcp_registry, mcp_connect_rx, mcp_telemetry_rx) = if opts.tools && opts.mcp {
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<McpConnectEvent>();
+        // A second listener, only when something is metering. The registry
+        // publishes to one sender, so the fan-out is here rather than in
+        // `atomcode-capabilities` — one consumer is still the common case, and
+        // a telemetry-free embedder pays nothing for this.
+        //
+        // Chaining instead of teeing would make the meter load-bearing for the
+        // tool catalog: turn telemetry off and the tools stop being published.
+        let (event_rx, telemetry_rx) = match cfg.telemetry.is_some() {
+            false => (event_rx, None),
+            true => {
+                let (rows_tx, rows_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (meter_tx, meter_rx) = tokio::sync::mpsc::unbounded_channel();
+                let mut source = event_rx;
+                // Ends when the registry drops its sender, which happens when
+                // these parts do — no handle to abort, and nothing to leak.
+                tokio::spawn(async move {
+                    while let Some(event) = source.recv().await {
+                        let to_rows = rows_tx.send(event.clone()).is_ok();
+                        let to_meter = meter_tx.send(event).is_ok();
+                        if !to_rows && !to_meter {
+                            break;
+                        }
+                    }
+                });
+                (rows_rx, Some(meter_rx))
+            }
+        };
         (
             Some(Arc::new(McpRegistry::from_config_background_with_extra(
                 &cfg.working_dir,
@@ -723,9 +754,10 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 opts.extra_mcp_servers.clone(),
             ))),
             Some(event_rx),
+            telemetry_rx,
         )
     } else {
-        (None, None)
+        (None, None, None)
     };
     let mcp_tool_names = Arc::new(std::sync::RwLock::new(Vec::new()));
 
@@ -919,6 +951,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         todo_enabled,
         mcp_tool_names,
         mcp_connect_rx: std::sync::Mutex::new(mcp_connect_rx),
+        mcp_telemetry_rx: std::sync::Mutex::new(mcp_telemetry_rx),
         mcp_publish_lock: Arc::new(tokio::sync::Mutex::new(())),
         mcp_publication_enabled,
         mcp_toolbox: Arc::new(std::sync::RwLock::new(None)),
@@ -1102,6 +1135,20 @@ impl CodingParts {
             catalog_ready: self.mcp_catalog_ready.clone(),
             toolbox_slot: Arc::clone(&self.mcp_toolbox),
         })
+    }
+
+    /// The connection events again, for the row that meters them.
+    ///
+    /// `None` when this assembly has no MCP or nothing to meter with, which is
+    /// what keeps the `mcp-telemetry` row out of a tree that would have nothing
+    /// for it to do.
+    pub(crate) fn mcp_connect_meter(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<McpConnectEvent>> {
+        self.mcp_telemetry_rx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
     }
 
     /// Where the provider for out-of-round model calls lives, refilled on every

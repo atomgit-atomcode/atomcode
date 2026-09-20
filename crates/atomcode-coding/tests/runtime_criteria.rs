@@ -3793,6 +3793,185 @@ async fn turn_reporting_compactions(
     }
 }
 
+// ---- what the retired engine metered ---------------------------------------
+//
+// `f296e6e2` moved MCP to `atomcode-capabilities` and dropped this event on the
+// way, and every test stayed green for two months. Written here rather than in
+// a document because a gap nobody can run is a gap that gets forgotten. The
+// shape it owes is `crates/atomcode-telemetry/tests/golden/wire/mcp_connect*`.
+//
+// Its sibling, `use_command`, is NOT here: commands are a front end's, not the
+// runtime's — `/quit` and `/help` never reach this crate — so it is pinned
+// where it happens (`atomcode-tui/src/command.rs` and
+// `atomcode-cli/src/tui_command_meter.rs`).
+
+/// Whether anything at all reached the test sink.
+///
+/// The control for both scenarios below: each asserts that a specific event is
+/// MISSING, and an assertion about an absence is worthless until something
+/// present has been shown.
+async fn sink_is_live(captured: &Arc<tokio::sync::Mutex<Vec<atomcode_telemetry::Record>>>) -> bool {
+    for _ in 0..200 {
+        if captured
+            .lock()
+            .await
+            .iter()
+            .any(|record| matches!(record.event, atomcode_telemetry::Event::LlmChat { .. }))
+        {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    false
+}
+
+/// A server that could not be started is reported.
+///
+/// The retired core engine reported every connection attempt, success or
+/// failure, with the transport, the duration and a classified `error_kind`
+/// (`git show f296e6e2^:crates/atomcode-core/src/mcp/registry.rs`, the two
+/// `TelemetryEvent::McpConnect` sites). `f296e6e2` moved MCP to
+/// `atomcode-capabilities`, which is core-free and holds no telemetry sink, and
+/// the emission was not rebuilt on this side: the neutral `McpConnectEvent` is
+/// published on a seam, and the runtime's only subscriber
+/// (`coding/src/host_rows.rs`) reads `Connected` to publish tools and discards
+/// the rest.
+///
+/// A server that cannot start is the case that matters — a working MCP setup
+/// reports nothing interesting, a broken one is the whole reason the event
+/// exists.
+#[cfg(unix)]
+async fn a_failed_mcp_connection_is_metered() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let (telemetry, captured) = atomcode_telemetry::Telemetry::in_memory("test".into());
+    let mut start = start(env.project.path(), &recorder, SessionMode::Fresh);
+    start.agent.telemetry = Some(telemetry);
+    start.prepare.mcp = true;
+    start.prepare.extra_mcp_servers = vec![atomcode_capabilities::mcp::McpServerConfig {
+        name: "broken".into(),
+        disabled: false,
+        config: atomcode_capabilities::mcp::McpTransportConfig::Stdio {
+            // Nothing is here, so the spawn fails the way a mistyped `command`
+            // in a person's `mcp.json` fails.
+            command: env
+                .project
+                .path()
+                .join("no-such-mcp-server")
+                .to_string_lossy()
+                .into_owned(),
+            args: Vec::new(),
+            env: Default::default(),
+            timeout_ms: Some(2_000),
+        },
+        source: atomcode_capabilities::mcp::config::McpConfigSource::Driver,
+        trust: true,
+        auto_approve: Vec::new(),
+    }];
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+    // The catalog settles whether or not the server came up; a failure to
+    // connect is not a failure to become ready.
+    let _ = runtime
+        .handle
+        .wait_mcp_ready(std::time::Duration::from_secs(10))
+        .await;
+
+    // What is being measured is the REPORTING, so first establish that there
+    // was something to report. Without this the criterion would be just as red
+    // if MCP had never been configured at all, and would go green the day
+    // somebody "fixed" it by making the connection succeed.
+    let status = runtime.handle.mcp_status().await.unwrap();
+    let broken = status
+        .servers
+        .iter()
+        .find(|(name, _)| name == "broken")
+        .map(|(_, status)| status.clone());
+    assert!(
+        matches!(
+            broken,
+            Some(atomcode_capabilities::mcp::ServerStatus::Failed(_))
+        ),
+        "the server was expected to fail to start; the runtime says {broken:?}"
+    );
+
+    // Positive control: the sink is live on this runtime. Without it a broken
+    // capture would be indistinguishable from a missing emitter, and the day
+    // the emitter lands this criterion would still be red for a reason nobody
+    // would think to look for.
+    turn(&mut runtime, "hello").await;
+    assert!(
+        sink_is_live(&captured).await,
+        "no model round was metered either; the capture, not the emitter, is what is missing"
+    );
+
+    let mut reported = None;
+    for _ in 0..200 {
+        reported = captured
+            .lock()
+            .await
+            .iter()
+            .find_map(|record| match &record.event {
+                atomcode_telemetry::Event::McpConnect {
+                    server_name,
+                    success,
+                    transport,
+                    error_kind,
+                    error_data,
+                    ..
+                } if server_name == "broken" => {
+                    Some((*success, *transport, *error_kind, error_data.clone()))
+                }
+                _ => None,
+            });
+        if reported.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    runtime.handle.shutdown().await.unwrap();
+
+    let (success, transport, error_kind, error_data) = reported.expect(
+        "a server that could not be started was not metered; the retired engine \
+         reported every connection attempt",
+    );
+    assert!(!success, "a spawn that failed was reported as a success");
+    assert!(
+        matches!(transport, atomcode_telemetry::McpTransport::Stdio),
+        "a stdio server was reported as {transport:?}"
+    );
+    assert!(
+        matches!(
+            error_kind,
+            Some(atomcode_telemetry::McpErrorKind::ExecutionFailed)
+        ),
+        "a missing executable is an execution failure; got {error_kind:?}"
+    );
+
+    // The detail blob the retired engine sent, key for key. A dashboard reads
+    // these out of the JSON, so a rename here is as breaking as a wire change.
+    let detail: serde_json::Value =
+        serde_json::from_str(&error_data.expect("a failure carries its detail")).unwrap();
+    assert_eq!(detail["server_name"], "broken");
+    assert_eq!(detail["transport"], "stdio");
+    assert_eq!(detail["config_source"], "driver");
+    assert!(detail["duration_ms"].is_number(), "detail: {detail}");
+
+    // And the one thing the retired engine got wrong: it sent the spawn error
+    // raw, so the absolute path — which contains the person's username — went
+    // out with it. Scrubbing is what makes this event safe to send at all, so
+    // it is pinned here rather than left to the reporter's good intentions.
+    let message = detail["message"].as_str().expect("a failure says why");
+    let project = env.project.path().to_string_lossy().into_owned();
+    assert!(
+        !message.contains(&project),
+        "the working directory went out verbatim in {message:?}"
+    );
+    assert!(
+        message.contains("<CWD>"),
+        "the path should have been replaced, not dropped: {message:?}"
+    );
+}
+
 /// Each scenario as its own test. Serialized because they share the process's
 /// environment (`ATOMCODE_HOME`, the offline verdict), which is also why each is
 /// its own process under `cargo nextest`.
@@ -3842,6 +4021,7 @@ mod criteria {
         a_round_budget_ends_the_turn,
         an_mcp_servers_tools_are_offered_and_run,
         withdrawing_mcp_takes_the_tools_off_the_model,
+        a_failed_mcp_connection_is_metered,
         a_written_task_list_outlives_the_messages_it_came_from,
         the_retry_budget_follows_a_model_switch,
         a_meaningless_temperature_is_ignored_rather_than_breaking_a_model_switch,

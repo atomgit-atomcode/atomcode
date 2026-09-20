@@ -8160,6 +8160,14 @@ fn harness_host_state(
         tool_switches: Some(parts.tool_switches()),
         tool_catalog_slot: parts.tool_catalog_slot(),
         mcp,
+        // Both halves or neither: the events only exist when this assembly has
+        // MCP, and `prepare` only started the fan-out when there was a sink.
+        mcp_telemetry: parts.mcp_connect_meter().zip(config.telemetry.clone()).map(
+            |(events, telemetry)| crate::host_rows::McpConnectMeter {
+                events,
+                meter: crate::telemetry::McpTelemetry::new(telemetry, config.working_dir.clone()),
+            },
+        ),
         rate_limit_source: parts.rate_limit_source().cloned(),
         front_end: prepare.front_end.clone(),
         delegated_llm: parts.delegated_provider(),

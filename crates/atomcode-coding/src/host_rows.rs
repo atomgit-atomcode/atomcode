@@ -1268,6 +1268,56 @@ pub(crate) struct McpPublication {
     pub(crate) toolbox_slot: Arc<RwLock<Option<Arc<atomcode_harness::seams::ToolBox>>>>,
 }
 
+/// What `mcp-telemetry` needs: the second stream of connection events, and the
+/// meter to report them through.
+pub(crate) struct McpConnectMeter {
+    pub(crate) events:
+        tokio::sync::mpsc::UnboundedReceiver<atomcode_capabilities::mcp::McpConnectEvent>,
+    pub(crate) meter: crate::telemetry::McpTelemetry,
+}
+
+/// `mcp-telemetry`: one report per MCP connection attempt.
+///
+/// Its own row rather than a few lines inside `mcp-host`, for the reason the
+/// MCP module has stated since the port — cross-cutting reporting belongs on
+/// the seam, not hard-coded into whoever else happens to be listening. Read
+/// concretely: `mcp-host`'s job is to publish tools, it only cares about
+/// `Connected`, and a meter living inside it would be switched off by every
+/// change to what that row listens for. Here, the two cannot drift.
+///
+/// Mounted only when the host has both MCP and a telemetry sink, so a tree
+/// without one simply has no such row (`--dump-config` shows this).
+pub(crate) struct McpTelemetryPlugin(pub(crate) Mutex<Option<McpConnectMeter>>);
+
+#[async_trait]
+impl Plugin for McpTelemetryPlugin {
+    fn name(&self) -> &'static str {
+        "mcp-telemetry"
+    }
+    fn uses(&self) -> &'static [&'static str] {
+        &["mcp"]
+    }
+    fn description(&self) -> &'static str {
+        "reports each MCP server connection attempt to the host's telemetry"
+    }
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        let Some(McpConnectMeter { mut events, meter }) =
+            self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
+        else {
+            return Err("mcp-telemetry mounted twice from one meter".into());
+        };
+        let task = tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                meter.report(&event);
+            }
+        });
+        // A late connection from a withdrawn tree must not be reported against
+        // the tree that replaced it.
+        let _ = ctx.effect(move || task.abort());
+        Ok(())
+    }
+}
+
 /// `mcp-host`: the MCP servers the runtime connected, and their tools in the tree.
 ///
 /// One owner: the registry the runtime's prepare built and connects in the
@@ -1469,7 +1519,7 @@ impl Plugin for McpHostPlugin {
                             break;
                         }
                         event = event => match event {
-                            Some(atomcode_capabilities::mcp::McpConnectEvent::Connected { name }) => {
+                            Some(atomcode_capabilities::mcp::McpConnectEvent::Connected { name, .. }) => {
                                 let tools = registry.list_tools_for_server(&name).await;
                                 publish_mcp(&toolbox, &registry, tools, &shared, false).await;
                             }

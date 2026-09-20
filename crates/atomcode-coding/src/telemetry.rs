@@ -588,6 +588,172 @@ impl LlmProvider for MeteredProvider {
     }
 }
 
+// ---- MCP connections -------------------------------------------------------
+
+/// Map an MCP connection error onto a telemetry `McpErrorKind`.
+///
+/// Restored unchanged from the engine that was retired
+/// (`git show f296e6e2^:crates/atomcode-core/src/mcp/registry.rs`), substring
+/// tests and order included. The order is load-bearing — "no such file" also
+/// contains neither "timeout" nor "server", but a message like
+/// `spawn failed: connection refused` is a network error first — and the value
+/// set is what two years of stored rows are bucketed by. A tidier
+/// classification here would silently split every existing series.
+fn classify_mcp_error(error: &str) -> atomcode_telemetry::McpErrorKind {
+    use atomcode_telemetry::McpErrorKind;
+    let e = error.to_lowercase();
+    if e.contains("connection refused") || e.contains("dns") || e.contains("network") {
+        McpErrorKind::NetworkError
+    } else if e.contains("401")
+        || e.contains("403")
+        || e.contains("unauthorized")
+        || e.contains("oauth")
+    {
+        McpErrorKind::AuthError
+    } else if e.contains("not found")
+        || e.contains("no such")
+        || e.contains("path")
+        || e.contains("spawn")
+    {
+        McpErrorKind::ExecutionFailed
+    } else if e.contains("timeout") || e.contains("timed out") {
+        McpErrorKind::Timeout
+    } else if e.contains("server") || e.contains("-326") || e.contains("mcp error") {
+        McpErrorKind::ServerError
+    } else {
+        McpErrorKind::Other
+    }
+}
+
+/// The transport as the wire names it.
+///
+/// `Http` maps to `streamable_http` rather than `sse`, which is what the
+/// retired engine sent for every HTTP server; `sse` has never been emitted.
+fn wire_transport(
+    kind: atomcode_capabilities::mcp::McpTransportKind,
+) -> atomcode_telemetry::McpTransport {
+    use atomcode_capabilities::mcp::McpTransportKind;
+    match kind {
+        McpTransportKind::Stdio => atomcode_telemetry::McpTransport::Stdio,
+        McpTransportKind::Http => atomcode_telemetry::McpTransport::StreamableHttp,
+    }
+}
+
+/// Reports one `McpConnect` per connection attempt, from the neutral events
+/// `atomcode-capabilities` publishes.
+///
+/// # Why it is not in `atomcode-capabilities`
+///
+/// That crate holds no telemetry sink and must not grow one: it is the
+/// reusable capability layer, and a product that embeds it decides for itself
+/// whether anything is metered. So the registry states the fact on a seam and
+/// this, the product, is what turns the fact into a report — the shape
+/// `crates/atomcode-capabilities/src/mcp/mod.rs` has described since the port.
+///
+/// # Parity
+///
+/// Exactly the two cases the retired engine reported: a server that connected
+/// and a server that did not. `BlockedUntrusted` and `Warning` were never
+/// metered and are not metered now — adding them would change what an existing
+/// `mcp_connect` row counts. The envelope is likewise the ambient one, with no
+/// provider/model scope: an MCP connection has nothing to do with the model,
+/// and the retired engine attributed none.
+pub struct McpTelemetry {
+    telemetry: Arc<Telemetry>,
+    /// Where this session runs, so a path in an error message reads as
+    /// `<CWD>/…` rather than naming the person's disk.
+    working_dir: std::path::PathBuf,
+}
+
+impl McpTelemetry {
+    pub fn new(telemetry: Arc<Telemetry>, working_dir: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            telemetry,
+            working_dir: working_dir.into(),
+        }
+    }
+
+    /// The server's own words, made safe to send.
+    ///
+    /// **This is the one deliberate departure from the retired engine**, which
+    /// sent `truncate_head(error, 200)` raw. Two things it therefore sent that
+    /// this does not: the absolute path of whatever failed to spawn — which
+    /// contains the person's username — and, for an HTTP server, whatever a
+    /// transport error quoted back of the request, which can include the
+    /// `Authorization` header. `a0dd5b49` made the same change for tool-call
+    /// failures; this is the MCP half of it.
+    ///
+    /// Redaction runs before truncation, so a secret cannot survive by sitting
+    /// past the 200th character.
+    fn safe_message(&self, error: &str) -> String {
+        let home = atomcode_config::util::real_home_dir();
+        let scrubbed = atomcode_telemetry::scrub::scrub_path(
+            error,
+            home.as_deref(),
+            Some(self.working_dir.as_path()),
+        );
+        atomcode_telemetry::scrub::truncate_head(
+            &atomcode_telemetry::scrub::redact_secrets(&scrubbed),
+            200,
+        )
+    }
+
+    /// Report `event`, if it is one of the two that are reported.
+    pub fn report(&self, event: &atomcode_capabilities::mcp::McpConnectEvent) {
+        use atomcode_capabilities::mcp::McpConnectEvent;
+        let (name, error, attempt) = match event {
+            McpConnectEvent::Connected { name, attempt } => (name, None, *attempt),
+            // A failure with nothing behind it is the config file itself
+            // failing to load, which the retired engine did not meter either.
+            McpConnectEvent::Failed {
+                name,
+                error,
+                attempt: Some(attempt),
+            } => (name, Some(error), *attempt),
+            _ => return,
+        };
+        let transport = wire_transport(attempt.transport);
+        let mut detail = serde_json::json!({
+            "server_name": name,
+            "transport": transport_str(transport),
+            "duration_ms": attempt.duration_ms,
+            "config_source": attempt.source.as_str(),
+        });
+        match error {
+            None => {
+                // Always zero when the retired engine sent it, with a note that
+                // it would be filled in once tools were listed. Kept so the
+                // field does not appear and disappear across builds.
+                detail["tool_count"] = serde_json::json!(0);
+            }
+            Some(error) => {
+                detail["message"] = serde_json::json!(self.safe_message(error));
+            }
+        }
+        self.telemetry.track(Event::McpConnect {
+            server_name: name.clone(),
+            transport,
+            success: error.is_none(),
+            duration_ms: Some(attempt.duration_ms as u32),
+            error_kind: error.map(|error| classify_mcp_error(error)),
+            error_data: Some(detail.to_string()),
+        });
+    }
+}
+
+/// The transport as it appears inside `error_data`.
+///
+/// The envelope's own `transport` field is serialized by serde; this is the
+/// copy the retired engine also wrote into the detail blob, spelled the same
+/// way so the two never disagree.
+fn transport_str(transport: atomcode_telemetry::McpTransport) -> &'static str {
+    match transport {
+        atomcode_telemetry::McpTransport::Stdio => "stdio",
+        atomcode_telemetry::McpTransport::Sse => "sse",
+        atomcode_telemetry::McpTransport::StreamableHttp => "streamable_http",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1472,6 +1472,9 @@ pub struct HostState {
     pub rows: Layer,
     /// The runtime's MCP registry, published into the tree by `mcp-host`.
     pub(crate) mcp: Option<crate::host_rows::McpPublication>,
+    /// The same registry's connection events, metered by `mcp-telemetry`.
+    /// `Some` only when the host has both MCP and a telemetry sink.
+    pub(crate) mcp_telemetry: Option<crate::host_rows::McpConnectMeter>,
     /// What the person chose this conversation to run, when the host knows it.
     ///
     /// Not `provider.model_name()`: a provider may report something other than
@@ -1730,6 +1733,9 @@ pub async fn mount_hosted(
         .when(host.mcp.is_some(), |layer| {
             layer.swap("mcp", "mcp-host").enable("mcp")
         })
+        .when(host.mcp_telemetry.is_some(), |layer| {
+            layer.insert(Entry::named("mcp-telemetry"))
+        })
         .when(host.delegated_llm.is_some(), |layer| {
             layer.insert(Entry::named("llm-delegated-host"))
         })
@@ -1845,6 +1851,11 @@ pub async fn mount_hosted(
     }
     if let Some(publication) = host.mcp {
         registry.register(Arc::new(crate::host_rows::McpHostPlugin::new(publication)));
+    }
+    if let Some(meter) = host.mcp_telemetry {
+        registry.register(Arc::new(crate::host_rows::McpTelemetryPlugin(
+            std::sync::Mutex::new(Some(meter)),
+        )));
     }
     if let Some(skills) = host.skills {
         registry.register(Arc::new(crate::host_rows::SkillsHostPlugin(skills)));
