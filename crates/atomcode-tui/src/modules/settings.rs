@@ -81,11 +81,9 @@ impl View for Settings {
                     } => usage_bar(share, &about, spent, w, vp.moment.caps),
                     UsageLine::Heat { label, cells } => heat_row(&label, &cells, w),
                     UsageLine::HeatKey { less, more } => heat_key(&less, &more, w),
-                    UsageLine::Pair { label, value } => Line::from_spans(vec![
-                        Span::styled(format!("  {label}"), theme::fg(Role::Muted)),
-                        Span::raw(value),
-                    ])
-                    .truncate(w),
+                    UsageLine::Columns { text } => {
+                        Line::styled(width::take_width(&format!("  {text}"), w), Style::new())
+                    }
                     UsageLine::Note(text) => Line::styled(
                         width::take_width(&format!("  {text}"), w),
                         theme::fg(Role::Muted),
@@ -106,6 +104,7 @@ impl View for Settings {
                 ),
                 Row::Blank => Line::empty(),
                 Row::Scroll { above, below } => scroll_note(above, below, w, vp.moment.caps),
+                Row::Pages { at } => pages_line(at, w),
                 Row::BoxTop => box_edge(w, vp.moment.caps, true),
                 Row::Search { caret } => search_line(&panel.query, caret, w, vp.moment.caps),
                 Row::BoxBottom => box_edge(w, vp.moment.caps, false),
@@ -194,6 +193,10 @@ enum Row {
         line: UsageLine,
     },
     /// A margin row, above the box or above the list.
+    /// The Stats tab's own row of pages, under the panel's.
+    Pages {
+        at: crate::settings::StatsPage,
+    },
     /// How much of a scrolled page is out of sight, above and below.
     ///
     /// A row of its own rather than a mark on the rule, because it is the only
@@ -332,10 +335,26 @@ fn rows_for(
     // The other pages are not the settings list, so the search box goes with
     // them: a filter with nothing to filter would be a box that collects
     // characters and changes nothing.
+    // Two pages out of one set of figures. Usage answers "what may I still do"
+    // — the allowance and the plan behind it — and Stats answers "what have I
+    // done", which is a question about the past and is read rather than acted
+    // on. They were one page until it grew past the panel twice over.
     if panel.tab == Tab::Usage {
         rows.push(Row::Blank);
         rows.extend(
-            usage_lines(usage)
+            allowance_lines(usage)
+                .into_iter()
+                .map(|line| Row::Usage { line }),
+        );
+        rows.extend([Row::Blank, Row::Rule]);
+        return rows;
+    }
+    if panel.tab == Tab::Stats {
+        rows.push(Row::Blank);
+        rows.push(Row::Pages { at: panel.stats });
+        rows.push(Row::Blank);
+        rows.extend(
+            stats_lines(usage, panel.stats)
                 .into_iter()
                 .map(|line| Row::Usage { line }),
         );
@@ -570,19 +589,33 @@ pub fn tab_at(col: usize) -> Option<crate::settings::Tab> {
 /// panel has somewhere to grow, and a page that invented content it does not
 /// have would be worse than one that says what it is waiting for. Each names
 /// the thing that would fill it, so the next person knows where to look.
+/// Whether a page draws itself from what the host answered, rather than saying
+/// in a line what it will one day be.
+///
+/// One answer, read by [`elsewhere`] and by the criteria that walk the pages:
+/// two lists of "which pages are real yet" would agree until a page was
+/// finished, and then a criterion would be asserting a placeholder that is no
+/// longer drawn.
+fn draws_itself(tab: crate::settings::Tab) -> bool {
+    use crate::settings::Tab;
+    matches!(tab, Tab::Config | Tab::Usage | Tab::Stats)
+}
+
 fn elsewhere(tab: crate::settings::Tab) -> &'static str {
+    // A page that draws itself has nothing for this to say. Asked rather than
+    // listed a second time, so the two cannot come apart: the day a page is
+    // finished, moving it into `draws_itself` is the whole edit.
+    if draws_itself(tab) {
+        return "";
+    }
     match tab {
-        // Not reachable — the settings page draws the box and the list instead —
-        // but a total function beats a `panic!` for the day someone adds a row.
-        crate::settings::Tab::Config => "",
         crate::settings::Tab::Status => {
             "这个会话跑在什么上面(模型、推理档、压缩,来自 agent 的描述)"
         }
-        // Unreachable now: the Usage page draws itself. Kept total for the same
-        // reason `Config` is — and the wording corrected, because what this page
-        // turned out to be is the account's allowance, not this session's tokens.
-        crate::settings::Tab::Usage => "",
-        crate::settings::Tab::Stats => "这次会话干了什么(回合数、工具调用、耗时,从日志折出来)",
+        // Total for the day someone adds a page: an unfinished page with no
+        // line of its own is caught by `every_other_page_says_something_different`
+        // rather than by a `panic!` in front of a person.
+        _ => "",
     }
 }
 
@@ -656,14 +689,12 @@ enum UsageLine {
     },
     /// The ramp, with a word at each end.
     HeatKey { less: String, more: String },
-    /// A label and its value, the label already padded so the values line up.
+    /// A row of the two-column figures, already laid out.
     ///
-    /// Padded by **display width**, not by character count: `请求次数` is four
-    /// characters and eight cells while `总 Token 数` is nine characters and
-    /// eleven, so counting characters puts every value at a different column.
-    /// The classic front end had this bug and fixed it; inheriting the fix is
-    /// cheaper than rediscovering it.
-    Pair { label: String, value: String },
+    /// Laid out here rather than at render for the reason [`UsageLine::Cols`]
+    /// is: where a column starts comes from what is in the columns, not from
+    /// how wide the screen is.
+    Columns { text: String },
     /// A blank line inside the page.
     Gap,
 }
@@ -681,7 +712,7 @@ enum UsageLine {
 ///   page drew time through the window instead and had to say so. A bar with no
 ///   percentage behind it is not drawn at all: an empty track reads as "none
 ///   used", and not knowing is a different thing from zero.
-fn usage_lines(page: Option<&crate::settings::UsagePage>) -> Vec<UsageLine> {
+fn allowance_lines(page: Option<&crate::settings::UsagePage>) -> Vec<UsageLine> {
     let Some(page) = page else {
         return vec![UsageLine::Note("正在问宿主…".into())];
     };
@@ -709,8 +740,7 @@ fn usage_lines(page: Option<&crate::settings::UsagePage>) -> Vec<UsageLine> {
     }
 
     // Said, not returned on: an account with no metered windows may still have
-    // spent something, and the first version of this bailed out here — so a
-    // host that reported per-model figures and no windows drew none of them.
+    // a plan, and the first version of this bailed out here.
     if page.windows.is_empty() {
         out.push(UsageLine::Head("额度".into()));
         out.push(UsageLine::Note("这个宿主不计额度".into()));
@@ -721,9 +751,7 @@ fn usage_lines(page: Option<&crate::settings::UsagePage>) -> Vec<UsageLine> {
         out.push(UsageLine::Head(window.label.clone()));
         match window.used_percent {
             // What the account service counted. The bar is *of the allowance*,
-            // which is the thing a person opened this page to see. A tenth of a
-            // percent because at the top of a window that is the digit that is
-            // still moving.
+            // which is the thing a person opened this page to see.
             Some(percent) => {
                 let counted = match (window.calls_used, window.call_limit) {
                     (Some(used), Some(limit)) => format!(" · {used} / {limit} 次"),
@@ -798,73 +826,120 @@ fn usage_lines(page: Option<&crate::settings::UsagePage>) -> Vec<UsageLine> {
         out.push(UsageLine::Gap);
     }
 
-    if let Some(stats) = page.stats.as_ref() {
-        out.push(UsageLine::Head("总览".into()));
-        if !stats.from.is_empty() && !stats.to.is_empty() {
-            out.push(UsageLine::Note(format!("{} 到 {}", stats.from, stats.to)));
-        }
-        out.push(UsageLine::Gap);
-
-        if !stats.daily.is_empty() {
-            out.extend(heat_calendar(&stats.daily));
-            out.push(UsageLine::Gap);
-        }
-
-        // The figures a person reads off this page one at a time, in a column.
-        // They were a run-on sentence before: "300m tokens · 3007 次请求 · …"
-        // is four numbers a reader has to parse apart, and four of the seven
-        // were not there at all.
-        let active = stats.daily.iter().filter(|day| day.tokens > 0).count();
-        let (longest, current) = streaks(&stats.daily);
-        let busiest = stats
-            .daily
-            .iter()
-            .filter(|day| day.tokens > 0)
-            .max_by_key(|day| day.tokens)
-            .map(|day| day.date.clone());
-        let mut rows = Vec::new();
-        // Biggest first is how the host sends them, so the head of the list is
-        // the answer — no second pass to find it.
-        if let Some(favourite) = stats.models.first() {
-            rows.push(("最常用模型".to_string(), favourite.name.clone()));
-        }
-        rows.push((
-            "总 Token 数".to_string(),
-            crate::content::token_count_u64(stats.total_tokens),
-        ));
-        rows.push(("请求次数".to_string(), stats.total_requests.to_string()));
-        if !stats.daily.is_empty() {
-            rows.push((
-                "活跃天数".to_string(),
-                format!("{active} / {}", stats.daily.len()),
-            ));
-        }
-        if let Some(day) = busiest {
-            rows.push(("最活跃日期".to_string(), day));
-        }
-        if !stats.daily.is_empty() {
-            rows.push(("最长连续天数".to_string(), format!("{longest} 天")));
-            rows.push(("当前连续天数".to_string(), format!("{current} 天")));
-        }
-        out.extend(pairs(rows));
-        out.push(UsageLine::Gap);
-
-        if !stats.daily.is_empty() {
-            out.push(UsageLine::Head("每天用掉多少".into()));
-            out.extend(day_chart(&stats.daily, &stats.series));
-            out.push(UsageLine::Gap);
-        }
-
-        if !stats.models.is_empty() {
-            out.push(UsageLine::Head("各模型用量".into()));
-            out.extend(model_table(&stats.models, stats.total_tokens));
-            out.push(UsageLine::Gap);
-        }
-    }
-
     if matches!(out.last(), Some(UsageLine::Gap)) {
         out.pop();
     }
+    out
+}
+
+/// What the account has done: the calendar and the figures, or the models.
+fn stats_lines(
+    page: Option<&crate::settings::UsagePage>,
+    which: crate::settings::StatsPage,
+) -> Vec<UsageLine> {
+    use crate::settings::StatsPage;
+    let Some(stats) = page.and_then(|page| page.stats.as_ref()) else {
+        return vec![UsageLine::Note(match page {
+            None => "正在问宿主…".into(),
+            Some(_) => "这个宿主不记账".to_string(),
+        })];
+    };
+    let mut out = Vec::new();
+    match which {
+        StatsPage::Overview => {
+            if !stats.daily.is_empty() {
+                out.extend(heat_calendar(&stats.daily));
+                out.push(UsageLine::Gap);
+            }
+            out.extend(overview_figures(stats));
+        }
+        StatsPage::Models => {
+            if stats.daily.is_empty() {
+                out.push(UsageLine::Note("没有按天的记录".into()));
+            } else {
+                out.push(UsageLine::Head("每天用掉多少".into()));
+                out.extend(day_chart(&stats.daily, &stats.series));
+                out.push(UsageLine::Gap);
+            }
+            if stats.models.is_empty() {
+                out.push(UsageLine::Note("没有按模型的记录".into()));
+            } else {
+                out.push(UsageLine::Head("各模型用量".into()));
+                out.extend(model_table(&stats.models, stats.total_tokens));
+            }
+        }
+    }
+    if matches!(out.last(), Some(UsageLine::Gap)) {
+        out.pop();
+    }
+    out
+}
+
+/// The figures, two to a row.
+///
+/// Two columns rather than seven rows: they are pairs of the same kind of thing
+/// — how much, how often, how long — and a column of seven single facts is a
+/// column a reader walks down looking for the one they came for. Paired the way
+/// the classic front end pairs them, so the left column is about volume and the
+/// right about time.
+fn overview_figures(stats: &atomcode_host_api::UsageStats) -> Vec<UsageLine> {
+    let active = stats.daily.iter().filter(|day| day.tokens > 0).count();
+    let (longest, current) = streaks(&stats.daily);
+    let busiest = stats
+        .daily
+        .iter()
+        .filter(|day| day.tokens > 0)
+        .max_by_key(|day| day.tokens)
+        .map(|day| day.date.clone());
+
+    let mut out = Vec::new();
+    if !stats.from.is_empty() && !stats.to.is_empty() {
+        out.push(UsageLine::Note(format!("{} 到 {}", stats.from, stats.to)));
+        out.push(UsageLine::Gap);
+    }
+    // Biggest first is how the host sends them, so the head of the list is the
+    // answer — no second pass to find it.
+    let favourite = stats
+        .models
+        .first()
+        .map(|model| model.name.clone())
+        .unwrap_or_else(|| "—".to_string());
+    let mut rows = vec![
+        (
+            ("最常用模型".to_string(), favourite),
+            (
+                "总 Token 数".to_string(),
+                crate::content::token_count_u64(stats.total_tokens),
+            ),
+        ),
+        (
+            ("请求次数".to_string(), stats.total_requests.to_string()),
+            (
+                "最长连续天数".to_string(),
+                match stats.daily.is_empty() {
+                    true => "—".to_string(),
+                    false => format!("{longest} 天"),
+                },
+            ),
+        ),
+    ];
+    if !stats.daily.is_empty() {
+        rows.push((
+            (
+                "活跃天数".to_string(),
+                format!("{active} / {}", stats.daily.len()),
+            ),
+            ("当前连续天数".to_string(), format!("{current} 天")),
+        ));
+        rows.push((
+            (
+                "最活跃日期".to_string(),
+                busiest.unwrap_or_else(|| "—".to_string()),
+            ),
+            (String::new(), String::new()),
+        ));
+    }
+    out.extend(two_columns(rows));
     out
 }
 
@@ -1279,17 +1354,57 @@ fn heat_key(less: &str, more: &str, w: usize) -> Line {
     Line::from_spans(spans).truncate(w)
 }
 
-/// Label/value rows whose values start at the same column.
-fn pairs(rows: Vec<(String, String)>) -> Vec<UsageLine> {
-    let widest = rows
-        .iter()
-        .map(|(label, _)| width::str_width(label))
-        .max()
-        .unwrap_or(0);
+/// The Stats tab's own row of pages, drawn under the panel's.
+///
+/// Lit the same way the page tabs are, because it means the same thing — this
+/// is the one showing — and a panel with two ways of saying "selected" is a
+/// panel a person has to learn twice.
+fn pages_line(at: crate::settings::StatsPage, w: usize) -> Line {
+    let mut spans = vec![Span::raw("    ")];
+    for (i, page) in crate::settings::StatsPage::ALL.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        let style = match *page == at {
+            true => theme::bg(Role::PanelSelBg).under(theme::fg(Role::PanelFg)),
+            false => theme::fg(Role::Muted),
+        };
+        spans.push(Span::styled(format!(" {} ", page.label()), style));
+    }
+    Line::from_spans(spans).truncate(w)
+}
+
+/// One figure: what it is called, and what it says.
+type Figure = (String, String);
+
+/// Pairs of label/value, two pairs to a row, each column lined up with itself.
+///
+/// The right column starts at a fixed distance from the left rather than from
+/// the longest left value, so the two columns stay put as the figures change
+/// under them — a column that moved when a number got a digit longer would be a
+/// column a reader re-finds every time the page refreshes.
+fn two_columns(rows: Vec<(Figure, Figure)>) -> Vec<UsageLine> {
+    const COLUMN: usize = 34;
+    let widest = |pick: fn(&(Figure, Figure)) -> &String| {
+        rows.iter()
+            .map(|row| width::str_width(pick(row)))
+            .max()
+            .unwrap_or(0)
+    };
+    let left = widest(|row| &row.0 .0);
+    let right = widest(|row| &row.1 .0);
     rows.into_iter()
-        .map(|(label, value)| UsageLine::Pair {
-            label: pad_right(&label, widest + 2),
-            value,
+        .map(|((left_label, left_value), (right_label, right_value))| {
+            let mut text = format!("{}{}", pad_right(&left_label, left + 2), left_value);
+            if !right_label.is_empty() {
+                text = format!(
+                    "{}{}{}",
+                    pad_right(&text, COLUMN),
+                    pad_right(&right_label, right + 2),
+                    right_value
+                );
+            }
+            UsageLine::Columns { text }
         })
         .collect()
 }
@@ -1866,15 +1981,53 @@ mod tests {
     }
     use std::sync::Arc;
 
+    /// The Usage tab: the allowance and the plan behind it.
     fn usage_page(page: crate::settings::UsagePage) -> Moment {
+        page_on(
+            page,
+            crate::settings::Tab::Usage,
+            crate::settings::StatsPage::Overview,
+        )
+    }
+
+    /// The panel open on one page of itself.
+    ///
+    /// One function and three names for it, so a criterion says which page it
+    /// is about in the call rather than in three lines of set-up — and so that
+    /// moving a section from one page to another is a one-word edit here
+    /// instead of a rewrite of every criterion that reads it.
+    fn page_on(
+        page: crate::settings::UsagePage,
+        tab: crate::settings::Tab,
+        which: crate::settings::StatsPage,
+    ) -> Moment {
         let mut panel = Panel::new();
-        panel.show(crate::settings::Tab::Usage);
+        panel.show(tab);
+        panel.stats = which;
         Moment {
             settings: two(),
             settings_panel: Some(panel),
             usage: Some(page),
             ..Moment::default()
         }
+    }
+
+    /// The Stats tab's overview: the calendar and the figures.
+    fn stats_page(page: crate::settings::UsagePage) -> Moment {
+        page_on(
+            page,
+            crate::settings::Tab::Stats,
+            crate::settings::StatsPage::Overview,
+        )
+    }
+
+    /// The Stats tab's models page: the day chart and the table.
+    fn models_page(page: crate::settings::UsagePage) -> Moment {
+        page_on(
+            page,
+            crate::settings::Tab::Stats,
+            crate::settings::StatsPage::Models,
+        )
     }
 
     fn window(label: &str, used: Option<u8>) -> atomcode_host_api::UsageWindow {
@@ -1962,9 +2115,9 @@ mod tests {
     /// (`UsageStats`), not from the allowance windows, and they had no way
     /// across the contract at all.
     #[test]
-    fn the_usage_page_shows_what_went_through_per_model_and_per_day() {
+    fn the_models_page_shows_what_went_through_per_model_and_per_day() {
         use atomcode_host_api::{DayUse, ModelSeries, ModelUse, UsageStats};
-        let page = usage_page(crate::settings::UsagePage {
+        let page = models_page(crate::settings::UsagePage {
             context: None,
             plan: None,
             windows: Vec::new(),
@@ -2016,11 +2169,8 @@ mod tests {
             "tokens as a person reads them: {shown}"
         );
         assert!(shown.contains("1604"), "and requests: {shown}");
-        assert!(shown.contains("2450"), "the overview totals: {shown}");
-        assert!(
-            shown.contains("2026-08-21") && shown.contains("2026-09-20"),
-            "and the span it covers: {shown}"
-        );
+        // The totals and the span belong to the overview page and are asserted
+        // there. This page is the chart and the table.
 
         // The chart has an axis, which is the whole difference between a shape
         // and a measurement. The first version of this page drew one row of
@@ -2086,7 +2236,7 @@ mod tests {
     #[test]
     fn each_model_is_drawn_in_its_own_colour_and_its_row_carries_it() {
         use atomcode_host_api::{DayUse, ModelSeries, ModelUse, UsageStats};
-        let page = usage_page(crate::settings::UsagePage {
+        let page = models_page(crate::settings::UsagePage {
             context: None,
             plan: None,
             windows: Vec::new(),
@@ -2193,7 +2343,7 @@ mod tests {
             .collect();
         let first = daily[0].date.clone();
         let last = daily[89].date.clone();
-        let page = usage_page(crate::settings::UsagePage {
+        let page = models_page(crate::settings::UsagePage {
             context: None,
             plan: None,
             windows: Vec::new(),
@@ -2299,7 +2449,7 @@ mod tests {
                 requests: 0,
             })
             .collect();
-        let page = usage_page(crate::settings::UsagePage {
+        let page = stats_page(crate::settings::UsagePage {
             context: None,
             plan: None,
             windows: Vec::new(),
@@ -2369,7 +2519,7 @@ mod tests {
     /// column, since `请求次数` is four characters and eight cells. Four of the
     /// seven figures were missing here entirely.
     #[test]
-    fn the_overview_says_all_seven_figures_with_the_values_in_one_column() {
+    fn the_overview_says_all_seven_figures_in_two_columns_that_line_up() {
         use atomcode_host_api::{DayUse, ModelUse, UsageStats};
         // Two runs of working days: three, then a gap, then two that reach the
         // end — so "longest" and "current" cannot be the same number, and a
@@ -2388,7 +2538,7 @@ mod tests {
                 requests: 1,
             })
             .collect();
-        let page = usage_page(crate::settings::UsagePage {
+        let page = stats_page(crate::settings::UsagePage {
             context: None,
             plan: None,
             windows: Vec::new(),
@@ -2438,21 +2588,43 @@ mod tests {
         );
         assert!(shown.contains("最长连续天数  3 天"), "{shown}");
         assert!(shown.contains("当前连续天数  2 天"), "{shown}");
-
-        // Every value starts at the same column. Measured in display cells, not
-        // characters — which is the whole point.
-        let starts: Vec<usize> = shown
-            .lines()
-            .filter(|line| line.contains("连续天数") || line.contains("请求次数"))
-            .map(|line| {
-                let at = line.rfind("  ").expect("two spaces before the value");
-                crate::width::str_width(&line[..at])
-            })
-            .collect();
-        assert_eq!(starts.len(), 3, "three of the pairs: {shown}");
         assert!(
-            starts.windows(2).all(|pair| pair[0] == pair[1]),
-            "the values line up: {starts:?}\n{shown}"
+            shown.contains("2026-07-23 到 2026-07-29"),
+            "the span it covers: {shown}"
+        );
+
+        // Both columns line up with themselves. Measured in display cells, not
+        // characters — `请求次数` is four characters and eight cells while
+        // `总 Token 数` is nine and eleven, so counting characters puts every
+        // value at a different column. The classic front end had this bug and
+        // fixed it; inheriting the fix is cheaper than rediscovering it.
+        let at = |needle: &str| -> usize {
+            let line = shown
+                .lines()
+                .find(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("{needle}: {shown}"));
+            crate::width::str_width(&line[..line.find(needle).expect("just found it")])
+        };
+        assert_eq!(
+            at("最长连续天数"),
+            at("当前连续天数"),
+            "the right column starts at one place: {shown}"
+        );
+        // And the left column's values do too — asserted on two labels of
+        // different display widths, which is the case that breaks.
+        let value_at = |label: &str| -> usize {
+            let line = shown
+                .lines()
+                .find(|line| line.contains(label))
+                .unwrap_or_else(|| panic!("{label}: {shown}"));
+            let after = line.find(label).expect("just found it") + label.len();
+            let value = line[after..].trim_start();
+            crate::width::str_width(&line[..line.len() - value.len()])
+        };
+        assert_eq!(
+            value_at("请求次数"),
+            value_at("活跃天数"),
+            "and the left column's values do: {shown}"
         );
     }
 
@@ -2540,9 +2712,12 @@ mod tests {
                 total_requests: 60,
             }),
         };
+        // The models page: the chart and the table are the long part, and its
+        // last row is the last row of the whole page.
         let at = |scroll: usize| -> Vec<String> {
             let mut panel = Panel::new();
-            panel.show(crate::settings::Tab::Usage);
+            panel.show(crate::settings::Tab::Stats);
+            panel.stats = crate::settings::StatsPage::Models;
             panel.scroll = scroll;
             let moment = Moment {
                 settings: two(),
@@ -2550,7 +2725,9 @@ mod tests {
                 usage: Some(page.clone()),
                 ..Moment::default()
             };
-            drawn(&moment, 92, 24)
+            // A short panel, which is the case this is about: on a small
+            // terminal every page is taller than the panel.
+            drawn(&moment, 92, 16)
         };
 
         let top = at(0);
@@ -2584,7 +2761,7 @@ mod tests {
         );
         assert_eq!(
             bottom.len(),
-            24,
+            16,
             "a panel scrolled past its end is not a shorter panel: {bottom:#?}"
         );
     }
@@ -2621,6 +2798,134 @@ mod tests {
             settings.scroll, 0,
             "and leave the offset alone: a list that both filters and scrolls \
              has two ways to lose the row you were looking at"
+        );
+    }
+
+    /// Usage says what may still be done and Stats says what was done, and
+    /// neither draws the other's sections.
+    ///
+    /// They were one page, and it grew past the panel twice. The split is what
+    /// this asserts — both halves of it, because a section moved and left a
+    /// copy behind is the failure that looks fine on each page on its own.
+    #[test]
+    fn the_allowance_and_the_history_are_two_pages() {
+        use atomcode_host_api::{DayUse, Entitlement, ModelUse, UsageStats};
+        let page = crate::settings::UsagePage {
+            context: None,
+            plan: Some(Entitlement {
+                plan: "CodingPlan Pro".into(),
+                active: true,
+                claimed_at: "2026-07-30".into(),
+                expires_at: "2036-07-30".into(),
+                remaining_days: 3601,
+                total_days: 3653,
+            }),
+            windows: vec![window("5 小时", Some(42))],
+            stats: Some(UsageStats {
+                from: "2026-07-23".into(),
+                to: "2026-07-24".into(),
+                models: vec![ModelUse {
+                    name: "a-model".into(),
+                    tokens: 100,
+                    requests: 1,
+                }],
+                daily: vec![DayUse {
+                    date: "2026-07-23".into(),
+                    tokens: 100,
+                    requests: 1,
+                }],
+                series: Vec::new(),
+                total_tokens: 100,
+                total_requests: 1,
+            }),
+        };
+        let allowance = drawn(&usage_page(page.clone()), 92, 40).join("\n");
+        assert!(
+            allowance.contains("5 小时") && allowance.contains("CodingPlan Pro"),
+            "the allowance and the plan are on Usage: {allowance}"
+        );
+        for moved in ["最常用模型", "各模型用量", "Sun"] {
+            assert!(
+                !allowance.contains(moved),
+                "{moved} moved to Stats and left no copy behind: {allowance}"
+            );
+        }
+
+        let overview = drawn(&stats_page(page.clone()), 92, 40).join("\n");
+        assert!(
+            overview.contains("最常用模型") && overview.contains("Sun"),
+            "the figures and the calendar are on Stats: {overview}"
+        );
+        assert!(
+            !overview.contains("CodingPlan Pro"),
+            "and the plan stayed on Usage: {overview}"
+        );
+
+        let models = drawn(&models_page(page), 92, 40).join("\n");
+        assert!(
+            models.contains("各模型用量") && models.contains("a-model"),
+            "the table is on the models page: {models}"
+        );
+        assert!(
+            !models.contains("最常用模型"),
+            "which is not the overview: {models}"
+        );
+    }
+
+    /// The Stats tab has a row of its own pages; left and right walk it, Tab
+    /// still walks the panel's, and the page a person left is the one they come
+    /// back to.
+    #[test]
+    fn the_stats_pages_are_their_own_row_of_tabs() {
+        use crate::settings::{StatsPage, Tab};
+        use crate::surface::{Key, KeyPress, Mods};
+        let view = two();
+        let press = |key| KeyPress {
+            key,
+            mods: Mods::NONE,
+        };
+
+        let mut panel = Panel::new();
+        panel.show(Tab::Stats);
+        let shown = drawn(
+            &Moment {
+                settings: two(),
+                settings_panel: Some(panel.clone()),
+                ..Moment::default()
+            },
+            92,
+            24,
+        )
+        .join("\n");
+        assert!(
+            shown.contains("Overview") && shown.contains("Models"),
+            "both pages are named: {shown}"
+        );
+
+        // Right walks the row the eye is on — the second one, here.
+        crate::settings::key(&view, &mut panel, press(Key::Right));
+        assert_eq!(panel.stats, StatsPage::Models, "right walks the inner row");
+        assert_eq!(panel.tab, Tab::Stats, "and leaves the outer one alone");
+        crate::settings::key(&view, &mut panel, press(Key::Left));
+        assert_eq!(panel.stats, StatsPage::Overview, "and left comes back");
+
+        // Tab always means the panel's own pages, so the outer row is never
+        // unreachable from a page that has an inner one.
+        crate::settings::key(&view, &mut panel, press(Key::Right));
+        crate::settings::key(
+            &view,
+            &mut panel,
+            KeyPress {
+                key: Key::Tab,
+                mods: Mods::NONE,
+            },
+        );
+        assert_ne!(panel.tab, Tab::Stats, "tab leaves the page");
+        panel.show(Tab::Stats);
+        assert_eq!(
+            panel.stats,
+            StatsPage::Models,
+            "and coming back lands on the page that was being read"
         );
     }
 
@@ -3339,10 +3644,11 @@ mod tests {
                 !joined.contains('┌'),
                 "{tab:?} draws no search box — it has nothing to filter:\n{joined}"
             );
-            if tab == Tab::Usage {
-                // This page draws itself now, from what the host answered. With
-                // no answer yet that is one line saying so — which is still a
-                // page that is not blank, the thing this criterion is about.
+            if draws_itself(tab) {
+                // These pages draw themselves now, from what the host answered.
+                // With no answer yet that is one line saying so — which is
+                // still a page that is not blank, the thing this criterion is
+                // about.
                 assert!(
                     joined.contains("正在问宿主"),
                     "{tab:?} draws what it has:\n{joined}"
@@ -3364,14 +3670,21 @@ mod tests {
         // content of its own, drawn as though it had.
         let mut said: Vec<&str> = Vec::new();
         for tab in Tab::ALL {
-            if tab == Tab::Config {
+            if draws_itself(tab) {
                 continue;
             }
             let words = elsewhere(tab);
+            assert!(!words.is_empty(), "{tab:?} has something to say");
             assert!(!said.contains(&words), "{tab:?} repeats another page");
             said.push(words);
         }
-        assert_eq!(said.len(), Tab::ALL.len() - 1);
+        // Every page either draws itself or has a line of its own. The count is
+        // asserted so that a page finished tomorrow has to be moved into
+        // `draws_itself` rather than left claiming a placeholder nobody draws.
+        assert_eq!(
+            said.len(),
+            Tab::ALL.iter().filter(|tab| !draws_itself(**tab)).count()
+        );
     }
 
     // ---- clicking the tabs ------------------------------------------------

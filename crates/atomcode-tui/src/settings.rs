@@ -207,6 +207,39 @@ pub struct Edit {
 ///
 /// Ordered as they are drawn, left to right, with the settings first: that is
 /// what the panel is for and what it opens on.
+/// Which page of the Stats tab is showing.
+///
+/// A second row of tabs rather than two more top-level ones: what is on them —
+/// how the days went, and what each model did — are two views of the same
+/// figures, and a tab row where four of six entries are about one subject is a
+/// row that has stopped saying what the panel's pages are.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StatsPage {
+    #[default]
+    Overview,
+    Models,
+}
+
+impl StatsPage {
+    /// Every page, in the order they are drawn.
+    pub const ALL: [StatsPage; 2] = [StatsPage::Overview, StatsPage::Models];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            StatsPage::Overview => "Overview",
+            StatsPage::Models => "Models",
+        }
+    }
+
+    /// The next one along, wrapping — two pages side by side are a ring however
+    /// few of them there are, and a key that stopped at the end would do
+    /// nothing half the time it was pressed.
+    pub fn cycled(self, by: i32) -> Self {
+        let at = Self::ALL.iter().position(|page| *page == self).unwrap_or(0) as i32;
+        Self::ALL[(at + by).rem_euclid(Self::ALL.len() as i32) as usize]
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Tab {
     #[default]
@@ -291,6 +324,12 @@ pub struct Panel {
     /// the day the calendar went in, and the panel silently dropped its own
     /// closing rule to make room.
     pub scroll: usize,
+    /// Which page of the Stats tab is showing.
+    ///
+    /// On the panel rather than inside the Stats page because it has to survive
+    /// leaving the tab and coming back: a person who was reading the model
+    /// table, looked at Config and came back, meant to come back to the table.
+    pub stats: StatsPage,
 }
 
 impl Panel {
@@ -506,14 +545,38 @@ pub fn key(view: &SettingsView, panel: &mut Panel, press: crate::surface::KeyPre
         // thing on a terminal uses, so nothing has to be learned. Left and right
         // do the same, because the row is drawn horizontally and a person who
         // sees `Config | Status | Usage | Stats` will reach for them.
-        (Key::Tab, Mods::NONE) | (Key::Right, _) => {
+        (Key::Tab, Mods::NONE) => {
             let next = panel.tab.cycled(1);
             panel.show(next);
             Step::Stay
         }
-        (Key::BackTab, _) | (Key::Tab, Mods::SHIFT) | (Key::Left, _) => {
+        (Key::BackTab, _) | (Key::Tab, Mods::SHIFT) => {
             let next = panel.tab.cycled(-1);
             panel.show(next);
+            Step::Stay
+        }
+        // Left and right walk the row the eye is on. On a page with a second
+        // row of tabs that is the second row — it is the one drawn right where
+        // the arrows are pointing — and everywhere else it is the page tabs.
+        // Tab and shift-tab always mean the page tabs, so the outer row is
+        // never unreachable.
+        (Key::Right, _) | (Key::Left, _) => {
+            let by = match press.key {
+                Key::Right => 1,
+                _ => -1,
+            };
+            match panel.tab {
+                Tab::Stats => {
+                    panel.stats = panel.stats.cycled(by);
+                    // A different page, read from its top: the offset was about
+                    // rows this page does not have.
+                    panel.scroll = 0;
+                }
+                _ => {
+                    let next = panel.tab.cycled(by);
+                    panel.show(next);
+                }
+            }
             Step::Stay
         }
         // Escape does the innermost thing, the same rule the composer's Escape

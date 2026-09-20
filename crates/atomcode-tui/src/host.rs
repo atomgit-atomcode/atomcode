@@ -1654,6 +1654,39 @@ impl Host {
     /// rect left over from an older frame — and a second check here would be the
     /// same fact stated twice, which is how the two come to disagree. The
     /// criterion that pins it is `a_click_missing_the_panel_hits_nothing`.
+    /// Scroll the settings panel under the pointer, and say whether it took it.
+    ///
+    /// Only the pages that are read rather than filtered scroll, and only when
+    /// the pointer is actually over the panel: a wheel anywhere else belongs to
+    /// the conversation, which is the thing people scroll all day. Answering
+    /// every wheel event while the panel happened to be open would take the
+    /// wheel away from the transcript the panel does not even cover.
+    pub fn settings_wheel(&self, x: u16, y: u16, by: i32) -> bool {
+        let over = self
+            .hits
+            .lock()
+            .expect("hits poisoned")
+            .settings
+            .is_some_and(|rect| rect.contains(x, y));
+        if !over {
+            return false;
+        }
+        let mut m = self.moment.write().expect("moment poisoned");
+        let Some(panel) = m.settings_panel.as_mut() else {
+            return false;
+        };
+        if panel.tab == crate::settings::Tab::Config {
+            return false;
+        }
+        // Clamped at the top here and at the bottom where the rows are counted:
+        // this side does not know how long the page is.
+        panel.scroll = match by < 0 {
+            true => panel.scroll.saturating_sub(by.unsigned_abs() as usize),
+            false => panel.scroll.saturating_add(by as usize),
+        };
+        true
+    }
+
     pub fn settings_row_at(&self, x: u16, y: u16) -> Option<usize> {
         let rect = *self.hits.lock().expect("hits poisoned").settings.as_ref()?;
         if !rect.contains(x, y) {
@@ -3797,6 +3830,63 @@ mod tests {
             ]);
         }
         h
+    }
+
+    /// The wheel over a page that is read scrolls that page, and the wheel
+    /// anywhere else is still the conversation's.
+    ///
+    /// Both halves matter. The panel's read-only pages can be longer than it
+    /// is, so a wheel over one that scrolled the transcript *behind* it would
+    /// be a wheel that does nothing a person can see — and a panel that
+    /// answered every wheel event while it happened to be open would take the
+    /// wheel away from the transcript it does not even cover.
+    #[test]
+    fn the_wheel_over_a_read_page_scrolls_it_and_elsewhere_does_not() {
+        let h = host_with_settings();
+        h.toggle_settings();
+        {
+            let mut m = h.moment.write().expect("moment poisoned");
+            let panel = m.settings_panel.as_mut().expect("a panel");
+            panel.show(crate::settings::Tab::Usage);
+        }
+        let frame = h.compose((60, 30));
+        let rect = frame
+            .part(crate::modules::settings::ID)
+            .expect("the panel is drawn")
+            .rect;
+
+        assert!(
+            h.settings_wheel(rect.x + 1, rect.y + 1, 3),
+            "over the panel, the wheel is the panel's"
+        );
+        let after = h
+            .moment
+            .read()
+            .expect("moment poisoned")
+            .settings_panel
+            .as_ref()
+            .expect("a panel")
+            .scroll;
+        assert_eq!(after, 3, "and it moved the page");
+
+        // Above the panel is the conversation, which is the thing people scroll
+        // all day.
+        assert!(
+            !h.settings_wheel(rect.x + 1, rect.y.saturating_sub(1), 3),
+            "off the panel, the wheel is not the panel's"
+        );
+
+        // The settings page is narrowed by typing, not scrolled: a list you can
+        // both filter and scroll has two ways to lose the row you were on.
+        {
+            let mut m = h.moment.write().expect("moment poisoned");
+            let panel = m.settings_panel.as_mut().expect("a panel");
+            panel.show(crate::settings::Tab::Config);
+        }
+        assert!(
+            !h.settings_wheel(rect.x + 1, rect.y + 1, 3),
+            "the page that is filtered does not scroll"
+        );
     }
 
     /// A click reads the row the frame drew: the pointed row is the one the

@@ -1263,6 +1263,20 @@ impl UserInterface for Tui {
                     // which it becomes is decided at the release, by whether
                     // the pointer moved. Deciding at the press would mean
                     // folding a block every time someone selects text on it.
+                    // The wheel over the settings panel is the panel's: its
+                    // read-only pages can be longer than it is, and a wheel
+                    // that scrolled the conversation *behind* an open panel
+                    // would be a wheel that does nothing a person can see.
+                    if matches!(click, Click::WheelUp | Click::WheelDown) {
+                        let by = match click {
+                            Click::WheelUp => -WHEEL_LINES,
+                            _ => WHEEL_LINES,
+                        };
+                        if self.host.settings_wheel(x, y, by) {
+                            stale = true;
+                            continue;
+                        }
+                    }
                     let action = match click {
                         Click::WheelUp => Some(Action::Scroll(-WHEEL_LINES)),
                         Click::WheelDown => Some(Action::Scroll(WHEEL_LINES)),
