@@ -38,6 +38,12 @@ pub struct Mods {
     pub ctrl: bool,
     pub alt: bool,
     pub shift: bool,
+    /// The Cmd key on macOS (Super/Meta elsewhere). Kept distinct from the
+    /// others so a Cmd chord does not collapse to [`Mods::NONE`] and fall
+    /// through to typing its letter — the copy reflex `Cmd+C` must not put a `c`
+    /// in the field. Only reaches us on terminals that pass the chord through
+    /// rather than handling it themselves.
+    pub cmd: bool,
 }
 
 impl Mods {
@@ -45,21 +51,25 @@ impl Mods {
         ctrl: false,
         alt: false,
         shift: false,
+        cmd: false,
     };
     pub const CTRL: Mods = Mods {
         ctrl: true,
         alt: false,
         shift: false,
+        cmd: false,
     };
     pub const ALT: Mods = Mods {
         ctrl: false,
         alt: true,
         shift: false,
+        cmd: false,
     };
     pub const SHIFT: Mods = Mods {
         ctrl: false,
         alt: false,
         shift: true,
+        cmd: false,
     };
 }
 
@@ -1556,6 +1566,11 @@ pub fn from_crossterm(event: crossterm::event::Event) -> Option<Input> {
                     ctrl: k.modifiers.contains(KeyModifiers::CONTROL),
                     alt: k.modifiers.contains(KeyModifiers::ALT),
                     shift: k.modifiers.contains(KeyModifiers::SHIFT),
+                    // Cmd on macOS arrives as SUPER (and as META on some
+                    // terminals); either way it must not be dropped, or `Cmd+C`
+                    // collapses to a bare `c` and lands in the field.
+                    cmd: k.modifiers.contains(KeyModifiers::SUPER)
+                        || k.modifiers.contains(KeyModifiers::META),
                 },
             )))
         }
@@ -1729,6 +1744,21 @@ mod tests {
         // Solarized light and dark, the two that a naive average gets wrong.
         assert_eq!(theme((0xfd, 0xf6, 0xe3)), Theme::Light);
         assert_eq!(theme((0x00, 0x2b, 0x36)), Theme::Dark);
+    }
+
+    #[test]
+    fn a_super_modifier_survives_so_cmd_c_is_not_a_bare_c() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        let press = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER);
+        let Some(Input::Key(kp)) = from_crossterm(Event::Key(press)) else {
+            panic!("a Cmd+C press is a key event");
+        };
+        assert!(kp.mods.cmd, "the Cmd/Super modifier is kept, not dropped");
+        assert_ne!(
+            kp.mods,
+            Mods::NONE,
+            "so the press never falls through to Insert('c')"
+        );
     }
 
     #[test]

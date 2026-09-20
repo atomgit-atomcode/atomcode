@@ -247,6 +247,7 @@ impl Keymap for Default_ {
                         ctrl: true,
                         alt: true,
                         shift: false,
+                        cmd: false,
                     },
                 ),
                 Action::AttachImage,
@@ -258,6 +259,45 @@ impl Keymap for Default_ {
             // that is the reflex to serve: it is the key a person reaches for
             // when the screen is wrong.
             (KeyPress::ctrl('l'), Action::Redraw),
+            // The copy reflex, bound to the OS chords rather than left to the
+            // Insert fallthrough — so `Cmd+C`/`Ctrl+Shift+C` copy the selection
+            // (as a mouse drag-release does) instead of typing a `c`. A no-op
+            // when nothing is selected, but still consumed. Both the lowercase
+            // and the shifted-uppercase char the enhanced protocol may report
+            // for Ctrl+Shift+C are bound. Only fires on terminals that pass the
+            // chord through; many handle their own copy and never send it.
+            (
+                KeyPress::new(
+                    Key::Char('c'),
+                    Mods {
+                        cmd: true,
+                        ..Mods::NONE
+                    },
+                ),
+                Action::CopySelection,
+            ),
+            (
+                KeyPress::new(
+                    Key::Char('c'),
+                    Mods {
+                        ctrl: true,
+                        shift: true,
+                        ..Mods::NONE
+                    },
+                ),
+                Action::CopySelection,
+            ),
+            (
+                KeyPress::new(
+                    Key::Char('C'),
+                    Mods {
+                        ctrl: true,
+                        shift: true,
+                        ..Mods::NONE
+                    },
+                ),
+                Action::CopySelection,
+            ),
         ]
     }
 }
@@ -271,6 +311,57 @@ mod tests {
         let keys = Keys::new();
         keys.add(&Default_).unwrap();
         assert_eq!(keys.len(), Default_.bindings().len());
+    }
+
+    #[test]
+    fn cmd_c_and_ctrl_shift_c_copy_rather_than_type_a_c() {
+        // The copy reflex: a person who selects text and reaches for the OS copy
+        // chord must not have a literal `c` land in the field. Both forms map to
+        // the same copy the mouse drag already performs.
+        let keys = Keys::new();
+        keys.add(&Default_).unwrap();
+
+        let cmd_c = KeyPress::new(
+            Key::Char('c'),
+            Mods {
+                cmd: true,
+                ..Mods::NONE
+            },
+        );
+        assert_eq!(
+            keys.resolve(cmd_c),
+            Some(Action::CopySelection),
+            "Cmd+C copies, it does not type a c"
+        );
+
+        let ctrl_shift_c = KeyPress::new(
+            Key::Char('c'),
+            Mods {
+                ctrl: true,
+                shift: true,
+                ..Mods::NONE
+            },
+        );
+        assert_eq!(
+            keys.resolve(ctrl_shift_c),
+            Some(Action::CopySelection),
+            "Ctrl+Shift+C copies, it does not type a c"
+        );
+
+        // The shifted char some terminals report for the same chord.
+        let ctrl_shift_upper = KeyPress::new(
+            Key::Char('C'),
+            Mods {
+                ctrl: true,
+                shift: true,
+                ..Mods::NONE
+            },
+        );
+        assert_eq!(
+            keys.resolve(ctrl_shift_upper),
+            Some(Action::CopySelection),
+            "the uppercase form the enhanced protocol may send also copies"
+        );
     }
 
     #[test]

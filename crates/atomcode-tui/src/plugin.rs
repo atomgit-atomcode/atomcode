@@ -1628,13 +1628,33 @@ impl Tui {
     /// this side's business. Costs one string compare a frame and writes
     /// nothing in the ordinary case.
     ///
-    /// The working directory when the session has no name yet: an untitled
-    /// session is the common case for the first minute, and a window called
-    /// `atomcode` tells nobody which of the four they are looking at.
+    /// The title carries a status dot — `🟢` idle, `🟡` working, `🔴` waiting on
+    /// the person (a question or approval) — then the session's name, or the app
+    /// and version for a window not yet named. The dot is the "红绿灯" the
+    /// reference and Claude Code put in the tab so a glance at the strip says
+    /// which session wants you.
     fn name_the_window(&self) {
-        let moment = self.host.moment.read().expect("moment poisoned");
-        let wanted = crate::text::window_name(moment.title.as_deref(), &moment.cwd);
-        drop(moment);
+        let (title, activity, cwd) = {
+            let m = self.host.moment.read().expect("moment poisoned");
+            (m.title.clone(), m.activity, m.cwd.clone())
+        };
+        let dot = if self.host.asks.is_waiting() {
+            "🔴"
+        } else if matches!(
+            activity,
+            crate::moment::Activity::Working | crate::moment::Activity::Stopping
+        ) {
+            "🟡"
+        } else {
+            "🟢"
+        };
+        // The project directory is the fallback for a window not yet named —
+        // which checkout this is, when the session has no title of its own. At
+        // the filesystem root there is no project segment, so fall back to the
+        // app rather than a bare dot.
+        let base = crate::text::basename(&cwd);
+        let fallback = if base.is_empty() { "AtomCode" } else { base };
+        let wanted = crate::text::terminal_title(title.as_deref(), fallback, Some(dot));
         if wanted.is_empty() {
             return;
         }
@@ -2781,6 +2801,11 @@ impl Tui {
                 let text = self.host.compose(self.surface.size()).selected_text(&sel);
                 if !text.is_empty() {
                     self.surface.copy(&text);
+                    // Confirm on the tip row, the way the right-click `copy` menu
+                    // item does — the auto-copy of a drag-release is still a copy,
+                    // and it must say so on the gesture itself rather than leave
+                    // the person to copy a second time to learn it worked.
+                    self.host.say("已复制选中的内容", false);
                 }
                 return false;
             }

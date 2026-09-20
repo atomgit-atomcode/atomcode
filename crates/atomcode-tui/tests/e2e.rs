@@ -1337,10 +1337,12 @@ async fn the_window_says_which_project_this_is() {
         .file_name()
         .and_then(|n| n.to_str())
         .expect("a directory name");
+    // An idle, not-yet-named session: the green status dot, then the project the
+    // session is working in (its fallback name).
     assert_eq!(
         s.term.title().as_deref(),
-        Some(here),
-        "the window is named after where the session is working"
+        Some(format!("🟢 {here}").as_str()),
+        "the window is a status dot then where the session is working"
     );
     task.abort();
 }
@@ -2145,6 +2147,56 @@ async fn moving_the_pointer_over_a_row_makes_it_the_highlighted_one() {
     assert!(
         screen.contains("head tail"),
         "enter did not take the row the pointer was over:\n{screen}"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+#[tokio::test]
+async fn a_drag_selection_confirms_the_copy_right_away() {
+    // Dragging to select auto-copies; the confirmation belongs on that gesture,
+    // not only after a second, explicit copy through the menu or a chord.
+    let dir = scratch("drag-copy-hint");
+    let s = start(tree(&dir, &replay(r#"{ text = "the model spoke" }"#), &[])).await;
+    let task = s.open().await;
+
+    s.term.type_line("ask a question");
+    s.quiet().await;
+
+    let row = s
+        .screen()
+        .lines()
+        .position(|l| l.contains("spoke"))
+        .expect("the answer is on screen") as u16;
+    let stream = s
+        .term
+        .last()
+        .expect("a frame")
+        .part("stream")
+        .expect("the conversation")
+        .rect;
+    s.term
+        .pointer(atomcode_tui::surface::Click::Press, stream.x, row);
+    s.term
+        .pointer(atomcode_tui::surface::Click::Drag, stream.right() - 1, row);
+    s.term.pointer(
+        atomcode_tui::surface::Click::Release,
+        stream.right() - 1,
+        row,
+    );
+    s.quiet().await;
+
+    assert!(
+        s.term
+            .clipboard_text()
+            .is_some_and(|t| t.contains("spoke")),
+        "the drag copied the answer"
+    );
+    assert!(
+        s.screen().contains("已复制选中"),
+        "the drag-copy confirms itself on screen right away:\n{}",
+        s.screen()
     );
 
     s.term.press(KeyPress::ctrl('d'));
