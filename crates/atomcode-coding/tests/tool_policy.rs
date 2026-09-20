@@ -64,6 +64,27 @@ fn tree(root: &std::path::Path, host: &str) -> ConfigTree {
     ConfigTree::from_layers(layers).unwrap()
 }
 
+/// The product's tree over switches a host holds — `HostState.tool_switches`,
+/// which is what the runtime fills from `CodingParts`.
+async fn mounted_with(
+    dir: &std::path::Path,
+    switches: std::sync::Arc<atomcode_harness::seams::ToolSwitches>,
+) -> App {
+    let mut catalog = plugins::catalog();
+    for plugin in atomcode_coding::on_harness::plugins() {
+        catalog.register(plugin);
+    }
+    catalog.register(std::sync::Arc::new(
+        atomcode_coding::on_harness::tools_host_row(switches),
+    ));
+    let mut tree = tree(dir, "");
+    tree.apply(&Layer::from_toml("[[patch]]\nid = \"tools\"\nname = \"tools-host\"\n").unwrap())
+        .unwrap();
+    let mut app = App::new(catalog, tree);
+    app.start().await.expect("must mount");
+    app
+}
+
 async fn mounted(dir: &std::path::Path, host: &str) -> App {
     let mut catalog = plugins::catalog();
     for plugin in atomcode_coding::on_harness::plugins() {
@@ -129,5 +150,37 @@ async fn a_host_can_drop_a_tool_this_product_added() {
             .iter()
             .any(|n| n.ends_with("skill") || n.ends_with("skills")),
         "both should be gone: {after:?}"
+    );
+}
+
+/// The switch is the person's, and the tree is rebuilt for reasons that have
+/// nothing to do with it — undo, restore, `/model`, a logout. A rebuilt tree
+/// must not hand back the tools they turned off.
+#[tokio::test]
+async fn a_tool_turned_off_stays_off_when_the_tree_is_rebuilt() {
+    let dir = scratch("rebuild");
+    let switches = atomcode_harness::seams::ToolSwitches::new();
+
+    let first = mounted_with(&dir, switches.clone()).await;
+    let tools = first.context().service::<ToolsSvc>().unwrap();
+    assert!(tools.names().contains(&"write_file".to_string()));
+    assert_eq!(tools.turn_off("write_file"), vec!["write_file".to_string()]);
+    drop(first);
+
+    // What a rebuild is: a second App over the same session's switches.
+    let second = mounted_with(&dir, switches).await;
+    let names = names(&second);
+    assert!(
+        !names.contains(&"write_file".to_string()),
+        "the rebuilt tree put back what the person turned off: {names:?}"
+    );
+    assert!(
+        names.contains(&"read_file".to_string()),
+        "and only that one: {names:?}"
+    );
+    assert_eq!(
+        second.context().service::<ToolsSvc>().unwrap().held_back(),
+        vec!["write_file".to_string()],
+        "held, not gone — `/tools on` still brings it back"
     );
 }

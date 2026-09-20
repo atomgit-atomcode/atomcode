@@ -371,6 +371,12 @@ pub struct CodingParts {
     /// The approval gate, handle EXPOSED: respawning on the same parts keeps every
     /// allow-always grant (the in_memory-buried-in-the-assembly bug from the review).
     pub approval: Arc<ApprovalMiddleware>,
+    /// The person's on/off over individual tools, for the same reason `approval`
+    /// is here: the tree is rebuilt on undo, restore, `/model` and a logout, and
+    /// none of those are "put the tools back". A reprepare hands the old one
+    /// over (`adopt_tool_switches`); a new session starts clean, because a new
+    /// session is where the config speaks again.
+    pub(crate) tool_switches: Arc<atomcode_harness::seams::ToolSwitches>,
     /// What the `capability-commands` row asks the runtime to do — goal, loop,
     /// the local-context queue, the policy intervention (`docs/adr/0021` §3).
     /// Filled by the runtime before it mounts, and kept across a rebuild:
@@ -881,6 +887,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
 
     Ok(CodingParts {
         runtime_commands: None,
+        tool_switches: atomcode_harness::seams::ToolSwitches::new(),
         shared_cwd: std::sync::Arc::new(std::sync::RwLock::new(cfg.working_dir.clone())),
         plan_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         bypass_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1156,6 +1163,20 @@ impl CodingParts {
 
     /// Preserve the exact current conversation across a sessionless provider reassembly.
     /// The runtime's own capabilities, for the row that offers them as commands.
+    /// The switches this session's catalog answers to.
+    pub(crate) fn tool_switches(&self) -> Arc<atomcode_harness::seams::ToolSwitches> {
+        self.tool_switches.clone()
+    }
+
+    /// Take over the switches a previous parts held, so a reprepare does not
+    /// quietly put back the tools the person turned off.
+    pub(crate) fn adopt_tool_switches(
+        &mut self,
+        switches: Arc<atomcode_harness::seams::ToolSwitches>,
+    ) {
+        self.tool_switches = switches;
+    }
+
     pub(crate) fn set_runtime_commands(
         &mut self,
         commands: Arc<dyn crate::runtime::RuntimeCommands>,

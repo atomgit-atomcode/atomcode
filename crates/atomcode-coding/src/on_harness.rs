@@ -904,6 +904,16 @@ pub fn config_rows(cfg: &crate::CodingAgentConfig) -> Result<Layer, String> {
     Ok(out)
 }
 
+/// The `tools-host` row, for a host assembling this product's tree itself.
+///
+/// The runtime fills it from `HostState.tool_switches`; anyone building the
+/// tree by hand needs a way to name the same row.
+pub fn tools_host_row(
+    switches: std::sync::Arc<atomcode_harness::seams::ToolSwitches>,
+) -> impl atomcode_plexus::Plugin {
+    crate::host_rows::ToolsHostPlugin(switches)
+}
+
 /// The coding overlay with this working directory substituted in.
 pub fn coding_overlay(
     working_dir: &Path,
@@ -1428,6 +1438,10 @@ pub struct HostState {
     /// MCP tools. Absent for a host with no switches: the tree keeps the
     /// harness's mount-time rows.
     pub modes: Option<HostModes>,
+    /// The person's on/off over individual tools, held here so it survives the
+    /// tree being rebuilt (`tools-host`). Absent means the catalog's switches
+    /// live and die with the tree, which is right for a tree nobody rebuilds.
+    pub tool_switches: Option<Arc<atomcode_harness::seams::ToolSwitches>>,
     /// Tool middleware the host built (telemetry, the AtomGit push label).
     pub middleware: Option<Arc<crate::host_rows::HostMiddleware>>,
     /// The person's `hooks.json` engine, as the host loaded it — plugin hooks,
@@ -1693,6 +1707,9 @@ pub async fn mount_hosted(
                 .swap("skills", "skills-host")
                 .disable("skill-catalog-inline")
         })
+        .when(host.tool_switches.is_some(), |layer| {
+            layer.swap("tools", "tools-host")
+        })
         .when(host.runtime_commands.is_some(), |layer| {
             layer.insert(Entry::named("capability-commands"))
         })
@@ -1788,6 +1805,9 @@ pub async fn mount_hosted(
         language: host.language,
         config_file: host.config_file.clone(),
     }));
+    if let Some(switches) = host.tool_switches.clone() {
+        registry.register(Arc::new(crate::host_rows::ToolsHostPlugin(switches)));
+    }
     registry.register(Arc::new(crate::host_rows::KernelHooksPlugin(
         host.hooks.unwrap_or_default(),
     )));

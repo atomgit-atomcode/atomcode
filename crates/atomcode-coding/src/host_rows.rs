@@ -579,6 +579,35 @@ impl Plugin for GrantsHostPlugin {
     }
 }
 
+/// `tools-host`: the tool catalog, over switches the runtime keeps.
+///
+/// Stands where the harness's `tools` row stands and builds the same catalog
+/// the same way — the difference is whose switches it answers to. A person who
+/// turned a tool off in this session did not mean "until the next `/model`",
+/// and the tree is rebuilt for a good many reasons that have nothing to do with
+/// the catalog (`docs/adr/0022` §2). The runtime holds the switches, so the
+/// rebuilt catalog starts where the old one left off.
+pub(crate) struct ToolsHostPlugin(pub(crate) Arc<atomcode_harness::seams::ToolSwitches>);
+
+#[async_trait]
+impl Plugin for ToolsHostPlugin {
+    fn name(&self) -> &'static str {
+        "tools-host"
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["tools"]
+    }
+    fn uses(&self) -> &'static [&'static str] {
+        &["commands", "operations"]
+    }
+    fn description(&self) -> &'static str {
+        "the live tool catalog, over the runtime's own on/off switches"
+    }
+    async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
+        atomcode_harness::plugins::registries::mount_catalog(ctx, config, Some(self.0.clone()))
+    }
+}
+
 /// `plan-mode-live`: plan mode as the coding product has it, switched live.
 ///
 /// The harness's own `plan-mode` row is a different policy — every tool without

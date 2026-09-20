@@ -331,3 +331,206 @@ async fn a_bare_name_excludes_every_rows_copy_of_it() {
         "the unqualified pattern names the tool, not one row's copy: {names:?}"
     );
 }
+
+// ---- the switch a person flips mid-session --------------------------------
+
+/// Off and back on, without touching the row that owns the tool.
+#[tokio::test]
+async fn a_tool_turned_off_leaves_the_catalog_and_comes_back_unchanged() {
+    let dir = scratch("switch");
+    let app = start(tree(&dir, ""), vec![]).await;
+    let tools = app.context().service::<ToolsSvc>().unwrap();
+
+    assert_eq!(tools.turn_off("write_file"), vec!["write_file".to_string()]);
+    assert!(!names(&app).contains(&"write_file".to_string()));
+    assert!(tools.get("write_file").is_none(), "nor may a call resolve");
+    assert!(!tools.defs().iter().any(|d| d.name == "write_file"));
+    assert_eq!(tools.held_back(), vec!["write_file".to_string()]);
+    assert!(
+        names(&app).contains(&"read_file".to_string()),
+        "the rest of the row is untouched"
+    );
+
+    assert_eq!(tools.turn_on("write_file"), vec!["write_file".to_string()]);
+    assert!(names(&app).contains(&"write_file".to_string()));
+    assert!(tools.held_back().is_empty());
+}
+
+/// A whole server off, one of its tools back — the shape of the request.
+#[tokio::test]
+async fn a_server_goes_off_by_pattern_and_one_tool_comes_back_by_name() {
+    let dir = scratch("server");
+    let app = start(
+        tree(
+            &dir,
+            "[[insert]]\nname = \"fake-github-a\"\n\n[[insert]]\nname = \"fake-github-b\"\n",
+        ),
+        vec![
+            Arc::new(StubRow {
+                row: "fake-github-a",
+                tool: "mcp__github__create_issue",
+                says: "a",
+            }),
+            Arc::new(StubRow {
+                row: "fake-github-b",
+                tool: "mcp__github__delete_repo",
+                says: "b",
+            }),
+        ],
+    )
+    .await;
+    let tools = app.context().service::<ToolsSvc>().unwrap();
+
+    let off = tools.turn_off("mcp__github__*");
+    assert_eq!(off.len(), 2, "both of that server's tools: {off:?}");
+    assert!(!names(&app).iter().any(|n| n.starts_with("mcp__github__")));
+
+    let back = tools.turn_on("mcp__github__create_issue");
+    assert_eq!(back, vec!["mcp__github__create_issue".to_string()]);
+    let live = names(&app);
+    assert!(
+        live.contains(&"mcp__github__create_issue".to_string()),
+        "the one asked back is back: {live:?}"
+    );
+    assert!(
+        !live.contains(&"mcp__github__delete_repo".to_string()),
+        "and the rest of the server stays off: {live:?}"
+    );
+}
+
+/// The case a switch has to survive: the tool is published after the person
+/// said to hide it, which is every MCP server that is still connecting.
+#[tokio::test]
+async fn a_tool_that_arrives_after_the_switch_is_born_hidden() {
+    let dir = scratch("late");
+    let app = start(tree(&dir, ""), vec![]).await;
+    let tools = app.context().service::<ToolsSvc>().unwrap();
+
+    assert!(tools.turn_off("mcp__github__*").is_empty(), "nothing yet");
+
+    // What `publish_mcp` does when the server finally answers.
+    tools
+        .register_from(
+            "mcp-host",
+            Arc::new(Stub {
+                name: "mcp__github__create_issue",
+                says: "late",
+            }),
+        )
+        .expect("publication must not fail");
+
+    assert!(
+        !names(&app).contains(&"mcp__github__create_issue".to_string()),
+        "it must not slip in behind the person"
+    );
+    assert_eq!(
+        tools.turn_on("mcp__github__*"),
+        vec!["mcp__github__create_issue".to_string()],
+        "and it is there to be asked back"
+    );
+}
+
+/// The config's answer is not a suggestion: a command cannot widen it.
+#[tokio::test]
+async fn a_switch_cannot_put_back_what_the_config_excluded() {
+    let dir = scratch("cannot");
+    let app = start(
+        tree(
+            &dir,
+            "[[patch]]\nid = \"tools\"\nconfig = { exclude = [\"write_file\"] }\n",
+        ),
+        vec![],
+    )
+    .await;
+    let tools = app.context().service::<ToolsSvc>().unwrap();
+
+    assert!(
+        tools.turn_on("write_file").is_empty(),
+        "there is nothing held back to restore — it never entered"
+    );
+    assert!(!names(&app).contains(&"write_file".to_string()));
+}
+
+/// The person's entry: `/tools`, `/tools off …`, `/tools on …`. Registered by
+/// the row that owns the catalog, and deliberately not a tool — an agent that
+/// can put its own tools back has not been restricted.
+#[tokio::test]
+async fn a_person_works_the_switch_through_the_command() {
+    let dir = scratch("command");
+    let app = start(tree(&dir, ""), vec![]).await;
+    let ctx = app.context();
+    let catalog = ctx
+        .service::<atomcode_harness::seams::CommandsSvc>()
+        .expect("the catalog is a core row");
+    let agent = atomcode_harness::create_agent(&app)
+        .await
+        .expect("an agent to run commands against");
+    let run = |args: &'static str| {
+        let catalog = catalog.clone();
+        let agent = agent.clone();
+        async move {
+            catalog
+                .find("tools", &agent)
+                .expect("`/tools` is on offer")
+                .run(agent.clone(), args)
+                .await
+        }
+    };
+
+    let listed = run("").await.expect("listing");
+    assert!(listed.contains("write_file"), "{listed}");
+
+    let off = run("off write_file").await.expect("off");
+    assert!(off.contains("write_file"), "{off}");
+    assert!(!names(&app).contains(&"write_file".to_string()));
+    let listed = run("").await.expect("listing");
+    assert!(
+        listed.contains("本次会话关掉的"),
+        "the listing separates what the person turned off: {listed}"
+    );
+
+    let on = run("on write_file").await.expect("on");
+    assert!(on.contains("write_file"), "{on}");
+    assert!(names(&app).contains(&"write_file".to_string()));
+
+    assert!(
+        run("off").await.is_err(),
+        "`off` with nothing to name is a refusal, not a no-op"
+    );
+    assert!(run("sideways nope").await.is_err(), "and so is a typo");
+
+    assert!(
+        !ctx.service::<ToolsSvc>()
+            .unwrap()
+            .names()
+            .iter()
+            .any(|n| n == "tools"),
+        "the switch is a command, not a tool the model can call"
+    );
+}
+
+/// And a tool the person turned off says so too — otherwise the model keeps
+/// telling them it can do a thing it no longer can.
+#[tokio::test]
+async fn the_tree_says_what_the_person_turned_off() {
+    let dir = scratch("said-off");
+    let app = start(tree(&dir, ""), vec![]).await;
+    let ctx = app.context();
+    let said = |ctx: &Context| {
+        ctx.service::<OperationsSvc>()
+            .unwrap()
+            .render(Aspect::Operations, ctx)
+            .join("\n")
+    };
+    assert!(
+        !said(&ctx).contains("TOOL CATALOG"),
+        "nothing is off, so there is nothing to say"
+    );
+
+    ctx.service::<ToolsSvc>().unwrap().turn_off("write_file");
+    let now = said(&ctx);
+    assert!(
+        now.contains("write_file") && now.contains("/tools on"),
+        "it must name the tool and how to put it back:\n{now}"
+    );
+}

@@ -59,6 +59,7 @@ plexus_service!(ModesSvc => Modes, "modes", Core, "Switches a person flips mid-s
 plexus_service!(ToolDriverSvc => dyn ToolDriver, "tool-driver", Seam, "What a running tool reaches of the person's front end: a progress line, a structured question");
 plexus_service!(DelegatedLlmSvc => dyn LlmProvider, "llm-delegated", Seam, "The model a delegated agent runs on when it inherits the conversation's, for a host that keeps a child's spend apart");
 plexus_service!(DelegationLaneSvc => DelegationLane, "delegation-lane", Core, "Where a delegated agent may write: the scopes it was given, on its own realm");
+plexus_service!(ToolSwitchesSvc => ToolSwitches, "tool-switches", Core, "The person's live on/off over individual tools, kept by a host so it survives the tree being rebuilt");
 plexus_service!(GrantsSvc => dyn atomcode_capabilities::tools::PermissionStore, "grants", Core, "The session's remembered always-allow answers, kept by a host that outlives the tree");
 
 /// Which names the catalog admits, as the `tools` row was configured.
@@ -157,11 +158,96 @@ fn glob_matches(pattern: &str, name: &str) -> bool {
 /// rebuilding anything.
 #[derive(Default)]
 pub struct ToolBox {
-    tools: RwLock<BTreeMap<String, Arc<dyn Tool>>>,
+    tools: RwLock<BTreeMap<String, Mounted>>,
     policy: ToolPolicy,
-    /// Names actually turned away, so the tree can say what it dropped rather
-    /// than the model wondering where a tool went.
+    /// Names actually turned away by [`policy`](Self::policy), so the tree can
+    /// say what it dropped rather than the model wondering where a tool went.
+    /// Config's answer is final for the life of this tree: a row offered it,
+    /// this tree does not have it.
     turned_away: RwLock<BTreeSet<String>>,
+    /// The person's own switches, and the tools they are currently holding
+    /// back. Shared with whoever outlives this catalog, so a switch survives
+    /// the tree being rebuilt (`ToolSwitches`).
+    switches: Arc<ToolSwitches>,
+}
+
+/// A tool its row registered: who offered it, and whether a switch is holding
+/// it back right now. Held tools stay here rather than being dropped, so
+/// turning the switch back on hands over the very tool the row mounted.
+struct Mounted {
+    owner: String,
+    tool: Arc<dyn Tool>,
+    held: bool,
+}
+
+/// What a person turned off in this session, kept apart from what the config
+/// excluded.
+///
+/// Two lists rather than one, because "off" has to survive tools that do not
+/// exist yet — an MCP server publishes its tools whenever it finishes
+/// connecting, which may be after the person said to hide them:
+///
+/// * `off` holds the patterns as they were typed, so a tool arriving later is
+///   born hidden;
+/// * `on` holds names the person asked back **by name**, which beats a pattern
+///   in `off` — "hide this server, except that one tool" is the ordinary shape
+///   of the request.
+///
+/// Neither can widen what the config excluded. A host that removed a tool from
+/// the tree removed it; a command must not put it back, or the config's answer
+/// is a suggestion.
+#[derive(Default, Debug)]
+pub struct ToolSwitches {
+    off: RwLock<Vec<String>>,
+    on: RwLock<BTreeSet<String>>,
+}
+
+impl ToolSwitches {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Is this tool currently held back by a switch?
+    pub fn holds(&self, owner: &str, name: &str) -> bool {
+        if self.on.read().expect("switches poisoned").contains(name) {
+            return false;
+        }
+        self.off
+            .read()
+            .expect("switches poisoned")
+            .iter()
+            .any(|p| names(p, owner, name))
+    }
+
+    /// Turn `pattern` off. A name asked back earlier loses to this: the person
+    /// just said to hide it again.
+    pub fn turn_off(&self, pattern: &str) {
+        self.on
+            .write()
+            .expect("switches poisoned")
+            .retain(|name| !names(pattern, "", name) && !names(pattern, "*", name));
+        let mut off = self.off.write().expect("switches poisoned");
+        if !off.iter().any(|p| p == pattern) {
+            off.push(pattern.to_string());
+        }
+    }
+
+    /// Ask `names` back by name, and drop the pattern if it was exactly this.
+    pub fn turn_on(&self, pattern: &str, restored: &[String]) {
+        self.off
+            .write()
+            .expect("switches poisoned")
+            .retain(|p| p != pattern);
+        let mut on = self.on.write().expect("switches poisoned");
+        for name in restored {
+            on.insert(name.clone());
+        }
+    }
+
+    /// The patterns currently off, as typed.
+    pub fn off(&self) -> Vec<String> {
+        self.off.read().expect("switches poisoned").clone()
+    }
 }
 
 impl ToolBox {
@@ -175,6 +261,23 @@ impl ToolBox {
             policy,
             ..Self::default()
         }
+    }
+
+    /// As [`with_policy`](Self::with_policy), over switches the host holds. The
+    /// tree is rebuilt for a good many reasons — `/model`, a config reload, a
+    /// logout — and a person who turned a tool off did not mean "until the next
+    /// one of those".
+    pub fn with_policy_and_switches(policy: ToolPolicy, switches: Arc<ToolSwitches>) -> Self {
+        Self {
+            policy,
+            switches,
+            ..Self::default()
+        }
+    }
+
+    /// The switches this catalog answers to, for whoever drives them.
+    pub fn switches(&self) -> Arc<ToolSwitches> {
+        self.switches.clone()
     }
 
     /// Add a tool. Pair every call with a `ctx.effect(.. unregister ..)` so the
@@ -216,7 +319,18 @@ impl ToolBox {
                 "tool `{name}` is already registered; disable the row that owns it before mounting another"
             ));
         }
-        tools.insert(name, tool);
+        // Born held when a switch already names it: an MCP server that finishes
+        // connecting after the person hid it does not slip its tools in behind
+        // them.
+        let held = self.switches.holds(owner, &name);
+        tools.insert(
+            name,
+            Mounted {
+                owner: owner.to_string(),
+                tool,
+                held,
+            },
+        );
         Ok(())
     }
 
@@ -224,7 +338,47 @@ impl ToolBox {
         self.tools.write().expect("toolbox poisoned").remove(name);
     }
 
-    /// What the policy kept out, by the name whoever offered it used.
+    /// Hold back everything `pattern` names, and keep holding it for whatever
+    /// registers later. Returns what left the catalog just now.
+    ///
+    /// A whole MCP server is `mcp__<server>__*`; one of its tools is its full
+    /// name. Nothing here reaches the server — the connection stays up, and the
+    /// tools come back without reconnecting or authorising again.
+    pub fn turn_off(&self, pattern: &str) -> Vec<String> {
+        self.switches.turn_off(pattern);
+        let mut tools = self.tools.write().expect("toolbox poisoned");
+        let mut hidden = Vec::new();
+        for (name, mounted) in tools.iter_mut() {
+            if !mounted.held && self.switches.holds(&mounted.owner, name) {
+                mounted.held = true;
+                hidden.push(name.clone());
+            }
+        }
+        hidden
+    }
+
+    /// Put back everything `pattern` names that a switch was holding. Returns
+    /// what came back. A tool the **config** excluded is not here to come back:
+    /// that answer belongs to whoever wrote the tree.
+    pub fn turn_on(&self, pattern: &str) -> Vec<String> {
+        let mut tools = self.tools.write().expect("toolbox poisoned");
+        let wanted: Vec<String> = tools
+            .iter()
+            .filter(|(name, m)| m.held && names(pattern, &m.owner, name))
+            .map(|(name, _)| name.clone())
+            .collect();
+        self.switches.turn_on(pattern, &wanted);
+        for name in &wanted {
+            if let Some(mounted) = tools.get_mut(name) {
+                mounted.held = false;
+            }
+        }
+        wanted
+    }
+
+    /// What the **config** kept out, by the name whoever offered it used.
+    /// Unlike [`held_back`](Self::held_back), nothing brings these back: the
+    /// tree was written without them.
     pub fn turned_away(&self) -> Vec<String> {
         self.turned_away
             .read()
@@ -234,12 +388,24 @@ impl ToolBox {
             .collect()
     }
 
+    /// What a switch is holding back right now, by name.
+    pub fn held_back(&self) -> Vec<String> {
+        self.tools
+            .read()
+            .expect("toolbox poisoned")
+            .iter()
+            .filter(|(_, m)| m.held)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools
             .read()
             .expect("toolbox poisoned")
             .get(name)
-            .cloned()
+            .filter(|m| !m.held)
+            .map(|m| m.tool.clone())
     }
 
     /// What the model is shown this round. Read fresh every request, so a
@@ -249,10 +415,11 @@ impl ToolBox {
             .read()
             .expect("toolbox poisoned")
             .values()
-            .map(|t| ToolDef {
-                name: t.name().to_string(),
-                description: t.description().to_string(),
-                parameters: t.parameters_schema(),
+            .filter(|m| !m.held)
+            .map(|m| ToolDef {
+                name: m.tool.name().to_string(),
+                description: m.tool.description().to_string(),
+                parameters: m.tool.parameters_schema(),
             })
             .collect()
     }
@@ -261,8 +428,9 @@ impl ToolBox {
         self.tools
             .read()
             .expect("toolbox poisoned")
-            .keys()
-            .cloned()
+            .iter()
+            .filter(|(_, m)| !m.held)
+            .map(|(name, _)| name.clone())
             .collect()
     }
 }

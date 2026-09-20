@@ -5481,7 +5481,12 @@ fn spawn_runtime_owner_with_optional_agent(
                             None => prepare_candidate.await.map_err(runtime_prepare_error),
                         };
                         let mut candidate = match candidate_parts {
-                            Ok(parts) => RuntimeResources {
+                            Ok(mut parts) => {
+                                // The person's tool switches are theirs, not this
+                                // tree's: a reprepare must not put back what they
+                                // turned off (`CodingParts::tool_switches`).
+                                parts.adopt_tool_switches(runtime.parts.tool_switches());
+                                RuntimeResources {
                                 config: input.config,
                                 prepare: input.prepare,
                                 provider_factory: runtime.provider_factory.clone(),
@@ -5496,7 +5501,8 @@ fn spawn_runtime_owner_with_optional_agent(
                                 // Preserve the injected VL hook across reprepare
                                 // (/model swap, reconfigure).
                                 image_preprocessor: runtime.image_preprocessor.clone(),
-                            },
+                                }
+                            }
                             Err(error) => {
                                 controls.state.store(
                                     runtime_phase_state(generation, previous_phase),
@@ -8057,6 +8063,7 @@ fn harness_host_state(
             .collect(),
         skills: parts.skill_registry(),
         runtime_commands: parts.runtime_commands.clone(),
+        tool_switches: Some(parts.tool_switches()),
         mcp,
         rate_limit_source: parts.rate_limit_source().cloned(),
         front_end: prepare.front_end.clone(),
