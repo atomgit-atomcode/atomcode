@@ -122,10 +122,29 @@ G 类七条**刻意排在翻默认之后**：自用会告诉我们哪几条是�
 会被当成提示词发给模型的命令——`acp/commands.rs` 自己那条判据
 （`the_advertised_commands_are_the_ones_acp_can_actually_run`）说的就是这件事。
 
-**广播那半是通的**（已验证可编译，代码没提交）：
-- ACP 会话没有回合之间的事件泵，`AgentEvent::Described` 今天没人接。
-- 解法：会话建的时候有界地等一次 `Described`（订阅时就会推，250ms 够），
-  之后在回合循环里顺手更新——那是这个通道唯一读流的地方。
+**⚠️ 2026-09-20 第二次尝试，把上面这句话推翻了。** 原文写的是「广播那半是通的」，
+并给了「会话建的时候等一次 `Described`」的解法。**做下去发现不成立**，原因比
+「没有事件泵」深一层：
+
+> **ACP 从来没有订阅过。** `AgentEvent::Described` 是推给**订阅者**的
+> （`harness/src/feed.rs:68`，`subscribe()` 的第一件事），而全仓只有 tui 发
+> `AgentCommand::Subscribe`（`tui/src/plugin.rs:321`）。ACP 不发，所以它永远收不到
+> 描述——不是「接得晚」，是根本没人推给它。
+
+补发 `Subscribe` 也没用：在 `create_session` 里发、在 250ms 内重试着发，**事件流里
+一个事件都收不到**（下过探针，连 `Rejected` 都没有），说明那一刻 agent 还没到能
+处理命令的状态。这是 ACP 会话生命周期的第三层，我没再往下挖。
+
+所以这条的实际状态是：**两半都卡着，而且卡点不同**——
+- 广播那半卡在「ACP 怎么、何时拿到 `AgentDescription`」（订阅时机 / 或者给契约一个
+  「问一次描述」的命令）；
+- 执行那半卡在下面那张表的契约决定。
+
+第二次尝试做到的、可复用的结论：`AgentEvent::Invoked` 加一个 `queued: bool`
+（由 `run_catalog_command` 读 `agent.inbox().has_waking_input()` 现场作答）是可行的，
+改动面是 kernel 事件枚举 + harness 产出方 + 4 处测试模式补 `..`；`translate` 认
+`Invoked` 后输出会自动成为 agent message chunk。这些都验证过能编译，但**没有提交**
+——半成品不入库，而且两半必须一起才有意义。
 
 **执行那半卡住了**：`AgentCommand::Invoke` 走 `handle.rs:1341`，只发
 `AgentEvent::Invoked { id, output }`，**不产生任何回合终态**（`run_catalog_command`
