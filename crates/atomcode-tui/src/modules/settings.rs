@@ -74,7 +74,18 @@ impl View for Settings {
                         width::take_width(&format!("  {text}"), w),
                         theme::fg(Role::Brand).bold(),
                     ),
-                    UsageLine::Bar { share, about } => usage_bar(share, &about, w, vp.moment.caps),
+                    UsageLine::Bar {
+                        share,
+                        about,
+                        spent,
+                    } => usage_bar(share, &about, spent, w, vp.moment.caps),
+                    UsageLine::Heat { label, cells } => heat_row(&label, &cells, w),
+                    UsageLine::HeatKey { less, more } => heat_key(&less, &more, w),
+                    UsageLine::Pair { label, value } => Line::from_spans(vec![
+                        Span::styled(format!("  {label}"), theme::fg(Role::Muted)),
+                        Span::raw(value),
+                    ])
+                    .truncate(w),
                     UsageLine::Note(text) => Line::styled(
                         width::take_width(&format!("  {text}"), w),
                         theme::fg(Role::Muted),
@@ -506,7 +517,15 @@ enum UsageLine {
     /// `share` is 0..=1. `about` is the words beside it — and they carry what
     /// the bar is *of*, because two bars on this page measure different things
     /// and a reader cannot tell them apart from the bar alone.
-    Bar { share: f32, about: String },
+    Bar {
+        share: f32,
+        about: String,
+        /// Drawn as a warning rather than in the page's own ink. What it means
+        /// is "this one is spent" — a bar that looked the same full as it did
+        /// at half would make a person read the number to find out, which is
+        /// the thing the bar is there to save them.
+        spent: bool,
+    },
     /// An ordinary line, dimmed.
     Note(String),
     /// One plot row of the day chart: what the gutter says at this height, and
@@ -545,6 +564,27 @@ enum UsageLine {
         head: bool,
         mark: Option<u8>,
     },
+    /// One weekday's row of the calendar.
+    ///
+    /// `None` is a day outside the span — left blank, so the grid has the shape
+    /// of the months it covers rather than a rectangle with filler in it.
+    /// `Some(level)` is a day in it, including a day with nothing on it: that
+    /// one is drawn too, because where the gaps are is half of what a calendar
+    /// says and a hole in the grid reads as missing data.
+    Heat {
+        label: String,
+        cells: Vec<Option<u8>>,
+    },
+    /// The ramp, with a word at each end.
+    HeatKey { less: String, more: String },
+    /// A label and its value, the label already padded so the values line up.
+    ///
+    /// Padded by **display width**, not by character count: `请求次数` is four
+    /// characters and eight cells while `总 Token 数` is nine characters and
+    /// eleven, so counting characters puts every value at a different column.
+    /// The classic front end had this bug and fixed it; inheriting the fix is
+    /// cheaper than rediscovering it.
+    Pair { label: String, value: String },
     /// A blank line inside the page.
     Gap,
 }
@@ -583,6 +623,7 @@ fn usage_lines(page: Option<&crate::settings::UsagePage>) -> Vec<UsageLine> {
                 crate::content::token_count(context.used),
                 crate::content::token_count(context.window)
             ),
+            spent: false,
         });
         out.push(UsageLine::Note(format!("模型 {}", context.model)));
         out.push(UsageLine::Gap);
@@ -601,7 +642,9 @@ fn usage_lines(page: Option<&crate::settings::UsagePage>) -> Vec<UsageLine> {
         out.push(UsageLine::Head(window.label.clone()));
         match window.used_percent {
             // What the account service counted. The bar is *of the allowance*,
-            // which is the thing a person opened this page to see.
+            // which is the thing a person opened this page to see. A tenth of a
+            // percent because at the top of a window that is the digit that is
+            // still moving.
             Some(percent) => {
                 let counted = match (window.calls_used, window.call_limit) {
                     (Some(used), Some(limit)) => format!(" · {used} / {limit} 次"),
@@ -611,6 +654,7 @@ fn usage_lines(page: Option<&crate::settings::UsagePage>) -> Vec<UsageLine> {
                 out.push(UsageLine::Bar {
                     share: f32::from(percent) / 100.0,
                     about: format!("用掉 {percent}%{counted}"),
+                    spent: window.exhausted || percent >= 100,
                 });
             }
             // No bar at all rather than an empty one: an empty track reads as
@@ -621,14 +665,14 @@ fn usage_lines(page: Option<&crate::settings::UsagePage>) -> Vec<UsageLine> {
         if window.exhausted {
             tail.push("用完了".to_string());
         }
-        if !window.resets_at.is_empty() {
-            tail.push(format!("{} 重置", window.resets_at));
-        }
         if window.resets_in_seconds > 0 {
             tail.push(format!(
-                "还有 {}",
-                crate::text::spoken_duration(window.resets_in_seconds as u64)
+                "剩余重置时间 {}",
+                countdown(window.resets_in_seconds)
             ));
+        }
+        if !window.resets_at.is_empty() {
+            tail.push(format!("{} 重置", window.resets_at));
         }
         if !tail.is_empty() {
             out.push(UsageLine::Note(tail.join(" · ")));
@@ -636,30 +680,94 @@ fn usage_lines(page: Option<&crate::settings::UsagePage>) -> Vec<UsageLine> {
         out.push(UsageLine::Gap);
     }
 
-    if let Some(stats) = page.stats.as_ref() {
-        out.push(UsageLine::Head("总览".into()));
-        let span = match (stats.from.is_empty(), stats.to.is_empty()) {
-            (false, false) => format!("{} 到 {}", stats.from, stats.to),
-            _ => String::new(),
-        };
-        let mut overview = format!(
-            "{} tokens · {} 次请求",
-            crate::content::token_count_u64(stats.total_tokens),
-            stats.total_requests
-        );
-        if !span.is_empty() {
-            overview.push_str(&format!(" · {span}"));
-        }
-        out.push(UsageLine::Note(overview));
-        // Days with anything on them, out of the days the span covers: the one
-        // figure the series says that the totals do not.
-        let active = stats.daily.iter().filter(|d| d.tokens > 0).count();
-        if !stats.daily.is_empty() {
+    // The plan behind the windows. Drawn even when it has run out — a person
+    // whose plan lapsed needs to be told that, and drawing nothing looks like
+    // never having had one.
+    if let Some(plan) = page.plan.as_ref() {
+        out.push(UsageLine::Head(format!(
+            "{} · {}",
+            plan.plan,
+            match plan.active {
+                true => "生效中",
+                false => "已过期",
+            }
+        )));
+        if !plan.claimed_at.is_empty() || !plan.expires_at.is_empty() {
             out.push(UsageLine::Note(format!(
-                "{active} / {} 天有用量",
-                stats.daily.len()
+                "领取 {} · 到期 {}",
+                blank_as_unknown(&plan.claimed_at),
+                blank_as_unknown(&plan.expires_at)
             )));
         }
+        if plan.total_days > 0 {
+            out.push(UsageLine::Note(format!(
+                "剩余 {}/{} 天",
+                plan.remaining_days, plan.total_days
+            )));
+            // Of the plan's whole term, how much is gone. The bar fills as the
+            // plan is used up, like the allowance bars above it — two bars on
+            // one page that filled in opposite directions would be two bars a
+            // person has to stop and think about.
+            let gone =
+                (plan.total_days - plan.remaining_days).max(0) as f32 / plan.total_days as f32;
+            out.push(UsageLine::Bar {
+                share: gone,
+                about: format!("{:.1}%", gone * 100.0),
+                spent: plan.remaining_days <= 0,
+            });
+        }
+        out.push(UsageLine::Gap);
+    }
+
+    if let Some(stats) = page.stats.as_ref() {
+        out.push(UsageLine::Head("总览".into()));
+        if !stats.from.is_empty() && !stats.to.is_empty() {
+            out.push(UsageLine::Note(format!("{} 到 {}", stats.from, stats.to)));
+        }
+        out.push(UsageLine::Gap);
+
+        if !stats.daily.is_empty() {
+            out.extend(heat_calendar(&stats.daily));
+            out.push(UsageLine::Gap);
+        }
+
+        // The figures a person reads off this page one at a time, in a column.
+        // They were a run-on sentence before: "300m tokens · 3007 次请求 · …"
+        // is four numbers a reader has to parse apart, and four of the seven
+        // were not there at all.
+        let active = stats.daily.iter().filter(|day| day.tokens > 0).count();
+        let (longest, current) = streaks(&stats.daily);
+        let busiest = stats
+            .daily
+            .iter()
+            .filter(|day| day.tokens > 0)
+            .max_by_key(|day| day.tokens)
+            .map(|day| day.date.clone());
+        let mut rows = Vec::new();
+        // Biggest first is how the host sends them, so the head of the list is
+        // the answer — no second pass to find it.
+        if let Some(favourite) = stats.models.first() {
+            rows.push(("最常用模型".to_string(), favourite.name.clone()));
+        }
+        rows.push((
+            "总 Token 数".to_string(),
+            crate::content::token_count_u64(stats.total_tokens),
+        ));
+        rows.push(("请求次数".to_string(), stats.total_requests.to_string()));
+        if !stats.daily.is_empty() {
+            rows.push((
+                "活跃天数".to_string(),
+                format!("{active} / {}", stats.daily.len()),
+            ));
+        }
+        if let Some(day) = busiest {
+            rows.push(("最活跃日期".to_string(), day));
+        }
+        if !stats.daily.is_empty() {
+            rows.push(("最长连续天数".to_string(), format!("{longest} 天")));
+            rows.push(("当前连续天数".to_string(), format!("{current} 天")));
+        }
+        out.extend(pairs(rows));
         out.push(UsageLine::Gap);
 
         if !stats.daily.is_empty() {
@@ -681,6 +789,37 @@ fn usage_lines(page: Option<&crate::settings::UsagePage>) -> Vec<UsageLine> {
     out
 }
 
+/// The longest run of working days in the span, and the run it ends on.
+///
+/// The second is not the first: a person wants to know both "how long have I
+/// kept this up" and "how long did I ever". Counted oldest-first, which is the
+/// order the days arrive in, so the run at the end is the run that is still
+/// going.
+fn streaks(daily: &[atomcode_host_api::DayUse]) -> (usize, usize) {
+    let mut longest = 0;
+    let mut run = 0;
+    for day in daily {
+        run = match day.tokens > 0 {
+            true => run + 1,
+            false => 0,
+        };
+        longest = longest.max(run);
+    }
+    (longest, run)
+}
+
+/// A date the service left empty, said as such.
+///
+/// An unactivated claim has no date. Printing the empty string would leave
+/// `领取  · 到期 2036-07-30`, which reads as a rendering fault rather than as
+/// the thing it is.
+fn blank_as_unknown(text: &str) -> &str {
+    match text.is_empty() {
+        true => "—",
+        false => text,
+    }
+}
+
 /// How wide the bar itself is drawn, in cells.
 ///
 /// Fixed rather than a share of the panel: two bars of different widths cannot
@@ -694,7 +833,7 @@ const BAR_CELLS: usize = 28;
 /// solid run at one that does not. The share is clamped and rounded down: a bar
 /// that showed a full track at 99% would say the thing it is there to warn about
 /// has already happened.
-fn usage_bar(share: f32, about: &str, w: usize, caps: crate::caps::Caps) -> Line {
+fn usage_bar(share: f32, about: &str, spent: bool, w: usize, caps: crate::caps::Caps) -> Line {
     use crate::caps::Glyph;
     let filled = ((share.clamp(0.0, 1.0) * BAR_CELLS as f32) as usize).min(BAR_CELLS);
     // Two characters, not one character in two colours. A track drawn in the
@@ -704,7 +843,11 @@ fn usage_bar(share: f32, about: &str, w: usize, caps: crate::caps::Caps) -> Line
     let empty = if caps.unicode { "░" } else { "-" };
     let mut spans = vec![Span::styled("  ".to_string(), Style::new())];
     if filled > 0 {
-        spans.push(Span::styled(full.repeat(filled), theme::fg(Role::Accent)));
+        let ink = match spent {
+            true => theme::fg(Role::Error),
+            false => theme::fg(Role::Accent),
+        };
+        spans.push(Span::styled(full.repeat(filled), ink));
     }
     if filled < BAR_CELLS {
         spans.push(Span::styled(
@@ -867,6 +1010,225 @@ fn day_chart(
 
 /// A cell no series claimed — drawn in the ordinary chart ink.
 const NO_SERIES: u8 = u8::MAX;
+
+/// How wide one day of the calendar is drawn, and how wide the weekday gutter
+/// beside it is. Both the classic front end's: four cells a day makes sixty
+/// days a grid you can pick a week out of, and adjacent cells join into a solid
+/// block rather than a row of dots.
+const DAY_CELLS: usize = 4;
+const WEEKDAY_CELLS: usize = 4;
+/// Sunday first, which is where the month headers are anchored from.
+const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// Days since 1970-01-01 for a proleptic-Gregorian date (Howard Hinnant's
+/// algorithm).
+///
+/// Here rather than from a date crate because this is the whole of what the
+/// calendar needs — which weekday a date is and which week it falls in — and a
+/// dependency for two arithmetic expressions is a dependency to keep in step
+/// with for no return.
+fn epoch_day(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) as i64 + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// `YYYY-MM-DD`, or nothing. A date the service worded differently is skipped
+/// rather than guessed at.
+fn ymd(text: &str) -> Option<(i64, u32, u32)> {
+    let mut parts = text.split('-');
+    let y = parts.next()?.parse().ok()?;
+    let m = parts.next()?.parse().ok()?;
+    let d = parts.next()?.parse().ok()?;
+    Some((y, m, d))
+}
+
+/// 1970-01-01 was a Thursday, so `(epoch + 4) mod 7` counts from Sunday.
+fn weekday(epoch: i64) -> usize {
+    (((epoch % 7) + 4).rem_euclid(7)) as usize
+}
+
+/// Which step of the ramp a day's tokens land on, against the busiest day.
+///
+/// Zero keeps step zero — "nothing happened" is a step of its own and must not
+/// round up into "a little happened". Everything else lands on 1..=5, so the
+/// quietest working day is still visibly a working day.
+fn heat_levels(daily: &[u64]) -> Vec<u8> {
+    let peak = daily.iter().copied().max().unwrap_or(0);
+    daily
+        .iter()
+        .map(|value| match (peak, value) {
+            (0, _) | (_, 0) => 0,
+            (peak, value) => {
+                let steps = f64::from(crate::theme::HEAT - 1);
+                (((*value as f64 / peak as f64) * steps).ceil() as u8)
+                    .clamp(1, crate::theme::HEAT - 1)
+            }
+        })
+        .collect()
+}
+
+/// The calendar: a month header, then one row per weekday.
+///
+/// Weeks run down the columns the way every contribution graph does, because
+/// the question it answers is "which days do I work" and that reads across a
+/// row. Days outside the span stay blank so the grid keeps the ragged ends the
+/// months actually have.
+fn heat_calendar(daily: &[atomcode_host_api::DayUse]) -> Vec<UsageLine> {
+    let levels = heat_levels(&daily.iter().map(|d| d.tokens).collect::<Vec<_>>());
+    let dated: Vec<(i64, u8, u32)> = daily
+        .iter()
+        .zip(levels)
+        .filter_map(|(day, level)| {
+            let (y, m, d) = ymd(&day.date)?;
+            Some((epoch_day(y, m, d), level, m))
+        })
+        .collect();
+    // Anchored on the earliest date across the whole set, not on the first
+    // entry: the service is not promised to be sorted, and a day older than the
+    // first would land in a negative column.
+    let Some(first) = dated.iter().map(|(epoch, _, _)| *epoch).min() else {
+        return Vec::new();
+    };
+    let start = first - weekday(first) as i64;
+    let column = |epoch: i64| ((epoch - start) / 7) as usize;
+    let columns = dated
+        .iter()
+        .map(|(epoch, _, _)| column(*epoch))
+        .max()
+        .unwrap_or(0)
+        + 1;
+
+    let mut grid: Vec<Option<u8>> = vec![None; columns * 7];
+    // Where each month first appears, for the header above the grid.
+    let mut month_at: Vec<(usize, u32)> = Vec::new();
+    let mut previous = 0u32;
+    for (epoch, level, month) in &dated {
+        grid[weekday(*epoch) * columns + column(*epoch)] = Some(*level);
+        if *month != previous {
+            month_at.push((column(*epoch), *month));
+            previous = *month;
+        }
+    }
+    month_at.sort_by_key(|(col, _)| *col);
+
+    let mut header = vec![' '; columns * DAY_CELLS];
+    for (i, (col, month)) in month_at.iter().enumerate() {
+        let name = MONTHS[(*month as usize).saturating_sub(1).min(11)];
+        let at = col * DAY_CELLS;
+        // Room to the next month, or to the end. A name that would not fit
+        // before the next one is left out rather than clipped: half a month
+        // name over the wrong column says less than nothing there.
+        let until = match month_at.get(i + 1) {
+            Some((next, _)) => (next * DAY_CELLS).saturating_sub(1),
+            None => header.len(),
+        };
+        if until.saturating_sub(at) < name.len() {
+            continue;
+        }
+        for (j, c) in name.chars().enumerate() {
+            if at + j < header.len() {
+                header[at + j] = c;
+            }
+        }
+    }
+
+    let mut out = vec![UsageLine::Note(format!(
+        "{}{}",
+        " ".repeat(WEEKDAY_CELLS),
+        header.into_iter().collect::<String>().trim_end()
+    ))];
+    out.extend((0..7).map(|row| UsageLine::Heat {
+        label: pad_right(WEEKDAYS[row], WEEKDAY_CELLS),
+        cells: grid[row * columns..(row + 1) * columns].to_vec(),
+    }));
+    out.push(UsageLine::Gap);
+    out.push(UsageLine::HeatKey {
+        less: "少".into(),
+        more: "多".into(),
+    });
+    out
+}
+
+/// One weekday's row: its name, then a block per week at that week's shade.
+fn heat_row(label: &str, cells: &[Option<u8>], w: usize) -> Line {
+    let mut spans = vec![Span::styled(format!("  {label}"), theme::fg(Role::Muted))];
+    // Runs of one shade become one span: the same picture, far fewer spans.
+    let mut run = 0usize;
+    let mut shade: Option<Option<u8>> = None;
+    let flush = |shade: Option<Option<u8>>, run: usize, spans: &mut Vec<Span>| {
+        if run == 0 {
+            return;
+        }
+        let cells = DAY_CELLS * run;
+        match shade {
+            Some(Some(level)) => spans.push(Span::styled(
+                "█".repeat(cells),
+                theme::fg(Role::Heat(level)),
+            )),
+            _ => spans.push(Span::raw(" ".repeat(cells))),
+        }
+    };
+    for cell in cells {
+        if shade != Some(*cell) {
+            flush(shade, run, &mut spans);
+            shade = Some(*cell);
+            run = 0;
+        }
+        run += 1;
+    }
+    flush(shade, run, &mut spans);
+    Line::from_spans(spans).truncate(w)
+}
+
+/// The ramp itself, so a shade can be read back as "more" or "less".
+///
+/// The empty step is left out: it means "a day with nothing on it", and putting
+/// it in a scale of amounts invites reading it as the smallest amount.
+fn heat_key(less: &str, more: &str, w: usize) -> Line {
+    let mut spans = vec![Span::styled(format!("  {less} "), theme::fg(Role::Muted))];
+    for level in 1..crate::theme::HEAT {
+        spans.push(Span::styled("██".to_string(), theme::fg(Role::Heat(level))));
+    }
+    spans.push(Span::styled(format!(" {more}"), theme::fg(Role::Muted)));
+    Line::from_spans(spans).truncate(w)
+}
+
+/// Label/value rows whose values start at the same column.
+fn pairs(rows: Vec<(String, String)>) -> Vec<UsageLine> {
+    let widest = rows
+        .iter()
+        .map(|(label, _)| width::str_width(label))
+        .max()
+        .unwrap_or(0);
+    rows.into_iter()
+        .map(|(label, value)| UsageLine::Pair {
+            label: pad_right(&label, widest + 2),
+            value,
+        })
+        .collect()
+}
+
+/// `01:02:03` — the countdown the classic front end shows.
+///
+/// Seconds and not "about an hour": this is the number a person watches when
+/// they are waiting for a window to come back, and rounding it to the nearest
+/// hour makes the last minute of the wait look like the first.
+fn countdown(seconds: i64) -> String {
+    let seconds = seconds.max(0);
+    format!(
+        "{:02}:{:02}:{:02}",
+        seconds / 3600,
+        (seconds % 3600) / 60,
+        seconds % 60
+    )
+}
 
 /// The dates under the plot, laid into the plot's own columns.
 ///
@@ -1463,6 +1825,7 @@ mod tests {
     fn the_usage_page_draws_what_was_counted_and_no_bar_for_what_was_not() {
         let counted = usage_page(crate::settings::UsagePage {
             context: None,
+            plan: None,
             windows: vec![window("5 小时", Some(42))],
             stats: None,
         });
@@ -1483,6 +1846,7 @@ mod tests {
         // table; the protection belongs wherever a bar still is.
         let pair = usage_page(crate::settings::UsagePage {
             context: None,
+            plan: None,
             windows: vec![window("5 小时", Some(90)), window("每周", Some(10))],
             stats: None,
         });
@@ -1500,6 +1864,7 @@ mod tests {
 
         let uncounted = usage_page(crate::settings::UsagePage {
             context: None,
+            plan: None,
             windows: vec![window("每周", None)],
             stats: None,
         });
@@ -1522,6 +1887,7 @@ mod tests {
         use atomcode_host_api::{DayUse, ModelSeries, ModelUse, UsageStats};
         let page = usage_page(crate::settings::UsagePage {
             context: None,
+            plan: None,
             windows: Vec::new(),
             stats: Some(UsageStats {
                 from: "2026-08-21".into(),
@@ -1643,6 +2009,7 @@ mod tests {
         use atomcode_host_api::{DayUse, ModelSeries, ModelUse, UsageStats};
         let page = usage_page(crate::settings::UsagePage {
             context: None,
+            plan: None,
             windows: Vec::new(),
             stats: Some(UsageStats {
                 from: "2026-09-19".into(),
@@ -1689,10 +2056,14 @@ mod tests {
         });
         let rows = lines(&page, 96, 60);
         let ink_of = |needle: &str| -> crate::frame::Style {
+            // The row of the *table*, named by its dot. A plain name match
+            // found the overview's "most used model" line instead once the page
+            // grew that far — a criterion that reaches for the first line
+            // mentioning something is a criterion about page order.
             let row = rows
                 .iter()
-                .find(|row| row.plain().contains(needle))
-                .unwrap_or_else(|| panic!("{needle} is on the page"));
+                .find(|row| row.plain().contains(needle) && row.plain().contains('●'))
+                .unwrap_or_else(|| panic!("{needle} has a row in the table"));
             row.spans
                 .iter()
                 .find(|span| span.text.contains('●'))
@@ -1745,6 +2116,7 @@ mod tests {
         let last = daily[89].date.clone();
         let page = usage_page(crate::settings::UsagePage {
             context: None,
+            plan: None,
             windows: Vec::new(),
             stats: Some(UsageStats {
                 from: first.clone(),
@@ -1776,6 +2148,268 @@ mod tests {
         assert!(
             shown.contains(&first) && shown.contains(&last),
             "both ends of ninety days are named: {shown}"
+        );
+    }
+
+    /// The plan behind the windows is drawn, and an expired one is drawn too.
+    ///
+    /// The second half is the criterion. A plan that ran out is the case a
+    /// person most needs told, and the easy mistake is to treat "not active"
+    /// as "nothing to show" — which looks exactly like never having had a
+    /// plan. Both states have to reach the page, and say which they are.
+    #[test]
+    fn a_plan_is_drawn_whether_or_not_it_still_runs() {
+        use atomcode_host_api::Entitlement;
+        let page = |active: bool, left: i32| {
+            usage_page(crate::settings::UsagePage {
+                context: None,
+                plan: Some(Entitlement {
+                    plan: "CodingPlan Pro".into(),
+                    active,
+                    claimed_at: "2026-07-30".into(),
+                    expires_at: "2036-07-30".into(),
+                    remaining_days: left,
+                    total_days: 3653,
+                }),
+                windows: Vec::new(),
+                stats: None,
+            })
+        };
+        let live = drawn(&page(true, 3601), 80, 24).join("\n");
+        assert!(live.contains("CodingPlan Pro"), "the plan's name: {live}");
+        assert!(live.contains("生效中"), "and that it runs: {live}");
+        assert!(
+            live.contains("领取 2026-07-30") && live.contains("到期 2036-07-30"),
+            "both dates: {live}"
+        );
+        assert!(live.contains("剩余 3601/3653 天"), "and the days: {live}");
+        // 52 of 3653 days gone. The bar is of the term, so it is nearly empty —
+        // a bar that filled as days *remained* would read as "nearly out" on
+        // day one.
+        assert!(
+            live.contains("1.4%"),
+            "how much of the term is gone: {live}"
+        );
+
+        let over = drawn(&page(false, 0), 80, 24).join("\n");
+        assert!(
+            over.contains("CodingPlan Pro") && over.contains("已过期"),
+            "an expired plan is still drawn, and says so: {over}"
+        );
+    }
+
+    /// The calendar has a square per day in the span and nothing outside it,
+    /// and a busy day is a different shade from a quiet one.
+    ///
+    /// The blanks are the point: the span starts on a Thursday, so Sunday to
+    /// Wednesday of that first week are days that did not happen. A grid that
+    /// filled them in would be claiming four days of data it was never given,
+    /// and would put every later day on the wrong weekday.
+    #[test]
+    fn the_calendar_starts_on_the_first_real_day_and_shades_by_how_much() {
+        use atomcode_host_api::{DayUse, UsageStats};
+        // 2026-07-23 is a Thursday.
+        let daily: Vec<DayUse> = (0..14)
+            .map(|d| DayUse {
+                date: format!("2026-07-{:02}", 23 + d),
+                tokens: match d {
+                    0 => 1,
+                    7 => 1_000_000,
+                    _ => 0,
+                },
+                requests: 0,
+            })
+            .collect();
+        let page = usage_page(crate::settings::UsagePage {
+            context: None,
+            plan: None,
+            windows: Vec::new(),
+            stats: Some(UsageStats {
+                from: "2026-07-23".into(),
+                to: "2026-08-05".into(),
+                models: Vec::new(),
+                daily,
+                series: Vec::new(),
+                total_tokens: 1_000_001,
+                total_requests: 2,
+            }),
+        });
+        let rows = lines(&page, 92, 60);
+        let row = |name: &str| -> &crate::frame::Line {
+            rows.iter()
+                .find(|row| row.plain().trim_start().starts_with(name))
+                .unwrap_or_else(|| panic!("a {name} row"))
+        };
+        // Thursday is the first day of the span, so its row starts at the very
+        // first column; Sunday's first two days are outside it, so its row
+        // begins with a blank week.
+        // A square per day in the span, and not one more. This is the whole
+        // claim: pad the grid out to a rectangle and this goes up, drop the
+        // days that did not fit a column and it goes down.
+        let squares: usize = WEEKDAYS
+            .iter()
+            .map(|name| row(name).plain().chars().filter(|c| *c == '█').count())
+            .sum();
+        assert_eq!(squares, 14 * DAY_CELLS, "fourteen days, fourteen squares");
+        assert!(
+            row("Thu").plain().starts_with("  Thu █"),
+            "Thursday is the first day of the span, so it starts at the edge: {:?}",
+            row("Thu").plain()
+        );
+        assert!(
+            row("Sun")
+                .plain()
+                .starts_with(&format!("  Sun{}", " ".repeat(DAY_CELLS))),
+            "the Sunday before the span is left blank: {:?}",
+            row("Sun").plain()
+        );
+
+        // The two working days differ by six orders of magnitude, so they must
+        // not be the same shade — that is the whole claim a heat map makes.
+        let shade_at = |name: &str, nth: usize| -> crate::frame::Style {
+            row(name)
+                .spans
+                .iter()
+                .filter(|span| span.text.contains('█'))
+                .nth(nth)
+                .unwrap_or_else(|| panic!("{name} has {} filled runs", nth + 1))
+                .style
+        };
+        assert_ne!(
+            shade_at("Thu", 0),
+            shade_at("Thu", 1),
+            "one token and a million are not the same shade"
+        );
+    }
+
+    /// The seven figures the classic front end showed are all here, in a column
+    /// whose values line up.
+    ///
+    /// Lining up is asserted because it was a reported bug over there: padding
+    /// CJK labels by character count puts every value at a different terminal
+    /// column, since `请求次数` is four characters and eight cells. Four of the
+    /// seven figures were missing here entirely.
+    #[test]
+    fn the_overview_says_all_seven_figures_with_the_values_in_one_column() {
+        use atomcode_host_api::{DayUse, ModelUse, UsageStats};
+        // Two runs of working days: three, then a gap, then two that reach the
+        // end — so "longest" and "current" cannot be the same number, and a
+        // page that computed one and printed it twice would go red.
+        let pattern = [true, true, true, false, false, true, true];
+        let daily: Vec<DayUse> = pattern
+            .iter()
+            .enumerate()
+            .map(|(d, busy)| DayUse {
+                date: format!("2026-07-{:02}", 23 + d),
+                tokens: match (busy, d) {
+                    (true, 6) => 900,
+                    (true, _) => 100,
+                    _ => 0,
+                },
+                requests: 1,
+            })
+            .collect();
+        let page = usage_page(crate::settings::UsagePage {
+            context: None,
+            plan: None,
+            windows: Vec::new(),
+            stats: Some(UsageStats {
+                from: "2026-07-23".into(),
+                to: "2026-07-29".into(),
+                models: vec![
+                    ModelUse {
+                        name: "the-one-it-uses".into(),
+                        tokens: 1200,
+                        requests: 4,
+                    },
+                    ModelUse {
+                        name: "the-other".into(),
+                        tokens: 100,
+                        requests: 1,
+                    },
+                ],
+                daily,
+                series: Vec::new(),
+                total_tokens: 1300,
+                total_requests: 5,
+            }),
+        });
+        let shown = drawn(&page, 92, 60).join("\n");
+        for wanted in [
+            "最常用模型",
+            "总 Token 数",
+            "请求次数",
+            "活跃天数",
+            "最活跃日期",
+            "最长连续天数",
+            "当前连续天数",
+        ] {
+            assert!(shown.contains(wanted), "{wanted} is on the page: {shown}");
+        }
+        // Biggest first is how the host sends them, so the head of the list is
+        // the answer.
+        assert!(shown.contains("the-one-it-uses"), "{shown}");
+        assert!(
+            shown.contains("5 / 7"),
+            "five working days of seven: {shown}"
+        );
+        assert!(
+            shown.contains("2026-07-29"),
+            "the busiest day, not the last one: {shown}"
+        );
+        assert!(shown.contains("最长连续天数  3 天"), "{shown}");
+        assert!(shown.contains("当前连续天数  2 天"), "{shown}");
+
+        // Every value starts at the same column. Measured in display cells, not
+        // characters — which is the whole point.
+        let starts: Vec<usize> = shown
+            .lines()
+            .filter(|line| line.contains("连续天数") || line.contains("请求次数"))
+            .map(|line| {
+                let at = line.rfind("  ").expect("two spaces before the value");
+                crate::width::str_width(&line[..at])
+            })
+            .collect();
+        assert_eq!(starts.len(), 3, "three of the pairs: {shown}");
+        assert!(
+            starts.windows(2).all(|pair| pair[0] == pair[1]),
+            "the values line up: {starts:?}\n{shown}"
+        );
+    }
+
+    /// A window that is spent says so with the bar, and the countdown is exact.
+    #[test]
+    fn a_spent_window_is_drawn_as_a_warning_and_counted_down_to_the_second() {
+        let mut spent = window("每周", Some(100));
+        spent.exhausted = true;
+        spent.resets_in_seconds = 11;
+        let page = usage_page(crate::settings::UsagePage {
+            context: None,
+            plan: None,
+            windows: vec![spent],
+            stats: None,
+        });
+        let rows = lines(&page, 80, 24);
+        let shown: Vec<String> = rows.iter().map(|row| row.plain()).collect();
+        assert!(
+            shown
+                .iter()
+                .any(|line| line.contains("剩余重置时间 00:00:11")),
+            "to the second, because that is the number being watched: {shown:?}"
+        );
+        let bar = rows
+            .iter()
+            .find(|row| row.plain().contains('█'))
+            .expect("a bar");
+        let filled = bar
+            .spans
+            .iter()
+            .find(|span| span.text.contains('█'))
+            .expect("the filled part");
+        assert_eq!(
+            filled.style,
+            theme::fg(Role::Error),
+            "a spent window's bar is a warning, not the page's own ink"
         );
     }
 

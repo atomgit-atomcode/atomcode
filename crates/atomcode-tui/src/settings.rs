@@ -408,6 +408,9 @@ pub struct UsagePage {
     pub context: Option<ContextUse>,
     /// The account's rolling windows. Empty means the host does not meter.
     pub windows: Vec<atomcode_host_api::UsageWindow>,
+    /// What the account is subscribed to. `None` when the host has no notion of
+    /// a plan — not the same as a plan that ran out, which is still reported.
+    pub plan: Option<atomcode_host_api::Entitlement>,
     /// What went through — per model and per day. `None` when the host does not
     /// count it.
     pub stats: Option<atomcode_host_api::UsageStats>,

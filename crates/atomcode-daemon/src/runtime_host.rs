@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use atomcode_coding::cc_hooks::HookConfig;
 use atomcode_coding::{
-    AccountUsage, DayUse, ModelSeries, ModelUse, PluginHookSource, RateLimitWindow,
+    AccountUsage, DayUse, Entitlement, ModelSeries, ModelUse, PluginHookSource, RateLimitWindow,
     RateLimitWindowSource,
 };
 
@@ -64,6 +64,19 @@ impl RateLimitWindowSource for CodingPlanRateLimitSource {
                 .into_iter()
                 .map(window_from)
                 .collect())
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+
+    /// The plan behind the windows — the same `status_v2` the windows come
+    /// from, asked a second time (see the trait's own note on why).
+    async fn fetch_plan(&self) -> Result<Option<Entitlement>, String> {
+        tokio::task::spawn_blocking(|| {
+            let client = atomcode_codingplan::Client::from_stored_auth()
+                .map_err(|error| error.to_string())?;
+            let status = client.status_v2().map_err(|error| error.to_string())?;
+            Ok(status.codingplan_free.map(plan_from))
         })
         .await
         .map_err(|error| error.to_string())?
@@ -139,6 +152,23 @@ fn usage_from(usage: atomcode_codingplan::usage::UsageResponse) -> AccountUsage 
     }
 }
 
+/// The account's plan, in the runtime's own words.
+///
+/// `status == 1` is the service's way of saying the plan is live; everything
+/// else is not, and an expired plan is still reported rather than dropped — a
+/// person whose plan lapsed needs to be told that, and dropping it here would
+/// show them a page with nothing where their subscription used to be.
+fn plan_from(plan: atomcode_codingplan::types::PlanInfo) -> Entitlement {
+    Entitlement {
+        plan: plan.plan_name,
+        active: plan.status == 1,
+        claimed_at: plan.claimed_at,
+        expires_at: plan.expires_at,
+        remaining_days: plan.remaining_days,
+        total_days: plan.total_days,
+    }
+}
+
 /// One account-service window, in the runtime's own words.
 ///
 /// A named function rather than a closure in the fetch, so what it carries can
@@ -170,6 +200,37 @@ pub fn coding_provider_factory() -> Arc<dyn atomcode_coding::CodingProviderFacto
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The plan crosses whole, and `status` becomes a yes-or-no rather than a
+    /// number nobody above this line could interpret.
+    ///
+    /// The third field-by-field map in this file, and the third one written
+    /// with a criterion beside it — the first two each lost a field silently.
+    /// The expired case is asserted because dropping it is the tempting bug:
+    /// it looks like "nothing to show" and reads like "you never had a plan".
+    #[test]
+    fn a_plan_crosses_with_its_dates_and_whether_it_still_runs() {
+        let upstream = |status| atomcode_codingplan::types::PlanInfo {
+            plan_name: "CodingPlan Pro".into(),
+            status,
+            claimed_at: "2026-07-30".into(),
+            expires_at: "2036-07-30".into(),
+            remaining_days: 3601,
+            total_days: 3653,
+            apply_id: 7,
+        };
+        let live = plan_from(upstream(1));
+        assert_eq!(live.plan, "CodingPlan Pro");
+        assert!(live.active, "status 1 is the service's yes");
+        assert_eq!(live.claimed_at, "2026-07-30");
+        assert_eq!(live.expires_at, "2036-07-30");
+        assert_eq!(live.remaining_days, 3601);
+        assert_eq!(live.total_days, 3653);
+        assert!(
+            !plan_from(upstream(0)).active,
+            "and anything else is a no — still crossed, not dropped"
+        );
+    }
 
     /// The per-model breakdown of each day reaches the runtime too.
     ///

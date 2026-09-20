@@ -1604,16 +1604,21 @@ impl Tui {
                 }),
                 _ => None,
             };
-            let (windows, stats) = match control.call(HostCommand::Usage { session }).await {
-                Ok(HostReply::Usage { windows, stats }) => (windows, stats),
+            let (windows, plan, stats) = match control.call(HostCommand::Usage { session }).await {
+                Ok(HostReply::Usage {
+                    windows,
+                    plan,
+                    stats,
+                }) => (windows, plan, stats),
                 // A host that will not say is a host with nothing to draw; the
                 // page says so rather than showing an error where a chart goes.
-                _ => (Vec::new(), None),
+                _ => (Vec::new(), None, None),
             };
             host.moment.write().expect("moment poisoned").usage =
                 Some(crate::settings::UsagePage {
                     context,
                     windows,
+                    plan,
                     stats,
                 });
             if let Some(repaint) = repaint {

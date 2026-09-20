@@ -108,13 +108,25 @@ pub enum Role {
     /// (`[75, 214, 208, 154, 183, 81]`), which assumed a dark terminal and
     /// disagreed with this front end about every one of them.
     Series(u8),
+    /// One step of a heat ramp: how much, as a shade rather than a number.
+    ///
+    /// `0` is a day inside the range with nothing on it and `HEAT - 1` is the
+    /// busiest. Computed from the terminal's own background and accent rather
+    /// than picked from fixed slots, because a ramp is the one thing that
+    /// *must* follow the ground it is drawn on: the classic front end's
+    /// `[231, 217, 210, 174, 131, 88]` goes white → deep red, which reads as a
+    /// ramp on a light terminal and as a row of bright blocks fading to
+    /// invisible on a dark one.
+    Heat(u8),
 }
 
 /// How many lines a chart can tell apart before it starts round-tripping.
 pub const SERIES: u8 = 6;
+/// How many steps the heat ramp has, counting the empty one.
+pub const HEAT: u8 = 6;
 
 /// Every role, so a check can walk them instead of keeping a list in step.
-pub const ROLES: [Role; 21] = [
+pub const ROLES: [Role; 27] = [
     Role::Brand,
     Role::Accent,
     Role::Border,
@@ -136,6 +148,12 @@ pub const ROLES: [Role; 21] = [
     Role::Series(3),
     Role::Series(4),
     Role::Series(5),
+    Role::Heat(0),
+    Role::Heat(1),
+    Role::Heat(2),
+    Role::Heat(3),
+    Role::Heat(4),
+    Role::Heat(5),
 ];
 
 /// xterm's sixteen, the fallback for a terminal that will not say what its own
@@ -375,6 +393,13 @@ fn floor(role: Role) -> f32 {
         // Chart ink: it has to read, but it is not prose and it is not asked to
         // carry a sentence. The same floor a mode badge gets.
         Role::Mode | Role::Series(_) => 4.5,
+        // A filled square, not a letter. A text floor does not apply to it and
+        // *cannot*: the emptiest step's whole job is to sit just off the
+        // surface, and a rule that forced it to read as ink would destroy the
+        // ramp it is the bottom of. What has to be true instead — each step
+        // visibly more than the one below — is its own criterion
+        // (`a_heat_ramp_climbs_on_any_ground`).
+        Role::Heat(_) => 0.0,
         Role::Muted => 6.0,
         _ => 7.0,
     }
@@ -431,6 +456,8 @@ fn candidates(role: Role) -> &'static [u8] {
         Role::Success | Role::DiffAdd => &[10, 2],
         Role::Mode => &[12, 4, 13, 5],
         Role::Secondary | Role::ToolName | Role::PanelFg | Role::PanelBg | Role::PanelSelBg => &[],
+        // Mixed, not chosen: see [`Role::Heat`].
+        Role::Heat(_) => &[],
         // Six hues a scheme is near certain to have set apart from each other,
         // bright first and the dim twin behind it. Round-tripped rather than
         // extended past six: a seventh line a reader cannot name is worse than
@@ -443,6 +470,26 @@ fn candidates(role: Role) -> &'static [u8] {
             4 => &[12, 4],
             _ => &[9, 1],
         },
+    }
+}
+
+/// How far off the panel the *emptiest* heat step sits.
+///
+/// Not zero: a cell the same colour as its surface is a hole in the grid, and
+/// the grid is the thing being read — where the gaps are is half of what a
+/// calendar says. Small enough that it still reads as "nothing happened".
+const HEAT_FLOOR: f32 = 0.10;
+
+/// Which slot the accent resolved to, for a role that mixes rather than picks.
+///
+/// Asked of [`resolve`] rather than hard-coded, so a ramp built out of the
+/// accent stays the same colour as everything else the accent draws.
+fn accent_slot(caps: Caps) -> u8 {
+    match resolve(Role::Accent, caps) {
+        Some(Color::Ansi(n)) => n,
+        // Truecolor terminals resolve the accent to an exact colour rather than
+        // a slot; the first candidate is the slot it was chosen from.
+        _ => candidates(Role::Accent).first().copied().unwrap_or(6),
     }
 }
 
@@ -479,6 +526,19 @@ pub fn resolve(role: Role, caps: Caps) -> Option<Color> {
         Role::Secondary | Role::ToolName => None,
         Role::PanelBg => Some(exact(panel_bg(p), caps.colors, p)),
         Role::PanelSelBg => Some(exact(panel_ground(p, PANEL_SEL_REACH), caps.colors, p)),
+        // The accent, mixed into the background by how much there was. Step 0
+        // is the panel's own surface — a day in range with nothing on it, which
+        // has to read as part of the grid rather than as a hole in it, so it is
+        // drawn and not left blank. Steps climb to the accent at full strength.
+        Role::Heat(n) => {
+            let step = f32::from(n.min(HEAT - 1)) / f32::from(HEAT - 1);
+            let ink = p.slot(accent_slot(caps));
+            Some(exact(
+                mix(panel_bg(p), ink, HEAT_FLOOR + (1.0 - HEAT_FLOOR) * step),
+                caps.colors,
+                p,
+            ))
+        }
         Role::PanelFg => {
             // Read against the panel, not against the screen behind it.
             let on = panel_bg(p);
@@ -872,6 +932,43 @@ mod tests {
             }
         }
         assert!(worst.is_empty(), "unreadable:\n{}", worst.join("\n"));
+    }
+
+    /// Every step of the heat ramp is visibly more than the step below it, on
+    /// a dark ground and on a light one.
+    ///
+    /// This is what a heat map claims, and it is not the claim the text roles
+    /// make: the ramp's bottom step has to be *nearly* the surface, so holding
+    /// it to a reading floor would flatten the ramp into six shades of the same
+    /// loud colour. The classic front end fixed the six colours outright
+    /// (`[231, 217, 210, 174, 131, 88]`, white → deep red), which climbs on a
+    /// light terminal and falls off a dark one.
+    #[test]
+    fn a_heat_ramp_climbs_on_any_ground() {
+        for bg in [(0, 0, 0), (255, 255, 255), (40, 42, 54), (250, 250, 245)] {
+            let caps = caps_on(bg);
+            let steps: Vec<f32> = (0..HEAT)
+                .map(|n| {
+                    let c = seen(Role::Heat(n), caps).expect("a heat step resolves");
+                    contrast(c, bg)
+                })
+                .collect();
+            for (n, pair) in steps.windows(2).enumerate() {
+                assert!(
+                    (pair[1] - pair[0]).abs() > 0.02,
+                    "step {} and {} are the same shade on {bg:?}: {steps:?}",
+                    n,
+                    n + 1
+                );
+            }
+            // And it climbs the same way all the way up — a ramp that turned
+            // round in the middle would read as two ramps.
+            let up = steps[1] > steps[0];
+            assert!(
+                steps.windows(2).all(|pair| (pair[1] > pair[0]) == up),
+                "the ramp changes direction on {bg:?}: {steps:?}"
+            );
+        }
     }
 
     #[test]

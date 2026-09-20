@@ -99,7 +99,8 @@ pub use provider_factory::{
     CodingProviderFactory, DefaultCodingProviderFactory, ProviderAuthenticator, ProviderBuildError,
 };
 pub use rate_limit::{
-    AccountUsage, DayUse, ModelSeries, ModelUse, RateLimitWindow, RateLimitWindowSource,
+    AccountUsage, DayUse, Entitlement, ModelSeries, ModelUse, RateLimitWindow,
+    RateLimitWindowSource,
 };
 pub use runtime::{
     CodingRuntime, CodingRuntimeEvent, CodingRuntimeEvents, CodingRuntimeHandle,

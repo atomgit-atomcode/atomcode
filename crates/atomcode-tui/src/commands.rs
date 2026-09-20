@@ -1869,6 +1869,7 @@ mod tests {
         let host = Arc::new(Recording::default());
         host.replies.lock().unwrap().extend([
             Ok(HostReply::Usage {
+                plan: None,
                 stats: None,
                 windows: vec![
                     atomcode_host_api::UsageWindow {
@@ -1894,6 +1895,7 @@ mod tests {
                 ],
             }),
             Ok(HostReply::Usage {
+                plan: None,
                 stats: None,
                 windows: Vec::new(),
             }),

@@ -1045,8 +1045,16 @@ impl HostControl for RuntimeControl {
             // the one command that breaks when the network hiccups.
             HostCommand::Usage { session } => {
                 self.addressed(&session)?;
-                let (windows, spent) = self.handle.usage().await.map_err(refused)?;
+                let (windows, plan, spent) = self.handle.usage().await.map_err(refused)?;
                 Ok(HostReply::Usage {
+                    plan: plan.map(|plan| atomcode_host_api::Entitlement {
+                        plan: plan.plan,
+                        active: plan.active,
+                        claimed_at: plan.claimed_at,
+                        expires_at: plan.expires_at,
+                        remaining_days: plan.remaining_days,
+                        total_days: plan.total_days,
+                    }),
                     stats: spent.map(|spent| atomcode_host_api::UsageStats {
                         from: spent.from,
                         to: spent.to,

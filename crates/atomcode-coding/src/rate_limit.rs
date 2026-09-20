@@ -101,6 +101,26 @@ pub struct DayUse {
     pub requests: u64,
 }
 
+/// The entitlement those windows belong to — what the account is subscribed to.
+///
+/// Separate from the windows because the two answer different questions and
+/// expire on different clocks: a window resets in minutes, a plan in years. A
+/// screen that showed only the window can say "you are throttled" and never
+/// "your plan runs out next week".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Entitlement {
+    pub plan: String,
+    /// Whether the service still honours it. Expired plans are still reported —
+    /// a person whose plan lapsed needs to be told that, not shown nothing.
+    pub active: bool,
+    /// `YYYY-MM-DD`, or empty when the service did not say. A claim that has
+    /// not been activated has no date, which is not the same as day zero.
+    pub claimed_at: String,
+    pub expires_at: String,
+    pub remaining_days: i32,
+    pub total_days: i32,
+}
+
 /// Host-owned source for provider-specific quota windows.
 ///
 /// `applies_to` is deliberately part of the source: only the host knows which endpoints carry
@@ -116,6 +136,18 @@ pub trait RateLimitWindowSource: Send + Sync + std::fmt::Debug {
     /// stays valid: this is an account-service feature, not something every
     /// provider has.
     async fn fetch_usage(&self) -> Result<Option<AccountUsage>, String> {
+        Ok(None)
+    }
+
+    /// The plan behind the windows, when there is one.
+    ///
+    /// A method of its own rather than a second field on [`Self::fetch_windows`]
+    /// on purpose: `fetch_windows` is on the 429 path, where the answer is
+    /// cached and aged and the plan has no business being. The cost is that a
+    /// host whose plan and windows arrive in one response asks for that
+    /// response twice when a person opens the page — which is the cheap half of
+    /// the trade, since the page is opened by hand and the 429 path is not.
+    async fn fetch_plan(&self) -> Result<Option<Entitlement>, String> {
         Ok(None)
     }
 }

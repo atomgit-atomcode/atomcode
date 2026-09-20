@@ -287,6 +287,9 @@ pub enum HostReply {
     /// meters nothing.
     Usage {
         windows: Vec<UsageWindow>,
+        /// What the account is subscribed to, when the host has a notion of it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan: Option<Entitlement>,
         /// What went through, when the host meters it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stats: Option<UsageStats>,
@@ -450,6 +453,29 @@ pub struct UsageStats {
     pub series: Vec<ModelSeries>,
     pub total_tokens: u64,
     pub total_requests: u64,
+}
+
+/// What the account is subscribed to.
+///
+/// Separate from the windows because the two run on different clocks and answer
+/// different questions: a window resets in minutes, a plan in years. A screen
+/// with only the windows can say "you are throttled now" and never "your plan
+/// runs out next week", which is the one of the two a person can act on.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Entitlement {
+    pub plan: String,
+    /// Whether the service still honours it. An expired plan is still reported:
+    /// a person whose plan lapsed needs to be told, and saying nothing looks
+    /// like never having had one.
+    pub active: bool,
+    /// `YYYY-MM-DD`, or empty when the service did not say — a claim that was
+    /// never activated has no date, which is not day zero.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub claimed_at: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub expires_at: String,
+    pub remaining_days: i32,
+    pub total_days: i32,
 }
 
 /// One model's day-by-day tokens, aligned with [`UsageStats::daily`].
@@ -1002,6 +1028,14 @@ mod tests {
                 working_dir: "/w".into(),
             },
             HostReply::Usage {
+                plan: Some(Entitlement {
+                    plan: "CodingPlan Pro".into(),
+                    active: true,
+                    claimed_at: "2026-07-30".into(),
+                    expires_at: "2036-07-30".into(),
+                    remaining_days: 3601,
+                    total_days: 3653,
+                }),
                 windows: vec![UsageWindow {
                     label: "5 小时".into(),
                     exhausted: true,

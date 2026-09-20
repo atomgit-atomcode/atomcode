@@ -1798,6 +1798,7 @@ impl CodingRuntimeHandle {
     ) -> Result<
         (
             Vec<crate::rate_limit::RateLimitWindow>,
+            Option<crate::rate_limit::Entitlement>,
             Option<crate::rate_limit::AccountUsage>,
         ),
         RuntimeError,
@@ -2492,6 +2493,7 @@ pub enum CodingRuntimeControl {
             Result<
                 (
                     Vec<crate::rate_limit::RateLimitWindow>,
+                    Option<crate::rate_limit::Entitlement>,
                     Option<crate::rate_limit::AccountUsage>,
                 ),
                 RuntimeError,
@@ -4004,29 +4006,31 @@ fn spawn_runtime_owner_with_optional_agent(
                             .and_then(|runtime| runtime.parts.rate_limit_source().cloned());
                         tokio::spawn(async move {
                             let Some(source) = source else {
-                                let _ = done.send(Ok((Vec::new(), None)));
+                                let _ = done.send(Ok((Vec::new(), None, None)));
                                 return;
                             };
-                            // One budget for both: a page that waited twice as
-                            // long to show the same thing is a page that feels
-                            // broken.
-                            let windows = tokio::time::timeout(
-                                std::time::Duration::from_secs(3),
-                                source.fetch_windows(),
-                            )
-                            .await
-                            .ok()
-                            .and_then(|fetched| fetched.ok())
-                            .unwrap_or_default();
-                            let spent = tokio::time::timeout(
-                                std::time::Duration::from_secs(3),
-                                source.fetch_usage(),
-                            )
-                            .await
-                            .ok()
-                            .and_then(|fetched| fetched.ok())
-                            .flatten();
-                            let _ = done.send(Ok((windows, spent)));
+                            // Asked for together, not one after another: these
+                            // are three separate calls on the same account, and
+                            // a page that waited three times as long to show
+                            // one screen is a page that feels broken. One
+                            // budget each, but they run at once, so the page is
+                            // late by the slowest rather than by the sum.
+                            let budget = std::time::Duration::from_secs(3);
+                            let (windows, plan, spent) = tokio::join!(
+                                tokio::time::timeout(budget, source.fetch_windows()),
+                                tokio::time::timeout(budget, source.fetch_plan()),
+                                tokio::time::timeout(budget, source.fetch_usage()),
+                            );
+                            // Each answer stands or falls on its own: a plan
+                            // the service would not say is not a reason to draw
+                            // no windows.
+                            let windows = windows
+                                .ok()
+                                .and_then(|fetched| fetched.ok())
+                                .unwrap_or_default();
+                            let plan = plan.ok().and_then(|fetched| fetched.ok()).flatten();
+                            let spent = spent.ok().and_then(|fetched| fetched.ok()).flatten();
+                            let _ = done.send(Ok((windows, plan, spent)));
                         });
                     }
                     // Reading only: unlike the rewind catalog this does not
