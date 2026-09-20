@@ -125,11 +125,29 @@ wire DTO 展开：
 
 **本机每跑一次 `cargo build`，`Cargo.lock` 都会被写进一批公开仓库不该有的私有依赖。**
 
-成因：`crates/atomcode-codingplan-crypto/` 在公开仓库里是**只有签名没有实现的 stub**，而本机放的是**实现版**——它的 `Cargo.toml` 声明了 `hmac`/`sha2`/`hkdf`/`zeroize`/`subtle`。根 `Cargo.toml` 的 `workspace.members = ["crates/*"]` 是 glob，把这个目录包了进来，于是 cargo 认为这些依赖属于本 workspace，解析后写进 lock。
+成因：`crates/atomcode-codingplan-crypto/` 在公开仓库里是**只有签名没有实现的 stub**，而本机放的是**实现版**——它的 `Cargo.toml` 声明了 `hmac`/`sha2`/`hkdf`/`zeroize`/`subtle`。根 `Cargo.toml` 的 `workspace.members = ["crates/*"]` 是 glob，把这个目录收成了 member，cargo 解析 workspace 时把这些依赖写进 lock。（**把它移出 member 名单并不解决问题**——真正让它们进 lock 的是 `atomcode-auth` 那条 optional path 依赖，见本节末尾的实测。）
 
 证据链（2026-09-15 实测）：`6504f4ca` 删掉那 41 行 → `8fb2eaf9` 又加回来 42 行（同一批 + 1 行合法的 `atomcode-coding`）→ 手工剔干净后跑一次 `cargo build -p atomcode-tui --lib`，`Cargo.lock` 的 md5 立刻变回含私有依赖的版本。
 
-**所以「剔掉那几行再提交」是一次性的，不是修好了。** push 前必须核：
+**所以「剔掉那几行再提交」是一次性的，不是修好了。**
+
+#### 本机设一次，之后不用再手工剔（2026-09-20）
+
+```bash
+git update-index --skip-worktree Cargo.lock
+```
+
+它改的是 `.git/index` 里那个条目上的一个标志位（设完 `git ls-files -v Cargo.lock` 打 `S`，普通状态是 `H`），意思是「别看工作树里的这个文件」。于是本机构建照常把私有依赖写进磁盘上那份 lock，而 `git status` / `git add -A` / `git commit -a` 全都跳过它，推上去的永远是仓库里那份干净的。
+
+**不改仓库任何文件**：`.gitignore` 没动，`git config` 没动，lock 的内容也没动。验证方式是设完之后**故意**跑一次 `cargo build` 让它重新变脏，再看 `git status` 是不是空的——空才说明是「它脏了但 git 不看」，而不是「我刚剔干净了」。
+
+三件要知道的：
+
+- **只对这个 clone 生效**（那个位存在 `.git/index` 里）。换机器、重新 clone、`.worktrees/` 下的每个 worktree 都要各设一次。
+- **上游真改了 lock 时它会挡住 pull**。那时：`git update-index --no-skip-worktree Cargo.lock` → `git checkout -- Cargo.lock` → `git pull` → 再设回去。
+- 撤销就是 `--no-skip-worktree`。
+
+没设这个位、或者不确定设没设的时候，push 前照旧核一遍：
 
 ```bash
 grep -c 'name = "hkdf"\|name = "hmac"\|name = "zeroize_derive"' Cargo.lock   # 必须是 0
@@ -137,7 +155,20 @@ grep -c 'name = "hkdf"\|name = "hmac"\|name = "zeroize_derive"' Cargo.lock   # �
 
 非 0 就用干净基线重来（`git show <干净 commit>:Cargo.lock > Cargo.lock`，再把该提交之后**合法的**依赖变化补回，例如 `atomcode-tui` 新增的 `atomcode-coding`），确认 `git diff Cargo.lock` 只剩你要删的那些行。**不要**用 `cargo update` 或 `cargo generate-lockfile` 去「修」它——它们只会把私有依赖写回来。
 
-这是个已知的反复成本，不是可以一次解决的 bug：`[workspace.exclude]` 看着对症，但 `atomcode-auth` 用 path 依赖引它，排除会打断公开侧的 feature 门。真要根治得先想清楚私有 overlay 该以什么身份进入 workspace。
+#### 为什么根治不了，以及原来写在这儿的判断是错的（2026-09-20 实测）
+
+**根因不是「它是 workspace member」**：默认 feature 下 `cargo tree -i hkdf` 报 `did not match any packages`——依赖图里根本没有它，可 lock 里有。**`Cargo.lock` 记的是所有 optional 依赖的解析结果，不管 feature 开不开**，而 `atomcode-auth` 用 `optional = true` 的 path 依赖引着 `atomcode-codingplan-crypto`。只要这条 path 依赖还在，它的依赖就必然落进 lock。
+
+原来这一段写的是「`[workspace.exclude]` 看着对症，但 `atomcode-auth` 用 path 依赖引它，排除会打断公开侧的 feature 门」。**两半都不成立**，实测如下（改根 `Cargo.toml` 加 `exclude = ["crates/atomcode-codingplan-crypto"]`，跑完还原）：
+
+| 断言 | 实测 |
+| --- | --- |
+| exclude 能让 lock 干净 | ✗ `cargo metadata` 之后照样是 3 行——它只是说这个目录不是 member，挡不住那条 path 依赖 |
+| exclude 会打断公开侧的 feature 门 | ✗ `cargo check -p atomcode-auth --features codingplan-crypto` 退出码 0——path 依赖本来就可以指向 workspace 之外 |
+
+所以 exclude 这个方向不是「有代价的解法」，是**无效**：别再照着它试第二遍。真要根治，得动的是那条 optional path 依赖本身（私有 overlay 以什么身份进入依赖图），而不是 workspace 的成员名单。在那之前，上面那个 `skip-worktree` 是本机这一侧的止血。
+
+**不要把 `Cargo.lock` 写进 `.gitignore`**：它已经 tracked，写进去也不生效（得 `git rm --cached`，那是把它从仓库删掉）；而 `.github/workflows/build.yml` 里五个平台的 `cargo build --release` 正是最需要它的场景——没有 lock，两次发布可能拿到不同的传递依赖版本，而且出事后无法复现当时的依赖图。
 
 ### 测试与构建命令（2026-09-13 实测定标，勿凭直觉推翻）
 
