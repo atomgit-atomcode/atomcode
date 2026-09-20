@@ -276,7 +276,7 @@ pub fn collapse_home_with(path: &str, home: Option<&std::path::Path>) -> String 
 /// `HOME` on unix, `USERPROFILE` on Windows. Empty is treated as absent: a set
 /// but blank variable is not an answer, and `~/proj` built from it would be
 /// wrong in a way nobody could see.
-fn home_dir() -> Option<std::path::PathBuf> {
+pub(crate) fn home_dir() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(std::path::PathBuf::from)

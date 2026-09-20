@@ -1949,14 +1949,16 @@ impl Tui {
                 // member's), so switching models moves the denominator the row
                 // shows the used tokens against. A change is stale — the footer
                 // must repaint to show the new window.
-                let window = self
-                    .client
-                    .described()
-                    .and_then(|d| d.context_window)
-                    .unwrap_or(0);
+                let described = self.client.described();
+                let window = described.as_ref().and_then(|d| d.context_window).unwrap_or(0);
+                let model = described
+                    .as_ref()
+                    .and_then(|d| d.model.clone())
+                    .unwrap_or_default();
                 let mut moment = self.host.moment.write().expect("moment poisoned");
-                let changed = moment.ctx_window != window;
+                let changed = moment.ctx_window != window || moment.model != model;
                 moment.ctx_window = window;
+                moment.model = model;
                 changed
             }
             AgentEvent::Accepted { command, .. } => {
@@ -2165,6 +2167,15 @@ impl Tui {
     /// Apply one action. Returns `true` to quit.
     fn act(&self, action: Action, client: &AgentClient) -> bool {
         let mut m = self.host.moment.write().expect("moment poisoned");
+        // Any action other than a repeat Ctrl+C disarms the "press again to quit"
+        // latch, and takes the exit hint below the box down with it: an accidental
+        // first press followed by real work must never leave the terminal one
+        // keystroke from exit, nor the hint up while that work goes on. First,
+        // before any early return below (e.g. Escape clearing a selection) can
+        // skip it.
+        if !matches!(action, Action::Cancel) {
+            m.disarm_quit();
+        }
         // A highlight is a rectangle of screen cells. Anything that repaints
         // those cells with different text leaves it pointing at the wrong
         // words, so it is dropped by everything except the gestures that are
@@ -2368,12 +2379,21 @@ impl Tui {
                 m.caret = at + inserted.len();
             }
             Action::Cancel => {
-                // Through the host, so the live line's appearance is pinned the
-                // same way a turn's start is: this is the third route that moves
-                // that row, and a pin on two of three jumps on the third.
-                drop(m);
-                self.stop_turn(client);
-                return false;
+                // A turn in flight: Ctrl+C stops it and clears any pending quit —
+                // the same live-line pin a turn's start gets (this is the third
+                // route that moves that row). Stopping counts as in-flight too. The
+                // line is left alone: cancelling the model's answer is not the same
+                // gesture as clearing what you were about to say next.
+                if m.activity != crate::moment::Activity::Idle {
+                    m.disarm_quit();
+                    drop(m);
+                    self.stop_turn(client);
+                    return false;
+                }
+                // Idle: the two-press exit. The first Ctrl+C clears the line and
+                // shows `再按 Ctrl+C 退出` below the box; a second press while it is
+                // up quits; once it has expired the next press is a fresh first one.
+                return m.cancel_idle();
             }
             Action::Scroll(by) => {
                 // Bounded by what is left to read, not by how much there is:

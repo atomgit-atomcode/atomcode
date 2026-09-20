@@ -337,10 +337,12 @@ fn lift(base: Rgb, bg: Rgb, need: f32) -> Rgb {
 ///
 /// - **7.0** — meaning-carrying ink: errors, diffs, warnings, success, the
 ///   brand and accent marks.
-/// - **6.0** — [`Role::Muted`]. It must stay below the prose (its hierarchy
-///   test asserts that against the loudest ink), and 7.0 on black leaves
-///   almost no room between it and plain text; 6.0 is still a solid jump from
-///   the 4.5 that read as washed out.
+/// - **4.5** — [`Role::Muted`]. AA, and no higher: a muted role's whole job is
+///   to recede, and most schemes' dim grey (slot 8) lands around 5:1 on a dark
+///   ground. A 6.0 target rejected that grey and stepped up to the *louder* slot
+///   7 — a status row and its prose in the same near-white, the opposite of
+///   muted (see `muted_uses_the_schemes_dim_grey_when_the_terminal_reports_one`).
+///   AA keeps it readable while letting the scheme's own recessive ink through.
 /// - **4.5** — [`Role::Mode`]. A badge sits on a filled ground it does not
 ///   control; AA there, bold weight does the rest.
 /// - **3.0** — [`Role::Border`] alone. Lines are chrome, not prose: a border
@@ -350,7 +352,7 @@ fn floor(role: Role) -> f32 {
     match role {
         Role::Border => 3.0,
         Role::Mode => 4.5,
-        Role::Muted => 6.0,
+        Role::Muted => 4.5,
         _ => 7.0,
     }
 }
@@ -801,6 +803,32 @@ mod tests {
                 "muted ({ratio:.2}) is as loud as plain text ({loudest:.2}) on {bg:?}"
             );
         }
+    }
+
+    /// A terminal that reports its palette has a real dim grey in slot 8 — the
+    /// scheme's own muted ink, whose whole job is to recede. `Role::Muted` must
+    /// use it, not step up to the louder slot 7 just because the dim one misses a
+    /// contrast target: a status row and its prose in the same near-white is the
+    /// exact "muted renders white" bug this guards.
+    #[test]
+    fn muted_uses_the_schemes_dim_grey_when_the_terminal_reports_one() {
+        // A typical dark scheme: black ground, a mid grey in slot 8 (~5.3:1) and a
+        // light grey in slot 7 (~13:1), both answered by the terminal.
+        let caps = Caps {
+            palette: Palette::assumed(Theme::Dark)
+                .with_background((0, 0, 0))
+                .with_foreground((0xcc, 0xcc, 0xcc))
+                .with_slot(7, (0xcc, 0xcc, 0xcc))
+                .with_slot(8, (0x80, 0x80, 0x80)),
+            colors: Colors::Ansi256,
+            ..Caps::default()
+        };
+        let muted = seen(Role::Muted, caps).unwrap();
+        assert_eq!(
+            muted,
+            (0x80, 0x80, 0x80),
+            "muted must take the scheme's dim grey (slot 8), not the louder slot 7"
+        );
     }
 
     #[test]

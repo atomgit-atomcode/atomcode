@@ -81,7 +81,10 @@ impl View for Tip {
             .moment
             .notice
             .as_ref()
-            .filter(|n| n.is_live(vp.moment.now));
+            // A `below` notice — the exit hint — is the status line's row, not
+            // this one; drawing it here would put it above the box and double it
+            // up with the row below.
+            .filter(|n| !n.below && n.is_live(vp.moment.now));
         let (text, role) = match live {
             Some(n) if n.refused => (n.text.clone(), Role::Error),
             Some(n) => (n.text.clone(), Role::Muted),
@@ -206,6 +209,25 @@ mod tests {
         assert!(
             out[0].plain().trim().is_empty(),
             "the tip is gone at its expiry: {:?}",
+            out[0].plain()
+        );
+    }
+
+    #[test]
+    fn a_below_notice_is_the_status_lines_and_not_drawn_here() {
+        // The exit hint is a notice too, but it belongs below the box. This row
+        // is above it and must stay blank so the two never draw at once.
+        let mut moment = Moment::default();
+        moment.now = Timestamp::millis(0);
+        moment.notice = Some(
+            crate::moment::Notice::for_ms("再按 Ctrl+C 退出", false, Timestamp::millis(0), 2_000)
+                .below(),
+        );
+        let out = draw_at(&moment, 60, 1);
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0].plain().trim().is_empty(),
+            "a below-notice is the status line's, not the tip row's: {:?}",
             out[0].plain()
         );
     }

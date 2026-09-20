@@ -60,13 +60,14 @@ impl View for Status {
     }
 
     /// The bottom line: what model, where, how full the context is, how much of
-    /// it was cached — `model │ cwd │ 49.0k/512k tok (10%) │ cache 96%`, the shape
-    /// and colours `atomcode-tuix` draws.
+    /// it was cached — `model │ cwd │ 49.0k/512k tok (10%) │ cache 96%`, with the
+    /// home directory collapsed to `~`.
     ///
-    /// Each part carries its own colour (model = accent, cwd = secondary, the
-    /// context usage green→yellow→red as it fills, the cache ratio gold, the
-    /// separators muted). It puts this last and lets it end where its text ends —
-    /// it is the thing you glance at, not the thing you read. A reverse-video bar
+    /// Each part carries its own colour: the model in the theme accent, the cwd
+    /// muted grey, the context usage green (shifting to yellow then red as the
+    /// window fills toward the auto-compaction threshold), the cache ratio gold,
+    /// the separators muted. It puts this last and lets it end where its text ends
+    /// — the thing you glance at, not the thing you read. A reverse-video bar
     /// across the top is what an editor does; a coding agent's screen belongs to
     /// the conversation.
     ///
@@ -80,6 +81,20 @@ impl View for Status {
         let w = vp.rect.w;
         if w == 0 || vp.rect.h == 0 {
             return Vec::new();
+        }
+        // The `再按 Ctrl+C 退出` hint takes the whole row while it is up — this is
+        // the footer below the box, where tuix and Claude Code put their exit
+        // prompt. It rides `notice.below` rather than a flag of its own so its
+        // expiry (the two-second exit window) is the one thing that decides both
+        // that it shows and that a second Ctrl+C quits. Left-aligned and muted:
+        // it is a prompt, not a report, and it is gone in two seconds.
+        if let Some(hint) = vp
+            .moment
+            .notice
+            .as_ref()
+            .filter(|n| n.below && n.is_live(vp.moment.now))
+        {
+            return El::styled(hint.text.clone(), theme::fg(Role::Muted)).lay(w);
         }
         let caps = vp.moment.caps;
         let dim = theme::fg(Role::Muted);
@@ -119,12 +134,21 @@ impl View for Status {
             reserved += width::str_width(text) + sep_w;
         }
 
-        let model_str = if state.model.is_empty() {
-            "atomcode".to_string()
-        } else {
+        // Prefer the folded model (what a request actually ran on); before the
+        // first turn that is empty, so fall back to the description's model — the
+        // real name the welcome already shows — and only then to the brand.
+        let model_str = if !state.model.is_empty() {
             state.model.clone()
+        } else if !vp.moment.model.is_empty() {
+            vp.moment.model.clone()
+        } else {
+            "atomcode".to_string()
         };
-        let cwd_full = vp.moment.cwd.clone();
+        // Home collapsed to `~` for display — the same optimisation the welcome
+        // banner and `/cd`/`/resume` apply at their own display sites. `Moment.cwd`
+        // itself stays absolute (the `@`-path completion in `plugin.rs` reads it as
+        // a real filesystem path), so the collapse happens here, not at the source.
+        let cwd_full = crate::text::collapse_home(&vp.moment.cwd);
         let cwd_base = path_basename(&cwd_full).to_string();
         // Only what means something: a context usage segment appears once there
         // are tokens or a window to report, never as a bare zero.
@@ -140,8 +164,10 @@ impl View for Status {
             &model_str, &cwd_full, &cwd_base, &ctx_str, &cache_str, budget, sep_w,
         );
 
-        // The context usage shifts green → yellow → red as the window fills toward
-        // the auto-compaction threshold, mirroring the reference status bar.
+        // Each part carries its own colour: the model in the theme accent, the cwd
+        // muted grey, the cache ratio gold, and the context usage green — shifting
+        // to yellow then red as the window fills toward the auto-compaction
+        // threshold. Separators stay muted.
         let ctx_style = match ctx_fill_pct(state.prompt_tokens, vp.moment.ctx_window) {
             p if p >= 90 => theme::fg(Role::Error),
             p if p >= 70 => theme::fg(Role::Warning),
@@ -149,7 +175,7 @@ impl View for Status {
         };
         let style_for = |seg: StatusSeg| match seg {
             StatusSeg::Model => theme::fg(Role::Accent),
-            StatusSeg::Cwd => theme::fg(Role::Secondary),
+            StatusSeg::Cwd => dim,
             StatusSeg::Ctx => ctx_style,
             StatusSeg::Cache => theme::fg(Role::Warning),
         };
@@ -538,6 +564,77 @@ mod tests {
         );
     }
 
+    /// While the `再按 Ctrl+C 退出` hint is up it takes the whole status row,
+    /// left-aligned — the same footer `atomcode-tuix` and Claude Code put their
+    /// exit prompt in. The model/cwd/usage step aside for the two seconds it shows.
+    #[test]
+    fn a_live_exit_hint_takes_the_status_row() {
+        let st = State {
+            model: "glm5.3-flash-pro".into(),
+            ..Default::default()
+        };
+        let mut m = Moment {
+            model: "glm5.3-flash-pro".into(),
+            ..Default::default()
+        };
+        m.now = crate::moment::Timestamp::millis(0);
+        m.notice = Some(
+            crate::moment::Notice::for_ms(
+                "再按 Ctrl+C 退出",
+                false,
+                crate::moment::Timestamp::millis(0),
+                crate::moment::QUIT_HINT_MS,
+            )
+            .below(),
+        );
+        let line = Status::render(&st, &Viewport::new(Rect::sized(120, 1), &m))[0].plain();
+        assert!(line.trim_start().starts_with("再按 Ctrl+C 退出"), "{line:?}");
+        assert!(
+            !line.contains("glm5.3-flash-pro"),
+            "the model steps aside while the hint shows: {line:?}"
+        );
+    }
+
+    /// Once the hint's two seconds are up the status row is itself again — the
+    /// model comes back, the hint is gone.
+    #[test]
+    fn an_expired_exit_hint_leaves_the_status_row_alone() {
+        let st = State {
+            model: "glm5.3-flash-pro".into(),
+            ..Default::default()
+        };
+        let mut m = Moment::default();
+        m.now = crate::moment::Timestamp::millis(crate::moment::QUIT_HINT_MS);
+        m.notice = Some(
+            crate::moment::Notice::for_ms(
+                "再按 Ctrl+C 退出",
+                false,
+                crate::moment::Timestamp::millis(0),
+                crate::moment::QUIT_HINT_MS,
+            )
+            .below(),
+        );
+        let line = Status::render(&st, &Viewport::new(Rect::sized(120, 1), &m))[0].plain();
+        assert!(line.contains("glm5.3-flash-pro"), "the row is itself again: {line:?}");
+        assert!(!line.contains("再按"), "the hint is gone: {line:?}");
+    }
+
+    /// Before the first turn the folded model is empty, so the footer names the
+    /// model from the description (what the welcome shows) rather than falling
+    /// back to the brand `atomcode`.
+    #[test]
+    fn a_fresh_session_names_the_real_model_not_the_brand() {
+        let m = Moment {
+            model: "glm5.3-flash-pro".into(),
+            ..Default::default()
+        };
+        // `State::default()` has no folded model yet — the pre-first-turn case.
+        let line = Status::render(&State::default(), &Viewport::new(Rect::sized(80, 1), &m))[0]
+            .plain();
+        assert!(line.contains("glm5.3-flash-pro"), "{line:?}");
+        assert!(!line.contains("atomcode"), "the brand is only the last resort: {line:?}");
+    }
+
     /// The reference footer: usage against the window and the cache ratio, in
     /// tuix's `49.0k/512k tok (10%)` / `cache 96%` shape.
     #[test]
@@ -559,6 +656,25 @@ mod tests {
         // 49000/512000 ≈ 9.57% → 10%.
         assert!(line.contains("49.0k/512k tok (10%)"), "{line:?}");
         assert!(line.contains("cache 96%"), "{line:?}");
+    }
+
+    /// The footer collapses the home directory to `~`, the space-saving
+    /// optimisation the welcome banner and `/cd` also apply — the row shows
+    /// `~/proj`, never the absolute `/Users/…/proj`.
+    #[test]
+    fn the_cwd_collapses_the_home_directory_to_a_tilde() {
+        let Some(home) = crate::text::home_dir() else {
+            return; // No home to collapse against on this runner.
+        };
+        let cwd = home.join("proj").display().to_string();
+        let m = Moment {
+            cwd: cwd.clone(),
+            ..Default::default()
+        };
+        let line = Status::render(&State::default(), &Viewport::new(Rect::sized(120, 1), &m))[0]
+            .plain();
+        assert!(line.contains("~/proj"), "{line:?}");
+        assert!(!line.contains(&cwd), "the absolute path must not appear: {line:?}");
     }
 
     /// With no window reported the usage is a bare count, not `x/0`.
@@ -600,13 +716,13 @@ mod tests {
         );
     }
 
-    /// Each part carries its own colour: model accent, cwd secondary, the usage
+    /// Each part carries its own colour: model accent, cwd muted grey, the usage
     /// green while the window is far from full, the cache ratio gold.
     #[test]
     fn each_part_of_the_row_carries_its_own_colour() {
         let st = State {
             model: "glm".into(),
-            prompt_tokens: 100,
+            prompt_tokens: 100, // 10% of the window — well below the warn threshold
             cached_tokens: 50,
             ..Default::default()
         };
@@ -625,13 +741,14 @@ mod tests {
                 .fg
         };
         assert_eq!(colour("glm"), theme::fg(Role::Accent).fg, "model is accent");
-        assert_eq!(colour("/w"), theme::fg(Role::Secondary).fg, "cwd is secondary");
+        assert_eq!(colour("/w"), theme::fg(Role::Muted).fg, "cwd is muted grey");
         // 100/1000 = 10% < 70, so the usage is green.
         assert_eq!(colour("tok"), theme::fg(Role::Success).fg, "usage is green");
         assert_eq!(colour("cache"), theme::fg(Role::Warning).fg, "cache is gold");
     }
 
-    /// The usage shifts green → yellow → red as the window fills.
+    /// The usage is green, shifting to yellow then red as the window fills past
+    /// the auto-compaction threshold.
     #[test]
     fn the_usage_colour_warns_as_the_window_fills() {
         let colour_at = |pct_used: u32| {

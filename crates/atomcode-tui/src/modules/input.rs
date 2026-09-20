@@ -30,24 +30,17 @@ pub struct State {
 /// A free function so it can be judged without a terminal — the interesting
 /// part is which of the four combinations says what.
 fn caption(moment: &crate::moment::Moment) -> Option<String> {
-    let named = moment
-        .title
-        .as_deref()
-        .map(str::trim)
-        .filter(|t| !t.is_empty());
-    // 1-based and counted from the newest, which is the direction a person
-    // arrows: the first press is 1, not `history.len()`.
-    let browsing = moment.history_at.map(|at| {
-        let total = moment.history.len();
+    // The session title is deliberately NOT shown above the field: it clutters
+    // the composer, and it lives in the terminal's own title bar instead. Only
+    // the history position rides the rule — and only while arrowing back through
+    // what was said, which is otherwise unanswerable from the screen. 1-based and
+    // counted from the newest, the direction a person arrows: the first press is
+    // 1, not `history.len()`.
+    let total = moment.history.len();
+    moment.history_at.map(|at| {
         let nth = total.saturating_sub(at);
         format!("历史 {nth}/{total}")
-    });
-    match (named, browsing) {
-        (None, None) => None,
-        (Some(name), None) => Some(name.to_string()),
-        (None, Some(where_)) => Some(where_),
-        (Some(name), Some(where_)) => Some(format!("{name} · {where_}")),
-    }
+    })
 }
 
 /// Rows the rules above and below the field eat, and cells the prompt eats.
@@ -281,14 +274,10 @@ impl View for Input {
             // past it had no prompt anywhere — ten rows of bare text between
             // two rules, which does not read as somewhere you can type.
             let lead = if i == 0 { prompt.clone() } else { "  ".into() };
-            // The typed text is drawn muted, the same recessed grey the rules and
-            // the ghost completion use: the composer reads as a quiet place to
-            // type rather than as another bright column competing with the
-            // transcript above it. `atomcode-tuix` dims the composer the same way.
-            let mut row = vec![
-                El::styled(lead, arrow),
-                El::styled(piece.clone(), theme::fg(Role::Muted)),
-            ];
+            // The typed text is the terminal's own foreground — what you are
+            // composing is the one thing on this screen you are actively working
+            // on, so it reads at full strength, not dimmed.
+            let mut row = vec![El::styled(lead, arrow), El::raw(piece.clone())];
             // The rest of something already said, dim, on the last row of what
             // is typed — pressing right takes it. Only there, because that is
             // where the caret is when a completion means anything.
@@ -376,35 +365,31 @@ mod tests {
     /// having typed the same words again. Counted from the newest and 1-based,
     /// because that is the direction a person arrows — the first press is 1.
     #[test]
-    fn the_upper_rule_says_which_session_and_where_in_the_history() {
+    fn the_upper_rule_says_where_in_the_history_but_never_the_title() {
         let mut m = Moment::default();
         assert_eq!(caption(&m), None, "nothing to say, so a bare rule");
 
+        // The session title never rides the composer rule any more — it lives in
+        // the terminal's title bar. A title alone leaves the rule bare.
         m.title = Some("修解析器".into());
-        assert_eq!(caption(&m).as_deref(), Some("修解析器"));
-        // A name of spaces is no name.
-        m.title = Some("   ".into());
-        assert_eq!(caption(&m), None);
+        assert_eq!(caption(&m), None, "the title is not shown above the field");
 
-        m.title = Some("修解析器".into());
         m.history = vec!["one".into(), "two".into(), "three".into()];
         m.history_at = Some(2); // the first press back: the newest entry
-        assert_eq!(caption(&m).as_deref(), Some("修解析器 · 历史 1/3"));
+        assert_eq!(caption(&m).as_deref(), Some("历史 1/3"));
         m.history_at = Some(0); // the oldest
-        assert_eq!(caption(&m).as_deref(), Some("修解析器 · 历史 3/3"));
-        m.title = None;
         assert_eq!(caption(&m).as_deref(), Some("历史 3/3"));
 
-        // And it reaches the rule, rather than only the function.
-        m.title = Some("修解析器".into());
+        // And it reaches the rule, rather than only the function — with the title
+        // absent even when one is set.
         let out = draw(&State::default(), &m, 40, 3);
         assert!(
-            out[0].contains("修解析器") && out[0].contains("3/3"),
+            out[0].contains("3/3") && !out[0].contains("修解析器"),
             "{out:?}"
         );
         // Too narrow for the words: the boundary survives, the caption goes.
         let narrow = draw(&State::default(), &m, 12, 3);
-        assert!(!narrow[0].contains("修解析器"), "{narrow:?}");
+        assert!(!narrow[0].contains("历史"), "{narrow:?}");
         assert_eq!(
             narrow[0].chars().count(),
             12,
@@ -452,12 +437,10 @@ mod tests {
         );
     }
 
-    /// The typed text is drawn in the recessed muted grey, not the terminal's
-    /// bright default — the composer is a quiet place to type, matching how
-    /// `atomcode-tuix` dims the composer rather than letting it compete with the
-    /// transcript above.
+    /// The typed text is the terminal's own foreground — full strength, not
+    /// dimmed: what you are actively composing is not chrome.
     #[test]
-    fn the_typed_text_is_muted() {
+    fn the_typed_text_is_the_default_ink() {
         let m = Moment::default().typing("hello");
         let row = &Input::render(&State::default(), &Viewport::new(Rect::sized(40, 3), &m))[1];
         // spans[0] is the prompt marker; the typed text follows it.
@@ -466,7 +449,7 @@ mod tests {
             .iter()
             .find(|s| s.text.contains("hello"))
             .expect("the typed text is on the first body row");
-        assert_eq!(text.style.fg, theme::fg(Role::Muted).fg, "{row:?}");
+        assert_eq!(text.style.fg, None, "the typed text uses the default ink: {row:?}");
     }
 
     #[test]

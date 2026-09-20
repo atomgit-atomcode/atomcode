@@ -272,10 +272,12 @@ impl Content for WelcomeBlock {
             .chain(std::iter::once(self.model.as_deref()))
             .flatten()
         {
+            // The cwd and model read at full strength — they are the two facts a
+            // person most wants at a glance when a session opens, not chrome.
             below.extend(wrapped(
                 text,
                 content_w as u16,
-                muted(),
+                Style::default(),
                 &format!("{bullet} "),
             ));
         }
@@ -620,7 +622,7 @@ pub enum Outcome {
 /// The column a tool call's result hangs in from the left edge of the stream.
 ///
 /// The `●` opens a call at the margin and what came back hangs under it, two
-/// cells in — `● read_file(a.rs)` over `  ⎿ 20 行`. An answer is set in by the
+/// cells in — `● ReadFile(a.rs)` over `  ⎿ 20 行`. An answer is set in by the
 /// same amount, and it reads this number rather than naming one of its own, so
 /// that "the reply lines up with the work that produced it" is one fact instead
 /// of two that happen to agree today. See `host::inset`.
@@ -698,7 +700,7 @@ impl ToolCallBlock {
         let subject = subject_of(&self.name, &self.args);
         let name = match look.verb {
             Some(verb) => verb.to_string(),
-            None => self.name.clone(),
+            None => display_tool_name(&self.name),
         };
         let mut spans = vec![Span::styled(name, name_style)];
         if !subject.is_empty() {
@@ -855,6 +857,25 @@ pub fn look(tool: &str) -> Look {
 /// expanding a call is a request to see what actually ran. The folded summary
 /// abbreviates separately, against the width it has — see [`ToolCallBlock`]'s
 /// `summary`.
+/// A tool's snake_case name as a display word: `read_file` → `ReadFile`, the way
+/// the reference names a call. Used when the tool has no hand-written verb, so
+/// `● ReadFile(a.rs)` reads as a name rather than a raw wire identifier.
+pub fn display_tool_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for word in name.split('_').filter(|w| !w.is_empty()) {
+        let mut chars = word.chars();
+        if let Some(first) = chars.next() {
+            out.extend(first.to_uppercase());
+            out.push_str(chars.as_str());
+        }
+    }
+    if out.is_empty() {
+        name.to_string()
+    } else {
+        out
+    }
+}
+
 pub fn subject_of(tool: &str, args: &str) -> String {
     let look = look(tool);
     let parsed: Option<serde_json::Value> = serde_json::from_str(args).ok();
@@ -934,7 +955,7 @@ impl Content for ToolCallBlock {
     /// are two products:
     ///
     /// ```text
-    /// ● read_file(README.md)
+    /// ● ReadFile(README.md)
     ///   ⎿ 20 行
     ///      1  <div align="center">
     /// ```
@@ -956,19 +977,40 @@ impl Content for ToolCallBlock {
         let caps = Caps::default();
         let lead = format!("{} ", caps.g(Glyph::ToolMark));
         let mut out = self.head(w, &lead, self.mark().1, self.name_style());
-        out.push(self.note_line(w));
 
         let body = match &self.outcome {
             Outcome::Ok(s) | Outcome::Failed(s) => s.as_str(),
             _ => "",
         };
-        if !body.is_empty() && body.lines().filter(|l| !l.trim().is_empty()).count() > 1 {
-            let detail = if matches!(self.outcome, Outcome::Failed(_)) {
-                bad()
-            } else {
-                Style::new()
-            };
-            out.extend(wrapped(body, w, detail, "     "));
+        let non_empty = body.lines().filter(|l| !l.trim().is_empty()).count();
+        let gutter = format!("{}{} ", " ".repeat(GUTTER), caps.g(Glyph::Gutter));
+        match non_empty {
+            // Pending / interrupted / a call that returned nothing: the short
+            // status note (`运行中` / `已中断` / `完成`) is all there is to say.
+            0 => out.push(self.note_line(w)),
+            // A single-line result rides one gutter line, shown WHOLE and wrapped
+            // rather than clipped — an image-attachment note or a one-line message
+            // is never cut off at the edge. A failure keeps its `失败 ·` word and
+            // the alarm colour; a clean result shows its own text.
+            1 => {
+                let line = body.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+                let (text, style) = if matches!(self.outcome, Outcome::Failed(_)) {
+                    (format!("失败 · {line}"), bad())
+                } else {
+                    (line.to_string(), muted())
+                };
+                out.extend(wrapped(&text, w, style, &gutter));
+            }
+            // A multi-line result: the `⎿ N 行` count, then the whole body under it.
+            _ => {
+                out.push(self.note_line(w));
+                let detail = if matches!(self.outcome, Outcome::Failed(_)) {
+                    bad()
+                } else {
+                    Style::new()
+                };
+                out.extend(wrapped(body, w, detail, "     "));
+            }
         }
         out
     }
@@ -997,7 +1039,7 @@ impl Content for ToolCallBlock {
         let look = look(&self.name);
         let name = match look.verb {
             Some(verb) => verb.to_string(),
-            None => self.name.clone(),
+            None => display_tool_name(&self.name),
         };
         let (note, note_style) = outcome_note(&self.outcome);
         // The note is capped to a share of the line. It is the secondary half —
@@ -2531,7 +2573,7 @@ mod tests {
         let named = head
             .spans
             .iter()
-            .find(|s| s.text.contains("read_file"))
+            .find(|s| s.text.contains("ReadFile"))
             .expect("the tool's name");
         assert_eq!(named.style.fg, warn, "the name is not in flight: {head:?}");
 
@@ -2551,7 +2593,7 @@ mod tests {
             let named = head
                 .spans
                 .iter()
-                .find(|s| s.text.contains("read_file"))
+                .find(|s| s.text.contains("ReadFile"))
                 .expect("the tool's name");
             assert_ne!(
                 named.style.fg, warn,
@@ -2582,7 +2624,7 @@ mod tests {
         let named = folded
             .spans
             .iter()
-            .find(|s| s.text.contains("read_file"))
+            .find(|s| s.text.contains("ReadFile"))
             .expect("the tool's name");
         assert_eq!(named.style.fg, heading, "the folded name is not receding");
         let subject = folded
@@ -2617,12 +2659,12 @@ mod tests {
 
         // A run behind one lid is the same drawing, so it recedes too.
         let lid = ToolCallBlock::group_lines(&failed, 3, 80);
-        let head = lid.iter().find(|l| l.plain().contains("read_file"));
+        let head = lid.iter().find(|l| l.plain().contains("ReadFile"));
         let head = head.expect("the last call under the lid");
         let named = head
             .spans
             .iter()
-            .find(|s| s.text.contains("read_file"))
+            .find(|s| s.text.contains("ReadFile"))
             .expect("the tool's name");
         assert_eq!(
             named.style.fg, heading,
@@ -2643,14 +2685,14 @@ mod tests {
     fn arguments_are_shown_in_the_form_a_person_scans() {
         // `brief` used to render `file_path=a.rs`, which reads like a debug
         // dump. `subject_of` picks the argument that names the thing acted on,
-        // so the line reads `read_file(a.rs)` — and it has a fallback, so a
+        // so the line reads `ReadFile(a.rs)` — and it has a fallback, so a
         // tool nobody wrote a rule for still says something.
         let c = ToolCallBlock::pending("c", "read_file", r#"{"file_path":"a.rs"}"#);
         assert_eq!(subject_of(&c.name, &c.args), "a.rs");
         assert!(c
             .summary(&crate::block::RenderCtx::bare(40))
             .plain()
-            .contains("read_file(a.rs)"));
+            .contains("ReadFile(a.rs)"));
 
         let unknown = ToolCallBlock::pending("d", "some_new_tool", r#"{"thing":"x.rs"}"#);
         assert!(
