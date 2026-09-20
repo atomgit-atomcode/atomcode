@@ -222,18 +222,57 @@ pub fn spoken_duration(secs: u64) -> String {
     }
 }
 
-/// What the window should be called: the session's name, or where it is
-/// working when it has none.
+/// The terminal window/tab title: an optional status dot, then the session's
+/// name — or a fallback for a window not yet named.
 ///
-/// An untitled session is the common case for the first minute, and four
-/// windows all called `atomcode` tell nobody which of the four they are looking
-/// at. A blank name counts as none — a title made of spaces is a title nobody
-/// can read across a room.
-pub fn window_name(title: Option<&str>, cwd: &str) -> String {
-    match title {
-        Some(title) if !title.trim().is_empty() => title.to_string(),
-        _ => basename(cwd).to_string(),
+/// The name is the newest `Titled` fact — the first-prompt guess, then the
+/// model's own summary, then a `/rename`. A placeholder (empty, `default`, an
+/// auto `session-…`, or a legacy `[…]`) is no name a person can read across a
+/// room, so those fall back to `fallback` (the app + version). Real names are
+/// scrubbed of control characters (an OSC title-injection embedded in an
+/// auto-name must not survive), whitespace-collapsed, and truncated to 40 chars
+/// with a trailing `…`. The dot rides in front — `🟢`/`🟡`/`🔴` for idle /
+/// working / needs-you — the way the reference and Claude Code prefix theirs.
+pub fn terminal_title(name: Option<&str>, fallback: &str, dot: Option<&str>) -> String {
+    let title = terminal_title_name(name, fallback);
+    match dot {
+        Some(d) => format!("{d} {title}"),
+        None => title,
     }
+}
+
+/// Max characters kept in the title's name before truncation. Tab strips are
+/// narrow; the ellipsis counts toward the budget.
+const MAX_TITLE_CHARS: usize = 40;
+
+fn terminal_title_name(name: Option<&str>, fallback: &str) -> String {
+    // A missing or blank title is the only placeholder here: unlike the reference
+    // — which names *sessions* and screens out synthetic ids like `session-…` and
+    // `[image]` — this names from `Titled`, which is either absent (no title yet)
+    // or a real title. Screening `[` / `session-` here would only hide a genuine
+    // title like `[WIP] fix login`.
+    let raw = name.unwrap_or("").trim();
+    if raw.is_empty() {
+        return fallback.to_string();
+    }
+    // Drop control characters (ESC, BEL, …) so a name derived from arbitrary
+    // user text cannot smuggle its own OSC title sequence; a control char that
+    // was a separator becomes a space, and the whitespace then collapses.
+    let cleaned: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if cleaned.is_empty() {
+        return fallback.to_string();
+    }
+    if cleaned.chars().count() > MAX_TITLE_CHARS {
+        let kept: String = cleaned.chars().take(MAX_TITLE_CHARS - 1).collect();
+        return format!("{kept}…");
+    }
+    cleaned
 }
 
 /// The implementation, with home explicit. See [`collapse_home`].
@@ -375,15 +414,36 @@ mod tests {
         assert_eq!(being_pathed("没有 at 符号"), None);
     }
 
-    /// The window says the session's name when it has one, and where it is
-    /// working when it does not.
+    /// The title is the session name behind a status dot, falling back to the
+    /// app + version for a window not yet named, and scrubbed/truncated so an
+    /// auto-name cannot smuggle an escape sequence or overflow the tab.
     #[test]
-    fn a_window_is_named_after_the_session_or_after_where_it_is() {
-        use super::window_name;
-        assert_eq!(window_name(Some("修解析器"), "/w/atomcode"), "修解析器");
-        assert_eq!(window_name(None, "/w/atomcode"), "atomcode");
-        // A name of spaces is no name.
-        assert_eq!(window_name(Some("   "), "/w/atomcode"), "atomcode");
+    fn the_terminal_title_is_a_dot_then_the_session_name() {
+        use super::terminal_title;
+        const FB: &str = "AtomCode v9.9.9";
+        // A real name rides behind the dot.
+        assert_eq!(
+            terminal_title(Some("修解析器"), FB, Some("🟢")),
+            "🟢 修解析器"
+        );
+        // Only a missing / blank title falls back to the app.
+        assert_eq!(terminal_title(None, FB, Some("🟡")), "🟡 AtomCode v9.9.9");
+        assert_eq!(terminal_title(Some("   "), FB, Some("🔴")), "🔴 AtomCode v9.9.9");
+        // A real title that happens to start with `[` is shown, not hidden.
+        assert_eq!(
+            terminal_title(Some("[WIP] fix login"), FB, None),
+            "[WIP] fix login"
+        );
+        // A control-char / OSC injection in the name does not survive.
+        assert_eq!(
+            terminal_title(Some("hi\x1b]2;pwned\x07there"), FB, None),
+            "hi ]2;pwned there"
+        );
+        // Over-long names are cut with an ellipsis, dot excluded from the budget.
+        let long = "a".repeat(50);
+        let title = terminal_title(Some(&long), FB, Some("🟢"));
+        assert!(title.starts_with("🟢 "));
+        assert!(title.ends_with('…'));
     }
 
     /// A window title says which project, not the whole path to it.
