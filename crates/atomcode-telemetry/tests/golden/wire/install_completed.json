@@ -1,0 +1,14 @@
+{
+  "app_version": "0.0.0",
+  "arch": "aarch64",
+  "device_id": "00000000-0000-0000-0000-000000000000",
+  "event_id": "install_completed",
+  "install_uuid": "00000000-0000-0000-0000-000000000000",
+  "invite_code": "INVITE",
+  "launch_id": "00000000-0000-0000-0000-000000000000",
+  "locale": "en-US",
+  "os": "macos",
+  "schema_version": 1,
+  "session_id": "00000000-0000-0000-0000-000000000000",
+  "ts": 0
+}

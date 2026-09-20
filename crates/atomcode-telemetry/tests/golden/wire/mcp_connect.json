@@ -1,0 +1,17 @@
+{
+  "app_version": "0.0.0",
+  "arch": "aarch64",
+  "device_id": "00000000-0000-0000-0000-000000000000",
+  "duration_ms": 150,
+  "error_data": "{\"config_source\":\"driver\",\"duration_ms\":150,\"server_name\":\"t\",\"tool_count\":0,\"transport\":\"stdio\"}",
+  "event_id": "mcp_connect",
+  "launch_id": "00000000-0000-0000-0000-000000000000",
+  "locale": "en-US",
+  "os": "macos",
+  "schema_version": 1,
+  "server_name": "t",
+  "session_id": "00000000-0000-0000-0000-000000000000",
+  "success": true,
+  "transport": "stdio",
+  "ts": 0
+}

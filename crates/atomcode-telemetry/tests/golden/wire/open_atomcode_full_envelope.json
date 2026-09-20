@@ -1,0 +1,24 @@
+{
+  "account_id": "42",
+  "app_version": "0.0.0",
+  "arch": "aarch64",
+  "dangerously_skip_permissions": true,
+  "device_id": "00000000-0000-0000-0000-000000000000",
+  "event_id": "open_atomcode",
+  "launch_id": "00000000-0000-0000-0000-000000000000",
+  "locale": "en-US",
+  "mode": "tui",
+  "model": "gpt-4o",
+  "os": "macos",
+  "provider": "openai",
+  "provider_host": "api.openai.com",
+  "repo_origin": {
+    "has_git": true,
+    "host": "gitcode"
+  },
+  "schema_version": 1,
+  "session_id": "00000000-0000-0000-0000-000000000000",
+  "surface": "code_review",
+  "ts": 0,
+  "turn_id": "00000000-0000-0000-0000-000000000000"
+}
