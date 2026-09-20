@@ -16,6 +16,7 @@ fn _isolate_atomcode_home() {
 pub mod askpass;
 pub mod tui_login;
 pub mod tui_onboarding;
+pub mod tui_providers;
 pub mod tui_settings;
 pub mod tui_welcome_words;
 pub mod uninstall;
@@ -66,7 +67,7 @@ pub mod tui_front {
         // is the panel `/config` pulls up. They are not alternatives — one is
         // what a host can be asked, the other is what this screen can show.
         let connection = connect(runtime, front_end, config, host_config)?;
-        // Three rows and one port. The onboarding row is here rather than behind
+        // Four rows and two ports. The onboarding row is here rather than behind
         // a condition because what it contributes is a command: whether it runs
         // is readiness's answer, asked when the screen starts, and a machine
         // that is already set up simply never names it.
@@ -77,15 +78,17 @@ pub mod tui_front {
         // and the row is how the second reaches the first.
         let layers = [
             crate::tui_settings::row_layer(),
+            crate::tui_providers::row_layer(),
             crate::tui_onboarding::row_layer(),
             crate::tui_login::row_layer(),
             crate::tui_welcome_words::row_layer(),
         ];
         launch::mount_with(
             screen,
-            &[&layers[0], &layers[1], &layers[2], &layers[3]],
+            &[&layers[0], &layers[1], &layers[2], &layers[3], &layers[4]],
             &[
                 Arc::new(crate::tui_settings::SettingsRow),
+                Arc::new(crate::tui_providers::ProvidersRow),
                 Arc::new(crate::tui_onboarding::OnboardingRow {
                     config_path: config_path.clone(),
                     telemetry: telemetry.clone(),
@@ -96,7 +99,12 @@ pub mod tui_front {
                 }),
                 Arc::new(crate::tui_welcome_words::WelcomeWordsRow),
             ],
-            Some(crate::tui_settings::ConfigSettings::new(config_path)),
+            launch::Ports {
+                settings: Some(crate::tui_settings::ConfigSettings::new(
+                    config_path.clone(),
+                )),
+                providers: Some(crate::tui_providers::ConfigProviders::new(config_path)),
+            },
             connection,
         )
         .await

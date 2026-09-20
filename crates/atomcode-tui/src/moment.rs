@@ -371,6 +371,21 @@ pub struct Moment {
     /// up — the open flag and the state in one field, so a panel that is drawn
     /// and a panel that takes keys cannot disagree.
     pub settings_panel: Option<crate::settings::Panel>,
+    /// The providers, as the launcher last read them.
+    ///
+    /// Here for the reason [`Moment::settings`] is: a provider is not a fact in
+    /// the log — nothing about a configuration file is — and `View::render` may
+    /// not reach a service, so this is the only road the list can travel. See
+    /// `crate::providers`.
+    pub providers: crate::providers::ProvidersView,
+    /// The providers panel, while it is up: which list, what is typed in its
+    /// search box, the row the arrows are on, and the form in progress.
+    ///
+    /// **Never the API key being typed into that form.** The panel carries how
+    /// many characters there are; the characters are the host's, for the reason
+    /// [`Moment::secret`] gives — this struct is cloned once a frame and every
+    /// module can read it.
+    pub providers_panel: Option<crate::providers::Panel>,
     /// What the Usage page draws, as the host last answered it.
     ///
     /// Asked for rather than pushed: an allowance window changes on the

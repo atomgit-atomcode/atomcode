@@ -92,6 +92,12 @@ pub enum Action {
     /// key is bound to it later are one implementation, and the panel is
     /// screen state, which only the screen may write.
     ToggleSettings,
+    /// Pull the providers panel up over the composer, or put it away.
+    ///
+    /// Its own action rather than a parameter on [`Action::ToggleSettings`]:
+    /// they are two panels with two ports behind them, and a build may mount
+    /// either without the other.
+    ToggleProviders,
     /// Put this session — the lead, or a member of its team — on screen.
     ///
     /// An action, and the only one carrying a value, for the reason

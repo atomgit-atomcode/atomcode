@@ -44,6 +44,10 @@ pub mod store;
 /// Safe, UI-neutral catalog of editable non-provider settings.
 pub mod settings;
 
+/// Writing provider accounts and model profiles into the config *document*,
+/// without disturbing the rest of a person's file.
+pub mod provider_edit;
+
 /// Pure parsers for OS system-proxy descriptions: Windows ProxyServer/ProxyOverride
 /// and macOS `scutil --proxy` output → normalized HTTP(S)_PROXY / NO_PROXY values.
 pub mod system_proxy;

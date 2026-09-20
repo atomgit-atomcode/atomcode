@@ -751,6 +751,8 @@ pub struct Hits {
     /// holds which setting is a fact about how the list was laid out at this
     /// width, and the panel already worked it out.
     settings: Option<Rect>,
+    /// And the providers panel's, for the same reason.
+    providers: Option<Rect>,
     /// Where the slash menu was drawn, so a press or the pointer on a row finds
     /// the command it is on.
     ///
@@ -835,6 +837,16 @@ pub struct Host {
     /// the composer's line and takes the keyboard from everything while it is
     /// there; see [`crate::secret`].
     pub secrets: Arc<crate::secret::Secrets>,
+    /// The API key being typed into the providers panel's form, while one is.
+    ///
+    /// Here rather than on the form for the reason `crate::secret` keeps a
+    /// password out of `Moment`: the panel lives in the moment, the moment is
+    /// cloned once a frame and readable by every module, and a credential has
+    /// no business travelling that road. The form carries its *length*, which
+    /// is all the dots a panel draws need. It is lent to
+    /// `crate::providers::key` for one press and emptied whenever a form is
+    /// left — see [`Host::providers_key`].
+    providers_secret: Mutex<String>,
     /// The mounted cell-grid bitmaps. The host holds the table; a row writes
     /// through `RastersSvc`, and every frame takes a snapshot of it into
     /// `Moment` for the modules to draw. See `docs/adr/0027`.
@@ -1042,6 +1054,7 @@ impl Host {
             overlays: Arc::new(crate::overlay::Overlays::new()),
             asks: crate::ask::Asks::new(),
             secrets: crate::secret::Secrets::new(),
+            providers_secret: Mutex::new(String::new()),
             rasters: Arc::new(crate::raster::Rasters::new()),
             modules: modules.clone(),
             layout: layout_svc.clone(),
@@ -1562,6 +1575,17 @@ impl Host {
         match m.settings_panel.take() {
             Some(_) => true,
             None => {
+                // The other panel goes away with it, for the reason
+                // [`Host::toggle_providers`] gives: two panels a person works in
+                // are two claims on one keyboard, and the one that is checked
+                // second would take the composer's rows without ever seeing a
+                // press. Its half-typed credential goes too.
+                if m.providers_panel.take().is_some() {
+                    self.providers_secret
+                        .lock()
+                        .expect("provider secret poisoned")
+                        .clear();
+                }
                 m.settings_panel = Some(crate::settings::Panel::new());
                 true
             }
@@ -1794,6 +1818,253 @@ impl Host {
         let vp = crate::moment::Viewport::new(rect, &m);
         let geom = crate::modules::settings::geometry(&m, &vp);
         geom.setting_at((y - rect.y) as usize)
+    }
+
+    /// Whether the providers panel is up.
+    pub fn providers_open(&self) -> bool {
+        self.moment
+            .read()
+            .expect("moment poisoned")
+            .providers_panel
+            .is_some()
+    }
+
+    /// Pull the providers panel up, or put it away. True when it changed.
+    ///
+    /// Opening it puts the settings panel away. They are the same kind of thing
+    /// — a panel a person works their configuration in — and two of them up at
+    /// once would be two claims on one keyboard: the key routing decides focus
+    /// in one place (`docs/adr/0022`), and a second panel under the first would
+    /// take its rows without ever seeing a press.
+    ///
+    /// Opening is idempotent rather than a toggle-by-accident, the same bargain
+    /// [`Host::toggle_settings`] strikes: a `/provider` typed while it is open
+    /// keeps what was typed into it.
+    pub fn toggle_providers(&self) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        match m.providers_panel.take() {
+            Some(_) => {
+                self.providers_secret
+                    .lock()
+                    .expect("provider secret poisoned")
+                    .clear();
+                true
+            }
+            None => {
+                // Nothing to draw it with is a refusal, not an empty panel: a
+                // panel that is "up" while its module is unmounted would take
+                // the composer's rows and every key and show neither.
+                if !self.modules.has_view(crate::modules::providers::ID) {
+                    return false;
+                }
+                m.settings_panel = None;
+                m.providers_panel = Some(crate::providers::Panel::new());
+                true
+            }
+        }
+    }
+
+    /// Put the providers panel away. True when it was up.
+    ///
+    /// Forgets the key that was being typed into it, wherever the close came
+    /// from: a credential that outlived the form it was typed into would be sent
+    /// with whatever was saved next.
+    pub fn close_providers(&self) -> bool {
+        let gone = self
+            .moment
+            .write()
+            .expect("moment poisoned")
+            .providers_panel
+            .take()
+            .is_some();
+        if gone {
+            self.providers_secret
+                .lock()
+                .expect("provider secret poisoned")
+                .clear();
+        }
+        gone
+    }
+
+    /// Put what the launcher read into the moment. True when it changed.
+    pub fn show_providers(&self, view: crate::providers::ProvidersView) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        if m.providers == view {
+            return false;
+        }
+        m.providers = view;
+        true
+    }
+
+    /// Run one key against the providers panel: the panel it writes back, and
+    /// the write to send over the seam when the key asked for one.
+    ///
+    /// The key being typed is lent for the press and never leaves this method
+    /// except inside the [`Step`](crate::providers::Step) that carries it to the
+    /// port — which is the whole reason the string lives on the host rather than
+    /// on the form.
+    pub fn providers_key(
+        &self,
+        press: crate::surface::KeyPress,
+    ) -> (bool, Option<crate::providers::Step>) {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let view = m.providers.clone();
+        let mut secret = self
+            .providers_secret
+            .lock()
+            .expect("provider secret poisoned");
+        let Some(panel) = m.providers_panel.as_mut() else {
+            return (false, None);
+        };
+        let before = panel.clone();
+        let step = crate::providers::key(&view, panel, &mut secret, press);
+        let changed = *panel != before;
+        match step {
+            crate::providers::Step::Stay => (changed, None),
+            crate::providers::Step::Close => {
+                m.providers_panel = None;
+                secret.clear();
+                (true, None)
+            }
+            // A write, a switch or a delete: the panel has already put its form
+            // away, so what is drawn next is never a form holding something that
+            // has been sent.
+            step => (true, Some(step)),
+        }
+    }
+
+    /// The wheel over the providers panel walks its list.
+    ///
+    /// The cursor *is* the scroll here: the window is drawn around it
+    /// (`crate::modules::providers::window`), so there is no second offset that
+    /// could disagree with where the highlight is — which is the bug a panel
+    /// with both a cursor and a scroll always eventually has.
+    pub fn providers_wheel(&self, x: u16, y: u16, by: i32) -> bool {
+        let over = self
+            .hits
+            .lock()
+            .expect("hits poisoned")
+            .providers
+            .is_some_and(|rect| rect.contains(x, y));
+        if !over {
+            return false;
+        }
+        let mut m = self.moment.write().expect("moment poisoned");
+        let rows = match m.providers_panel.as_ref() {
+            // A form has no list to walk, and a wheel over it must not scroll
+            // the conversation behind it either — it is still the panel's.
+            Some(panel) if panel.form.is_some() => return true,
+            Some(panel) => m.providers.listed(panel).len(),
+            None => return false,
+        };
+        let Some(panel) = m.providers_panel.as_mut() else {
+            return false;
+        };
+        let want = match by < 0 {
+            true => panel.cursor.saturating_sub(by.unsigned_abs() as usize),
+            false => panel.cursor.saturating_add(by as usize),
+        };
+        panel.point_at(want, rows);
+        true
+    }
+
+    /// Show one account's models, as walking into it from the account list does.
+    ///
+    /// Used after an account is added: an account with no model under it cannot
+    /// be talked to, so the panel answers "what now" by standing where the one
+    /// thing left to do is.
+    pub fn walk_into_provider(&self, account: &str) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let Some(panel) = m.providers_panel.as_mut() else {
+            return false;
+        };
+        panel.show(crate::providers::Tab::Models);
+        panel.drill = Some(account.to_string());
+        true
+    }
+
+    /// Put a paste into whatever the providers panel has the keyboard on.
+    ///
+    /// The composer is not on screen while the panel is up, so a paste that fell
+    /// through to it would be text typed into a field nobody can see — which is
+    /// where it went until this existed.
+    pub fn providers_paste(&self, text: &str) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let mut secret = self
+            .providers_secret
+            .lock()
+            .expect("provider secret poisoned");
+        let Some(panel) = m.providers_panel.as_mut() else {
+            return false;
+        };
+        crate::providers::paste(panel, &mut secret, text)
+    }
+
+    /// Show a list, by index. True when it moved.
+    pub fn show_providers_tab(&self, tab: crate::providers::Tab) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        match m.providers_panel.as_mut() {
+            Some(panel) => panel.show(tab),
+            None => false,
+        }
+    }
+
+    /// Which list is under the pointer, when it is on the header row.
+    pub fn providers_tab_at(&self, x: u16, y: u16) -> Option<crate::providers::Tab> {
+        let rect = *self
+            .hits
+            .lock()
+            .expect("hits poisoned")
+            .providers
+            .as_ref()?;
+        if !rect.contains(x, y) {
+            return None;
+        }
+        // Which row the tabs are on is a fact about the layout that was drawn.
+        // This panel opens with a rule, so they are **not** on its first row —
+        // the assumption that they were is why a click on a tab did nothing at
+        // all until the first real run of the panel found it.
+        let m = self.moment.read().expect("moment poisoned");
+        let vp = crate::moment::Viewport::new(rect, &m);
+        let header = crate::modules::providers::geometry(&m, &vp).header_row()?;
+        if (y - rect.y) as usize != header {
+            return None;
+        }
+        crate::modules::providers::tab_at((x - rect.x) as usize)
+    }
+
+    /// Which listed row is under the pointer, when it is on one.
+    ///
+    /// Read off the rect the panel was **drawn** in, for the reason
+    /// [`Host::settings_row_at`] is: the tail's split decides where the panel
+    /// sits, and a formula that re-derived it would be a second layout to keep
+    /// in step with the one on screen.
+    pub fn providers_row_at(&self, x: u16, y: u16) -> Option<usize> {
+        let rect = *self
+            .hits
+            .lock()
+            .expect("hits poisoned")
+            .providers
+            .as_ref()?;
+        if !rect.contains(x, y) {
+            return None;
+        }
+        let m = self.moment.read().expect("moment poisoned");
+        let vp = crate::moment::Viewport::new(rect, &m);
+        crate::modules::providers::geometry(&m, &vp).listed_at((y - rect.y) as usize)
+    }
+
+    /// Point the panel at a listed row. True when it moved.
+    pub fn point_providers_at(&self, row: usize) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let rows = match m.providers_panel.as_ref() {
+            Some(panel) => m.providers.listed(panel).len(),
+            None => return false,
+        };
+        match m.providers_panel.as_mut() {
+            Some(panel) => panel.point_at(row, rows),
+            None => false,
+        }
     }
 
     /// Run `change`, keeping the reader's place across whatever it did.
@@ -2549,6 +2820,7 @@ impl Host {
                         ask: None,
                         team: None,
                         settings: None,
+                        providers: None,
                         menu: None,
                     };
                     *self.last_room.lock().expect("room poisoned") = rect;
@@ -2592,6 +2864,11 @@ impl Host {
                         // formula that re-splits the tail.
                         if id == crate::modules::settings::ID {
                             self.hits.lock().expect("hits poisoned").settings = Some(*tail_rect);
+                        }
+                        // And the providers panel, which rides the same tail and
+                        // is worked with the same pointer.
+                        if id == crate::modules::providers::ID {
+                            self.hits.lock().expect("hits poisoned").providers = Some(*tail_rect);
                         }
                         frame.place(id.clone(), *tail_rect, lines);
                     }
@@ -3146,8 +3423,8 @@ fn asked_height(modules: &Modules, id: &str, moment: &Moment, width: u16) -> u16
 /// Whether what is on screen stands in the composer's place.
 ///
 /// The one question [`asked_height`] arbitrates on, named so that the two
-/// things that can answer yes — a question, and the settings panel — are listed
-/// in a single place. A caller that asked them separately would be a second
+/// things that can answer yes — a question, and a panel a person works in — are
+/// listed in a single place. A caller that asked them separately would be a second
 /// answer to one question, and the two would part company the day a third panel
 /// was added.
 pub fn displaces_composer(moment: &Moment) -> bool {
@@ -3161,7 +3438,7 @@ pub fn displaces_composer(moment: &Moment) -> bool {
     if moment.secret.is_some() {
         return false;
     }
-    moment.asking.is_some() || moment.settings_panel.is_some()
+    moment.asking.is_some() || moment.settings_panel.is_some() || moment.providers_panel.is_some()
 }
 
 /// The view modules whose rows ride at the foot of the conversation.
@@ -3188,6 +3465,10 @@ pub fn displaces_composer(moment: &Moment) -> bool {
 /// with and words not yet sent are what happens next. While it is there it is
 /// also the only thing on the tail that takes keys.
 ///
+/// **`providers` rides with `settings`**, because it is the same kind of thing —
+/// a panel a person edits their configuration in — and only one of the two is
+/// ever up: opening either puts the other away ([`Host::toggle_providers`]).
+///
 /// **`settings` rides here too, and directly under the live line** — above the
 /// question, because the two cannot both be up in a way that matters: a question
 /// is the model *waiting*, and a person who opened the settings is answering it
@@ -3198,6 +3479,7 @@ pub const TAIL: &[&str] = &[
     crate::modules::todo::ID,
     crate::modules::live::ID,
     crate::modules::settings::ID,
+    crate::modules::providers::ID,
     crate::modules::ask::ID,
     crate::modules::steering::ID,
 ];
@@ -3295,6 +3577,44 @@ mod tests {
         mods.add_view(Arc::new(Mounted::<input::Input>::new()))
             .unwrap();
         Host::new(mods, default_layout())
+    }
+
+    /// A host with the providers panel's module mounted, as a launcher that
+    /// filled the seam gives it.
+    fn host_with_providers() -> Host {
+        let mods = Arc::new(Modules::new());
+        mods.add_view(Arc::new(Mounted::<status::Status>::new()))
+            .unwrap();
+        mods.add_view(Arc::new(
+            Mounted::<crate::modules::providers::Providers>::new(),
+        ))
+        .unwrap();
+        Host::new(mods, default_layout())
+    }
+
+    /// Two panels a person works in are two claims on one keyboard: the routing
+    /// checks them in order, so the second would take the composer's rows and
+    /// never see a press. Opening either puts the other away.
+    #[test]
+    fn only_one_panel_a_person_works_in_is_ever_up() {
+        let h = host_with_providers();
+        assert!(h.toggle_providers());
+        assert!(h.providers_open());
+        assert!(h.toggle_settings());
+        assert!(!h.providers_open(), "settings put the providers away");
+        assert!(h.settings_open());
+        assert!(h.toggle_providers());
+        assert!(!h.settings_open(), "and the other way round");
+        assert!(h.providers_open());
+    }
+
+    /// A panel with no module to draw it would take the composer's rows and
+    /// every key and show neither, so it is refused instead of opened.
+    #[test]
+    fn a_screen_without_the_panels_module_refuses_to_open_it() {
+        let h = host();
+        assert!(!h.toggle_providers());
+        assert!(!h.providers_open());
     }
 
     /// Two turns, the second with something long enough to take several rows.

@@ -119,6 +119,21 @@ pub fn tree(screen: &Screen, extra: &[&str]) -> Result<ConfigTree, String> {
     ConfigTree::from_layers(layers).map_err(|e| e.to_string())
 }
 
+/// The seams a launcher fills, once the tree is up.
+///
+/// A struct rather than a parameter each: the screen has grown two of these
+/// ports and will grow more, and every one added as an argument is every caller
+/// edited to pass `None` again. A launcher fills what it has
+/// (`docs/adr/0022` §3); what it leaves out is a seam with nothing behind it,
+/// and the panel that wanted it says so rather than pretending.
+#[derive(Default, Clone)]
+pub struct Ports {
+    /// The configuration, as this launcher reads and writes it.
+    pub settings: Option<Arc<dyn crate::settings::Settings>>,
+    /// The provider accounts and models, likewise.
+    pub providers: Option<Arc<dyn crate::providers::Providers>>,
+}
+
 /// The screen, mounted and connected, not yet running.
 pub struct Mounted {
     pub app: App,
@@ -131,7 +146,7 @@ pub async fn mount(
     extra: &[&str],
     connection: HostConnection,
 ) -> Result<Mounted, String> {
-    mount_with(screen, extra, &[], None, connection).await
+    mount_with(screen, extra, &[], Ports::default(), connection).await
 }
 
 /// [`mount`], with the launcher's own rows registered and its settings port.
@@ -141,10 +156,10 @@ pub async fn mount(
 /// against the registry, so a row that is not registered is a row the tree
 /// refuses to mount, by name, at startup.
 ///
-/// `settings` is the configuration, as the launcher reads it. `None` is a
-/// launcher with none to offer — a test, or a product with no settings file —
-/// and the panel is then a row that draws an empty list, which is honest about
-/// what it has rather than a claim that there is nothing to configure.
+/// `ports` are the seams this launcher fills. An empty one is a launcher with
+/// nothing to offer — a test, or a product with no configuration file — and a
+/// panel whose port is missing draws an empty list, which is honest about what
+/// it has rather than a claim that there is nothing to configure.
 ///
 /// The launcher supplies the rows; the screen still mounts an empty UI and the
 /// tree fills it. Nothing here reaches into `Modules` to `add_view`, which is
@@ -153,7 +168,7 @@ pub async fn mount_with(
     screen: &Screen,
     extra: &[&str],
     plugins: &[Arc<dyn Plugin>],
-    settings: Option<Arc<dyn crate::settings::Settings>>,
+    ports: Ports,
     connection: HostConnection,
 ) -> Result<Mounted, String> {
     let mut app = App::new(catalog_with(plugins), tree(screen, extra)?);
@@ -165,9 +180,14 @@ pub async fn mount_with(
     // Provided after the tree is up, like the connection: the rows that want it
     // look it up when they run, and a screen mounted without one simply has no
     // settings to show.
-    if let Some(settings) = settings {
+    if let Some(settings) = ports.settings {
         let _ = ctx
             .provide::<crate::plugin::SettingsSvc>(settings)
+            .map_err(|e| e.to_string())?;
+    }
+    if let Some(providers) = ports.providers {
+        let _ = ctx
+            .provide::<crate::plugin::ProvidersSvc>(providers)
             .map_err(|e| e.to_string())?;
     }
     let ui = ctx
@@ -182,7 +202,7 @@ pub async fn run(
     connection: HostConnection,
     initial: Option<String>,
 ) -> Result<(), String> {
-    run_with(screen, &[], &[], None, connection, initial).await
+    run_with(screen, &[], &[], Ports::default(), connection, initial).await
 }
 
 /// [`run`], with the launcher's own rows, its settings port, and extra layers.
@@ -194,11 +214,11 @@ pub async fn run_with(
     screen: &Screen,
     extra: &[&str],
     plugins: &[Arc<dyn Plugin>],
-    settings: Option<Arc<dyn crate::settings::Settings>>,
+    ports: Ports,
     connection: HostConnection,
     initial: Option<String>,
 ) -> Result<(), String> {
-    let mounted = mount_with(screen, extra, plugins, settings, connection).await?;
+    let mounted = mount_with(screen, extra, plugins, ports, connection).await?;
     let ctx = mounted.app.context();
     mounted.ui.run(&ctx, initial).await
 }

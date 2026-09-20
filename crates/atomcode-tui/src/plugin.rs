@@ -81,6 +81,12 @@ plexus_service!(RastersSvc => crate::raster::Rasters, "tui-rasters", Core, "Cell
 // (`docs/adr/0022` §3).
 plexus_service!(SettingsSvc => dyn crate::settings::Settings, "tui-settings", Seam, "The settings a launcher can read and change");
 
+// The providers, on the same terms and for the same reason: which accounts
+// exist, what a protocol is called, and what writing one back to the
+// configuration means are the product's answers. This one carries a credential
+// on its way *in* and never on its way out — see `crate::providers`.
+plexus_service!(ProvidersSvc => dyn crate::providers::Providers, "tui-providers", Seam, "The provider accounts and models a launcher can read and change");
+
 /// The session's clock, and the only place this crate reads one.
 ///
 /// A duration on screen is the difference of two readings the log does not
@@ -1300,6 +1306,12 @@ impl UserInterface for Tui {
                             stale = true;
                             continue;
                         }
+                        // And over the providers panel, which is a list longer
+                        // than the rows it is given.
+                        if self.host.providers_wheel(x, y, by) {
+                            stale = true;
+                            continue;
+                        }
                     }
                     let action = match click {
                         Click::WheelUp => Some(Action::Scroll(-WHEEL_LINES)),
@@ -1378,6 +1390,28 @@ impl UserInterface for Tui {
                                 // would hand it to whatever the list put there.
                                 if let Some(page) = self.host.settings_stats_page_at(x, y) {
                                     let _ = self.host.show_stats_page(page);
+                                    stale = true;
+                                    continue;
+                                }
+                            }
+                            // The providers panel's header, on the same terms
+                            // as the settings one: chrome first, so a stray row
+                            // cannot answer a press aimed at a tab.
+                            if self.host.providers_open() {
+                                if let Some(tab) = self.host.providers_tab_at(x, y) {
+                                    let _ = self.host.show_providers_tab(tab);
+                                    stale = true;
+                                    continue;
+                                }
+                                // And a press on one of its rows takes that row,
+                                // through the return key's own path — so a click
+                                // that walks into an account and a keypress that
+                                // does cannot come to mean different things.
+                                if let Some(row) = self.host.providers_row_at(x, y) {
+                                    let _ = self.host.point_providers_at(row);
+                                    self.run_providers_key(crate::surface::KeyPress::plain(
+                                        crate::surface::Key::Enter,
+                                    ));
                                     stale = true;
                                     continue;
                                 }
@@ -1476,6 +1510,12 @@ impl UserInterface for Tui {
                                     stale |= self.host.point_settings_at(row);
                                 }
                             }
+                            // And the providers panel.
+                            if self.host.providers_open() {
+                                if let Some(row) = self.host.providers_row_at(x, y) {
+                                    stale |= self.host.point_providers_at(row);
+                                }
+                            }
                             continue;
                         }
                         // Handled above, and never reached.
@@ -1495,6 +1535,12 @@ impl UserInterface for Tui {
                 Wake::Input(Input::Paste(text)) if self.host.secret_waiting() => {
                     self.host.secret_paste(&text);
                     stale = true;
+                }
+                // A paste while the providers panel is up belongs to the field
+                // it is working in: the composer is off screen, so falling
+                // through would be typing into something nobody can see.
+                Wake::Input(Input::Paste(text)) if self.host.providers_open() => {
+                    stale |= self.host.providers_paste(&text);
                 }
                 Wake::Input(Input::Paste(text)) => {
                     quit = self.act(Action::Paste(text), &client);
@@ -1535,6 +1581,12 @@ impl UserInterface for Tui {
                 // screen cannot answer for the person.
                 Wake::Input(Input::Key(press)) if self.host.settings_open() => {
                     stale |= self.run_settings_key(press);
+                }
+                // The providers panel, on the same terms: only one of the two is
+                // ever up (`Host::toggle_providers`), so these two arms cannot
+                // both match.
+                Wake::Input(Input::Key(press)) if self.host.providers_open() => {
+                    stale |= self.run_providers_key(press);
                 }
                 // A question on screen gets first refusal on every key. It is a
                 // panel riding the tail now, not a modal, so this is the only
@@ -1699,6 +1751,148 @@ impl Tui {
         }
         moment.settings = view;
         true
+    }
+
+    /// Bring `Moment::providers` in step with what the launcher reads.
+    ///
+    /// Asked when the panel opens and after every write, never per frame, for
+    /// the reason [`Tui::refresh_settings`] is: the port reads a file, and a
+    /// `render` that did filesystem work would break the purity the crate rests
+    /// on. **True when the rows changed.**
+    fn refresh_providers(&self) -> bool {
+        let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
+            return false;
+        };
+        // No port, no rows: a launcher that mounted the panel without providing
+        // `tui-providers` gets an empty list rather than a panic — the same
+        // bargain every other absent seam strikes.
+        let Some(port) = ctx.service::<crate::plugin::ProvidersSvc>() else {
+            return false;
+        };
+        // The file says which model the *next* session starts on; this one may
+        // have been switched with `/model` since. The screen knows that, so it
+        // marks the row rather than asking the port to know it.
+        let live = self.client.described().and_then(|d| d.model);
+        let view = port.rows().with_current(live.as_deref());
+        self.host.show_providers(view)
+    }
+
+    /// Run one key against the providers panel, and act on what it asked for.
+    ///
+    /// **True when a frame is owed.**
+    fn run_providers_key(&self, press: crate::surface::KeyPress) -> bool {
+        let (changed, asked) = self.host.providers_key(press);
+        let Some(step) = asked else {
+            return changed;
+        };
+        match self.apply_provider_step(step) {
+            Ok(Some(said)) => self.host.say(&said, false),
+            Ok(None) => {}
+            Err(why) => self.host.say(&why, true),
+        }
+        self.refresh_providers();
+        true
+    }
+
+    /// Send one change over the providers seam, then tell the runtime.
+    ///
+    /// `Err` is the launcher's refusal, verbatim: a name the product will not
+    /// take, a file it cannot write. This end does not second-guess it — the
+    /// screen has no idea what the configuration accepts, which is the whole
+    /// reason the port exists.
+    ///
+    /// **Writing the file is not making it so.** Every write here changes what
+    /// the agent would be built from, so each one is followed by
+    /// `HostCommand::Reload`, which reads the configuration again and rebuilds
+    /// what changed — the same road the settings panel takes
+    /// (`Tui::reload_if_a_change_needs_it`), and for the same reason: "the file
+    /// changed but the session did not" is the state a person must not be left
+    /// in silently.
+    fn apply_provider_step(&self, step: crate::providers::Step) -> Result<Option<String>, String> {
+        use crate::providers::Step;
+        // Switching model is not a write at all: it is the gesture `/model <id>`
+        // already is, dispatched as exactly that command so a panel and a typed
+        // command cannot come to mean different things.
+        if let Step::Use { id } = &step {
+            let keys = self.wake.lock().expect("wake poisoned").clone();
+            if let Some(keys) = keys {
+                let _ = keys.send(Wake::Chose(Some(format!("/model {id}"))));
+            }
+            self.host.close_providers();
+            return Ok(None);
+        }
+        let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
+            return Err("屏幕还没接上,改不了 provider".into());
+        };
+        let Some(port) = ctx.service::<crate::plugin::ProvidersSvc>() else {
+            return Err("这个屏幕没有接 provider:启动器没有提供 `tui-providers`".into());
+        };
+        let said = match step {
+            Step::Use { .. } | Step::Stay | Step::Close => None,
+            Step::SaveAccount {
+                id: Some(id),
+                draft,
+            } => {
+                port.edit_account(&id, &draft)?;
+                Some(format!("改好了 {id}"))
+            }
+            Step::SaveAccount { id: None, draft } => {
+                let id = port.add_account(&draft)?;
+                // Straight into its model list: an account with no model under
+                // it cannot be talked to, so "what now" is answered by showing
+                // the one thing left to do.
+                self.host.show_providers(port.rows());
+                self.host.walk_into_provider(&id);
+                Some(format!("加好了 {id},给它添一个模型"))
+            }
+            Step::SaveModel {
+                id: Some(id),
+                draft,
+            } => {
+                port.edit_model(&id, &draft)?;
+                Some(format!("改好了 {id}"))
+            }
+            Step::SaveModel { id: None, draft } => {
+                let id = port.add_model(&draft)?;
+                Some(format!("加好了 {id}"))
+            }
+            Step::DeleteAccount { id } => {
+                port.delete_account(&id)?;
+                Some(format!("删了 {id},连同它下面的模型"))
+            }
+            Step::DeleteModel { id } => {
+                port.delete_model(&id)?;
+                Some(format!("删了 {id}"))
+            }
+        };
+        self.reload_after_provider_change();
+        Ok(said)
+    }
+
+    /// Hand the runtime a reload after a provider changed.
+    ///
+    /// Fire and forget, on its own task, for the reason every other host command
+    /// is: a reload rebuilds the graph, and a screen that blocked on it would
+    /// stop painting while it did. A failure is said out loud rather than
+    /// swallowed.
+    fn reload_after_provider_change(&self) {
+        let Some(control) = self.client.control() else {
+            return;
+        };
+        let root = self.client.root();
+        let host = self.host.clone();
+        let keys = self.wake.lock().expect("wake poisoned").clone();
+        tokio::spawn(async move {
+            let outcome = control
+                .call(atomcode_host_api::HostCommand::Reload { session: root })
+                .await;
+            if let Err(error) = outcome {
+                host.say(&format!("配置写下了,但会话没能重新加载:{error:?}"), true);
+                if let Some(keys) = keys {
+                    let _ = keys.send(Wake::Fact);
+                }
+            }
+        });
     }
 
     /// Ask the host what the Status page shows, and repaint when it answers.
@@ -2742,6 +2936,23 @@ impl Tui {
             // Put another session on screen. The lock goes first: `switch_to`
             // draws that session and writes the moment, which is a lock this
             // guard still holds.
+            Action::ToggleProviders => {
+                drop(m);
+                // Refused rather than silently opening a panel with no module
+                // to draw it: a panel that is "up" but unmounted would take the
+                // composer's rows and every key, and show nothing for either.
+                if !self.host.toggle_providers() {
+                    self.say("这个屏幕没有 provider 面板:启动器没有提供 `tui-panel-providers`");
+                    return false;
+                }
+                // Read when the panel opens, not once at start-up: a file edited
+                // behind the screen's back is whatever the file says, and a list
+                // frozen at launch would quietly lie.
+                if self.host.providers_open() {
+                    self.refresh_providers();
+                }
+                return false;
+            }
             Action::LookAt(session) => {
                 drop(m);
                 self.switch_to(&session);

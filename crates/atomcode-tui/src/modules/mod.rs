@@ -4,6 +4,7 @@ pub mod ask;
 pub mod chrome;
 pub mod input;
 pub mod live;
+pub mod providers;
 pub mod raster;
 pub mod settings;
 pub mod status;

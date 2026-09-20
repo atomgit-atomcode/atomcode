@@ -42,6 +42,10 @@ const SCREEN: &[Command] = &[
         "把剪贴板(或一个文件)的内容放进输入框;Ctrl+V 被终端或系统拦下时用它",
     ),
     Command::new("config", "拉出设置面板:搜索、改值;esc 关"),
+    Command::new(
+        "provider",
+        "拉出 provider 面板:账号与模型,增改删;⏎ 换过去,esc 关",
+    ),
 ];
 
 #[async_trait]
@@ -91,6 +95,7 @@ impl CommandSet for ScreenCommands {
                 },
             },
             "config" => Outcome::Do(Action::ToggleSettings),
+            "provider" => Outcome::Do(Action::ToggleProviders),
             "keys" => Outcome::Said(
                 "enter 发送 · shift+enter 换行(或 ctrl-j) · ctrl-d 退出 · ctrl-w 删词\n\
                  esc 依次:取消选中 -> 清空输入 -> 停止当轮 · ctrl-c 直接停止当轮\n\
@@ -315,7 +320,6 @@ const SESSION: &[Command] = &[
         "[模型 id]",
         "这个会话从现在起用哪个模型;不带 id 则挑一个",
     ),
-    Command::new("provider", "配置里有哪些 provider,现在用的是哪个;挑一个就换过去"),
     Command::new("autonomy", "现在有没有在自己干(goal / loop),跑到第几轮、用了多久"),
     Command::taking("rename", "<名字>", "给这个会话改个名字"),
     Command::taking(
@@ -1109,43 +1113,6 @@ impl CommandSet for SessionCommands {
             // Switching is `/model <id>` — a provider and a model are resolved
             // by the same call, so the picked value is that command rather than
             // a second switch that would have to agree with it.
-            "provider" => {
-                let control = match host(control) {
-                    Ok(control) => control,
-                    Err(refusal) => return refusal,
-                };
-                match control
-                    .call(HostCommand::Providers {
-                        session: root.clone(),
-                    })
-                    .await
-                {
-                    Ok(HostReply::Providers { providers, .. }) if providers.is_empty() => {
-                        Outcome::Said("配置里没有 provider".into())
-                    }
-                    Ok(HostReply::Providers { providers, current }) => {
-                        let choices = providers
-                            .into_iter()
-                            .map(|p| {
-                                let here = current.as_deref() == Some(p.id.as_str());
-                                crate::overlay::Choice::new(
-                                    format!("/model {}", p.id),
-                                    p.id.clone(),
-                                )
-                                .about(p.about)
-                                .marked(here)
-                            })
-                            .collect();
-                        Outcome::Open(crate::overlay::Picker::new(
-                            "provider",
-                            "换成哪个 provider · enter 换过去",
-                            choices,
-                        ))
-                    }
-                    Ok(other) => Outcome::Refused(format!("宿主答了别的:{other:?}")),
-                    Err(error) => Outcome::Refused(refusal(error)),
-                }
-            }
             // The runtime publishes `GoalChanged` every round, but that stream
             // is its own and this screen is not on it — so this asks. An
             // always-on status line would want the push instead; that is the
@@ -2097,56 +2064,6 @@ mod tests {
         assert_eq!(host.asked.lock().unwrap().len(), 3);
     }
 
-    /// `/provider` lists what is configured and hands a pick to `/model`, which
-    /// is the one switch — and the list never carries a credential.
-    #[tokio::test]
-    async fn provider_lists_what_is_configured_and_picks_through_the_one_switch() {
-        let host = Arc::new(Recording::default());
-        host.replies.lock().unwrap().extend([
-            Ok(HostReply::Providers {
-                providers: vec![
-                    atomcode_host_api::ProviderChoice {
-                        id: "zhipu".into(),
-                        about: "openai_compat · glm-5".into(),
-                    },
-                    atomcode_host_api::ProviderChoice {
-                        id: "local".into(),
-                        about: "ollama · qwen".into(),
-                    },
-                ],
-                current: Some("zhipu".into()),
-            }),
-            Ok(HostReply::Providers {
-                providers: Vec::new(),
-                current: None,
-            }),
-        ]);
-        let (app, _client, all) = following(&host);
-
-        match all.dispatch("/provider", &app.context()).await {
-            Outcome::Open(picker) => assert_eq!(picker.id(), "provider"),
-            other => panic!("{other:?}"),
-        }
-        // Nothing configured is said, not refused.
-        match all.dispatch("/provider", &app.context()).await {
-            Outcome::Said(text) => assert!(text.contains("没有 provider"), "{text}"),
-            other => panic!("{other:?}"),
-        }
-        assert_eq!(
-            *host.asked.lock().unwrap(),
-            vec![
-                HostCommand::Providers {
-                    session: "lead".into(),
-                },
-                HostCommand::Providers {
-                    session: "lead".into(),
-                },
-            ]
-        );
-    }
-
-    /// `/language` is a named way in to one setting, and it is that setting —
-    /// not a second copy of it.
     #[tokio::test]
     async fn language_reads_and_writes_the_one_setting_it_names() {
         let host = Arc::new(Recording::default());
@@ -2679,6 +2596,15 @@ mod tests {
         assert_eq!(
             c.dispatch("/config", &app.context()).await,
             Outcome::Do(Action::ToggleSettings)
+        );
+        // And `/provider` is the other panel, on the same terms. It used to be a
+        // picker over `HostCommand::Providers` that could only switch between
+        // the legacy `[providers.*]` entries — which is why an account in the
+        // new schema was invisible to it (`docs/adr/0022` §3, and the panel's
+        // own doc).
+        assert_eq!(
+            c.dispatch("/provider", &app.context()).await,
+            Outcome::Do(Action::ToggleProviders)
         );
     }
 
