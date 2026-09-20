@@ -382,6 +382,21 @@ pub enum AgentEvent {
     Invoked {
         id: CommandId,
         output: String,
+        /// Whether the command also left the model something to do.
+        ///
+        /// Some catalog commands only answer (`policy`, `queue`); some answer
+        /// **and** queue a message a turn will pick up (`worklog`, `init`). A
+        /// front end that draws facts as they arrive never had to tell those
+        /// apart — a turn either happens or it does not, and either way the
+        /// screen draws what comes. One that answers a *request* with a turn
+        /// does: it has to know whether the exchange is over here or whether a
+        /// turn is starting. Both guesses are wrong in a way that bites later —
+        /// end too early and the turn's facts land on the next request, wait
+        /// for a turn that never comes and the request hangs.
+        ///
+        /// Answered rather than inferred because only the side that ran the
+        /// command can see the inbox it queued into.
+        queued: bool,
     },
     /// A member of a subscribed session is gone.
     AgentRemoved {
@@ -703,6 +718,7 @@ mod tests {
             AgentEvent::Invoked {
                 id: "i-1".into(),
                 output: "stopped: scout".into(),
+                queued: false,
             },
         ] {
             let json = serde_json::to_string(&event).unwrap();

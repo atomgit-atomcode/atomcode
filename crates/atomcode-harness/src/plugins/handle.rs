@@ -1015,8 +1015,14 @@ pub fn run_catalog_command(
     events: mpsc::UnboundedSender<AgentEvent>,
 ) {
     tokio::spawn(async move {
+        let agent = target.clone();
         let output = command.run(target, &args).await.unwrap_or_else(|e| e);
-        let _ = events.send(AgentEvent::Invoked { id, output });
+        // Asked here because here is where it can be answered: the command has
+        // run, and whatever it queued is in this agent's inbox now. A caller
+        // deciding "is a turn coming" cannot see that — the field's own doc
+        // says what goes wrong when it guesses.
+        let queued = agent.inbox().has_waking_input();
+        let _ = events.send(AgentEvent::Invoked { id, output, queued });
     });
 }
 

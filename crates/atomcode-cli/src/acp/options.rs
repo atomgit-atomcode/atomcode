@@ -426,6 +426,7 @@ mod tests {
             todo_calls: Vec::new(),
             title: None,
             additional_directories: Vec::new(),
+            catalog: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
         };
         let sessions: crate::acp::sessions::Sessions =
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
@@ -523,6 +524,7 @@ mod tests {
             todo_calls: Vec::new(),
             title: None,
             additional_directories: Vec::new(),
+            catalog: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
         };
         let sessions: crate::acp::sessions::Sessions =
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::from([
@@ -655,6 +657,7 @@ mod tests {
                         todo_calls: Vec::new(),
                         title: None,
                         additional_directories: Vec::new(),
+                        catalog: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
                     },
                 )
             })
@@ -752,6 +755,7 @@ mod tests {
             todo_calls: Vec::new(),
             title: None,
             additional_directories: Vec::new(),
+            catalog: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
         };
         let sessions: crate::acp::sessions::Sessions =
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::from([
@@ -857,6 +861,7 @@ mod tests {
             todo_calls: Vec::new(),
             title: None,
             additional_directories: Vec::new(),
+            catalog: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
         };
         let sessions: crate::acp::sessions::Sessions =
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::from([

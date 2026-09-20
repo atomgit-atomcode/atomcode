@@ -177,13 +177,21 @@ pub(crate) async fn run_turn<W: TurnWire>(
     // Arc), then release the map lock so it is never held across the turn.
     // The message id is allocated AFTER the lookup: an unknown-session prompt
     // never consumes an id (v2 already ordered it this way).
-    let (commands, events): (
+    #[allow(clippy::type_complexity)]
+    let (commands, events, catalog, native): (
         mpsc::UnboundedSender<AgentCommand>,
         Arc<Mutex<mpsc::UnboundedReceiver<AgentEvent>>>,
+        Arc<Mutex<Vec<atomcode_kernel::agent::CommandDescription>>>,
+        String,
     ) = {
         let map = sessions.lock().await;
         match map.get(sid) {
-            Some(st) => (st.commands.clone(), Arc::clone(&st.events)),
+            Some(st) => (
+                st.commands.clone(),
+                Arc::clone(&st.events),
+                Arc::clone(&st.catalog),
+                st.native_id.clone(),
+            ),
             None => return wire.unknown_session(),
         }
     };
@@ -207,18 +215,44 @@ pub(crate) async fn run_turn<W: TurnWire>(
         return Ok(());
     }
 
+    // A command the **agent** registered — goal, review, worktree, stopping a
+    // member. Not a prompt: it runs in the agent and answers, and only
+    // sometimes leaves the model work to do. Never one when the prompt carries
+    // attachments, for the reason a local slash is not: a handler would drop
+    // what was attached.
+    let invoked = if has_attachments {
+        None
+    } else {
+        let names = catalog.lock().await.clone();
+        crate::acp::commands::parse_catalog_command(&text, &names)
+            .map(|(name, args)| (name, args.to_string()))
+    };
+
     // Lock the receiver BEFORE enqueuing this turn's message: one prompt runs
     // per session at a time, so a concurrent same-session prompt blocks here
     // on the events mutex and cannot interleave its `SendMessage` into the
     // kernel ahead of this turn's recv loop.
     let mut rx = events.lock().await;
-    if commands
-        .send(AgentCommand::SendMessage {
+    // The id is the receipt: the `Invoked` that carries the result names it, so
+    // a late one from an earlier command cannot be taken for this one's.
+    let invoke_id = invoked
+        .as_ref()
+        .map(|_| format!("acp-{}", next_message_id(msg_ids)));
+    let submitted = match (&invoked, &invoke_id) {
+        (Some((name, args)), Some(id)) => commands.send(AgentCommand::Invoke {
+            id: id.clone().into(),
+            // The session it acts on, the same way the screen names it: a
+            // command addresses an agent, and an empty name addresses none.
+            session: native.clone(),
+            name: name.clone(),
+            args: args.clone(),
+        }),
+        _ => commands.send(AgentCommand::SendMessage {
             text: text.clone(),
             images,
-        })
-        .is_err()
-    {
+        }),
+    };
+    if submitted.is_err() {
         // The kernel agent is gone (panicked / cancelled / session torn down):
         // the prompt will NEVER reach it, so answer the terminal now instead of
         // falling into the recv loop and reporting a FALSE end_turn success.
@@ -280,6 +314,34 @@ pub(crate) async fn run_turn<W: TurnWire>(
                     id,
                     value: serde_json::Value::Null,
                 });
+            }
+            // What the agent offers can change mid-session — a row mounted by a
+            // reload, a member that came or went. This is the only place this
+            // channel reads the stream, so it is where the catalog is kept
+            // current.
+            Some(AgentEvent::Described { description }) => {
+                *catalog.lock().await = description.commands;
+            }
+            // The command answered. Whether this exchange is over depends on
+            // what it left behind: one that only answered is done here; one
+            // that queued a message has a turn starting, and that turn's facts
+            // belong to this request rather than to the next one.
+            Some(AgentEvent::Invoked { id, output, queued })
+                if invoke_id.as_deref() == Some(id.as_ref()) =>
+            {
+                if let Some(update) = wire.translate(
+                    &AgentEvent::Invoked {
+                        id: id.clone(),
+                        output,
+                        queued,
+                    },
+                    &msg_id,
+                ) {
+                    wire.notify(update)?;
+                }
+                if !queued {
+                    break Ok(StopReason::Stopped);
+                }
             }
             Some(AgentEvent::TurnComplete { reason, .. }) => break Ok(reason),
             Some(AgentEvent::Error { message, .. }) => {
@@ -370,7 +432,9 @@ pub(crate) async fn run_turn<W: TurnWire>(
     // (handled in the v1 wrapper), so the text arriving here is a real user
     // message (or an unknown `/…` that fell through to the kernel);
     // attachment-only turns have empty text and never title the session.
-    if let Some(title) = derive_title(&text) {
+    // A command is not a prompt, so it never names the session: `/goal ship it`
+    // is what somebody asked the agent to do, not what the conversation is.
+    if let Some(title) = derive_title(&text).filter(|_| invoked.is_none()) {
         let mut map = sessions.lock().await;
         let announce = match map.get_mut(sid) {
             Some(state) if state.title.is_none() => {

@@ -1169,6 +1169,225 @@ async fn slash_commands_and_plan_updates() {
     agent_task.abort();
 }
 
+/// What the agent offers is advertised on this channel too.
+///
+/// The bug: this channel advertised fifteen names of its own and nothing else,
+/// so `policy`, `goal`, `worktree` — everything a row registered — did not
+/// exist for an ACP client. It was not a missing lookup. The description is
+/// pushed to whoever **subscribes** (`harness/src/feed.rs`), subscribing needs
+/// `FrontEnd::app`, and that is filled by the `front-end-feed` row — which only
+/// mounts when the runtime was **built with** a front end. This channel made
+/// its front end *after* starting the runtime, so the row never mounted, the
+/// app was never filled, every subscribe was refused, and no description ever
+/// arrived. Three layers down from where it looked.
+#[tokio::test]
+#[serial_test::serial]
+async fn the_commands_the_agent_registered_are_advertised_here_too() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    std::env::set_var("ATOMCODE_HOME", home.path());
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+
+    let stub: Arc<MockProvider> = Arc::new(
+        MockProvider::new(vec![vec![
+            StreamEvent::TextDelta("ok".into()),
+            StreamEvent::Done { truncated: false },
+        ]])
+        .with_ctx_window(200_000),
+    );
+
+    let (agent_channel, client_channel) = Channel::duplex();
+    let stub_provider: Arc<dyn LlmProvider> = stub.clone();
+    let opts = AcpServeOptions {
+        engine: Some(dummy_engine()),
+        provider_factory: Some(Arc::new(StubProviderFactory(stub_provider))),
+        auto_approve: true,
+        ..Default::default()
+    };
+    let agent_task = tokio::spawn(async move { serve_over(opts, agent_channel).await });
+
+    let updates: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let cwd_path_in_client = cwd.path().to_path_buf();
+    let updates_for_handler = Arc::clone(&updates);
+    let client_run = Client
+        .builder()
+        .on_receive_notification(
+            move |notif: SessionNotification, _cx| {
+                let updates = Arc::clone(&updates_for_handler);
+                async move {
+                    updates
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::to_value(&notif.update).unwrap());
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .connect_with(client_channel, |conn: ConnectionTo<_>| async move {
+            conn.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            conn.send_request(NewSessionRequest::new(cwd_path_in_client))
+                .block_task()
+                .await?;
+            Ok(())
+        });
+
+    tokio::time::timeout(Duration::from_secs(30), client_run)
+        .await
+        .expect("advertise client run timed out")
+        .expect("advertise client run failed");
+
+    let got = updates.lock().unwrap().clone();
+    let commands = got
+        .iter()
+        .find(|u| u["sessionUpdate"] == "available_commands_update")
+        .unwrap_or_else(|| panic!("no available_commands_update: {got:?}"));
+    let names: Vec<&str> = commands["availableCommands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+
+    // This channel's own, as before.
+    assert!(names.contains(&"status"), "{names:?}");
+    // And the agent's — registered by rows, never named in this crate.
+    for name in ["policy", "init"] {
+        assert!(
+            names.contains(&name),
+            "the agent registered /{name} and this channel must say so: {names:?}"
+        );
+    }
+    assert!(
+        names.windows(2).all(|w| w[0] <= w[1]),
+        "still one sorted list: {names:?}"
+    );
+
+    agent_task.abort();
+}
+
+/// A command the agent registered runs **in the agent**, and the exchange ends
+/// where the command does.
+///
+/// `Invoke` produces no turn terminal. A command that only answers is done when
+/// it answers; one that also queues a message for the model has a turn
+/// starting, whose facts belong to *this* request. Ending too early leaves them
+/// to land on the next prompt — the failure the rest of this file keeps
+/// guarding against. So `Invoked` says which it was, and this pins both shapes.
+#[tokio::test]
+#[serial_test::serial]
+async fn an_agent_command_runs_in_the_agent_and_ends_where_it_ends() {
+    let home = tempfile::tempdir().expect("home tempdir");
+    std::env::set_var("ATOMCODE_HOME", home.path());
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+
+    // Scripts for the turn `/init` starts. `/policy` must not touch them: a
+    // command that only answers costs no model call.
+    let script = || {
+        vec![
+            StreamEvent::TextDelta("wrote AGENTS.md".into()),
+            StreamEvent::Done { truncated: false },
+        ]
+    };
+    let stub: Arc<MockProvider> =
+        Arc::new(MockProvider::new(vec![script(), script(), script()]).with_ctx_window(200_000));
+
+    let (agent_channel, client_channel) = Channel::duplex();
+    let stub_provider: Arc<dyn LlmProvider> = stub.clone();
+    let opts = AcpServeOptions {
+        engine: Some(dummy_engine()),
+        provider_factory: Some(Arc::new(StubProviderFactory(stub_provider))),
+        auto_approve: true,
+        ..Default::default()
+    };
+    let agent_task = tokio::spawn(async move { serve_over(opts, agent_channel).await });
+
+    let updates: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let cwd_path_in_client = cwd.path().to_path_buf();
+    let updates_for_handler = Arc::clone(&updates);
+    let client_run = Client
+        .builder()
+        .on_receive_notification(
+            move |notif: SessionNotification, _cx| {
+                let updates = Arc::clone(&updates_for_handler);
+                async move {
+                    updates
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::to_value(&notif.update).unwrap());
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .connect_with(client_channel, |conn: ConnectionTo<_>| async move {
+            conn.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let new = conn
+                .send_request(NewSessionRequest::new(cwd_path_in_client))
+                .block_task()
+                .await?;
+            let sid = new.session_id.clone();
+
+            let answered = conn
+                .send_request(PromptRequest::new(
+                    sid.clone(),
+                    vec![ContentBlock::Text(TextContent::new("/policy"))],
+                ))
+                .block_task()
+                .await?;
+            let answered = serde_json::to_value(&answered).unwrap();
+            assert_eq!(
+                answered["stopReason"], "end_turn",
+                "a command that only answers ends its own request: {answered}"
+            );
+
+            let queued = conn
+                .send_request(PromptRequest::new(
+                    sid,
+                    vec![ContentBlock::Text(TextContent::new("/init"))],
+                ))
+                .block_task()
+                .await?;
+            let queued = serde_json::to_value(&queued).unwrap();
+            assert_eq!(
+                queued["stopReason"], "end_turn",
+                "and one that queues work waits for it: {queued}"
+            );
+            Ok(())
+        });
+
+    tokio::time::timeout(Duration::from_secs(30), client_run)
+        .await
+        .expect("agent-command client run timed out")
+        .expect("agent-command client run failed");
+
+    let got = updates.lock().unwrap().clone();
+    let texts: Vec<String> = got
+        .iter()
+        .filter(|u| u["sessionUpdate"] == "agent_message_chunk")
+        .filter_map(|u| u["content"]["text"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains("策略") || t.contains("policy")),
+        "what the command answered came back as text: {texts:?}"
+    );
+    // The turn `/init` queued ran **inside that request**: its output is here
+    // rather than waiting to surprise the next prompt.
+    assert!(
+        texts.contains(&"wrote AGENTS.md".to_string()),
+        "the queued turn ran and was reported: {texts:?}"
+    );
+
+    agent_task.abort();
+}
+
 /// Per-LLM-round message ids: two model calls in ONE turn must stream their
 /// text with DIFFERENT `messageId` values (v1 semantics: chunks sharing an id
 /// belong to one message; a changed id starts a new one). The old

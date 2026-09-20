@@ -114,54 +114,109 @@ const ACP_COMMANDS: &[AcpCommand] = &[
 
 /// The commands advertised on the ACP channel, mapped from the one command
 /// table (`acp: true`, not hidden) and sorted by name.
-pub fn available_acp_commands() -> Vec<AvailableCommand> {
-    let hints = [
-        ("undo", "N (optional; default 1)"),
-        ("effort", "high | max | off"),
-        ("model", "<model id>"),
-    ];
-    let mut out: Vec<AvailableCommand> = ACP_COMMANDS
+/// One name, one sentence, and how its argument is written — what both wire
+/// versions advertise, whoever it came from.
+struct Advert {
+    name: String,
+    about: String,
+    hint: Option<String>,
+}
+
+const LOCAL_HINTS: &[(&str, &str)] = &[
+    ("undo", "N (optional; default 1)"),
+    ("effort", "high | max | off"),
+    ("model", "<model id>"),
+];
+
+/// Everything this session offers: the commands this channel runs itself, and
+/// the ones the agent registered.
+///
+/// Two sources because there are two kinds, and neither can stand for the
+/// other. `model`, `undo` and the rest are answered here against session state
+/// the agent knows nothing about; `goal`, `review`, `worktree` and whatever a
+/// row mounted are the agent's, and this channel only knows them because the
+/// description says so. A name in both is the local one — that is what runs
+/// when this channel sees it, so advertising the agent's sentence for it would
+/// describe something the client will never get.
+fn adverts(catalog: &[atomcode_kernel::agent::CommandDescription]) -> Vec<Advert> {
+    let mut out: Vec<Advert> = ACP_COMMANDS
         .iter()
-        .copied()
-        .map(|c| {
-            let mut advert = AvailableCommand::new(c.name, c.desc);
-            if let Some((_, hint)) = hints.iter().find(|(name, _)| *name == c.name) {
+        .map(|c| Advert {
+            name: c.name.to_string(),
+            about: c.desc.to_string(),
+            hint: LOCAL_HINTS
+                .iter()
+                .find(|(name, _)| *name == c.name)
+                .map(|(_, hint)| (*hint).to_string()),
+        })
+        .collect();
+    for command in catalog {
+        if out.iter().any(|a| a.name == command.name) {
+            continue;
+        }
+        out.push(Advert {
+            name: command.name.clone(),
+            about: command.summary.clone(),
+            hint: command.usage.clone(),
+        });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// What `sid`'s agent offers right now, or nothing when there is no such
+/// session (which the caller is about to find out anyway).
+pub async fn catalog_of(
+    sessions: &Sessions,
+    sid: &str,
+) -> Vec<atomcode_kernel::agent::CommandDescription> {
+    let held = {
+        let map = sessions.lock().await;
+        match map.get(sid) {
+            Some(state) => state.catalog.clone(),
+            None => return Vec::new(),
+        }
+    };
+    let catalog = held.lock().await;
+    catalog.clone()
+}
+
+pub fn available_acp_commands(
+    catalog: &[atomcode_kernel::agent::CommandDescription],
+) -> Vec<AvailableCommand> {
+    adverts(catalog)
+        .into_iter()
+        .map(|a| {
+            let mut advert = AvailableCommand::new(a.name, a.about);
+            if let Some(hint) = a.hint {
                 advert = advert.input(AvailableCommandInput::Unstructured(
-                    UnstructuredCommandInput::new(*hint),
+                    UnstructuredCommandInput::new(hint),
                 ));
             }
             advert
         })
-        .collect();
-    out.sort_by(|a, b| a.name.cmp(&b.name));
-    out
+        .collect()
 }
 
 /// The same ACP command subset as [`available_acp_commands`], but shaped for the
 /// v2 wire (`Text` command input instead of v1's `Unstructured`). Sourced from
 /// the single built-in command table so the v1 and v2 ads never diverge.
-pub fn available_acp_commands_v2() -> Vec<agent_client_protocol::schema::v2::AvailableCommand> {
+pub fn available_acp_commands_v2(
+    catalog: &[atomcode_kernel::agent::CommandDescription],
+) -> Vec<agent_client_protocol::schema::v2::AvailableCommand> {
     use agent_client_protocol::schema::v2::{
         AvailableCommand, AvailableCommandInput, TextCommandInput,
     };
-    let hints = [
-        ("undo", "N (optional; default 1)"),
-        ("effort", "high | max | off"),
-        ("model", "<model id>"),
-    ];
-    let mut out: Vec<AvailableCommand> = ACP_COMMANDS
-        .iter()
-        .copied()
-        .map(|c| {
-            let mut advert = AvailableCommand::new(c.name, c.desc);
-            if let Some((_, hint)) = hints.iter().find(|(name, _)| *name == c.name) {
-                advert = advert.input(AvailableCommandInput::Text(TextCommandInput::new(*hint)));
+    adverts(catalog)
+        .into_iter()
+        .map(|a| {
+            let mut advert = AvailableCommand::new(a.name, a.about);
+            if let Some(hint) = a.hint {
+                advert = advert.input(AvailableCommandInput::Text(TextCommandInput::new(hint)));
             }
             advert
         })
-        .collect();
-    out.sort_by(|a, b| a.name.cmp(&b.name));
-    out
+        .collect()
 }
 
 /// Parse `/cmd arg` from a prompt. Returns `(canonical name, argument)` when
@@ -185,6 +240,34 @@ pub fn parse_slash_command(text: &str) -> Option<(&'static str, &str)> {
         .iter()
         .find(|c| c.name.eq_ignore_ascii_case(name))
         .map(|c| (c.name, arg))
+}
+
+/// Parse `/cmd arg` against the **agent's** catalog — the commands this channel
+/// does not run itself.
+///
+/// Tried after [`parse_slash_command`], so a name this channel implements wins:
+/// that is the one that runs when it sees it, and advertising said so. `None`
+/// for everything else, including an unknown `/…`, which keeps its meaning: the
+/// prompt reaches the model as typed.
+pub fn parse_catalog_command<'a>(
+    text: &'a str,
+    catalog: &[atomcode_kernel::agent::CommandDescription],
+) -> Option<(String, &'a str)> {
+    let rest = text.trim_start().strip_prefix('/')?;
+    let (name, arg) = match rest.find(char::is_whitespace) {
+        Some(i) => (&rest[..i], rest[i..].trim()),
+        None => (rest, ""),
+    };
+    if ACP_COMMANDS
+        .iter()
+        .any(|c| c.name.eq_ignore_ascii_case(name))
+    {
+        return None;
+    }
+    catalog
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(name))
+        .map(|c| (c.name.clone(), arg))
 }
 
 /// Run a parsed slash command against the session. Returns `Some(text)` when
@@ -521,7 +604,7 @@ mod tests {
 
     #[test]
     fn acp_catalog_is_sorted_and_filtered() {
-        let catalog = available_acp_commands();
+        let catalog = available_acp_commands(&[]);
         let names: Vec<&str> = catalog.iter().map(|c| c.name.as_str()).collect();
         for expected in ["status", "plan", "todo", "help", "build", "effort"] {
             assert!(names.contains(&expected), "missing {expected}: {names:?}");
@@ -627,6 +710,7 @@ mod tests {
             todo_calls: Vec::new(),
             title: None,
             additional_directories: Vec::new(),
+            catalog: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
         };
         let sessions: crate::acp::sessions::Sessions =
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::from([
@@ -686,6 +770,7 @@ mod tests {
             todo_calls: Vec::new(),
             title: None,
             additional_directories: Vec::new(),
+            catalog: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
         };
         let sessions: crate::acp::sessions::Sessions =
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::from([
@@ -712,6 +797,82 @@ mod tests {
     /// (plan M6.3). Two things had to survive the move and neither was checked
     /// before: the wire-visible set must not shift under a client, and an
     /// advertisement must correspond to a handler — the old arrangement could
+    /// A name this channel runs itself wins over the agent's, both ways.
+    ///
+    /// Advertising the agent's sentence for a command this file intercepts
+    /// would describe something the client will never get; handing such a name
+    /// to the agent would run something the client did not ask for. One rule,
+    /// checked on both sides of it.
+    #[test]
+    fn a_name_this_channel_runs_is_this_channels_both_ways() {
+        use atomcode_kernel::agent::{CommandDescription, CommandTarget};
+        let catalog = vec![
+            CommandDescription {
+                name: "goal".into(),
+                usage: Some("<要什么>".into()),
+                summary: "让这个会话自己干到某个目标".into(),
+                target: CommandTarget::Session,
+            },
+            CommandDescription {
+                name: "status".into(),
+                usage: None,
+                summary: "agent 自己那份说明".into(),
+                target: CommandTarget::Session,
+            },
+        ];
+
+        let advertised = available_acp_commands(&catalog);
+        let names: Vec<&str> = advertised.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"goal"), "{names:?}");
+        assert_eq!(
+            names.iter().filter(|n| **n == "status").count(),
+            1,
+            "one name, once: {names:?}"
+        );
+        assert!(names.windows(2).all(|w| w[0] <= w[1]), "sorted: {names:?}");
+        assert_eq!(
+            advertised
+                .iter()
+                .find(|c| c.name == "status")
+                .map(|c| c.description.clone()),
+            Some("Show session status".into()),
+            "the local sentence stays for the local command"
+        );
+        assert_eq!(
+            advertised
+                .iter()
+                .find(|c| c.name == "goal")
+                .map(|c| c.description.clone()),
+            Some("让这个会话自己干到某个目标".into()),
+            "and the agent's comes across for the agent's"
+        );
+        assert_eq!(
+            names,
+            available_acp_commands_v2(&catalog)
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            "v1 and v2 advertise the same set"
+        );
+
+        assert_eq!(
+            parse_catalog_command("/goal ship it", &catalog),
+            Some(("goal".to_string(), "ship it"))
+        );
+        assert_eq!(
+            parse_catalog_command("/Goal ship it", &catalog).map(|(n, _)| n),
+            Some("goal".to_string()),
+            "the same case-insensitivity the local table has"
+        );
+        assert_eq!(
+            parse_catalog_command("/status", &catalog),
+            None,
+            "a name this channel runs is not handed to the agent"
+        );
+        assert_eq!(parse_catalog_command("/nobody-has-this", &catalog), None);
+        assert_eq!(parse_catalog_command("just talking", &catalog), None);
+    }
+
     /// flag a row `acp: true` in one crate while the arm that runs it lives in
     /// another, and nothing would have noticed.
     #[test]
@@ -721,11 +882,11 @@ mod tests {
             "auto", "build", "compact", "config", "context", "cost", "diff", "effort", "help",
             "model", "plan", "status", "todo", "undo", "usage",
         ];
-        let advertised = available_acp_commands();
+        let advertised = available_acp_commands(&[]);
         let now: Vec<&str> = advertised.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(now, before, "the advertised set moved crates, not contents");
         // v1 and v2 advertise the same commands; only the input shape differs.
-        let v2: Vec<String> = available_acp_commands_v2()
+        let v2: Vec<String> = available_acp_commands_v2(&[])
             .iter()
             .map(|c| c.name.clone())
             .collect();

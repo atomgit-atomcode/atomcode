@@ -82,6 +82,12 @@ pub struct SessionState {
     /// reporting; the session's effective filesystem semantics remain the
     /// kernel's single pinned `working_dir` (see the module docs).
     pub additional_directories: Vec<std::path::PathBuf>,
+    /// What the agent in this session says it offers, as it last said it.
+    ///
+    /// Not this file's to know: rows register commands into the catalog that
+    /// travels with `AgentDescription`, and every front end reads it rather
+    /// than keeping a list (`docs/adr/0019`, `docs/adr/0021` §10).
+    pub catalog: Arc<Mutex<Vec<atomcode_kernel::agent::CommandDescription>>>,
 }
 
 /// Live ACP sessions, keyed by session id.
@@ -298,6 +304,9 @@ pub fn validate_additional_directories(additional: &[std::path::PathBuf]) -> Res
 pub async fn register_session(
     sessions: &Sessions,
     runtime: CodingRuntime,
+    // The one the runtime was **built with** — see `engine::spawn_session` for
+    // why it cannot be made here.
+    front_end: Arc<FrontEnd>,
     config: CodingAgentConfig,
     resolve_model: Option<std::sync::Arc<crate::acp::SessionModelResolver>>,
     cwd: std::path::PathBuf,
@@ -317,7 +326,6 @@ pub async fn register_session(
     // The same `connect()` the full-screen UI goes through. ACP stops reading
     // the product's own event enum here: what it sees from now on is what the
     // contract says, which is what every other front end sees.
-    let front_end = FrontEnd::new();
     let host: Arc<dyn crate::host::HostConfig> = Arc::new(AcpHost {
         resolve_model,
         current: config.clone(),
@@ -345,13 +353,20 @@ pub async fn register_session(
         });
     }
 
+    // Ask to be told what this agent offers, and wait briefly for the answer.
+    // The description is pushed to whoever subscribes (`harness/src/feed.rs`),
+    // and this channel never did.
+    let events = Arc::new(Mutex::new(events));
+    let catalog = Arc::new(Mutex::new(Vec::new()));
+    take_first_description(&commands, &native_id, &events, &catalog).await;
+
     let id = wire_session_id(&native_id);
     sessions.lock().await.insert(
         id.0.to_string(),
         SessionState {
             commands,
             control,
-            events: Arc::new(Mutex::new(events)),
+            events,
             _front_end: front_end,
             persistence_failure,
             native_id,
@@ -362,10 +377,56 @@ pub async fn register_session(
             todo_calls: Vec::new(),
             title: None,
             additional_directories,
+            catalog,
         },
     );
     Ok(id)
 }
+
+/// Subscribe, and take the description out of the stream.
+///
+/// Bounded, and never an error: a session whose agent has not said anything yet
+/// advertises this channel's own commands, and the first turn that goes past a
+/// `Described` fills in the rest. Events read on the way are dropped — before a
+/// prompt there is no turn to report on.
+async fn take_first_description(
+    commands: &mpsc::UnboundedSender<AgentCommand>,
+    session: &str,
+    events: &Arc<Mutex<mpsc::UnboundedReceiver<AgentEvent>>>,
+    catalog: &Arc<Mutex<Vec<atomcode_kernel::agent::CommandDescription>>>,
+) {
+    // `u64::MAX`: what is wanted is the description and what happens from here,
+    // not the log. This channel reports turns as they run and has no use for
+    // facts that predate the connection.
+    if commands
+        .send(AgentCommand::Subscribe {
+            session: session.to_string(),
+            from: u64::MAX,
+        })
+        .is_err()
+    {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + FIRST_DESCRIPTION_WAIT;
+    let mut stream = events.lock().await;
+    loop {
+        match tokio::time::timeout_at(deadline, stream.recv()).await {
+            Ok(Some(AgentEvent::Described { description })) => {
+                *catalog.lock().await = description.commands;
+                return;
+            }
+            Ok(Some(_)) => continue,
+            // Timed out, or the stream is gone: the session still works, with
+            // fewer commands advertised, and neither is this to report.
+            _ => return,
+        }
+    }
+}
+
+/// How long a new session waits for its agent to say what it offers. Short
+/// because a client is waiting for a session id; what it buys is a first
+/// advertisement that is complete rather than one correction later.
+const FIRST_DESCRIPTION_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
 // ── session teardown handlers ────────────────────────────────────────────────
 
@@ -511,6 +572,7 @@ pub(crate) mod test_support {
             todo_calls: Vec::new(),
             title: None,
             additional_directories: Vec::new(),
+            catalog: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -662,6 +724,7 @@ mod tests {
             todo_calls: Vec::new(),
             title: None,
             additional_directories: Vec::new(),
+            catalog: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
         };
         let sessions: Sessions =
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));

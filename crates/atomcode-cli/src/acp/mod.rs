@@ -276,10 +276,12 @@ fn build_v1_agent(state: SharedState) -> impl ConnectTo<Client> + 'static {
                     // the handler returns success (the request is already
                     // answered, so a send failure only means the connection is
                     // closing and there is nobody to receive it).
+                    let catalog =
+                        crate::acp::commands::catalog_of(&sessions, sid.0.as_ref()).await;
                     let _ = cx.send_notification(SessionNotification::new(
                         sid,
                         SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(
-                            crate::acp::commands::available_acp_commands(),
+                            crate::acp::commands::available_acp_commands(&catalog),
                         )),
                     ));
                     Ok(())
@@ -323,10 +325,12 @@ fn build_v1_agent(state: SharedState) -> impl ConnectTo<Client> + 'static {
                     // Best-effort: a dropped notification must not fail the
                     // already-accepted session/resume (same reasoning as the
                     // session/new handler above).
+                    let catalog =
+                        crate::acp::commands::catalog_of(&sessions, id.0.as_ref()).await;
                     let _ = cx.send_notification(SessionNotification::new(
                         id,
                         SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(
-                            crate::acp::commands::available_acp_commands(),
+                            crate::acp::commands::available_acp_commands(&catalog),
                         )),
                     ));
                     Ok(())

@@ -982,7 +982,7 @@ async fn a_person_stops_a_member_from_the_catalog() {
     assert!(
         seen.iter().any(|e| matches!(
             e,
-            AgentEvent::Invoked { id, output } if id == "on-scout" && output == "stopped: scout"
+            AgentEvent::Invoked { id, output, .. } if id == "on-scout" && output == "stopped: scout"
         )),
         "{seen:#?}"
     );

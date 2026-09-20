@@ -113,63 +113,32 @@ G 类七条**刻意排在翻默认之后**：自用会告诉我们哪几条是�
 - `deliver()`：命令被「选中」和被「打出来」原本走两条路，选中那条把 `Outcome::Open`
   静默丢掉——选中项若要再开一个浮层，什么都不会发生。
 
-### B. 解开 6.3 的尾巴（6.3 今天不能算完成）
+### B. 解开 6.3 的尾巴 —— **已完成（2026-09-20）**
 
-> **🔴 2026-09-20 摸到底了，卡在一个契约决定上，没做。** 下面是摸出来的事实，
-> 省得下一个人再摸一遍。
+- [x] **B1 ACP 命令改投影**。两半一起落地了，而**卡住它的从来不是那两个"设计决定"，
+      是一处接线漏了**——前两版诊断都没找对，记在这里免得后人照着错的方向走。
 
-**两半都得做，缺一不可**：只把目录广播出去而不能执行，等于让客户端列出一条跑了
-会被当成提示词发给模型的命令——`acp/commands.rs` 自己那条判据
-（`the_advertised_commands_are_the_ones_acp_can_actually_run`）说的就是这件事。
+**真正的根因（第三次才挖到）**：ACP 起运行时时 `PrepareOptions.front_end` 是 `None`
+（`acp/engine.rs` 走 `..default()`），而它的 `FrontEnd` 是**运行时起好之后**才建的。
+于是 `front-end-feed` 那条行根本没挂（它只在 `host.front_end.is_some()` 时插），
+`FrontEnd::app` 永远是空，每一次 `Subscribe` 都被拒，`Described` 永远不来——
+所以这个通道对"自己 agent 注册了哪些命令"一无所知。tui 是在 `main.rs` 先建
+FrontEnd 再传进 prepare 的，所以它一直是对的。
 
-**⚠️ 2026-09-20 第二次尝试，把上面这句话推翻了。** 原文写的是「广播那半是通的」，
-并给了「会话建的时候等一次 `Described`」的解法。**做下去发现不成立**，原因比
-「没有事件泵」深一层：
+修法：`spawn_session` 自己建 FrontEnd、传进 `PrepareOptions`、连同运行时一起返回；
+`register_session` 收下它，不再自己造一个。判据
+`the_commands_the_agent_registered_are_advertised_here_too`（把 front_end 从 prepare
+里摘掉就判红）。
 
-> **ACP 从来没有订阅过。** `AgentEvent::Described` 是推给**订阅者**的
-> （`harness/src/feed.rs:68`，`subscribe()` 的第一件事），而全仓只有 tui 发
-> `AgentCommand::Subscribe`（`tui/src/plugin.rs:321`）。ACP 不发，所以它永远收不到
-> 描述——不是「接得晚」，是根本没人推给它。
+**执行那半**按当初写的 C 方案做了：`AgentEvent::Invoked` 多一个 `queued: bool`，
+由 `run_catalog_command` 读 `agent.inbox().has_waking_input()` 现场作答。只答的命令
+在收到 `Invoked` 时就收口，排了活的接着等那个回合的 `TurnComplete`——两种都错不得：
+早收口，那个回合的事实会落到**下一次** prompt 上（turn.rs 通篇在防的就是这件事）；
+干等，请求就挂住。判据 `an_agent_command_runs_in_the_agent_and_ends_where_it_ends`
+两种形状都钉了。
 
-补发 `Subscribe` 也没用：在 `create_session` 里发、在 250ms 内重试着发，**事件流里
-一个事件都收不到**（下过探针，连 `Rejected` 都没有），说明那一刻 agent 还没到能
-处理命令的状态。这是 ACP 会话生命周期的第三层，我没再往下挖。
-
-所以这条的实际状态是：**两半都卡着，而且卡点不同**——
-- 广播那半卡在「ACP 怎么、何时拿到 `AgentDescription`」（订阅时机 / 或者给契约一个
-  「问一次描述」的命令）；
-- 执行那半卡在下面那张表的契约决定。
-
-第二次尝试做到的、可复用的结论：`AgentEvent::Invoked` 加一个 `queued: bool`
-（由 `run_catalog_command` 读 `agent.inbox().has_waking_input()` 现场作答）是可行的，
-改动面是 kernel 事件枚举 + harness 产出方 + 4 处测试模式补 `..`；`translate` 认
-`Invoked` 后输出会自动成为 agent message chunk。这些都验证过能编译，但**没有提交**
-——半成品不入库，而且两半必须一起才有意义。
-
-**执行那半卡住了**：`AgentCommand::Invoke` 走 `handle.rs:1341`，只发
-`AgentEvent::Invoked { id, output }`，**不产生任何回合终态**（`run_catalog_command`
-在 `handle.rs:1010`，`Invoke` 那一支 `continue` 掉了起回合的那段）。而有的目录命令
-会顺带给模型排一条消息（`/worklog`、`/init` 都是 `agent.send(prompt)`），那之后会
-另起一个回合。于是 ACP 不知道这一回合该在哪儿结束：
-
-| 做法 | 问题 |
-|---|---|
-| A. 收到 `Invoked` 就结束本回合 | 排了活的那种，回合事件会漏给下一次 prompt——`turn.rs` 注释里反复警告的 "poisons the NEXT prompt" |
-| B. 收到 `Invoked` 后继续等 `TurnComplete`，超时就结束 | 不挂死，但靠一个时间窗，有竞态 |
-| C. 契约里说清楚：`AgentEvent::Invoked` 多带一个「还排了活」的字段 | **架构上对的那个**：harness 当场就知道（inbox 里有没有东西），而调用方今天只能猜。代价是动 kernel 的事件枚举与所有消费者 |
-
-今天 `Invoked` 全仓只有 tui 一个消费者（`plugin.rs:1918`），它是「facts 来了就画」
-的模型，所以这个边界对它根本不存在；ACP 是一问一答，才撞上。daemon 的
-`/live/command` 走的是另一条路，没有用 `Invoke`。
-
-**我的建议是 C**，但它动公共契约，该由你拍。拍完再做，两半一起。
-
-
-
-- [ ] **B1 ACP 命令改投影**：`acp/commands.rs:52` 的 `ACP_COMMANDS` 15 条硬编码
-      → 投影自 `AgentDescription` 的命令目录（tui 侧 `commands.rs:1447` 已是活投影，照抄）。
-      `commands.rs:718` 那条把 15 条钉死的判据要一起改。
-      **影响**：ACP 客户端今天拿不到 goal / loop / cd / team / worktree / review 等 ~30 条。
+名字冲突的规矩：两边都有的名字算**这个通道自己的**——它才是真正会跑的那个，
+拿 agent 的句子去描述一条被本通道截走的命令，说的是客户端永远拿不到的东西。
 
 ### C. 便宜且独立（各 30 分钟量级，随时插队）
 

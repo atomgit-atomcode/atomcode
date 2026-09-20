@@ -118,7 +118,7 @@ pub async fn spawn_and_register_session(
         )));
     }
     validate_additional_directories(&additional_directories)?;
-    let runtime = crate::acp::engine::spawn_session(
+    let (runtime, front_end) = crate::acp::engine::spawn_session(
         engine,
         cwd.clone(),
         provider_factory,
@@ -130,6 +130,7 @@ pub async fn spawn_and_register_session(
     register_session(
         sessions,
         runtime,
+        front_end,
         engine.to_coding_config(cwd.clone()),
         engine.model_resolver(),
         cwd,
@@ -232,10 +233,11 @@ pub async fn handle_resume_session(
     )
     .await
     {
-        Ok(runtime) => {
+        Ok((runtime, front_end)) => {
             register_session(
                 sessions,
                 runtime,
+                front_end,
                 engine.to_coding_config(cwd.clone()),
                 engine.model_resolver(),
                 cwd,

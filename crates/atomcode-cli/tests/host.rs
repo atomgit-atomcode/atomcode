@@ -350,7 +350,7 @@ async fn a_front_end_talks_to_a_member_stops_it_and_reads_it_after() {
         })
         .unwrap();
     until(&mut connection, |e| {
-        matches!(e, AgentEvent::Invoked { id, output } if id == "stop" && output == "stopped: scout")
+        matches!(e, AgentEvent::Invoked { id, output, .. } if id == "stop" && output == "stopped: scout")
     })
     .await;
     quiet(&mut connection).await;
@@ -1257,7 +1257,7 @@ async fn the_runtimes_own_capabilities_are_commands_in_the_catalog() {
     assert!(
         seen.iter().any(|e| matches!(
             e,
-            AgentEvent::Invoked { id, output } if id == "q" && !output.is_empty()
+            AgentEvent::Invoked { id, output, .. } if id == "q" && !output.is_empty()
         )),
         "it says what it did: {seen:#?}"
     );
@@ -1291,7 +1291,7 @@ async fn the_runtimes_own_capabilities_are_commands_in_the_catalog() {
     assert!(
         seen.iter().any(|e| matches!(
             e,
-            AgentEvent::Invoked { id, output } if id == "p" && output.contains("策略")
+            AgentEvent::Invoked { id, output, .. } if id == "p" && output.contains("策略")
         )),
         "the row says nothing is waiting: {seen:#?}"
     );

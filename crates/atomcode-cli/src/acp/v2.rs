@@ -676,10 +676,11 @@ pub(crate) fn build_v2_agent(state: SharedState) -> impl ConnectTo<Client> + 'st
                     )?;
                     // Advertise the slash-command surface right after setup
                     // (best-effort, mirroring the v1 chain's reasoning).
+                    let catalog = crate::acp::commands::catalog_of(&sessions, id.0.as_ref()).await;
                     let _ = cx.send_notification(UpdateSessionNotification::new(
                         id,
                         SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(
-                            crate::acp::commands::available_acp_commands_v2(),
+                            crate::acp::commands::available_acp_commands_v2(&catalog),
                         )),
                     ));
                     Ok(())
@@ -885,10 +886,13 @@ pub(crate) fn build_v2_agent(state: SharedState) -> impl ConnectTo<Client> + 'st
                     )?;
                     // Advertise the slash-command surface right after resume
                     // (best-effort, mirroring the v1 chain's reasoning).
+                    let catalog =
+                        crate::acp::commands::catalog_of(&sessions, req.session_id.0.as_ref())
+                            .await;
                     let _ = cx.send_notification(UpdateSessionNotification::new(
                         req.session_id.clone(),
                         SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(
-                            crate::acp::commands::available_acp_commands_v2(),
+                            crate::acp::commands::available_acp_commands_v2(&catalog),
                         )),
                     ));
                     Ok(())

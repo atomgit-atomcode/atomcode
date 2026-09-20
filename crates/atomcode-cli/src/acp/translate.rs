@@ -48,6 +48,15 @@ pub fn event_to_update(ev: &AgentEvent, message_id: Option<&str>) -> Option<Sess
             ContentChunk::new(ContentBlock::Text(TextContent::new(s.clone())))
                 .message_id(msg.clone()),
         )),
+        // What a catalog command answered, said the way the model's own words
+        // are said: the client typed a slash command and gets text back in the
+        // channel it would have got a reply in.
+        AgentEvent::Invoked { output, .. } if !output.is_empty() => {
+            Some(SessionUpdate::AgentMessageChunk(
+                ContentChunk::new(ContentBlock::Text(TextContent::new(output.clone())))
+                    .message_id(msg.clone()),
+            ))
+        }
         AgentEvent::Reasoning(s) => Some(SessionUpdate::AgentThoughtChunk(
             ContentChunk::new(ContentBlock::Text(TextContent::new(s.clone())))
                 .message_id(msg.clone()),
