@@ -41,7 +41,7 @@ pub enum StepKind {
     Choose(Vec<Choice>),
     /// Something to type.
     ///
-    /// Not for secrets — a password is [`crate::secret::SecretPrompt`], and the
+    /// Not for secrets — a password is [`crate::secret::Secrets`], and the
     /// reason is in that file: what is typed here is an ordinary answer and is
     /// drawn as it is typed.
     Type { placeholder: String },

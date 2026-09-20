@@ -576,10 +576,10 @@ fn serve_askpass(
     Some(guard)
 }
 
-/// Put each prompt on screen and hand back what the person typed.
+/// Put each prompt on the composer's line and hand back what the person typed.
 ///
 /// Split from [`serve_askpass`] so it can be judged without a socket: what is
-/// worth judging is that a prompt becomes a modal, that the answer reaches the
+/// worth judging is that a prompt reaches the field, that the answer reaches the
 /// one waiting for it, and that esc reaches them as a refusal.
 #[cfg(unix)]
 async fn answer_prompts(
@@ -588,18 +588,11 @@ async fn answer_prompts(
     mut prompts: tokio::sync::mpsc::Receiver<atomcode_capabilities::askpass::server::AskpassPrompt>,
 ) {
     while let Some(prompt) = prompts.recv().await {
-        let asking = Arc::new(crate::secret::SecretPrompt::new(prompt.prompt));
-        let reply = Mutex::new(Some(prompt.reply));
-        host.overlays.open(
-            asking,
-            Box::new(move |answer| {
-                if let Some(reply) = reply.lock().expect("askpass reply poisoned").take() {
-                    // `None` is a refusal — the person pressed esc — and every
-                    // reader downstream must take it as one.
-                    let _ = reply.send(answer);
-                }
-            }),
-        );
+        // Not a modal: a password is typed, and what a person types belongs on
+        // the line they type on — the same place `atomcode-tuix` asks for it.
+        // The reply travels with it, so `None` reaches the asking program as a
+        // refusal however the prompt ends. See `crate::secret`.
+        host.ask_secret(&prompt.prompt, prompt.reply);
         // The prompt arrives while nothing else is waking the loop: a turn is
         // running and the screen is idle between frames.
         if wake.send(Wake::Fact).is_err() {
@@ -1493,8 +1486,28 @@ impl UserInterface for Tui {
                     }
                     stale = true;
                 }
+                // A password being asked for takes a paste before the composer
+                // does, and this is why the arm is here rather than beside the
+                // key one: without it a pasted password would land in the
+                // draft, which is history, and which becomes a `UserMessage`
+                // fact the moment it is sent. A password manager's paste is how
+                // most people answer a prompt like this.
+                Wake::Input(Input::Paste(text)) if self.host.secret_waiting() => {
+                    self.host.secret_paste(&text);
+                    stale = true;
+                }
                 Wake::Input(Input::Paste(text)) => {
                     quit = self.act(Action::Paste(text), &client);
+                    stale = true;
+                }
+                // A password a blocked process is waiting on has the keyboard
+                // before anything else — above a modal, because it is not one:
+                // it is the field, it is one key from being refused, and a
+                // `sudo` is holding the turn open until it is. Everything else
+                // is swallowed rather than passed on, so a key cannot act on a
+                // screen whose field is showing something else.
+                Wake::Input(Input::Key(press)) if self.host.secret_waiting() => {
+                    self.host.secret_key(press);
                     stale = true;
                 }
                 // A modal has the keyboard while it is open, then the
@@ -1573,6 +1586,10 @@ impl UserInterface for Tui {
         // turn to say it has ended — but not forever: a tool that ignores its
         // cancel is not a reason to leave the terminal in the alternate screen.
         self.host.asks.refuse_all();
+        // And the password, for the same reason and with the same meaning: a
+        // `sudo` waiting on an answer that is never coming holds the turn open,
+        // and `None` is a refusal rather than a blank.
+        self.host.refuse_secret();
         if !client.settled() {
             client.cancel();
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -3998,16 +4015,29 @@ mod askpass_tests {
     fn typed(host: &crate::host::Host, text: &str) {
         for c in text.chars() {
             assert!(
-                !host.overlays.key(press(Key::Char(c))),
+                !host.secret_key(press(Key::Char(c))),
                 "typing does not close the prompt"
             );
         }
     }
 
-    /// A password `sudo` asks for reaches the screen as a modal, and what the
-    /// person types reaches the one waiting for it — which is what makes a
-    /// `sudo` inside a tool call finish instead of hanging on a tty this screen
-    /// owns (`docs/plans/2026-09-18-tui-panels-and-commands-inventory.md` P0-1).
+    /// What the composer is showing right now, drawn.
+    fn field(host: &crate::host::Host) -> String {
+        host.compose((60, 12))
+            .part(input::ID)
+            .expect("the field is on screen")
+            .lines
+            .iter()
+            .map(|l| l.plain())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A password `sudo` asks for reaches the screen **on the composer's line**,
+    /// and what the person types reaches the one waiting for it — which is what
+    /// makes a `sudo` inside a tool call finish instead of hanging on a tty this
+    /// screen owns (`docs/plans/2026-09-18-tui-panels-and-commands-inventory.md`
+    /// P0-1).
     #[tokio::test]
     async fn a_password_sudo_asks_for_is_answered_from_the_screen() {
         let host = screen();
@@ -4034,20 +4064,32 @@ mod askpass_tests {
             matches!(woke, Ok(Some(Wake::Fact))),
             "the screen is told to repaint (timed out or wrong wake)"
         );
-        let open = host.overlays.current().expect("a modal is up");
-        assert_eq!(open.id(), "secret");
+        assert!(host.secret_waiting(), "the prompt is up");
+        let asked = field(&host);
         assert!(
-            open.title().contains("password for lichao"),
-            "asked in the words the program used: {}",
-            open.title()
+            asked.contains("password for lichao"),
+            "asked in the words the program used, on the line: {asked:?}"
         );
 
         typed(&host, "hunter2");
+        // One mask glyph per character and not one of the characters: the field
+        // is the composer's, and what is typed into it here is not.
+        let masked = field(&host);
+        assert_eq!(
+            masked.matches("•").count(),
+            7,
+            "a keystroke shows, as a mask: {masked:?}"
+        );
+        assert!(!masked.contains("hunter2"), "{masked:?}");
         assert!(
-            host.overlays.key(press(Key::Enter)),
+            host.secret_key(press(Key::Enter)),
             "enter closes the prompt"
         );
         assert_eq!(answered.await.unwrap().as_deref(), Some("hunter2"));
+        assert!(
+            !host.secret_waiting(),
+            "and the field is the composer's again"
+        );
         drop(asking);
         pump.await.unwrap();
     }
@@ -4070,11 +4112,11 @@ mod askpass_tests {
             })
             .await
             .unwrap();
-        while host.overlays.current().is_none() {
+        while !host.secret_waiting() {
             tokio::task::yield_now().await;
         }
         typed(&host, "half a password");
-        assert!(host.overlays.key(press(Key::Esc)), "esc closes the prompt");
+        assert!(host.secret_key(press(Key::Esc)), "esc closes the prompt");
         assert_eq!(answered.await.unwrap(), None, "a refusal, not a blank");
         drop(asking);
         pump.await.unwrap();

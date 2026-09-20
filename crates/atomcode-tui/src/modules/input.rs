@@ -30,6 +30,14 @@ pub struct State {
 /// A free function so it can be judged without a terminal — the interesting
 /// part is which of the four combinations says what.
 fn caption(moment: &crate::moment::Moment) -> Option<String> {
+    // While a password is being asked the field is not the composer, so the
+    // rule says what the keys do now rather than where a draft came from — the
+    // draft is still in the buffer, and is not what is on the line. It is the
+    // one place the two ways out are written down: the prompt itself is the
+    // asking program's words and says nothing about esc.
+    if moment.secret.is_some() {
+        return Some("enter 送出 · esc 不给".into());
+    }
     // The session title is deliberately NOT shown above the field: it clutters
     // the composer, and it lives in the terminal's own title bar instead. Only
     // the history position rides the rule — and only while arrowing back through
@@ -138,6 +146,30 @@ fn lay(input: &str, caret: usize, body: usize) -> (Vec<String>, (usize, usize), 
     (rows, at, starts)
 }
 
+/// What the field is showing, and where the caret sits in it.
+///
+/// Usually the line being typed. While a password is being asked
+/// (`crate::secret`), the asking program's own words followed by one mask glyph
+/// per character — and the caret at the end of them, because a mask has nothing
+/// in it to move a caret through. **The password never reaches here**: what
+/// arrives is a count, and the draft is left where it is, untouched, to come
+/// back when the prompt closes.
+///
+/// One function, because everything that measures this field has to measure the
+/// same one: `render` draws it, `caret` puts the cursor in it, `height` asks how
+/// many rows it needs, and a click resolves against it.
+fn shown(moment: &crate::moment::Moment) -> (std::borrow::Cow<'_, str>, usize) {
+    use std::borrow::Cow;
+    match &moment.secret {
+        Some(asking) => {
+            let line = asking.line(&moment.caps);
+            let caret = line.len();
+            (Cow::Owned(line), caret)
+        }
+        None => (Cow::Borrowed(moment.input.as_str()), moment.caret),
+    }
+}
+
 /// Where the caret sits in the drawn text: its row, its column, and how many
 /// rows there are.
 ///
@@ -176,6 +208,12 @@ pub fn offset_at_cell(
     y: u16,
 ) -> Option<usize> {
     if !rect.contains(x, y) {
+        return None;
+    }
+    // A click cannot put the caret in a mask: there is one place to type while a
+    // password is being asked, and it is the end. Nothing moves, rather than the
+    // caret landing somewhere the keys would ignore.
+    if moment.secret.is_some() {
         return None;
     }
     let body = body_width(rect.w);
@@ -265,7 +303,8 @@ impl View for Input {
         // walk, so the cursor cannot land off the text.
         let prompt = format!("{} ", vp.moment.caps.g(crate::caps::Glyph::Prompt));
         let body = body_width(w);
-        let (typed, (caret_row, _), _) = lay(&vp.moment.input, vp.moment.caret, body);
+        let (text, at) = shown(vp.moment);
+        let (typed, (caret_row, _), _) = lay(&text, at, body);
         let room = typed_room(vp.rect.h);
         let first = caret_row.saturating_sub(room.saturating_sub(1));
         for (i, piece) in typed.iter().skip(first).take(room).enumerate() {
@@ -280,8 +319,11 @@ impl View for Input {
             let mut row = vec![El::styled(lead, arrow), El::raw(piece.clone())];
             // The rest of something already said, dim, on the last row of what
             // is typed — pressing right takes it. Only there, because that is
-            // where the caret is when a completion means anything.
-            if i + first == typed.len().saturating_sub(1) {
+            // where the caret is when a completion means anything. Never while
+            // a password is being asked: what is on the line is not the draft,
+            // and a completion of the draft drawn after the mask would offer to
+            // finish something nobody is typing.
+            if i + first == typed.len().saturating_sub(1) && vp.moment.secret.is_none() {
                 if let Some(rest) = crate::text::ghost(
                     &vp.moment.input,
                     &vp.moment.history,
@@ -312,7 +354,8 @@ impl View for Input {
     /// buffer whole and was sent whole, but only its first line was ever drawn.
     fn height(_state: &State, moment: &crate::moment::Moment, width: u16) -> Height {
         let body = body_width(width);
-        let typed = lay(&moment.input, moment.caret, body).0.len().min(MAX_ROWS);
+        let (text, at) = shown(moment);
+        let typed = lay(&text, at, body).0.len().min(MAX_ROWS);
         Height::Hug((RULES + typed.max(1)) as u16)
     }
 }
@@ -321,7 +364,8 @@ impl View for Input {
 /// `render` used, so it cannot drift off the character it belongs to.
 pub fn caret(moment: &crate::moment::Moment, rect: crate::frame::Rect) -> (u16, u16) {
     let body = body_width(rect.w);
-    let (_, (row, col), _) = lay(&moment.input, moment.caret, body);
+    let (text, at) = shown(moment);
+    let (_, (row, col), _) = lay(&text, at, body);
     let room = typed_room(rect.h);
     let first = row.saturating_sub(room.saturating_sub(1));
     // The prompt eats two cells; the rule above eats one row.
@@ -693,6 +737,69 @@ mod tests {
         let (rows, at, _) = lay("中文中文", 0, 3);
         assert_eq!(rows, vec!["中", "文", "中", "文"], "never mid-character");
         assert_eq!(at, (0, 0));
+    }
+
+    /// A password `sudo` asks for is asked **on the line**, the way
+    /// `atomcode-tuix` asks it: the program's own words, then one mask glyph per
+    /// character, in the field — not in a box of its own.
+    ///
+    /// And the draft is still there underneath. A person mid-sentence when a
+    /// tool call hits a `sudo` gets their sentence back; a field that had thrown
+    /// it away to borrow the line would be the worse bug of the two.
+    #[test]
+    fn a_password_is_asked_on_the_line_and_the_draft_waits_under_it() {
+        let caps = Caps::default();
+        let m = Moment::default()
+            .typing("把这个改好")
+            .asking_password("[sudo] password for lichao:", 6);
+        let out = draw(&State::default(), &m, 60, 4);
+
+        let field = &out[1];
+        assert!(
+            field.starts_with(&format!(
+                "{} [sudo] password for lichao: ",
+                caps.g(Glyph::Prompt)
+            )),
+            "the asking program's own words, on the line: {field:?}"
+        );
+        assert_eq!(
+            field.matches(caps.g(Glyph::Bullet)).count(),
+            6,
+            "one mask glyph per character typed: {field:?}"
+        );
+        assert!(
+            !out.iter().any(|row| row.contains("把这个改好")),
+            "the draft is not on the line while the password is: {out:?}"
+        );
+        // …and is untouched in the buffer, to come back when the prompt closes.
+        assert_eq!(m.input, "把这个改好");
+
+        // The rule says what the keys do now — the two ways out, which the
+        // program's own prompt says nothing about.
+        assert!(
+            out[0].contains("enter 送出") && out[0].contains("esc 不给"),
+            "the way out rides the rule: {out:?}"
+        );
+
+        // The caret sits after the last mask glyph, which is the only place
+        // there is to type. `PROMPT` cells for the `❯ `, one row for the rule.
+        let rect = Rect::new(0, 7, 60, 4);
+        let cells = width::str_width(&format!("[sudo] password for lichao: {}", "•".repeat(6)));
+        assert_eq!(caret(&m, rect), ((PROMPT + cells) as u16, 8));
+        // And a click cannot put it anywhere else: there is nothing in a mask
+        // to put a caret into.
+        assert_eq!(offset_at_cell(&m, rect, 5, 8), None);
+    }
+
+    /// The composer keeps its own words when nothing is being asked — the other
+    /// half of the judgement above, so a field that showed the prompt always
+    /// (or never) fails one of them.
+    #[test]
+    fn with_no_password_being_asked_the_line_is_the_draft() {
+        let m = Moment::default().typing("把这个改好");
+        let out = draw(&State::default(), &m, 60, 4);
+        assert!(out[1].contains("把这个改好"), "{out:?}");
+        assert!(!out[0].contains("esc 不给"), "{out:?}");
     }
 
     #[test]

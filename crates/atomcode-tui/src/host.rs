@@ -828,6 +828,13 @@ pub struct Host {
     /// Questions waiting for the person. Rendered as a live block at the foot
     /// of the stream, and given first refusal on every key while it is there.
     pub asks: Arc<crate::ask::Asks>,
+    /// The password a running process is blocked on, while one is being asked
+    /// for. Beside `asks` because it is the same kind of thing — something
+    /// outside this screen waiting on the person — and apart from it because a
+    /// password must never become a fact the way an answer does. It is typed on
+    /// the composer's line and takes the keyboard from everything while it is
+    /// there; see [`crate::secret`].
+    pub secrets: Arc<crate::secret::Secrets>,
     /// The mounted cell-grid bitmaps. The host holds the table; a row writes
     /// through `RastersSvc`, and every frame takes a snapshot of it into
     /// `Moment` for the modules to draw. See `docs/adr/0027`.
@@ -1034,6 +1041,7 @@ impl Host {
             context_menu: RwLock::new(None),
             overlays: Arc::new(crate::overlay::Overlays::new()),
             asks: crate::ask::Asks::new(),
+            secrets: crate::secret::Secrets::new(),
             rasters: Arc::new(crate::raster::Rasters::new()),
             modules: modules.clone(),
             layout: layout_svc.clone(),
@@ -1478,6 +1486,56 @@ impl Host {
         let cur = ask.cursor as i32;
         let row = (cur + delta).clamp(0, last as i32) as usize;
         m.asking.as_mut().is_some_and(|a| a.point_at(row))
+    }
+
+    /// Ask for a password on the composer's line (`crate::secret`).
+    ///
+    /// The queue is the truth about whether one is being asked for; the moment
+    /// is what the field draws from. Two copies of one thing on purpose — a
+    /// view module may not reach into the host — so every route that changes
+    /// one goes through here and changes the other, which is what keeps a field
+    /// showing a prompt nobody is waiting on from being possible.
+    pub fn ask_secret(&self, prompt: &str, reply: tokio::sync::oneshot::Sender<Option<String>>) {
+        self.secrets.ask(prompt, reply);
+        self.sync_secret();
+    }
+
+    /// Whether a password is being asked for. Read by the one place focus is
+    /// decided, so that "who has the keyboard" and "what the field is showing"
+    /// cannot be two different answers.
+    pub fn secret_waiting(&self) -> bool {
+        self.secrets.is_waiting()
+    }
+
+    /// Give a key to the password prompt. `true` when it closed.
+    pub fn secret_key(&self, press: crate::surface::KeyPress) -> bool {
+        let closed = self.secrets.key(press);
+        self.sync_secret();
+        closed
+    }
+
+    /// Paste into the password rather than into the draft. `true` when the
+    /// prompt closed — a pasted newline is the enter that was not pressed.
+    pub fn secret_paste(&self, text: &str) -> bool {
+        let closed = self.secrets.paste(text);
+        self.sync_secret();
+        closed
+    }
+
+    /// Refuse a password still being asked for. For shutdown, and fail-closed:
+    /// the `sudo` waiting on it would otherwise hold the turn open forever.
+    pub fn refuse_secret(&self) {
+        self.secrets.refuse();
+        self.sync_secret();
+    }
+
+    /// Bring `Moment::secret` in step with the mailbox. The only place it is
+    /// written, for the reason [`Host::sync_asking`] is the only place `asking`
+    /// is.
+    fn sync_secret(&self) {
+        let asking = self.secrets.asking();
+        let mut m = self.moment.write().expect("moment poisoned");
+        m.secret = asking;
     }
 
     /// Whether the settings panel is up.
@@ -3093,6 +3151,16 @@ fn asked_height(modules: &Modules, id: &str, moment: &Moment, width: u16) -> u16
 /// answer to one question, and the two would part company the day a third panel
 /// was added.
 pub fn displaces_composer(moment: &Moment) -> bool {
+    // Nothing displaces it while a password is being asked for, and that is not
+    // a courtesy: the password is typed **in the field**, so a panel that took
+    // the composer's rows would take the prompt off the screen with them — and
+    // the keys still go to it (focus is decided in one place, and a password a
+    // blocked process is waiting on comes first there). A question and a `sudo`
+    // can be up at once whenever two tools run in one batch; the panel keeps its
+    // own rows, and both are on screen.
+    if moment.secret.is_some() {
+        return false;
+    }
     moment.asking.is_some() || moment.settings_panel.is_some()
 }
 
@@ -3794,6 +3862,64 @@ mod tests {
         };
         assert_eq!(after, before, "and the field is exactly as it was");
         assert!(!displaces_composer(&h.moment.read().unwrap()));
+    }
+
+    /// A password is asked on the composer's line, so nothing may take the line
+    /// away while one is being asked — not even the two panels that otherwise
+    /// stand there.
+    ///
+    /// The case is real rather than theoretical: two tools run in one batch, one
+    /// asks for approval and the other hits a `sudo`. If the question kept the
+    /// composer's rows the prompt would be off the screen while the keys still
+    /// went to it — a person typing a password into nothing, with both the turn
+    /// and the `sudo` waiting on them.
+    #[tokio::test]
+    async fn a_password_keeps_the_line_a_question_would_have_taken() {
+        let h = host();
+        h.modules
+            .add_view(Arc::new(Mounted::<crate::modules::ask::Ask>::new()))
+            .unwrap();
+        let w = 60u16;
+        let rows = |h: &Host| {
+            let mods = h.modules.clone();
+            let m = h.moment.read().unwrap().clone();
+            crate::host::asked_height(&mods, crate::modules::input::ID, &m, w)
+        };
+        let before = rows(&h);
+        assert!(before > 0, "the field has rows to give");
+
+        h.asks.push(atomcode_harness::seams::Question::plain(
+            "Allow?",
+            &["yes", "no"],
+        ));
+        assert!(h.sync_asking());
+        assert_eq!(rows(&h), 0, "the question stands where the composer does");
+
+        let (reply, answered) = tokio::sync::oneshot::channel();
+        h.ask_secret("[sudo] password for lichao:", reply);
+        assert_eq!(rows(&h), before, "and gives the line back for the password");
+        assert!(!displaces_composer(&h.moment.read().unwrap()));
+        assert!(h.secret_waiting(), "which is where the keys are going");
+
+        // Answered, the field is the question's business again.
+        assert!(!h.secret_key(crate::surface::KeyPress::ch('p')));
+        assert!(h.secret_key(crate::surface::KeyPress::plain(crate::surface::Key::Enter)));
+        assert_eq!(answered.await.unwrap().as_deref(), Some("p"));
+        assert_eq!(rows(&h), 0, "the question has the line back");
+    }
+
+    /// Shutdown refuses a password still being asked for, and says so through
+    /// the same channel `sudo` is blocked on. Fail-closed: a refusal is `None`,
+    /// never a blank password.
+    #[tokio::test]
+    async fn a_screen_going_away_refuses_the_password_it_was_asked_for() {
+        let h = host();
+        let (reply, answered) = tokio::sync::oneshot::channel();
+        h.ask_secret("password:", reply);
+        assert!(h.moment.read().unwrap().secret.is_some(), "on screen");
+        h.refuse_secret();
+        assert_eq!(answered.await.unwrap(), None);
+        assert!(h.moment.read().unwrap().secret.is_none(), "and off it");
     }
 
     /// Opening the panel twice does not throw away what was typed in it.

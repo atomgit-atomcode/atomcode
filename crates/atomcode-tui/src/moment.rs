@@ -307,6 +307,19 @@ pub struct Moment {
     /// a module that folded "is a question waiting?" from facts would be folding
     /// something that is not in them. See `modules::ask`.
     pub asking: Option<Ask>,
+    /// The password a running process is blocked on, if one is being asked for:
+    /// the asking program's own words, and how many characters have been typed.
+    ///
+    /// **Never the characters.** This struct is cloned once a frame and read by
+    /// anything that draws, so a password in it would be a copy of the password
+    /// per frame; the buffer stays in [`crate::secret::Secrets`], which the host
+    /// mirrors from. Here for the reason [`Moment::asking`] is — a password is
+    /// not a fact, the log records nothing about it, and a module may not reach
+    /// a service to ask.
+    ///
+    /// While it is `Some` the composer draws it in place of the draft, and the
+    /// draft is left alone: see [`crate::modules::input`].
+    pub secret: Option<crate::secret::Asking>,
     /// What the session is doing on its own, as the host last said.
     ///
     /// Pushed, not polled: the host announces it when a round lands, so a line
@@ -426,6 +439,16 @@ impl Moment {
     pub fn typing(mut self, text: impl Into<String>) -> Self {
         self.input = text.into();
         self.caret = self.input.len();
+        self
+    }
+    /// A password being asked for, with `typed` characters in it. What the host
+    /// mirrors from [`crate::secret::Secrets`] — the words and a count, never
+    /// the characters — so a test draws the same field a `sudo` produces.
+    pub fn asking_password(mut self, prompt: impl Into<String>, typed: usize) -> Self {
+        self.secret = Some(crate::secret::Asking {
+            prompt: prompt.into(),
+            typed,
+        });
         self
     }
     /// Set who is running under this agent. Every field of this struct has to
