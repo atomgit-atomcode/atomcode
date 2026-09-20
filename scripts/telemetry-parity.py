@@ -214,6 +214,7 @@ class Handler(BaseHTTPRequestHandler):
     # Set by the driver before each run.
     scenario = SCENARIOS[0]
     collected = []
+    requests = []
     round_index = [0]
     lock = threading.Lock()
 
@@ -252,7 +253,11 @@ class Handler(BaseHTTPRequestHandler):
             self._empty(200)
             return
 
-        self._read_body()
+        body = self._read_body()
+        try:
+            Handler.requests.append(json.loads(body))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            pass
         scenario = Handler.scenario
         with Handler.lock:
             i = min(Handler.round_index[0], len(scenario.script) - 1)
@@ -339,20 +344,28 @@ VOLATILE_EVENT = {
     # Carries paths, wall-clock durations and the provider's own words. Its
     # PRESENCE is compared; its content cannot be.
     "error_data",
-    # Token accounting: the two builds send different prompts (the system
-    # prompt is not the thing under test), so exact numbers cannot match.
-    # Presence and non-zero-ness are what `shape()` keeps.
-    "input_tokens",
-    "output_tokens",
-    "cached_tokens",
-    "context_window",
+    # The per-zone breakdown, and the message count it is computed over. These
+    # CANNOT match and it is not a defect: the two builds ship different system
+    # prompts (36895B against 35671B here), the zones are byte/4 estimates
+    # scaled to the real prompt total, and `messages_count` counts the internal
+    # list rather than the wire — where the two builds agree exactly, as
+    # `--dump-requests` shows. Bucketed rather than dropped, so a zone that
+    # stops being reported at all is still a diff.
     "system_tokens",
     "tool_def_tokens",
     "tool_result_tokens",
     "message_tokens",
     "messages_count",
-    "tool_calls_count",
 }
+
+# NOT volatile, and compared exactly. Every one of these is decided by the fake
+# model's `usage` block or by the config, so the two builds must agree to the
+# token — these are the numbers a bill is computed from. They were bucketed with
+# the rest until someone asked to see them, which is how a harness ends up
+# reporting "identical" about fields it never compared.
+#   input/output/cached — straight from the provider's usage report
+#   context_window      — straight from the config
+#   tool_calls_count    — the length of what the model was scripted to call
 
 
 def shape(record):
@@ -428,6 +441,7 @@ def read_queue(queue_dir):
 def run_one(binary, port, scenario, keep):
     Handler.scenario = scenario
     Handler.collected.clear()
+    Handler.requests.clear()
     Handler.round_index[0] = 0
 
     work = Path(tempfile.mkdtemp(prefix=f"atomcode-parity-{scenario.name}-"))
@@ -488,6 +502,7 @@ def run_one(binary, port, scenario, keep):
 
     with Handler.lock:
         records = list(Handler.collected)
+        requests = list(Handler.requests)
     # A run that was killed never got to drain, but the queue is on disk and
     # the next launch would have sent it. Reading it is what makes a cancelled
     # run measurable at all — otherwise the scenario compares nothing to
@@ -500,6 +515,7 @@ def run_one(binary, port, scenario, keep):
         shutil.rmtree(work, ignore_errors=True)
     return {
         "records": records,
+        "requests": requests,
         "exit": proc.returncode,
         "elapsed": elapsed,
         "timed_out": timed_out,
@@ -516,6 +532,12 @@ def main():
     ap.add_argument("--list", action="store_true", help="print the scenarios and why each exists")
     ap.add_argument("--keep", action="store_true", help="keep the scratch dirs")
     ap.add_argument("--raw", action="store_true", help="also print every record unnormalised")
+    ap.add_argument(
+        "--dump-requests",
+        action="store_true",
+        help="print the role and size of every message each build sent the model — "
+        "what the per-zone token breakdown in `llm_chat` is computed from",
+    )
     args = ap.parse_args()
 
     if args.list:
@@ -567,6 +589,15 @@ def main():
             if args.raw:
                 for record in run["records"]:
                     print(f"      {json.dumps(record, sort_keys=True, ensure_ascii=False)}")
+            if args.dump_requests:
+                for n, body in enumerate(run["requests"]):
+                    roles = [
+                        f"{m.get('role')}({len(json.dumps(m, ensure_ascii=False))}B"
+                        + (",calls" if m.get("tool_calls") else "")
+                        + ")"
+                        for m in body.get("messages", [])
+                    ]
+                    print(f"      request {n}: {len(roles)} message(s)  {' '.join(roles)}")
 
         old = summarise(runs["old"]["records"])
         new = summarise(runs["new"]["records"])
