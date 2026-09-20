@@ -405,7 +405,7 @@ fn field_line(
                 return Line::empty();
             };
             let focused = field == f.focus;
-            account_field(view, f, field, focused)
+            account_field(view, f, field, focused, caps)
         }
         Form::Model(f) => {
             let fields = f.fields(view);
@@ -413,7 +413,7 @@ fn field_line(
                 return Line::empty();
             };
             let focused = field == f.focus;
-            model_field(view, f, field, focused)
+            model_field(view, f, field, focused, caps)
         }
     };
     // A text field with the keyboard is drawn with its caret in it; everything
@@ -450,6 +450,7 @@ fn account_field(
     form: &AccountForm,
     field: AccountField,
     focused: bool,
+    caps: crate::caps::Caps,
 ) -> (String, String, bool, bool, usize) {
     match field {
         AccountField::Name => ("名字".into(), form.name.clone(), focused, true, form.caret),
@@ -469,7 +470,7 @@ fn account_field(
         ),
         AccountField::Key => (
             "密钥".into(),
-            dots(form.key_len, form.editing.is_some()),
+            dots(form.key_len, form.editing.is_some(), caps),
             focused,
             false,
             0,
@@ -482,6 +483,7 @@ fn model_field(
     form: &ModelForm,
     field: ModelField,
     focused: bool,
+    caps: crate::caps::Caps,
 ) -> (String, String, bool, bool, usize) {
     match field {
         ModelField::Account => (
@@ -491,7 +493,13 @@ fn model_field(
             false,
             0,
         ),
-        ModelField::Key => ("密钥".into(), dots(form.key_len, false), focused, false, 0),
+        ModelField::Key => (
+            "密钥".into(),
+            dots(form.key_len, false, caps),
+            focused,
+            false,
+            0,
+        ),
         ModelField::Model => ("模型".into(), form.model.clone(), focused, true, form.caret),
         ModelField::Vision => (
             "看图".into(),
@@ -516,7 +524,7 @@ fn model_field(
         ),
         ModelField::Levels => (
             "可选强度".into(),
-            levels_text(view, form, focused),
+            levels_text(view, form, focused, caps),
             focused,
             false,
             0,
@@ -551,23 +559,38 @@ fn cycled(value: &str, focused: bool) -> String {
 /// Never the characters — this module could not draw them if it wanted to: what
 /// it is handed is a count (`crate::providers`). An empty field on an edit says
 /// what empty *means* there, which is "the stored one stays".
-fn dots(len: usize, editing: bool) -> String {
+fn dots(len: usize, editing: bool, caps: crate::caps::Caps) -> String {
     if len == 0 {
         return match editing {
             true => "（留空则不改）".to_string(),
             false => String::new(),
         };
     }
-    "•".repeat(len.min(32))
+    // Through `Caps` rather than a literal `•`: an ASCII terminal draws that as
+    // a tofu box, and a field of tofu is a worse answer about a credential than
+    // a field of asterisks.
+    caps.g(crate::caps::Glyph::Bullet)
+        .to_string()
+        .repeat(len.min(32))
 }
 
-fn levels_text(view: &ProvidersView, form: &ModelForm, focused: bool) -> String {
+fn levels_text(
+    view: &ProvidersView,
+    form: &ModelForm,
+    focused: bool,
+    caps: crate::caps::Caps,
+) -> String {
     view.efforts()
         .iter()
         .enumerate()
         .map(|(i, level)| {
             let on = form.levels.get(i).copied().unwrap_or(true);
-            let mark = if on { "✓" } else { "·" };
+            let mark = match on {
+                true => caps.g(crate::caps::Glyph::Ok).to_string(),
+                // A space, not a second glyph: the row is read as a list of what
+                // is *on*, and a mark for "off" would compete with the tick.
+                false => " ".to_string(),
+            };
             if focused && i == form.level {
                 format!("[{level}{mark}]")
             } else {
@@ -806,7 +829,8 @@ mod tests {
             ..Panel::new()
         }));
         let out = drawn(&m, 80, 24);
-        assert!(out.contains("•••••"), "{out}");
+        let dot = crate::caps::Caps::default().g(crate::caps::Glyph::Bullet);
+        assert!(out.contains(&dot.to_string().repeat(5)), "{out}");
         assert!(out.contains("密钥"), "{out}");
     }
 

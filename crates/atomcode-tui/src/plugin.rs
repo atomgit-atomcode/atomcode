@@ -1906,7 +1906,7 @@ impl Tui {
                 .call(atomcode_host_api::HostCommand::Reload { session: root })
                 .await;
             if let Err(error) = outcome {
-                host.say(&format!("配置写下了,但会话没能重新加载:{error:?}"), true);
+                host.say(format!("配置写下了,但会话没能重新加载:{error:?}"), true);
                 if let Some(keys) = keys {
                     let _ = keys.send(Wake::Fact);
                 }
