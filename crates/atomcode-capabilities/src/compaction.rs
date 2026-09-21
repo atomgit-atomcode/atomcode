@@ -38,9 +38,16 @@ pub const MIN_COLLAPSE_SIZE: usize = 500;
 /// Cache-friendly stub compaction (port of core's `collapse_committed` /
 /// `compact_old_tool_results_in_place`).
 pub struct StubCompaction {
-    /// Keep this many most-recent turns FULL (`1` = only the active turn). A "turn"
-    /// begins at a non-synthetic [`Role::User`] message.
-    keep_recent_turns: usize,
+    /// Token budget for the protect window: keep the most-recent WHOLE turns whose combined
+    /// token estimate fits (ALWAYS ≥ the active turn) via [`recent_keep_boundary`]; stub the
+    /// big tool results of everything older.
+    ///
+    /// `None` (the default) scales the budget with the context window at plan time
+    /// ([`recent_keep_budget`]) — the SAME budget the proactive drain uses, so gentle-stub
+    /// and drain agree on "recent", and a small-window model still stubs proactively rather
+    /// than never reaching a fixed budget. `Some(n)` pins a fixed budget; the mechanism
+    /// tests pin `Some(1)` (= keep only the active turn).
+    protect_tokens: Option<usize>,
     /// Never stub `read_file` results — compacting them makes the model "falsely
     /// confident" and re-edit the same file (core's 5–7 atomgr finding); keeping them
     /// preserves line-number context for edit mode.
@@ -48,24 +55,26 @@ pub struct StubCompaction {
 }
 
 impl Default for StubCompaction {
-    /// Keep the two most-recent turns FULL (was 1 = active turn only), exempt read_file.
-    /// One-turn keep stubbed the PREVIOUS turn's tool outputs to a one-line summary the
-    /// moment the next turn began — so a multi-step investigation lost its `bash`/`grep`
-    /// results almost immediately. Comparable agents protect a rolling ~40 K-token window
-    /// of recent tool output; keeping 2 turns is the cheap approximation (a full token
-    /// budget window is a later refinement).
+    /// Window-scaled protect window (`None` → [`recent_keep_budget`]), exempt read_file.
+    /// A fixed turn count stubbed the PREVIOUS turn's tool outputs to a one-line summary
+    /// the moment the next turn began — so a multi-step investigation lost its `bash`/`grep`
+    /// results almost immediately. A window-scaled token window keeps recent tool output
+    /// readable, matches the proactive drain, and scales with the model's context.
     fn default() -> Self {
         Self {
-            keep_recent_turns: 2,
+            protect_tokens: None,
             exempt_read_file: true,
         }
     }
 }
 
 impl StubCompaction {
-    pub fn new(keep_recent_turns: usize, exempt_read_file: bool) -> Self {
+    /// Pin a FIXED protect-window budget (mostly for tests / callers that want a
+    /// window-independent boundary). Production uses [`StubCompaction::default`], which
+    /// scales the budget with the context window.
+    pub fn new(protect_tokens: usize, exempt_read_file: bool) -> Self {
         Self {
-            keep_recent_turns,
+            protect_tokens: Some(protect_tokens),
             exempt_read_file,
         }
     }
@@ -75,7 +84,14 @@ impl StubCompaction {
 impl CompactionStrategy for StubCompaction {
     async fn plan(&self, view: &CompactionView<'_>) -> CompactionPlan {
         let msgs = view.messages;
-        let boundary = active_turn_start(msgs, self.keep_recent_turns);
+        // Token-based protect window (turn-aligned, always ≥ the active turn, clamped to the
+        // sacred floor). The budget scales with the context window by default — the SAME
+        // `recent_keep_budget` the proactive drain uses, so gentle-stub and drain agree on
+        // what "recent" means and a small-window model still stubs proactively.
+        let budget = self
+            .protect_tokens
+            .unwrap_or_else(|| recent_keep_budget(view.ctx_window));
+        let boundary = recent_keep_boundary(msgs, budget, view.sacred_floor);
         if boundary <= view.sacred_floor {
             return CompactionPlan::noop(); // nothing older than the kept window
         }
