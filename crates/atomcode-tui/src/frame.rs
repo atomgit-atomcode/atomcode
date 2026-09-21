@@ -459,8 +459,16 @@ impl Frame {
                 let a = a.max(part.rect.x) - part.rect.x;
                 let b = b.min(part.rect.right()).saturating_sub(part.rect.x);
                 if a < b {
+                    // A UNIFORM selection band, not per-cell reverse. Toggling
+                    // `reverse` swaps each span's fg into its bg, so a run of cyan
+                    // code, a green ✓, and white prose each lit up in their OWN bright
+                    // colour — a rainbow patchwork. Instead paint one calm selection
+                    // ground under the whole range and keep each span's foreground, so
+                    // the selection reads as a single readable band (an editor's
+                    // selection, not inverse video).
                     *line = line.restyle(a as usize, b as usize, |st| Style {
-                        reverse: !st.reverse,
+                        bg: Some(Color::role(crate::theme::Role::PanelSelBg)),
+                        reverse: false,
                         ..st
                     });
                 }
@@ -637,15 +645,16 @@ mod tests {
             anchor: (2, 0),
             head: (4, 0),
         });
+        let sel_bg = Some(Color::role(crate::theme::Role::PanelSelBg));
         let marked: String = f.parts[0].lines[0]
             .spans
             .iter()
-            .filter(|s| s.style.reverse)
+            .filter(|s| s.style.bg == sel_bg)
             .map(|s| s.text.as_str())
             .collect();
         assert_eq!(marked, "cde", "the head's own cell is selected too");
         assert!(
-            f.parts[1].lines[0].spans.iter().all(|s| !s.style.reverse),
+            f.parts[1].lines[0].spans.iter().all(|s| s.style.bg != sel_bg),
             "a one-row selection reached the row below"
         );
     }
@@ -767,10 +776,11 @@ thr"
         assert_eq!(f.selected_text(&sel), "中");
         let mut marked = f.clone();
         marked.highlight(&sel);
+        let sel_bg = Some(Color::role(crate::theme::Role::PanelSelBg));
         let hot: String = marked.parts[0].lines[0]
             .spans
             .iter()
-            .filter(|s| s.style.reverse)
+            .filter(|s| s.style.bg == sel_bg)
             .map(|s| s.text.as_str())
             .collect();
         assert_eq!(hot, "中");
