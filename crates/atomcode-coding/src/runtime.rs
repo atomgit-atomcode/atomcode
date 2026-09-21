@@ -4380,6 +4380,20 @@ fn spawn_runtime_owner_with_optional_agent(
                             }
                         }
                         if !native_protocol || request_generation != generation || !agent_available {
+                            // Which of the three refused is the whole answer to
+                            // "esc did not stop the turn": a stale generation
+                            // means the runtime was rebuilt under the driver, and
+                            // `agent_available == false` means there is no agent
+                            // left to stop. Neither is a bug in the cancel path,
+                            // and without this line a report of the symptom
+                            // cannot be told apart from one that is.
+                            tracing::warn!(
+                                protocol = native_protocol,
+                                requested_generation = request_generation,
+                                current_generation = generation,
+                                agent_available,
+                                "a cancel was refused before it reached the agent"
+                            );
                             let _ = done.send(Err(RuntimeError::Unavailable));
                         } else if let Some((turn_id, _, snapshot, stats)) = held_turn.take() {
                             if let Some(mut state) = goal.take() {

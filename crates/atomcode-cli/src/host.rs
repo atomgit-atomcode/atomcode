@@ -353,16 +353,100 @@ fn reply(out: &mpsc::UnboundedSender<AgentEvent>, receipt: Option<CommandId>, an
             let _ = out.send(AgentEvent::Rejected { command, error });
         }
         // Nobody asked for a receipt, so a failure a person should see is said
-        // the way every other failure is.
-        (None, Err((_, Some(message)))) => {
+        // the way every other failure is. **Every** failure: a command refused
+        // without a word is a refusal the front end cannot read, and a front
+        // end that wrote a provisional state on the strength of having asked
+        // is left holding it. That is the shape of the stop button that looked
+        // pressed and did nothing — `esc` sends a bare `Cancel` (no receipt),
+        // the screen says 正在停止, and only an *event* takes that back. When
+        // an arm has no specific reason, say what the error class was rather
+        // than nothing at all.
+        (None, Err((error, message))) => {
             let _ = out.send(AgentEvent::Error {
-                message,
+                message: message.unwrap_or_else(|| refused_words(&error)),
                 http_status: None,
                 code: None,
                 retryable: None,
             });
         }
-        (None, _) => {}
+        (None, Ok(_)) => {}
+    }
+}
+
+/// A refusal in words, for a front end that was sent no receipt and so has only
+/// this channel to hear it on.
+fn refused_words(error: &CommandError) -> String {
+    match error {
+        CommandError::StaleQuestion => "that question is no longer waiting for an answer".into(),
+        CommandError::NotRunning => "nothing is running to act on".into(),
+        CommandError::Unavailable => "the agent cannot take commands now".into(),
+        CommandError::Busy { reason } => reason.clone(),
+        CommandError::NotFound => "no session by that id".into(),
+        CommandError::Unsupported => "that command is not supported here".into(),
+        // `CommandError` is `non_exhaustive`: a refusal added later still has
+        // to reach the person as *something*.
+        _ => "the command was refused".into(),
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::{refused_words, reply};
+    use atomcode_kernel::event::{AgentEvent, CommandError};
+
+    /// A refusal is said even when the command carried no receipt.
+    ///
+    /// `esc` sends a bare `Cancel` — no receipt — and the screen has already
+    /// written 正在停止 by the time the runtime answers. Only an *event* takes
+    /// that claim back, so a refusal that produced none left the stop button
+    /// looking pressed while the turn ran on: the reported "按 esc 没反应,
+    /// 一直显示正在停止". The words matter as much as the event: they are how a
+    /// person (and whoever reads the report) learns *why* the stop was refused.
+    #[test]
+    fn a_refusal_without_a_receipt_is_still_said() {
+        let (out, mut events) = tokio::sync::mpsc::unbounded_channel();
+        reply(&out, None, Err((CommandError::Unavailable, None)));
+        let event = events
+            .try_recv()
+            .expect("a refusal nobody holds a receipt for must not be swallowed");
+        assert!(
+            matches!(event, AgentEvent::Error { ref message, .. }
+                if message == &refused_words(&CommandError::Unavailable)),
+            "{event:?}"
+        );
+    }
+
+    /// The negative control: a command that WAS taken says nothing.
+    ///
+    /// Otherwise every keystroke that reached the runtime would paint an error,
+    /// and the event above would prove nothing about refusals in particular.
+    #[test]
+    fn a_command_that_was_taken_says_nothing() {
+        let (out, mut events) = tokio::sync::mpsc::unbounded_channel();
+        reply(&out, None, Ok(None));
+        assert!(events.try_recv().is_err(), "nothing happened to report");
+    }
+
+    /// A receipt still comes back as a receipt, not as an error line: a driver
+    /// that asked for an id is matching on it.
+    #[test]
+    fn a_refusal_with_a_receipt_is_answered_with_the_receipt() {
+        let (out, mut events) = tokio::sync::mpsc::unbounded_channel();
+        reply(
+            &out,
+            Some("c-1".into()),
+            Err((
+                CommandError::Busy {
+                    reason: "working".into(),
+                },
+                None,
+            )),
+        );
+        let event = events.try_recv().expect("the receipt is owed an answer");
+        assert!(
+            matches!(event, AgentEvent::Rejected { ref command, .. } if command == "c-1"),
+            "{event:?}"
+        );
     }
 }
 
@@ -404,11 +488,12 @@ async fn run(
             .await
             .map(|_| None)
             .map_err(|error| (command_error(error), None)),
-        AgentCommand::Cancel => handle
-            .cancel()
-            .await
-            .map(|_| None)
-            .map_err(|error| (command_error(error), None)),
+        // A stop the runtime could not take is said out loud: the screen has
+        // already written 正在停止 by the time this comes back, and an event is
+        // the only thing that can take that back. `refused` carries the
+        // runtime's own words (unavailable / delivery failed / …) instead of
+        // collapsing them to a bare class name.
+        AgentCommand::Cancel => handle.cancel().await.map(|_| None).map_err(refused),
         AgentCommand::Compact { focus } => handle.compact(focus).map(|_| None).map_err(|_| {
             (
                 CommandError::Unavailable,
