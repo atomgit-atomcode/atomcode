@@ -111,6 +111,14 @@ fn tool_loop_terminal_warning(policy: ToolLoopPolicy) -> String {
 /// than spinning — a genuinely-unrecoverable history (sacred floor alone over the window).
 const MAX_OVERFLOW_ATTEMPTS: u8 = 3;
 
+/// Byte budget (base64 image data) for a single outgoing request. Accumulated
+/// inline images — which a vision model re-sends EVERY turn — are folded oldest-
+/// first down to this before dispatch, so the request cannot blow a gateway's
+/// body-size limit (the CodingPlan gateway rejects >20MB with HTTP 413) and
+/// 413 on every turn. 14 MB leaves headroom for text / tool schemas / JSON under
+/// a 20 MB wire cap; images dominate the body, so their sum is an accurate proxy.
+const IMAGE_SEND_BUDGET_BYTES: usize = 14 * 1024 * 1024;
+
 /// How many times the agent loop re-opens a round after a TRANSIENT provider
 /// failure (`ProviderError::retryable`) before surfacing the error. This is the
 /// SECOND retry tier — the provider's transport layer already did its own fast
@@ -2080,6 +2088,10 @@ impl RunningAgent {
         // decrements that reset `round` to 1) AND tells the empty-exhaustion
         // terminal not to repeat the same size-blame.
         let mut over_window_warned = false;
+        // Per-turn latch for the image-fold advisory, mirroring `over_window_warned`:
+        // once told this turn that images were folded to fit the request-body limit,
+        // stay quiet across the round re-entries below.
+        let mut images_folded_warned = false;
         // Per-turn state for the always-on coarse fuse. Unlike the exact guard's
         // session-owned streak, this only describes consecutive rounds of this
         // running turn.
@@ -2305,6 +2317,37 @@ impl RunningAgent {
                      request (a pre_request hook may only APPEND tail reminders)",
                     convo.messages.len()
                 )));
+            }
+            // PRE-SEND IMAGE-BODY GUARD (止血): a vision model re-sends EVERY inline
+            // image on EVERY turn, so a conversation that accumulates images grows the
+            // request body without bound — past the gateway's 20MB cap it 413s on every
+            // turn, an unrecoverable "image-poisoned session" that per-image downscaling
+            // (which bounds each image, not the total) cannot fix. Fold the OLDEST images
+            // out of THIS projection down to the byte budget; the stored history keeps the
+            // originals. Runs after the cache-prefix guard (so its own non-append edit is
+            // not miscounted) and before on_request/chat_stream (so telemetry and the wire
+            // see the folded request). Once-per-turn advisory; escalated when even the
+            // most-recent image had to go.
+            {
+                let (folded, all_folded) = crate::message::Conversation::fold_oldest_images_to_budget(
+                    &mut messages,
+                    IMAGE_SEND_BUDGET_BYTES,
+                );
+                if folded > 0 && !images_folded_warned {
+                    images_folded_warned = true;
+                    let advisory = if all_folded {
+                        format!(
+                            "本轮图片过大/过多,已折叠全部 {folded} 张图片以让请求通过约 20MB 的网关上限 —— \
+                             模型本轮看不到图片。请减少图片数量、换更小的图,或分多轮发送。"
+                        )
+                    } else {
+                        format!(
+                            "本轮请求过大,已折叠较早的 {folded} 张图片以适应约 20MB 的网关上限\
+                             (仅本轮出站,会话历史仍保留原图)。"
+                        )
+                    };
+                    self.rt.emit(AgentEvent::Warning(advisory));
+                }
             }
             // READ-ONLY wire observation of the FINAL outgoing request (post
             // pre_request projection, pre chat_stream): telemetry/datalog/cache-RCA

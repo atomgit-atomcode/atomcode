@@ -539,6 +539,81 @@ impl Conversation {
         *msgs = rebuilt;
     }
 
+    /// Fold the OLDEST inline images down to a byte budget, so a conversation that
+    /// has accumulated many images cannot blow the gateway's request-body limit and
+    /// 413 on EVERY turn — an unrecoverable "image-poisoned session". A vision model
+    /// re-sends every image on every turn (images are never captioned/stripped for
+    /// it), so per-image downscaling alone can't bound the UNBOUNDED accumulation;
+    /// this caps the total.
+    ///
+    /// Operates on the per-send PROJECTION (the caller folds `convo.messages.clone()`
+    /// right before dispatch), so stored history and the on-screen images keep the
+    /// full-resolution originals — only THIS outgoing request is trimmed.
+    ///
+    /// Budget is base64 image bytes — images dominate the body, so their sum is an
+    /// accurate proxy. Oldest-first: the most recent image (what this turn is about)
+    /// is the last to go, and is kept inline for as long as the budget allows. Each
+    /// message that loses an image gets ONE placeholder line so the model knows one
+    /// was there.
+    ///
+    /// Returns `(folded, all_folded)`: how many images were folded, and whether even
+    /// the most-recent image had to go (the budget could not be met while keeping one
+    /// inline). The caller escalates its warning when `all_folded`.
+    pub fn fold_oldest_images_to_budget(msgs: &mut [Message], budget: usize) -> (usize, bool) {
+        const MARK: &str = "[较早的图片已折叠以适应请求大小上限]";
+
+        /// Remove the oldest inline image (first message that still has one, its
+        /// first image), tagging that message with `MARK` once. Returns bytes freed.
+        fn fold_oldest_image(msgs: &mut [Message]) -> Option<usize> {
+            for m in msgs.iter_mut() {
+                if !m.images.is_empty() {
+                    let freed = m.images.remove(0).data.len();
+                    if !m.text.contains(MARK) {
+                        if !m.text.is_empty() {
+                            m.text.push('\n');
+                        }
+                        m.text.push_str(MARK);
+                    }
+                    return Some(freed);
+                }
+            }
+            None
+        }
+
+        let mut total: usize = msgs
+            .iter()
+            .flat_map(|m| m.images.iter())
+            .map(|i| i.data.len())
+            .sum();
+        if total <= budget {
+            return (0, false);
+        }
+
+        let mut folded = 0usize;
+        // Fold oldest-first, keeping the single most-recent image inline while it fits.
+        while total > budget {
+            let remaining: usize = msgs.iter().map(|m| m.images.len()).sum();
+            if remaining <= 1 {
+                break;
+            }
+            match fold_oldest_image(msgs) {
+                Some(freed) => {
+                    total -= freed;
+                    folded += 1;
+                }
+                None => break,
+            }
+        }
+        // Still over with only the most-recent image left → fold it too (severe).
+        if total > budget {
+            if fold_oldest_image(msgs).is_some() {
+                folded += 1;
+            }
+            return (folded, true);
+        }
+        (folded, false)
+    }
+
     /// The number of LEADING messages that must NEVER be removed by compaction:
     /// a leading `Role::System` message (if present) PLUS up to and INCLUDING the
     /// FIRST NON-SYNTHETIC (`synthetic == false`) `Role::User` message. This keeps
@@ -1007,6 +1082,47 @@ impl SessionSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn img(bytes: usize) -> ImageContent {
+        ImageContent {
+            media_type: "image/png".into(),
+            data: "a".repeat(bytes),
+        }
+    }
+
+    #[test]
+    fn fold_images_noop_when_under_budget() {
+        let mut msgs = vec![Message::user_with_images("look", vec![img(100), img(100)])];
+        let (folded, all) = Conversation::fold_oldest_images_to_budget(&mut msgs, 1000);
+        assert_eq!((folded, all), (0, false));
+        assert_eq!(msgs[0].images.len(), 2, "nothing folded under budget");
+    }
+
+    #[test]
+    fn fold_images_drops_oldest_first_and_keeps_the_most_recent() {
+        // Three 100-byte images across two messages, budget 150 → must fold the two
+        // oldest and keep the most recent one inline.
+        let mut msgs = vec![
+            Message::user_with_images("first", vec![img(100), img(100)]),
+            Message::user_with_images("second", vec![img(100)]),
+        ];
+        let (folded, all) = Conversation::fold_oldest_images_to_budget(&mut msgs, 150);
+        assert_eq!((folded, all), (2, false));
+        assert!(msgs[0].images.is_empty(), "oldest message's images folded");
+        assert_eq!(msgs[1].images.len(), 1, "most-recent image kept inline");
+        assert!(msgs[0].text.contains("已折叠"), "folded message tagged once");
+        // The tag is added once, not per-image.
+        assert_eq!(msgs[0].text.matches("已折叠").count(), 1);
+    }
+
+    #[test]
+    fn fold_images_folds_everything_when_even_the_last_is_over_budget() {
+        // One giant recent image over budget → even it must go; all_folded = true.
+        let mut msgs = vec![Message::user_with_images("only", vec![img(500)])];
+        let (folded, all) = Conversation::fold_oldest_images_to_budget(&mut msgs, 100);
+        assert_eq!((folded, all), (1, true));
+        assert!(msgs[0].images.is_empty());
+    }
 
     #[test]
     fn last_pressure_reads_latest_assistant_meta() {
