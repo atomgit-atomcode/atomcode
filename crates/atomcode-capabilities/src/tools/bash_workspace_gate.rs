@@ -105,6 +105,36 @@ fn bash_command(args: &str) -> Option<String> {
     serde_json::from_str::<A>(args).ok().map(|a| a.command)
 }
 
+/// True iff any of these destructive `targets` is a sensitive path — the floor that
+/// makes such a command ask EVERY time (`grantable:false`) and that the session-wide
+/// "allow all bash" blanket must never cover. With a `cwd` the target is resolved
+/// against it (catches a relative `.ssh/authorized_keys`); without one, the raw target
+/// is classified — the same conservative fallback this gate itself uses when the cwd is
+/// unknown (an absolute/home/extension secret is still caught; only a relative secret
+/// is missed). One predicate so the gate and the blanket cannot drift apart.
+pub(crate) fn any_target_sensitive(targets: &[String], cwd: Option<&Path>) -> bool {
+    match cwd {
+        Some(cwd) => targets.iter().any(|t| path_is_sensitive(&resolve_path(t, cwd))),
+        None => targets.iter().any(|t| path_is_sensitive(Path::new(t))),
+    }
+}
+
+/// True iff a destructive command in `args` names a sensitive target, classified without
+/// a cwd. [`crate::tools::bash::BashTool::allow_all_group`] calls this so the blanket
+/// withholds "allow all bash" for exactly the destructive commands [`bash_workspace_verdict`]
+/// forces to ask every time. A read, an unparseable command, or an unresolvable target is
+/// not classified here — a sensitive READ is caught upstream by the `references_sensitive_path`
+/// floor the blanket checks first.
+pub(crate) fn args_name_sensitive_destructive_target(args: &str) -> bool {
+    let Some(command) = bash_command(args) else {
+        return false;
+    };
+    match scan_destructive_bash(&command) {
+        BashScan::Targets(t) => any_target_sensitive(&t, None),
+        BashScan::Unresolvable | BashScan::NotDestructive => false,
+    }
+}
+
 fn base(token: &str) -> &str {
     token.rsplit('/').next().unwrap_or(token)
 }
@@ -915,7 +945,7 @@ pub async fn bash_workspace_verdict(
         BashScan::Targets(t) => t,
     };
     let Some(cwd) = cwd else {
-        return if targets.iter().any(|t| path_is_sensitive(Path::new(t))) {
+        return if any_target_sensitive(&targets, None) {
             ungrantable
         } else {
             BashWorkspaceVerdict::Defer
@@ -924,10 +954,7 @@ pub async fn bash_workspace_verdict(
     // Sensitive TARGET → ask every time. Classified on the RESOLVED target (not a substring
     // of the whole command) so a benign command that merely MENTIONS a secret name
     // (`echo id_rsa >> ./notes.txt`) is not caught.
-    if targets
-        .iter()
-        .any(|t| path_is_sensitive(&resolve_path(t, cwd)))
-    {
+    if any_target_sensitive(&targets, Some(cwd)) {
         return ungrantable;
     }
     // Canonicalizes paths (filesystem I/O) — off the async worker and bounded, so a hung
@@ -1008,7 +1035,7 @@ impl ToolMiddleware for BashWorkspaceGate {
         let cwd = match self.cwd.read().ok().map(|g| g.clone()) {
             Some(c) => c,
             None => {
-                return if targets.iter().any(|t| path_is_sensitive(Path::new(t))) {
+                return if any_target_sensitive(&targets, None) {
                     self.prompt_unremembered(call, tool, rt).await
                 } else {
                     BeforeOutcome::Proceed
@@ -1021,10 +1048,7 @@ impl ToolMiddleware for BashWorkspaceGate {
         // command that merely MENTIONS a secret name (`echo id_rsa >> ./notes.txt`) isn't blocked.
         // This check runs BEFORE the allow-all bypass: sensitive targets are NEVER covered by the
         // session-wide allow-all grant — the sensitive floor must not be weakened.
-        if targets
-            .iter()
-            .any(|t| path_is_sensitive(&resolve_path(t, &cwd)))
-        {
+        if any_target_sensitive(&targets, Some(&cwd)) {
             return self.prompt_unremembered(call, tool, rt).await;
         }
 

@@ -28,7 +28,7 @@ use atomcode_capabilities::tools::request_user_input::{
 };
 use atomcode_kernel::session::LoggedEvent;
 use atomcode_kernel::session::{
-    Answer, Question, SessionEvent, ANSWER_ALLOW, ANSWER_ALWAYS, ANSWER_DENY,
+    Answer, Question, SessionEvent, ANSWER_ALLOW, ANSWER_ALWAYS, ANSWER_ALWAYS_ALL, ANSWER_DENY,
 };
 use serde_json::Value;
 use tokio::sync::oneshot;
@@ -185,7 +185,7 @@ pub fn question_for(kind: &str, payload: &Value, events: &[LoggedEvent]) -> Opti
                         .is_some_and(|a| a.tool == request.tool && a.arguments == request.args)
                 })
                 .unwrap_or_else(|| {
-                    Question::approval(&request.tool, &request.args, Some(""), None)
+                    Question::approval(&request.tool, &request.args, Some(""), None, None)
                 }),
             )
         }
@@ -349,13 +349,16 @@ pub const STOP: &str = "stop";
 /// declined, or nobody answered — is a refusal, never consent.
 pub fn response_for(kind: &str, _question: &Question, answer: Option<String>) -> Value {
     match kind {
-        APPROVAL_KIND => serde_json::json!({
-            "decision": match answer.as_deref() {
-                Some(ANSWER_ALLOW) => "allow",
-                Some(ANSWER_ALWAYS) => "allow_always",
-                _ => "deny",
+        APPROVAL_KIND => match answer.as_deref() {
+            Some(ANSWER_ALLOW) => serde_json::json!({ "decision": "allow" }),
+            Some(ANSWER_ALWAYS) => serde_json::json!({ "decision": "allow_always" }),
+            // The blanket answer carries the old front end's wire shape so a driver
+            // that parses `PermissionDecision` (daemon / ACP) reads it as `AllowAlwaysAll`.
+            Some(ANSWER_ALWAYS_ALL) => {
+                serde_json::json!({ "decision": "allow", "remember": true, "grant_scope": "all" })
             }
-        }),
+            _ => serde_json::json!({ "decision": "deny" }),
+        },
         REQUEST_USER_INPUT_KIND => {
             let response = match answer {
                 Some(chosen) => UserInputResponse {
@@ -400,6 +403,8 @@ pub fn answer_label(value: &str, fallback: &str) -> String {
     match value {
         ANSWER_ALLOW => pt(PMsg::ApprovalAllowOnce).into_owned(),
         ANSWER_ALWAYS => t(Msg::AskAlwaysAllow).into_owned(),
+        // The session-wide blanket — the same product words the old front end offered.
+        ANSWER_ALWAYS_ALL => pt(PMsg::ApprovalAllowAllBash).into_owned(),
         ANSWER_DENY => pt(PMsg::ApprovalDeny).into_owned(),
         _ => fallback.to_string(),
     }
@@ -653,6 +658,7 @@ mod tests {
             r#"{"file_path":"a"}"#,
             None,
             Some("scout".into()),
+            None,
         );
         let payload = serde_json::json!({ "call_id": "c", "tool": "write_file", "args": r#"{"file_path":"a"}"# });
         let question =
@@ -669,6 +675,35 @@ mod tests {
             let value = response_for(APPROVAL_KIND, &question, answer.map(str::to_string));
             assert_eq!(value["decision"], decision, "{answer:?}");
         }
+    }
+
+    /// The session-wide "allow all Bash" blanket is offered only when the policy
+    /// says the call is eligible (`allow_all = Some`), and it answers in the old
+    /// front end's wire shape so a `PermissionDecision` parser reads `AllowAlwaysAll`.
+    #[test]
+    fn the_allow_all_blanket_is_offered_when_eligible_and_answers_in_the_old_wire_shape() {
+        let none = Question::approval("bash", r#"{"command":"ls"}"#, Some(""), None, None);
+        assert!(
+            !none.has(ANSWER_ALWAYS_ALL),
+            "not offered when the policy withheld it (sensitive / not a group)"
+        );
+
+        let offered = Question::approval("bash", r#"{"command":"rm -rf x"}"#, Some(""), None, Some("bash"));
+        assert!(
+            offered.has(ANSWER_ALWAYS_ALL),
+            "offered when eligible"
+        );
+        assert!(offered.has(ANSWER_ALLOW) && offered.has(ANSWER_ALWAYS) && offered.has(ANSWER_DENY));
+
+        // The blanket answer carries `remember + grant_scope:"all"` (the AllowAlwaysAll wire).
+        let value = response_for(
+            APPROVAL_KIND,
+            &offered,
+            Some(ANSWER_ALWAYS_ALL.to_string()),
+        );
+        assert_eq!(value["decision"], "allow");
+        assert_eq!(value["remember"], true);
+        assert_eq!(value["grant_scope"], "all");
     }
 
     #[test]

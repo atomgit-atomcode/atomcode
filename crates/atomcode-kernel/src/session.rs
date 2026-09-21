@@ -1133,6 +1133,10 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<TracedMessage> {
 /// thing whichever gate asked and whatever carries it.
 pub const ANSWER_ALLOW: &str = "allow";
 pub const ANSWER_ALWAYS: &str = "allow_always";
+/// Allow AND remember for ALL calls of this call's group (e.g. every non-sensitive
+/// `bash`) this session — the blanket "本会话允许所有 Bash". Offered only when the
+/// call is eligible (see [`crate::tool::Tool::allow_all_group`]).
+pub const ANSWER_ALWAYS_ALL: &str = "allow_always_all";
 pub const ANSWER_DENY: &str = "deny";
 
 /// One answer: what comes back, and what a plain front end prints.
@@ -1234,10 +1238,20 @@ impl Question {
         arguments: &str,
         grant: Option<&str>,
         asker: Option<String>,
+        allow_all: Option<&str>,
     ) -> Self {
         let mut options = vec![Answer::labelled(ANSWER_ALLOW, "allow once")];
         if grant.is_some() {
             options.push(Answer::labelled(ANSWER_ALWAYS, "always allow"));
+        }
+        // The session-wide blanket for this call's group (`Some("bash")`), offered
+        // only when the policy says it may be — a sensitive target keeps it `None`,
+        // so the floor is not something a driver can accidentally offer past.
+        if let Some(group) = allow_all {
+            options.push(Answer::labelled(
+                ANSWER_ALWAYS_ALL,
+                format!("allow all {group} this session"),
+            ));
         }
         options.push(Answer::labelled(ANSWER_DENY, "deny"));
         Self {

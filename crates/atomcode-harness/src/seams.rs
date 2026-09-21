@@ -967,7 +967,7 @@ pub trait SessionTitle: Send + Sync {
 /// Questions put to a person, and their answers — session vocabulary, so the
 /// kernel's (`docs/adr/0024` §6). Re-exported where the seams have always named them.
 pub use atomcode_kernel::session::{
-    AboutCall, Answer, Question, ANSWER_ALLOW, ANSWER_ALWAYS, ANSWER_DENY,
+    AboutCall, Answer, Question, ANSWER_ALLOW, ANSWER_ALWAYS, ANSWER_ALWAYS_ALL, ANSWER_DENY,
 };
 
 /// Asking a human. `None` means "no answer" — every caller must treat that as a

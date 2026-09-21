@@ -728,6 +728,11 @@ impl ApprovalPolicy for Asker {
             &call.arguments,
             grantable.then_some(scope.as_str()),
             crate::agent::current_member_name(&self.ctx),
+            // The session-wide "allow all bash" blanket is wired on the in-process
+            // (`AskingPolicy`) path the new TUI uses; the driver/handle path here
+            // (daemon / ACP / webui) keeps the three answers until it grows the same
+            // shared sentinel store. Not offered rather than offered-and-ignored.
+            None,
         );
         // Written down around the round-trip, not instead of it: what goes over
         // the wire stays the driver's own `ApprovalRequest`/`PermissionDecision`

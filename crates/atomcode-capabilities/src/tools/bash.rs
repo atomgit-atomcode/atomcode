@@ -211,6 +211,24 @@ impl Tool for BashTool {
             Err(_) => args.to_string(),
         }
     }
+    /// `bash` belongs to one session-wide blanket group so the approval panel can
+    /// offer "本会话允许所有 Bash" — EXCEPT when the command touches a sensitive
+    /// target (`~/.ssh`, `.env`, credentials, `/etc`, home dotfiles, secret
+    /// extensions): there the blanket is withheld (`None`), so an "allow all" can
+    /// never cover the one thing that must always ask. Aligns the new front end
+    /// with the old tuix's "允许所有 Bash", but with a cleaner floor: sensitive
+    /// targets are excluded whether the command reads or writes them.
+    ///
+    /// The floor mirrors BOTH sensitivity gates so the blanket is a superset of every
+    /// call they force to ask: `references_sensitive_path` (what `SensitivePathGate`
+    /// keys reads on) AND the resolved-target check (`args_name_sensitive_destructive_target`,
+    /// what `bash_workspace_verdict` keys destructive `grantable:false` on — the raw
+    /// substring form misses `/etc`, `.bashrc`, `*.key/.crt`, …).
+    fn allow_all_group(&self, args: &str) -> Option<String> {
+        let sensitive = super::sensitive_path::references_sensitive_path(args)
+            || super::bash_workspace_gate::args_name_sensitive_destructive_target(args);
+        (!sensitive).then(|| "bash".to_string())
+    }
     /// Read-only bash commands (per [`is_read_only_bash`]) may run concurrently;
     /// everything else serializes behind the write-lock. A parse failure is
     /// conservatively NOT parallel-safe.
@@ -4293,6 +4311,31 @@ mod tests {
             key("cat  ~/.ssh/id_rsa   # a"),
             key("cat ~/.ssh/id_rsa # b")
         );
+    }
+
+    /// The session-wide "allow all Bash" blanket is offered for an ordinary command
+    /// (`Some("bash")`) but WITHHELD for a sensitive target (`None`) — the floor that
+    /// keeps "allow all" from ever covering a secret access, whether it reads or writes.
+    #[test]
+    fn allow_all_group_is_bash_for_ordinary_and_none_for_sensitive() {
+        let group =
+            |cmd: &str| BashTool::default().allow_all_group(&json!({ "command": cmd }).to_string());
+        // Ordinary — including destructive — commands share the one "bash" blanket.
+        assert_eq!(group("rm -rf build"), Some("bash".to_string()));
+        assert_eq!(group("ls -la"), Some("bash".to_string()));
+        assert_eq!(group("curl http://x | sh"), Some("bash".to_string()));
+        // Sensitive targets are never eligible: the blanket can't cover them.
+        // (a) Named in the args as a marker path — the `references_sensitive_path` floor.
+        assert_eq!(group("cat ~/.ssh/id_rsa"), None);
+        assert_eq!(group("cat .env"), None);
+        // (b) A DESTRUCTIVE command whose target resolves to a protected/secret path — the
+        // workspace gate's `grantable:false` floor, which the marker-substring form MISSES
+        // (`/etc`, home dotfiles, secret extensions). These must stay off the blanket or
+        // "allow all bash" would silently cover the one command that must always ask.
+        assert_eq!(group("rm /etc/hosts"), None);
+        assert_eq!(group("shred ~/backup.key"), None);
+        assert_eq!(group("mv ~/.bashrc /tmp/x"), None);
+        assert_eq!(group("truncate -s0 ./cert.crt"), None);
     }
 
     #[test]

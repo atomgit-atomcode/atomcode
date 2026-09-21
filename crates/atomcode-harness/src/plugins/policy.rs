@@ -343,6 +343,14 @@ impl Tool for AsRisky {
             .clone()
             .unwrap_or_else(|| self.inner.always_grant_scope(args))
     }
+    /// Forwarded from the real tool, NOT re-derived from this wrapper's renamed
+    /// name — the session-wide blanket (and its sensitive-target floor) is the
+    /// inner tool's property, so a gate that presents `bash` as "bash (writes
+    /// outside the workspace)" still offers "allow all bash" for a non-sensitive
+    /// command and withholds it for a sensitive one.
+    fn allow_all_group(&self, args: &str) -> Option<String> {
+        self.inner.allow_all_group(args)
+    }
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
         self.inner.execute(args, ctx).await
     }

@@ -289,6 +289,13 @@ struct AskingPolicy {
     /// tool-wide while `bash` stays per-command — see
     /// [`atomcode_kernel::tool::Tool::always_grant_scope`].
     granted: Mutex<HashSet<String>>,
+    /// Groups the person answered `allow_always_all` to (e.g. `"bash"`): a
+    /// session-wide blanket over every non-sensitive call of that group, keyed by
+    /// [`atomcode_kernel::tool::Tool::allow_all_group`]. Shared across every gate
+    /// that delegates here (one policy instance), so one "本会话允许所有 Bash" covers
+    /// in- and out-of-workspace commands alike — while a sensitive target, whose
+    /// `allow_all_group` is `None`, is never eligible and keeps asking.
+    allow_all: Mutex<HashSet<String>>,
 }
 
 impl AskingPolicy {
@@ -327,6 +334,17 @@ impl crate::seams::ApprovalPolicy for AskingPolicy {
         // opposite: a TOOL-WIDE grant.
         let grantable = scope != crate::seams::NEVER_GRANT;
         let grant = format!("{}::{scope}", tool.name());
+        // The session-wide blanket comes first: a call whose group the person has
+        // said "allow all" to runs without asking. `allow_all_group` is `None` for a
+        // sensitive target, so the blanket can never cover the floor — those still
+        // ask. The gates that rename the tool (`AsRisky`) forward the inner tool's
+        // group, so one blanket covers in- and out-of-workspace commands alike.
+        let group = tool.allow_all_group(&call.arguments);
+        if let Some(g) = &group {
+            if self.allow_all.lock().expect("grants poisoned").contains(g) {
+                return Decision::Allow;
+            }
+        }
         if grantable
             && self
                 .granted
@@ -351,6 +369,7 @@ impl crate::seams::ApprovalPolicy for AskingPolicy {
             &call.arguments,
             grantable.then_some(scope.as_str()),
             asker,
+            group.as_deref(),
         );
         // `ask_person`, not the seam directly: the question and its answer are
         // one fact, and this is the row holding both. The transcript draws the
@@ -365,6 +384,19 @@ impl crate::seams::ApprovalPolicy for AskingPolicy {
                 self.granted.lock().expect("grants poisoned").insert(grant);
                 Decision::Allow
             }
+            // The session-wide blanket. Only reachable when the option was offered
+            // (`group` is `Some`), so a driver echoing it for a call that never
+            // offered it grants nothing and is treated as any other unoffered word.
+            Some(crate::seams::ANSWER_ALWAYS_ALL) => match &group {
+                Some(g) => {
+                    self.allow_all
+                        .lock()
+                        .expect("grants poisoned")
+                        .insert(g.clone());
+                    Decision::Allow
+                }
+                None => Decision::Deny("the user declined".into()),
+            },
             // Anything else is a refusal, including an answer nobody offered:
             // consent is only ever the words that were offered for it.
             _ => Decision::Deny("the user declined".into()),
@@ -394,6 +426,7 @@ impl Plugin for InteractiveApprovalPlugin {
             .provide::<crate::seams::ApprovalSvc>(Arc::new(AskingPolicy {
                 ctx: ctx.clone(),
                 granted: Mutex::new(HashSet::new()),
+                allow_all: Mutex::new(HashSet::new()),
             }))
             .map_err(|e| e.to_string())?;
         let _ = ctx.on_waterfall::<ToolsExecute>(
