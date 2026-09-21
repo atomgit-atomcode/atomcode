@@ -28,7 +28,12 @@ mod table;
 pub(super) const RULE: &str = "─";
 
 fn code() -> Style {
-    Style::new().fg(Color::role(Role::Warning))
+    // Inline code is a COOL accent, not a warning colour. Highlighting every
+    // identifier / path / command in `Role::Warning` (orange) made a normal
+    // paragraph loud and busy; the calmer peers tint code in the accent hue and
+    // keep the loud/warning colours for actual warnings. Distinguished from a
+    // heading by weight — heading is the same accent but BOLD.
+    Style::new().fg(Color::role(Role::Accent))
 }
 fn heading() -> Style {
     Style::new().fg(Color::role(Role::Accent)).bold()
@@ -212,7 +217,11 @@ fn ordinary_line(t: &str, indent: usize, w: u16, base: Style) -> Vec<Line> {
         return vec![Line::styled(RULE.repeat(w as usize), fence())];
     }
     if let Some(b) = t.strip_prefix("> ").or_else(|| t.strip_prefix(">")) {
-        return wrap_spans(&inline(b, quote()), w, "▏ ", quote());
+        // A blockquote is a CALLOUT, not a heading. Keep the Accent gutter to mark it,
+        // but render the quoted TEXT as body (`base`, like an ordinary paragraph) — the
+        // text sharing `quote()`'s Accent with `heading()` made a `>` line read as a
+        // heading and lowered readability on a full sentence. Inline code still highlights.
+        return wrap_spans(&inline(b, base), w, "▏ ", quote());
     }
     if let Some((marker, b)) = list_item(t) {
         let lead = format!("{}{marker} ", " ".repeat(indent));
