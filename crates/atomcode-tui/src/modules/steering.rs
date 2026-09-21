@@ -20,23 +20,15 @@
 //! because the transcript draws the folded `UserMessage` from that same
 //! boundary onward.
 //!
-//! # Rendering is the settled rendering
+//! # Rendering: a compact queue preview
 //!
-//! The words are drawn by [`UserSaid`] — the very block the transcript will draw
-//! a moment later — rather than by a look-alike built here. Two reasons, and the
-//! second is the one that decided it:
-//!
-//! * The person is looking at their own words. A provisional style would read as
-//!   "something is wrong with what I typed".
-//! * **It is the same code, so it cannot drift.** A hand-copied bar is a second
-//!   answer to "what does the user's line look like", and it would be right on
-//!   the day it was written and wrong the first time that block changed. What
-//!   this panel is doing is showing the block early; showing it *differently*
-//!   would be the bug.
-//!
-//! One bar per queued message, because that is what folding produces: each input
-//! becomes its own `UserMessage`, hence its own block. Joining them into one bar
-//! would draw a paragraph the transcript is never going to have.
+//! Not a stack of transcript look-alikes. A header says what these lines ARE —
+//! typed ahead while a turn runs, folded in at the next tool-call boundary (or
+//! flushed now with Esc) — and each waiting message is one compact `↳ <text>`
+//! preview row, oldest first. So several lines typed ahead read as ONE pending
+//! batch rather than N sent-looking bars; the panel stays small even with a
+//! handful queued, and a long line is a single truncated preview (the full text
+//! is what actually gets sent at the boundary).
 //!
 //! Where the text lives, and why not here: [`Moment::steering`]. Nothing in the
 //! log is a steering line — that is the whole reason this panel exists — so it
@@ -49,11 +41,12 @@
 
 use atomcode_harness::session::SessionEvent;
 
-use crate::block::Content;
-use crate::content::UserSaid;
+use crate::el::El;
 use crate::frame::Line;
+use crate::i18n::{t, Msg};
 use crate::module::{Height, View};
 use crate::moment::{Moment, Viewport};
+use crate::theme::{self, Role};
 
 pub const ID: &str = "steering";
 
@@ -124,20 +117,26 @@ impl View for Steering {
     }
 }
 
-/// One [`UserSaid`] bar per message waiting, oldest first.
-///
-/// The blank lines between the bars that the conversation will have are not
-/// drawn: that spacing belongs to the seam between two blocks
-/// (`host::blank_between`), and these rows are not blocks. Nothing here decides
-/// it, so nothing here can disagree with it.
+/// A header, then one compact `↳ <text>` preview row per waiting message, oldest
+/// first. Empty (no header) when nothing is queued.
 fn bars(moment: &Moment, width: u16) -> Vec<Line> {
+    let queued: Vec<&str> = moment
+        .steering
+        .lines()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .collect();
+    if queued.is_empty() {
+        return Vec::new();
+    }
+    // A queue, not a stack of full user bars: a header that says these are waiting
+    // (folded at the next tool call, or flushed now with Esc), then one compact
+    // `↳ <text>` per message oldest-first — so several lines typed ahead read as one
+    // pending batch instead of N look-alike sent messages.
     let mut out: Vec<Line> = Vec::new();
-    for message in moment.steering.lines() {
-        let message = message.trim();
-        if message.is_empty() {
-            continue;
-        }
-        out.extend(UserSaid(message.to_string()).lines(&crate::block::RenderCtx::bare(width)));
+    out.extend(El::styled(t(Msg::SteeringQueued), theme::fg(Role::Muted)).lay(width));
+    for message in queued {
+        out.extend(El::styled(format!("  ↳ {message}"), theme::fg(Role::Muted)).lay(width));
     }
     out
 }
@@ -196,82 +195,61 @@ mod tests {
     }
 
     #[test]
-    fn what_is_drawn_is_exactly_what_the_transcript_will_draw() {
-        // The point of going through `UserSaid` instead of a look-alike: this
-        // test would have to be rewritten if the panel built its own spans, and
-        // rewriting it is the moment somebody notices the two drifted. Compared
-        // against the block itself at the same width, styles included.
-        let text = "看看 crates/ 的结构";
-        let m = waiting(text);
-        let panel = draw_at(&m, 60, 6);
-        assert_eq!(panel.len(), 2, "margin, then one bar");
-        let settled = UserSaid(text.to_string()).lines(&crate::block::RenderCtx::bare(60));
-        assert_eq!(
-            panel[1].spans, settled[0].spans,
-            "the panel must draw the same row the transcript draws"
+    fn the_queue_is_a_header_then_a_row_per_message() {
+        // Not a stack of transcript look-alikes: a header that says the lines are
+        // waiting, then one `↳ <text>` per message.
+        let m = waiting("看看 crates/ 的结构");
+        let lines = draw(&m, 80, 8);
+        assert_eq!(lines[0], "", "margin first");
+        assert!(
+            !lines[1].is_empty() && !lines[1].contains('↳'),
+            "a header row, not an entry: {lines:#?}"
         );
         assert!(
-            panel[1].plain().contains("❯"),
-            "the prompt marker is part of that row: {:?}",
-            panel[1].plain()
+            lines
+                .iter()
+                .any(|l| l.contains('↳') && l.contains("看看 crates/ 的结构")),
+            "the message is a ↳ entry: {lines:#?}"
         );
     }
 
     #[test]
-    fn words_waiting_draw_a_margin_then_the_bar() {
+    fn a_rect_that_cannot_seat_the_margin_keeps_the_content() {
+        // Same bargain as the live line: the margin drops first, so the queue
+        // shows rather than a blank row.
         let m = waiting("and also this");
-        let lines = draw(&m, 60, 6);
-        assert_eq!(lines.len(), 2, "{lines:#?}");
-        assert_eq!(lines[0], "", "the margin comes first: {lines:#?}");
-        assert!(
-            lines[1].contains("and also this"),
-            "the words are the row: {lines:#?}"
-        );
-        assert_eq!(Steering::height(&State, &m, 60), Height::Hug(2));
-    }
-
-    #[test]
-    fn a_rect_that_cannot_seat_the_margin_keeps_the_words() {
-        // Same bargain as the live line: at a height that cannot hold both, the
-        // words win, because a blank row drawn in place of them is a panel that
-        // says nothing.
-        let m = waiting("and also this");
-        let lines = draw(&m, 60, 1);
+        let lines = draw(&m, 80, 1);
         assert_eq!(lines.len(), 1, "{lines:#?}");
-        assert!(lines[0].contains("and also this"), "{lines:#?}");
+        assert_ne!(lines[0], "", "not a blank margin row: {lines:#?}");
     }
 
     #[test]
-    fn each_message_gets_its_own_bar_the_way_folding_will() {
-        // Folding turns each input into its own `UserMessage`, so joining them
-        // into one bar here would draw a paragraph the transcript never has.
-        let m = waiting("first follow-up\nsecond follow-up");
-        let lines = draw(&m, 60, 8);
-        assert_eq!(lines.len(), 3, "{lines:#?}");
+    fn several_lines_typed_ahead_read_as_one_pending_batch() {
+        // Three follow-ups → ONE header + three ↳ rows (a batch), not three bars.
+        let m = waiting("first follow-up\nsecond follow-up\nthird");
+        let lines = draw(&m, 80, 10);
         assert_eq!(lines[0], "");
-        assert!(lines[1].contains("first follow-up"), "{lines:#?}");
-        assert!(lines[2].contains("second follow-up"), "{lines:#?}");
-        assert_eq!(Steering::height(&State, &m, 60), Height::Hug(3));
+        let entries: Vec<&String> = lines.iter().filter(|l| l.contains('↳')).collect();
+        assert_eq!(entries.len(), 3, "one ↳ per message: {lines:#?}");
+        assert!(entries[0].contains("first follow-up"));
+        assert!(entries[2].contains("third"));
+        // margin(1) + header(1) + 3 entries = 5
+        assert_eq!(Steering::height(&State, &m, 80), Height::Hug(5));
     }
 
     #[test]
-    fn a_long_message_wraps_the_way_the_settled_one_does() {
-        // The height has to follow the wrapping, or a long sentence would be
-        // drawn into rows the host was never asked for.
+    fn a_long_message_is_one_truncated_preview_row() {
+        // A queue is a glance, not the full paste: a long entry is a single
+        // truncated preview row so the panel stays compact.
         let text = "a sentence long enough that it cannot possibly fit on one row of \
                     a sixty column screen without wrapping somewhere";
         let m = waiting(text);
         let width = 60u16;
-        let rows = UserSaid(text.to_string())
-            .lines(&crate::block::RenderCtx::bare(width))
-            .len();
-        assert!(rows > 1, "the fixture must actually wrap: {rows} rows");
         let lines = draw(&m, width, 20);
-        assert_eq!(lines.len(), rows + 1, "margin plus the bar's own rows");
-        assert_eq!(
-            Steering::height(&State, &m, width),
-            Height::Hug((rows + 1) as u16)
-        );
+        // margin(1) + header(1) + one (truncated) entry(1)
+        assert_eq!(lines.len(), 3, "one preview row per message: {lines:#?}");
+        assert!(lines[2].contains('↳'), "the entry stays one row: {lines:#?}");
+        assert_eq!(Steering::height(&State, &m, width), Height::Hug(3));
     }
 
     #[test]
