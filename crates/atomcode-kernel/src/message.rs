@@ -1110,7 +1110,10 @@ mod tests {
         assert_eq!((folded, all), (2, false));
         assert!(msgs[0].images.is_empty(), "oldest message's images folded");
         assert_eq!(msgs[1].images.len(), 1, "most-recent image kept inline");
-        assert!(msgs[0].text.contains("已折叠"), "folded message tagged once");
+        assert!(
+            msgs[0].text.contains("已折叠"),
+            "folded message tagged once"
+        );
         // The tag is added once, not per-image.
         assert_eq!(msgs[0].text.matches("已折叠").count(), 1);
     }

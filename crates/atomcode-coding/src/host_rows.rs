@@ -2787,7 +2787,6 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::Arc;
 
-
     /// What a person wrote themselves reaches the model, and a configuration
     /// that will not parse still gets them the built-in prompt.
     ///

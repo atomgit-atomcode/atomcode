@@ -168,7 +168,11 @@ async fn the_assembly_lifecycle() {
         // appended AFTER the cached prefix — on EVERY round, round 1 included. So round 1 ends
         // with that reminder (a synthetic user-role tail), not the user turn itself.
         let tail = first.last().unwrap();
-        assert_eq!(tail.role, Role::User, "the date tail is a user-role message");
+        assert_eq!(
+            tail.role,
+            Role::User,
+            "the date tail is a user-role message"
+        );
         assert!(
             tail.text.contains("<system-reminder>") && tail.text.contains("Current date"),
             "round 1 ends with the current-date reminder tail: {:?}",

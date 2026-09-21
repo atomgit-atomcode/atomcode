@@ -425,13 +425,20 @@ mod tests {
     #[test]
     fn the_upper_rule_carries_the_history_on_the_left_and_the_name_on_the_right() {
         let mut m = Moment::default();
-        assert_eq!(history_caption(&m), None, "nothing arrowed, no left caption");
+        assert_eq!(
+            history_caption(&m),
+            None,
+            "nothing arrowed, no left caption"
+        );
 
         // The name alone rides the right shoulder — a resumed or renamed session
         // says which one it is even before anybody arrows the history.
         m.title = Some("修解析器".into());
         let named = draw(&State::default(), &m, 40, 3);
-        assert!(named[0].contains("修解析器"), "the name is on the rule:\n{named:?}");
+        assert!(
+            named[0].contains("修解析器"),
+            "the name is on the rule:\n{named:?}"
+        );
 
         m.history = vec!["one".into(), "two".into(), "three".into()];
         m.history_at = Some(2); // the first press back: the newest entry
@@ -443,7 +450,10 @@ mod tests {
         let out = draw(&State::default(), &m, 40, 3);
         let left = out[0].find("3/3").expect("the history position");
         let right = out[0].find("修解析器").expect("the session name");
-        assert!(left < right, "history on the left, name on the right:\n{out:?}");
+        assert!(
+            left < right,
+            "history on the left, name on the right:\n{out:?}"
+        );
 
         // Too narrow for either shoulder: the boundary survives, the words go.
         let narrow = draw(&State::default(), &m, 12, 3);

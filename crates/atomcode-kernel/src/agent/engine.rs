@@ -2332,10 +2332,11 @@ impl RunningAgent {
             // once-per-turn warning, because the user's image task can't be met and they
             // need to act.
             {
-                let (folded, all_folded) = crate::message::Conversation::fold_oldest_images_to_budget(
-                    &mut messages,
-                    IMAGE_SEND_BUDGET_BYTES,
-                );
+                let (folded, all_folded) =
+                    crate::message::Conversation::fold_oldest_images_to_budget(
+                        &mut messages,
+                        IMAGE_SEND_BUDGET_BYTES,
+                    );
                 if all_folded && !images_folded_warned {
                     images_folded_warned = true;
                     self.rt.emit(AgentEvent::Warning(format!(

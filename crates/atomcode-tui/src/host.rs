@@ -8291,7 +8291,11 @@ mod tests {
         for _ in 0..4 {
             p.toggle("tool_call");
         }
-        assert_eq!(p.tool_output(), ToolOutput::Full, "back at the default view");
+        assert_eq!(
+            p.tool_output(),
+            ToolOutput::Full,
+            "back at the default view"
+        );
         assert!(
             p.is_block_folded(id, "tool_call"),
             "the finished call falls back to its one-row default, not expanded"

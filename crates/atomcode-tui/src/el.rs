@@ -1081,14 +1081,18 @@ mod tests {
 
         // Name alone still rides the right shoulder.
         let named = flanked_rule(None, Some("修解析器"), 40, s, s, s).plain();
-        assert!(named.contains("修解析器") && !named.contains("历史"), "{named:?}");
+        assert!(
+            named.contains("修解析器") && !named.contains("历史"),
+            "{named:?}"
+        );
 
         // Neither fits: a bare full-width rule, no half-words.
         let narrow = flanked_rule(Some("历史 1/3"), Some("修解析器"), 12, s, s, s).plain();
         assert_eq!(narrow, "─".repeat(12), "{narrow:?}");
 
         // A name too long for its budget truncates with an ellipsis, never spills.
-        let long = flanked_rule(None, Some("一个特别特别长的会话名字确实很长"), 24, s, s, s).plain();
+        let long =
+            flanked_rule(None, Some("一个特别特别长的会话名字确实很长"), 24, s, s, s).plain();
         assert_eq!(width::str_width(&long), 24, "{long:?}");
         assert!(long.contains('…'), "truncated, not dropped: {long:?}");
     }
