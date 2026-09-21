@@ -235,10 +235,12 @@ fn layout(question: &Question, w: usize, h: usize) -> Vec<Row> {
 /// Cut the layout down to the height it was given, least important row first.
 ///
 /// The order is deliberate: the margin above the question goes, then the legend
-/// and its blank, and only then the tail of what is left. Truncating the end
-/// instead would take the answers first — the one thing the panel is for — and
-/// leave a blank row and a legend behind, which is a panel that says nothing and
-/// explains how to work it.
+/// and its blank, then the command's OWN lines (the text between the header and
+/// the answers) from the bottom up — and only as a last resort the answers. The
+/// answers are the one thing the panel is for; a short terminal that cannot hold
+/// a long command AND its options drops command lines, never an option a person
+/// still has to pick from. `geometry` fits the same way, so a click still lands
+/// on the row it lit.
 fn fit(mut rows: Vec<Row>, h: usize) -> Vec<Row> {
     if rows.len() <= h {
         return rows;
@@ -251,6 +253,22 @@ fn fit(mut rows: Vec<Row>, h: usize) -> Vec<Row> {
         if rows.last() == Some(&Row::Blank) {
             rows.pop();
         }
+    }
+    // Still too tall: shed the command's own lines before the answers. Each pass
+    // drops the LAST text row that sits before the first answer — the tail of the
+    // command (its `…` marker first, then its bottom lines), keeping the header
+    // and the answers. Only when no such line is left does the final truncate
+    // reach the answers, which no panel this short could have shown in full.
+    while rows.len() > h {
+        let first_answer = rows.iter().position(|r| matches!(r, Row::Answer(_)));
+        let Some(cut) = first_answer.and_then(|a| {
+            rows[..a]
+                .iter()
+                .rposition(|r| matches!(r, Row::Text { .. }))
+        }) else {
+            break;
+        };
+        rows.remove(cut);
     }
     rows.truncate(h);
     rows
@@ -479,6 +497,27 @@ mod tests {
                 .position(|r| matches!(r, Row::Text { .. }))
                 .map(|p| p + 2),
             "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_short_rect_sheds_the_command_lines_before_the_answers() {
+        // An approval whose command is a long heredoc, at a height too short to
+        // hold the whole command AND its options: the command's own lines are what
+        // go — never an answer, because a person cannot pick an option that was
+        // truncated off the panel.
+        let cmd = (0..40)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let args = serde_json::json!({ "command": cmd }).to_string();
+        let question = approval(None, "bash (writes outside the workspace)", &args, Some(""));
+        let rows = layout(&question, 40, 5);
+        assert!(rows.len() <= 5, "fits the height: {rows:?}");
+        assert_eq!(
+            rows.iter().filter(|r| matches!(r, Row::Answer(_))).count(),
+            question.options.len(),
+            "every option survives the squeeze: {rows:?}"
         );
     }
 
