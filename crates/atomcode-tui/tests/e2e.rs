@@ -1141,12 +1141,11 @@ async fn folding_changes_what_is_shown_and_not_what_was_said() {
     s.quiet().await;
 
     let before = s.screen();
-    // The cycle is `Full → Head → Each → Group`; the first press previews
-    // (identical on screen for a call this short), the second summarises
-    // each call to one row.
-    s.term.press(KeyPress::ctrl('t'));
-    s.quiet().await;
-    s.term.press(KeyPress::ctrl('t')); // fold tool calls
+    // A finished call folds itself to one row (`Full` auto-collapses what has
+    // stopped running). The cycle is `Full → Head → Each → Group`; the first
+    // press moves to `Head`, which previews the call in full again, so the one
+    // gesture visibly re-expands the row that was folded.
+    s.term.press(KeyPress::ctrl('t')); // full (auto-folded) -> head (previewed)
     s.quiet().await;
     let after = s.screen();
     assert_ne!(before, after, "folding must change the screen");
@@ -2897,14 +2896,17 @@ async fn a_command_and_a_key_share_one_implementation() {
     s.term.type_line("hi");
     s.quiet().await;
 
-    // Fold with the key, then unfold and fold again with the command. If they
-    // were two implementations these two screens would differ. The cycle is
-    // three states now (`full → each → group → full`), so the key is pressed
-    // back round to the start before the command takes its one step.
-    s.term.press(KeyPress::ctrl('t'));
+    // Step the cycle once with the key, then step it once with the command from
+    // the same starting point. If they were two implementations the two screens
+    // would differ. The cycle is four states (`full → head → each → group →
+    // full`), so after the key takes its one step we run the rest of the way
+    // round to `full` before the command takes its one step.
+    s.term.press(KeyPress::ctrl('t')); // full -> head
     s.quiet().await;
     let by_key = s.screen();
 
+    s.term.press(KeyPress::ctrl('t')); // head -> each
+    s.quiet().await;
     s.term.press(KeyPress::ctrl('t')); // each -> group
     s.quiet().await;
     s.term.press(KeyPress::ctrl('t')); // group -> full, back to the start

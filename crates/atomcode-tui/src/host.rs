@@ -140,6 +140,14 @@ pub struct Presentation {
     /// state on a mode change — a statement about one call does not survive
     /// into a mode that decides for every call.
     full_open: std::collections::HashSet<BlockId>,
+    /// Tool calls collapsed automatically the moment they finished — the
+    /// "expanded while running, one row once done" default. Separate from
+    /// `by_block` (a hand fold) so it survives a mode change: `ctrl-t` clears the
+    /// hand state, but the auto-fold is a property of the *default* view, so a
+    /// full cycle of the modes comes back to exactly the same screen. Consulted
+    /// only in [`ToolOutput::Full`] (the default); the compact modes decide for
+    /// themselves. Cleared with the stream, and rebuilt as results re-arrive.
+    auto_folded: std::collections::HashSet<BlockId>,
     /// The turns that were taken back: their blocks are drawn as one dim line
     /// (`docs/adr/0024` §17). Here rather than only on the moment because the
     /// row count keys on this struct's revision, and folding a turn changes
@@ -194,6 +202,7 @@ impl Presentation {
             tool_output: ToolOutput::default(),
             by_block: std::collections::HashMap::new(),
             full_open: std::collections::HashSet::new(),
+            auto_folded: std::collections::HashSet::new(),
             undone: std::collections::BTreeSet::new(),
             revision: 0,
         }
@@ -271,6 +280,15 @@ impl Presentation {
         if self.by_block.get(&id).copied().unwrap_or(false) {
             return ToolShow::Folded;
         }
+        // A finished call recedes to one summary row in the default view — unless
+        // the reader has spoken about it by hand (`by_block`, checked above and
+        // guarded here so a hand-opened call is not re-folded).
+        if !self.by_block.contains_key(&id)
+            && self.tool_output == ToolOutput::Full
+            && self.auto_folded.contains(&id)
+        {
+            return ToolShow::Folded;
+        }
         match self.tool_output {
             ToolOutput::Full => ToolShow::Full,
             ToolOutput::Head => {
@@ -315,10 +333,18 @@ impl Presentation {
     ///
     /// [`is_hidden`]: Self::is_hidden
     pub fn is_block_folded(&self, id: BlockId, kind: &str) -> bool {
-        match self.by_block.get(&id) {
-            Some(folded) => *folded,
-            None => self.is_folded(kind),
+        if let Some(folded) = self.by_block.get(&id) {
+            return *folded;
         }
+        // A finished call recedes to one row in the default view; a hand fold
+        // above already took precedence.
+        if kind == "tool_call"
+            && self.tool_output == ToolOutput::Full
+            && self.auto_folded.contains(&id)
+        {
+            return true;
+        }
+        self.is_folded(kind)
     }
 
     /// Show more of every block of a kind, or put it away again. The keyboard
@@ -399,6 +425,20 @@ impl Presentation {
     pub fn set_block(&mut self, id: BlockId, folded: bool) {
         self.by_block.insert(id, folded);
         self.bump();
+    }
+
+    /// Collapse a block by default — but only if the reader has not already said
+    /// something about it by hand. Used to fold a tool call the moment it
+    /// finishes: it was expanded while running (so its command was in view), and
+    /// once the result is in there is nothing to watch, so it recedes to one row.
+    /// A call the reader opened or closed themselves keeps their choice.
+    pub fn fold_finished(&mut self, id: BlockId) {
+        // A hand fold/unfold wins: if the reader has already spoken about this
+        // call, leave it. Otherwise remember it as auto-folded — a separate set
+        // from `by_block` so it survives a mode change (see [`auto_folded`]).
+        if !self.by_block.contains_key(&id) && self.auto_folded.insert(id) {
+            self.bump();
+        }
     }
 }
 
@@ -1586,7 +1626,38 @@ impl Host {
         // Pinned while the reader is holding a position: what the fact does to
         // the conversation is what moves the reading, and the reading has to
         // move with it or the same words slide out from under the same eyes.
-        self.pinned(true, || self.fold(logged));
+        // The finished-call fold rides inside the pin too: it changes the row
+        // count (the call drops from full to one row), so it must be measured
+        // the same way everything else that moves the conversation is.
+        self.pinned(true, || {
+            self.fold(logged);
+            if let SessionEvent::ToolResultLogged { call_id, .. } = fact {
+                self.fold_finished_call(call_id);
+            }
+        });
+    }
+
+    /// Remember a tool call as auto-folded the moment its result lands — the way
+    /// the reference does it: expanded while running, one row once done. Recorded
+    /// in every mode (it is only *read* in the default `Full` view; the compact
+    /// modes decide for themselves), so switching to the default later still
+    /// shows a call that finished under another mode as one row. A hand
+    /// fold/unfold still wins (see [`Presentation::fold_finished`]).
+    fn fold_finished_call(&self, call_id: &str) {
+        let id = {
+            let stream = self.stream.read().expect("stream poisoned");
+            stream.slots().iter().find_map(|s| {
+                let b = s.block();
+                (b.content.as_tool_call().map(|t| t.call_id.as_str()) == Some(call_id))
+                    .then_some(b.id)
+            })
+        };
+        if let Some(id) = id {
+            self.presentation
+                .write()
+                .expect("presentation poisoned")
+                .fold_finished(id);
+        }
     }
 
     /// Fold one fact into every module, and into the few things the host keeps
@@ -7793,6 +7864,54 @@ mod tests {
         );
     }
 
+    /// A call is expanded while it runs — its command is worth watching — and
+    /// collapses to one summary row the moment its result lands, the way the
+    /// reference does it. The default (`Full`) view, no `ctrl-t` needed.
+    #[test]
+    fn a_call_is_open_while_running_and_folds_once_it_finishes() {
+        let h = host();
+        let call = SessionEvent::AssistantMessage {
+            turn: 1,
+            round: 1,
+            text: String::new(),
+            reasoning: String::new(),
+            tool_calls: vec![atomcode_kernel::tool::ToolCall {
+                id: "c1".into(),
+                name: "read_file".into(),
+                arguments: r#"{"file_path":"a.rs"}"#.into(),
+            }],
+            reasoning_blocks: Vec::new(),
+            meta: None,
+        };
+        h.absorb(&call);
+        // Running: expanded, so the result gutter (`⎿ 运行中`) is on its own row.
+        let running = h.compose((64, 40)).rows();
+        assert!(
+            running.iter().any(|r| r.contains('⎿')),
+            "a running call is expanded:\n{running:#?}"
+        );
+
+        // The result lands — the call collapses to a single summary row.
+        h.absorb(&SessionEvent::ToolResultLogged {
+            turn: 1,
+            round: 1,
+            call_id: "c1".into(),
+            content: "fn main() {}".into(),
+            is_error: false,
+            images: Vec::new(),
+        });
+        let done = h.compose((64, 40)).rows();
+        assert!(
+            !done.iter().any(|r| r.contains('⎿')),
+            "a finished call folds to one row:\n{done:#?}"
+        );
+        assert!(
+            done.iter()
+                .any(|r| r.contains("ReadFile(a.rs)") && r.contains("fn main")),
+            "the summary carries the result:\n{done:#?}"
+        );
+    }
+
     #[test]
     fn the_users_message_opens_a_paragraph_the_answer_starts_under() {
         // What you asked is the row you scan for. With the reply's first row
@@ -7878,7 +7997,22 @@ mod tests {
         // fold. When the corpus outgrows this, the row that fell off the top is
         // the user's bar and its `.expect` says so; the fix is a taller window,
         // not a shorter corpus.
-        let rows = stream_rows(&fed(), (64, 120));
+        let h = fed();
+        // Finished calls now auto-collapse to one row; expand one by hand so the
+        // expanded-gutter alignment this test is about is on screen.
+        let call_id = {
+            let stream = h.stream.read().expect("stream poisoned");
+            stream
+                .slots()
+                .iter()
+                .find_map(|s| s.block().content.as_tool_call().map(|_| s.block().id))
+                .expect("a tool call in the corpus")
+        };
+        h.presentation
+            .write()
+            .expect("presentation poisoned")
+            .set_block(call_id, false);
+        let rows = stream_rows(&h, (64, 120));
         let prose = rows
             .iter()
             .find(|r| r.contains("Fixed it"))
