@@ -1159,10 +1159,9 @@ impl Content for ToolCallBlock {
         // accounting does not, and what the next block draws lands on top of it.
         let full = flatten(&subject_of(&self.name, &self.args));
         let has_subject = !full.is_empty();
-        // What is already spoken for: the mark and its space, the tool's name,
-        // the parentheses, and the ` · ` that introduces the note.
-        let fixed = 2
-            + width::str_width(&name)
+        // What is already spoken for: the tool's name, the parentheses, and the
+        // ` · ` that introduces the note. No mark — a folded call is flush-left.
+        let fixed = width::str_width(&name)
             + if has_subject { 2 } else { 0 }
             + if note.is_empty() {
                 0
@@ -1175,16 +1174,16 @@ impl Content for ToolCallBlock {
             String::new()
         };
 
-        let mut spans = vec![Span::styled(
-            format!("{} ", Caps::default().g(Glyph::ToolMark)),
-            style,
-        )];
-        // `name(subject)` — the same shape as the expanded form, so folding
-        // changes how much you see and not what you are looking at.
+        // No `●` on a folded call, and flush-left: a screenful of folded
+        // commands reads cleaner without a column of grey dots, and the work is
+        // not set in — only its reply is (`⎿` in the gutter). The coloured dot
+        // stays on the EXPANDED call, where it opens the block.
         //
-        // A verb replaces the tool name when the name is machinery rather than
+        // `name(subject)` — the same shape as the expanded head, just without the
+        // mark: folding changes how much you see, not what you are looking at. A
+        // verb replaces the tool name when the name is machinery rather than
         // meaning: `$ cargo test` reads; `bash {"command":…}` does not.
-        spans.push(Span::styled(name, style));
+        let mut spans = vec![Span::styled(name, style)];
         if has_subject {
             spans.push(Span::styled(format!("({subject})"), style));
         }
@@ -2905,8 +2904,10 @@ mod tests {
             !lid.contains('\n') && !lid.contains('\r'),
             "the lid is more than one row: {lid:?}"
         );
-        // Still the command, still readable at both ends.
-        assert!(lid.starts_with("● $(cd /tmp"), "{lid:?}");
+        // Still the command, still readable at both ends — and no dot on a
+        // folded call (the coloured one stays on the expanded head).
+        assert!(!lid.contains('●'), "a folded call keeps no dot: {lid:?}");
+        assert!(lid.trim_start().starts_with("$(cd /tmp"), "{lid:?}");
         assert!(lid.ends_with("PY) · 运行中"), "{lid:?}");
 
         // Expanded: over as many rows as it takes, and every one of them one row.
@@ -2945,8 +2946,12 @@ mod tests {
         );
         let a = width::str_width(&ascii.summary(&crate::block::RenderCtx::bare(60)).plain());
         let c = width::str_width(&cjk.summary(&crate::block::RenderCtx::bare(60)).plain());
+        // Within one CJK character: a flush-left folded line (no `●`) has no even
+        // mark offset to align the parity, so the last two-wide character can be
+        // the one that will not fit — up to its own two cells left blank, never a
+        // whole extra character's worth less than the ASCII line.
         assert!(
-            (a as i64 - c as i64).abs() <= 1,
+            (a as i64 - c as i64).abs() <= 2,
             "ascii {a} vs cjk {c} cells"
         );
         assert_eq!(a, 60, "the line does not use the width it was given");
@@ -2964,8 +2969,9 @@ mod tests {
         // Narrower than the command, so the line is forced to abbreviate.
         let line = c.summary(&crate::block::RenderCtx::bare(48)).plain();
         assert!(line.contains('…'), "nothing was abbreviated: {line:?}");
+        assert!(!line.contains('●'), "a folded call keeps no dot: {line:?}");
         assert!(
-            line.starts_with("● $(git log"),
+            line.trim_start().starts_with("$(git log"),
             "the head of the command is gone: {line:?}"
         );
         assert!(
