@@ -8591,7 +8591,9 @@ mod tests {
             .iter()
             .find(|r| r.contains("cd /Users"))
             .expect("a tool call");
-        assert_eq!(leading(call), 0, "the call was set in too: {call:?}");
+        // A folded call sits in the expanded head's name column (two cells) but
+        // carries no dot — the coloured mark stays on the expanded call.
+        assert_eq!(leading(call), 2, "the folded call left its column: {call:?}");
 
         let notice = rows
             .iter()

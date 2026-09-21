@@ -1159,9 +1159,10 @@ impl Content for ToolCallBlock {
         // accounting does not, and what the next block draws lands on top of it.
         let full = flatten(&subject_of(&self.name, &self.args));
         let has_subject = !full.is_empty();
-        // What is already spoken for: the tool's name, the parentheses, and the
-        // ` · ` that introduces the note. No mark — a folded call is flush-left.
-        let fixed = width::str_width(&name)
+        // What is already spoken for: the two-cell indent (where the mark used to
+        // be), the tool's name, the parentheses, and the ` · ` before the note.
+        let fixed = 2
+            + width::str_width(&name)
             + if has_subject { 2 } else { 0 }
             + if note.is_empty() {
                 0
@@ -1174,16 +1175,18 @@ impl Content for ToolCallBlock {
             String::new()
         };
 
-        // No `●` on a folded call, and flush-left: a screenful of folded
-        // commands reads cleaner without a column of grey dots, and the work is
-        // not set in — only its reply is (`⎿` in the gutter). The coloured dot
-        // stays on the EXPANDED call, where it opens the block.
+        // No `●` on a folded call, but the command keeps its column: a screenful
+        // of folded commands reads cleaner without a column of grey dots, while
+        // the command still sits where the expanded head puts it (two cells in),
+        // rather than jumping to the margin. The coloured dot stays on the
+        // EXPANDED call, where it opens the block.
         //
-        // `name(subject)` — the same shape as the expanded head, just without the
-        // mark: folding changes how much you see, not what you are looking at. A
-        // verb replaces the tool name when the name is machinery rather than
-        // meaning: `$ cargo test` reads; `bash {"command":…}` does not.
-        let mut spans = vec![Span::styled(name, style)];
+        // `name(subject)` — the same shape and column as the expanded head, just
+        // without the mark: folding changes how much you see, not what you are
+        // looking at. A verb replaces the tool name when the name is machinery
+        // rather than meaning: `$ cargo test` reads; `bash {"command":…}` does not.
+        let mut spans = vec![Span::styled("  ".to_string(), style)];
+        spans.push(Span::styled(name, style));
         if has_subject {
             spans.push(Span::styled(format!("({subject})"), style));
         }
@@ -1399,7 +1402,7 @@ impl Content for ChoiceBlock {
         if w == 0 {
             return Vec::new();
         }
-        let ask = Style::new().fg(Color::role(Role::Warning));
+        let ask = Style::new().fg(Color::role(Role::Secondary));
         match &self.answer {
             Some(a) => {
                 let mut out = wrapped(&self.question, w, muted(), "? ");
@@ -1666,12 +1669,13 @@ pub fn cache_hit_rate(cached: u32, prompt: u32) -> Option<String> {
 /// quantity on the same screen, and two renderings of one number is a
 /// disagreement a person has to stop and resolve.
 pub fn token_count(n: u32) -> String {
-    if n < 10_000 {
+    // `k` from a thousand, with one decimal kept (`8.0k`, not `8k`): the live line
+    // shows `入` and `出` side by side, and a bare `8003` next to `78.2k` reads as
+    // two different units. One decimal, always, keeps the column consistent.
+    if n < 1_000 {
         return n.to_string();
     }
-    let thousands = format!("{:.1}", n as f64 / 1000.0);
-    let trimmed = thousands.strip_suffix(".0").unwrap_or(&thousands);
-    format!("{trimmed}k")
+    format!("{:.1}k", n as f64 / 1000.0)
 }
 
 /// The same, for a figure an account service reports.
@@ -2580,8 +2584,10 @@ mod tests {
     fn token_counts_are_exact_while_that_is_readable_and_rounded_after() {
         assert_eq!(token_count(0), "0");
         assert_eq!(token_count(28), "28");
-        assert_eq!(token_count(9_999), "9999");
-        assert_eq!(token_count(10_000), "10k");
+        assert_eq!(token_count(999), "999");
+        // From a thousand it is `k` with one decimal kept, so `入`/`出` share a unit.
+        assert_eq!(token_count(1_000), "1.0k");
+        assert_eq!(token_count(8_003), "8.0k");
         assert_eq!(token_count(90_659), "90.7k");
         assert_eq!(token_count(1_048_576), "1048.6k");
     }
@@ -2946,12 +2952,8 @@ mod tests {
         );
         let a = width::str_width(&ascii.summary(&crate::block::RenderCtx::bare(60)).plain());
         let c = width::str_width(&cjk.summary(&crate::block::RenderCtx::bare(60)).plain());
-        // Within one CJK character: a flush-left folded line (no `●`) has no even
-        // mark offset to align the parity, so the last two-wide character can be
-        // the one that will not fit — up to its own two cells left blank, never a
-        // whole extra character's worth less than the ASCII line.
         assert!(
-            (a as i64 - c as i64).abs() <= 2,
+            (a as i64 - c as i64).abs() <= 1,
             "ascii {a} vs cjk {c} cells"
         );
         assert_eq!(a, 60, "the line does not use the width it was given");
