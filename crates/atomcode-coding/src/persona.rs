@@ -31,6 +31,18 @@ pub(crate) fn todo_switch_enabled_for(configured: bool) -> bool {
     )
 }
 
+/// Resolve the AtomGit typed-tools switch (`ATOMCODE_ATOMGIT` env, default ON via
+/// config `tools.atomgit.enabled`). Delegates to
+/// `atomcode_config::config::atomgit_enabled_from_env` so the persona gate, the
+/// `parts.rs` prepare gate, and the config helper all read the SAME resolved value
+/// — keeping the tool catalog and persona guidance block in sync.
+pub(crate) fn atomgit_tool_switch_enabled_for(configured: bool) -> bool {
+    atomcode_config::config::atomgit_enabled_from_env(
+        std::env::var("ATOMCODE_ATOMGIT").ok().as_deref(),
+        configured,
+    )
+}
+
 /// Resolve the `request_user_input` tool switch for every `coding_persona` call site
 /// (`ATOMCODE_REQUEST_USER_INPUT` env, default ON — opt-out via `=0`/`false`/`off`).
 /// Delegates to `atomcode_config::config::request_user_input_enabled_from_env` so the
@@ -166,6 +178,7 @@ pub fn coding_persona(model: &str, todo_enabled: bool, request_user_input_enable
         true,
         subagent_delegation_enabled(),
         false,
+        true,
     )
 }
 
@@ -183,6 +196,7 @@ pub fn coding_persona_with_language(
         true,
         subagent_delegation_enabled(),
         false,
+        true,
     )
 }
 
@@ -194,6 +208,7 @@ pub(crate) fn coding_persona_with_capabilities(
     review_enabled: bool,
     subagents_enabled: bool,
     external_subagents_enabled: bool,
+    atomgit_enabled: bool,
 ) -> String {
     let commit_language = commit_language_guidance(preferred_language);
     #[allow(unused_mut)] // `mut` is only used under `cfg(windows)` below.
@@ -264,8 +279,18 @@ Skip the trailer for `git commit --amend` and `git revert`. Only commit when the
     if request_user_input_enabled {
         p.push_str(REQUEST_USER_INPUT_USAGE);
     }
+    // AtomGit typed-tools guidance — gated on the SAME resolved switch as the
+    // `register_atomgit_capabilities` call in `parts.rs` / `assemble.rs`:
+    // instructing the model to call tools that aren't mounted provokes phantom
+    // tool calls. `atomgit_enabled` is resolved by the caller.
     #[cfg(feature = "atomgit")]
-    p.push_str(ATOMGIT_TOOL_USAGE);
+    if atomgit_enabled {
+        p.push_str(ATOMGIT_TOOL_USAGE);
+    }
+    // Silence `unused_variables` on `atomgit_enabled` when the `atomgit` feature
+    // is off — the gate above is the sole consumer.
+    #[cfg(not(feature = "atomgit"))]
+    let _ = atomgit_enabled;
     if memory_tool_enabled() {
         p.push_str(MEMORY_USAGE);
     }
@@ -1809,19 +1834,23 @@ mod tests {
 
     #[test]
     fn persona_omits_review_routing_when_the_tool_is_not_mounted() {
-        let persona =
-            coding_persona_with_capabilities("glm-5.2", None, true, false, false, true, false);
+        let persona = coding_persona_with_capabilities(
+            "glm-5.2", None, true, false, false, true, false, true,
+        );
         assert!(!persona.contains("## CODE REVIEW:"));
         assert!(!persona.contains("`code_review` tool is available"));
     }
 
     #[test]
     fn external_subagent_delegation_is_gated_on_the_mount_flag() {
-        let on = coding_persona_with_capabilities("glm-5.2", None, true, false, false, false, true);
+        let on = coding_persona_with_capabilities(
+            "glm-5.2", None, true, false, false, false, true, true,
+        );
         assert!(on.contains("## EXTERNAL AGENT SUBAGENTS:"));
         assert!(on.contains("subagent_<name>"));
-        let off =
-            coding_persona_with_capabilities("glm-5.2", None, true, false, false, false, false);
+        let off = coding_persona_with_capabilities(
+            "glm-5.2", None, true, false, false, false, false, true,
+        );
         assert!(!off.contains("## EXTERNAL AGENT SUBAGENTS:"));
     }
 
@@ -1940,5 +1969,46 @@ mod tests {
                 && p.contains("explicit wait condition, interval, or observable progress"),
             "persona must distinguish the echo loop from legitimate bounded polling: {p}"
         );
+    }
+
+    #[cfg(feature = "atomgit")]
+    #[test]
+    fn persona_omits_atomgit_guidance_when_disabled() {
+        // When atomgit_enabled=false, the persona must not contain the AtomGit
+        // guidance block NOR any atomgit tool name — instructing the model to
+        // call unmounted tools provokes phantom tool calls.
+        let p = coding_persona_with_capabilities(
+            "glm-5.2", None, true, false, true, false, false, false,
+        );
+        assert!(
+            !p.contains("## ATOMGIT TOOLS:"),
+            "no atomgit guidance block when switch is disabled: {p}"
+        );
+        for name in ["atomgit_repo", "atomgit_pr", "atomgit_issue", "atomgit_api"] {
+            assert!(
+                !p.contains(name),
+                "no reference to {name} when switch is disabled"
+            );
+        }
+    }
+
+    #[cfg(feature = "atomgit")]
+    #[test]
+    fn persona_keeps_atomgit_guidance_when_default() {
+        // When atomgit_enabled=true (default), the persona must contain the
+        // guidance block and all four tool names — matching the tool catalog.
+        let p = coding_persona_with_capabilities(
+            "glm-5.2", None, true, false, true, false, false, true,
+        );
+        assert!(
+            p.contains("## ATOMGIT TOOLS:"),
+            "atomgit guidance block present when switch is default: {p}"
+        );
+        for name in ["atomgit_repo", "atomgit_pr", "atomgit_issue", "atomgit_api"] {
+            assert!(
+                p.contains(name),
+                "reference to {name} present when switch is default"
+            );
+        }
     }
 }

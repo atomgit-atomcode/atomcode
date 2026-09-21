@@ -73,6 +73,14 @@ pub static SETTINGS: &[SettingSpec] = &[
         &["task list"],
         ApplyPolicy::CapabilityReprepare,
     ),
+    bool_setting(
+        "tools.atomgit.enabled",
+        &["tools", "atomgit", "enabled"],
+        "AtomGit tools",
+        "AtomGit 工具",
+        &["atomgit", "REST"],
+        ApplyPolicy::CapabilityReprepare,
+    ),
     SettingSpec {
         id: "tools.todo.eager",
         path: &["tools", "todo", "eager"],
@@ -325,6 +333,7 @@ impl SettingSpec {
             "auto_update" => config.auto_update.to_string(),
             "keep_interrupted_context" => config.keep_interrupted_context.to_string(),
             "tools.todo.enabled" => config.tools.todo.enabled.to_string(),
+            "tools.atomgit.enabled" => config.tools.atomgit.enabled.to_string(),
             "tools.todo.eager" => format!("{:?}", config.tools.todo.eager).to_lowercase(),
             "coding.max_rounds" => config.coding.max_rounds.to_string(),
             "coding.shell_guard_policy" => {
@@ -952,6 +961,7 @@ model = "model-a"
         for id in [
             "keep_interrupted_context",
             "tools.todo.enabled",
+            "tools.atomgit.enabled",
             "tools.todo.eager",
             "coding.max_rounds",
             "coding.shell_guard_policy",
@@ -965,6 +975,7 @@ model = "model-a"
             let setting = SETTINGS.iter().find(|setting| setting.id == id).unwrap();
             let expected = match id {
                 "tools.todo.enabled"
+                | "tools.atomgit.enabled"
                 | "subagent.max_concurrent"
                 | "subagent.max_rounds"
                 | "datalog.enabled"

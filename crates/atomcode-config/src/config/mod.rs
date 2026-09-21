@@ -106,11 +106,44 @@ impl Default for TodoToolConfig {
     }
 }
 
+/// `[tools.atomgit]` policy — runtime switch for the AtomGit typed REST tools
+/// (`atomgit_repo` / `atomgit_pr` / `atomgit_issue` / `atomgit_api`).
+///
+/// Default is `enabled: true` so production builds keep exposing the tools without
+/// a recompile. The switch is ADDITIVE: old config files without `[tools.atomgit]`
+/// parse identically to before.
+///
+/// NOT covered by this switch (contract behavior, not implementation detail):
+/// - AtomGit OAuth login / signed-in state / CodingPlan claim — the login flow
+///   lives in `atomcode-auth::oauth` and is decoupled from this coding-assembly
+///   gate. Signed-in accounts keep using the OAuth signer for CodingPlan
+///   providers, and `/login` / `atomcode login` / TUI `/login` all work under
+///   both switch states. Users who want zero AtomGit interaction must
+///   additionally `atomcode logout`, avoid setting `ATOMGIT_TOKEN`, and (optionally)
+///   use `permissions.deny = ["Bash(curl https://api.atomgit.com*)"]` to block
+///   raw REST via `bash`.
+/// - `GitPushLabelMiddleware` — post-push `atomcode` label is non-model-facing,
+///   occupies no prompt tokens, and disabling it would silently drop labels.
+/// - Raw AtomGit REST calls via the `bash` tool — intentionally not gated here;
+///   credential exposure risk is covered by `CredentialBashGate` (`$ATOMGIT_TOKEN`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AtomGitToolConfig {
+    pub enabled: bool,
+}
+
+impl Default for AtomGitToolConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 /// Tool-specific policies. Persisted as `[tools.*]` tables.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ToolsConfig {
     pub todo: TodoToolConfig,
+    pub atomgit: AtomGitToolConfig,
 }
 
 /// `[permissions]` — user-declared pre-authorization for tool calls, so the common
@@ -1749,6 +1782,21 @@ pub fn todo_enabled_from_env(env: Option<&str>, cfg_value: bool) -> bool {
     }
 }
 
+/// Resolve the effective AtomGit typed-tools switch: env `ATOMCODE_ATOMGIT`
+/// (0/false/off vs 1/true/on) overrides the config value; absent/empty env → config value.
+/// Priority semantics are identical to [`todo_enabled_from_env`].
+///
+/// Called by `atomcode-coding`'s persona gate (`atomgit_tool_switch_enabled_for`)
+/// and the `parts.rs` prepare path — both read the SAME resolved value so the tool
+/// catalog and the persona guidance block stay in sync (no phantom tool calls).
+pub fn atomgit_enabled_from_env(env: Option<&str>, cfg_value: bool) -> bool {
+    match env.map(|s| s.trim().to_ascii_lowercase()) {
+        Some(v) if v == "0" || v == "false" || v == "off" => false,
+        Some(v) if v == "1" || v == "true" || v == "on" => true,
+        _ => cfg_value,
+    }
+}
+
 /// Resolve the effective `request_user_input` tool switch: DEFAULT-ON semantics.
 /// Returns `false` only when `env` is `Some("")`/`"0"`/`"false"`/`"off"` (case-insensitive,
 /// trimmed).  `None` (unset) or any other value → `true`.
@@ -3312,6 +3360,7 @@ model = "missing-type"
                     enabled: false,
                     eager: TodoEagerness::Always,
                 },
+                atomgit: Default::default(),
             },
             vision_preprocessor_provider: None,
             language: None,
@@ -4585,5 +4634,47 @@ base_url = "https://b.invalid/v1"
             toml::from_str("[tools.todo]\nenabled = false\neager = \"always\"\n").unwrap();
         assert!(!configured.tools.todo.enabled);
         assert_eq!(configured.tools.todo.eager, TodoEagerness::Always);
+    }
+
+    #[test]
+    fn atomgit_tool_policy_defaults_and_parses() {
+        // Default: enabled, absent [tools.atomgit] section.
+        let defaulted: Config = toml::from_str("").unwrap();
+        assert!(defaulted.tools.atomgit.enabled);
+
+        // Explicit enabled = true.
+        let enabled: Config = toml::from_str("[tools.atomgit]\nenabled = true\n").unwrap();
+        assert!(enabled.tools.atomgit.enabled);
+
+        // Explicit enabled = false.
+        let disabled: Config = toml::from_str("[tools.atomgit]\nenabled = false\n").unwrap();
+        assert!(!disabled.tools.atomgit.enabled);
+
+        // Existing fields (todo) are unaffected by the new section.
+        let both: Config =
+            toml::from_str("[tools.todo]\nenabled = false\n[tools.atomgit]\nenabled = false\n")
+                .unwrap();
+        assert!(!both.tools.todo.enabled);
+        assert!(!both.tools.atomgit.enabled);
+    }
+
+    #[test]
+    fn atomgit_enabled_from_env_priority() {
+        // env overrides config in both directions.
+        assert!(!super::atomgit_enabled_from_env(Some("0"), true));
+        assert!(!super::atomgit_enabled_from_env(Some("false"), true));
+        assert!(!super::atomgit_enabled_from_env(Some("off"), true));
+        assert!(!super::atomgit_enabled_from_env(Some("OFF"), true));
+        assert!(!super::atomgit_enabled_from_env(Some("  off  "), true));
+        assert!(super::atomgit_enabled_from_env(Some("1"), false));
+        assert!(super::atomgit_enabled_from_env(Some("true"), false));
+        assert!(super::atomgit_enabled_from_env(Some("on"), false));
+        assert!(super::atomgit_enabled_from_env(Some("ON"), false));
+        // absent / empty / unknown → config value.
+        assert!(super::atomgit_enabled_from_env(None, true));
+        assert!(!super::atomgit_enabled_from_env(None, false));
+        assert!(super::atomgit_enabled_from_env(Some(""), true));
+        assert!(super::atomgit_enabled_from_env(Some("maybe"), true));
+        assert!(!super::atomgit_enabled_from_env(Some("maybe"), false));
     }
 }

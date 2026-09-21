@@ -340,6 +340,10 @@ pub struct CodingParts {
     /// reassembly must not advertise a tool absent from the mounted catalog.
     todo_enabled: bool,
     request_user_input_enabled: bool,
+    /// AtomGit typed-tools switch (`[tools.atomgit]` + `ATOMCODE_ATOMGIT` env).
+    /// Drives BOTH the `register_atomgit_capabilities` gate and the persona guidance
+    /// block via `reconcile_coding_persona` — single resolved value, no split.
+    atomgit_enabled: bool,
     /// At least one external-agent subagent tool (`subagent_<name>`) is mounted;
     /// drives the persona's external-delegation guidance (kept in sync on model
     /// swap via `reconcile_coding_persona`).
@@ -483,6 +487,11 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         && opts.request_user_input
         && crate::persona::request_user_input_switch_enabled();
     let todo_enabled = opts.tools && crate::persona::todo_switch_enabled_for(cfg.todo.enabled);
+    let atomgit_enabled = opts.tools
+        && atomcode_config::config::atomgit_enabled_from_env(
+            std::env::var("ATOMCODE_ATOMGIT").ok().as_deref(),
+            cfg.atomgit_enabled,
+        );
     let subagents_enabled = opts.tools
         && opts
             .subagents
@@ -520,7 +529,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     };
 
     #[cfg(feature = "atomgit")]
-    if opts.tools {
+    if opts.tools && atomgit_enabled {
         crate::assemble::register_atomgit_capabilities(&mut registry, &mut names)
             .map_err(|error| io::Error::other(format!("AtomGit tool setup failed: {error}")))?;
     }
@@ -1090,6 +1099,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         tool_names: names,
         todo_enabled,
         request_user_input_enabled,
+        atomgit_enabled,
         has_external_subagents,
         mcp_tool_names,
         mounted_tools: None,
@@ -1557,6 +1567,7 @@ pub fn assemble(
                     parts.review_provider.is_some(),
                     parts.subagent_provider.is_some(),
                     parts.has_external_subagents,
+                    parts.atomgit_enabled,
                 );
                 b.resume = Some(snap);
             }
@@ -1679,6 +1690,7 @@ pub fn assemble(
             parts.review_provider.is_some(),
             parts.subagent_provider.is_some(),
             parts.has_external_subagents,
+            parts.atomgit_enabled,
         ))
         // Repair model-produced arguments before any observer or policy gate reads them.
         // Approval must inspect the same bytes that the tool executes.
@@ -1973,6 +1985,7 @@ pub fn assemble(
             parts.review_provider.is_some(),
             parts.subagent_provider.is_some(),
             parts.has_external_subagents,
+            parts.atomgit_enabled,
         );
         builder = builder.resume(snapshot);
     }
@@ -2058,6 +2071,7 @@ fn reconcile_coding_persona(
     review_enabled: bool,
     subagents_enabled: bool,
     external_subagents_enabled: bool,
+    atomgit_enabled: bool,
 ) {
     let persona = coding_persona_with_capabilities(
         &cfg.model,
@@ -2067,6 +2081,7 @@ fn reconcile_coding_persona(
         review_enabled,
         subagents_enabled,
         external_subagents_enabled,
+        atomgit_enabled,
     );
     let is_persona = |message: &Message| {
         message.role == Role::System && message.text.starts_with(ATOMCODE_PERSONA_PREFIX)
@@ -2361,6 +2376,7 @@ mod tests {
             true,
             true,
             false,
+            true,
         );
 
         assert!(snapshot.messages[0]
@@ -2375,7 +2391,7 @@ mod tests {
         let mut snapshot = SessionSnapshot::new(vec![Message::system("SESSION CONTEXT")]);
         let cfg = agent_config("deepseek-v4-flash");
 
-        reconcile_coding_persona(&mut snapshot, &cfg, false, true, true, true, false);
+        reconcile_coding_persona(&mut snapshot, &cfg, false, true, true, true, false, true);
 
         assert!(!snapshot.messages[0].text.contains("## TASK TRACKING"));
         assert!(snapshot.messages[0]
@@ -2408,6 +2424,7 @@ mod tests {
             true,
             true,
             false,
+            true,
         );
 
         let personas = snapshot
@@ -2451,6 +2468,7 @@ mod tests {
             true,
             true,
             false,
+            true,
         );
         reconcile_coding_persona(
             &mut snapshot,
@@ -2460,6 +2478,7 @@ mod tests {
             true,
             true,
             false,
+            true,
         );
 
         assert!(snapshot.messages[0]
@@ -2515,6 +2534,7 @@ mod tests {
             true,
             true,
             false,
+            true,
         );
 
         assert_eq!(snapshot.messages[0].text, persona);
@@ -2539,7 +2559,7 @@ mod tests {
         let mut cfg = agent_config("model-a");
         cfg.preferred_language = Some(Locale::ZhCn);
 
-        reconcile_coding_persona(&mut snapshot, &cfg, true, true, true, true, false);
+        reconcile_coding_persona(&mut snapshot, &cfg, true, true, true, true, false, true);
 
         assert!(snapshot.messages[0]
             .text
@@ -2574,6 +2594,7 @@ mod tests {
             true,
             true,
             false,
+            true,
         );
         snapshot.messages.push(Message::system(format!(
             "{MODEL_CHANGE_CONTEXT_PREFIX}\nlegacy transition"
@@ -2581,7 +2602,7 @@ mod tests {
         let mut cfg = agent_config("model-b");
         cfg.preferred_language = Some(Locale::ZhCn);
 
-        reconcile_coding_persona(&mut snapshot, &cfg, true, true, true, true, false);
+        reconcile_coding_persona(&mut snapshot, &cfg, true, true, true, true, false, true);
 
         assert!(!snapshot
             .messages
@@ -2737,6 +2758,7 @@ mod tests {
 
     #[cfg(feature = "atomgit")]
     #[tokio::test]
+    #[serial_test::serial(atomgit_env)]
     async fn production_prepare_exposes_atomgit_tools() {
         let project = tempfile::tempdir().unwrap();
         let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
@@ -2748,6 +2770,129 @@ mod tests {
                 names.iter().any(|name| name == expected),
                 "production tool catalog must expose {expected}: {names:?}"
             );
+        }
+    }
+
+    #[cfg(feature = "atomgit")]
+    #[tokio::test]
+    #[serial_test::serial(atomgit_env)]
+    async fn atomgit_tools_absent_when_switch_disabled() {
+        let project = tempfile::tempdir().unwrap();
+        let mut cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
+        cfg.atomgit_enabled = false;
+        let parts = prepare(&cfg, io_free_opts()).await.unwrap();
+        let names = parts.selected_tool_names();
+
+        for expected in ["atomgit_repo", "atomgit_pr", "atomgit_issue", "atomgit_api"] {
+            assert!(
+                !names.iter().any(|name| name == expected),
+                "atomgit tools must be absent when switch is off: {expected} in {names:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "atomgit")]
+    #[tokio::test]
+    #[serial_test::serial(atomgit_env)]
+    async fn other_tools_present_when_atomgit_disabled() {
+        let project = tempfile::tempdir().unwrap();
+        let mut cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
+        cfg.atomgit_enabled = false;
+        let parts = prepare(&cfg, io_free_opts()).await.unwrap();
+        let names = parts.selected_tool_names();
+
+        for expected in [
+            "read_file",
+            "write_file",
+            "edit_file",
+            "list_directory",
+            "open_file",
+            "bash",
+            "grep",
+            "glob",
+            "search_replace",
+            "ast_grep",
+            "todowrite",
+            "fetch_output",
+        ] {
+            assert!(
+                names.iter().any(|name| name == expected),
+                "non-atomgit tool must be present when atomgit is disabled: {expected} in {names:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "atomgit")]
+    #[tokio::test]
+    #[serial_test::serial(atomgit_env)]
+    async fn atomgit_env_overrides_config_when_disabled() {
+        // ATOMCODE_ATOMGIT=0 must disable atomgit tools even when cfg.atomgit_enabled=true.
+        // The serial guard prevents concurrent env mutations leaking into other tests.
+        std::env::set_var("ATOMCODE_ATOMGIT", "0");
+        let project = tempfile::tempdir().unwrap();
+        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
+        assert!(
+            cfg.atomgit_enabled,
+            "default must be true before env override"
+        );
+        let parts = prepare(&cfg, io_free_opts()).await.unwrap();
+        let names = parts.selected_tool_names();
+        // Clean up immediately — holding the env leak across the test window would
+        // let a concurrently-running non-serial test observe the override.
+        std::env::remove_var("ATOMCODE_ATOMGIT");
+
+        for expected in ["atomgit_repo", "atomgit_pr", "atomgit_issue", "atomgit_api"] {
+            assert!(
+                !names.iter().any(|name| name == expected),
+                "ATOMCODE_ATOMGIT=0 must disable atomgit tools: {expected} in {names:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "atomgit")]
+    #[tokio::test]
+    #[serial_test::serial(atomgit_env)]
+    async fn git_push_label_middleware_independent_of_switch() {
+        // The GitPushLabelMiddleware (post-push `atomcode` label) is registered
+        // unconditionally within `#[cfg(feature = "atomgit")]` at parts.rs:2037-2042 —
+        // NOT gated on `atomgit_enabled`. This test verifies that `assemble` succeeds
+        // with both switch states, confirming the middleware registration path is
+        // reachable regardless of the tool switch.
+        //
+        // Note: `Agent` does not expose middleware introspection, so this is an
+        // assembly-level guard. The actual label-application behavior is verified
+        // by the middleware's own unit tests in `atomcode-capabilities`.
+        let project = tempfile::tempdir().unwrap();
+
+        // Switch ON (default) — 4 atomgit tools present, middleware registered.
+        {
+            let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
+            let mut parts = prepare(&cfg, io_free_opts()).await.unwrap();
+            let names = parts.selected_tool_names();
+            for expected in ["atomgit_repo", "atomgit_pr", "atomgit_issue", "atomgit_api"] {
+                assert!(
+                    names.iter().any(|name| name == expected),
+                    "switch ON: {expected} must be present"
+                );
+            }
+            let provider: Arc<dyn LlmProvider> = Arc::new(CannedProvider);
+            let _agent = assemble(&mut parts, &cfg, provider).unwrap();
+        }
+
+        // Switch OFF — 4 atomgit tools absent, middleware STILL registered.
+        {
+            let mut cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
+            cfg.atomgit_enabled = false;
+            let mut parts = prepare(&cfg, io_free_opts()).await.unwrap();
+            let names = parts.selected_tool_names();
+            for expected in ["atomgit_repo", "atomgit_pr", "atomgit_issue", "atomgit_api"] {
+                assert!(
+                    !names.iter().any(|name| name == expected),
+                    "switch OFF: {expected} must be absent"
+                );
+            }
+            let provider: Arc<dyn LlmProvider> = Arc::new(CannedProvider);
+            let _agent = assemble(&mut parts, &cfg, provider).unwrap();
         }
     }
 

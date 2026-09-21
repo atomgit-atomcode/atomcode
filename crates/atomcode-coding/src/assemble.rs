@@ -3,7 +3,7 @@
 use crate::config::CodingAgentConfig;
 use crate::discipline::VerifyCadenceHook;
 use crate::execution_policy::TurnExecutionPolicy;
-use crate::persona::coding_persona_with_language;
+use crate::persona::coding_persona_with_capabilities;
 use atomcode_capabilities::codeintel::{
     codeintel_tool_names, register_codeintel_tools, register_lsp_tool, LspSettings,
 };
@@ -69,7 +69,8 @@ pub fn build_coding_agent(cfg: CodingAgentConfig) -> Result<Agent, String> {
 /// [`try_build_coding_agent_with`].
 pub fn build_coding_agent_with(cfg: &CodingAgentConfig, provider: Arc<dyn LlmProvider>) -> Agent {
     let todo_enabled = crate::persona::todo_switch_enabled_for(cfg.todo.enabled);
-    match mount_coding_tools(cfg.supports_vision, todo_enabled, &cfg.lsp) {
+    let atomgit_enabled = crate::persona::atomgit_tool_switch_enabled_for(cfg.atomgit_enabled);
+    match mount_coding_tools(cfg.supports_vision, todo_enabled, atomgit_enabled, &cfg.lsp) {
         Ok(tools) => build_coding_agent_from_tools(cfg, provider, tools, None),
         Err(_error) => build_coding_agent_from_tools(
             cfg,
@@ -89,6 +90,7 @@ pub fn try_build_coding_agent_with(
     let tools = mount_coding_tools(
         cfg.supports_vision,
         crate::persona::todo_switch_enabled_for(cfg.todo.enabled),
+        crate::persona::atomgit_tool_switch_enabled_for(cfg.atomgit_enabled),
         &cfg.lsp,
     )?;
     Ok(build_coding_agent_from_tools(cfg, provider, tools, None))
@@ -107,11 +109,16 @@ fn build_coding_agent_from_tools(
                                              // when the tool + hook aren't mounted (and vice-versa). The `todowrite` TOOL
                                              // itself is registered on the same env gate in `atomcode-capabilities`.
     let todo_enabled = crate::persona::todo_switch_enabled_for(cfg.todo.enabled);
-    let mut persona = coding_persona_with_language(
+    let atomgit_enabled = crate::persona::atomgit_tool_switch_enabled_for(cfg.atomgit_enabled);
+    let mut persona = coding_persona_with_capabilities(
         &cfg.model,
         cfg.preferred_language,
         todo_enabled,
         crate::persona::request_user_input_switch_enabled(),
+        true,
+        crate::persona::subagent_delegation_enabled(),
+        false,
+        atomgit_enabled,
     );
     if let Some(warning) = startup_warning {
         persona.push_str("\n\n<system-reminder>");
@@ -226,15 +233,22 @@ fn build_coding_agent_from_tools(
 fn mount_coding_tools(
     vision: bool,
     todo_enabled: bool,
+    atomgit_enabled: bool,
     lsp: &LspSettings,
 ) -> Result<MountedTools, String> {
     let (registry, names) = base_coding_tools(vision, todo_enabled, lsp);
     #[cfg(feature = "atomgit")]
     let (registry, names) = {
         let (mut registry, mut names) = (registry, names);
-        register_atomgit_capabilities(&mut registry, &mut names)?;
+        if atomgit_enabled {
+            register_atomgit_capabilities(&mut registry, &mut names)?;
+        }
         (registry, names)
     };
+    // Silence `unused_variables` on the `atomgit_enabled` param when the `atomgit`
+    // feature is off — the gate above is the sole consumer.
+    #[cfg(not(feature = "atomgit"))]
+    let _ = atomgit_enabled;
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
     Ok(registry.mount(&refs))
 }
