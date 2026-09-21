@@ -109,7 +109,7 @@ tuix 的富交互全在 `modals/`，**16,824 行**。逐个对：
 | `model_picker` | 735 | `/model` Picker | 没分组、没能力标注 |
 | `config_panel` | 565 | `/config` 三级（项 → 值 → 写） | ✅ 四样在 2026-09-19/20 补齐，逐条见下 |
 | `diff_viewer` | 539 | `/diff` 两级 | 接近 |
-| `rewind` | 404 | `/rewind` Picker | 接近 |
+| `rewind` | 404 | 第五块面板（`crate::rewind`） | ✅ 2026-09-21：从 Picker 改成从底下升起来的两步面板（挑回合 → 挑范围），每条两行（那句话 + 它动过什么），末行「（当前）」是反悔出口；**双击 Esc 拉起它**，`/rewind` 无参同一个入口；契约 `RewindPoint` 由计数换成 `changes: Vec<ChangedFile>` |
 | `password` | 294 | `secret.rs` | ✅ |
 | `qr` | 249 | 无 | 属 `/app`，判归 CLI |
 | `language_picker` | 155 | `/language` 已改成走 `/config` 的值选择器 | ✅ |

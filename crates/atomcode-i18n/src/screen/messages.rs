@@ -206,6 +206,49 @@ pub enum Msg<'a> {
     ToolsLegendFilter,
     ToolsLegendClose,
 
+    // ── the rewind panel (`modules/rewind.rs`) ──
+    /// The line under the panel's name: what a press in here would do.
+    RewindPanelAbout,
+    RewindPanelReading,
+    RewindPanelGoing {
+        turn: u64,
+    },
+    RewindPanelNoPoints,
+    RewindPanelStopWaiting,
+    /// The last row of the list: where the session is now, and the way out for
+    /// someone who opened the panel and changed their mind.
+    RewindPanelCurrent,
+    RewindPanelNoCodeChanges,
+    RewindPanelFiles {
+        files: usize,
+    },
+    /// The second step's question: this turn goes back — carrying what?
+    RewindPanelScopeAsk,
+    /// The workspace half is off in this build, and how to turn it on.
+    RewindCodeNotEnabled,
+    /// This session is not written down, so there is nothing to put back.
+    RewindCodeNoSession,
+    /// It is on, but the checkpoint could not be set up — the host's own words
+    /// about this machine, which are a fact rather than a sentence to write.
+    RewindCodeFailed {
+        why: &'a str,
+    },
+    RewindPanelTurnNoFiles,
+    RewindLegendChoose,
+    RewindLegendContinue,
+    RewindLegendGo,
+    RewindLegendBack,
+    RewindLegendClose,
+    RewindPointsUnreadable {
+        why: &'a str,
+    },
+    RewindFailed {
+        why: &'a str,
+    },
+    NoRewindPanel,
+    NoRewind,
+    ScreenNotConnectedRewind,
+
     // ── notes in the transcript (`modules/transcript.rs`) ──
     TranscriptCompacted {
         through: u64,
@@ -393,12 +436,6 @@ pub enum Msg<'a> {
     NotATurnNumber {
         what: &'a str,
     },
-    RewindPointAbout {
-        turn: u64,
-        files: usize,
-    },
-    RewindPickerHint,
-    RewindNoPoints,
     RewindScopeUnknown {
         what: &'a str,
     },

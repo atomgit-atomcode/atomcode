@@ -110,7 +110,7 @@ pub struct SnapshotHook {
 #[derive(Default)]
 struct RewindState {
     checkpoint: Option<Arc<WorkspaceCheckpoint>>,
-    unavailable: Option<String>,
+    unavailable: Option<CodeRewindUnavailable>,
     transaction_unavailable: Option<String>,
     pending: Option<PendingRewindPoint>,
     points: Vec<RewindPoint>,
@@ -122,9 +122,42 @@ struct PendingRewindPoint {
     before_tree: Option<String>,
 }
 
-const CODE_REWIND_DISABLED_REASON: &str =
-    "Code Rewind (workspace file restore) is off by default to protect disk space; \
-     set ATOMCODE_CODE_REWIND=1 to opt in. Conversation Rewind remains available.";
+/// Why the workspace half of a rewind is not on offer.
+///
+/// **A kind, not a sentence.** The two cases are different things to be told:
+/// one is a switch the person can throw, the other is a failure with a cause.
+/// They were both flattened into an English string here, which left every front
+/// end with a sentence it could only pass through — so a Chinese screen said
+/// "代码回不去：Code Rewind (workspace file restore) is off by default…". The
+/// words belong to whoever is talking to the person; this layer says which case
+/// it is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CodeRewindUnavailable {
+    /// Off by default, to protect disk space. The person can opt in with
+    /// `ATOMCODE_CODE_REWIND=1`.
+    NotEnabled,
+    /// Opted in, but the checkpoint could not be set up — with the cause,
+    /// which is a fact about this machine and travels as text.
+    SetupFailed(String),
+}
+
+impl std::fmt::Display for CodeRewindUnavailable {
+    /// For the places inside this crate that need *a* reason string: a
+    /// checkpoint error, a log line. A front end matches on the kind instead.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotEnabled => f.write_str(
+                "Code Rewind (workspace file restore) is off by default to protect disk \
+                 space; set ATOMCODE_CODE_REWIND=1 to opt in. Conversation Rewind remains \
+                 available.",
+            ),
+            Self::SetupFailed(why) => write!(
+                f,
+                "Code Rewind unavailable (ATOMCODE_CODE_REWIND=1 is set but setup failed): {why}"
+            ),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct RewindTransactionReceipt {
@@ -172,13 +205,11 @@ impl SnapshotHook {
                 Ok(cp) => (Some(Arc::new(cp)), None),
                 Err(e) => (
                     None,
-                    Some(format!(
-                    "Code Rewind unavailable (ATOMCODE_CODE_REWIND=1 is set but setup failed): {e}"
-                )),
+                    Some(CodeRewindUnavailable::SetupFailed(e.to_string())),
                 ),
             }
         } else {
-            (None, Some(CODE_REWIND_DISABLED_REASON.to_string()))
+            (None, Some(CodeRewindUnavailable::NotEnabled))
         };
         let points = mgr
             .load_rewind_ledger(&session_id)
@@ -290,7 +321,7 @@ impl SnapshotHook {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if let Some(reason) = &state.unavailable {
-            return Err(reason.clone());
+            return Err(reason.to_string());
         }
         let checkpoint = state
             .checkpoint
@@ -308,7 +339,7 @@ impl SnapshotHook {
         Ok((checkpoint, first))
     }
 
-    pub fn code_rewind_unavailable(&self) -> Option<String> {
+    pub fn code_rewind_unavailable(&self) -> Option<CodeRewindUnavailable> {
         self.rewind
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -339,7 +370,8 @@ impl SnapshotHook {
             WorkspaceCheckpointError::Unsupported(
                 rewind
                     .unavailable
-                    .clone()
+                    .as_ref()
+                    .map(CodeRewindUnavailable::to_string)
                     .unwrap_or_else(|| "code rewind is unavailable".into()),
             )
         })?;
@@ -398,7 +430,8 @@ impl SnapshotHook {
                 WorkspaceCheckpointError::Unsupported(
                     rewind
                         .unavailable
-                        .clone()
+                        .as_ref()
+                        .map(CodeRewindUnavailable::to_string)
                         .unwrap_or_else(|| "code rewind is unavailable".into()),
                 )
             })?;

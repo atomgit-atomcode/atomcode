@@ -54,7 +54,7 @@ pub use rewind::{
     WorkspaceRestoreReceipt,
 };
 pub use session_list::ListSessionsTool;
-pub use snapshot::{RewindTransactionReceipt, SnapshotHook};
+pub use snapshot::{CodeRewindUnavailable, RewindTransactionReceipt, SnapshotHook};
 pub use status_reminder::StatusReminderHook;
 pub use transcript::{ToolRecord, TurnRecord, TurnTimestamp, UsageRecord};
 pub use usage_provider::UsageRecordingProvider;

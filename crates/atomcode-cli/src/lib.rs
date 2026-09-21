@@ -32,6 +32,7 @@ pub mod tui_login;
 pub mod tui_onboarding;
 pub mod tui_plugins;
 pub mod tui_providers;
+pub mod tui_rewind;
 pub mod tui_settings;
 pub mod tui_tools;
 pub mod tui_welcome_words;
@@ -102,6 +103,7 @@ pub mod tui_front {
             crate::tui_providers::row_layer(),
             crate::tui_plugins::row_layer(),
             crate::tui_tools::row_layer(),
+            crate::tui_rewind::row_layer(),
             crate::tui_onboarding::row_layer(),
             crate::tui_login::row_layer(),
             crate::tui_welcome_words::row_layer(),
@@ -113,6 +115,7 @@ pub mod tui_front {
                 config_path: config_path.clone(),
             }),
             Arc::new(crate::tui_tools::ToolsRow),
+            Arc::new(crate::tui_rewind::RewindRow),
             Arc::new(crate::tui_onboarding::OnboardingRow {
                 config_path: config_path.clone(),
                 telemetry: telemetry.clone(),

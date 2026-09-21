@@ -157,8 +157,15 @@ rewind、恢复、会话目录、租约、落盘失败即停只认它。harness 
     - **目标用回合号**,加 0021 第 9 条的 `based_on`;回合进行中回 `Busy`;不支持重做。
     - **代码范围**:先用 git 检查点还原工作区,再提交 `Rewound`;做检查点时提交
       `Checkpointed { turn, id }` 记下对应。
-    - **屏幕**:流不可逆,被撤的块不删,只把呈现改成已撤销(变暗并折叠,0004 允许改呈现),加一个
-      「已撤销到回合 N」的标记块;被撤的 prompt 放回输入框。
+    - **屏幕**(2026-09-21 改):日志仍然不可逆——删的只是**呈现**(0004 允许)。两种「撤回」分开画:
+      人 **rewind** 掉的回合**不画**(`rewound_turns`,`Presentation::is_rewound`),因为人说的是
+      「这轮不该发生」,屏上还留着它等于让人看见的一半和模型看见的一半对不上;人**取消**
+      (`Interrupted { undone: true }`)的回合**留一行变暗的摘要**,它停在半截,而它停之前做完的
+      事正是人下一眼要看的。两种都留下「已把…撤回到第 N 轮之前」那个标记块(`always_open`,
+      不受上面两条影响),所以历史不会安静地少掉一段;被撤的 prompt 放回输入框。
+      原文是「被撤的块不删,只变暗并折叠」——两者不分,于是一次 rewind 之后满屏都是自己刚
+      说过不该发生的话。判据:`tui/src/host.rs` 的 `a_rewound_turn_is_not_drawn_at_all`、
+      `a_cancelled_turn_is_drawn_as_one_dim_line_each`、`a_cancelled_turn_counts_as_undone_but_not_as_rewound`。
     - **前缀缓存**:撤销后下一次请求是撤销点之前那段的前缀,能命中之前的缓存。
 
 ## 迁移要改的写路径

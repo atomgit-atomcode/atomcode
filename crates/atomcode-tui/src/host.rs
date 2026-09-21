@@ -148,11 +148,22 @@ pub struct Presentation {
     /// only in [`ToolOutput::Full`] (the default); the compact modes decide for
     /// themselves. Cleared with the stream, and rebuilt as results re-arrive.
     auto_folded: std::collections::HashSet<BlockId>,
-    /// The turns that were taken back: their blocks are drawn as one dim line
-    /// (`docs/adr/0024` §17). Here rather than only on the moment because the
-    /// row count keys on this struct's revision, and folding a turn changes
+    /// The turns a person **cancelled** and asked to have undone: their blocks
+    /// are drawn as one dim line. Here rather than only on the moment because
+    /// the row count keys on this struct's revision, and folding a turn changes
     /// what a frame counts.
     undone: std::collections::BTreeSet<u64>,
+    /// The turns a **rewind** took back: their blocks are not drawn at all.
+    ///
+    /// A different answer from `undone`, for a different question. A cancelled
+    /// turn is one somebody stopped halfway, and what it got done before they
+    /// stopped is still worth reading — dim, because the model no longer sees
+    /// it. A rewound turn is one they said should not have happened; leaving it
+    /// on screen is leaving a conversation whose visible half disagrees with
+    /// the model's. The `Rewound` block itself stays (it is `always_open`), so
+    /// the history says what happened rather than quietly losing a stretch of
+    /// itself.
+    rewound: std::collections::BTreeSet<u64>,
     /// Bumped by every change above. See `host::row_index` for why the row
     /// count keys on this rather than being invalidated by hand: folding a
     /// kind, folding one block and hiding a kind all change what the frame
@@ -204,21 +215,33 @@ impl Presentation {
             full_open: std::collections::HashSet::new(),
             auto_folded: std::collections::HashSet::new(),
             undone: std::collections::BTreeSet::new(),
+            rewound: std::collections::BTreeSet::new(),
             revision: 0,
         }
     }
 
-    /// Whether this turn was taken back.
+    /// Whether this turn was cancelled and undone — drawn as one dim line.
     pub fn is_undone(&self, turn: u64) -> bool {
         self.undone.contains(&turn)
     }
 
-    /// The turns that were taken back. `true` when that changed.
-    fn set_undone(&mut self, turns: std::collections::BTreeSet<u64>) -> bool {
-        if self.undone == turns {
+    /// Whether a rewind took this turn back — not drawn at all.
+    pub fn is_rewound(&self, turn: u64) -> bool {
+        self.rewound.contains(&turn)
+    }
+
+    /// The turns that were taken back, each kind in its own set. `true` when
+    /// either changed.
+    fn set_undone(
+        &mut self,
+        turns: std::collections::BTreeSet<u64>,
+        rewound: std::collections::BTreeSet<u64>,
+    ) -> bool {
+        if self.undone == turns && self.rewound == rewound {
             return false;
         }
         self.undone = turns;
+        self.rewound = rewound;
         self.bump();
         true
     }
@@ -874,7 +897,14 @@ fn lid_row(
     if pres.is_hidden(kind) {
         return None;
     }
-    // A turn that was taken back is one dim line, whatever its kind does and
+    // A turn a rewind took back is not drawn at all: the person said it should
+    // not have happened, and a screen still showing it is a conversation whose
+    // visible half disagrees with the model's. What *did* happen is the
+    // `Rewound` block, which is `always_open` and so survives this.
+    if pres.is_rewound(b.at.turn) && !b.content.always_open() {
+        return None;
+    }
+    // A turn the person cancelled is one dim line, whatever its kind does and
     // whether or not it would have merged into a run: what it said happened, and
     // the model no longer sees it.
     if pres.is_undone(b.at.turn) && !b.content.always_open() {
@@ -1064,6 +1094,8 @@ pub struct Hits {
     plugins: Option<Rect>,
     /// And the tools panel's.
     tools: Option<Rect>,
+    /// And the rewind panel's.
+    rewind: Option<Rect>,
     /// Where the slash menu was drawn, so a press or the pointer on a row finds
     /// the command it is on.
     ///
@@ -1541,14 +1573,19 @@ impl Host {
         self.moment.write().expect("moment poisoned").team_keyboard = false;
     }
 
-    /// Which turns the screen draws as taken back. `true` when that changed, so
-    /// the caller knows a frame is owed.
-    pub fn mark_undone(&self, turns: std::collections::BTreeSet<u64>) -> bool {
+    /// Which turns the screen draws as taken back, and which of them a rewind
+    /// took (those are not drawn at all). `true` when that changed, so the
+    /// caller knows a frame is owed.
+    pub fn mark_undone(
+        &self,
+        turns: std::collections::BTreeSet<u64>,
+        rewound: std::collections::BTreeSet<u64>,
+    ) -> bool {
         let changed = self
             .presentation
             .write()
             .expect("presentation poisoned")
-            .set_undone(turns.clone());
+            .set_undone(turns.clone(), rewound);
         if changed {
             self.moment.write().expect("moment poisoned").undone = turns;
         }
@@ -1974,6 +2011,7 @@ impl Host {
                         .clear();
                 }
                 m.plugins_panel = None;
+                m.rewind_panel = None;
                 m.settings_panel = Some(crate::settings::Panel::new());
                 true
             }
@@ -2247,6 +2285,8 @@ impl Host {
                 }
                 m.settings_panel = None;
                 m.plugins_panel = None;
+                m.tools_panel = None;
+                m.rewind_panel = None;
                 m.providers_panel = Some(crate::providers::Panel::new());
                 true
             }
@@ -2495,6 +2535,8 @@ impl Host {
                         .expect("provider secret poisoned")
                         .clear();
                 }
+                m.tools_panel = None;
+                m.rewind_panel = None;
                 m.plugins_panel = Some(crate::plugins::Panel::new());
                 true
             }
@@ -2687,6 +2729,7 @@ impl Host {
                         .expect("provider secret poisoned")
                         .clear();
                 }
+                m.rewind_panel = None;
                 m.tools_panel = Some(crate::tools::Panel::new());
                 true
             }
@@ -2819,6 +2862,184 @@ impl Host {
             None => return false,
         };
         match m.tools_panel.as_mut() {
+            Some(panel) => panel.point_at(row, rows),
+            None => false,
+        }
+    }
+
+    // ---- the rewind panel ---------------------------------------------------
+    //
+    // The fifth panel, and deliberately the same dozen methods as the other
+    // four. What is different is only what it is *for*: the other four change
+    // what this build is, and this one takes back what it did.
+
+    /// Whether the rewind panel is up.
+    pub fn rewind_open(&self) -> bool {
+        self.moment
+            .read()
+            .expect("moment poisoned")
+            .rewind_panel
+            .is_some()
+    }
+
+    /// Pull the rewind panel up, or put it away. True when it changed.
+    pub fn toggle_rewind(&self) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        match m.rewind_panel.take() {
+            Some(_) => true,
+            None => {
+                // Nothing to draw it with is a refusal, not an empty panel — the
+                // same bargain the other four strike.
+                if !self.modules.has_view(crate::modules::rewind::ID) {
+                    return false;
+                }
+                m.settings_panel = None;
+                m.plugins_panel = None;
+                m.tools_panel = None;
+                if m.providers_panel.take().is_some() {
+                    self.providers_secret
+                        .lock()
+                        .expect("provider secret poisoned")
+                        .clear();
+                }
+                m.rewind_panel = Some(crate::rewind::Panel::new());
+                true
+            }
+        }
+    }
+
+    /// Put the rewind panel away. True when it was up.
+    pub fn close_rewind(&self) -> bool {
+        self.moment
+            .write()
+            .expect("moment poisoned")
+            .rewind_panel
+            .take()
+            .is_some()
+    }
+
+    /// Put what the host answered into the moment, and rest the cursor on
+    /// "(current)". True when it changed.
+    ///
+    /// **The cursor goes back to the bottom on every answer**, including the one
+    /// that follows a rewind: the list it was pointing into is not the list that
+    /// came back, and a cursor left at row 3 of a shorter list is a panel aimed
+    /// at whatever slid under it.
+    pub fn show_rewind(&self, view: crate::rewind::RewindView) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let rows = view.rows();
+        let mut changed = false;
+        if m.rewind != view {
+            m.rewind = view;
+            changed = true;
+        }
+        if let Some(panel) = m.rewind_panel.as_mut() {
+            let was = panel.cursor;
+            panel.rest_at_current(rows);
+            changed |= panel.cursor != was;
+        }
+        changed
+    }
+
+    /// Say that a rewind is on its way there and back, or that it landed.
+    pub fn rewind_busy(&self, busy: Option<crate::rewind::Busy>) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let Some(panel) = m.rewind_panel.as_mut() else {
+            return false;
+        };
+        if panel.busy == busy {
+            return false;
+        }
+        panel.busy = busy;
+        true
+    }
+
+    /// Say what the last key came to, when it came to something worth reading.
+    pub fn rewind_note(&self, note: Option<String>) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let Some(panel) = m.rewind_panel.as_mut() else {
+            return false;
+        };
+        if panel.note == note {
+            return false;
+        }
+        panel.note = note;
+        true
+    }
+
+    /// Run one key against the rewind panel: the panel it writes back, and the
+    /// work to send over the seam when the key asked for some.
+    pub fn rewind_key(
+        &self,
+        press: crate::surface::KeyPress,
+    ) -> (bool, Option<crate::rewind::Step>) {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let view = m.rewind.clone();
+        let Some(panel) = m.rewind_panel.as_mut() else {
+            return (false, None);
+        };
+        let before = panel.clone();
+        let step = crate::rewind::key(&view, panel, press);
+        let changed = *panel != before;
+        match step {
+            crate::rewind::Step::Stay => (changed, None),
+            crate::rewind::Step::Close => {
+                m.rewind_panel = None;
+                (true, None)
+            }
+            step => (true, Some(step)),
+        }
+    }
+
+    /// The wheel over the rewind panel walks its list.
+    pub fn rewind_wheel(&self, x: u16, y: u16, by: i32) -> bool {
+        let over = self
+            .hits
+            .lock()
+            .expect("hits poisoned")
+            .rewind
+            .is_some_and(|rect| rect.contains(x, y));
+        if !over {
+            return false;
+        }
+        let mut m = self.moment.write().expect("moment poisoned");
+        let rows = match m.rewind_panel.as_ref() {
+            // A rewind in flight has no list to walk, and the wheel is still the
+            // panel's — it must not scroll the conversation behind it.
+            Some(panel) if panel.busy.is_some() => return true,
+            Some(_) => m.rewind.rows(),
+            None => return false,
+        };
+        let Some(panel) = m.rewind_panel.as_mut() else {
+            return false;
+        };
+        let want = match by < 0 {
+            true => panel.cursor.saturating_sub(by.unsigned_abs() as usize),
+            false => panel.cursor.saturating_add(by as usize),
+        };
+        panel.point_at(want, rows);
+        true
+    }
+
+    /// Which row of the list is under the pointer — a turn, or "(current)".
+    pub fn rewind_row_at(&self, x: u16, y: u16) -> Option<usize> {
+        let rect = *self.hits.lock().expect("hits poisoned").rewind.as_ref()?;
+        if !rect.contains(x, y) {
+            return None;
+        }
+        let m = self.moment.read().expect("moment poisoned");
+        let vp = crate::moment::Viewport::new(rect, &m);
+        crate::modules::rewind::geometry(&m, &vp).row_at((y - rect.y) as usize)
+    }
+
+    /// Point the panel at a row. True when it moved.
+    pub fn point_rewind_at(&self, row: usize) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let rows = match m.rewind_panel.as_ref() {
+            Some(_) => m.rewind.rows(),
+            None => return false,
+        };
+        match m.rewind_panel.as_mut() {
             Some(panel) => panel.point_at(row, rows),
             None => false,
         }
@@ -3634,6 +3855,7 @@ impl Host {
                         providers: None,
                         plugins: None,
                         tools: None,
+                        rewind: None,
                         menu: None,
                     };
                     *self.last_room.lock().expect("room poisoned") = rect;
@@ -3690,6 +3912,10 @@ impl Host {
                         // And the tools panel.
                         if id == crate::modules::tools::ID {
                             self.hits.lock().expect("hits poisoned").tools = Some(*tail_rect);
+                        }
+                        // And the rewind panel.
+                        if id == crate::modules::rewind::ID {
+                            self.hits.lock().expect("hits poisoned").rewind = Some(*tail_rect);
                         }
                         frame.place(id.clone(), *tail_rect, lines);
                     }
@@ -4354,6 +4580,7 @@ pub const TAIL: &[&str] = &[
     crate::modules::providers::ID,
     crate::modules::plugins::ID,
     crate::modules::tools::ID,
+    crate::modules::rewind::ID,
     crate::modules::ask::ID,
     crate::modules::steering::ID,
 ];
@@ -4548,11 +4775,16 @@ mod tests {
         );
     }
 
-    /// A turn the person took back stays on the screen — the stream is not
-    /// reversible — as one dim line per block, and the reader can still see what
-    /// it said (`docs/adr/0024` §17).
+    /// A turn the person **cancelled** stays on the screen as one dim line per
+    /// block: they stopped it halfway, and what it got done before they stopped
+    /// is still worth reading. The model no longer sees it, which is what the
+    /// dimming says (`docs/adr/0024` §17).
+    ///
+    /// A turn a *rewind* took back is a different thing and is drawn
+    /// differently — see
+    /// [`a_rewound_turn_is_not_drawn_at_all`](Self::a_rewound_turn_is_not_drawn_at_all).
     #[test]
-    fn a_taken_back_turn_is_drawn_as_one_dim_line_each() {
+    fn a_cancelled_turn_is_drawn_as_one_dim_line_each() {
         let h = host();
         two_turns(&h);
         let size = (60u16, 24u16);
@@ -4575,7 +4807,10 @@ mod tests {
             "the answer is drawn whole while the turn stands:\n{whole}"
         );
 
-        assert!(h.mark_undone(std::collections::BTreeSet::from([2])));
+        assert!(h.mark_undone(
+            std::collections::BTreeSet::from([2]),
+            std::collections::BTreeSet::new(),
+        ));
         let after = h.compose(size);
         let text = shown(&after);
         assert!(
@@ -4606,7 +4841,104 @@ mod tests {
             );
         }
         // Nothing changed: no second frame is owed.
-        assert!(!h.mark_undone(std::collections::BTreeSet::from([2])));
+        assert!(!h.mark_undone(
+            std::collections::BTreeSet::from([2]),
+            std::collections::BTreeSet::new(),
+        ));
+    }
+
+    /// **The two kinds of "taken back" are counted apart.**
+    ///
+    /// The screen asks the log two questions — which turns are gone from what
+    /// the model sees, and which of those the person *rewound past* — and
+    /// draws the answers differently. One set for both would make a cancelled
+    /// turn vanish along with a rewound one, and what a cancelled turn got
+    /// done before it was stopped is exactly what a person looks at next.
+    #[test]
+    fn a_cancelled_turn_counts_as_undone_but_not_as_rewound() {
+        use atomcode_kernel::session::{rewound_turns, undone_turns};
+        let said = |turn: u64| SessionEvent::UserMessage {
+            turn,
+            text: format!("turn {turn}"),
+            images: Vec::new(),
+        };
+        let facts = vec![
+            SessionEvent::TurnStart { turn: 1 },
+            said(1),
+            SessionEvent::TurnStart { turn: 2 },
+            said(2),
+            // Stopped by hand, and asked to be left out of what the model sees.
+            SessionEvent::Interrupted {
+                turn: 2,
+                undone: true,
+            },
+            SessionEvent::TurnStart { turn: 3 },
+            said(3),
+            // A rewind back to the start of turn 3 — seq 6, counting from one.
+            SessionEvent::Rewound {
+                turn: 3,
+                to: 6,
+                scope: atomcode_harness::session::RewindScope::Conversation,
+            },
+        ];
+        let logged: Vec<_> = facts
+            .iter()
+            .enumerate()
+            .map(|(i, fact)| crate::conformance::logged(i, fact))
+            .collect();
+        let undone = undone_turns(&logged);
+        let rewound = rewound_turns(&logged);
+        assert!(
+            undone.contains(&2) && undone.contains(&3),
+            "both are gone from what the model sees: {undone:?}"
+        );
+        assert_eq!(
+            rewound,
+            std::collections::BTreeSet::from([3]),
+            "but only turn 3 was rewound past — a cancel is not a rewind: \
+             {rewound:?}"
+        );
+    }
+
+    /// **A turn a rewind took back is not drawn at all.**
+    ///
+    /// Going back is not the same gesture as stopping: a person who rewinds
+    /// says that turn should not have happened, and a screen still showing it
+    /// is a conversation whose visible half disagrees with what the model is
+    /// being sent. The `Rewound` block stays, so the history says what
+    /// happened rather than quietly losing a stretch of itself.
+    #[test]
+    fn a_rewound_turn_is_not_drawn_at_all() {
+        let h = host();
+        two_turns(&h);
+        let size = (60u16, 24u16);
+        let shown = |h: &Host| {
+            h.compose(size)
+                .part("stream")
+                .map(|part| {
+                    part.lines
+                        .iter()
+                        .map(|line| line.plain())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default()
+        };
+        assert!(shown(&h).contains("the second thing"), "it is there first");
+
+        assert!(h.mark_undone(
+            std::collections::BTreeSet::from([2]),
+            std::collections::BTreeSet::from([2]),
+        ));
+        let text = shown(&h);
+        assert!(
+            !text.contains("the second thing") && !text.contains("answer line one"),
+            "nothing of the rewound turn is left on screen:\n{text}"
+        );
+        assert!(
+            text.contains("the first thing"),
+            "and the turn that stands is untouched:\n{text}"
+        );
     }
 
     /// A block whose row count follows the terminal's capabilities.

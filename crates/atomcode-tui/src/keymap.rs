@@ -113,6 +113,13 @@ pub enum Action {
     /// Its own action for the same reason: its port is its own, and a build may
     /// mount it without the others.
     ToggleTools,
+    /// Pull the rewind panel up, or put it away.
+    ///
+    /// Its own action for the same reason the other four are: its port is its
+    /// own, and a build may mount it without the others. Two gestures ask for
+    /// it — a double-tap on Esc and `/rewind` with nothing after it — and they
+    /// are one implementation because they are one action.
+    ToggleRewind,
     /// Put this session — the lead, or a member of its team — on screen.
     ///
     /// An action, and the only one carrying a value, for the reason

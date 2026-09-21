@@ -133,6 +133,18 @@ pub const NOTICE_MS: u64 = 3_000;
 /// that a wandering hand is not left one keystroke from quitting.
 pub const QUIT_HINT_MS: u64 = 2_000;
 
+/// How long after one Escape a second one still means "open the rewind panel",
+/// in milliseconds.
+///
+/// Shorter than [`QUIT_HINT_MS`], and for the opposite reason: the two-press
+/// exit *says* it is armed, so its window can be generous. This one says
+/// nothing — it is a double-tap, the way a double-click is — so the window has
+/// to be short enough that two unrelated presses a second apart are two
+/// presses, not a gesture. 800ms is about twice a comfortable double-click and
+/// still well under the pause that means "I stopped, then decided something
+/// else".
+pub const ESC_AGAIN_MS: u64 = 800;
+
 /// Something the screen has to say for a moment and then stop saying.
 ///
 /// Transient by construction: the reading it stops at travels with the text, so
@@ -277,6 +289,17 @@ pub struct Moment {
     /// — a `below` [`Notice`] on [`Moment::notice`] — is still up; see
     /// [`Moment::cancel_idle`] and [`Moment::exit_hint_live`].
     pub quit_armed: bool,
+    /// When the last Escape was pressed, while a second one would still mean
+    /// "open the rewind panel".
+    ///
+    /// Screen state and not a fact, the same as [`Moment::quit_armed`] — and a
+    /// reading rather than a flag, because this gesture says nothing on screen:
+    /// the person who double-taps Esc gets the panel, and the person who pressed
+    /// it once and went back to work must not find a panel under their next
+    /// stray press. The clock is the only thing that can tell those two apart.
+    /// Any other action drops it (`plugin.rs`'s `act`); see
+    /// [`Moment::escape_again`].
+    pub esc_armed: Option<Timestamp>,
     /// The mounted cell-grid bitmaps, **as of the frame this moment was taken
     /// for**.
     ///
@@ -407,6 +430,16 @@ pub struct Moment {
     /// row the arrows are on, what it has to say about the last key, and the
     /// switch that is still on its way there and back.
     pub tools_panel: Option<crate::tools::Panel>,
+    /// The turns this session can go back to, as the host last answered it.
+    ///
+    /// Here for the same reason the four above are: which turns can be rewound
+    /// is a fact of the running tree (and of a workspace checkpoint on disk),
+    /// not of the log, and `View::render` may not ask the tree anything — so it
+    /// travels this road or none. See `crate::rewind`.
+    pub rewind: crate::rewind::RewindView,
+    /// The rewind panel, while it is up: which turn the arrows are on, which
+    /// step it is at, and the rewind that is still on its way there and back.
+    pub rewind_panel: Option<crate::rewind::Panel>,
     /// What the Usage page draws, as the host last answered it.
     ///
     /// Asked for rather than pushed: an allowance window changes on the
@@ -591,6 +624,30 @@ impl Moment {
         if self.notice.as_ref().is_some_and(|n| n.below) {
             self.notice = None;
         }
+    }
+
+    /// Arm the double-tap: one Escape has been dealt with, and a second one
+    /// within [`ESC_AGAIN_MS`] opens the rewind panel.
+    pub fn arm_escape(&mut self) {
+        self.esc_armed = Some(self.now);
+    }
+
+    /// Drop it. Called for every action other than an Escape, so a press
+    /// followed by real work never leaves the next Escape opening a panel
+    /// nobody asked for.
+    pub fn disarm_escape(&mut self) {
+        self.esc_armed = None;
+    }
+
+    /// Whether this Escape is the second of a double-tap — the one that pulls
+    /// the rewind panel up.
+    ///
+    /// Read against the injected clock, never `Instant::now()` (`docs/adr/0008`):
+    /// the reading is whatever the frame before this press was painted from,
+    /// which is exactly the resolution a gesture made of two presses needs.
+    pub fn escape_again(&self) -> bool {
+        self.esc_armed
+            .is_some_and(|at| self.now.as_millis().saturating_sub(at.as_millis()) <= ESC_AGAIN_MS)
     }
 
     /// Apply a Ctrl+C on an idle line. Returns `true` when it is the second press
@@ -781,6 +838,47 @@ mod tests {
             !m.cancel_idle(),
             "real work between presses disarms the exit"
         );
+    }
+
+    /// Two Escapes inside the window are one gesture: the second one is what
+    /// pulls the rewind panel up.
+    #[test]
+    fn a_second_escape_inside_the_window_is_the_gesture() {
+        let mut m = Moment {
+            now: Timestamp::millis(1_000),
+            ..Moment::default()
+        };
+        assert!(!m.escape_again(), "一下不是手势");
+        m.arm_escape();
+        m.now = Timestamp::millis(1_000 + ESC_AGAIN_MS);
+        assert!(m.escape_again(), "窗口之内的第二下就是那个手势");
+    }
+
+    /// Past the window it is a fresh first tap. The gesture says nothing on
+    /// screen, so a pause has to be the thing that ends it — otherwise an Esc
+    /// pressed a minute ago would still be half a gesture.
+    #[test]
+    fn a_second_escape_after_the_window_is_a_fresh_first_tap() {
+        let mut m = Moment {
+            now: Timestamp::millis(1_000),
+            ..Moment::default()
+        };
+        m.arm_escape();
+        m.now = Timestamp::millis(1_001 + ESC_AGAIN_MS);
+        assert!(!m.escape_again(), "停顿之后,下一下又是第一下");
+    }
+
+    /// Anything else between them ends it too — that is what `act` calls when
+    /// the action is not an Escape.
+    #[test]
+    fn work_between_two_escapes_ends_the_gesture() {
+        let mut m = Moment {
+            now: Timestamp::millis(1_000),
+            ..Moment::default()
+        };
+        m.arm_escape();
+        m.disarm_escape();
+        assert!(!m.escape_again());
     }
 
     #[test]

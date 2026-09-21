@@ -273,7 +273,49 @@ pub struct RewindCatalog {
     pub generation: RuntimeGeneration,
     pub revision: u64,
     pub points: Vec<RewindPoint>,
-    pub code_unavailable: Option<String>,
+    pub code_unavailable: Option<CodeUnavailable>,
+}
+
+/// Why the workspace half of a rewind is not on offer.
+///
+/// **A kind, not a sentence** — the words belong to whoever is talking to the
+/// person, and a front end that was handed a sentence could only pass it
+/// through in whatever language this crate happened to write it in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CodeUnavailable {
+    /// Off by default, to protect disk space. The person can opt in.
+    NotEnabled,
+    /// This session is not written down, so there is nothing to checkpoint
+    /// against.
+    NoSession,
+    /// Opted in, but the checkpoint could not be set up — with the cause.
+    SetupFailed(String),
+}
+
+impl CodeUnavailable {
+    /// A reason string, for a caller that has nowhere to put the kind.
+    pub fn say(&self) -> String {
+        match self {
+            Self::NotEnabled => {
+                atomcode_capabilities::session::CodeRewindUnavailable::NotEnabled.to_string()
+            }
+            Self::NoSession => "rewind requires a persistent session".to_string(),
+            Self::SetupFailed(why) => {
+                atomcode_capabilities::session::CodeRewindUnavailable::SetupFailed(why.clone())
+                    .to_string()
+            }
+        }
+    }
+}
+
+impl From<atomcode_capabilities::session::CodeRewindUnavailable> for CodeUnavailable {
+    fn from(why: atomcode_capabilities::session::CodeRewindUnavailable) -> Self {
+        use atomcode_capabilities::session::CodeRewindUnavailable as Why;
+        match why {
+            Why::NotEnabled => Self::NotEnabled,
+            Why::SetupFailed(message) => Self::SetupFailed(message),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1897,7 +1939,10 @@ impl CodingRuntimeHandle {
             .ok_or(RuntimeError::RewindPointUnavailable { turn_id })?;
         if scope.restores_code() {
             if let Some(reason) = catalog.code_unavailable {
-                return Err(RuntimeError::CodeRewindUnavailable(reason));
+                // The error carries a sentence because that is what a
+                // `RuntimeError` is; the *kind* reached the front end on the
+                // catalog, which is where a screen looks.
+                return Err(RuntimeError::CodeRewindUnavailable(reason.say()));
             }
         }
         let original = self.snapshot_with_revision().await?;
@@ -3990,9 +4035,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 generation: RuntimeGeneration(generation),
                                 revision: conversation_revision,
                                 points: Vec::new(),
-                                code_unavailable: Some(
-                                    "rewind requires a persistent session".into(),
-                                ),
+                                code_unavailable: Some(CodeUnavailable::NoSession),
                             }));
                             continue;
                         };
@@ -4004,7 +4047,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             generation: RuntimeGeneration(generation),
                             revision: conversation_revision,
                             points: hook.rewind_points(),
-                            code_unavailable: hook.code_rewind_unavailable(),
+                            code_unavailable: hook.code_rewind_unavailable().map(Into::into),
                         }));
                     }
                     // The two controllers live as locals of this loop, which is
@@ -15933,13 +15976,12 @@ mod tests {
         assert_eq!(catalog.points.len(), 1);
         assert_eq!(catalog.points[0].prompt_number, 1);
         assert_eq!(catalog.points[0].prompt_preview, "first rewind prompt");
-        assert!(catalog
-            .code_unavailable
-            .as_deref()
-            // "off by default" is UNIQUE to the disabled reason; the
-            // opted-in-setup-failed error also mentions ATOMCODE_CODE_REWIND, so
-            // that substring can't prove we're in the disabled state.
-            .is_some_and(|reason| reason.contains("off by default")));
+        // The kind, not a substring of a sentence. This used to hunt for
+        // "off by default" — with a comment explaining that the *other* reason
+        // also mentions `ATOMCODE_CODE_REWIND`, so the obvious substring could
+        // not tell the two apart. That was the reason being a sentence; it is a
+        // kind now, and the two states are simply two values.
+        assert_eq!(catalog.code_unavailable, Some(CodeUnavailable::NotEnabled));
 
         let code_error = runtime
             .handle

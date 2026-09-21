@@ -272,7 +272,7 @@ pub enum HostReply {
         /// Why the workspace cannot be rewound here, when it cannot: only the
         /// conversation can.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        code_unavailable: Option<String>,
+        code_unavailable: Option<CodeUnavailable>,
     },
     McpServers {
         servers: Vec<McpServer>,
@@ -633,12 +633,39 @@ pub struct RewindPoint {
     pub turn: u64,
     /// The person's message that opened it, shortened for a list.
     pub prompt: String,
-    /// How many workspace files it changed.
+    /// What it changed in the workspace, one entry per file.
+    ///
+    /// The files themselves and not a count: a screen offering the turn has to
+    /// answer "is this the one?", and `rewind.rs +484` answers it while
+    /// `3 files` does not. The count is `changes.len()`, so carrying both would
+    /// be two truths about one thing. [`ChangedFile`] is the same type `/diff`
+    /// hands back — one contract, one notion of "a file a turn touched".
     #[serde(default)]
-    pub files: usize,
+    pub changes: Vec<ChangedFile>,
     /// Whether the workspace can be put back to before it.
     #[serde(default)]
     pub code: bool,
+}
+
+/// Why the workspace half of a rewind is not on offer.
+///
+/// **A kind, not a sentence.** A front end draws this for a person, in that
+/// person's language — so what travels is which case it is, and the host's own
+/// words only where they are a fact about this machine (a checkpoint that
+/// failed, and why). It arrived here as an English sentence once, which left
+/// every screen able only to pass it through untranslated.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeUnavailable {
+    /// This build keeps workspace checkpoints off by default, to protect disk
+    /// space. The person can turn them on.
+    NotEnabled,
+    /// The session is not written down, so there is nothing to checkpoint
+    /// against.
+    NoSession,
+    /// Turned on, but the checkpoint could not be set up — with the cause.
+    Failed { message: String },
 }
 
 /// One name in the tool catalog, as a screen offering the switch needs it.
@@ -1022,10 +1049,17 @@ mod tests {
                 points: vec![RewindPoint {
                     turn: 2,
                     prompt: "fix the parser".into(),
-                    files: 1,
+                    changes: vec![ChangedFile {
+                        path: "src/parser.rs".into(),
+                        added: 12,
+                        removed: 3,
+                        binary: false,
+                    }],
                     code: true,
                 }],
-                code_unavailable: Some("not a repository".into()),
+                code_unavailable: Some(CodeUnavailable::Failed {
+                    message: "not a repository".into(),
+                }),
             },
             HostReply::McpServers {
                 servers: vec![

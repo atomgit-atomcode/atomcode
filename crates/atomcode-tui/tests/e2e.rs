@@ -320,7 +320,7 @@ async fn start_with_connection(
     setup: Setup,
     wrap: impl FnOnce(atomcode_host_api::HostConnection) -> atomcode_host_api::HostConnection,
 ) -> Session {
-    start_full(setup, wrap, None, None, None).await
+    start_full(setup, wrap, None, None, None, None).await
 }
 
 /// A settings port that answers one row with `value` and knows nothing else.
@@ -353,7 +353,7 @@ async fn start_with_connection_and_settings(
     setup: Setup,
     settings: Option<Arc<dyn atomcode_tui::settings::Settings>>,
 ) -> Session {
-    start_full(setup, |control| control, settings, None, None).await
+    start_full(setup, |control| control, settings, None, None, None).await
 }
 
 /// The layer that puts the test's plugins panel on screen.
@@ -387,7 +387,7 @@ async fn start_with_plugins(
     setup: Setup,
     plugins: Arc<dyn atomcode_tui::plugins::Plugins>,
 ) -> Session {
-    start_full(setup, |control| control, None, Some(plugins), None).await
+    start_full(setup, |control| control, None, Some(plugins), None, None).await
 }
 
 async fn start_full(
@@ -396,6 +396,7 @@ async fn start_full(
     settings: Option<Arc<dyn atomcode_tui::settings::Settings>>,
     plugins: Option<Arc<dyn atomcode_tui::plugins::Plugins>>,
     tools: Option<Arc<dyn atomcode_tui::tools::Tools>>,
+    rewind: Option<Arc<dyn atomcode_tui::rewind::Rewind>>,
 ) -> Session {
     let agent_layers = setup.agent.clone();
     let registry: Registry = Arc::new(agent_catalog);
@@ -436,6 +437,12 @@ async fn start_full(
     if let Some(tools) = tools {
         extra.push(TOOLS_PANEL_LAYER);
         panel_row.push(Arc::new(ToolsPanelRow(tools)));
+    }
+    // And for the rewind panel, whose row carries its port too
+    // (`atomcode::tui_rewind`).
+    if let Some(rewind) = rewind {
+        extra.push(REWIND_PANEL_LAYER);
+        panel_row.push(Arc::new(RewindPanelRow(rewind)));
     }
     let mounted = launch::mount_with(
         &screen,
@@ -4788,10 +4795,46 @@ impl Plugin for ToolsPanelRow {
     }
 }
 
+const REWIND_PANEL_LAYER: &str = "[[insert]]\nname = \"tui-panel-rewind\"\n";
+
+/// The rewind panel's view and its port, mounted the way the launcher's row
+/// mounts them.
+struct RewindPanelRow(Arc<dyn atomcode_tui::rewind::Rewind>);
+
+#[async_trait]
+impl Plugin for RewindPanelRow {
+    fn name(&self) -> &'static str {
+        "tui-panel-rewind"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["tui-modules"]
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["tui-rewind"]
+    }
+    async fn apply(&self, ctx: &Context, _config: &serde_json::Value) -> Result<(), String> {
+        let mods = ctx
+            .require::<atomcode_tui::plugin::ModulesSvc>()
+            .map_err(|e| e.to_string())?;
+        mods.add_view(Arc::new(atomcode_tui::module::Mounted::<
+            atomcode_tui::modules::rewind::Rewind,
+        >::new()))?;
+        let _ = ctx
+            .provide::<atomcode_tui::plugin::RewindSvc>(self.0.clone())
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+/// Start the screen with a rewind port behind it.
+async fn start_with_rewind(setup: Setup, rewind: Arc<dyn atomcode_tui::rewind::Rewind>) -> Session {
+    start_full(setup, |control| control, None, None, None, Some(rewind)).await
+}
+
 /// Start the screen with a tools port behind it — the only way to see the
 /// panel: a screen with no port refuses to open it.
 async fn start_with_tools(setup: Setup, tools: Arc<dyn atomcode_tui::tools::Tools>) -> Session {
-    start_full(setup, |control| control, None, None, Some(tools)).await
+    start_full(setup, |control| control, None, None, Some(tools), None).await
 }
 
 // ---- the plugins panel ---------------------------------------------------
@@ -5319,5 +5362,237 @@ async fn a_screen_with_no_tools_port_says_so() {
 
     s.term.type_line("/toolbox");
     until(&s, "tui-panel-tools").await;
+    task.abort();
+}
+
+// ---- the rewind panel -----------------------------------------------------
+
+/// A rewind port that answers from memory and records what it was asked to do.
+///
+/// A recording rather than a live session, because what these judge is the
+/// screen: that a double-tap on Esc opens the panel, that a turn and a scope
+/// leave together, and that what came back lands where the person types.
+/// Whether a workspace can really be put back is judged where that happens
+/// (`atomcode-capabilities`' checkpoint tests).
+struct FakeRewind {
+    view: atomcode_tui::rewind::RewindView,
+    did: std::sync::Mutex<Vec<String>>,
+    /// What the host hands back, as the words of the turn that was taken back.
+    restored: Option<String>,
+}
+
+impl FakeRewind {
+    fn new(view: atomcode_tui::rewind::RewindView, restored: Option<&str>) -> Arc<Self> {
+        Arc::new(Self {
+            view,
+            did: std::sync::Mutex::new(Vec::new()),
+            restored: restored.map(str::to_string),
+        })
+    }
+}
+
+#[async_trait]
+impl atomcode_tui::rewind::Rewind for FakeRewind {
+    async fn points(&self) -> Result<atomcode_tui::rewind::RewindView, String> {
+        Ok(self.view.clone())
+    }
+
+    async fn rewind(
+        &self,
+        turn: u64,
+        scope: atomcode_tui::rewind::Scope,
+    ) -> Result<atomcode_tui::rewind::Done, String> {
+        self.did
+            .lock()
+            .expect("recording poisoned")
+            .push(format!("{turn} {scope:?}"));
+        Ok(atomcode_tui::rewind::Done {
+            prompt: self.restored.clone(),
+            files: 3,
+        })
+    }
+}
+
+/// Two turns: one that changed a file and one that changed nothing.
+fn two_turns() -> atomcode_tui::rewind::RewindView {
+    use atomcode_tui::rewind::{Change, Point};
+    atomcode_tui::rewind::RewindView::new(
+        vec![
+            Point {
+                turn: 1,
+                prompt: "写个解析器".into(),
+                changes: vec![Change {
+                    path: "parser.rs".into(),
+                    additions: 484,
+                    deletions: 12,
+                }],
+                code: true,
+            },
+            Point {
+                turn: 2,
+                prompt: "再加一个测试".into(),
+                changes: Vec::new(),
+                code: false,
+            },
+        ],
+        None,
+    )
+}
+
+/// **Esc twice pulls the rewind panel up.** The gesture a person reaches for
+/// when the last turn went the wrong way: stop, then take it back.
+#[tokio::test]
+async fn a_double_tap_on_esc_pulls_the_rewind_panel_up() {
+    let dir = scratch("rewind-double-esc");
+    let port = FakeRewind::new(two_turns(), None);
+    let s = start_with_rewind(tree(&dir, &replay(r#"{ text = "ok" }"#), &[]), port.clone()).await;
+    let task = s.open().await;
+    s.quiet().await;
+
+    // One press is not the gesture: it is the ordinary Escape, and it leaves the
+    // screen alone.
+    s.term.press(KeyPress::plain(Key::Esc));
+    s.quiet().await;
+    assert!(
+        !s.screen().contains("写个解析器"),
+        "一下 Esc 不该拉起面板:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::plain(Key::Esc));
+    until(&s, "写个解析器").await;
+    let open = s.screen();
+    assert!(
+        open.contains("parser.rs") && open.contains("+484"),
+        "每个回合底下压着它动过什么:\n{open}"
+    );
+    assert!(
+        open.contains("没有代码改动"),
+        "没动过文件的那个回合也要说出来:\n{open}"
+    );
+    task.abort();
+}
+
+/// The latch is the quiet kind: anything else between the two presses means the
+/// second one is an ordinary Escape again, not half a gesture.
+#[tokio::test]
+async fn work_between_two_escapes_is_not_a_double_tap() {
+    let dir = scratch("rewind-latch-drops");
+    let port = FakeRewind::new(two_turns(), None);
+    let s = start_with_rewind(tree(&dir, &replay(r#"{ text = "ok" }"#), &[]), port.clone()).await;
+    let task = s.open().await;
+    s.quiet().await;
+
+    s.term.press(KeyPress::plain(Key::Esc));
+    s.term.press(KeyPress::plain(Key::Char('h')));
+    s.term.press(KeyPress::plain(Key::Esc));
+    s.quiet().await;
+    assert!(
+        !s.screen().contains("写个解析器"),
+        "中间干过别的,第二下 Esc 就只是 Esc:\n{}",
+        s.screen()
+    );
+    task.abort();
+}
+
+/// **A turn and a scope leave together, and the words come back to the
+/// composer.** Two presses of ⏎: the first picks the turn, the second says what
+/// goes back with it.
+#[tokio::test]
+async fn choosing_a_turn_and_a_scope_sends_that_rewind_and_returns_the_words() {
+    let dir = scratch("rewind-go");
+    let port = FakeRewind::new(two_turns(), Some("写个解析器"));
+    let s = start_with_rewind(tree(&dir, &replay(r#"{ text = "ok" }"#), &[]), port.clone()).await;
+    let task = s.open().await;
+    s.quiet().await;
+
+    s.term.type_line("/rewind");
+    until(&s, "写个解析器").await;
+    // The panel rests on "(current)"; two steps up is the turn that changed a
+    // file, which is the only one a code rewind is offered for.
+    s.term.press(KeyPress::plain(Key::Up));
+    s.term.press(KeyPress::plain(Key::Up));
+    s.term.press(KeyPress::plain(Key::Enter));
+    until(&s, "把什么一起带回去").await;
+    s.term.press(KeyPress::plain(Key::Enter));
+    until(&s, "已还原 3 个文件").await;
+
+    assert_eq!(
+        port.did.lock().expect("recording poisoned").as_slice(),
+        ["1 Both"],
+        "一次回退,带着人挑的那一档范围"
+    );
+    let after = s.screen();
+    assert!(
+        !after.contains("把什么一起带回去"),
+        "落地之后面板收起来:\n{after}"
+    );
+    assert!(
+        after.contains("写个解析器"),
+        "而被撤回的那句话回到人打字的地方:\n{after}"
+    );
+    task.abort();
+}
+
+/// **The panel opens aimed at nothing.** It rests on "(current)", where ⏎ puts
+/// it away without rewinding anything — a panel that opened aimed at a rewind
+/// would be one stray press from taking work back.
+#[tokio::test]
+async fn the_rewind_panel_opens_aimed_at_nothing() {
+    let dir = scratch("rewind-rests");
+    let port = FakeRewind::new(two_turns(), None);
+    let s = start_with_rewind(tree(&dir, &replay(r#"{ text = "ok" }"#), &[]), port.clone()).await;
+    let task = s.open().await;
+    s.quiet().await;
+
+    s.term.type_line("/rewind");
+    until(&s, "（当前）").await;
+    s.term.press(KeyPress::plain(Key::Enter));
+    until_gone(&s, "写个解析器").await;
+    assert!(
+        port.did.lock().expect("recording poisoned").is_empty(),
+        "什么都没回退"
+    );
+    task.abort();
+}
+
+/// A turn that changed no file is not offered a code rewind: the scope is
+/// refused with the reason, rather than quietly doing the conversation instead.
+#[tokio::test]
+async fn a_turn_with_no_file_refuses_the_code_scope_in_the_panel() {
+    let dir = scratch("rewind-no-code");
+    let port = FakeRewind::new(two_turns(), None);
+    let s = start_with_rewind(tree(&dir, &replay(r#"{ text = "ok" }"#), &[]), port.clone()).await;
+    let task = s.open().await;
+    s.quiet().await;
+
+    s.term.type_line("/rewind");
+    until(&s, "再加一个测试").await;
+    // One step up from "(current)" is the turn that changed nothing.
+    s.term.press(KeyPress::plain(Key::Up));
+    s.term.press(KeyPress::plain(Key::Enter));
+    until(&s, "把什么一起带回去").await;
+    s.term.press(KeyPress::plain(Key::Down));
+    s.term.press(KeyPress::plain(Key::Enter));
+    until(&s, "没改过文件").await;
+
+    assert!(
+        port.did.lock().expect("recording poisoned").is_empty(),
+        "没派出去:那一档按下去本来就什么都不会发生"
+    );
+    task.abort();
+}
+
+/// A screen whose launcher gave it no rewind panel says so, rather than opening
+/// a panel with nothing in it.
+#[tokio::test]
+async fn a_screen_with_no_rewind_port_says_so() {
+    let dir = scratch("rewind-absent");
+    let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    let task = s.open().await;
+    s.quiet().await;
+
+    s.term.type_line("/rewind");
+    until(&s, "tui-panel-rewind").await;
     task.abort();
 }

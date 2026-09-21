@@ -739,59 +739,21 @@ impl CommandSet for SessionCommands {
                         })
                         .await
                 } else {
+                    // With no turn: the panel, which is where choosing one
+                    // belongs (`crate::rewind`). It used to be a modal picker
+                    // here — a list you picked from once and lost — and the scope
+                    // could only be said by typing it. The panel is the same
+                    // gesture a double-tap on Esc makes, so there is one rewind
+                    // on screen rather than two.
                     let Some(turn) = turn else {
-                        return match control
-                            .call(HostCommand::RewindPoints { session: root })
-                            .await
-                        {
-                            Ok(HostReply::RewindPoints {
-                                points,
-                                code_unavailable,
-                            }) if !points.is_empty() => {
-                                let choices = points
-                                    .into_iter()
-                                    .map(|point| {
-                                        // The word the parser takes, not the one
-                                        // on screen: this string is dispatched as
-                                        // a command, and a command spelled in
-                                        // whichever language was in force when the
-                                        // menu opened is a command that stops
-                                        // parsing when the language changes.
-                                        let scope = if point.code && code_unavailable.is_none() {
-                                            " both"
-                                        } else {
-                                            ""
-                                        };
-                                        crate::overlay::Choice::new(
-                                            format!("/rewind {}{scope}", point.turn),
-                                            point.prompt.clone(),
-                                        )
-                                        .about(t(
-                                            Msg::RewindPointAbout {
-                                                turn: point.turn,
-                                                files: point.files,
-                                            },
-                                        ))
-                                    })
-                                    .collect();
-                                Outcome::Open(crate::overlay::Picker::new(
-                                    "rewind",
-                                    t(Msg::RewindPickerHint),
-                                    choices,
-                                ))
-                            }
-                            Ok(HostReply::RewindPoints { .. }) => {
-                                Outcome::Said(t(Msg::RewindNoPoints).into_owned())
-                            }
-                            Ok(other) => Outcome::Refused(format!("{other:?}")),
-                            Err(error) => Outcome::Refused(refusal(error)),
-                        };
+                        return Outcome::Do(Action::ToggleRewind);
                     };
                     let scope = match words.next() {
                         // Both spellings of each scope are taken, in either
                         // language: what a person typed last month must keep
-                        // parsing after `/language`, and a menu pick dispatches
-                        // the English one (see the picker above).
+                        // parsing after `/language`. The panel never dispatches
+                        // a command at all — it carries a `Scope` — so this
+                        // parser exists for what a person types, and only that.
                         None | Some("对话") | Some("conversation") => {
                             atomcode_kernel::session::RewindScope::Conversation
                         }
@@ -1806,23 +1768,12 @@ mod tests {
         );
     }
 
-    /// `/rewind` with nothing after it offers the points to pick from; with a
-    /// turn and a scope it goes back.
+    /// `/rewind` with nothing after it asks for the panel — the same thing a
+    /// double-tap on Esc asks for, so there is one rewind on screen rather than
+    /// two. With a turn and a scope it goes back without opening anything.
     #[tokio::test]
-    async fn rewind_offers_the_points_and_goes_back_with_a_scope() {
+    async fn rewind_opens_the_panel_and_goes_back_with_a_scope() {
         let host = Arc::new(Recording::default());
-        host.replies
-            .lock()
-            .unwrap()
-            .push_back(Ok(HostReply::RewindPoints {
-                points: vec![atomcode_host_api::RewindPoint {
-                    turn: 2,
-                    prompt: "two".into(),
-                    files: 1,
-                    code: true,
-                }],
-                code_unavailable: None,
-            }));
         host.replies
             .lock()
             .unwrap()
@@ -1831,10 +1782,15 @@ mod tests {
                 restored_files: vec!["src/a.rs".into()],
             }));
         let (app, _client, all) = following(&host);
-        match all.dispatch("/rewind", &app.context()).await {
-            Outcome::Open(picker) => assert_eq!(picker.id(), "rewind"),
-            other => panic!("{other:?}"),
-        }
+        assert_eq!(
+            all.dispatch("/rewind", &app.context()).await,
+            Outcome::Do(Action::ToggleRewind),
+            "无参的 /rewind 不问宿主,它要的是那块面板"
+        );
+        assert!(
+            host.asked.lock().unwrap().is_empty(),
+            "而且一趟往返都没发出去"
+        );
         assert_eq!(
             all.dispatch("/rewind 2 代码", &app.context()).await,
             Outcome::Said("已还原 1 个文件".into())

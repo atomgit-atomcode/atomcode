@@ -96,6 +96,7 @@ plexus_service!(PluginsSvc => dyn crate::plugins::Plugins, "tui-plugins", Seam, 
 // a fact of the running tree, which this crate may not reach into
 // (`docs/adr/0022` §3) — so it arrives over a seam like everything else.
 plexus_service!(ToolCatalogSvc => dyn crate::tools::Tools, "tui-tools", Seam, "The tool catalog a person can look at and switch, one tool at a time");
+plexus_service!(RewindSvc => dyn crate::rewind::Rewind, "tui-rewind", Seam, "The turns this session can be taken back to, and the taking back");
 
 /// The session's clock, and the only place this crate reads one.
 ///
@@ -1349,6 +1350,10 @@ impl UserInterface for Tui {
                             stale = true;
                             continue;
                         }
+                        if self.host.rewind_wheel(x, y, by) {
+                            stale = true;
+                            continue;
+                        }
                         if self.host.providers_wheel(x, y, by) {
                             stale = true;
                             continue;
@@ -1460,6 +1465,20 @@ impl UserInterface for Tui {
                                 if let Some(row) = self.host.tools_row_at(x, y) {
                                     let _ = self.host.point_tools_at(row);
                                     self.run_tools_key(crate::surface::KeyPress::plain(
+                                        crate::surface::Key::Enter,
+                                    ));
+                                    stale = true;
+                                    continue;
+                                }
+                            }
+                            // And the rewind panel: a click on a turn points at
+                            // it and walks on to the second step — the same two
+                            // presses the keyboard makes, so a click can never
+                            // reach further than a key can.
+                            if self.host.rewind_open() {
+                                if let Some(row) = self.host.rewind_row_at(x, y) {
+                                    let _ = self.host.point_rewind_at(row);
+                                    self.run_rewind_key(crate::surface::KeyPress::plain(
                                         crate::surface::Key::Enter,
                                     ));
                                     stale = true;
@@ -1600,6 +1619,12 @@ impl UserInterface for Tui {
                                     stale |= self.host.point_tools_at(row);
                                 }
                             }
+                            // And the rewind panel.
+                            if self.host.rewind_open() {
+                                if let Some(row) = self.host.rewind_row_at(x, y) {
+                                    stale |= self.host.point_rewind_at(row);
+                                }
+                            }
                             continue;
                         }
                         // Handled above, and never reached.
@@ -1692,6 +1717,15 @@ impl UserInterface for Tui {
                 // four is ever up (`Host::toggle_tools`).
                 Wake::Input(Input::Key(press)) if self.host.tools_open() => {
                     stale |= self.run_tools_key(press);
+                }
+                // And the rewind panel, on the same terms: at most one of the
+                // five is ever up (`Host::toggle_rewind`). Above the composer
+                // for the reason all of them are — and it is also why a person
+                // in this panel can press Esc without it reaching the
+                // double-tap in `act`: the panel owns the key while it is up,
+                // and Esc in there means "back a step", then "put it away".
+                Wake::Input(Input::Key(press)) if self.host.rewind_open() => {
+                    stale |= self.run_rewind_key(press);
                 }
                 // A question on screen gets first refusal on every key. It is a
                 // panel riding the tail now, not a modal, so this is the only
@@ -2057,6 +2091,128 @@ impl Tui {
                         t(Msg::ToolCatalogUnreadable { why: &why }).into_owned(),
                         true,
                     );
+                }
+            }
+            if let Some(keys) = keys {
+                let _ = keys.send(Wake::Fact);
+            }
+        });
+    }
+
+    /// Ask the host which turns this session can go back to, and put the answer
+    /// on the panel.
+    ///
+    /// Read when the panel opens and again after a rewind lands, never per
+    /// frame: it is a round trip to the running tree (and, for the workspace
+    /// half, to a checkpoint on disk), while `render` must stay pure.
+    fn refresh_rewind(&self) {
+        let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
+            self.host.rewind_busy(None);
+            self.host
+                .say(t(Msg::ScreenNotConnectedRewind).into_owned(), true);
+            return;
+        };
+        let Some(port) = ctx.service::<crate::plugin::RewindSvc>() else {
+            self.host.rewind_busy(None);
+            self.host.say(t(Msg::NoRewind).into_owned(), true);
+            return;
+        };
+        let host = self.host.clone();
+        let keys = self.wake.lock().expect("wake poisoned").clone();
+        tokio::spawn(async move {
+            match port.points().await {
+                Ok(view) => {
+                    host.show_rewind(view);
+                }
+                Err(why) => {
+                    host.said(
+                        t(Msg::RewindPointsUnreadable { why: &why }).into_owned(),
+                        true,
+                    );
+                }
+            }
+            // Whatever came back, the reading is over — including the failure,
+            // which must not leave a panel saying "reading…" forever.
+            host.rewind_busy(None);
+            if let Some(keys) = keys {
+                let _ = keys.send(Wake::Fact);
+            }
+        });
+    }
+
+    /// Pull the rewind panel up (or put it away), and read the turns when it
+    /// comes up.
+    fn toggle_rewind_panel(&self) {
+        if !self.host.toggle_rewind() {
+            self.say(&t(Msg::NoRewindPanel));
+            return;
+        }
+        if self.host.rewind_open() {
+            self.refresh_rewind();
+        }
+    }
+
+    /// Run one key against the rewind panel, and act on what it asked for.
+    ///
+    /// **True when a frame is owed.**
+    fn run_rewind_key(&self, press: crate::surface::KeyPress) -> bool {
+        let (changed, asked) = self.host.rewind_key(press);
+        let Some(step) = asked else {
+            return changed;
+        };
+        self.apply_rewind_step(step);
+        true
+    }
+
+    /// Send one rewind over the seam.
+    ///
+    /// **The panel goes away when it lands, and the words come back to the
+    /// composer** — the same ending `/undo` has (`docs/adr/0024` §17): what the
+    /// person said in the turn that was taken back is put where they type, to
+    /// change and send again. A failure keeps the panel up with the reason on
+    /// it, because the next thing to do is still in there.
+    fn apply_rewind_step(&self, step: crate::rewind::Step) {
+        use crate::rewind::Step;
+        let Step::Go { turn, scope } = step else {
+            return;
+        };
+        let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
+            self.host.rewind_busy(None);
+            self.host
+                .say(t(Msg::ScreenNotConnectedRewind).into_owned(), true);
+            return;
+        };
+        let Some(port) = ctx.service::<crate::plugin::RewindSvc>() else {
+            self.host.rewind_busy(None);
+            self.host.say(t(Msg::NoRewind).into_owned(), true);
+            return;
+        };
+        let host = self.host.clone();
+        let keys = self.wake.lock().expect("wake poisoned").clone();
+        tokio::spawn(async move {
+            let done = port.rewind(turn, scope).await;
+            // The panel first: whatever happened, that trip is over.
+            host.rewind_busy(None);
+            match done {
+                Ok(done) => {
+                    host.close_rewind();
+                    host.said(
+                        t(Msg::RewindRestored { files: done.files }).into_owned(),
+                        false,
+                    );
+                    if let Some(prompt) = done.prompt.filter(|p| !p.is_empty()) {
+                        if let Some(keys) = keys.as_ref() {
+                            // Through the loop rather than into the moment from
+                            // here: putting words where a person types is an
+                            // action, and actions have one implementation
+                            // (`act`) whether a key, a command or this asked
+                            // for them.
+                            let _ = keys.send(Wake::Act(Action::Paste(prompt)));
+                        }
+                    }
+                }
+                Err(why) => {
+                    host.rewind_note(Some(t(Msg::RewindFailed { why: &why }).into_owned()));
                 }
             }
             if let Some(keys) = keys {
@@ -2598,12 +2754,14 @@ impl Tui {
         true
     }
 
-    /// Tell the screen which turns were taken back, from the facts it has.
+    /// Tell the screen which turns were taken back, from the facts it has —
+    /// and which of them a *rewind* took, which is drawn differently.
     fn mark_undone(&self) -> bool {
-        self.host
-            .mark_undone(atomcode_kernel::session::undone_turns(
-                &self.client.events(),
-            ))
+        let events = self.client.events();
+        self.host.mark_undone(
+            atomcode_kernel::session::undone_turns(&events),
+            atomcode_kernel::session::rewound_turns(&events),
+        )
     }
 
     /// A key while the team panel has the keyboard: move, switch, or give it back.
@@ -3019,6 +3177,13 @@ impl Tui {
         if !matches!(action, Action::Cancel) {
             m.disarm_quit();
         }
+        // The same shape, for the other latch: every action but an Escape drops
+        // the pending double-tap. Someone who pressed Esc once and went back to
+        // work must not find a panel under their next stray press — the gesture
+        // says nothing on screen, so it has to be the quieter of the two.
+        if !matches!(action, Action::Escape) {
+            m.disarm_escape();
+        }
         // A highlight is a rectangle of screen cells. Anything that repaints
         // those cells with different text leaves it pointing at the wrong
         // words, so it is dropped by everything except the gestures that are
@@ -3035,6 +3200,10 @@ impl Tui {
             // Escape does the innermost thing, and the selection is the
             // innermost of them.
             if m.selection.take().is_some() && matches!(action, Action::Escape) {
+                // It counts as the first tap all the same: clearing a highlight
+                // is what *this* press did, and the next one is still the second
+                // of a double-tap.
+                m.arm_escape();
                 return false;
             }
         }
@@ -3373,6 +3542,11 @@ impl Tui {
                 }
                 return false;
             }
+            Action::ToggleRewind => {
+                drop(m);
+                self.toggle_rewind_panel();
+                return false;
+            }
             Action::LookAt(session) => {
                 drop(m);
                 self.switch_to(&session);
@@ -3445,6 +3619,17 @@ impl Tui {
             // annoying; losing it because you wanted to stop the model is
             // worse, which is why ctrl-c stays `Cancel` and only stops.
             Action::Escape => {
+                // The second tap of a double-tap pulls the rewind panel up. It
+                // does not redo the first tap's work: the draft was already
+                // cleared, the turn was already stopped — what is left to want,
+                // one press later, is the turn before that.
+                if m.escape_again() {
+                    m.disarm_escape();
+                    drop(m);
+                    self.toggle_rewind_panel();
+                    return false;
+                }
+                m.arm_escape();
                 if !m.input.is_empty() {
                     m.draft.clear();
                     m.history_at = None;

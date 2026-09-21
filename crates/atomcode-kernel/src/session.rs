@@ -825,6 +825,25 @@ pub fn undone_turns(events: &[LoggedEvent]) -> std::collections::BTreeSet<u64> {
         .collect()
 }
 
+/// Which turns a **rewind** took back — the subset of [`undone_turns`] a person
+/// asked for by name, leaving out the ones a cancel withdrew.
+///
+/// The two are drawn differently, which is why they are counted separately: a
+/// turn a person rewound past is one they said should not have happened, and
+/// the screen takes it off (`docs/adr/0024` §17). A turn they *cancelled* is
+/// one they stopped halfway, and what it got done before they stopped is still
+/// worth reading — so that one stays, dimmed.
+pub fn rewound_turns(events: &[LoggedEvent]) -> std::collections::BTreeSet<u64> {
+    let taken_back = taken_back(events);
+    events
+        .iter()
+        .filter_map(|logged| match logged.event {
+            SessionEvent::TurnStart { turn } if taken_back(logged.seq) => Some(turn),
+            _ => None,
+        })
+        .collect()
+}
+
 /// What undos took back: every fact from a `Rewound`'s target up to the
 /// `Rewound` itself. Several stack.
 fn taken_back(events: &[LoggedEvent]) -> impl Fn(SeqNo) -> bool {

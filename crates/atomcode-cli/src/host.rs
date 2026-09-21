@@ -846,11 +846,33 @@ impl HostControl for RuntimeControl {
                         .map(|point| atomcode_host_api::RewindPoint {
                             turn: point.turn_id,
                             prompt: point.prompt_preview,
-                            files: point.files.len(),
+                            // The ledger already carries a line count per file;
+                            // it used to be thrown away here and counted, which
+                            // left a screen able to say "3 files" and nothing
+                            // about which.
+                            changes: point
+                                .files
+                                .into_iter()
+                                .map(|file| atomcode_host_api::ChangedFile {
+                                    path: file.path,
+                                    added: file.additions,
+                                    removed: file.deletions,
+                                    binary: file.binary,
+                                })
+                                .collect(),
                             code: point.before_tree.is_some(),
                         })
                         .collect(),
-                    code_unavailable: catalog.code_unavailable,
+                    code_unavailable: catalog.code_unavailable.map(|why| {
+                        use atomcode_coding::runtime::CodeUnavailable as Why;
+                        match why {
+                            Why::NotEnabled => atomcode_host_api::CodeUnavailable::NotEnabled,
+                            Why::NoSession => atomcode_host_api::CodeUnavailable::NoSession,
+                            Why::SetupFailed(message) => {
+                                atomcode_host_api::CodeUnavailable::Failed { message }
+                            }
+                        }
+                    }),
                 })
             }
             HostCommand::Rewind {

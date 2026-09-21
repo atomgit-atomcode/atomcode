@@ -680,7 +680,7 @@ mod tests {
         let point = |turn: u64, prompt: &str| atomcode_host_api::RewindPoint {
             turn,
             prompt: prompt.to_string(),
-            files: 0,
+            changes: Vec::new(),
             code: false,
         };
         host.replies.lock().unwrap().extend([

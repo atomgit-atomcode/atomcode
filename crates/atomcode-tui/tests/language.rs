@@ -89,6 +89,11 @@ fn each_panel_s_own_words_follow_the_language() {
             atomcode_tui::plugins::PluginAction::Uninstall.label(),
             atomcode_tui::plugins::MarketAction::Remove.label(),
             atomcode_tui::tools::State::On.about(),
+            atomcode_tui::rewind::Scope::Conversation.about(),
+            // 这一句真跑起来是英文的:它本是宿主写死的一句英文,屏幕原样
+            // 传了出去。现在它是屏幕自己的话,所以跟着语言走。
+            atomcode_tui::rewind::CodeOff::NotEnabled.say(),
+            atomcode_tui::rewind::CodeOff::NoSession.say(),
             atomcode_tui::text::spoken_duration(4 * 60 + 12),
             atomcode_tui::text::when(0),
         ]

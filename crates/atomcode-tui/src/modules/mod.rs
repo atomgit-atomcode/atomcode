@@ -7,6 +7,7 @@ pub mod live;
 pub mod plugins;
 pub mod providers;
 pub mod raster;
+pub mod rewind;
 pub mod settings;
 pub mod status;
 pub mod steering;

@@ -71,6 +71,7 @@ pub mod providers;
 pub mod qr;
 pub mod raster;
 pub mod region;
+pub mod rewind;
 pub mod rows;
 pub mod secret;
 pub mod settings;

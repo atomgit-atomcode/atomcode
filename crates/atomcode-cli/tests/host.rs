@@ -1895,3 +1895,59 @@ fn every_reason_a_provider_cannot_serve_says_something_and_only_some_name_a_fix(
         }
     }
 }
+
+/// A listed turn says **which** files it changed, not just how many.
+///
+/// The panel that offers these turns answers "is this the one?" with
+/// `parser.rs +484`; `3 files` does not answer it. The contract carried only a
+/// count for a while, and the per-file summary the ledger already had was
+/// thrown away with a `.len()` on this side.
+#[tokio::test]
+async fn a_listed_turn_says_which_files_it_changed() {
+    let env = env_with_code_rewind();
+    let mut connection = connected(&env).await;
+    let session = connection.session.clone();
+    connection.commands.send(subscribe(&session)).unwrap();
+    // Writes go through without a question, so the turn this judges is about
+    // the listing rather than about approval.
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::SetMode {
+                session: session.clone(),
+                mode: atomcode_host_api::Mode::Auto,
+            })
+            .await,
+        Ok(HostReply::Done)
+    );
+    let written = env.project.path().join("a.txt");
+    connection
+        .commands
+        .send(message(&format!("write {}", written.display())))
+        .unwrap();
+    through_turn(&mut connection).await;
+    // A second turn, so the first one's checkpoint has a later tree to be
+    // compared against.
+    connection.commands.send(message("two")).unwrap();
+    through_turn(&mut connection).await;
+    quiet(&mut connection).await;
+
+    let Ok(HostReply::RewindPoints { points, .. }) = connection
+        .control
+        .call(HostCommand::RewindPoints {
+            session: session.clone(),
+        })
+        .await
+    else {
+        panic!("rewind points");
+    };
+    let changed: Vec<&str> = points
+        .iter()
+        .flat_map(|point| point.changes.iter())
+        .map(|file| file.path.as_str())
+        .collect();
+    assert!(
+        changed.iter().any(|path| path.ends_with("a.txt")),
+        "the turn that wrote a file says which one: {points:#?}"
+    );
+}
