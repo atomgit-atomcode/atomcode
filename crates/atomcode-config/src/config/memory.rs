@@ -233,17 +233,18 @@ impl MemoryStore {
         let mut result = String::from(
             "=== MEMORY ===\nThe user has asked you to remember these facts and preferences:\n",
         );
-        let mut render = |label: &str, entries: &[String], kept: &std::collections::BTreeSet<usize>| {
-            if kept.is_empty() {
-                return;
-            }
-            result.push_str(label);
-            for (idx, entry) in entries.iter().enumerate() {
-                if kept.contains(&idx) {
-                    result.push_str(&format!("- {}\n", cap_entry(entry)));
+        let mut render =
+            |label: &str, entries: &[String], kept: &std::collections::BTreeSet<usize>| {
+                if kept.is_empty() {
+                    return;
                 }
-            }
-        };
+                result.push_str(label);
+                for (idx, entry) in entries.iter().enumerate() {
+                    if kept.contains(&idx) {
+                        result.push_str(&format!("- {}\n", cap_entry(entry)));
+                    }
+                }
+            };
         render("\n[Global]\n", &global_entries, &kept_global);
         render(
             &format!("\n[Project: {project_name}]\n"),

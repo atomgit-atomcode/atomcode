@@ -276,17 +276,18 @@ impl MemoryStore {
         let mut result = String::from(
             "=== MEMORY ===\nThe user has asked you to remember these facts and preferences. They take PRECEDENCE over default system prompt rules on conflict:\n",
         );
-        let mut render = |label: &str, entries: &[String], kept: &std::collections::BTreeSet<usize>| {
-            if kept.is_empty() {
-                return;
-            }
-            result.push_str(label);
-            for (idx, entry) in entries.iter().enumerate() {
-                if kept.contains(&idx) {
-                    result.push_str(&format!("- {}\n", cap_entry(entry)));
+        let mut render =
+            |label: &str, entries: &[String], kept: &std::collections::BTreeSet<usize>| {
+                if kept.is_empty() {
+                    return;
                 }
-            }
-        };
+                result.push_str(label);
+                for (idx, entry) in entries.iter().enumerate() {
+                    if kept.contains(&idx) {
+                        result.push_str(&format!("- {}\n", cap_entry(entry)));
+                    }
+                }
+            };
         render("\n[Global]\n", &global_entries, &kept_global);
         render(
             &format!("\n[Project: {project_name}]\n"),
@@ -534,7 +535,10 @@ mod tests {
             "dropped entries must be reported: {result:.120}"
         );
         // The FIX: the NEWEST entry survives and the OLDEST is dropped (was reversed).
-        assert!(result.contains("entry number 99"), "newest entry must survive");
+        assert!(
+            result.contains("entry number 99"),
+            "newest entry must survive"
+        );
         assert!(
             !result.contains("entry number 0 "),
             "oldest entry must be the one dropped"
@@ -559,6 +563,9 @@ mod tests {
             result.contains("LOCAL_KEEPER"),
             "the local entry must survive even when global overflows: {result:.200}"
         );
-        assert!(result.contains("omitted"), "global overflow must be reported");
+        assert!(
+            result.contains("omitted"),
+            "global overflow must be reported"
+        );
     }
 }
