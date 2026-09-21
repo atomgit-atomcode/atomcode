@@ -45,18 +45,20 @@ fn warn() -> Style {
 }
 /// A call that has receded behind a fold.
 ///
-/// The heading role, so a folded line reads as scaffolding over the answer
-/// rather than as one more thing being said: an expanded call is a fact the
-/// reader is looking at, a folded one is a fact they have chosen not to. The
-/// whole summary takes it — name, subject and mark alike — because a line that
-/// stated two colours would be saying two things.
+/// The muted grey, so a folded line reads as scaffolding over the answer rather
+/// than as one more thing being said: an expanded call is a fact the reader is
+/// looking at, a folded one is a fact they have chosen not to, so it recedes
+/// like the rest of the chrome. The whole summary takes it — name, subject and
+/// mark alike — because a line that stated two colours would be saying two
+/// things. (An accent here read as *louder* than the open call, the opposite of
+/// receding.)
 ///
 /// It overrides the state a call is in, deliberately. A run that is still going
 /// is [`warn`] *while it is open*, where the reader is watching it; folded, it
 /// has already told the reader it exists, and the live line below is where "in
 /// flight" is stated.
 fn fold() -> Style {
-    Style::new().fg(Color::role(Role::Accent))
+    muted()
 }
 
 fn wrapped(text: &str, w: u16, style: Style, prefix: &str) -> Vec<Line> {
@@ -2746,17 +2748,17 @@ mod tests {
     }
 
     /// A folded call recedes: it is scaffolding over the answer rather than one
-    /// more thing being said, so its summary takes the heading role — and takes
-    /// it *instead of* the state it is in. A run still going is yellow while it
-    /// is open; folded it is heading-coloured like everything else, because the
-    /// reader has already been told it exists and the live line is where "still
-    /// running" is stated.
+    /// more thing being said, so its summary takes the muted grey — and takes it
+    /// *instead of* the state it is in. A run still going is yellow while it is
+    /// open; folded it is muted like the rest of the chrome, because the reader
+    /// has already been told it exists and the live line is where "still running"
+    /// is stated. (An accent here read as louder than the open call.)
     ///
     /// The note is the exception, and deliberately: `失败 · …` is the answer
     /// rather than the summary, and a fold must not swallow that.
     #[test]
-    fn a_folded_call_recedes_to_the_heading_colour_and_keeps_its_failure_note() {
-        let heading = Some(crate::frame::Color::role(Role::Accent));
+    fn a_folded_call_recedes_to_the_muted_grey_and_keeps_its_failure_note() {
+        let receded = Some(crate::frame::Color::role(Role::Muted));
         let pending = ToolCallBlock::pending(
             "c",
             "read_file",
@@ -2769,14 +2771,14 @@ mod tests {
             .iter()
             .find(|s| s.text.contains("ReadFile"))
             .expect("the tool's name");
-        assert_eq!(named.style.fg, heading, "the folded name is not receding");
+        assert_eq!(named.style.fg, receded, "the folded name is not receding");
         let subject = folded
             .spans
             .iter()
             .find(|s| s.text.contains("content.rs"))
             .expect("the subject");
         assert_eq!(
-            subject.style.fg, heading,
+            subject.style.fg, receded,
             "the folded subject is not receding"
         );
         // The whole line, so a folded line cannot be half-loud.
