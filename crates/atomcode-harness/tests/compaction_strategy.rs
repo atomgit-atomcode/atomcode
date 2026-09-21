@@ -79,7 +79,10 @@ impl LlmProvider for Summarizer {
 
 fn strategy(summarizer: Option<Arc<Summarizer>>) -> OverflowCompaction {
     OverflowCompaction::new(
-        StubCompaction::default(),
+        // Pin keep=1: these tests build 2-turn histories and assert the OLDER turn's tool
+        // output stubs. The default now keeps 2 recent turns full, which would leave a
+        // 2-turn history entirely full and make the gentle-stub assertions vacuous.
+        StubCompaction::new(1, true),
         summarizer.map(|s| s as Arc<dyn LlmProvider>),
     )
 }

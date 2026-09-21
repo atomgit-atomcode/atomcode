@@ -48,10 +48,15 @@ pub struct StubCompaction {
 }
 
 impl Default for StubCompaction {
-    /// The normal-path policy from core: keep only the active turn full, exempt read_file.
+    /// Keep the two most-recent turns FULL (was 1 = active turn only), exempt read_file.
+    /// One-turn keep stubbed the PREVIOUS turn's tool outputs to a one-line summary the
+    /// moment the next turn began — so a multi-step investigation lost its `bash`/`grep`
+    /// results almost immediately. Comparable agents protect a rolling ~40 K-token window
+    /// of recent tool output; keeping 2 turns is the cheap approximation (a full token
+    /// budget window is a later refinement).
     fn default() -> Self {
         Self {
-            keep_recent_turns: 1,
+            keep_recent_turns: 2,
             exempt_read_file: true,
         }
     }
@@ -1163,7 +1168,9 @@ mod tests {
         conv.messages = msgs;
         let floor = conv.sacred_floor();
 
-        let plan = StubCompaction::default()
+        // Pin keep=1 to exercise the stubbing MECHANISM on this 2-turn history (the
+        // default now keeps 2 recent turns, so both turns here would stay full).
+        let plan = StubCompaction::new(1, true)
             .plan(&view(&conv.messages, floor))
             .await;
         // Only the OLD bash result is stubbed: read_file exempt, grep is in the active turn.
@@ -1199,7 +1206,8 @@ mod tests {
         conv.messages = msgs;
         let floor = conv.sacred_floor();
 
-        let p1 = StubCompaction::default()
+        // Pin keep=1 to exercise the mechanism on this 2-turn history (default is now 2).
+        let p1 = StubCompaction::new(1, true)
             .plan(&view(&conv.messages, floor))
             .await;
         let r1 = conv.apply_plan(p1, floor);
@@ -1207,7 +1215,7 @@ mod tests {
         let epoch = conv.cache_epoch;
 
         // Re-plan on the now-stubbed history → nothing left to stub → noop, no epoch bump.
-        let p2 = StubCompaction::default()
+        let p2 = StubCompaction::new(1, true)
             .plan(&view(&conv.messages, floor))
             .await;
         assert!(
@@ -1372,12 +1380,18 @@ mod tests {
         let mut b = Conversation::new();
         b.messages = msgs;
         let floor = a.sacred_floor();
-        let pa = OverflowCompaction::new(StubCompaction::default(), None)
+        // Pin keep=1 so this 2-turn history produces a REAL stub on both sides (the
+        // default keeps 2 turns → both plans empty → the equality would be vacuous).
+        let pa = OverflowCompaction::new(StubCompaction::new(1, true), None)
             .plan(&view(&a.messages, floor))
             .await;
-        let pb = StubCompaction::default()
+        let pb = StubCompaction::new(1, true)
             .plan(&view(&b.messages, floor))
             .await;
+        assert!(
+            !pa.rewrites.is_empty(),
+            "the delegation must actually rewrite something"
+        );
         assert_eq!(
             pa.rewrites, pb.rewrites,
             "Auto trigger must match inner StubCompaction byte-for-byte"

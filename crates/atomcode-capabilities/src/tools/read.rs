@@ -1018,16 +1018,20 @@ mod tests {
 
         assert!(!r.is_error, "{}", r.content);
         // read_file is EXEMPT from the artifact head/tail middleware, so a page is bounded
-        // by its OWN budget and may exceed the generic 16 KiB artifact threshold while
-        // keeping full line-based pagination.
+        // by its OWN budget and keeps full line-based pagination.
         assert!(
             r.content.len() <= MAX_READ_OUTPUT_BYTES,
             "page must stay within the read budget: {} bytes",
             r.content.len()
         );
+        // The page fills a substantial slice of read_file's OWN budget and paginates via
+        // its own mechanism — so it is the read budget bounding the page, not some smaller
+        // cap. (The middleware EXEMPTION itself is tested where the middleware actually
+        // runs: `output_artifact::self_bounding_tool_output_passes_through_whole`; this
+        // test constructs `ReadFileTool::execute` directly, so no middleware is in path.)
         assert!(
-            r.content.len() > crate::tools::output_artifact::THRESHOLD_BYTES,
-            "a wide page now legitimately exceeds the artifact threshold: {} bytes",
+            r.content.len() > MAX_READ_OUTPUT_BYTES / 2,
+            "a wide page should substantially fill the read budget: {} bytes",
             r.content.len()
         );
         assert!(

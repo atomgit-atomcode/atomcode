@@ -76,11 +76,20 @@ impl ArtifactStore {
     }
 }
 
-pub const THRESHOLD_BYTES: usize = 16 * 1024;
+pub const THRESHOLD_BYTES: usize = 50 * 1024;
 /// Stable prefix embedded in a conversation-visible result when the complete
 /// tool output was replaced by an artifact-backed head/tail preview.
 pub const ARTIFACT_TRUNCATION_MARKER_PREFIX: &str = "[atomcode: output truncated";
-const PREVIEW_HALF: usize = 4 * 1024;
+/// Head/tail kept inline when an oversized result is spilled. HEAD-HEAVY on purpose:
+/// the START of a command's output (a diff header, an error's first frames, a log's
+/// opening) is usually the more useful half, so the head gets the larger share while a
+/// smaller tail preserves a trailing error/summary line. Sized to the ~50 KB peer
+/// baseline (the previous 16 KB / 4 KB was ~3× tighter than comparable agents, which is
+/// what forced the model to keep working around "output truncated" on ordinary diffs /
+/// logs). `THRESHOLD_BYTES` stays above `HEAD + TAIL` so a truncated result always
+/// shrinks below the original.
+const PREVIEW_HEAD: usize = 32 * 1024;
+const PREVIEW_TAIL: usize = 12 * 1024;
 const MAX_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
 
 /// Largest char-boundary index ≤ n.
@@ -135,8 +144,8 @@ impl ArtifactMiddleware {
         if total <= THRESHOLD_BYTES {
             return;
         }
-        let head_end = head_boundary(&result.content, PREVIEW_HALF);
-        let tail_begin = tail_start(&result.content, PREVIEW_HALF);
+        let head_end = head_boundary(&result.content, PREVIEW_HEAD);
+        let tail_begin = tail_start(&result.content, PREVIEW_TAIL);
         let head = &result.content[..head_end];
         let tail = &result.content[tail_begin..];
 
@@ -263,7 +272,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = std::sync::Arc::new(super::ArtifactStore::new(dir.path()));
         let mw = super::ArtifactMiddleware::new(store.clone());
-        let big = "x".repeat(20 * 1024);
+        let big = "x".repeat(60 * 1024);
         let mk = || ToolResult {
             call_id: "c".into(),
             content: big.clone(),
@@ -304,7 +313,7 @@ mod tests {
             std::sync::Arc::new(crate::tools::read::ReadFileTool::new(false));
 
         // A large read_file result (over THRESHOLD) must reach the model WHOLE.
-        let big = "x".repeat(40 * 1024);
+        let big = "x".repeat(60 * 1024);
         let mut r = ToolResult {
             call_id: "rc".into(),
             content: big.clone(),
