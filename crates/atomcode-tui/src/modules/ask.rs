@@ -177,13 +177,36 @@ fn layout(question: &Question, w: usize, h: usize) -> Vec<Row> {
                 text: about.tool.clone(),
                 role: Role::Accent,
             });
-            for (key, value) in crate::ask::highlights(&about.arguments) {
+            // Keep room for the answers, their blank, and the legend, so a long
+            // command (a heredoc) WRAPS into what is left rather than shoving the
+            // options off the panel. Whatever fits is the full command; past the
+            // budget a single `…` says the rest is there — the exact bytes still
+            // execute, this is what the reader is shown of them.
+            let keep = question.options.len() + 3;
+            let budget = h.saturating_sub(rows.len().saturating_add(keep)).max(1);
+            let mut used = 0usize;
+            let mut clipped = false;
+            'outer: for (key, value) in crate::ask::highlights(&about.arguments) {
+                let head = match key.is_empty() {
+                    true => value,
+                    false => format!("{key} {value}"),
+                };
+                for line in crate::ask::textwrap(&head, body) {
+                    if used >= budget {
+                        clipped = true;
+                        break 'outer;
+                    }
+                    rows.push(Row::Text {
+                        text: line,
+                        role: Role::Secondary,
+                    });
+                    used += 1;
+                }
+            }
+            if clipped {
                 rows.push(Row::Text {
-                    text: match key.is_empty() {
-                        true => value,
-                        false => format!("{key} {value}"),
-                    },
-                    role: Role::Secondary,
+                    text: "…".to_string(),
+                    role: Role::Muted,
                 });
             }
         }

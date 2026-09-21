@@ -180,9 +180,19 @@ pub fn question_for(kind: &str, payload: &Value, events: &[LoggedEvent]) -> Opti
             let request: ApprovalRequest = serde_json::from_value(payload.clone()).ok()?;
             Some(
                 asked(&|q| {
-                    q.about
-                        .as_ref()
-                        .is_some_and(|a| a.tool == request.tool && a.arguments == request.args)
+                    q.about.as_ref().is_some_and(|a| {
+                        // Match on the exact executing bytes, not the tool NAME. A gate
+                        // renames the tool it asks about (`bash (writes outside the
+                        // workspace)`) while the wire request carries the raw call name
+                        // (`bash`), so a name compare misses and the fallback below would
+                        // synthesize a poorer question — no "allow all bash" option, the
+                        // raw header — that disagrees with the card the log already drew.
+                        // The arguments ARE the reconciliation anchor; a tool-name prefix
+                        // keeps the match scoped without demanding the gate's exact wording.
+                        a.arguments == request.args
+                            && (a.tool == request.tool
+                                || a.tool.starts_with(&format!("{} ", request.tool)))
+                    })
                 })
                 .unwrap_or_else(|| {
                     Question::approval(&request.tool, &request.args, Some(""), None, None)
@@ -425,7 +435,9 @@ pub fn recorded(question: &Question) -> String {
     };
     let what = highlights(&about.arguments)
         .first()
-        .map(|(_, value)| format!(" · {value}"))
+        // The scrollback record is one line — the full command lives in the panel
+        // that asked; here it is a summary someone scrolling past reads at a glance.
+        .map(|(_, value)| format!(" · {}", one_line(value)))
         .unwrap_or_default();
     format!("{who}{}{what}", about.tool)
 }
@@ -457,7 +469,15 @@ pub fn highlights(arguments: &str) -> Vec<(String, String)> {
     ] {
         if let Some(found) = object.get(key).and_then(|v| v.as_str()) {
             if !found.trim().is_empty() {
-                out.push((key.to_string(), one_line(found)));
+                // The command is the exact thing being approved, so it is kept
+                // WHOLE — a heredoc body cut to `…` hides what would actually run.
+                // The panel wraps it and caps it to leave room for the options.
+                // Every other key is single-line, so `one_line` is a no-op there.
+                let value = match key {
+                    "command" => found.trim().to_string(),
+                    _ => one_line(found),
+                };
+                out.push((key.to_string(), value));
             }
         }
     }
@@ -675,6 +695,40 @@ mod tests {
             let value = response_for(APPROVAL_KIND, &question, answer.map(str::to_string));
             assert_eq!(value["decision"], decision, "{answer:?}");
         }
+    }
+
+    /// The live modal reconciles against the RENAMED gate tool. A gate asks about
+    /// `bash (writes outside the workspace)` and logs that question — with the
+    /// allow-all option — while the wire request carries the raw call name `bash`.
+    /// Matching on the executing BYTES (not the tool name) means the modal draws the
+    /// recorded 4-option question instead of synthesizing a poorer 3-option one, so
+    /// the scrollback card and the interactive panel show the same options.
+    #[test]
+    fn an_approval_reconciles_against_a_renamed_gate_tool_by_its_bytes() {
+        let recorded = Question::approval(
+            "bash (writes outside the workspace)",
+            r#"{"command":"rm -rf build"}"#,
+            Some(""),
+            None,
+            Some("bash"),
+        );
+        assert!(recorded.has(ANSWER_ALWAYS_ALL), "the gate offered allow-all");
+        // The wire request names the RAW tool, not the gate's renamed one.
+        let payload = serde_json::json!({
+            "call_id": "c",
+            "tool": "bash",
+            "args": r#"{"command":"rm -rf build"}"#,
+        });
+        let drawn =
+            question_for(APPROVAL_KIND, &payload, &[asked(recorded.clone())]).expect("drawn");
+        assert_eq!(
+            drawn, recorded,
+            "the recorded question, not a synthesized 3-option one"
+        );
+        assert!(
+            drawn.has(ANSWER_ALWAYS_ALL),
+            "the modal keeps the allow-all option"
+        );
     }
 
     /// The session-wide "allow all Bash" blanket is offered only when the policy

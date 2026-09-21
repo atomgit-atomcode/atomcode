@@ -150,9 +150,11 @@ impl View for Status {
         // shoving it off the edge. The phase comes from the injected tick, never
         // a clock (docs/adr/0008).
         let activity: Option<(String, Style)> = match vp.moment.activity {
-            // The terminal's own foreground (white on dark), not warning yellow: a
-            // running turn is not a warning. `停止中` keeps the error red below.
-            Activity::Working => Some((working_indicator(vp.moment), theme::fg(Role::Secondary))),
+            // The warning gold, for identifiability: the terminal's own white blended
+            // into the quiet figures beside it, so the running indicator carries the
+            // gold that makes "it is still going" read at a glance. `停止中` keeps the
+            // error red below.
+            Activity::Working => Some((working_indicator(vp.moment), theme::fg(Role::Warning))),
             Activity::Stopping => {
                 Some((t(Msg::StatusStopping).into_owned(), theme::fg(Role::Error)))
             }
@@ -547,7 +549,7 @@ impl View for Mascot {
         let f = frames[(vp.moment.tick as usize) % frames.len()];
         vec![Line::styled(
             width::take_width(f, vp.rect.w as usize),
-            Style::new().fg(Color::role(Role::Error)),
+            Style::new().fg(Color::role(Role::Brand)),
         )]
     }
 

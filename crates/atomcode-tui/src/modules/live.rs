@@ -185,14 +185,29 @@ impl View for Live {
         // to `1` reads as a second, and `出 8` reads as a number nobody
         // measured, so which figure fits is decided before drawing rather than
         // by the last cell of the row.
+        // The figures ride in one parenthesised group after the words:
+        // `正在运行 1 个工具 （耗时 8m54s · 入 78.2k · 出 8.0k …）`. The open comes
+        // before the first figure that fits, the close after the last — and the
+        // close's width is reserved on every step, so a figure is never taken in
+        // and then left with no room to close the group behind it.
+        let open = " （";
+        let close = "）";
+        let close_w = width::str_width(close);
+        let mut opened = false;
         for part in parts(state, vp.moment) {
-            let need = width::str_width(&sep) + width::str_width(&part);
+            let lead = if opened { sep.as_str() } else { open };
+            let need = width::str_width(lead) + width::str_width(&part) + close_w;
             if used + need > w as usize {
                 break;
             }
-            used += need;
-            row.push(El::styled(sep.clone(), muted));
+            used += width::str_width(lead) + width::str_width(&part);
+            row.push(El::styled(lead.to_string(), muted));
             row.push(El::styled(part, muted));
+            opened = true;
+        }
+        if opened {
+            used += close_w;
+            row.push(El::styled(close.to_string(), muted));
         }
 
         // The margin, only when the rect can hold it: at a height that cannot
@@ -422,10 +437,12 @@ fn short(ms: u64) -> String {
 fn style_of(moment: &Moment) -> Style {
     match moment.activity {
         Activity::Stopping => theme::fg(Role::Error),
-        // Work in flight is the terminal's own foreground (white on a dark theme),
-        // not the warning yellow: a running turn is not a warning. Stopping stays
-        // the error red — that one IS a state worth the alarm colour.
-        _ => theme::fg(Role::Secondary),
+        // Work in flight is the warning gold, for identifiability: the terminal's
+        // own white blended into the quiet figures beside it and the line was easy
+        // to miss, so the running words carry the gold that makes "it is still
+        // going" read at a glance. Stopping stays the error red — a state worth the
+        // alarm colour.
+        _ => theme::fg(Role::Warning),
     }
 }
 
@@ -745,7 +762,7 @@ mod tests {
     #[test]
     fn the_context_is_the_last_round_and_the_output_is_the_whole_turn() {
         let mut state = fold(&a_turn());
-        assert!(working(&state, 0)[0].contains("入 1200"));
+        assert!(working(&state, 0)[0].contains("入 1.2k"));
         assert!(working(&state, 0)[0].contains("缓存 33.33%"));
 
         Live::absorb(
@@ -762,11 +779,11 @@ mod tests {
         );
         let said = working(&state, 0)[0].clone();
         assert!(
-            said.contains("入 2000"),
-            "the latest context, not 1200 + 2000: {said}"
+            said.contains("入 2.0k"),
+            "the latest context, not 1.2k + 2.0k: {said}"
         );
         assert!(
-            !said.contains("3200"),
+            !said.contains("3.2k"),
             "a sum of contexts counts the same tokens once per round: {said}"
         );
         assert!(said.contains("出 100"), "the output adds up: {said}");
@@ -864,21 +881,22 @@ mod tests {
         moment.turn_started = Some(Timestamp::millis(0));
 
         let roomy = line_at(&state, &moment, 60);
-        for want in ["耗时 12s", "入 1200", "出 80", "缓存 33.33%"] {
+        for want in ["耗时 12s", "入 1.2k", "出 80", "缓存 33.33%"] {
             assert!(roomy.contains(want), "{want} missing from {roomy}");
         }
 
-        // Room for the words and the clock, not for the first token figure:
-        // `⠋ 正在等待模型` is 14 cells, `耗时 12s` takes it to 25, and the next
-        // separator and figure would put it at 34.
-        let narrow = line_at(&state, &moment, 25);
+        // Room for the words and the clock, not for the next figure. `⠋ 正在等待模型`
+        // is 14 cells; the parenthesised group opens with ` （` (3) and its `）` (2)
+        // is reserved from the first figure on, so `耗时 12s` (8) takes it to 27, and
+        // the separator and next figure would put it past that.
+        let narrow = line_at(&state, &moment, 27);
         assert!(narrow.contains("正在等待模型"), "the words stay: {narrow}");
         assert!(
             narrow.contains("耗时 12s"),
             "and so does the clock: {narrow}"
         );
         assert!(!narrow.contains("入"), "the figure is dropped: {narrow}");
-        assert!(!narrow.contains("1200"), "whole, not halved: {narrow}");
+        assert!(!narrow.contains("1.2k"), "whole, not halved: {narrow}");
 
         // Narrower than the words alone: nothing to do but clip them.
         let nothing_fits = line_at(&state, &moment, 3);
