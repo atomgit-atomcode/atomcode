@@ -2975,40 +2975,29 @@ pub(crate) async fn spawn_native_cli_runtime(
             None => (atomcode_coding::SessionMode::Fresh, None, None),
         }
     };
-    // External-agent subagents (Claude Code / Codex) from `[[subagent.external]]`.
-    // Interactive TUI ⇒ dangerous (`bypass`) modes are allowed to be configured
-    // (each risky call is still approval-gated); a headless run (`-p`, a schedule)
-    // has nobody to approve with, so a `bypass` entry is downgraded to read-only.
-    // This function serves both, which is how it used to pass `true` for both.
-    let external_subagents = cfg
-        .subagent_config
-        .as_ref()
-        .map(|c| atomcode_coding::parts::resolve_external_subagents(&c.subagent, cfg.interactive))
-        .unwrap_or_default();
-    let prepare = atomcode_coding::PrepareOptions {
-        subagents: atomcode_coding::SubagentPolicy::Enabled,
-        session,
-        tools: !no_tools,
-        skill_dirs: no_tools.then(Vec::new),
-        plugin_skill_dirs: if no_tools {
-            Vec::new()
-        } else {
-            atomcode_daemon::gather_plugin_skill_dirs_for(&cfg.working_dir)
-        },
-        mcp: cfg.mcp && !no_tools,
-        external_subagents: if no_tools {
-            Vec::new()
-        } else {
-            external_subagents
-        },
-        memory: !no_tools,
-        web: !no_tools,
-        review: !no_tools,
-        request_user_input: !no_tools,
-        rate_limit_source: Some(atomcode_daemon::coding_plan_rate_limit_source()),
-        front_end,
-        ..atomcode_coding::PrepareOptions::default()
-    };
+    // Build the driver-neutral half from the runtime config (external-agent
+    // subagents, MCP, full-capability defaults), then overlay what makes THIS
+    // driver different. `no_tools` strips every tool beyond the core; the
+    // CLI serves both interactive and headless spawns, which is why
+    // `prepare_from_config` resolves bypass-downgrade from `cfg.interactive`.
+    let mut prepare = atomcode_coding::prepare_from_config(cfg);
+    if no_tools {
+        prepare.tools = false;
+        prepare.skill_dirs = Some(Vec::new());
+        prepare.plugin_skill_dirs = Vec::new();
+        prepare.mcp = false;
+        prepare.external_subagents = Vec::new();
+        prepare.memory = false;
+        prepare.web = false;
+        prepare.review = false;
+        prepare.request_user_input = false;
+    } else {
+        prepare.plugin_skill_dirs = atomcode_daemon::gather_plugin_skill_dirs_for(&cfg.working_dir);
+    }
+    prepare.subagents = atomcode_coding::SubagentPolicy::Enabled;
+    prepare.session = session;
+    prepare.rate_limit_source = Some(atomcode_daemon::coding_plan_rate_limit_source());
+    prepare.front_end = front_end;
     let start = atomcode_coding::CodingRuntimeStart {
         agent: agent.clone(),
         prepare,

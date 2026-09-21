@@ -1,7 +1,7 @@
 //! Daemon entry points for the unified native [`atomcode_coding::CodingRuntime`].
 
 use atomcode_coding::config::CodingAgentConfig;
-use atomcode_coding::parts::{PrepareOptions, SessionMode};
+use atomcode_coding::parts::SessionMode;
 use atomcode_coding::runtime::CodingRuntimeEvent;
 use atomcode_coding::CodingRuntimeConfig;
 use tokio::sync::{mpsc, watch};
@@ -156,22 +156,22 @@ async fn start_native_runtime_with_session_bootstrap(
         }
         other => (other, None),
     };
-    let prepare = PrepareOptions {
-        subagents: atomcode_coding::SubagentPolicy::Enabled,
-        request_user_input: true,
-        session,
-        tools: true,
-        skill_dirs: None,
-        plugin_skill_dirs: crate::gather_plugin_skill_dirs_for(&cfg.working_dir),
-        mcp: cfg.mcp,
-        extra_mcp_servers: Vec::new(),
-        external_subagents: Vec::new(),
-        memory: true,
-        web: true,
-        review: true,
-        rate_limit_source: Some(crate::coding_plan_rate_limit_source()),
-        front_end: None,
-    };
+    // Driver-neutral half from the runtime config — external-agent subagents
+    // resolved from `[subagent]` (the `claude`/`codex` switches and
+    // `[[subagent.external]]`), MCP per config, full-capability defaults.
+    // Overriding only driver differences after this is the contract (see
+    // `prepare_from_config`): this path previously hardcoded
+    // `external_subagents: Vec::new()`, and the TUI's in-session respawns —
+    // which borrow this constructor — silently lost `subagent_claude-code`.
+    let mut prepare = atomcode_coding::prepare_from_config(&cfg);
+    prepare.subagents = atomcode_coding::SubagentPolicy::Enabled;
+    prepare.request_user_input = true;
+    prepare.session = session;
+    prepare.tools = true;
+    prepare.skill_dirs = None;
+    prepare.plugin_skill_dirs = crate::gather_plugin_skill_dirs_for(&cfg.working_dir);
+    prepare.rate_limit_source = Some(crate::coding_plan_rate_limit_source());
+    prepare.front_end = None;
     let start = atomcode_coding::CodingRuntimeStart {
         agent: coding_cfg.clone(),
         prepare,

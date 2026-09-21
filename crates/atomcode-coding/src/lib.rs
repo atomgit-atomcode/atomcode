@@ -87,8 +87,9 @@ pub use config::{
 pub use controllers::{GoalPhase, GoalProgress, GoalTerminal, LoopProgress};
 pub use init_prompt::{build_init_prompt, INIT_PROMPT, INIT_PROMPT_ZH_CN};
 pub use parts::{
-    prepare, prepare_with_plugin_hook_source, prepare_with_plugin_hooks, subagent_enabled_from_env,
-    CodingParts, PrepareOptions, SessionBinding, SessionMode, SubagentPolicy,
+    prepare, prepare_from_config, prepare_with_plugin_hook_source, prepare_with_plugin_hooks,
+    subagent_enabled_from_env, CodingParts, PrepareOptions, SessionBinding, SessionMode,
+    SubagentPolicy,
 };
 pub use persona::{coding_persona, coding_persona_with_language, commit_language_guidance};
 pub use plan_mode::PlanModeGate;

@@ -287,6 +287,34 @@ fn builtin_external_profile(
     })
 }
 
+/// Derive the DRIVER-NEUTRAL half of a production [`PrepareOptions`] from a
+/// [`CodingRuntimeConfig`]: the full-capability defaults (`tools`/`memory`/
+/// `web`/`review`/`request_user_input` on), MCP per the config, in-process
+/// delegation enabled, and external-agent subagents resolved from
+/// `[subagent]` — including the `claude`/`codex` convenience switches and
+/// `[[subagent.external]]` entries. Dangerous (`bypass`) profiles follow
+/// `cfg.interactive` (the same rule the CLI headless path applies).
+///
+/// Every spawn site (CLI startup, daemon, the TUI's deferred respawns) MUST
+/// build its `PrepareOptions` from this and then override only what makes its
+/// driver different (session mode, `front_end`, `no_tools`, plugin skill dirs,
+/// rate-limit source). That is how a config field can never again be wired at
+/// one spawn site and silently dropped at another — which is exactly what
+/// happened to `external_subagents` when the daemon path hardcoded
+/// `Vec::new()` and in-TUI respawns lost `subagent_claude-code`.
+pub fn prepare_from_config(cfg: &crate::config::CodingRuntimeConfig) -> PrepareOptions {
+    let external_subagents = cfg
+        .subagent_config
+        .as_ref()
+        .map(|c| resolve_external_subagents(&c.subagent, cfg.interactive))
+        .unwrap_or_default();
+    PrepareOptions {
+        mcp: cfg.mcp,
+        external_subagents,
+        ..PrepareOptions::default()
+    }
+}
+
 /// The session identity + persistence wiring, allocated ONCE by [`prepare`] —
 /// the single owner the design review asked for.
 pub struct SessionBinding {
@@ -1715,6 +1743,64 @@ mod tests {
             p.is_empty(),
             "disabled explicit codex blocks the built-in switch"
         );
+    }
+
+    /// Every production spawn site (CLI startup, daemon, the TUI's in-session
+    /// deferred respawns) builds its `PrepareOptions` through
+    /// [`prepare_from_config`]. This pins the seam the daemon path once broke:
+    /// its hand-written `PrepareOptions` hardcoded
+    /// `external_subagents: Vec::new()`, so a `[subagent] claude = "auto"`
+    /// config silently lost `subagent_claude-code` on every in-TUI respawn
+    /// while CLI startup mounted it. One derivation, one place — no second
+    /// hand-copied field list to drift.
+    #[test]
+    fn prepare_from_config_resolves_external_subagents_for_every_spawn_site() {
+        use crate::config::CodingRuntimeConfig;
+
+        let toml = r#"
+            default_provider = "p"
+            [providers.p]
+            type = "openai"
+            model = "m"
+            api_key = "k"
+            base_url = "https://example.test/v1"
+            [subagent]
+            claude = "auto"
+        "#;
+        let config: atomcode_config::config::Config = toml::from_str(toml).unwrap();
+
+        // The daemon / in-TUI-respawn shape (non-interactive): the convenience
+        // switch still resolves — a bypass entry would be downgraded, `auto`
+        // mounts as-is.
+        let cfg = CodingRuntimeConfig::from_config(
+            &config,
+            std::path::Path::new("/tmp/proj"),
+            None,
+            None,
+            false,
+            false,
+        );
+        let prepare = prepare_from_config(&cfg);
+        let names: Vec<&str> = prepare
+            .external_subagents
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert!(
+            names.contains(&"claude-code"),
+            "a `[subagent] claude = \"auto\"` config must resolve through \
+             prepare_from_config on EVERY spawn site; got {names:?}"
+        );
+        assert!(!prepare.external_subagents[0].allow_dangerous);
+
+        // Defaults stay the full-capability production shape the daemon
+        // expects; drivers overlay only their differences on top.
+        assert!(prepare.tools);
+        assert!(prepare.memory);
+        assert!(prepare.web);
+        assert!(prepare.review);
+        assert!(prepare.request_user_input);
+        assert!(prepare.mcp, "mcp follows the config flag");
     }
 
     struct TestMcpTool;
