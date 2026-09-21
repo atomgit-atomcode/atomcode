@@ -2326,27 +2326,22 @@ impl RunningAgent {
             // out of THIS projection down to the byte budget; the stored history keeps the
             // originals. Runs after the cache-prefix guard (so its own non-append edit is
             // not miscounted) and before on_request/chat_stream (so telemetry and the wire
-            // see the folded request). Once-per-turn advisory; escalated when even the
-            // most-recent image had to go.
+            // see the folded request). The ORDINARY fold (trimming older images) is SILENT
+            // — no notice just for staying under the limit. Only the SEVERE case (even the
+            // most-recent image had to go, so the model sees NO image this turn) surfaces a
+            // once-per-turn warning, because the user's image task can't be met and they
+            // need to act.
             {
                 let (folded, all_folded) = crate::message::Conversation::fold_oldest_images_to_budget(
                     &mut messages,
                     IMAGE_SEND_BUDGET_BYTES,
                 );
-                if folded > 0 && !images_folded_warned {
+                if all_folded && !images_folded_warned {
                     images_folded_warned = true;
-                    let advisory = if all_folded {
-                        format!(
-                            "本轮图片过大/过多,已折叠全部 {folded} 张图片以让请求通过约 20MB 的网关上限 —— \
-                             模型本轮看不到图片。请减少图片数量、换更小的图,或分多轮发送。"
-                        )
-                    } else {
-                        format!(
-                            "本轮请求过大,已折叠较早的 {folded} 张图片以适应约 20MB 的网关上限\
-                             (仅本轮出站,会话历史仍保留原图)。"
-                        )
-                    };
-                    self.rt.emit(AgentEvent::Warning(advisory));
+                    self.rt.emit(AgentEvent::Warning(format!(
+                        "本轮图片过大/过多,已折叠全部 {folded} 张图片以让请求通过约 20MB 的网关上限 —— \
+                         模型本轮看不到图片。请减少图片数量、换更小的图,或分多轮发送。"
+                    )));
                 }
             }
             // READ-ONLY wire observation of the FINAL outgoing request (post
