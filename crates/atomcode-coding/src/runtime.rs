@@ -8037,6 +8037,15 @@ fn harness_host_state(
     // Everything the chain's `prepare` + `assemble` hang on the kernel agent that
     // the rows do not already carry, as the same objects.
     let hooks = crate::host_rows::HostHooks::new();
+    // The current-date tail: a per-turn `<system-reminder>` carrying today's date, appended
+    // AFTER the cached prefix. It is the SOLE date source — the persona no longer bakes a
+    // wall-clock date into the system prompt, because a date at the FRONT of the request
+    // re-prefills the whole cached prefix once per day (the `project_system_prompt_date`
+    // cache-poison bug). Unconditional: every session needs the model to know the date.
+    hooks.insert(
+        "status-reminder",
+        Arc::new(atomcode_capabilities::session::StatusReminderHook::new()),
+    );
     if let Some(snapshot) = parts.snapshot_hook() {
         hooks.insert("native-snapshot", snapshot);
     }

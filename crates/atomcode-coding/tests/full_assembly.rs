@@ -164,22 +164,26 @@ async fn the_assembly_lifecycle() {
             .unwrap_or_else(|| panic!("no ask: {:?}", shape()));
         assert!(memory < ask, "memory is in front of the ask: {:?}", shape());
         assert!(first[memory].text.contains("prefers tabs"));
-        // No per-round status/date <system-reminder> tail rides any request: the date lives in
-        // the frozen persona anchor and the per-round StatusReminderHook was removed from the
-        // production hook chain, so the last message here is the user turn, not a reminder.
-        assert_eq!(
-            first.last().unwrap().role,
-            Role::User,
-            "round 1 ends at the user turn"
-        );
-        // Scope to USER messages: the reminder is a user-role tail. (The persona — a System
-        // message — legitimately *mentions* the `<system-reminder>` tag to explain it, so a
-        // blanket text search would false-positive on the persona.)
+        // The current date rides a per-turn `<system-reminder>` tail (`StatusReminderHook`),
+        // appended AFTER the cached prefix — on EVERY round, round 1 included. So round 1 ends
+        // with that reminder (a synthetic user-role tail), not the user turn itself.
+        let tail = first.last().unwrap();
+        assert_eq!(tail.role, Role::User, "the date tail is a user-role message");
         assert!(
-            !first
-                .iter()
-                .any(|m| m.role == Role::User && m.text.contains("<system-reminder>")),
-            "no status reminder (user tail) on a turn's round 1: {:?}",
+            tail.text.contains("<system-reminder>") && tail.text.contains("Current date"),
+            "round 1 ends with the current-date reminder tail: {:?}",
+            shape()
+        );
+        // And the date is GONE from the persona: a wall-clock date at the FRONT of the request
+        // re-prefills the whole cached prefix once per day (the `project_system_prompt_date`
+        // cache-poison bug), which moving it to the tail fixes.
+        let persona = first
+            .iter()
+            .find(|m| m.role == Role::System)
+            .expect("a system persona");
+        assert!(
+            !persona.text.contains("Today's date:") && !persona.text.contains("## ENVIRONMENT:"),
+            "the persona no longer bakes a date anchor into the prefix: {:?}",
             shape()
         );
     }

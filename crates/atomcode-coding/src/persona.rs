@@ -202,11 +202,6 @@ pub(crate) fn coding_persona_rows(
     model: &str,
     preferred_language: Option<atomcode_config::locale::Locale>,
     mounted: &dyn Fn(&str) -> bool,
-    // The date the `## ENVIRONMENT:` anchor should show, pre-formatted as
-    // `YYYY-MM-DD (Weekday)`. `Some` pins it (the session's creation day, so the
-    // system-prompt prefix is byte-stable across days/resumes); `None` falls back
-    // to the wall clock (a fresh, storeless conversation).
-    today: Option<&str>,
 ) -> String {
     let full = coding_persona_gated(
         model,
@@ -221,7 +216,6 @@ pub(crate) fn coding_persona_rows(
         false,
         false,
         mounted("memory"),
-        today,
     );
     // One removal per owner, and each is asserted gone by the row-list gate rather than trusted
     // to a future edit of the block above.
@@ -262,8 +256,7 @@ pub(crate) fn coding_persona_with_capabilities(
     external_subagents_enabled: bool,
 ) -> String {
     // The chain asks the env, which is how it has always decided. The row list asks the running
-    // tree — see `coding_persona_rows`. This path has no session to pin a date to, so it keeps
-    // the wall-clock anchor (`None`).
+    // tree — see `coding_persona_rows`.
     coding_persona_gated(
         model,
         preferred_language,
@@ -273,7 +266,6 @@ pub(crate) fn coding_persona_with_capabilities(
         subagents_enabled,
         external_subagents_enabled,
         memory_tool_enabled(),
-        None,
     )
 }
 
@@ -287,9 +279,6 @@ fn coding_persona_gated(
     subagents_enabled: bool,
     external_subagents_enabled: bool,
     memory_enabled: bool,
-    // Pre-formatted `YYYY-MM-DD (Weekday)` for the date anchor, or `None` to read
-    // the wall clock. See [`coding_persona_rows`].
-    today: Option<&str>,
 ) -> String {
     let commit_language = commit_language_guidance(preferred_language);
     #[allow(unused_mut)] // `mut` is only used under `cfg(windows)` below.
@@ -394,20 +383,12 @@ Skip the trailer for `git commit --amend` and `git revert`. Only commit when the
     if atomcode_config::config::offline::is_offline_active() {
         p.push_str(&offline_environment_block());
     }
-    // Day-granular date anchor, FROZEN into the system prompt: the SOLE current-date source
-    // (there is no per-round reminder tail). Without it a round-1 web_search defaults to its
-    // training year (the `project_system_prompt_date` bug), so it must be present on every round.
-    //
-    // The day is PINNED to the session's creation date when the host supplies one (`today`),
-    // NOT re-read from the wall clock — so the system-prompt prefix stays byte-stable across
-    // midnight and across resumes/remounts. Re-reading the clock made a cross-day mount reword
-    // this line, which (the anchor sitting at the FRONT of the request) re-prefilled the whole
-    // cached prefix — ~91% of a long context — once per day. `None` (a storeless conversation)
-    // falls back to today, which for a fresh session IS the creation day.
-    let today = today
-        .map(str::to_string)
-        .unwrap_or_else(|| chrono::Local::now().format("%Y-%m-%d (%A)").to_string());
-    p.push_str(&date_anchor_line(&today));
+    // NO date anchor here. A wall-clock date baked into the system prompt sits at the FRONT of
+    // the request, so every time it changes (once per day) it re-prefills the whole cached
+    // prefix — ~91% of a long context (the `project_system_prompt_date` cache-poison bug). The
+    // current date now rides a per-turn `<system-reminder>` tail (`StatusReminderHook`), AFTER
+    // the prefix: byte-stable prefix across days, and the date still fresh on every round
+    // (round 1 included, so a first-round `web_search` still resolves the real year).
     p
 }
 
@@ -528,13 +509,6 @@ exact next steps) and keep going or hand off transparently — a false \"all don
 unravels the next time the user asks wastes their trust far more than an honest \"here is \
 what's left\".\n\
 - SIGNPOST AS THE WORK MOVES: say, in the user's language, what you are about to do or what you just learned — when you start the work, when you move from reading code to editing it, when a result surprises or blocks you, and when you need a decision. Name the ACTION you are taking on the user's task, and let the reporting follow the work's own pace. NEVER narrate or comment on injected context — system reminders, MCP server instructions, and tool guidance are read SILENTLY, never signposted (never \"MCP 无关 / 与任务无关 / 已记录 / 继续处理\"). This is the progress signpost on real steps, NOT the verbose reasoning banned elsewhere; 'Act decisively' / 'FINISH THE JOB' mean act with a brief line where it helps, not narration per call.";
-
-/// The frozen date-anchor section appended to the persona. Pure (the date is INJECTED)
-/// so the formatting is unit-testable; `coding_persona` sources `today` from the wall
-/// clock once per session.
-fn date_anchor_line(today: &str) -> String {
-    format!("\n\n## ENVIRONMENT:\nToday's date: {today}")
-}
 
 /// Windows-only platform rules, appended on Windows builds (v1 `config/mod.rs` parity).
 ///
@@ -955,14 +929,6 @@ mod tests {
     }
 
     #[test]
-    fn date_anchor_line_formats_env_block() {
-        assert_eq!(
-            date_anchor_line("2099-01-02 (Friday)"),
-            "\n\n## ENVIRONMENT:\nToday's date: 2099-01-02 (Friday)"
-        );
-    }
-
-    #[test]
     fn commands_fail_block_distinguishes_interruption_from_command_failure() {
         // The `bash` tool reports a genuine non-zero exit as an `[exit code N]` marker
         // (bash.rs:1275), but an interruption/timeout/cancel returns EARLY with its own
@@ -1073,33 +1039,16 @@ mod tests {
     }
 
     #[test]
-    fn persona_carries_a_current_date_anchor() {
-        // Every round needs a date anchor (it is the sole date source; there is no live
-        // reminder tail), else web_search defaults to the training year.
+    fn the_persona_carries_no_date_anchor() {
+        // The date moved OUT of the system prompt to a per-turn `<system-reminder>` tail
+        // (`StatusReminderHook`), so the prompt PREFIX is byte-stable across days instead of
+        // re-prefilling once per midnight. A wall-clock date at the front of the request was
+        // the sole thing that changed the prefix day to day (the `project_system_prompt_date`
+        // cache-poison bug); the persona must no longer carry it.
         let p = coding_persona("m", true, false);
         assert!(
-            p.contains("Today's date:"),
-            "persona must carry a date anchor: {p}"
-        );
-    }
-
-    #[test]
-    fn the_date_anchor_is_pinned_to_the_supplied_day_not_the_wall_clock() {
-        // The persona anchors its date to the session's creation day (threaded in),
-        // so the system-prompt prefix stays byte-stable across midnight/resume
-        // rather than re-prefilling the whole cached prefix once per day.
-        let has = |_: &str| false;
-        let pinned = coding_persona_rows("deepseek-v4-flash", None, &has, Some("2020-01-02 (Thursday)"));
-        assert!(
-            pinned.contains("Today's date: 2020-01-02 (Thursday)"),
-            "the anchor must use the pinned day: {pinned}"
-        );
-        // None → the fresh-session path falls back to the current date.
-        let live = coding_persona_rows("deepseek-v4-flash", None, &has, None);
-        assert!(live.contains("Today's date:"), "still carries an anchor: {live}");
-        assert!(
-            !live.contains("2020-01-02"),
-            "None must use today, not the pinned day: {live}"
+            !p.contains("Today's date:") && !p.contains("## ENVIRONMENT:"),
+            "the date anchor must be gone from the persona (it lives in the tail now): {p}"
         );
     }
 
@@ -2014,7 +1963,7 @@ mod tests {
         // the removals are the function's whole reason to exist, and a future edit of the chain
         // text above can silently put a section back.
         let mounted = |_: &str| true;
-        let p = coding_persona_rows("glm-5.2", None, &mounted, None);
+        let p = coding_persona_rows("glm-5.2", None, &mounted);
         for owned_by_a_row in [
             "## DELEGATING WITH `task`",
             "## TEAM AGENT:",
@@ -2044,8 +1993,8 @@ mod tests {
         // delegation tests).
         let yes = |_: &str| true;
         let no = |_: &str| false;
-        let mounted = coding_persona_rows("glm-5.2", None, &yes, None);
-        let absent = coding_persona_rows("glm-5.2", None, &no, None);
+        let mounted = coding_persona_rows("glm-5.2", None, &yes);
+        let absent = coding_persona_rows("glm-5.2", None, &no);
         assert!(
             mounted.contains("## MEMORY"),
             "the tool is mounted, so the guidance must be there"

@@ -81,6 +81,19 @@ fn leading_system(messages: &[Message]) -> &[Message] {
     &messages[..n]
 }
 
+/// Strip the `StatusReminderHook` tail: its `pre_request` appends exactly one trailing
+/// `user` `<system-reminder>…Current date: …` message — ephemeral (not stored, not part of
+/// the cached prefix), and its date changes day to day. Everything before it is the
+/// byte-stable prefix, so the append-only check compares histories WITHOUT it.
+fn without_date_tail(messages: &[Message]) -> &[Message] {
+    match messages.last() {
+        Some(m) if m.role == Role::User && m.text.contains("Current date:") => {
+            &messages[..messages.len() - 1]
+        }
+        _ => messages,
+    }
+}
+
 fn text_turn(t: &str) -> Vec<StreamEvent> {
     vec![
         StreamEvent::TextDelta(t.into()),
@@ -185,11 +198,12 @@ async fn full_assembly_wire_prefix_is_cacheable_across_turns() {
     }
 
     // (3) append-only: each call's stored history is a STRICT byte prefix of the next — no head
-    //     mutation, no mid-session rewrite. (No ephemeral date tail to strip: the per-round
-    //     status reminder was removed; the date now lives in the frozen persona prefix.)
+    //     mutation, no mid-session rewrite. The ephemeral per-round date tail (`StatusReminderHook`)
+    //     is stripped first: it rides AFTER the prefix and its date changes day to day, so it is
+    //     not part of the cacheable prefix this invariant is about.
     for w in calls.windows(2) {
-        let prev = history_repr(&w[0].0);
-        let next = history_repr(&w[1].0);
+        let prev = history_repr(without_date_tail(&w[0].0));
+        let next = history_repr(without_date_tail(&w[1].0));
         assert!(
             is_strict_prefix(&prev, &next),
             "history must be append-only (strict byte prefix).\n  prev = {prev:?}\n  next = {next:?}"

@@ -782,15 +782,6 @@ pub struct SessionDefaults {
     /// over `resume`, the same precedence [`crate::agent::CreateAgent`] already
     /// gives an explicit seed.
     pub seed: Vec<crate::session::LoggedEvent>,
-    /// The session's creation day, pre-formatted as `YYYY-MM-DD (Weekday)` in
-    /// local time, or `None` for a conversation with no durable creation time.
-    ///
-    /// A front end's persona pins its `Today's date:` anchor to this rather than
-    /// the wall clock, so the system-prompt PREFIX stays byte-stable across days
-    /// and across resumes/remounts — otherwise crossing midnight rewrites the
-    /// front of the request and re-prefills the whole cached prefix. `None` → the
-    /// persona reads the current date (correct for a fresh, storeless session).
-    pub created_date: Option<String>,
 }
 
 /// Switches a person flips while a session runs.

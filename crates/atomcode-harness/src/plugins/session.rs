@@ -71,9 +71,6 @@ impl Plugin for SessionPlugin {
                 id: row.id,
                 resume: row.resume,
                 seed: Vec::new(),
-                // This row keeps sessions as replayed events, not a dated store, so it
-                // has no creation day to pin the persona's date anchor to.
-                created_date: None,
             }))
             .map_err(|e| e.to_string())?;
         Ok(())
