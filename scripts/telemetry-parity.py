@@ -455,9 +455,18 @@ def new_only(record):
     (`coding/src/parts.rs`, `MeteredProvider` tagged `surface="subagent"`) —
     which 5.1.0 did not have wired. The child's token spend was invisible.
 
-    Only `subagent` is listed, because only `subagent` was measured.
+    The same for a rate-limited turn. `turn_complete` used to report only
+    `ProviderError` and `Timeout`; a 429 pause fell into `_ => return`, so the
+    whole turn produced `open_atomcode` and nothing else — a person who waited
+    and gave up was indistinguishable from a session where nothing happened.
+    Measured here: old 1 record, new 2.
+
+    Listed one by one, each against a measurement. A predicate that guessed
+    would be a place for divergence to hide.
     """
-    return record.get("surface") == "subagent"
+    if record.get("surface") == "subagent":
+        return True
+    return record.get("event_id") == "llm_chat" and record.get("error_kind") == "rate_limited"
 
 
 def summarise(records):
@@ -683,7 +692,12 @@ def main():
         if extra:
             # Said out loud rather than dropped quietly: "the new build reports
             # more" is a result, and a silent exemption is how it stops being one.
-            kinds = sorted({f"{r.get('event_id')}/{r.get('surface')}" for r in extra})
+            kinds = sorted(
+                {
+                    f"{r.get('event_id')}/{r.get('surface') or r.get('error_kind')}"
+                    for r in extra
+                }
+            )
             print(f"   +  {len(extra)} record(s) only the new build reports: {kinds}")
         if not old and not new:
             if scenario.expect_silence:

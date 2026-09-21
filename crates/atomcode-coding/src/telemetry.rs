@@ -403,15 +403,34 @@ impl LifecycleHooks for TelemetryHook {
 
     async fn turn_complete(&self, _convo: &Conversation, reason: &StopReason, ctx: &TurnCtx) {
         let last = self.last_error.lock().ok().and_then(|mut g| g.take());
-        // A round that produced a model response already emitted its LlmChat. Emit an
-        // extra had_error one ONLY for an LLM/provider terminal failure — not normal
-        // stop, cancel, or the round/continuation fuses (those aren't LLM errors).
+        // A round that produced a model response already emitted its LlmChat.
+        // This is the extra one, for a turn that ended WITHOUT an answer and
+        // for a reason worth counting — not normal stop, cancel, or the
+        // round/continuation fuses.
         let kind = match reason {
             StopReason::ProviderError => last
                 .as_deref()
                 .map(classify_llm_error)
                 .unwrap_or(LlmErrorKind::Other),
             StopReason::Timeout => LlmErrorKind::StreamTimeout,
+            // `StopReason::RateLimited` says of itself "Not a failure — already
+            // produced content is preserved", and it is still reported with
+            // `had_error: true`, deliberately:
+            //
+            //   - the wire has ONE shape for "the turn produced no answer, and
+            //     here is why", and `error_kind` is documented as `None` when
+            //     `had_error` is false, so there is no way to send the reason
+            //     without the flag;
+            //   - the alternative is what shipped until now — silence. A person
+            //     who waited out a 429 and gave up looked, in the data, exactly
+            //     like a session where nothing happened. Measured against 5.1.0
+            //     (`scripts/telemetry-parity.py --only rate-limited`): the whole
+            //     turn produced `open_atomcode` and nothing else, on both builds.
+            //
+            // A consumer that wants "failures" without pauses filters on
+            // `error_kind != rate_limited`, which is a filter it can write; it
+            // cannot invent a row that was never sent.
+            StopReason::RateLimited => LlmErrorKind::RateLimited,
             _ => return,
         };
         let event = Event::LlmChat {
@@ -978,6 +997,78 @@ mod tests {
 
         // Failed round (total 0): estimates pass through, anchor folds into message.
         assert_eq!(apportion(0, 5, [1, 2, 3, 4]), (1, 7, 3, 4));
+    }
+
+    /// A turn the host paused for a rate limit is counted.
+    ///
+    /// It used to be silent: `turn_complete` reported only `ProviderError` and
+    /// `Timeout`, and a 429 pause fell into `_ => return`. Measured against
+    /// 5.1.0 the whole turn produced `open_atomcode` and nothing else, on both
+    /// builds — a person who waited and gave up was indistinguishable from a
+    /// session where nothing happened.
+    ///
+    /// Also pins what it is NOT: a plain stop and a cancel stay silent, because
+    /// a turn that ended normally already reported its rounds and a cancelled
+    /// one is not an LLM outcome.
+    #[tokio::test]
+    async fn a_rate_limited_turn_is_counted_and_a_normal_one_is_not() {
+        let (tel, captured) = Telemetry::in_memory("test".into());
+        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m", None, Default::default());
+        let convo = Conversation {
+            messages: Vec::new(),
+            cache_epoch: 0,
+        };
+        let ctx = TurnCtx {
+            turn_id: 4,
+            round: 2,
+            request_id: 9,
+            ..TurnCtx::default()
+        };
+
+        for quiet in [
+            StopReason::Stopped,
+            StopReason::Cancelled,
+            StopReason::MaxRounds,
+        ] {
+            hook.turn_complete(&convo, &quiet, &ctx).await;
+        }
+        // The sink hands records to a task; the module's other tests wait the
+        // same 50ms. Long enough that "nothing arrived" means nothing was sent.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            captured.lock().await.is_empty(),
+            "a turn that stopped, was cancelled or ran out of rounds is not an LLM outcome"
+        );
+
+        hook.turn_complete(&convo, &StopReason::RateLimited, &ctx)
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let records = captured.lock().await;
+        let record = records.first().expect("a paused turn is counted");
+        assert_eq!(records.len(), 1, "exactly one: {records:?}");
+        match &record.event {
+            Event::LlmChat {
+                had_error,
+                error_kind,
+                ..
+            } => {
+                assert!(had_error, "the turn produced no answer");
+                assert!(
+                    matches!(error_kind, Some(LlmErrorKind::RateLimited)),
+                    "a pause must be its own bucket, not Other: {error_kind:?}"
+                );
+            }
+            other => panic!("not an llm_chat: {other:?}"),
+        }
+        // And it says where it happened, like every other metered event.
+        assert_eq!(
+            (
+                record.envelope.turn,
+                record.envelope.round,
+                record.envelope.request
+            ),
+            (Some(4), Some(2), Some(9))
+        );
     }
 
     #[tokio::test]
