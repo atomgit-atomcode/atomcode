@@ -203,6 +203,22 @@ pub trait Content: Send + Sync + std::fmt::Debug {
         self.lines(ctx).into_iter().next().unwrap_or_default()
     }
 
+    /// The block's folded form, as rows.
+    ///
+    /// One row for every block but a tool call: a call the model explained keeps
+    /// BOTH of its rows when it folds, so the folded screen says the same two
+    /// things the open one does and differs only by the result it left out —
+    /// see `ToolCallBlock::summary_lines`.
+    ///
+    /// The default derives from [`summary`](Self::summary) rather than from
+    /// `lines`, so a block that folds to something other than its first rendered
+    /// row keeps doing so; overriding `summary` alone is therefore complete for
+    /// every block that folds to one row. This is the accessor a folder should
+    /// ask, and the row count and the picture must come from the same one.
+    fn summary_lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+        vec![self.summary(ctx)]
+    }
+
     /// This block as a tool call, when it is one.
     ///
     /// The screen draws a run of folded calls as a single lid — `● 4 个工具`

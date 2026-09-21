@@ -912,7 +912,12 @@ fn lid_row(
     // the model no longer sees it.
     if pres.is_undone(b.at.turn) && !b.content.always_open() {
         return Some(SlotRows {
-            rows: 1,
+            // Asked of the content, not assumed: the count and the picture have
+            // to be the same answer. It was a constant `1` while every folded
+            // block was one row; a call the model explained draws two, and a
+            // `1` here would be the ghost/overlap class of bug — the scroll
+            // counting one row under a block that wrote two.
+            rows: b.content.summary_lines(ctx).len(),
             kind,
             lid: None,
             lid_failed: 0,
@@ -954,7 +959,10 @@ fn lid_row(
             })
         }
         None if !b.content.always_open() && pres.is_block_folded(b.id, kind) => Some(SlotRows {
-            rows: 1,
+            // Measured, not assumed — same reason as the undone branch above:
+            // this is the number `stream_height` sums and the painter scrolls
+            // by, and a folded call the model explained draws two rows.
+            rows: b.content.summary_lines(ctx).len(),
             kind,
             lid: None,
             lid_failed: 0,
@@ -3739,15 +3747,19 @@ impl Host {
             } else if entry.undone {
                 // Dimmed as well as folded: it is still there to read, and it
                 // is no longer what the model sees.
-                let line = block
+                let rows = block
                     .content
-                    .summary(&crate::block::RenderCtx { width: room, caps });
-                let width = line.width();
-                Arc::new(vec![line.restyle(0, width, |_| {
-                    crate::theme::fg(crate::theme::Role::Muted)
-                })])
+                    .summary_lines(&crate::block::RenderCtx { width: room, caps });
+                Arc::new(
+                    rows.into_iter()
+                        .map(|line| {
+                            let width = line.width();
+                            line.restyle(0, width, |_| crate::theme::fg(crate::theme::Role::Muted))
+                        })
+                        .collect(),
+                )
             } else if entry.folded {
-                Arc::new(vec![block.content.summary(&ctx)])
+                Arc::new(block.content.summary_lines(&ctx))
             } else {
                 // The count comes from the index — the same number
                 // `stream_height` summed — rather than from a second measurement
@@ -8422,6 +8434,109 @@ mod tests {
                 .any(|r| r.contains("ReadFile(a.rs)") && r.contains("fn main")),
             "the summary carries the result:\n{done:#?}"
         );
+    }
+
+    /// A folded call the model explained draws TWO rows, and the scroll counts
+    /// both.
+    ///
+    /// The pair of facts is the point. The painter and `stream_height` are
+    /// different walks over the same slots, and the count was a constant `1` while
+    /// every folded block was one row; the moment one draws two, a constant there
+    /// is the ghost-row class of bug this file keeps paying for — the terminal
+    /// writes a row the arithmetic never reserved, and what comes after lands on
+    /// top of it.
+    ///
+    /// Asserted as a delta on the same host, so it cannot be satisfied by a
+    /// fixture that changed size: the only difference between the two measurements
+    /// is which call it holds.
+    #[test]
+    fn a_folded_call_that_states_its_reason_is_counted_at_two_rows() {
+        let explained =
+            || host_with_one_call(r#"{"file_path":"a.rs","intent":"checking what main does"}"#);
+        let silent = || host_with_one_call(r#"{"file_path":"a.rs"}"#);
+        let size = (80u16, 24u16);
+        let height = |h: &Host| h.stream_height(size, &h.moment.read().unwrap().clone());
+
+        // The control first: with no reason the call is one row, which is what it
+        // was before any of this existed.
+        let h = silent();
+        let quiet = h.compose(size).rows();
+        assert_eq!(
+            quiet.iter().filter(|r| r.contains("ReadFile")).count(),
+            1,
+            "an unexplained call still folds to one row:\n{quiet:#?}"
+        );
+
+        let h = explained();
+        // The stream region, not `rows()`: `rows()` is the whole frame, and the
+        // status bar and the input box are not part of the call.
+        let frame = h.compose(size);
+        let written: Vec<String> = frame
+            .part("stream")
+            .expect("the conversation")
+            .lines
+            .iter()
+            .map(|l| l.plain())
+            .filter(|r| !r.trim().is_empty())
+            .collect();
+        assert_eq!(
+            written.len(),
+            2,
+            "a folded call with a reason draws two rows: {written:#?}"
+        );
+        assert!(
+            written[0].contains("checking what main does"),
+            "the reason is the first: {written:#?}"
+        );
+        assert!(
+            written[1].contains("ReadFile(a.rs)"),
+            "the call itself is the second: {written:#?}"
+        );
+
+        // And the sum agrees with the picture. Asserted as the DIFFERENCE the
+        // reason makes, not as an absolute row count: an absolute number here
+        // would be a second copy of the block's height, and it would keep passing
+        // if the reason stopped being counted and the fixture were nudged.
+        //
+        // A row the count misses is a row out of reach at the bottom of the
+        // scroll — the thing this file's `stream_height` notes go on about.
+        let quiet = silent();
+        assert_eq!(
+            height(&h) - height(&quiet),
+            1,
+            "the reason adds a row to the picture but not to the sum: {} explained \
+             vs {} silent",
+            height(&h),
+            height(&quiet)
+        );
+    }
+
+    /// A host holding exactly one finished tool call, folded, with the given
+    /// arguments.
+    fn host_with_one_call(arguments: &str) -> Host {
+        let h = host();
+        h.absorb(&SessionEvent::AssistantMessage {
+            turn: 1,
+            round: 1,
+            text: String::new(),
+            reasoning: String::new(),
+            tool_calls: vec![atomcode_kernel::tool::ToolCall {
+                id: "c1".into(),
+                name: "read_file".into(),
+                arguments: arguments.into(),
+            }],
+            reasoning_blocks: Vec::new(),
+            meta: None,
+        });
+        h.absorb(&SessionEvent::ToolResultLogged {
+            turn: 1,
+            round: 1,
+            call_id: "c1".into(),
+            content: "fn main() {}".into(),
+            is_error: false,
+            images: Vec::new(),
+        });
+        h
     }
 
     /// `auto_folded` is the *default* layer under the hand fold, so it survives a

@@ -659,6 +659,17 @@ pub enum Outcome {
 /// of two that happen to agree today. See `host::inset`.
 pub(crate) const GUTTER: usize = 2;
 
+/// How many rows a folded tool call draws.
+///
+/// Two, because a call the model explained has two identifying rows — the reason
+/// and the call — and folding is supposed to leave out the RESULT rather than
+/// half of the call's own name. A call nobody explained has one identifying row
+/// and so folds to one; this is a ceiling, not a target.
+///
+/// Not more: a folded call is a line a reader scans past, and since the subject
+/// row wraps, a lid that took every row of it would cost the run it stands for.
+const FOLDED_ROWS: usize = 2;
+
 /// A tool call and, once it lands, its result. One block, two facts.
 #[derive(Debug)]
 pub struct ToolCallBlock {
@@ -758,39 +769,78 @@ impl ToolCallBlock {
         (!text.is_empty()).then(|| flatten(text))
     }
 
-    /// `⎿ what it acted on` — the subject, on the gutter line.
+    /// The word this call reads as: a verb where the tool's name is machinery
+    /// (`$ cargo test` reads; `bash {"command":…}` does not), its own name
+    /// otherwise.
+    fn display_name(&self) -> String {
+        match look(&self.name).verb {
+            Some(verb) => verb.say(),
+            None => display_tool_name(&self.name),
+        }
+    }
+
+    /// `⎿ ReadFile(what it acted on)` — the call itself, on the gutter line.
     ///
-    /// Only drawn when there is a reason above it. With a reason the head line
-    /// belongs to the *why*, and the *what* has to stay on the screen: `$
-    /// release the port` is not an answer to "what actually ran".
-    fn subject_line(&self, w: u16) -> Option<Line> {
+    /// Drawn only when there is a reason above it, which is also why it carries
+    /// the tool's name: with the reason on the head line, this row is the only
+    /// place left that says WHICH call this is. The name is not decoration there
+    /// — `⎿ /path/to/thing.rs` alone would not tell a reader whether the agent
+    /// read it, wrote it or searched it.
+    ///
+    /// Wrapped rather than cut, for the reason the head is: a command ending in
+    /// `…` is not an answer to "what actually ran", and expanding a call is
+    /// exactly how a reader asks that question. The folded form takes only the
+    /// first row of this (`summary_lines`), so the full thing is one keypress
+    /// away and nothing here has to guess how much of it to keep.
+    fn subject_line(&self, w: u16, name_style: Style) -> Vec<Line> {
         let subject = flatten(&self.subject());
         if subject.is_empty() {
-            return None;
+            return Vec::new();
         }
         let caps = Caps::default();
-        Some(
-            Line::from_spans(vec![
-                Span::styled(
-                    format!("{}{} ", " ".repeat(GUTTER), caps.g(Glyph::Gutter)),
-                    muted(),
-                ),
-                Span::styled(subject, muted()),
-            ])
-            .truncate(w as usize),
+        // Indented under the tool mark, with the gutter glyph on the first row
+        // only — the shape a result takes, so the two read as the same kind of
+        // thing hanging off the call. The glyph itself recedes; the call's own
+        // name keeps the volume the caller asked for, so a folded row is not
+        // half-loud.
+        let prefix = format!("{}{} ", " ".repeat(GUTTER), caps.g(Glyph::Gutter));
+        crate::markdown::wrap_spans(
+            &[Span::styled(
+                format!("{}({subject})", self.display_name()),
+                name_style,
+            )],
+            w,
+            &prefix,
+            muted(),
         )
     }
 
-    /// The opening line: whatever marks it, the tool, and the subject — whole.
+    /// The rows that identify this call — the same ones in both shapes the
+    /// screen draws it.
+    ///
+    /// Solely because the folded form is the open form's identifying rows with
+    /// the result left out: two copies of this pairing is how a fold comes to
+    /// say something the open call never said. `lines` and `summary_lines` both
+    /// come through here.
+    fn opening_rows(&self, w: u16, lead: &str, lead_style: Style, name_style: Style) -> Vec<Line> {
+        let mut out = self.head(w, lead, lead_style, name_style);
+        if self.reason().is_some() {
+            out.extend(self.subject_line(w, name_style));
+        }
+        out
+    }
+
+    /// The opening line: whatever marks it, and what the call is about — whole.
     ///
     /// Whole rather than abbreviated, and wrapped rather than cut: expanding a
     /// call is how a reader asks what actually ran, and a command ending in `…`
     /// is not an answer to that question. `lead` is what marks the line, and its
     /// width is the indent its continuations hang under.
     ///
-    /// With a reason, the parentheses carry THAT instead of the subject — the
-    /// person's question about a call in flight is "what is it doing and why",
-    /// and the subject is one line below rather than gone (`subject_line`).
+    /// With a reason, this line is the REASON and nothing else — the tool then
+    /// names itself on the row below (`subject_line`). Without one the line is
+    /// the call as it always was, `Name(subject)`: a call nobody explained must
+    /// not need a second row to say what it is.
     ///
     /// `name_style` is the caller's because the same line is drawn twice at two
     /// different volumes: open, where the call is the subject of the screen, and
@@ -798,19 +848,17 @@ impl ToolCallBlock {
     /// the screen and not about the call, so it is passed in rather than decided
     /// here — see [`fold`].
     fn head(&self, w: u16, lead: &str, lead_style: Style, name_style: Style) -> Vec<Line> {
-        let look = look(&self.name);
-        let name = match look.verb {
-            Some(verb) => verb.say(),
-            None => display_tool_name(&self.name),
+        let spans = match self.reason() {
+            Some(reason) => vec![Span::styled(reason, name_style)],
+            None => {
+                let subject = self.subject();
+                let mut spans = vec![Span::styled(self.display_name(), name_style)];
+                if !subject.is_empty() {
+                    spans.push(Span::styled(format!("({subject})"), name_style));
+                }
+                spans
+            }
         };
-        let parenthesised = match self.reason() {
-            Some(reason) => reason,
-            None => self.subject(),
-        };
-        let mut spans = vec![Span::styled(name, name_style)];
-        if !parenthesised.is_empty() {
-            spans.push(Span::styled(format!("({parenthesised})"), name_style));
-        }
         crate::markdown::wrap_spans(&spans, w, lead, lead_style)
     }
 
@@ -866,7 +914,11 @@ impl ToolCallBlock {
         if live {
             let caps = Caps::default();
             let lead = format!("{}{} ", " ".repeat(GUTTER), caps.g(Glyph::Gutter));
-            let mut out = last.head(w, &lead, muted(), fold());
+            // The same identifying rows a folded call draws, through the same
+            // accessor: a live lid and a folded call are the same two answers
+            // about one call, and a second copy of the pairing is how they come
+            // to disagree on screen.
+            let mut out = last.opening_rows(w, &lead, muted(), fold());
             out.push(last.note_line(w));
             return out;
         }
@@ -1143,14 +1195,7 @@ impl Content for ToolCallBlock {
         }
         let caps = Caps::default();
         let lead = format!("{} ", caps.g(Glyph::ToolMark));
-        let mut out = self.head(w, &lead, self.mark().1, self.name_style());
-        // With a reason on the head line, the subject follows it on the gutter —
-        // the `why` up top, the `what` right under it. Without one the head
-        // already carries the subject and this draws nothing, which is what
-        // keeps a session the model never annotated looking exactly as before.
-        if self.reason().is_some() {
-            out.extend(self.subject_line(w));
-        }
+        let mut out = self.opening_rows(w, &lead, self.mark().1, self.name_style());
 
         let body = match &self.outcome {
             Outcome::Ok(s) | Outcome::Failed(s) => s.as_str(),
@@ -1196,32 +1241,80 @@ impl Content for ToolCallBlock {
         out
     }
 
-    /// One line that is worth reading on its own.
+    /// The folded call, in one of two shapes.
     ///
-    /// The old version took the first line of the expanded form, which meant a
-    /// folded call said what was *asked* and nothing about what came back —
-    /// exactly the half a reader already knows. This one names the tool, the
-    /// thing it acted on, and what it returned.
+    /// **Explained** (the model said why): the first two rows of the expanded
+    /// form, and no result — the same rows, produced by the same
+    /// [`opening_rows`], so folding changes how much you see rather than what you
+    /// are looking at. The result is what expanding is FOR, so a successful one is
+    /// not repeated; a call in flight, an interrupted one and a failed one still
+    /// say so, appended to the second row rather than taking a third (the mark is
+    /// the same muted `●` in every state, so that note is the only thing on a
+    /// folded row that would say anything happened at all).
     ///
-    /// The subject is abbreviated to fit the room the rest of the line leaves,
-    /// rather than to a fixed budget and then cut again by the line's own
-    /// truncation: that cut landed on whatever happened to be last, which for a
-    /// long command was the result note — the folded line lost its ending while
-    /// keeping a command nobody could finish reading.
+    /// **Unexplained**: exactly the row it always was — [`summary`](Self::summary),
+    /// one elided line carrying the call and its result. A session nobody
+    /// annotated, an older log replayed and a tool whose schema never took the
+    /// argument all keep the density they had before any of this existed.
     ///
-    /// One row at [`fold`]'s volume: the mark, the name and the subject are the
-    /// summary, and the summary is what the reader has chosen to put away. The
-    /// note keeps its own style, because it is not the summary — it is the
-    /// answer, and a failed call's red is the one thing on a folded line that
-    /// has to survive being folded.
+    /// Two, not ten, is the point in the explained case: a folded call is a line
+    /// you scan past, and a lid that grew a row per wrapped command would cost the
+    /// whole run it hides.
+    fn summary_lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+        if self.reason().is_none() {
+            return vec![self.summary(ctx)];
+        }
+        let w = ctx.width;
+        if w == 0 {
+            return Vec::new();
+        }
+        let caps = Caps::default();
+        let lead = format!("{} ", caps.g(Glyph::ToolMark));
+        let mut rows: Vec<Line> = self
+            .opening_rows(w, &lead, fold(), fold())
+            .into_iter()
+            .take(FOLDED_ROWS)
+            .collect();
+        if matches!(self.outcome, Outcome::Ok(_)) {
+            return rows;
+        }
+        let (note, note_style) = outcome_note(&self.outcome);
+        if note.is_empty() {
+            return rows;
+        }
+        // Capped to a share of the row, then dropped if the row has no room left
+        // for it: the call below is what the reader is scanning for, and at a
+        // width where both cannot fit the one that identifies the call wins.
+        let note = clip(&note, (w as usize / 3).clamp(12, 48));
+        if let Some(last) = rows.last_mut() {
+            if last.width() + 3 + width::str_width(&note) <= w as usize {
+                last.spans
+                    .push(Span::styled(format!(" · {note}"), note_style));
+            }
+        }
+        rows
+    }
+
+    /// One line worth reading on its own: the call, its subject, and its result.
+    ///
+    /// Used for a call the model never explained — the folded form of every call
+    /// that existed before reasons did, and of every call from a model that
+    /// ignores the guide. Kept intact for exactly that reason: it is the only
+    /// line those calls have, so it carries everything they can carry.
+    ///
+    /// The subject is abbreviated to the room the rest of the line leaves, rather
+    /// than to a fixed budget and then cut again by the line's own truncation:
+    /// that cut landed on whatever happened to be last, which for a long command
+    /// was the result note — the folded line lost its ending while keeping a
+    /// command nobody could finish reading.
+    ///
+    /// The note keeps its own style, because it is not the summary — it is the
+    /// answer, and a failed call's red is the one thing on a folded line that has
+    /// to survive being folded.
     fn summary(&self, ctx: &RenderCtx) -> Line {
         let w = ctx.width;
         let style = fold();
-        let look = look(&self.name);
-        let name = match look.verb {
-            Some(verb) => verb.say(),
-            None => display_tool_name(&self.name),
-        };
+        let name = self.display_name();
         let (note, note_style) = outcome_note(&self.outcome);
         // The note is capped to a share of the line. It is the secondary half —
         // the reader is scanning for *what ran* — and an uncapped one-line
@@ -1236,10 +1329,6 @@ impl Content for ToolCallBlock {
         // heredoc's body would otherwise be written as extra *physical* rows
         // under a line the scroll counted as one — the terminal moves down, the
         // accounting does not, and what the next block draws lands on top of it.
-        //
-        // The SUBJECT, not the reason: a folded line is scanned for what ran, and
-        // the reason is what the expanded form adds. So the two shapes differ by
-        // how much you see and not by which question they answer.
         let full = flatten(&self.subject());
         let has_subject = !full.is_empty();
         // What is already spoken for: the two-cell indent (where the mark used to
@@ -2811,7 +2900,11 @@ mod tests {
             "a running call is not a warning: {:?}",
             running.mark()
         );
-        assert_eq!(running.mark().0, "⋯", "the `⋯` glyph is what marks it in flight");
+        assert_eq!(
+            running.mark().0,
+            "⋯",
+            "the `⋯` glyph is what marks it in flight"
+        );
         let head = running.lines(&crate::block::RenderCtx::bare(60)).remove(0);
         let named = head
             .spans
@@ -2836,7 +2929,7 @@ mod tests {
     }
 
     /// A folded call recedes: it is scaffolding over the answer rather than one
-    /// more thing being said, so its summary takes the muted grey — and takes it
+    /// more thing being said, so its rows take the muted grey — and take it
     /// *instead of* the state it is in. A run still going is yellow while it is
     /// open; folded it is muted like the rest of the chrome, because the reader
     /// has already been told it exists and the live line is where "still running"
@@ -2853,14 +2946,15 @@ mod tests {
             r#"{"file_path":"/Users/x/crates/atomcode-tui/src/content.rs"}"#,
         );
 
-        let folded = pending.summary(&crate::block::RenderCtx::bare(80));
-        let named = folded
+        let folded = pending.summary_lines(&crate::block::RenderCtx::bare(80));
+        let first = folded.first().expect("the folded call has a first row");
+        let named = first
             .spans
             .iter()
             .find(|s| s.text.contains("ReadFile"))
             .expect("the tool's name");
         assert_eq!(named.style.fg, receded, "the folded name is not receding");
-        let subject = folded
+        let subject = first
             .spans
             .iter()
             .find(|s| s.text.contains("content.rs"))
@@ -2869,32 +2963,34 @@ mod tests {
             subject.style.fg, receded,
             "the folded subject is not receding"
         );
-        // The whole line, so a folded line cannot be half-loud.
-        assert_ne!(
-            folded.spans.first().expect("the mark").style.fg,
-            Some(crate::frame::Color::role(Role::Warning)),
-            "a folded call is still painted as in flight: {folded:?}"
-        );
+        // Every row, so a folded line cannot be half-loud.
+        for row in &folded {
+            assert_ne!(
+                row.spans.first().expect("the mark").style.fg,
+                Some(crate::frame::Color::role(Role::Warning)),
+                "a folded call is still painted as in flight: {row:?}"
+            );
+        }
 
         // And the note survives the fold in its own colour.
         let failed = pending.with(Outcome::Failed("no such file".into()));
-        let line = failed.summary(&crate::block::RenderCtx::bare(80));
-        let note = line
-            .spans
+        let rows = failed.summary_lines(&crate::block::RenderCtx::bare(80));
+        let note = rows
             .iter()
+            .flat_map(|r| r.spans.iter())
             .find(|s| s.text.contains("失败"))
             .expect("the failure note");
         assert_eq!(
             note.style.fg,
             Some(crate::frame::Color::role(Role::Error)),
-            "a fold swallowed the one thing that had to survive it: {line:?}"
+            "a fold swallowed the one thing that had to survive it: {rows:?}"
         );
 
         // A run still at the visible end of the stream draws the call in
         // flight — the same two rows a single folded call draws, finished or
         // not; once something visible has followed it, the lid is the count
         // alone. The receding volume is the folded call's question
-        // (`summary`), so here it is only asserted that the two forms stay
+        // (`summary_lines`), so here it is only asserted that the two forms stay
         // the two forms.
         let running = ToolCallBlock::group_lines(&pending, 3, 0, true, 80);
         assert!(
@@ -2952,9 +3048,9 @@ mod tests {
         // char boundary" — the abbreviation runs while rendering, so the panic
         // took the whole process down mid-turn.
         //
-        // Asserted through `summary`, because that is where the cut now lives:
-        // `subject_of` returns the command whole and the folded line abbreviates
-        // it to the room it has.
+        // Asserted through `summary`, because that is where the cut lives for a
+        // call nobody explained: `subject_of` returns the command whole and the
+        // folded line abbreviates it to the room it has.
         let command = "中文".repeat(15) + "/尾";
         assert!(
             !command.is_char_boundary(command.len() - 44),
@@ -3201,14 +3297,16 @@ mod tests {
         );
     }
 
-    /// A call the model explained: the reason takes the head line's parentheses,
-    /// and what the call acted on moves to the gutter line under it.
+    /// A call the model explained: the head row is the reason and nothing else,
+    /// and the call itself moves to the gutter row under it — tool name and all.
     ///
     /// Both halves matter and they are asserted together on purpose. A build that
-    /// only replaced the parentheses would answer "why" while hiding "what ran";
-    /// one that only added the line would say everything twice.
+    /// dropped the tool's name from the row below would leave a bare path a
+    /// reader cannot tell was read, written or searched; one that kept the name
+    /// on the head would answer "why" by putting the mechanics back in front of
+    /// it.
     #[test]
-    fn a_reason_takes_the_head_and_the_subject_moves_to_the_gutter() {
+    fn a_reason_takes_the_head_and_the_call_moves_to_the_gutter() {
         let c = ToolCallBlock::pending(
             "c",
             "read_file",
@@ -3224,12 +3322,12 @@ mod tests {
             "the head line carries the reason: {rows:?}"
         );
         assert!(
-            !rows[0].contains("src/auth.rs"),
-            "and not the subject as well, which is the line below: {rows:?}"
+            !rows[0].contains("ReadFile") && !rows[0].contains("src/auth.rs"),
+            "and nothing else — the call names itself on the row below: {rows:?}"
         );
         assert!(
-            rows[1].contains("src/auth.rs"),
-            "the subject stays on the screen, on the gutter line: {rows:?}"
+            rows[1].contains("ReadFile(src/auth.rs)"),
+            "the call keeps its tool name where the reason took the head: {rows:?}"
         );
     }
 
@@ -3259,7 +3357,7 @@ mod tests {
 
     /// For a tool the table has never heard of, `subject_of` falls back to the
     /// raw argument text — and the reason is an argument. It must not end up
-    /// flattened into that line.
+    /// flattened into that line, in either shape.
     #[test]
     fn an_unknown_tools_subject_never_quotes_the_reason() {
         let c = ToolCallBlock::pending(
@@ -3267,11 +3365,8 @@ mod tests {
             "some_new_tool",
             r#"{"thing":"x.rs","intent":"checking the thing"}"#,
         );
-        let rows: Vec<String> = c
-            .lines(&crate::block::RenderCtx::bare(120))
-            .iter()
-            .map(|l| l.plain())
-            .collect();
+        let ctx = crate::block::RenderCtx::bare(120);
+        let rows: Vec<String> = c.lines(&ctx).iter().map(|l| l.plain()).collect();
         assert!(
             rows.iter().any(|r| r.contains("x.rs")),
             "the fallback still names the argument: {rows:?}"
@@ -3280,11 +3375,92 @@ mod tests {
             !rows[1].contains("intent") && !rows[1].contains("checking the thing"),
             "the reason is not part of what it acted on: {rows:?}"
         );
-        // The folded form is the same fallback, so it has to agree.
-        let folded = c.summary(&crate::block::RenderCtx::bare(120)).plain();
+        // The folded form draws those same rows, so it has to agree.
+        let folded: Vec<String> = c.summary_lines(&ctx).iter().map(|l| l.plain()).collect();
         assert!(
-            !folded.contains("intent"),
-            "a folded line scanned for what ran must not quote the reason: {folded:?}"
+            !folded.iter().any(|r| r.contains("intent")),
+            "a folded row scanned for what ran must not quote the reason: {folded:?}"
+        );
+        assert_eq!(
+            c.lines(&ctx).len().min(2),
+            folded.len(),
+            "folding takes the first two rows and no rewriting: {folded:?}"
+        );
+    }
+
+    /// The folded call is the OPEN call's first two rows, minus the result.
+    ///
+    /// This is the whole contract of the shape: the two must be the same rows,
+    /// so that folding changes how much you see and not what you are looking at
+    /// — and a second, hand-written summary is exactly how they drift apart.
+    #[test]
+    fn a_folded_call_is_the_open_calls_first_two_rows_without_the_result() {
+        let c = ToolCallBlock::pending(
+            "c",
+            "read_file",
+            r#"{"file_path":"src/auth.rs","intent":"finding where credentials are loaded"}"#,
+        )
+        .with(Outcome::Ok("20 行".into()));
+        let ctx = crate::block::RenderCtx::bare(80);
+        let open: Vec<String> = c.lines(&ctx).iter().map(|l| l.plain()).collect();
+        let folded: Vec<String> = c.summary_lines(&ctx).iter().map(|l| l.plain()).collect();
+
+        assert_eq!(
+            folded.len(),
+            2,
+            "explained calls fold to two rows: {folded:?}"
+        );
+        assert_eq!(
+            folded,
+            open[..2].to_vec(),
+            "the folded rows must BE the open ones: {folded:?} vs {open:?}"
+        );
+        assert!(
+            !folded.iter().any(|r| r.contains("20 行")),
+            "and the result is what folding leaves out: {folded:?}"
+        );
+    }
+
+    /// A successful call folds without its result; a call that is still running,
+    /// was interrupted, or failed still says so — on the second row, not a third.
+    ///
+    /// The mark is the same muted `●` in every state, so that note is the only
+    /// thing left on a folded row that would say anything happened at all.
+    #[test]
+    fn a_folded_call_keeps_its_outcome_note_except_when_it_succeeded() {
+        let ctx = crate::block::RenderCtx::bare(80);
+        let call = || {
+            ToolCallBlock::pending(
+                "c",
+                "read_file",
+                r#"{"file_path":"src/auth.rs","intent":"finding the credentials loader"}"#,
+            )
+        };
+        let folded = |b: ToolCallBlock| -> Vec<String> {
+            b.summary_lines(&ctx).iter().map(|l| l.plain()).collect()
+        };
+
+        assert!(
+            folded(call()).last().expect("a row").contains("运行中"),
+            "a call still in flight must not fold to silence: {:?}",
+            folded(call())
+        );
+
+        let rows = folded(call().with(Outcome::Failed("no such file".into())));
+        assert!(
+            rows.last().expect("a row").contains("no such file"),
+            "a fold swallowed the one thing that had to survive it: {rows:?}"
+        );
+        assert_eq!(
+            rows.len(),
+            2,
+            "the note rides the second row rather than taking a third: {rows:?}"
+        );
+
+        let done = folded(call().with(Outcome::Ok("20 行".into())));
+        assert!(
+            !done.iter().any(|r| r.contains("20 行")),
+            "a successful result is what expanding the call is for: {done:?}"
         );
     }
 }
