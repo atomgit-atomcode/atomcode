@@ -222,15 +222,42 @@ impl Plugin for SessionNativePlugin {
             }
             _ => Vec::new(),
         };
+        // The session's creation DAY, pinned so the persona's date anchor — and
+        // with it the whole system-prompt prefix — stays byte-stable across days
+        // and resumes. Read from the stored meta (a resume returns the ORIGINAL
+        // creation day, not today), and left `None` when there is no store, which
+        // is exactly the fresh/in-memory case whose "today" is the current date.
+        let created_date = match (self.0.id.as_deref(), self.0.store()) {
+            (Some(id), Some(store)) => store
+                .read_meta(id)
+                .ok()
+                .and_then(|meta| format_created_day(meta.created_at)),
+            _ => None,
+        };
         let _ = ctx
             .provide::<SessionDefaultsSvc>(Arc::new(SessionDefaults {
                 id: self.0.id.clone(),
                 resume: self.0.stored.is_some() && self.0.resume,
                 seed,
+                created_date,
             }))
             .map_err(|e| e.to_string())?;
         Ok(())
     }
+}
+
+/// Format an epoch-millisecond timestamp as the persona's `YYYY-MM-DD (Weekday)`
+/// anchor, in local time — the same shape `chrono::Local::now()` produces there.
+///
+/// `None` for a timestamp outside the representable range (a corrupt meta), so
+/// the persona falls back to the wall clock rather than showing a wrong day.
+fn format_created_day(created_at_ms: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp_millis(created_at_ms)
+        .map(|dt| {
+            dt.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d (%A)")
+                .to_string()
+        })
 }
 
 /// Host-built lifecycle hooks, by the name a `kernel-hooks` row asks for.
@@ -2786,6 +2813,35 @@ impl atomcode_harness::commands::CatalogCommand for PolicyCommand {
 mod tests {
     use async_trait::async_trait;
     use std::sync::Arc;
+
+    /// The session's creation timestamp renders in the persona's anchor shape,
+    /// `YYYY-MM-DD (Weekday)` — the same one `chrono::Local::now()` produces —
+    /// and a frozen instant renders the SAME string every time (the whole point:
+    /// a pinned day does not drift, so the prefix stays byte-stable).
+    #[test]
+    fn a_creation_timestamp_renders_in_the_anchor_shape() {
+        // A fixed instant. The local calendar day it lands on is the runner's, so
+        // the test checks the SHAPE and DETERMINISM rather than a tz-specific day.
+        let ms = 1_577_966_400_000; // 2020-01-02T12:00:00Z
+        let s = super::format_created_day(ms).expect("a valid instant");
+        let (date, weekday) = s.split_at(10);
+        assert!(
+            date.len() == 10 && date.chars().all(|c| c.is_ascii_digit() || c == '-'),
+            "a `YYYY-MM-DD` date leads: {s}"
+        );
+        assert!(
+            weekday.starts_with(" (") && weekday.ends_with(')'),
+            "the weekday follows in parens: {s}"
+        );
+        assert_eq!(s, super::format_created_day(ms).unwrap(), "same instant, same string");
+    }
+
+    #[test]
+    fn a_corrupt_timestamp_falls_back_rather_than_showing_a_wrong_day() {
+        // Out of chrono's representable range → None, so the persona reads the
+        // wall clock instead of printing a nonsense day.
+        assert!(super::format_created_day(i64::MAX).is_none());
+    }
 
     /// What a person wrote themselves reaches the model, and a configuration
     /// that will not parse still gets them the built-in prompt.

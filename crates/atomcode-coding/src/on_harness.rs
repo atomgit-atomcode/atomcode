@@ -2815,6 +2815,15 @@ impl Plugin for CodingPersonaPlugin {
         // report a row that is absent when the consumer never said it wanted it.
         &["system-prompt", "tools", "llm"]
     }
+    fn inject(&self) -> &'static [&'static str] {
+        // `session-defaults` carries the session's creation day, which pins the
+        // date anchor (below). Injected, not merely used, so this row applies
+        // AFTER the session row that provides it — otherwise the read would race
+        // and silently fall back to the wall clock, defeating the pin. Always
+        // provided (the generic `session` row or `session-native`), so the
+        // dependency is satisfiable in every runtime.
+        &["session-defaults"]
+    }
     fn description(&self) -> &'static str {
         "coding's own persona, in place of the harness's generic one"
     }
@@ -2847,7 +2856,14 @@ impl Plugin for CodingPersonaPlugin {
         // rather than of the `ATOMCODE_MEMORY_TOOL` / `ATOMCODE_REQUEST_USER_INPUT` envs the
         // chain reads, which cannot see a tree that failed to mount the tool. See
         // `coding_persona_rows`.
-        let text = crate::persona::coding_persona_rows(&model, row.language, &has);
+        // The date anchor's day, pinned to the session's creation day so the
+        // system-prompt prefix is byte-stable across days/resumes. `None` (no
+        // durable session) → the persona reads the wall clock, which for a fresh
+        // conversation IS today.
+        let today = ctx
+            .service::<atomcode_harness::seams::SessionDefaultsSvc>()
+            .and_then(|defaults| defaults.created_date.clone());
+        let text = crate::persona::coding_persona_rows(&model, row.language, &has, today.as_deref());
         // Rank 0, and an id of this row's own: the identity line goes first,
         // and the generic row it replaces is removed by `CODING_ROWS` rather
         // than overwritten here.

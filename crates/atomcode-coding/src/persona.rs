@@ -202,6 +202,11 @@ pub(crate) fn coding_persona_rows(
     model: &str,
     preferred_language: Option<atomcode_config::locale::Locale>,
     mounted: &dyn Fn(&str) -> bool,
+    // The date the `## ENVIRONMENT:` anchor should show, pre-formatted as
+    // `YYYY-MM-DD (Weekday)`. `Some` pins it (the session's creation day, so the
+    // system-prompt prefix is byte-stable across days/resumes); `None` falls back
+    // to the wall clock (a fresh, storeless conversation).
+    today: Option<&str>,
 ) -> String {
     let full = coding_persona_gated(
         model,
@@ -216,6 +221,7 @@ pub(crate) fn coding_persona_rows(
         false,
         false,
         mounted("memory"),
+        today,
     );
     // One removal per owner, and each is asserted gone by the row-list gate rather than trusted
     // to a future edit of the block above.
@@ -256,7 +262,8 @@ pub(crate) fn coding_persona_with_capabilities(
     external_subagents_enabled: bool,
 ) -> String {
     // The chain asks the env, which is how it has always decided. The row list asks the running
-    // tree — see `coding_persona_rows`.
+    // tree — see `coding_persona_rows`. This path has no session to pin a date to, so it keeps
+    // the wall-clock anchor (`None`).
     coding_persona_gated(
         model,
         preferred_language,
@@ -266,6 +273,7 @@ pub(crate) fn coding_persona_with_capabilities(
         subagents_enabled,
         external_subagents_enabled,
         memory_tool_enabled(),
+        None,
     )
 }
 
@@ -279,6 +287,9 @@ fn coding_persona_gated(
     subagents_enabled: bool,
     external_subagents_enabled: bool,
     memory_enabled: bool,
+    // Pre-formatted `YYYY-MM-DD (Weekday)` for the date anchor, or `None` to read
+    // the wall clock. See [`coding_persona_rows`].
+    today: Option<&str>,
 ) -> String {
     let commit_language = commit_language_guidance(preferred_language);
     #[allow(unused_mut)] // `mut` is only used under `cfg(windows)` below.
@@ -383,17 +394,20 @@ Skip the trailer for `git commit --amend` and `git revert`. Only commit when the
     if atomcode_config::config::offline::is_offline_active() {
         p.push_str(&offline_environment_block());
     }
-    // Day-granular date anchor, FROZEN into the system prompt. assemble runs ONCE per
-    // session (and on model-swap via reconcile_coding_persona), NOT per turn — so this is
-    // cache-stable AND present on EVERY round — it is the SOLE current-date source (the
-    // per-round StatusReminderHook tail was removed as redundant). Without it the model has no
-    // current-date reference and a round-1 web_search defaults to its training year (the
-    // `project_system_prompt_date` bug). A cross-day resume refreshes it (reconcile re-inserts
-    // the fresh persona + bumps cache_epoch — ~one cold prefill per day, negligible). v1
-    // `prompt.rs:67` parity.
-    p.push_str(&date_anchor_line(
-        &chrono::Local::now().format("%Y-%m-%d (%A)").to_string(),
-    ));
+    // Day-granular date anchor, FROZEN into the system prompt: the SOLE current-date source
+    // (there is no per-round reminder tail). Without it a round-1 web_search defaults to its
+    // training year (the `project_system_prompt_date` bug), so it must be present on every round.
+    //
+    // The day is PINNED to the session's creation date when the host supplies one (`today`),
+    // NOT re-read from the wall clock — so the system-prompt prefix stays byte-stable across
+    // midnight and across resumes/remounts. Re-reading the clock made a cross-day mount reword
+    // this line, which (the anchor sitting at the FRONT of the request) re-prefilled the whole
+    // cached prefix — ~91% of a long context — once per day. `None` (a storeless conversation)
+    // falls back to today, which for a fresh session IS the creation day.
+    let today = today
+        .map(str::to_string)
+        .unwrap_or_else(|| chrono::Local::now().format("%Y-%m-%d (%A)").to_string());
+    p.push_str(&date_anchor_line(&today));
     p
 }
 
@@ -1066,6 +1080,26 @@ mod tests {
         assert!(
             p.contains("Today's date:"),
             "persona must carry a date anchor: {p}"
+        );
+    }
+
+    #[test]
+    fn the_date_anchor_is_pinned_to_the_supplied_day_not_the_wall_clock() {
+        // The persona anchors its date to the session's creation day (threaded in),
+        // so the system-prompt prefix stays byte-stable across midnight/resume
+        // rather than re-prefilling the whole cached prefix once per day.
+        let has = |_: &str| false;
+        let pinned = coding_persona_rows("deepseek-v4-flash", None, &has, Some("2020-01-02 (Thursday)"));
+        assert!(
+            pinned.contains("Today's date: 2020-01-02 (Thursday)"),
+            "the anchor must use the pinned day: {pinned}"
+        );
+        // None → the fresh-session path falls back to the current date.
+        let live = coding_persona_rows("deepseek-v4-flash", None, &has, None);
+        assert!(live.contains("Today's date:"), "still carries an anchor: {live}");
+        assert!(
+            !live.contains("2020-01-02"),
+            "None must use today, not the pinned day: {live}"
         );
     }
 
@@ -1980,7 +2014,7 @@ mod tests {
         // the removals are the function's whole reason to exist, and a future edit of the chain
         // text above can silently put a section back.
         let mounted = |_: &str| true;
-        let p = coding_persona_rows("glm-5.2", None, &mounted);
+        let p = coding_persona_rows("glm-5.2", None, &mounted, None);
         for owned_by_a_row in [
             "## DELEGATING WITH `task`",
             "## TEAM AGENT:",
@@ -2010,8 +2044,8 @@ mod tests {
         // delegation tests).
         let yes = |_: &str| true;
         let no = |_: &str| false;
-        let mounted = coding_persona_rows("glm-5.2", None, &yes);
-        let absent = coding_persona_rows("glm-5.2", None, &no);
+        let mounted = coding_persona_rows("glm-5.2", None, &yes, None);
+        let absent = coding_persona_rows("glm-5.2", None, &no, None);
         assert!(
             mounted.contains("## MEMORY"),
             "the tool is mounted, so the guidance must be there"
