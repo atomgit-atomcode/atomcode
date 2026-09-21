@@ -459,14 +459,26 @@ impl Frame {
                 let a = a.max(part.rect.x) - part.rect.x;
                 let b = b.min(part.rect.right()).saturating_sub(part.rect.x);
                 if a < b {
+                    let (a, b) = (a as usize, b as usize);
+                    // Fill the whole band, not just the words in it. `restyle`
+                    // only touches cells that exist, so a ragged right edge, the
+                    // gaps in a table, or a blank row inside the selection would
+                    // stay unlit — a comb of lit words rather than one block. Pad
+                    // the row out to the band's right edge with plain spaces first,
+                    // so those blanks take the selection ground too and the region
+                    // reads as a solid rectangle (an editor's selection).
+                    let have = line.width();
+                    if have < b {
+                        line.spans
+                            .push(Span::styled(" ".repeat(b - have), Style::default()));
+                    }
                     // A UNIFORM selection band, not per-cell reverse. Toggling
                     // `reverse` swaps each span's fg into its bg, so a run of cyan
                     // code, a green ✓, and white prose each lit up in their OWN bright
                     // colour — a rainbow patchwork. Instead paint one calm selection
                     // ground under the whole range and keep each span's foreground, so
-                    // the selection reads as a single readable band (an editor's
-                    // selection, not inverse video).
-                    *line = line.restyle(a as usize, b as usize, |st| Style {
+                    // the selection reads as a single readable band.
+                    *line = line.restyle(a, b, |st| Style {
                         bg: Some(Color::role(crate::theme::Role::PanelSelBg)),
                         reverse: false,
                         ..st
@@ -656,6 +668,31 @@ mod tests {
         assert!(
             f.parts[1].lines[0].spans.iter().all(|s| s.style.bg != sel_bg),
             "a one-row selection reached the row below"
+        );
+    }
+
+    #[test]
+    fn a_selection_fills_the_band_past_the_end_of_a_short_row() {
+        use crate::moment::Selection;
+        // A three-wide word in a ten-wide row, selected end to end: the band has
+        // to be a solid rectangle, not just the word — the seven trailing blanks
+        // take the selection ground too, or the region reads as a comb of words.
+        let mut f = Frame::new(10, 1);
+        f.place("a", Rect::new(0, 0, 10, 1), vec![Line::raw("abc")]);
+        f.highlight(&Selection {
+            anchor: (0, 0),
+            head: (9, 0),
+        });
+        let sel_bg = Some(Color::role(crate::theme::Role::PanelSelBg));
+        let banded: String = f.parts[0].lines[0]
+            .spans
+            .iter()
+            .filter(|s| s.style.bg == sel_bg)
+            .map(|s| s.text.as_str())
+            .collect();
+        assert_eq!(
+            banded, "abc       ",
+            "the band stopped at the last word instead of the row's edge"
         );
     }
 
