@@ -45,9 +45,14 @@ impl View for Status {
             }
             SessionEvent::RequestHeader { model, .. } => state.model = model.clone(),
             SessionEvent::Usage { usage, .. } => {
-                // Field-wise max, not sum: providers re-send a growing
-                // cumulative figure, and summing would double-count it.
-                state.prompt_tokens = state.prompt_tokens.max(usage.prompt);
+                // The LATEST request's prompt, not a session-wide max: the gauge
+                // answers "how full is the window NOW". Within a turn the prompt only
+                // grows, so overwriting reads the same as a max — but when compaction
+                // cuts the history the next request is smaller, and the gauge must drop
+                // with it. A max would stay pinned at the pre-compaction peak, a stale
+                // over-100% red long after the context came back down. This mirrors the
+                // live line (`modules::live`), which already tracks the latest request.
+                state.prompt_tokens = usage.prompt;
                 state.completion_tokens += usage.completion;
                 // The cached share belongs to one request, so it is the last
                 // reading rather than a max: a hit rate is only meaningful against
@@ -554,6 +559,31 @@ mod tests {
         assert!(
             paused.contains("等审批"),
             "why it is not moving: {paused:?}"
+        );
+    }
+
+    #[test]
+    fn the_context_gauge_tracks_the_latest_request_not_a_session_peak() {
+        use atomcode_kernel::stream::TokenUsage;
+        // The gauge answers "how full is the window NOW", so it follows the latest
+        // request. When compaction cuts the history, the next request is smaller and
+        // the gauge must DROP — a session-wide max would stay pinned at the old peak
+        // (a stale, misleading over-100% red long after the context came back down).
+        let usage = |prompt| SessionEvent::Usage {
+            turn: 1,
+            round: 1,
+            usage: TokenUsage {
+                prompt,
+                completion: 10,
+                cached: 0,
+            },
+        };
+        let mut st = State::default();
+        Status::absorb(&mut st, &usage(300_000)); // spiked near/over the window
+        Status::absorb(&mut st, &usage(40_000)); // …then compaction shrank it
+        assert_eq!(
+            st.prompt_tokens, 40_000,
+            "the gauge follows the latest request, it does not stay at the peak"
         );
     }
 
