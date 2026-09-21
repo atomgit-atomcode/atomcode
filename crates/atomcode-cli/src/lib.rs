@@ -332,6 +332,45 @@ pub mod tui_front {
             std::fs::write(&self.path, document.to_string()).map_err(|e| e.to_string())
         }
 
+        /// Persist `model` as `default_model`, in place, so a `/model` switch
+        /// survives the next start.
+        ///
+        /// `toml_edit` rather than a whole rewrite, for the same reason
+        /// [`Self::set_setting`] does it: the file keeps its comments and order.
+        /// A selection that does not resolve against the file on disk — an
+        /// ephemeral OAuth/login model that lives only in the running config —
+        /// is left unwritten, so the file never points `default_model` at
+        /// something a fresh start cannot find (it would just fall back).
+        fn set_default_model(&self, model: &str) -> Result<(), String> {
+            use atomcode_config::config::Config;
+            let disk = if self.path.exists() {
+                Config::load(&self.path).map_err(|e| e.to_string())?
+            } else {
+                // No file yet: nothing persistent to point at, and writing a
+                // bare `default_model` with no providers would not resolve.
+                return Ok(());
+            };
+            if disk.resolve_model(Some(model)).is_err() {
+                // Runtime-only selection — keep the switch live-only.
+                return Ok(());
+            }
+            // Propagate a read error rather than `unwrap_or_default()`: the file
+            // was readable a line ago (the load above), so a failure here is a
+            // real one, and defaulting to "" would parse an empty document and
+            // write it back — wiping every provider, model and setting to leave
+            // a bare `default_model`.
+            let text = std::fs::read_to_string(&self.path).map_err(|e| e.to_string())?;
+            let mut document: toml_edit::DocumentMut =
+                text.parse().map_err(|e: toml_edit::TomlError| {
+                    atomcode_config::i18n::t(atomcode_config::i18n::Msg::ConfigFileUnreadable {
+                        error: &e.to_string(),
+                    })
+                    .into_owned()
+                })?;
+            atomcode_config::provider_edit::set_default_model(&mut document, Some(model));
+            std::fs::write(&self.path, document.to_string()).map_err(|e| e.to_string())
+        }
+
         /// The configured providers, as choices — id, kind, model.
         ///
         /// **The key is not read.** A `ProviderConfig` carries an `api_key`, and
@@ -487,6 +526,53 @@ model = "vendor-b"
                 "and the person's own file survived that too: {unset}"
             );
             assert!(file.reset_setting("no.such.setting").is_err());
+        }
+
+        /// A `/model <id>` switch is persisted, in place, so the next start opens
+        /// on it instead of the old default — the fix for "the switch reverts on
+        /// restart". A selection that does not resolve against the file (an
+        /// ephemeral/runtime-only model) is left unwritten so the file never
+        /// points at something a fresh start cannot find.
+        #[test]
+        fn switching_the_model_persists_the_resolvable_one_and_skips_the_rest() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            std::fs::write(&path, format!("# 我的注释\n{CONFIG}")).unwrap();
+            let file = ConfigFile {
+                path: path.clone(),
+                working_dir: dir.path().to_path_buf(),
+                telemetry: None,
+                skip_permissions: false,
+                provider_override: None,
+            };
+
+            // A configured model is written as the new default, in place.
+            file.set_default_model("custom/b").unwrap();
+            let after = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                after.contains(r#"default_model = "custom/b""#),
+                "the selection was persisted: {after}"
+            );
+            assert!(
+                after.contains("# 我的注释"),
+                "the person's file survived the edit: {after}"
+            );
+            assert_eq!(
+                atomcode_config::config::Config::load(&path)
+                    .unwrap()
+                    .default_model
+                    .as_deref(),
+                Some("custom/b"),
+                "and a fresh load resolves the switched-to model"
+            );
+
+            // An id the file cannot resolve is not written — the old default holds.
+            file.set_default_model("oauth-only/runtime").unwrap();
+            let unchanged = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                unchanged.contains(r#"default_model = "custom/b""#),
+                "a runtime-only selection is not persisted: {unchanged}"
+            );
         }
 
         /// Which screen opens: the flag beats the setting, the setting beats the

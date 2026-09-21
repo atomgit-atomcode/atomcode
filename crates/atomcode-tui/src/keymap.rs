@@ -103,6 +103,12 @@ pub enum Action {
     /// they are two panels with two ports behind them, and a build may mount
     /// either without the other.
     ToggleProviders,
+    /// Open the providers panel on its 模型 (models) list, opening the panel if
+    /// it is not already up. What `/model` with no argument lands on: the model
+    /// list is where a person switches models, and it is the same panel
+    /// `/provider` opens (which starts on the 账号 tab) — one surface, not a
+    /// second popup that only lists models.
+    OpenModels,
     /// Pull the plugins panel up over the composer, or put it away.
     ///
     /// Its own action for the reason [`Action::ToggleProviders`] is one: it has

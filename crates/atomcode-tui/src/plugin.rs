@@ -3623,6 +3623,20 @@ impl Tui {
                 }
                 return false;
             }
+            // `/model`: the same providers panel, opened straight onto its model
+            // list. One surface for switching and editing models, not a second
+            // popup — mirrors `Action::ToggleProviders`'s refusal and refresh.
+            Action::OpenModels => {
+                drop(m);
+                if !self.host.open_providers_on_models() {
+                    self.say(&t(Msg::NoProviderPanel));
+                    return false;
+                }
+                if self.host.providers_open() {
+                    self.refresh_providers();
+                }
+                return false;
+            }
             Action::TogglePlugins => {
                 drop(m);
                 // Refused rather than silently opening a panel with no module to

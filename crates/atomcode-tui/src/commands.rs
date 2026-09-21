@@ -827,47 +827,12 @@ impl CommandSet for SessionCommands {
             }
             "model" => {
                 let wanted = args.trim();
-                // With no argument: the catalog, to pick from. It used to print
-                // the current model and stop, which left the id itself as
-                // something a person had to know by heart — the host has the
-                // catalog and now says so (`HostCommand::Models`).
+                // With no argument: open the providers panel on its model list —
+                // one surface for switching and editing models, the same panel
+                // `/provider` opens on its 账号 tab. It replaced a models-only
+                // popup so switching and editing a model are never two places.
                 if wanted.is_empty() {
-                    let control = match host(control) {
-                        Ok(control) => control,
-                        Err(refused) => return refused,
-                    };
-                    return match control.call(HostCommand::Models { session: root }).await {
-                        Ok(HostReply::Models { models, current }) if models.is_empty() => {
-                            Outcome::Said(
-                                match current {
-                                    Some(current) => t(Msg::ModelOnlyCurrent { current: &current }),
-                                    None => t(Msg::ModelNoneConfigured),
-                                }
-                                .into_owned(),
-                            )
-                        }
-                        Ok(HostReply::Models { models, current }) => {
-                            let choices: Vec<crate::overlay::Choice> = models
-                                .into_iter()
-                                .map(|model| {
-                                    let here = current.as_deref() == Some(model.id.as_str());
-                                    crate::overlay::Choice::new(
-                                        format!("/model {}", model.id),
-                                        model.id.clone(),
-                                    )
-                                    .about(model.about)
-                                    .marked(here)
-                                })
-                                .collect();
-                            Outcome::Open(crate::overlay::Picker::new(
-                                "model",
-                                t(Msg::ModelPickerHint),
-                                choices,
-                            ))
-                        }
-                        Ok(other) => Outcome::Refused(format!("{other:?}")),
-                        Err(error) => Outcome::Refused(refusal(error)),
-                    };
+                    return Outcome::Do(Action::OpenModels);
                 }
                 let control = match host(control) {
                     Ok(control) => control,
@@ -1883,6 +1848,27 @@ mod tests {
             ]
         );
     }
+
+    /// `/model` with no argument opens the providers panel on its model list —
+    /// one surface for switching and editing — instead of a models-only popup.
+    /// It asks the host for nothing: opening a panel is screen state.
+    #[tokio::test]
+    async fn bare_model_opens_the_providers_model_list() {
+        let host = Arc::new(Recording::default());
+        let (app, _client, all) = following(&host);
+        assert!(
+            matches!(
+                all.dispatch("/model", &app.context()).await,
+                Outcome::Do(Action::OpenModels)
+            ),
+            "/model with no arg routes to the providers model list"
+        );
+        assert!(
+            host.asked.lock().unwrap().is_empty(),
+            "opening the panel asks the host for nothing"
+        );
+    }
+
     /// `/context` says both numbers, because they answer different questions.
     ///
     /// What the screen can count is what it was shown. The budget is the host's
