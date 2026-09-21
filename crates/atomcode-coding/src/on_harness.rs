@@ -611,6 +611,14 @@ config = { working_dir = {working_dir}, force = {force_verify} }
 [[insert]]
 name = "chat-options"
 
+# Every tool call states why it is being made, in one line the person reads on
+# the call's own row. It rides in the call's arguments — which is what makes it
+# need no protocol change — and is stripped back off at `tools/execute-batch`
+# before any gate reads those arguments (`tool_intent` explains why that is not
+# optional).
+[[insert]]
+name = "tool-intent"
+
 # The driver protocol: this is what `CodingRuntimeHandle` drives.
 [[insert]]
 name = "ui-handle"
@@ -1387,6 +1395,11 @@ pub fn plugins() -> Vec<Arc<dyn Plugin>> {
         Arc::new(crate::policy_rows::CredentialShellPlugin),
         Arc::new(crate::policy_rows::WriteApprovalPlugin),
         Arc::new(crate::policy_rows::BashWorkspacePlugin),
+        // Every tool call states its reason in one line, for the person reading
+        // the transcript. This product's call, not the mechanism's: what a tool
+        // call should say about itself is a presentation decision
+        // (`docs/adr/0024`, and `tool_intent`'s own module doc).
+        Arc::new(crate::tool_intent::ToolIntentPlugin),
     ]
 }
 

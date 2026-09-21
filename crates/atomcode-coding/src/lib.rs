@@ -75,6 +75,7 @@ mod rate_limit;
 mod skill_first;
 pub mod subagent_tiers;
 mod todo;
+mod tool_intent;
 
 /// The image type carried by [`UserInput`] / [`ImagePreprocessor`], re-exported
 /// so driver crates can implement the hook without naming `atomcode_kernel`.

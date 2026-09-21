@@ -716,12 +716,81 @@ impl ToolCallBlock {
         }
     }
 
+    /// The call's arguments as the subject guess should read them.
+    ///
+    /// The reason is not something the call ACTS ON, and `subject_of` falls back
+    /// to the raw argument text for any tool its table has never heard of — so
+    /// an unstripped reason would be flattened into that line as
+    /// `"thing":"x.rs","intent":"…"`. Taken out here, and only when it is
+    /// actually there, so a call without one keeps the exact bytes it had and
+    /// the fallback reads as it always did.
+    fn args_without_reason(&self) -> String {
+        let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(&self.args) else {
+            return self.args.clone();
+        };
+        let Some(map) = parsed.as_object_mut() else {
+            return self.args.clone();
+        };
+        if map.remove("intent").is_none() {
+            return self.args.clone();
+        }
+        serde_json::to_string(&parsed).unwrap_or_else(|_| self.args.clone())
+    }
+
+    /// What this call acted on, for display.
+    fn subject(&self) -> String {
+        subject_of(&self.name, &self.args_without_reason())
+    }
+
+    /// Why this call is being made, if the model said.
+    ///
+    /// `intent` rides in the call's own arguments — that is what makes a reason
+    /// per call need no protocol, no log format and no new field anywhere up the
+    /// stack (see `atomcode-coding`'s `tool_intent`). It is stripped back off
+    /// before the call runs, so this is the only reader.
+    ///
+    /// `None` for every call that did not carry one, which is most of the calls
+    /// in an older session and every call from a model that ignores the guide.
+    /// The caller then draws exactly what it drew before this existed.
+    fn reason(&self) -> Option<String> {
+        let parsed: serde_json::Value = serde_json::from_str(&self.args).ok()?;
+        let text = parsed.get("intent")?.as_str()?.trim();
+        (!text.is_empty()).then(|| flatten(text))
+    }
+
+    /// `⎿ what it acted on` — the subject, on the gutter line.
+    ///
+    /// Only drawn when there is a reason above it. With a reason the head line
+    /// belongs to the *why*, and the *what* has to stay on the screen: `$
+    /// release the port` is not an answer to "what actually ran".
+    fn subject_line(&self, w: u16) -> Option<Line> {
+        let subject = flatten(&self.subject());
+        if subject.is_empty() {
+            return None;
+        }
+        let caps = Caps::default();
+        Some(
+            Line::from_spans(vec![
+                Span::styled(
+                    format!("{}{} ", " ".repeat(GUTTER), caps.g(Glyph::Gutter)),
+                    muted(),
+                ),
+                Span::styled(subject, muted()),
+            ])
+            .truncate(w as usize),
+        )
+    }
+
     /// The opening line: whatever marks it, the tool, and the subject — whole.
     ///
     /// Whole rather than abbreviated, and wrapped rather than cut: expanding a
     /// call is how a reader asks what actually ran, and a command ending in `…`
     /// is not an answer to that question. `lead` is what marks the line, and its
     /// width is the indent its continuations hang under.
+    ///
+    /// With a reason, the parentheses carry THAT instead of the subject — the
+    /// person's question about a call in flight is "what is it doing and why",
+    /// and the subject is one line below rather than gone (`subject_line`).
     ///
     /// `name_style` is the caller's because the same line is drawn twice at two
     /// different volumes: open, where the call is the subject of the screen, and
@@ -730,14 +799,17 @@ impl ToolCallBlock {
     /// here — see [`fold`].
     fn head(&self, w: u16, lead: &str, lead_style: Style, name_style: Style) -> Vec<Line> {
         let look = look(&self.name);
-        let subject = subject_of(&self.name, &self.args);
         let name = match look.verb {
             Some(verb) => verb.say(),
             None => display_tool_name(&self.name),
         };
+        let parenthesised = match self.reason() {
+            Some(reason) => reason,
+            None => self.subject(),
+        };
         let mut spans = vec![Span::styled(name, name_style)];
-        if !subject.is_empty() {
-            spans.push(Span::styled(format!("({subject})"), name_style));
+        if !parenthesised.is_empty() {
+            spans.push(Span::styled(format!("({parenthesised})"), name_style));
         }
         crate::markdown::wrap_spans(&spans, w, lead, lead_style)
     }
@@ -1072,6 +1144,13 @@ impl Content for ToolCallBlock {
         let caps = Caps::default();
         let lead = format!("{} ", caps.g(Glyph::ToolMark));
         let mut out = self.head(w, &lead, self.mark().1, self.name_style());
+        // With a reason on the head line, the subject follows it on the gutter —
+        // the `why` up top, the `what` right under it. Without one the head
+        // already carries the subject and this draws nothing, which is what
+        // keeps a session the model never annotated looking exactly as before.
+        if self.reason().is_some() {
+            out.extend(self.subject_line(w));
+        }
 
         let body = match &self.outcome {
             Outcome::Ok(s) | Outcome::Failed(s) => s.as_str(),
@@ -1157,7 +1236,11 @@ impl Content for ToolCallBlock {
         // heredoc's body would otherwise be written as extra *physical* rows
         // under a line the scroll counted as one — the terminal moves down, the
         // accounting does not, and what the next block draws lands on top of it.
-        let full = flatten(&subject_of(&self.name, &self.args));
+        //
+        // The SUBJECT, not the reason: a folded line is scanned for what ran, and
+        // the reason is what the expanded form adds. So the two shapes differ by
+        // how much you see and not by which question they answer.
+        let full = flatten(&self.subject());
         let has_subject = !full.is_empty();
         // What is already spoken for: the two-cell indent (where the mark used to
         // be), the tool's name, the parentheses, and the ` · ` before the note.
@@ -3115,6 +3198,93 @@ mod tests {
         assert_eq!(
             b.summary(&crate::block::RenderCtx::bare(40)).plain(),
             "[reminder]"
+        );
+    }
+
+    /// A call the model explained: the reason takes the head line's parentheses,
+    /// and what the call acted on moves to the gutter line under it.
+    ///
+    /// Both halves matter and they are asserted together on purpose. A build that
+    /// only replaced the parentheses would answer "why" while hiding "what ran";
+    /// one that only added the line would say everything twice.
+    #[test]
+    fn a_reason_takes_the_head_and_the_subject_moves_to_the_gutter() {
+        let c = ToolCallBlock::pending(
+            "c",
+            "read_file",
+            r#"{"file_path":"src/auth.rs","intent":"finding where credentials are loaded"}"#,
+        );
+        let rows: Vec<String> = c
+            .lines(&crate::block::RenderCtx::bare(80))
+            .iter()
+            .map(|l| l.plain())
+            .collect();
+        assert!(
+            rows[0].contains("finding where credentials are loaded"),
+            "the head line carries the reason: {rows:?}"
+        );
+        assert!(
+            !rows[0].contains("src/auth.rs"),
+            "and not the subject as well, which is the line below: {rows:?}"
+        );
+        assert!(
+            rows[1].contains("src/auth.rs"),
+            "the subject stays on the screen, on the gutter line: {rows:?}"
+        );
+    }
+
+    /// The negative control: a call nobody annotated draws exactly what it drew
+    /// before this existed — one head line, no extra row.
+    ///
+    /// Without this the whole feature could be a rewrite of every call in every
+    /// existing session, and the criteria above would not notice.
+    #[test]
+    fn a_call_without_a_reason_draws_exactly_as_before() {
+        let c = ToolCallBlock::pending("c", "read_file", r#"{"file_path":"src/auth.rs"}"#);
+        let rows: Vec<String> = c
+            .lines(&crate::block::RenderCtx::bare(80))
+            .iter()
+            .map(|l| l.plain())
+            .collect();
+        assert!(
+            rows[0].contains("ReadFile(src/auth.rs)"),
+            "the head is unchanged: {rows:?}"
+        );
+        assert_eq!(
+            rows.iter().filter(|r| r.contains("src/auth.rs")).count(),
+            1,
+            "the subject is named once, on the head — no gutter line is added: {rows:?}"
+        );
+    }
+
+    /// For a tool the table has never heard of, `subject_of` falls back to the
+    /// raw argument text — and the reason is an argument. It must not end up
+    /// flattened into that line.
+    #[test]
+    fn an_unknown_tools_subject_never_quotes_the_reason() {
+        let c = ToolCallBlock::pending(
+            "c",
+            "some_new_tool",
+            r#"{"thing":"x.rs","intent":"checking the thing"}"#,
+        );
+        let rows: Vec<String> = c
+            .lines(&crate::block::RenderCtx::bare(120))
+            .iter()
+            .map(|l| l.plain())
+            .collect();
+        assert!(
+            rows.iter().any(|r| r.contains("x.rs")),
+            "the fallback still names the argument: {rows:?}"
+        );
+        assert!(
+            !rows[1].contains("intent") && !rows[1].contains("checking the thing"),
+            "the reason is not part of what it acted on: {rows:?}"
+        );
+        // The folded form is the same fallback, so it has to agree.
+        let folded = c.summary(&crate::block::RenderCtx::bare(120)).plain();
+        assert!(
+            !folded.contains("intent"),
+            "a folded line scanned for what ran must not quote the reason: {folded:?}"
         );
     }
 }
