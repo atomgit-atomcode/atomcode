@@ -149,6 +149,8 @@ pub enum Msg<'a> {
         nth: usize,
         total: usize,
     },
+    /// The dim line under the composer after you stop a turn yourself.
+    ComposerInterrupted,
 
     // ── the status bar (`modules/status.rs`) ──
     StatusMember {
@@ -1263,4 +1265,7 @@ pub enum Msg<'a> {
     },
     CmdAboutOnboarding,
     CmdAboutOnboardingFinished,
+    /// Header above the type-ahead queue: lines typed while a turn runs, folded
+    /// in at the next tool-call boundary (or flushed immediately with Esc).
+    SteeringQueued,
 }

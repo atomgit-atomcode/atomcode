@@ -1830,6 +1830,13 @@ impl Content for TurnEndBlock {
     /// outcome alone, with whatever was dropped going under the rule, wrapped —
     /// the same ladder the cause of a failed turn already climbed.
     fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+        // A turn you stopped yourself closes on the composer, not here: the dim
+        // `已中断 · …` line under the field carries it (driven by
+        // `moment.interrupted`), so the transcript drops the centered separator
+        // for a cancel rather than draw a boundary the composer already draws.
+        if matches!(self.stop, StopReason::Cancelled) {
+            return Vec::new();
+        }
         let w = ctx.width;
         let caps = Caps::default();
         let (mark, said, style) = turn_end_note(self.stop, self.done_index);
@@ -2307,14 +2314,14 @@ mod tests {
 
         // A short cause still sits in the rule, on one line.
         let short = TurnEndBlock {
-            stop: StopReason::Cancelled,
-            error: Some("by the user".into()),
+            stop: StopReason::ProviderError,
+            error: Some("quota reached".into()),
             stats: TurnStats::default(),
             done_index: 0,
         };
         let lines = short.lines(&crate::block::RenderCtx::bare(100));
         assert_eq!(lines.len(), 1);
-        assert!(lines[0].plain().contains("已中断 · by the user"));
+        assert!(lines[0].plain().contains("已中断 · quota reached"));
     }
 
     /// The reason a turn stopped is a value, and a person reads words. This is
@@ -2388,10 +2395,14 @@ mod tests {
             "{clean}"
         );
 
+        // A turn you stopped yourself draws no separator at all: it closes on the
+        // dim `已中断` line under the composer instead (see `modules::input`), so
+        // the transcript block is empty. Its label still exists for that line —
+        // `turn_end_note` below proves the mark — it just is not drawn here.
         let cancelled = drawn(StopReason::Cancelled);
         assert!(
-            cancelled.contains("已中断") && !cancelled.contains("Cancelled"),
-            "{cancelled}"
+            cancelled.trim().is_empty(),
+            "a cancel closes on the composer, not a transcript separator: {cancelled:?}"
         );
 
         let failed = drawn(StopReason::ProviderError);
@@ -2483,11 +2494,14 @@ mod tests {
     }
 
     /// A turn the log recorded nothing about — cut before its first request —
-    /// is drawn exactly as it was before there were figures to draw.
+    /// is drawn exactly as it was before there were figures to draw. (Not a
+    /// self-cancel, which draws no separator at all now — a provider that died
+    /// before the first reply is the same "nothing recorded" shape and still
+    /// closes the turn on a rule.)
     #[test]
     fn a_turn_with_nothing_recorded_says_only_how_it_ended() {
         let block = TurnEndBlock {
-            stop: StopReason::Cancelled,
+            stop: StopReason::ProviderError,
             error: None,
             stats: TurnStats::default(),
             done_index: 0,

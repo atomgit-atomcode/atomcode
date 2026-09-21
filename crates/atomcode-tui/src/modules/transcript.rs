@@ -889,20 +889,26 @@ mod tests {
         // so a billable cost of `80 + (1200 - 400) = 880` tokens and a 33% hit
         // rate, in tuix's `轮 · 工具 · dur · tokens · cached` shape.
         let s = fold(&conformance::facts());
-        let ends: Vec<String> = s
+        let ends: Vec<Vec<String>> = s
             .slots()
             .iter()
             .filter(|x| x.block().kind() == "turn_end")
-            .map(|x| x.block().content.lines(&crate::block::RenderCtx::bare(60))[0].plain())
+            .map(|x| {
+                x.block()
+                    .content
+                    .lines(&crate::block::RenderCtx::bare(60))
+                    .iter()
+                    .map(|l| l.plain())
+                    .collect()
+            })
             .collect();
         assert_eq!(ends.len(), 2, "two turns end in the corpus: {ends:?}");
         for want in ["1 轮", "2 工具", "880 tokens", "33% cached"] {
-            assert!(ends[0].contains(want), "{want} missing from {:?}", ends[0]);
+            assert!(ends[0][0].contains(want), "{want} missing from {:?}", ends[0]);
         }
-        // Turn 2 reported nothing, so its line is the outcome alone — not a row
-        // of zeroes.
-        assert!(!ends[1].contains("轮"), "{:?}", ends[1]);
-        assert!(!ends[1].contains("tokens"), "{:?}", ends[1]);
+        // Turn 2 was a self-cancel: it draws no separator in the transcript now —
+        // it closes on the composer instead.
+        assert!(ends[1].is_empty(), "a cancel draws nothing: {:?}", ends[1]);
     }
 
     /// A turn's cost belongs to that turn. The corpus ends turn 1 and then
@@ -918,13 +924,22 @@ mod tests {
             error: None,
         });
         let s = fold(&facts);
+        // A self-cancel draws no line now, so read the first line of each
+        // turn-end block that draws one — the corpus's cancelled turn-2 end is
+        // skipped, the clean one we pushed is not.
         let ends: Vec<String> = s
             .slots()
             .iter()
             .filter(|x| x.block().kind() == "turn_end")
-            .map(|x| x.block().content.lines(&crate::block::RenderCtx::bare(60))[0].plain())
+            .filter_map(|x| {
+                x.block()
+                    .content
+                    .lines(&crate::block::RenderCtx::bare(60))
+                    .first()
+                    .map(|l| l.plain())
+            })
             .collect();
-        let last = ends.last().expect("turn 2 ends");
+        let last = ends.last().expect("a turn-end that draws a line");
         // Turn 1 took `DONE_LABELS[0]` (`Done`); turn 2's Cancelled end did not
         // advance the rotation, so this clean turn-2 end is `DONE_LABELS[1]`.
         assert!(last.contains("Nailed it"), "{last:?}");

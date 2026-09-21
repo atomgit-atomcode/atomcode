@@ -44,6 +44,14 @@ fn secret_caption(moment: &crate::moment::Moment) -> Option<String> {
 /// direction a person arrows: the first press is 1, not `history.len()`.
 ///
 /// A free function so it can be judged without a terminal.
+/// Whether the dim `已中断` line under the box is on screen: a turn the person
+/// stopped, and the turn is idle now so the line does not sit over one still
+/// landing. The one predicate `render` and `height` both ask, so the row they
+/// reserve and the row they draw cannot disagree.
+fn note_shown(moment: &crate::moment::Moment) -> bool {
+    moment.interrupted && moment.activity == Activity::Idle
+}
+
 fn history_caption(moment: &crate::moment::Moment) -> Option<String> {
     let total = moment.history.len();
     moment.history_at.map(|at| {
@@ -360,6 +368,22 @@ impl View for Input {
 
         rows.push(rule());
 
+        // A turn you stopped yourself closes here, under the box, rather than on
+        // a centered separator up in the transcript: one dim gutter line, the way
+        // a tool result hangs under its call. It stays until the next prompt is
+        // sent (`moment.interrupted`, cleared in `Action::Submit`). Only while
+        // idle: the flag is raised the instant Escape is pressed, but the turn is
+        // still landing then, so drawing it before the turn is idle would put a
+        // "已中断" line over a turn that is visibly still stopping.
+        if note_shown(vp.moment) {
+            let note = format!(
+                "{} {}",
+                vp.moment.caps.g(crate::caps::Glyph::Gutter),
+                t(Msg::ComposerInterrupted)
+            );
+            rows.push(El::styled(note, theme::fg(Role::Muted)));
+        }
+
         // The slash menu is not drawn here any more. It used to hang below this
         // rule and be counted in `height`, which meant opening it pushed the
         // conversation up — a discovery surface that resizes the thing beside
@@ -379,7 +403,9 @@ impl View for Input {
         let body = body_width(width);
         let (text, at) = shown(moment);
         let typed = lay(&text, at, body).0.len().min(MAX_ROWS);
-        Height::Hug((RULES + typed.max(1)) as u16)
+        // The `已中断` note under the box is one more row while it is up.
+        let note = usize::from(note_shown(moment));
+        Height::Hug((RULES + typed.max(1) + note) as u16)
     }
 }
 

@@ -1188,6 +1188,107 @@ async fn a_panel_is_on_screen_because_a_row_mounted_it() {
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
 
+/// Stop a running turn with an empty composer and the prompt that was running
+/// comes back into the field, ready to edit and resend — and the composer says
+/// it was stopped.
+#[tokio::test]
+async fn esc_hands_the_running_prompt_back_to_the_empty_composer() {
+    let dir = scratch("esc-restore");
+    let script = replay(
+        r#"{ text = "Working.", calls = [ { name = "bash", args = { command = "sleep 0.4" } } ] },
+           { text = "Done." }"#,
+    );
+    let s = start(tree(&dir, &script, &[])).await;
+    let task = s.open().await;
+
+    s.term.type_line("fix the parser");
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    s.term.press(KeyPress::plain(Key::Esc));
+    s.quiet().await;
+
+    let screen = s.screen();
+    // Twice now: once in the transcript as what was asked, once back in the
+    // composer as what to resend. Without the hand-back it would be there once.
+    assert_eq!(
+        screen.matches("fix the parser").count(),
+        2,
+        "the stopped prompt is back in the composer:\n{screen}"
+    );
+    assert!(
+        screen.contains("已中断"),
+        "the composer says it was stopped:\n{screen}"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+/// Stop a running turn while you were already typing something else and the
+/// draft is left exactly as it is — the prompt is not handed back on top of it.
+#[tokio::test]
+async fn esc_keeps_a_typed_draft_and_does_not_hand_the_prompt_back() {
+    let dir = scratch("esc-keep-draft");
+    let script = replay(
+        r#"{ text = "Working.", calls = [ { name = "bash", args = { command = "sleep 0.4" } } ] },
+           { text = "Done." }"#,
+    );
+    let s = start(tree(&dir, &script, &[])).await;
+    let task = s.open().await;
+
+    s.term.type_line("run it");
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    // Typed while the turn is still in flight — it lands in the composer, not
+    // the model (see `typing_during_a_turn_is_folded_into_it`).
+    s.term.type_text("half a thought");
+    s.term.press(KeyPress::plain(Key::Esc));
+    s.quiet().await;
+
+    let screen = s.screen();
+    assert!(
+        screen.contains("half a thought"),
+        "the draft is kept as it was:\n{screen}"
+    );
+    assert_eq!(
+        screen.matches("run it").count(),
+        1,
+        "the sent prompt stays in the transcript, not re-added over the draft:\n{screen}"
+    );
+    assert!(screen.contains("已中断"), "and it says it was stopped:\n{screen}");
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+/// On an idle screen a draft takes two taps of Esc to clear — the first arms,
+/// the second clears — so a stray press does not wipe what you were writing.
+#[tokio::test]
+async fn an_idle_draft_takes_two_taps_of_esc_to_clear() {
+    let dir = scratch("esc-idle-clear");
+    let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    let task = s.open().await;
+    s.quiet().await;
+
+    s.term.type_text("scratch note");
+    s.term.press(KeyPress::plain(Key::Esc));
+    s.quiet().await;
+    assert!(
+        s.screen().contains("scratch note"),
+        "one tap does not clear the draft:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::plain(Key::Esc));
+    s.quiet().await;
+    assert!(
+        !s.screen().contains("scratch note"),
+        "the second tap clears it:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
 #[tokio::test]
 async fn esc_stops_the_turn_and_the_next_one_still_runs() {
     let dir = scratch("cancel");

@@ -98,6 +98,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         // ── 输入行 ──
         Msg::InputAnswerKeys => "enter 送出 · esc 不给".into(),
         Msg::InputHistoryNth { nth, total } => format!("历史 {nth}/{total}").into(),
+        Msg::ComposerInterrupted => "已中断 · 接下来做什么？".into(),
 
         // ── 状态栏 ──
         Msg::StatusMember { name } => format!("成员 {name}").into(),
@@ -760,5 +761,6 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::OnboardSignedInConfigNotWritten { error } => format!("登录成了，但配置没写成：{error}").into(),
         Msg::CmdAboutOnboarding => "把这台机器配到能干活：语言、登录、看一眼结果".into(),
         Msg::CmdAboutOnboardingFinished => "引导走完了".into(),
+        Msg::SteeringQueued => "将在下一次工具调用后提交的消息（按 Esc 中断并立即发送）".into(),
     }
 }

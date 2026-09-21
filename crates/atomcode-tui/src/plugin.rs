@@ -1044,7 +1044,10 @@ impl UserInterface for Tui {
 
         if let Some(text) = initial {
             // A start-up prompt is text by construction — there is no composer
-            // yet, so there is nothing it could have been attached to.
+            // yet, so there is nothing it could have been attached to. Kept as
+            // `last_sent` all the same, so an Escape that stops this first turn
+            // hands it back the way it would any other (see `Action::Escape`).
+            self.host.moment.write().expect("moment poisoned").last_sent = Some(text.clone());
             client.send(text, Vec::new());
         }
 
@@ -2987,6 +2990,20 @@ impl Tui {
                 ) {
                     self.mark_undone();
                 }
+                // The turn's opening line is on screen now (its own message,
+                // normally; an assistant's first word for a turn nobody typed).
+                // Let the working status catch up — it was armed at `TurnStarted`
+                // and held back so it never draws above this line. Structural
+                // facts (`TurnStart`/`TurnEnd`/`Titled`) draw nothing, so they do
+                // not spend the arm — otherwise the spinner would settle on the
+                // `TurnStart` that the log writes *before* the message.
+                if matches!(
+                    committed.event,
+                    atomcode_kernel::session::SessionEvent::UserMessage { .. }
+                        | atomcode_kernel::session::SessionEvent::AssistantMessage { .. }
+                ) {
+                    self.host.settle_working();
+                }
                 true
             }
             AgentEvent::Described { description } => {
@@ -3119,12 +3136,17 @@ impl Tui {
             {
                 false
             }
-            AgentEvent::TurnStarted { .. } => self.set_activity(Activity::Working),
+            // Arm the working line rather than raise it here: it settles when the
+            // turn's first fact is folded (`AgentEvent::Fact`), so "正在等待模型"
+            // never paints a frame ahead of the message that started the turn.
+            AgentEvent::TurnStarted { .. } => self.host.arm_working(),
+            // A cancel (whoever asked for it) or a failure can end the turn with
+            // words still in the inbox — nothing folded them, and no `Steered` is
+            // coming. The panel is a claim about the model's inbox, so it goes
+            // with the turn rather than lying about work that will not happen. The
+            // `已中断` note is not raised here: a self-cancel already marked it on
+            // the key (`Action::Escape`), and an internal cancel must not.
             AgentEvent::TurnComplete { .. } | AgentEvent::Cancelled => {
-                // A cancel or a failure can end the turn with words still in the
-                // inbox — nothing folded them, and no `Steered` is coming. The
-                // panel is a claim about the model's inbox, so it goes with the
-                // turn rather than lying about work that will not happen.
                 self.host.clear_steering();
                 self.set_activity(Activity::Idle)
             }
@@ -3198,10 +3220,11 @@ impl Tui {
     ///
     /// So the command is always sent (a cancel is never wrong to ask for; it is
     /// how a turn that just opened and has not yet marked itself working is
-    /// still stoppable), and the *words* are said only while the agent is
-    /// working. Since the status line is the only route that can move `activity`
-    /// to `Working` on this connection, `Working` here means a turn really is in
-    /// flight.
+    /// still stoppable — including the arm window, where the turn is in flight
+    /// but `activity` still reads `Idle` until its first fact), and the *words*
+    /// are said only while the agent is visibly working. Both routes that move
+    /// `activity` to `Working` — the status stream and `Host::settle_working` —
+    /// only fire for a real in-flight turn, so `Working` here means one is.
     ///
     /// [`Activity::Stopping`]: crate::moment::Activity::Stopping
     fn stop_turn(&self, client: &AgentClient) {
@@ -3366,8 +3389,15 @@ impl Tui {
                 // opens a new turn and reaches the model immediately — there is
                 // no gap to fill, and `Steered` will never come to close a panel
                 // that was opened for it.
-                let steering = self.host.moment.read().expect("moment poisoned").activity
-                    != crate::moment::Activity::Idle;
+                let steering = {
+                    let mut m = self.host.moment.write().expect("moment poisoned");
+                    // Kept for an Escape that stops the next running turn to hand
+                    // back (see the `Escape` arm); the `已中断` note is stale the
+                    // instant a new prompt is on its way.
+                    m.last_sent = Some(text.clone());
+                    m.interrupted = false;
+                    m.turn_in_flight()
+                };
                 client.send(text.clone(), images);
                 if steering {
                     self.host.add_steering(&text);
@@ -3510,7 +3540,7 @@ impl Tui {
                 // route that moves that row). Stopping counts as in-flight too. The
                 // line is left alone: cancelling the model's answer is not the same
                 // gesture as clearing what you were about to say next.
-                if m.activity != crate::moment::Activity::Idle {
+                if m.turn_in_flight() {
                     m.disarm_quit();
                     drop(m);
                     self.stop_turn(client);
@@ -3750,26 +3780,52 @@ impl Tui {
             // annoying; losing it because you wanted to stop the model is
             // worse, which is why ctrl-c stays `Cancel` and only stops.
             Action::Escape => {
-                // The second tap of a double-tap pulls the rewind panel up. It
-                // does not redo the first tap's work: the draft was already
-                // cleared, the turn was already stopped — what is left to want,
-                // one press later, is the turn before that.
+                // While a turn is in flight, one Escape stops it — no double-tap
+                // when there is something running to stop. If the composer is
+                // empty, the prompt that was running comes back into it, caret at
+                // the end, ready to edit and resend; if you had already started
+                // typing something else, that is left exactly as it was, caret
+                // where it sat.
+                if m.turn_in_flight() {
+                    m.disarm_escape();
+                    // Marked here, on the key, not on `AgentEvent::Cancelled`: the
+                    // kernel cancels a turn for its own reasons too (a mid-turn
+                    // model switch reconfigures and cancels), and only a stop the
+                    // person asked for is theirs to be told about. The note waits
+                    // for the turn to be idle before it draws (see `modules::input`),
+                    // so it never overlaps the turn it closes.
+                    m.interrupted = true;
+                    if m.input.is_empty() {
+                        if let Some(sent) = m.last_sent.clone() {
+                            m.input = sent;
+                            m.caret = m.input.len();
+                            m.history_at = None;
+                            m.draft.clear();
+                        }
+                    }
+                    drop(m);
+                    self.stop_turn(client);
+                    return false;
+                }
+                // Idle. Every step is a double-tap inside `ESC_AGAIN_MS`, and the
+                // second tap acts on whatever the field holds now: a field with
+                // text clears, an empty one pulls the rewind panel up. So text
+                // takes two taps to clear and two more to reach rewind; an empty
+                // field takes two to reach rewind.
                 if m.escape_again() {
                     m.disarm_escape();
+                    if !m.input.is_empty() {
+                        m.draft.clear();
+                        m.history_at = None;
+                        m.input.clear();
+                        m.caret = 0;
+                        return false;
+                    }
                     drop(m);
                     self.toggle_rewind_panel();
                     return false;
                 }
                 m.arm_escape();
-                if !m.input.is_empty() {
-                    m.draft.clear();
-                    m.history_at = None;
-                    m.input.clear();
-                    m.caret = 0;
-                    return false;
-                }
-                drop(m);
-                self.stop_turn(client);
                 return false;
             }
             Action::Newline => {

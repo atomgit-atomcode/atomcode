@@ -119,6 +119,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         // ── the input line ──
         Msg::InputAnswerKeys => "enter to send · esc to withhold".into(),
         Msg::InputHistoryNth { nth, total } => format!("history {nth}/{total}").into(),
+        Msg::ComposerInterrupted => "Interrupted · what next?".into(),
 
         // ── the status bar ──
         Msg::StatusMember { name } => format!("member {name}").into(),
@@ -782,5 +783,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::OnboardSignedInConfigNotWritten { error } => format!("signed in, but the config was not written: {error}").into(),
         Msg::CmdAboutOnboarding => "set this machine up to work: language, sign in, and a look at the result".into(),
         Msg::CmdAboutOnboardingFinished => "the walkthrough is done".into(),
+        Msg::SteeringQueued => {
+            "Queued — sent after the next tool call (press Esc to interrupt and send now)".into()
+        }
     }
 }

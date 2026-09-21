@@ -1785,11 +1785,63 @@ impl Host {
     /// `true` when it changed what the line would draw — the caller's business,
     /// because a frame for the same picture is a frame nobody needed.
     pub fn set_activity(&self, activity: crate::moment::Activity) -> bool {
-        if self.moment.read().expect("moment poisoned").activity == activity {
+        {
+            let m = self.moment.read().expect("moment poisoned");
+            // Fast path: nothing to change and no arm to spend.
+            if m.activity == activity && !m.pending_working {
+                return false;
+            }
+        }
+        // Any explicit decision about what the line says supersedes a pending
+        // arm — a turn that ends before its first fact (an immediate error) must
+        // not leave the arm set to fire on the next turn's opening line.
+        let mut visual_changed = false;
+        self.pinned(true, || {
+            let mut m = self.moment.write().expect("moment poisoned");
+            m.pending_working = false;
+            if m.activity != activity {
+                m.activity = activity;
+                visual_changed = true;
+            }
+        });
+        visual_changed
+    }
+
+    /// A turn has started: remember to raise the working line, but not yet —
+    /// [`Self::settle_working`] does it once the turn's first fact is folded, so
+    /// the spinner never appears above the message that started the turn
+    /// (the "waiting for model, then my text shows up" ordering). Never lowers a
+    /// line already up, so a steering message folding into a running turn is
+    /// untouched.
+    ///
+    /// Also spends any `已中断` note: it belongs to the turn you stopped, and a
+    /// turn is running again now. `Action::Submit` clears it for a typed send,
+    /// but a turn that starts without one (a scheduled or resumed prompt) arrives
+    /// here instead, and the stale note must not hang under a live turn. Draws a
+    /// frame only when it actually took that note down — arming alone is
+    /// invisible until the arm is spent.
+    pub fn arm_working(&self) -> bool {
+        let mut cleared = false;
+        self.pinned(true, || {
+            let mut m = self.moment.write().expect("moment poisoned");
+            m.pending_working = true;
+            cleared = m.interrupted;
+            m.interrupted = false;
+        });
+        cleared
+    }
+
+    /// The turn's first fact is on screen now — raise the working line if a start
+    /// was waiting on it. A no-op mid-turn (nothing armed) and for a turn whose
+    /// line is already up.
+    pub fn settle_working(&self) -> bool {
+        if !self.moment.read().expect("moment poisoned").pending_working {
             return false;
         }
         self.pinned(true, || {
-            self.moment.write().expect("moment poisoned").activity = activity;
+            let mut m = self.moment.write().expect("moment poisoned");
+            m.pending_working = false;
+            m.activity = crate::moment::Activity::Working;
         });
         true
     }
@@ -4785,6 +4837,67 @@ mod tests {
                 event: fact,
             });
         }
+    }
+
+    /// The working line ("正在等待模型") waits for the turn's first message, so it
+    /// never paints a frame above the message that started the turn. The runtime
+    /// logs `TurnStart` *before* the user's message, so arming on the turn start
+    /// and then folding that structural fact must NOT raise the line — only the
+    /// message that follows does.
+    #[test]
+    fn the_working_line_waits_for_the_turns_first_message() {
+        use crate::moment::Activity;
+        let h = host();
+        assert_eq!(h.moment.read().unwrap().activity, Activity::Idle);
+
+        assert!(!h.arm_working(), "arming draws no frame of its own");
+        h.absorb(&SessionEvent::TurnStart { turn: 1 });
+        assert_eq!(
+            h.moment.read().unwrap().activity,
+            Activity::Idle,
+            "the spinner must not show before the message"
+        );
+        assert!(h.moment.read().unwrap().pending_working, "still armed");
+
+        h.absorb(&SessionEvent::UserMessage {
+            turn: 1,
+            text: "3333333".into(),
+            images: Vec::new(),
+        });
+        assert!(h.settle_working(), "the first message spends the arm");
+        assert_eq!(h.moment.read().unwrap().activity, Activity::Working);
+        assert!(!h.moment.read().unwrap().pending_working);
+    }
+
+    /// A turn that starts without a typed Submit (a scheduled or resumed prompt)
+    /// arms through here, not through `Action::Submit` — so the stale `已中断`
+    /// note from a turn you stopped earlier must be spent here, or it would hang
+    /// under a turn that is now running.
+    #[test]
+    fn arming_a_turn_spends_a_stale_interrupted_note() {
+        let h = host();
+        h.moment.write().unwrap().interrupted = true;
+        assert!(h.arm_working(), "taking the 已中断 note down draws a frame");
+        assert!(!h.moment.read().unwrap().interrupted, "note spent");
+        assert!(h.moment.read().unwrap().pending_working, "and the turn is armed");
+        assert!(!h.arm_working(), "arming with no note to take down is invisible");
+    }
+
+    /// A turn that ends before any fact (an immediate error) must not leave the
+    /// arm set to fire on the next turn's opening line.
+    #[test]
+    fn an_explicit_activity_spends_a_pending_arm() {
+        use crate::moment::Activity;
+        let h = host();
+        h.arm_working();
+        assert!(h.moment.read().unwrap().pending_working);
+        h.set_activity(Activity::Idle); // a TurnComplete/Error before any fact
+        assert!(
+            !h.moment.read().unwrap().pending_working,
+            "no arm left to fire on the next turn"
+        );
+        assert!(!h.settle_working(), "nothing armed to settle");
+        assert_eq!(h.moment.read().unwrap().activity, Activity::Idle);
     }
 
     /// A session's name is read off the log, and the newest one wins — the
@@ -9488,8 +9601,11 @@ mod tests {
             .rev()
             .find(|l| !l.plain().trim().is_empty())
             .expect("something was said");
+        // The corpus's turn 2 ends on an unanswered question and a self-cancel;
+        // the cancel now draws no separator (it closes on the composer), so the
+        // last line on screen is that turn's refused question card.
         assert!(
-            last.plain().contains("已中断"),
+            last.plain().contains("拒绝"),
             "the newest line is the last one on screen: {:?}",
             last.plain()
         );

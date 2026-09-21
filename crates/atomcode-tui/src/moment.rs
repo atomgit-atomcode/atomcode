@@ -140,10 +140,9 @@ pub const QUIT_HINT_MS: u64 = 2_000;
 /// exit *says* it is armed, so its window can be generous. This one says
 /// nothing — it is a double-tap, the way a double-click is — so the window has
 /// to be short enough that two unrelated presses a second apart are two
-/// presses, not a gesture. 800ms is about twice a comfortable double-click and
-/// still well under the pause that means "I stopped, then decided something
-/// else".
-pub const ESC_AGAIN_MS: u64 = 800;
+/// presses, not a gesture. 1s is a comfortable "consecutive" window and still
+/// well under the pause that means "I stopped, then decided something else".
+pub const ESC_AGAIN_MS: u64 = 1_000;
 
 /// Something the screen has to say for a moment and then stop saying.
 ///
@@ -199,6 +198,12 @@ impl Notice {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Moment {
     pub activity: Activity,
+    /// A turn has started but its opening line is not on screen yet. The working
+    /// status ("正在等待模型") waits on this: it is armed when the turn starts and
+    /// spent when the turn's first fact (the person's own message, normally)
+    /// lands, so the spinner never paints a frame ahead of the message that
+    /// started the turn. Screen state, not a fact — it never leaves this struct.
+    pub pending_working: bool,
     /// The line being typed. Not a fact until it is sent.
     pub input: String,
     /// Byte offset of the caret within `input`.
@@ -313,6 +318,17 @@ pub struct Moment {
     /// Any other action drops it (`plugin.rs`'s `act`); see
     /// [`Moment::escape_again`].
     pub esc_armed: Option<Timestamp>,
+    /// The last prompt this session sent to the model, kept so an Escape that
+    /// stops a running turn can hand it back to the composer — you interrupt,
+    /// the words you sent are in the field again (caret at the end), ready to
+    /// edit and resend. Only the model-bound text (not a slash command), and
+    /// only restored when the field is empty at the moment of the stop, so an
+    /// Escape never overwrites something you had already started typing.
+    pub last_sent: Option<String>,
+    /// Whether the last turn ended because you stopped it. Drives the dim
+    /// `已中断 · …` line under the composer, and is cleared the moment the next
+    /// turn starts — screen state, not a fact, the same as the rest here.
+    pub interrupted: bool,
     /// The mounted cell-grid bitmaps, **as of the frame this moment was taken
     /// for**.
     ///
@@ -692,6 +708,16 @@ impl Moment {
             .is_some_and(|at| self.now.as_millis().saturating_sub(at.as_millis()) <= ESC_AGAIN_MS)
     }
 
+    /// Whether a turn is running right now — the question Escape, Ctrl+C and a
+    /// steering Submit all ask before they act. `activity` alone is not the whole
+    /// answer: a turn that has just started reads `Idle` until its first fact
+    /// raises the working line (see `Host::arm_working`), and in that window a
+    /// turn is very much in flight. `pending_working` closes that gap, so a stop
+    /// gesture the instant after a send still stops.
+    pub fn turn_in_flight(&self) -> bool {
+        self.activity != Activity::Idle || self.pending_working
+    }
+
     /// Apply a Ctrl+C on an idle line. Returns `true` when it is the second press
     /// that quits, `false` when it is the first that arms.
     ///
@@ -741,6 +767,27 @@ impl<'a> Viewport<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stop gesture (Escape / Ctrl+C) and a steering Submit all ask
+    /// `turn_in_flight`, and a turn is in flight the instant it is armed — before
+    /// its first fact raises the working line, when `activity` still reads `Idle`.
+    /// Without the `pending_working` half, an Escape in that window would find
+    /// nothing to stop.
+    #[test]
+    fn a_turn_is_in_flight_the_instant_it_is_armed() {
+        let mut m = Moment::default();
+        assert!(!m.turn_in_flight(), "idle, nothing armed");
+        m.pending_working = true;
+        assert!(
+            m.turn_in_flight(),
+            "armed but not yet Working is still a running turn"
+        );
+        m.pending_working = false;
+        m.activity = Activity::Working;
+        assert!(m.turn_in_flight());
+        m.activity = Activity::Stopping;
+        assert!(m.turn_in_flight());
+    }
 
     #[test]
     fn a_moment_is_constructible_without_a_terminal() {
