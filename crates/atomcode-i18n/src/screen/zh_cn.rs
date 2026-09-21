@@ -537,7 +537,6 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ToolsRun { count } => format!("已执行了 {count} 个工具").into(),
         Msg::ToolsFailed { failed } => format!(" · {failed} 失败").into(),
         Msg::VerbSkill => "技能".into(),
-        Msg::VerbDescribeSelf => "自省".into(),
         Msg::VerbMemory => "记忆".into(),
         Msg::OutcomeInterrupted => "已中断".into(),
         Msg::OutcomeFailedWith { first } => format!("失败 · {first}").into(),

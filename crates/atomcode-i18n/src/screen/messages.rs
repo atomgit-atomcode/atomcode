@@ -895,7 +895,6 @@ pub enum Msg<'a> {
         failed: usize,
     },
     VerbSkill,
-    VerbDescribeSelf,
     VerbMemory,
     OutcomeInterrupted,
     OutcomeFailedWith {

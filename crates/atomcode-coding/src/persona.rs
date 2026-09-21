@@ -427,6 +427,12 @@ pub(crate) fn model_needs_firm_execution(model: &str) -> bool {
 /// models flagged by [`model_needs_firm_tool_steering`]. The soft `## TOOLS:` guidance
 /// already says this once; weak models need it stated as a hard rule. The aggregation
 /// carve-out keeps audit-style shell pipelines legitimate.
+///
+/// The closing `describe_self` line is the same shape of restatement for a different soft
+/// rule: the self-knowledge row's prompt already says "call `describe_self` when asked what
+/// you are / can do / how to change yourself", but the flagged weak models (GLM / DeepSeek /
+/// Qwen) followed it unreliably — answering self-questions from stale training or by grepping
+/// the repo — so it is restated here as a hard rule at the point of decision.
 const FIRM_TOOL_DISCIPLINE: &str = "\n\n## TOOL DISCIPLINE (MANDATORY):\n\
 Do NOT shell out for file work:\n\
 - List a directory → list_directory (NOT `bash ls`).\n\
@@ -437,7 +443,12 @@ Do NOT shell out for file work:\n\
 Use bash ONLY for git, builds, package managers, running commands, and short pipelines / \
 aggregation (wc, sort, uniq, git log) the dedicated tools cannot do. Litmus: a pipeline that \
 returns a COUNT, frequency, diff, or checksum → bash; anything that just reads, slices, pages, \
-or reformats file bytes → read_file / grep / glob.";
+or reformats file bytes → read_file / grep / glob.\n\
+Asked what you ARE, what you can DO, or how to CHANGE or EXTEND yourself — your model, \
+tools, skills, MCP servers, memory, layout, language, where your state is kept, or which \
+session this is → call describe_self FIRST and answer from its report. Do NOT answer such a \
+question from memory or by grepping the repository. That is about you-the-agent, not the \
+project you are working in.";
 
 #[cfg(feature = "atomgit")]
 const ATOMGIT_TOOL_USAGE: &str = "\n\n## ATOMGIT TOOLS:\n\

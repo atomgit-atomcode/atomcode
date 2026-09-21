@@ -843,7 +843,6 @@ pub enum Verb {
     Skill,
     /// Not a word in any language: the shell's own prompt character.
     Shell,
-    DescribeSelf,
     Memory,
     Plan,
 }
@@ -853,7 +852,6 @@ impl Verb {
         match self {
             Verb::Skill => t(Msg::VerbSkill).into_owned(),
             Verb::Shell => "$".to_string(),
-            Verb::DescribeSelf => t(Msg::VerbDescribeSelf).into_owned(),
             Verb::Memory => t(Msg::VerbMemory).into_owned(),
             Verb::Plan => pt(PMsg::TodoPanelTitle).into_owned(),
         }
@@ -921,8 +919,11 @@ pub fn look(tool: &str) -> Look {
             subject: &["query"],
             ..GENERIC
         },
+        // No verb: it reads as its own name, `DescribeSelf`, in every language.
+        // A localized verb ("自省") hid the one call people go looking for by
+        // name, and its English rendering ("about itself") read as prose, not a
+        // tool. The name is already English and already the thing to recognise.
         "describe_self" => Look {
-            verb: Some(Verb::DescribeSelf),
             subject: &["aspect"],
             ..GENERIC
         },

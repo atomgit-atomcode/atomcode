@@ -230,11 +230,15 @@ impl Tool for DescribeSelf {
          how to change things and add capabilities — model, memory, skills, MCP \
          servers, plugins, layout — with the files and commands involved \
          (`aspect: operations`), and the user-settings catalog including language \
-         (`aspect: settings`). Read this instead of guessing or searching the \
-         repository whenever you are asked what you are, what you can do, how to \
-         change or extend something, or where your own state is kept — and before \
-         helping someone install a skill or an MCP server. Every answer is \
-         generated from the running system, so none of it can be out of date."
+         (`aspect: settings`). Call this FIRST — before you answer, and instead \
+         of guessing or searching the repository — whenever you are asked what you \
+         are, what you are made of, what you can do, which tools or models you \
+         have, how to change or extend something about yourself, which session \
+         this is, or where your own state is kept, and before helping someone \
+         install a skill or an MCP server. This reports YOU, the running agent — \
+         not the project you are working in. Every answer is generated from the \
+         running system, so none of it can be out of date; it is read-only and \
+         cheap, so prefer calling it over answering such a question from memory."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -342,14 +346,15 @@ is no fixed feature set — only the rows the running tree happens to have \
 mounted, which is why you cannot know what you are made of from anything you \
 were trained on.
 
-When you are asked what you are made of, what you can do, how to change or \
-extend something about yourself — the model, memory, skills, MCP servers, \
-plugins, the layout, the language, where a file lives — which session this is, \
-or where your own state is kept, call `describe_self` rather than guessing or \
-searching the repository for clues; do the same before helping someone install \
-a skill or an MCP server. Reading the source of a build is not the \
-same as reading the tree that is running, and only the tool reports the tree \
-that is running.";
+So when a question is about the running agent — what you are or are made of, \
+what you can do, which tools, models, skills, or MCP servers you have, how to \
+change or extend any of that, which session this is, or where your own state is \
+kept — call `describe_self` FIRST and answer from its report, rather than \
+guessing or searching the repository; do the same before helping someone install \
+a skill or an MCP server. Reading the source of a build is not the same as \
+reading the tree that is running. This is about the running agent, not the \
+project or repository being worked in: \"what does this codebase do\" is answered \
+from the project's own files, not from `describe_self`.";
 
         // Rank 3: after the persona, before per-tool guidance. What the agent
         // *is* should be established before what any one tool wants.

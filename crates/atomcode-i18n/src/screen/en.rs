@@ -559,7 +559,6 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ToolsRun { count } => format!("{count} tools were run").into(),
         Msg::ToolsFailed { failed } => format!(" · {failed} failed").into(),
         Msg::VerbSkill => "skill".into(),
-        Msg::VerbDescribeSelf => "about itself".into(),
         Msg::VerbMemory => "memory".into(),
         Msg::OutcomeInterrupted => "stopped".into(),
         Msg::OutcomeFailedWith { first } => format!("failed · {first}").into(),
