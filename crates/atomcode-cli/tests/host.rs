@@ -1703,6 +1703,127 @@ async fn the_mode_a_person_picks_is_the_one_the_session_runs_in() {
     );
 }
 
+/// The host can be *asked* which mode the session is in, and the answer is what
+/// the runtime is actually doing rather than what this adapter last heard.
+///
+/// The reading half exists because a pushed change can predate the subscription
+/// — a host's own startup flag seeds the mode before any front end connects —
+/// and a front end that only listened would draw an unattended session as an
+/// ordinary one. So the assertion is a round trip on the *runtime*: set a mode,
+/// have the runtime act on it, and read back the mode that made it act.
+#[tokio::test]
+async fn the_mode_a_session_is_in_can_be_read_back_from_the_runtime() {
+    let env = env();
+    let mut connection = connected(&env).await;
+    let session = connection.session.clone();
+
+    // A fresh session is in the contract's `Ask` — this runtime's `Build` —
+    // which is the mapping a reader must not skip.
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::Mode {
+                session: session.clone(),
+            })
+            .await,
+        Ok(HostReply::Mode {
+            mode: Some(atomcode_host_api::Mode::Ask),
+        })
+    );
+
+    // It follows a write, and reads off the runtime rather than off a copy the
+    // adapter kept for itself.
+    connection
+        .control
+        .call(HostCommand::SetMode {
+            session: session.clone(),
+            mode: atomcode_host_api::Mode::Auto,
+        })
+        .await
+        .expect("auto is settable");
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::Mode {
+                session: session.clone(),
+            })
+            .await,
+        Ok(HostReply::Mode {
+            mode: Some(atomcode_host_api::Mode::Auto),
+        })
+    );
+
+    // And it is addressed: a session this host does not hold is not silently
+    // answered with nothing's mode.
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::Mode {
+                session: "not-the-live-one".into(),
+            })
+            .await,
+        Err(HostError::NotFound)
+    );
+}
+
+/// A mode change reaches every front end watching this host, and it is the
+/// *mode a person chose* that arrives rather than the runtime's own name for it.
+///
+/// The screen draws the execution mode on its status row, and the mode is
+/// session state rather than a fact in the log — so this broadcast is the only
+/// road it has. The name is the half that would rot silently: the runtime calls
+/// the default `Build` and the contract calls it `Ask`, and a subscriber handed
+/// the runtime's word would be handed a mode no front end can map back.
+#[tokio::test]
+async fn a_mode_change_is_broadcast_to_watchers_in_the_contracts_own_words() {
+    let env = env();
+    let mut connection = connected(&env).await;
+    let session = connection.session.clone();
+    let mut watching = connection.control.subscribe();
+
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::SetMode {
+                session: session.clone(),
+                mode: atomcode_host_api::Mode::Plan,
+            })
+            .await,
+        Ok(HostReply::Done)
+    );
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), watching.recv())
+            .await
+            .unwrap(),
+        Some(HostEvent::ModeChanged {
+            session: session.clone(),
+            mode: atomcode_host_api::Mode::Plan,
+        }),
+        "a watcher was not told the mode moved"
+    );
+
+    // And the runtime's `Build` arrives as the contract's `Ask` — the mapping
+    // that would otherwise be a mode no front end recognises.
+    connection
+        .control
+        .call(HostCommand::SetMode {
+            session: session.clone(),
+            mode: atomcode_host_api::Mode::Ask,
+        })
+        .await
+        .expect("the default mode is settable");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), watching.recv())
+            .await
+            .unwrap(),
+        Some(HostEvent::ModeChanged {
+            session,
+            mode: atomcode_host_api::Mode::Ask,
+        }),
+        "the runtime's `Build` did not come back as the contract's `Ask`"
+    );
+}
+
 /// The catalog a person picks a model from, the name they give the session, and
 /// the tools one MCP server put on the model — three things the host knows and
 /// the screen could not reach

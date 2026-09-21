@@ -129,6 +129,15 @@ pub enum Action {
     /// member the strip no longer has a row for (`docs/adr/0023` §5), and both
     /// land in the same place.
     LookAt(String),
+    /// Step the execution mode on to the next one — the gesture behind
+    /// Shift+Tab, and plain Tab where the configuration says so.
+    ///
+    /// An action rather than a binding because which key it is depends on a
+    /// setting read live (`ui.mode_switch_key`), and a keymap is a fixed table:
+    /// the predicate that asks the setting lives in the loop, and this is what
+    /// it asks for. What it *does* is `/mode`'s business, so the key, the word
+    /// and the command are one implementation.
+    CycleMode,
 }
 
 /// A set of bindings contributed by one row.

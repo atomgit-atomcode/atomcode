@@ -214,6 +214,19 @@ pub fn connect(
                         watched.front_end.feed().redescribe(&app);
                     }
                 }
+                // How much the session may do without asking is session state,
+                // not a fact in the log — so a screen draws it from here or not
+                // at all. Pushed rather than polled, like the two above: the
+                // mode moves under the person's hands when their own Shift+Tab
+                // (or `/mode`) asks for it, and a screen that had to ask back
+                // would be one frame behind its own keystroke.
+                CodingRuntimeEvent::ModeChanged { mode } => {
+                    let session = watched.session.lock().expect("session poisoned").clone();
+                    watched.announce(HostEvent::ModeChanged {
+                        session,
+                        mode: host_mode(mode),
+                    });
+                }
                 other => {
                     if let Some(event) = translate(other) {
                         if out.send(event).is_err() {
@@ -481,6 +494,33 @@ fn running_of_loop(looping: atomcode_coding::LoopProgress) -> atomcode_host_api:
         of: None,
         elapsed_secs: looping.elapsed_secs,
         paused: (!looping.active).then(|| tr(SMsg::HostHeld).into_owned()),
+    }
+}
+
+/// The mode a *person* means, for the one this runtime calls it.
+///
+/// `Ask` is `Build`: the contract names what a person chooses and the runtime
+/// names what it does. One function for both directions — who a mode reaches
+/// the runtime and what the runtime reports back — because two tables would be
+/// two chances to map one of the four onto the wrong side.
+fn host_mode(mode: atomcode_coding::RuntimeMode) -> atomcode_host_api::Mode {
+    use atomcode_host_api::Mode;
+    match mode {
+        atomcode_coding::RuntimeMode::Plan => Mode::Plan,
+        atomcode_coding::RuntimeMode::Build => Mode::Ask,
+        atomcode_coding::RuntimeMode::AcceptEdits => Mode::AcceptEdits,
+        atomcode_coding::RuntimeMode::Auto => Mode::Auto,
+    }
+}
+
+/// The same table the other way round, for [`HostCommand::SetMode`].
+fn runtime_mode(mode: atomcode_host_api::Mode) -> atomcode_coding::RuntimeMode {
+    use atomcode_coding::RuntimeMode;
+    match mode {
+        atomcode_host_api::Mode::Plan => RuntimeMode::Plan,
+        atomcode_host_api::Mode::Ask => RuntimeMode::Build,
+        atomcode_host_api::Mode::AcceptEdits => RuntimeMode::AcceptEdits,
+        atomcode_host_api::Mode::Auto => RuntimeMode::Auto,
     }
 }
 
@@ -993,17 +1033,23 @@ impl HostControl for RuntimeControl {
             // person chooses and the runtime names what it does.
             HostCommand::SetMode { session, mode } => {
                 self.addressed(&session)?;
-                use atomcode_host_api::Mode;
                 self.handle
-                    .set_mode(match mode {
-                        Mode::Plan => atomcode_coding::RuntimeMode::Plan,
-                        Mode::Ask => atomcode_coding::RuntimeMode::Build,
-                        Mode::AcceptEdits => atomcode_coding::RuntimeMode::AcceptEdits,
-                        Mode::Auto => atomcode_coding::RuntimeMode::Auto,
-                    })
+                    .set_mode(runtime_mode(mode))
                     .await
                     .map_err(refused)?;
                 Ok(HostReply::Done)
+            }
+            // Read back from the runtime, not from a copy this adapter keeps:
+            // the mode that governs a tool call is the runtime's three flags, and
+            // a second answer here could disagree with the one that refuses a
+            // write. `Some` always — this host governs an execution mode, and
+            // `None` is for a host whose tree carries none (see the contract).
+            HostCommand::Mode { session } => {
+                self.addressed(&session)?;
+                let mode = self.handle.mode().await.map_err(refused)?;
+                Ok(HostReply::Mode {
+                    mode: Some(host_mode(mode)),
+                })
             }
             // A new session, because what a conversation read and wrote belongs
             // to where it ran — the runtime says so by handing back a session

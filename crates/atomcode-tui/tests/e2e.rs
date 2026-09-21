@@ -5596,3 +5596,394 @@ async fn a_screen_with_no_rewind_port_says_so() {
     until(&s, "tui-panel-rewind").await;
     task.abort();
 }
+
+// ---- the execution mode: a key, a command, and the badge they move -------
+
+/// The status row as one string.
+fn status_row(s: &Session) -> String {
+    s.term
+        .last()
+        .and_then(|frame| frame.part("status").cloned())
+        .map(|part| part.lines.iter().map(|l| l.plain()).collect::<String>())
+        .unwrap_or_default()
+}
+
+/// Wait for the status row to say `text`.
+///
+/// Reading the row rather than the whole screen, because what is asserted is
+/// that the *row* carries something — a string that also appears in a command's
+/// own output would otherwise pass while the row said nothing.
+async fn until_status(s: &Session, text: &str) {
+    for _ in 0..400 {
+        if status_row(s).contains(text) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!(
+        "the status row never said `{text}`: {:?}\n{}",
+        status_row(s),
+        s.screen()
+    );
+}
+
+/// The thinking level the agent describes itself with reaches the status row,
+/// against the model — tuix's shape, `model [high]`.
+///
+/// The level is set on the session by `/effort`, and the row draws it from the
+/// agent's *description* rather than from the command's own output: the command
+/// saying `思考强度 → high` is about the turn to come, while the row is about
+/// what the session is now. So the description is what is pushed here, which is
+/// the road the row reads.
+///
+/// Injected rather than driven through `/effort`, because the tree these tests
+/// mount is a bare one: its host patches the row on a level change and never
+/// re-describes, so a level set that way is genuinely not described back. What
+/// is worth judging here is the screen's half — that a described level lands on
+/// the row beside the model — which is exactly what injection isolates.
+#[tokio::test]
+async fn the_described_thinking_level_lands_on_the_status_row_beside_the_model() {
+    let dir = scratch("effort-row");
+    let (s, agent) = start_with_agent_events(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    let task = s.open().await;
+    s.quiet().await;
+
+    // Nothing is drawn before a level is described: "the endpoint's default
+    // stands" is not a level, and inventing one would be a claim about the
+    // session that nothing made.
+    assert!(
+        !status_row(&s).contains('['),
+        "a level was drawn with nothing described: {:?}",
+        status_row(&s)
+    );
+
+    let session = s.client().root();
+    let described = s.client().described().unwrap_or_default();
+    agent
+        .send(atomcode_kernel::event::AgentEvent::Described {
+            description: Box::new(atomcode_kernel::agent::AgentDescription {
+                session,
+                reasoning_effort: Some(atomcode_kernel::provider::ReasoningEffort::High),
+                ..described
+            }),
+        })
+        .expect("the screen is listening");
+
+    until_status(&s, "[high]").await;
+
+    // Against the model, not adrift at the end of the row: the level is how
+    // *this* model is driven, so it is drawn immediately after its name.
+    let row = status_row(&s);
+    let level = row.find("[high]").expect("the level");
+    let sep = row.find('│').expect("the separator after the model");
+    assert!(level < sep, "the level is not against the model: {row:?}");
+    task.abort();
+}
+
+/// A host that takes the mode switch and can say the mode changed back.
+///
+/// The cycle is one exchange with two halves — the key asks, the host answers —
+/// so the fixture stands in for both: it records what was asked, keeps the mode
+/// it was told to be in, and holds the channel the screen subscribed to. That is
+/// the same shape `atomcode::host` gives a real host (minus the runtime behind
+/// it): a `SetMode` moves the mode, a `Mode` reads it back, and a change is
+/// announced. Anything else is passed through, so a screen that asks its host
+/// something else on the way up still gets an answer.
+struct ModeHost {
+    inner: Arc<dyn atomcode_host_api::HostControl>,
+    asked: Arc<std::sync::Mutex<Vec<atomcode_host_api::Mode>>>,
+    /// What this host says the session's mode is. `None` until something sets
+    /// one, which is the state a real host is in only before its startup flag —
+    /// and it is what makes the screen's own pull meaningful.
+    current: Arc<std::sync::Mutex<Option<atomcode_host_api::Mode>>>,
+    /// The screen's own subscription, taken once when it starts.
+    said: Arc<
+        std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<atomcode_host_api::HostEvent>>>,
+    >,
+}
+
+impl ModeHost {
+    fn announce(&self, session: &str, mode: atomcode_host_api::Mode) {
+        *self.current.lock().expect("current poisoned") = Some(mode);
+        let said = self.said.lock().expect("said poisoned");
+        said.as_ref()
+            .expect("the screen subscribed before it could be told")
+            .send(atomcode_host_api::HostEvent::ModeChanged {
+                session: session.to_string(),
+                mode,
+            })
+            .expect("the screen is still there to hear it");
+    }
+}
+
+#[async_trait]
+impl atomcode_host_api::HostControl for ModeHost {
+    async fn call(
+        &self,
+        command: atomcode_host_api::HostCommand,
+    ) -> Result<atomcode_host_api::HostReply, atomcode_host_api::HostError> {
+        use atomcode_host_api::{HostCommand, HostReply};
+        match command {
+            HostCommand::SetMode { mode, .. } => {
+                self.asked.lock().expect("asked poisoned").push(mode);
+                *self.current.lock().expect("current poisoned") = Some(mode);
+                Ok(HostReply::Done)
+            }
+            // The reading half, answered from what this host was told — the same
+            // way `atomcode::host` reads its runtime's flags, minus the runtime.
+            HostCommand::Mode { .. } => Ok(HostReply::Mode {
+                mode: *self.current.lock().expect("current poisoned"),
+            }),
+            other => self.inner.call(other).await,
+        }
+    }
+
+    fn subscribe(&self) -> tokio::sync::mpsc::UnboundedReceiver<atomcode_host_api::HostEvent> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *self.said.lock().expect("said poisoned") = Some(tx);
+        rx
+    }
+}
+
+/// Start the screen with a mode-recording host behind it, and a settings port
+/// when the test needs one.
+///
+/// `seed` is the mode this host holds *before* the screen connects, which is the
+/// whole point of the reading half: a host whose startup flag already set one
+/// must be able to say so, and `None` is the host that has nothing to report.
+async fn start_with_mode_host(
+    setup: Setup,
+    settings: Option<Arc<dyn atomcode_tui::settings::Settings>>,
+    seed: Option<atomcode_host_api::Mode>,
+) -> (Session, Arc<ModeHost>) {
+    let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let said = Arc::new(std::sync::Mutex::new(None));
+    let current = Arc::new(std::sync::Mutex::new(seed));
+    let made = Arc::new(std::sync::Mutex::new(None::<Arc<ModeHost>>));
+    let s = start_full(
+        setup,
+        {
+            let asked = asked.clone();
+            let said = said.clone();
+            let current = current.clone();
+            let made = made.clone();
+            move |connection| {
+                let atomcode_host_api::HostConnection {
+                    session,
+                    commands,
+                    events,
+                    control,
+                } = connection;
+                let host = Arc::new(ModeHost {
+                    inner: control,
+                    asked: asked.clone(),
+                    current: current.clone(),
+                    said: said.clone(),
+                });
+                *made.lock().expect("made poisoned") = Some(host.clone());
+                atomcode_host_api::HostConnection {
+                    session,
+                    commands,
+                    events,
+                    control: host as Arc<dyn atomcode_host_api::HostControl>,
+                }
+            }
+        },
+        settings,
+        None,
+        None,
+        None,
+    )
+    .await;
+    let host = made
+        .lock()
+        .expect("made poisoned")
+        .clone()
+        .expect("the wrapper ran");
+    (s, host)
+}
+
+/// Shift+Tab steps the mode on, the host is told which one, and the status row
+/// says what the host said back.
+///
+/// All three halves in one test, because the feature *is* the loop: a key that
+/// computes the next mode but never tells the host would pass a key-only
+/// assertion, and a badge drawn from the screen's own guess rather than the
+/// host's answer would agree with itself while disagreeing with the session.
+#[tokio::test]
+async fn shift_tab_cycles_the_mode_and_the_status_row_says_which_one() {
+    let dir = scratch("mode-cycle");
+    let (s, host) = start_with_mode_host(
+        tree(&dir, &replay(r#"{ text = "ok" }"#), &[]),
+        None,
+        // What a coding host always reports: a session starts in `ask`, and the
+        // screen only learned that because it asked (`HostCommand::Mode`).
+        Some(atomcode_host_api::Mode::Ask),
+    )
+    .await;
+    let task = s.open().await;
+    s.quiet().await;
+    let session = s.client().root();
+
+    // The default mode is not drawn: a badge on every screen would be chrome
+    // that stopped meaning "somebody changed something".
+    let idle = status_row(&s);
+    assert!(
+        !idle.contains("accept edits"),
+        "the default is drawn: {idle:?}"
+    );
+    assert!(!idle.contains("auto"), "the default is drawn: {idle:?}");
+
+    // One step: ask → accept edits.
+    s.term.press(KeyPress::plain(Key::BackTab));
+    for _ in 0..200 {
+        if !host.asked.lock().expect("asked poisoned").is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        host.asked.lock().expect("asked poisoned").as_slice(),
+        &[atomcode_host_api::Mode::AcceptEdits],
+        "shift+tab did not ask the host for the next mode"
+    );
+    // The host says so, and the row follows — it draws the host's answer, not
+    // a guess of its own.
+    host.announce(&session, atomcode_host_api::Mode::AcceptEdits);
+    until(&s, "accept edits").await;
+
+    // And on again: accept edits → auto, off the mode the host pushed.
+    s.term.press(KeyPress::plain(Key::BackTab));
+    for _ in 0..200 {
+        if host.asked.lock().expect("asked poisoned").len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        host.asked.lock().expect("asked poisoned").last(),
+        Some(&atomcode_host_api::Mode::Auto),
+        "the second step did not come off the mode the host pushed"
+    );
+    task.abort();
+}
+
+/// Plain Tab does *not* cycle the mode by default: it is the completion menu's
+/// and the team panel's.
+///
+/// The half that makes the setting worth having. Stealing Tab from the menu
+/// would break completion on every terminal, and this is the assertion that
+/// says the default still belongs to it.
+#[tokio::test]
+async fn plain_tab_leaves_the_mode_alone_unless_the_setting_says_otherwise() {
+    let dir = scratch("mode-tab-default");
+    let (s, host) = start_with_mode_host(
+        tree(&dir, &replay(r#"{ text = "ok" }"#), &[]),
+        None,
+        Some(atomcode_host_api::Mode::Ask),
+    )
+    .await;
+    let task = s.open().await;
+    s.quiet().await;
+
+    s.term.press(KeyPress::plain(Key::Tab));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        host.asked.lock().expect("asked poisoned").is_empty(),
+        "plain tab cycled the mode under the default setting"
+    );
+    task.abort();
+}
+
+/// A settings port that answers `ui.mode_switch_key` and nothing else.
+///
+/// A `Choice`, because that is what the setting is — the criterion is about the
+/// value the screen reads, and a fixture that lied about the kind would be
+/// describing a different setting.
+struct TabSwitch(&'static str);
+
+impl atomcode_tui::settings::Settings for TabSwitch {
+    fn rows(&self) -> atomcode_tui::settings::SettingsView {
+        atomcode_tui::settings::SettingsView::new(vec![atomcode_tui::settings::SettingRow {
+            id: atomcode_tui::settings::MODE_SWITCH_KEY.to_string(),
+            label: "模式切换键".to_string(),
+            value: self.0.to_string(),
+            kind: atomcode_tui::settings::SettingKind::Choice(vec![
+                "shift_tab".to_string(),
+                "tab".to_string(),
+            ]),
+            applies: atomcode_tui::settings::Applies::Immediately,
+        }])
+    }
+    fn set(&self, _id: &str, _value: &str) -> Result<atomcode_tui::settings::SettingsView, String> {
+        Err("this port cannot write".into())
+    }
+    fn reset(&self, _id: &str) -> Result<atomcode_tui::settings::SettingsView, String> {
+        Err("this port cannot write".into())
+    }
+}
+
+/// A mode the host set **before this screen subscribed** still reaches the row.
+///
+/// The gap this closes, and the reason the contract grew a reading half: the
+/// screen learns the mode from `HostEvent::ModeChanged`, and an event pushed to
+/// nobody is an event nobody heard. A host that seeds its mode at startup — the
+/// product does exactly this for `--dangerously-skip-permissions`, which sets
+/// `Auto` before the front end has connected — used to leave the row claiming
+/// the session was an ordinary one while it was in fact running without asking.
+///
+/// Nothing is pushed here on purpose. The screen must find this out by *asking*,
+/// which is the behaviour under test; a test that announced the change would
+/// pass whether or not the pull exists.
+#[tokio::test]
+async fn a_mode_set_before_the_screen_connected_still_reaches_the_row() {
+    let dir = scratch("mode-seeded");
+    let (s, _host) = start_with_mode_host(
+        tree(&dir, &replay(r#"{ text = "ok" }"#), &[]),
+        None,
+        // Already `auto` when the screen arrives, as `--dangerously-skip-permissions`
+        // leaves it. No `announce` follows: the event this seeds predates the
+        // subscription and was dropped, which is the whole situation.
+        Some(atomcode_host_api::Mode::Auto),
+    )
+    .await;
+    let task = s.open().await;
+    s.quiet().await;
+
+    // The badge, from the host's answer rather than from anything pushed.
+    let row = status_row(&s);
+    assert!(
+        row.contains("auto"),
+        "a session running without asking drew as an ordinary one: {row:?}"
+    );
+    task.abort();
+}
+
+/// With `ui.mode_switch_key = "tab"` plain Tab cycles — the setting, not a
+/// second key.
+#[tokio::test]
+async fn the_tab_setting_moves_the_cycle_onto_plain_tab() {
+    let dir = scratch("mode-tab-setting");
+    let (s, host) = start_with_mode_host(
+        tree(&dir, &replay(r#"{ text = "ok" }"#), &[]),
+        Some(Arc::new(TabSwitch("tab"))),
+        Some(atomcode_host_api::Mode::Ask),
+    )
+    .await;
+    let task = s.open().await;
+    s.quiet().await;
+
+    s.term.press(KeyPress::plain(Key::Tab));
+    for _ in 0..200 {
+        if !host.asked.lock().expect("asked poisoned").is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        host.asked.lock().expect("asked poisoned").as_slice(),
+        &[atomcode_host_api::Mode::AcceptEdits],
+        "the tab setting did not move the cycle onto plain tab"
+    );
+    task.abort();
+}

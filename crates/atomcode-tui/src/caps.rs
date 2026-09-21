@@ -318,6 +318,7 @@ fn ascii_for(ch: char) -> Option<&'static str> {
         // media / state
         '\u{23F8}' => "=",
         '\u{23F9}' => "#",
+        '\u{23F5}' => ">",
 
         // box drawing
         '\u{2500}' | '\u{2550}' | '\u{2501}' => "-",
@@ -398,6 +399,12 @@ pub enum Glyph {
     Gutter,
     /// Points at what is below the fold.
     Down,
+    /// This session is paused where it is: `plan` mode, which explores and
+    /// declines to touch. Chrome for the mode badge, so it lives in both tables.
+    Pause,
+    /// This session goes ahead: `accept edits` and `auto`. Drawn twice for the
+    /// one mode that asks nothing at all.
+    Play,
 }
 
 /// The frames a spinner cycles through, one per redraw.
@@ -480,6 +487,8 @@ pub fn glyph(unicode: bool, glyph: Glyph) -> &'static str {
             ToolMark => "●",
             Gutter => "⎿",
             Down => "↓",
+            Pause => "\u{23F8}",
+            Play => "\u{23F5}",
         }
     } else {
         match glyph {
@@ -500,6 +509,8 @@ pub fn glyph(unicode: bool, glyph: Glyph) -> &'static str {
             ToolMark => "*",
             Gutter => "`",
             Down => "v",
+            Pause => "=",
+            Play => ">",
         }
     }
 }
@@ -595,6 +606,8 @@ mod tests {
             Glyph::ToolMark,
             Glyph::Gutter,
             Glyph::Down,
+            Glyph::Pause,
+            Glyph::Play,
         ] {
             let rich = Caps::default().g(glyph);
             let plain = Caps::plain().g(glyph);

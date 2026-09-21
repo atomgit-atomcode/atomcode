@@ -34,6 +34,15 @@ use std::sync::Arc;
 /// which is why a launcher with no settings port still gets a light.
 pub const STATUS_DOT: &str = "ui.terminal_status_glyph";
 
+/// The id of the setting that decides which key cycles the execution mode.
+///
+/// Here for the same reason [`STATUS_DOT`] is: this crate reads a row by id and
+/// the product's catalog names the setting, so the string would drift silently
+/// if it were typed twice. The values are `shift_tab` and `tab`; anything else,
+/// or no row at all, is `shift_tab` — this build's default and the one every
+/// terminal but the phone can send.
+pub const MODE_SWITCH_KEY: &str = "ui.mode_switch_key";
+
 /// What a value is, as far as editing it goes.
 ///
 /// Not a type system for settings — a description of the *gesture*. Three

@@ -1518,6 +1518,17 @@ impl Host {
         self.moment.read().expect("moment poisoned").team_keyboard
     }
 
+    /// Whether plain Tab cycles the execution mode
+    /// (`ui.mode_switch_key = "tab"`). Read live on each press, so a `/config`
+    /// change takes effect without a restart — the same promise the setting's
+    /// own `applies` makes.
+    pub fn mode_switch_on_tab(&self) -> bool {
+        self.moment
+            .read()
+            .expect("moment poisoned")
+            .mode_switch_on_tab()
+    }
+
     /// Give the team panel the keyboard, pointing at the agent on screen. `false`
     /// when there is no team to switch between.
     pub fn focus_team(&self) -> bool {

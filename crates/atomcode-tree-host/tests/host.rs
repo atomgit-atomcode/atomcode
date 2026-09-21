@@ -362,3 +362,37 @@ async fn the_thinking_level_is_set_on_the_live_session_and_described() {
     });
     assert_eq!(level, Some(Some(ReasoningEffort::High)), "{events:#?}");
 }
+
+/// This host answers the mode question with `None`, and `None` is not `Ask`.
+///
+/// The trees it mounts carry no execution mode — `modes` is a host-provided
+/// seam and this host provides none — so there is no plan switch and no approval
+/// row for a mode to be *of*. Reporting the most careful mode instead would be
+/// claiming a policy nobody configured, which is why the contract separates the
+/// two answers. Addressed like every other command: a session that is not live
+/// is not answered with nothing's mode.
+#[tokio::test]
+async fn this_host_says_it_has_no_execution_mode_rather_than_guessing_one() {
+    let (mut connection, _) = connect("mode-none", r#"{ text = "unused" }"#).await;
+    let session = connection.session.clone();
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::Mode {
+                session: session.clone(),
+            })
+            .await,
+        Ok(HostReply::Mode { mode: None }),
+        "a host with no mode must say so, not report `ask`"
+    );
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::Mode {
+                session: "not-the-live-one".into(),
+            })
+            .await,
+        Err(HostError::NotFound)
+    );
+    let _ = &mut connection;
+}

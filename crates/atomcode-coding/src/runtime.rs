@@ -1574,6 +1574,24 @@ impl CodingRuntimeHandle {
         result.await.map_err(|_| RuntimeError::Unavailable)?
     }
 
+    /// The execution mode in force, as the flags that govern a tool call have it.
+    ///
+    /// `Err` is "this runtime cannot answer" — a stopped or unavailable one. It
+    /// is not "no mode": a coding runtime always has one, and the caller's
+    /// `None` for "a host that does not govern modes at all" is a different
+    /// fact, kept by the host that knows it (`atomcode_host_api::HostReply`).
+    pub async fn mode(&self) -> Result<RuntimeMode, RuntimeError> {
+        let state = self.state.load(Ordering::Acquire);
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::Mode {
+                generation: runtime_state_generation(state),
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
     /// Explicit headless readiness policy. Interactive callers should let MCP
     /// connect in the background and observe new tools from the next turn.
     pub async fn wait_mcp_ready(&self, timeout: std::time::Duration) -> Result<(), RuntimeError> {
@@ -2500,6 +2518,18 @@ pub enum CodingRuntimeControl {
     ContextStats {
         generation: u64,
         done: oneshot::Sender<Result<RuntimeContextStats, RuntimeError>>,
+    },
+    /// The execution mode in force, decoded from the same three flags the
+    /// approval and plan middlewares read.
+    ///
+    /// Read here rather than mirrored onto the handle, deliberately: a second
+    /// copy of "which mode is on" could disagree with the flags that actually
+    /// govern a tool call, and the one a person reads on screen would be the
+    /// copy. Answering through the owner also orders it against `SetMode` on
+    /// the same queue, so a read that follows a set sees it.
+    Mode {
+        generation: u64,
+        done: oneshot::Sender<Result<RuntimeMode, RuntimeError>>,
     },
     WaitMcpReady {
         generation: u64,
@@ -4545,6 +4575,33 @@ fn spawn_runtime_owner_with_optional_agent(
                         );
                         let _ = runtime_event_tx.send(CodingRuntimeEvent::ModeChanged { mode });
                         let _ = done.send(Ok(()));
+                    }
+                    Some(CodingRuntimeControl::Mode {
+                        generation: request_generation,
+                        done,
+                    }) => {
+                        let Some(runtime) = resources.as_ref() else {
+                            let _ = done.send(Err(RuntimeError::Unavailable));
+                            continue;
+                        };
+                        if request_generation != generation {
+                            let _ = done.send(Err(RuntimeError::Busy));
+                            continue;
+                        }
+                        // The flags, decoded — not a fourth field that would have
+                        // to be kept in step with them. Plan wins when two are set,
+                        // which cannot happen through `SetMode` (it writes all
+                        // three) but is the safe reading of a tree where it did.
+                        let mode = if runtime.parts.plan_mode.load(Ordering::Acquire) {
+                            RuntimeMode::Plan
+                        } else if runtime.parts.bypass_mode.load(Ordering::Acquire) {
+                            RuntimeMode::Auto
+                        } else if runtime.parts.accept_edits.load(Ordering::Acquire) {
+                            RuntimeMode::AcceptEdits
+                        } else {
+                            RuntimeMode::Build
+                        };
+                        let _ = done.send(Ok(mode));
                     }
                     Some(CodingRuntimeControl::ContextStats {
                         generation: request_generation,
@@ -7523,6 +7580,11 @@ fn reject_runtime_control(
             let _ = done.send(Err(RuntimeError::Unavailable));
         }
         CodingRuntimeControl::ContextStats { done, .. } => {
+            let _ = done.send(Err(RuntimeError::Unavailable));
+        }
+        // A stopping runtime cannot say which mode it is in either — the flags
+        // belong to a tree that is being torn down.
+        CodingRuntimeControl::Mode { done, .. } => {
             let _ = done.send(Err(RuntimeError::Unavailable));
         }
         CodingRuntimeControl::McpStatus { done, .. } => {

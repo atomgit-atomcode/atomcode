@@ -111,6 +111,38 @@ impl CommandSet for ScreenCommands {
     }
 }
 
+/// The word `/mode` takes for one of the four.
+///
+/// Beside the arm that reads them, and paired with [`mode_named`] by a
+/// round-trip test: the cycle key asks for "the next one" and has to say it in
+/// the same vocabulary a person types, so a second table here would be the
+/// second place for the two to disagree.
+pub fn mode_word(mode: atomcode_host_api::Mode) -> &'static str {
+    use atomcode_host_api::Mode;
+    match mode {
+        Mode::Plan => "plan",
+        Mode::Ask => "ask",
+        Mode::AcceptEdits => "edits",
+        Mode::Auto => "auto",
+    }
+}
+
+/// The mode a word names, or `None` for a word that names none.
+///
+/// `accept-edits` is accepted as well as `edits`: the contract calls the mode
+/// `AcceptEdits` and the shorter word is what the badge and the help text use,
+/// so both spellings are the one mode rather than two.
+pub fn mode_named(word: &str) -> Option<atomcode_host_api::Mode> {
+    use atomcode_host_api::Mode;
+    match word {
+        "plan" => Some(Mode::Plan),
+        "ask" => Some(Mode::Ask),
+        "edits" | "accept-edits" => Some(Mode::AcceptEdits),
+        "auto" => Some(Mode::Auto),
+        _ => None,
+    }
+}
+
 /// Turn `/showinject <what>` into the one action it means.
 ///
 /// Split out from the dispatch because the interesting part is the refusal, and
@@ -853,16 +885,16 @@ impl CommandSet for SessionCommands {
                 }
             }
             "mode" => {
-                use atomcode_host_api::Mode;
                 let wanted = match args.trim() {
                     "" => return Outcome::Said(t(Msg::ModeWhatEachDoes).into_owned()),
-                    "plan" => Mode::Plan,
-                    "ask" => Mode::Ask,
-                    "edits" | "accept-edits" => Mode::AcceptEdits,
-                    "auto" => Mode::Auto,
-                    other => {
-                        return Outcome::Refused(t(Msg::ModeUnknown { what: other }).into_owned())
-                    }
+                    other => match mode_named(other) {
+                        Some(mode) => mode,
+                        None => {
+                            return Outcome::Refused(
+                                t(Msg::ModeUnknown { what: other }).into_owned(),
+                            )
+                        }
+                    },
                 };
                 let control = match host(control) {
                     Ok(control) => control,
@@ -2093,6 +2125,40 @@ mod tests {
                 mode: atomcode_host_api::Mode::Plan,
             })
         );
+    }
+
+    /// The two tables over the four modes agree, and both spellings of the one
+    /// mode mean it.
+    ///
+    /// The cycle key builds a `/mode <word>` line from [`mode_word`], and the
+    /// command reads it back with [`mode_named`]. A pair that disagreed — a word
+    /// the command does not take, or a word that named a different mode — is the
+    /// drift this pins, and it would show up as a key that says "no such mode"
+    /// rather than as a wrong mode.
+    #[test]
+    fn every_mode_has_one_word_both_ways_and_the_cycle_visits_them_all() {
+        use atomcode_host_api::Mode;
+        for mode in [Mode::Plan, Mode::Ask, Mode::AcceptEdits, Mode::Auto] {
+            let word = mode_word(mode);
+            assert_eq!(mode_named(word), Some(mode), "`{word}` does not round-trip");
+        }
+        // The long spelling is the one mode, not a fifth.
+        assert_eq!(mode_named("accept-edits"), Some(Mode::AcceptEdits));
+        assert_eq!(mode_named("nonsense"), None);
+
+        // Four steps from anywhere and the cycle is back where it started,
+        // visiting each mode once — the property that makes the key usable
+        // without looking.
+        let mut seen = Vec::new();
+        let mut mode = Mode::Ask;
+        for _ in 0..4 {
+            seen.push(mode);
+            mode = mode.next();
+        }
+        assert_eq!(mode, Mode::Ask, "the cycle does not close");
+        seen.sort_by_key(|m| mode_word(*m));
+        seen.dedup();
+        assert_eq!(seen.len(), 4, "the cycle skips a mode: {seen:?}");
     }
 
     /// `/autonomy` says whether the session is driving itself, and how far it

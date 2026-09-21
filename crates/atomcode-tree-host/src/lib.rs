@@ -312,6 +312,22 @@ impl HostControl for TreeHost {
                 self.set_effort(&session, level).await
             }
             HostCommand::ListSessions { working_dir } => self.list(working_dir).await,
+            // `None`, and that is the honest answer rather than a shrug: the
+            // trees this host mounts carry no execution mode at all. `modes` is
+            // a host-provided seam (`atomcode_harness::seam_map::HOST_PROVIDED`)
+            // and this host provides none, so there is no plan switch and no
+            // approval row for a mode to be *of*. Answering `Ask` would report a
+            // policy nobody configured; see the contract on why the two differ.
+            HostCommand::Mode { session } => {
+                {
+                    let live = self.live.lock().await;
+                    let current = live.as_ref().ok_or(HostError::Unavailable)?;
+                    if current.session != session {
+                        return Err(HostError::NotFound);
+                    }
+                }
+                Ok(HostReply::Mode { mode: None })
+            }
             _ => Err(HostError::Failed {
                 message: "this host does not do that".into(),
             }),

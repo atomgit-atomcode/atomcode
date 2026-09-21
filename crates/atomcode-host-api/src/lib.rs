@@ -70,6 +70,16 @@ pub enum HostCommand {
     /// How much `session` may do without asking, from now on
     /// (`docs/plans/2026-09-18-tui-panels-and-commands-inventory.md` A1).
     SetMode { session: String, mode: Mode },
+    /// How much `session` may do without asking, as it stands now.
+    ///
+    /// [`HostCommand::SetMode`]'s reading half, and it is not redundant with
+    /// [`HostEvent::ModeChanged`]: the mode can be set before a front end has
+    /// subscribed — a host's own `--dangerously-skip-permissions` seeds it at
+    /// startup — and an event pushed to nobody is an event nobody heard. So a
+    /// front end that draws the mode asks once and follows the events from
+    /// then on, which is the bargain [`HostCommand::Readiness`] and
+    /// [`HostCommand::Autonomy`] already strike.
+    Mode { session: String },
     /// Work in `directory` from now on. A new conversation, because what a
     /// session read and wrote belongs to where it ran (A2).
     ChangeDirectory { session: String, directory: String },
@@ -218,6 +228,7 @@ impl HostCommand {
             | Self::SetSetting { session, .. }
             | Self::ResetSetting { session, .. }
             | Self::SetMode { session, .. }
+            | Self::Mode { session }
             | Self::ChangeDirectory { session, .. }
             | Self::Models { session }
             | Self::Rename { session, .. }
@@ -300,6 +311,17 @@ pub enum HostReply {
     /// What the session is doing on its own, if anything. `None` is idle.
     Autonomy {
         running: Option<Running>,
+    },
+    /// How much the session may do without asking, as the host found it.
+    ///
+    /// `None` is "this host cannot say", and it is a different answer from
+    /// [`Mode::Ask`] — a host that governs no execution mode at all (one whose
+    /// tree carries no approval rows) has no mode rather than the most careful
+    /// one, and a front end that drew `ask` for it would be reporting a policy
+    /// nobody configured. Same distinction [`HostReply::Autonomy`] keeps
+    /// between `None` and a stopped goal.
+    Mode {
+        mode: Option<Mode>,
     },
     /// How much of the window this session occupies.
     Context {
@@ -597,6 +619,28 @@ pub enum Mode {
     Auto,
 }
 
+impl Mode {
+    /// The next one along, for a key that cycles rather than names.
+    ///
+    /// The order is the reference front end's: ask → accept edits → auto → plan
+    /// → ask. It runs from the most ordinary mode to the most permissive and
+    /// then to the most careful, so a person stepping through it passes the
+    /// dangerous one on the way rather than landing on it from a screen they
+    /// were reading.
+    ///
+    /// Here rather than in a front end because it is a fact about these four
+    /// modes and not about any one screen: two front ends stepping in two
+    /// orders would be two products.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Ask => Self::AcceptEdits,
+            Self::AcceptEdits => Self::Auto,
+            Self::Auto => Self::Plan,
+            Self::Plan => Self::Ask,
+        }
+    }
+}
+
 /// One setting a person may change.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Setting {
@@ -773,6 +817,16 @@ pub enum HostEvent {
         session: String,
         running: Option<Running>,
     },
+    /// How much the session may do without asking changed — at this front end's
+    /// request ([`HostCommand::SetMode`]), another's, or a host's own startup
+    /// flag.
+    ///
+    /// The mode is session state rather than a fact in the log: the log records
+    /// what happened, and a run under one mode looks the same as a run under
+    /// another. So a screen that had to fold it out of the conversation could
+    /// not draw it, and this is the road it travels instead — the same bargain
+    /// [`HostEvent::Autonomy`] strikes, and for the same reason.
+    ModeChanged { session: String, mode: Mode },
 }
 
 /// Why a host refused or failed a command (`docs/adr/0021` §8).
@@ -907,6 +961,9 @@ mod tests {
                 session: "a".into(),
                 mode: Mode::Plan,
             },
+            HostCommand::Mode {
+                session: "a".into(),
+            },
             HostCommand::ChangeDirectory {
                 session: "a".into(),
                 directory: "/w/other".into(),
@@ -995,6 +1052,7 @@ mod tests {
                 | HostCommand::Settings { .. }
                 | HostCommand::SetSetting { .. }
                 | HostCommand::SetMode { .. }
+                | HostCommand::Mode { .. }
                 | HostCommand::ChangeDirectory { .. }
                 | HostCommand::Models { .. }
                 | HostCommand::Sources { .. }
@@ -1149,6 +1207,12 @@ mod tests {
                 why: Some("还没有配置任何 provider".into()),
                 fix: Some("login".into()),
             },
+            HostReply::Mode {
+                mode: Some(Mode::Plan),
+            },
+            // And the host that cannot say, which is a different answer from
+            // the most careful mode.
+            HostReply::Mode { mode: None },
             HostReply::Context {
                 window: 200_000,
                 used: 48_000,
@@ -1227,6 +1291,7 @@ mod tests {
                 | HostReply::Changes { .. }
                 | HostReply::Providers { .. }
                 | HostReply::Autonomy { .. }
+                | HostReply::Mode { .. }
                 | HostReply::Usage { .. }
                 | HostReply::Context { .. }
                 | HostReply::Identity { .. }
@@ -1259,11 +1324,16 @@ mod tests {
                     paused: None,
                 }),
             },
+            HostEvent::ModeChanged {
+                session: "b".into(),
+                mode: Mode::Plan,
+            },
         ];
         for e in &all {
             match e {
                 HostEvent::SessionChanged { .. }
                 | HostEvent::Autonomy { .. }
+                | HostEvent::ModeChanged { .. }
                 | HostEvent::PersistenceFailed { .. } => {}
             }
         }

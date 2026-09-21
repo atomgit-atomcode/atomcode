@@ -278,6 +278,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
              up/down move the caret, and page through history once at the end · click to put the caret where you clicked\n\
              pgup/pgdn and the wheel scroll the conversation\n\
              ctrl-r reasoning (one line / in full / folded, cycles) · ctrl-t tool output (all / one summary each / summarised in groups, cycles) · ctrl-l redraws\n\
+             shift+tab steps to the next execution mode (plan/ask/edits/auto; with no completion menu up) · set ui.mode_switch_key=tab in /config to cycle with tab instead, leaving tab for completion\n\
              /showinject [name] injected context (hidden by default; all of them with no name, `all` includes peers' reports)\n\
              drag to select and copy · esc drops the selection · click a thought or a tool call to fold or open that one\n\
              ctrl-o hands the mouse back to the terminal (use its own selection instead)".into(),

@@ -264,6 +264,14 @@ pub struct Moment {
     /// a bare `49.0k tok`. Injected from the agent's description, not folded from
     /// the log: the window is the agent's, not a fact the conversation records.
     pub ctx_window: u32,
+    /// How hard the agent is asked to think, from its description. `None` is no
+    /// opinion — the endpoint's own default stands — which is what a session
+    /// that never ran `/effort` has, and the row says nothing about it then
+    /// rather than inventing a level nothing was configured with.
+    ///
+    /// Travels the road [`Moment::ctx_window`] does, and for the same reason:
+    /// the thinking level is the agent's, not a fact the conversation records.
+    pub effort: Option<atomcode_kernel::provider::ReasoningEffort>,
     /// The agents running under this one, as the registry has them now.
     /// Empty for a screen that never delegates, which is most of them.
     pub members: Vec<MemberNow>,
@@ -352,6 +360,21 @@ pub struct Moment {
     /// a fact about the conversation, it is the state of something running
     /// beside it. `None` is "not driving itself".
     pub autonomy: Option<atomcode_host_api::Running>,
+    /// How much this session may do without asking, as the host last said.
+    ///
+    /// Here for the reason [`Moment::autonomy`] is: an execution mode is not a
+    /// fact about the conversation — the log records what happened, and a run
+    /// under one mode looks the same as a run under another — so a module could
+    /// not fold it and might not reach a service. The screen asks once when it
+    /// connects (`HostCommand::Mode`) and follows `HostEvent::ModeChanged` from
+    /// then on.
+    ///
+    /// `None` is **"the host has not said"**, and it is a different state from
+    /// any mode: a host whose tree governs no execution mode has none to report,
+    /// and a front end that drew `ask` for it would be reporting a policy
+    /// nobody configured. `Some(Mode::Ask)` is the other thing — a host that
+    /// said the session really is asking.
+    pub mode: Option<atomcode_host_api::Mode>,
     /// The session this screen follows: the lead, when there is a team.
     pub lead: String,
     /// The session on screen — the lead, or one of its members the person
@@ -606,6 +629,20 @@ impl Moment {
             .iter()
             .find(|row| row.id == crate::settings::STATUS_DOT)
             .is_none_or(|row| row.value == "true")
+    }
+
+    /// Whether plain Tab cycles the execution mode, rather than reserving itself
+    /// for the completion menu (`ui.mode_switch_key = "tab"`).
+    ///
+    /// `false` for no row at all, on the same terms [`Moment::status_dot_on`]
+    /// keeps: a launcher with no settings port gets this build's default, which
+    /// is `shift_tab` — the chord every terminal but the phone can send.
+    pub fn mode_switch_on_tab(&self) -> bool {
+        self.settings
+            .rows()
+            .iter()
+            .find(|row| row.id == crate::settings::MODE_SWITCH_KEY)
+            .is_some_and(|row| row.value == "tab")
     }
 
     /// The light for the window title: what is happening, or `None` when the

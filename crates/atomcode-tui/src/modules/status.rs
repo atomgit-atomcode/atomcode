@@ -114,8 +114,23 @@ impl View for Status {
 
         let mut row: Vec<El> = Vec::new();
         // Width already spoken for by the parts that sit outside the fitted info
-        // group: the member prefix ahead of it and the activity indicator after.
+        // group: the mode badge at the head of the row, the member prefix after
+        // it, and the activity indicator at the tail.
         let mut reserved = 0usize;
+
+        // How much this session may do without asking — at the head of the row,
+        // which is where tuix draws its mode badge and where the eye lands
+        // first: it is the one thing on this line that a person *did*, and the
+        // rest of the row (model, directory, fill) is what the session *is*.
+        //
+        // `None` for `ask`, where every session starts: a badge for it would be
+        // permanent chrome on every screen and would stop meaning "somebody
+        // changed something".
+        if let Some((text, style)) = mode_badge(vp.moment.mode, caps) {
+            reserved += width::str_width(&text) + sep_w;
+            row.push(El::styled(text, style));
+            row.push(El::styled(sep_text.clone(), dim));
+        }
 
         // Whose screen this is, when it is a team member's rather than the
         // lead's: everything below and everything typed is that member's.
@@ -162,13 +177,23 @@ impl View for Status {
         // Prefer the folded model (what a request actually ran on); before the
         // first turn that is empty, so fall back to the description's model — the
         // real name the welcome already shows — and only then to the brand.
-        let model_str = if !state.model.is_empty() {
+        //
+        // The thinking level rides on the model, as `model [high]`, the shape
+        // tuix draws: it is a property of how *this* model is driven, not a
+        // field of its own, and a level with no model named would be a badge
+        // about nothing. Nothing is appended when the session has no opinion —
+        // the endpoint's default stands, and the row does not invent a level
+        // nobody configured.
+        let mut model_str = if !state.model.is_empty() {
             state.model.clone()
         } else if !vp.moment.model.is_empty() {
             vp.moment.model.clone()
         } else {
             "atomcode".to_string()
         };
+        if let Some(level) = vp.moment.effort {
+            model_str.push_str(&format!(" [{}]", level.as_str()));
+        }
         // Home collapsed to `~` for display — the same optimisation the welcome
         // banner and `/cd`/`/resume` apply at their own display sites. `Moment.cwd`
         // itself stays absolute (the `@`-path completion in `plugin.rs` reads it as
@@ -365,6 +390,42 @@ fn fit_status_segments(
     build(cwd_base, false, false)
 }
 
+/// What the status line says about how much this session may do without asking.
+///
+/// `None` for a mode that needs no badge — `ask`, where every session starts, so
+/// a badge for it would be permanent chrome that stopped meaning "somebody
+/// changed something" — **and for a mode the host has not reported at all**.
+/// The two are the same drawing and different facts: this function answers the
+/// second without knowing which it was, and [`Moment::mode`] keeps the
+/// distinction for whoever needs it.
+///
+/// The four modes are drawn as a glyph plus the word the `/mode` list uses,
+/// because that is the word a person typed to get here and the one they will
+/// type to get out. The glyph carries the meaning at a glance (`⏸` paused, `⏵`
+/// going ahead, `⏵⏵` asking nothing at all) and downgrades to ASCII where the
+/// terminal cannot draw it. The pair is deliberate: a badge with only a glyph
+/// would be a symbol a reader has to learn, and one with only a word would not
+/// stand out from the model and directory beside it.
+fn mode_badge(
+    mode: Option<atomcode_host_api::Mode>,
+    caps: crate::caps::Caps,
+) -> Option<(String, Style)> {
+    use atomcode_host_api::Mode;
+    let (glyphs, word, role) = match mode? {
+        Mode::Ask => return None,
+        Mode::Plan => (caps.g(crate::caps::Glyph::Pause), "plan", Role::Mode),
+        Mode::AcceptEdits => (caps.g(crate::caps::Glyph::Play), "accept edits", Role::Mode),
+        // Two glyphs, the way tuix draws it: the one mode that asks nothing is
+        // louder than the one that only stops asking about edits, and a colour
+        // alone would not say that on a terminal whose palette is thin.
+        Mode::Auto => {
+            let play = caps.g(crate::caps::Glyph::Play);
+            return Some((format!("{play}{play} auto"), theme::fg(Role::Warning)));
+        }
+    };
+    Some((format!("{glyphs} {word}"), theme::fg(role)))
+}
+
 /// What the status line says about a session running on its own.
 ///
 /// Short on purpose — it shares a row with the model, the directory and the
@@ -514,6 +575,108 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// Every mode but the default says which one it is, and the default says
+    /// nothing.
+    ///
+    /// Both halves are the criterion, for the reason the autonomy badge's is:
+    /// `ask` is where a session starts, so a badge for it would be permanent
+    /// chrome on every screen and would stop meaning "somebody changed
+    /// something". The three that *are* changes each have to be told apart —
+    /// and the two glyphs' distinction (one play for edits, two for auto) is
+    /// part of it, because a palette-shy terminal would otherwise see one word
+    /// each and no difference in weight.
+    #[test]
+    fn the_mode_badge_names_every_mode_but_the_default() {
+        let st = State::default();
+        let caps = crate::caps::Caps::default();
+        let mut m = Moment::default();
+
+        // A host that has not said, and one that said `ask`: the same drawing,
+        // and the state is the one thing that tells them apart.
+        assert_eq!(m.mode, None, "nothing has been reported yet");
+        let unknown = draw::<Status>(&st, 80, &m);
+        assert!(!unknown.contains("ask"), "a mode was invented: {unknown:?}");
+
+        m.mode = Some(atomcode_host_api::Mode::Ask);
+        let plain = draw::<Status>(&st, 80, &m);
+        assert!(!plain.contains("ask"), "the default is drawn: {plain:?}");
+
+        m.mode = Some(atomcode_host_api::Mode::Plan);
+        let plan = draw::<Status>(&st, 80, &m);
+        assert!(plan.contains("plan"), "{plan:?}");
+        assert!(plan.contains(caps.g(crate::caps::Glyph::Pause)), "{plan:?}");
+
+        m.mode = Some(atomcode_host_api::Mode::AcceptEdits);
+        let edits = draw::<Status>(&st, 80, &m);
+        assert!(edits.contains("accept edits"), "{edits:?}");
+
+        m.mode = Some(atomcode_host_api::Mode::Auto);
+        let auto = draw::<Status>(&st, 80, &m);
+        assert!(auto.contains("auto"), "{auto:?}");
+        // Two glyphs, and the one mode that asks nothing is the loud one.
+        let play = caps.g(crate::caps::Glyph::Play);
+        assert!(
+            auto.contains(&format!("{play}{play} auto")),
+            "auto is not drawn louder than accept-edits: {auto:?}"
+        );
+    }
+
+    /// The badge is the *first* thing on the row, not the last.
+    ///
+    /// Where tuix draws it, and the reason is the row's own reading order: the
+    /// mode is the one part a person *did* — the rest (model, directory, how
+    /// full the window is) is what the session *is*. At the tail it sat beside
+    /// the exit hint and the spinner, which are the row's transient half, and a
+    /// badge that moved about as they came and went would be one a reader has
+    /// to hunt for.
+    #[test]
+    fn the_mode_badge_leads_the_row() {
+        let caps = crate::caps::Caps::default();
+        let st = State {
+            model: "glm-5".into(),
+            ..Default::default()
+        };
+        let m = Moment {
+            mode: Some(atomcode_host_api::Mode::Plan),
+            model: "glm-5".into(),
+            cwd: "~/w".into(),
+            ..Default::default()
+        };
+        let line = Status::render(&st, &Viewport::new(Rect::sized(80, 1), &m))[0].plain();
+        let badge = line.find("plan").expect("the badge is drawn");
+        let model = line.find("glm-5").expect("the model is drawn");
+        assert!(
+            badge < model,
+            "the mode badge is behind the model: {line:?}"
+        );
+        // At the very head of the row: what precedes it is only the glyph it
+        // opens with, so nothing — a member prefix, a separator — can get in
+        // front of it.
+        let head = line.trim_start();
+        assert!(
+            head.starts_with(&format!("{} plan", caps.g(crate::caps::Glyph::Pause))),
+            "the row does not open with the badge: {line:?}"
+        );
+    }
+
+    /// The badge survives a terminal that cannot draw the glyphs, which is the
+    /// half a picture-only badge would lose.
+    #[test]
+    fn the_mode_badge_still_reads_on_an_ascii_terminal() {
+        let st = State::default();
+        let mut m = Moment {
+            mode: Some(atomcode_host_api::Mode::Auto),
+            ..Default::default()
+        };
+        m.caps = crate::caps::Caps::plain();
+        let line = Status::render(&st, &Viewport::new(Rect::sized(80, 1), &m))[0].plain();
+        assert!(line.contains("auto"), "{line:?}");
+        assert!(
+            line.is_ascii(),
+            "an ASCII terminal got a glyph it cannot draw: {line:?}"
+        );
+    }
+
     /// A session running on its own says so without being asked.
     ///
     /// The gap this closes: the fact was already kept (`Moment::autonomy`, fed
@@ -559,6 +722,42 @@ mod tests {
         assert!(
             paused.contains("等审批"),
             "why it is not moving: {paused:?}"
+        );
+    }
+
+    /// The thinking level rides on the model, as `model [high]` — tuix's shape.
+    ///
+    /// Both halves are the criterion. A level is *how this model is driven*, so
+    /// it belongs against the model rather than as a field of its own; and a
+    /// session with no opinion must draw nothing rather than invent a level,
+    /// because "the endpoint's default stands" is not `medium`.
+    #[test]
+    fn the_thinking_level_sits_on_the_model_and_only_when_there_is_one() {
+        let st = State {
+            model: "glm-5".into(),
+            ..Default::default()
+        };
+        let mut m = Moment {
+            model: "glm-5".into(),
+            cwd: "~/w".into(),
+            ..Default::default()
+        };
+
+        // No opinion: nothing is appended, and nothing is invented either.
+        let plain = draw::<Status>(&st, 80, &m);
+        assert!(plain.contains("glm-5"), "{plain:?}");
+        assert!(!plain.contains('['), "a level was invented: {plain:?}");
+
+        m.effort = Some(atomcode_kernel::provider::ReasoningEffort::High);
+        let with = draw::<Status>(&st, 80, &m);
+        assert!(with.contains("glm-5 [high]"), "{with:?}");
+        // Immediately after the model, not adrift at the end of the row.
+        let model = with.find("glm-5").expect("the model");
+        let level = with.find("[high]").expect("the level");
+        let cwd = with.find("~/w").expect("the directory");
+        assert!(
+            model < level && level < cwd,
+            "the level is not against the model: {with:?}"
         );
     }
 

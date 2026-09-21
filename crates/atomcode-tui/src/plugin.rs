@@ -858,6 +858,9 @@ impl UserInterface for Tui {
         // Kept before the connection takes it: the one question asked of the
         // host before a person has typed anything.
         let readiness = control.clone();
+        // And the second one — which mode this session is in, which a host may
+        // have set before this screen subscribed.
+        let mode_of_session = control.clone();
         client.connect(commands, control);
 
         let (wake_tx, mut wake) = mpsc::unbounded_channel::<Wake>();
@@ -1007,6 +1010,34 @@ impl UserInterface for Tui {
                 // say goes.
                 if let Some(fix) = fix {
                     let _ = keys.send(Wake::Chose(Some(fix)));
+                }
+            });
+        }
+
+        // How much this session may do without asking, asked once before the
+        // events start. The mode can be set before this screen subscribed — a
+        // host's own `--dangerously-skip-permissions` seeds it at startup — and
+        // an event pushed to nobody is an event nobody heard. So the read
+        // happens here and `HostEvent::ModeChanged` carries it from then on,
+        // which is the same bargain as the readiness question above and the
+        // autonomy line: the one thing that must not happen is a session
+        // running unattended while the row says it is an ordinary one.
+        {
+            let announced = session.clone();
+            let control = mode_of_session;
+            let host = self.host.clone();
+            let keys = wake_tx.clone();
+            tokio::spawn(async move {
+                let Ok(HostReply::Mode { mode }) =
+                    control.call(HostCommand::Mode { session }).await
+                else {
+                    return;
+                };
+                // Through the same filter the pushed news takes: what arrived
+                // is about the session this screen follows, and `took_mode` is
+                // where that is decided.
+                if took_mode(&host.moment, &announced, mode) {
+                    let _ = keys.send(Wake::Fact);
                 }
             });
         }
@@ -1210,6 +1241,14 @@ impl UserInterface for Tui {
                 // its own progress bar.
                 Wake::Host(HostEvent::Autonomy { session, running }) => {
                     stale |= took_autonomy(&self.host.moment, &session, running);
+                }
+                // How much the session may do without asking. Kept, not said:
+                // the mode is drawn on the status row, and a line of prose per
+                // change would put a sentence in the conversation for a badge
+                // that already says it — a person's own Shift+Tab would read as
+                // news.
+                Wake::Host(HostEvent::ModeChanged { session, mode }) => {
+                    stale |= took_mode(&self.host.moment, &session, Some(mode));
                 }
                 // The turn finished; the log did not get it. Said loudly and
                 // at once: the log is the session's only authority
@@ -1759,6 +1798,21 @@ impl UserInterface for Tui {
                         && press.mods == crate::surface::Mods::NONE
                         && self.host.focus_team() =>
                 {
+                    stale = true;
+                }
+                // Shift+Tab steps the execution mode on, and plain Tab too where
+                // `ui.mode_switch_key = "tab"` says so — the phone, where
+                // Shift+Tab is undeliverable. Above the composer's own keys
+                // because it is *not* one: which key it is depends on a live
+                // setting, so it cannot be a row in the keymap.
+                //
+                // After the two arms above, deliberately. Plain Tab is already
+                // the completion menu's and the team panel's, and both of those
+                // are about a list that is up or a panel that was opened on
+                // purpose; the mode is not, so it yields to them. Shift+Tab is
+                // nobody else's, which is why it is the default.
+                Wake::Input(Input::Key(press)) if self.is_mode_cycle_key(press) => {
+                    quit = self.cycle_mode();
                     stale = true;
                 }
                 Wake::Input(Input::Key(press)) => {
@@ -2952,10 +3006,16 @@ impl Tui {
                     .as_ref()
                     .and_then(|d| d.model.clone())
                     .unwrap_or_default();
+                // The thinking level, on the same terms as the window and the
+                // model: it is the agent's, and the row draws it beside the
+                // model the way tuix does (`glm-5 [high]`).
+                let effort = described.as_ref().and_then(|d| d.reasoning_effort);
                 let mut moment = self.host.moment.write().expect("moment poisoned");
-                let changed = moment.ctx_window != window || moment.model != model;
+                let changed =
+                    moment.ctx_window != window || moment.model != model || moment.effort != effort;
                 moment.ctx_window = window;
                 moment.model = model;
+                moment.effort = effort;
                 changed
             }
             AgentEvent::Accepted { command, .. } => {
@@ -3163,6 +3223,57 @@ impl Tui {
                 refused: true,
             }),
         );
+    }
+
+    /// Whether this press steps the execution mode on.
+    ///
+    /// The rule, ported from the reference front end so neither loses the
+    /// gesture: `BackTab` (how most terminals encode Shift+Tab) and `Tab+SHIFT`
+    /// (how a few do) always cycle; plain `Tab` cycles too when
+    /// `ui.mode_switch_key = "tab"`, the phone's setting, where Shift+Tab
+    /// cannot be sent at all. Ctrl/Alt/Cmd+Tab never cycle — those are the
+    /// terminal's own chords, and a UI that swallowed them would be eating keys
+    /// that were never meant for it.
+    ///
+    /// Plain Tab additionally yields to the completion menu and the team panel,
+    /// which is the caller's business, not this predicate's: both of those are
+    /// about a list that is up, and this only answers "is this the mode key".
+    fn is_mode_cycle_key(&self, press: crate::surface::KeyPress) -> bool {
+        use crate::surface::Key;
+        // Only bare or Shift-modified chords qualify.
+        if press.mods.ctrl || press.mods.alt || press.mods.cmd {
+            return false;
+        }
+        if press.key == Key::BackTab || (press.key == Key::Tab && press.mods.shift) {
+            return true;
+        }
+        press.key == Key::Tab && !press.mods.shift && self.host.mode_switch_on_tab()
+    }
+
+    /// Step the execution mode on to the next one, the way Shift+Tab does.
+    ///
+    /// The mode is asked of the screen's own state rather than tracked a second
+    /// time: what the host last pushed is the truth, and a counter here would be
+    /// a second answer that could disagree after a `/mode` typed at another
+    /// front end.
+    ///
+    /// The change goes out as the command a person would type, so the key, the
+    /// word and `/mode` are one implementation. `deliver` reads the command's
+    /// own line back, which is also how the person is told what happened — the
+    /// same sentence `/mode` prints.
+    fn cycle_mode(&self) -> bool {
+        // A mode the host has not reported cannot be stepped from: the next one
+        // is the *following* mode, and guessing `ask` as the starting point would
+        // cycle into `accept edits` on a screen whose session might be `auto`.
+        // Nothing happens instead, which is the honest answer — and the update
+        // that carries the mode is already on its way (`HostCommand::Mode` asked
+        // at startup, `ModeChanged` after).
+        let Some(mode) = self.host.moment.read().expect("moment poisoned").mode else {
+            return false;
+        };
+        let line = format!("/mode {}", crate::commands::mode_word(mode.next()));
+        self.run_command(&line);
+        false
     }
 
     /// Apply one action. Returns `true` to quit.
@@ -3551,6 +3662,12 @@ impl Tui {
                 drop(m);
                 self.switch_to(&session);
                 return false;
+            }
+            // The cycle key's action, so a modal or a command that asks for the
+            // same step lands in the same place the key does.
+            Action::CycleMode => {
+                drop(m);
+                return self.cycle_mode();
             }
 
             Action::SelectFrom(x, y) => {
@@ -4274,6 +4391,31 @@ pub fn took_autonomy(
         return false;
     }
     m.autonomy = running;
+    true
+}
+
+/// Take the host's word for how much this session may do without asking.
+///
+/// [`took_autonomy`]'s twin, and split out for the same reason: the loop it is
+/// called from cannot be reached from a criterion, and "did the screen keep
+/// what the host pushed" is exactly the thing worth asserting. Returns whether
+/// anything moved.
+///
+/// News about a session nobody is looking at is dropped on the same terms: a
+/// member switching its own mode must not relabel the lead's status row.
+pub fn took_mode(
+    moment: &std::sync::RwLock<crate::moment::Moment>,
+    session: &str,
+    mode: Option<atomcode_host_api::Mode>,
+) -> bool {
+    let mut m = moment.write().expect("moment poisoned");
+    if m.viewing != session && m.lead != session {
+        return false;
+    }
+    if m.mode == mode {
+        return false;
+    }
+    m.mode = mode;
     true
 }
 

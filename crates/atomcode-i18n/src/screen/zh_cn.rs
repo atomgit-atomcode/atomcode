@@ -256,6 +256,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
              上/下 在输入里移动游标,到头则翻历史 · 点击输入框定位游标\n\
              pgup/pgdn 与滚轮滚动对话\n\
              ctrl-r 思考(一行/全文/收起,循环) · ctrl-t 工具输出(全部/单个摘要/成组摘要,循环) · ctrl-l 重画屏幕\n\
+             shift+tab 切下一个执行模式(plan/ask/edits/auto;没有补全菜单时) · /config 里 ui.mode_switch_key=tab 可改用 tab 切、tab 则只用于补全\n\
              /showinject [名字] 环境注入(默认不显示;不带名字则全部,all 含同伴报告)\n\
              拖动选中并复制 · esc 取消选中 · 点击思考或工具调用折叠展开那一个\n\
              ctrl-o 把鼠标交还终端(改用终端自己的框选)".into(),
