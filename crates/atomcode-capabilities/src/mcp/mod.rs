@@ -14,6 +14,20 @@
 //! own a coding session transition or decide when discovered tools become visible.
 //! The embedding runtime may connect in the background and atomically publish a new
 //! per-turn tool catalog; non-interactive surfaces may instead await readiness.
+//!
+//! # Panic discipline (trust boundary)
+//! An MCP server is an EXTERNAL process (a stdio child / a remote HTTP peer) whose
+//! output AtomCode does not control. Production code in this module must turn every
+//! malformed input (illegal JSON-RPC, unexpected schema, non-JSON stdout, binary
+//! noise) into a RECOVERABLE `Result` error, NEVER a panic — the release profile is
+//! `panic = "abort"`, so a single `unwrap()` on a bad server response would abort the
+//! whole session instead of degrading (mark the server `Failed`, keep the session
+//! alive). The lint below denies `unwrap`/`expect`/`panic!` in production to lock that
+//! in against regressions; `#[cfg(test)]` code keeps them for assertions.
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
 
 use std::sync::Arc;
 use std::time::Duration;
