@@ -851,6 +851,87 @@ pub fn captioned_rule(caption: &str, w: usize, rule_style: Style, text_style: St
     ])
 }
 
+/// A rule with a caption at the left shoulder and a name on a pill at the right,
+/// the way `atomcode-tuix` lays the composer's top rule: where in the history
+/// the field is being browsed reads on the left, and the session's name rides a
+/// reverse-video pill on the right. Either may be absent, and with neither this
+/// is a bare rule.
+///
+/// It degrades toward the boundary, not away from it: the left caption is
+/// dropped whole when it will not fit its margin, and the name is truncated to
+/// what is left after the left caption plus a minimum run of rule between the
+/// two — and dropped entirely if even that does not fit. So a narrow terminal
+/// loses the words before it loses the line, and loses the name (the thing the
+/// title bar also carries) before the history position (the thing nothing else
+/// says).
+pub fn flanked_rule(
+    left: Option<&str>,
+    name: Option<&str>,
+    w: usize,
+    rule_style: Style,
+    text_style: Style,
+    pill_style: Style,
+) -> Line {
+    // Mirrors the tuix budget: a 2-cell margin at each edge, a 2-cell gap
+    // between the shoulders, the name padded a space each side on its pill, and
+    // at least 8 cells of rule to the pill's left so it never abuts the caption.
+    const MARGIN: usize = 2;
+    const GAP: usize = 2;
+    const PILL_PAD: usize = 2;
+    const MIN_RULE: usize = 8;
+
+    let left_text = left
+        .map(|c| format!(" {} ", c.trim()))
+        .filter(|t| MARGIN + width::str_width(t) + GAP <= w);
+    let left_w = left_text.as_ref().map_or(0, |t| width::str_width(t));
+    let left_end = if left_w > 0 { MARGIN + left_w } else { 0 };
+
+    let pill = name.filter(|n| !n.is_empty()).and_then(|n| {
+        let min_rule_left = MIN_RULE.max(left_end + GAP);
+        let chrome = MARGIN + PILL_PAD + min_rule_left;
+        if w <= chrome {
+            return None;
+        }
+        let max_name = w - chrome;
+        let shown = if width::str_width(n) <= max_name {
+            n.to_string()
+        } else if max_name <= 1 {
+            "…".to_string()
+        } else {
+            format!("{}…", width::take_width(n, max_name - 1))
+        };
+        let text = format!(" {shown} ");
+        let pw = width::str_width(&text);
+        Some((w.saturating_sub(MARGIN + pw), text))
+    });
+
+    // Assemble left to right, filling the space between the shoulders with rule.
+    let mut spans: Vec<Span> = Vec::new();
+    let mut col = 0usize;
+    let place = |spans: &mut Vec<Span>, col: &mut usize, at: usize, text: String, style: Style| {
+        if at > *col {
+            spans.push(Span::styled("─".repeat(at - *col), rule_style));
+            *col = at;
+        }
+        *col += width::str_width(&text);
+        spans.push(Span::styled(text, style));
+    };
+    if let Some(text) = left_text {
+        place(&mut spans, &mut col, MARGIN, text, text_style);
+    }
+    if let Some((start, text)) = pill {
+        // The name budget already keeps the pill clear of the caption; this only
+        // guards a future tweak from splicing it over what was placed.
+        if start >= col {
+            place(&mut spans, &mut col, start, text, pill_style);
+        }
+    }
+    if col < w {
+        spans.push(Span::styled("─".repeat(w - col), rule_style));
+    }
+    Line::from_spans(spans)
+}
+
 pub fn rule(left: char, right: char, caption: Option<&str>, w: usize) -> Line {
     if w < 2 {
         return Line::styled("─".repeat(w), edge());
@@ -984,6 +1065,32 @@ mod tests {
         for line in el.lay(20) {
             assert_eq!(line.width(), 20, "{:?}", line.plain());
         }
+    }
+
+    #[test]
+    fn a_flanked_rule_puts_the_history_left_and_the_name_right() {
+        let s = Style::new();
+        let line = flanked_rule(Some("历史 1/3"), Some("修解析器"), 40, s, s, s);
+        let row = line.plain();
+        assert_eq!(width::str_width(&row), 40, "fills the width: {row:?}");
+        let left = row.find("1/3").expect("history on the rule");
+        let right = row.find("修解析器").expect("name on the rule");
+        assert!(left < right, "history left of name: {row:?}");
+        // The name ends a 2-cell margin in from the right edge.
+        assert!(row.trim_end_matches('─').ends_with("修解析器 "), "{row:?}");
+
+        // Name alone still rides the right shoulder.
+        let named = flanked_rule(None, Some("修解析器"), 40, s, s, s).plain();
+        assert!(named.contains("修解析器") && !named.contains("历史"), "{named:?}");
+
+        // Neither fits: a bare full-width rule, no half-words.
+        let narrow = flanked_rule(Some("历史 1/3"), Some("修解析器"), 12, s, s, s).plain();
+        assert_eq!(narrow, "─".repeat(12), "{narrow:?}");
+
+        // A name too long for its budget truncates with an ellipsis, never spills.
+        let long = flanked_rule(None, Some("一个特别特别长的会话名字确实很长"), 24, s, s, s).plain();
+        assert_eq!(width::str_width(&long), 24, "{long:?}");
+        assert!(long.contains('…'), "truncated, not dropped: {long:?}");
     }
 
     // ---- the block-level pass (moved here with `Region`) ----------------

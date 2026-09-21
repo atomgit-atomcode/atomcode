@@ -1569,15 +1569,20 @@ impl Host {
 
     /// Let this conversation say its first word, if any producer will.
     ///
-    /// **Only when the stream is empty**, and that is the whole test for "a new
-    /// session": a resumed one has its history folded in by `Tui::run` before this
-    /// is called, so its stream is not empty and it opens with nothing. A separate
-    /// "is this new?" flag would be a second source of truth for one fact.
+    /// **Only when the stream is empty**, and that is the whole test for "opens
+    /// its top": a fresh session is empty, and a resumed one is empty too *at the
+    /// moment this is asked* — `Tui::run` asks the instant the session has been
+    /// described but before its history has begun to fold in (the stream is
+    /// append-ordered, so the welcome has to be emitted first to sit first). A
+    /// separate "is this new?" flag would be a second source of truth for one
+    /// fact.
     ///
     /// **It does not go through `absorb`.** That path stands for a committed fact
     /// in the log, and what this synthesises is a way of opening, not a fact:
     /// going through it would write to `SessionLog` and be replayed on resume. So
-    /// it writes the stream directly — the one place in this crate that does.
+    /// it writes the stream directly — the one place in this crate that does. A
+    /// resumed conversation therefore folds a log that never had the welcome, and
+    /// this re-emits it on top per view.
     ///
     /// The first producer with something to say wins and the loop stops: the rule
     /// is "when the stream is empty", and once it has spoken the stream is not.

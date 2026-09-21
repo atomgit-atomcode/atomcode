@@ -940,19 +940,20 @@ impl UserInterface for Tui {
         }
 
         // Whether the conversation still owes its first word. Answered in the
-        // loop below rather than here, and the reason is the whole of it:
-        // `open_conversation` opens **only when the stream is empty**, and a
-        // resumed session's history no longer arrives before this point. It comes
-        // as facts over the subscription just sent (`follow` above), which means
-        // that asking now would find every session empty and put a welcome block
-        // in front of every resumed conversation.
+        // loop below rather than here, because the welcome names the session's
+        // model, which arrives asynchronously as the `Described` off the
+        // subscription just sent (`follow` above) — there is nothing to say yet
+        // at this point.
         //
-        // So the question is asked at the first moment the answer means anything:
-        // the loop about to paint with nothing left in the queue. The ordering
-        // that makes that sound is the feed's (`harness/src/feed.rs`): on
-        // `Subscribe` it sends `Described`, then the status, the members, and
-        // then every fact from `from` on — so a description in hand plus a
-        // drained queue is exactly "the history, if any, is already folded".
+        // The stream is emission-ordered (`block.rs`: positions are assigned on
+        // open and never move), so the welcome sits on top only by being emitted
+        // before any history. The feed's order (`harness/src/feed.rs`) makes that
+        // reachable: on `Subscribe` it sends `Described` first, then the status,
+        // the members, and only then the facts, one wake at a time. So the loop
+        // emits the welcome the moment `described()` first answers — into a
+        // still-empty stream — and the backfill folds in beneath it over the
+        // wakes that follow. Waiting for a drained queue instead would fold the
+        // history first and leave the welcome stranded at the bottom.
         let mut owes_opening = true;
 
         // Input comes from the surface when it has its own — that is what a
@@ -1058,11 +1059,18 @@ impl UserInterface for Tui {
             // new session has no facts, so nothing else would mark the screen
             // stale and the welcome would wait for a frame that never comes.
             //
-            // Only with the queue actually drained: `described()` says the
-            // subscription has been answered, and an empty queue says its
-            // backfill — a resumed session's whole history — is already folded.
+            // Asked the instant the session is described, **not** once the queue
+            // is drained. The stream is append-ordered (`block.rs`), so the
+            // welcome has to be emitted before the history to sit above it — and
+            // the feed's order makes that safe: on `Subscribe` it sends
+            // `Described` first and then, one wake at a time, the facts. So the
+            // turn after `described()` first answers, `open_conversation` finds a
+            // still-empty stream and lands the welcome on top; the backfill folds
+            // in below it over the wakes that follow. `described()` is reset by
+            // `follow` and re-answered per session, so a resume waits for the
+            // resumed session's own description rather than the outgoing one's.
             {
-                if owes_opening && wake.is_empty() {
+                if owes_opening {
                     if let Some(described) = client.described() {
                         let cwd = self
                             .host

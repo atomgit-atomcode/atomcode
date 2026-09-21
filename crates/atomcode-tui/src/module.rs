@@ -143,10 +143,11 @@ pub trait Producer: Send + Sync {
     fn reset(&self) {}
     /// Say something first, if this producer has anything to say.
     ///
-    /// Asked **only when the stream is empty** (`Host::open_conversation`), so it
-    /// does not need to know whether this is a new session — an empty stream is
-    /// that question's answer. The default is `None`, which is why the producers
-    /// that existed before this needed no change.
+    /// Asked **only when the stream is empty** (`Host::open_conversation`) — a
+    /// fresh session, or a resumed one at the instant it has been described but
+    /// before its history begins to fold in, so the opening sits on top. The
+    /// default is `None`, which is why the producers that existed before this
+    /// needed no change.
     ///
     /// The block it returns is emitted and settled at once: an opening has no
     /// stage at which it is still growing.

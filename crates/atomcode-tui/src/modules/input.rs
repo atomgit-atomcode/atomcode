@@ -21,30 +21,30 @@ pub struct State {
     pub spoke: bool,
 }
 
-/// What the upper rule says, or `None` for a bare one.
+/// What the rule says when a password is being asked, or `None` when it is the
+/// ordinary composer.
 ///
-/// The session's name, and where in the history the field is being browsed
-/// from. Nothing when there is neither: an unnamed session that nobody is
-/// arrowing through has nothing to say here, and a rule that always carries
-/// words is decoration.
+/// While a password is being asked the field is not the composer, so the rule
+/// says what the keys do now rather than where a draft came from — the draft is
+/// still in the buffer, and is not what is on the line. It is the one place the
+/// two ways out are written down: the prompt itself is the asking program's
+/// words and says nothing about esc. Centred, because it is one instruction
+/// about the whole field rather than two facts about its shoulders.
+fn secret_caption(moment: &crate::moment::Moment) -> Option<String> {
+    moment
+        .secret
+        .is_some()
+        .then(|| t(Msg::InputAnswerKeys).into_owned())
+}
+
+/// Where in the history the field is being browsed from, for the left shoulder
+/// of the rule — or `None` when nobody is arrowing through it, which is
+/// otherwise unanswerable from the screen (browsing looked exactly like having
+/// typed the same words yourself). 1-based and counted from the newest, the
+/// direction a person arrows: the first press is 1, not `history.len()`.
 ///
-/// A free function so it can be judged without a terminal — the interesting
-/// part is which of the four combinations says what.
-fn caption(moment: &crate::moment::Moment) -> Option<String> {
-    // While a password is being asked the field is not the composer, so the
-    // rule says what the keys do now rather than where a draft came from — the
-    // draft is still in the buffer, and is not what is on the line. It is the
-    // one place the two ways out are written down: the prompt itself is the
-    // asking program's words and says nothing about esc.
-    if moment.secret.is_some() {
-        return Some(t(Msg::InputAnswerKeys).into_owned());
-    }
-    // The session title is deliberately NOT shown above the field: it clutters
-    // the composer, and it lives in the terminal's own title bar instead. Only
-    // the history position rides the rule — and only while arrowing back through
-    // what was said, which is otherwise unanswerable from the screen. 1-based and
-    // counted from the newest, the direction a person arrows: the first press is
-    // 1, not `history.len()`.
+/// A free function so it can be judged without a terminal.
+fn history_caption(moment: &crate::moment::Moment) -> Option<String> {
     let total = moment.history.len();
     moment.history_at.map(|at| {
         let nth = total.saturating_sub(at);
@@ -276,25 +276,37 @@ impl View for Input {
         .bold();
 
         let rule = || El::text(crate::el::plain_rule(w as usize, theme::fg(Role::Muted)));
-        // The upper rule carries what is true about the field right now: which
-        // session this is, and — while arrowing back — where in the history the
-        // text came from. Both were otherwise unanswerable from the screen: the
-        // session's name appeared nowhere, and browsing history looked exactly
-        // like having typed the same words yourself.
+        // The upper rule carries what is true about the field right now, laid on
+        // its two shoulders the way `atomcode-tuix` does it: the history position
+        // (while arrowing back) on the left, and the session's name on a pill on
+        // the right. Both were otherwise unanswerable from the screen — the name
+        // appeared nowhere but the terminal's title bar, and browsing history
+        // looked exactly like having typed the same words yourself.
         //
         // In the rule rather than on a row of its own, because it is only
         // sometimes there and a reserved row that is usually blank is a row of
-        // chrome. A caption that does not fit falls back to a bare rule
-        // (`captioned_rule`), so a narrow terminal loses the words, not the
-        // boundary.
-        let top = match caption(vp.moment) {
-            Some(caption) => El::text(crate::el::captioned_rule(
-                &caption,
-                w as usize,
-                theme::fg(Role::Muted),
-                theme::fg(Role::Muted),
-            )),
-            None => rule(),
+        // chrome. Each shoulder degrades to the bare rule when it will not fit,
+        // so a narrow terminal loses the words, not the boundary.
+        let muted = theme::fg(Role::Muted);
+        let top = if let Some(keys) = secret_caption(vp.moment) {
+            // A password: one centred instruction about the whole field, and no
+            // name pill — what is on the line is not this session's to label.
+            El::text(crate::el::captioned_rule(&keys, w as usize, muted, muted))
+        } else {
+            let history = history_caption(vp.moment);
+            let name = vp.moment.title.as_deref().filter(|s| !s.is_empty());
+            if history.is_none() && name.is_none() {
+                rule()
+            } else {
+                El::text(crate::el::flanked_rule(
+                    history.as_deref(),
+                    name,
+                    w as usize,
+                    muted,
+                    muted,
+                    theme::fg(Role::Border).reverse(),
+                ))
+            }
         };
         let mut rows: Vec<El> = vec![top];
 
@@ -402,39 +414,43 @@ mod tests {
             .collect()
     }
 
-    /// The upper rule says which session this is and, while arrowing back,
-    /// where the words came from.
+    /// The upper rule carries the history position on the left and the session's
+    /// name on the right, the way the reference does it.
     ///
-    /// Both were unanswerable from the screen before: the session's name
-    /// appeared nowhere at all, and browsing the history looked exactly like
-    /// having typed the same words again. Counted from the newest and 1-based,
-    /// because that is the direction a person arrows — the first press is 1.
+    /// Both were unanswerable from the screen before: the name appeared nowhere
+    /// but the terminal's title bar, and browsing the history looked exactly like
+    /// having typed the same words again. The history is counted from the newest
+    /// and 1-based, because that is the direction a person arrows — the first
+    /// press is 1.
     #[test]
-    fn the_upper_rule_says_where_in_the_history_but_never_the_title() {
+    fn the_upper_rule_carries_the_history_on_the_left_and_the_name_on_the_right() {
         let mut m = Moment::default();
-        assert_eq!(caption(&m), None, "nothing to say, so a bare rule");
+        assert_eq!(history_caption(&m), None, "nothing arrowed, no left caption");
 
-        // The session title never rides the composer rule any more — it lives in
-        // the terminal's title bar. A title alone leaves the rule bare.
+        // The name alone rides the right shoulder — a resumed or renamed session
+        // says which one it is even before anybody arrows the history.
         m.title = Some("修解析器".into());
-        assert_eq!(caption(&m), None, "the title is not shown above the field");
+        let named = draw(&State::default(), &m, 40, 3);
+        assert!(named[0].contains("修解析器"), "the name is on the rule:\n{named:?}");
 
         m.history = vec!["one".into(), "two".into(), "three".into()];
         m.history_at = Some(2); // the first press back: the newest entry
-        assert_eq!(caption(&m).as_deref(), Some("历史 1/3"));
+        assert_eq!(history_caption(&m).as_deref(), Some("历史 1/3"));
         m.history_at = Some(0); // the oldest
-        assert_eq!(caption(&m).as_deref(), Some("历史 3/3"));
+        assert_eq!(history_caption(&m).as_deref(), Some("历史 3/3"));
 
-        // And it reaches the rule, rather than only the function — with the title
-        // absent even when one is set.
+        // Both reach the rule, and the history sits to the left of the name.
         let out = draw(&State::default(), &m, 40, 3);
-        assert!(
-            out[0].contains("3/3") && !out[0].contains("修解析器"),
-            "{out:?}"
-        );
-        // Too narrow for the words: the boundary survives, the caption goes.
+        let left = out[0].find("3/3").expect("the history position");
+        let right = out[0].find("修解析器").expect("the session name");
+        assert!(left < right, "history on the left, name on the right:\n{out:?}");
+
+        // Too narrow for either shoulder: the boundary survives, the words go.
         let narrow = draw(&State::default(), &m, 12, 3);
-        assert!(!narrow[0].contains("历史"), "{narrow:?}");
+        assert!(
+            !narrow[0].contains("历史") && !narrow[0].contains("修"),
+            "{narrow:?}"
+        );
         assert_eq!(
             narrow[0].chars().count(),
             12,

@@ -650,12 +650,11 @@ async fn a_ctrl_c_is_disarmed_by_other_input() {
 }
 
 #[tokio::test]
-async fn a_resumed_session_does_not_open_with_a_welcome() {
-    // The judgement behind "the stream is empty is the whole test for a new
-    // session", and the reason `open_conversation` runs **after** the history is
-    // folded in: a resumed conversation already has its log in the stream, so
-    // nothing opens it. The other order would put a welcome block in front of
-    // every resumed conversation, every time.
+async fn a_resumed_session_opens_with_a_welcome_above_its_history() {
+    // The welcome rides the top of a resumed conversation, not only a fresh one.
+    // The stream is emission-ordered, so it sits on top by being emitted first:
+    // the loop opens the moment the session is described — before the backfill
+    // folds in — and the history then lands beneath it.
     let home = scratch("welcome-resume-home");
     let root = scratch("welcome-resume-work");
     let id = "welcomed-once";
@@ -694,15 +693,13 @@ async fn a_resumed_session_does_not_open_with_a_welcome() {
         "the resumed screen shows the history:\n{screen}"
     );
 
-    // **A resumed session has no welcome at all — not even the first one's.**
+    // **A resumed session opens with the welcome, once, at the top.**
     //
-    // That is a consequence of the design, not an accident, and it is worth stating
-    // where a reader will meet it: the block is deliberately **not** a logged fact
-    // (`open_conversation` writes the stream directly, so that a resume does not
-    // replay it and persistence does not record it as something the session said).
-    // So a resumed conversation folds a log that never had it. The alternative —
-    // logging it — would put a "fact" in the log that the model never saw and that
-    // a compaction would have to account for.
+    // The block is still deliberately **not** a logged fact (`open_conversation`
+    // writes the stream directly, so a resume does not replay it and persistence
+    // does not record it as something the session said). So a resumed
+    // conversation folds a log that never had it, and this re-emits it on top per
+    // view — exactly once, above the history.
     for _ in 0..40 {
         s.term
             .pointer(atomcode_tui::surface::Click::WheelUp, 10, 10);
@@ -711,13 +708,16 @@ async fn a_resumed_session_does_not_open_with_a_welcome() {
     let top = s.screen();
     assert_eq!(
         top.matches("上手提示").count(),
-        0,
-        "a resumed session must not open again, and its opening was never a log \
-         fact to begin with:\n{top}"
+        1,
+        "a resumed session opens with the welcome, and only once:\n{top}"
     );
+    let heading = top.find("上手提示").expect("the welcome heading");
+    let history = top
+        .find("remember the number 42")
+        .expect("the history is still all there");
     assert!(
-        top.contains("remember the number 42"),
-        "and the history is still all there:\n{top}"
+        heading < history,
+        "the welcome sits above the history it opened:\n{top}"
     );
 
     s.term.press(KeyPress::ctrl('d'));
