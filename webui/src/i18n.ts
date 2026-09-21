@@ -339,6 +339,7 @@ const zh = {
   'perm.deny': '拒绝',
   'perm.approve': '批准',
   'perm.alwaysAllow': '本会话总是允许',
+  'perm.allowAllBash': '本会话允许所有 Bash（含破坏性）',
   'perm.allowPersist': '永久允许此工具',
 
   // User input card
@@ -756,6 +757,7 @@ const en: Record<MsgKey, string> = {
   'perm.deny': 'Deny',
   'perm.approve': 'Approve',
   'perm.alwaysAllow': 'Always allow this session',
+  'perm.allowAllBash': 'Allow ALL Bash this session (incl. destructive)',
   'perm.allowPersist': 'Always allow this tool',
 
   // User input card

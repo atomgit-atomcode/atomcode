@@ -720,6 +720,28 @@ impl ApprovalPolicy for Asker {
             Some(store) => store.is_granted(&key),
             None => self.granted.lock().expect("grants poisoned").contains(&key),
         };
+        // The session-wide "allow all bash" blanket, offered and honoured on this
+        // driver path too (daemon / ACP / webui). `allow_all_group` is `None` for a
+        // sensitive target, so the blanket is never offered for — nor able to cover —
+        // the floor. Kept in the SAME store as the per-key grants (the host's
+        // `GrantsSvc` when present, so it survives an undo rebuild the way per-key
+        // grants do), under a reserved `{group}::*` key that no `{tool}::{scope}`
+        // grant can collide with. Same shape as `policy_rows::AskingPolicy`.
+        let group = tool.allow_all_group(&call.arguments);
+        if let Some(g) = &group {
+            let blanket = format!("{g}::*");
+            let granted = match &kept {
+                Some(store) => store.is_granted(&blanket),
+                None => self
+                    .granted
+                    .lock()
+                    .expect("grants poisoned")
+                    .contains(&blanket),
+            };
+            if granted {
+                return Decision::Allow;
+            }
+        }
         if grantable && remembered {
             return Decision::Allow;
         }
@@ -728,11 +750,7 @@ impl ApprovalPolicy for Asker {
             &call.arguments,
             grantable.then_some(scope.as_str()),
             crate::agent::current_member_name(&self.ctx),
-            // The session-wide "allow all bash" blanket is wired on the in-process
-            // (`AskingPolicy`) path the new TUI uses; the driver/handle path here
-            // (daemon / ACP / webui) keeps the three answers until it grows the same
-            // shared sentinel store. Not offered rather than offered-and-ignored.
-            None,
+            group.as_deref(),
         );
         // Written down around the round-trip, not instead of it: what goes over
         // the wire stays the driver's own `ApprovalRequest`/`PermissionDecision`
@@ -751,6 +769,10 @@ impl ApprovalPolicy for Asker {
             // is a plain approval — a gate that re-confirms despite a session
             // grant is the one with something to explain — so there is none.
             reason: None,
+            // Whether the driver may show the fourth "allow all bash" button for
+            // this call. `Some` group ⇔ a non-sensitive bash; a sensitive one is
+            // `None` here, so the floor is drawn before the wire, not on it.
+            allow_all_bash: group.is_some(),
         };
         let answer = self
             .request(
@@ -761,17 +783,26 @@ impl ApprovalPolicy for Asker {
         // A missing answer parses as deny, which is the point: `from_value`
         // fails closed on `Null`.
         let decision = PermissionDecision::from_value(&answer.unwrap_or(Value::Null));
+        // A blanket is only a blanket when it was offered (`group` is `Some`). An
+        // `AllowAlwaysAll` echoed for a call that never offered it — a sensitive
+        // target, or any non-bash tool — is NOT quietly downgraded to a per-tool
+        // "always"; it is a refusal, the way `AskingPolicy` treats an unoffered
+        // answer. Consent is only ever the words that were offered for it.
+        let blanket = match (decision, &group) {
+            (PermissionDecision::AllowAlwaysAll, Some(g)) => Some(g.clone()),
+            _ => None,
+        };
         let value = match decision {
             PermissionDecision::AllowOnce => crate::seams::ANSWER_ALLOW,
-            // A "yes, and every one like it" is an `always` as far as the record
-            // goes: which scope it was granted for is the gate's business, and a
-            // second word for it here would be this row's vocabulary leaking
-            // into a log that outlives it. The allow-all sentinel is recorded by
-            // the bash gate that owns it, not by this generic round-trip.
-            PermissionDecision::AllowAlways | PermissionDecision::AllowAlwaysAll => {
-                crate::seams::ANSWER_ALWAYS
+            PermissionDecision::AllowAlwaysAll if blanket.is_some() => {
+                crate::seams::ANSWER_ALWAYS_ALL
             }
-            PermissionDecision::Deny => crate::seams::ANSWER_DENY,
+            // A per-key "yes, and every one like it".
+            PermissionDecision::AllowAlways => crate::seams::ANSWER_ALWAYS,
+            // Deny, or an unoffered blanket → a refusal.
+            PermissionDecision::AllowAlwaysAll | PermissionDecision::Deny => {
+                crate::seams::ANSWER_DENY
+            }
         };
         // The answer as a value the log can hold, not the decision: `allow` is
         // what the person chose, and what the policy makes of it is this row's
@@ -780,7 +811,21 @@ impl ApprovalPolicy for Asker {
         crate::agent::record_answered(&self.ctx, Some(value.to_string()));
         match decision {
             PermissionDecision::AllowOnce => Decision::Allow,
-            PermissionDecision::AllowAlways | PermissionDecision::AllowAlwaysAll => {
+            // The blanket: remember the GROUP under its reserved `{group}::*` key,
+            // not this one call's per-key scope, so every later non-sensitive call
+            // in the group runs without asking — in the same store as per-key grants.
+            PermissionDecision::AllowAlwaysAll if blanket.is_some() => {
+                let g = blanket.expect("checked is_some");
+                let bk = format!("{g}::*");
+                match &kept {
+                    Some(store) => store.grant(&bk),
+                    None => {
+                        self.granted.lock().expect("grants poisoned").insert(bk);
+                    }
+                }
+                Decision::Allow
+            }
+            PermissionDecision::AllowAlways => {
                 // An "always" for something un-grantable is honoured as an
                 // allow-once rather than refused: the person did say yes. It is
                 // simply not remembered, which is the whole meaning of
@@ -795,7 +840,8 @@ impl ApprovalPolicy for Asker {
                 }
                 Decision::Allow
             }
-            PermissionDecision::Deny => {
+            // Deny, or an unoffered blanket answer.
+            PermissionDecision::AllowAlwaysAll | PermissionDecision::Deny => {
                 Decision::Deny(format!("`{}` was not approved", tool.name()))
             }
         }

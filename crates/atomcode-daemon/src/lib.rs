@@ -3562,6 +3562,10 @@ pub enum ChatEvent {
         reason: String,
         call_id: String,
         arguments: String,
+        /// Whether the client may show the session-wide "allow all Bash" button
+        /// for this call. Omitted (false) for everything but a non-sensitive bash.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        allow_all_bash: bool,
     },
     /// The model asks the user a structured question. The browser answers through
     /// `/chat/user-input`, correlated by session and native request id.
@@ -4276,6 +4280,7 @@ impl ChatRuntimeProjector {
                     reason: "Requires approval".into(),
                     call_id: approval.call_id,
                     arguments: approval.args,
+                    allow_all_bash: approval.allow_all_bash,
                 }]
             }
             // Silent, cache-friendly tool-output folding is invisible transcript

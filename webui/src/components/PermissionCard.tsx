@@ -11,6 +11,10 @@ interface PermissionRequest {
   reason: string;
   call_id: string;
   arguments: unknown;
+  /** True only for a non-sensitive bash call: the backend says the session-wide
+   *  "allow all Bash (incl. destructive)" button may be offered. A sensitive
+   *  target leaves it false, so the floor is drawn server-side, not here. */
+  allow_all_bash?: boolean;
 }
 
 interface PermissionCardProps {
@@ -19,7 +23,7 @@ interface PermissionCardProps {
   /** Optional override for the decision action. When provided, replaces the
    *  default respondPermission call. Used by live-session approval (POST /live/permission)
    *  so the non-sync /chat path is unchanged. */
-  onDecide?: (decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist', toolName?: string) => Promise<void>;
+  onDecide?: (decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist' | 'allow_all_bash', toolName?: string) => Promise<void>;
 }
 
 function formatArgs(args: unknown): string {
@@ -43,7 +47,7 @@ export function PermissionCard({ req, onDone, onDecide }: PermissionCardProps) {
   const t = useT();
   const [loading, setLoading] = useState(false);
 
-  async function decide(decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist') {
+  async function decide(decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist' | 'allow_all_bash') {
     if (loading) return;
     setLoading(true);
     try {
@@ -91,6 +95,11 @@ export function PermissionCard({ req, onDone, onDecide }: PermissionCardProps) {
           <button class="btn" disabled={loading} onClick={() => decide('always_allow')}>
             {t('perm.alwaysAllow')}
           </button>
+          {req.allow_all_bash && (
+            <button class="btn btn-danger" disabled={loading} onClick={() => decide('allow_all_bash')}>
+              {t('perm.allowAllBash')}
+            </button>
+          )}
           {req.tool_name.startsWith('mcp__') && (
             <button class="btn" disabled={loading} onClick={() => decide('allow_persist')}>
               {t('perm.allowPersist')}

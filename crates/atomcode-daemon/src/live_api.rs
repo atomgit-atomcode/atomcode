@@ -524,7 +524,11 @@ pub(crate) async fn run_chat_turn_v2(
                 let response = match decision {
                     PermissionDecision::AllowOnce => ApprovalResponse::allow(),
                     PermissionDecision::AllowAlways => ApprovalResponse::allow_always(),
-                    _ => ApprovalResponse::deny(),
+                    // The session-wide blanket must re-encode as itself, not fall to
+                    // the `_ => deny` arm — otherwise "allow all Bash" becomes a denial
+                    // on the sync `/chat` path (the `/live` handler mirrors this).
+                    PermissionDecision::AllowAlwaysAll => ApprovalResponse::allow_all_bash(),
+                    PermissionDecision::Deny => ApprovalResponse::deny(),
                 };
                 let value = serde_json::to_value(response).unwrap_or(serde_json::Value::Null);
                 let _ = handle.respond(request.id, value).await;
@@ -752,6 +756,10 @@ pub(crate) enum LiveWireEvent {
         reason: String,
         call_id: String,
         arguments: String,
+        /// Whether the client may show the session-wide "allow all Bash" button
+        /// for this call. Omitted (false) for everything but a non-sensitive bash.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        allow_all_bash: bool,
     },
     #[serde(rename = "user_input_request")]
     UserInputRequest {
@@ -985,6 +993,7 @@ impl NativeLiveWireProjector {
                         reason: "Requires approval".into(),
                         call_id: approval.call_id,
                         arguments: approval.args,
+                        allow_all_bash: approval.allow_all_bash,
                     }
                 } else if request.kind == REQUEST_USER_INPUT_KIND {
                     LiveWireEvent::UserInputRequest {
@@ -2294,7 +2303,10 @@ pub(crate) async fn live_permission(
         PermissionDecision::AllowAlways => {
             atomcode_capabilities::tools::ApprovalResponse::allow_always()
         }
-        _ => atomcode_capabilities::tools::ApprovalResponse::deny(),
+        PermissionDecision::AllowAlwaysAll => {
+            atomcode_capabilities::tools::ApprovalResponse::allow_all_bash()
+        }
+        PermissionDecision::Deny => atomcode_capabilities::tools::ApprovalResponse::deny(),
     };
     let value = serde_json::to_value(response).unwrap_or(serde_json::Value::Null);
     let ok = crate::native_live::respond_pending_kind_confirmed(
