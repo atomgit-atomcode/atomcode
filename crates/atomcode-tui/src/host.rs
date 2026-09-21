@@ -854,15 +854,18 @@ fn lids(
             // contributes no rows, so it does not end the run's tenure as the
             // newest thing on screen. `run_from` ended the run at `next`, so
             // everything from there on is what follows it.
+            // Live only while NOTHING non-hidden follows the run — decided by the
+            // block's EXISTENCE, not its current rendered height. Blocks only
+            // accumulate, so "a non-hidden block follows" is monotonic and the fold
+            // never flips back to live. The earlier `!lines(bare(1)).is_empty()`
+            // check read the *following* block's height each frame, which a
+            // streaming answer (and reasoning that is stripped and re-filled)
+            // toggles empty↔non-empty — flipping `live` true↔false and re-expanding
+            // an already-folded run every few frames: the tool-output flicker.
             let live = activity == crate::moment::Activity::Working
-                && !slots[next..].iter().any(|s| {
-                    let b = s.block();
-                    !pres.is_hidden(b.kind())
-                        && !b
-                            .content
-                            .lines(&crate::block::RenderCtx::bare(1))
-                            .is_empty()
-                });
+                && !slots[next..]
+                    .iter()
+                    .any(|s| !pres.is_hidden(s.block().kind()));
             let run = Run {
                 last: *members.last().expect("a run has a first member"),
                 count: members.len(),

@@ -150,7 +150,9 @@ impl View for Status {
         // shoving it off the edge. The phase comes from the injected tick, never
         // a clock (docs/adr/0008).
         let activity: Option<(String, Style)> = match vp.moment.activity {
-            Activity::Working => Some((working_indicator(vp.moment), theme::fg(Role::Warning))),
+            // The terminal's own foreground (white on dark), not warning yellow: a
+            // running turn is not a warning. `停止中` keeps the error red below.
+            Activity::Working => Some((working_indicator(vp.moment), theme::fg(Role::Secondary))),
             Activity::Stopping => {
                 Some((t(Msg::StatusStopping).into_owned(), theme::fg(Role::Error)))
             }

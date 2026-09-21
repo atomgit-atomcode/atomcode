@@ -36,13 +36,6 @@ fn bad() -> Style {
 fn ok() -> Style {
     Style::new().fg(Color::role(Role::Success))
 }
-/// Work in flight, and the one thing in a turn that is not a finished fact.
-///
-/// The same role `modules::live` colours the running turn with, so "still going"
-/// is one colour on one screen rather than two that have to be kept in step.
-fn warn() -> Style {
-    Style::new().fg(Color::role(Role::Warning))
-}
 /// A call that has receded behind a fold.
 ///
 /// The muted grey, so a folded line reads as scaffolding over the answer rather
@@ -678,7 +671,7 @@ pub struct ToolCallBlock {
 impl ToolCallBlock {
     fn mark(&self) -> (&'static str, Style) {
         match &self.outcome {
-            Outcome::Pending => ("⋯", warn()),
+            Outcome::Pending => ("⋯", tool()),
             Outcome::Ok(_) => ("✓", ok()),
             Outcome::Failed(_) => ("✗", bad()),
             Outcome::Interrupted => ("—", muted()),
@@ -687,17 +680,13 @@ impl ToolCallBlock {
 
     /// The colour the call's name is drawn in.
     ///
-    /// Uncoloured once the call is a fact about the past: it sits in a line that
-    /// already has a marker, so a colour here would be a second thing saying
-    /// what the marker says. While the call is *running* the whole head takes
-    /// [`Role::Warning`], the colour the live line uses for work in flight — so
-    /// which calls are still going is something the screen says, rather than
-    /// something the reader works out by comparing the clock to the last result.
+    /// The terminal's own foreground throughout — running or finished. It sits in
+    /// a line that already has a marker (`⋯`/`✓`/`✗`), so the marker says the
+    /// state and the name needs no second colour. Running work is NOT painted the
+    /// warning yellow: a call in flight is not a warning, and yellow read as one.
+    /// "In flight" is stated by the live line below and the `⋯` marker here.
     fn name_style(&self) -> Style {
-        match &self.outcome {
-            Outcome::Pending => warn(),
-            _ => tool(),
-        }
+        tool()
     }
 
     /// Whether this call failed. For the run lid, which shows the last call's
@@ -2701,32 +2690,38 @@ mod tests {
         assert_ne!(pending.content_hash(), done.content_hash());
     }
 
-    /// Work in flight is the one thing in a turn that is not a finished fact,
-    /// and the whole head says so: the mark *and* the tool's name take the
-    /// warning role, because a screen where only a dot changed colour is a
-    /// screen you have to squint at to answer "is anything still running".
+    /// A running call is NOT painted the warning yellow: a call in flight is not
+    /// a warning, and the yellow read as one. Its `⋯` mark and its name take the
+    /// terminal's own foreground; the `⋯` glyph and the live line below say "still
+    /// going". A finished call keeps its own mark colour (✓ green, ✗ red), and none
+    /// of the states borrow the warning role.
     ///
     /// The assertion is on the role, never on a colour: a test that named
-    /// `#ffcc00` would pass on a palette where yellow reads as red, and would
-    /// have to be edited the first time the theme moved.
+    /// `#ffcc00` would pass on a palette where yellow reads as red.
     #[test]
-    fn a_running_call_is_the_warning_colour_and_a_finished_one_is_not() {
+    fn a_running_call_is_not_painted_the_warning_colour() {
         let warn = Some(crate::frame::Color::role(Role::Warning));
 
         let running = ToolCallBlock::pending("c", "read_file", r#"{"file_path":"a.rs"}"#);
-        assert_eq!(running.mark().1.fg, warn, "{:?}", running.mark());
+        assert_ne!(
+            running.mark().1.fg,
+            warn,
+            "a running call is not a warning: {:?}",
+            running.mark()
+        );
+        assert_eq!(running.mark().0, "⋯", "the `⋯` glyph is what marks it in flight");
         let head = running.lines(&crate::block::RenderCtx::bare(60)).remove(0);
         let named = head
             .spans
             .iter()
             .find(|s| s.text.contains("ReadFile"))
             .expect("the tool's name");
-        assert_eq!(named.style.fg, warn, "the name is not in flight: {head:?}");
+        assert_ne!(
+            named.style.fg, warn,
+            "the running name is not the warning yellow: {head:?}"
+        );
 
-        // The other half: a call that has an answer is a fact about the past,
-        // and the successful and failed marks are their own colours rather than
-        // the warning one — otherwise everything is "in flight" and the colour
-        // stops meaning anything.
+        // A finished call's mark is its own colour, and never the warning one.
         for done in [
             Outcome::Ok("20 行".into()),
             Outcome::Failed("no such file".into()),
@@ -2735,16 +2730,6 @@ mod tests {
             let block =
                 ToolCallBlock::pending("c", "read_file", r#"{"file_path":"a.rs"}"#).with(done);
             assert_ne!(block.mark().1.fg, warn, "{:?}", block.mark());
-            let head = block.lines(&crate::block::RenderCtx::bare(60)).remove(0);
-            let named = head
-                .spans
-                .iter()
-                .find(|s| s.text.contains("ReadFile"))
-                .expect("the tool's name");
-            assert_ne!(
-                named.style.fg, warn,
-                "a settled call is still in flight: {head:?}"
-            );
         }
     }
 

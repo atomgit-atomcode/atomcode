@@ -422,7 +422,10 @@ fn short(ms: u64) -> String {
 fn style_of(moment: &Moment) -> Style {
     match moment.activity {
         Activity::Stopping => theme::fg(Role::Error),
-        _ => theme::fg(Role::Warning),
+        // Work in flight is the terminal's own foreground (white on a dark theme),
+        // not the warning yellow: a running turn is not a warning. Stopping stays
+        // the error red — that one IS a state worth the alarm colour.
+        _ => theme::fg(Role::Secondary),
     }
 }
 

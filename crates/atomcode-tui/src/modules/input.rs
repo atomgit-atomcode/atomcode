@@ -268,8 +268,11 @@ impl View for Input {
         if w == 0 || vp.rect.h == 0 {
             return Vec::new();
         }
+        // Idle: the accent, ready. Working: the terminal's own foreground (white
+        // on dark) — a running turn is not a warning, so it is no longer the
+        // warning yellow. The spinner and live line still say "busy".
         let arrow = theme::fg(if vp.moment.activity == Activity::Working {
-            Role::Warning
+            Role::Secondary
         } else {
             Role::Accent
         })
