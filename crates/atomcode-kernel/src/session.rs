@@ -308,6 +308,12 @@ pub enum SessionEvent {
     Titled {
         turn: u64,
         title: String,
+        /// The PERSON named it (via `/rename` / `/title`), rather than the runtime
+        /// auto-guessing from the first prompt. Drivers show a user-chosen name
+        /// more prominently (e.g. a pill on the composer). `#[serde(default)]` so a
+        /// v1 log without the field reads as an auto title.
+        #[serde(default)]
+        user_set: bool,
     },
     /// A rate limit paused the turn: it ended cleanly, and resets later.
     ///

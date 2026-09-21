@@ -95,6 +95,17 @@ pub trait HostConfig: Send + Sync {
         Vec::new()
     }
 
+    /// Make `model` the persisted default, so a `/model <id>` switch survives
+    /// the next start instead of being a runtime-only pin.
+    ///
+    /// The default is a no-op: a host with no file to write keeps the switch
+    /// live-only, which is the outcome those hosts already had. A host that
+    /// does keep a file overrides this to write the selection (`ConfigFile`).
+    fn set_default_model(&self, model: &str) -> Result<(), String> {
+        let _ = model;
+        Ok(())
+    }
+
     /// Who is signed in, when anybody is.
     ///
     /// `None` is the ordinary answer for a host that runs on a key in a file:
@@ -957,7 +968,21 @@ impl HostControl for RuntimeControl {
                     .expect("config poisoned")
                     .chat_options
                     .reasoning_effort;
-                self.reconfigure(next).await
+                let reply = self.reconfigure(next).await?;
+                // Persist the selection so it survives the next start. Without
+                // this the switch is runtime-only and the next launch resolves
+                // the stale `default_model` from the file (the "reverts to the
+                // old model on restart" bug). Best-effort: the live switch has
+                // already taken effect, so a write failure must not fail it.
+                if let Err(error) = source.set_default_model(&model) {
+                    tracing::warn!(
+                        target: "atomcode::model",
+                        %model,
+                        %error,
+                        "model switched for this run but could not be persisted",
+                    );
+                }
+                Ok(reply)
             }
             HostCommand::McpStatus { session } => {
                 self.addressed(&session)?;
@@ -1148,7 +1173,13 @@ impl HostControl for RuntimeControl {
                 atomcode_harness::session::commit(
                     agent.ctx(),
                     &log,
-                    atomcode_harness::session::SessionEvent::Titled { turn, title },
+                    // The person named it: `/rename` is an explicit choice, so the
+                    // driver may pin it (a composer pill) as user-chosen.
+                    atomcode_harness::session::SessionEvent::Titled {
+                        turn,
+                        title,
+                        user_set: true,
+                    },
                 );
                 Ok(HostReply::Done)
             }

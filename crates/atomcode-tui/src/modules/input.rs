@@ -294,7 +294,14 @@ impl View for Input {
             El::text(crate::el::captioned_rule(&keys, w as usize, muted, muted))
         } else {
             let history = history_caption(vp.moment);
-            let name = vp.moment.title.as_deref().filter(|s| !s.is_empty());
+            // Only a name the PERSON chose (`/rename`) earns the pill; an auto
+            // first-prompt guess would otherwise pin a chip to the composer for a
+            // name nobody asked for. The window title still carries any name.
+            let name = vp
+                .moment
+                .title
+                .as_deref()
+                .filter(|s| !s.is_empty() && vp.moment.title_user_set);
             if history.is_none() && name.is_none() {
                 rule()
             } else {
@@ -431,13 +438,22 @@ mod tests {
             "nothing arrowed, no left caption"
         );
 
-        // The name alone rides the right shoulder — a resumed or renamed session
-        // says which one it is even before anybody arrows the history.
+        // An AUTO-generated name (first-prompt guess) does NOT pin a pill to the
+        // composer: the rule stays bare until the person names the session.
         m.title = Some("修解析器".into());
+        m.title_user_set = false;
+        let auto = draw(&State::default(), &m, 40, 3);
+        assert!(
+            !auto[0].contains("修解析器"),
+            "an auto title must not show a name pill:\n{auto:?}"
+        );
+
+        // A name the PERSON gave (via /rename) rides the right shoulder.
+        m.title_user_set = true;
         let named = draw(&State::default(), &m, 40, 3);
         assert!(
             named[0].contains("修解析器"),
-            "the name is on the rule:\n{named:?}"
+            "a user-set name is on the rule:\n{named:?}"
         );
 
         m.history = vec!["one".into(), "two".into(), "three".into()];

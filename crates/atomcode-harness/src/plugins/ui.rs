@@ -342,6 +342,7 @@ impl Repl {
                         crate::session::SessionEvent::Titled {
                             turn: log.current_turn(),
                             title: name.to_string(),
+                            user_set: true,
                         },
                     );
                     eprintln!("\x1b[2m  renamed: {name}\x1b[0m");

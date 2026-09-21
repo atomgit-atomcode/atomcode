@@ -1165,6 +1165,7 @@ async fn a_fork_carries_the_parents_events_under_its_own_name() {
         SessionEvent::Titled {
             turn: 1,
             title: "the parent's name".into(),
+            user_set: false,
         },
     );
     assert_eq!(

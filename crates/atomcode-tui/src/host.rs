@@ -1686,9 +1686,15 @@ impl Host {
             SessionEvent::TurnEnd { .. } => {
                 self.moment.write().expect("moment poisoned").turn_started = None;
             }
-            // The newest wins, which is the whole rule the fact carries.
-            SessionEvent::Titled { title, .. } => {
-                self.moment.write().expect("moment poisoned").title = Some(title.clone());
+            // The newest wins, which is the whole rule the fact carries. The window
+            // title takes any name; the composer pill reads `user_set` to show only
+            // a name the person chose (`/rename`), not an auto first-prompt guess.
+            SessionEvent::Titled {
+                title, user_set, ..
+            } => {
+                let mut m = self.moment.write().expect("moment poisoned");
+                m.title = Some(title.clone());
+                m.title_user_set = *user_set;
             }
             _ => {}
         }
@@ -2302,6 +2308,21 @@ impl Host {
                 true
             }
         }
+    }
+
+    /// Open the providers panel on its 模型 list, opening it if it is not
+    /// already up. What `/model` lands on.
+    ///
+    /// Opening-if-closed rather than a toggle: `/model` means "show me the
+    /// models", never "hide them if they happen to be up". Returns false only
+    /// when there is nothing to draw the panel with — the same refusal
+    /// [`Self::toggle_providers`] gives — so the caller can say so.
+    pub fn open_providers_on_models(&self) -> bool {
+        if !self.providers_open() && !self.toggle_providers() {
+            return false;
+        }
+        self.show_providers_tab(crate::providers::Tab::Models);
+        true
     }
 
     /// Put the providers panel away. True when it was up.
@@ -4773,16 +4794,26 @@ mod tests {
         h.absorb(&SessionEvent::Titled {
             turn: 1,
             title: "修解析器".into(),
+            user_set: false,
         });
         assert_eq!(h.moment.read().unwrap().title.as_deref(), Some("修解析器"));
+        assert!(
+            !h.moment.read().unwrap().title_user_set,
+            "an auto title is not user-set"
+        );
         h.absorb(&SessionEvent::Titled {
             turn: 2,
             title: "重构配置".into(),
+            user_set: true,
         });
         assert_eq!(
             h.moment.read().unwrap().title.as_deref(),
             Some("重构配置"),
             "the newest wins"
+        );
+        assert!(
+            h.moment.read().unwrap().title_user_set,
+            "a /rename is user-set"
         );
     }
 

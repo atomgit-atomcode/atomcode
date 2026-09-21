@@ -210,6 +210,11 @@ pub struct Moment {
     /// whatever somebody typed — so it is read off the log rather than kept as
     /// a header field, and the newest wins. `None` until the session has one.
     pub title: Option<String>,
+    /// Whether [`title`](Self::title) was set by the PERSON (via `/rename` /
+    /// `/title`) rather than auto-generated from the first prompt. The window
+    /// title still carries any name; the name PILL on the input rule shows only a
+    /// user-chosen one, so an auto-guess does not pin a chip to the composer.
+    pub title_user_set: bool,
     pub scroll: ScrollPos,
     /// What the pointer has selected, if anything. Screen state, not a fact —
     /// which is exactly what this struct is for.

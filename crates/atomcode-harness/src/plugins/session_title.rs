@@ -336,9 +336,12 @@ impl Plugin for TitleOnFirstPromptPlugin {
                     crate::session::commit(
                         &agent_ctx,
                         &log,
+                        // Auto-guessed from the first prompt — not a name the person
+                        // chose, so drivers keep it out of any "user named this" chrome.
                         SessionEvent::Titled {
                             turn: log.current_turn(),
                             title,
+                            user_set: false,
                         },
                     );
                 });

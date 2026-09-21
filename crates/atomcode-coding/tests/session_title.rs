@@ -168,6 +168,7 @@ async fn a_name_the_person_gave_is_kept() {
         SessionEvent::Titled {
             turn: 0,
             title: "mine".into(),
+            user_set: true,
         },
     );
     run_turn(&app, "something else entirely").await.unwrap();
