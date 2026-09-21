@@ -276,17 +276,30 @@ impl Presentation {
     ///
     /// A hand fold (`by_block`) wins over everything: it is what a click said
     /// about *this* call.
+    /// Whether a finished tool call recedes to its one-row summary by default.
+    ///
+    /// The paint ([`tool_show`]) and the row count ([`is_block_folded`]) both
+    /// ask, through this one predicate, so the two cannot drift: a call measured
+    /// as one row and drawn as many is the ghost/overlap class of bug. Only the
+    /// default [`ToolOutput::Full`] view auto-folds; the compact modes decide for
+    /// every call themselves. A hand fold/unfold in `by_block` sits on top and is
+    /// checked by each caller first, so it is not consulted here.
+    ///
+    /// [`tool_show`]: Self::tool_show
+    /// [`is_block_folded`]: Self::is_block_folded
+    fn auto_folds(&self, id: BlockId) -> bool {
+        self.tool_output == ToolOutput::Full && self.auto_folded.contains(&id)
+    }
+
     fn tool_show(&self, id: BlockId) -> ToolShow {
         if self.by_block.get(&id).copied().unwrap_or(false) {
             return ToolShow::Folded;
         }
         // A finished call recedes to one summary row in the default view — unless
-        // the reader has spoken about it by hand (`by_block`, checked above and
-        // guarded here so a hand-opened call is not re-folded).
-        if !self.by_block.contains_key(&id)
-            && self.tool_output == ToolOutput::Full
-            && self.auto_folded.contains(&id)
-        {
+        // the reader has spoken about it by hand (`by_block`: `unwrap_or(false)`
+        // above returns only on a hand *fold*, so the guard here keeps a
+        // hand-*opened* call, present with `false`, from being re-folded).
+        if !self.by_block.contains_key(&id) && self.auto_folds(id) {
             return ToolShow::Folded;
         }
         match self.tool_output {
@@ -337,11 +350,8 @@ impl Presentation {
             return *folded;
         }
         // A finished call recedes to one row in the default view; a hand fold
-        // above already took precedence.
-        if kind == "tool_call"
-            && self.tool_output == ToolOutput::Full
-            && self.auto_folded.contains(&id)
-        {
+        // above already took precedence (`by_block.get` returns for any entry).
+        if kind == "tool_call" && self.auto_folds(id) {
             return true;
         }
         self.is_folded(kind)
@@ -427,16 +437,23 @@ impl Presentation {
         self.bump();
     }
 
-    /// Collapse a block by default — but only if the reader has not already said
-    /// something about it by hand. Used to fold a tool call the moment it
-    /// finishes: it was expanded while running (so its command was in view), and
-    /// once the result is in there is nothing to watch, so it recedes to one row.
-    /// A call the reader opened or closed themselves keeps their choice.
+    /// Collapse a block by default the moment a tool call finishes: it was
+    /// expanded while running (so its command was in view), and once the result
+    /// is in there is nothing to watch, so it recedes to one row.
+    ///
+    /// `auto_folded` is the *default* layer, distinct from `by_block`. A hand
+    /// fold/unfold sits on top and wins at paint time while it is present (both
+    /// [`tool_show`] and [`is_block_folded`] check `by_block` first). So the
+    /// finished call is recorded here regardless of what the reader has said by
+    /// hand: while their choice stands it is overruled, but once a mode cycle
+    /// clears `by_block` the call falls back to its one-row default rather than
+    /// springing open — the "a full cycle comes back to the same screen" property
+    /// that `auto_folded` exists to keep, held for hand-touched calls too.
+    ///
+    /// [`tool_show`]: Self::tool_show
+    /// [`is_block_folded`]: Self::is_block_folded
     pub fn fold_finished(&mut self, id: BlockId) {
-        // A hand fold/unfold wins: if the reader has already spoken about this
-        // call, leave it. Otherwise remember it as auto-folded — a separate set
-        // from `by_block` so it survives a mode change (see [`auto_folded`]).
-        if !self.by_block.contains_key(&id) && self.auto_folded.insert(id) {
+        if self.auto_folded.insert(id) {
             self.bump();
         }
     }
@@ -7909,6 +7926,38 @@ mod tests {
             done.iter()
                 .any(|r| r.contains("ReadFile(a.rs)") && r.contains("fn main")),
             "the summary carries the result:\n{done:#?}"
+        );
+    }
+
+    /// `auto_folded` is the *default* layer under the hand fold, so it survives a
+    /// mode cycle. A call the reader folds by hand while it runs must therefore
+    /// come back to its one-row default — not spring open — once a full
+    /// `Full → Head → Each → Group → Full` cycle has cleared the hand state. If
+    /// `fold_finished` skipped hand-touched calls the finished call would be in
+    /// neither `by_block` nor `auto_folded` after the cycle and draw expanded,
+    /// breaking the "a full cycle comes back to the same screen" invariant.
+    #[test]
+    fn a_hand_folded_finished_call_keeps_its_default_after_a_mode_cycle() {
+        let mut p = Presentation::default_folds();
+        let id = BlockId(7);
+
+        // Running: the reader folds it by hand, then it finishes.
+        p.set_block(id, true);
+        p.fold_finished(id);
+        assert!(
+            p.is_block_folded(id, "tool_call"),
+            "the hand fold folds it while it stands"
+        );
+
+        // A full cycle of the four tool-output modes, ending back at the default
+        // `Full`. The first step's `set_tool_output` clears `by_block`.
+        for _ in 0..4 {
+            p.toggle("tool_call");
+        }
+        assert_eq!(p.tool_output(), ToolOutput::Full, "back at the default view");
+        assert!(
+            p.is_block_folded(id, "tool_call"),
+            "the finished call falls back to its one-row default, not expanded"
         );
     }
 
