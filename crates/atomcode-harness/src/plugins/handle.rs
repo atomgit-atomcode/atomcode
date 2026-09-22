@@ -656,9 +656,24 @@ impl Asker {
         let (tx, rx) = oneshot::channel();
         // Whose turn is asking: a question is refused when that agent is
         // stopped, not when some other one is.
-        let asker = crate::agent::current()
+        let asking = crate::agent::current();
+        let asker = asking
+            .as_ref()
             .and_then(|ctx| ctx.service::<SessionSvc>())
             .map(|log| log.id().to_string());
+        // A turn that is being stopped does not get to ask. The sweep on
+        // `Stopping` (`mount_handle`) refuses the questions already waiting;
+        // one asked after it — a hook that finished after the stop, then the
+        // approval behind it — waited for an answer from a person who had
+        // already said stop, and the turn with it.
+        let stopping = asking.as_ref().zip(asker.as_deref()).and_then(|(ctx, session)| {
+            ctx.service::<crate::seams::AgentsSvc>()?
+                .by_session(session)
+                .map(|agent| agent.cancel_token())
+        });
+        if stopping.as_ref().is_some_and(|token| token.is_cancelled()) {
+            return None;
+        }
         self.pending
             .lock()
             .expect("pending poisoned")
@@ -680,14 +695,28 @@ impl Asker {
         }
         // Zero is "wait for the answer": a person at the terminal is not auto-denied
         // for stepping away, which is what a host with nobody bounded asks for.
-        let answered = if self.timeout.is_zero() {
-            Ok(rx.await)
-        } else {
-            tokio::time::timeout(self.timeout, rx).await
+        let wait = async {
+            if self.timeout.is_zero() {
+                rx.await.ok()
+            } else {
+                tokio::time::timeout(self.timeout, rx)
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+            }
+        };
+        // And a stop that lands while this waits ends the wait, including one
+        // that fired between the sweep and this question's arrival.
+        let answered = match stopping {
+            Some(token) => tokio::select! {
+                answered = wait => answered,
+                _ = token.cancelled() => None,
+            },
+            None => wait.await,
         };
         match answered {
-            Ok(Ok(value)) => Some(value),
-            _ => {
+            Some(value) => Some(value),
+            None => {
                 self.pending.lock().expect("pending poisoned").remove(&id);
                 None
             }
@@ -1018,9 +1047,11 @@ pub fn command_member(
             target.send_receipted(text, MessageOrigin::User, images, receipt.cloned());
             Ok(None)
         }
-        // Only its turn.
+        // Only its turn — and what was queued behind it, for the same reason
+        // as the lead's (`Agent::stand_down`).
         AgentCommand::Cancel => {
             let running = target.status() != crate::agent::AgentStatus::Idle;
+            let _ = target.stand_down();
             target.interrupt();
             if running {
                 Ok(Some(Some(target.session().current_turn())))
@@ -1233,6 +1264,8 @@ async fn pump(
         let command = match woke {
             Woke::TurnDone => {
                 turn = None;
+                // A stop held for the turn that just ended is not the next one's.
+                agent.settle_cancel();
                 for focus in std::mem::take(&mut compactions_waiting) {
                     compact(&ctx, &events, focus, &manual_compaction).await;
                 }
@@ -1336,13 +1369,33 @@ async fn pump(
                 continue;
             }
             AgentCommand::Cancel => {
+                // What was waiting behind the turn goes with it: left in the
+                // inbox, it opened the next turn the instant this one ended, and
+                // a person who pressed stop watched the agent carry on. That
+                // includes a message sent just before the stop that no turn has
+                // taken yet — enter then esc.
+                let withdrawn = agent.stand_down();
+                for command in &withdrawn.receipts {
+                    let _ = events.send(AgentEvent::Rejected {
+                        command: command.clone(),
+                        error: atomcode_kernel::event::CommandError::NotRunning,
+                    });
+                }
                 if turn.is_some() {
                     accept(Some(agent.session().current_turn()));
+                } else if withdrawn.messages > 0 {
+                    accept(None);
                 } else {
                     reject(atomcode_kernel::event::CommandError::NotRunning);
                 }
                 // The driver's cancel is a person's: the turn's end records it.
-                agent.interrupt();
+                // For the turn this pump started, whether or not it has opened
+                // yet — one spawned a moment ago still reads as idle.
+                if turn.is_some() {
+                    agent.interrupt_started();
+                } else {
+                    agent.interrupt();
+                }
                 // And release anything parked on an answer. Cancelling is
                 // cooperative: a tool blocked on an approval nobody will now
                 // give never reaches a point where it can observe the token,

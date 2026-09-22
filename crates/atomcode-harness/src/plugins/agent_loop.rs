@@ -381,6 +381,15 @@ impl PluginAgentLoop {
         // Opening the turn is what mints its cancellation token. Asking an
         // agent to stop must not outlive the turn it stopped.
         agent.begin_turn();
+        // Stopped before it opened, and what it would have answered went with
+        // the stop (`Agent::stand_down`): there is no turn to log.
+        if agent.cancelled() && !agent.inbox().has_waking_input() {
+            agent.end_turn();
+            return TurnOutcome {
+                stop: StopReason::Cancelled,
+                ..Default::default()
+            };
+        }
         let turn = session.next_turn();
         self.commit(&session, SessionEvent::TurnStart { turn });
         let mut outcome = TurnOutcome {

@@ -580,6 +580,132 @@ async fn a_cancelled_turn_ends_and_the_next_one_still_runs() {
     );
 }
 
+/// Everything the handle says for `window`, or until it goes quiet for good.
+async fn collect_for(handle: &mut AgentHandle, window: Duration) -> Vec<AgentEvent> {
+    let mut seen = Vec::new();
+    let deadline = tokio::time::Instant::now() + window;
+    while let Ok(Some(event)) = tokio::time::timeout_at(deadline, handle.events.recv()).await {
+        seen.push(event);
+    }
+    seen
+}
+
+/// A stop takes back what was queued behind the turn it stops.
+///
+/// A person who typed while the agent worked and then pressed stop used to
+/// watch it stop and start straight back up on what they had typed: the
+/// message sat in the inbox, and the end of the stopped turn is exactly when a
+/// waiting message opens the next one. The engine this replaced cleared its
+/// steer buffer on cancel, and front ends still drop their steering panel on
+/// that understanding.
+#[tokio::test]
+async fn a_stop_takes_back_what_was_waiting_behind_the_turn() {
+    let dir = scratch("stand-down");
+    // Parked on an approval: nothing the turn does can claim the second
+    // message before the stop lands, so what happens to it is the pump's doing
+    // alone.
+    let script = replay(
+        r#"{ text = "Writing.", calls = [ { name = "write_file", args = { file_path = "out.txt", content = "x" } } ] },
+           { text = "Answering what was typed." }"#,
+    );
+    let app = start(tree(&dir, &script, &[])).await;
+    let mut handle = handle_of(&app);
+
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "write it".into(),
+            images: Vec::new(),
+        })
+        .unwrap();
+    next_request(&mut handle).await;
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "and then this".into(),
+            images: Vec::new(),
+        })
+        .unwrap();
+    handle.commands.send(AgentCommand::Cancel).unwrap();
+
+    let stopped = drain_turn(&mut handle).await;
+    assert!(
+        matches!(
+            stopped.last(),
+            Some(AgentEvent::TurnComplete {
+                reason: StopReason::Cancelled,
+                ..
+            })
+        ),
+        "{:?}",
+        names(&stopped)
+    );
+    let after = collect_for(&mut handle, Duration::from_millis(500)).await;
+    assert!(
+        !names(&after).contains(&"TurnStarted"),
+        "the agent started again on what was queued before the stop: {:?}",
+        names(&after)
+    );
+    assert!(
+        !std::fs::exists(dir.join("out.txt")).unwrap(),
+        "the refused write must not have run"
+    );
+}
+
+/// A stop sent right behind a message stops the turn that message starts.
+///
+/// Enter then esc. The message lands in the inbox and the pump spawns a turn
+/// for it; the cancel arrives before that turn has opened — before the pump
+/// has even spawned it, as often as not. It used to be dropped either way (an
+/// idle agent has no turn to stop, and a turn opening mints a fresh token), and
+/// the turn ran in full while the driver had been told it was cancelled.
+#[tokio::test]
+async fn a_stop_right_behind_a_message_stops_that_message_s_turn() {
+    // Many tries, because which of the two windows it lands in is the
+    // scheduler's choice; either must stop the turn.
+    for attempt in 0..10 {
+        let dir = scratch(&format!("enter-esc-{attempt}"));
+        let script = replay(
+            r#"{ text = "Writing.", calls = [ { name = "write_file", args = { file_path = "out.txt", content = "x" } } ] },
+               { text = "Done." }"#,
+        );
+        let app = start(tree(&dir, &script, &[])).await;
+        let mut handle = handle_of(&app);
+
+        handle
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "write it".into(),
+                images: Vec::new(),
+            })
+            .unwrap();
+        handle.commands.send(AgentCommand::Cancel).unwrap();
+        handle.commands.send(AgentCommand::Snapshot).unwrap();
+
+        let seen = collect_for(&mut handle, Duration::from_millis(300)).await;
+        let said = names(&seen);
+        assert!(
+            !said.contains(&"Request"),
+            "attempt {attempt}: the stopped turn went on to ask for approval: {said:?}"
+        );
+        assert!(
+            !seen.iter().any(|e| matches!(
+                e,
+                AgentEvent::TurnComplete {
+                    reason: StopReason::Stopped,
+                    ..
+                }
+            )),
+            "attempt {attempt}: the turn ran to its end: {said:?}"
+        );
+        assert!(
+            said.contains(&"Snapshot"),
+            "attempt {attempt}: the snapshot behind the stop is owed an answer: {said:?}"
+        );
+        drop(app);
+    }
+}
+
 #[tokio::test]
 async fn shutdown_closes_the_stream_and_ends_the_task() {
     let dir = scratch("shutdown");

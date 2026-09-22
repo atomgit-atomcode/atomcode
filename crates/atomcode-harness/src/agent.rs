@@ -404,6 +404,16 @@ impl Claimed {
     }
 }
 
+/// What [`Agent::stand_down`] took out of the inbox.
+#[derive(Debug, Default)]
+pub struct StoodDown {
+    /// Messages that will no longer open a turn.
+    pub messages: usize,
+    /// The receipts their commands asked for. Each is owed an answer: no turn
+    /// will claim these messages now.
+    pub receipts: Vec<atomcode_kernel::event::CommandId>,
+}
+
 /// The single door into an agent.
 #[derive(Default)]
 pub struct Inbox {
@@ -517,6 +527,24 @@ impl Inbox {
         taken
     }
 
+    /// Take every message no turn has claimed yet, leaving injections alone.
+    ///
+    /// For a person's stop ([`Agent::stand_down`]): a message still waiting here
+    /// would open the next turn the moment the stopped one ends.
+    pub fn withdraw_messages(&self) -> Vec<InboxItem> {
+        let mut queue = self.queue.lock().expect("inbox poisoned");
+        let mut taken = Vec::new();
+        queue.retain(|item| {
+            if matches!(item, InboxItem::Message { .. }) {
+                taken.push(item.clone());
+                false
+            } else {
+                true
+            }
+        });
+        taken
+    }
+
     /// Is there a message waiting — something that should wake or extend a turn?
     /// Whether a message from `origin` is waiting.
     pub fn waiting_from(&self, origin: MessageOrigin) -> bool {
@@ -579,6 +607,11 @@ pub struct Agent {
     /// Set when the current turn was stopped by a person rather than by the
     /// harness (a reconfigure, a shutdown). Read once, at the turn's end.
     interrupted: std::sync::atomic::AtomicBool,
+    /// A person's stop for a turn its driver has already started but that has
+    /// not opened yet ([`Agent::interrupt_started`]). The next
+    /// [`begin_turn`](Agent::begin_turn) opens that turn already stopped; the
+    /// driver clears it once that turn is over ([`Agent::settle_cancel`]).
+    cancel_ahead: std::sync::atomic::AtomicBool,
     /// The pump driving this agent, while one is (`docs/adr/0023` §6). Weak: the
     /// agent must not keep its own pump alive — the pump stops when whoever
     /// drives the agent lets go of it.
@@ -806,6 +839,66 @@ impl Agent {
         self.cancel();
     }
 
+    /// [`interrupt`](Self::interrupt), from a driver that knows it has started
+    /// a turn: the stop holds for that turn even if it has not opened yet.
+    ///
+    /// Between a driver spawning a turn and the turn calling
+    /// [`begin_turn`](Self::begin_turn) the agent still reads as idle, so a plain
+    /// `interrupt` there fired the idle token that `begin_turn` then replaced —
+    /// and the turn ran to its end under a fresh one while the person watched
+    /// "stopping". Enter then esc lands in exactly that window.
+    pub fn interrupt_started(&self) {
+        self.cancel_ahead
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.interrupt();
+    }
+
+    /// The started turn is over: a stop held for it is not held against the
+    /// next one. The driver's call, because only the driver knows when the turn
+    /// it started — opened or not — is done.
+    pub fn settle_cancel(&self) {
+        self.cancel_ahead
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// What a person's stop does to what is waiting: nothing queued goes on to
+    /// open a turn of its own.
+    ///
+    /// Their own messages, and the harness's continuations and nudges, are
+    /// withdrawn — each would have started the next turn the instant the
+    /// stopped one ended, which is the agent carrying on after being told to
+    /// stop. (The engine this replaced cleared its steer buffer on cancel, and
+    /// front ends still clear their steering panel on the same understanding.)
+    /// A peer's report is kept, as a note for the next turn rather than a
+    /// reason to start one: it is information the person did not write and has
+    /// not seen.
+    pub fn stand_down(&self) -> StoodDown {
+        let mut stood = StoodDown::default();
+        for item in self.inbox.withdraw_messages() {
+            let InboxItem::Message {
+                text,
+                origin,
+                receipt,
+                ..
+            } = item
+            else {
+                continue;
+            };
+            stood.messages += 1;
+            stood.receipts.extend(receipt);
+            if let MessageOrigin::Peer(sender) = origin {
+                let from = self
+                    .ctx
+                    .service::<crate::seams::AgentsSvc>()
+                    .and_then(|agents| agents.get(sender))
+                    .map(|agent| agent.session_id().to_string())
+                    .unwrap_or_else(|| format!("agent-{sender}"));
+                self.note(text, InjectionOrigin::Peer { from });
+            }
+        }
+        stood
+    }
+
     /// Whether a person interrupted the turn now ending. Clears the mark.
     pub fn take_interrupted(&self) -> bool {
         self.interrupted
@@ -835,6 +928,14 @@ impl Agent {
         let fresh = CancellationToken::new();
         *self.cancel.write().expect("cancel token poisoned") = fresh.clone();
         self.set_status(AgentStatus::Working);
+        // Stopped before it opened: it opens stopped, and the person's stop is
+        // recorded as theirs.
+        if self
+            .cancel_ahead
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.interrupt();
+        }
         fresh
     }
 
@@ -989,6 +1090,7 @@ impl Agents {
             moving: Mutex::new(()),
             cancel: RwLock::new(CancellationToken::new()),
             interrupted: std::sync::atomic::AtomicBool::new(false),
+            cancel_ahead: std::sync::atomic::AtomicBool::new(false),
             commands: Mutex::new(None),
         });
         self.agents
