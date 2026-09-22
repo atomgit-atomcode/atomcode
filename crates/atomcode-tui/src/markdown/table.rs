@@ -1,52 +1,77 @@
-//! GFM tables, laid out as aligned columns.
+//! GFM tables, laid out as a full box grid.
 //!
-//! The layout *decisions* here are `atomcode-tuix`'s, ported: borderless columns
-//! with segmented rules rather than a box, and three tiers — the natural grid,
-//! a wrapped grid whose cells fold to shrunk column widths, and, when even that
-//! squeezes the values into unreadable strips, flat `header：value` records.
-//! Those rules were beaten out of real model output (pipeless tables, pre-drawn
-//! box-drawing tables, CJK that shifts every border after it), and this row is
-//! the same problem, so they are worth keeping.
+//! A table is drawn the way most readers expect one: an outer box, a vertical
+//! border between the columns, and a horizontal rule between every pair of rows
+//! (`┌┬┐ │…│ ├┼┤ └┴┘`). The header is told from the body by its bold text, not by
+//! a heavier rule. This replaces the earlier borderless form — segmented rules
+//! and no verticals — which rendered on more hosts but read as a list of
+//! dividers; the compatibility that form bought is kept by other means (below).
 //!
-//! The row rules are tuix's too: a heavy rule (`━`) under the header and a light
-//! rule (`─`) between every pair of body rows, each segmented per column. The
-//! two weights are what tell the header apart from the body — a light rule under
-//! the header, with light rules between the body rows as well, would read as one
-//! more body separator rather than the boundary it is.
+//! The column maths are `atomcode-tuix`'s, and so are the three tiers, which the
+//! box did not change: the **natural grid** at the columns' own widths; a
+//! **wrapped grid** whose cells fold to shrunk widths when the natural one is too
+//! wide (a tall cell makes a several-line row, the short columns blank on the
+//! lines they have run out of); and, when even that squeezes the values into
+//! unreadable strips, flat `header：value` records. Those tiers were beaten out of
+//! real model output (pipeless tables, pre-drawn box tables, CJK that shifts
+//! every border after it).
 //!
-//! What is not ported is the exit. tuix emits ANSI strings and therefore has to
-//! measure a cell by *re-parsing* it with a strip function that must mirror the
-//! renderer — a second parser that drifted, and the drift was a real reported
-//! misalignment. Here the exit is `Line`s of spans, so a cell's visible width
-//! and visible text both come from rendering it once. There is only one parser.
+//! **Compatibility, three ways.** A cell's visible width and text both come from
+//! rendering it once — one parser, unlike tuix's ANSI-plus-strip pair that
+//! drifted into a reported misalignment — so CJK columns line up. The box glyphs
+//! are all in the `ascii_for` downgrade table, so a non-Unicode terminal gets
+//! `+ | -` for free on the way out. And the fit budget reserves a slack cell per
+//! border ([`chrome_width`]) against the one width it cannot see: box glyphs are
+//! East Asian *Ambiguous*, so a CJK host may draw them two cells wide — the very
+//! error that first drove tuix to drop the box.
 //!
 //! Everything above [`render`] works on strings and widths only; the mapping to
-//! styles happens in the last step of each tier. That keeps the layout reusable
-//! if this ever moves to a shared crate.
+//! styles happens in the last step of each tier.
 
 use crate::frame::{Line, Span, Style};
 use crate::width;
 
-use super::{fence, heading, inline, wrap_spans, RULE};
+use super::{fence, heading, inline, wrap_spans};
 
-/// Cells are padded by one space on each side and columns separated by two.
-/// No vertical border glyph: hosts disagree about the width of East Asian
-/// Ambiguous box characters, and that error used to accumulate once per column
-/// until the row crossed the terminal edge.
+/// Cells are padded by one space on each side; columns and the table's edges are
+/// separated by a vertical border. The column maths are `atomcode-tuix`'s; the
+/// box is new — the earlier segmented-rule form rendered on more hosts but read
+/// as a list of dividers rather than a table.
 const PAD: usize = 1;
-const GAP: usize = 2;
 /// A column is never given the last cell of the viewport. Besides looking less
 /// cramped, a line that exactly touches the right edge is the one a terminal is
 /// most likely to wrap on its own.
 const RIGHT_GUARD: usize = 1;
 
-/// The heavy rule drawn under the header, `atomcode-tuix`'s `━`. The header is
-/// told apart from the body by weight rather than by being the only row with a
-/// rule beneath it: with a light rule between every body row (the shape tuix
-/// draws), a light rule under the header too would read as one more body
-/// separator. Both weights are width-1 box-drawing glyphs, so the column maths
-/// is identical either way. See [`RULE`] for the light one.
-const HEAVY_RULE: &str = "━";
+// The box, in light box-drawing glyphs. Every one of these is in the `ascii_for`
+// downgrade table (`caps.rs`), so a non-Unicode terminal gets `+ | -` for free
+// as the lines leave the renderer — the table needs no ASCII branch of its own.
+const VERT: &str = "│";
+const HORIZ: &str = "─";
+const TOP_L: &str = "┌";
+const TOP_MID: &str = "┬";
+const TOP_R: &str = "┐";
+const MID_L: &str = "├";
+const MID_X: &str = "┼";
+const MID_R: &str = "┤";
+const BOT_L: &str = "└";
+const BOT_MID: &str = "┴";
+const BOT_R: &str = "┘";
+
+/// The chrome (everything that is not cell content) the box costs `ncols`
+/// columns, for the fit budget: the `ncols + 1` vertical borders, two pad cells
+/// per column, and a slack of one extra cell per border.
+///
+/// That slack is the compatibility hedge. `│ ┼ ┬ …` are East Asian *Ambiguous*,
+/// so a CJK-configured host may draw each one two cells wide while the layout —
+/// like every terminal-width measurement — counts it as one. Budgeting the
+/// borders at their worst case keeps the row inside the terminal there too; on
+/// the common terminal, where they are one cell, it just leaves a little air on
+/// the right. It is the width the module's ancestors dropped the box to avoid.
+fn chrome_width(ncols: usize) -> usize {
+    let borders = ncols + 1;
+    borders + PAD * 2 * ncols + borders
+}
 
 /// Is this line a table row? Returns its canonical `|` form when it is.
 ///
@@ -156,8 +181,7 @@ pub(super) fn render(rows: &[String], w: u16, base: Style) -> Option<Vec<Line>> 
             natural[j] = natural[j].max(visible_width(cell, base));
         }
     }
-    let chrome = PAD * 2 * ncols + GAP * ncols.saturating_sub(1);
-    let natural_row = natural.iter().sum::<usize>() + chrome;
+    let natural_row = natural.iter().sum::<usize>() + chrome_width(ncols);
     let budget = (w as usize).saturating_sub(RIGHT_GUARD);
     if natural_row > budget {
         // Middle tier: keep the grid by shrinking wide columns and folding their
@@ -343,8 +367,7 @@ fn fit_columns(
 ) -> Option<Vec<usize>> {
     const MIN_COL: usize = 4;
     const TOKEN_CAP: usize = 16;
-    let chrome = PAD * 2 * ncols + GAP * ncols.saturating_sub(1);
-    let content_budget = budget.checked_sub(chrome)?;
+    let content_budget = budget.checked_sub(chrome_width(ncols))?;
     if content_budget == 0 {
         return None;
     }
@@ -430,29 +453,31 @@ fn too_starved(parsed: &[Vec<String>], col_widths: &[usize], base: Style) -> boo
     affected >= threshold
 }
 
-/// A segmented rule in `ch`: one run per column, joined by the gap, mirroring
-/// the column layout (`━━━  ━━━`) without drawing vertical borders. The weight
-/// is the caller's — [`HEAVY_RULE`] under the header, [`RULE`] between body rows.
-fn rule_line(col_widths: &[usize], ch: &str) -> Line {
-    let Some((&first, rest)) = col_widths.split_first() else {
-        return Line::empty();
-    };
-    let mut spans = vec![Span::styled(ch.repeat(first + PAD * 2), fence())];
-    for &cw in rest {
-        spans.push(Span::styled(" ".repeat(GAP), fence()));
-        spans.push(Span::styled(ch.repeat(cw + PAD * 2), fence()));
+/// A horizontal border across all columns: `left`, then a run of `─` for each
+/// column (its content width plus its two pad cells), joined by `junction`, then
+/// `right`. Top (`┌┬┐`), the header/row separators (`├┼┤`) and the bottom
+/// (`└┴┘`) differ only in those three glyphs. Drawn in one string so the whole
+/// rule shares one style and one downgrade scan.
+fn border_line(col_widths: &[usize], left: &str, junction: &str, right: &str) -> Line {
+    let mut s = String::from(left);
+    for (j, &cw) in col_widths.iter().enumerate() {
+        if j > 0 {
+            s.push_str(junction);
+        }
+        s.push_str(&HORIZ.repeat(cw + PAD * 2));
     }
-    Line::from_spans(spans)
+    s.push_str(right);
+    Line::styled(s, fence())
 }
 
-/// The rule between rows `i` and `i+1` of a `rows`-row table, or `None` when
-/// there is no next row. `atomcode-tuix`'s shape: a heavy rule under the header
-/// (row 0), a light one between every pair of body rows.
-fn row_separator(i: usize, rows: usize, col_widths: &[usize]) -> Option<Line> {
-    (i + 1 < rows).then(|| {
-        let ch = if i == 0 { HEAVY_RULE } else { RULE };
-        rule_line(col_widths, ch)
-    })
+/// The separator below a row: the bottom border after the last row, an inner
+/// `├┼┤` rule between every other pair — the full grid the reader chose.
+fn separator_below(i: usize, rows: usize, col_widths: &[usize]) -> Line {
+    if i + 1 == rows {
+        border_line(col_widths, BOT_L, BOT_MID, BOT_R)
+    } else {
+        border_line(col_widths, MID_L, MID_X, MID_R)
+    }
 }
 
 /// Rows of a table that are not delimiter rows.
@@ -460,31 +485,35 @@ fn data_rows(parsed: &[Vec<String>]) -> Vec<&Vec<String>> {
     parsed.iter().filter(|r| !is_separator(r)).collect()
 }
 
-/// The natural grid: every row drawn at the columns' natural widths, the header
-/// row styled as a heading, a heavy rule under the header and a light rule
-/// between every pair of body rows — `atomcode-tuix`'s shape.
+/// One content cell inside its borders: left pad, the cell, the fill to the
+/// column width, right pad. The caller draws the `│` between cells; this is just
+/// what sits in one column.
+fn padded_cell(spans: &mut Vec<Span>, content: Vec<Span>, used: usize, cw: usize, base: Style) {
+    let fill = cw.saturating_sub(used);
+    spans.push(Span::styled(" ".repeat(PAD), base));
+    spans.extend(content);
+    if fill > 0 {
+        spans.push(Span::styled(" ".repeat(fill), base));
+    }
+    spans.push(Span::styled(" ".repeat(PAD), base));
+    spans.push(Span::styled(VERT.to_string(), fence()));
+}
+
+/// The natural grid: a full box, every row at the columns' natural widths, the
+/// header styled as a heading, and `├┼┤` rules between every pair of rows.
 fn aligned(parsed: &[Vec<String>], col_widths: &[usize], base: Style) -> Vec<Line> {
-    let ncols = col_widths.len();
     let rows = data_rows(parsed);
-    let mut out = Vec::new();
+    let mut out = vec![border_line(col_widths, TOP_L, TOP_MID, TOP_R)];
     for (i, row) in rows.iter().enumerate() {
         let style = if i == 0 { heading() } else { base };
-        let mut spans: Vec<Span> = Vec::new();
+        let mut spans = vec![Span::styled(VERT.to_string(), fence())];
         for (j, &cw) in col_widths.iter().enumerate() {
             let cell = cell_line(row.get(j).map(String::as_str).unwrap_or(""), style);
-            let pad = cw.saturating_sub(cell.width());
-            spans.push(Span::styled(" ".repeat(PAD), base));
-            spans.extend(cell.spans);
-            if pad > 0 {
-                spans.push(Span::styled(" ".repeat(pad), base));
-            }
-            spans.push(Span::styled(" ".repeat(PAD), base));
-            if j + 1 < ncols {
-                spans.push(Span::styled(" ".repeat(GAP), base));
-            }
+            let used = cell.width();
+            padded_cell(&mut spans, cell.spans, used, cw, base);
         }
         out.push(Line::from_spans(spans));
-        out.extend(row_separator(i, rows.len(), col_widths));
+        out.push(separator_below(i, rows.len(), col_widths));
     }
     out
 }
@@ -500,7 +529,7 @@ fn aligned(parsed: &[Vec<String>], col_widths: &[usize], base: Style) -> Vec<Lin
 fn wrapped_grid(parsed: &[Vec<String>], col_widths: &[usize], base: Style) -> Vec<Line> {
     let ncols = col_widths.len();
     let rows = data_rows(parsed);
-    let mut out = Vec::new();
+    let mut out = vec![border_line(col_widths, TOP_L, TOP_MID, TOP_R)];
     for (i, row) in rows.iter().enumerate() {
         let style = if i == 0 { heading() } else { base };
         let wrapped: Vec<Vec<String>> = (0..ncols)
@@ -509,25 +538,25 @@ fn wrapped_grid(parsed: &[Vec<String>], col_widths: &[usize], base: Style) -> Ve
                 word_wrap(&visible_plain(cell, base), col_widths[j])
             })
             .collect();
+        // A tall cell makes the row several lines; the shorter columns are blank
+        // on the lines they have run out of, so their borders still line up.
         let height = wrapped.iter().map(Vec::len).max().unwrap_or(1).max(1);
         for k in 0..height {
-            let mut spans: Vec<Span> = Vec::new();
+            let mut spans = vec![Span::styled(VERT.to_string(), fence())];
             for (j, &cw) in col_widths.iter().enumerate() {
                 let text = wrapped[j].get(k).map(String::as_str).unwrap_or("");
-                let pad = cw.saturating_sub(width::str_width(text));
-                spans.push(Span::styled(" ".repeat(PAD), base));
-                spans.push(Span::styled(text.to_string(), style));
-                if pad > 0 {
-                    spans.push(Span::styled(" ".repeat(pad), base));
-                }
-                spans.push(Span::styled(" ".repeat(PAD), base));
-                if j + 1 < ncols {
-                    spans.push(Span::styled(" ".repeat(GAP), base));
-                }
+                let used = width::str_width(text);
+                padded_cell(
+                    &mut spans,
+                    vec![Span::styled(text.to_string(), style)],
+                    used,
+                    cw,
+                    base,
+                );
             }
             out.push(Line::from_spans(spans));
         }
-        out.extend(row_separator(i, rows.len(), col_widths));
+        out.push(separator_below(i, rows.len(), col_widths));
     }
     out
 }
@@ -603,14 +632,11 @@ mod tests {
         .collect()
     }
 
-    /// Rules are drawn under the header (heavy) and between body rows (light), so
-    /// not every drawn line is a row — both weights are filtered out here.
+    /// A full box is drawn around the grid, so not every line is a row: the
+    /// borders (`┌├└`) are filtered out and only the content rows (`│ … │`) kept.
     fn rows_of(out: &[String]) -> Vec<String> {
         out.iter()
-            .filter(|l| {
-                let head = l.trim_start().chars().next();
-                head != Some('─') && head != Some('━')
-            })
+            .filter(|l| l.trim_start().starts_with('│'))
             .cloned()
             .collect()
     }
@@ -626,6 +652,81 @@ mod tests {
 
     fn cells(line: &str) -> Vec<String> {
         split_row(line)
+    }
+
+    // ─── the box ───
+
+    #[test]
+    fn a_table_is_drawn_as_a_full_grid() {
+        let out = drawn(&["| a | b |", "|---|---|", "| 1 | 2 |"], 40);
+        // Top border, corners and a top junction.
+        assert!(
+            out[0].starts_with('┌') && out[0].contains('┬') && out[0].ends_with('┐'),
+            "top border: {:?}",
+            out[0]
+        );
+        // Every content row is bordered left and right, with a vertical between the
+        // two columns — three verticals for a two-column table.
+        let body: Vec<&String> = out.iter().filter(|l| l.starts_with('│')).collect();
+        assert!(
+            body.iter().all(|l| l.ends_with('│')),
+            "rows closed on the right: {out:?}"
+        );
+        assert!(
+            body.iter().all(|l| l.matches('│').count() == 3),
+            "three verticals per two-column row: {out:?}"
+        );
+        // A full grid rules between every row, with a cross at the column boundary.
+        assert!(
+            out.iter()
+                .any(|l| l.starts_with('├') && l.contains('┼') && l.ends_with('┤')),
+            "an inner separator: {out:?}"
+        );
+        // Bottom border, corners and a bottom junction.
+        let last = out.last().expect("some output");
+        assert!(
+            last.starts_with('└') && last.contains('┴') && last.ends_with('┘'),
+            "bottom border: {last:?}"
+        );
+    }
+
+    #[test]
+    fn a_wrapped_row_keeps_its_borders_aligned_down_a_tall_cell() {
+        // A description too wide for its column wraps to several lines; the short
+        // column is blank on the extra lines, but every content line is the same
+        // width and closed by a border in the same place.
+        let rows = [
+            "| k | description |",
+            "|---|---|",
+            "| a | one two three four five six seven eight nine ten eleven |",
+        ];
+        let out = drawn(&rows, 30);
+        let body = rows_of(&out);
+        assert!(body.len() >= 2, "the tall cell did not wrap: {out:?}");
+        let w0 = width::str_width(&body[0]);
+        assert!(
+            body.iter().all(|l| width::str_width(l) == w0),
+            "the wrapped rows are ragged: {out:?}"
+        );
+        assert!(
+            body.iter().all(|l| l.starts_with('│') && l.ends_with('│')),
+            "a wrapped line lost a border: {out:?}"
+        );
+    }
+
+    #[test]
+    fn the_box_downgrades_to_ascii_on_a_non_unicode_terminal() {
+        // Every box glyph has an ASCII stand-in in `caps::ascii_for`, so the
+        // `downgrade` pass turns the whole grid into `+ | -` on a terminal that
+        // cannot draw Unicode. Content is ASCII here so only the box is in play.
+        let out = drawn(&["| a | b |", "|---|---|", "| 1 | 2 |"], 40);
+        for line in &out {
+            let ascii = crate::caps::downgrade(line, false);
+            assert!(
+                ascii.is_ascii(),
+                "a box glyph had no ASCII stand-in: {line:?} -> {ascii:?}"
+            );
+        }
     }
 
     // ─── splitting ───
@@ -689,10 +790,11 @@ mod tests {
         assert!(row("| 只有一列 |").is_some());
         assert!(row("|:---|").is_some());
         let out = drawn(&["| 只有一列 |", "|:---|", "| 单元格 |"], 40);
-        assert_eq!(out.len(), 3, "header, rule, body: {out:?}");
+        // Boxed like any other: top, header, its separator, body, bottom.
+        assert_eq!(out.len(), 5, "top, header, sep, body, bottom: {out:?}");
         assert!(
             !out.iter().any(|l| l.contains('|')),
-            "the pipes leaked into the output: {out:?}"
+            "the ASCII pipes leaked into the output: {out:?}"
         );
     }
 
@@ -731,7 +833,13 @@ mod tests {
             .iter()
             .map(Line::plain)
             .collect();
-        assert_eq!(out[0].trim(), "a    b");
+        let body = rows_of(&out);
+        assert!(
+            body[0].contains('a') && body[0].contains('b'),
+            "the two columns did not survive the conversion: {out:?}"
+        );
+        // The ASCII shapes of a pre-drawn table must not leak: it is re-rendered
+        // as this table's own box, not passed through.
         assert!(
             !out.iter().any(|l| l.contains('|') || l.contains("---")),
             "the drawn borders leaked into the output: {out:?}"
@@ -771,9 +879,11 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
+        // Line 0 is the top border; the header is line 1, its separator line 2,
+        // the body line 3.
         let lines = render(&rows, 40, Style::new()).unwrap();
-        let header = lines[0].spans.iter().find(|s| s.text == "a").unwrap();
-        let body = lines[2].spans.iter().find(|s| s.text == "1").unwrap();
+        let header = lines[1].spans.iter().find(|s| s.text == "a").unwrap();
+        let body = lines[3].spans.iter().find(|s| s.text == "1").unwrap();
         assert_eq!(header.style, heading());
         assert_ne!(body.style, heading());
     }
@@ -784,7 +894,15 @@ mod tests {
             &["| a | b |", "|---|---|", "| **bold** | `code` |"],
             40,
         ));
-        assert_eq!(out[1].trim(), "bold    code");
+        // The markup is applied, not shown: `bold`/`code`, not `**bold**`/`` `code` ``.
+        assert!(
+            out[1].contains("bold") && out[1].contains("code"),
+            "{out:?}"
+        );
+        assert!(
+            !out[1].contains('*') && !out[1].contains('`'),
+            "the markup leaked: {out:?}"
+        );
     }
 
     #[test]
@@ -794,18 +912,17 @@ mod tests {
             40,
         ));
         assert!(
-            out[1].trim().starts_with("a | b"),
+            out[1].contains("a | b"),
             "the code span was split across cells: {out:?}"
         );
     }
 
     // ─── the shape of the grid ───
 
-    /// A heavy rule under the header and a light rule between the two body rows,
-    /// `atomcode-tuix`'s shape. Both grid tiers draw them, so both are exercised
-    /// here: the natural one and the folded one.
+    /// A full box in BOTH grid tiers: a top border, `├┼┤` rules between every
+    /// pair of rows, a bottom border, and every content row closed on both edges.
     #[test]
-    fn a_heavy_rule_marks_the_header_and_light_rules_separate_the_body() {
+    fn both_grid_tiers_draw_a_full_box() {
         let parsed: Vec<Vec<String>> = ["| h1 | h2 |", "|---|---|", "| a | b |", "| c | d |"]
             .iter()
             .map(|r| split_row(r))
@@ -817,45 +934,51 @@ mod tests {
         ];
         for (tier, lines) in tiers {
             let plain: Vec<String> = lines.iter().map(Line::plain).collect();
-            // header, heavy rule, body1, light rule, body2.
             assert!(
-                plain[0].contains("h1"),
-                "{tier}: the header is not first: {plain:?}"
+                plain[0].starts_with('┌') && plain[0].ends_with('┐'),
+                "{tier}: no top border: {plain:?}"
             );
             assert!(
-                plain[1].trim_start().starts_with('━'),
-                "{tier}: the header rule is not heavy: {plain:?}"
+                plain.last().unwrap().starts_with('└') && plain.last().unwrap().ends_with('┘'),
+                "{tier}: no bottom border: {plain:?}"
             );
+            // A full grid: an inner `├┼┤` rule between the header and the body AND
+            // between the two body rows — two of them.
+            let inner = plain
+                .iter()
+                .filter(|l| l.starts_with('├') && l.contains('┼'))
+                .count();
+            assert_eq!(inner, 2, "{tier}: not a full grid: {plain:?}");
+            // Every content row is closed on both edges.
             assert!(
-                plain[3].trim_start().starts_with('─'),
-                "{tier}: the body rows are not separated by a light rule: {plain:?}"
-            );
-            // The header rule is heavy and the body rule light — the two weights
-            // are what tell the header apart from the body.
-            assert!(
-                !plain[3].contains('━'),
-                "{tier}: a body separator must not be heavy: {plain:?}"
+                rows_of(&plain).iter().all(|l| l.ends_with('│')),
+                "{tier}: an unclosed row: {plain:?}"
             );
         }
     }
 
-    /// A header with no body gets no rule: a lone rule under a lone row reads as
-    /// a table that swallowed its contents.
+    /// A header with no body is still boxed: a top border, the header row, and a
+    /// bottom border — three lines, closed all round.
     #[test]
-    fn a_table_with_no_body_rows_draws_no_rule() {
+    fn a_header_only_table_is_still_boxed() {
         let out = drawn(&["| h1 | h2 |", "|---|---|"], 40);
-        assert_eq!(out.len(), 1, "header only: {out:?}");
-        assert!(!out[0].contains('─'), "a dangling rule was drawn: {out:?}");
+        assert_eq!(out.len(), 3, "top, header, bottom: {out:?}");
+        assert!(out[0].starts_with('┌') && out[0].ends_with('┐'), "{out:?}");
+        assert!(out[1].starts_with('│') && out[1].ends_with('│'), "{out:?}");
+        assert!(out[2].starts_with('└') && out[2].ends_with('┘'), "{out:?}");
     }
 
     #[test]
     fn an_over_long_delimiter_row_does_not_paint_a_ghost_column() {
         let rows = ["| a | b |", "|---|---|---|", "| 1 | 2 |"];
         let out = rows_of(&drawn(&rows, 40));
-        // Two real columns only: the widest content row is two cells, so nothing
-        // is drawn past the last one.
-        assert_eq!(out[0].trim(), "a    b");
-        assert_eq!(out[1].trim(), "1    2");
+        // Two real columns only: three verticals per row, no ghost third column.
+        assert!(
+            out.iter().all(|l| l.matches('│').count() == 3),
+            "a ghost column was painted: {out:?}"
+        );
+        assert!(out[0].contains('a') && out[0].contains('b'), "{out:?}");
+        assert!(out[1].contains('1') && out[1].contains('2'), "{out:?}");
     }
 
     #[test]
@@ -869,7 +992,7 @@ mod tests {
     #[test]
     fn cjk_and_ascii_cells_line_up_to_the_same_column() {
         let rows = ["| 名称 | 说明 |", "|---|---|", "| ab | cd |"];
-        let out = drawn(&rows, 40);
+        let out = rows_of(&drawn(&rows, 40));
         // '说明' begins at the same cell index on the header row as 'cd' does on
         // the body row — the whole point of measuring in cells, not chars.
         let col = |s: &str, mark: &str| {
@@ -879,7 +1002,7 @@ mod tests {
             )]
             width::str_width(&s[..s.find(mark).unwrap()])
         };
-        assert_eq!(col(&out[0], "说明"), col(&out[2], "cd"));
+        assert_eq!(col(&out[0], "说明"), col(&out[1], "cd"));
     }
 
     #[test]
@@ -936,8 +1059,13 @@ mod tests {
         ];
         let out = drawn(&rows, 44);
         assert!(
-            out[0].contains("key") && out[0].contains("value"),
+            out.iter().any(|l| l.contains("key") && l.contains("value")),
             "collapsed to flat although the grid fits when folded: {out:?}"
+        );
+        // A folded grid still has a box around it, not the flat `key：value` form.
+        assert!(
+            out[0].starts_with('┌'),
+            "the folded tier lost its box: {out:?}"
         );
         assert!(
             out.iter().any(|l| l.contains("alpha")),
