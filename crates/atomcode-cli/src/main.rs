@@ -857,14 +857,14 @@ struct Cli {
     )]
     pub dangerously_skip_permissions: bool,
 
-    /// Use the full-screen UI assembled from plugin rows instead of the default
-    /// one. Same runtime, same sessions. `[ui] screen = "rows"` makes it the
-    /// one that opens without the flag.
+    /// Open the full-screen UI assembled from plugin rows for this launch,
+    /// whatever `[ui] screen` says. It is also what opens without a flag.
     #[arg(long, conflicts_with = "headless_input")]
     pub tui: bool,
 
     /// Open the classic screen for this launch, whatever `[ui] screen` says —
-    /// the escape hatch.
+    /// the escape hatch. `[ui] screen = "classic"` makes it the one that opens
+    /// without the flag.
     #[arg(long, conflicts_with = "tui")]
     pub classic: bool,
 

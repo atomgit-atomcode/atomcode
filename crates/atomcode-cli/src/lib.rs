@@ -193,7 +193,7 @@ pub mod tui_front {
         }
         match configured {
             // What this build opens when nobody said. It moves once, here.
-            Screen::Default => Screen::Classic,
+            Screen::Default => Screen::Rows,
             chosen => chosen,
         }
     }
@@ -590,7 +590,7 @@ model = "vendor-b"
             // Nobody said anything: this build's default.
             assert_eq!(
                 screen_for(false, false, Screen::Default),
-                Screen::Classic,
+                Screen::Rows,
                 "the default this build opens"
             );
             // The setting decides once.

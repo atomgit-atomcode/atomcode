@@ -149,7 +149,8 @@ impl Default for AtomGitToolConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Screen {
-    /// The screen this build opens by default. Today that is the classic one.
+    /// The screen this build opens by default. Since 2026-09-22 that is the
+    /// row-assembled one; the classic one stays behind `--classic`.
     #[default]
     Default,
     /// The screen assembled from plugin rows (`atomcode --tui`).
