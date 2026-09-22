@@ -666,11 +666,14 @@ impl Asker {
         // one asked after it — a hook that finished after the stop, then the
         // approval behind it — waited for an answer from a person who had
         // already said stop, and the turn with it.
-        let stopping = asking.as_ref().zip(asker.as_deref()).and_then(|(ctx, session)| {
-            ctx.service::<crate::seams::AgentsSvc>()?
-                .by_session(session)
-                .map(|agent| agent.cancel_token())
-        });
+        let stopping = asking
+            .as_ref()
+            .zip(asker.as_deref())
+            .and_then(|(ctx, session)| {
+                ctx.service::<crate::seams::AgentsSvc>()?
+                    .by_session(session)
+                    .map(|agent| agent.cancel_token())
+            });
         if stopping.as_ref().is_some_and(|token| token.is_cancelled()) {
             return None;
         }

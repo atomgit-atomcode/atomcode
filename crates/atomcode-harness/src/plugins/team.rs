@@ -1776,10 +1776,7 @@ impl Plugin for TeamPlugin {
             // stops the lead and every member, and each member's "finished:
             // Cancelled" used to open a fresh lead turn right after. It is kept
             // as a note, for whenever the lead next works.
-            let stopped = matches!(
-                stop,
-                atomcode_kernel::event::StopReason::Cancelled
-            );
+            let stopped = matches!(stop, atomcode_kernel::event::StopReason::Cancelled);
             if lead_asked && !stopped {
                 lead.send_from(report, MessageOrigin::Peer(member.id()));
             } else {
