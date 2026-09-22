@@ -194,6 +194,74 @@ impl Notice {
     }
 }
 
+/// A paste of at least this many lines folds into a `[Pasted #N …]` marker.
+/// The same threshold `atomcode-tuix` uses, so the two screens fold the same
+/// pastes.
+pub const PASTE_FOLD_LINES: usize = 5;
+/// …or at least this many characters (a long single-line paste — a URL, a
+/// token — that `+1 lines` would misdescribe).
+pub const PASTE_FOLD_CHARS: usize = 400;
+/// How long after folding a paste a *second* paste of the same block counts as
+/// "expand it in place" rather than a fresh paste.
+pub const DOUBLE_PASTE_EXPAND_MS: u64 = 1_000;
+
+/// The paste just folded into a `[Pasted #N …]` marker, kept so a second paste
+/// of the same block can expand it in place (the "paste again to see it all"
+/// gesture).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecentFoldedPaste {
+    /// Which paste this is: `[Pasted #id …]`, at index `id - 1` in `pastes`.
+    pub id: usize,
+    /// Byte offset where the marker starts in `input`.
+    pub start: usize,
+    /// The exact marker text, so an edited marker is not taken for an untouched
+    /// one.
+    pub placeholder: String,
+    /// When it was folded, against [`Moment::now`].
+    pub at: Timestamp,
+}
+
+/// `\r\n` and lone `\r` to `\n`. Most terminals separate the lines of a
+/// bracketed paste with CR, and without this a twenty-line paste reads as one
+/// line to `str::lines()` (so it would never fold) and the model would get
+/// CR-only separators.
+fn normalize_newlines(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+/// Put every `[Pasted #N …]` marker in `text` back to its body from `pastes`
+/// (index `N - 1`). A malformed or out-of-range marker is left exactly as
+/// written. Called at submit: the model gets the whole paste, while the composer
+/// and the history keep the terse marker.
+pub fn expand_pastes(text: &str, pastes: &[String]) -> String {
+    if pastes.is_empty() {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("[Pasted #") {
+        out.push_str(&rest[..start]);
+        let tail = &rest[start..];
+        let Some(end) = tail.find(']') else {
+            // An unterminated marker is not a marker — keep the rest verbatim.
+            out.push_str(tail);
+            return out;
+        };
+        let header = &tail[..=end];
+        let id = header
+            .strip_prefix("[Pasted #")
+            .and_then(|body| body.split_whitespace().next())
+            .and_then(|token| token.parse::<usize>().ok());
+        match id {
+            Some(id) if id >= 1 && id <= pastes.len() => out.push_str(&pastes[id - 1]),
+            _ => out.push_str(header),
+        }
+        rest = &tail[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// The non-derivable half of what a module renders from.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Moment {
@@ -240,6 +308,17 @@ pub struct Moment {
     /// them. Not a fact until it is sent: a screenshot attached and then
     /// deleted is a gesture, not a thing that happened.
     pub attachments: crate::attach::Attachments,
+    /// The bodies of the big blocks folded into `[Pasted #N …]` markers in
+    /// [`input`](Self::input), in marker order (index 0 = paste #1). The
+    /// composer shows the terse marker; `expand_pastes` puts the body back at
+    /// submit, so the model gets the whole paste. Screen state, cleared when the
+    /// draft is sent or dropped.
+    pub pastes: Vec<String>,
+    /// The paste that was JUST folded, for the "paste it again to expand it"
+    /// gesture: a second paste of the same block within a short window, with its
+    /// marker still untouched at the caret, swaps the marker back for the body
+    /// in place. `None` once anything else is typed.
+    pub recent_folded_paste: Option<RecentFoldedPaste>,
     /// Logical frame counter. Animation phase comes from here, never from a
     /// clock read inside `render` — that would make the whole test loop
     /// non-deterministic while leaving it green.
@@ -725,6 +804,87 @@ impl Moment {
     /// gesture the instant after a send still stops.
     pub fn turn_in_flight(&self) -> bool {
         self.activity != Activity::Idle || self.pending_working
+    }
+
+    /// Insert a pasted block at the caret. A block past the fold threshold
+    /// ([`PASTE_FOLD_LINES`]/[`PASTE_FOLD_CHARS`]) folds into a `[Pasted #N …]`
+    /// marker — the body kept in [`pastes`](Self::pastes), the composer left
+    /// terse — while a *second* paste of the same block, its marker untouched at
+    /// the caret and within [`DOUBLE_PASTE_EXPAND_MS`], expands it in place
+    /// instead. A small paste goes in raw.
+    ///
+    /// `now` is threaded in (not read from a clock) so the double-paste window
+    /// stays testable, the same as everything else that needs the wall time.
+    pub fn insert_paste(&mut self, text: &str, now: Timestamp) {
+        let text = normalize_newlines(text);
+        if self.expand_recent_folded_paste(&text, now) {
+            return;
+        }
+        self.recent_folded_paste = None;
+        let line_count = text.lines().count().max(1);
+        let char_count = text.chars().count();
+        let at = self.caret.min(self.input.len());
+        if line_count >= PASTE_FOLD_LINES || char_count >= PASTE_FOLD_CHARS {
+            let id = self.pastes.len() + 1;
+            // A single long line uses `{N} chars`; `+1 lines` would misdescribe a
+            // 600-char URL. Multi-line uses `+{M} lines`, what a code block reads as.
+            let placeholder = if line_count <= 1 {
+                format!("[Pasted #{id} {char_count} chars]")
+            } else {
+                format!("[Pasted #{id} +{line_count} lines]")
+            };
+            self.pastes.push(text);
+            self.input.insert_str(at, &placeholder);
+            self.caret = at + placeholder.len();
+            self.recent_folded_paste = Some(RecentFoldedPaste {
+                id,
+                start: at,
+                placeholder,
+                at: now,
+            });
+        } else {
+            self.input.insert_str(at, &text);
+            self.caret = at + text.len();
+        }
+    }
+
+    /// The "paste again to expand it" gesture: a second paste of the block that
+    /// was just folded, its marker still whole at the caret and within the
+    /// window, swaps the marker back for the body. `true` when it did.
+    fn expand_recent_folded_paste(&mut self, incoming: &str, now: Timestamp) -> bool {
+        let Some(recent) = self.recent_folded_paste.clone() else {
+            return false;
+        };
+        let within = now.as_millis().saturating_sub(recent.at.as_millis()) <= DOUBLE_PASTE_EXPAND_MS;
+        let end = recent.start + recent.placeholder.len();
+        let untouched = self.caret == end
+            && self
+                .input
+                .get(recent.start..end)
+                .is_some_and(|current| current == recent.placeholder);
+        // Only the newest paste can un-fold this way, and only if its body is
+        // exactly what came in again — an edited registry or a different block
+        // is a fresh paste, not an expansion.
+        let backing = recent.id == self.pastes.len()
+            && self
+                .pastes
+                .get(recent.id.saturating_sub(1))
+                .is_some_and(|body| body == incoming);
+        if !within || !untouched || !backing {
+            return false;
+        }
+        self.input.replace_range(recent.start..end, incoming);
+        self.caret = recent.start + incoming.len();
+        self.pastes.pop();
+        self.recent_folded_paste = None;
+        self.history_at = None;
+        true
+    }
+
+    /// Drop the folded-paste bookkeeping — after the draft is sent, or dropped.
+    pub fn clear_pastes(&mut self) {
+        self.pastes.clear();
+        self.recent_folded_paste = None;
     }
 
     /// Apply a Ctrl+C on an idle line. Returns `true` when it is the second press
