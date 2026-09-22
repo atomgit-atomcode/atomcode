@@ -27,6 +27,7 @@ fn _tests_assert_in_chinese() {
 
 #[cfg(unix)]
 pub mod askpass;
+pub mod tui_classic_only;
 pub mod tui_command_meter;
 pub mod tui_login;
 pub mod tui_onboarding;
@@ -110,6 +111,7 @@ pub mod tui_front {
             crate::tui_onboarding::row_layer(),
             crate::tui_login::row_layer(),
             crate::tui_welcome_words::row_layer(),
+            crate::tui_classic_only::row_layer(),
         ];
         let mut rows: Vec<Arc<dyn atomcode_plexus::Plugin>> = vec![
             Arc::new(crate::tui_settings::SettingsRow),
@@ -129,6 +131,7 @@ pub mod tui_front {
                 telemetry: telemetry.clone(),
             }),
             Arc::new(crate::tui_welcome_words::WelcomeWordsRow),
+            Arc::new(crate::tui_classic_only::ClassicOnlyRow),
         ];
         // The eighth row, and only when there is something to count into:
         // a launch with telemetry off has no such row at all, which is what

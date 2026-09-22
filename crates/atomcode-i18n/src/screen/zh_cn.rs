@@ -772,6 +772,12 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::OnboardSignedInConfigNotWritten { error } => format!("登录成了，但配置没写成：{error}").into(),
         Msg::CmdAboutOnboarding => "把这台机器配到能干活：语言、登录、看一眼结果".into(),
         Msg::CmdAboutOnboardingFinished => "引导走完了".into(),
+        Msg::ClassicOnlyForNow { command } => format!(
+            "/{command} 暂时只在经典界面里有：退出后用 `atomcode --classic` 打开（会话是同一份）。\
+             新界面的版本在做。"
+        )
+        .into(),
+        Msg::CmdAboutClassicOnly => "暂时只在经典界面里有".into(),
         Msg::SteeringQueued => "将在下一次工具调用后提交的消息（按 Esc 中断并立即发送）".into(),
     }
 }

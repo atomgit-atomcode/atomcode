@@ -1291,6 +1291,12 @@ pub enum Msg<'a> {
     },
     CmdAboutOnboarding,
     CmdAboutOnboardingFinished,
+    /// A command the classic screen has and this one does not have yet — typed
+    /// here, it says where it still lives rather than "no such command".
+    ClassicOnlyForNow {
+        command: &'a str,
+    },
+    CmdAboutClassicOnly,
     /// Header above the type-ahead queue: lines typed while a turn runs, folded
     /// in at the next tool-call boundary (or flushed immediately with Esc).
     SteeringQueued,

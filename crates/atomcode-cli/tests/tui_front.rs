@@ -342,3 +342,71 @@ async fn the_welcome_block_reads_the_language_the_launcher_knows() {
     term.press(atomcode_tui::surface::KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), running).await;
 }
+
+/// The commands only the classic screen has yet (`/webui`, `/sync`, `/app`,
+/// `/desktop`), typed on this one after the default moved: each says where it
+/// still lives instead of "no such command" — and none is recommended, so the
+/// menu never offers something that can only answer "go elsewhere"
+/// (`docs/plans/2026-09-19-remaining-gaps.md`, decision 10).
+#[tokio::test]
+async fn a_command_only_the_classic_screen_has_says_where_it_lives() {
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("ATOMCODE_HOME", home.path());
+    let project = tempfile::tempdir().unwrap();
+    let count = Arc::new(Count::default());
+    let config_path = home.path().join("config.toml");
+    let _locale = atomcode_config::i18n::test_lock();
+    atomcode_config::i18n::set_locale(atomcode_config::locale::Locale::ZhCn);
+
+    let front_end = FrontEnd::new();
+    let (start, config) = start(
+        project.path(),
+        &count,
+        SessionMode::Fresh,
+        Some(front_end.clone()),
+    );
+    let runtime = CodingRuntime::start(start).await.expect("starts");
+    let screen = Screen {
+        headless: Some((120, 40)),
+        ..Screen::default()
+    };
+    let mounted = tui_front::mount(runtime, front_end, config, None, &screen, config_path, None)
+        .await
+        .expect("the screen mounts");
+    let term = mounted
+        .app
+        .context()
+        .service::<atomcode_tui::plugin::SurfaceSvc>()
+        .and_then(|surface| surface.as_any_headless())
+        .expect("a headless surface");
+    let ui = mounted.ui.clone();
+    let ctx = mounted.app.context();
+    let running = tokio::spawn(async move {
+        let _ = ui.run(&ctx, None).await;
+    });
+
+    for name in atomcode::tui_classic_only::NAMES {
+        term.type_line(&format!("/{name}"));
+        let expected = format!("/{name} 暂时只在经典界面里有");
+        let mut screen_text = String::new();
+        for _ in 0..200 {
+            screen_text = term.text();
+            if screen_text.contains(&expected) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            screen_text.contains(&expected) && screen_text.contains("atomcode --classic"),
+            "/{name} says where it still lives:\n{screen_text}"
+        );
+        assert_eq!(
+            count.0.load(Ordering::SeqCst),
+            0,
+            "and it is not sent to the model as a prompt"
+        );
+    }
+
+    term.press(atomcode_tui::surface::KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), running).await;
+}
