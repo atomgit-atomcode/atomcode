@@ -175,6 +175,12 @@ struct SessionView {
     outstanding: HashSet<CommandId>,
 }
 
+impl SessionView {
+    fn settled(&self) -> bool {
+        self.outstanding.is_empty() && matches!(self.status, None | Some(AgentStatus::Idle))
+    }
+}
+
 impl Views {
     fn screen(&self) -> Option<&SessionView> {
         self.sessions.get(&self.on_screen)
@@ -262,9 +268,28 @@ impl AgentClient {
     /// says it is idle.
     pub fn settled(&self) -> bool {
         let views = self.view.lock().expect("client poisoned");
-        views.screen().is_none_or(|view| {
-            view.outstanding.is_empty() && matches!(view.status, None | Some(AgentStatus::Idle))
-        })
+        views.screen().is_none_or(SessionView::settled)
+    }
+
+    /// [`settled`](Self::settled), for the session this screen follows rather
+    /// than the one on screen — they differ while a member is looked at, and
+    /// quitting is about the lead's turn whichever is up.
+    pub fn root_settled(&self) -> bool {
+        let views = self.view.lock().expect("client poisoned");
+        views
+            .sessions
+            .get(&views.root)
+            .is_none_or(SessionView::settled)
+    }
+
+    /// What `session` last said it was doing, when it has said.
+    pub(crate) fn status_of(&self, session: &str) -> Option<AgentStatus> {
+        self.view
+            .lock()
+            .expect("client poisoned")
+            .sessions
+            .get(session)
+            .and_then(|view| view.status)
     }
 
     /// Say something to the agent on screen.
@@ -1870,8 +1895,15 @@ impl UserInterface for Tui {
         // `sudo` waiting on an answer that is never coming holds the turn open,
         // and `None` is a refusal rather than a blank.
         self.host.refuse_secret();
-        if !client.settled() {
-            client.cancel();
+        // The lead's turn is what the wait is for, whoever is on screen: the
+        // turn events on this connection are the lead's, and a screen left on a
+        // member used to stop only that member and then sit out the whole
+        // timeout for a lead that was never asked. Quitting stops them all.
+        let lead_busy = !client.root_settled();
+        if lead_busy || !client.settled() {
+            client.cancel_all();
+        }
+        if lead_busy {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 while let Some(woke) = wake.recv().await {
                     if matches!(
@@ -2850,11 +2882,21 @@ impl Tui {
             self.host.absorb_logged(logged);
         }
         self.mark_undone();
-        let working = self.members.is_working(session);
+        // `switch_view` left the line at Idle; what the session last said puts
+        // it back. The lead too, not only the members the roster knows: its
+        // turn events are dropped while a member is on screen, so coming back
+        // to a lead that is still working found it "idle" — and esc, reading
+        // that, armed a double-tap instead of stopping the turn.
+        let activity = match self.client.status_of(session) {
+            Some(AgentStatus::Working) => Some(crate::moment::Activity::Working),
+            Some(AgentStatus::Stopping) => Some(crate::moment::Activity::Stopping),
+            _ if self.members.is_working(session) => Some(crate::moment::Activity::Working),
+            _ => None,
+        };
         let mut m = self.host.moment.write().expect("moment poisoned");
         m.viewing = session.to_string();
-        if working {
-            m.activity = crate::moment::Activity::Working;
+        if let Some(activity) = activity {
+            m.activity = activity;
         }
         true
     }
@@ -3597,8 +3639,9 @@ impl Tui {
                 // the same live-line pin a turn's start gets (this is the third
                 // route that moves that row). Stopping counts as in-flight too. The
                 // line is left alone: cancelling the model's answer is not the same
-                // gesture as clearing what you were about to say next.
-                if m.turn_in_flight() {
+                // gesture as clearing what you were about to say next. In flight
+                // by the agent's account too, as for `Action::Escape`.
+                if m.turn_in_flight() || !client.settled() {
                     m.disarm_quit();
                     drop(m);
                     self.stop_turn(client);
@@ -3854,7 +3897,14 @@ impl Tui {
                 // the end, ready to edit and resend; if you had already started
                 // typing something else, that is left exactly as it was, caret
                 // where it sat.
-                if m.turn_in_flight() {
+                //
+                // In flight by either account: this screen's own (`activity`),
+                // or the agent's — it says it is working, or something sent to it
+                // has not been taken yet. The second is what knows about a turn
+                // this screen did not start (`/init`, `/setup`, a member's report
+                // waking the lead) and the instant between a send and its
+                // `TurnStarted`; without it esc armed a double-tap there.
+                if m.turn_in_flight() || !client.settled() {
                     m.disarm_escape();
                     // Marked here, on the key, not on `AgentEvent::Cancelled`: the
                     // kernel cancels a turn for its own reasons too (a mid-turn
