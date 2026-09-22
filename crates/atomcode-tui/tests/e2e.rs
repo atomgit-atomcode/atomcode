@@ -452,6 +452,7 @@ async fn start_full(
             settings,
             providers: None,
             plugins,
+            setup: None,
         },
         connection,
     )

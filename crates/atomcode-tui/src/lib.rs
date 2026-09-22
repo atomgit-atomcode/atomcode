@@ -76,6 +76,7 @@ pub mod rewind;
 pub mod rows;
 pub mod secret;
 pub mod settings;
+pub mod setup;
 pub mod surface;
 pub mod text;
 pub mod theme;

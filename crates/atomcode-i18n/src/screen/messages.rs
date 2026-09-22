@@ -626,6 +626,27 @@ pub enum Msg<'a> {
         lines: &'a str,
     },
     NoPluginPort,
+    /// `takes` for `/setup`: what a person may type after it.
+    CmdTakesSetup,
+    /// `/setup`'s line in `/help` and in the slash menu.
+    CmdAboutSetup,
+    /// 这个屏幕没有接种子安装:启动器没有提供 `tui-setup`。`/setup` 在没装过种子的
+    /// 机器上要靠它把种子放上磁盘,所以这条只有第一次用得着,但那时非它不可。
+    NoSetupPort,
+    /// 装种子的活没能派出去(线程起不来)。
+    SetupJobDidNotStart {
+        error: &'a str,
+    },
+    /// 装种子失败了。
+    SetupFailed {
+        error: &'a str,
+    },
+    /// 「正在装种子文件…」——装之前说,因为解压要一两秒,而一条从不出声的命令
+    /// 看起来像没跑。
+    SetupInstalling,
+    /// 种子齐了、转发给 agent 之后说。说的是「这条命令接住了」,不是「模型答完了」
+    /// ——后者是那个回合的事,由它在屏上自己出现。
+    SetupRunningSkill,
     PluginNothingInstalled,
     PluginInstalledList {
         lines: &'a str,

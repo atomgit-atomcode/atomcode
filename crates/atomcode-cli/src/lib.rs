@@ -35,6 +35,7 @@ pub mod tui_providers;
 pub mod tui_resume;
 pub mod tui_rewind;
 pub mod tui_settings;
+pub mod tui_setup;
 pub mod tui_tools;
 pub mod tui_welcome_words;
 pub mod uninstall;
@@ -148,7 +149,8 @@ pub mod tui_front {
                     config_path.clone(),
                 )),
                 providers: Some(crate::tui_providers::ConfigProviders::new(config_path)),
-                plugins: Some(crate::tui_plugins::DiskPlugins::new(working_dir)),
+                plugins: Some(crate::tui_plugins::DiskPlugins::new(working_dir.clone())),
+                setup: Some(crate::tui_setup::DiskSetup::new(working_dir)),
             },
             connection,
         )

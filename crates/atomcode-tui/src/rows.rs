@@ -151,6 +151,15 @@ name = "tui-commands-session"
 [[insert]]
 name = "tui-commands-plugin"
 
+# `/setup`: unfold the seed skills on a machine that has never run it, reload,
+# then hand the name to the agent. Its own row rather than the agent's catalog,
+# because on the machine that needs it the agent's catalog does not have the
+# command yet — that is the whole problem this row solves. It takes the name
+# whether or not the agent has it (`CommandSet::overrides`), so both machines
+# end in the same place.
+[[insert]]
+name = "tui-commands-setup"
+
 # `/tools`: the panel, and the same two switches typed out. Its own row for the
 # same reason `/plugin` has one — the panel it pulls up is the launcher's, and a
 # screen with no `tui-tools` port keeps the command and says where the panel
@@ -197,6 +206,7 @@ pub fn catalog() -> Vec<std::sync::Arc<dyn Plugin>> {
         Arc::new(SessionCommandsRow),
         Arc::new(PluginCommandsRow),
         Arc::new(ToolCommandsRow),
+        Arc::new(SetupCommandsRow),
         Arc::new(TakeAwayCommandsRow),
         Arc::new(AgentCatalogCommandsRow),
         Arc::new(HelpCommandsRow),
@@ -741,6 +751,12 @@ commands!(
     "tui-commands-tools",
     crate::commands::ToolCommands,
     "/tools: the panel, and the same two switches from the command line"
+);
+commands!(
+    SetupCommandsRow,
+    "tui-commands-setup",
+    crate::commands::SetupCommands,
+    "/setup: unfold the seeds, reload, and set the model on this project"
 );
 commands!(
     TakeAwayCommandsRow,

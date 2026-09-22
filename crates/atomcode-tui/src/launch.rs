@@ -134,6 +134,10 @@ pub struct Ports {
     pub providers: Option<Arc<dyn crate::providers::Providers>>,
     /// The plugins and marketplaces, likewise.
     pub plugins: Option<Arc<dyn crate::plugins::Plugins>>,
+    /// The seed installation, likewise: `/setup` on a machine that has never run
+    /// it has to put the seed skills on disk before the agent can be asked for
+    /// one, and unpacking them is not this crate's to know how to do.
+    pub setup: Option<Arc<dyn crate::setup::Setup>>,
 }
 
 /// The screen, mounted and connected, not yet running.
@@ -195,6 +199,11 @@ pub async fn mount_with(
     if let Some(plugins) = ports.plugins {
         let _ = ctx
             .provide::<crate::plugin::PluginsSvc>(plugins)
+            .map_err(|e| e.to_string())?;
+    }
+    if let Some(setup) = ports.setup {
+        let _ = ctx
+            .provide::<crate::plugin::SetupSvc>(setup)
             .map_err(|e| e.to_string())?;
     }
     let ui = ctx

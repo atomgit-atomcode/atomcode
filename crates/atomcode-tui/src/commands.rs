@@ -1547,6 +1547,110 @@ impl CommandSet for HelpCommands {
     }
 }
 
+/// `/setup`: put the seed skills on disk if this machine never has, then hand
+/// the name to the agent — which owns what running it means.
+///
+/// **Why the screen owns this at all.** `/setup` is a skill
+/// (`assets/setup-seeds/skills/atomcode-automation-recommender/SKILL.md` —
+/// `name: setup`, `user_invocable: true`), and the `skills` row registers one
+/// command per user-invocable skill, so on a machine where the seeds *are*
+/// installed the agent's catalog already offers `/setup` and there is nothing to
+/// add here. On a machine where they are not, that command does not exist yet —
+/// and typing `/setup` is answered with "no such command" by the very command
+/// that would have installed what it needs. Unpacking the seeds is the one step
+/// the agent cannot take, because it has to have the skill before it can be
+/// asked for one.
+///
+/// **Why it declares `overrides`.** Both machines have to end in the same place,
+/// so this set claims the name unconditionally rather than only when the agent
+/// lacks it. Who would notice the difference is the person, at the moment one of
+/// the two worked and the other did not.
+///
+/// What is left of tuix's `/setup` (`event_loop/commands.rs:3947`) is exactly
+/// this: install → reload → forward. The reload is not optional — writing the
+/// files is not making them so, and the command about to be handed over is one
+/// of the things that arrives by that rebuild.
+pub struct SetupCommands;
+
+fn setup_catalogue() -> Vec<Command> {
+    vec![Command::said_taking(
+        "setup",
+        t(Msg::CmdTakesSetup),
+        t(Msg::CmdAboutSetup),
+    )]
+}
+
+#[async_trait]
+impl CommandSet for SetupCommands {
+    fn id(&self) -> &'static str {
+        "cmd-setup"
+    }
+    fn commands(&self) -> Vec<Command> {
+        setup_catalogue()
+    }
+    fn overrides(&self) -> Vec<&'static str> {
+        vec!["setup"]
+    }
+    async fn run(&self, _name: &str, args: &str, ctx: &Context) -> Outcome {
+        let Some(client) = ctx.service::<crate::plugin::AgentClientSvc>() else {
+            return Outcome::Refused(t(Msg::NoAgent).into_owned());
+        };
+        let Some(port) = ctx.service::<crate::plugin::SetupSvc>() else {
+            return Outcome::Refused(t(Msg::NoSetupPort).into_owned());
+        };
+        // The common case, and the whole reason this is a question rather than
+        // an attempt: on a machine that has run `/setup` once, unfolding the
+        // seeds, taking the file lock and rebuilding the graph are all work with
+        // nothing behind it.
+        if port.installed() {
+            return run_setup_skill(client.as_ref(), args);
+        }
+        // Said before the work, not after: unpacking the embedded seeds is a
+        // second of file I/O, and a command that says nothing until it is over
+        // reads as one that did nothing.
+        let ui = ctx.service::<atomcode_harness::seams::UiSvc>();
+        let announce = |line: &str| {
+            if let Some(ui) = ui.as_ref() {
+                ui.say(line);
+            }
+        };
+        announce(&t(Msg::SetupInstalling));
+        let report = match port.install().await {
+            Ok(report) => report,
+            Err(why) => return Outcome::Refused(why),
+        };
+        if let Err(why) = reload(ctx).await {
+            // The files really are on disk — saying only the failure would have
+            // a person run `/setup` twice for nothing.
+            return Outcome::Said(
+                t(Msg::ReloadFailedAfter {
+                    said: report.trim_end(),
+                    why: &why,
+                })
+                .into_owned(),
+            );
+        }
+        announce(report.trim_end());
+        run_setup_skill(client.as_ref(), args)
+    }
+}
+
+/// Hand the name to the agent, which is where the skill actually runs.
+///
+/// The skill expands into **the person's own message** (`RunSkill` in
+/// `harness/plugins/capabilities.rs`): a skill is a prompt somebody wrote to
+/// send, so what comes back is an ordinary turn — logged as theirs, answerable,
+/// undoable. Asking to send it is all the screen does.
+///
+/// Not gated on the agent having said it offers `setup`: right after the reload
+/// above, what the screen was last *described* as offering is the answer from
+/// before it. The agent looks the name up in the catalog it has now and refuses
+/// it out loud if it is not there — one honest refusal beats a fresh false one.
+fn run_setup_skill(client: &crate::plugin::AgentClient, args: &str) -> Outcome {
+    client.invoke("setup", args);
+    Outcome::Said(t(Msg::SetupRunningSkill).into_owned())
+}
+
 /// The agent's own commands, as its description lists them (`docs/adr/0021`
 /// §10): whatever the rows in its tree registered — stopping a team member, say.
 /// Run by name through the connection; what one produced comes back on screen.
@@ -3269,5 +3373,186 @@ mod plugin_tests {
                 .marketplace,
             "official"
         );
+    }
+}
+
+#[cfg(test)]
+mod setup_tests {
+    use super::*;
+    use atomcode_plexus::{App, ConfigTree, PluginRegistry};
+
+    /// A host that keeps what it was asked, and answers `Done`.
+    #[derive(Default)]
+    struct Recording {
+        asked: std::sync::Mutex<Vec<HostCommand>>,
+    }
+
+    #[async_trait]
+    impl atomcode_host_api::HostControl for Recording {
+        async fn call(&self, command: HostCommand) -> Result<HostReply, HostError> {
+            self.asked.lock().unwrap().push(command);
+            Ok(HostReply::Done)
+        }
+        fn subscribe(&self) -> tokio::sync::mpsc::UnboundedReceiver<atomcode_host_api::HostEvent> {
+            tokio::sync::mpsc::unbounded_channel().1
+        }
+    }
+
+    /// A setup port whose answer to "installed?" is `installed`, and which counts
+    /// how many times it was asked to install.
+    #[derive(Default)]
+    struct FakeSetup {
+        installed: bool,
+        installs: std::sync::Mutex<usize>,
+    }
+
+    #[async_trait]
+    impl crate::setup::Setup for FakeSetup {
+        fn installed(&self) -> bool {
+            self.installed
+        }
+        async fn install(&self) -> Result<String, String> {
+            *self.installs.lock().unwrap() += 1;
+            Ok("✅ Setup 完成 — 1 装好, 0 跳过, 0 失败".into())
+        }
+    }
+
+    struct Rig {
+        app: App,
+        host: Arc<Recording>,
+        /// What the screen sent the agent — `Invoke` is how `/setup` is
+        /// forwarded, and this is the only place that can see it.
+        sent: std::sync::Mutex<
+            tokio::sync::mpsc::UnboundedReceiver<atomcode_kernel::event::AgentCommand>,
+        >,
+        port: Arc<FakeSetup>,
+        all: Arc<Commands>,
+    }
+
+    fn rig(installed: bool) -> Rig {
+        let app = App::new(PluginRegistry::new(), ConfigTree::default());
+        let host = Arc::new(Recording::default());
+        let client = Arc::new(crate::plugin::AgentClient::default());
+        let (commands, received) = tokio::sync::mpsc::unbounded_channel();
+        client.connect(commands, host.clone());
+        client.follow("lead");
+        let _ = app
+            .context()
+            .provide::<crate::plugin::AgentClientSvc>(client);
+        let port = Arc::new(FakeSetup {
+            installed,
+            installs: std::sync::Mutex::new(0),
+        });
+        let _ = app
+            .context()
+            .provide::<crate::plugin::SetupSvc>(port.clone());
+        let all = Arc::new(Commands::new());
+        all.add(Arc::new(SetupCommands)).unwrap();
+        Rig {
+            app,
+            host,
+            sent: std::sync::Mutex::new(received),
+            port,
+            all,
+        }
+    }
+
+    impl Rig {
+        /// Everything the screen has sent the agent so far.
+        fn sent(&self) -> Vec<atomcode_kernel::event::AgentCommand> {
+            let mut rx = self.sent.lock().unwrap();
+            let mut out = Vec::new();
+            while let Ok(command) = rx.try_recv() {
+                out.push(command);
+            }
+            out
+        }
+
+        /// The name `/setup` handed over, if it handed one over.
+        fn invoked(&self) -> Option<String> {
+            self.sent().into_iter().find_map(|c| match c {
+                atomcode_kernel::event::AgentCommand::Invoke { name, .. } => Some(name),
+                _ => None,
+            })
+        }
+    }
+
+    /// On a machine that already has the seeds, `/setup` is one thing: hand the
+    /// name to the agent. No unpacking, no file lock, no rebuild.
+    #[tokio::test]
+    async fn a_machine_that_has_the_seeds_only_forwards() {
+        let rig = rig(true);
+        let outcome = rig.all.dispatch("/setup", &rig.app.context()).await;
+        assert!(
+            matches!(outcome, Outcome::Said(_)),
+            "forwarding is not a refusal: {outcome:?}"
+        );
+        assert_eq!(
+            rig.invoked().as_deref(),
+            Some("setup"),
+            "the name went over"
+        );
+        assert_eq!(*rig.port.installs.lock().unwrap(), 0, "nothing to install");
+        assert!(
+            rig.host.asked.lock().unwrap().is_empty(),
+            "no reload for work that did not happen: {:?}",
+            rig.host.asked.lock().unwrap()
+        );
+    }
+
+    /// On a machine that has never run it, the three steps happen in the order
+    /// that makes them work: install, reload, forward. The reload is not
+    /// decoration — handing over a name the agent does not have yet is the
+    /// failure this whole command exists to avoid.
+    #[tokio::test]
+    async fn a_machine_without_the_seeds_installs_reloads_then_forwards() {
+        let rig = rig(false);
+        let outcome = rig.all.dispatch("/setup hooks", &rig.app.context()).await;
+        assert!(matches!(outcome, Outcome::Said(_)), "{outcome:?}");
+        assert_eq!(*rig.port.installs.lock().unwrap(), 1, "installed once");
+        assert_eq!(
+            *rig.host.asked.lock().unwrap(),
+            vec![HostCommand::Reload {
+                session: "lead".into()
+            }],
+            "the graph is rebuilt before the name is handed over"
+        );
+        // And the args the person typed travel with it: the seed skill takes a
+        // focus area, and dropping it would silently answer a narrower question.
+        let sent = rig.sent();
+        assert!(
+            sent.iter().any(|c| matches!(
+                c,
+                atomcode_kernel::event::AgentCommand::Invoke { name, args, .. }
+                    if name == "setup" && args == "hooks"
+            )),
+            "the words after `/setup` are the skill's argument: {sent:?}"
+        );
+    }
+
+    /// The name is claimed whether or not the agent offers it, so a machine with
+    /// the seeds and one without end in the same place.
+    #[test]
+    fn setup_takes_the_name_from_the_agent_catalog() {
+        assert_eq!(SetupCommands.overrides(), vec!["setup"]);
+        assert!(SetupCommands.commands().iter().any(|c| c.name == "setup"));
+    }
+
+    /// A screen with no port says so, rather than claiming to have installed
+    /// something.
+    #[tokio::test]
+    async fn no_port_is_a_refusal_not_a_silent_success() {
+        let app = App::new(PluginRegistry::new(), ConfigTree::default());
+        let client = Arc::new(crate::plugin::AgentClient::default());
+        client.follow("lead");
+        let _ = app
+            .context()
+            .provide::<crate::plugin::AgentClientSvc>(client);
+        let all = Arc::new(Commands::new());
+        all.add(Arc::new(SetupCommands)).unwrap();
+        match all.dispatch("/setup", &app.context()).await {
+            Outcome::Refused(why) => assert!(!why.is_empty(), "refused with nothing"),
+            other => panic!("{other:?}"),
+        }
     }
 }

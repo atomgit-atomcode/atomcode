@@ -97,6 +97,11 @@ plexus_service!(PluginsSvc => dyn crate::plugins::Plugins, "tui-plugins", Seam, 
 // (`docs/adr/0022` §3) — so it arrives over a seam like everything else.
 plexus_service!(ToolCatalogSvc => dyn crate::tools::Tools, "tui-tools", Seam, "The tool catalog a person can look at and switch, one tool at a time");
 plexus_service!(RewindSvc => dyn crate::rewind::Rewind, "tui-rewind", Seam, "The turns this session can be taken back to, and the taking back");
+// And the seed installation, on the same terms: unpacking the embedded seeds,
+// scanning the project and locking a file are the launcher's to do — this crate
+// keeps its `atomcode-capabilities` features down to `tools` on purpose, and
+// `/setup` on a brand-new machine is the one thing that needs more than that.
+plexus_service!(SetupSvc => dyn crate::setup::Setup, "tui-setup", Seam, "Installing the seed skills on a machine that has none yet");
 
 /// The session's clock, and the only place this crate reads one.
 ///
