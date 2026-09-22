@@ -394,12 +394,23 @@ struct ReviewRow {
 /// way `task` is. It reuses the host's provider on purpose: a reviewer that
 /// built its own would miss a signing gateway and fail where the conversation
 /// around it works.
+/// `/review` over a `code_review` tool, whoever mounted it.
+///
+/// Public for the same reason as [`register_skill_commands`]: a product that
+/// mounts its own reviewer — `atomcode-coding` disables `tool-code-review` and
+/// mounts the product's `code_review`, with the product's limits and provider
+/// slot — owns the command as well. It once mounted the tool and not this, so
+/// on the product `/review` did not exist.
+pub fn register_review_command(ctx: &Context, tool: Arc<dyn Tool>) -> Result<(), String> {
+    crate::commands::register(ctx, Arc::new(ReviewCommand(tool)))
+}
+
 /// `review`: the reviewer over the current changes, run by a person.
 ///
 /// The same tool the row mounted, with the same rules and the same provider
 /// slot. What "the current changes" means — staged, a base, a range — is the
 /// tool's own argument, passed through as typed.
-struct ReviewCommand(Arc<ReviewTool>);
+struct ReviewCommand(Arc<dyn Tool>);
 
 #[async_trait]
 impl crate::commands::CatalogCommand for ReviewCommand {
@@ -413,7 +424,7 @@ impl crate::commands::CatalogCommand for ReviewCommand {
     }
 
     async fn run(&self, agent: Arc<crate::agent::Agent>, args: &str) -> Result<String, String> {
-        use atomcode_kernel::tool::{Tool, ToolContext};
+        use atomcode_kernel::tool::ToolContext;
         let scope = args.trim();
         let mut call = serde_json::Map::new();
         if !scope.is_empty() {
@@ -489,7 +500,7 @@ impl Plugin for ReviewToolPlugin {
         // "review what I changed" is a thing a person asks for directly, and
         // asking the model to call a tool on their behalf spends a turn to
         // reach the same reviewer.
-        crate::commands::register(ctx, Arc::new(ReviewCommand(tool)))?;
+        register_review_command(ctx, tool)?;
         // This row's guidance for this row's tool. It lived in the coding persona as
         // `## CODE REVIEW`, which described the tool on BOTH assemblies — and stayed describing
         // it after this row was patched out of the tree.
@@ -692,7 +703,7 @@ impl crate::commands::CatalogCommand for MemoryCommand {
     }
 
     async fn run(&self, _agent: Arc<crate::agent::Agent>, args: &str) -> Result<String, String> {
-        use atomcode_kernel::tool::{Tool, ToolContext};
+        use atomcode_kernel::tool::ToolContext;
         let content = args.trim();
         if self.action != "list" && content.is_empty() {
             return Err(format!("要有话可{}", self.summary));

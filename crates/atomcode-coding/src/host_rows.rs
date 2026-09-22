@@ -1007,13 +1007,23 @@ impl Plugin for HostToolsPlugin {
         &["tools"]
     }
     fn uses(&self) -> &'static [&'static str] {
-        &["system-prompt"]
+        // `commands`: the product's `code_review` is a thing a person asks for
+        // directly as well, as `/review`.
+        &["system-prompt", "commands"]
     }
     fn description(&self) -> &'static str {
         "tools the coding runtime built itself: its controllers' and its capability graph's"
     }
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
         atomcode_harness::plugins::tools::mount(ctx, self.0.clone())?;
+        // The product disables the harness's `tool-code-review` row and mounts
+        // its own reviewer here (the product's limits and provider slot), so
+        // the command that row would have registered is this row's to register
+        // — or `/review` does not exist on the product at all, which is what it
+        // was until 2026-09-22.
+        if let Some(review) = self.0.iter().find(|tool| tool.name() == "code_review") {
+            atomcode_harness::plugins::capabilities::register_review_command(ctx, review.clone())?;
+        }
         let mut guided = std::collections::BTreeSet::new();
         for tool in &self.0 {
             if let Some((key, text)) = crate::persona::host_tool_guidance(tool.name()) {
