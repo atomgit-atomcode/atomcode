@@ -513,6 +513,14 @@ pub struct UiConfig {
     /// `--classic` still win over it for one launch.
     #[serde(default)]
     pub screen: Screen,
+    /// Report the pointer for in-app mouse — click-to-fold a tool call, the copy
+    /// menu, drag-select. `false` hands the pointer to the terminal, so click-drag
+    /// does the terminal's OWN selection (spans the scrollback, copies clean) at
+    /// the cost of those in-app clicks; wheel-scroll still works. Read once at
+    /// startup (like `theme`); `--no-mouse` overrides it off for one launch, and
+    /// Ctrl+O toggles it live. Default on.
+    #[serde(default = "default_true")]
+    pub mouse: bool,
     /// Auto-copy a rendered code block's raw source to the clipboard when the
     /// AI finishes emitting it. OFF by default — it silently overwrote the
     /// user's clipboard on every code-block reply (issue #699 feedback). Env
@@ -566,6 +574,7 @@ impl Default for UiConfig {
         Self {
             theme: UiTheme::default(),
             screen: Screen::default(),
+            mouse: true,
             auto_copy_code_blocks: default_auto_copy_code_blocks(),
             ai_session_naming: default_ai_session_naming(),
             terminal_status_glyph: default_terminal_status_glyph(),

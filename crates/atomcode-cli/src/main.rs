@@ -2503,7 +2503,10 @@ async fn run() -> Result<i32> {
                 let screen = atomcode_tui::launch::Screen {
                     mascot: cli.mascot,
                     theme: cli.theme.clone(),
-                    mouse: !cli.no_mouse,
+                    // The `[ui] mouse` default, with `--no-mouse` as the one-launch
+                    // override — so `/config ui.mouse false` persists it and the flag
+                    // still forces it off on a single run.
+                    mouse: config.ui.mouse && !cli.no_mouse,
                     ..Default::default()
                 };
                 tracing::info!(

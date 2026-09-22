@@ -421,6 +421,7 @@ impl SettingSpec {
             "subagent.codex" => config.subagent.codex.clone(),
             "subagent.claude" => config.subagent.claude.clone(),
             "ui.screen" => format!("{:?}", config.ui.screen).to_lowercase(),
+            "ui.mouse" => config.ui.mouse.to_string(),
             "ui.theme" => format!("{:?}", config.ui.theme).to_lowercase(),
             "ui.mode_switch_key" => match config.ui.mode_switch_key {
                 crate::config::ModeSwitchKey::ShiftTab => "shift_tab",
@@ -897,6 +898,21 @@ mod tests {
             "shift_tab"
         };
         assert_eq!(setting.value(&configured), expected_token);
+    }
+
+    #[test]
+    fn ui_mouse_defaults_on_and_the_catalog_reflects_the_config() {
+        // The whole point of the setting: `[ui] mouse` is read back into the
+        // config AND the catalog renders the value on disk — the two ways the
+        // dead-key version silently failed.
+        let on: Config = toml::from_str("").unwrap();
+        assert!(on.ui.mouse, "mouse defaults on");
+        let setting = SETTINGS.iter().find(|s| s.id == "ui.mouse").unwrap();
+        assert_eq!(setting.value(&on), "true");
+
+        let off: Config = toml::from_str("[ui]\nmouse = false\n").unwrap();
+        assert!(!off.ui.mouse, "`mouse = false` is honoured, not discarded");
+        assert_eq!(setting.value(&off), "false");
     }
 
     #[test]
