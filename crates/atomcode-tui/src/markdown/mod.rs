@@ -225,7 +225,16 @@ fn ordinary_line(t: &str, indent: usize, w: u16, base: Style) -> Vec<Line> {
     }
     if let Some((marker, b)) = list_item(t) {
         let lead = format!("{}{marker} ", " ".repeat(indent));
-        return wrap_spans(&inline(b, base), w, &lead, bullet());
+        // An ordered marker (`1.`) is drawn in the body's own colour, not the
+        // bullet accent: a number is content a reader counts, not chrome, and the
+        // accent made it read like a link. The unordered `•` keeps the accent —
+        // a coloured dot is what makes an unnumbered list read as a list.
+        let marker_style = if marker.starts_with(|c: char| c.is_ascii_digit()) {
+            base
+        } else {
+            bullet()
+        };
+        return wrap_spans(&inline(b, base), w, &lead, marker_style);
     }
     wrap_spans(&inline(t, base), w, " ".repeat(indent).as_str(), base)
 }
@@ -918,6 +927,26 @@ mod tests {
         assert_eq!(out[0], "## Title");
         assert_eq!(out[1], "• one");
         assert_eq!(out[2], "2. two");
+    }
+
+    #[test]
+    fn an_ordered_marker_is_plain_while_a_bullet_keeps_its_accent() {
+        let lines = render("- one\n2. two", 40, Style::new());
+        // The unordered `•` is drawn in the bullet accent (`Role::Border`) — a
+        // coloured dot is what makes an unnumbered list read as a list.
+        let dot = lines[0]
+            .spans
+            .iter()
+            .find(|s| s.text.contains('•'))
+            .expect("a bullet marker");
+        assert_eq!(dot.style.fg, Some(Color::role(Role::Border)), "{dot:?}");
+        // The ordered `2.` is the body's own colour — no highlight, no accent.
+        let num = lines[1]
+            .spans
+            .iter()
+            .find(|s| s.text.contains("2."))
+            .expect("a number marker");
+        assert_eq!(num.style.fg, None, "the number should be plain: {num:?}");
     }
 
     #[test]
