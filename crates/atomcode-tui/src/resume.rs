@@ -144,12 +144,15 @@ pub fn key(view: &ResumeView, panel: &mut Panel, press: KeyPress) -> Step {
             Step::Stay
         }
         (Key::Enter, _) => {
-            match listed.get(panel.cursor).and_then(|&index| view.sessions().get(index)) {
+            match listed
+                .get(panel.cursor)
+                .and_then(|&index| view.sessions().get(index))
+            {
                 // 读不了的会话(更新版本写的)不恢复——选中也是空动作,像 rewind 停在
                 // 「当前」上按回车。
-                Some(session) if !session.needs_newer_version => {
-                    Step::Resume { id: session.id.clone() }
-                }
+                Some(session) if !session.needs_newer_version => Step::Resume {
+                    id: session.id.clone(),
+                },
                 _ => Step::Stay,
             }
         }
@@ -198,7 +201,11 @@ mod tests {
     #[test]
     fn heading_falls_back_to_id_when_unnamed() {
         assert_eq!(session("ccc", None).heading(), "ccc");
-        assert_eq!(session("a", Some("  ")).heading(), "a", "blank name is no name");
+        assert_eq!(
+            session("a", Some("  ")).heading(),
+            "a",
+            "blank name is no name"
+        );
         assert_eq!(session("a", Some("real")).heading(), "real");
     }
 

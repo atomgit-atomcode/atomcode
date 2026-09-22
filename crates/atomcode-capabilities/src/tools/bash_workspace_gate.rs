@@ -114,7 +114,9 @@ fn bash_command(args: &str) -> Option<String> {
 /// is missed). One predicate so the gate and the blanket cannot drift apart.
 pub(crate) fn any_target_sensitive(targets: &[String], cwd: Option<&Path>) -> bool {
     match cwd {
-        Some(cwd) => targets.iter().any(|t| path_is_sensitive(&resolve_path(t, cwd))),
+        Some(cwd) => targets
+            .iter()
+            .any(|t| path_is_sensitive(&resolve_path(t, cwd))),
         None => targets.iter().any(|t| path_is_sensitive(Path::new(t))),
     }
 }

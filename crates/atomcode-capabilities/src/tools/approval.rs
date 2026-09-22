@@ -409,7 +409,10 @@ mod tests {
             allow_all_bash: false,
         })
         .unwrap();
-        assert!(off.get("allow_all_bash").is_none(), "omitted when false: {off}");
+        assert!(
+            off.get("allow_all_bash").is_none(),
+            "omitted when false: {off}"
+        );
 
         let on = serde_json::to_value(ApprovalRequest {
             call_id: "c".into(),

@@ -850,7 +850,10 @@ mod tests {
 
     #[test]
     fn a_box_drawing_table_arriving_as_text_is_drawn_as_a_table() {
-        let out = plain("┌──────┬──────┐\n│ a    │ b    │\n├──────┼──────┤\n│ 1    │ 2    │\n└──────┴──────┘", 40);
+        let out = plain(
+            "┌──────┬──────┐\n│ a    │ b    │\n├──────┼──────┤\n│ 1    │ 2    │\n└──────┴──────┘",
+            40,
+        );
         // A pre-drawn table is re-rendered as this table's own box — not passed
         // through — so the ASCII shapes of the source never leak.
         assert!(
@@ -859,7 +862,8 @@ mod tests {
         );
         // The columns survive, inside our box (a content row carries both).
         assert!(
-            out.iter().any(|l| l.starts_with('│') && l.contains('a') && l.contains('b')),
+            out.iter()
+                .any(|l| l.starts_with('│') && l.contains('a') && l.contains('b')),
             "the columns were lost: {out:?}"
         );
     }

@@ -248,7 +248,10 @@ mod tests {
         let lines = draw(&m, width, 20);
         // margin(1) + header(1) + one (truncated) entry(1)
         assert_eq!(lines.len(), 3, "one preview row per message: {lines:#?}");
-        assert!(lines[2].contains('↳'), "the entry stays one row: {lines:#?}");
+        assert!(
+            lines[2].contains('↳'),
+            "the entry stays one row: {lines:#?}"
+        );
         assert_eq!(Steering::height(&State, &m, width), Height::Hug(3));
     }
 

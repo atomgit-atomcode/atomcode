@@ -712,7 +712,10 @@ mod tests {
             None,
             Some("bash"),
         );
-        assert!(recorded.has(ANSWER_ALWAYS_ALL), "the gate offered allow-all");
+        assert!(
+            recorded.has(ANSWER_ALWAYS_ALL),
+            "the gate offered allow-all"
+        );
         // The wire request names the RAW tool, not the gate's renamed one.
         let payload = serde_json::json!({
             "call_id": "c",
@@ -742,19 +745,20 @@ mod tests {
             "not offered when the policy withheld it (sensitive / not a group)"
         );
 
-        let offered = Question::approval("bash", r#"{"command":"rm -rf x"}"#, Some(""), None, Some("bash"));
-        assert!(
-            offered.has(ANSWER_ALWAYS_ALL),
-            "offered when eligible"
+        let offered = Question::approval(
+            "bash",
+            r#"{"command":"rm -rf x"}"#,
+            Some(""),
+            None,
+            Some("bash"),
         );
-        assert!(offered.has(ANSWER_ALLOW) && offered.has(ANSWER_ALWAYS) && offered.has(ANSWER_DENY));
+        assert!(offered.has(ANSWER_ALWAYS_ALL), "offered when eligible");
+        assert!(
+            offered.has(ANSWER_ALLOW) && offered.has(ANSWER_ALWAYS) && offered.has(ANSWER_DENY)
+        );
 
         // The blanket answer carries `remember + grant_scope:"all"` (the AllowAlwaysAll wire).
-        let value = response_for(
-            APPROVAL_KIND,
-            &offered,
-            Some(ANSWER_ALWAYS_ALL.to_string()),
-        );
+        let value = response_for(APPROVAL_KIND, &offered, Some(ANSWER_ALWAYS_ALL.to_string()));
         assert_eq!(value["decision"], "allow");
         assert_eq!(value["remember"], true);
         assert_eq!(value["grant_scope"], "all");

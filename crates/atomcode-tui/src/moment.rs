@@ -855,7 +855,8 @@ impl Moment {
         let Some(recent) = self.recent_folded_paste.clone() else {
             return false;
         };
-        let within = now.as_millis().saturating_sub(recent.at.as_millis()) <= DOUBLE_PASTE_EXPAND_MS;
+        let within =
+            now.as_millis().saturating_sub(recent.at.as_millis()) <= DOUBLE_PASTE_EXPAND_MS;
         let end = recent.start + recent.placeholder.len();
         let untouched = self.caret == end
             && self
@@ -959,7 +960,10 @@ mod tests {
     }
 
     fn big(lines: usize) -> String {
-        (0..lines).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n")
+        (0..lines)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
@@ -1005,11 +1009,17 @@ mod tests {
     fn expand_puts_several_pastes_back_and_leaves_prose_alone() {
         let pastes = vec!["FIRST".to_string(), "SECOND".to_string()];
         assert_eq!(
-            expand_pastes("see [Pasted #1 +9 lines] and [Pasted #2 +2 lines] ok", &pastes),
+            expand_pastes(
+                "see [Pasted #1 +9 lines] and [Pasted #2 +2 lines] ok",
+                &pastes
+            ),
             "see FIRST and SECOND ok"
         );
         // An out-of-range or malformed marker is left exactly as written.
-        assert_eq!(expand_pastes("[Pasted #9 +1 lines]", &pastes), "[Pasted #9 +1 lines]");
+        assert_eq!(
+            expand_pastes("[Pasted #9 +1 lines]", &pastes),
+            "[Pasted #9 +1 lines]"
+        );
         assert_eq!(expand_pastes("nothing here", &pastes), "nothing here");
     }
 

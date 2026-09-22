@@ -666,7 +666,10 @@ mod tests {
             .collect();
         assert_eq!(marked, "cde", "the head's own cell is selected too");
         assert!(
-            f.parts[1].lines[0].spans.iter().all(|s| s.style.bg != sel_bg),
+            f.parts[1].lines[0]
+                .spans
+                .iter()
+                .all(|s| s.style.bg != sel_bg),
             "a one-row selection reached the row below"
         );
     }

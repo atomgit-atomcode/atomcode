@@ -86,7 +86,10 @@ enum Row {
     /// 一个也没有,或筛掉了。
     Nothing,
     /// 上下各有多少条不在视野里。
-    Scroll { above: usize, below: usize },
+    Scroll {
+        above: usize,
+        below: usize,
+    },
     Legend,
 }
 
@@ -171,10 +174,7 @@ fn session_line(
     caps: crate::caps::Caps,
 ) -> Line {
     let listed = view.listed(panel);
-    let Some(session) = listed
-        .get(at)
-        .and_then(|&index| view.sessions().get(index))
-    else {
+    let Some(session) = listed.get(at).and_then(|&index| view.sessions().get(index)) else {
         return Line::empty();
     };
     let here = at == panel.cursor;

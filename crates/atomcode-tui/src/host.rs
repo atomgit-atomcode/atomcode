@@ -4997,7 +4997,10 @@ mod tests {
     /// own answer — so the `》` bar is easy to scan back to.
     #[test]
     fn a_user_bar_gets_a_blank_row_above_and_below_it() {
-        assert!(blank_between("commands", "user"), "a blank above the user bar");
+        assert!(
+            blank_between("commands", "user"),
+            "a blank above the user bar"
+        );
         assert!(blank_between("user", "tool_call"), "and below it");
         // Unrelated neighbours still butt together — the rule is the user bar,
         // not a blank between everything.
@@ -5078,8 +5081,14 @@ mod tests {
         h.moment.write().unwrap().interrupted = true;
         assert!(h.arm_working(), "taking the 已中断 note down draws a frame");
         assert!(!h.moment.read().unwrap().interrupted, "note spent");
-        assert!(h.moment.read().unwrap().pending_working, "and the turn is armed");
-        assert!(!h.arm_working(), "arming with no note to take down is invisible");
+        assert!(
+            h.moment.read().unwrap().pending_working,
+            "and the turn is armed"
+        );
+        assert!(
+            !h.arm_working(),
+            "arming with no note to take down is invisible"
+        );
     }
 
     /// A turn that ends before any fact (an immediate error) must not leave the

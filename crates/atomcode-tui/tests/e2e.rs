@@ -1274,7 +1274,10 @@ async fn esc_keeps_a_typed_draft_and_does_not_hand_the_prompt_back() {
         1,
         "the sent prompt stays in the transcript, not re-added over the draft:\n{screen}"
     );
-    assert!(screen.contains("已中断"), "and it says it was stopped:\n{screen}");
+    assert!(
+        screen.contains("已中断"),
+        "and it says it was stopped:\n{screen}"
+    );
 
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;

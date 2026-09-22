@@ -904,7 +904,11 @@ mod tests {
             .collect();
         assert_eq!(ends.len(), 2, "two turns end in the corpus: {ends:?}");
         for want in ["1 轮", "2 工具", "880 tokens", "33% cached"] {
-            assert!(ends[0][0].contains(want), "{want} missing from {:?}", ends[0]);
+            assert!(
+                ends[0][0].contains(want),
+                "{want} missing from {:?}",
+                ends[0]
+            );
         }
         // Turn 2 was a self-cancel: it draws no separator in the transcript now —
         // it closes on the composer instead.
