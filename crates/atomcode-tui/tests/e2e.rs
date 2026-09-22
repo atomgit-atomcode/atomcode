@@ -2043,6 +2043,43 @@ async fn tab_completes_a_command_that_takes_an_argument_and_leaves_a_space() {
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
 
+/// A command whose free-text argument is required and has no bare form — like
+/// `/rename` — completes onto the line when its row is taken, rather than
+/// dispatching a bare "needs a name". So the return key leaves it in the
+/// composer for the argument to be typed, the same as a closed set opens its
+/// values.
+#[tokio::test]
+async fn enter_on_a_required_argument_command_completes_it_rather_than_running() {
+    let dir = scratch("menu-require-arg");
+    let s = start(tree(
+        &dir,
+        &replay(r#"{ text = "ok" }"#),
+        &["[[remove]]\nid = \"tui-panel-welcome\"\n"],
+    ))
+    .await;
+    let task = s.open().await;
+
+    s.term.type_text("/ren");
+    until(&s, "/rename").await;
+    s.term.press(KeyPress::plain(Key::Enter));
+    s.quiet().await;
+
+    // Not dispatched: the name and a space are on the line, so typing the
+    // argument reads as `/rename my work` and lands apart from the name. Had
+    // enter run it bare, the line would be empty behind a "needs a name" reply
+    // and this text would stand alone.
+    s.term.type_text("my work");
+    s.quiet().await;
+    assert!(
+        s.screen().contains("/rename my work"),
+        "enter completed the name onto the line for the argument to be typed:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
 #[tokio::test]
 async fn the_pointer_lights_and_chooses_a_slash_menu_row() {
     // A menu only the keyboard can drive is a menu half the people who reach for
