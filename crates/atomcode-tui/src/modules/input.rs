@@ -46,10 +46,13 @@ fn secret_caption(moment: &crate::moment::Moment) -> Option<String> {
 /// A free function so it can be judged without a terminal.
 /// Whether the dim `已中断` line under the box is on screen: a turn the person
 /// stopped, and the turn is idle now so the line does not sit over one still
-/// landing. The one predicate `render` and `height` both ask, so the row they
-/// reserve and the row they draw cannot disagree.
+/// landing. Not while a password is being asked — the field is the asking
+/// program's then, not the composer, and a "what next?" prompt under a masked
+/// line the person is answering is two prompts at once. The one predicate
+/// `render` and `height` both ask, so the row they reserve and the row they
+/// draw cannot disagree.
 fn note_shown(moment: &crate::moment::Moment) -> bool {
-    moment.interrupted && moment.activity == Activity::Idle
+    moment.interrupted && moment.activity == Activity::Idle && moment.secret.is_none()
 }
 
 fn history_caption(moment: &crate::moment::Moment) -> Option<String> {
@@ -441,6 +444,29 @@ mod tests {
     use crate::moment::Moment;
 
     crate::tui_conformance!(view Input as input_conformance);
+
+    /// The `已中断` note is up only while the field is the composer and idle:
+    /// never over a turn still running (or landing), and never over a password
+    /// the person is answering.
+    #[test]
+    fn the_interrupted_note_shows_only_idle_and_not_over_a_password() {
+        let mut m = Moment::default();
+        assert!(!note_shown(&m), "nothing was stopped, no note");
+
+        m.interrupted = true;
+        assert!(note_shown(&m), "stopped and idle: the note is up");
+
+        for busy in [Activity::Working, Activity::Stopping] {
+            m.activity = busy;
+            assert!(!note_shown(&m), "no note over a turn that is {busy:?}");
+        }
+        m.activity = Activity::Idle;
+
+        m.secret = Some(crate::secret::Asking::default());
+        assert!(!note_shown(&m), "no note under a masked password field");
+        m.secret = None;
+        assert!(note_shown(&m), "and back once the password is answered");
+    }
 
     fn draw(state: &State, moment: &Moment, w: u16, h: u16) -> Vec<String> {
         let vp = Viewport::new(Rect::sized(w, h), moment);

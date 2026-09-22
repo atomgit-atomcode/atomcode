@@ -1513,6 +1513,13 @@ impl Host {
         m.selection = None;
         m.turn_started = None;
         m.steering.clear();
+        // Both belong to the view being left, not the one arriving: the `已中断`
+        // note is about a turn this session stopped, and `last_sent` is what to
+        // hand back on the next Escape. Carried across a `/clear` or a member
+        // switch they would draw a phantom note over — and resend a foreign
+        // prompt into — a conversation that never saw either.
+        m.interrupted = false;
+        m.last_sent = None;
     }
 
     /// Which team panel row a screen point is on, when it is a row that switches
@@ -4929,6 +4936,22 @@ mod tests {
         mods.add_view(Arc::new(Mounted::<input::Input>::new()))
             .unwrap();
         Host::new(mods, default_layout())
+    }
+
+    /// Switching the view leaves no `已中断` note or `last_sent` prompt behind
+    /// for the conversation that arrives: both belong to the one being left.
+    #[test]
+    fn a_view_switch_clears_the_interrupted_note_and_the_kept_prompt() {
+        let h = host();
+        {
+            let mut m = h.moment.write().expect("moment poisoned");
+            m.interrupted = true;
+            m.last_sent = Some("fix the parser".into());
+        }
+        h.switch_view();
+        let m = h.moment.read().expect("moment poisoned");
+        assert!(!m.interrupted, "the note does not follow the switch");
+        assert_eq!(m.last_sent, None, "nor does the prompt to hand back");
     }
 
     /// A host with the providers panel's module mounted, as a launcher that
