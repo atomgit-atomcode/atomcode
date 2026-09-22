@@ -31,7 +31,7 @@
 use crate::frame::{Line, Span, Style};
 use crate::width;
 
-use super::{fence, heading, inline, wrap_spans};
+use super::{fence, inline, wrap_spans};
 
 /// Cells are padded by one space on each side; columns and the table's edges are
 /// separated by a vertical border. The column maths are `atomcode-tuix`'s; the
@@ -500,12 +500,13 @@ fn padded_cell(spans: &mut Vec<Span>, content: Vec<Span>, used: usize, cw: usize
 }
 
 /// The natural grid: a full box, every row at the columns' natural widths, the
-/// header styled as a heading, and `├┼┤` rules between every pair of rows.
+/// header set in bold (the body's colour, not a highlight), and `├┼┤` rules
+/// between every pair of rows.
 fn aligned(parsed: &[Vec<String>], col_widths: &[usize], base: Style) -> Vec<Line> {
     let rows = data_rows(parsed);
     let mut out = vec![border_line(col_widths, TOP_L, TOP_MID, TOP_R)];
     for (i, row) in rows.iter().enumerate() {
-        let style = if i == 0 { heading() } else { base };
+        let style = if i == 0 { base.bold() } else { base };
         let mut spans = vec![Span::styled(VERT.to_string(), fence())];
         for (j, &cw) in col_widths.iter().enumerate() {
             let cell = cell_line(row.get(j).map(String::as_str).unwrap_or(""), style);
@@ -531,7 +532,7 @@ fn wrapped_grid(parsed: &[Vec<String>], col_widths: &[usize], base: Style) -> Ve
     let rows = data_rows(parsed);
     let mut out = vec![border_line(col_widths, TOP_L, TOP_MID, TOP_R)];
     for (i, row) in rows.iter().enumerate() {
-        let style = if i == 0 { heading() } else { base };
+        let style = if i == 0 { base.bold() } else { base };
         let wrapped: Vec<Vec<String>> = (0..ncols)
             .map(|j| {
                 let cell = row.get(j).map(String::as_str).unwrap_or("");
@@ -587,7 +588,7 @@ fn flat(parsed: &[Vec<String>], w: u16, base: Style) -> Vec<Line> {
         for j in 0..ncols {
             let mut spans: Vec<Span> = Vec::new();
             if let Some(header) = headers.get(j) {
-                let label = cell_line(header, heading());
+                let label = cell_line(header, base.bold());
                 let pad = label_w.saturating_sub(label.width());
                 spans.extend(label.spans);
                 if pad > 0 {
@@ -874,18 +875,22 @@ mod tests {
     }
 
     #[test]
-    fn a_header_cell_is_styled_as_a_heading_and_the_body_is_not() {
+    fn a_header_cell_is_bold_but_not_highlighted_and_the_body_is_neither() {
         let rows: Vec<String> = ["| a | b |", "|---|---|", "| 1 | 2 |"]
             .iter()
             .map(|s| s.to_string())
             .collect();
         // Line 0 is the top border; the header is line 1, its separator line 2,
         // the body line 3.
-        let lines = render(&rows, 40, Style::new()).unwrap();
+        let base = Style::new();
+        let lines = render(&rows, 40, base).unwrap();
         let header = lines[1].spans.iter().find(|s| s.text == "a").unwrap();
         let body = lines[3].spans.iter().find(|s| s.text == "1").unwrap();
-        assert_eq!(header.style, heading());
-        assert_ne!(body.style, heading());
+        // The header is told from the body by weight alone: bold, but wearing the
+        // body's own foreground rather than the accent hue a heading would.
+        assert!(header.style.bold, "the header should be bold");
+        assert_eq!(header.style.fg, base.fg, "the header must not be highlighted");
+        assert!(!body.style.bold, "the body is not bold");
     }
 
     #[test]
