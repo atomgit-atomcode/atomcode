@@ -4898,6 +4898,20 @@ fn spawn_runtime_owner_with_optional_agent(
                                 runtime.harness_app.as_mut(),
                                 runtime.harness_providers.clone(),
                             ) {
+                                // What the patch interrupts is put back when it
+                                // is done, under whichever generation is current
+                                // then. A patch does not end a running turn, and
+                                // a phase left at `Reconfiguring` carries the old
+                                // generation: every cancel read from it was
+                                // refused as stale while the turn ran on (`/model`
+                                // mid-turn, then esc → "unavailable").
+                                let resumed = if active_turn.is_none() {
+                                    RuntimePhase::Ready
+                                } else if pending_requests.is_empty() {
+                                    RuntimePhase::InTurn
+                                } else {
+                                    RuntimePhase::WaitingApproval
+                                };
                                 controls.state.store(
                                     runtime_phase_state(
                                         generation,
@@ -4924,10 +4938,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                     // the old provider is still behind the seam and
                                     // the session carries on with the model it had.
                                     controls.state.store(
-                                        runtime_phase_state(
-                                            generation,
-                                            RuntimePhase::Ready,
-                                        ),
+                                        runtime_phase_state(generation, resumed),
                                         Ordering::Release,
                                     );
                                     resources = Some(runtime);
@@ -4976,12 +4987,10 @@ fn spawn_runtime_owner_with_optional_agent(
                                 generation = generation.wrapping_add(1);
                                 event_generation.store(generation, Ordering::Release);
                                 pending_steer_acknowledgements.clear();
-                                if active_turn.is_none() {
-                                    controls.state.store(
-                                        runtime_phase_state(generation, RuntimePhase::Ready),
-                                        Ordering::Release,
-                                    );
-                                }
+                                controls.state.store(
+                                    runtime_phase_state(generation, resumed),
+                                    Ordering::Release,
+                                );
                                 let _ = runtime_event_tx.send(
                                     CodingRuntimeEvent::ProviderChanged {
                                         provider: provider.clone(),
@@ -7361,6 +7370,18 @@ fn spawn_runtime_owner_with_optional_agent(
                                     );
                                 }
                                 turn_started_at = Some(std::time::Instant::now());
+                                // A turn nobody submitted: a catalog command
+                                // (`/init`, `/worklog`, a skill like `/setup`)
+                                // put its prompt in the agent's inbox and the
+                                // agent woke on it. It is still this owner's
+                                // turn to account for — without an
+                                // `active_turn`, a cancel reads it as idle,
+                                // answers `Ok` and never reaches the kernel.
+                                if active_turn.is_none() {
+                                    next_turn_id = next_turn_id.wrapping_add(1);
+                                    active_turn = Some(next_turn_id);
+                                    turn_stats = RuntimeTurnStats::default();
+                                }
                                 controls.state.store(
                                     runtime_phase_state(generation, RuntimePhase::InTurn),
                                     Ordering::Release,
@@ -13785,6 +13806,138 @@ mod tests {
                 snapshot,
                 ..
             })) if snapshot.as_ref() == &expected
+        ));
+        assert_eq!(handle.status().phase, RuntimePhase::Ready);
+        handle.shutdown().await.unwrap();
+    }
+
+    /// `/model` in the middle of a turn, then esc: the stop still reaches the
+    /// turn.
+    ///
+    /// On the harness a model switch is a patch — the turn runs on under the new
+    /// generation. The phase was left at `Reconfiguring` with the *old*
+    /// generation, so `cancel()` stamped every request with a generation the
+    /// owner no longer had and each was refused as stale ("unavailable") while
+    /// the turn carried on.
+    #[tokio::test]
+    async fn a_model_switched_mid_turn_leaves_the_turn_stoppable() {
+        let mut start = native_start(false);
+        start.provider_factory = Arc::new(PendingProviderFactory);
+        let mut runtime = CodingRuntime::start(start).await.unwrap();
+        runtime
+            .handle
+            .submit(UserInput::from("a long answer"))
+            .await
+            .unwrap();
+
+        let next = CodingAgentConfig::new("key", "https://example.test/v1", "after-switch", ".");
+        runtime.handle.reassemble_provider(next).await.unwrap();
+        assert_eq!(
+            runtime.handle.status().phase,
+            RuntimePhase::InTurn,
+            "the patch did not end the turn, so the phase must still say it runs"
+        );
+
+        runtime
+            .handle
+            .cancel()
+            .await
+            .expect("a cancel after a mid-turn model switch was refused as stale");
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let CodingRuntimeEvent::TurnFinished(completion) =
+                    runtime.events.recv().await.unwrap().event
+                {
+                    break completion;
+                }
+            }
+        })
+        .await
+        .expect("the cancelled turn never ended");
+        assert!(
+            matches!(
+                terminal,
+                TurnCompletion::Completed {
+                    reason: StopReason::Cancelled,
+                    ..
+                }
+            ),
+            "{terminal:?}"
+        );
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    /// A turn the agent opened itself is still one a person can stop.
+    ///
+    /// Not every turn comes through `submit`: a catalog command — `/init`,
+    /// `/worklog`, a skill such as `/setup` — puts its prompt straight into the
+    /// agent's inbox, and the agent wakes and runs it. This owner used to learn
+    /// of such a turn only as a phase (`InTurn`), with no `active_turn`, so a
+    /// cancel read it as idle, answered `Ok` and never told the kernel: esc
+    /// said 正在停止 while the turn ran on to its end, and quitting waited out
+    /// its timeout for a terminal that was not coming.
+    #[tokio::test]
+    async fn a_turn_the_agent_started_itself_can_still_be_cancelled() {
+        let (agent, mut kernel_commands, kernel_events) = fake_agent();
+        let (handle, controls) = coding_runtime_control_channel();
+        let (runtime_tx, mut runtime_events) = mpsc::unbounded_channel();
+        let _adapter = spawn_runtime_owner_with_protocol(
+            agent, controls, runtime_tx, true, true, None, None, None,
+        );
+
+        // No submit: the turn is the agent's own.
+        kernel_events
+            .send(AgentEvent::TurnStarted { turn: None })
+            .unwrap();
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::Agent(AgentEvent::TurnStarted { .. }))
+        ));
+
+        handle.cancel().await.unwrap();
+        assert!(
+            matches!(
+                tokio::time::timeout(std::time::Duration::from_secs(2), kernel_commands.recv())
+                    .await,
+                Ok(Some(AgentCommand::Cancel))
+            ),
+            "the cancel was answered but never reached the agent"
+        );
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+
+        kernel_events
+            .send(AgentEvent::TurnComplete {
+                turn: None,
+                reason: StopReason::Cancelled,
+            })
+            .unwrap();
+        let kept = SessionSnapshot::new(vec![Message::user("/setup")]);
+        kernel_events
+            .send(AgentEvent::Snapshot {
+                snapshot: kept.clone(),
+            })
+            .unwrap();
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match runtime_events.recv().await {
+                    Some(CodingRuntimeEvent::TurnFinished(completion)) => break completion,
+                    Some(_) => {}
+                    None => panic!("runtime events closed before the cancel's terminal"),
+                }
+            }
+        })
+        .await
+        .expect("a cancelled turn must end in a terminal the driver can see");
+        assert!(matches!(
+            terminal,
+            TurnCompletion::Completed {
+                reason: StopReason::Cancelled,
+                snapshot,
+                ..
+            } if snapshot.as_ref() == &kept
         ));
         assert_eq!(handle.status().phase, RuntimePhase::Ready);
         handle.shutdown().await.unwrap();

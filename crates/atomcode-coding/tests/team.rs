@@ -287,6 +287,73 @@ async fn a_member_that_finishes_silently_is_reported_on() {
     );
 }
 
+/// A member turn that was stopped does not wake its lead.
+///
+/// `/cancel-all` stops the lead and every member, and each member's
+/// "finished turn N: Cancelled" used to arrive as a message the lead was
+/// waiting for — opening a fresh lead turn right after the person had stopped
+/// everything. It is kept as a note instead, for whenever the lead next works.
+///
+/// The stopped turn is written into the member's log directly: which of a
+/// member's turns a stop lands in is the scheduler's choice, and what is under
+/// test is only what the team makes of a turn that ended this way.
+#[tokio::test]
+async fn a_stopped_member_turn_does_not_wake_the_lead() {
+    let dir = scratch("stopped-member");
+    let app = start(tree(
+        &dir,
+        &format!(r#"{DELEGATE}, {{ text = "delegated" }}, {{ text = "noted" }}"#),
+        r#"{ text = "looking" }"#,
+    ))
+    .await;
+    let lead = create_agent(&app).await.unwrap();
+    run_turn(&app, "go").await.unwrap();
+    let agents = app.context().service::<AgentsSvc>().unwrap();
+    let scout = agents
+        .by_session(&format!("{}/scout", lead.session_id()))
+        .unwrap();
+    until_idle(&scout).await;
+    // Its first report is an ordinary one, and is heard.
+    heard_by(&app, &lead).await;
+    assert!(!lead.inbox().has_waking_input());
+
+    let log = scout.session();
+    let turn = log.current_turn() + 1;
+    for event in [
+        SessionEvent::TurnStart { turn },
+        SessionEvent::Injected {
+            turn,
+            text: "look again".into(),
+            origin: InjectionOrigin::Peer {
+                from: lead.session_id().to_string(),
+            },
+        },
+        SessionEvent::TurnEnd {
+            turn,
+            stop: atomcode_kernel::event::StopReason::Cancelled,
+            error: None,
+        },
+    ] {
+        atomcode_harness::session::commit(scout.ctx(), &log, event);
+    }
+
+    assert!(
+        !lead.inbox().has_waking_input(),
+        "a stopped member's report woke the lead"
+    );
+    let noted = lead.session().events().into_iter().any(|e| {
+        matches!(
+            e.event,
+            SessionEvent::Injected {
+                origin: InjectionOrigin::TeamNote { .. },
+                ref text,
+                ..
+            } if text.contains(&format!("finished turn {turn}: Cancelled"))
+        )
+    });
+    assert!(noted, "and the lead is still told, as a note");
+}
+
 #[tokio::test]
 async fn status_tell_and_stop_are_the_leads_to_call() {
     let dir = scratch("lifecycle");
