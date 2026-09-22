@@ -958,6 +958,98 @@ mod tests {
         assert!(m.turn_in_flight());
     }
 
+    fn big(lines: usize) -> String {
+        (0..lines).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn a_small_paste_goes_in_raw() {
+        let mut m = Moment::default();
+        m.insert_paste("hi there", Timestamp::millis(0));
+        assert_eq!(m.input, "hi there");
+        assert!(m.pastes.is_empty(), "nothing folded");
+        assert_eq!(m.caret, "hi there".len());
+    }
+
+    #[test]
+    fn a_multi_line_paste_folds_to_a_lines_marker() {
+        let mut m = Moment::default();
+        let body = big(PASTE_FOLD_LINES);
+        m.insert_paste(&body, Timestamp::millis(0));
+        assert_eq!(m.input, format!("[Pasted #1 +{PASTE_FOLD_LINES} lines]"));
+        assert_eq!(m.pastes, vec![body.clone()]);
+        // And submit puts the whole thing back.
+        assert_eq!(expand_pastes(&m.input, &m.pastes), body);
+    }
+
+    #[test]
+    fn a_long_single_line_paste_folds_to_a_chars_marker() {
+        let mut m = Moment::default();
+        let url = "x".repeat(PASTE_FOLD_CHARS);
+        m.insert_paste(&url, Timestamp::millis(0));
+        assert_eq!(m.input, format!("[Pasted #1 {PASTE_FOLD_CHARS} chars]"));
+        assert_eq!(expand_pastes(&m.input, &m.pastes), url);
+    }
+
+    #[test]
+    fn crlf_pastes_normalise_and_count_their_lines() {
+        let mut m = Moment::default();
+        // Five CR-separated lines must count as five (fold), not one.
+        let body = "a\r\nb\r\nc\r\nd\r\ne";
+        m.insert_paste(body, Timestamp::millis(0));
+        assert_eq!(m.input, "[Pasted #1 +5 lines]");
+        assert_eq!(expand_pastes(&m.input, &m.pastes), "a\nb\nc\nd\ne");
+    }
+
+    #[test]
+    fn expand_puts_several_pastes_back_and_leaves_prose_alone() {
+        let pastes = vec!["FIRST".to_string(), "SECOND".to_string()];
+        assert_eq!(
+            expand_pastes("see [Pasted #1 +9 lines] and [Pasted #2 +2 lines] ok", &pastes),
+            "see FIRST and SECOND ok"
+        );
+        // An out-of-range or malformed marker is left exactly as written.
+        assert_eq!(expand_pastes("[Pasted #9 +1 lines]", &pastes), "[Pasted #9 +1 lines]");
+        assert_eq!(expand_pastes("nothing here", &pastes), "nothing here");
+    }
+
+    #[test]
+    fn pasting_the_same_block_again_expands_it_in_place() {
+        let mut m = Moment::default();
+        let body = big(6);
+        m.insert_paste(&body, Timestamp::millis(0));
+        assert_eq!(m.input, "[Pasted #1 +6 lines]");
+        // Second paste of the same block, marker untouched, within the window.
+        m.insert_paste(&body, Timestamp::millis(500));
+        assert_eq!(m.input, body, "the marker was swapped for the body");
+        assert!(m.pastes.is_empty(), "the folded body was taken back");
+        assert!(m.recent_folded_paste.is_none());
+    }
+
+    #[test]
+    fn a_second_paste_after_the_window_folds_again_instead_of_expanding() {
+        let mut m = Moment::default();
+        let body = big(6);
+        m.insert_paste(&body, Timestamp::millis(0));
+        // Same block, but too late — a fresh paste, folded as #2.
+        m.insert_paste(&body, Timestamp::millis(DOUBLE_PASTE_EXPAND_MS + 1));
+        assert_eq!(m.input, "[Pasted #1 +6 lines][Pasted #2 +6 lines]");
+        assert_eq!(m.pastes.len(), 2);
+    }
+
+    #[test]
+    fn a_second_paste_after_typing_does_not_expand_the_marker() {
+        let mut m = Moment::default();
+        let body = big(6);
+        m.insert_paste(&body, Timestamp::millis(0));
+        // A keystroke moved the caret off the marker's end — the double-paste
+        // gesture is off, so the same block folds again.
+        m.caret = 0;
+        m.insert_paste(&body, Timestamp::millis(100));
+        assert!(m.input.contains("[Pasted #2 +6 lines]"), "{}", m.input);
+        assert_eq!(m.pastes.len(), 2);
+    }
+
     #[test]
     fn a_moment_is_constructible_without_a_terminal() {
         let m = Moment::default().working().typing("hal").at_tick(7);

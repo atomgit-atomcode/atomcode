@@ -3399,13 +3399,18 @@ impl Tui {
         match action {
             Action::Quit => return true,
             Action::Submit => {
-                let text = m.input.trim().to_string();
+                // The composer shows `[Pasted #N …]` markers to stay terse; the
+                // model gets the whole paste — put the bodies back before
+                // anything reads the text.
+                let text = crate::moment::expand_pastes(&m.input, &m.pastes);
+                let text = text.trim().to_string();
                 // Take the pictures the text still shows before the text is
                 // cleared: what was written and what was attached have to be
                 // decided together, or an attachment can outlive the marker
                 // that was the only reason it was going.
                 let images = m.attachments.take_shown(&text);
                 m.input.clear();
+                m.clear_pastes();
                 m.caret = 0;
                 m.history_at = None;
                 m.draft.clear();
@@ -3482,6 +3487,9 @@ impl Tui {
             }
             Action::Clear => {
                 m.input.clear();
+                // The `[Pasted …]` markers went with the text, so the bodies they
+                // stood for go too.
+                m.clear_pastes();
                 // The markers went with the text, so the images they stood for
                 // go too. Leaving them held would make the composer's state
                 // disagree with the only place a person can see it.
@@ -3533,10 +3541,12 @@ impl Tui {
                 return false;
             }
             Action::Paste(text) => {
+                // A big block folds into a `[Pasted #N …]` marker rather than
+                // filling the composer; the body is put back at submit
+                // (`expand_pastes`). Paste the same block again to expand it.
                 let text = sanitize_paste(&text);
-                let at = m.caret.min(m.input.len());
-                m.input.insert_str(at, &text);
-                m.caret = at + text.len();
+                let now = m.now;
+                m.insert_paste(&text, now);
             }
             Action::AttachImage => {
                 // The destination is decided before the clipboard is even read.
