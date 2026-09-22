@@ -155,26 +155,11 @@ impl Plugin for SkillsPlugin {
         // (`docs/plans/2026-09-18-tui-panels-and-commands-inventory.md` B1,
         // `docs/adr/0021` §10). The row that owns the capability registers it;
         // nothing in the screen knows this command exists.
-        crate::commands::register(ctx, Arc::new(ListSkills(registry.clone())))?;
-        // And one command per skill a person may invoke, so `/init`, `/setup`
-        // and anything they wrote themselves are in the menu without this row
-        // — or the screen — knowing their names
-        // (`docs/plans/2026-09-18-tui-panels-and-commands-inventory.md` B1).
         //
-        // Per skill rather than four hard-coded commands: what is installed is
-        // the person's choice, and a fixed list would offer `/init` on a
-        // machine that does not have it and nothing for the skill they wrote
-        // this morning.
-        for skill in registry.user_invocable() {
-            // A name a command already has is left alone rather than refused:
-            // a skill called `compact` must not take the host's `/compact`
-            // away, and a mount that failed over it would take the whole tree
-            // down for a file someone dropped in a directory.
-            if catalog_has(ctx, &bare_name(&skill.name)) {
-                continue;
-            }
-            crate::commands::register(ctx, Arc::new(RunSkill(skill)))?;
-        }
+        // The same call a host's own skills row makes — a row that replaces this
+        // one has to take over what it did, and this is where that is stated
+        // once (`register_skill_commands`).
+        register_skill_commands(ctx, &registry)?;
         crate::plugins::self_knowledge::describes(
             ctx,
             "skills",
@@ -560,6 +545,32 @@ impl Default for MemoryRow {
 
 fn yes() -> bool {
     true
+}
+
+/// 把一份 skill 目录变成命令：`/skills`，以及每个可被调用的 skill 一条。
+///
+/// **一行一次，而不是每个装配各写一遍。** 这件事原本只住在 [`SkillsPlugin`] 里，
+/// 而 coding 装配把那一行换成了自己的 `skills-host`——于是那套装配里一条 skill 命令
+/// 都没有（`/setup` 因此回了 `NotFound`，任何人写在 `.atomcode/skills/` 里的 skill
+/// 也一样进不了目录）。要换掉一行就得接过它该说的话；把一个机制留在某个具体行里，
+/// 换行的人看不见它，只能靠踩一次才知道。
+///
+/// 两件事都在这里：`/skills`（人能看装了什么，不必让模型替他调工具）和
+/// **每个 `user_invocable` 的 skill 一条**——`/init`、`/setup` 和任何人自己写的
+/// 那条，都不必由这一行或屏幕知道它们的名字。
+pub fn register_skill_commands(ctx: &Context, registry: &Arc<SkillRegistry>) -> Result<(), String> {
+    crate::commands::register(ctx, Arc::new(ListSkills(registry.clone())))?;
+    for skill in registry.user_invocable() {
+        // A name a command already has is left alone rather than refused:
+        // a skill called `compact` must not take the host's `/compact`
+        // away, and a mount that failed over it would take the whole tree
+        // down for a file someone dropped in a directory.
+        if catalog_has(ctx, &bare_name(&skill.name)) {
+            continue;
+        }
+        crate::commands::register(ctx, Arc::new(RunSkill(skill)))?;
+    }
+    Ok(())
 }
 
 /// The name a person types for a skill: `skills:init` is typed `/init`.

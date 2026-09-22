@@ -897,7 +897,12 @@ impl Plugin for SkillsHostPlugin {
         &["tools", "system-prompt"]
     }
     fn uses(&self) -> &'static [&'static str] {
-        &["operations"]
+        // `commands` because this row took the harness `skills` row's place, and
+        // that row registers the command catalog entries for skills. Replacing a
+        // row means taking over what it did: without this, no skill is a command
+        // in this runtime at all — a person's own skill included, and `/setup`
+        // answered `NotFound` the first time it was forwarded here.
+        &["operations", "commands"]
     }
     fn provides(&self) -> &'static [&'static str] {
         &["skills"]
@@ -928,6 +933,14 @@ impl Plugin for SkillsHostPlugin {
             let (id, rank) = crate::on_harness::SKILLS_FRAGMENT;
             atomcode_harness::plugins::tools::contribute_prompt(ctx, id, rank, catalog);
         }
+        // The command catalog half of what the harness `skills` row did: `/skills`
+        // and one command per user-invocable skill — this runtime's own `/setup`
+        // among them, and anything a person wrote into `.atomcode/skills/`.
+        //
+        // Declared here rather than left to the row this one replaces, because a
+        // swapped row is not mounted at all: the mechanism has to be named by the
+        // row that took its place, or it silently stops existing.
+        atomcode_harness::plugins::capabilities::register_skill_commands(ctx, registry)?;
         Ok(())
     }
 }

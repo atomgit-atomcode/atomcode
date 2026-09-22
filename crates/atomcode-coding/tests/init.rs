@@ -124,3 +124,70 @@ async fn the_command_hands_the_model_the_prompt_this_machine_is_configured_with(
     // answer, and it is judged where it can be: the path this row reads comes
     // from how the runtime was configured, which a test cannot hand it.
 }
+
+fn write_skill(dir: &std::path::Path, name: &str, description: &str) {
+    let skill = dir.join(name);
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        format!("---\nname: {name}\ndescription: {description}\n---\nDo the thing.\n"),
+    )
+    .unwrap();
+}
+
+/// A skill a person may invoke is a command the agent can run.
+///
+/// **This criterion comes from a live failure.** The new front end gave `/setup`
+/// a "unseal the seeds first" step, forwarded the name to the agent afterwards,
+/// and was answered `没有送达:NotFound`. The root cause was not in the front end:
+/// the code that registers one command per user-invocable skill lives in the
+/// harness's `skills` row (`plugins/capabilities.rs:168`), and the coding
+/// assembly **swaps that row out** (`on_harness.rs`:
+/// `.swap("skills", "skills-host")`). Its replacement provides `SkillsSvc` and
+/// mounts `use_skill` / `list_skills`, and never took over "one command per
+/// skill".
+///
+/// The damage is wider than `/setup`: in this runtime *no* skill reaches the
+/// command catalog — including the ones a person writes into `.atomcode/skills/`
+/// themselves. `/init` works only because `host_rows.rs` registers that one by
+/// hand, which is a patch per command rather than this mechanism working.
+#[tokio::test]
+#[serial_test::serial(atomcode_home)]
+async fn a_skill_a_person_can_invoke_is_a_command_the_agent_can_run() {
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("ATOMCODE_HOME", home.path());
+    let project = tempfile::tempdir().unwrap();
+    let skills = tempfile::tempdir().unwrap();
+    write_skill(skills.path(), "demo-skill", "does demo things");
+
+    let cfg = CodingAgentConfig::new("k", "http://localhost", "canned", project.path());
+    let opts = PrepareOptions {
+        session: SessionMode::Fresh,
+        skill_dirs: Some(vec![skills.path().to_path_buf()]),
+        ..quiet_options()
+    };
+    let mounted = mount(&cfg, opts, Arc::new(CannedProvider)).await;
+
+    let ctx = mounted.context();
+    let agent = ctx
+        .service::<AgentsSvc>()
+        .expect("agents")
+        .list()
+        .into_iter()
+        .find(|a| a.parent().is_none())
+        .expect("the conversation's own agent");
+    let offered: Vec<String> = ctx
+        .service::<CommandsSvc>()
+        .expect("the command catalog")
+        .offered_for(&agent)
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
+    mounted.shutdown().await;
+
+    assert!(
+        offered.contains(&"demo-skill".to_string()),
+        "a skill a person may invoke must be a command the agent can run — \
+         `/demo-skill` is how they run it, and the classic front end offered it: {offered:?}"
+    );
+}
