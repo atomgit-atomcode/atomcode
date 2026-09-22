@@ -4127,21 +4127,54 @@ impl Tui {
     /// the same command once the list has narrowed.
     fn refresh_menu(&self) {
         let menu = match self.slash_prefix() {
-            Some(rest) => self
-                .host
-                .commands
-                .matching(&rest)
-                .into_iter()
-                .map(|c| {
+            Some(rest) => {
+                // The level in force, so a command that expands its closed set
+                // (below) can mark the row already chosen — the ✓ the modal used
+                // to carry, now on the inline row.
+                let current_effort = self
+                    .client
+                    .described()
+                    .and_then(|d| d.reasoning_effort)
+                    .map(|level| level.as_str().to_string());
+                let mut items: Vec<crate::menu::Item> = Vec::new();
+                for c in self.host.commands.matching(&rest) {
+                    // A command with a closed set of values, once fully named, is
+                    // not one row but one row per value: the menu's own way to
+                    // pick an argument, in place of a modal. `{name} {value}`
+                    // dispatches the command the row stands for.
+                    if !c.options.is_empty() && c.answers_to(&rest) {
+                        for opt in &c.options {
+                            // Effort's `default` is "leave it to the endpoint",
+                            // i.e. no level set — so `default` is the marked row
+                            // exactly when nothing is in force.
+                            let active = match &current_effort {
+                                Some(level) => level == opt.value.as_ref(),
+                                None => opt.value == "default",
+                            };
+                            let shown = format!("{} {}", c.name, opt.value);
+                            let label = if active {
+                                format!("{shown} ✓")
+                            } else {
+                                shown.clone()
+                            };
+                            items.push(
+                                crate::menu::Item::new(shown, label).about(opt.about.to_string()),
+                            );
+                        }
+                        continue;
+                    }
                     // The label shows the aliases (`session (new)`); the value
                     // inserted / dispatched stays the canonical name.
                     let label = match &c.takes {
                         Some(t) => format!("{} {t}", c.display_name()),
                         None => c.display_name(),
                     };
-                    crate::menu::Item::new(c.name.to_string(), label).about(c.about.to_string())
-                })
-                .collect(),
+                    items.push(
+                        crate::menu::Item::new(c.name.to_string(), label).about(c.about.to_string()),
+                    );
+                }
+                items
+            }
             // Not a command being named. It may still be a path being typed
             // after `@` — the same discovery surface the slash menu is, for the
             // other thing people type by name and get wrong. It lists and
@@ -4969,6 +5002,26 @@ impl Plugin for HeadlessSurfacePlugin {
             .provide::<SurfaceSvc>(Headless::new(row.width, row.height))
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod surface_row_tests {
+    use super::surface_row;
+
+    /// `[ui] mouse = false` hands the pointer back to the terminal, so click-drag
+    /// does the terminal's own selection. `false && env` is false whatever the
+    /// `ATOMCODE_NO_MOUSE` override is, so this does not read the environment.
+    #[test]
+    fn mouse_off_hands_the_pointer_back_to_the_terminal() {
+        let (_, on, _) =
+            surface_row(&serde_json::json!({ "mouse": false })).expect("mouse=false parses");
+        assert!(!on, "mouse=false must hand the pointer back");
+        // A realistic surface config (theme + mouse together) still parses, and
+        // its unknown-field guard does not choke on the pair.
+        let (_, on, _) = surface_row(&serde_json::json!({ "theme": "dark", "mouse": false }))
+            .expect("theme + mouse parse");
+        assert!(!on);
     }
 }
 

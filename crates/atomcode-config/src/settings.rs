@@ -220,6 +220,20 @@ pub static SETTINGS: &[SettingSpec] = &[
         kind: SettingKind::Choice(SCREENS),
         apply: ApplyPolicy::NextStartup,
     },
+    // `false` hands the pointer back to the terminal, so click-drag does the
+    // terminal's OWN selection (which spans the scrollback and copies clean),
+    // at the cost of in-app mouse clicks — folding a tool call, the copy menu.
+    // Wheel-scroll still works (alternate-scroll → arrow keys). The live toggle
+    // is Ctrl+O; this is the persistent default. See `plugin::SurfaceRow::mouse`.
+    SettingSpec {
+        id: "ui.mouse",
+        path: &["ui", "mouse"],
+        label_en: "Mouse (off = terminal selection)",
+        label_zh: "鼠标(关=交还终端做选择)",
+        aliases: &["selection", "copy", "select", "拖动", "选中", "复制", "鼠标"],
+        kind: SettingKind::Boolean,
+        apply: ApplyPolicy::NextStartup,
+    },
     SettingSpec {
         id: "ui.theme",
         path: &["ui", "theme"],
