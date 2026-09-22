@@ -64,7 +64,7 @@ async fn neutral_turn_runs_without_persona_or_middleware() {
 
 // CLAIM 2: a risky tool is gated by ApprovalMiddleware, which round-trips a
 // decision via Request/Respond correlated by id.
-#[tokio::test]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn approval_middleware_gates_risky_tool_via_id_roundtrip() {
     let mut reg = ToolRegistry::new();
     reg.register(Arc::new(RiskyWriteTool));
@@ -222,7 +222,7 @@ async fn lifecycle_hook_injects_and_continues_loop() {
     let (mut turn_started, mut echoed, mut completed) = (false, false, false);
     while let Some(ev) = events.recv().await {
         match ev {
-            AgentEvent::TurnStarted => turn_started = true,
+            AgentEvent::TurnStarted { .. } => turn_started = true,
             AgentEvent::ToolResult { result } if result.content.contains("echo: ") => echoed = true,
             AgentEvent::TurnComplete { .. } => {
                 completed = true;
@@ -656,7 +656,7 @@ async fn dropping_tool_calls_in_on_model_response_prevents_execution() {
 // CLAIM 12: tool-level concerns live in ToolMiddleware — `before` can rewrite the
 // call (args) and block without a ghost ToolStarted; `after` transforms the result.
 // (pre_tool/post_tool folded into ToolMiddleware.)
-#[tokio::test]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn tool_middleware_rewrites_blocks_and_transforms() {
     // (a) before rewrites args → reaches execution
     {
@@ -799,7 +799,7 @@ async fn tool_middleware_rewrites_blocks_and_transforms() {
 // CLAIM 13: command-level approval — risk is ARG-AWARE (dangerous command → gated,
 // safe command → not gated), and a session grant ("remember") caches so an
 // identical dangerous command isn't asked twice.
-#[tokio::test]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn dangerous_command_requires_approval_safe_does_not_and_grant_is_cached() {
     // --- Phase A: a SAFE command needs no approval ---
     {
@@ -958,7 +958,7 @@ async fn user_prompt_submit_can_block_a_prompt() {
     while let Some(ev) = handle.events.recv().await {
         match ev {
             AgentEvent::Error { message, .. } if message.contains("rejected") => rejected = true,
-            AgentEvent::TurnStarted => turn_started = true,
+            AgentEvent::TurnStarted { .. } => turn_started = true,
             AgentEvent::TurnComplete { .. } => break,
             _ => {}
         }

@@ -197,7 +197,7 @@ async function buildOne(lang) {
   }
 
   const outFile = path.join(DOCS_DIR, `search-index.${lang}.json`);
-  await fs.writeFile(outFile, JSON.stringify(out));
+  await fs.writeFile(outFile, JSON.stringify(out, null, 2) + '\n');
   const bytes = (await fs.stat(outFile)).size;
   console.log(`[search-index] ${lang}: ${out.length} pages, ${(bytes/1024).toFixed(1)} KB, injected ids into ${injectedFiles} page(s) → ${path.relative(process.cwd(), outFile)}`);
 }

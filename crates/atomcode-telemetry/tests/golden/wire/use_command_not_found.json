@@ -1,0 +1,16 @@
+{
+  "app_version": "0.0.0",
+  "arch": "aarch64",
+  "device_id": "00000000-0000-0000-0000-000000000000",
+  "error_data": "{\"command\":\"nope\",\"duration_ms\":0,\"message\":\"Unknown command: nope\"}",
+  "error_kind": "not_found",
+  "event_id": "use_command",
+  "launch_id": "00000000-0000-0000-0000-000000000000",
+  "locale": "en-US",
+  "os": "macos",
+  "schema_version": 1,
+  "session_id": "00000000-0000-0000-0000-000000000000",
+  "success": false,
+  "ts": 0,
+  "type": "nope"
+}

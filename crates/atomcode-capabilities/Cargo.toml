@@ -119,6 +119,10 @@ sha2 = { version = "0.10", optional = true }
 # base64 is non-optional: `read_file` always needs it to hand an image file to a
 # vision model (encode bytes → data URL). Also used by the `mcp` OAuth PKCE flow.
 base64 = { version = "0.22" }
+# Image downscale/re-encode for oversized user attachments (read_file image + clipboard
+# paste) so a huge screenshot can't blow the per-request body. Optional — pulled in by
+# `tools` (read_file lives there); decoders kept to the common paste/screenshot formats.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif", "webp"], optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
 dirs = { version = "6", optional = true }
 toml = { version = "0.8", optional = true }
@@ -150,7 +154,7 @@ default = ["provider", "tools"]
 provider = ["dep:reqwest", "dep:rustls-native-certs", "dep:rustls", "dep:bytes", "dep:async-stream", "dep:dirs", "dep:httpdate", "dep:atomcode-auth", "dep:atomcode-config", "dep:getrandom", "dep:tracing", "dep:fs2", "dep:hyper"]
 # Real neutral coding Tools (fs read/write/edit/list + bash + grep/glob) + a generic
 # approval middleware. Pulls fs/process/io tokio features + the search stack.
-tools = ["dep:ignore", "dep:regex", "dep:grep", "dep:globset", "dep:encoding_rs", "dep:chardetng", "dep:tokio-util", "dep:similar", "dep:tree-sitter", "dep:tree-sitter-bash", "dep:sha2", "dep:dirs", "tokio/fs", "tokio/process", "tokio/io-util"]
+tools = ["dep:ignore", "dep:regex", "dep:grep", "dep:globset", "dep:encoding_rs", "dep:chardetng", "dep:tokio-util", "dep:similar", "dep:tree-sitter", "dep:tree-sitter-bash", "dep:sha2", "dep:dirs", "dep:image", "tokio/fs", "tokio/process", "tokio/io-util"]
 # Network tools (web_fetch / web_search). Opt-in on top of `tools` — pulls the HTTP stack
 # (reqwest + url + tokio/net for SSRF DNS checks). NOT in default: a tools-only embedder
 # that wants no network egress skips it.
@@ -209,7 +213,14 @@ mcp = [
 # coexist) — a per-turn compacted <id>.snapshot for RESUME + an append-only,
 # never-compacted <id>.jsonl transcript for RECALL — plus the SnapshotHook /
 # TranscriptHook / recall tool / current-date hook that drive it. Opt-in (NOT default).
-session = ["dep:dirs", "dep:chrono", "dep:fs2", "dep:atomcode-config", "dep:sha2"]
+# The project-instructions loader alone (AGENTS.md / CLAUDE.md / .atomcode.md).
+# Zero dependencies — the module is pure path-in/string-out — so any stack can
+# read a repository's standing instructions without the session subsystem.
+instructions = []
+# Keyword ranking only (tokenizer + scoring). Zero dependencies; `session` needs
+# it because `recall` ranks with it.
+search = []
+session = ["dep:dirs", "dep:chrono", "dep:fs2", "dep:atomcode-config", "instructions", "search", "dep:sha2"]
 # User-driven persistent memory: the production memory.md store (global
 # $ATOMCODE_HOME/memory.md + per-project <root>/.atomcode/memory.md + machine-local
 # <root>/.atomcode/local/memory.md, same files so old/new coexist) + a MemoryHook

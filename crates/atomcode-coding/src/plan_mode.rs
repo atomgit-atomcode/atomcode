@@ -47,15 +47,66 @@ impl PlanModeGate {
     pub fn new(active: Arc<AtomicBool>, mcp_grants: Arc<dyn PermissionStore>) -> Self {
         Self { active, mcp_grants }
     }
+}
 
-    /// The hard-block message for a built-in mutating tool under plan mode.
-    fn blocked(name: &str) -> BeforeOutcome {
-        BeforeOutcome::deny(format!(
-            "plan mode is active — `{name}` would modify the workspace and is blocked. Only \
-             read-only tools are allowed: explore and present a plan for the user to approve \
-             before making changes."
-        ))
+/// What plan mode says about one call. The judgement both shells — the kernel
+/// middleware and the harness row — ask, so the two cannot drift.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PlanVerdict {
+    /// Plan mode has no opinion: it is off, or the call cannot change anything.
+    Proceed,
+    /// A mutating MCP tool the person already allowed for this session.
+    Granted,
+    /// A mutating MCP tool nobody has allowed yet: ask, with "always" available.
+    AskMcp,
+    /// A built-in mutating tool: refused, with the message the model reads.
+    Blocked(String),
+}
+
+/// Plan mode's verdict on `call`.
+///
+/// Policy while active (mirrors codex `readOnlyHint` + Claude Code's prompt):
+/// built-in `Risky` tools are refused; an MCP tool declared `readOnlyHint` runs; any
+/// other MCP tool is asked about, because an external call may be exactly what the
+/// plan needs and a trusted server must still not write silently.
+pub fn plan_verdict(
+    active: bool,
+    call: &ToolCall,
+    tool: &Arc<dyn Tool>,
+    mcp_grants: &dyn PermissionStore,
+) -> PlanVerdict {
+    if !active {
+        return PlanVerdict::Proceed;
     }
+    if call.name.starts_with("mcp__") {
+        // A server-declared read-only external query can't modify anything. It is
+        // `Safe`, so the approval step won't prompt for it either; a later guard
+        // (e.g. the sensitive-path gate) may still fire if the args touch a secret
+        // path, which is the intended exfiltration guard — same as outside plan mode.
+        if tool.read_only_hint() {
+            return PlanVerdict::Proceed;
+        }
+        if mcp_grants.is_granted(&call.name) {
+            return PlanVerdict::Granted;
+        }
+        return PlanVerdict::AskMcp;
+    }
+    if tool.risk(&call.arguments) == RiskLevel::Risky {
+        return PlanVerdict::Blocked(format!(
+            "plan mode is active — `{}` would modify the workspace and is blocked. Only \
+             read-only tools are allowed: explore and present a plan for the user to approve \
+             before making changes.",
+            call.name
+        ));
+    }
+    PlanVerdict::Proceed
+}
+
+/// The refusal a person's "no" to a mutating MCP tool becomes.
+pub fn plan_mcp_denied(name: &str) -> String {
+    format!(
+        "plan mode: `{name}` was not approved — present a plan and switch to build mode to run it."
+    )
 }
 
 #[async_trait]
@@ -66,31 +117,31 @@ impl ToolMiddleware for PlanModeGate {
         tool: &Arc<dyn Tool>,
         rt: &RequestCtx,
     ) -> BeforeOutcome {
-        if !self.active.load(Ordering::Relaxed) {
-            return BeforeOutcome::Proceed;
-        }
-
-        if call.name.starts_with("mcp__") {
-            // A server-declared read-only external query can't modify anything → proceed.
-            // It is `Safe`, so the ApprovalMiddleware won't prompt for it either; a later
-            // guard (e.g. SensitivePathGate) may still fire if the args touch a secret path,
-            // which is the intended exfiltration guard — same as outside plan mode.
-            if tool.read_only_hint() {
-                return BeforeOutcome::Proceed;
+        match plan_verdict(
+            self.active.load(Ordering::Relaxed),
+            call,
+            tool,
+            self.mcp_grants.as_ref(),
+        ) {
+            PlanVerdict::Proceed => return BeforeOutcome::Proceed,
+            PlanVerdict::Blocked(message) => return BeforeOutcome::deny(message),
+            PlanVerdict::Granted => {
+                return BeforeOutcome::Allow {
+                    reason: Some("approved this session".into()),
+                }
             }
+            PlanVerdict::AskMcp => {}
+        }
+        {
             // Mutating / unannotated MCP tool: prompt instead of hard-blocking. Owns the
             // decision (returns Allow/Deny) so the generic ApprovalMiddleware after it
             // never double-prompts — same pattern as the write gate.
-            if self.mcp_grants.is_granted(&call.name) {
-                return BeforeOutcome::Allow {
-                    reason: Some("approved this session".into()),
-                };
-            }
             let payload = serde_json::to_value(ApprovalRequest {
                 call_id: call.id.clone(),
                 tool: tool.name().to_string(),
                 args: call.arguments.clone(),
                 reason: None,
+                allow_all_bash: false,
             })
             .unwrap_or(serde_json::Value::Null);
             return match PermissionDecision::from_value(&rt.request(APPROVAL_KIND, payload).await) {
@@ -103,19 +154,9 @@ impl ToolMiddleware for PlanModeGate {
                         reason: Some("approved always (plan mode)".into()),
                     }
                 }
-                PermissionDecision::Deny => BeforeOutcome::deny(format!(
-                    "plan mode: `{}` was not approved — present a plan and switch to build mode \
-                     to run it.",
-                    call.name
-                )),
+                PermissionDecision::Deny => BeforeOutcome::deny(plan_mcp_denied(&call.name)),
             };
         }
-
-        // Built-in mutating tools (bash/edit/write) stay hard-blocked.
-        if tool.risk(&call.arguments) == RiskLevel::Risky {
-            return Self::blocked(&call.name);
-        }
-        BeforeOutcome::Proceed
     }
 }
 
@@ -126,7 +167,7 @@ impl ToolMiddleware for PlanModeGate {
 /// `<system-reminder>` convention lives in ONE place. The [`PlanModeGate`] blocks mutating
 /// TOOLS, but nothing stops the model from writing the implementation straight into its
 /// reply — this keeps it planning. (Ported from core's `plan_mode_turn_reminder`.)
-const PLAN_MODE_REMINDER_BODY: &str = "\
+pub(crate) const PLAN_MODE_REMINDER_BODY: &str = "\
 PLAN MODE is active. Do NOT create, edit, or delete files, and do NOT write out the \
 implementation — not even as code blocks in your reply. Investigate with read-only tools, \
 then present a concise implementation plan and STOP, waiting for the user to review and \

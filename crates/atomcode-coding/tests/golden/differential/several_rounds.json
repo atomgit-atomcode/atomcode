@@ -1,0 +1,38 @@
+[
+  {
+    "kind": "TurnStarted",
+    "detail": ""
+  },
+  {
+    "kind": "Usage",
+    "detail": ""
+  },
+  {
+    "kind": "ToolStarted",
+    "detail": "read_file"
+  },
+  {
+    "kind": "ToolResult",
+    "detail": "error=false"
+  },
+  {
+    "kind": "Usage",
+    "detail": ""
+  },
+  {
+    "kind": "ToolStarted",
+    "detail": "read_file"
+  },
+  {
+    "kind": "ToolResult",
+    "detail": "error=false"
+  },
+  {
+    "kind": "Usage",
+    "detail": ""
+  },
+  {
+    "kind": "TurnComplete",
+    "detail": "Stopped"
+  }
+]

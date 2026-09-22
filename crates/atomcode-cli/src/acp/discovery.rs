@@ -148,7 +148,7 @@ pub async fn handle_list_sessions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::v1::{ListSessionsRequest, SessionId};
+    use agent_client_protocol::schema::v1::ListSessionsRequest;
     use atomcode_capabilities::session::{CatalogEntry, CatalogPresence};
 
     use crate::acp::sessions::test_support::{catalog_entry, empty_scan, sessions_with};

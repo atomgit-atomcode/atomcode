@@ -5,27 +5,62 @@
 use super::skill::{parse_skill_dir, parse_skill_file, Skill};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 /// Skills indexed by name. `BTreeMap` for deterministic (sorted) order — the skill list
 /// is injected into the system prompt, so a stable order keeps the prompt prefix
 /// byte-identical (prompt-prefix caching), same rationale as the kernel ToolRegistry.
 pub struct SkillRegistry {
-    skills: BTreeMap<String, Arc<Skill>>,
+    /// Behind a lock because skills live on disk and the disk changes under a
+    /// running session: a person writes a skill, or installs a plugin, and then
+    /// reloads. Every holder of this registry has an `Arc` to it — the
+    /// `use_skill` and `list_skills` tools, the `skills` seam, the catalog
+    /// fragment — so re-reading in place is what lets a reload reach all of
+    /// them without rebuilding the tree they are mounted in (`docs/adr/0022`
+    /// §2).
+    skills: RwLock<BTreeMap<String, Arc<Skill>>>,
 }
 
 impl SkillRegistry {
     pub fn new() -> Self {
         Self {
-            skills: BTreeMap::new(),
+            skills: RwLock::new(BTreeMap::new()),
         }
+    }
+
+    /// The map, for a reader. A poisoned lock is taken over rather than
+    /// propagated: a panic in a catalog render must not take every later skill
+    /// lookup down with it.
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, BTreeMap<String, Arc<Skill>>> {
+        self.skills.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, BTreeMap<String, Arc<Skill>>> {
+        self.skills.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Read `dirs` again, in place, replacing what is indexed now.
+    ///
+    /// The swap is one write: a reader either sees every skill from before or
+    /// every skill from after, never a half-scanned catalog — which is what a
+    /// model would otherwise be told about mid-reload.
+    pub fn reload_dirs(&self, dirs: &[PathBuf], namespaced: &[(PathBuf, String)]) {
+        let fresh = Self::new();
+        for dir in dirs {
+            fresh.load_dir(dir, None);
+        }
+        for (dir, namespace) in namespaced {
+            fresh.load_dir(dir, Some(namespace));
+        }
+        let next = std::mem::take(&mut *fresh.write());
+        *self.write() = next;
     }
 
     /// Load from `dirs` in LOW→HIGH priority order (a later dir's same-named skill wins).
     /// Each dir is scanned for flat `*.md` files AND `*/SKILL.md` subdirectories; parse
     /// failures are skipped.
     pub fn load(dirs: &[PathBuf]) -> Self {
-        let mut reg = Self::new();
+        let reg = Self::new();
         for dir in dirs {
             reg.load_dir(dir, None);
         }
@@ -33,7 +68,7 @@ impl SkillRegistry {
     }
 
     /// Load one directory, optionally namespacing the skill names (`{ns}:{name}`).
-    pub fn load_dir(&mut self, dir: &Path, namespace: Option<&str>) {
+    pub fn load_dir(&self, dir: &Path, namespace: Option<&str>) {
         self.scan_skill_dir(dir, namespace, 0);
     }
 
@@ -43,7 +78,7 @@ impl SkillRegistry {
     /// recursively, so `skills/GROUP/SUB/SKILL.md` is still found. Flat `*.md`
     /// slash-commands are TOP-LEVEL only (depth 0) — a skill's own `*.md` are resources,
     /// not separate commands. `depth` is bounded to guard against symlink cycles.
-    fn scan_skill_dir(&mut self, dir: &Path, namespace: Option<&str>, depth: usize) {
+    fn scan_skill_dir(&self, dir: &Path, namespace: Option<&str>, depth: usize) {
         const MAX_DEPTH: usize = 8;
         if depth > MAX_DEPTH {
             return;
@@ -57,14 +92,14 @@ impl SkillRegistry {
             if p.is_file() {
                 if depth == 0 && p.extension().and_then(|e| e.to_str()) == Some("md") {
                     if let Ok(s) = parse_skill_file(&p, namespace) {
-                        self.skills.insert(s.name.clone(), Arc::new(s));
+                        self.write().insert(s.name.clone(), Arc::new(s));
                     }
                 }
             } else if p.is_dir() {
                 let skill_md = p.join("SKILL.md");
                 if skill_md.is_file() {
                     if let Ok(s) = parse_skill_dir(&p, &skill_md, namespace) {
-                        self.skills.insert(s.name.clone(), Arc::new(s));
+                        self.write().insert(s.name.clone(), Arc::new(s));
                     }
                 } else {
                     self.scan_skill_dir(&p, namespace, depth + 1);
@@ -93,7 +128,8 @@ impl SkillRegistry {
     /// or several user-invocable matches — returns `None`; the menu shows the
     /// qualified form there, which resolves via the exact-match branch.
     pub fn get(&self, name: &str) -> Option<Arc<Skill>> {
-        if let Some(skill) = self.skills.get(name) {
+        let skills = self.read();
+        if let Some(skill) = skills.get(name) {
             return Some(skill.clone());
         }
         if name.contains(':') {
@@ -104,7 +140,7 @@ impl SkillRegistry {
         let mut last_all: Option<&Arc<Skill>> = None;
         let mut n_invocable = 0usize;
         let mut last_invocable: Option<&Arc<Skill>> = None;
-        for skill in self.skills.values() {
+        for skill in skills.values() {
             if skill.name.ends_with(&suffix) {
                 n_all += 1;
                 last_all = Some(skill);
@@ -125,14 +161,14 @@ impl SkillRegistry {
         None
     }
     pub fn len(&self) -> usize {
-        self.skills.len()
+        self.read().len()
     }
     pub fn is_empty(&self) -> bool {
-        self.skills.is_empty()
+        self.read().is_empty()
     }
     /// `(name, description)` for every skill, sorted by name.
     pub fn list(&self) -> Vec<(String, String)> {
-        self.skills
+        self.read()
             .values()
             .map(|s| (s.name.clone(), s.description.clone()))
             .collect()
@@ -146,8 +182,8 @@ impl SkillRegistry {
     /// `reload` (driver call sites surface them). Currently always empty: this loader
     /// silently skips unparseable skills — the SAME behavior the runtime skill path
     /// uses — so no parse warnings are collected.
-    pub fn reload(&mut self, working_dir: &Path) -> Vec<String> {
-        self.skills.clear();
+    pub fn reload(&self, working_dir: &Path) -> Vec<String> {
+        self.write().clear();
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         for dir in runtime_skill_dirs(&home, working_dir) {
             self.load_dir(&dir, Some("skills"));
@@ -157,22 +193,23 @@ impl SkillRegistry {
 
     /// Skills a user can invoke from the `/` menu (frontmatter `user-invocable` not
     /// `false`), sorted by name.
-    pub fn user_invocable(&self) -> impl Iterator<Item = &Skill> {
-        self.skills
+    pub fn user_invocable(&self) -> Vec<Arc<Skill>> {
+        self.read()
             .values()
-            .map(|s| s.as_ref())
             .filter(|s| s.user_invocable)
+            .cloned()
+            .collect()
     }
 
     /// Insert a skill programmatically (same-name replaces). Mirrors core
     /// `SkillRegistry::register`; used by drivers injecting non-file skills and by tests.
-    pub fn register(&mut self, skill: Skill) {
-        self.skills.insert(skill.name.clone(), Arc::new(skill));
+    pub fn register(&self, skill: Skill) {
+        self.write().insert(skill.name.clone(), Arc::new(skill));
     }
 
     /// Every loaded skill, sorted by name.
-    pub fn all(&self) -> impl Iterator<Item = &Skill> {
-        self.skills.values().map(|s| s.as_ref())
+    pub fn all(&self) -> Vec<Arc<Skill>> {
+        self.read().values().cloned().collect()
     }
 
     /// Render the `=== AVAILABLE SKILLS ===` system-prompt section (budget-gated,
@@ -185,8 +222,8 @@ impl SkillRegistry {
     /// Render the catalog while preserving installed skills whose exact names
     /// appear in the effective project instruction text.
     pub fn render_catalog_prioritizing(&self, instruction_text: &str) -> Option<String> {
-        let entries: Vec<super::render::CatalogEntry> = self
-            .skills
+        let skills = self.read();
+        let entries: Vec<super::render::CatalogEntry> = skills
             .values()
             .map(|s| super::render::CatalogEntry {
                 name: s.name.clone(),
@@ -195,8 +232,7 @@ impl SkillRegistry {
                 source_rank: super::render::source_rank(&s.source_path),
             })
             .collect();
-        let priority_names = self
-            .skills
+        let priority_names = skills
             .keys()
             .filter(|name| text_mentions_exact_name(instruction_text, name))
             .cloned()
@@ -276,8 +312,50 @@ pub fn runtime_skill_dirs(home: &Path, project: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Where a new skill should be written so [`runtime_skill_dirs`] finds it and it
+/// wins a name clash at its level: `(every project, this project)`.
+///
+/// Next to the list it indexes into, so the two cannot drift: the test
+/// `install_dirs_are_the_winning_dirs_of_the_runtime_list` pins it.
+pub fn runtime_skill_install_dirs(home: &Path, project: &Path) -> (PathBuf, PathBuf) {
+    let user = std::env::var_os("ATOMCODE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".atomcode"))
+        .join("skills");
+    (user, project.join(".atomcode/skills"))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[serial_test::serial]
+    fn install_dirs_are_the_winning_dirs_of_the_runtime_list() {
+        let home = Path::new("/home/u");
+        let project = Path::new("/proj");
+        for atomcode_home in [None, Some("/custom/atomcode")] {
+            match atomcode_home {
+                Some(dir) => std::env::set_var("ATOMCODE_HOME", dir),
+                None => std::env::remove_var("ATOMCODE_HOME"),
+            }
+            let dirs = runtime_skill_dirs(home, project);
+            let (user, this_project) = runtime_skill_install_dirs(home, project);
+            let at = |p: &PathBuf| dirs.iter().position(|d| d == p);
+            let user_at = at(&user).expect("the user install dir is scanned");
+            let project_at = at(&this_project).expect("the project install dir is scanned");
+            assert_eq!(
+                project_at,
+                dirs.len() - 1,
+                "the project dir wins every clash"
+            );
+            assert!(
+                dirs[user_at + 1..].iter().all(|d| d.starts_with(project)),
+                "the user dir wins every clash at the user level: {dirs:?}"
+            );
+        }
+        std::env::remove_var("ATOMCODE_HOME");
+    }
+
     use super::*;
 
     #[test]
@@ -358,7 +436,7 @@ mod tests {
             "---\nname: atomcode-smoke-test\ndescription: probe\n---\nbody\n",
         )
         .unwrap();
-        let mut reg = SkillRegistry::new();
+        let reg = SkillRegistry::new();
         reg.load_dir(d.path(), Some("skills"));
 
         // Stored under the namespaced key…
@@ -378,7 +456,7 @@ mod tests {
     /// still resolves via exact match).
     #[test]
     fn get_bare_name_is_ambiguous_across_namespaces() {
-        let mut reg = SkillRegistry::new();
+        let reg = SkillRegistry::new();
         reg.register(Skill {
             name: "skills:dup".into(),
             description: "a".into(),
@@ -409,7 +487,7 @@ mod tests {
     /// otherwise the "menu shows it but resolve fails → 未知技能" bug returns.
     #[test]
     fn get_bare_name_prefers_sole_user_invocable_over_hidden() {
-        let mut reg = SkillRegistry::new();
+        let reg = SkillRegistry::new();
         reg.register(Skill {
             name: "skills:review".into(),
             description: "visible".into(),

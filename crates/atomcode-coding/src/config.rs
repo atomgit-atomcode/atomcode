@@ -7,8 +7,8 @@ use std::time::Duration;
 use atomcode_config::locale::Locale;
 use atomcode_kernel::agent::ToolLoopPolicy;
 
-/// Everything [`build_coding_agent`](crate::build_coding_agent) needs: provider
-/// credentials, the working directory the tools are scoped to, and liveness bounds.
+/// Everything an assembly needs: provider credentials, the working directory the
+/// tools are scoped to, and liveness bounds.
 ///
 /// Timeouts default to sane non-infinite values — the kernel itself defaults to
 /// unbounded, and the assembly map flagged "L2 MUST set stream/request timeouts" so a
@@ -38,11 +38,18 @@ pub struct CodingAgentConfig {
     pub working_dir: PathBuf,
     /// Model context window in tokens (forwarded to the provider). Default 128k.
     pub context_window: u32,
-    /// Liveness: max byte-idle wait for the next stream event (first-token + inter-token).
-    /// Default 300s, override via `ATOMCODE_STREAM_TIMEOUT_SECS`. Thinking models go quiet
-    /// for a long stretch after a large (~200K) prompt before the first reasoning byte; the
-    /// old 120s cut them off mid-think and surfaced as a spurious "stream timeout".
+    /// Liveness: max byte-idle wait BETWEEN stream events, once the first content byte
+    /// has arrived (inter-token). Default 300s, override via `ATOMCODE_STREAM_TIMEOUT_SECS`.
+    /// The prefill / first-token wait is governed separately by `first_token_timeout`.
     pub stream_timeout: Duration,
+    /// Liveness: max wait for the FIRST content byte (prefill / time-to-first-token).
+    /// A slow local model on a large prompt can churn far longer before the first byte
+    /// than between subsequent tokens, so this budget is separate from — and usually
+    /// larger than — `stream_timeout`. Env `ATOMCODE_FIRST_TOKEN_TIMEOUT_SECS` (explicit
+    /// value wins), else `max(600s, stream_timeout)` so it never drops below the
+    /// inter-token budget. Once the first byte arrives, `stream_timeout` takes over.
+    /// Reconnecting on a slow-but-progressing prefill just restarts it, so we wait longer.
+    pub first_token_timeout: Duration,
     /// Liveness: max wait for a driver approval response before it degrades to deny.
     /// `Some(d)` ⇒ fail-closed after `d` — for HEADLESS / no-human drivers where a never-
     /// answered approval must not park a turn forever. `None` ⇒ PARK: block until the driver
@@ -131,6 +138,9 @@ pub struct CodingAgentConfig {
     /// /unknown ⇒ Exa. Mirrors v1's `[web_search] provider` config knob — without this the
     /// tool was hardwired to Exa with no way to opt into DDG.
     pub web_search_provider: Option<String>,
+    /// `[web_search] api_key`, for Exa. `None` leaves the tool to `EXA_API_KEY` or
+    /// the keyless tier.
+    pub web_search_api_key: Option<String>,
     /// Opt-in read-only LSP policy. The manager is created by this runtime's tool
     /// assembly, so provider/session reloads cannot create a second hidden owner.
     pub lsp: atomcode_capabilities::codeintel::LspSettings,
@@ -235,6 +245,9 @@ pub struct CodingRuntimeConfig {
     pub next_prompt_suggestions: bool,
     pub supports_vision: bool,
     pub lsp: atomcode_capabilities::codeintel::LspSettings,
+    /// `[web_search]`, see [`web_search_from_config`].
+    pub web_search_provider: Option<String>,
+    pub web_search_api_key: Option<String>,
 }
 
 pub fn lsp_settings_from_config(
@@ -276,6 +289,80 @@ pub fn permission_rules_from_config(
         );
     }
     rules
+}
+
+/// What this runtime takes from `config.toml`, for an agent asked how AtomCode is
+/// configured.
+///
+/// Here, beside [`CodingRuntimeConfig::from_config`] and the `*_from_config`
+/// helpers, because these are the functions that read each section: a key
+/// added or dropped there is a sentence to change a few lines away, not in a
+/// document somewhere else. Sections a front end reads (`[ui]`,
+/// `[notifications]`, the proxy) are the front end's to describe.
+pub fn describe_config_file(config_file: &std::path::Path) -> String {
+    format!(
+        "CONFIG FILE. This runtime was configured from `{file}` — the AtomCode home's \
+         `config.toml`, unless the front end was started with `--config <file>`. It read \
+         the file when it was built and does not watch it: an edit reaches a runtime \
+         built after the file is read again (a new session, or a restart). Switching the \
+         model is `/model`, not an edit.\n\
+         What this runtime takes from it:\n\
+         - Model: `default_model` names a `[models.<id>]` entry (`account`, `model`, and \
+         optional `context_window`, `max_tokens`, `supports_vision`, `reasoning_effort`, \
+         `capable_model`, `note`) whose `account` is a `[provider_accounts.<id>]` entry \
+         (`provider`, `api_key`, `base_url`). The legacy form is `default_provider` naming \
+         a `[providers.<name>]` entry (`type`, `model`, `api_key`, `base_url`, …); \
+         `default_model` wins. An `api_key` may be written `${{VAR}}`. `capable_model` \
+         ranks models for `task` and `team`: the lowest rank is the fast tier, the \
+         highest the capable one.\n\
+         - `evaluator_provider`: the model that judges whether a `/goal` is met.\n\
+         - `[permissions]` `allow` / `deny`: rules such as `Bash(git *)`, `Read(<path>)` or \
+         `mcp__<server>__<tool>`. `deny` wins, and `allow` never opens a sensitive path.\n\
+         - `[coding]` `max_rounds` (per turn; 0 = no cap; `ATOMCODE_TURN_MAX_ROUNDS` wins) \
+         and `shell_guard_policy`: a shell command that reaches for credentials is asked \
+         about (`prompt`, the default), refused and the turn ended (`strict`), or left to \
+         the ordinary approval rules (`off`).\n\
+         - `[loop_config]` `max_rounds`: how many passes a `/loop` may run (default 100; \
+         0 = no cap).\n\
+         - `[subagent]` `max_concurrent` (default 3) and `max_rounds` (default 200) for \
+         `task` and `team`; `codex` / `claude` = `off` | `read-only` | `accept-edits` | \
+         `auto`, and `[[subagent.external]]` entries (`name`, `kind` = `codex` | \
+         `claude-code`, `model`, `permission`, `timeout_secs`, `enabled`), add the Codex \
+         or Claude Code CLI as a delegate where the front end allows it.\n\
+         - `[tools.todo]` `enabled`, and `eager` = `auto` | `preferred` | `always`.\n\
+         - `[lsp]` `enabled`, `auto_detect`, and `[lsp.servers.<extension>]` = \
+         `{{ command, args, root_markers }}`.\n\
+         - `[web_search]` `provider` = `exa` | `duckduckgo`, and `api_key` for Exa; the \
+         `ATOMCODE_WEB_SEARCH_PROVIDER` and `EXA_API_KEY` environment variables win.\n\
+         - `keep_interrupted_context` (keep a cancelled turn's partial work; default \
+         true), `language` (`en` | `zh_CN`), `[network]` `upstream_retry_max_attempts`, \
+         and `[datalog]` `enabled` / `dir`.\n\
+         Sections not listed here are read by the front end, not by this runtime. \
+         `describe_self` with `aspect: settings` lists the settings that are safe to \
+         edit and when each takes effect.",
+        file = config_file.display(),
+    )
+}
+
+/// `[web_search]` as the `tool-web` row takes it: `(provider, api_key)`.
+///
+/// The environment keeps the last word it always had — `ATOMCODE_WEB_SEARCH_PROVIDER`
+/// over `provider`, `EXA_API_KEY` over `api_key` — by leaving the file's value out
+/// when the variable is set, so the row falls back to it. Before this the section
+/// was parsed and then read by nobody: a person's `provider = "duckduckgo"` did
+/// nothing at all.
+pub fn web_search_from_config(
+    web_search: &atomcode_config::config::WebSearchConfig,
+) -> (Option<String>, Option<String>) {
+    let set = |name: &str| std::env::var(name).is_ok_and(|value| !value.trim().is_empty());
+    let provider = (!set("ATOMCODE_WEB_SEARCH_PROVIDER"))
+        .then(|| web_search.provider.trim().to_string())
+        .filter(|provider| !provider.is_empty());
+    let api_key = (!set("EXA_API_KEY"))
+        .then(|| web_search.api_key.clone())
+        .flatten()
+        .filter(|key| !key.trim().is_empty());
+    (provider, api_key)
 }
 
 pub fn credential_shell_policy_from_config(
@@ -375,6 +462,8 @@ impl CodingRuntimeConfig {
             round_cap_checkpoint: false,
             next_prompt_suggestions: false,
             lsp: lsp_settings_from_config(&config.lsp),
+            web_search_provider: web_search_from_config(&config.web_search).0,
+            web_search_api_key: web_search_from_config(&config.web_search).1,
         }
     }
 
@@ -424,6 +513,8 @@ impl CodingRuntimeConfig {
         config.round_cap_checkpoint = self.round_cap_checkpoint;
         config.next_prompt_suggestions = self.next_prompt_suggestions;
         config.lsp = self.lsp.clone();
+        config.web_search_provider = self.web_search_provider.clone();
+        config.web_search_api_key = self.web_search_api_key.clone();
         config
     }
 }
@@ -669,15 +760,32 @@ impl TierProvider {
     }
 }
 
-/// The default byte-idle stream timeout: `ATOMCODE_STREAM_TIMEOUT_SECS` if set to a valid
-/// positive integer, else 300s. Ported from core's env-configurable liveness knob.
-fn default_stream_timeout() -> Duration {
-    std::env::var("ATOMCODE_STREAM_TIMEOUT_SECS")
+/// A positive-integer-seconds duration read from env var `var`: `None` when unset,
+/// non-numeric, or ≤ 0 (so a bogus/zero value falls back to the caller's default
+/// rather than silently disabling the timeout).
+fn env_duration_secs(var: &str) -> Option<Duration> {
+    std::env::var(var)
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|n| *n > 0)
         .map(Duration::from_secs)
-        .unwrap_or_else(|| Duration::from_secs(300))
+}
+/// The default byte-idle stream timeout: `ATOMCODE_STREAM_TIMEOUT_SECS` if set to a valid
+/// positive integer, else 300s. Ported from core's env-configurable liveness knob.
+fn default_stream_timeout() -> Duration {
+    env_duration_secs("ATOMCODE_STREAM_TIMEOUT_SECS").unwrap_or_else(|| Duration::from_secs(300))
+}
+/// The default first-token (prefill / TTFB) timeout. An explicit
+/// `ATOMCODE_FIRST_TOKEN_TIMEOUT_SECS` (valid positive integer) wins as-is — a
+/// deliberate user choice, even if shorter than `stream_timeout`. Otherwise it
+/// defaults to 600s but is NEVER shorter than `stream_timeout`: prefill on a slow
+/// local model legitimately exceeds inter-token latency, so a first-token budget
+/// below the inter-token one inverts the intent. In particular a user who raised
+/// `ATOMCODE_STREAM_TIMEOUT_SECS` (e.g. following the reconnect hint) must not end
+/// up with a SHORTER prefill window than inter-token — hence the `.max()`.
+fn default_first_token_timeout() -> Duration {
+    env_duration_secs("ATOMCODE_FIRST_TOKEN_TIMEOUT_SECS")
+        .unwrap_or_else(|| default_stream_timeout().max(Duration::from_secs(600)))
 }
 /// Share of the CodingPlan 5h rolling `call_limit` a single `/goal` may consume
 /// (percent). A goal that eats more than this starves the user's interactive work
@@ -828,6 +936,7 @@ impl CodingAgentConfig {
             working_dir: working_dir.into(),
             context_window: 128_000,
             stream_timeout: default_stream_timeout(),
+            first_token_timeout: default_first_token_timeout(),
             request_timeout: Some(Duration::from_secs(300)),
             max_continuations: 50,
             max_rounds: default_turn_max_rounds(),
@@ -848,6 +957,7 @@ impl CodingAgentConfig {
             thinking_keep: None,
             compact_threshold: 0.7,
             web_search_provider: None,
+            web_search_api_key: None,
             lsp: Default::default(),
             keep_interrupted_context: false,
             credential_shell_policy: Default::default(),
@@ -1447,6 +1557,7 @@ impl std::fmt::Debug for CodingAgentConfig {
             .field("working_dir", &self.working_dir)
             .field("context_window", &self.context_window)
             .field("stream_timeout", &self.stream_timeout)
+            .field("first_token_timeout", &self.first_token_timeout)
             .field("request_timeout", &self.request_timeout)
             .field("interactive", &self.interactive)
             .field("max_continuations", &self.max_continuations)

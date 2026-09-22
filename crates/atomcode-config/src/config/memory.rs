@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 
 const MAX_MEMORY_FILE_SIZE: u64 = 64 * 1024;
 const DEFAULT_CHAR_LIMIT: usize = 4000;
+/// Per-entry char cap for the injected prompt, so one runaway `remember` can't eat the
+/// whole [`DEFAULT_CHAR_LIMIT`] budget and starve every other fact.
+const MAX_MEMORY_ENTRY_CHARS: usize = 500;
 
 pub struct MemoryStore {
     path: PathBuf,
@@ -192,37 +195,70 @@ impl MemoryStore {
             return String::new();
         }
 
+        // Cap a single overly-long entry so it can't eat the whole budget.
+        fn cap_entry(entry: &str) -> String {
+            if entry.chars().count() > MAX_MEMORY_ENTRY_CHARS {
+                let head: String = entry.chars().take(MAX_MEMORY_ENTRY_CHARS).collect();
+                format!("{head} …")
+            } else {
+                entry.to_string()
+            }
+        }
+
+        // SELECT which entries fit the budget, keeping the MOST RELEVANT first: NEWEST
+        // within a scope, and the more-specific scopes ahead of global (local > project >
+        // global). So when memory outgrows the budget the OLDEST / most-global facts drop —
+        // not the freshest project/local ones. (The previous head-truncate kept the oldest
+        // and silently dropped the newest, which are usually the most relevant.) Kept
+        // indices still render in natural oldest→newest reading order per section.
+        let mut budget = DEFAULT_CHAR_LIMIT.saturating_sub(320); // header + labels + marker
+        let mut dropped = 0usize;
+        let mut keep_scope = |entries: &[String]| -> std::collections::BTreeSet<usize> {
+            let mut kept = std::collections::BTreeSet::new();
+            for (idx, entry) in entries.iter().enumerate().rev() {
+                let cost = cap_entry(entry).chars().count() + 3; // "- " + "\n"
+                if cost <= budget {
+                    budget -= cost;
+                    kept.insert(idx);
+                } else {
+                    dropped += 1;
+                }
+            }
+            kept
+        };
+        let kept_local = keep_scope(&local_entries);
+        let kept_project = keep_scope(&project_entries);
+        let kept_global = keep_scope(&global_entries);
+
         let mut result = String::from(
             "=== MEMORY ===\nThe user has asked you to remember these facts and preferences:\n",
         );
-
-        if !global_entries.is_empty() {
-            result.push_str("\n[Global]\n");
-            for entry in &global_entries {
-                result.push_str(&format!("- {}\n", entry));
-            }
+        let mut render =
+            |label: &str, entries: &[String], kept: &std::collections::BTreeSet<usize>| {
+                if kept.is_empty() {
+                    return;
+                }
+                result.push_str(label);
+                for (idx, entry) in entries.iter().enumerate() {
+                    if kept.contains(&idx) {
+                        result.push_str(&format!("- {}\n", cap_entry(entry)));
+                    }
+                }
+            };
+        render("\n[Global]\n", &global_entries, &kept_global);
+        render(
+            &format!("\n[Project: {project_name}]\n"),
+            &project_entries,
+            &kept_project,
+        );
+        render("\n[Local]\n", &local_entries, &kept_local);
+        if dropped > 0 {
+            result.push_str(&format!(
+                "\n[... {dropped} older memory {} omitted to fit the budget; run /memory to review]\n",
+                if dropped == 1 { "entry" } else { "entries" }
+            ));
         }
-
-        if !project_entries.is_empty() {
-            result.push_str(&format!("\n[Project: {}]\n", project_name));
-            for entry in &project_entries {
-                result.push_str(&format!("- {}\n", entry));
-            }
-        }
-
-        if !local_entries.is_empty() {
-            result.push_str("\n[Local]\n");
-            for entry in &local_entries {
-                result.push_str(&format!("- {}\n", entry));
-            }
-        }
-
-        if result.chars().count() > DEFAULT_CHAR_LIMIT {
-            let truncated: String = result.chars().take(DEFAULT_CHAR_LIMIT).collect();
-            format!("{}\n[...truncated, run /memory to review]", truncated)
-        } else {
-            result
-        }
+        result
     }
 }
 
@@ -374,16 +410,29 @@ mod tests {
     }
 
     #[test]
-    fn test_merged_for_prompt_truncation() {
+    fn test_merged_for_prompt_caps_entry_and_keeps_newest() {
         let dir = tempfile::tempdir().unwrap();
+        // One runaway entry is capped, not injected whole.
         let path = dir.path().join("memory.md");
-        let long_entry = "x".repeat(5000);
-        fs::write(&path, format!("- {}\n", long_entry)).unwrap();
+        fs::write(&path, format!("- {}\n", "x".repeat(5000))).unwrap();
         let store = MemoryStore::new(path);
-        let empty = MemoryStore::new(PathBuf::from("/none"));
+        let empty = MemoryStore::new(dir.path().join("none.md"));
         let result = MemoryStore::merged_for_prompt(&store, &empty, &empty, "p");
-        assert!(result.contains("[...truncated"));
-        assert!(result.chars().count() < 5000);
+        assert!(result.chars().count() < 1000, "giant entry must be capped");
+        assert!(result.contains('…'));
+
+        // Over budget → NEWEST kept, OLDEST dropped (the fix), with an omitted-count marker.
+        let path2 = dir.path().join("many.md");
+        let mut content = String::new();
+        for i in 0..100 {
+            content.push_str(&format!("- entry number {i} {}\n", "y".repeat(80)));
+        }
+        fs::write(&path2, content).unwrap();
+        let many = MemoryStore::new(path2);
+        let result = MemoryStore::merged_for_prompt(&many, &empty, &empty, "p");
+        assert!(result.contains("omitted to fit the budget"));
+        assert!(result.contains("entry number 99"), "newest survives");
+        assert!(!result.contains("entry number 0 "), "oldest dropped");
     }
 
     #[test]

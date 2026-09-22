@@ -163,7 +163,7 @@ async fn shutdown(handle: AgentHandle) {
 
 fn terminal_reason(events: &[AgentEvent]) -> Option<StopReason> {
     events.iter().find_map(|event| match event {
-        AgentEvent::TurnComplete { reason } => Some(*reason),
+        AgentEvent::TurnComplete { reason, .. } => Some(*reason),
         _ => None,
     })
 }

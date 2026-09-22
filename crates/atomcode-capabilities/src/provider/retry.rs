@@ -19,6 +19,33 @@ pub(crate) enum StreamReadRecovery {
     PartialResponse,
 }
 
+/// Await the next chunk from a provider byte stream with a PHASE-AWARE idle watchdog:
+/// `first_token` before the first DATA byte of this (re)opened stream (prefill / TTFB —
+/// a slow local model can be silent for minutes), then the tighter inter-token `idle`.
+/// Flips `*first_byte_seen` on the first `Ok` chunk ONLY — a transport `Err` does not
+/// count (it triggers a reopen, which resets the flag). Returns the `timeout` result for
+/// the caller to match: `Err(_)` = idle timeout, `Ok(None)` = stream end, `Ok(Some(_))`
+/// = a data chunk or a transport error.
+///
+/// Shared by all four provider byte loops (openai_compat / responses / anthropic /
+/// ollama) so the phase-aware liveness policy lives in exactly one place.
+pub(crate) async fn next_chunk_phased<S, T, E>(
+    byte_stream: &mut S,
+    first_token: Duration,
+    idle: Duration,
+    first_byte_seen: &mut bool,
+) -> Result<Option<Result<T, E>>, tokio::time::error::Elapsed>
+where
+    S: futures::Stream<Item = Result<T, E>> + Unpin,
+{
+    let watchdog = if *first_byte_seen { idle } else { first_token };
+    let next = tokio::time::timeout(watchdog, futures::StreamExt::next(byte_stream)).await;
+    if matches!(&next, Ok(Some(Ok(_)))) {
+        *first_byte_seen = true;
+    }
+    next
+}
+
 /// Whether replaying the whole provider request could duplicate user-visible output
 /// or a tool side effect. Observational metadata is deliberately replay-safe.
 pub(crate) fn is_replay_sensitive_event(event: &StreamEvent) -> bool {

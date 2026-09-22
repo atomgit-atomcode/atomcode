@@ -41,8 +41,6 @@ const SENSITIVE_MARKERS: &[&str] = &[
     "/.config/gcloud",
     ".netrc",
     ".git-credentials",
-    "/.atomcode/auth.toml",
-    "/.atomcode/auth/",
     "/.docker/config",
     ".npmrc",
     ".pypirc",
@@ -98,7 +96,27 @@ fn grant_scope(args: &str) -> String {
     targets.join("\u{1f}")
 }
 
-/// [`SENSITIVE_MARKERS`] plus the resolved config dir's credential paths.
+/// The AtomCode home's credential stores, named relative to it. A trailing `/`
+/// marks a directory.
+///
+/// - `auth.toml`, `auth/`: the login store.
+/// - `config.toml`: every `api_key` a person wrote in plain — `[provider_accounts.*]`,
+///   `[providers.*]`, `[web_search]`. It used to be absent here and even pinned as an
+///   ordinary file, so a `read_file` of it was `Safe` and asked nobody; on 2026-09-16 a
+///   session read it to describe the settings, and a turn later repeated a provider key
+///   to the person who asked for it — by then the key had already gone to the model
+///   provider and into the session log.
+/// - `mcp_auth.toml`: MCP OAuth tokens.
+///
+/// A file matches with anything after its name as well: `config.toml.bak` and
+/// `config.toml.bak-before-…` are copies of the store and hold the same keys.
+///
+/// The uninstaller classifies the same files as credentials
+/// (`atomcode-cli/src/uninstall/paths.rs`); `mcp.json` is on its list but not on
+/// this one, because the agent reads it to help configure MCP servers.
+const HOME_CREDENTIAL_STORES: &[&str] = &["auth.toml", "auth/", "config.toml", "mcp_auth.toml"];
+
+/// [`SENSITIVE_MARKERS`] plus the credential stores of the AtomCode home.
 fn matches_a_marker(lowercased: &str) -> bool {
     SENSITIVE_MARKERS.iter().any(|m| lowercased.contains(m))
         || configured_credential_markers()
@@ -106,20 +124,23 @@ fn matches_a_marker(lowercased: &str) -> bool {
             .any(|m| lowercased.contains(m.as_str()))
 }
 
-/// The credential paths under the CONFIGURED config dir, as lowercased
-/// `/`-separated substrings.
+/// [`HOME_CREDENTIAL_STORES`] as lowercased `/`-separated substrings, twice over.
 ///
-/// [`SENSITIVE_MARKERS`] hardcodes the `/.atomcode/…` spelling, which covers the
-/// default location under any home (and the `~/.atomcode/…` form a model is
-/// likely to write). It matches nothing once `$ATOMCODE_HOME` points elsewhere,
-/// so the credentials of exactly the users who moved their config tree would
-/// ride out through a `Safe` read without a prompt. These markers close that.
+/// Once under the `/.atomcode` spelling, which covers the default location under
+/// any home (and the `~/.atomcode/…` form a model is likely to write). That
+/// matches nothing once `$ATOMCODE_HOME` points elsewhere, so the credentials of
+/// exactly the users who moved their config tree would ride out through a `Safe`
+/// read without a prompt — hence once more under the CONFIGURED config dir.
 ///
 /// Resolved once: `$ATOMCODE_HOME` is read at process start and every other
 /// consumer of it caches the same way.
 fn configured_credential_markers() -> &'static [String] {
     static MARKERS: OnceLock<Vec<String>> = OnceLock::new();
-    MARKERS.get_or_init(|| credential_markers_for(&crate::paths::config_dir()))
+    MARKERS.get_or_init(|| {
+        let mut markers = credential_markers_for(Path::new("/.atomcode"));
+        markers.extend(credential_markers_for(&crate::paths::config_dir()));
+        markers
+    })
 }
 
 /// Pure core of [`configured_credential_markers`] — takes the dir so the marker
@@ -133,7 +154,10 @@ fn credential_markers_for(config_dir: &Path) -> Vec<String> {
     if dir.is_empty() {
         return Vec::new();
     }
-    vec![format!("{dir}/auth.toml"), format!("{dir}/auth/")]
+    HOME_CREDENTIAL_STORES
+        .iter()
+        .map(|store| format!("{dir}/{store}"))
+        .collect()
 }
 
 fn decoded_json_references_sensitive_path(value: &serde_json::Value) -> bool {
@@ -179,17 +203,26 @@ fn home_dir() -> Option<PathBuf> {
     crate::pathutil::home_dir()
 }
 
-/// True iff `path` is the atomcode credential store under `config_dir`.
+/// True iff `path` is one of the [`HOME_CREDENTIAL_STORES`] under `config_dir`.
 ///
 /// Anchored on the resolved config dir rather than a literal `~/.atomcode`: with
 /// `$ATOMCODE_HOME` set, the old form guarded a path that does not exist while
 /// the real `auth.toml` stayed unguarded. Pure (dir passed in) so the rule is
 /// testable without mutating the process-global env.
-///
-/// `starts_with` is component-wise, so the second arm covers the `auth/`
-/// DIRECTORY and not the `auth.toml` file — hence the explicit first arm.
-fn is_credential_path(path: &Path, config_dir: &Path) -> bool {
-    path == config_dir.join("auth.toml") || path.starts_with(config_dir.join("auth"))
+pub(crate) fn is_credential_path(path: &Path, config_dir: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(config_dir) else {
+        return false;
+    };
+    let relative = relative.to_string_lossy().replace('\\', "/");
+    HOME_CREDENTIAL_STORES
+        .iter()
+        .any(|store| match store.strip_suffix('/') {
+            Some(dir) => relative == dir || relative.starts_with(store),
+            // A file, or a copy of it (`config.toml.bak`) — but not a nested
+            // file of the same name, which `starts_with` on the relative path
+            // already rules out.
+            None => relative.starts_with(store),
+        })
 }
 
 /// True iff a RESOLVED (absolute, cwd-joined) `path` is sensitive — a system-protected
@@ -352,6 +385,7 @@ impl ToolMiddleware for SensitivePathGate {
             tool: tool.name().to_string(),
             args: call.arguments.clone(),
             reason: None,
+            allow_all_bash: false,
         })
         .unwrap_or(serde_json::Value::Null);
         match PermissionDecision::from_value(&rt.request(&self.kind, payload).await) {
@@ -432,6 +466,33 @@ mod tests {
         assert!(references_sensitive_path(
             r#"{"file_path":"C:\\Users\\u\\.atomcode\\auth.toml"}"#
         ));
+        // The config file holds every plain `api_key`, and a copy of it holds the same.
+        assert!(references_sensitive_path(
+            r#"{"file_path":"/Users/u/.atomcode/config.toml"}"#
+        ));
+        assert!(references_sensitive_path(
+            r#"{"file_path":"~/.atomcode/config.toml.bak-before-permissions-cleanup"}"#
+        ));
+        assert!(references_sensitive_path(
+            r#"{"pattern":"api_key","path":"/Users/u/.atomcode/config.toml"}"#
+        ));
+        assert!(references_sensitive_path(
+            r#"{"file_path":"C:\\Users\\u\\.atomcode\\config.toml"}"#
+        ));
+        assert!(references_sensitive_path(
+            r#"{"file_path":"/Users/u/.atomcode/mcp_auth.toml"}"#
+        ));
+        // …but the rest of the home is not a credential store, and neither is a
+        // project's own `config.toml`.
+        assert!(!references_sensitive_path(
+            r#"{"file_path":"/Users/u/.atomcode/memory.md"}"#
+        ));
+        assert!(!references_sensitive_path(
+            r#"{"file_path":"/Users/u/.atomcode/plugins/x/config.toml"}"#
+        ));
+        assert!(!references_sensitive_path(
+            r#"{"file_path":"/proj/.cargo/config.toml"}"#
+        ));
         // Placeholder templates (committed to VCS, no real secrets) → NOT flagged.
         assert!(
             !references_sensitive_path(r#"{"file_path":"/proj/.env.example"}"#),
@@ -492,7 +553,7 @@ mod tests {
         // A Risky tool is ApprovalMiddleware's job; this gate must skip it (no double-prompt)
         // even if its args look sensitive.
         let gate = SensitivePathGate::new();
-        let tool: Arc<dyn Tool> = Arc::new(crate::tools::write::WriteFileTool);
+        let tool: Arc<dyn Tool> = Arc::new(crate::tools::write::WriteFileTool::default());
         let mut call = ToolCall {
             id: "1".into(),
             name: "write_file".into(),
@@ -536,9 +597,34 @@ mod tests {
             Path::new("/home/u/.atomcode/auth.toml"),
             moved
         ));
-        // Prefix-of-a-name must not count: `auth.toml.bak` is a different file,
-        // and `authors/` is not the credential dir.
+        // A copy of a store is a store: `auth.toml.bak` holds the same tokens.
+        // A name that merely starts like the credential DIR is not it.
+        assert!(is_credential_path(
+            Path::new("/opt/ac/auth.toml.bak"),
+            moved
+        ));
         assert!(!is_credential_path(Path::new("/opt/ac/authors"), moved));
+
+        // The config file carries plain `api_key`s; its hand-made copies carry them too.
+        assert!(is_credential_path(Path::new("/opt/ac/config.toml"), moved));
+        assert!(is_credential_path(
+            Path::new("/opt/ac/config.toml.bak-before-permissions-cleanup"),
+            moved
+        ));
+        assert!(is_credential_path(
+            Path::new("/opt/ac/mcp_auth.toml"),
+            moved
+        ));
+        // Only at the top of the home: a plugin's own `config.toml` is not the store.
+        assert!(!is_credential_path(
+            Path::new("/opt/ac/plugins/x/config.toml"),
+            moved
+        ));
+        assert!(!is_credential_path(Path::new("/opt/ac/memory.md"), moved));
+        assert!(!is_credential_path(
+            Path::new("/elsewhere/config.toml"),
+            moved
+        ));
 
         let default = Path::new("/home/u/.atomcode");
         assert!(is_credential_path(
@@ -551,18 +637,23 @@ mod tests {
     fn markers_are_derived_from_the_configured_dir() {
         assert_eq!(
             credential_markers_for(Path::new("/opt/AC")),
-            vec!["/opt/ac/auth.toml".to_string(), "/opt/ac/auth/".to_string()],
+            vec![
+                "/opt/ac/auth.toml".to_string(),
+                "/opt/ac/auth/".to_string(),
+                "/opt/ac/config.toml".to_string(),
+                "/opt/ac/mcp_auth.toml".to_string(),
+            ],
             "lowercased so it matches the lowercased args"
         );
         // Windows dirs reach the matcher `/`-normalized, like every other marker.
         assert_eq!(
-            credential_markers_for(Path::new(r"C:\ac")),
-            vec!["c:/ac/auth.toml".to_string(), "c:/ac/auth/".to_string()]
+            credential_markers_for(Path::new(r"C:\ac"))[0],
+            "c:/ac/auth.toml"
         );
         // A trailing separator must not double up.
         assert_eq!(
-            credential_markers_for(Path::new("/opt/ac/")),
-            vec!["/opt/ac/auth.toml".to_string(), "/opt/ac/auth/".to_string()]
+            credential_markers_for(Path::new("/opt/ac/"))[0],
+            "/opt/ac/auth.toml"
         );
         assert!(credential_markers_for(Path::new("")).is_empty());
     }
@@ -592,9 +683,16 @@ mod tests {
         let args = serde_json::json!({ "command": format!("cat {}", token.display()) }).to_string();
         assert!(references_sensitive_path(&args), "{args}");
 
-        // Same tree, ordinary file → still no prompt. Pins that the new markers
-        // are path-shaped and did not widen into "anything under the config dir".
-        let ordinary = dir.join("config.toml");
+        let config = dir.join("config.toml");
+        let args = serde_json::json!({ "file_path": config.to_string_lossy() }).to_string();
+        assert!(
+            references_sensitive_path(&args),
+            "the relocated config file holds the api keys too: {args}"
+        );
+
+        // Same tree, ordinary file → still no prompt. Pins that the markers are
+        // path-shaped and did not widen into "anything under the config dir".
+        let ordinary = dir.join("memory.md");
         let args = serde_json::json!({ "file_path": ordinary.to_string_lossy() }).to_string();
         assert!(!references_sensitive_path(&args), "{args}");
     }

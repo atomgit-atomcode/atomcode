@@ -114,6 +114,7 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                 let mut ac = AnthropicConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
                 ac.context_window = cfg.context_window;
                 ac.idle_timeout = cfg.stream_timeout;
+                ac.first_token_timeout = cfg.first_token_timeout;
                 ac.max_tokens = default_max_tokens(cfg.context_window);
                 ac.supports_vision = cfg.supports_vision;
                 ac.thinking = cfg.thinking_enabled.unwrap_or(false);
@@ -130,6 +131,7 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                 oc.api_key = cfg.api_key.clone();
                 oc.context_window = cfg.context_window;
                 oc.idle_timeout = cfg.stream_timeout;
+                oc.first_token_timeout = cfg.first_token_timeout;
                 oc.max_tokens = Some(default_max_tokens(cfg.context_window));
                 // Explicit opt-in: pin the Ollama runtime window only when the user set
                 // ATOMCODE_OLLAMA_NUM_CTX. Unset ⇒ leave the daemon's own default alone.
@@ -151,6 +153,7 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                 let mut pc = OpenAiCompatConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
                 pc.context_window = cfg.context_window;
                 pc.idle_timeout = cfg.stream_timeout;
+                pc.first_token_timeout = cfg.first_token_timeout;
                 pc.supports_vision = cfg.supports_vision;
                 pc.max_tokens = Some(default_max_tokens(cfg.context_window));
                 pc.supports_reasoning_effort = supports_reasoning_effort(cfg);
@@ -164,13 +167,15 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                     pc.request_signer = authenticator.request_signer(&cfg.base_url)?;
                 }
                 Arc::new(
-                    ResponsesProvider::new(pc).map_err(|e| ProviderBuildError::Adapter(e.message))?,
+                    ResponsesProvider::new(pc)
+                        .map_err(|e| ProviderBuildError::Adapter(e.message))?,
                 )
             }
             _ => {
                 let mut pc = OpenAiCompatConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
                 pc.context_window = cfg.context_window;
                 pc.idle_timeout = cfg.stream_timeout;
+                pc.first_token_timeout = cfg.first_token_timeout;
                 pc.supports_vision = cfg.supports_vision;
                 pc.max_tokens = Some(default_max_tokens(cfg.context_window));
                 // An explicit per-model default is also an explicit capability

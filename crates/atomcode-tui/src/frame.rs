@@ -1,0 +1,833 @@
+//! What gets painted: geometry, a styled line, and a composed frame.
+//!
+//! A frame is a **value**. Nothing here writes to a terminal — that is the
+//! `surface` seam's job. Keeping the frame a value is what lets a test assert
+//! on what would be shown without a tty, and what lets the same frame be
+//! checked against a real terminal emulator's cell grid (the external oracle).
+
+use std::fmt;
+
+/// A rectangle in cells. Origin is top-left, `(0, 0)`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Rect {
+    pub x: u16,
+    pub y: u16,
+    pub w: u16,
+    pub h: u16,
+}
+
+impl Rect {
+    pub const fn new(x: u16, y: u16, w: u16, h: u16) -> Self {
+        Self { x, y, w, h }
+    }
+
+    /// A rect at the origin — the shape a module usually cares about, since a
+    /// module must render the same regardless of where it sits.
+    pub const fn sized(w: u16, h: u16) -> Self {
+        Self::new(0, 0, w, h)
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.w == 0 || self.h == 0
+    }
+
+    pub const fn right(&self) -> u16 {
+        self.x + self.w
+    }
+
+    pub const fn bottom(&self) -> u16 {
+        self.y + self.h
+    }
+
+    pub fn contains(&self, x: u16, y: u16) -> bool {
+        x >= self.x && x < self.right() && y >= self.y && y < self.bottom()
+    }
+
+    /// Split vertically: `top` rows above, the rest below. Saturates rather
+    /// than panicking — a layout op must never be able to crash the host.
+    pub fn split_v(&self, top: u16) -> (Rect, Rect) {
+        let top = top.min(self.h);
+        (
+            Rect::new(self.x, self.y, self.w, top),
+            Rect::new(self.x, self.y + top, self.w, self.h - top),
+        )
+    }
+
+    /// Split horizontally: `left` columns, then the rest.
+    pub fn split_h(&self, left: u16) -> (Rect, Rect) {
+        let left = left.min(self.w);
+        (
+            Rect::new(self.x, self.y, left, self.h),
+            Rect::new(self.x + left, self.y, self.w - left, self.h),
+        )
+    }
+}
+
+/// How a run of text is drawn. Deliberately small: a theme maps meaning to
+/// colour, so modules speak in roles rather than in ANSI.
+///
+/// Attributes only — and deliberately not SGR 2 (`faint`). "Darker than
+/// whatever the terminal's foreground is" is a contrast the terminal picks,
+/// after the palette has done arithmetic to guarantee one, and nothing in this
+/// tree can measure the result. That is the same failure the role palette exists
+/// to remove. Metadata wants [`Role::Muted`]: a colour this tree chose, which
+/// `--probe-terminal` reports and a test can hold to a floor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Style {
+    pub fg: Option<Color>,
+    pub bg: Option<Color>,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub reverse: bool,
+}
+
+impl Style {
+    pub const fn new() -> Self {
+        Self {
+            fg: None,
+            bg: None,
+            bold: false,
+            italic: false,
+            underline: false,
+            reverse: false,
+        }
+    }
+    /// Fill unset fields from `base`. What this style states wins; what it
+    /// leaves open is inherited — the same rule CSS uses, and what lets a
+    /// container give every child a background without every child knowing.
+    pub fn under(self, base: Style) -> Style {
+        Style {
+            fg: self.fg.or(base.fg),
+            bg: self.bg.or(base.bg),
+            bold: self.bold || base.bold,
+            italic: self.italic || base.italic,
+            underline: self.underline || base.underline,
+            reverse: self.reverse || base.reverse,
+        }
+    }
+
+    pub const fn fg(mut self, c: Color) -> Self {
+        self.fg = Some(c);
+        self
+    }
+    pub const fn bg(mut self, c: Color) -> Self {
+        self.bg = Some(c);
+        self
+    }
+    pub const fn bold(mut self) -> Self {
+        self.bold = true;
+        self
+    }
+    pub const fn reverse(mut self) -> Self {
+        self.reverse = true;
+        self
+    }
+    pub const fn italic(mut self) -> Self {
+        self.italic = true;
+        self
+    }
+    pub const fn underline(mut self) -> Self {
+        self.underline = true;
+        self
+    }
+}
+
+/// A colour, in the terminal's own vocabulary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Color {
+    /// One of the 256 indexed colours.
+    Ansi(u8),
+    Rgb(u8, u8, u8),
+    /// What this text *is*, resolved to an actual colour at paint time.
+    ///
+    /// The same trick as the glyph fallback, for the same reason: a module has
+    /// no idea whether the terminal is light or dark, and threading that answer
+    /// through every `render` and every `Content::lines` would mean every one
+    /// of them could get it wrong. Instead they state the role and
+    /// [`crate::ansi::encode_with`] — which does know — resolves it.
+    Role(crate::theme::Role),
+    /// A colour **the picture brings with it**, as a 256-index the art was baked
+    /// with — `atomcode-tuix`'s mascot (`mascot_color`).
+    ///
+    /// The third case beside "a colour the scheme chose" (`Role`) and "a measured
+    /// triple" (`Rgb`), and it exists because neither fits: a role can only say
+    /// what a colour *means*, and there is no role that means "orange", while an
+    /// index says exactly which orange the artist meant.
+    ///
+    /// Deliberately **not** `Ansi`: that one states a sequence and gets it
+    /// written out verbatim, which on a terminal without the cube is a colour
+    /// nobody chose. This says "the picture's colour 202", and the encoder — which
+    /// holds the capabilities — resolves it, passing 202 through where the cube
+    /// exists and taking the nearest real slot where it does not.
+    Picture(u8),
+}
+
+impl Color {
+    /// Shorthand, because this is how nearly every colour should be written.
+    pub const fn role(r: crate::theme::Role) -> Color {
+        Color::Role(r)
+    }
+
+    /// A picture's own index. See [`Color::Picture`].
+    pub const fn picture(index: u8) -> Color {
+        Color::Picture(index)
+    }
+
+    /// An exact colour, from a measured triple. Only the palette resolver
+    /// produces these, and only when no slot in the user's scheme reads.
+    pub fn rgb((r, g, b): crate::theme::Rgb) -> Color {
+        Color::Rgb(r, g, b)
+    }
+}
+
+/// A run of text sharing one style. Lines are made of these so a renderer can
+/// emit one escape sequence per run rather than one per character.
+///
+/// `Hash` is derived rather than hand-written because it feeds the repaint
+/// diff: a style field added later must change a row's fingerprint, or the row
+/// it was added to would keep painting its old bytes. Deriving it makes that
+/// the default instead of the thing someone has to remember.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Span {
+    pub text: String,
+    pub style: Style,
+}
+
+impl Span {
+    pub fn raw(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            style: Style::new(),
+        }
+    }
+    pub fn styled(text: impl Into<String>, style: Style) -> Self {
+        Self {
+            text: text.into(),
+            style,
+        }
+    }
+    /// Display width in cells, which is not the byte length and not the char
+    /// count — CJK and emoji occupy two.
+    pub fn width(&self) -> usize {
+        crate::width::str_width(&self.text)
+    }
+}
+
+/// One rendered row.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Line {
+    pub spans: Vec<Span>,
+}
+
+impl Line {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    pub fn raw(text: impl Into<String>) -> Self {
+        Self {
+            spans: vec![Span::raw(text)],
+        }
+    }
+
+    pub fn styled(text: impl Into<String>, style: Style) -> Self {
+        Self {
+            spans: vec![Span::styled(text, style)],
+        }
+    }
+
+    pub fn from_spans(spans: Vec<Span>) -> Self {
+        Self { spans }
+    }
+
+    pub fn push(&mut self, span: Span) {
+        self.spans.push(span);
+    }
+
+    pub fn width(&self) -> usize {
+        self.spans.iter().map(Span::width).sum()
+    }
+
+    /// The text with styling dropped. For assertions and for the exit dump.
+    pub fn plain(&self) -> String {
+        self.spans.iter().map(|s| s.text.as_str()).collect()
+    }
+
+    /// Cut to `w` cells, never mid-grapheme and never mid-wide-character.
+    pub fn truncate(&self, w: usize) -> Line {
+        if self.width() <= w {
+            return self.clone();
+        }
+        let mut out = Vec::new();
+        let mut used = 0usize;
+        for span in &self.spans {
+            if used >= w {
+                break;
+            }
+            let room = w - used;
+            let cut = crate::width::take_width(&span.text, room);
+            used += crate::width::str_width(&cut);
+            if !cut.is_empty() {
+                out.push(Span::styled(cut, span.style));
+            }
+        }
+        Line { spans: out }
+    }
+}
+
+impl Line {
+    /// A copy with the cells in `[from, to)` restyled.
+    ///
+    /// Spans are split at the boundaries and never mid-grapheme, so a selection
+    /// that lands in the middle of a word — or in the middle of a CJK character
+    /// — still highlights whole cells. Cells, not bytes and not chars: the
+    /// selection is a rectangle on screen, and that is what the person drew.
+    pub fn restyle(&self, from: usize, to: usize, f: impl Fn(Style) -> Style) -> Line {
+        if from >= to {
+            return self.clone();
+        }
+        let mut out: Vec<Span> = Vec::with_capacity(self.spans.len());
+        let mut at = 0usize;
+        for span in &self.spans {
+            let w = span.width();
+            let (lo, hi) = (at, at + w);
+            at = hi;
+            if hi <= from || lo >= to {
+                out.push(span.clone());
+                continue;
+            }
+            // Up to three pieces: before the range, inside it, after it.
+            // The two slices below cut at the *byte length of a grapheme
+            // prefix* `take_width` just returned, so the index is a boundary by
+            // construction — not by anyone's arithmetic.
+            let head = crate::width::take_width(&span.text, from.saturating_sub(lo));
+            #[allow(
+                clippy::string_slice,
+                reason = "cut at the length of a take_width prefix, which is a grapheme boundary"
+            )]
+            let rest = &span.text[head.len()..];
+            let inside =
+                crate::width::take_width(rest, to.min(hi) - (lo + crate::width::str_width(&head)));
+            #[allow(
+                clippy::string_slice,
+                reason = "cut at the length of a take_width prefix, which is a grapheme boundary"
+            )]
+            let tail = &rest[inside.len()..];
+            for (text, style) in [
+                (head.as_str(), span.style),
+                (inside.as_str(), f(span.style)),
+                (tail, span.style),
+            ] {
+                if !text.is_empty() {
+                    out.push(Span::styled(text, style));
+                }
+            }
+        }
+        Line { spans: out }
+    }
+}
+
+impl fmt::Display for Line {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.plain())
+    }
+}
+
+/// Lines placed at a rect, tagged with who produced them.
+///
+/// The tag is not decoration: the containment check ("every cell a module drew
+/// is inside the rect it was given") is what makes spatial composability
+/// verifiable per module, and it needs to know whose cell each one is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Placed {
+    pub owner: String,
+    pub rect: Rect,
+    pub lines: Vec<Line>,
+}
+
+/// A row's characters paired with the cell each starts at — the mapping cell
+/// positions need, since a wide character is one `char` over two cells.
+/// `rows()` has already dropped wide-character continuation cells, so each
+/// entry is a real character.
+fn cells_of(row: &str) -> Vec<(u16, char)> {
+    let mut out = Vec::new();
+    let mut cell = 0u16;
+    for ch in row.chars() {
+        out.push((cell, ch));
+        cell = cell.saturating_add(crate::width::char_width(ch).max(1) as u16);
+    }
+    out
+}
+
+/// The last cell a `(start_cell, char)` covers — its start plus its width, less
+/// one — so a selection's inclusive head lands on the far cell of a wide char.
+fn last_cell((cell, ch): (u16, char)) -> u16 {
+    cell + crate::width::char_width(ch).max(1) as u16 - 1
+}
+
+/// What double-click keeps together: letters, digits, `_`, and any script's
+/// characters — `is_alphanumeric` is true for CJK, so a run of them selects as
+/// one word, while whitespace and punctuation are boundaries.
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+/// A whole screen, composed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Frame {
+    pub size: Rect,
+    pub parts: Vec<Placed>,
+    /// Where the terminal cursor should end up, if anywhere.
+    pub cursor: Option<(u16, u16)>,
+}
+
+impl Frame {
+    pub fn new(w: u16, h: u16) -> Self {
+        Self {
+            size: Rect::sized(w, h),
+            parts: Vec::new(),
+            cursor: None,
+        }
+    }
+
+    pub fn place(&mut self, owner: impl Into<String>, rect: Rect, lines: Vec<Line>) {
+        self.parts.push(Placed {
+            owner: owner.into(),
+            rect,
+            lines,
+        });
+    }
+
+    /// What one module drew.
+    pub fn part(&self, owner: &str) -> Option<&Placed> {
+        self.parts.iter().find(|p| p.owner == owner)
+    }
+
+    /// Flatten to plain rows, for assertions and the exit dump. Later parts
+    /// overwrite earlier ones, which is what `Region::Stack` means.
+    pub fn rows(&self) -> Vec<String> {
+        let mut grid: Vec<Vec<char>> = vec![vec![' '; self.size.w as usize]; self.size.h as usize];
+        for part in &self.parts {
+            for (dy, line) in part.lines.iter().enumerate() {
+                let y = part.rect.y as usize + dy;
+                if y >= grid.len() || dy >= part.rect.h as usize {
+                    break;
+                }
+                let mut x = part.rect.x as usize;
+                for ch in line.truncate(part.rect.w as usize).plain().chars() {
+                    let cw = crate::width::char_width(ch);
+                    if x >= grid[y].len() {
+                        break;
+                    }
+                    grid[y][x] = ch;
+                    for k in 1..cw {
+                        if x + k < grid[y].len() {
+                            grid[y][x + k] = '\0';
+                        }
+                    }
+                    x += cw.max(1);
+                }
+            }
+        }
+        grid.into_iter()
+            .map(|row| row.into_iter().filter(|c| *c != '\0').collect())
+            .collect()
+    }
+
+    /// Mark the cells a selection covers, wherever they were drawn.
+    ///
+    /// Applied to the composed frame rather than by each module, because a
+    /// selection is a rectangle on the *screen*: it crosses parts, and a module
+    /// asked to highlight its own share would have to know where it sits and
+    /// what its neighbours did.
+    pub fn highlight(&mut self, sel: &crate::moment::Selection) {
+        if sel.is_empty() {
+            return;
+        }
+        let width = self.size.w;
+        for part in &mut self.parts {
+            for (dy, line) in part.lines.iter_mut().enumerate() {
+                let row = part.rect.y as usize + dy;
+                let Ok(row) = u16::try_from(row) else {
+                    continue;
+                };
+                let Some((a, b)) = sel.on_row(row, width) else {
+                    continue;
+                };
+                // Screen cells to this part's own, clipped to its rect.
+                let a = a.max(part.rect.x) - part.rect.x;
+                let b = b.min(part.rect.right()).saturating_sub(part.rect.x);
+                if a < b {
+                    let (a, b) = (a as usize, b as usize);
+                    // Fill the whole band, not just the words in it. `restyle`
+                    // only touches cells that exist, so a ragged right edge, the
+                    // gaps in a table, or a blank row inside the selection would
+                    // stay unlit — a comb of lit words rather than one block. Pad
+                    // the row out to the band's right edge with plain spaces first,
+                    // so those blanks take the selection ground too and the region
+                    // reads as a solid rectangle (an editor's selection).
+                    let have = line.width();
+                    if have < b {
+                        line.spans
+                            .push(Span::styled(" ".repeat(b - have), Style::default()));
+                    }
+                    // A UNIFORM selection band, not per-cell reverse. Toggling
+                    // `reverse` swaps each span's fg into its bg, so a run of cyan
+                    // code, a green ✓, and white prose each lit up in their OWN bright
+                    // colour — a rainbow patchwork. Instead paint one calm selection
+                    // ground under the whole range and keep each span's foreground, so
+                    // the selection reads as a single readable band.
+                    *line = line.restyle(a, b, |st| Style {
+                        bg: Some(Color::role(crate::theme::Role::PanelSelBg)),
+                        reverse: false,
+                        ..st
+                    });
+                }
+            }
+        }
+    }
+
+    /// The text a selection covers, as a person would expect to paste it.
+    ///
+    /// Read back from the flattened frame rather than from the blocks behind
+    /// it: what was selected is what was *on screen*, wrapped the way it was
+    /// wrapped. Trailing blanks go, because a terminal's own selection drops
+    /// them and pasting a rectangle of spaces is never what was meant.
+    pub fn selected_text(&self, sel: &crate::moment::Selection) -> String {
+        if sel.is_empty() {
+            return String::new();
+        }
+        let rows = self.rows();
+        let mut out: Vec<String> = Vec::new();
+        for (y, row) in rows.iter().enumerate() {
+            let Ok(y) = u16::try_from(y) else { continue };
+            let Some((a, b)) = sel.on_row(y, self.size.w) else {
+                continue;
+            };
+            let head = crate::width::take_width(row, a as usize);
+            #[allow(
+                clippy::string_slice,
+                reason = "cut at the length of a take_width prefix, which is a grapheme boundary"
+            )]
+            let rest = &row[head.len()..];
+            let piece = crate::width::take_width(rest, (b - a) as usize);
+            out.push(piece.trim_end().to_string());
+        }
+        out.join("\n")
+    }
+
+    /// The word the pointer is over, as a [`Selection`](crate::moment::Selection),
+    /// or `None` over whitespace / off the row. Double-click reproduces the
+    /// terminal's own word-select, which taking the mouse for drag-select
+    /// disabled. Works in cell space (a wide character is one word-char over two
+    /// cells), same as [`selected_text`](Self::selected_text).
+    pub fn word_at(&self, x: u16, y: u16) -> Option<crate::moment::Selection> {
+        let rows = self.rows();
+        let cells = cells_of(rows.get(y as usize)?);
+        let idx = cells.iter().position(|&(c, ch)| {
+            let w = crate::width::char_width(ch).max(1) as u16;
+            x >= c && x < c + w
+        })?;
+        if !is_word_char(cells[idx].1) {
+            return None;
+        }
+        let mut lo = idx;
+        while lo > 0 && is_word_char(cells[lo - 1].1) {
+            lo -= 1;
+        }
+        let mut hi = idx;
+        while hi + 1 < cells.len() && is_word_char(cells[hi + 1].1) {
+            hi += 1;
+        }
+        Some(crate::moment::Selection {
+            anchor: (cells[lo].0, y),
+            head: (last_cell(cells[hi]), y),
+        })
+    }
+
+    /// The whole row, trimmed to its non-blank span, as a
+    /// [`Selection`](crate::moment::Selection). Triple-click, same reasoning as
+    /// [`word_at`](Self::word_at). `None` on a blank row.
+    pub fn line_at(&self, y: u16) -> Option<crate::moment::Selection> {
+        let rows = self.rows();
+        let cells = cells_of(rows.get(y as usize)?);
+        let first = cells.iter().position(|&(_, ch)| !ch.is_whitespace())?;
+        let last = cells.iter().rposition(|&(_, ch)| !ch.is_whitespace())?;
+        Some(crate::moment::Selection {
+            anchor: (cells[first].0, y),
+            head: (last_cell(cells[last]), y),
+        })
+    }
+
+    /// Every cell a module drew is inside the rect it was given.
+    ///
+    /// The machine-checkable form of "a module occupies its part of the window
+    /// and no more" — the pixel-level verdict on spatial composability.
+    pub fn containment_violations(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for part in &self.parts {
+            if part.lines.len() > part.rect.h as usize {
+                out.push(format!(
+                    "`{}` drew {} lines into a rect {} tall",
+                    part.owner,
+                    part.lines.len(),
+                    part.rect.h
+                ));
+            }
+            for (i, line) in part.lines.iter().enumerate() {
+                if line.width() > part.rect.w as usize {
+                    out.push(format!(
+                        "`{}` line {i} is {} cells wide in a rect {} wide",
+                        part.owner,
+                        line.width(),
+                        part.rect.w
+                    ));
+                }
+            }
+            if part.rect.right() > self.size.w || part.rect.bottom() > self.size.h {
+                out.push(format!(
+                    "`{}` was given {:?}, which is outside the {}×{} screen",
+                    part.owner, part.rect, self.size.w, self.size.h
+                ));
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_split_saturates_instead_of_panicking() {
+        let r = Rect::sized(10, 4);
+        let (a, b) = r.split_v(99);
+        assert_eq!(a.h, 4);
+        assert_eq!(b.h, 0);
+        let (a, b) = r.split_h(99);
+        assert_eq!(a.w, 10);
+        assert_eq!(b.w, 0);
+    }
+
+    #[test]
+    fn width_counts_cells_not_bytes_or_chars() {
+        assert_eq!(Span::raw("abc").width(), 3);
+        assert_eq!(Span::raw("中文").width(), 4, "CJK is two cells each");
+        assert_eq!(Span::raw("").width(), 0);
+    }
+
+    #[test]
+    fn truncating_never_splits_a_wide_character() {
+        let line = Line::raw("中文abc");
+        assert_eq!(
+            line.truncate(3).plain(),
+            "中",
+            "3 cells cannot hold two CJK"
+        );
+        assert_eq!(line.truncate(4).plain(), "中文");
+        assert_eq!(line.truncate(99).plain(), "中文abc");
+    }
+
+    #[test]
+    fn containment_catches_a_module_drawing_outside_its_box() {
+        let mut f = Frame::new(10, 3);
+        f.place("good", Rect::new(0, 0, 10, 1), vec![Line::raw("hi")]);
+        assert!(f.containment_violations().is_empty());
+
+        f.place(
+            "greedy",
+            Rect::new(0, 1, 4, 1),
+            vec![Line::raw("far too wide"), Line::raw("and too tall")],
+        );
+        let v = f.containment_violations();
+        // One for the line count, one for each over-wide line.
+        assert_eq!(v.len(), 3, "{v:?}");
+        assert!(v.iter().all(|m| m.contains("greedy")));
+    }
+
+    #[test]
+    fn a_selection_marks_the_cells_it_covers_and_no_others() {
+        use crate::moment::Selection;
+        let mut f = Frame::new(10, 2);
+        f.place("a", Rect::new(0, 0, 10, 1), vec![Line::raw("abcdefghij")]);
+        f.place("b", Rect::new(0, 1, 10, 1), vec![Line::raw("klmnopqrst")]);
+        f.highlight(&Selection {
+            anchor: (2, 0),
+            head: (4, 0),
+        });
+        let sel_bg = Some(Color::role(crate::theme::Role::PanelSelBg));
+        let marked: String = f.parts[0].lines[0]
+            .spans
+            .iter()
+            .filter(|s| s.style.bg == sel_bg)
+            .map(|s| s.text.as_str())
+            .collect();
+        assert_eq!(marked, "cde", "the head's own cell is selected too");
+        assert!(
+            f.parts[1].lines[0].spans.iter().all(|s| s.style.bg != sel_bg),
+            "a one-row selection reached the row below"
+        );
+    }
+
+    #[test]
+    fn a_selection_fills_the_band_past_the_end_of_a_short_row() {
+        use crate::moment::Selection;
+        // A three-wide word in a ten-wide row, selected end to end: the band has
+        // to be a solid rectangle, not just the word — the seven trailing blanks
+        // take the selection ground too, or the region reads as a comb of words.
+        let mut f = Frame::new(10, 1);
+        f.place("a", Rect::new(0, 0, 10, 1), vec![Line::raw("abc")]);
+        f.highlight(&Selection {
+            anchor: (0, 0),
+            head: (9, 0),
+        });
+        let sel_bg = Some(Color::role(crate::theme::Role::PanelSelBg));
+        let banded: String = f.parts[0].lines[0]
+            .spans
+            .iter()
+            .filter(|s| s.style.bg == sel_bg)
+            .map(|s| s.text.as_str())
+            .collect();
+        assert_eq!(
+            banded, "abc       ",
+            "the band stopped at the last word instead of the row's edge"
+        );
+    }
+
+    #[test]
+    fn dragging_upward_selects_the_same_text_as_dragging_down_over_it() {
+        use crate::moment::Selection;
+        let text = |sel: &Selection| {
+            let mut f = Frame::new(6, 3);
+            for (y, s) in ["one---", "two---", "three-"].iter().enumerate() {
+                f.place(
+                    format!("r{y}"),
+                    Rect::new(0, y as u16, 6, 1),
+                    vec![Line::raw(*s)],
+                );
+            }
+            f.selected_text(sel)
+        };
+        let down = Selection {
+            anchor: (1, 0),
+            head: (2, 2),
+        };
+        let up = Selection {
+            anchor: (2, 2),
+            head: (1, 0),
+        };
+        assert_eq!(text(&down), text(&up));
+        assert_eq!(
+            text(&down),
+            "ne---
+two---
+thr"
+        );
+    }
+
+    #[test]
+    fn double_click_selects_the_word_triple_the_line() {
+        use crate::moment::Selection;
+        let mut f = Frame::new(20, 1);
+        f.place(
+            "t",
+            Rect::new(0, 0, 20, 1),
+            vec![Line::raw("  foo_bar baz  ")],
+        );
+
+        // Over the 'o' of foo_bar (cell 3): the whole `foo_bar` token, copied.
+        let w = f.word_at(3, 0).expect("a word under the pointer");
+        assert_eq!(f.selected_text(&w), "foo_bar");
+        // The head is inclusive and on the last letter, not past it.
+        assert_eq!(
+            w,
+            Selection {
+                anchor: (2, 0),
+                head: (8, 0)
+            }
+        );
+
+        // Over a space (cell 9): no word.
+        assert!(f.word_at(9, 0).is_none());
+        // Over the trailing blanks / past the text: no word.
+        assert!(f.word_at(18, 0).is_none());
+
+        // Triple-click: the row's non-blank span (leading/trailing blanks off).
+        let l = f.line_at(0).expect("a non-blank row");
+        assert_eq!(f.selected_text(&l), "foo_bar baz");
+    }
+
+    #[test]
+    fn double_click_on_a_wide_character_covers_both_its_cells() {
+        let mut f = Frame::new(10, 1);
+        // Two CJK characters: 4 cells wide, one word.
+        f.place("t", Rect::new(0, 0, 10, 1), vec![Line::raw("你好 x")]);
+        let w = f.word_at(0, 0).expect("a word");
+        assert_eq!(f.selected_text(&w), "你好");
+        // Anchor on the first cell, head on the LAST cell of the second char.
+        assert_eq!(w.anchor, (0, 0));
+        assert_eq!(w.head, (3, 0));
+    }
+
+    #[test]
+    fn what_is_copied_is_what_was_on_screen() {
+        use crate::moment::Selection;
+        let mut f = Frame::new(20, 2);
+        // Two parts side by side: a selection crosses them, because it is a
+        // rectangle on the screen and knows nothing about who drew what.
+        f.place("left", Rect::new(0, 0, 10, 1), vec![Line::raw("hello")]);
+        f.place("right", Rect::new(10, 0, 10, 1), vec![Line::raw("world")]);
+        let all = Selection {
+            anchor: (0, 0),
+            head: (19, 0),
+        };
+        assert_eq!(f.selected_text(&all), "hello     world");
+
+        // Trailing blanks go: a terminal drops them and a rectangle of spaces
+        // is never what was meant.
+        let tail = Selection {
+            anchor: (5, 0),
+            head: (19, 0),
+        };
+        assert_eq!(f.selected_text(&tail), "     world");
+        assert_eq!(
+            f.selected_text(&Selection::at(3, 0)),
+            "",
+            "a press is not a selection"
+        );
+    }
+
+    #[test]
+    fn a_selection_never_splits_a_wide_character() {
+        use crate::moment::Selection;
+        let mut f = Frame::new(8, 1);
+        f.place("a", Rect::new(0, 0, 8, 1), vec![Line::raw("中文abc")]);
+        // Cells 0..=2 cover 中 (two cells) and half of 文 — the half cannot be
+        // taken, so it is not.
+        let sel = Selection {
+            anchor: (0, 0),
+            head: (2, 0),
+        };
+        assert_eq!(f.selected_text(&sel), "中");
+        let mut marked = f.clone();
+        marked.highlight(&sel);
+        let sel_bg = Some(Color::role(crate::theme::Role::PanelSelBg));
+        let hot: String = marked.parts[0].lines[0]
+            .spans
+            .iter()
+            .filter(|s| s.style.bg == sel_bg)
+            .map(|s| s.text.as_str())
+            .collect();
+        assert_eq!(hot, "中");
+    }
+
+    #[test]
+    fn rows_flatten_to_a_grid_the_size_of_the_screen() {
+        let mut f = Frame::new(6, 2);
+        f.place("a", Rect::new(0, 0, 6, 1), vec![Line::raw("abc")]);
+        f.place("b", Rect::new(2, 1, 4, 1), vec![Line::raw("xy")]);
+        assert_eq!(f.rows(), vec!["abc   ".to_string(), "  xy  ".to_string()]);
+    }
+}

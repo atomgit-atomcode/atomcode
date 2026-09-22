@@ -1,14 +1,14 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use atomcode_coding::{
-    assemble, build_coding_agent_with, prepare, CodingAgentConfig, PrepareOptions, SessionMode,
-};
-use atomcode_kernel::agent::{Agent, AutoRespond, Outcome};
+mod support;
+
+use atomcode_coding::{prepare, CodingAgentConfig, PrepareOptions, SessionMode};
 use atomcode_kernel::event::{AgentCommand, AgentEvent};
 use atomcode_kernel::stream::StreamEvent;
 use atomcode_kernel::testkit::MockProvider;
 use atomcode_kernel::tool::ToolCall;
+use support::{allow, mount_parts, turn, Turn};
 
 fn malformed_write_provider(file_path: &Path) -> Arc<MockProvider> {
     Arc::new(MockProvider::new(vec![
@@ -27,16 +27,14 @@ fn malformed_write_provider(file_path: &Path) -> Arc<MockProvider> {
             StreamEvent::TextDelta("done".into()),
             StreamEvent::Done { truncated: false },
         ],
+        vec![
+            StreamEvent::TextDelta("nothing further".into()),
+            StreamEvent::Done { truncated: false },
+        ],
     ]))
 }
 
-async fn run_write(agent: Agent) -> Outcome {
-    agent
-        .run_to_completion("write the file", AutoRespond::AllowAll)
-        .await
-}
-
-fn assert_repaired_write(outcome: &Outcome, file_path: &Path) {
+fn assert_repaired_write(outcome: &Turn, file_path: &Path) {
     assert_eq!(outcome.tool_results.len(), 1);
     assert!(
         !outcome.tool_results[0].is_error,
@@ -47,46 +45,29 @@ fn assert_repaired_write(outcome: &Outcome, file_path: &Path) {
 }
 
 #[tokio::test]
-async fn minimal_assembly_repairs_tool_arguments_before_execution() {
-    let project = tempfile::tempdir().unwrap();
-    let file_path = project.path().join("minimal.txt");
-    let cfg = CodingAgentConfig::new("k", "http://localhost:0", "mock-model", project.path());
-    let agent = build_coding_agent_with(&cfg, malformed_write_provider(&file_path));
-
-    let outcome = run_write(agent).await;
-
-    assert_repaired_write(&outcome, &file_path);
-}
-
-#[tokio::test]
-async fn full_assembly_repairs_tool_arguments_before_execution() {
+async fn the_assembly_repairs_tool_arguments_before_execution() {
     let project = tempfile::tempdir().unwrap();
     let file_path = project.path().join("full.txt");
     let cfg = CodingAgentConfig::new("k", "http://localhost:0", "mock-model", project.path());
-    let mut parts = prepare(
-        &cfg,
-        PrepareOptions {
-            session: SessionMode::Disabled,
-            tools: true,
-            skill_dirs: Some(vec![project.path().join("skills")]),
-            mcp: false,
-            memory: false,
-            web: false,
-            review: false,
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-    let agent = assemble(&mut parts, &cfg, malformed_write_provider(&file_path)).unwrap();
-
-    let outcome = run_write(agent).await;
+    let opts = PrepareOptions {
+        session: SessionMode::Disabled,
+        tools: true,
+        skill_dirs: Some(vec![project.path().join("skills")]),
+        mcp: false,
+        memory: false,
+        web: false,
+        review: false,
+        ..Default::default()
+    };
+    let parts = prepare(&cfg, opts.clone()).await.unwrap();
+    let mut mounted = mount_parts(&parts, &cfg, &opts, malformed_write_provider(&file_path)).await;
+    let outcome = turn(&mut mounted.handle, "write the file", allow()).await;
 
     assert_repaired_write(&outcome, &file_path);
 }
 
 #[tokio::test]
-async fn full_assembly_approval_sees_the_repaired_arguments_that_execute() {
+async fn approval_sees_the_repaired_arguments_that_execute() {
     let project = tempfile::tempdir().unwrap();
     // The write gate intentionally auto-approves the OS temp directory. Put the
     // target under the workspace's build output instead: it is outside this
@@ -96,25 +77,23 @@ async fn full_assembly_approval_sees_the_repaired_arguments_that_execute() {
         .join("target");
     let outside = tempfile::tempdir_in(workspace_target).unwrap();
     let file_path = outside.path().join("approved.txt");
-    let cfg = CodingAgentConfig::new("k", "http://localhost:0", "mock-model", project.path());
-    let mut parts = prepare(
-        &cfg,
-        PrepareOptions {
-            session: SessionMode::Disabled,
-            tools: true,
-            skill_dirs: Some(vec![project.path().join("skills")]),
-            mcp: false,
-            memory: false,
-            web: false,
-            review: false,
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-    let mut handle = assemble(&mut parts, &cfg, malformed_write_provider(&file_path))
-        .unwrap()
-        .spawn();
+    let mut cfg = CodingAgentConfig::new("k", "http://localhost:0", "mock-model", project.path());
+    // A person is at the screen, so a write next door is a question rather than
+    // something the world refuses on its own.
+    cfg.interactive = true;
+    let opts = PrepareOptions {
+        session: SessionMode::Disabled,
+        tools: true,
+        skill_dirs: Some(vec![project.path().join("skills")]),
+        mcp: false,
+        memory: false,
+        web: false,
+        review: false,
+        ..Default::default()
+    };
+    let parts = prepare(&cfg, opts.clone()).await.unwrap();
+    let mut mounted = mount_parts(&parts, &cfg, &opts, malformed_write_provider(&file_path)).await;
+    let handle = &mut mounted.handle;
     let commands = handle.commands.clone();
     commands
         .send(AgentCommand::SendMessage {
@@ -169,7 +148,6 @@ async fn full_assembly_approval_sees_the_repaired_arguments_that_execute() {
     .expect("turn timed out waiting for repaired-argument execution");
 
     commands.send(AgentCommand::Shutdown).unwrap();
-    let _ = handle.task.await;
     assert!(
         approved_args.is_some(),
         "out-of-workspace write must request approval"

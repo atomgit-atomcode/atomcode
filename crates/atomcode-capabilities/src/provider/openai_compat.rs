@@ -157,7 +157,13 @@ pub struct OpenAiCompatConfig {
     /// Kimi K2.6 preserved thinking: `thinking.keep` in the request body.
     pub thinking_keep: Option<String>,
     /// Per-chunk stream-idle watchdog: no bytes for this long ⇒ terminal error.
+    /// Governs the INTER-token phase (after the first byte of a stream).
     pub idle_timeout: Duration,
+    /// FIRST-byte (prefill / TTFB) idle watchdog: no bytes for this long BEFORE the
+    /// first byte of a (re)opened stream ⇒ terminal error. Separate from (and ≥)
+    /// `idle_timeout` because prefill on a slow local model can be silent far longer
+    /// than inter-token gaps. Wired from the coding-layer `first_token_timeout`.
+    pub first_token_timeout: Duration,
     pub connect_timeout: Duration,
     /// Per-ATTEMPT first-byte (TTFB) watchdog for the OPEN call. A gateway that
     /// accepts the connection but never responds would otherwise hang FOREVER —
@@ -196,7 +202,17 @@ pub struct OpenAiCompatConfig {
 /// It gates provider image encoding and the `read_file` vision path; daemon live
 /// preprocessing also uses it. A drift would silently drop or wrongly forward images.
 pub fn model_suggests_vision(name: &str) -> bool {
-    let n = name.to_lowercase();
+    let lowered = name.to_lowercase();
+    // A gateway that fronts many vendors qualifies the model with its vendor:
+    // OpenRouter ids are `anthropic/claude-opus-4.1`, `openai/gpt-4o`,
+    // `google/gemini-2.5-pro`, and Vertex's are a whole resource path ending in
+    // the model name. Every `starts_with` rule below looks at the *front* of
+    // the string, so on a prefixed id not one of them fired — a vision model
+    // behind `anthropic/…` was classified blind, and the image someone pasted
+    // for it was degraded to a caption with nothing saying so. The rules are
+    // about the model, so they run against the model: the last path segment,
+    // which is the whole name when there is no prefix.
+    let n = lowered.rsplit('/').next().unwrap_or(lowered.as_str());
     n.contains("vision")
         || n.contains("-vl")
         || n.contains("vl-")
@@ -240,6 +256,7 @@ impl OpenAiCompatConfig {
             thinking_type: None,
             thinking_keep: None,
             idle_timeout: Duration::from_secs(120),
+            first_token_timeout: Duration::from_secs(120),
             open_timeout: Duration::from_secs(90),
             connect_timeout: Duration::from_secs(30),
             retry: RetryPolicy::default(),
@@ -518,6 +535,12 @@ impl LlmProvider for OpenAiCompatProvider {
         self.cfg.context_window
     }
 
+    /// The same flag `format_messages` degrades on, so what a front end is told
+    /// before attaching a picture is what the encoder will actually do with it.
+    fn supports_vision(&self) -> bool {
+        self.cfg.supports_vision
+    }
+
     fn bind_session_id(&self, session_id: &str) {
         // One-shot: the kernel binds exactly once at spawn. Ignore a redundant
         // re-bind (OnceLock keeps the first value) rather than panicking.
@@ -579,6 +602,7 @@ impl LlmProvider for OpenAiCompatProvider {
         // the initial open and any mid-stream reopen.
         let session_id = self.session_id.get().cloned().unwrap_or_default();
         let idle = self.cfg.idle_timeout;
+        let first_token = self.cfg.first_token_timeout;
         let open_timeout = self.cfg.open_timeout;
         let rate_limit_retry_owner = options.rate_limit_retry_owner;
         let resp = match open_stream(
@@ -629,8 +653,23 @@ impl LlmProvider for OpenAiCompatProvider {
                 let mut pending_metadata = Vec::new();
                 let byte_stream = resp.bytes_stream();
                 futures::pin_mut!(byte_stream);
+                // PHASE-AWARE byte-idle watchdog: before the first byte of THIS (re)opened
+                // stream we are in prefill (TTFB) — a slow local model can be silent for
+                // minutes — so allow up to `first_token`; once any byte has arrived, tighten
+                // to the inter-token `idle`. Keep-alive bytes flip us early but also keep
+                // resetting the watchdog, so it won't fire spuriously; a fully-silent prefill
+                // gets the full first-token budget, matching the kernel first_token_timeout.
+                // Reset per (re)open: a transparent reconnect restarts prefill on the server.
+                let mut first_byte_seen = false;
                 loop {
-                    match tokio::time::timeout(idle, byte_stream.next()).await {
+                    match retry::next_chunk_phased(
+                        &mut byte_stream,
+                        first_token,
+                        idle,
+                        &mut first_byte_seen,
+                    )
+                    .await
+                    {
                         Err(_elapsed) => {
                             // Mid-stream idle: non-recoverable (partial deltas may already
                             // have reached the consumer), so not retryable.
@@ -1239,6 +1278,16 @@ fn normalize_openai_tool_schema_in_place(schema: &mut Value) {
     if allows_object && !map.contains_key("properties") {
         map.insert("properties".into(), Value::Object(Map::new()));
     }
+    // Some strict OpenAI-compatible validators (observed on a self-hosted DeepSeek
+    // gateway) require an object schema's `required` to be an ARRAY and reject its
+    // ABSENCE with "Invalid schema … null is not of type array" — which 400'd every
+    // turn as soon as an all-optional-param tool (`code_review`, `list_directory`, …)
+    // was in the tool list. An empty `[]` is semantically identical (no required
+    // properties) and satisfies them. Wire-boundary only; the neutral kernel schema
+    // stays untouched. Recurses, so nested objects + MCP/plugin schemas get it too.
+    if allows_object && !map.contains_key("required") {
+        map.insert("required".into(), Value::Array(Vec::new()));
+    }
 
     // Traverse only values that are themselves JSON Schemas. Literal-bearing
     // keywords such as `const`, `enum`, `default`, and `examples` must remain
@@ -1490,6 +1539,14 @@ pub(crate) fn inband_error_http_status(err: &serde_json::Value) -> Option<u16> {
 
 const MAX_TOOL_CALL_DELTAS: usize = 20000;
 
+/// Upper bound on a streamed tool-call `index`. The index pads `tool_calls` up to
+/// its value, so an out-of-range one from a buggy/malicious server (e.g.
+/// `index: 999_999_999`) would allocate a gigantic vector → OOM. Real responses
+/// index parallel tool calls densely from 0 and never approach this; a larger index
+/// is malformed and its delta is dropped. Generous so legitimate high fan-out is
+/// never rejected, while keeping the buffer trivially small.
+const MAX_TOOL_CALLS: usize = 256;
+
 /// Stateful Server-Sent-Events decoder. Feed it raw byte chunks; it returns whole
 /// kernel `StreamEvent`s. Splitting tool-call assembly + usage buffering out here (vs
 /// inline in the network loop) makes the wire→event mapping deterministic and
@@ -1677,6 +1734,13 @@ impl SseDecoder {
             for tc in tcs {
                 self.tool_call_delta_count += 1;
                 let idx = tc.index.unwrap_or(0);
+                // Bound the index BEFORE it pads the vector: an out-of-range value
+                // (e.g. `index: 999_999_999`) would otherwise push ~a billion slots →
+                // OOM. Real responses index densely from 0; a huge sparse index is
+                // malformed, so drop that delta rather than allocate for it.
+                if idx >= MAX_TOOL_CALLS {
+                    continue;
+                }
                 while self.tool_calls.len() <= idx {
                     self.tool_calls
                         .push((String::new(), String::new(), String::new()));
@@ -2074,7 +2138,7 @@ mod tests {
     // Classification lock for every supported vision naming rule plus a
     // representative text-only negative.
     #[test]
-    fn model_suggests_vision_matches_core_classifications() {
+    fn model_suggests_vision_classification_lock() {
         for m in [
             "gpt-4-vision-preview",
             "glm-4v",
@@ -2101,6 +2165,40 @@ mod tests {
             "gpt-4-turbo",
             "claude-2.1",
             "o3-mini",
+        ] {
+            assert!(!model_suggests_vision(m), "should be text-only: {m}");
+        }
+    }
+
+    // A vendor prefix is a fact about the route, not about the model. Every
+    // `starts_with` rule looks at the front of the string, so before the
+    // last-segment normalization not one of them fired on a prefixed id:
+    // OpenRouter's `anthropic/claude-opus-4.1` was classified blind, and an
+    // image pasted for it was degraded to a caption in silence. This is the
+    // classification the paste gate and the degrade path both read.
+    #[test]
+    fn a_vendor_prefixed_id_is_classified_by_its_model_segment() {
+        for m in [
+            "anthropic/claude-opus-4.1",
+            "anthropic/claude-sonnet-4-6",
+            "openai/gpt-4o",
+            "google/gemini-2.5-pro",
+            "mistralai/pixtral-12b",
+            // Vertex hands over the whole resource path as the model id.
+            "projects/p/locations/us-central1/publishers/google/models/gemini-2.5-pro",
+            // A `:free`-style tag suffix leaves the family at the front.
+            "google/gemini-2.0-flash-exp:free",
+        ] {
+            assert!(model_suggests_vision(m), "should be vision: {m}");
+        }
+        // The vendor segment must not be able to call a model vision-capable on
+        // its own, and a prefixed text-only model must stay text-only: only the
+        // model segment decides, in both directions.
+        for m in [
+            "anthropic/claude-2.1",
+            "deepseek/deepseek-v4",
+            "openai/o3-mini",
+            "vision-plus/gpt-3.5",
         ] {
             assert!(!model_suggests_vision(m), "should be text-only: {m}");
         }
@@ -2230,6 +2328,63 @@ mod tests {
         assert!(out.iter().skip(1).all(|v| v["role"] != "system"));
         assert_eq!(out[1], json!({"role":"user","content":"hi"}));
         assert_eq!(out[3], json!({"role":"user","content":"continue"}));
+    }
+
+    #[test]
+    fn a_mid_turn_reminder_appends_and_does_not_rewrite_the_system_prompt() {
+        // A runtime note (a stale-task-list reminder, `InjectionOrigin::Reminder`)
+        // is committed mid-turn, so it projects to a message placed AFTER the tool
+        // result it followed — not at the head. It must ride as a `user` message.
+        // As a `system` one it would be LIFTED to position 0 and coalesced into
+        // the assembled prompt, so every request after it would carry a different
+        // prefix than the one before: the whole prefix cache invalidates, while
+        // the log still records the round as `Append`. The system entry is the
+        // only thing here the provider is allowed to reorder.
+        const REMINDER: &str = "<system-reminder>The task list still shows \"fix the parser\" \
+                                 in progress. Do not mention this reminder to the user.</system-reminder>";
+        let mut note = Message::user(REMINDER);
+        // `derive_messages` marks every injected message synthetic; keep the
+        // fixture faithful so this test fails if that ever stops being true in a
+        // way that matters here.
+        note.synthetic = true;
+        let msgs = vec![
+            Message::system("persona"),
+            Message::user("fix the parser"),
+            Message::assistant(
+                "Planning.",
+                vec![ToolCall {
+                    id: "call_1".into(),
+                    name: "list_directory".into(),
+                    arguments: "{}".into(),
+                }],
+            ),
+            Message::tool_result("call_1", "result text", false),
+            note,
+        ];
+
+        let out = format_messages(&msgs, ReasoningPolicy::Exclude, true);
+
+        assert_eq!(out[0]["role"], "system");
+        assert_eq!(
+            out[0]["content"], "persona",
+            "the instruction header is untouched by a mid-turn note: {out:?}"
+        );
+        assert_eq!(
+            out.iter().filter(|v| v["role"] == "system").count(),
+            1,
+            "exactly one system entry, and no second one to lift"
+        );
+        assert_eq!(
+            out.last().unwrap(),
+            &json!({ "role": "user", "content": REMINDER }),
+            "the reminder appends at the tail as a user message: {out:?}"
+        );
+        // Appended, not merged: the tool result keeps its own wire entry, so the
+        // model can still tell the harness's judgement from the tool's output.
+        assert_eq!(
+            out[3],
+            json!({"role":"tool","tool_call_id":"call_1","content":"result text"})
+        );
     }
 
     #[test]
@@ -2636,11 +2791,11 @@ mod tests {
 
         assert_eq!(
             body["tools"][0]["function"]["parameters"],
-            json!({"type":"object","properties":{}})
+            json!({"type":"object","properties":{},"required":[]})
         );
         assert_eq!(
             body["tools"][1]["function"]["parameters"]["properties"]["options"],
-            json!({"type":["object","null"],"properties":{}})
+            json!({"type":["object","null"],"properties":{},"required":[]})
         );
         assert_eq!(
             body["tools"][1]["function"]["parameters"]["properties"]["query"],
@@ -2665,12 +2820,35 @@ mod tests {
         );
         assert_eq!(
             external["properties"]["labels"]["additionalProperties"],
-            json!({"type":"object","properties":{}})
+            json!({"type":"object","properties":{},"required":[]})
         );
         assert_eq!(
             external["$defs"]["record"],
-            json!({"type":"object","properties":{}})
+            json!({"type":"object","properties":{},"required":[]})
         );
+    }
+
+    #[test]
+    fn normalizer_injects_empty_required_for_all_optional_object_schemas() {
+        // A strict gateway (self-hosted DeepSeek) 400'd with "null is not of type
+        // array" when a tool's parameters object omitted `required` (all-optional
+        // params, e.g. `code_review`). The wire boundary must add an empty `[]`.
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "scope": { "type": "object", "properties": { "kind": { "type": "string" } }, "required": ["kind"] },
+                "paths": { "type": "array", "items": { "type": "string" } },
+                "depth": { "type": "string", "enum": ["a", "b"] }
+            }
+        });
+        let out = shared_normalize_tool_schema(&schema);
+        // Top-level (was missing) gets an empty required array.
+        assert_eq!(out["required"], json!([]), "top-level required must be []");
+        // A nested object that ALREADY declares required is left intact.
+        assert_eq!(out["properties"]["scope"]["required"], json!(["kind"]));
+        // Non-object property schemas are untouched (no spurious required).
+        assert!(out["properties"]["paths"].get("required").is_none());
+        assert!(out["properties"]["depth"].get("required").is_none());
     }
 
     #[test]
@@ -2968,6 +3146,38 @@ mod tests {
         );
         let _ = d.feed(line(json!({"choices":[{"delta":{},"finish_reason":"stop"}]})).as_bytes());
         assert!(d.seen_finish(), "non-empty finish_reason arms seen_finish");
+    }
+
+    #[test]
+    fn sse_tool_call_out_of_range_index_is_dropped_not_oom() {
+        // A buggy/malicious server sending a huge `index` must NOT pad the buffer up
+        // to that value (which would allocate ~a billion slots → OOM). The
+        // out-of-range delta is dropped; a legitimate index-0 call in the same stream
+        // still assembles. If the bound were missing this test would OOM/hang.
+        let mut d = SseDecoder::new();
+        let mut ev = Vec::new();
+        ev.extend(d.feed(line(json!({"choices":[{"delta":{"tool_calls":[{"index":999_999_999u64,"id":"evil","function":{"name":"x","arguments":"{}"}}]}}]})).as_bytes()));
+        ev.extend(d.feed(line(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_ok","function":{"name":"read","arguments":"{\"path\":\"a\"}"}}]}}]})).as_bytes()));
+        ev.extend(
+            d.feed(line(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})).as_bytes()),
+        );
+        let calls: Vec<_> = ev
+            .iter()
+            .filter_map(|e| {
+                if let StreamEvent::ToolCall(t) = e {
+                    Some(t)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "only the in-range call is emitted: {calls:?}"
+        );
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(calls[0].id, "call_ok");
     }
 
     #[test]
@@ -4129,12 +4339,18 @@ mod tests {
         };
         // opencode.ai + non-empty session → header carries the stable id.
         assert_eq!(
-            header_of("https://opencode.ai/zen/v1/chat/completions", "sess-abc-123"),
+            header_of(
+                "https://opencode.ai/zen/v1/chat/completions",
+                "sess-abc-123"
+            ),
             Some("sess-abc-123".to_string())
         );
         // Non-opencode host → never sent (no product-identity leak to other gateways).
         assert_eq!(
-            header_of("https://api.deepseek.com/v1/chat/completions", "sess-abc-123"),
+            header_of(
+                "https://api.deepseek.com/v1/chat/completions",
+                "sess-abc-123"
+            ),
             None
         );
         // Empty session (sub-agent / summary) → omitted even on opencode.

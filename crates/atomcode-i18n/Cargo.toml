@@ -1,0 +1,15 @@
+[package]
+name = "atomcode-i18n"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+description = "Every sentence this build says to a person, in both languages, behind one locale. Zero atomcode dependencies — the product's config crate and the screen both read this leaf, so there is one language switch and not two."
+publish = false
+
+[dependencies]
+# `Locale` is written to and read from `config.toml` and the wire, so it carries
+# its own serde impl rather than making every caller map it.
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

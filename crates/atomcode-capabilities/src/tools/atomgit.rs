@@ -426,14 +426,15 @@ impl Tool for AtomgitIssueTool {
                     "atomgit_issue update: owner, repo, number and title are required".to_string(),
                 ),
             },
-            "close" => match need_owner_repo_number(a.owner, a.repo, a.number, "atomgit_issue close")
-            {
-                Ok((o, r, n)) => match c.issue_close(&o, &r, n).await {
-                    Ok(i) => ok(format!("Closed {}", render_issue(&i))),
-                    Err(e) => err(e),
-                },
-                Err(e) => e,
-            },
+            "close" => {
+                match need_owner_repo_number(a.owner, a.repo, a.number, "atomgit_issue close") {
+                    Ok((o, r, n)) => match c.issue_close(&o, &r, n).await {
+                        Ok(i) => ok(format!("Closed {}", render_issue(&i))),
+                        Err(e) => err(e),
+                    },
+                    Err(e) => e,
+                }
+            }
             "comment_create" => match need_owner_repo_number(
                 a.owner,
                 a.repo,
@@ -1338,7 +1339,9 @@ mod tests {
             .await;
         Mock::given(method("PATCH"))
             .and(path("/api/v5/repos/o/issues/5"))
-            .and(body_json(json!({ "repo": "r", "title": "T", "state": "close" })))
+            .and(body_json(
+                json!({ "repo": "r", "title": "T", "state": "close" }),
+            ))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(json!({"number":5,"title":"T","state":"closed"})),
@@ -1365,7 +1368,8 @@ mod tests {
             .await;
         assert!(r.is_error, "{}", r.content);
         assert!(
-            r.content.contains("owner, repo, number and title are required"),
+            r.content
+                .contains("owner, repo, number and title are required"),
             "{}",
             r.content
         );

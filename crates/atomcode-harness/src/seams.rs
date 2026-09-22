@@ -1,0 +1,1206 @@
+//! The capability seams: what can be replaced, and the face a consumer sees.
+//!
+//! Each seam is three roles — a **definition** (here), one or more **providers**
+//! (plugins that fill the slot), and **consumers** (plugins that read it). No
+//! consumer names an implementation, which is why swapping a provider changes the
+//! product without touching anything that uses it.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, RwLock};
+
+use async_trait::async_trait;
+use atomcode_capabilities::codeintel::CodeIndex;
+use atomcode_capabilities::mcp::McpRegistry;
+use atomcode_capabilities::skills::SkillRegistry;
+use atomcode_kernel::provider::LlmProvider;
+use atomcode_kernel::tool::{Tool, ToolDef};
+use atomcode_plexus::{plexus_service, Context};
+
+use crate::agent::{Agent, Agents};
+pub use crate::model_source::{cheapest, choices, delegatable, Chose, ModelInfo, Models};
+use crate::session::{LoggedEvent, SessionLog, SessionProjections};
+pub use atomcode_capabilities::tools::Opener;
+pub use atomcode_capabilities::world::{FileSystem, Shell};
+
+plexus_service!(LlmSvc => dyn LlmProvider, "llm", Seam, "Model adapter");
+plexus_service!(LlmUtilitySvc => dyn LlmProvider, "llm-utility", Seam, "The model for side calls whose result a program consumes — titles, summaries, suggestions — not the conversation");
+plexus_service!(ModelsSvc => dyn Models, "models", Seam, "Every model this host can build a provider for, so a row can run a child on a different one");
+plexus_service!(ToolsSvc => ToolBox, "tools", Core, "The live tool catalog");
+plexus_service!(SystemPromptSvc => PromptRegistry, "system-prompt", Core, "Ordered prompt fragments");
+// Never sent to the model unprompted. It is answered when asked, so a row can
+// describe a knob in as much detail as the knob deserves without that detail
+// costing tokens on every single request — and, unlike the system prompt, an
+// answer may depend on the session asking (see `Descriptions`).
+plexus_service!(CommandsSvc => crate::commands::CommandCatalog, "commands", Core, "The commands a person can run from a front end against a session or one agent in it, registered by the rows they belong to");
+plexus_service!(OperationsSvc => Descriptions, "operations", Core, "What each row says about itself — how to work it, and its part of this session — answered when asked");
+plexus_service!(SessionSvc => SessionLog, "sessions", Core, "The append-only session log of the agent whose realm this is");
+plexus_service!(SessionDefaultsSvc => SessionDefaults, "session-defaults", Core, "What the front end's own agent is told about its session: an id, whether to resume it");
+plexus_service!(SessionProjectionsSvc => SessionProjections, "session-projections", Core, "Incremental folds over the log");
+plexus_service!(SessionPersistenceSvc => dyn SessionPersistence, "session-persistence", Seam, "Durable session storage");
+plexus_service!(SkillsSvc => SkillRegistry, "skills", Core, "Markdown skill catalog");
+plexus_service!(CodeIndexSvc => CodeIndex, "code-index", Core, "Shared lazily-built code graph");
+plexus_service!(FsSvc => dyn FileSystem, "fs", Seam, "One execution world's view of files");
+plexus_service!(ShellSvc => dyn Shell, "shell", Seam, "Shell execution for one world: spawn, stream, kill the tree");
+plexus_service!(OpenerSvc => dyn Opener, "opener", Seam, "Where a file or URL is shown to the person — the front end's to provide");
+plexus_service!(CompactionSvc => dyn Compaction, "compaction", Seam, "History compaction strategy");
+plexus_service!(SessionTitleSvc => dyn SessionTitle, "session-title", Seam, "How a session gets named");
+plexus_service!(UserQuestionsSvc => dyn UserQuestions, "user-questions", Seam, "Asking a human");
+plexus_service!(McpSvc => McpRegistry, "mcp", Core, "Connected MCP servers");
+plexus_service!(AgentsSvc => Agents, "agents", Core, "Live agent registry");
+plexus_service!(UiSvc => dyn UserInterface, "ui", Seam, "The interaction front end");
+plexus_service!(WallClockSvc => dyn atomcode_kernel::clock::WallClock, "wall-clock", Seam, "When a session record was committed");
+plexus_service!(ControlSvc => dyn Control, "control", Core, "Reconfiguring the running tree");
+plexus_service!(FindingsSvc => dyn Findings, "findings", Seam, "Where structured findings are collected");
+plexus_service!(SubagentsSvc => dyn Subagents, "subagents", Seam, "Delegating work to a child agent");
+plexus_service!(AgentLoopSvc => dyn AgentLoop, "agent-loop", Seam, "The turn driver");
+plexus_service!(ApprovalSvc => dyn ApprovalPolicy, "approval", Seam, "Whether a tool call may run");
+plexus_service!(AgentHandleSvc => dyn AgentHandleSource, "agent-handle", Seam, "A driver-protocol handle on this harness");
+plexus_service!(ModesSvc => Modes, "modes", Core, "Switches a person flips mid-session — plan mode, accept edits — read live by the rows they govern");
+plexus_service!(ToolDriverSvc => dyn ToolDriver, "tool-driver", Seam, "What a running tool reaches of the person's front end: a progress line, a structured question");
+plexus_service!(DelegatedLlmSvc => dyn LlmProvider, "llm-delegated", Seam, "The model a delegated agent runs on when it inherits the conversation's, for a host that keeps a child's spend apart");
+plexus_service!(DelegationLaneSvc => DelegationLane, "delegation-lane", Core, "Where a delegated agent may write: the scopes it was given, on its own realm");
+plexus_service!(GrantsSvc => dyn atomcode_capabilities::tools::PermissionStore, "grants", Core, "The session's remembered always-allow answers, kept by a host that outlives the tree");
+
+/// Which names the catalog admits, as the `tools` row was configured.
+///
+/// The switch a config tree has is the **row**, and a row usually mounts
+/// several tools — `tool-fs-world` alone brings five. So "drop `write_file`,
+/// keep `read_file`" had no expression, and neither did "let this MCP server
+/// offer two of its forty tools": an MCP server's tools are published at
+/// runtime by one row, long after any row list was written.
+///
+/// Hence a policy on the **aggregate** rather than a switch on each
+/// contributor: one implementation, and it covers contributors that do not
+/// exist yet when the tree is written.
+///
+/// A pattern is either a tool name (`write_file`, `mcp__github__*`) or a row
+/// and a tool (`tool-fs-world:read_file`). The qualified form is what makes
+/// **replacing** one tool out of a row possible: exclude the incumbent row's
+/// `read_file` and the name is free, so the host's own row registers under it.
+/// The bare form excludes that name from everyone, which is what you want for
+/// "this tree has no `write_file`, whoever offers one".
+///
+/// `include` empty means "everything not excluded". A name matching both is
+/// excluded — the narrower statement wins, and a host that wrote both meant to
+/// carve something out.
+#[derive(Default, Clone, Debug)]
+pub struct ToolPolicy {
+    include: Vec<String>,
+    exclude: Vec<String>,
+}
+
+impl ToolPolicy {
+    pub fn new(include: Vec<String>, exclude: Vec<String>) -> Self {
+        Self { include, exclude }
+    }
+
+    /// Nothing named, nothing to enforce — the ordinary case, and worth asking
+    /// about before a caller pays for a match.
+    pub fn is_open(&self) -> bool {
+        self.include.is_empty() && self.exclude.is_empty()
+    }
+
+    /// `owner` is the row offering the tool, as the config tree names it.
+    pub fn admits(&self, owner: &str, name: &str) -> bool {
+        if self.exclude.iter().any(|p| names(p, owner, name)) {
+            return false;
+        }
+        self.include.is_empty() || self.include.iter().any(|p| names(p, owner, name))
+    }
+}
+
+/// Does `pattern` name this tool? Qualified patterns match `owner:name`, bare
+/// ones match the name alone.
+fn names(pattern: &str, owner: &str, name: &str) -> bool {
+    match pattern.split_once(':') {
+        Some((row, tool)) => glob_matches(row, owner) && glob_matches(tool, name),
+        None => glob_matches(pattern, name),
+    }
+}
+
+/// `*` stands for any run of characters, anywhere in the pattern. Enough for
+/// `mcp__github__*` and `*_file`, and small enough to read — a tool name is an
+/// identifier, not a path, so there is nothing for a `?` or a class to do.
+fn glob_matches(pattern: &str, name: &str) -> bool {
+    let mut rest = name;
+    let mut parts = pattern.split('*');
+    let Some(first) = parts.next() else {
+        return pattern == name;
+    };
+    let Some(stripped) = rest.strip_prefix(first) else {
+        return false;
+    };
+    rest = stripped;
+    let mut last: Option<&str> = None;
+    for part in parts {
+        if let Some(previous) = last.replace(part) {
+            // A middle segment: find it anywhere ahead.
+            match rest.find(previous) {
+                Some(at) => rest = &rest[at + previous.len()..],
+                None => return false,
+            }
+        }
+    }
+    match last {
+        // The pattern had no `*`: it must have consumed the whole name.
+        None => rest.is_empty(),
+        // The tail after the final `*`.
+        Some(tail) => rest.len() >= tail.len() && rest.ends_with(tail),
+    }
+}
+
+/// One name in the catalog, as a screen needs it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolListing {
+    pub name: String,
+    /// The row that offered it, empty when whoever registered it did not say.
+    pub owner: String,
+    pub state: ToolState,
+}
+
+/// Why a tool is or is not on offer to the model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolState {
+    /// The model can call it.
+    On,
+    /// A person turned it off in this session, and can put it back.
+    OffInSession,
+    /// The tree was configured without it. Only editing the config changes
+    /// this — a command must not, or the config's answer is a suggestion.
+    ExcludedByConfig,
+}
+
+/// The live tool catalog.
+///
+/// Deliberately mutable at runtime rather than a snapshot taken at assembly: a
+/// tool plugin registers on apply and *unregisters on unload*, so unmounting
+/// `tool-bash` removes bash from the model's schema list mid-session with nobody
+/// rebuilding anything.
+#[derive(Default)]
+pub struct ToolBox {
+    tools: RwLock<BTreeMap<String, Mounted>>,
+    policy: ToolPolicy,
+    /// Names actually turned away by [`policy`](Self::policy), so the tree can
+    /// say what it dropped rather than the model wondering where a tool went.
+    /// Config's answer is final for the life of this tree: a row offered it,
+    /// this tree does not have it.
+    turned_away: RwLock<BTreeSet<(String, String)>>,
+    /// The person's own switches, and the tools they are currently holding
+    /// back. Shared with whoever outlives this catalog, so a switch survives
+    /// the tree being rebuilt (`ToolSwitches`).
+    switches: Arc<ToolSwitches>,
+}
+
+/// A tool its row registered: who offered it, and whether a switch is holding
+/// it back right now. Held tools stay here rather than being dropped, so
+/// turning the switch back on hands over the very tool the row mounted.
+struct Mounted {
+    owner: String,
+    tool: Arc<dyn Tool>,
+    held: bool,
+}
+
+/// What a person turned off in this session, kept apart from what the config
+/// excluded.
+///
+/// Two lists rather than one, because "off" has to survive tools that do not
+/// exist yet — an MCP server publishes its tools whenever it finishes
+/// connecting, which may be after the person said to hide them:
+///
+/// * `off` holds the patterns as they were typed, so a tool arriving later is
+///   born hidden;
+/// * `on` holds names the person asked back **by name**, which beats a pattern
+///   in `off` — "hide this server, except that one tool" is the ordinary shape
+///   of the request.
+///
+/// Neither can widen what the config excluded. A host that removed a tool from
+/// the tree removed it; a command must not put it back, or the config's answer
+/// is a suggestion.
+#[derive(Default, Debug)]
+pub struct ToolSwitches {
+    off: RwLock<Vec<String>>,
+    on: RwLock<BTreeSet<String>>,
+}
+
+impl ToolSwitches {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Is this tool currently held back by a switch?
+    pub fn holds(&self, owner: &str, name: &str) -> bool {
+        if self.on.read().expect("switches poisoned").contains(name) {
+            return false;
+        }
+        self.off
+            .read()
+            .expect("switches poisoned")
+            .iter()
+            .any(|p| names(p, owner, name))
+    }
+
+    /// Turn `pattern` off. A name asked back earlier loses to this: the person
+    /// just said to hide it again.
+    pub fn turn_off(&self, pattern: &str) {
+        self.on
+            .write()
+            .expect("switches poisoned")
+            .retain(|name| !names(pattern, "", name) && !names(pattern, "*", name));
+        let mut off = self.off.write().expect("switches poisoned");
+        if !off.iter().any(|p| p == pattern) {
+            off.push(pattern.to_string());
+        }
+    }
+
+    /// Ask `names` back by name, and drop the pattern if it was exactly this.
+    pub fn turn_on(&self, pattern: &str, restored: &[String]) {
+        self.off
+            .write()
+            .expect("switches poisoned")
+            .retain(|p| p != pattern);
+        let mut on = self.on.write().expect("switches poisoned");
+        for name in restored {
+            on.insert(name.clone());
+        }
+    }
+
+    /// The patterns currently off, as typed.
+    pub fn off(&self) -> Vec<String> {
+        self.off.read().expect("switches poisoned").clone()
+    }
+}
+
+impl ToolBox {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The catalog the `tools` row builds when a host narrowed it.
+    pub fn with_policy(policy: ToolPolicy) -> Self {
+        Self {
+            policy,
+            ..Self::default()
+        }
+    }
+
+    /// As [`with_policy`](Self::with_policy), over switches the host holds. The
+    /// tree is rebuilt for a good many reasons — `/model`, a config reload, a
+    /// logout — and a person who turned a tool off did not mean "until the next
+    /// one of those".
+    pub fn with_policy_and_switches(policy: ToolPolicy, switches: Arc<ToolSwitches>) -> Self {
+        Self {
+            policy,
+            switches,
+            ..Self::default()
+        }
+    }
+
+    /// The switches this catalog answers to, for whoever drives them.
+    pub fn switches(&self) -> Arc<ToolSwitches> {
+        self.switches.clone()
+    }
+
+    /// Add a tool. Pair every call with a `ctx.effect(.. unregister ..)` so the
+    /// tool leaves when its plugin does.
+    ///
+    /// A duplicate name is an error, not last-write-wins: two rows claiming
+    /// `read_file` means the config is ambiguous about which execution world the
+    /// model is talking to, and silently picking one would be the worst answer.
+    /// A name the policy excludes is **not** an error: the row that offered it
+    /// mounts as it always did, and the name stays free for whoever the host
+    /// meant to have it. That is what makes replacing one tool out of a row
+    /// possible at all — the incumbent never takes the name, so a second row
+    /// can register under it without colliding.
+    pub fn register(&self, tool: Arc<dyn Tool>) -> Result<(), String> {
+        self.register_from("", tool)
+    }
+
+    /// [`register`](Self::register), saying which row is offering the tool, so
+    /// a policy can name one row's copy of a name without excluding the name
+    /// itself. The door (`plugins::tools::mount`) passes `ctx.entry()`; there
+    /// is nowhere else a row's identity is known.
+    pub fn register_from(&self, owner: &str, tool: Arc<dyn Tool>) -> Result<(), String> {
+        let name = tool.name().to_string();
+        if !self.policy.admits(owner, &name) {
+            self.turned_away
+                .write()
+                .expect("toolbox poisoned")
+                .insert((owner.to_string(), name));
+            return Ok(());
+        }
+        let mut tools = self.tools.write().expect("toolbox poisoned");
+        if tools.contains_key(&name) {
+            return Err(format!(
+                "tool `{name}` is already registered; disable the row that owns it before mounting another"
+            ));
+        }
+        // Born held when a switch already names it: an MCP server that finishes
+        // connecting after the person hid it does not slip its tools in behind
+        // them.
+        let held = self.switches.holds(owner, &name);
+        tools.insert(
+            name,
+            Mounted {
+                owner: owner.to_string(),
+                tool,
+                held,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn unregister(&self, name: &str) {
+        self.tools.write().expect("toolbox poisoned").remove(name);
+    }
+
+    /// Hold back everything `pattern` names, and keep holding it for whatever
+    /// registers later. Returns what left the catalog just now.
+    ///
+    /// A whole MCP server is `mcp__<server>__*`; one of its tools is its full
+    /// name. Nothing here reaches the server — the connection stays up, and the
+    /// tools come back without reconnecting or authorising again.
+    pub fn turn_off(&self, pattern: &str) -> Vec<String> {
+        self.switches.turn_off(pattern);
+        let mut tools = self.tools.write().expect("toolbox poisoned");
+        let mut hidden = Vec::new();
+        for (name, mounted) in tools.iter_mut() {
+            if !mounted.held && self.switches.holds(&mounted.owner, name) {
+                mounted.held = true;
+                hidden.push(name.clone());
+            }
+        }
+        hidden
+    }
+
+    /// Put back everything `pattern` names that a switch was holding. Returns
+    /// what came back. A tool the **config** excluded is not here to come back:
+    /// that answer belongs to whoever wrote the tree.
+    pub fn turn_on(&self, pattern: &str) -> Vec<String> {
+        let mut tools = self.tools.write().expect("toolbox poisoned");
+        let wanted: Vec<String> = tools
+            .iter()
+            .filter(|(name, m)| m.held && names(pattern, &m.owner, name))
+            .map(|(name, _)| name.clone())
+            .collect();
+        self.switches.turn_on(pattern, &wanted);
+        for name in &wanted {
+            if let Some(mounted) = tools.get_mut(name) {
+                mounted.held = false;
+            }
+        }
+        wanted
+    }
+
+    /// What the **config** kept out, by the name whoever offered it used.
+    /// Unlike [`held_back`](Self::held_back), nothing brings these back: the
+    /// tree was written without them.
+    pub fn turned_away(&self) -> Vec<String> {
+        self.turned_away
+            .read()
+            .expect("toolbox poisoned")
+            .iter()
+            .map(|(owner, name)| {
+                if owner.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{owner}:{name}")
+                }
+            })
+            .collect()
+    }
+
+    /// Every name this catalog knows about and what is true of it, for a screen
+    /// that offers the switch: what the model can call, what a person turned
+    /// off, and what the config kept out (which no command can undo).
+    pub fn listing(&self) -> Vec<ToolListing> {
+        let mut out: Vec<ToolListing> = self
+            .tools
+            .read()
+            .expect("toolbox poisoned")
+            .iter()
+            .map(|(name, m)| ToolListing {
+                name: name.clone(),
+                owner: m.owner.clone(),
+                state: if m.held {
+                    ToolState::OffInSession
+                } else {
+                    ToolState::On
+                },
+            })
+            .collect();
+        out.extend(
+            self.turned_away
+                .read()
+                .expect("toolbox poisoned")
+                .iter()
+                .map(|(owner, name)| ToolListing {
+                    name: name.clone(),
+                    owner: owner.clone(),
+                    state: ToolState::ExcludedByConfig,
+                }),
+        );
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    /// What a switch is holding back right now, by name.
+    pub fn held_back(&self) -> Vec<String> {
+        self.tools
+            .read()
+            .expect("toolbox poisoned")
+            .iter()
+            .filter(|(_, m)| m.held)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        self.tools
+            .read()
+            .expect("toolbox poisoned")
+            .get(name)
+            .filter(|m| !m.held)
+            .map(|m| m.tool.clone())
+    }
+
+    /// What the model is shown this round. Read fresh every request, so a
+    /// plugin mounted mid-session is visible on the very next one.
+    pub fn defs(&self) -> Vec<ToolDef> {
+        self.tools
+            .read()
+            .expect("toolbox poisoned")
+            .values()
+            .filter(|m| !m.held)
+            .map(|m| ToolDef {
+                name: m.tool.name().to_string(),
+                description: m.tool.description().to_string(),
+                parameters: m.tool.parameters_schema(),
+            })
+            .collect()
+    }
+
+    pub fn names(&self) -> Vec<String> {
+        self.tools
+            .read()
+            .expect("toolbox poisoned")
+            .iter()
+            .filter(|(_, m)| !m.held)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+}
+
+/// Prompt fragments, contributed by whoever owns the behaviour they describe.
+///
+/// A tool plugin that needs usage guidance ships it here rather than the persona
+/// growing a paragraph about a tool it does not own. Fragments are ordered by an
+/// explicit rank so the assembled prompt is stable no matter what order plugins
+/// activated in — which also keeps the prefix cacheable.
+#[derive(Default)]
+pub struct PromptRegistry {
+    fragments: RwLock<Vec<Fragment>>,
+}
+
+struct Fragment {
+    id: String,
+    rank: i32,
+    text: String,
+}
+
+impl PromptRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn contribute(&self, id: impl Into<String>, rank: i32, text: impl Into<String>) {
+        let id = id.into();
+        let mut fragments = self.fragments.write().expect("prompt registry poisoned");
+        fragments.retain(|f| f.id != id);
+        fragments.push(Fragment {
+            id,
+            rank,
+            text: text.into(),
+        });
+        fragments.sort_by(|a, b| a.rank.cmp(&b.rank).then_with(|| a.id.cmp(&b.id)));
+    }
+
+    pub fn remove(&self, id: &str) {
+        self.fragments
+            .write()
+            .expect("prompt registry poisoned")
+            .retain(|f| f.id != id);
+    }
+
+    pub fn render(&self) -> String {
+        self.fragments
+            .read()
+            .expect("prompt registry poisoned")
+            .iter()
+            .map(|f| f.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    pub fn ids(&self) -> Vec<String> {
+        self.fragments
+            .read()
+            .expect("prompt registry poisoned")
+            .iter()
+            .map(|f| f.id.clone())
+            .collect()
+    }
+}
+
+/// Which question a description answers — the `aspect` a `describe_self` caller
+/// names. The tool owns this vocabulary; the rows own every answer in it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Aspect {
+    /// This session: where it is kept, what it is called, how it is continued.
+    Session,
+    /// How to work the running system: the knobs, and who turns them.
+    Operations,
+    /// The settings file that configured this tree, and what in it is safe to
+    /// edit. Said by whatever read that file.
+    Settings,
+    /// The models work may be delegated to. Said by the row that tells the agent
+    /// a catalog exists; how a delegation names one is each tool's own
+    /// description.
+    Models,
+}
+
+/// A description computed when it is asked for, from the asking agent's
+/// context. `None` when the row has nothing to say about this particular asker.
+pub type LiveDescription = Arc<dyn Fn(&Context) -> Option<String> + Send + Sync>;
+
+enum Said {
+    Fixed(String),
+    Live(LiveDescription),
+}
+
+struct Description {
+    id: String,
+    aspect: Aspect,
+    rank: i32,
+    said: Said,
+}
+
+/// What each row says about itself, answered on request.
+///
+/// One registry for every domain, not one per domain. A row that keeps
+/// sessions, picks the model or holds memory describes its part here — as
+/// fixed text when the answer is settled at mount, or as a closure when it
+/// depends on who asks and when (this session's file, the model after a
+/// `/model`). `describe_self` renders; it knows no domain, so it cannot answer
+/// for a row that is not mounted or miss one that is.
+///
+/// Not a [`PromptRegistry`], on purpose: a description may be computed per
+/// session, and the system prompt must never be. Keeping the two types apart
+/// is what makes a per-session value in the prompt impossible rather than
+/// merely discouraged.
+#[derive(Default)]
+pub struct Descriptions {
+    entries: RwLock<Vec<Description>>,
+}
+
+impl Descriptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn insert(&self, id: String, aspect: Aspect, rank: i32, said: Said) {
+        let mut entries = self.entries.write().expect("descriptions poisoned");
+        entries.retain(|e| e.id != id);
+        entries.push(Description {
+            id,
+            aspect,
+            rank,
+            said,
+        });
+        entries.sort_by(|a, b| a.rank.cmp(&b.rank).then_with(|| a.id.cmp(&b.id)));
+    }
+
+    pub fn contribute(
+        &self,
+        aspect: Aspect,
+        id: impl Into<String>,
+        rank: i32,
+        text: impl Into<String>,
+    ) {
+        self.insert(id.into(), aspect, rank, Said::Fixed(text.into()));
+    }
+
+    pub fn contribute_live(
+        &self,
+        aspect: Aspect,
+        id: impl Into<String>,
+        rank: i32,
+        describe: LiveDescription,
+    ) {
+        self.insert(id.into(), aspect, rank, Said::Live(describe));
+    }
+
+    pub fn remove(&self, id: &str) {
+        self.entries
+            .write()
+            .expect("descriptions poisoned")
+            .retain(|e| e.id != id);
+    }
+
+    /// Everything said under `aspect`, for the agent whose context is `asking`.
+    pub fn render(&self, aspect: Aspect, asking: &Context) -> Vec<String> {
+        // Taken out of the lock first: a live description reads live state, and
+        // must not do it while holding what a row unloading right now needs.
+        let said: Vec<Result<String, LiveDescription>> = self
+            .entries
+            .read()
+            .expect("descriptions poisoned")
+            .iter()
+            .filter(|e| e.aspect == aspect)
+            .map(|e| match &e.said {
+                Said::Fixed(text) => Ok(text.clone()),
+                Said::Live(describe) => Err(describe.clone()),
+            })
+            .collect();
+        said.into_iter()
+            .filter_map(|s| match s {
+                Ok(text) => Some(text),
+                Err(describe) => describe(asking),
+            })
+            .collect()
+    }
+
+    pub fn ids(&self) -> Vec<String> {
+        self.entries
+            .read()
+            .expect("descriptions poisoned")
+            .iter()
+            .map(|e| e.id.clone())
+            .collect()
+    }
+}
+
+/// Durable session storage. A seam: the shipped provider appends JSONL under
+/// the harness home, but the same interface covers a database, an object store,
+/// or nothing at all.
+///
+/// It receives *events*, not messages — persistence that stored the projection
+/// instead of the facts could not reproduce a UI replay or a different
+/// compaction after the fact.
+#[async_trait]
+pub trait SessionPersistence: Send + Sync {
+    /// Record a session's header, once, before any of its events. A session
+    /// the store already holds keeps the header it has: this is where a new
+    /// file gets its first line, not where an old one is rewritten.
+    async fn begin(&self, _header: &crate::session::SessionHeader) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// The header a stored session was created with — `None` for a store that
+    /// keeps none, or a file written before there was one.
+    async fn header(
+        &self,
+        _session_id: &str,
+    ) -> Result<Option<crate::session::SessionHeader>, String> {
+        Ok(None)
+    }
+
+    /// What `session/list` wants to say about one session without replaying
+    /// it into an agent: the header, the name, and how much happened.
+    async fn describe(&self, session_id: &str) -> Result<Option<SessionSummary>, String> {
+        let header = self.header(session_id).await?;
+        let events = self.load(session_id).await?;
+        if header.is_none() && events.is_empty() {
+            return Ok(None);
+        }
+        let inherited = header.as_ref().map(|h| h.inherited).unwrap_or(0);
+        let title = events
+            .iter()
+            .skip(inherited)
+            .rev()
+            .find_map(|e| match &e.event {
+                crate::session::SessionEvent::Titled { title, .. } => Some(title.clone()),
+                _ => None,
+            });
+        let turns = events
+            .iter()
+            .filter(|e| matches!(e.event, crate::session::SessionEvent::TurnStart { .. }))
+            .count();
+        Ok(Some(SessionSummary {
+            header,
+            title,
+            turns,
+            events: events.len(),
+        }))
+    }
+
+    /// Append everything after `cursor`. Implementations must be idempotent for
+    /// a re-sent range: a crash between write and cursor update is normal.
+    async fn append(&self, session_id: &str, events: &[LoggedEvent]) -> Result<(), String>;
+
+    /// Replay a session's events in order.
+    async fn load(&self, session_id: &str) -> Result<Vec<LoggedEvent>, String>;
+
+    /// The sessions a person can pick up, newest first where the backend can
+    /// tell. A delegated agent's session — a team member, a task child — is
+    /// not one of them: it is kept under its parent, not beside it
+    /// (`docs/adr/0024` §11), and [`Self::children`] is how it is found.
+    async fn list(&self) -> Result<Vec<String>, String> {
+        Ok(Vec::new())
+    }
+
+    /// The headers of the sessions whose header names `parent` — what a resumed
+    /// lead reads to bring its team back.
+    async fn children(&self, _parent: &str) -> Result<Vec<crate::session::SessionHeader>, String> {
+        Ok(Vec::new())
+    }
+
+    /// Where this session's events actually land, in whatever terms the backend
+    /// uses — a path, a URL, a table name.
+    ///
+    /// The store answers because the store is the only thing that knows. A
+    /// caller that recomputed the path from the same config would be a second
+    /// copy of the rule, and the copy is what drifts.
+    fn location(&self, _session_id: &str) -> Option<String> {
+        None
+    }
+}
+
+/// The `session` row's answer for the agent a front end creates on its own:
+/// which id it gets and whether that id's stored log is replayed first. Read
+/// by [`crate::agent::CreateAgent::root`]; an agent created any other way — a
+/// delegated child, an ACP session — names its own.
+#[derive(Clone, Debug, Default)]
+pub struct SessionDefaults {
+    pub id: Option<String>,
+    pub resume: bool,
+    /// The conversation to start from, when the host keeps sessions somewhere
+    /// the `session-persistence` seam does not read.
+    ///
+    /// A host whose durable store is not this tree's (the coding runtime keeps
+    /// native snapshots) cannot say "resume" — that would replay whatever the
+    /// seam holds — so it hands the events over instead. A non-empty seed wins
+    /// over `resume`, the same precedence [`crate::agent::CreateAgent`] already
+    /// gives an explicit seed.
+    pub seed: Vec<crate::session::LoggedEvent>,
+}
+
+/// Switches a person flips while a session runs.
+///
+/// Live rather than row config because flipping one must not remount anything:
+/// a remount is a new row instance, and a gate that holds a session grant would
+/// lose it on every toggle. The host that owns the switches provides this; a
+/// row it governs reads the flag at the moment it decides, and a tree with no
+/// host reads its own row config instead.
+#[derive(Clone, Debug, Default)]
+pub struct Modes {
+    /// Read-only exploration.
+    pub plan: Arc<std::sync::atomic::AtomicBool>,
+    /// Edits inside the workspace are applied without asking.
+    pub accept_edits: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// One stored session, as a list would show it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionSummary {
+    /// `None` for a file written before headers existed.
+    pub header: Option<crate::session::SessionHeader>,
+    pub title: Option<String>,
+    pub turns: usize,
+    pub events: usize,
+}
+
+/// Where to cut the history, what to leave in its place, and what the model sees
+/// shortened from here on.
+#[derive(Clone, Debug, Default)]
+pub struct CompactionDecision {
+    /// Everything at or below this sequence number stops being model-visible.
+    /// `0` folds nothing.
+    pub through: crate::session::SeqNo,
+    /// What the model sees instead.
+    pub summary: String,
+    /// Events at or below this are not folded — the session's first request.
+    /// `0` folds from the start.
+    pub from: crate::session::SeqNo,
+    /// Messages the model sees in other words from here on: stubbed tool
+    /// output, a message too large to send.
+    pub rewrites: Vec<crate::session::RewrittenText>,
+    /// For the person, when the compaction did less than was asked.
+    pub note: Option<String>,
+}
+
+impl CompactionDecision {
+    /// Fold everything at or below `through` into `summary`.
+    pub fn fold(through: crate::session::SeqNo, summary: impl Into<String>) -> Self {
+        Self {
+            through,
+            summary: summary.into(),
+            ..Self::default()
+        }
+    }
+
+    /// Whether committing it would change anything.
+    pub fn is_empty(&self) -> bool {
+        self.through == 0 && self.rewrites.is_empty()
+    }
+}
+
+/// Why compaction is being asked for, and the pressure it answers to.
+#[derive(Clone, Debug)]
+pub struct CompactionAsk {
+    /// Pressure before a request, the provider refusing one as too long, or a
+    /// person asking (with the topic they gave).
+    pub trigger: atomcode_kernel::message::CompactTrigger,
+    /// The model's context window. `0` when unknown.
+    pub window: u32,
+    /// Prompt tokens the provider reported for the last request. `0` when none.
+    pub used_tokens: u32,
+}
+
+/// History compaction. A seam because the right answer differs by deployment:
+/// a model-free summary is cheap and always available, a model-written one is
+/// better and costs a call, and a token-budget-aware pruner is different again.
+#[async_trait]
+pub trait Compaction: Send + Sync {
+    fn describe(&self) -> String;
+    /// `None` means "nothing worth compacting" — for an overflow, nothing
+    /// further this strategy can shrink.
+    async fn compact(
+        &self,
+        log: &crate::session::SessionLog,
+        ask: &CompactionAsk,
+    ) -> Option<CompactionDecision>;
+    /// Whether [`compact`](Self::compact) would call a model for this ask: a
+    /// compaction slow enough that a person should see it start.
+    fn calls_model(&self, log: &crate::session::SessionLog, ask: &CompactionAsk) -> bool {
+        let _ = (log, ask);
+        false
+    }
+}
+
+/// Reconfiguring the tree while it runs.
+///
+/// `App::patch` can already replace any row without disturbing the rest — the
+/// missing piece was a way to reach it from inside. A front end holds a
+/// `Context`, not the `App`, so the host puts this in the tree and every front
+/// end gets the same capability without knowing how the host is structured.
+///
+/// **Not reentrant.** A patch unloads and remounts fibers, so calling it from
+/// inside a plugin's `apply` would deadlock; the implementation refuses rather
+/// than hanging.
+#[async_trait]
+pub trait Control: Send + Sync {
+    /// Apply a patch layer, given as TOML. Returns a description of what moved.
+    async fn patch(&self, toml: &str) -> Result<String, String>;
+
+    /// The running tree, as `--dump-config` prints it.
+    async fn dump(&self) -> String;
+
+    /// Check the running composition. Empty means consistent.
+    async fn audit(&self) -> Vec<String>;
+
+    /// Row ids currently in the tree, with whether each is enabled.
+    async fn rows(&self) -> Vec<(String, String, bool)>;
+
+    /// One row's config, as the JSON the tree holds. `None` when there is no
+    /// such row.
+    async fn row_config(&self, id: &str) -> Option<serde_json::Value>;
+}
+
+/// Handing out a driver-protocol handle.
+///
+/// A seam rather than a return value, because whoever embeds this harness holds
+/// a [`Context`], not the plugin — the same way every other front end resolves
+/// what it needs from the tree. Its consumer is outside the tree by
+/// construction; that is what makes it a handle.
+pub trait AgentHandleSource: Send + Sync {
+    /// The handle, once. A second caller gets `None`: two owners of one command
+    /// channel is two drivers fighting over one conversation.
+    fn take(&self) -> Option<atomcode_kernel::agent::AgentHandle>;
+}
+
+/// The front end: whoever drives agents and talks to a person.
+///
+/// A seam, so "run one prompt and exit", "a terminal session", "a web server"
+/// and "an ACP endpoint" are four rows rather than four binaries. The runtime
+/// hands it the context and gets out of the way; everything a front end needs —
+/// the agent registry, the session log, the event stream — it resolves for
+/// itself.
+#[async_trait]
+pub trait UserInterface: Send + Sync {
+    fn describe(&self) -> String;
+
+    /// Drive the interaction to completion.
+    ///
+    /// `initial` is whatever the launcher was given on the command line, which
+    /// a one-shot front end treats as the whole job and an interactive one
+    /// treats as the first message.
+    async fn run(&self, ctx: &Context, initial: Option<String>) -> Result<(), String>;
+
+    /// Run a slash command the way a person typing it would.
+    ///
+    /// Default: nothing — a front end without a command surface has nothing to
+    /// run. A screen that has one runs it through its own dispatch and shows
+    /// what it said, which is how a row off the loop (onboarding's wizard, at
+    /// the end of a login) asks the screen to open the session that work made
+    /// possible.
+    fn run_slash(&self, _line: &str) {}
+
+    /// Put a line of the front end's own into what the person is reading.
+    ///
+    /// Default: nothing — a front end with no scrollback has nowhere to put it.
+    /// The one that has one appends it to the conversation, which is how a row
+    /// says something *while it works* rather than only when it returns: a
+    /// login shows a QR code, a URL and each step it is on, and a modal would
+    /// make that a frame the person has to read before it goes away.
+    fn say(&self, _text: &str) {}
+}
+
+/// Naming a session. A seam because the cheap answer (the first prompt) and the
+/// good answer (a model call) are different trade-offs, not different quality
+/// levels of one implementation.
+#[async_trait]
+pub trait SessionTitle: Send + Sync {
+    fn describe(&self) -> String;
+    async fn title(&self, log: &SessionLog) -> Option<String>;
+}
+
+/// Questions put to a person, and their answers — session vocabulary, so the
+/// kernel's (`docs/adr/0024` §6). Re-exported where the seams have always named them.
+pub use atomcode_kernel::session::{
+    AboutCall, Answer, Question, ANSWER_ALLOW, ANSWER_ALWAYS, ANSWER_ALWAYS_ALL, ANSWER_DENY,
+};
+
+/// Asking a human. `None` means "no answer" — every caller must treat that as a
+/// refusal, never as consent.
+#[async_trait]
+pub trait UserQuestions: Send + Sync {
+    fn describe(&self) -> String;
+    /// Put the question and wait. The returned string is an [`Answer::value`].
+    async fn ask(&self, question: &Question) -> Option<String>;
+}
+
+/// What a delegated task produced.
+#[derive(Clone, Debug)]
+pub struct SubagentOutcome {
+    pub text: String,
+    pub rounds: u32,
+    pub tool_calls: u32,
+    pub stop: StopReason,
+    pub error: Option<String>,
+    /// Events the child's own log accumulated. Reported, not returned: the
+    /// point of delegation is that the parent does not carry the transcript.
+    pub transcript_len: usize,
+}
+
+impl SubagentOutcome {
+    pub fn failed(message: impl Into<String>) -> Self {
+        Self {
+            text: String::new(),
+            rounds: 0,
+            tool_calls: 0,
+            stop: StopReason::ProviderError,
+            error: Some(message.into()),
+            transcript_len: 0,
+        }
+    }
+
+    /// What the parent model sees. The child's transcript stays in the child.
+    pub fn report(&self) -> String {
+        if let Some(error) = &self.error {
+            return format!("Subagent failed: {error}");
+        }
+        format!(
+            "{}\n\n[subagent: {} round(s), {} tool call(s), {:?}]",
+            self.text, self.rounds, self.tool_calls, self.stop
+        )
+    }
+}
+
+/// Where a review or audit puts what it found.
+///
+/// A seam because the destination differs by deployment: a CLI prints, CI posts
+/// to a pull request, a web front end renders, an eval counts.
+pub trait Findings: Send + Sync {
+    fn describe(&self) -> String;
+    /// Everything reported so far.
+    fn all(&self) -> Vec<atomcode_capabilities::tools::Finding>;
+    /// Everything reported, clearing the sink.
+    fn take(&self) -> Vec<atomcode_capabilities::tools::Finding>;
+}
+
+/// One delegated job, as asked for.
+///
+/// A struct rather than a growing argument list: what a delegation may state
+/// grows with what a deployment turns out to need — a model, then an effort —
+/// and each addition as a positional argument is a silent change of meaning at
+/// every call site.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Delegation<'a> {
+    /// What the child should accomplish.
+    pub task: &'a str,
+    /// Standing instructions for the child.
+    pub instructions: &'a str,
+    /// A selection id from the [`Models`] seam, or `None` to run the child on
+    /// the conversation's own model. An id the catalog does not offer is an
+    /// error, never a silent fallback: a subagent quietly running on a different
+    /// model than was asked for is the one outcome nobody could spot.
+    pub model: Option<&'a str>,
+    /// How hard the child should think, for a model that accepts the knob.
+    /// `None` leaves whatever the tree already decided (the `reasoning-effort`
+    /// row) in charge — the right default, and the wrong thing to be stuck with
+    /// when the delegated job is a five-minute survey and the conversation is
+    /// set to `max`.
+    pub effort: Option<&'a str>,
+}
+
+/// Delegation. A seam because "a child agent in this process", "a fork of this
+/// session" and "another product entirely" are all legitimate answers behind
+/// one interface.
+#[async_trait]
+pub trait Subagents: Send + Sync {
+    fn describe(&self) -> String;
+    async fn spawn(&self, work: Delegation<'_>) -> SubagentOutcome;
+}
+
+/// The turn driver. A seam like any other: the shipped loop is one row in the
+/// config tree, and a different loop (a plan-first driver, a replay harness, a
+/// remote delegator) is a different row filling the same slot.
+///
+/// It drives an [`Agent`] rather than taking a prompt, because a turn is not a
+/// function call: input arrives through the agent's inbox, and a message that
+/// lands mid-turn belongs to the turn already running.
+#[async_trait]
+pub trait AgentLoop: Send + Sync {
+    /// Run one turn for `agent`: open, claim, step until nothing is owed, close.
+    /// Returns immediately with an empty turn when the inbox has nothing waking.
+    async fn drive(&self, agent: &Agent) -> TurnOutcome;
+}
+
+/// Whether a tool call may run, asked before execution.
+/// A grant scope meaning "this decision may never be remembered".
+///
+/// It needs a value of its own because EMPTY is already taken: several tools
+/// return an empty scope to mean a TOOL-WIDE grant — "always allow every edit
+/// this session" (`tools/edit.rs`, `tools/parallel_edit.rs`). Reusing empty for
+/// "never" silently turned those into un-grantable, which is how this constant
+/// came to exist. A NUL byte is not a path, an argument or a command, so nothing
+/// real collides with it.
+pub const NEVER_GRANT: &str = "\u{0}never-grant";
+
+#[async_trait]
+pub trait ApprovalPolicy: Send + Sync {
+    async fn decide(
+        &self,
+        call: &atomcode_kernel::tool::ToolCall,
+        tool: &Arc<dyn Tool>,
+    ) -> Decision;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Decision {
+    Allow,
+    Deny(String),
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TurnOutcome {
+    pub text: String,
+    /// Which turn this was, 1-based within the session.
+    pub turn: u64,
+    /// Steps taken. A step is one model request plus the tools it called.
+    pub steps: u32,
+    /// Kept as an alias for `steps` while callers migrate.
+    pub rounds: u32,
+    pub tool_calls: u32,
+    pub stop: StopReason,
+    pub error: Option<String>,
+}
+
+/// Why a turn ended — the kernel's one enum, re-exported where the loop has
+/// always named it. There used to be a second copy here that the handle pump
+/// translated (`docs/adr/0021` §6).
+pub use atomcode_kernel::event::StopReason;
+
+/// What a running tool can reach of the front end driving its agent.
+///
+/// A kernel agent hands every tool a progress sink tagged with the call's id and
+/// a requester for structured questions. A tool written against that context —
+/// `task` narrating its subtasks, `request_user_input` asking a choice — works
+/// the same on this loop only if something here hands it the same two things.
+/// The front end is that something: it owns the channel both travel on.
+///
+/// Keyed by session, because the answer depends on whose tool it is. A delegated
+/// child's call has no line to the person; only the agent the front end drives
+/// does.
+pub trait ToolDriver: Send + Sync {
+    /// Where this call's progress goes. `noop` when nobody is listening.
+    fn progress(&self, session: &str, call_id: &str) -> atomcode_kernel::tool::ProgressSink;
+    /// A round trip to the person, or `None` when this session has nobody to ask.
+    fn requester(&self, session: &str) -> Option<atomcode_kernel::request::Requester>;
+}
+
+/// The files a delegated agent was given to write, as scopes (globs relative to
+/// its working directory). Provided on the agent's own realm by whoever
+/// delegated it; an agent without one may write anywhere in its workspace, and
+/// `delegation-bounds` holds it to that.
+#[derive(Clone, Debug)]
+pub struct DelegationLane {
+    pub scopes: Vec<String>,
+}
+
+#[cfg(test)]
+mod tool_policy_tests {
+    use super::ToolPolicy;
+
+    fn policy(exclude: &[&str]) -> ToolPolicy {
+        ToolPolicy::new(vec![], exclude.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn a_pattern_without_a_star_is_the_whole_name() {
+        let p = policy(&["read_file"]);
+        assert!(!p.admits("tool-fs", "read_file"));
+        assert!(p.admits("tool-fs", "read_file_2"));
+        assert!(p.admits("tool-fs", "my_read_file"));
+    }
+
+    #[test]
+    fn a_star_stands_for_any_run_including_none() {
+        let p = policy(&["mcp__github__*"]);
+        assert!(!p.admits("mcp-host", "mcp__github__create_issue"));
+        assert!(!p.admits("mcp-host", "mcp__github__"));
+        assert!(p.admits("mcp-host", "mcp__gitlab__create_issue"));
+
+        let tail = policy(&["*_file"]);
+        assert!(!tail.admits("tool-fs", "read_file"));
+        assert!(tail.admits("tool-fs", "read_file_range"));
+
+        let middle = policy(&["mcp__*__delete_*"]);
+        assert!(!middle.admits("mcp-host", "mcp__github__delete_repo"));
+        assert!(middle.admits("mcp-host", "mcp__github__create_repo"));
+
+        assert!(!policy(&["*"]).admits("anything", "at_all"));
+    }
+
+    #[test]
+    fn a_qualified_pattern_names_one_rows_copy() {
+        let p = policy(&["tool-fs-world:read_file"]);
+        assert!(!p.admits("tool-fs-world", "read_file"));
+        assert!(
+            p.admits("my-read-file", "read_file"),
+            "which is what leaves the name free for a replacement"
+        );
+    }
+
+    #[test]
+    fn an_empty_include_admits_everything_the_exclude_leaves() {
+        let open = ToolPolicy::new(vec![], vec![]);
+        assert!(open.is_open());
+        assert!(open.admits("any-row", "any_tool"));
+
+        let only = ToolPolicy::new(vec!["read_file".into(), "grep".into()], vec!["grep".into()]);
+        assert!(only.admits("tool-fs", "read_file"));
+        assert!(!only.admits("tool-search", "glob"), "not on the list");
+        assert!(!only.admits("tool-search", "grep"), "exclude beats include");
+    }
+}

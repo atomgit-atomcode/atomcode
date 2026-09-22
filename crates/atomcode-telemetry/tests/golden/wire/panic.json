@@ -1,0 +1,20 @@
+{
+  "app_version": "0.0.0",
+  "arch": "aarch64",
+  "backtrace_top_5": [
+    "core::panicking::panic_bounds_check"
+  ],
+  "device_id": "00000000-0000-0000-0000-000000000000",
+  "error_data": "{\"last_event\":null,\"last_tool_name\":null,\"session_duration_secs\":12,\"turns_completed\":null}",
+  "error_kind": "panic",
+  "event_id": "panic",
+  "launch_id": "00000000-0000-0000-0000-000000000000",
+  "locale": "en-US",
+  "location": "~/p/src/main.rs:10:5",
+  "message_head": "index out of bounds",
+  "os": "macos",
+  "schema_version": 1,
+  "session_id": "00000000-0000-0000-0000-000000000000",
+  "thread": "main",
+  "ts": 0
+}

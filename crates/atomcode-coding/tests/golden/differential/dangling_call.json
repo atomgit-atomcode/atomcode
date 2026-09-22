@@ -1,0 +1,26 @@
+[
+  {
+    "kind": "TurnStarted",
+    "detail": ""
+  },
+  {
+    "kind": "Usage",
+    "detail": ""
+  },
+  {
+    "kind": "ToolStarted",
+    "detail": "read_file"
+  },
+  {
+    "kind": "ToolResult",
+    "detail": "error=false"
+  },
+  {
+    "kind": "Error",
+    "detail": "died holding the bag"
+  },
+  {
+    "kind": "TurnComplete",
+    "detail": "ProviderError"
+  }
+]

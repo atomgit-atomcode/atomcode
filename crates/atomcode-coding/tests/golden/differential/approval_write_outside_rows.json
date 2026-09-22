@@ -1,0 +1,30 @@
+[
+  {
+    "kind": "TurnStarted",
+    "detail": ""
+  },
+  {
+    "kind": "Usage",
+    "detail": ""
+  },
+  {
+    "kind": "Request",
+    "detail": "approval"
+  },
+  {
+    "kind": "ToolStarted",
+    "detail": "write_file"
+  },
+  {
+    "kind": "ToolResult",
+    "detail": "error=false"
+  },
+  {
+    "kind": "Usage",
+    "detail": ""
+  },
+  {
+    "kind": "TurnComplete",
+    "detail": "Stopped"
+  }
+]

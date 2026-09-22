@@ -33,7 +33,8 @@ use agent_client_protocol::{Client, ConnectionTo};
 use atomcode_capabilities::tools::request_user_input::{
     parse_batch, UserInputMode, UserInputRequest, UserInputResponse,
 };
-use atomcode_coding::CodingRuntimeHandle;
+use atomcode_kernel::event::AgentCommand;
+use tokio::sync::mpsc;
 
 /// Property name for a single-question elicitation.
 const SINGLE_PROPERTY: &str = "answer";
@@ -165,7 +166,7 @@ fn accept_content_to_response(
 pub async fn handle_request_user_input(
     cx: &ConnectionTo<Client>,
     session_id: &SessionId,
-    runtime: &CodingRuntimeHandle,
+    commands: &mpsc::UnboundedSender<AgentCommand>,
     req_id: u64,
     payload: serde_json::Value,
     form_supported: bool,
@@ -173,19 +174,20 @@ pub async fn handle_request_user_input(
     if !form_supported {
         // Same behavior as before elicitation: `Null` round-trip → the tool's
         // `null_result` ("interactive questions are not supported…").
-        let _ = runtime.respond(req_id, serde_json::Value::Null).await;
+        let _ = commands.send(AgentCommand::Respond {
+            id: req_id,
+            value: serde_json::Value::Null,
+        });
         return;
     }
     let (reqs, is_batch) = match parse_batch(&payload.to_string()) {
         Ok(parsed) => parsed,
         Err(e) => {
             eprintln!("acp: request_user_input: bad payload ({e}); answering declined");
-            let _ = runtime
-                .respond(
-                    req_id,
-                    serde_json::to_value(UserInputResponse::declined()).unwrap(),
-                )
-                .await;
+            let _ = commands.send(AgentCommand::Respond {
+                id: req_id,
+                value: serde_json::to_value(UserInputResponse::declined()).unwrap(),
+            });
             return;
         }
     };
@@ -196,12 +198,10 @@ pub async fn handle_request_user_input(
         Ok(response) => response.action,
         Err(e) => {
             eprintln!("acp: elicitation/create round-trip failed ({e}); answering declined");
-            let _ = runtime
-                .respond(
-                    req_id,
-                    serde_json::to_value(UserInputResponse::declined()).unwrap(),
-                )
-                .await;
+            let _ = commands.send(AgentCommand::Respond {
+                id: req_id,
+                value: serde_json::to_value(UserInputResponse::declined()).unwrap(),
+            });
             return;
         }
     };
@@ -218,7 +218,7 @@ pub async fn handle_request_user_input(
             }
         }
     };
-    let _ = runtime.respond(req_id, value).await;
+    let _ = commands.send(AgentCommand::Respond { id: req_id, value });
 }
 
 #[cfg(test)]

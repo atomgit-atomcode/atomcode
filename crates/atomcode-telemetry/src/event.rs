@@ -35,8 +35,29 @@ pub struct Envelope {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
     pub session_id: Uuid,
+    /// Which turn of that session — one thing the person asked for, 1-based and
+    /// monotonic (`TurnCtx.turn_id`). `None` for an event that happens outside a
+    /// turn: the launch, a login, a panic.
+    ///
+    /// This replaces a `turn_id: Option<Uuid>` that was declared here and never
+    /// once populated — `skip_serializing_if` meant the key never appeared in a
+    /// single emitted record, so nothing downstream can have been reading it.
+    /// Changing its name and type is therefore free, and a `u64` is what the
+    /// kernel actually mints.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub turn_id: Option<Uuid>,
+    pub turn: Option<u64>,
+    /// Which LLM call within that turn, 1-based and reset each turn
+    /// (`TurnCtx.round`). A turn that uses tools is several rounds; this is what
+    /// makes "how many model calls did one request from a person cost" a
+    /// question the data can answer. `None` outside a turn, and for an LLM call
+    /// that is not a round of the main loop (a sub-agent, a compaction summary).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub round: Option<u32>,
+    /// Which LLM request of the whole session (`TurnCtx.request_id`) — unlike
+    /// `round` it does not reset, so it orders every call the session made even
+    /// across a resume (the id continues past what the stored log already holds).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request: Option<u64>,
     pub ts: i64,
     pub schema_version: u32,
     pub app_version: String,
@@ -331,7 +352,9 @@ mod tests {
             launch_id: Uuid::nil(),
             account_id: None,
             session_id: Uuid::nil(),
-            turn_id: None,
+            turn: None,
+            round: None,
+            request: None,
             ts: 0,
             schema_version: 1,
             app_version: "0.0.0".into(),

@@ -11,6 +11,13 @@ atomgit = ["atomcode-capabilities/atomgit"]
 
 [dependencies]
 atomcode-kernel = { path = "../atomcode-kernel" }
+# The engine underneath. The dependency points THIS way on purpose: the question
+# is whether coding can sit ON the harness, so the harness must know nothing of
+# coding — it used to carry the differential rig and a dev edge back to here,
+# which made the pair mutually referential and prejudged the direction.
+atomcode-harness = { path = "../atomcode-harness" }
+# The container the harness assembles in: `App` / `ConfigTree` / `Layer`.
+atomcode-plexus = { path = "../atomcode-plexus" }
 # Config system leaf consumed directly by the coding assembly.
 atomcode-config = { path = "../atomcode-config" }
 # The FULL capability set: L2 is the opinionated assembly — a coding agent ships
@@ -29,7 +36,8 @@ atomcode-capabilities = { path = "../atomcode-capabilities", features = [
 # The review specialization, mounted as a `code_review` sub-agent TOOL so the coding
 # agent can review the current changes in-session (L2 composing a sibling L2).
 atomcode-review = { path = "../atomcode-review" }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "test-util"] }
+toml = "0.8"
 tokio-util = "0.7"
 async-trait = "0.1"
 # Stream proxying for the compaction-summary telemetry provider decorator (folds
@@ -51,12 +59,19 @@ serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
 
 [dev-dependencies]
+# The differential ratchet takes a cross-PROCESS lock on `gates/differential.baseline`.
+# An in-process Mutex used to be enough because `cargo test` runs a binary's tests as
+# threads; `cargo nextest` runs each as its own process, so a process-local lock guards
+# nothing and the read-modify-write races — silently, since a lost entry looks like a
+# first run.
+fs2 = "0.4"
 # in-memory capturing Telemetry for the TelemetryHook test.
 atomcode-telemetry = { path = "../atomcode-telemetry", features = ["test-util"] }
 # Enable reset_offline_verdict_for_test() for offline-gate tests.
 atomcode-config = { path = "../atomcode-config", features = ["test-util"] }
 # atomcode-kernel::testkit (MockProvider, scripted StreamEvents) is ungated — no extra dep.
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "test-util"] }
+toml = "0.8"
 tempfile = "3"
 async-trait = "0.1"
 # Serialize tests that mutate the process-global ATOMCODE_HOME env var so they

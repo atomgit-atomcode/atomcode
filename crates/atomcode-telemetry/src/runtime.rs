@@ -22,7 +22,11 @@ use uuid::Uuid;
 /// all events emitted after sign-in, including `login_success` itself.
 #[derive(Debug, Clone, Default)]
 pub struct CurrentContext {
-    pub turn_id: Option<Uuid>,
+    /// The turn and the round within it. Set per emit rather than per scope:
+    /// a scope is fixed at assembly and these change every request.
+    pub turn: Option<u64>,
+    pub round: Option<u32>,
+    pub request: Option<u64>,
     pub provider: Option<String>,
     pub provider_host: Option<String>,
     pub model: Option<String>,
@@ -401,7 +405,9 @@ impl Telemetry {
                 .session_id
                 .or_else(|| self.session_id.read().ok().map(|g| *g))
                 .unwrap_or(self.launch_id),
-            turn_id: ctx.turn_id,
+            turn: ctx.turn,
+            round: ctx.round,
+            request: ctx.request,
             ts: now_ms(),
             schema_version: crate::SCHEMA_VERSION,
             app_version: self.app_version.clone(),

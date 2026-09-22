@@ -11,19 +11,6 @@
 //!   to start a new conversation / clear history. Without this, GLM/DeepSeek proactively
 //!   suggest "开启新对话" around ~80% context, which reads as a product defect.
 
-/// Build the coding system prompt for `model`. The identity line carries the model name
-/// so the agent self-identifies correctly; the rest is the language-agnostic coding
-/// discipline (workflow / tool-parallelism / doing-tasks / verification / output).
-/// The single source of truth for the todo switch across every production
-/// `coding_persona` call site (assemble, parts, model-swap reconcile) AND the
-/// `todowrite` tool/hook gate: `ATOMCODE_TODO` env (0/false/off) overrides the
-/// default-on config. Keeping ALL call sites on this one helper guarantees the
-/// system-prompt guidance and the mounted tool never disagree.
-#[cfg(test)]
-pub(crate) fn todo_switch_enabled() -> bool {
-    todo_switch_enabled_for(true)
-}
-
 pub(crate) fn todo_switch_enabled_for(configured: bool) -> bool {
     atomcode_config::config::todo_enabled_from_env(
         std::env::var("ATOMCODE_TODO").ok().as_deref(),
@@ -186,6 +173,79 @@ pub fn coding_persona_with_language(
     )
 }
 
+/// The same discipline for the row-list assembly (`on_harness`), where two of the guidance
+/// paragraphs belong to rows instead of to this module.
+///
+/// `## TASK TRACKING` and `## CODE REVIEW` are contributed by the rows that mount `todowrite`
+/// and `code_review` — `contribute_prompt` ties each paragraph to the row that owns it, so it
+/// arrives and leaves with the tool. This module used to hand the row-list persona the CHAIN
+/// assembly's paragraphs as well.
+///
+/// Two sections stay here and are gated on the running tree instead of on anything read before
+/// it exists:
+///
+/// - `## MEMORY`: the `memory` row registers the tool without contributing a paragraph, so
+///   dropping the text would drop the guidance entirely rather than move it. The GATE was what
+///   was wrong — an `ATOMCODE_MEMORY_TOOL` env read inside `coding_persona`, which cannot see a
+///   row list that failed to mount the tool.
+/// - `## ASKING THE USER`: it teaches `request_user_input`, and the row list mounts `ask_user`
+///   instead — a different tool, with `question`/`options` where that one takes
+///   `single`/`multiple`/`questions`, and with its own paragraph contributed by `tool-ask`. So
+///   this section is off here, and it is off because `mounted` was asked rather than answered on
+///   the section's behalf: a row that ever does mount `request_user_input` gets the section back
+///   without an edit in this function.
+///
+/// Why the chain's copies were wrong HERE, specifically: the losing answer is whichever the
+/// model reads second, and the chain's named a `wait` action the row list's `team` does not
+/// have and a `subagent_type` its `task` does not take.
+pub(crate) fn coding_persona_rows(
+    model: &str,
+    preferred_language: Option<atomcode_config::locale::Locale>,
+    mounted: &dyn Fn(&str) -> bool,
+) -> String {
+    let full = coding_persona_gated(
+        model,
+        preferred_language,
+        // `todo`/`review` are still passed on: they are what put the two paragraphs there for
+        // the removals below to take out. Nothing else about the chain text changes.
+        true,
+        // Brought by the host with the tool (`host_tool_guidance`), not asked of the
+        // tree here: whether it is mounted yet depends on which row applied first.
+        false,
+        true,
+        false,
+        false,
+        mounted("memory"),
+    );
+    // One removal per owner, and each is asserted gone by the row-list gate rather than trusted
+    // to a future edit of the block above.
+    let mut p = full;
+    for owned_by_a_row in ["\n\n## TASK TRACKING:", "\n\n## CODE REVIEW:"] {
+        p = remove_section(&p, owned_by_a_row);
+    }
+    p
+}
+
+/// Drop the `## SECTION` starting at `heading` up to the next `## ` heading (or the end).
+///
+/// The row list composes its prompt from fragments joined by `\n\n`, so a top-level `## ` at the
+/// start of a line is the boundary. Returning the input unchanged when the heading is absent is
+/// deliberate: a missing section must be loud in the gate, not silent here.
+fn remove_section(text: &str, heading: &str) -> String {
+    let Some(start) = text.find(heading) else {
+        return text.to_string();
+    };
+    let body = &text[start + heading.len()..];
+    let end = body
+        .find("\n## ")
+        .map(|i| start + heading.len() + i)
+        .unwrap_or(text.len());
+    let mut out = String::with_capacity(text.len());
+    out.push_str(&text[..start]);
+    out.push_str(&text[end..]);
+    out
+}
+
 pub(crate) fn coding_persona_with_capabilities(
     model: &str,
     preferred_language: Option<atomcode_config::locale::Locale>,
@@ -194,6 +254,31 @@ pub(crate) fn coding_persona_with_capabilities(
     review_enabled: bool,
     subagents_enabled: bool,
     external_subagents_enabled: bool,
+) -> String {
+    // The chain asks the env, which is how it has always decided. The row list asks the running
+    // tree — see `coding_persona_rows`.
+    coding_persona_gated(
+        model,
+        preferred_language,
+        todo_enabled,
+        request_user_input_enabled,
+        review_enabled,
+        subagents_enabled,
+        external_subagents_enabled,
+        memory_tool_enabled(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn coding_persona_gated(
+    model: &str,
+    preferred_language: Option<atomcode_config::locale::Locale>,
+    todo_enabled: bool,
+    request_user_input_enabled: bool,
+    review_enabled: bool,
+    subagents_enabled: bool,
+    external_subagents_enabled: bool,
+    memory_enabled: bool,
 ) -> String {
     let commit_language = commit_language_guidance(preferred_language);
     #[allow(unused_mut)] // `mut` is only used under `cfg(windows)` below.
@@ -266,7 +351,7 @@ Skip the trailer for `git commit --amend` and `git revert`. Only commit when the
     }
     #[cfg(feature = "atomgit")]
     p.push_str(ATOMGIT_TOOL_USAGE);
-    if memory_tool_enabled() {
+    if memory_enabled {
         p.push_str(MEMORY_USAGE);
     }
     // Delegation guidance for the `task` subagent tool — surfaced in the system prompt (not
@@ -298,17 +383,12 @@ Skip the trailer for `git commit --amend` and `git revert`. Only commit when the
     if atomcode_config::config::offline::is_offline_active() {
         p.push_str(&offline_environment_block());
     }
-    // Day-granular date anchor, FROZEN into the system prompt. assemble runs ONCE per
-    // session (and on model-swap via reconcile_coding_persona), NOT per turn — so this is
-    // cache-stable AND present on EVERY round — it is the SOLE current-date source (the
-    // per-round StatusReminderHook tail was removed as redundant). Without it the model has no
-    // current-date reference and a round-1 web_search defaults to its training year (the
-    // `project_system_prompt_date` bug). A cross-day resume refreshes it (reconcile re-inserts
-    // the fresh persona + bumps cache_epoch — ~one cold prefill per day, negligible). v1
-    // `prompt.rs:67` parity.
-    p.push_str(&date_anchor_line(
-        &chrono::Local::now().format("%Y-%m-%d (%A)").to_string(),
-    ));
+    // NO date anchor here. A wall-clock date baked into the system prompt sits at the FRONT of
+    // the request, so every time it changes (once per day) it re-prefills the whole cached
+    // prefix — ~91% of a long context (the `project_system_prompt_date` cache-poison bug). The
+    // current date now rides a per-turn `<system-reminder>` tail (`StatusReminderHook`), AFTER
+    // the prefix: byte-stable prefix across days, and the date still fresh on every round
+    // (round 1 included, so a first-round `web_search` still resolves the real year).
     p
 }
 
@@ -331,7 +411,11 @@ fn model_needs_firm_tool_steering(model: &str) -> bool {
 /// NARROWER than [`model_needs_firm_tool_steering`]: DeepSeek (silently deleting code to
 /// clear errors, shipping unverified edits, offloading, quitting early) and Qwen (observed:
 /// fires a whole tool batch — use_skill/bash/todowrite — with ZERO text, ignoring the soft
-/// `## PROGRESS SIGNPOSTS` rule, so it needs the hard `SIGNPOST BEFORE ACTING` restatement).
+/// `## PROGRESS SIGNPOSTS` rule, so it needs the hard restatement to speak up at all). The
+/// bullet is scoped to the work's PHASES, not to every batch: the earlier per-batch wording
+/// ("a batch of two or more ALWAYS gets a signpost") is exactly what made these models
+/// narrate each tool call, and the fix was to re-scope the rule, not to swing it toward
+/// silence — these models still need the nudge to report at all.
 /// GLM is more capable and is deliberately EXCLUDED — it still gets the tool block but not
 /// this one. Add another substring here (by evidence) if a further model is observed to need it.
 pub(crate) fn model_needs_firm_execution(model: &str) -> bool {
@@ -343,6 +427,12 @@ pub(crate) fn model_needs_firm_execution(model: &str) -> bool {
 /// models flagged by [`model_needs_firm_tool_steering`]. The soft `## TOOLS:` guidance
 /// already says this once; weak models need it stated as a hard rule. The aggregation
 /// carve-out keeps audit-style shell pipelines legitimate.
+///
+/// The closing `describe_self` line is the same shape of restatement for a different soft
+/// rule: the self-knowledge row's prompt already says "call `describe_self` when asked what
+/// you are / can do / how to change yourself", but the flagged weak models (GLM / DeepSeek /
+/// Qwen) followed it unreliably — answering self-questions from stale training or by grepping
+/// the repo — so it is restated here as a hard rule at the point of decision.
 const FIRM_TOOL_DISCIPLINE: &str = "\n\n## TOOL DISCIPLINE (MANDATORY):\n\
 Do NOT shell out for file work:\n\
 - List a directory → list_directory (NOT `bash ls`).\n\
@@ -353,7 +443,12 @@ Do NOT shell out for file work:\n\
 Use bash ONLY for git, builds, package managers, running commands, and short pipelines / \
 aggregation (wc, sort, uniq, git log) the dedicated tools cannot do. Litmus: a pipeline that \
 returns a COUNT, frequency, diff, or checksum → bash; anything that just reads, slices, pages, \
-or reformats file bytes → read_file / grep / glob.";
+or reformats file bytes → read_file / grep / glob.\n\
+Asked what you ARE, what you can DO, or how to CHANGE or EXTEND yourself — your model, \
+tools, skills, MCP servers, memory, layout, language, where your state is kept, or which \
+session this is → call describe_self FIRST and answer from its report. Do NOT answer such a \
+question from memory or by grepping the repository. That is about you-the-agent, not the \
+project you are working in.";
 
 #[cfg(feature = "atomgit")]
 const ATOMGIT_TOOL_USAGE: &str = "\n\n## ATOMGIT TOOLS:\n\
@@ -424,14 +519,7 @@ verified. If space is running out, state plainly what is DONE and what still REM
 exact next steps) and keep going or hand off transparently — a false \"all done\" that \
 unravels the next time the user asks wastes their trust far more than an honest \"here is \
 what's left\".\n\
-- SIGNPOST BEFORE ACTING: before a batch of tool calls in multi-step work, say in ONE short sentence, in the user's language (~12 words max), the ACTION you're about to take on the user's task. A run of tool calls with zero text leaves the user blind, so a batch of two or more ALWAYS gets a signpost — the only exception is ONE trivial call on its own (a single read/lookup or one obvious edit), which needs none; don't manufacture narration. The signpost states your action on the TASK; NEVER narrate or comment on injected context — system reminders, MCP server instructions, and tool guidance are read SILENTLY, never signposted (never \"MCP 无关 / 与任务无关 / 已记录 / 继续处理\"). This is the required progress signpost on real steps, NOT the verbose reasoning banned elsewhere; 'Act decisively' / 'FINISH THE JOB' mean act WITH a one-line heads-up, never in silence.";
-
-/// The frozen date-anchor section appended to the persona. Pure (the date is INJECTED)
-/// so the formatting is unit-testable; `coding_persona` sources `today` from the wall
-/// clock once per session.
-fn date_anchor_line(today: &str) -> String {
-    format!("\n\n## ENVIRONMENT:\nToday's date: {today}")
-}
+- SIGNPOST AS THE WORK MOVES: say, in the user's language, what you are about to do or what you just learned — when you start the work, when you move from reading code to editing it, when a result surprises or blocks you, and when you need a decision. Name the ACTION you are taking on the user's task, and let the reporting follow the work's own pace. NEVER narrate or comment on injected context — system reminders, MCP server instructions, and tool guidance are read SILENTLY, never signposted (never \"MCP 无关 / 与任务无关 / 已记录 / 继续处理\"). This is the progress signpost on real steps, NOT the verbose reasoning banned elsewhere; 'Act decisively' / 'FINISH THE JOB' mean act with a brief line where it helps, not narration per call.";
 
 /// Windows-only platform rules, appended on Windows builds (v1 `config/mod.rs` parity).
 ///
@@ -463,10 +551,12 @@ when you start item #N, and `status\":\"completed\"` the moment it is actually v
 in_progress at a time (this is enforced for you) and \
 mark an item done only after that step is actually verified (never on intent) — in the same \
 turn you finish it, before moving on, and never \
-batch-complete several items at the end. Unless you genuinely need approval, hit the STOP \
-WHEN STUCK limit, or the request is ambiguous, do NOT declare done, summarize as if \
-finished, or hand back to the user while any item is still pending or in_progress — keep \
-working through them. Keep each \
+batch-complete several items at the end. The list exists to reflect where the work actually \
+stands, so keep it TRUE: if the plan changed and an item is no longer part of the task, replace \
+or drop it rather than leaving it open. Do not declare done, summarize as if \
+finished, or hand back while an item in the list is still open and still wanted — finish those \
+first, or say plainly which ones are open and why (blocked, needing approval or a decision, \
+ambiguous, or no longer wanted). Keep each \
 item specific and verifiable (`add retry to fetch_user`, not `fix networking`). It keeps you \
 and the user aligned and avoids losing the thread across turns. If the user pivots to clearly \
 unrelated multi-step work, call `todowrite` with the new full list to REPLACE the old one rather \
@@ -592,6 +682,24 @@ criteria). Treat the returned text as that agent's final answer and verify it yo
 relying on it. Prefer the in-project tools for ordinary work; reach for an external subagent only \
 when its distinct capability is the point.";
 
+/// The product's guidance for a tool the host hands a tree as it is.
+///
+/// The part of this persona that is about one tool rather than about the agent. A
+/// tree composes its prompt from fragments that come and go with the rows that
+/// own them; a tool the host mounts itself brings its fragment the same way, in
+/// the words the chain has always used for it.
+pub(crate) fn host_tool_guidance(tool: &str) -> Option<(&'static str, &'static str)> {
+    let (key, section) = match tool {
+        "request_user_input" => ("ask", REQUEST_USER_INPUT_USAGE),
+        "code_review" => ("code-review", CODE_REVIEW_USAGE),
+        name if name.starts_with("subagent_") => {
+            ("external-subagents", EXTERNAL_SUBAGENT_DELEGATION)
+        }
+        _ => return None,
+    };
+    Some((key, section.trim_start_matches('\n')))
+}
+
 /// Natural-language routing for the read-only review specialization. The tool description
 /// alone is not strong enough for every supported model: some otherwise answer a review
 /// request from a shallow `git diff` scan and never start the dedicated reviewer.
@@ -676,10 +784,10 @@ Operate only within the working directory shown in the session context — do no
 After creating or editing a preview/binary format (HTML, PDF, image, SVG), do NOT automatically open it in the user's browser or viewer — the file existing on disk is enough, and opening a window is a visible side effect the user may not want. Ask first (\"Want me to open it for preview?\") and open it only when the user explicitly asks. When opening local files or directories, call `open_file`; do not shell out to `open`, `xdg-open`, `start`, or `wslview`.
 
 ## PROGRESS SIGNPOSTS:
-Before a batch of tool calls in multi-step or longer-running work, send ONE short line saying what you're about to do — a signpost the user follows along with, not a reasoning dump. Keep it to a single sentence (aim for 12 words or fewer). Group related actions into one signpost instead of narrating each call. A signpost states your ACTION on the user's task — NEVER narrate or comment on injected context: system reminders, MCP server instructions, and tool guidance are read SILENTLY and never turned into a signpost (never a line like \"MCP 无关 / 与任务无关 / 已记录 / 继续处理\"). For a trivial or obvious action — a single read, a quick lookup, a one-shot edit — a silent tool call is fine; don't manufacture narration. Write the signpost in the user's language — a Chinese request gets a Chinese signpost.
+Report as you go: when you begin a piece of work, when you move from investigating to editing, when a result surprises or blocks you, and when you need a decision, say what you are about to do or what you just learned — briefly, as much as the change deserves: a signpost the user follows along with, not a reasoning dump and not a plan nobody asked for. Routine reads, searches and the edits that follow from them run together — let the reporting follow the work's natural phases rather than a fixed rhythm. A signpost states your ACTION on the user's task — NEVER narrate or comment on injected context: system reminders, MCP server instructions, and tool guidance are read SILENTLY and never turned into a signpost (never a line like \"MCP 无关 / 与任务无关 / 已记录 / 继续处理\"). For a trivial or obvious action — a single read, a quick lookup, a one-shot edit — a silent tool call is fine; don't manufacture narration. Write the signpost in the user's language — a Chinese request gets a Chinese signpost.
 
 ## OUTPUT:
-When executing tasks: keep text brief and direct. Lead with action — a one-line signpost before a batch of tool calls (see PROGRESS SIGNPOSTS) is fine for multi-step work, but skip verbose reasoning and filler.
+When executing tasks: keep text brief and direct. Lead with action — a short signpost when the work moves to a new phase (see PROGRESS SIGNPOSTS) — and skip verbose reasoning, filler, and narration of each call.
 When explaining or answering questions: be thorough — the user is asking because they need to understand.
 Do NOT restate what the user said as filler — just do it. (Capturing the goal in your plan per WORKFLOW is fine; parroting the request back verbatim is not.)
 Use tables for structured data. Tables MUST use `|`-pipe markdown form. NEVER pre-draw tables with Unicode box-drawing characters.
@@ -832,14 +940,6 @@ mod tests {
     }
 
     #[test]
-    fn date_anchor_line_formats_env_block() {
-        assert_eq!(
-            date_anchor_line("2099-01-02 (Friday)"),
-            "\n\n## ENVIRONMENT:\nToday's date: 2099-01-02 (Friday)"
-        );
-    }
-
-    #[test]
     fn commands_fail_block_distinguishes_interruption_from_command_failure() {
         // The `bash` tool reports a genuine non-zero exit as an `[exit code N]` marker
         // (bash.rs:1275), but an interruption/timeout/cancel returns EARLY with its own
@@ -900,6 +1000,23 @@ mod tests {
             p.contains("Do NOT use it for a single quick edit"),
             "must keep the trivial-task skip clause: {p}"
         );
+        // The list must be about being TRUE, not about being LONG: the earlier wording
+        // ("keep working through them") read as an order to keep executing, so a model
+        // ground on items the task had outgrown instead of reconciling them. Reconciling
+        // — replace or drop what the plan left behind — is now stated, and the stop clause
+        // asks it to SAY which items are open rather than forbidding the stop outright.
+        assert!(
+            p.contains("keep it TRUE") && p.contains("replace or drop it"),
+            "must ask for a list that matches reality: {p}"
+        );
+        assert!(
+            !p.contains("keep working through them") && !p.contains("still pending or in_progress"),
+            "must not order the model to keep executing past a changed plan: {p}"
+        );
+        assert!(
+            p.contains("say plainly which ones are open and why"),
+            "stopping with open items must be allowed when it is explained: {p}"
+        );
     }
 
     #[test]
@@ -933,13 +1050,16 @@ mod tests {
     }
 
     #[test]
-    fn persona_carries_a_current_date_anchor() {
-        // Every round needs a date anchor (it is the sole date source; there is no live
-        // reminder tail), else web_search defaults to the training year.
+    fn the_persona_carries_no_date_anchor() {
+        // The date moved OUT of the system prompt to a per-turn `<system-reminder>` tail
+        // (`StatusReminderHook`), so the prompt PREFIX is byte-stable across days instead of
+        // re-prefilling once per midnight. A wall-clock date at the front of the request was
+        // the sole thing that changed the prefix day to day (the `project_system_prompt_date`
+        // cache-poison bug); the persona must no longer carry it.
         let p = coding_persona("m", true, false);
         assert!(
-            p.contains("Today's date:"),
-            "persona must carry a date anchor: {p}"
+            !p.contains("Today's date:") && !p.contains("## ENVIRONMENT:"),
+            "the date anchor must be gone from the persona (it lives in the tail now): {p}"
         );
     }
 
@@ -1081,24 +1201,41 @@ mod tests {
             "signposts header must be on its own line: {frontier}"
         );
         assert!(
-            frontier.contains("Before a batch of tool calls"),
+            frontier.contains("Report as you go"),
             "signpost guidance present: {frontier}"
+        );
+        // The per-batch mandate is GONE — that wording is what made models narrate every
+        // call. But the fix must NOT swing the other way into a silence mandate: the
+        // section keeps signposts normal and expected, scoped to the work's phases.
+        assert!(
+            !frontier.contains("Before a batch of tool calls")
+                && !frontier.contains("ALWAYS gets a signpost"),
+            "the per-call / per-batch signpost mandate must be gone: {frontier}"
+        );
+        assert!(
+            !frontier.contains("silent tool calls") && !frontier.contains("Do NOT post a line"),
+            "the section must not push toward silence either: {frontier}"
         );
         // The old "silence is worse than one plain line" push is REMOVED from the universal
         // section: it over-narrated capable mid-tier models on trivial tasks (observed:
-        // minimax narrating every batch on simple style edits). The section now scopes
-        // signposts to multi-step/longer work and explicitly permits silent trivial calls.
+        // minimax narrating every batch on simple style edits). The replacement keeps
+        // reporting normal — it drops the fixed per-batch rhythm rather than the reporting,
+        // because the old "before a batch of tool calls" wording was itself read as one
+        // report per batch.
         assert!(
             !frontier.contains("leaves the user blind"),
             "universal signposts must drop the 'silence is worse' push: {frontier}"
         );
         assert!(
-            frontier.contains("a silent tool call is fine"),
-            "universal signposts must permit silent trivial calls: {frontier}"
+            frontier.contains("let the reporting follow the work's natural phases"),
+            "universal signposts must pace reporting to the work's phases: {frontier}"
         );
+        // No per-call exemption clause either: "you do not need a separate announcement for
+        // each individual call" reads as a licence (and its mirror, "one per call", reads as
+        // a duty). The section says where reporting belongs, not what it is excused from.
         assert!(
-            frontier.contains("multi-step or longer-running work"),
-            "universal signposts scope to multi-step/longer work: {frontier}"
+            !frontier.contains("separate announcement"),
+            "the per-call exemption phrasing must be gone: {frontier}"
         );
         // Signpost must be produced in the user's language (Chinese request → Chinese
         // signpost); reinforced at point-of-use since the signpost is the turn's first text.
@@ -1117,7 +1254,7 @@ mod tests {
         );
         let glm = coding_persona("glm-4.6", false, false);
         assert!(
-            !glm.contains("SIGNPOST BEFORE ACTING")
+            !glm.contains("SIGNPOST AS THE WORK MOVES")
                 && glm.contains("NEVER narrate or comment on injected context"),
             "GLM (soft-only, no FIRM signpost) must still get the anti-narration clause: {glm}"
         );
@@ -1127,9 +1264,11 @@ mod tests {
             !frontier.contains("Lead with action, not reasoning."),
             "old terse OUTPUT line must be gone: {frontier}"
         );
+        // OUTPUT reconciled with the re-scoped rule: a signpost marks a phase change rather
+        // than a per-batch ritual.
         assert!(
-            frontier.contains("a one-line signpost before a batch of tool calls"),
-            "OUTPUT reconciled to allow signpost: {frontier}"
+            frontier.contains("a short signpost when the work moves to a new phase"),
+            "OUTPUT reconciled to allow signposts at phase changes: {frontier}"
         );
 
         // Gating invariant: the SIGNPOSTS section must not name env-gated tools.
@@ -1146,25 +1285,38 @@ mod tests {
         // GLM is excluded from firm-execution and keeps only the universal section.
         let deepseek = coding_persona("deepseek-v4-flash", false, false);
         assert!(
-            deepseek.contains("SIGNPOST BEFORE ACTING"),
+            deepseek.contains("SIGNPOST AS THE WORK MOVES"),
             "deepseek gets the firm signpost bullet: {deepseek}"
         );
         // FIRM-bullet-specific phrase — NOT the bare "in the user's language", which the
         // universal SIGNPOSTS section (also in deepseek's persona) would satisfy on its own.
         assert!(
-            deepseek.contains("in ONE short sentence, in the user's language"),
+            deepseek.contains("in the user's language, what you are about to do"),
             "deepseek firm signpost binds to the user's language: {deepseek}"
         );
-        // Qwen was observed firing a full tool batch with zero text; it now gets the same
-        // hard signpost bullet as deepseek (user request: parity with deepseek).
+        // No word-count cap and no per-call exemption clause: the brief "send ONE short line
+        // (aim for 12 words or fewer)" quota nagged models into a mechanical one-liner per
+        // batch, and its removal is incomplete if "nobody needs a separate announcement
+        // before each individual call" stays — that reads as a licence to skip reporting,
+        // which these models take. Both layers now state when to report and stop there.
+        for (whose, p) in [("universal", &frontier), ("firm", &deepseek)] {
+            assert!(
+                !p.contains("12 words") && !p.contains("separate announcement"),
+                "the {whose} layer must carry no word cap and no per-call exemption: {p}"
+            );
+        }
+        // Qwen was observed firing a full tool batch with zero text; it gets the same hard
+        // bullet as deepseek (user request: parity with deepseek) — re-scoped to phase
+        // changes, since "a batch of two or more ALWAYS gets a signpost" was the wording
+        // that produced a report per batch.
         let qwen = coding_persona("qwen3.8-27b", false, false);
         assert!(
-            qwen.contains("SIGNPOST BEFORE ACTING"),
+            qwen.contains("SIGNPOST AS THE WORK MOVES"),
             "qwen gets the firm signpost bullet: {qwen}"
         );
         let glm = coding_persona("glm-5.2", false, false);
         assert!(
-            !glm.contains("SIGNPOST BEFORE ACTING"),
+            !glm.contains("SIGNPOST AS THE WORK MOVES"),
             "GLM excluded from firm-execution block: {glm}"
         );
         assert!(
@@ -1178,7 +1330,7 @@ mod tests {
             "SIGNPOSTS section must end with a blank line before OUTPUT: {frontier}"
         );
         assert!(
-            deepseek.contains("\n- SIGNPOST BEFORE ACTING"),
+            deepseek.contains("\n- SIGNPOST AS THE WORK MOVES"),
             "firm bullet must be its own line (no weld with prior bullet): {deepseek}"
         );
     }
@@ -1813,6 +1965,71 @@ mod tests {
             coding_persona_with_capabilities("glm-5.2", None, true, false, false, true, false);
         assert!(!persona.contains("## CODE REVIEW:"));
         assert!(!persona.contains("`code_review` tool is available"));
+    }
+
+    #[test]
+    fn the_row_list_persona_leaves_the_rows_own_paragraphs_to_the_rows() {
+        // The row-list entry point must not carry what a row contributes. Each of these is
+        // locked by the row-list gate too (`differential.rs`), but this pins the seam itself:
+        // the removals are the function's whole reason to exist, and a future edit of the chain
+        // text above can silently put a section back.
+        let mounted = |_: &str| true;
+        let p = coding_persona_rows("glm-5.2", None, &mounted);
+        for owned_by_a_row in [
+            "## DELEGATING WITH `task`",
+            "## TEAM AGENT:",
+            "## TASK TRACKING:",
+        ] {
+            assert!(
+                !p.contains(owned_by_a_row),
+                "`{owned_by_a_row}` belongs to the row that mounts the tool, not to the persona"
+            );
+        }
+        // What stays: the identity line, the discipline, and the sections no row writes.
+        assert!(p.starts_with("You are AtomCode"));
+        assert!(p.contains("## DOING TASKS"));
+        assert!(p.contains("## SKILLS:"));
+        assert!(
+            p.contains("## WHEN COMMANDS FAIL"),
+            "the discipline must survive"
+        );
+    }
+
+    #[test]
+    fn the_persona_paragraphs_that_stay_follow_the_mounted_tool_not_the_env() {
+        // The chain reads `ATOMCODE_MEMORY_TOOL` / `ATOMCODE_REQUEST_USER_INPUT`; the row list
+        // asks the tree. The difference is observable exactly where the old gate was wrong — a
+        // tree that has the tool while the env says otherwise — and testing it that way keeps
+        // this off the process-global env (which runtime tests race on; see the note above the
+        // delegation tests).
+        let yes = |_: &str| true;
+        let no = |_: &str| false;
+        let mounted = coding_persona_rows("glm-5.2", None, &yes);
+        let absent = coding_persona_rows("glm-5.2", None, &no);
+        assert!(
+            mounted.contains("## MEMORY"),
+            "the tool is mounted, so the guidance must be there"
+        );
+        assert!(
+            !absent.contains("## MEMORY"),
+            "no tool, no guidance — this is the phantom-call case the gate exists for"
+        );
+        // `## ASKING THE USER` is not the persona's to decide any more: the host mounts the
+        // product's `request_user_input` and brings the section with it, so whether it shows
+        // cannot depend on which row happened to apply first.
+        assert!(
+            !mounted.contains("## ASKING THE USER") && !absent.contains("## ASKING THE USER"),
+            "the section travels with the host's tool, never in the persona"
+        );
+        assert!(
+            super::host_tool_guidance("request_user_input")
+                .is_some_and(|(_, text)| text.starts_with("## ASKING THE USER")),
+            "and the host has it to bring"
+        );
+        // And nothing else moved with it: the gate must not silently drop other sections.
+        for section in ["## SKILLS:", "## DOING TASKS", "## WHEN COMMANDS FAIL"] {
+            assert!(mounted.contains(section) && absent.contains(section));
+        }
     }
 
     #[test]

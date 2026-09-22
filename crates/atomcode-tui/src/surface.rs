@@ -1,0 +1,1826 @@
+//! Where a frame is painted, and where input comes from.
+//!
+//! A seam with exactly one provider, bound at the root realm. The terminal is a
+//! physical singleton: the region tree can divide it, realms cannot duplicate
+//! it. Two implementations ship — a real terminal and a headless recorder —
+//! and every test above this line runs against the second one, with no tty.
+
+use std::io::Write;
+use std::sync::{Arc, Mutex};
+
+use crate::ansi;
+use crate::frame::Frame;
+use crate::theme::{Palette, Rgb, Theme};
+
+/// A key the user pressed, in a form a test can construct.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Key {
+    Char(char),
+    Enter,
+    Backspace,
+    Delete,
+    Tab,
+    BackTab,
+    Esc,
+    Up,
+    Down,
+    Left,
+    Right,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+}
+
+/// Modifiers, as a set rather than a bitfield so an assertion reads plainly.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Mods {
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+    /// The Cmd key on macOS (Super/Meta elsewhere). Kept distinct from the
+    /// others so a Cmd chord does not collapse to [`Mods::NONE`] and fall
+    /// through to typing its letter — the copy reflex `Cmd+C` must not put a `c`
+    /// in the field. Only reaches us on terminals that pass the chord through
+    /// rather than handling it themselves.
+    pub cmd: bool,
+}
+
+impl Mods {
+    pub const NONE: Mods = Mods {
+        ctrl: false,
+        alt: false,
+        shift: false,
+        cmd: false,
+    };
+    pub const CTRL: Mods = Mods {
+        ctrl: true,
+        alt: false,
+        shift: false,
+        cmd: false,
+    };
+    pub const ALT: Mods = Mods {
+        ctrl: false,
+        alt: true,
+        shift: false,
+        cmd: false,
+    };
+    pub const SHIFT: Mods = Mods {
+        ctrl: false,
+        alt: false,
+        shift: true,
+        cmd: false,
+    };
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct KeyPress {
+    pub key: Key,
+    pub mods: Mods,
+}
+
+impl KeyPress {
+    pub const fn new(key: Key, mods: Mods) -> Self {
+        Self { key, mods }
+    }
+    pub const fn plain(key: Key) -> Self {
+        Self::new(key, Mods::NONE)
+    }
+    pub const fn ch(c: char) -> Self {
+        Self::new(Key::Char(c), Mods::NONE)
+    }
+    pub const fn ctrl(c: char) -> Self {
+        Self::new(Key::Char(c), Mods::CTRL)
+    }
+}
+
+/// What the pointer did, in the only three shapes this UI has a use for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Click {
+    /// The primary button went down at this cell.
+    Press,
+    /// The secondary button went down here.
+    ///
+    /// Not a second [`Click::Press`]: a press is the start of a caret or a
+    /// selection, and a menu would then move the caret every time one was
+    /// opened. Two intentions that arrive as the same event shape, told apart
+    /// at the only layer that can still tell — the one reading the terminal.
+    RightPress,
+    /// The pointer moved with the button held. What a drag is made of.
+    Drag,
+    /// …and came up here. A release at the cell it was pressed on is a click;
+    /// anywhere else it is the end of a selection.
+    Release,
+    /// The pointer moved here with nothing held. Not a press and not a drag.
+    ///
+    /// Reported rather than dropped because the composer's menu is the one
+    /// thing in this UI that follows a pointer: it uses this to know which of
+    /// its rows the pointer is over. Nothing else reads it, and a move that
+    /// changes no row is expected to cost no repaint — which is the only reason
+    /// a stream of these is affordable at all.
+    Hover,
+    WheelUp,
+    WheelDown,
+}
+
+/// Everything that can arrive from the outside world.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Input {
+    Key(KeyPress),
+    /// A bracketed paste, delivered whole rather than as N keystrokes.
+    Paste(String),
+    /// A pointer event at a cell, in the frame's own coordinates.
+    Mouse(Click, u16, u16),
+    Resize(u16, u16),
+}
+
+/// The terminal, as a seam.
+pub trait Surface: Send + Sync {
+    fn describe(&self) -> String;
+    fn size(&self) -> (u16, u16);
+    /// Paint. Must be total: a frame larger than the surface is clipped, never
+    /// an error and never a panic.
+    fn present(&self, frame: &Frame);
+    /// Called once on the way out. Restoring the terminal is not optional —
+    /// leaving a shell in raw mode is worse than showing no UI at all.
+    fn restore(&self) {}
+
+    /// Take this surface's own input stream, once.
+    ///
+    /// `None` means "read the real terminal" — which is what the terminal
+    /// surface says, because its input is the tty. A headless surface returns a
+    /// channel it feeds itself, and that is the whole reason the UI can be
+    /// driven end to end with no tty, no keyboard and no human.
+    fn take_input(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<Input>> {
+        None
+    }
+
+    /// What the terminal on the other end can render.
+    ///
+    /// Detected once, here, because this is the only layer allowed to touch the
+    /// environment or the tty — everything above is *given* the answer rather
+    /// than asking for it (`caps.rs`, `docs/adr/0008`). A `render` that read
+    /// `TERM` would be green on the developer's machine and wrong on the
+    /// user's, with no test to say so.
+    fn caps(&self) -> crate::caps::Caps {
+        crate::caps::Caps::default()
+    }
+
+    /// Take the pointer, or hand it back to the terminal.
+    ///
+    /// Runtime rather than launch-time on purpose. Reporting the pointer buys a
+    /// click that folds a tool call and costs the terminal's own click-drag
+    /// selection, and which of those a person wants changes minute to minute —
+    /// they are folding now and copying an error message next. A choice that
+    /// can only be made by restarting is a choice made once, wrongly.
+    fn set_mouse(&self, _on: bool) {}
+
+    /// Whether the pointer is currently ours.
+    fn mouse(&self) -> bool {
+        false
+    }
+
+    /// Ask for the pointer's *free* motion — the pointer crossing cells with
+    /// nothing held — or stop asking for it.
+    ///
+    /// Separate from [`Surface::set_mouse`] because it is a different trade in
+    /// the same currency: the mouse itself is worth taking because a click that
+    /// folds a tool call is worth more than a selection gesture, and free
+    /// motion is worth taking only for as long as something on screen follows
+    /// the pointer. The composer's context menu does — it lights the row the
+    /// pointer is over — so it turns this on while it is open and off again
+    /// when it closes. Asking for what is already the case does nothing.
+    fn set_motion(&self, _on: bool) {}
+
+    /// Whether free motion is currently requested.
+    fn motion(&self) -> bool {
+        false
+    }
+
+    /// The mouse mode this side believes the terminal's tracker is in.
+    fn pointer_mode(&self) -> crate::ansi::Pointer {
+        crate::ansi::Pointer::Terminal
+    }
+
+    /// Say the mouse mode again, whether or not this side believes it is
+    /// already there.
+    ///
+    /// The terminal can put its own tracker back without telling us: a session
+    /// restore, a tab or split switch, a reset written by anything else that
+    /// holds the tty. The obvious answer — ask — is not available, and the
+    /// reason is worth writing down because it is not obvious. The query is
+    /// `CSI ? 1002 $ p` and the reply is `CSI ? 1002 ; 1 $ y`; crossterm parses
+    /// `CSI ?` by looking at the *last* byte and only knows `u` and `c`:
+    ///
+    /// ```text
+    /// b'?' => match buffer[buffer.len() - 1] {
+    ///     b'u' => …keyboard flags…, b'c' => …device attributes…, _ => None,
+    /// },
+    /// ```
+    ///
+    /// `None` there means "wait for more bytes", and the reader keeps the
+    /// buffer — so a `$y` reply never drains, and every real keypress after it
+    /// is appended to a sequence that can never parse. Asking the terminal this
+    /// question costs the whole input stream.
+    ///
+    /// Saying the mode again is idempotent — a DECSET for a mode that is already
+    /// set changes nothing — so the answer is to repeat rather than to ask.
+    /// Nothing goes out while the pointer is believed to be the terminal's:
+    /// there is nothing to take back.
+    fn heal_mouse(&self) {}
+
+    /// Forget what is believed to be on screen, so the next frame is painted
+    /// in full.
+    ///
+    /// The renderer only sends rows that changed, which is what stops an idle
+    /// screen from churning — and which means anything *else* that writes to
+    /// this terminal leaves marks that are never painted over, because from
+    /// here nothing changed. Before the diff, a full erase every 110ms hid that
+    /// class of damage by brute force. This is the way back from it.
+    fn forget(&self) {}
+
+    /// Name the window.
+    ///
+    /// The surface's job for the same reason the clipboard is: only this layer
+    /// may talk to the terminal, and the title belongs to the terminal. Above
+    /// this line it is a string, which is what lets a criterion read back what
+    /// the window would have been called with no terminal in the room.
+    ///
+    /// A surface that has no window ignores it.
+    fn set_title(&self, _title: &str) {}
+
+    /// Put text on the system clipboard.
+    ///
+    /// The surface's job because it is the only layer that may talk to the
+    /// terminal, and the terminal is what has a clipboard — see
+    /// [`crate::ansi::set_clipboard`] for why not `pbcopy`.
+    fn copy(&self, _text: &str) {}
+
+    /// Take what the clipboard holds as text.
+    ///
+    /// The reading half of [`Surface::copy`], behind the same seam for the same
+    /// reason: a clipboard is the terminal's, so the one layer allowed to touch
+    /// the terminal is where `arboard` lives. Above this line pasted text is a
+    /// value, which is what lets the paste path be driven end to end with no
+    /// clipboard and no human.
+    ///
+    /// `None` is the ordinary answer — the clipboard holds an image, or holds
+    /// nothing — and not a failure. That is why a composer can say "there is no
+    /// text in the clipboard" without calling anything an error.
+    fn clipboard_text(&self) -> Option<String> {
+        None
+    }
+
+    /// Take an image off the system clipboard, as the value the model sees.
+    ///
+    /// The same seam as [`Surface::copy`], for the same reason and in the other
+    /// direction: a clipboard is the terminal's, so the one layer allowed to
+    /// touch the terminal is where `arboard` lives. Above this line an
+    /// attachment is a value — which is what makes it testable without a
+    /// clipboard, without a screenshot tool and without a human: the headless
+    /// surface answers with whatever a test put there.
+    ///
+    /// `None` is the ordinary answer (the clipboard holds text, or nothing),
+    /// not an error. Encoding happens here too — one place turns RGBA into the
+    /// bytes every provider adapter can carry, rather than three.
+    fn clipboard_image(&self) -> Option<atomcode_kernel::message::ImageContent> {
+        None
+    }
+
+    /// The recorder behind this surface, when it is one. How a test reaches the
+    /// frames without the tree having to know it is being tested.
+    fn as_any_headless(&self) -> Option<Arc<Headless>> {
+        None
+    }
+}
+
+// ---- headless -----------------------------------------------------------
+
+/// [`Pointer`](crate::ansi::Pointer) as a number, for the two surfaces that
+/// keep it in an atomic.
+///
+/// A value and not a bit pattern: a state added to the enum is a state these
+/// have to be taught, rather than a number that silently comes to mean something
+/// else. Both surfaces use the same pair, so the recorder and the writer cannot
+/// disagree about which state they are in.
+fn pointer_state(p: crate::ansi::Pointer) -> u8 {
+    use crate::ansi::Pointer;
+    match p {
+        Pointer::Terminal => 0,
+        Pointer::Buttons => 1,
+        Pointer::ButtonsAndHover => 2,
+    }
+}
+
+fn pointer_from_state(n: u8) -> crate::ansi::Pointer {
+    use crate::ansi::Pointer;
+    match n {
+        1 => Pointer::Buttons,
+        2 => Pointer::ButtonsAndHover,
+        _ => Pointer::Terminal,
+    }
+}
+
+/// A surface that paints into memory and remembers everything.
+///
+/// The whole automated loop rests on this: no tty, no escape-sequence guessing,
+/// and every frame kept so a test can assert on the *sequence* rather than only
+/// on the end state.
+#[derive(Debug)]
+pub struct Headless {
+    size: Mutex<(u16, u16)>,
+    frames: Mutex<Vec<Frame>>,
+    keys: tokio::sync::mpsc::UnboundedSender<Input>,
+    incoming: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<Input>>>,
+    /// What a scripted clipboard holds. A real one cannot be scripted, so
+    /// without this the paste path would only ever be tested by hand — which
+    /// means never, on the path where "no image in the clipboard" is the
+    /// ordinary case.
+    clipboard: Mutex<Option<atomcode_kernel::message::ImageContent>>,
+    /// What a scripted clipboard holds as text. Separate from the image above
+    /// because they are separate clipboard flavours, and a test that says "the
+    /// clipboard holds text" must not also be saying "it holds a picture".
+    clipboard_text: Mutex<Option<String>>,
+    /// What the window would have been called. `None` until something names it.
+    title: Mutex<Option<String>>,
+    /// A weak handle back to the `Arc` this lives in, so a consumer holding
+    /// `Arc<dyn Surface>` can get the recorder back without downcasting.
+    me: Mutex<Option<std::sync::Weak<Headless>>>,
+    /// Whether free motion is being asked for, as a real terminal would have
+    /// been told. Kept so a test can assert the request went out at all: the
+    /// events a menu consumes are scripted here, and a scripted event says
+    /// nothing about whether a terminal would ever have sent one.
+    ///
+    /// The intents, not the state — the state is derived by [`Headless::pointer`]
+    /// exactly the way the terminal's is, so a test cannot pass on a pair of
+    /// flags that the terminal would never have been put into.
+    grab: std::sync::atomic::AtomicBool,
+    hover: std::sync::atomic::AtomicBool,
+    /// Which setting of the mouse tracker this surface last said it was in.
+    state: std::sync::atomic::AtomicU8,
+    /// Every mouse-mode escape the real terminal would have received, in order.
+    ///
+    /// The bytes rather than another flag, because the bug this exists to catch
+    /// was in the *sequence*: closing the menu sent `1003l` on its own, which a
+    /// terminal reads as "no mouse at all", while the flag it was asserted
+    /// against said the same thing either way.
+    escapes: Mutex<Vec<String>>,
+}
+
+impl Headless {
+    pub fn new(w: u16, h: u16) -> Arc<Self> {
+        let (keys, incoming) = tokio::sync::mpsc::unbounded_channel();
+        let me = Arc::new(Self {
+            size: Mutex::new((w, h)),
+            frames: Mutex::new(Vec::new()),
+            keys,
+            incoming: Mutex::new(Some(incoming)),
+            clipboard: Mutex::new(None),
+            clipboard_text: Mutex::new(None),
+            title: Mutex::new(None),
+            me: Mutex::new(None),
+            grab: std::sync::atomic::AtomicBool::new(true),
+            hover: std::sync::atomic::AtomicBool::new(false),
+            state: std::sync::atomic::AtomicU8::new(pointer_state(crate::ansi::Pointer::Buttons)),
+            escapes: Mutex::new(Vec::new()),
+        });
+        *me.me.lock().expect("headless poisoned") = Some(Arc::downgrade(&me));
+        me
+    }
+
+    /// What the window is called, for a criterion about the title.
+    pub fn title(&self) -> Option<String> {
+        self.title.lock().expect("headless poisoned").clone()
+    }
+
+    /// Put an image on the scripted clipboard — a screenshot, for a test.
+    pub fn set_clipboard_image(&self, image: atomcode_kernel::message::ImageContent) {
+        *self.clipboard.lock().expect("headless poisoned") = Some(image);
+    }
+
+    /// Empty it again, so the "nothing to paste" path is reachable too.
+    pub fn clear_clipboard(&self) {
+        *self.clipboard.lock().expect("headless poisoned") = None;
+    }
+
+    /// Put text on the scripted clipboard, as a test would after copying from
+    /// another window. What a real clipboard is for, scripted.
+    pub fn set_clipboard_text(&self, text: impl Into<String>) {
+        *self.clipboard_text.lock().expect("headless poisoned") = Some(text.into());
+    }
+
+    /// What a copy under test put on the clipboard. Text, so a test can assert
+    /// the words rather than that "something" was written.
+    pub fn clipboard_text(&self) -> Option<String> {
+        self.clipboard_text
+            .lock()
+            .expect("headless poisoned")
+            .clone()
+    }
+
+    /// Feed a pointer event, the way the terminal would.
+    ///
+    /// A scripted mouse, for the same reason as the scripted clipboard: the
+    /// right-button path is otherwise only ever exercised by a hand.
+    pub fn pointer(&self, click: Click, x: u16, y: u16) {
+        let _ = self.keys.send(Input::Mouse(click, x, y));
+    }
+
+    /// Press a key.
+    pub fn press(&self, press: KeyPress) {
+        let _ = self.keys.send(Input::Key(press));
+    }
+
+    /// Type a line and submit it — the single most common scripted gesture.
+    pub fn type_line(&self, text: &str) {
+        for c in text.chars() {
+            self.press(KeyPress::ch(c));
+        }
+        self.press(KeyPress::plain(Key::Enter));
+    }
+
+    /// Type without submitting, for asserting on a half-finished line.
+    pub fn type_text(&self, text: &str) {
+        for c in text.chars() {
+            self.press(KeyPress::ch(c));
+        }
+    }
+
+    pub fn paste(&self, text: &str) {
+        let _ = self.keys.send(Input::Paste(text.to_string()));
+    }
+
+    /// Wait until the screen stops changing.
+    ///
+    /// A quiescence predicate, not a sleep: `settle` that timed out would be a
+    /// test that passes while nothing happened, so the caller gets `false` and
+    /// is expected to fail on it.
+    pub async fn settle(&self, quiet_for: std::time::Duration, limit: std::time::Duration) -> bool {
+        let start = std::time::Instant::now();
+        let mut last = self.frame_count();
+        let mut still = std::time::Instant::now();
+        while start.elapsed() < limit {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            let now = self.frame_count();
+            if now != last {
+                last = now;
+                still = std::time::Instant::now();
+            } else if still.elapsed() >= quiet_for {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn resize(&self, w: u16, h: u16) {
+        *self.size.lock().expect("headless poisoned") = (w, h);
+    }
+
+    /// Every frame painted, in order.
+    pub fn frames(&self) -> Vec<Frame> {
+        self.frames.lock().expect("headless poisoned").clone()
+    }
+
+    pub fn frame_count(&self) -> usize {
+        self.frames.lock().expect("headless poisoned").len()
+    }
+
+    pub fn last(&self) -> Option<Frame> {
+        self.frames
+            .lock()
+            .expect("headless poisoned")
+            .last()
+            .cloned()
+    }
+
+    /// The last frame as plain rows — what a person would see.
+    pub fn screen(&self) -> Vec<String> {
+        self.last().map(|f| f.rows()).unwrap_or_default()
+    }
+
+    /// The last frame as one string, for `contains` assertions.
+    pub fn text(&self) -> String {
+        self.screen().join("\n")
+    }
+
+    /// The bytes the real terminal would have received for the last frame.
+    /// The input to the external oracle.
+    pub fn bytes(&self) -> String {
+        self.last().map(|f| ansi::encode(&f)).unwrap_or_default()
+    }
+
+    /// Every mouse-mode escape the real terminal would have received, in order.
+    ///
+    /// What `motion()` cannot say. Closing the menu owes the terminal a `1002h`
+    /// — the tracker it just cleared — and a flag that reads `false` either way
+    /// cannot tell that apart from handing the pointer back for good.
+    pub fn escapes(&self) -> Vec<String> {
+        self.escapes.lock().expect("headless poisoned").clone()
+    }
+
+    /// The state this surface last said the terminal's tracker was in.
+    ///
+    /// The semantic view of [`Headless::escapes`]: the bytes say what was
+    /// written, this says what it means. A test that cares about behaviour wants
+    /// this one, and a test that cares about the wire wants the other.
+    pub fn pointer_mode(&self) -> crate::ansi::Pointer {
+        pointer_from_state(self.state.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// Record the escape that moves the tracker to where the intents say it
+    /// should be — the same derivation, and the same "only when it changes", as
+    /// the terminal surface's.
+    fn record_pointer(&self) {
+        use std::sync::atomic::Ordering;
+        let want = crate::ansi::Pointer::from_intents(
+            self.grab.load(Ordering::SeqCst),
+            self.hover.load(Ordering::SeqCst),
+        );
+        let Some(escape) = want.escape_from(self.pointer_mode()) else {
+            return;
+        };
+        self.state.store(pointer_state(want), Ordering::SeqCst);
+        self.escapes
+            .lock()
+            .expect("headless poisoned")
+            .push(escape.to_string());
+    }
+
+    pub fn clear(&self) {
+        self.frames.lock().expect("headless poisoned").clear();
+    }
+}
+
+impl Surface for Headless {
+    fn describe(&self) -> String {
+        "headless (frames kept in memory)".into()
+    }
+    fn size(&self) -> (u16, u16) {
+        *self.size.lock().expect("headless poisoned")
+    }
+    fn present(&self, frame: &Frame) {
+        self.frames
+            .lock()
+            .expect("headless poisoned")
+            .push(frame.clone());
+    }
+    fn take_input(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<Input>> {
+        self.incoming.lock().expect("headless poisoned").take()
+    }
+    fn set_title(&self, title: &str) {
+        *self.title.lock().expect("headless poisoned") = Some(title.to_string());
+    }
+    /// The scripted clipboard is one text buffer: a copy writes it and a paste
+    /// reads it, so the round trip a person performs works with no clipboard,
+    /// and a test can watch either end.
+    fn copy(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        *self.clipboard_text.lock().expect("headless poisoned") = Some(text.to_string());
+    }
+    fn clipboard_text(&self) -> Option<String> {
+        self.clipboard_text
+            .lock()
+            .expect("headless poisoned")
+            .clone()
+    }
+    fn clipboard_image(&self) -> Option<atomcode_kernel::message::ImageContent> {
+        self.clipboard.lock().expect("headless poisoned").clone()
+    }
+    /// Recorded rather than written anywhere, which is the point: a scripted
+    /// pointer already delivers the events a menu reads, so without recording
+    /// the request a test could not tell "the menu asked for motion" from "the
+    /// menu was handed motion by a test that assumed a terminal would".
+    ///
+    /// The bytes the terminal surface would have written, not just the flag, so
+    /// the same test can see *what* was asked for — which is the whole
+    /// difference between staying in button reporting and giving the pointer up.
+    ///
+    /// `set_mouse` is here for the same reason, and has the same shape as the
+    /// terminal's: this surface has to model *both* intents, because the state
+    /// that matters is derived from the pair rather than from either one.
+    fn set_mouse(&self, on: bool) {
+        use std::sync::atomic::Ordering;
+        if self.grab.swap(on, Ordering::SeqCst) == on {
+            return;
+        }
+        // Same as the terminal: handing the pointer back takes the hover with
+        // it, so the two sides cannot disagree about what was asked for.
+        if !on {
+            self.hover.store(false, Ordering::SeqCst);
+        }
+        self.record_pointer();
+    }
+    fn mouse(&self) -> bool {
+        self.grab.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn set_motion(&self, on: bool) {
+        use std::sync::atomic::Ordering;
+        if self.hover.swap(on, Ordering::SeqCst) == on {
+            return;
+        }
+        self.record_pointer();
+    }
+    fn motion(&self) -> bool {
+        self.pointer_mode() == crate::ansi::Pointer::ButtonsAndHover
+    }
+    fn pointer_mode(&self) -> crate::ansi::Pointer {
+        Headless::pointer_mode(self)
+    }
+    /// Recorded like every other mouse escape, so a test can see the repetition
+    /// the real terminal would have received — and so the two surfaces cannot
+    /// drift apart on *whether* they heal.
+    fn heal_mouse(&self) {
+        use std::sync::atomic::Ordering;
+        if !self.grab.load(Ordering::SeqCst) {
+            return;
+        }
+        let bytes = self.pointer_mode().escape().to_string();
+        self.escapes.lock().expect("headless poisoned").push(bytes);
+    }
+    fn as_any_headless(&self) -> Option<Arc<Headless>> {
+        self.me
+            .lock()
+            .expect("headless poisoned")
+            .clone()?
+            .upgrade()
+    }
+}
+
+// ---- a real terminal ----------------------------------------------------
+
+/// The alternate screen, restored on drop.
+///
+/// Full-screen rather than inline because folding a settled block, and putting
+/// a panel beside the transcript, both require the whole stream to stay
+/// addressable — native scrollback is not. See `docs/adr/0006`.
+pub struct Terminal {
+    raw: bool,
+    /// Which setting the terminal's mouse tracker is on, as this side believes.
+    ///
+    /// One enum rather than `mouse` and `motion` flags, because the terminal
+    /// keeps one tracker: two booleans here can say "no hover and no buttons",
+    /// which is not a state the two intents can add up to, and which the old
+    /// pair expressed by accident — it thought it was in 1002 while the
+    /// terminal had left reporting entirely.
+    ///
+    /// This is the record of what was *told*; the two intents it is derived from
+    /// are [`Terminal::grab`] and [`Terminal::hover`]. Both have to be kept,
+    /// because the loop asks for the hover on every iteration and a derived
+    /// value alone cannot tell "already there" from "asked for again".
+    state: std::sync::atomic::AtomicU8,
+    /// Whether the pointer is ours at all.
+    grab: std::sync::atomic::AtomicBool,
+    /// Whether the thing that follows the pointer asked for free motion.
+    hover: std::sync::atomic::AtomicBool,
+    caps: crate::caps::Caps,
+    painted: LastPainted,
+    /// Where stderr was sent while we hold the screen, and the descriptor it
+    /// came from. See [`Terminal::take_stderr`].
+    stderr: Option<StderrHeld>,
+}
+
+/// The real stderr, set aside, and the file it was pointed at instead.
+#[cfg(unix)]
+struct StderrHeld {
+    original: std::os::fd::RawFd,
+    path: std::path::PathBuf,
+}
+
+#[cfg(not(unix))]
+struct StderrHeld;
+
+impl Terminal {
+    /// The bytes this frame would send, given what is already on the screen —
+    /// and the record of it, so the next frame can be a diff too.
+    ///
+    /// The previous frame goes in as the *input* to encoding, not just to the
+    /// diff that follows it: an unchanged row is skipped before it is escaped
+    /// and clipped, which is where the per-frame cost was.
+    fn patch(&self, frame: &Frame) -> String {
+        let mut last = self.painted.0.lock().expect("last frame poisoned");
+        let next = ansi::Lines::of(frame, self.caps, last.as_ref());
+        let out = next.patch_from(last.as_ref());
+        *last = Some(next);
+        out
+    }
+}
+
+impl Terminal {
+    /// Take the screen. `theme` forces a palette; `None` means ask the terminal
+    /// what colour it is and follow the answer. `overrides` is what this build
+    /// says about the terminal over what detection found.
+    pub fn enter(
+        theme: Option<Theme>,
+        mouse: bool,
+        overrides: crate::caps::Overrides,
+    ) -> std::io::Result<Self> {
+        crossterm::terminal::enable_raw_mode()?;
+        let mut out = std::io::stdout();
+        out.write_all(ansi::ENTER.as_bytes())?;
+        // Before anything names the window, so leaving can put back whatever a
+        // person had called it.
+        out.write_all(ansi::SAVE_TITLE.as_bytes())?;
+        let pointer = if mouse {
+            ansi::Pointer::Buttons
+        } else {
+            ansi::Pointer::Terminal
+        };
+        out.write_all(pointer.escape().as_bytes())?;
+        out.flush()?;
+        let mut caps = crate::caps::Caps::detect_with(overrides);
+        // Inside the alternate screen on purpose: a terminal that does not know
+        // the queries may echo them, and here the first frame paints over it.
+        //
+        // A forced theme skips the exchange entirely. It is the escape hatch
+        // for a terminal that will not answer (some tmux and ssh setups) — and
+        // it costs contrast rather than correctness, because the resolver still
+        // measures against whatever background the assumption implies.
+        caps.palette = match theme {
+            Some(theme) => Palette::assumed(theme),
+            None => measure_palette(),
+        };
+        let stderr = take_stderr();
+        // Armed once the screen is actually taken, so a panic between here and
+        // `restore` gives it back before it prints.
+        #[cfg(unix)]
+        arm_panic_restore(stderr.as_ref().map(|held| held.original));
+        #[cfg(not(unix))]
+        arm_panic_restore(None);
+        Ok(Self {
+            raw: true,
+            state: std::sync::atomic::AtomicU8::new(pointer_state(pointer)),
+            grab: std::sync::atomic::AtomicBool::new(mouse),
+            hover: std::sync::atomic::AtomicBool::new(false),
+            caps,
+            painted: LastPainted::default(),
+            stderr,
+        })
+    }
+
+    /// What the terminal was last told its mouse tracker should be.
+    fn pointer_mode(&self) -> ansi::Pointer {
+        pointer_from_state(self.state.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// Put the terminal's mouse tracker where the two intents say it should be.
+    ///
+    /// The only place the tracker is written. Everything that changes an intent
+    /// — the grab, the hover — lands here rather than writing a byte of its own,
+    /// which is what keeps the record and the terminal from disagreeing: the
+    /// bytes are always the whole target state, and only when it is not already
+    /// the state.
+    fn refresh_pointer(&self) {
+        use std::sync::atomic::Ordering;
+        let want = ansi::Pointer::from_intents(
+            self.grab.load(Ordering::SeqCst),
+            self.hover.load(Ordering::SeqCst),
+        );
+        let had = self.pointer_mode();
+        let Some(escape) = want.escape_from(had) else {
+            return;
+        };
+        self.state.store(pointer_state(want), Ordering::SeqCst);
+        let mut out = std::io::stdout();
+        let _ = out.write_all(escape.as_bytes());
+        let _ = out.flush();
+    }
+}
+
+/// What a panic needs in order to give the screen back.
+///
+/// A panic hook has no `self`, and by the time unwinding reaches
+/// [`Terminal`]'s `Drop` the message has already been printed — into the file
+/// stderr was pointed at, which is the one place nobody looks. Four crashes
+/// were reported as "the window just blinked" for exactly that reason: the
+/// diagnosis existed, in `$TMPDIR/atomcode-tui-<pid>.stderr.log`, and the
+/// person saw a restored shell with nothing on it.
+///
+/// So the screen and stderr are given back *at panic time*, before the message
+/// is printed, by a hook that then chains to whatever hook was there. These two
+/// are the whole of what it needs, and an atomic swap makes sure the hook and
+/// `restore` cannot both do it.
+static SCREEN_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(unix)]
+static STDERR_ORIGINAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// Arm the emergency restore, and install the hook the first time.
+fn arm_panic_restore(#[allow(unused_variables)] original: Option<std::os::fd::RawFd>) {
+    use std::sync::atomic::Ordering;
+    #[cfg(unix)]
+    STDERR_ORIGINAL.store(original.unwrap_or(-1), Ordering::SeqCst);
+    SCREEN_HELD.store(true, Ordering::SeqCst);
+
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            emergency_restore();
+            // Now the message goes to a terminal that can show it.
+            previous(info);
+        }));
+    });
+}
+
+/// Give the screen back, from anywhere, at most once.
+///
+/// Both the panic hook and [`Terminal::restore`] call it; whichever gets there
+/// first wins the swap and the other does nothing. `MOUSE_OFF` goes out
+/// unconditionally — disabling reporting that was never enabled costs a few
+/// bytes, and tracking the flag from a global would be one more thing to keep
+/// in step for no gain.
+fn emergency_restore() {
+    use std::sync::atomic::Ordering;
+    if !SCREEN_HELD.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    let mut out = std::io::stdout();
+    let _ = out.write_all(ansi::MOUSE_OFF.as_bytes());
+    let _ = out.write_all(ansi::RESTORE_TITLE.as_bytes());
+    let _ = out.write_all(ansi::LEAVE.as_bytes());
+    let _ = out.flush();
+    let _ = crossterm::terminal::disable_raw_mode();
+    #[cfg(unix)]
+    {
+        let original = STDERR_ORIGINAL.swap(-1, Ordering::SeqCst);
+        if original >= 0 {
+            // SAFETY: `original` is the descriptor `take_stderr` duplicated and
+            // has not been closed — this swap took it, so nobody else will.
+            unsafe {
+                libc::dup2(original, libc::STDERR_FILENO);
+                libc::close(original);
+            }
+        }
+    }
+}
+
+/// Point stderr at a file for as long as this UI owns the screen.
+///
+/// **The terminal is a physical singleton and this row holds it.** Anything
+/// else that writes here — a library's `eprintln!`, a dependency's warning, a
+/// panic message from a background task — lands as characters at whatever cell
+/// the cursor happens to be on. That was survivable when every frame began with
+/// a full-screen erase: the damage lasted 110ms. It is not survivable against a
+/// renderer that only repaints rows it believes changed, because from here
+/// nothing changed, and the marks stay until something else happens to touch
+/// that row. A stray character in the middle of a session is exactly that.
+///
+/// Nothing is silenced: the output goes to a file, and [`Terminal::restore`]
+/// says where when there is anything in it. Losing a diagnostic would be a
+/// worse trade than the corruption it prevents.
+#[cfg(unix)]
+fn take_stderr() -> Option<StderrHeld> {
+    use std::os::fd::IntoRawFd;
+
+    let path = std::env::temp_dir().join(format!("atomcode-tui-{}.stderr.log", std::process::id()));
+    let file = std::fs::File::create(&path).ok()?;
+    // SAFETY: both are open descriptors for the length of these calls; `dup`
+    // and `dup2` are the documented way to swap one, and failure is reported
+    // rather than assumed away.
+    let original = unsafe { libc::dup(libc::STDERR_FILENO) };
+    if original < 0 {
+        return None;
+    }
+    let fd = file.into_raw_fd();
+    if unsafe { libc::dup2(fd, libc::STDERR_FILENO) } < 0 {
+        unsafe { libc::close(fd) };
+        unsafe { libc::close(original) };
+        return None;
+    }
+    unsafe { libc::close(fd) };
+    Some(StderrHeld { original, path })
+}
+
+#[cfg(not(unix))]
+fn take_stderr() -> Option<StderrHeld> {
+    None
+}
+
+/// Say where anything written to stderr went.
+///
+/// The descriptor itself is put back by [`emergency_restore`], which runs on
+/// the panic path too — this half only runs when there is a terminal left to
+/// print the note on.
+#[cfg(unix)]
+fn give_back_stderr(held: &StderrHeld) {
+    use std::io::Write;
+    match std::fs::metadata(&held.path).map(|m| m.len()) {
+        Ok(0) | Err(_) => {
+            let _ = std::fs::remove_file(&held.path);
+        }
+        Ok(n) => {
+            let mut err = std::io::stderr();
+            let _ = writeln!(
+                err,
+                "{n} bytes went to stderr; kept at {}",
+                held.path.display()
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn give_back_stderr(_held: &StderrHeld) {}
+
+/// Read an image off the system clipboard, encoded the way providers want it.
+///
+/// `arboard::get_image` hands back raw RGBA and no format; every provider
+/// adapter expects an encoded image, and which format is a wire detail each of
+/// them owns. So this is where RGBA becomes a PNG — one place, at the boundary,
+/// rather than the same three lines in three adapters. Everything above sees
+/// `image/png` and base64, which is what the kernel's `ImageContent` promises.
+///
+/// Deliberately only the raw-bytes tier. A clipboard carrying a *path* to an
+/// image (Finder's ⌘C on a file) is a different fact, not a different image,
+/// and reading it here would mean a picture that the composer says it has and
+/// the filesystem disagreed with by the time it is sent.
+fn read_clipboard_image() -> Option<atomcode_kernel::message::ImageContent> {
+    use base64::Engine as _;
+
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    let img = clipboard.get_image().ok()?;
+    let png = encode_rgba_png(img.width, img.height, &img.bytes)?;
+    // Downscale/re-encode an oversized paste (longest edge > 1568px or > ~1.5 MB) so a
+    // big screenshot can't blow the per-request body — the image is re-sent every turn.
+    // Falls back to the original PNG on any decode failure. See image_normalize.
+    let (media_type, data) = match atomcode_capabilities::image_normalize::normalize_image_raw(&png)
+    {
+        Some((mt, out)) => (mt, base64::engine::general_purpose::STANDARD.encode(out)),
+        None => (
+            "image/png".to_string(),
+            base64::engine::general_purpose::STANDARD.encode(png),
+        ),
+    };
+    Some(atomcode_kernel::message::ImageContent { media_type, data })
+}
+
+/// RGBA bytes into a PNG stream, or `None` if the buffer does not describe the
+/// pixels it claims to.
+///
+/// The length check is the point: `arboard` has been known to hand back a
+/// buffer that is short for its declared size on some platforms, and a PNG
+/// written from that decodes to garbage — a picture the model is shown and
+/// nobody can explain, which is worse than a paste that refuses.
+fn encode_rgba_png(width: usize, height: usize, rgba: &[u8]) -> Option<Vec<u8>> {
+    if width == 0 || height == 0 || rgba.len() != width.checked_mul(height)?.checked_mul(4)? {
+        return None;
+    }
+    let mut out = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut out, width as u32, height as u32);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut writer = enc.write_header().ok()?;
+        writer.write_image_data(rgba).ok()?;
+    }
+    Some(out)
+}
+
+/// Read text off the system clipboard.
+///
+/// The counterpart of [`read_clipboard_image`], and the same seam: the one
+/// layer that may touch the terminal is the one that owns `arboard`. Empty text
+/// is reported as `None`, because "the clipboard holds an empty string" and
+/// "the clipboard holds no text" are the same thing to everyone above this
+/// line, and collapsing them here means no caller has to decide what to say
+/// about a paste of nothing.
+fn read_clipboard_text() -> Option<String> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    let text = clipboard.get_text().ok()?;
+    (!text.is_empty()).then_some(text)
+}
+
+/// Hand the text to whatever this machine uses for a clipboard.
+///
+/// Skipped over ssh: the helper would put it on the *server's* clipboard, which
+/// is not the one anybody is looking at. There OSC 52 is the only thing that
+/// can work, and it is already on its way.
+fn local_clipboard(text: &str) {
+    use std::process::{Command, Stdio};
+
+    if std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some() {
+        return;
+    }
+    let helpers: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
+        &[("pbcopy", &[])]
+    } else if cfg!(windows) {
+        &[("clip", &[])]
+    } else {
+        &[
+            ("wl-copy", &[]),
+            ("xclip", &["-selection", "clipboard"]),
+            ("xsel", &["--clipboard", "--input"]),
+        ]
+    };
+    for (bin, args) in helpers {
+        let Ok(mut child) = Command::new(bin)
+            .args(*args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            continue; // not installed; try the next one
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            // Best effort, and deliberately not `?`: a helper that exits before
+            // reading gives EPIPE, and losing the copy — or hanging the UI —
+            // over a broken pipe would be worse than a copy that half worked.
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        // `stdin` is dropped here, so the child sees EOF and can exit.
+        let _ = child.wait();
+        return;
+    }
+}
+
+// ---- what colour is the terminal? ---------------------------------------
+
+/// What the terminal answered, and what every role resolves to on it.
+///
+/// The half of the fix that is not code: a palette chosen by measurement is
+/// only trustworthy if the measurement can be seen. When something still looks
+/// wrong, this says whether the terminal answered at all, what it said, and
+/// which roles are running below their contrast floor — instead of leaving
+/// "still can't read it" as the only available bug report.
+pub fn probe_report() -> String {
+    use std::fmt::Write as _;
+
+    let raw = crossterm::terminal::enable_raw_mode().is_ok();
+    let palette = measure_palette();
+    if raw {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+    let mut caps = crate::caps::Caps::detect();
+    caps.palette = palette;
+
+    let hex = |(r, g, b): Rgb| format!("#{r:02x}{g:02x}{b:02x}");
+    let mut out = String::new();
+    let env = |k: &str| std::env::var(k).unwrap_or_else(|_| "(unset)".into());
+    let _ = writeln!(out, "terminal");
+    let _ = writeln!(
+        out,
+        "  TERM={}  TERM_PROGRAM={}  COLORTERM={}  COLORFGBG={}",
+        env("TERM"),
+        env("TERM_PROGRAM"),
+        env("COLORTERM"),
+        env("COLORFGBG")
+    );
+    let _ = writeln!(
+        out,
+        "  colours: {:?}   unicode: {}",
+        caps.colors, caps.unicode
+    );
+    let bg = palette.background();
+    let _ = writeln!(
+        out,
+        "  background: {} ({})   leaning: {:?}",
+        hex(bg),
+        if palette.background_measured() {
+            "answered by the terminal"
+        } else {
+            "assumed — the terminal did not answer"
+        },
+        palette.theme()
+    );
+    // The other measured end. `Muted` is derived from it, so a terminal that
+    // does not answer for its foreground gets a muted that fell back to a slot
+    // table — which is a fact the report has to state, not hide.
+    let _ = writeln!(
+        out,
+        "  foreground: {}",
+        match palette.foreground() {
+            Some(fg) => format!("{} (answered by the terminal)", hex(fg)),
+            None => "assumed — the terminal did not answer".to_string(),
+        }
+    );
+    let _ = writeln!(
+        out,
+        "  slots answered: {}/16{}",
+        palette.measured(),
+        if palette.measured() == 0 {
+            "  (falling back to xterm's values)"
+        } else {
+            ""
+        }
+    );
+    for row in 0..2 {
+        let _ = write!(out, "   ");
+        for n in row * 8..row * 8 + 8 {
+            let _ = write!(out, " {n:>2} {}", hex(palette.slot(n as u8)));
+        }
+        let _ = writeln!(out);
+    }
+
+    let _ = writeln!(out, "\nroles");
+    // The palette explains itself: taking a resolved colour apart would mean
+    // naming `Color::Ansi` here, which is the one thing the layering gate
+    // forbids outside it — and a diagnostic is no reason to bypass it.
+    for line in crate::theme::explain(caps) {
+        let _ = writeln!(out, "{line}");
+    }
+    out
+}
+
+/// Ask the terminal what colours it actually renders.
+///
+/// Two questions in one exchange: OSC 11 for the background, OSC 4 for each of
+/// the sixteen slots. What comes back is what the resolver measures against, so
+/// a terminal that answers fully gets a palette chosen for *its* colours rather
+/// than for a guess about which of two families it belongs to.
+///
+/// Anything unanswered falls back in order: `COLORFGBG` for the background —
+/// a hint, not an answer, since it is set once and survives a theme change —
+/// then a dark assumption. A missing slot falls back to xterm's value for it.
+/// None of that is a failure mode: the resolver checks whatever it is given, so
+/// a wrong assumption costs contrast, not correctness.
+fn measure_palette() -> Palette {
+    let (bg, fg, slots) = query_terminal();
+    let theme = bg
+        .map(|rgb| {
+            if crate::theme::luminance(rgb) > 0.18 {
+                Theme::Light
+            } else {
+                Theme::Dark
+            }
+        })
+        .or_else(colorfgbg_theme)
+        .unwrap_or(Theme::Dark);
+    let mut p = Palette::assumed(theme);
+    if let Some(rgb) = bg {
+        p = p.with_background(rgb);
+    }
+    if let Some(rgb) = fg {
+        p = p.with_foreground(rgb);
+    }
+    for (n, rgb) in slots {
+        p = p.with_slot(n, rgb);
+    }
+    p
+}
+
+/// `COLORFGBG` is `fg;bg` or `fg;<something>;bg`. The last field is the
+/// background, as an ANSI slot.
+fn colorfgbg_theme() -> Option<Theme> {
+    theme_from_colorfgbg(&std::env::var("COLORFGBG").ok()?)
+}
+
+fn theme_from_colorfgbg(raw: &str) -> Option<Theme> {
+    let bg: u8 = raw.rsplit(';').next()?.trim().parse().ok()?;
+    // 7 (white) and 15 (bright white) are the light ones; 8 is bright black.
+    Some(if bg == 7 || (9..=15).contains(&bg) {
+        Theme::Light
+    } else {
+        Theme::Dark
+    })
+}
+
+/// One exchange: the background, the foreground and all sixteen slots, then a
+/// fence.
+///
+/// Unix only — it needs the tty as a file descriptor, with a timeout, which is
+/// not something crossterm exposes. Elsewhere the palette is assumed and
+/// `COLORFGBG` and config still apply.
+#[cfg(unix)]
+fn query_terminal() -> (Option<Rgb>, Option<Rgb>, Vec<(u8, Rgb)>) {
+    use std::os::fd::AsRawFd;
+
+    let mut query: Vec<u8> = Vec::with_capacity(256);
+    query.extend_from_slice(b"\x1b]11;?\x1b\\");
+    // OSC 10 as well: body text is drawn in the terminal's own foreground, and
+    // so is metadata (`theme::muted_ink`) — it is the one colour that is
+    // legible by construction, and a slot is not a substitute for it.
+    query.extend_from_slice(b"\x1b]10;?\x1b\\");
+    for n in 0..16u8 {
+        query.extend_from_slice(format!("\x1b]4;{n};?\x1b\\").as_bytes());
+    }
+    // DA1 last, as a fence. Every terminal answers it, and answers in order, so
+    // a terminal that ignores the colour queries ends the wait immediately
+    // instead of costing the whole timeout — and one that honours them has
+    // already replied by the time this answer arrives.
+    query.extend_from_slice(b"\x1b[c");
+
+    let mut out = std::io::stdout();
+    if out.write_all(&query).is_err() || out.flush().is_err() {
+        return (None, None, Vec::new());
+    }
+
+    let stdin = std::io::stdin();
+    let fd = stdin.as_raw_fd();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+    let mut seen: Vec<u8> = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 512];
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() || !readable(fd, left) {
+            break;
+        }
+        // SAFETY: `fd` is stdin, borrowed for the length of this call, and the
+        // buffer is a live local of exactly `chunk.len()` bytes.
+        let n = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+        if n <= 0 {
+            break;
+        }
+        seen.extend_from_slice(&chunk[..n as usize]);
+        if answered_da1(&seen) {
+            break;
+        }
+    }
+    (parse_osc11(&seen), parse_osc10(&seen), parse_osc4(&seen))
+}
+
+#[cfg(not(unix))]
+fn query_terminal() -> (Option<Rgb>, Option<Rgb>, Vec<(u8, Rgb)>) {
+    // No tty descriptor to read a reply from. `COLORFGBG` and config remain.
+    (None, None, Vec::new())
+}
+
+/// Wait until `fd` has something to read, or the timeout passes.
+#[cfg(unix)]
+fn readable(fd: std::os::fd::RawFd, within: std::time::Duration) -> bool {
+    let mut poll = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ms = within.as_millis().min(i32::MAX as u128) as i32;
+    // SAFETY: one initialised `pollfd`, and the count says so.
+    unsafe { libc::poll(&mut poll, 1, ms) > 0 }
+}
+
+/// Has a Device Attributes reply (`ESC [ ... c`) arrived?
+///
+/// Checked structurally rather than by looking for a `c`, because `c` is also a
+/// hex digit and the colour reply is full of them.
+fn answered_da1(seen: &[u8]) -> bool {
+    let mut from = 0;
+    while let Some(at) = seen[from..].iter().position(|&b| b == 0x1b) {
+        let esc = from + at;
+        if seen.get(esc + 1) == Some(&b'[') {
+            let mut i = esc + 2;
+            while let Some(&b) = seen.get(i) {
+                if b.is_ascii_digit() || b == b';' || b == b'?' {
+                    i += 1;
+                    continue;
+                }
+                return b == b'c';
+            }
+            return false;
+        }
+        from = esc + 1;
+    }
+    false
+}
+
+/// The payloads of every OSC reply in the stream — what sits between `ESC ]`
+/// and its terminator (BEL, or `ESC \\`).
+///
+/// Scanned rather than pattern-matched on the whole buffer because seventeen
+/// answers arrive interleaved with a device-attributes reply, in an order the
+/// terminal chooses.
+fn osc_payloads(seen: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i + 1 < seen.len() {
+        if seen[i] != 0x1b || seen[i + 1] != b']' {
+            i += 1;
+            continue;
+        }
+        let body = i + 2;
+        let mut j = body;
+        while j < seen.len() {
+            if seen[j] == 0x07 || (seen[j] == 0x1b && seen.get(j + 1) == Some(&b'\\')) {
+                break;
+            }
+            j += 1;
+        }
+        if j < seen.len() {
+            out.push(String::from_utf8_lossy(&seen[body..j]).into_owned());
+        }
+        i = j + 1;
+    }
+    out
+}
+
+/// `rgb:RRRR/GGGG/BBBB` — or `#RRGGBB`, the older form.
+///
+/// Components are one to four hex digits: xterm answers in sixteen bits per
+/// channel, others in eight. Both scale to the top byte.
+fn parse_colour(spec: &str) -> Option<Rgb> {
+    let spec = spec.trim();
+    let hex = match spec.strip_prefix("rgb:") {
+        Some(rest) => rest,
+        None => spec.strip_prefix('#').filter(|h| h.len() == 6)?,
+    };
+    let parts: Vec<&str> = if hex.contains('/') {
+        hex.split('/').collect()
+    } else {
+        vec![hex.get(0..2)?, hex.get(2..4)?, hex.get(4..6)?]
+    };
+    if parts.len() < 3 {
+        return None;
+    }
+    let scale = |p: &str| -> Option<u8> {
+        let p = p.trim();
+        if p.is_empty() || p.len() > 4 || !p.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        let v = u32::from_str_radix(p, 16).ok()?;
+        // One hex digit is four bits, four are sixteen; normalise to the top
+        // eight so every width lands on the same scale.
+        Some((v << (4 * (4 - p.len())) >> 8) as u8)
+    };
+    Some((scale(parts[0])?, scale(parts[1])?, scale(parts[2])?))
+}
+
+/// The background, from an OSC 11 reply.
+fn parse_osc11(seen: &[u8]) -> Option<Rgb> {
+    osc_payloads(seen)
+        .iter()
+        .find_map(|p| parse_colour(p.strip_prefix("11;")?))
+}
+
+/// The terminal's own text colour, from an OSC 10 reply. Absent on terminals
+/// that do not implement the query — `Secondary` and `ToolName` need no number
+/// at all, so only metadata feels it.
+fn parse_osc10(seen: &[u8]) -> Option<Rgb> {
+    osc_payloads(seen)
+        .iter()
+        .find_map(|p| parse_colour(p.strip_prefix("10;")?))
+}
+
+/// The slots, from the OSC 4 replies. Slots the terminal did not answer for are
+/// simply absent — the palette falls back to xterm's value for each.
+fn parse_osc4(seen: &[u8]) -> Vec<(u8, Rgb)> {
+    osc_payloads(seen)
+        .iter()
+        .filter_map(|p| {
+            let rest = p.strip_prefix("4;")?;
+            let (n, spec) = rest.split_once(';')?;
+            Some((n.trim().parse::<u8>().ok()?, parse_colour(spec)?))
+        })
+        .filter(|(n, _)| *n < 16)
+        .collect()
+}
+
+/// The last frame that reached the terminal, so an unchanged screen is not
+/// repainted.
+///
+/// The animation rows ask to be woken about nine times a second so a spinner
+/// has frames to show. Nothing else on the screen moves at that rate, and an
+/// idle screen does not move at all — but every one of those wake-ups used to
+/// arrive at the terminal as a full erase and a full redraw, whether or not a
+/// single cell had changed. That is a screen that never settles.
+#[derive(Debug, Default)]
+pub struct LastPainted(Mutex<Option<ansi::Lines>>);
+
+impl LastPainted {
+    /// Forget what was painted, so the next frame is drawn in full. For after
+    /// anything that may have written over the screen behind our back.
+    pub fn forget(&self) {
+        *self.0.lock().expect("last frame poisoned") = None;
+    }
+}
+
+impl Surface for Terminal {
+    fn describe(&self) -> String {
+        "the terminal, full screen".into()
+    }
+    fn size(&self) -> (u16, u16) {
+        crossterm::terminal::size().unwrap_or((80, 24))
+    }
+    fn present(&self, frame: &Frame) {
+        // Only the rows that moved, and silence for a screen that did not.
+        let patch = self.patch(frame);
+        if patch.is_empty() {
+            return;
+        }
+        let mut out = std::io::stdout();
+        let _ = out.write_all(patch.as_bytes());
+        let _ = out.flush();
+    }
+    fn caps(&self) -> crate::caps::Caps {
+        self.caps
+    }
+    fn set_mouse(&self, on: bool) {
+        use std::sync::atomic::Ordering;
+        if self.grab.swap(on, Ordering::SeqCst) == on {
+            return;
+        }
+        // Handing it back mid-hover must not leave the terminal reporting every
+        // cell the pointer crosses — and the record has to say what the terminal
+        // was told, so the hover *intent* goes with it rather than only the
+        // state derived from it.
+        if !on {
+            self.hover.store(false, Ordering::SeqCst);
+        }
+        self.refresh_pointer();
+    }
+    fn mouse(&self) -> bool {
+        self.grab.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    /// Turn free motion on or off.
+    ///
+    /// Only when the mouse is ours: reporting motion with the pointer handed
+    /// back would be asking for events nothing here owns, and asking for them
+    /// while a person is selecting text with the terminal's own gesture is
+    /// exactly the packet-per-cell cost the switch exists to avoid. That
+    /// conjunction is `Pointer::from_intents` rather than an `&&` here, so this
+    /// side cannot ask for a state the terminal does not have.
+    fn set_motion(&self, on: bool) {
+        use std::sync::atomic::Ordering;
+        if self.hover.swap(on, Ordering::SeqCst) == on {
+            return;
+        }
+        self.refresh_pointer();
+    }
+    fn motion(&self) -> bool {
+        self.pointer_mode() == ansi::Pointer::ButtonsAndHover
+    }
+    /// Forwards to the inherent method by name rather than through `self.`,
+    /// which would resolve back to itself: an inherent `pointer_mode` shadows a
+    /// trait one, so `self.pointer_mode()` here means the inherent method — but
+    /// a reader (and a future rename) deserves the explicit form, since the
+    /// trait's *default* answer is `Terminal` and a missing forward is a
+    /// silent "the terminal has the mouse" on a machine where it does not.
+    fn pointer_mode(&self) -> crate::ansi::Pointer {
+        Terminal::pointer_mode(self)
+    }
+    fn heal_mouse(&self) {
+        use std::sync::atomic::Ordering;
+        // Nothing to say while the pointer is the terminal's: the state we
+        // would be repeating is the one already in force.
+        if !self.grab.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut out = std::io::stdout();
+        let _ = out.write_all(self.pointer_mode().escape().as_bytes());
+        let _ = out.flush();
+    }
+    fn forget(&self) {
+        self.painted.forget();
+    }
+    fn set_title(&self, title: &str) {
+        let mut out = std::io::stdout();
+        let _ = out.write_all(crate::ansi::set_title(title).as_bytes());
+        let _ = out.flush();
+    }
+    fn copy(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        // Both paths, because either can be unavailable and they fail
+        // differently. OSC 52 crosses ssh and tmux, but the terminal may refuse
+        // it — iTerm2 ships with clipboard access *off* and the refusal is
+        // silent, which is a copy that looks like it worked. A local helper
+        // always works locally and is the wrong machine over ssh. Doing both
+        // means the copy lands whichever of those is true; writing the same
+        // text to the same clipboard twice costs nothing.
+        let mut out = std::io::stdout();
+        let _ = out.write_all(ansi::set_clipboard(text).as_bytes());
+        let _ = out.flush();
+        local_clipboard(text);
+    }
+    fn clipboard_image(&self) -> Option<atomcode_kernel::message::ImageContent> {
+        read_clipboard_image()
+    }
+    fn clipboard_text(&self) -> Option<String> {
+        read_clipboard_text()
+    }
+    fn restore(&self) {
+        self.painted.forget();
+        // The same path a panic takes, so an ordinary exit and a crash cannot
+        // give the screen back two different ways — and so the second caller
+        // is a no-op rather than a double `dup2`.
+        emergency_restore();
+        // Last, so anything it has to report is printed to a terminal that is
+        // back in its normal mode.
+        if let Some(held) = &self.stderr {
+            give_back_stderr(held);
+        }
+    }
+}
+
+impl Drop for Terminal {
+    /// Restores on every path out, including a panic. Without this a crash
+    /// leaves the user in a raw-mode alternate screen with no echo.
+    fn drop(&mut self) {
+        if self.raw {
+            self.restore();
+        }
+    }
+}
+
+/// Translate a crossterm event. `None` for events this UI has no use for.
+pub fn from_crossterm(event: crossterm::event::Event) -> Option<Input> {
+    use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+    use crossterm::event::{MouseButton, MouseEventKind};
+    match event {
+        Event::Resize(w, h) => Some(Input::Resize(w, h)),
+        Event::Paste(text) => Some(Input::Paste(text)),
+        // Press, not release: a fold should happen under the finger. A move is
+        // reported rather than dropped — the menu is the one thing here that
+        // follows a pointer and it needs to know which row it is over. The
+        // terminal sends these whether or not anyone reads them (crossterm
+        // captures with any-motion tracking on), so the reader is the whole
+        // cost.
+        Event::Mouse(m) => {
+            let click = match m.kind {
+                MouseEventKind::Down(MouseButton::Left) => Click::Press,
+                // The secondary button opens a menu; it is never a caret and
+                // never a selection, which is why it is a distinct `Click`
+                // rather than a second `Press`.
+                MouseEventKind::Down(MouseButton::Right) => Click::RightPress,
+                MouseEventKind::Drag(MouseButton::Left) => Click::Drag,
+                MouseEventKind::Up(MouseButton::Left) => Click::Release,
+                MouseEventKind::Moved => Click::Hover,
+                MouseEventKind::ScrollUp => Click::WheelUp,
+                MouseEventKind::ScrollDown => Click::WheelDown,
+                _ => return None,
+            };
+            Some(Input::Mouse(click, m.column, m.row))
+        }
+        Event::Key(k) if k.kind == KeyEventKind::Press => {
+            let key = match k.code {
+                KeyCode::Char(c) => Key::Char(c),
+                KeyCode::Enter => Key::Enter,
+                KeyCode::Backspace => Key::Backspace,
+                KeyCode::Delete => Key::Delete,
+                KeyCode::Tab => Key::Tab,
+                KeyCode::BackTab => Key::BackTab,
+                KeyCode::Esc => Key::Esc,
+                KeyCode::Up => Key::Up,
+                KeyCode::Down => Key::Down,
+                KeyCode::Left => Key::Left,
+                KeyCode::Right => Key::Right,
+                KeyCode::Home => Key::Home,
+                KeyCode::End => Key::End,
+                KeyCode::PageUp => Key::PageUp,
+                KeyCode::PageDown => Key::PageDown,
+                _ => return None,
+            };
+            Some(Input::Key(KeyPress::new(
+                key,
+                Mods {
+                    ctrl: k.modifiers.contains(KeyModifiers::CONTROL),
+                    alt: k.modifiers.contains(KeyModifiers::ALT),
+                    shift: k.modifiers.contains(KeyModifiers::SHIFT),
+                    // Cmd on macOS arrives as SUPER (and as META on some
+                    // terminals); either way it must not be dropped, or `Cmd+C`
+                    // collapses to a bare `c` and lands in the field.
+                    cmd: k.modifiers.contains(KeyModifiers::SUPER)
+                        || k.modifiers.contains(KeyModifiers::META),
+                },
+            )))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frame::{Line, Rect};
+
+    #[test]
+    fn a_headless_surface_keeps_every_frame_not_just_the_last() {
+        let s = Headless::new(10, 2);
+        for n in 0..3 {
+            let mut f = Frame::new(10, 2);
+            f.place(
+                "m",
+                Rect::new(0, 0, 10, 1),
+                vec![Line::raw(format!("f{n}"))],
+            );
+            s.present(&f);
+        }
+        assert_eq!(s.frame_count(), 3, "the sequence is what a test asserts on");
+        assert_eq!(s.frames()[0].rows()[0].trim(), "f0");
+        assert_eq!(s.text().lines().next().unwrap().trim(), "f2");
+    }
+
+    #[test]
+    fn the_bytes_are_available_for_an_external_oracle() {
+        let s = Headless::new(6, 1);
+        let mut f = Frame::new(6, 1);
+        f.place("m", Rect::new(0, 0, 6, 1), vec![Line::raw("hi")]);
+        s.present(&f);
+        assert!(s.bytes().contains("\x1b[1;1Hhi"));
+    }
+
+    #[test]
+    fn a_key_press_is_constructible_without_a_keyboard() {
+        assert_eq!(KeyPress::ctrl('c').mods, Mods::CTRL);
+        assert_eq!(KeyPress::ch('a').key, Key::Char('a'));
+    }
+
+    /// A screen of `n` rows where only the last one animates.
+    fn screen(rows: u16, last: &str) -> Frame {
+        let mut f = Frame::new(20, rows);
+        for y in 0..rows - 1 {
+            f.place(
+                format!("m{y}"),
+                Rect::new(0, y, 20, 1),
+                vec![Line::raw(format!("row {y}"))],
+            );
+        }
+        f.place(
+            "status",
+            Rect::new(0, rows - 1, 20, 1),
+            vec![Line::raw(last)],
+        );
+        f
+    }
+
+    #[test]
+    fn an_unchanged_screen_is_not_repainted_at_all() {
+        // The defect this closes: the spinner asks to be woken nine times a
+        // second, and every wake-up used to reach the terminal as a full erase
+        // and a full redraw — on an idle screen, with nothing to redraw.
+        let a = ansi::encode_rows(&screen(6, "idle"), crate::caps::Caps::default());
+        let b = ansi::encode_rows(&screen(6, "idle"), crate::caps::Caps::default());
+        assert!(
+            b.patch_from(Some(&a)).is_empty(),
+            "an identical frame has nothing to say"
+        );
+        assert!(
+            !b.patch_from(None).is_empty(),
+            "but a first paint still draws"
+        );
+    }
+
+    #[test]
+    fn only_the_row_that_moved_is_repainted() {
+        // A spinner is one row. Repainting six because one of them ticked is
+        // what a terminal sees as the screen never settling.
+        let caps = crate::caps::Caps::default();
+        let a = ansi::encode_rows(&screen(6, "· thinking"), caps);
+        let b = ansi::encode_rows(&screen(6, "⋯ thinking"), caps);
+        let patch = b.patch_from(Some(&a));
+        assert!(patch.contains("\x1b[6;1H"), "the status row: {patch:?}");
+        for row in 1..=5 {
+            assert!(
+                !patch.contains(&format!("\x1b[{row};1H")),
+                "row {row} did not change: {patch:?}"
+            );
+        }
+        assert!(patch.len() < b.full().len() / 2, "a patch, not a repaint");
+    }
+
+    #[test]
+    fn a_resize_repaints_everything_rather_than_diffing_a_reflow() {
+        let caps = crate::caps::Caps::default();
+        let small = ansi::encode_rows(&screen(4, "idle"), caps);
+        let big = ansi::encode_rows(&screen(8, "idle"), caps);
+        assert_eq!(
+            big.patch_from(Some(&small)),
+            big.full(),
+            "a different size is not a diff"
+        );
+    }
+
+    #[test]
+    fn the_terminals_own_background_decides_the_palette() {
+        // The exchange this parses is the whole of theme detection: get it
+        // wrong and a light terminal is painted in a dark palette, which is
+        // unreadable rather than merely ugly.
+        let dark = b"\x1b]11;rgb:1c1c/1c1c/1c1c\x1b\\";
+        assert_eq!(parse_osc11(dark), Some((0x1c, 0x1c, 0x1c)));
+
+        // Eight bits per channel, BEL-terminated — the other common shape.
+        let light = b"\x1b]11;rgb:ff/ff/f8\x07";
+        assert_eq!(parse_osc11(light), Some((0xff, 0xff, 0xf8)));
+
+        // And the older `#RRGGBB`.
+        assert_eq!(parse_osc11(b"\x1b]11;#ffffff\x07"), Some((255, 255, 255)));
+
+        // A terminal that answered only the fence has said nothing about colour.
+        assert_eq!(parse_osc11(b"\x1b[?62;1;2;6;9;15;22c"), None);
+        assert_eq!(parse_osc11(b""), None);
+        assert_eq!(parse_osc11(b"\x1b]11;not-a-colour\x07"), None);
+    }
+
+    #[test]
+    fn the_fence_is_recognised_by_shape_not_by_the_letter_c() {
+        // `c` is also a hex digit, and the colour reply is full of them. A
+        // substring check would end the wait on `rgb:1c1c/...` and throw the
+        // answer away — the bug this shape check exists to prevent.
+        assert!(answered_da1(b"\x1b[?62;1;2c"));
+        assert!(answered_da1(b"\x1b]11;rgb:1c1c/1c1c/1c1c\x07\x1b[?6c"));
+        assert!(
+            !answered_da1(b"\x1b]11;rgb:1c1c/1c1c/1c1c\x07"),
+            "the colour reply alone is not the fence"
+        );
+        assert!(!answered_da1(b"\x1b[?62;1"), "still arriving");
+        assert!(!answered_da1(b""));
+    }
+
+    #[test]
+    fn colorfgbg_is_read_as_a_hint_when_the_terminal_will_not_answer() {
+        assert_eq!(theme_from_colorfgbg("0;15"), Some(Theme::Light));
+        assert_eq!(theme_from_colorfgbg("15;0"), Some(Theme::Dark));
+        assert_eq!(theme_from_colorfgbg("0;default;15"), Some(Theme::Light));
+        assert_eq!(theme_from_colorfgbg("7"), Some(Theme::Light));
+        assert_eq!(theme_from_colorfgbg("8"), Some(Theme::Dark), "bright black");
+        assert_eq!(theme_from_colorfgbg(""), None);
+        assert_eq!(theme_from_colorfgbg("default;default"), None);
+    }
+
+    #[test]
+    fn a_white_background_reads_as_light_and_a_dark_one_as_dark() {
+        let theme = |(r, g, b): (u8, u8, u8)| {
+            let l = 0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32;
+            if l > 127.5 {
+                Theme::Light
+            } else {
+                Theme::Dark
+            }
+        };
+        assert_eq!(theme((255, 255, 255)), Theme::Light);
+        assert_eq!(theme((250, 250, 245)), Theme::Light, "off-white");
+        assert_eq!(theme((0, 0, 0)), Theme::Dark);
+        assert_eq!(theme((0x1c, 0x1c, 0x1c)), Theme::Dark, "a dark grey");
+        // Solarized light and dark, the two that a naive average gets wrong.
+        assert_eq!(theme((0xfd, 0xf6, 0xe3)), Theme::Light);
+        assert_eq!(theme((0x00, 0x2b, 0x36)), Theme::Dark);
+    }
+
+    #[test]
+    fn a_super_modifier_survives_so_cmd_c_is_not_a_bare_c() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        let press = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER);
+        let Some(Input::Key(kp)) = from_crossterm(Event::Key(press)) else {
+            panic!("a Cmd+C press is a key event");
+        };
+        assert!(kp.mods.cmd, "the Cmd/Super modifier is kept, not dropped");
+        assert_ne!(
+            kp.mods,
+            Mods::NONE,
+            "so the press never falls through to Insert('c')"
+        );
+    }
+
+    #[test]
+    fn crossterm_key_releases_are_dropped_not_doubled() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+        let press = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        assert!(from_crossterm(Event::Key(press)).is_some());
+        let mut release = press;
+        release.kind = KeyEventKind::Release;
+        assert!(
+            from_crossterm(Event::Key(release)).is_none(),
+            "a release must not read as a second press"
+        );
+    }
+
+    #[test]
+    fn a_move_arrives_as_a_hover_and_not_as_any_kind_of_press() {
+        // The menu follows the pointer off this, and the rest of the UI must not
+        // read it as anything that asks for something. A `Moved` translated to
+        // `Press` would move the caret on every cell the pointer crossed.
+        use crossterm::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+        let moved = MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 7,
+            row: 9,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        assert_eq!(
+            from_crossterm(Event::Mouse(moved)),
+            Some(Input::Mouse(Click::Hover, 7, 9))
+        );
+        let mut dragged = moved;
+        dragged.kind = MouseEventKind::Drag(MouseButton::Left);
+        assert_eq!(
+            from_crossterm(Event::Mouse(dragged)),
+            Some(Input::Mouse(Click::Drag, 7, 9)),
+            "a move with the button held is still a drag, not a hover"
+        );
+    }
+
+    /// The screen is given back exactly once, whoever gets there first.
+    ///
+    /// The panic hook and `restore` both call it, and on a crash they both
+    /// run: the hook at panic time, `restore` as `Drop` unwinds past it. Two
+    /// `dup2`s on a descriptor the first call already closed is how that kind
+    /// of safety net becomes its own crash.
+    #[test]
+    fn the_screen_is_given_back_once_and_only_once() {
+        use std::sync::atomic::Ordering;
+
+        // Arming without having entered anything is safe: nothing was taken,
+        // so the restore is a few bytes at a stdout the harness is capturing.
+        arm_panic_restore(None);
+        assert!(SCREEN_HELD.load(Ordering::SeqCst), "armed");
+        emergency_restore();
+        assert!(
+            !SCREEN_HELD.load(Ordering::SeqCst),
+            "the first caller wins the swap"
+        );
+        // The second is a no-op rather than a second attempt at the same
+        // descriptor.
+        emergency_restore();
+        assert!(!SCREEN_HELD.load(Ordering::SeqCst));
+    }
+}

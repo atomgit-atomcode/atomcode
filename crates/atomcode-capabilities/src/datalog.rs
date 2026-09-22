@@ -101,10 +101,7 @@ pub fn build_cas_index(cas_contents: &str) -> HashMap<u32, serde_json::Value> {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
-        if let (Some(id), Some(body)) = (
-            value.get("i").and_then(|v| v.as_u64()),
-            value.get("c"),
-        ) {
+        if let (Some(id), Some(body)) = (value.get("i").and_then(|v| v.as_u64()), value.get("c")) {
             index.insert(id as u32, body.clone());
         }
     }
@@ -208,6 +205,15 @@ enum WriteOp {
     },
     Barrier {
         reply: tokio::sync::oneshot::Sender<()>,
+    },
+    /// The same wait, for a caller with no `await` to spend.
+    ///
+    /// Tearing a tree down is synchronous (`Context::effect`), and that is the
+    /// last moment anything can make sure what was queued is on disk. Without
+    /// it the final turn's log is whatever the writer thread happened to get
+    /// through before the process went away.
+    BarrierSync {
+        reply: mpsc::Sender<()>,
     },
 }
 
@@ -350,14 +356,30 @@ impl DatalogHook {
     }
 }
 
-#[async_trait]
-impl LifecycleHooks for DatalogHook {
-    async fn user_prompt_submit(&self, text: &mut String) -> Result<(), String> {
-        self.start_turn(text);
-        Ok(())
+/// The datalog as a SINK, apart from the seams that drive it.
+///
+/// `DatalogHook` was written as one struct wearing two kernel traits, with every
+/// decision inlined in the trait methods. The harness reaches the same moments
+/// through entirely different seams (`turn/start`, `agent/request`,
+/// `tool/result`, `turn/end`), so the `datalog` row drives these directly.
+///
+/// Same split as the approval gates and the verify cadence before it: what to
+/// write is decided once, and how it is delivered is the assembly's business.
+impl DatalogHook {
+    /// A new turn opened, with the text that opened it.
+    pub fn begin_turn(&self, prompt: &str) {
+        self.start_turn(prompt);
     }
 
-    async fn on_request(
+    /// A request is about to go to the model — the JSONL record.
+    ///
+    /// The reason this row cannot be a plain session-log listener: the log
+    /// holds FACTS (a user message, an assistant message, a tool result), and
+    /// this record is the ASSEMBLED REQUEST — the system prompt as sent, every
+    /// message, the tools, the options, the cache epoch. That is exactly what a
+    /// prompt-cache or "did the model actually see it" investigation needs, and
+    /// it exists nowhere else.
+    pub async fn record_request(
         &self,
         messages: &[Message],
         tools: &[ToolDef],
@@ -387,14 +409,24 @@ impl LifecycleHooks for DatalogHook {
         // empty ref rather than aborting the record (rehydration tolerates it).
         let mut cas_lines = String::new();
         let log = &mut *state;
-        let message_refs =
-            intern_bodies(&mut log.blob_ids, &mut log.next_blob_id, "m", messages, &mut cas_lines);
-        let tool_refs =
-            intern_bodies(&mut log.blob_ids, &mut log.next_blob_id, "t", tools, &mut cas_lines);
+        let message_refs = intern_bodies(
+            &mut log.blob_ids,
+            &mut log.next_blob_id,
+            "m",
+            messages,
+            &mut cas_lines,
+        );
+        let tool_refs = intern_bodies(
+            &mut log.blob_ids,
+            &mut log.next_blob_id,
+            "t",
+            tools,
+            &mut cas_lines,
+        );
         let record = serde_json::json!({
             "v": RECORD_FORMAT_VERSION,
             "step": ctx.round,
-            "session_id": ctx.session_id.as_deref().map(|id| id.as_ref()).unwrap_or(""),
+            "session_id": ctx.session_id.as_deref().unwrap_or(""),
             "turn_id": ctx.turn_id,
             "request_id": ctx.request_id,
             "model": self.model,
@@ -431,7 +463,8 @@ impl LifecycleHooks for DatalogHook {
         self.append_markdown(markdown);
     }
 
-    async fn on_model_response(&self, response: &mut Message) {
+    /// What the model answered.
+    pub fn record_response(&self, response: &Message) {
         let mut state = self.lock();
         if !state.active {
             return;
@@ -483,64 +516,28 @@ impl LifecycleHooks for DatalogHook {
         self.append_markdown(markdown);
     }
 
-    async fn on_error(&self, error: &str) {
+    /// Something went wrong mid-turn.
+    pub fn record_error(&self, error: &str) {
         if !self.lock().active {
             return;
         }
         self.append_markdown(format!("**Error:** {error}\n\n"));
     }
 
-    async fn turn_complete(&self, _convo: &Conversation, reason: &StopReason, _ctx: &TurnCtx) {
-        let markdown = {
-            let mut state = self.lock();
-            if !state.active {
-                return;
-            }
-            let duration = state
-                .started
-                .map(|started| started.elapsed().as_secs_f64())
-                .unwrap_or_default();
-            let rounds = state.rounds;
-            let tool_calls = state.tool_calls;
-            let total_tokens = state.total_tokens;
-            let mut markdown = String::new();
-            let _ = writeln!(
-                markdown,
-                "---\n**Stats:** {rounds} turns, {tool_calls} tool calls, {duration:.1}s, {total_tokens} tokens\n\
-                 **End:** reason={reason:?}",
-            );
-            state.active = false;
-            markdown
-        };
-        self.append_markdown(markdown);
-        self.writer.barrier().await;
-    }
-}
-
-#[async_trait]
-impl ToolMiddleware for DatalogHook {
-    async fn before(
-        &self,
-        call: &mut ToolCall,
-        _tool: &Arc<dyn Tool>,
-        _rt: &RequestCtx,
-    ) -> atomcode_kernel::middleware::BeforeOutcome {
+    /// Remember a call id's tool name, so its result can be labelled.
+    pub fn note_tool_call(&self, id: &str, name: &str) {
         let mut state = self.lock();
         if state.active {
-            state.tool_names.insert(call.id.clone(), call.name.clone());
-            state.tool_started.insert(call.id.clone(), Instant::now());
+            state.tool_names.insert(id.to_string(), name.to_string());
+            state.tool_started.insert(id.to_string(), Instant::now());
         }
-        atomcode_kernel::middleware::BeforeOutcome::Proceed
     }
 
-    async fn after(
-        &self,
-        result: &mut ToolResult,
-        _tool: Option<&std::sync::Arc<dyn atomcode_kernel::tool::Tool>>,
-    ) -> AfterOutcome {
+    /// One tool result.
+    pub fn record_tool_result(&self, result: &ToolResult) {
         let mut state = self.lock();
         if !state.active {
-            return AfterOutcome::Proceed;
+            return;
         }
         let name = state
             .tool_names
@@ -558,6 +555,114 @@ impl ToolMiddleware for DatalogHook {
             "**Tool result:** `{name}` (`{}`, {status}{dur})\n```\n{}\n```\n\n",
             result.call_id, result.content
         ));
+    }
+
+    /// Wait until everything queued has actually been written.
+    ///
+    /// Separate from [`Self::finish_turn`] because the write is a channel push
+    /// and the wait is not: a sync listener can do the first and spawn the
+    /// second, while the kernel hook does both in order as it always did.
+    pub async fn flush(&self) {
+        self.writer.barrier().await;
+    }
+
+    /// The same, for a caller with no `await` — a teardown, in practice.
+    ///
+    /// The gap this closes: the turn-end listener is synchronous, so the flush
+    /// it asks for is *spawned*, and nothing after that waits for it. In a
+    /// process that keeps running, the writer thread gets there on its own and
+    /// the only cost is when. In one that ends right after a turn — a `-p` run,
+    /// a test reading the file it just asked for — the tail of the log is
+    /// whatever the thread happened to finish first.
+    pub fn flush_blocking(&self) {
+        self.writer.barrier_blocking();
+    }
+
+    /// The turn ended; write the stats.
+    pub fn finish_turn(&self, reason: &StopReason) {
+        self.finish_turn_named(&format!("{reason:?}"));
+    }
+
+    /// As [`Self::finish_turn`], for a caller whose stop reason is its own type.
+    ///
+    /// The harness has a `StopReason` of its own, and the datalog only ever
+    /// rendered this value with `{:?}` — so taking the rendering keeps the two
+    /// crates from having to agree on an enum neither of them owns.
+    pub fn finish_turn_named(&self, reason: &str) {
+        let markdown = {
+            let mut state = self.lock();
+            if !state.active {
+                return;
+            }
+            let duration = state
+                .started
+                .map(|started| started.elapsed().as_secs_f64())
+                .unwrap_or_default();
+            let rounds = state.rounds;
+            let tool_calls = state.tool_calls;
+            let total_tokens = state.total_tokens;
+            let mut markdown = String::new();
+            let _ = writeln!(
+                markdown,
+                "---\n**Stats:** {rounds} turns, {tool_calls} tool calls, {duration:.1}s, {total_tokens} tokens\n\
+                 **End:** reason={reason}",
+            );
+            state.active = false;
+            markdown
+        };
+        self.append_markdown(markdown);
+    }
+}
+
+#[async_trait]
+impl LifecycleHooks for DatalogHook {
+    async fn user_prompt_submit(&self, text: &mut String) -> Result<(), String> {
+        self.begin_turn(text);
+        Ok(())
+    }
+
+    async fn on_request(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+        options: &ChatOptions,
+        ctx: &TurnCtx,
+    ) {
+        self.record_request(messages, tools, options, ctx).await;
+    }
+
+    async fn on_model_response(&self, response: &mut Message) {
+        self.record_response(response);
+    }
+
+    async fn on_error(&self, error: &str) {
+        self.record_error(error);
+    }
+
+    async fn turn_complete(&self, _convo: &Conversation, reason: &StopReason, _ctx: &TurnCtx) {
+        self.finish_turn(reason);
+        self.flush().await;
+    }
+}
+
+#[async_trait]
+impl ToolMiddleware for DatalogHook {
+    async fn before(
+        &self,
+        call: &mut ToolCall,
+        _tool: &Arc<dyn Tool>,
+        _rt: &RequestCtx,
+    ) -> atomcode_kernel::middleware::BeforeOutcome {
+        self.note_tool_call(&call.id, &call.name);
+        atomcode_kernel::middleware::BeforeOutcome::Proceed
+    }
+
+    async fn after(
+        &self,
+        result: &mut ToolResult,
+        _tool: Option<&std::sync::Arc<dyn atomcode_kernel::tool::Tool>>,
+    ) -> AfterOutcome {
+        self.record_tool_result(result);
         AfterOutcome::Proceed
     }
 }
@@ -597,12 +702,29 @@ impl DatalogWriter {
         let _ = self.tx.send(WriteOp::Append { path, content });
     }
 
+    /// Wait, without an `await`, for at most [`SYNC_BARRIER_WAIT`].
+    ///
+    /// Bounded because this runs while something is being torn down: a writer
+    /// that has gone away must not hold the teardown open, and what is at stake
+    /// is the tail of a log rather than anything the program needs next.
+    fn barrier_blocking(&self) {
+        let (reply, receive) = mpsc::channel();
+        if self.tx.send(WriteOp::BarrierSync { reply }).is_err() {
+            return;
+        }
+        let _ = receive.recv_timeout(SYNC_BARRIER_WAIT);
+    }
+
     async fn barrier(&self) {
         let (reply, receive) = tokio::sync::oneshot::channel();
         let _ = self.tx.send(WriteOp::Barrier { reply });
         let _ = tokio::time::timeout(IO_WAIT_TIMEOUT, receive).await;
     }
 }
+
+/// How long a teardown waits for the log to land. Long enough for a queue of
+/// turn markdown, short enough that a wedged writer cannot hold a shutdown.
+const SYNC_BARRIER_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn writer_loop(rx: mpsc::Receiver<WriteOp>) {
     while let Ok(operation) = rx.recv() {
@@ -624,6 +746,9 @@ fn writer_loop(rx: mpsc::Receiver<WriteOp>) {
                 if let Ok(mut file) = open_private_append(&path) {
                     let _ = file.write_all(content.as_bytes());
                 }
+            }
+            WriteOp::BarrierSync { reply } => {
+                let _ = reply.send(());
             }
             WriteOp::Barrier { reply } => {
                 let _ = reply.send(());
@@ -962,7 +1087,8 @@ mod tests {
         // refs in the record, no inline `messages`.
         let jsonl = fs::read_to_string(jsonl_path).unwrap();
         assert_eq!(jsonl.lines().count(), 2);
-        let record: serde_json::Value = serde_json::from_str(jsonl.lines().next().unwrap()).unwrap();
+        let record: serde_json::Value =
+            serde_json::from_str(jsonl.lines().next().unwrap()).unwrap();
         assert_eq!(record["v"], RECORD_FORMAT_VERSION);
         assert!(record.get("messages").is_none());
         assert_eq!(record["message_refs"].as_array().unwrap().len(), 1);
@@ -987,8 +1113,20 @@ mod tests {
         let mut cas = String::new();
         let a = serde_json::json!({"role":"user","text":"a"});
         let b = serde_json::json!({"role":"user","text":"b"});
-        let refs1 = intern_bodies(&mut seen, &mut next_id, "m", std::slice::from_ref(&a), &mut cas);
-        let refs2 = intern_bodies(&mut seen, &mut next_id, "m", &[a.clone(), b.clone()], &mut cas);
+        let refs1 = intern_bodies(
+            &mut seen,
+            &mut next_id,
+            "m",
+            std::slice::from_ref(&a),
+            &mut cas,
+        );
+        let refs2 = intern_bodies(
+            &mut seen,
+            &mut next_id,
+            "m",
+            &[a.clone(), b.clone()],
+            &mut cas,
+        );
         assert_eq!(refs2[0], refs1[0], "identical body → same blob id");
         assert_eq!(cas.lines().count(), 2, "a interned once despite two sends");
 

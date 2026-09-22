@@ -1284,6 +1284,13 @@ pub struct UiState {
     /// turn-complete / turn-cancelled so the idle spinner
     /// (rare) doesn't tick a stale duration.
     pub phase_started_at: Option<std::time::Instant>,
+    /// `turn_output_chars` at the moment the current phase clock started. The spinner's
+    /// `tok/s` throughput is computed over the CURRENT generation phase only —
+    /// `(turn_output_chars - phase_start_output_chars) / 4 ÷ phase_elapsed` — so an
+    /// earlier phase's tool-execution / idle time can't dilute the rate toward 0 (the
+    /// old whole-turn average did, reading e.g. "1 tok/s" on tool-heavy turns). Stamped
+    /// alongside `phase_started_at`; zeroed with `turn_output_chars` at turn start/end.
+    pub phase_start_output_chars: usize,
     /// When the last stream activity (any foreground agent event) was observed.
     /// Set on submit and refreshed on every received event; the spinner reads its
     /// elapsed to warn the user when the stream has gone silent (e.g. network drop)
@@ -1606,6 +1613,7 @@ impl UiState {
             showing_first_thinking: false,
             turn_started_at: None,
             phase_started_at: None,
+            phase_start_output_chars: 0,
             last_stream_activity: None,
             last_context: None,
             post_compaction_used_tokens: None,
@@ -1859,6 +1867,23 @@ impl UiState {
         self.turn_output_chars / 4
     }
 
+    /// Estimated output tokens produced during the CURRENT phase only (since the
+    /// phase clock last started). Numerator for the spinner's `tok/s` so the rate
+    /// reflects live generation speed rather than a whole-turn average diluted by
+    /// earlier tool-execution / idle time.
+    pub fn phase_output_token_estimate(&self) -> usize {
+        self.turn_output_chars
+            .saturating_sub(self.phase_start_output_chars)
+            / 4
+    }
+
+    /// Start the phase clock at `at` and snapshot the output baseline so
+    /// [`phase_output_token_estimate`] measures only this phase's generation.
+    pub fn stamp_phase_start(&mut self, at: std::time::Instant) {
+        self.phase_started_at = Some(at);
+        self.phase_start_output_chars = self.turn_output_chars;
+    }
+
     /// Stamp "the stream is alive" — called on submit and on every received
     /// foreground agent event. Resets the stall clock read by [`Self::stream_stalled`].
     pub fn note_stream_activity(&mut self) {
@@ -1939,7 +1964,7 @@ impl UiState {
         self.team_dispatched_this_turn = false;
         let now = std::time::Instant::now();
         self.turn_started_at = Some(now);
-        self.phase_started_at = Some(now);
+        self.stamp_phase_start(now);
         // Fresh turn: no visible text or reasoning seen yet (drives the
         // blank-turn notice on TurnComplete).
         self.turn_rendered_visible_text = false;
@@ -1948,6 +1973,7 @@ impl UiState {
         // won't wrongly suppress its reason based on a prior turn's error line.
         self.turn_error_line_shown = false;
         self.turn_output_chars = 0;
+        self.phase_start_output_chars = 0;
         // Seed the stall clock so the first silent stretch is measured from submit,
         // not a stale stamp from the previous turn (which would flash the warning).
         self.last_stream_activity = Some(now);
@@ -1986,11 +2012,14 @@ impl UiState {
         self.turn_started_at = None;
         self.phase_started_at = None;
         // Per-turn token tallies are consumed by the separator that renders just
-        // before this; clear them so the next turn starts fresh.
+        // before this; clear them so the next turn starts fresh. (The status-row
+        // cache indicator reads the SESSION-cumulative tallies, which are not
+        // touched here, so it stays visible across turns.)
         self.turn_prompt_tokens = 0;
         self.turn_completion_tokens = 0;
         self.turn_cached_tokens = 0;
         self.turn_output_chars = 0;
+        self.phase_start_output_chars = 0;
         self.turn_rendered_visible_text = false;
         self.turn_saw_reasoning = false;
         // Disarm the first-thinking latch so a later `/goal` continuation (which
@@ -2040,6 +2069,7 @@ impl UiState {
         self.turn_completion_tokens = 0;
         self.turn_cached_tokens = 0;
         self.turn_output_chars = 0;
+        self.phase_start_output_chars = 0;
         self.turn_rendered_visible_text = false;
         self.turn_saw_reasoning = false;
         // Disarm the first-thinking latch (see `on_turn_complete`).
@@ -2145,7 +2175,7 @@ impl UiState {
         // batch anchors the clock once (`on_tool_batch_started`); only a
         // standalone tool call resets it here.
         if self.active_tool_batches.is_empty() {
-            self.phase_started_at = Some(std::time::Instant::now());
+            self.stamp_phase_start(std::time::Instant::now());
         }
     }
 
@@ -2159,7 +2189,7 @@ impl UiState {
         let entering = !self.spinner_label.starts_with("Preparing");
         self.spinner_label = format!("Preparing {}", name);
         if entering && self.active_tool_batches.is_empty() {
-            self.phase_started_at = Some(std::time::Instant::now());
+            self.stamp_phase_start(std::time::Instant::now());
         }
     }
 
@@ -2167,7 +2197,7 @@ impl UiState {
     /// the elapsed-ms ticks steadily for the whole batch, instead of being reset
     /// by every interleaved per-tool event (the "Preparing … · 0ms" flicker).
     pub fn on_tool_batch_started(&mut self) {
-        self.phase_started_at = Some(std::time::Instant::now());
+        self.stamp_phase_start(std::time::Instant::now());
     }
 
     pub fn on_thinking(&mut self) {
@@ -2201,7 +2231,7 @@ impl UiState {
         // elapsed-ms flicker 0→N→0. The batch anchors the clock once
         // (`on_tool_batch_started`); leave it alone until the batch finishes.
         if self.active_tool_batches.is_empty() {
-            self.phase_started_at = Some(std::time::Instant::now());
+            self.stamp_phase_start(std::time::Instant::now());
         }
     }
 
@@ -2219,7 +2249,7 @@ impl UiState {
         self.sub_agent_done = 0;
         self.sub_agent_failed = 0;
         self.spinner_label = format!("SubAgents 0/{}", tasks.len());
-        self.phase_started_at = Some(std::time::Instant::now());
+        self.stamp_phase_start(std::time::Instant::now());
         self.sub_agent_started_at = Some(std::time::Instant::now());
         self.sub_agent_tasks = tasks;
     }
@@ -2285,7 +2315,7 @@ impl UiState {
         // Reset the phase clock so the elapsed suffix tracks how long
         // we've been waiting on the user, not how long the prior phase
         // (often the just-emitted ToolCallStarted) had been running.
-        self.phase_started_at = Some(std::time::Instant::now());
+        self.stamp_phase_start(std::time::Instant::now());
     }
 
     pub fn on_approval_resolved(&mut self) {
@@ -2296,7 +2326,7 @@ impl UiState {
             // The tool is about to actually start running now (hook +
             // bash_execute). Restart the clock so the spinner suffix
             // reflects that, not the cumulative wait-then-run time.
-            self.phase_started_at = Some(std::time::Instant::now());
+            self.stamp_phase_start(std::time::Instant::now());
         }
     }
 
@@ -2777,6 +2807,27 @@ mod tests {
     }
 
     #[test]
+    fn on_turn_complete_keeps_session_cumulative_tallies() {
+        // The status-row cache indicator reads the SESSION-level tallies, so
+        // `on_turn_complete` must clear only the per-turn ones — leaving the
+        // cumulative prompt/cached counts (hence the ratio) intact at idle.
+        let mut s = UiState::new();
+        s.prompt_tokens = 100;
+        s.cached_tokens = 80;
+        s.turn_prompt_tokens = 100;
+        s.turn_cached_tokens = 80;
+        s.on_turn_complete();
+        assert_eq!(s.turn_cached_tokens, 0, "per-turn tally cleared");
+        assert_eq!(s.prompt_tokens, 100, "session prompt tally survives");
+        assert_eq!(s.cached_tokens, 80, "session cache tally survives");
+        // Session ratio the status row will show: 80 / 100 = 80%.
+        assert_eq!(
+            turn_token_summary(s.prompt_tokens, s.completion_tokens, s.cached_tokens).1,
+            Some(80)
+        );
+    }
+
+    #[test]
     fn turn_token_summary_no_cache_info_omits_pct() {
         // Provider didn't report cached tokens → no annotation, billable = prompt+completion.
         let (billable, pct) = turn_token_summary(100, 10, 0);
@@ -2997,7 +3048,10 @@ mod tests {
         s.on_turn_complete();
         s.on_thinking();
         let label = s.display_spinner_label().to_string();
-        assert_ne!(label, FIRST_THINKING_LABEL, "stale first-thinking leaked: {label:?}");
+        assert_ne!(
+            label, FIRST_THINKING_LABEL,
+            "stale first-thinking leaked: {label:?}"
+        );
         assert!(THINKING_LABELS.contains(&label.as_str()), "got {label:?}");
     }
 

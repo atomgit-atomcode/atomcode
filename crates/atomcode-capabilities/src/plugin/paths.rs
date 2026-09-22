@@ -48,15 +48,6 @@ pub fn project_installed_plugins_file(
     project_plugins_root(working_dir, scope).map(|root| root.join("installed_plugins.json"))
 }
 
-/// Project-level marketplaces directory for a given scope.
-#[allow(dead_code)]
-pub fn project_marketplaces_root(
-    working_dir: &std::path::Path,
-    scope: &InstallScope,
-) -> Option<PathBuf> {
-    project_plugins_root(working_dir, scope).map(|root| root.join("marketplaces"))
-}
-
 /// True when a project/local scope's `installed_plugins.json` resolves to the
 /// same file as the user-scope one.
 ///

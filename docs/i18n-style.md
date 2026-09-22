@@ -135,13 +135,51 @@ ErrLoginFailed(&'a str)
 
 ---
 
+## 词表在哪
+
+一个叶子 crate，两张表，一个 locale：
+
+```text
+crates/atomcode-i18n/
+  locale.rs     Locale（en / zh_CN），serde 直接读写 config.toml
+  runtime.rs    LOCALE / BRAND / OAUTH、set_locale、{brand} 代入、test_lock
+  product/      产品说的话：CLI、daemon、setup、/login、tuix
+  screen/       屏幕说的话：atomcode-tui 与它在 cli 里的启动器行
+```
+
+- **零 atomcode 依赖**，所以两边都能读它而不破分层：`atomcode-config` 依赖它并按旧路径
+  re-export（`atomcode_config::i18n` = `atomcode_i18n::product`，`atomcode_config::locale`
+  同理），`atomcode-tui` 直接依赖它。`gates/layers.sh` 守着这条叶子。
+- **一个 locale**。`/language` 只调一次 `set_locale`，两张表同时换。屏幕自带第二张表、
+  第二个 locale 的写法已经试过：结果是欢迎块换了、状态栏没换。
+- 前端各有一行本地导入面，形状一样：`tui/src/i18n/mod.rs` 是
+  `pub use atomcode_i18n::screen::*;`，`tuix/src/i18n/mod.rs` 是
+  `pub use atomcode_config::i18n::*;`。调用点一律 `crate::i18n::t(Msg::X)`，需要
+  `String` 时 `.into_owned()`——**不要**为省几个字再造一个返回 `String` 的别名。
+
+### 屏幕怎么读产品那张表
+
+`atomcode_i18n::screen` re-export 了 `product`，所以屏幕代码写：
+
+```rust
+use crate::i18n::product::{t as pt, Msg as PMsg};
+pt(PMsg::ApprovalAllowOnce)
+```
+
+**产品表已经有的那句话，屏幕读它，不重写。** 「允许一次」「Accounts」「{n}m ago」、
+策略介入的四个选项、待办面板的表头，都是两个前端说同一件事——写第二遍就是给它们两
+种说法的机会。`gates/tui-i18n.sh` 的第二条判据数的就是这个，基线 0。
+
 ## 新增翻译的流程
 
-添加一条新的可翻译文本时，必须同时修改三个文件，缺一不可。Rust 编译器会通过 `match` 穷尽性检查保证不会遗漏。
+添加一条新的可翻译文本时，必须同时修改三个文件，缺一不可。Rust 编译器会通过 `match`
+穷尽性检查保证不会遗漏。
+
+**先问一句：产品表里有没有？** 有就读它，这一步到此为止。
 
 ### 步骤
 
-1. **在 `messages.rs` 添加 variant**
+1. **在 `messages.rs` 添加 variant**（`product/` 还是 `screen/`，看这句话是谁说的）
 
    ```rust
    pub enum Msg<'a> {
@@ -154,7 +192,7 @@ ErrLoginFailed(&'a str)
 
    ```rust
    Msg::StatusTokenUsage { used, total } => {
-       format!("{used}/{total} tokens used")
+       format!("{used}/{total} tokens used").into()
    }
    ```
 
@@ -162,22 +200,43 @@ ErrLoginFailed(&'a str)
 
    ```rust
    Msg::StatusTokenUsage { used, total } => {
-       format!("已使用 {used}/{total} 个 token")
+       format!("已使用 {used}/{total} 个 token").into()
    }
    ```
 
 4. **编译验证**
 
    ```bash
-   cargo build -p atomcode-core
+   cargo check -p atomcode-i18n
    ```
 
    如果任一语言文件遗漏了新 variant，编译将失败并明确指出缺少的分支，从而杜绝翻译遗漏。
 
 ### 检查清单
 
-- [ ] `messages.rs` 中添加了新 variant
-- [ ] `en.rs` 中添加了对应的英文文本
+- [ ] 产品表里没有同义的条目（有就读它，不新增）
+- [ ] `messages.rs` 中添加了新 variant，字段是**具名**的
+- [ ] `en.rs` 中添加了对应的英文文本，而且**真的是英文**
 - [ ] `zh_cn.rs` 中添加了对应的中文文本
 - [ ] 中文文本符合本风格指南的标点、空格、术语规范
 - [ ] 编译通过，无 `non-exhaustive patterns` 错误
+
+## 机器判的部分
+
+散文管不住的三件事，各有判据：
+
+| 判据 | 在哪 | 判什么 |
+| --- | --- | --- |
+| `hardcoded_cjk` | `gates/tui-i18n.sh` | 屏幕与启动器的生产代码里还有几处写死的中文字面量（棘轮，只能降） |
+| `said_twice` | 同上 | 同一句话（中英都相同）在两张表里各写了一遍（基线 0） |
+| `no_english_arm_is_left_in_chinese` | `atomcode-i18n/tests/tables.rs` | 英文表里还留着中文的条目——复制上一行忘了改后半句 |
+| `the_two_tables_say_nothing_twice` | 同上 | 与 `said_twice` 同一条规则，跟着测试跑 |
+| `atomcode-tui/tests/language.rs` | 五条 | 同一批界面画两遍，必须读起来不同、而且各自是对的文字系统 |
+
+闸门本身有阴性对照（`gates/tui-i18n.spec.sh`）：每条规则各造一个违规 fixture 断言它判红，
+再造合规的断言判绿——包括注释里的中文、测试里的中文、被豁免的 fixture 文件都不许误报。
+
+**测试断言哪种语言**：`atomcode-tui` 与 `atomcode-cli` 的测试二进制各有一个
+`#[cfg(test)] #[ctor]` 把 locale 设成 `zh_CN`，因为那些断言是照中文写的，意思是「中文下
+这一行读作 X」。另一种语言由上表最后一行的五条判据单独钉住。要断言英文的单个测试
+自己 `test_lock()` + `set_locale(En)`。

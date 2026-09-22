@@ -16,9 +16,9 @@ use atomcode_kernel::tool::{RiskLevel, Tool, ToolContext, ToolResult};
 use serde::Deserialize;
 use serde_json::json;
 use std::borrow::Cow;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
-use tokio::process::Command;
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -31,7 +31,7 @@ const MAX_TIMEOUT_SECS: u64 = 300;
 /// phases (file lock waits, dependency downloads, linker blocking, large file
 /// reads). This is NOT tool- or language-specific — any process with these
 /// patterns benefits. Tradeoff: genuine deadlocks wait 60s longer than before.
-const SILENT_KILL_SECS: u64 = 90;
+pub const SILENT_KILL_SECS: u64 = 90;
 
 /// Environment injected into every model-run shell child so interactive programs
 /// degrade to non-interactive behavior instead of blocking on our closed stdin or
@@ -110,10 +110,32 @@ unsafe fn detach_child_from_controlling_tty() {
 /// it can reuse the private spawn/reaper primitives (`build_command`, `PgroupChild`,
 /// `detach_child_from_controlling_tty`) without widening their visibility.
 pub(crate) mod background;
-pub(crate) use background::{BashKillTool, BashPollTool, BashStartTool};
+pub use background::{BashKillTool, BashPollTool, BashStartTool};
 
-#[derive(Default)]
-pub struct BashTool;
+/// `bash`, run in whichever execution world it was handed.
+///
+/// The world is what decides where the command lands — this machine, a
+/// container, a remote sandbox. Everything this tool keeps is the part that is
+/// the same wherever it runs: what counts as destructive, how long to wait, and
+/// how to present the result.
+pub struct BashTool {
+    world: Arc<dyn crate::world::Shell>,
+}
+
+impl Default for BashTool {
+    fn default() -> Self {
+        Self {
+            world: Arc::new(LocalShell),
+        }
+    }
+}
+
+impl BashTool {
+    /// Run commands through `world` instead of this machine.
+    pub fn with_world(world: Arc<dyn crate::world::Shell>) -> Self {
+        Self { world }
+    }
+}
 
 #[derive(Deserialize)]
 struct Args {
@@ -189,6 +211,24 @@ impl Tool for BashTool {
             Err(_) => args.to_string(),
         }
     }
+    /// `bash` belongs to one session-wide blanket group so the approval panel can
+    /// offer "本会话允许所有 Bash" — EXCEPT when the command touches a sensitive
+    /// target (`~/.ssh`, `.env`, credentials, `/etc`, home dotfiles, secret
+    /// extensions): there the blanket is withheld (`None`), so an "allow all" can
+    /// never cover the one thing that must always ask. Aligns the new front end
+    /// with the old tuix's "允许所有 Bash", but with a cleaner floor: sensitive
+    /// targets are excluded whether the command reads or writes them.
+    ///
+    /// The floor mirrors BOTH sensitivity gates so the blanket is a superset of every
+    /// call they force to ask: `references_sensitive_path` (what `SensitivePathGate`
+    /// keys reads on) AND the resolved-target check (`args_name_sensitive_destructive_target`,
+    /// what `bash_workspace_verdict` keys destructive `grantable:false` on — the raw
+    /// substring form misses `/etc`, `.bashrc`, `*.key/.crt`, …).
+    fn allow_all_group(&self, args: &str) -> Option<String> {
+        let sensitive = super::sensitive_path::references_sensitive_path(args)
+            || super::bash_workspace_gate::args_name_sensitive_destructive_target(args);
+        (!sensitive).then(|| "bash".to_string())
+    }
     /// Read-only bash commands (per [`is_read_only_bash`]) may run concurrently;
     /// everything else serializes behind the write-lock. A parse failure is
     /// conservatively NOT parallel-safe.
@@ -219,144 +259,54 @@ impl Tool for BashTool {
         let dur = Duration::from_secs(secs);
         let clamp_notice = timeout_clamp_notice(secs, requested_timeout);
 
-        // macOS sudo (and some Linux configs) needs explicit `-A` to use SUDO_ASKPASS —
-        // rewrite `sudo` → `sudo -A` so a plain `sudo` pops our password modal. Only when
-        // the askpass helper is actually active; off Windows the command is untouched.
-        #[cfg(unix)]
-        let effective_command = if crate::askpass::current_env().is_some() {
-            rewrite_sudo_for_askpass(&a.command)
-        } else {
-            a.command.clone()
+        // Everything about *how* a command is launched — which shell, the
+        // non-interactive env, the askpass wiring, the tty detach, the reaper —
+        // now belongs to the world (see `LocalShell`). What stays here is what
+        // is true wherever it runs.
+        let options = crate::world::SpawnOptions {
+            cwd: Some(ctx.working_dir.clone()),
+            env: Vec::new(),
         };
-        #[cfg(not(unix))]
-        let effective_command = a.command.clone();
-
-        let mut cmd = match build_command(&effective_command) {
-            Ok(c) => c,
-            Err(reason) => return err(reason),
-        };
-        #[cfg(unix)]
-        crate::process_utils::apply_utf8_locale_env(&mut cmd);
-        // Coax interactive programs (REPLs, pagers, git prompts) into non-interactive
-        // behavior so they can't block on our closed stdin or paint the TUI. Both
-        // platforms (git honors GIT_TERMINAL_PROMPT; Git Bash honors TERM).
-        apply_non_interactive_env(&mut cmd);
-        // Windows GBK locale (CP936): a Python child the model runs (python -c, scripts)
-        // defaults its `subprocess` text pipes AND stdio to the console code page, so reading
-        // UTF-8 output with the GBK codec dies with UnicodeDecodeError (#876). `PYTHONUTF8=1`
-        // (PEP 540) flips `locale.getpreferredencoding()` to utf-8 — which is what `subprocess`
-        // text pipes use — so that case stops crashing; `PYTHONIOENCODING` only covers Python's
-        // OWN stdio (not child pipes), kept as belt-and-suspenders. Set HERE (not in
-        // build_command) so it covers BOTH the cmd.exe and the Git Bash shells. Mirrors
-        // AtomCode's own decode_output UTF-8-first policy.
-        //
-        // KNOWN TRADEOFFS (this is a mitigation, not a complete fix — env vars can't do better):
-        //   1. NOT fixed: TRULY binary output. `0x80` is invalid in utf-8 too, so a text-mode
-        //      pipe over real binary still crashes — just with a utf-8 codec error. The real
-        //      fix there is the model using bytes mode / `errors=` (its code, not ours).
-        //   2. MIRROR REGRESSION: the SAME locale flip changes `open()`'s default encoding from
-        //      GBK to utf-8, so `open('gbk_file.txt')` WITHOUT an explicit `encoding=` now fails
-        //      on a GBK-encoded file (it worked before). `open()` and `subprocess` share
-        //      `locale.getpreferredencoding()`, so no env can fix the pipe case without moving
-        //      this one — they cannot be decoupled. Accepted because modern files/output are
-        //      predominantly utf-8; the model can pass `encoding='gbk'` for legacy files.
-        #[cfg(windows)]
-        {
-            cmd.env("PYTHONUTF8", "1");
-            cmd.env("PYTHONIOENCODING", "utf-8");
-        }
-        // No console-window flash per command on Windows: in headless/daemon mode (e.g.
-        // the WeChat clawbot bridge) there's no console to inherit, so each cmd.exe would
-        // otherwise allocate a NEW console window on the desktop. No-op off Windows.
-        super::suppress_console_window(&mut cmd);
-        cmd.current_dir(&ctx.working_dir)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true); // dropping the wait future (cancel/timeout) SIGKILLs the child
-
-        // Unix only: detach from the controlling tty so neither the child nor a
-        // grandchild (ssh, git hooks) can grab /dev/tty and fight the TUI, and inject
-        // the askpass env vars so password prompts use our secure modal. Full detach
-        // (setsid + TIOCNOTTY) shared with run_shell via `detach_child_from_controlling_tty`.
-        #[cfg(unix)]
-        {
-            if let Some(env) = crate::askpass::current_env() {
-                apply_askpass_env(&mut cmd, env);
-            }
-            unsafe {
-                cmd.pre_exec(|| {
-                    detach_child_from_controlling_tty();
-                    Ok(())
-                });
-            }
-        }
-
-        let child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => return err(format!("bash: failed to spawn shell: {e}")),
-        };
-        // Reap the WHOLE shell process tree (mvn → java, pipeline sub-shells,
-        // busybox applets) on timeout/cancel — not just the direct child, which
-        // is all `kill_on_drop` covers.
-        //
-        // Windows: a kill-on-close Job Object. Held until this fn returns; the
-        // cancel/timeout arms `terminate()` the job explicitly, and if that's
-        // skipped (or atomcode dies) dropping the guard closes the handle →
-        // KILL_ON_JOB_CLOSE reaps the tree anyway. (A process the command
-        // intentionally left running is in the job too, so it's reaped on
-        // return — consistent with this tool having no background path.)
-        //
-        // Unix: the setsid pre_exec made the shell its own pgroup leader
-        // (pgid == pid), so `killpg(pid)` reaches the grandchildren that
-        // `kill_on_drop` (direct child only) would otherwise orphan — the same
-        // leak, and the same fix, as Windows.
-        #[cfg(windows)]
-        let job_guard = crate::process_utils::assign_child_to_kill_on_close_job(&child);
-        // PID captured before `wait_with_output` consumes `child`. On Unix it is
-        // the pgid (setsid leader); on Windows it's the `taskkill /T` fallback
-        // root for when the Job Object couldn't be set up.
-        let child_pid = child.id();
-        let wait = child.wait_with_output();
-
-        let kill_tree = || {
-            #[cfg(windows)]
-            crate::process_utils::kill_windows_tree(&job_guard, child_pid);
-            #[cfg(not(target_os = "windows"))]
-            if let Some(pgid) = child_pid {
-                // SIGKILL the whole group; `kill_on_drop` already SIGKILLs the
-                // direct child, this extends it to the detached grandchildren.
-                unsafe { killpg(pgid as i32, SIGKILL) };
-            }
+        let process = match self.world.spawn(&a.command, &options).await {
+            Ok(process) => process,
+            // The world's rewrite directive goes back as-is; a failure to start is
+            // this tool's to report.
+            Err(crate::world::SpawnError::Unsupported(reason)) => return err(reason),
+            Err(crate::world::SpawnError::Failed(reason)) => return err(format!("bash: {reason}")),
         };
 
         let result = tokio::select! {
             biased;
-            // Cooperative cancel: returning drops `wait` → kill_on_drop SIGKILLs the child.
+            // Cooperative cancel. `kill()` is tree-wide and takes no borrow, so it
+            // can fire while the other arm is still holding the process to collect
+            // from it — the reason the seam hands back a handle rather than a result.
             _ = ctx.cancel.cancelled() => {
-                kill_tree();
+                process.kill().await;
                 // The command itself is already shown in the `● Bash(…)`
                 // header above (for the user) and in the tool-call record
                 // (for the model), so don't echo it back — a long command
                 // just wraps into several redundant error lines.
                 err("bash: cancelled before completion.".to_string())
             }
-            res = tokio::time::timeout(dur, wait) => match res {
-                Ok(Ok(output)) => format_output(&output),
+            res = tokio::time::timeout(dur, process.collect()) => match res {
+                Ok(Ok(collected)) => format_output(
+                    &self.world.decode(&collected.stdout),
+                    &self.world.decode(&collected.stderr),
+                    collected.exit.code,
+                ),
                 Ok(Err(e)) => err(format!("bash: error running command: {e}")),
-                // Timed out: the timeout future drops `wait` → kill_on_drop SIGKILLs the child.
                 // Don't echo the command (see the cancel arm); point at the actionable knob —
                 // a larger `timeout` — BUT only while that knob still has room. Once the run
                 // was already at MAX_TIMEOUT_SECS, "pass a larger timeout" is advice that
                 // provably cannot work, and the model reads tool output as ground truth and
                 // retries it. At the ceiling `timeout_message` names the ceiling and points at
                 // the one escape that ACTUALLY works on THIS platform: background+file on Unix
-                // (a detached child survives our reap — we only killpg on cancel/timeout), but
+                // (a detached child survives our reap — we only kill on cancel/timeout), but
                 // split-into-steps on Windows, where the KILL_ON_JOB_CLOSE job reaps anything
                 // left running the moment we return (this tool has no background path there —
-                // see the job-object comment above the spawn).
+                // see the job-object comment in `LocalShell::spawn`).
                 Err(_) => {
-                    kill_tree();
+                    process.kill().await;
                     err(timeout_message(secs))
                 }
             }
@@ -1490,9 +1440,15 @@ fn sanitize_terminal_output(s: &str) -> String {
         .collect()
 }
 
-fn format_output(output: &std::process::Output) -> ToolResult {
-    let stdout = sanitize_terminal_output(&decode_output(&output.stdout));
-    let stderr = sanitize_terminal_output(&decode_output(&output.stderr));
+/// Frame a finished command for the model.
+///
+/// Takes text, not bytes: decoding is the *world's* answer (see
+/// [`crate::world::Shell::decode`]) because the code page belongs to the machine
+/// the command ran on. Sanitising is this layer's, because it is about what a
+/// transcript can show.
+fn format_output(stdout: &str, stderr: &str, code: Option<i32>) -> ToolResult {
+    let stdout = sanitize_terminal_output(stdout);
+    let stderr = sanitize_terminal_output(stderr);
     let mut s = String::new();
     if !stdout.is_empty() {
         s.push_str(&stdout);
@@ -1504,7 +1460,7 @@ fn format_output(output: &std::process::Output) -> ToolResult {
         s.push_str("[stderr]\n");
         s.push_str(&stderr);
     }
-    match output.status.code() {
+    match code {
         Some(0) => {
             if s.trim().is_empty() {
                 s = "(no output)".to_string();
@@ -2666,24 +2622,6 @@ impl PgroupChild {
         self.terminated = true;
         status
     }
-
-    /// Graceful pgroup shutdown: SIGTERM → 200ms grace → SIGKILL → reap.
-    /// Call from explicit cleanup paths (timeout/idle) where we can await.
-    async fn terminate(&mut self) {
-        unsafe {
-            killpg(self.pgid, SIGTERM);
-        }
-        // 200ms is empirically: long enough for well-behaved servers
-        // (uvicorn, vite, cargo-watch) to release ports and flush logs,
-        // short enough that Ctrl-C still feels instant.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        unsafe {
-            killpg(self.pgid, SIGKILL);
-        }
-        // Reap the bash leader so its zombie doesn't linger.
-        let _ = self.child.wait().await;
-        self.terminated = true;
-    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -2739,6 +2677,315 @@ pub(crate) fn sigkill_pgroup(pgid: i32) {
     }
 }
 
+// ---- the local shell: this machine as a world ---------------------------
+
+/// The local machine, reached through whichever shell it actually has.
+///
+/// Every host probe in this file lives behind this type — `where bash`, `reg
+/// query`, the console code page, `setsid`, the job object — because "which
+/// shell exists here and how is its tree reaped" is exactly what a *world*
+/// answers, and a tool that asked those questions itself would be deciding them
+/// for a machine it may not be running on.
+///
+/// It is also the reason the `shell` seam is a trait and not an argv runner: a
+/// remote or containerised world implements three methods and needs none of the
+/// several hundred lines of platform probing below.
+#[derive(Default)]
+pub struct LocalShell;
+
+/// A live child of [`LocalShell`], plus the two things needed to kill its whole
+/// tree without borrowing it.
+///
+/// The reaper identity (a process-group id on Unix, a kill-on-close job object
+/// on Windows) is copied out at spawn and kept *beside* the child. That is what
+/// makes [`Process::kill`] callable from a `select!` arm while another arm holds
+/// the child to wait on it — the borrow that a `&mut self` handle could not
+/// share.
+struct LocalProcess {
+    /// One stream, both pipes, in arrival order. Behind a lock because the seam
+    /// hands out `&self`; only one consumer drains at a time.
+    chunks: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<crate::world::Chunk>>,
+    /// The pipe readers. Aborted when the handle goes, so the read ends close
+    /// the way they did when `wait_with_output` was dropped — a grandchild that
+    /// escaped the process group and still holds stdout then gets EPIPE on its
+    /// next write instead of keeping a reader task alive forever.
+    pumps: Vec<tokio::task::JoinHandle<()>>,
+    state: tokio::sync::Mutex<ChildState>,
+    #[cfg(not(target_os = "windows"))]
+    pgid: i32,
+    #[cfg(target_os = "windows")]
+    job: Option<crate::process_utils::JobHandle>,
+    #[cfg(target_os = "windows")]
+    pid: Option<u32>,
+}
+
+struct ChildState {
+    #[cfg(not(target_os = "windows"))]
+    child: Option<PgroupChild>,
+    #[cfg(target_os = "windows")]
+    child: Option<tokio::process::Child>,
+    /// Memoised, so a second `wait()` answers instead of blocking on a child
+    /// that has already been reaped.
+    exit: Option<crate::world::Exit>,
+}
+
+/// Read one pipe to EOF, forwarding raw bytes. Undecoded on purpose: a chunk
+/// boundary inside a multi-byte character must not become a replacement
+/// character, and a lossy decode that yields "" must not be mistaken for EOF.
+async fn pump<R>(
+    mut pipe: R,
+    tx: tokio::sync::mpsc::UnboundedSender<crate::world::Chunk>,
+    wrap: fn(Vec<u8>) -> crate::world::Chunk,
+) where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let mut buf = vec![0u8; 65536];
+    loop {
+        match pipe.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if tx.send(wrap(buf[..n].to_vec())).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl crate::world::Shell for LocalShell {
+    fn describe(&self) -> String {
+        if cfg!(target_os = "windows") {
+            format!(
+                "{} on this machine",
+                windows_shell_label(windows_bash_active())
+            )
+        } else {
+            "bash on this machine".to_string()
+        }
+    }
+
+    fn decode(&self, bytes: &[u8]) -> String {
+        decode_output(bytes)
+    }
+
+    async fn spawn(
+        &self,
+        command: &str,
+        options: &crate::world::SpawnOptions,
+    ) -> Result<std::sync::Arc<dyn crate::world::Process>, crate::world::SpawnError> {
+        // macOS sudo (and some Linux configs) needs explicit `-A` to use SUDO_ASKPASS —
+        // rewrite `sudo` → `sudo -A` so a plain `sudo` pops our password modal. Only when
+        // the askpass helper is actually active; off Windows the command is untouched.
+        #[cfg(unix)]
+        let effective_command = if crate::askpass::current_env().is_some() {
+            rewrite_sudo_for_askpass(command)
+        } else {
+            command.to_string()
+        };
+        #[cfg(not(unix))]
+        let effective_command = command.to_string();
+
+        // On Windows without a POSIX bash this is where a construct cmd.exe would
+        // silently corrupt is refused with a rewrite directive; that refusal is
+        // the model's to act on, hence `Unsupported`.
+        let mut cmd =
+            build_command(&effective_command).map_err(crate::world::SpawnError::Unsupported)?;
+        #[cfg(unix)]
+        crate::process_utils::apply_utf8_locale_env(&mut cmd);
+        // Coax interactive programs (REPLs, pagers, git prompts) into non-interactive
+        // behavior so they can't block on our closed stdin or paint the TUI. Both
+        // platforms (git honors GIT_TERMINAL_PROMPT; Git Bash honors TERM).
+        apply_non_interactive_env(&mut cmd);
+        // Windows GBK locale (CP936): a Python child the model runs (python -c, scripts)
+        // defaults its `subprocess` text pipes AND stdio to the console code page, so reading
+        // UTF-8 output with the GBK codec dies with UnicodeDecodeError (#876). `PYTHONUTF8=1`
+        // (PEP 540) flips `locale.getpreferredencoding()` to utf-8 — which is what `subprocess`
+        // text pipes use — so that case stops crashing; `PYTHONIOENCODING` only covers Python's
+        // OWN stdio (not child pipes), kept as belt-and-suspenders. Set HERE (not in
+        // build_command) so it covers BOTH the cmd.exe and the Git Bash shells. Mirrors
+        // AtomCode's own decode_output UTF-8-first policy.
+        //
+        // KNOWN TRADEOFFS (this is a mitigation, not a complete fix — env vars can't do better):
+        //   1. NOT fixed: TRULY binary output. `0x80` is invalid in utf-8 too, so a text-mode
+        //      pipe over real binary still crashes — just with a utf-8 codec error. The real
+        //      fix there is the model using bytes mode / `errors=` (its code, not ours).
+        //   2. MIRROR REGRESSION: the SAME locale flip changes `open()`'s default encoding from
+        //      GBK to utf-8, so `open('gbk_file.txt')` WITHOUT an explicit `encoding=` now fails
+        //      on a GBK-encoded file (it worked before). `open()` and `subprocess` share
+        //      `locale.getpreferredencoding()`, so no env can fix the pipe case without moving
+        //      this one — they cannot be decoupled. Accepted because modern files/output are
+        //      predominantly utf-8; the model can pass `encoding='gbk'` for legacy files.
+        #[cfg(windows)]
+        {
+            cmd.env("PYTHONUTF8", "1");
+            cmd.env("PYTHONIOENCODING", "utf-8");
+        }
+        // No console-window flash per command on Windows: in headless/daemon mode (e.g.
+        // the WeChat clawbot bridge) there's no console to inherit, so each cmd.exe would
+        // otherwise allocate a NEW console window on the desktop. No-op off Windows.
+        super::suppress_console_window(&mut cmd);
+        if let Some(cwd) = &options.cwd {
+            cmd.current_dir(cwd);
+        }
+        for (key, value) in &options.env {
+            cmd.env(key, value);
+        }
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true); // dropping the handle SIGKILLs the child
+
+        // Unix only: detach from the controlling tty so neither the child nor a
+        // grandchild (ssh, git hooks) can grab /dev/tty and fight the TUI, and inject
+        // the askpass env vars so password prompts use our secure modal. Full detach
+        // (setsid + TIOCNOTTY) shared with run_shell via `detach_child_from_controlling_tty`.
+        #[cfg(unix)]
+        {
+            if let Some(env) = crate::askpass::current_env() {
+                apply_askpass_env(&mut cmd, env);
+            }
+            unsafe {
+                cmd.pre_exec(|| {
+                    detach_child_from_controlling_tty();
+                    Ok(())
+                });
+            }
+        }
+
+        // `mut` is consumed on Windows, where the child is not rebound below.
+        #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| crate::world::SpawnError::Failed(format!("failed to spawn shell: {e}")))?;
+
+        // Reap the WHOLE shell process tree (mvn → java, pipeline sub-shells,
+        // busybox applets) on kill — not just the direct child, which is all
+        // `kill_on_drop` covers.
+        //
+        // Windows: a kill-on-close Job Object, held by the handle. An explicit
+        // `kill()` terminates the job; if that never happens (or atomcode dies)
+        // dropping the handle closes it → KILL_ON_JOB_CLOSE reaps the tree anyway.
+        //
+        // Unix: the setsid pre_exec made the shell its own pgroup leader
+        // (pgid == pid), so `killpg(pgid)` reaches the grandchildren that
+        // `kill_on_drop` (direct child only) would otherwise orphan.
+        #[cfg(target_os = "windows")]
+        let job = crate::process_utils::assign_child_to_kill_on_close_job(&child);
+        #[cfg(target_os = "windows")]
+        let pid = child.id();
+        #[cfg(not(target_os = "windows"))]
+        let mut child = PgroupChild::new(child);
+        #[cfg(not(target_os = "windows"))]
+        let pgid = child.pgid();
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut pumps = Vec::with_capacity(2);
+        if let Some(out) = child.stdout.take() {
+            pumps.push(tokio::spawn(pump(
+                out,
+                tx.clone(),
+                crate::world::Chunk::Stdout,
+            )));
+        }
+        if let Some(errs) = child.stderr.take() {
+            pumps.push(tokio::spawn(pump(
+                errs,
+                tx.clone(),
+                crate::world::Chunk::Stderr,
+            )));
+        }
+        drop(tx); // so the receiver sees EOF once both pumps are done
+
+        Ok(std::sync::Arc::new(LocalProcess {
+            chunks: tokio::sync::Mutex::new(rx),
+            pumps,
+            state: tokio::sync::Mutex::new(ChildState {
+                child: Some(child),
+                exit: None,
+            }),
+            #[cfg(not(target_os = "windows"))]
+            pgid,
+            #[cfg(target_os = "windows")]
+            job,
+            #[cfg(target_os = "windows")]
+            pid,
+        }))
+    }
+}
+
+impl Drop for LocalProcess {
+    fn drop(&mut self) {
+        for pump in &self.pumps {
+            pump.abort();
+        }
+    }
+}
+
+#[async_trait]
+impl crate::world::Process for LocalProcess {
+    async fn next_chunk(&self) -> Option<crate::world::Chunk> {
+        self.chunks.lock().await.recv().await
+    }
+
+    async fn wait(&self) -> Result<crate::world::Exit, String> {
+        let mut state = self.state.lock().await;
+        if let Some(exit) = state.exit {
+            return Ok(exit);
+        }
+        let Some(child) = state.child.as_mut() else {
+            return Err("the process handle was already consumed".to_string());
+        };
+        // Unix: `wait_and_disarm` reaps AND disarms the Drop killpg, closing the
+        // PID-reuse window a bare `wait()` would leave open.
+        #[cfg(not(target_os = "windows"))]
+        let status = child.wait_and_disarm().await;
+        #[cfg(target_os = "windows")]
+        let status = child.wait().await;
+        let status = status.map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        let signal = {
+            use std::os::unix::process::ExitStatusExt;
+            status.signal()
+        };
+        #[cfg(not(unix))]
+        let signal = None;
+        let exit = crate::world::Exit {
+            code: status.code(),
+            signal,
+        };
+        state.exit = Some(exit);
+        Ok(exit)
+    }
+
+    async fn kill(&self) {
+        // Deliberately takes no lock: the caller is killing *because* another
+        // task holds the child to wait on it.
+        #[cfg(not(target_os = "windows"))]
+        sigkill_pgroup(self.pgid);
+        #[cfg(target_os = "windows")]
+        crate::process_utils::kill_windows_tree(&self.job, self.pid);
+    }
+
+    /// SIGTERM the group → 200ms grace → SIGKILL the group. 200ms is empirical:
+    /// long enough for well-behaved servers (uvicorn, vite, cargo-watch) to
+    /// release ports and flush logs, short enough that Ctrl-C still feels
+    /// instant. Reaping is [`wait`](crate::world::Process::wait)'s job, as
+    /// always. Windows has no gentler signal than terminating the job.
+    async fn terminate(&self) {
+        #[cfg(not(target_os = "windows"))]
+        {
+            unsafe {
+                killpg(self.pgid, SIGTERM);
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            sigkill_pgroup(self.pgid);
+        }
+        #[cfg(target_os = "windows")]
+        crate::process_utils::kill_windows_tree(&self.job, self.pid);
+    }
+}
+
 /// Result of running a shell command, decoupled from tool-result framing.
 /// `bash_execute` (model-invoked Bash tool) and `handle_local_shell`
 /// (user-invoked `!` mode) both build on this.
@@ -2761,194 +3008,98 @@ pub enum ShellExit {
     KilledTimeout,
 }
 
-/// Capabilities-owned shell runner used by the current coding stack. Core still has a separate
-/// implementation for its remaining tool consumers; consolidate that copy only when those
-/// consumers migrate. This implementation reuses capabilities' own `sanitize_terminal_output`,
-/// a deliberate superset of core's: it additionally strips DCS/SOS/PM/APC + 8-bit C1
-/// introducers, so `!cmd` output is cleaner.
+/// The `!cmd` runner: every chunk as it arrives, killed on silence, stopped
+/// gently before it is stopped hard.
 ///
-/// Spawn `command` in `wd`, stream output via `chunk_cb`, return raw outcome.
-/// No ToolResult framing, no git snapshot, no error-signature tracking —
-/// those stay in the tool layer. `chunk_cb` receives stdout chunks verbatim
-/// and stderr chunks prefixed with `[stderr] `.
+/// A thin *policy* over the `shell` seam — the third consumer the seam's
+/// [`SpawnOptions`](crate::world::SpawnOptions) doc names, the one that kills
+/// on silence rather than on duration. It used to be a second copy of the
+/// spawn (its own `Command`, tty detach, pgroup, decoder); all of that is the
+/// world's now, and what is left is exactly what a person typing `!cargo build`
+/// wants that the model's `bash` does not: output streamed live through
+/// `chunk_cb` (stdout verbatim, stderr prefixed `[stderr] `), a stuck process
+/// killed after [`SILENT_KILL_SECS`] of silence *once it has said something*,
+/// and a SIGTERM before the SIGKILL so a dev server can let go of its port.
+///
+/// No `ToolResult` framing, no approval, no error-signature tracking — those
+/// stay in the tool layer. `wd` is the working directory the command runs in.
 pub async fn run_shell(
+    world: &dyn crate::world::Shell,
     command: &str,
     wd: &std::path::Path,
     timeout_secs: u64,
     chunk_cb: impl Fn(&str),
 ) -> ShellOutcome {
+    use crate::world::Chunk;
+
     let start_instant = Instant::now();
-
-    // Platform-aware shell: cmd.exe on Windows, bash on Unix
-    #[cfg(target_os = "windows")]
-    let mut child = {
-        let mut cmd = Command::new("cmd.exe");
-        cmd.arg("/C");
-        cmd.as_std_mut().raw_arg(command);
-        cmd.current_dir(wd)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            // kill_on_drop covers the direct cmd.exe PID on `tokio::select!`
-            // cancel / hard timeout. The descendant tree is reaped by the Job
-            // Object assigned below (see `job_guard`).
-            .kill_on_drop(true);
-        apply_non_interactive_env(&mut cmd);
-        crate::process_utils::suppress_console_window(&mut cmd);
-        match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                return ShellOutcome {
-                    stdout: String::new(),
-                    stderr: format!("failed to spawn: {e}"),
-                    exit: ShellExit::Exited {
-                        success: false,
-                        code: None,
-                    },
-                    elapsed_secs: start_instant.elapsed().as_secs_f64(),
-                };
-            }
+    let options = crate::world::SpawnOptions {
+        cwd: Some(wd.to_path_buf()),
+        env: Vec::new(),
+    };
+    let process = match world.spawn(command, &options).await {
+        Ok(process) => process,
+        Err(e) => {
+            return ShellOutcome {
+                stdout: String::new(),
+                stderr: e.to_string(),
+                exit: ShellExit::Exited {
+                    success: false,
+                    code: None,
+                },
+                elapsed_secs: start_instant.elapsed().as_secs_f64(),
+            };
         }
     };
 
-    #[cfg(not(target_os = "windows"))]
-    let mut child = {
-        #[cfg(not(target_env = "ohos"))]
-        let mut cmd = Command::new("bash");
-        #[cfg(target_env = "ohos")]
-        let mut cmd = Command::new("sh");
-
-        cmd.arg("-c")
-            .arg(command)
-            .current_dir(wd)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            // kill_on_drop ensures bash itself dies if the tool future is
-            // dropped mid-flight. PgroupChild::Drop below extends that
-            // to bash's whole process group (cargo / ssh / dev-server
-            // grandchildren that setsid() detached from us).
-            .kill_on_drop(true);
-        crate::process_utils::apply_utf8_locale_env(&mut cmd);
-        // Same non-interactive env as BashTool::execute — keep the two shell paths
-        // from drifting (a REPL run via `!cmd` should degrade the same way).
-        apply_non_interactive_env(&mut cmd);
-        // Detach child from the controlling terminal so neither it nor any
-        // grandchild (ssh, git credential helpers, server-side hook output
-        // rendered by git) can write directly to /dev/tty.  Without this,
-        // programs that open /dev/tty bypass our piped stdout/stderr and
-        // scribble ANSI escape sequences onto the TUI — producing artifacts
-        // like the [PASSED] box from AtomGit push hooks. Shared with
-        // BashTool::execute so the two paths can't drift.
-        unsafe {
-            cmd.pre_exec(|| {
-                detach_child_from_controlling_tty();
-                Ok(())
-            });
-        }
-        // Wrap the spawned child so pgroup cleanup runs on Drop (cancel)
-        // and via the explicit terminate() calls below (timeout/idle).
-        match cmd.spawn() {
-            Ok(c) => PgroupChild::new(c),
-            Err(e) => {
-                return ShellOutcome {
-                    stdout: String::new(),
-                    stderr: format!("failed to spawn: {e}"),
-                    exit: ShellExit::Exited {
-                        success: false,
-                        code: None,
-                    },
-                    elapsed_secs: start_instant.elapsed().as_secs_f64(),
-                };
-            }
-        }
-    };
-
-    // Windows: put the shell tree under a kill-on-close Job Object so the
-    // idle/timeout kill (and atomcode's own exit) reaps grandchildren
-    // (mvn → java, pipeline sub-shells, busybox applets) instead of orphaning
-    // them. Unix already reaps the pgroup via `PgroupChild::terminate` below.
-    // Held until this fn returns; `None` degrades to the direct-child kill.
-    #[cfg(target_os = "windows")]
-    let job_guard = crate::process_utils::assign_child_to_kill_on_close_job(&child);
-    // Fallback root for `taskkill /T` when the Job Object couldn't be set up.
-    #[cfg(target_os = "windows")]
-    let child_pid = child.id();
-
-    let mut stdout = child.stdout.take().unwrap();
-    let mut stderr = child.stderr.take().unwrap();
     let mut stdout_buf = Vec::new();
     let mut stderr_buf = Vec::new();
-
-    let idle_timeout = Duration::from_secs(SILENT_KILL_SECS);
-    let has_any_output = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let has_out_1 = has_any_output.clone();
-    let has_out_2 = has_any_output.clone();
-    let chunk_cb = &chunk_cb;
     let mut stdout_decode_pending = Vec::new();
     let mut stderr_decode_pending = Vec::new();
+    let idle_timeout = Duration::from_secs(SILENT_KILL_SECS);
+    let chunk_cb = &chunk_cb;
 
     let result = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
-        let (_, _) = tokio::join!(
-            async {
-                let mut buf = vec![0u8; 65536];
-                loop {
-                    match tokio::time::timeout(idle_timeout, stdout.read(&mut buf)).await {
-                        Ok(Ok(0)) => break,
-                        Ok(Ok(n)) => {
-                            stdout_buf.extend_from_slice(&buf[..n]);
-                            has_out_1.store(true, std::sync::atomic::Ordering::Relaxed);
-                            if let Some(chunk) =
-                                decode_stream_chunk(&mut stdout_decode_pending, &buf[..n], false)
-                            {
-                                chunk_cb(&sanitize_terminal_output(&chunk));
-                            }
-                        }
-                        Ok(Err(_)) => break,
-                        Err(_) => {
-                            if has_out_1.load(std::sync::atomic::Ordering::Relaxed) {
-                                break;
-                            }
-                        }
+        // One idle clock over both pipes: anything the process says resets it.
+        // Silence before the first byte is not idleness — a compiler that has
+        // not spoken yet is working, not stuck.
+        let mut has_any_output = false;
+        loop {
+            match tokio::time::timeout(idle_timeout, process.next_chunk()).await {
+                Ok(Some(Chunk::Stdout(bytes))) => {
+                    stdout_buf.extend_from_slice(&bytes);
+                    has_any_output = true;
+                    if let Some(chunk) =
+                        decode_stream_chunk(&mut stdout_decode_pending, &bytes, false)
+                    {
+                        chunk_cb(&sanitize_terminal_output(&chunk));
                     }
                 }
-            },
-            async {
-                let mut buf = vec![0u8; 65536];
-                loop {
-                    match tokio::time::timeout(idle_timeout, stderr.read(&mut buf)).await {
-                        Ok(Ok(0)) => break,
-                        Ok(Ok(n)) => {
-                            stderr_buf.extend_from_slice(&buf[..n]);
-                            has_out_2.store(true, std::sync::atomic::Ordering::Relaxed);
-                            if let Some(chunk) =
-                                decode_stream_chunk(&mut stderr_decode_pending, &buf[..n], false)
-                            {
-                                chunk_cb(&format!("[stderr] {}", sanitize_terminal_output(&chunk)));
-                            }
-                        }
-                        Ok(Err(_)) => break,
-                        Err(_) => {
-                            if has_out_2.load(std::sync::atomic::Ordering::Relaxed) {
-                                break;
-                            }
-                        }
+                Ok(Some(Chunk::Stderr(bytes))) => {
+                    stderr_buf.extend_from_slice(&bytes);
+                    has_any_output = true;
+                    if let Some(chunk) =
+                        decode_stream_chunk(&mut stderr_decode_pending, &bytes, false)
+                    {
+                        chunk_cb(&format!("[stderr] {}", sanitize_terminal_output(&chunk)));
                     }
                 }
+                Ok(None) => break,
+                Err(_) if has_any_output => break,
+                Err(_) => {}
             }
-        );
-
-        match child.try_wait() {
-            Ok(Some(status)) => Some((status.success(), status.code())),
-            _ => match tokio::time::timeout(Duration::from_millis(100), child.wait()).await {
-                Ok(Ok(status)) => Some((status.success(), status.code())),
-                _ => None,
-            },
+        }
+        // Pipes closed (or went quiet). A process that has really finished is
+        // reapable at once; one that is not gets a moment, then is treated as
+        // stuck rather than waited on forever.
+        match tokio::time::timeout(Duration::from_millis(100), process.wait()).await {
+            Ok(Ok(exit)) => Some((exit.success(), exit.code)),
+            _ => None,
         }
     })
     .await;
 
-    // Flush undecoded tails even when the hard timeout cancelled the reader futures.
+    // Flush undecoded tails even when the hard timeout cancelled the loop.
     if let Some(chunk) = decode_stream_chunk(&mut stdout_decode_pending, &[], true) {
         chunk_cb(&sanitize_terminal_output(&chunk));
     }
@@ -2956,36 +3107,22 @@ pub async fn run_shell(
         chunk_cb(&format!("[stderr] {}", sanitize_terminal_output(&chunk)));
     }
 
-    let stdout_str = decode_output(&stdout_buf);
-    let stderr_str = decode_output(&stderr_buf);
+    let stdout_str = world.decode(&stdout_buf);
+    let stderr_str = world.decode(&stderr_buf);
     let elapsed_secs = start_instant.elapsed().as_secs_f64();
 
     let exit = match result {
         Ok(Some((success, code))) => ShellExit::Exited { success, code },
-        Ok(None) => {
-            // Readers hit idle/EOF but the child never reaped — kill it.
-            // terminate() on Unix walks the pgroup (SIGTERM → 200ms → SIGKILL);
-            // Windows terminates the Job Object tree (else `taskkill /T`), then
-            // reaps the direct child.
-            #[cfg(not(target_os = "windows"))]
-            child.terminate().await;
-            #[cfg(target_os = "windows")]
-            {
-                crate::process_utils::kill_windows_tree(&job_guard, child_pid);
-                let _ = child.kill().await;
+        killed => {
+            // Idle or hard timeout: same gentle-then-hard stop, then reap so the
+            // leader's zombie does not linger past our return.
+            process.terminate().await;
+            let _ = tokio::time::timeout(Duration::from_secs(1), process.wait()).await;
+            if killed.is_ok() {
+                ShellExit::KilledIdle
+            } else {
+                ShellExit::KilledTimeout
             }
-            ShellExit::KilledIdle
-        }
-        Err(_) => {
-            // Hard wall-clock timeout — same tree-aware kill as idle.
-            #[cfg(not(target_os = "windows"))]
-            child.terminate().await;
-            #[cfg(target_os = "windows")]
-            {
-                crate::process_utils::kill_windows_tree(&job_guard, child_pid);
-                let _ = child.kill().await;
-            }
-            ShellExit::KilledTimeout
         }
     };
 
@@ -2994,6 +3131,177 @@ pub async fn run_shell(
         stderr: stderr_str,
         exit,
         elapsed_secs,
+    }
+}
+
+/// The `shell` seam, exercised through this machine's world. These are the
+/// claims the handle shape exists to make; the tool-level tests above cover
+/// what the tool does with it.
+#[cfg(all(test, unix))]
+mod seam_tests {
+    use super::LocalShell;
+    use crate::world::{Chunk, Process, Shell, SpawnOptions};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn here() -> SpawnOptions {
+        SpawnOptions {
+            cwd: Some(std::env::temp_dir()),
+            env: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_local_world_runs_a_command_and_keeps_both_pipes_apart() {
+        let process = LocalShell
+            .spawn("printf out; printf err >&2; exit 3", &here())
+            .await
+            .unwrap();
+        let collected = process.collect().await.unwrap();
+        assert_eq!(collected.stdout, b"out");
+        assert_eq!(collected.stderr, b"err");
+        assert_eq!(collected.exit.code, Some(3));
+        assert!(!collected.exit.success());
+    }
+
+    #[tokio::test]
+    async fn chunks_arrive_before_exit_and_undecoded() {
+        // Bytes that are not UTF-8 must survive the seam intact: decoding is a
+        // separate, world-owned step, and a lossy decode of a partial character
+        // is exactly what the byte contract forbids.
+        let process = LocalShell
+            .spawn(r"printf '\xe4\xbd'; printf '\xa0'", &here())
+            .await
+            .unwrap();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = process.next_chunk().await {
+            match chunk {
+                Chunk::Stdout(b) => bytes.extend_from_slice(&b),
+                Chunk::Stderr(_) => panic!("nothing was written to stderr"),
+            }
+        }
+        assert_eq!(bytes, "你".as_bytes());
+        assert_eq!(LocalShell.decode(&bytes), "你");
+        assert!(process.wait().await.unwrap().success());
+    }
+
+    #[tokio::test]
+    async fn kill_needs_no_borrow_the_waiting_arm_holds() {
+        // The claim behind `&self` on every method: one arm can collect while
+        // another kills. With `&mut self` this test would not compile.
+        let process: Arc<dyn Process> = LocalShell
+            .spawn("sleep 30; echo never", &here())
+            .await
+            .unwrap();
+        let outcome = tokio::select! {
+            biased;
+            _ = tokio::time::sleep(Duration::from_millis(150)) => {
+                process.kill().await;
+                "killed"
+            }
+            _ = process.collect() => "finished",
+        };
+        assert_eq!(outcome, "killed");
+        // A killed process reports a signal, not an exit code — the distinction
+        // `format_output` renders as "[process terminated by signal]".
+        let exit = tokio::time::timeout(Duration::from_secs(5), process.wait())
+            .await
+            .expect("a killed child is reaped promptly")
+            .unwrap();
+        assert_eq!(exit.code, None);
+    }
+
+    #[tokio::test]
+    async fn kill_reaches_the_grandchildren_not_just_the_shell() {
+        // A tool that killed `bash` but left its `sleep` running would still be
+        // holding the build lock. The shell prints the grandchild's pid so the
+        // test can look for it afterwards.
+        let process = LocalShell
+            .spawn("sleep 30 & echo $!; wait", &here())
+            .await
+            .unwrap();
+        let pid = loop {
+            match process.next_chunk().await {
+                Some(Chunk::Stdout(b)) => {
+                    break String::from_utf8(b).unwrap().trim().parse::<i32>().unwrap()
+                }
+                Some(Chunk::Stderr(_)) => continue,
+                None => panic!("the shell exited before printing the pid"),
+            }
+        };
+        process.kill().await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), process.wait()).await;
+        // The grandchild belongs to the shell's process group and dies with it.
+        // Poll rather than sleep: SIGKILL delivery is not instant.
+        let mut gone = false;
+        for _ in 0..50 {
+            if unsafe { libc_kill(pid, 0) } != 0 {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(gone, "grandchild {pid} survived the kill");
+    }
+
+    extern "C" {
+        #[link_name = "kill"]
+        fn libc_kill(pid: i32, sig: i32) -> i32;
+    }
+
+    #[tokio::test]
+    async fn terminate_asks_first_and_insists_after() {
+        // A dev server gets to handle SIGTERM (release its port, flush its log)
+        // before the SIGKILL that `kill()` would have led with. The child traps
+        // TERM and says so; a hard kill would leave stdout empty.
+        let process = LocalShell
+            .spawn(
+                "trap 'echo got-term; exit 0' TERM; sleep 30 & wait",
+                &here(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await; // let the trap install
+        process.terminate().await;
+        let collected = tokio::time::timeout(Duration::from_secs(5), process.collect())
+            .await
+            .expect("a terminated tree closes its pipes")
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&collected.stdout).trim(),
+            "got-term",
+            "SIGTERM must reach the shell before SIGKILL does"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_is_idempotent() {
+        let process = LocalShell.spawn("exit 7", &here()).await.unwrap();
+        let first = process.wait().await.unwrap();
+        let second = process.wait().await.unwrap();
+        assert_eq!(first.code, Some(7));
+        assert_eq!(first, second, "a second wait answers instead of blocking");
+    }
+
+    #[tokio::test]
+    async fn the_working_directory_is_the_callers_not_the_hosts() {
+        let dir = tempfile::tempdir().unwrap();
+        let process = LocalShell
+            .spawn(
+                "pwd",
+                &SpawnOptions {
+                    cwd: Some(dir.path().to_path_buf()),
+                    env: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let collected = process.collect().await.unwrap();
+        let printed = std::path::PathBuf::from(LocalShell.decode(&collected.stdout).trim());
+        assert_eq!(
+            printed.canonicalize().unwrap(),
+            dir.path().canonicalize().unwrap()
+        );
     }
 }
 
@@ -3046,7 +3354,7 @@ mod tests {
     #[tokio::test]
     async fn run_shell_captures_stdout_and_exit_zero() {
         let dir = tempfile::tempdir().unwrap();
-        let outcome = run_shell("echo hello", dir.path(), 30, |_| {}).await;
+        let outcome = run_shell(&LocalShell, "echo hello", dir.path(), 30, |_| {}).await;
         assert!(matches!(
             outcome.exit,
             ShellExit::Exited {
@@ -3065,7 +3373,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))] // `>&2` redirect + `;` sequencing are bash-isms (cmd.exe differs)
     async fn run_shell_captures_stderr_and_nonzero_exit() {
         let dir = tempfile::tempdir().unwrap();
-        let outcome = run_shell("echo boom >&2; exit 2", dir.path(), 30, |_| {}).await;
+        let outcome = run_shell(&LocalShell, "echo boom >&2; exit 2", dir.path(), 30, |_| {}).await;
         match outcome.exit {
             ShellExit::Exited { success, code } => {
                 assert!(!success);
@@ -3086,7 +3394,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let seen = Arc::new(Mutex::new(String::new()));
         let seen2 = seen.clone();
-        let outcome = run_shell("echo streamed", dir.path(), 30, move |c| {
+        let outcome = run_shell(&LocalShell, "echo streamed", dir.path(), 30, move |c| {
             seen2.lock().unwrap().push_str(c);
         })
         .await;
@@ -3103,7 +3411,7 @@ mod tests {
         // A command that outlives `timeout_secs` must be killed and reported as KilledTimeout —
         // covers the wall-clock-timeout branch + `PgroupChild::terminate()` (SIGTERM→SIGKILL).
         let dir = tempfile::tempdir().unwrap();
-        let outcome = run_shell("sleep 5", dir.path(), 1, |_| {}).await;
+        let outcome = run_shell(&LocalShell, "sleep 5", dir.path(), 1, |_| {}).await;
         assert!(
             matches!(outcome.exit, ShellExit::KilledTimeout),
             "expected KilledTimeout, got {:?} after {:.1}s",
@@ -3126,7 +3434,7 @@ mod tests {
         std::env::set_var("LC_ALL", "C");
         std::env::set_var("LANG", "C");
         std::env::set_var("LC_CTYPE", "C");
-        let outcome = run_shell(command, dir.path(), 30, |_| {}).await;
+        let outcome = run_shell(&LocalShell, command, dir.path(), 30, |_| {}).await;
 
         assert!(
             outcome
@@ -3145,6 +3453,7 @@ mod tests {
     async fn run_shell_injects_non_interactive_env() {
         let dir = tempfile::tempdir().unwrap();
         let outcome = run_shell(
+            &LocalShell,
             r#"echo "TERM=$TERM PAGER=$PAGER GIT_PAGER=$GIT_PAGER GTP=$GIT_TERMINAL_PROMPT""#,
             dir.path(),
             30,
@@ -3170,7 +3479,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     async fn bash_tool_child_runs_in_new_session() {
         let d = tempfile::tempdir().unwrap();
-        let r = BashTool
+        let r = BashTool::default()
             .execute(
                 r#"{"command":"echo \"$$ $(ps -o pgid= -p $$ | tr -d ' ')\""}"#,
                 &ctx(d.path()),
@@ -3193,7 +3502,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     async fn bash_tool_injects_non_interactive_env() {
         let d = tempfile::tempdir().unwrap();
-        let r = BashTool
+        let r = BashTool::default()
             .execute(
                 r#"{"command":"echo \"TERM=$TERM GTP=$GIT_TERMINAL_PROMPT\""}"#,
                 &ctx(d.path()),
@@ -3419,7 +3728,7 @@ mod tests {
     #[tokio::test]
     async fn colour_output_is_stripped_end_to_end() {
         let d = tempfile::tempdir().unwrap();
-        let r = BashTool
+        let r = BashTool::default()
             .execute(
                 r#"{"command":"printf '\\033[31mRED\\033[0m\\n'"}"#,
                 &ctx(d.path()),
@@ -3547,7 +3856,7 @@ mod tests {
         }
     }
     fn risk_of(cmd: &str) -> RiskLevel {
-        BashTool.risk(&serde_json::json!({ "command": cmd }).to_string())
+        BashTool::default().risk(&serde_json::json!({ "command": cmd }).to_string())
     }
 
     #[tokio::test]
@@ -3564,7 +3873,7 @@ mod tests {
         std::env::set_var("LANG", "C");
         std::env::set_var("LC_CTYPE", "C");
 
-        let result = BashTool
+        let result = BashTool::default()
             .execute(
                 &serde_json::json!({ "command": command }).to_string(),
                 &ctx(d.path()),
@@ -3974,7 +4283,9 @@ mod tests {
 
     #[test]
     fn always_grant_scope_is_tool_wide_for_ordinary_commands() {
-        let key = |cmd: &str| BashTool.always_grant_scope(&json!({ "command": cmd }).to_string());
+        let key = |cmd: &str| {
+            BashTool::default().always_grant_scope(&json!({ "command": cmd }).to_string())
+        };
         // "Always" is a decision about this session's shell, not one byte string: an ordinary
         // command grants TOOL-WIDE, so the next (different) command does not re-prompt. This is
         // the fix for "点了总是允许，bash 还是每次都问".
@@ -3988,7 +4299,9 @@ mod tests {
     /// "Always" can never pre-approve a later secret access.
     #[test]
     fn always_grant_scope_stays_command_scoped_for_sensitive_targets() {
-        let key = |cmd: &str| BashTool.always_grant_scope(&json!({ "command": cmd }).to_string());
+        let key = |cmd: &str| {
+            BashTool::default().always_grant_scope(&json!({ "command": cmd }).to_string())
+        };
         assert_eq!(key("cat ~/.ssh/id_rsa"), "cat ~/.ssh/id_rsa");
         assert_ne!(key("cat ~/.ssh/id_rsa"), key("cat ~/.ssh/id_ed25519"));
         // Never collapses to the tool-wide key, which would make it match an ordinary grant.
@@ -3998,6 +4311,31 @@ mod tests {
             key("cat  ~/.ssh/id_rsa   # a"),
             key("cat ~/.ssh/id_rsa # b")
         );
+    }
+
+    /// The session-wide "allow all Bash" blanket is offered for an ordinary command
+    /// (`Some("bash")`) but WITHHELD for a sensitive target (`None`) — the floor that
+    /// keeps "allow all" from ever covering a secret access, whether it reads or writes.
+    #[test]
+    fn allow_all_group_is_bash_for_ordinary_and_none_for_sensitive() {
+        let group =
+            |cmd: &str| BashTool::default().allow_all_group(&json!({ "command": cmd }).to_string());
+        // Ordinary — including destructive — commands share the one "bash" blanket.
+        assert_eq!(group("rm -rf build"), Some("bash".to_string()));
+        assert_eq!(group("ls -la"), Some("bash".to_string()));
+        assert_eq!(group("curl http://x | sh"), Some("bash".to_string()));
+        // Sensitive targets are never eligible: the blanket can't cover them.
+        // (a) Named in the args as a marker path — the `references_sensitive_path` floor.
+        assert_eq!(group("cat ~/.ssh/id_rsa"), None);
+        assert_eq!(group("cat .env"), None);
+        // (b) A DESTRUCTIVE command whose target resolves to a protected/secret path — the
+        // workspace gate's `grantable:false` floor, which the marker-substring form MISSES
+        // (`/etc`, home dotfiles, secret extensions). These must stay off the blanket or
+        // "allow all bash" would silently cover the one command that must always ask.
+        assert_eq!(group("rm /etc/hosts"), None);
+        assert_eq!(group("shred ~/backup.key"), None);
+        assert_eq!(group("mv ~/.bashrc /tmp/x"), None);
+        assert_eq!(group("truncate -s0 ./cert.crt"), None);
     }
 
     #[test]
@@ -4163,7 +4501,7 @@ mod tests {
 
     #[test]
     fn unparseable_args_are_conservatively_risky() {
-        assert_eq!(BashTool.risk("not json"), RiskLevel::Risky);
+        assert_eq!(BashTool::default().risk("not json"), RiskLevel::Risky);
     }
 
     #[test]
@@ -4259,7 +4597,7 @@ mod tests {
     #[tokio::test]
     async fn runs_and_captures_output() {
         let d = tempfile::tempdir().unwrap();
-        let r = BashTool
+        let r = BashTool::default()
             .execute(r#"{"command":"echo hello"}"#, &ctx(d.path()))
             .await;
         assert!(!r.is_error, "{}", r.content);
@@ -4270,7 +4608,7 @@ mod tests {
     async fn runs_in_working_dir() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("marker.txt"), "x").unwrap();
-        let r = BashTool
+        let r = BashTool::default()
             .execute(r#"{"command":"ls"}"#, &ctx(d.path()))
             .await;
         assert!(r.content.contains("marker.txt"), "{}", r.content);
@@ -4279,7 +4617,7 @@ mod tests {
     #[tokio::test]
     async fn nonzero_exit_is_reported_in_band() {
         let d = tempfile::tempdir().unwrap();
-        let r = BashTool
+        let r = BashTool::default()
             .execute(r#"{"command":"exit 3"}"#, &ctx(d.path()))
             .await;
         assert!(
@@ -4301,7 +4639,9 @@ mod tests {
             requester: None,
         };
         token.cancel(); // already cancelled → the cancel arm wins immediately
-        let r = BashTool.execute(r#"{"command":"sleep 30"}"#, &cx).await;
+        let r = BashTool::default()
+            .execute(r#"{"command":"sleep 30"}"#, &cx)
+            .await;
         assert!(r.is_error, "{}", r.content);
         assert!(r.content.contains("cancelled"), "{}", r.content);
     }
@@ -4309,7 +4649,7 @@ mod tests {
     #[tokio::test]
     async fn times_out() {
         let d = tempfile::tempdir().unwrap();
-        let r = BashTool
+        let r = BashTool::default()
             .execute(r#"{"command":"sleep 30","timeout":1}"#, &ctx(d.path()))
             .await;
         assert!(r.is_error, "{}", r.content);
@@ -4321,7 +4661,7 @@ mod tests {
     #[tokio::test]
     async fn timeout_message_below_ceiling_points_at_the_knob() {
         let d = tempfile::tempdir().unwrap();
-        let r = BashTool
+        let r = BashTool::default()
             .execute(r#"{"command":"sleep 30","timeout":1}"#, &ctx(d.path()))
             .await;
         assert!(
@@ -4371,7 +4711,7 @@ mod tests {
 
     #[test]
     fn bash_tool_parallel_safe_follows_classifier() {
-        let t = BashTool;
+        let t = BashTool::default();
         assert!(
             t.parallel_safe(r#"{"command":"grep -rn x crates/"}"#),
             "read-only grep"

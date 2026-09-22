@@ -105,6 +105,36 @@ fn bash_command(args: &str) -> Option<String> {
     serde_json::from_str::<A>(args).ok().map(|a| a.command)
 }
 
+/// True iff any of these destructive `targets` is a sensitive path — the floor that
+/// makes such a command ask EVERY time (`grantable:false`) and that the session-wide
+/// "allow all bash" blanket must never cover. With a `cwd` the target is resolved
+/// against it (catches a relative `.ssh/authorized_keys`); without one, the raw target
+/// is classified — the same conservative fallback this gate itself uses when the cwd is
+/// unknown (an absolute/home/extension secret is still caught; only a relative secret
+/// is missed). One predicate so the gate and the blanket cannot drift apart.
+pub(crate) fn any_target_sensitive(targets: &[String], cwd: Option<&Path>) -> bool {
+    match cwd {
+        Some(cwd) => targets.iter().any(|t| path_is_sensitive(&resolve_path(t, cwd))),
+        None => targets.iter().any(|t| path_is_sensitive(Path::new(t))),
+    }
+}
+
+/// True iff a destructive command in `args` names a sensitive target, classified without
+/// a cwd. [`crate::tools::bash::BashTool::allow_all_group`] calls this so the blanket
+/// withholds "allow all bash" for exactly the destructive commands [`bash_workspace_verdict`]
+/// forces to ask every time. A read, an unparseable command, or an unresolvable target is
+/// not classified here — a sensitive READ is caught upstream by the `references_sensitive_path`
+/// floor the blanket checks first.
+pub(crate) fn args_name_sensitive_destructive_target(args: &str) -> bool {
+    let Some(command) = bash_command(args) else {
+        return false;
+    };
+    match scan_destructive_bash(&command) {
+        BashScan::Targets(t) => any_target_sensitive(&t, None),
+        BashScan::Unresolvable | BashScan::NotDestructive => false,
+    }
+}
+
 fn base(token: &str) -> &str {
     token.rsplit('/').next().unwrap_or(token)
 }
@@ -733,7 +763,13 @@ impl BashWorkspaceGate {
         tool: &Arc<dyn Tool>,
         rt: &RequestCtx,
     ) -> PermissionDecision {
-        self.prompt_with_reason(call, tool, rt, Some("此命令会写到工作区外 — 需要单独确认。".into())).await
+        self.prompt_with_reason(
+            call,
+            tool,
+            rt,
+            Some("此命令会写到工作区外 — 需要单独确认。".into()),
+        )
+        .await
     }
 
     /// Round-trip the driver with an explicit reason string.
@@ -749,6 +785,7 @@ impl BashWorkspaceGate {
             tool: tool.name().to_string(),
             args: call.arguments.clone(),
             reason,
+            allow_all_bash: false,
         })
         .unwrap_or(serde_json::Value::Null);
         PermissionDecision::from_value(&rt.request(&self.kind, payload).await)
@@ -845,6 +882,133 @@ impl BashWorkspaceGate {
     }
 }
 
+/// What the destructive-bash policy says about one call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BashWorkspaceVerdict {
+    /// Not a shell tool, not destructive, unparseable, or every target is inside
+    /// the workspace — defer to the ordinary flow. (In-workspace is a DEFER, not
+    /// an allow: a recursive `rm` is still Risky and must reach approval.)
+    Defer,
+    /// Ask a person.
+    Ask {
+        /// Whether "allow always" may be offered. `false` for a sensitive target.
+        grantable: bool,
+        /// What an `allow always` is remembered against. Empty when not grantable.
+        scope: String,
+    },
+}
+
+/// The destructive-bash verdict for one call.
+///
+/// `cwd` is `None` when the working directory could not be read: relative targets
+/// cannot be resolved then, so an ABSOLUTE sensitive target still asks and
+/// everything else defers.
+///
+/// `fallback_scope` is what an unresolvable-but-benign command is remembered
+/// against — the caller passes `Tool::always_grant_scope`, which this module
+/// cannot reach without the tool.
+///
+/// ONE SCOPE, NOT MANY. The kernel shell grants per out-of-workspace DIRECTORY and
+/// auto-allows only when every one of them is already granted. This returns the
+/// same directories joined into a single scope, so "always" remembers exactly the
+/// combination that was shown. That is NARROWER: a later command touching only one
+/// of those directories asks again. Narrower is the safe direction, and it makes
+/// the "ride along" hazard the kernel shell guards against explicitly
+/// (`rm /granted/x && mv ws_file /tmp/stolen`) impossible by construction.
+pub async fn bash_workspace_verdict(
+    tool_name: &str,
+    arguments: &str,
+    cwd: Option<&Path>,
+    fallback_scope: &str,
+) -> BashWorkspaceVerdict {
+    let ungrantable = BashWorkspaceVerdict::Ask {
+        grantable: false,
+        scope: String::new(),
+    };
+    if !super::is_command_shell_tool(tool_name) {
+        return BashWorkspaceVerdict::Defer;
+    }
+    let Some(command) = bash_command(arguments) else {
+        return BashWorkspaceVerdict::Defer; // unparseable — the bash tool / risk flow handles it
+    };
+    let targets = match scan_destructive_bash(&command) {
+        BashScan::NotDestructive => return BashWorkspaceVerdict::Defer,
+        BashScan::Unresolvable => {
+            return if references_sensitive_path(arguments) {
+                ungrantable
+            } else {
+                BashWorkspaceVerdict::Ask {
+                    grantable: true,
+                    scope: format!("bash-unresolvable::{fallback_scope}"),
+                }
+            }
+        }
+        BashScan::Targets(t) => t,
+    };
+    let Some(cwd) = cwd else {
+        return if any_target_sensitive(&targets, None) {
+            ungrantable
+        } else {
+            BashWorkspaceVerdict::Defer
+        };
+    };
+    // Sensitive TARGET → ask every time. Classified on the RESOLVED target (not a substring
+    // of the whole command) so a benign command that merely MENTIONS a secret name
+    // (`echo id_rsa >> ./notes.txt`) is not caught.
+    if any_target_sensitive(&targets, Some(cwd)) {
+        return ungrantable;
+    }
+    // Canonicalizes paths (filesystem I/O) — off the async worker and bounded, so a hung
+    // mount cannot freeze the caller's loop. On timeout → "not in workspace" → an ordinary
+    // ask (safe, never hangs).
+    let mv_pairs = mv_moves(&command);
+    let (all_in_workspace, out_keys) = {
+        let targets = targets.clone();
+        let cwd = cwd.to_path_buf();
+        let fallback = (false, Vec::<String>::new());
+        super::run_bounded(super::GATE_FS_TIMEOUT, fallback, move || {
+            // Temp-dir targets count as in-workspace (`cargo build > /tmp/x` is scratch).
+            let mut out: Vec<String> = targets
+                .iter()
+                .filter(|t| !(path_in_workspace(t, &cwd) || path_in_temp_dir(t, &cwd)))
+                .cloned()
+                .collect();
+            // A `mv` carrying an in-workspace file OUT removes it from the workspace — an
+            // equivalent delete. Temp does NOT rescue the dest here, so a rejected `rm`
+            // cannot be laundered through `mv <ws_file> /tmp/backup`.
+            for (src, dst) in &mv_pairs {
+                if path_in_workspace(src, &cwd)
+                    && !path_in_workspace(dst, &cwd)
+                    && !out.contains(dst)
+                {
+                    out.push(dst.clone());
+                }
+            }
+            let all_in = out.is_empty();
+            let mut keys: Vec<String> = out
+                .iter()
+                .map(|t| format!("bashdir::{}", canonical_dir_key(t, &cwd)))
+                .collect();
+            keys.sort();
+            keys.dedup();
+            (all_in, keys)
+        })
+        .await
+    };
+    if all_in_workspace {
+        return BashWorkspaceVerdict::Defer;
+    }
+    // Empty keys = the FS-timeout fallback. Nothing to remember, so ask un-grantably
+    // rather than remember a scope that means "we could not tell".
+    if out_keys.is_empty() {
+        return ungrantable;
+    }
+    BashWorkspaceVerdict::Ask {
+        grantable: true,
+        scope: out_keys.join("+"),
+    }
+}
+
 #[async_trait]
 impl ToolMiddleware for BashWorkspaceGate {
     async fn before(
@@ -872,7 +1036,7 @@ impl ToolMiddleware for BashWorkspaceGate {
         let cwd = match self.cwd.read().ok().map(|g| g.clone()) {
             Some(c) => c,
             None => {
-                return if targets.iter().any(|t| path_is_sensitive(Path::new(t))) {
+                return if any_target_sensitive(&targets, None) {
                     self.prompt_unremembered(call, tool, rt).await
                 } else {
                     BeforeOutcome::Proceed
@@ -885,10 +1049,7 @@ impl ToolMiddleware for BashWorkspaceGate {
         // command that merely MENTIONS a secret name (`echo id_rsa >> ./notes.txt`) isn't blocked.
         // This check runs BEFORE the allow-all bypass: sensitive targets are NEVER covered by the
         // session-wide allow-all grant — the sensitive floor must not be weakened.
-        if targets
-            .iter()
-            .any(|t| path_is_sensitive(&resolve_path(t, &cwd)))
-        {
+        if any_target_sensitive(&targets, Some(&cwd)) {
             return self.prompt_unremembered(call, tool, rt).await;
         }
 
@@ -1344,7 +1505,7 @@ mod tests {
     // ---- gate integration tests ------------------------------------------------------------
 
     fn bash_tool() -> Arc<dyn Tool> {
-        Arc::new(crate::tools::bash::BashTool)
+        Arc::new(crate::tools::bash::BashTool::default())
     }
 
     /// A driver that never answers → the bounded round-trip times out → Null → Deny. Any path
@@ -1415,7 +1576,7 @@ mod tests {
         let ws = tempfile::tempdir().unwrap();
         let target = std::path::PathBuf::from("/atomcode-test-outside-rm/x.txt");
         let gate = BashWorkspaceGate::pinned(ws.path().to_path_buf());
-        let tool: Arc<dyn Tool> = Arc::new(crate::tools::bash::BashStartTool);
+        let tool: Arc<dyn Tool> = Arc::new(crate::tools::bash::BashStartTool::default());
         let mut call = ToolCall {
             id: "1".into(),
             name: "bash_start".into(),

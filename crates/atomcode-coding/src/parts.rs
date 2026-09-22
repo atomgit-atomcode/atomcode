@@ -22,38 +22,24 @@ use std::sync::Arc;
 
 use atomcode_capabilities::cc_hooks::{CCExternalHooks, HookConfig};
 use atomcode_capabilities::codeintel::register_codeintel_tools;
-use atomcode_capabilities::datalog::DatalogHook;
-use atomcode_capabilities::mcp::{self, McpConnectEvent, McpRegistry, McpServerConfig};
-use atomcode_capabilities::memory::MemoryHook;
+use atomcode_capabilities::mcp::{McpConnectEvent, McpRegistry, McpServerConfig};
 use atomcode_capabilities::session::snapshot::SnapshotPersistenceStatus;
 use atomcode_capabilities::session::{
-    ListSessionsTool, PresentationFile, RecallTool, SessionContextHook, SessionLease,
-    SessionManager, SessionMeta, SnapshotHook, StorageOwner, TranscriptHook,
+    ListSessionsTool, RecallTool, SessionContextHook, SessionLease, SessionManager, SessionMeta,
+    SnapshotHook, StorageOwner,
 };
-use atomcode_capabilities::skills::{
-    register_skill_tools, runtime_skill_dirs, SkillCatalogHook, SkillRegistry,
-};
+use atomcode_capabilities::skills::{register_skill_tools, runtime_skill_dirs, SkillRegistry};
 use atomcode_capabilities::tools::{
-    register_coding_tools_with_vision, APPROVAL_KIND, ApprovalMiddleware, ArtifactMiddleware,
-    ArtifactStore, BashWorkspaceGate, FetchOutputTool, OpenFileWorkspaceGate, ReadFileTool,
-    RepairToolArgsMiddleware, SensitivePathGate, WebFetchTool, WebSearchTool, WriteApprovalGate,
+    register_coding_tools_with_vision, ApprovalMiddleware, WebFetchTool, WebSearchTool,
 };
-use atomcode_kernel::agent::Agent;
-use atomcode_kernel::checkpoint::CompactionCheckpoint;
-use atomcode_kernel::hook::LifecycleHooks;
-use atomcode_kernel::message::{Message, Role, SessionSnapshot};
-use atomcode_kernel::middleware::ToolMiddleware;
+use atomcode_kernel::message::{Message, SessionSnapshot};
 use atomcode_kernel::provider::LlmProvider;
-use atomcode_kernel::tool::{MountedTools, MountedToolsPublisher, ToolRegistry};
+use atomcode_kernel::session::SessionHeader;
+use atomcode_kernel::tool::ToolRegistry;
 use atomcode_review::{ReviewTool, ReviewToolConfig, SharedReviewProvider};
 
 use crate::config::CodingAgentConfig;
-use crate::discipline::VerifyCadenceHook;
 use crate::execution_policy::TurnExecutionPolicy;
-use crate::mcp_instructions::McpInstructionsHook;
-#[cfg(test)]
-use crate::persona::coding_persona;
-use crate::persona::coding_persona_with_capabilities;
 use crate::plugin_hooks::PluginHookSource;
 use crate::rate_limit::RateLimitWindowSource;
 
@@ -154,6 +140,10 @@ pub struct PrepareOptions {
     pub request_user_input: bool,
     /// Provider-specific quota source supplied by the host. `None` keeps 429 handling generic.
     pub rate_limit_source: Option<Arc<dyn RateLimitWindowSource>>,
+    /// A front end outside the App, fed from every App the runtime builds
+    /// (`crate::front_end`). `None` when the driver reads the runtime's own
+    /// events instead.
+    pub front_end: Option<Arc<crate::front_end::FrontEnd>>,
 }
 
 impl Default for PrepareOptions {
@@ -172,6 +162,7 @@ impl Default for PrepareOptions {
             subagents: SubagentPolicy::Disabled,
             request_user_input: true,
             rate_limit_source: None,
+            front_end: None,
         }
     }
 }
@@ -296,6 +287,34 @@ fn builtin_external_profile(
     })
 }
 
+/// Derive the DRIVER-NEUTRAL half of a production [`PrepareOptions`] from a
+/// [`CodingRuntimeConfig`]: the full-capability defaults (`tools`/`memory`/
+/// `web`/`review`/`request_user_input` on), MCP per the config, in-process
+/// delegation enabled, and external-agent subagents resolved from
+/// `[subagent]` — including the `claude`/`codex` convenience switches and
+/// `[[subagent.external]]` entries. Dangerous (`bypass`) profiles follow
+/// `cfg.interactive` (the same rule the CLI headless path applies).
+///
+/// Every spawn site (CLI startup, daemon, the TUI's deferred respawns) MUST
+/// build its `PrepareOptions` from this and then override only what makes its
+/// driver different (session mode, `front_end`, `no_tools`, plugin skill dirs,
+/// rate-limit source). That is how a config field can never again be wired at
+/// one spawn site and silently dropped at another — which is exactly what
+/// happened to `external_subagents` when the daemon path hardcoded
+/// `Vec::new()` and in-TUI respawns lost `subagent_claude-code`.
+pub fn prepare_from_config(cfg: &crate::config::CodingRuntimeConfig) -> PrepareOptions {
+    let external_subagents = cfg
+        .subagent_config
+        .as_ref()
+        .map(|c| resolve_external_subagents(&c.subagent, cfg.interactive))
+        .unwrap_or_default();
+    PrepareOptions {
+        mcp: cfg.mcp,
+        external_subagents,
+        ..PrepareOptions::default()
+    }
+}
+
 /// The session identity + persistence wiring, allocated ONCE by [`prepare`] —
 /// the single owner the design review asked for.
 pub struct SessionBinding {
@@ -309,9 +328,9 @@ pub struct SessionBinding {
     /// Accepted user input recovered from an interrupted turn. It is replayed
     /// through the normal runtime submit path after an agent becomes available.
     pub(crate) pending_resume_prompt: Option<Message>,
-    /// Fresh metadata prepared in memory but not yet catalog-visible. CodingRuntime
+    /// A fresh session prepared in memory but not yet catalog-visible. CodingRuntime
     /// publishes it only after the complete candidate graph has assembled.
-    staged_fresh: Option<SessionMeta>,
+    staged_fresh: Option<(SessionMeta, SessionHeader)>,
 }
 
 struct McpWorkGuard {
@@ -329,6 +348,27 @@ impl Drop for McpWorkGuard {
     }
 }
 
+/// Register the shipped AtomGit REST capabilities into a coding tool catalog.
+///
+#[cfg(feature = "atomgit")]
+fn register_atomgit_capabilities(
+    registry: &mut ToolRegistry,
+    names: &mut Vec<String>,
+) -> Result<(), String> {
+    use atomcode_capabilities::tools::{
+        atomgit_tool_names, register_atomgit_tools, AtomgitClient, AtomgitConfig, LiveTokenProvider,
+    };
+
+    let client = AtomgitClient::new(AtomgitConfig {
+        base_url: "https://api.atomgit.com/api/v5".to_string(),
+        user_agent: format!("atomcode/{}", env!("CARGO_PKG_VERSION")),
+        token: Arc::new(LiveTokenProvider),
+    })?;
+    register_atomgit_tools(registry, Arc::new(client));
+    names.extend(atomgit_tool_names().iter().map(|name| (*name).to_string()));
+    Ok(())
+}
+
 /// Everything `assemble` composes — and everything a respawn must REUSE so state
 /// survives (approval grants, hook state, session identity).
 pub struct CodingParts {
@@ -338,17 +378,24 @@ pub struct CodingParts {
     /// changing the master switch requires a capability reprepare; provider-only
     /// reassembly must not advertise a tool absent from the mounted catalog.
     todo_enabled: bool,
-    request_user_input_enabled: bool,
-    /// At least one external-agent subagent tool (`subagent_<name>`) is mounted;
-    /// drives the persona's external-delegation guidance (kept in sync on model
-    /// swap via `reconcile_coding_persona`).
-    has_external_subagents: bool,
     mcp_tool_names: Arc<std::sync::RwLock<Vec<String>>>,
-    mounted_tools: Option<MountedTools>,
-    mounted_tools_publisher: Option<MountedToolsPublisher>,
-    mcp_connect_rx: Option<tokio::sync::mpsc::UnboundedReceiver<McpConnectEvent>>,
+    /// Connection events for whoever publishes this registry's tools: the chain's
+    /// catalog task, or a tree's `mcp-host` row. Taken once.
+    mcp_connect_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<McpConnectEvent>>>,
+    /// The same events again, for the `mcp-telemetry` row. `None` when nothing
+    /// is metering, which is also when no fan-out was started. Taken once.
+    mcp_telemetry_rx:
+        std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<McpConnectEvent>>>,
     mcp_publish_lock: Arc<tokio::sync::Mutex<()>>,
     mcp_publication_enabled: Arc<std::sync::atomic::AtomicBool>,
+    /// The mounted catalog the `mcp-host` row publishes into, once it is up.
+    ///
+    /// Withdrawal has to reach the SAME catalog the model is offered, not just
+    /// this struct's bookkeeping: `/mcp reload` and friends withdraw first and
+    /// may then fail without rebuilding, leaving the mounted tree serving
+    /// whatever was published. Filled by the row; `None` before it mounts or
+    /// when no MCP is configured, and that is the "nothing published yet" case.
+    mcp_toolbox: Arc<std::sync::RwLock<Option<Arc<atomcode_harness::seams::ToolBox>>>>,
     /// True only after the publisher has reconciled every initial connection into
     /// the mounted kernel catalog. This is distinct from transport readiness.
     mcp_catalog_ready: tokio::sync::watch::Sender<bool>,
@@ -356,20 +403,39 @@ pub struct CodingParts {
     /// The approval gate, handle EXPOSED: respawning on the same parts keeps every
     /// allow-always grant (the in_memory-buried-in-the-assembly bug from the review).
     pub approval: Arc<ApprovalMiddleware>,
-    /// Lifecycle hooks in the CANONICAL ORDER (see [`assemble`]).
-    hooks: Vec<Arc<dyn LifecycleHooks>>,
-    /// The same session snapshot writer used by `SnapshotHook`, exposed through
-    /// the kernel's manual-compaction checkpoint seam.
-    compaction_checkpoint: Option<Arc<dyn CompactionCheckpoint>>,
+    /// The person's on/off over individual tools, for the same reason `approval`
+    /// is here: the tree is rebuilt on undo, restore, `/model` and a logout, and
+    /// none of those are "put the tools back". A reprepare hands the old one
+    /// over (`adopt_tool_switches`); a new session starts clean, because a new
+    /// session is where the config speaks again.
+    pub(crate) tool_switches: Arc<atomcode_harness::seams::ToolSwitches>,
+    /// The mounted catalog the `tools-host` row built, so the runtime can
+    /// answer "what can the model call right now" without reaching into the
+    /// App. Filled by the row, cleared when it unloads — the same shape
+    /// `mcp_toolbox` uses, and for the same reason.
+    tool_catalog: Arc<std::sync::RwLock<Option<Arc<atomcode_harness::seams::ToolBox>>>>,
+    /// What the `capability-commands` row asks the runtime to do — goal, loop,
+    /// the local-context queue, the policy intervention (`docs/adr/0021` §3).
+    /// Filled by the runtime before it mounts, and kept across a rebuild:
+    /// nothing in `prepare` can build it, because it talks back to the loop that
+    /// owns these parts.
+    pub(crate) runtime_commands: Option<Arc<dyn crate::runtime::RuntimeCommands>>,
     /// Concrete handle retained so provider-only reassembly can update the
     /// per-turn cost attribution without rebuilding session-owned hooks.
     snapshot_hook: Option<Arc<SnapshotHook>>,
+    extra_tools: Vec<Arc<dyn atomcode_kernel::tool::Tool>>,
+    host_only_tools: Vec<String>,
+    /// The skill catalog prepare loaded, and its prompt rendering (prioritizing
+    /// skills the project's instructions name), and where it looked. `None`
+    /// without tools.
+    skill_registry: Option<crate::host_rows::LoadedSkills>,
     snapshot_persistence_status: Option<SnapshotPersistenceStatus>,
     pub session: Option<SessionBinding>,
     /// Runtime-owned resume for sessionless drivers during an in-process reassembly.
     /// Persistent sessions reload their canonical snapshot through `SessionBinding` instead.
     runtime_resume: Option<SessionSnapshot>,
-    /// Connected MCP servers (None when `opts.mcp` was false or no config exists).
+    /// Connected MCP servers (None when `opts.tools` or `opts.mcp` was false; an empty
+    /// registry, not None, when MCP is on but nothing is configured).
     pub mcp_registry: Option<Arc<McpRegistry>>,
     /// The agent's tool working dir as a LIVE handle (kernel Seam 1b): the driver
     /// mutates it to implement `/cd` — tools resolve against the new dir from the
@@ -403,10 +469,6 @@ pub struct CodingParts {
     /// credential command survives a model swap / capability re-prepare (mirrors the
     /// sibling gates above); otherwise the user re-approves it every time.
     pub credential_shell_grants: std::sync::Arc<dyn atomcode_capabilities::tools::PermissionStore>,
-    /// Shared allow-all store for both bash gates (workspace gate + generic approval
-    /// middleware). Allows the user to grant "always approve bash" across both gates
-    /// with a single decision, persisting across model swaps.
-    pub bash_allow_all_grants: std::sync::Arc<dyn atomcode_capabilities::tools::PermissionStore>,
     /// Provider slot for the `code_review` sub-agent tool, FILLED by [`assemble`] (the tool
     /// is built in `prepare` before the provider exists). Shared so a respawn/model-swap
     /// updates the reviewer's provider too. `None` when `opts.review` was false.
@@ -416,12 +478,16 @@ pub struct CodingParts {
     /// [`CodingAgentConfig`].
     /// `None` when the driver policy or `ATOMCODE_SUBAGENT` override disables it.
     pub subagent_provider: Option<SharedReviewProvider>,
+    /// The provider for model calls made outside a round — summaries — recorded
+    /// and metered; filled with the others by [`wire_side_providers`].
+    side_provider: SharedReviewProvider,
     /// Child-agent assembly prepared from the same live tier-provider cells and
     /// execution policy as `task`. The `team` tool is mounted in the next phase.
-    pub team_runner: Option<crate::team::TeamRunnerFactory>,
     /// Runtime-owned Team Agent orchestration. The manager is shared with the
     /// mounted tool, while lifecycle termination is driven only by CodingRuntime.
     pub team_manager: crate::team::TeamRunManager,
+    /// `[subagent]` `(max_concurrent, max_rounds)`, when delegation is on.
+    pub(crate) subagent_knobs: Option<(usize, u32)>,
     /// User/project CC external hooks (`$ATOMCODE_HOME/hooks.json` + `<root>/.hooks.json`).
     /// ONE instance is registered as BOTH a [`LifecycleHooks`] (already pushed into `hooks`)
     /// and a [`ToolMiddleware`](atomcode_kernel::middleware::ToolMiddleware) (registered by
@@ -462,6 +528,10 @@ async fn prepare_with_plugin_hooks_reusing_lease(
 ) -> io::Result<CodingParts> {
     let mut registry = ToolRegistry::new();
     let mut names: Vec<String> = Vec::new();
+    // Tools a tree takes from here as they are (see `CodingParts::host_only_tools`):
+    // no harness row provides them, or the product's own version is the one that
+    // ships and the row's is a different contract under the same capability.
+    let mut host_only_tools: Vec<String> = Vec::new();
     let turn_execution_policy = Arc::new(TurnExecutionPolicy::new());
 
     // Always-on core: neutral fs/bash toolset + codeintel. Vision gating: a VL model
@@ -491,6 +561,11 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     }
     if !request_user_input_enabled {
         names.retain(|name| name != "request_user_input");
+    } else {
+        // The product's structured question — single, multiple, free text, a batch
+        // of up to four — in place of the tree's `ask_user`, which offers a choice
+        // and nothing else.
+        host_only_tools.push("request_user_input".into());
     }
     if opts.tools {
         register_codeintel_tools(&mut registry);
@@ -501,12 +576,15 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         );
         if atomcode_capabilities::codeintel::register_lsp_tool(&mut registry, &cfg.lsp) {
             names.push("lsp".into());
+            host_only_tools.push("lsp".into());
         }
     }
 
     // External-agent subagents (Claude Code / Codex as named subagent tools).
     // Each enabled profile whose binary is present on PATH mounts one tool.
-    let has_external_subagents = if !opts.tools || opts.external_subagents.is_empty() {
+    // External-agent subagents: each enabled profile whose binary is on PATH
+    // mounts one tool, which the tree takes as a host tool.
+    if !opts.tools || opts.external_subagents.is_empty() {
         false
     } else {
         let mounted = atomcode_capabilities::subagent::tool::register_external_subagent_tools(
@@ -514,14 +592,17 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             &opts.external_subagents,
         );
         let any = !mounted.is_empty();
+        host_only_tools.extend(mounted.iter().cloned());
         names.extend(mounted);
         any
     };
 
     #[cfg(feature = "atomgit")]
     if opts.tools {
-        crate::assemble::register_atomgit_capabilities(&mut registry, &mut names)
+        let before = names.len();
+        register_atomgit_capabilities(&mut registry, &mut names)
             .map_err(|error| io::Error::other(format!("AtomGit tool setup failed: {error}")))?;
+        host_only_tools.extend(names[before..].iter().cloned());
     }
 
     if opts.tools && opts.web && !atomcode_config::config::offline::is_offline_active() {
@@ -554,6 +635,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                     model: cfg.model.clone(),
                     context_window: cfg.context_window,
                     stream_timeout: cfg.stream_timeout,
+                    first_token_timeout: cfg.first_token_timeout,
                     request_timeout: cfg
                         .request_timeout
                         .unwrap_or_else(|| std::time::Duration::from_secs(300)),
@@ -567,6 +649,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             .with_tool_loop_policy(cfg.tool_loop_policy),
         ));
         names.push("code_review".into());
+        host_only_tools.push("code_review".into());
         Some(slot)
     } else {
         None
@@ -594,167 +677,15 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         max_concurrent: subagent_max_concurrent,
         ..Default::default()
     });
-    let subagent_provider: Option<SharedReviewProvider> = if subagents_enabled {
-        use atomcode_capabilities::tools::TaskTool;
-
-        let slot: SharedReviewProvider = Arc::new(std::sync::RwLock::new(None));
-
-        // Child subagent tool registry (mount a subset per type).
-        let mut child_reg = atomcode_kernel::tool::ToolRegistry::new();
-        atomcode_capabilities::tools::register_coding_tools_with_vision(&mut child_reg, false);
-        let child_reg = Arc::new(child_reg);
-
-        let explore_names: Vec<String> = ["read_file", "grep", "glob", "list_directory"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let worker_names: Vec<String> = [
-            "read_file",
-            "edit_file",
-            "write_file",
-            "bash",
-            "grep",
-            "glob",
-            "search_replace",
-            "list_directory",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-
-        let reg_e = child_reg.clone();
-        let reg_w = child_reg.clone();
-        let make_explore_tools = move || {
-            let refs: Vec<&str> = explore_names.iter().map(|s| s.as_str()).collect();
-            reg_e.mount(&refs)
-        };
-        let make_worker_tools = move || {
-            let refs: Vec<&str> = worker_names.iter().map(|s| s.as_str()).collect();
-            reg_w.mount(&refs)
-        };
-
-        // Prefer a runtime-injected tier provider, else fall back to the host-provider
-        // slot (filled at assemble — the single-model / same-as-host collapse path). The
-        // tier provider is a SHARED, swap-aware cell ([`TierProvider`]): it builds lazily on
-        // first `task` use (startup never pays the reqwest-client cost) and its cache is
-        // reset by the runtime on a `/model` swap, so routing re-resolves without a respawn.
-        let fast_cell = cfg.subagent_fast_provider.clone();
-        let cap_cell = cfg.subagent_capable_provider.clone();
-        let slot_fast = slot.clone();
-        let slot_cap = slot.clone();
-        let slot_host = slot.clone();
-        let make_fast = move || {
-            fast_cell.as_ref().and_then(|c| c.get()).unwrap_or_else(|| {
-                slot_fast
-                    .read()
-                    .ok()
-                    .and_then(|g| g.clone())
-                    .expect("subagent provider slot filled at assemble before any turn")
-            })
-        };
-        let make_capable = move || {
-            cap_cell.as_ref().and_then(|c| c.get()).unwrap_or_else(|| {
-                slot_cap
-                    .read()
-                    .ok()
-                    .and_then(|g| g.clone())
-                    .expect("subagent provider slot filled at assemble before any turn")
-            })
-        };
-        let make_host = move || {
-            slot_host
-                .read()
-                .ok()
-                .and_then(|provider| provider.clone())
-                .expect("subagent provider slot filled at assemble before any turn")
-        };
-
-        // `[subagent]` live knobs. `timeout_secs` remains parse-only compatibility:
-        // a productive child is never cancelled for total wall-clock age.
-        let task_team_manager = team_manager.clone();
-        let mut task_tool = TaskTool::new(
-            make_fast,
-            make_capable,
-            make_explore_tools,
-            make_worker_tools,
-        )
-        .with_host_provider(make_host)
-        .with_max_concurrent(subagent_max_concurrent)
-        .with_max_rounds(subagent_max_rounds)
-        .with_stream_timeout(cfg.stream_timeout)
-        .with_tool_loop_policy(cfg.tool_loop_policy)
-        .with_credential_shell_policy(cfg.credential_shell_policy)
-        .with_worker_middleware(turn_execution_policy.clone())
-        .with_team_event_sink(Arc::new(move |event| {
-            task_team_manager.publish_external(event);
-        }));
-        if let Some(models) = cfg.subagent_model_providers.clone() {
-            task_tool = task_tool.with_named_provider(move |selection| models.get(selection));
-        }
-        registry.register(Arc::new(task_tool));
-        names.push("task".to_string());
-        Some(slot)
-    } else {
-        None
-    };
-
-    let team_runner = subagent_provider.as_ref().map(|slot| {
-        use atomcode_capabilities::team::{TeamDifficulty, TeamPermission};
-
-        let mut child_registry = atomcode_kernel::tool::ToolRegistry::new();
-        atomcode_capabilities::tools::register_coding_tools_with_vision(&mut child_registry, false);
-        let child_registry = Arc::new(child_registry);
-        let provider_slot = slot.clone();
-        let fast_cell = cfg.subagent_fast_provider.clone();
-        let capable_cell = cfg.subagent_capable_provider.clone();
-        let providers = Arc::new(move |difficulty| {
-            let tier = match difficulty {
-                TeamDifficulty::Simple => fast_cell.as_ref(),
-                TeamDifficulty::Hard => capable_cell.as_ref(),
-            };
-            tier.and_then(|cell| cell.get()).unwrap_or_else(|| {
-                provider_slot
-                    .read()
-                    .ok()
-                    .and_then(|provider| provider.clone())
-                    .expect("team provider slot filled at assemble before any turn")
-            })
-        });
-        let tools_registry = Arc::clone(&child_registry);
-        let tools = Arc::new(move |permission| {
-            let names: &[&str] = match permission {
-                TeamPermission::Explore => &["read_file", "grep", "glob", "list_directory"],
-                // Bash is intentionally absent. DenyTeamBash remains a second
-                // fail-closed gate if this registry is broadened later.
-                TeamPermission::Worker => &[
-                    "read_file",
-                    "edit_file",
-                    "write_file",
-                    "grep",
-                    "glob",
-                    "search_replace",
-                    "list_directory",
-                ],
-            };
-            tools_registry.mount(names)
-        });
-        let runner = crate::team::TeamRunnerFactory::new(providers, tools, cfg.working_dir.clone())
-            .with_runtime_policy(
-                (subagent_max_rounds > 0).then_some(subagent_max_rounds),
-                cfg.tool_loop_policy,
-                Some(cfg.stream_timeout),
-                cfg.request_timeout,
-            )
-            .with_credential_shell_policy(cfg.credential_shell_policy)
-            .with_worker_middleware(turn_execution_policy.clone());
-        registry.register(Arc::new(crate::team::TeamTool::new(
-            team_manager.clone(),
-            runner.job_factory(),
-            runner.model_factory(),
-        )));
-        names.push("team".to_string());
-        runner
-    });
+    // Delegation is the tree's: the `subagent-in-process` and `team-in-process`
+    // rows (`docs/adr/0023` §2), configured from `[subagent]` by the runtime.
+    // What stays here is the provider a delegated agent runs on when it inherits
+    // the conversation's model — billed to the session apart from it — filled at
+    // assemble like the reviewer's.
+    let subagent_provider: Option<SharedReviewProvider> =
+        subagents_enabled.then(|| Arc::new(std::sync::RwLock::new(None)) as SharedReviewProvider);
+    let subagent_knobs =
+        subagents_enabled.then_some((subagent_max_concurrent, subagent_max_rounds));
 
     // Build the context hook once so skill-catalog ranking and later context
     // injection observe the exact same instruction-file precedence and bytes.
@@ -774,7 +705,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // `<namespace>:<skill-name>`, matching the slash-menu's core registry
     // convention. Empty when the driver saw no installed plugins (the L1
     // capabilities crate cannot reach the core plugin loader by design).
-    let mut skills = SkillRegistry::load(&skill_dirs);
+    let skills = SkillRegistry::load(&skill_dirs);
     if opts.tools {
         for (dir, ns) in &opts.plugin_skill_dirs {
             skills.load_dir(dir, Some(ns));
@@ -785,6 +716,23 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // leading system message by SkillCatalogHook below (without it the model never
     // learns which skills exist — only the use_skill/list_skills tools were mounted).
     let skill_catalog = skills.render_catalog_prioritizing(&instruction_text);
+    let skill_registry = opts.tools.then(|| crate::host_rows::LoadedSkills {
+        registry: Arc::clone(&skills),
+        catalog: skill_catalog.clone(),
+        dirs: skill_dirs.clone(),
+        // Only for the standard list: a driver that named its own directories
+        // decided where skills come from, and this runtime cannot say where a
+        // new one belongs in that.
+        install: opts.skill_dirs.is_none().then(|| {
+            let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+            atomcode_capabilities::skills::runtime_skill_install_dirs(&home, &cfg.working_dir)
+        }),
+        plugins: opts
+            .plugin_skill_dirs
+            .iter()
+            .map(|(_, plugin)| plugin.clone())
+            .collect(),
+    });
     if opts.tools {
         register_skill_tools(&mut registry, skills);
         names.extend(
@@ -798,8 +746,35 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // the session candidate path. `mount()` publishes each connected server's tools
     // atomically for the next turn, then publishes once more when the initial pass
     // reaches its bounded terminal state.
-    let (mcp_registry, mcp_connect_rx) = if opts.tools && opts.mcp {
-        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (mcp_registry, mcp_connect_rx, mcp_telemetry_rx) = if opts.tools && opts.mcp {
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<McpConnectEvent>();
+        // A second listener, only when something is metering. The registry
+        // publishes to one sender, so the fan-out is here rather than in
+        // `atomcode-capabilities` — one consumer is still the common case, and
+        // a telemetry-free embedder pays nothing for this.
+        //
+        // Chaining instead of teeing would make the meter load-bearing for the
+        // tool catalog: turn telemetry off and the tools stop being published.
+        let (event_rx, telemetry_rx) = match cfg.telemetry.is_some() {
+            false => (event_rx, None),
+            true => {
+                let (rows_tx, rows_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (meter_tx, meter_rx) = tokio::sync::mpsc::unbounded_channel();
+                let mut source = event_rx;
+                // Ends when the registry drops its sender, which happens when
+                // these parts do — no handle to abort, and nothing to leak.
+                tokio::spawn(async move {
+                    while let Some(event) = source.recv().await {
+                        let to_rows = rows_tx.send(event.clone()).is_ok();
+                        let to_meter = meter_tx.send(event).is_ok();
+                        if !to_rows && !to_meter {
+                            break;
+                        }
+                    }
+                });
+                (rows_rx, Some(meter_rx))
+            }
+        };
         (
             Some(Arc::new(McpRegistry::from_config_background_with_extra(
                 &cfg.working_dir,
@@ -807,9 +782,10 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 opts.extra_mcp_servers.clone(),
             ))),
             Some(event_rx),
+            telemetry_rx,
         )
     } else {
-        (None, None)
+        (None, None, None)
     };
     let mcp_tool_names = Arc::new(std::sync::RwLock::new(Vec::new()));
 
@@ -821,16 +797,20 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             let manager = Arc::new(SessionManager::for_project(&cfg.working_dir));
             let lease = session_lease(&manager, &id, reuse_lease.as_ref())?;
             let now = atomcode_capabilities::session::now_ms();
-            let mut meta = SessionMeta::new(&id, cfg.working_dir.to_string_lossy().as_ref(), now);
+            let working_dir = cfg.working_dir.to_string_lossy().into_owned();
+            let mut meta = SessionMeta::new(&id, working_dir.as_str(), now);
             meta.owner = StorageOwner::Native;
+            // The session's log starts with what stays true of it, the context
+            // block its prompt opens with among them: a resume sends that
+            // prefix again rather than one rendered from a repository that has
+            // moved on.
+            let mut header = SessionHeader::new(&id);
+            header.created_at = u64::try_from(now).unwrap_or(0);
+            header.cwd = Some(working_dir);
+            header.context = Some(SessionContextHook::new(&cfg.working_dir).block(None));
             if !stage_fresh {
                 manager
-                    .commit_native_import(
-                        &lease,
-                        Some(&SessionSnapshot::new(Vec::new())),
-                        Some(&PresentationFile::default()),
-                        &meta,
-                    )
+                    .create_event_session(&lease, &header, &meta)
                     .map_err(io::Error::from)?;
             }
             Some(SessionBinding {
@@ -839,7 +819,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 lease,
                 resume: None,
                 pending_resume_prompt: None,
-                staged_fresh: stage_fresh.then_some(meta),
+                staged_fresh: stage_fresh.then_some((meta, header)),
             })
         }
         SessionMode::Resume(id) => {
@@ -848,9 +828,10 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             // Resume is a native-only boundary. Legacy/unconfirmed data must first
             // converge through a driver importer; accepting a lone snapshot here
             // would bypass ownership and manufacture an incomplete native session.
-            let (loaded, pending_resume_prompt) = manager
-                .load_native_session_for_resume(&lease)
-                .map_err(io::Error::from)?;
+            // A session a released build stored as a snapshot becomes a log here,
+            // once (`docs/adr/0024` §10).
+            let (loaded, pending_resume_prompt) =
+                manager.open_for_resume(&lease).map_err(io::Error::from)?;
             // A version-mismatched snapshot must FAIL here, not fall through to the
             // kernel's empty-start seam — that would silently fresh-start under the
             // SAME session id and corrupt on-disk state.
@@ -868,9 +849,15 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             check_snapshot_version(snapshot)?;
             let manager = Arc::new(SessionManager::for_project(&cfg.working_dir));
             let lease = session_lease(&manager, id, reuse_lease.as_ref())?;
+            manager.open_as_events(&lease).map_err(io::Error::from)?;
             let loaded = manager.load_native_session(id).map_err(io::Error::from)?;
             check_snapshot_version(&loaded.snapshot)?;
-            if loaded.snapshot != *snapshot {
+            // What the log projects carries no system prompt; that is assembled
+            // for each request.
+            if !atomcode_capabilities::session::events::same_conversation(
+                &loaded.snapshot.messages,
+                &snapshot.messages,
+            ) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!(
@@ -894,51 +881,22 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             RecallTool::new().with_sessions_dir(b.manager.root()),
         ));
         names.push("recall".into());
+        host_only_tools.push("recall".into());
         registry.register(Arc::new(
             ListSessionsTool::new().with_sessions_dir(b.manager.root()),
         ));
         names.push("list_sessions".into());
+        host_only_tools.push("list_sessions".into());
     }
 
-    // Hooks in the CANONICAL ORDER (registration order = HookChain execution order):
-    // 1. SessionContextHook — session_start: inject env + project-instructions + git
-    //    snapshot after persona. Rewrites the leading-system run (like MemoryHook); runs
-    //    FIRST so the order is persona → context → memory.
-    // 2. MemoryHook    — session_start: inject memory.md after the leading-system run
-    //    (fresh inject / resume reconcile). Both 1 and 2 reconcile by their own header
-    //    prefix, so they compose (the insert position is computed live each time).
-    // 2b. SkillCatalogHook — session_start: inject the AVAILABLE SKILLS catalog after
-    //    memory (persona → context → memory → skills). Same header-prefix reconcile.
-    // 2c. McpInstructionsHook — pre_request append-only projection of live,
-    //     server-scoped instructions for currently mounted MCP tools. Ephemeral:
-    //     never persists external server guidance into the session snapshot.
-    // 3. SnapshotHook  — turn_complete: persist .snapshot + .meta.
-    // 4. TranscriptHook— turn_complete: append the .jsonl record. (No coupling with
-    //    3 — the order is fixed purely for determinism.)
-    // 5. VerifyCadenceHook — offer_continuation; FIRST `Some` wins in the chain, so
-    //    keep it last: any earlier hook's continuation outranks the cadence nudge.
-    let mut hooks: Vec<Arc<dyn LifecycleHooks>> = Vec::new();
-    let mut compaction_checkpoint: Option<Arc<dyn CompactionCheckpoint>> = None;
+    // What the session keeps beside its log — per-turn statistics, the rewind
+    // ledger, the name — which a `kernel-hooks` row runs at the tree's own
+    // moments (see `host_rows`). The log itself is `session-store`'s. Everything
+    // else the chain registered here — memory, the skill catalog, the MCP
+    // instructions tail, the verify cadence, the todo reminder, the skill-first
+    // nudge — is a row now, and the row builds its own.
     let mut snapshot_hook_handle = None;
     let mut snapshot_persistence_status = None;
-    // Env / project-instructions / git context — unconditional (v1 parity: always present).
-    hooks.push(session_context_hook);
-    if opts.memory {
-        hooks.push(Arc::new(MemoryHook::for_project(&cfg.working_dir)));
-    }
-    // Skill catalog — leading system message (persona → context → memory → skills), so
-    // the model sees which skills are installed and can trigger one on a description
-    // match. `None` (no skills) makes the hook a no-op. Reconciles in place on resume.
-    // Capture whether any skill is installed BEFORE the catalog is moved — SkillFirstHook
-    // (registered below) uses it to stay a no-op when there's nothing to trigger.
-    let has_skills = skill_catalog.as_ref().is_some_and(|c| !c.trim().is_empty());
-    hooks.push(Arc::new(SkillCatalogHook::new(skill_catalog)));
-    if let Some(registry) = &mcp_registry {
-        hooks.push(Arc::new(McpInstructionsHook::new(
-            Arc::clone(registry),
-            Arc::clone(&mcp_tool_names),
-        )));
-    }
     if let Some(b) = &session {
         let wd = cfg.working_dir.to_string_lossy().into_owned();
         let snapshot_hook = Arc::new(
@@ -947,94 +905,30 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 .with_model_attribution(&cfg.provider_name, &cfg.model),
         );
         snapshot_persistence_status = Some(snapshot_hook.persistence_status());
-        compaction_checkpoint = Some(snapshot_hook.clone());
-        snapshot_hook_handle = Some(snapshot_hook.clone());
-        hooks.push(snapshot_hook.clone());
-        hooks.push(Arc::new(
-            TranscriptHook::new(b.manager.clone(), &b.id)
-                .with_persistence_status(snapshot_hook.persistence_status()),
-        ));
+        snapshot_hook_handle = Some(snapshot_hook);
     }
-    // Date awareness comes from the frozen date anchor in the persona system prompt (cache-stable,
-    // present on EVERY round including round 1), so recall's relative-date resolution has a current
-    // date WITHOUT a per-round <system-reminder> tail. The old StatusReminderHook re-injected the
-    // same date every round from round 2 — redundant with the anchor, and it prompted chatty
-    // mid-tier models to narrate "reminder recorded, continuing" each turn. TRADEOFF: the anchor is
-    // frozen at assemble/reconcile time (spawn, /model swap, resume), NOT refreshed per-round — so a
-    // session left running continuously across midnight keeps the prior day's date until the next
-    // reassemble; the removed hook used to self-correct that live. Accepted as a rare edge vs. the
-    // per-round narration cost. (The hook type still exists but is no longer registered.)
-    // Pin the workspace root the cadence uses to gate out-of-workspace edits (e.g. a throwaway
-    // /tmp write must not arm the "run cargo check" nudge). INVARIANT: this must equal the dir
-    // the edit/write tools resolve relative `file_path` against — they stay in lockstep because
-    // `/cd` respawns the agent (rebuilding this hook with the new dir), not by mutating cwd in
-    // place. If `/cd` ever moves to an in-place cwd mutation, thread the live cwd in here too.
-    hooks.push(turn_execution_policy.clone());
-    hooks.push(Arc::new(
-        VerifyCadenceHook::with_execution_policy(
-            cfg.working_dir.clone(),
-            turn_execution_policy.clone(),
-        )
-        // Attended (a present human who reviews edits — see CodingAgentConfig::is_attended) →
-        // don't FORCE post-edit checks (codex-style); headless / scheduled keep the cadence.
-        // `ATOMCODE_VERIFY` overrides. Weak-model anti-hide discipline (FIX, DON'T HIDE) is a
-        // SEPARATE persona block and is unaffected.
-        .attended(cfg.is_attended()),
-    ));
-    // Todo hook (native runtime path — the live TUI + webui): per-turn <system-reminder> of the
-    // current list so the model keeps it accurate after compaction, PLUS an `offer_continuation`
-    // that nudges once to close out open items when the model tries to stop. Gated on the SAME
-    // ATOMCODE_TODO switch as the todowrite/todo tools + persona guidance (so the reminder never
-    // references tools that aren't mounted). Pushed AFTER VerifyCadenceHook so verify's
-    // "first Some wins" continuation outranks the todo-completion nudge. This is the ONLY
-    // production registration of TodoHook — every real entrypoint (CLI, daemon, clix) goes
-    // through prepare()/assemble() here; `assemble.rs::build_coding_agent` (which also registers
-    // it) is reachable only from tests + examples, so there is no double-registration.
-    if todo_enabled {
-        hooks.push(Arc::new(crate::todo::TodoHook::new(&cfg.working_dir)));
-    }
-    // DeepSeek-only opening-turn skill-first reminder. A weak model (deepseek) skips
-    // use_skill and dives straight into exploring/solutioning; a static persona line did
-    // not hold. This injects a forceful <system-reminder> on the opening turn only, where
-    // recency is high. Gated to deepseek (model_needs_firm_execution) + a non-empty skill
-    // catalog (never nudge use_skill when no skills are installed). No-op otherwise.
-    hooks.push(Arc::new(crate::skill_first::SkillFirstHook::new(
-        &cfg.model, has_skills,
-    )));
-    // NOTE: the `RateLimitHook` is NOT built here. It gates CodingPlan-specific 429
-    // messaging on `cfg.base_url` being the gateway, so — like the turn-level
-    // `TelemetryHook` — it must be built in `assemble` (which re-runs on a /model
-    // swap), NOT here in `prepare` (which does not). A prepare-frozen base_url would
-    // keep mislabelling an external-model 429 as a CodingPlan quota after a switch.
     // CC external hooks: user/project `hooks.json` + plugin-contributed inline hooks
-    // (`plugin_cc_hooks`, resolved by the host) on the kernel seams — the port of core's
-    // CC-parity hook engine onto CodingRuntime. ONE instance serves both seams: pushed here
-    // for its LifecycleHooks side (session_start / user_prompt_submit / session_end) and
-    // stored in `cc_external_hooks` for its ToolMiddleware side (assemble registers it
-    // before approval). Only when hooks actually exist — no hooks at all registers nothing,
-    // so the no-hooks path stays free. Its session_start context append sits after the
-    // built-in context/status hooks (later = appended after), and it implements no
-    // offer_continuation, so VerifyCadenceHook's "first Some wins" contract is untouched.
+    // (`plugin_cc_hooks`, resolved by the host), mounted by the `cc-hooks-host` row on
+    // both the lifecycle and the tool-middleware seam. Only when hooks actually exist.
     let cc_external = {
         let mut cc = CCExternalHooks::load_with_extra(&cfg.working_dir, plugin_cc_hooks);
         // Stamp the persistent session id into every CC payload (CC `session_id`), so a
         // hook can correlate its events with the session. Empty for non-persistent runs.
         if let Some(b) = &session {
             cc = cc.with_session_id(b.id.as_str());
-            // CC `transcript_path` = the session's append-only JSONL transcript, so a
-            // Stop/StopFailure hook can open the finished turn's full record. The path
-            // resolves even before the file is written; unresolvable (session dir gone)
-            // → left `None` → the payload carries `null`, never a wedge.
-            if let Ok(p) = b.manager.jsonl_path(&b.id) {
+            // CC `transcript_path` = the session's log, which replaced the transcript
+            // (`docs/adr/0024` §14), so a Stop/StopFailure hook can open the finished
+            // turn's full record: one JSON fact per line after a header line. The
+            // path resolves before the file is written (a session not published yet);
+            // unresolvable → left `None` → the payload carries `null`, never a wedge.
+            if let Ok(p) = b.manager.events_path(&b.id) {
                 cc = cc.with_transcript_path(p.to_string_lossy().into_owned());
             }
         }
         if cc.is_empty() {
             None
         } else {
-            let cc = Arc::new(cc);
-            hooks.push(cc.clone() as Arc<dyn LifecycleHooks>);
-            Some(cc)
+            Some(Arc::new(cc))
         }
     };
     // NOTE: the turn-level `TelemetryHook` is NOT built here. Its envelope fixes the
@@ -1056,11 +950,10 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         names.clear();
     }
 
-    // Shared allow-all store for both bash gates (workspace gate + generic approval middleware).
-    let bash_allow_all: Arc<dyn atomcode_capabilities::tools::PermissionStore> =
-        Arc::new(atomcode_capabilities::tools::InMemoryPermissionStore::new());
-
     Ok(CodingParts {
+        runtime_commands: None,
+        tool_switches: atomcode_harness::seams::ToolSwitches::new(),
+        tool_catalog: Arc::new(std::sync::RwLock::new(None)),
         shared_cwd: std::sync::Arc::new(std::sync::RwLock::new(cfg.working_dir.clone())),
         plan_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         bypass_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1081,39 +974,79 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         credential_shell_grants: std::sync::Arc::new(
             atomcode_capabilities::tools::InMemoryPermissionStore::new(),
         ),
-        bash_allow_all_grants: bash_allow_all.clone(),
         registry,
         tool_names: names,
         todo_enabled,
-        request_user_input_enabled,
-        has_external_subagents,
         mcp_tool_names,
-        mounted_tools: None,
-        mounted_tools_publisher: None,
-        mcp_connect_rx,
+        mcp_connect_rx: std::sync::Mutex::new(mcp_connect_rx),
+        mcp_telemetry_rx: std::sync::Mutex::new(mcp_telemetry_rx),
         mcp_publish_lock: Arc::new(tokio::sync::Mutex::new(())),
         mcp_publication_enabled,
+        mcp_toolbox: Arc::new(std::sync::RwLock::new(None)),
         mcp_catalog_ready: tokio::sync::watch::channel(mcp_registry.is_none()).0,
         _mcp_work_guard: mcp_work_guard,
-        approval: Arc::new(ApprovalMiddleware::with_allow_all_store(
-            Arc::new(atomcode_capabilities::tools::InMemoryPermissionStore::new()),
-            bash_allow_all.clone(),
-            APPROVAL_KIND.to_string(),
-        )),
-        hooks,
-        compaction_checkpoint,
+        approval: Arc::new(ApprovalMiddleware::in_memory()),
         snapshot_hook: snapshot_hook_handle,
+        extra_tools: Vec::new(),
+        host_only_tools,
+        skill_registry,
         snapshot_persistence_status,
         session,
         runtime_resume: None,
         mcp_registry,
         review_provider,
         subagent_provider,
-        team_runner,
+        side_provider: Arc::new(std::sync::RwLock::new(None)),
         team_manager,
+        subagent_knobs,
         cc_external_hooks: cc_external,
         rate_limit_source: opts.rate_limit_source,
     })
+}
+
+/// A provider that is whatever a slot holds when it is called.
+struct SlotProvider {
+    slot: SharedReviewProvider,
+    model: String,
+}
+
+impl SlotProvider {
+    fn current(&self) -> Option<Arc<dyn LlmProvider>> {
+        self.slot.read().ok().and_then(|provider| provider.clone())
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for SlotProvider {
+    fn model_name(&self) -> &str {
+        &self.model
+    }
+    fn context_window(&self) -> u32 {
+        self.current().map(|p| p.context_window()).unwrap_or(0)
+    }
+    fn supports_vision(&self) -> bool {
+        self.current().is_some_and(|p| p.supports_vision())
+    }
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &[atomcode_kernel::tool::ToolDef],
+        options: &atomcode_kernel::provider::ChatOptions,
+    ) -> Result<
+        futures::stream::BoxStream<'static, atomcode_kernel::stream::StreamEvent>,
+        atomcode_kernel::stream::ProviderError,
+    > {
+        match self.current() {
+            Some(provider) => provider.chat_stream(messages, tools, options).await,
+            None => Err(atomcode_kernel::stream::ProviderError {
+                retryable: false,
+                message: "no model is signed in for delegated work".into(),
+                http_status: None,
+                code: None,
+                retry_after_secs: None,
+            }),
+        }
+    }
 }
 
 /// Load plugin-contributed hooks for every prepare/reprepare instead of freezing the startup
@@ -1156,6 +1089,13 @@ fn session_lease(
     }
 }
 
+impl SessionBinding {
+    /// The header a session not published yet will be created with.
+    pub(crate) fn staged_header(&self) -> Option<&SessionHeader> {
+        self.staged_fresh.as_ref().map(|(_, header)| header)
+    }
+}
+
 impl CodingParts {
     /// The host-owned CodingPlan quota source, if any. Used at `/goal` start to
     /// size the round budget from the live request quota.
@@ -1183,6 +1123,85 @@ impl CodingParts {
         self.snapshot_hook.clone()
     }
 
+    /// `[subagent]` `(max_concurrent, max_rounds)`, when delegation is on.
+    pub(crate) fn subagent_knobs(&self) -> Option<(usize, u32)> {
+        self.subagent_knobs
+    }
+
+    /// The provider a delegated agent inheriting the conversation's model runs
+    /// on: whatever the subagent slot holds at the moment of each call. Read
+    /// through, never copied — a logout empties the slot, and a copy taken at
+    /// mount would keep the signed-in provider alive in the tree.
+    pub(crate) fn delegated_provider(&self) -> Option<Arc<dyn LlmProvider>> {
+        let slot = self.subagent_provider.clone()?;
+        let model = slot
+            .read()
+            .ok()
+            .and_then(|provider| provider.as_ref().map(|p| p.model_name().to_string()))
+            .unwrap_or_default();
+        Some(Arc::new(SlotProvider { slot, model }))
+    }
+
+    pub(crate) fn todo_enabled(&self) -> bool {
+        self.todo_enabled
+    }
+
+    /// Everything a tree needs to publish this registry's MCP tools the way the
+    /// chain's catalog task does, sharing its locks, switches and readiness.
+    pub(crate) fn mcp_publication(&self) -> Option<crate::host_rows::McpPublication> {
+        let registry = self.mcp_registry.clone()?;
+        Some(crate::host_rows::McpPublication {
+            registry,
+            connect_rx: self
+                .mcp_connect_rx
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take(),
+            tool_names: Arc::clone(&self.mcp_tool_names),
+            publish_lock: Arc::clone(&self.mcp_publish_lock),
+            publication_enabled: Arc::clone(&self.mcp_publication_enabled),
+            catalog_ready: self.mcp_catalog_ready.clone(),
+            toolbox_slot: Arc::clone(&self.mcp_toolbox),
+        })
+    }
+
+    /// The connection events again, for the row that meters them.
+    ///
+    /// `None` when this assembly has no MCP or nothing to meter with, which is
+    /// what keeps the `mcp-telemetry` row out of a tree that would have nothing
+    /// for it to do.
+    pub(crate) fn mcp_connect_meter(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<McpConnectEvent>> {
+        self.mcp_telemetry_rx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+
+    /// Where the provider for out-of-round model calls lives, refilled on every
+    /// model change.
+    pub(crate) fn side_provider_slot(&self) -> SharedReviewProvider {
+        Arc::clone(&self.side_provider)
+    }
+
+    /// Tools a tree takes from this capability graph as the objects prepare built:
+    /// the ones no harness row provides — `list_sessions` over the native catalog,
+    /// `lsp`, external-agent subagents, the AtomGit tools — and the ones whose
+    /// product contract a row does not match: `request_user_input`, `task` and
+    /// `team` (tiers, worker scopes, the team panel), `code_review` (the product's
+    /// limits and provider), `recall` (over the native store, which is the master).
+    pub(crate) fn host_only_tools(&self) -> Vec<Arc<dyn atomcode_kernel::tool::Tool>> {
+        self.host_only_tools
+            .iter()
+            .filter_map(|name| self.registry.mount(&[name.as_str()]).get(name))
+            .collect()
+    }
+
+    pub(crate) fn skill_registry(&self) -> Option<crate::host_rows::LoadedSkills> {
+        self.skill_registry.clone()
+    }
+
     #[cfg(test)]
     pub(crate) fn report_snapshot_persistence_uncertain(&mut self, message: impl Into<String>) {
         self.snapshot_persistence_status
@@ -1192,23 +1211,18 @@ impl CodingParts {
     }
 
     /// Make a prepared fresh session durable and catalog-visible. This is the
-    /// session transition's persistence commit point; preparation and assembly
+    /// session transition's persistence commit point; preparing and mounting
     /// deliberately leave the catalog untouched.
-    pub(crate) fn publish_staged_session(&mut self) -> io::Result<()> {
+    pub fn publish_staged_session(&mut self) -> io::Result<()> {
         let Some(binding) = self.session.as_mut() else {
             return Ok(());
         };
-        let Some(meta) = binding.staged_fresh.as_ref() else {
+        let Some((meta, header)) = binding.staged_fresh.as_ref() else {
             return Ok(());
         };
         binding
             .manager
-            .commit_native_import(
-                &binding.lease,
-                Some(&SessionSnapshot::new(Vec::new())),
-                Some(&PresentationFile::default()),
-                meta,
-            )
+            .create_event_session(&binding.lease, header, meta)
             .map_err(io::Error::from)?;
         binding.staged_fresh = None;
         Ok(())
@@ -1226,109 +1240,52 @@ impl CodingParts {
         self.bash_workspace_grants = Arc::clone(&previous.bash_workspace_grants);
         self.sensitive_path_grants = Arc::clone(&previous.sensitive_path_grants);
         self.credential_shell_grants = Arc::clone(&previous.credential_shell_grants);
-        self.bash_allow_all_grants = Arc::clone(&previous.bash_allow_all_grants);
     }
 
     /// Preserve the exact current conversation across a sessionless provider reassembly.
+    /// The runtime's own capabilities, for the row that offers them as commands.
+    /// The switches this session's catalog answers to.
+    pub(crate) fn tool_switches(&self) -> Arc<atomcode_harness::seams::ToolSwitches> {
+        self.tool_switches.clone()
+    }
+
+    /// Where the `tools-host` row publishes the catalog it built.
+    pub(crate) fn tool_catalog_slot(
+        &self,
+    ) -> Arc<std::sync::RwLock<Option<Arc<atomcode_harness::seams::ToolBox>>>> {
+        Arc::clone(&self.tool_catalog)
+    }
+
+    /// The live catalog, once a tree carrying `tools-host` has mounted.
+    pub(crate) fn tool_catalog(&self) -> Option<Arc<atomcode_harness::seams::ToolBox>> {
+        self.tool_catalog
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Take over the switches a previous parts held, so a reprepare does not
+    /// quietly put back the tools the person turned off.
+    pub(crate) fn adopt_tool_switches(
+        &mut self,
+        switches: Arc<atomcode_harness::seams::ToolSwitches>,
+    ) {
+        self.tool_switches = switches;
+    }
+
+    pub(crate) fn set_runtime_commands(
+        &mut self,
+        commands: Arc<dyn crate::runtime::RuntimeCommands>,
+    ) {
+        self.runtime_commands = Some(commands);
+    }
+
     pub(crate) fn set_runtime_resume(&mut self, snapshot: SessionSnapshot) {
         self.runtime_resume = Some(snapshot);
     }
 
     pub(crate) fn runtime_resume_snapshot(&self) -> Option<SessionSnapshot> {
         self.runtime_resume.clone()
-    }
-    /// Mount the full toolset. The first call creates one updatable catalog shared
-    /// by every reassembly of these parts; later calls republish the complete current
-    /// set so model-dependent tools (notably `read_file`) stay fresh.
-    fn mount(&mut self) -> MountedTools {
-        let names = self.selected_tool_names();
-        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-
-        if let (Some(mounted), Some(publisher)) =
-            (&self.mounted_tools, &self.mounted_tools_publisher)
-        {
-            publisher.publish(&self.registry, &refs);
-            return mounted.clone();
-        }
-
-        let (mounted, publisher) = self.registry.mount_updatable(&refs);
-        if let (Some(mcp_registry), Some(mut connect_rx)) =
-            (self.mcp_registry.clone(), self.mcp_connect_rx.take())
-        {
-            let tool_registry = self.registry.clone();
-            let base_names = self.tool_names.clone();
-            let mcp_tool_names = Arc::clone(&self.mcp_tool_names);
-            let catalog_publisher = publisher.clone();
-            let publish_lock = Arc::clone(&self.mcp_publish_lock);
-            let publication_enabled = Arc::clone(&self.mcp_publication_enabled);
-            let catalog_ready = self.mcp_catalog_ready.clone();
-            tokio::spawn(async move {
-                let readiness_registry = Arc::clone(&mcp_registry);
-                let initial_readiness = async move {
-                    readiness_registry
-                        .wait_until_initial_connections_done()
-                        .await;
-                };
-                tokio::pin!(initial_readiness);
-                let cancellation_registry = Arc::clone(&mcp_registry);
-                let cancellation = async move {
-                    cancellation_registry.wait_for_cancellation().await;
-                };
-                tokio::pin!(cancellation);
-
-                loop {
-                    tokio::select! {
-                        _ = &mut cancellation => break,
-                        _ = &mut initial_readiness => {
-                            publish_ready_mcp_tools(
-                                Arc::clone(&mcp_registry),
-                                tool_registry.clone(),
-                                base_names.clone(),
-                                Arc::clone(&mcp_tool_names),
-                                catalog_publisher.clone(),
-                                Arc::clone(&publish_lock),
-                                Arc::clone(&publication_enabled),
-                            )
-                            .await;
-                            catalog_ready.send_replace(true);
-                            break;
-                        }
-                        event = connect_rx.recv() => {
-                            match event {
-                                Some(McpConnectEvent::Connected { name }) => {
-                                    publish_connected_mcp_server(
-                                        Arc::clone(&mcp_registry),
-                                        name,
-                                        tool_registry.clone(),
-                                        base_names.clone(),
-                                        Arc::clone(&mcp_tool_names),
-                                        catalog_publisher.clone(),
-                                        Arc::clone(&publish_lock),
-                                        Arc::clone(&publication_enabled),
-                                    )
-                                    .await;
-                                }
-                                Some(_) => {}
-                                None => break,
-                            }
-                        }
-                    }
-                }
-            });
-        }
-        self.mounted_tools = Some(mounted.clone());
-        self.mounted_tools_publisher = Some(publisher);
-        mounted
-    }
-
-    fn selected_tool_names(&self) -> Vec<String> {
-        let mut names = self.tool_names.clone();
-        let dynamic = match self.mcp_tool_names.read() {
-            Ok(names) => names,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        names.extend(dynamic.iter().cloned());
-        names
     }
 
     /// Readiness receiver for non-interactive surfaces whose first turn should
@@ -1340,20 +1297,36 @@ impl CodingParts {
     /// Fail-closed cutover used before a capability reload reads mutable MCP
     /// config/trust/auth state. Once disabled, this scope's late connection events
     /// cannot republish tools even if the replacement candidate fails.
+    ///
+    /// Takes the tools OFF the mounted catalog, not just off the books. Every
+    /// caller (`/mcp reload`, `/mcp untrust`, `/mcp logout`) withdraws before it
+    /// reads state that may turn out to be unusable, and returns without
+    /// rebuilding when it does — so the tree that is still mounted must already
+    /// have stopped offering `mcp__*` by the time this returns. Criterion:
+    /// `withdrawing_mcp_takes_the_tools_off_the_model`.
     pub(crate) async fn withdraw_mcp_tools(&mut self) {
         self.mcp_publication_enabled
             .store(false, std::sync::atomic::Ordering::Release);
         if let Some(registry) = &self.mcp_registry {
             registry.cancel_pending_work();
         }
+        // Held across the unregister so a publish that is already inside the
+        // lock finishes first and its names are in the list we drain — rather
+        // than being added right after we cleared it.
         let _publish_guard = self.mcp_publish_lock.lock().await;
-        match self.mcp_tool_names.write() {
-            Ok(mut names) => names.clear(),
-            Err(poisoned) => poisoned.into_inner().clear(),
-        }
-        if let Some(publisher) = &self.mounted_tools_publisher {
-            let refs: Vec<&str> = self.tool_names.iter().map(String::as_str).collect();
-            publisher.publish(&self.registry, &refs);
+        let names: Vec<String> = match self.mcp_tool_names.write() {
+            Ok(mut names) => names.drain(..).collect(),
+            Err(poisoned) => poisoned.into_inner().drain(..).collect(),
+        };
+        let toolbox = self
+            .mcp_toolbox
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(toolbox) = toolbox {
+            for name in &names {
+                toolbox.unregister(name);
+            }
         }
     }
 
@@ -1398,169 +1371,37 @@ impl CodingParts {
     pub fn register_extra_tool(&mut self, tool: Arc<dyn atomcode_kernel::tool::Tool>) {
         let name = tool.name().to_string();
         if !self.tool_names.iter().any(|n| n == &name) {
-            self.tool_names.push(name);
+            self.tool_names.push(name.clone());
         }
+        self.extra_tools.retain(|existing| existing.name() != name);
+        self.extra_tools.push(tool.clone());
         self.registry.register(tool);
     }
+
+    /// Tools the runtime added on top of the capability graph (`schedule_wakeup`),
+    /// latest registration per name.
+    pub(crate) fn extra_tools(&self) -> Vec<Arc<dyn atomcode_kernel::tool::Tool>> {
+        self.extra_tools.clone()
+    }
 }
 
-async fn publish_ready_mcp_tools(
-    mcp_registry: Arc<McpRegistry>,
-    mut tool_registry: ToolRegistry,
-    base_names: Vec<String>,
-    mcp_tool_names: Arc<std::sync::RwLock<Vec<String>>>,
-    catalog_publisher: MountedToolsPublisher,
-    publish_lock: Arc<tokio::sync::Mutex<()>>,
-    publication_enabled: Arc<std::sync::atomic::AtomicBool>,
-) {
-    if !publication_enabled.load(std::sync::atomic::Ordering::Acquire) {
-        return;
-    }
-    // Discovery is network I/O. Keep it outside the publication lock so a
-    // fail-closed withdrawal is never delayed by an MCP server timeout.
-    let tool_infos = tokio::select! {
-        tools = mcp_registry.list_all_tools() => tools,
-        _ = mcp_registry.wait_for_cancellation() => return,
-    };
-    let adapters: Vec<Arc<dyn atomcode_kernel::tool::Tool>> = tool_infos
-        .into_iter()
-        .filter_map(|info| {
-            match atomcode_capabilities::mcp::McpToolAdapter::new(mcp_registry.clone(), info) {
-                Ok(adapter) => Some(Arc::new(adapter) as Arc<dyn atomcode_kernel::tool::Tool>),
-                Err(error) => {
-                    eprintln!("[mcp] tool publication skipped: {error}");
-                    None
-                }
-            }
-        })
-        .collect();
-    // Serialize only the in-memory commit. Re-check after locking because a
-    // capability reload may have revoked this publication while discovery ran.
-    let _publish_guard = publish_lock.lock().await;
-    if !publication_enabled.load(std::sync::atomic::Ordering::Acquire) {
-        return;
-    }
-    let discovered = mcp::register_mcp_tools(&mut tool_registry, adapters);
-    match mcp_tool_names.write() {
-        Ok(mut names) => *names = discovered.clone(),
-        Err(poisoned) => *poisoned.into_inner() = discovered.clone(),
-    }
-    let mut selected = base_names;
-    selected.extend(discovered);
-    let refs: Vec<&str> = selected.iter().map(String::as_str).collect();
-    catalog_publisher.publish(&tool_registry, &refs);
-}
-
-async fn publish_connected_mcp_server(
-    mcp_registry: Arc<McpRegistry>,
-    server: String,
-    mut tool_registry: ToolRegistry,
-    base_names: Vec<String>,
-    mcp_tool_names: Arc<std::sync::RwLock<Vec<String>>>,
-    catalog_publisher: MountedToolsPublisher,
-    publish_lock: Arc<tokio::sync::Mutex<()>>,
-    publication_enabled: Arc<std::sync::atomic::AtomicBool>,
-) {
-    // A newly connected server should not make every existing server repeat
-    // tools/list. The final readiness publication below remains the reconciliation
-    // pass for transient discovery failures.
-    if !publication_enabled.load(std::sync::atomic::Ordering::Acquire) {
-        return;
-    }
-    let tool_infos = tokio::select! {
-        tools = mcp_registry.list_tools_for_server(&server) => tools,
-        _ = mcp_registry.wait_for_cancellation() => return,
-    };
-    let adapters: Vec<Arc<dyn atomcode_kernel::tool::Tool>> = tool_infos
-        .into_iter()
-        .filter_map(|info| {
-            match atomcode_capabilities::mcp::McpToolAdapter::new(Arc::clone(&mcp_registry), info) {
-                Ok(adapter) => Some(Arc::new(adapter) as Arc<dyn atomcode_kernel::tool::Tool>),
-                Err(error) => {
-                    eprintln!("[mcp] tool publication skipped: {error}");
-                    None
-                }
-            }
-        })
-        .collect();
-    let _publish_guard = publish_lock.lock().await;
-    if !publication_enabled.load(std::sync::atomic::Ordering::Acquire) {
-        return;
-    }
-    let discovered = mcp::register_mcp_tools(&mut tool_registry, adapters);
-    let mut selected = base_names;
-    {
-        let mut names = match mcp_tool_names.write() {
-            Ok(names) => names,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        names.extend(discovered);
-        names.sort_unstable();
-        names.dedup();
-        selected.extend(names.iter().cloned());
-    }
-    let refs: Vec<&str> = selected.iter().map(String::as_str).collect();
-    catalog_publisher.publish(&tool_registry, &refs);
-}
-
-/// Phase 2 — composition: parts + provider → a runnable [`Agent`].
+/// Fill the providers this capability graph's own sub-agents run on, for `cfg`'s
+/// model: the reviewer's and the subagent host tier's slots, the fast/capable tier
+/// cells and the named-model resolver — each billed to this session's detached
+/// usage and metered under its own telemetry surface.
 ///
-/// A session-bound assemble ALWAYS picks up the session's latest on-disk snapshot
-/// (the SnapshotHook persisted one every turn), so calling it again on the SAME
-/// parts with a new provider IS the respawn (B2 model swap / reload): approval
-/// grants, hook state, session identity, AND the conversation all carry over. A
-/// plain re-`assemble` can never rewind a live session — the one respawn footgun
-/// the design review flagged. Errors:
-/// - a snapshot that exists but can't be read or has an unsupported version
-///   (continuing would silently fresh-start the SAME session id and corrupt its
-///   transcript/snapshot — the exact "silent fresh start" the Resume contract
-///   forbids);
-/// - only an explicitly staged fresh session may have no aggregate yet; every
-///   resume/reassemble requires metadata, snapshot, and presentation together.
+/// Returns the provider for model calls the primary loop makes outside a round
+/// (the overflow summary), recorded and metered the same way.
 ///
-/// CONCURRENCY CONTRACT: at most ONE live agent per `CodingParts` — await the old
-/// `AgentHandle.task` (after `Shutdown`) before re-assembling. The session hooks
-/// hold per-turn state and write per-session files; two live agents on the same
-/// parts would interleave both.
-pub fn assemble(
-    parts: &mut CodingParts,
+/// Its own function because both assemblies need it: the chain's `assemble`, and a
+/// tree that mounts this graph's `task`, `team` and `code_review` as they are. A
+/// slot left empty is a tool that panics on first use; a slot filled with the bare
+/// provider is spend nobody is billed for.
+pub(crate) fn wire_side_providers(
+    parts: &CodingParts,
     cfg: &CodingAgentConfig,
-    provider: Arc<dyn LlmProvider>,
-) -> io::Result<Agent> {
-    // Model swap (e.g. `/model`) routes here via the runtime WITHOUT re-running `prepare`,
-    // so re-register `read_file` with the CURRENT model's vision capability — otherwise the
-    // PREPARE-time flag goes stale and a text-only model could receive a base64 image (or a
-    // VL model none). `register` overwrites by name, so this idempotently refreshes the one
-    // tool whose behavior depends on the model. Same model-swap-refresh pattern as the
-    // `review_provider` slot below.
-    parts
-        .registry
-        .register(Arc::new(ReadFileTool::new(cfg.supports_vision)));
-
-    // Session-bound: reload the complete canonical aggregate. Only a fresh
-    // runtime intentionally staged in memory is allowed to assemble before its
-    // first aggregate publication.
-    if let Some(b) = &mut parts.session {
-        match b.manager.load_native_session(&b.id) {
-            Ok(loaded) => {
-                let mut snap = loaded.snapshot;
-                check_snapshot_version(&snap)?;
-                reconcile_coding_persona(
-                    &mut snap,
-                    cfg,
-                    parts.todo_enabled,
-                    parts.request_user_input_enabled,
-                    parts.review_provider.is_some(),
-                    parts.subagent_provider.is_some(),
-                    parts.has_external_subagents,
-                );
-                b.resume = Some(snap);
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound && b.staged_fresh.is_some() => {}
-            Err(e) => return Err(e.into()),
-        }
-    }
-
+    provider: &Arc<dyn LlmProvider>,
+) -> Arc<dyn LlmProvider> {
     // A telemetry-metering decorator over the host provider. Calls made OUTSIDE the host
     // agent loop — the tier-2 overflow summary AND the `code_review` sub-agent's rounds —
     // never reach the turn-level TelemetryHook (which fires on this loop's on_request /
@@ -1645,258 +1486,7 @@ pub fn assemble(
         }
     }
 
-    // Tier-2 overflow summary uses the same metered provider so its summary LLM call is
-    // likewise counted.
-    let summary_provider = metered_provider;
-
-    // When a session is present, wire the artifact store: register the fetch_output tool
-    // so the model can retrieve large outputs, and prepare the middleware that intercepts
-    // oversized tool results and spills them to disk.  No session → no artifact I/O.
-    let artifact_store: Option<Arc<ArtifactStore>> = parts.session.as_ref().and_then(|b| {
-        b.manager
-            .artifacts_dir(&b.id)
-            .ok()
-            .map(|dir| Arc::new(ArtifactStore::new(dir)))
-    });
-    if let Some(store) = &artifact_store {
-        parts
-            .registry
-            .register(Arc::new(FetchOutputTool::new(store.clone())));
-    }
-
-    let mut builder = Agent::builder()
-        .provider(provider)
-        .tools(parts.mount())
-        .persona(coding_persona_with_capabilities(
-            &cfg.model,
-            cfg.preferred_language,
-            parts.todo_enabled,
-            parts.request_user_input_enabled,
-            parts.review_provider.is_some(),
-            parts.subagent_provider.is_some(),
-            parts.has_external_subagents,
-        ))
-        // Repair model-produced arguments before any observer or policy gate reads them.
-        // Approval must inspect the same bytes that the tool executes.
-        .middleware(Arc::new(RepairToolArgsMiddleware));
-    // Tool telemetry is the first observation middleware. It never rewrites or blocks.
-    // Its `before` always stamps the call, including a call that approval later denies.
-    if let Some(tel) = &cfg.telemetry {
-        builder = builder.middleware(Arc::new(crate::telemetry::ToolTelemetryMiddleware::new(
-            tel.clone(),
-            cfg.provider_type.as_str(),
-            &cfg.base_url,
-            &cfg.model,
-            parts.session.as_ref().map(|b| b.id.as_str()),
-        )));
-        // Turn-level TelemetryHook (observation-only: on_request + on_model_response →
-        // one LlmChat per round). Built HERE, not in `prepare`, so a /login or /model
-        // swap (which re-runs assemble only) re-attributes every subsequent round to the
-        // CURRENT model + provider_host instead of the value frozen at prepare. Vendor =
-        // the configured `provider_type` (the exact vocabulary telemetry's
-        // `resolve_provider_host` keys on). It mutates nothing, so chain order is moot.
-        builder = builder.hook(Arc::new(crate::telemetry::TelemetryHook::new(
-            tel.clone(),
-            cfg.provider_type.as_str(),
-            &cfg.base_url,
-            &cfg.model,
-            parts.session.as_ref().map(|b| b.id.as_str()),
-        )));
-    }
-    let datalog = DatalogHook::new(
-        &cfg.working_dir,
-        &cfg.datalog,
-        &cfg.model,
-        cfg.context_window,
-    )
-    .map(Arc::new);
-    let rate_limit_hook = match &parts.rate_limit_source {
-        Some(source) => {
-            crate::rate_limit::RateLimitHook::with_source(cfg.base_url.clone(), source.clone())
-        }
-        None => crate::rate_limit::RateLimitHook::new(cfg.base_url.clone()),
-    }
-    .with_max_attempts(cfg.retry_max_attempts);
-    let rate_limit_hook: Arc<dyn LifecycleHooks> = Arc::new(rate_limit_hook);
-    let mut builder = builder
-        // Hard per-turn user boundary. Register before every middleware that can `Allow`
-        // and bypass downstream approval gates.
-        .middleware(parts.turn_execution_policy.clone())
-        // Plan-mode gate BEFORE approval: while active it blocks mutating (Risky)
-        // tools outright, so there's no point prompting the user to approve a write
-        // plan mode forbids. Read-only when inactive — zero cost off the plan path.
-        .middleware(Arc::new(crate::plan_mode::PlanModeGate::new(
-            parts.plan_mode.clone(),
-            parts.mcp_plan_grants.clone(),
-        )))
-        // Plan-mode reminder (ephemeral request tail) — pairs with the gate: the gate
-        // blocks mutating TOOLS, this keeps the model PLANNING instead of writing the
-        // implementation inline. Shares the same plan_mode flag; cache-safe (tail only).
-        .hook(Arc::new(crate::plan_mode::PlanModeReminderHook::new(
-            parts.plan_mode.clone(),
-        )))
-        // Rate-limit hook: on a 429 it decides wait-vs-pause from CodingPlan usage windows.
-        // Built HERE (not in `prepare`) — like TelemetryHook — so a /model swap (which re-runs
-        // assemble only) re-captures the CURRENT provider's base_url. That base_url is the gate
-        // that keeps a user's external-model 429 from being mislabelled as a CodingPlan quota;
-        // a prepare-frozen base_url would defeat it after a model switch.
-        .hook(rate_limit_hook)
-        // Credentials are a product-wide security boundary, independent of whether
-        // the optional AtomGit integration is compiled in. It must run before the
-        // approval-oriented SensitivePathGate so an explicit extraction cannot be
-        // downgraded from terminal denial into a retryable approval denial.
-        .middleware(Arc::new(
-            atomcode_capabilities::tools::CredentialBashGate::with_store(
-                cfg.credential_shell_policy,
-                parts.credential_shell_grants.clone(),
-            ),
-        ))
-        // Sensitive-path read gate: read tools are Safe (skip approval), so without this an
-        // agent could silently read ~/.ssh / .env / creds and leak them to the provider.
-        // Acts ONLY on Safe tools touching a sensitive path → one approval round-trip.
-        .middleware(Arc::new(SensitivePathGate::with_store(
-            parts.sensitive_path_grants.clone(),
-        )));
-    // NOTE: raw AtomGit API calls through bash are intentionally NOT blocked —
-    // read-only/public queries are legitimate, and credential exposure (the real
-    // risk) is already caught by CredentialBashGate above (its `*_token` detection
-    // covers `$ATOMGIT_TOKEN`). The typed AtomGit tools remain available and are
-    // steered by the persona for credential-bearing / write operations.
-    // CC external hooks (PreToolUse gate). Runs AFTER the hard PlanMode/SensitivePath gates
-    // (which must stay un-bypassable by a hook `allow`) but BEFORE every auto-approve
-    // convenience gate — OpenFileWorkspaceGate and especially WriteApprovalGate, which
-    // auto-`Allow`s in-workspace writes and would short-circuit the chain before a hook ever
-    // sees the call (so a PreToolUse hook on edit/write would silently never run). This
-    // matches Claude Code, where a PreToolUse hook IS the permission entry point: its
-    // `updatedInput` rewrite lands before WriteApprovalGate inspects the path and before the
-    // user sees approval (so the approved bytes are what run), `allow` short-circuits the
-    // whole approval chain, and `deny` blocks. Registered only when hooks exist (else zero
-    // middleware overhead).
-    if let Some(cc) = &parts.cc_external_hooks {
-        builder = builder.middleware(cc.clone());
-    }
-    // User-declared `[permissions]` allow/deny rules. Registered only when the user wrote
-    // some (zero middleware overhead otherwise). Placement is the whole contract: AFTER every
-    // hard boundary (turn policy, plan mode, CredentialBashGate, SensitivePathGate, CC
-    // PreToolUse hooks) so a user rule can never unlock a security gate, and BEFORE the
-    // convenience gates + the generic approval prompt so a matched `allow` actually skips the
-    // prompt. Reads the SAME live cwd handle, so a /cd moves what a relative path rule means.
-    if !cfg.permission_rules.is_empty() {
-        builder = builder.middleware(Arc::new(
-            atomcode_capabilities::tools::PermissionRuleGate::new(
-                cfg.permission_rules.clone(),
-                parts.shared_cwd.clone(),
-            ),
-        ));
-    }
-    let mut builder = builder
-        // open_file is Risky (launches a GUI), so approval would prompt on EVERY preview.
-        // Restore the legacy engine's behavior: auto-approve when the target is inside the
-        // workspace (benign side effect on the user's own files). BEFORE approval so its
-        // `Allow` short-circuits the prompt; out-of-workspace paths fall through and still
-        // prompt. Reads the SAME live cwd handle below, so a /cd moves the boundary.
-        .middleware(Arc::new(OpenFileWorkspaceGate::new(
-            parts.shared_cwd.clone(),
-        )))
-        // Workspace-aware, per-path approval for the file-mutation tools (v1 granularity):
-        // in-workspace non-sensitive writes auto-approve; sensitive writes always re-prompt
-        // (never remembered); out-of-workspace writes prompt with a PER-PATH "Always". Owns
-        // write-tool approval, so it must sit BEFORE the generic approval gate (its `Allow`
-        // short-circuits the prompt). Reads the SAME live cwd handle, so /cd moves the boundary.
-        .middleware(Arc::new(
-            WriteApprovalGate::with_store(
-                parts.shared_cwd.clone(),
-                parts.write_approval_grants.clone(),
-            )
-            .with_accept_edits(parts.accept_edits.clone()),
-        ))
-        // Workspace-aware approval for DESTRUCTIVE bash (rm/mv/cp/dd/redirect…) whose target
-        // lands OUTSIDE the workspace: prompt with a per-directory "Always", mirroring
-        // WriteApprovalGate for the write tools. In-workspace destructive bash is unchanged
-        // (single-file rm stays Safe→runs; recursive rm still reaches ApprovalMiddleware).
-        // BEFORE the generic approval gate so its `Allow` short-circuits the prompt; reads the
-        // SAME live cwd handle, so /cd moves the boundary. Mode-independent (accept-edits is for
-        // edits only); full Auto bypasses it via the driver auto-answering.
-        .middleware(Arc::new(BashWorkspaceGate::with_allow_all_store(
-            parts.shared_cwd.clone(),
-            parts.bash_workspace_grants.clone(),
-            parts.bash_allow_all_grants.clone(),
-        )))
-        // Approval AFTER the CC PreToolUse gate + the write/open auto-approve gates — every
-        // arg-rewrite (CC `updatedInput`) has already applied, so the user approves the exact
-        // bytes that run.
-        .middleware(parts.approval.clone())
-        // LIVE cwd handle (not the immutable pin): /cd mutates parts.shared_cwd.
-        .working_dir_shared(parts.shared_cwd.clone())
-        .chat_options(cfg.chat_options.clone())
-        // Cache-friendly task-boundary stub + hard-overflow recovery ladder (stub→truncate
-        // →drain+LLM-summary). Stubs old tool results once utilization crosses the threshold
-        // (kept full below it); the overflow tiers fire only on a typed overflow error.
-        .compaction(Arc::new(
-            atomcode_capabilities::compaction::OverflowCompaction::new(
-                atomcode_capabilities::compaction::StubCompaction::default(),
-                Some(summary_provider),
-            ),
-        ))
-        .compact_threshold(cfg.compact_threshold)
-        .stream_timeout(cfg.stream_timeout)
-        .max_continuations(cfg.max_continuations)
-        // Ctrl-C semantics: false = UNDO (default), true = PRESERVE the interrupted turn.
-        .keep_interrupted_context(cfg.keep_interrupted_context);
-    if let Some(policy) = cfg.tool_loop_policy {
-        builder = builder.tool_loop_policy(policy);
-    }
-    // Coarse round-cap backstop: the repetition guards catch exact loops quickly, while this
-    // also bounds varying-call runaways. `0` leaves the neutral kernel fuse unwired.
-    if cfg.max_rounds != 0 {
-        builder = builder.max_rounds(cfg.max_rounds);
-    }
-    // Provider-retry tiers. `upstream_retry_max_attempts` (global `[network]`) is
-    // the explicit knob for the VISIBLE kernel tier and WINS when set — it lets a
-    // flaky-gateway user keep the fast adapter budget small AND make the patient
-    // tier more persistent. Otherwise the legacy coupling holds: an explicit
-    // per-model `retry_max_attempts` is the TOTAL adapter OPEN budget, so the
-    // kernel's outer same-round retries are disabled to avoid multiplying it.
-    // With neither set, the neutral kernel default (patient) stands.
-    if let Some(n) = cfg.upstream_retry_max_attempts {
-        builder = builder.max_provider_retries(n);
-    } else if cfg.retry_max_attempts.is_some() {
-        builder = builder.max_provider_retries(0);
-    }
-    builder = builder.round_cap_checkpoint(cfg.round_cap_checkpoint);
-    // Approval liveness: `Some(d)` ⇒ fail-closed after `d` (headless); `None` ⇒ PARK until
-    // answered (interactive — a present human must not be auto-denied). The kernel defaults
-    // to unbounded when `.request_timeout` is never set, so None = park.
-    if let Some(d) = cfg.request_timeout {
-        builder = builder.request_timeout(d);
-    }
-    for h in &parts.hooks {
-        builder = builder.hook(h.clone());
-    }
-    // Eagerness is generation-scoped: `/model` reuses CodingParts and re-runs only
-    // `assemble`, so deriving this hook in `prepare` would freeze Auto/eagerness against the
-    // session's original model generation. TodoHook itself is model-neutral and remains
-    // in the reusable parts chain above.
-    if parts.todo_enabled {
-        builder = builder.hook(Arc::new(crate::todo::TodoEagerHook::new(
-            &cfg.model,
-            &cfg.provider_type,
-            cfg.todo.eager,
-        )));
-    }
-    if let Some(datalog) = datalog {
-        // Register last in both chains: the lifecycle observer sees the final prompt/request
-        // after product hooks, and the tool observer sees the final middleware-transformed
-        // result. The same writer owns correlation for both without owning runtime state.
-        builder = builder
-            .hook(datalog.clone())
-            .middleware(datalog as Arc<dyn ToolMiddleware>);
-    }
-    if let Some(checkpoint) = &parts.compaction_checkpoint {
-        builder = builder.compaction_checkpoint(checkpoint.clone());
-    }
     if let Some(b) = &parts.session {
-        builder = builder.session_id(&b.id);
         // Share the parent's `x-atomcode-session-id` with the subagent tier providers so a
         // `task` fan-out's children run within the SAME gateway window as the main
         // conversation — otherwise each session-less child is a distinct window and GLM-5.2's
@@ -1956,20 +1546,6 @@ pub fn assemble(
                 }
             }
         }
-        if let Some(snap) = &b.resume {
-            builder = builder.resume(snap.clone());
-        }
-    } else if let Some(mut snapshot) = parts.runtime_resume.as_ref().cloned() {
-        reconcile_coding_persona(
-            &mut snapshot,
-            cfg,
-            parts.todo_enabled,
-            parts.request_user_input_enabled,
-            parts.review_provider.is_some(),
-            parts.subagent_provider.is_some(),
-            parts.has_external_subagents,
-        );
-        builder = builder.resume(snapshot);
     }
     if let Some(models) = cfg.subagent_model_providers.as_ref() {
         let telemetry_factory = match (cfg.telemetry.as_ref(), cfg.subagent_config.as_ref()) {
@@ -2010,89 +1586,11 @@ pub fn assemble(
         };
         models.set_telemetry_provider_factory(telemetry_factory);
     }
-    // Ensure the repo's `atomcode` project label after a successful `git push` to a
-    // gitcode/atomgit remote. THIS is the production mount: the terminal TUI, daemon, and
-    // webui all build their agent here via `parts::assemble`. (`assemble.rs::build_coding_agent`
-    // also mounts it, but that path is reachable only from tests/examples — so before this the
-    // middleware never ran for a real session.) Best-effort: every failure is a `tracing::warn`
-    // and the turn proceeds. Gated on `atomgit` (its sole consumer).
-    #[cfg(feature = "atomgit")]
-    {
-        builder = builder.middleware(Arc::new(
-            atomcode_capabilities::tools::GitPushLabelMiddleware::new(cfg.working_dir.clone()),
-        ));
-    }
-    // Artifact spill middleware: intercepts oversized tool results and saves them to disk so
-    // the conversation only carries a preview + handle. Only wired when a session is present
-    // (no session = no on-disk store; the fetch_output tool is not registered either).
-    if let Some(store) = artifact_store {
-        builder = builder.middleware(Arc::new(ArtifactMiddleware::new(store)));
-    }
-    let agent = builder.build();
-    // Commit model attribution only after every fallible assembly step has
-    // succeeded. ReassembleProvider stops the old agent before entering here,
-    // so no accepted turn can observe a half-switched attribution.
-    if let Some(snapshot_hook) = &parts.snapshot_hook {
-        snapshot_hook.set_model_attribution(&cfg.provider_name, &cfg.model);
-    }
-    Ok(agent)
-}
 
-const ATOMCODE_PERSONA_PREFIX: &str =
-    "You are AtomCode, an AI coding agent by AtomGit running the ";
-const MODEL_CHANGE_CONTEXT_PREFIX: &str = "=== MODEL CHANGE ===";
-
-/// Legacy drivers persist conversation history without the separately supplied
-/// system prompt. A v2 resume must restore that prompt, while a model switch must
-/// replace the old model identity instead of retaining or duplicating it.
-fn reconcile_coding_persona(
-    snapshot: &mut SessionSnapshot,
-    cfg: &CodingAgentConfig,
-    todo_enabled: bool,
-    request_user_input_enabled: bool,
-    review_enabled: bool,
-    subagents_enabled: bool,
-    external_subagents_enabled: bool,
-) {
-    let persona = coding_persona_with_capabilities(
-        &cfg.model,
-        cfg.preferred_language,
-        todo_enabled,
-        request_user_input_enabled,
-        review_enabled,
-        subagents_enabled,
-        external_subagents_enabled,
-    );
-    let is_persona = |message: &Message| {
-        message.role == Role::System && message.text.starts_with(ATOMCODE_PERSONA_PREFIX)
-    };
-    let is_model_change = |message: &Message| {
-        message.role == Role::System && message.text.starts_with(MODEL_CHANGE_CONTEXT_PREFIX)
-    };
-    let already_current = snapshot
-        .messages
-        .first()
-        .is_some_and(|message| message.role == Role::System && message.text == persona)
-        && snapshot
-            .messages
-            .iter()
-            .skip(1)
-            .all(|message| !is_persona(message))
-        && snapshot
-            .messages
-            .iter()
-            .filter(|message| is_model_change(message))
-            .count()
-            == 0;
-    if already_current {
-        return;
+    if let Ok(mut slot) = parts.side_provider.write() {
+        *slot = Some(metered_provider.clone());
     }
-
-    snapshot
-        .messages
-        .retain(|message| !is_persona(message) && !is_model_change(message));
-    snapshot.messages.insert(0, Message::system(persona));
-    snapshot.cache_epoch = snapshot.cache_epoch.saturating_add(1);
+    metered_provider
 }
 
 /// A snapshot from another kernel version must NOT be silently re-bound to its
@@ -2142,6 +1640,7 @@ pub fn subagent_runtime_knobs(
 mod tests {
     use super::*;
     use crate::config::CodingAgentConfig;
+    use atomcode_capabilities::session::PresentationFile;
 
     #[test]
     fn external_profiles_convert_and_guard_bypass() {
@@ -2246,8 +1745,62 @@ mod tests {
         );
     }
 
-    fn agent_config(model: &str) -> CodingAgentConfig {
-        CodingAgentConfig::new("", "", model, ".")
+    /// Every production spawn site (CLI startup, daemon, the TUI's in-session
+    /// deferred respawns) builds its `PrepareOptions` through
+    /// [`prepare_from_config`]. This pins the seam the daemon path once broke:
+    /// its hand-written `PrepareOptions` hardcoded
+    /// `external_subagents: Vec::new()`, so a `[subagent] claude = "auto"`
+    /// config silently lost `subagent_claude-code` on every in-TUI respawn
+    /// while CLI startup mounted it. One derivation, one place — no second
+    /// hand-copied field list to drift.
+    #[test]
+    fn prepare_from_config_resolves_external_subagents_for_every_spawn_site() {
+        use crate::config::CodingRuntimeConfig;
+
+        let toml = r#"
+            default_provider = "p"
+            [providers.p]
+            type = "openai"
+            model = "m"
+            api_key = "k"
+            base_url = "https://example.test/v1"
+            [subagent]
+            claude = "auto"
+        "#;
+        let config: atomcode_config::config::Config = toml::from_str(toml).unwrap();
+
+        // The daemon / in-TUI-respawn shape (non-interactive): the convenience
+        // switch still resolves — a bypass entry would be downgraded, `auto`
+        // mounts as-is.
+        let cfg = CodingRuntimeConfig::from_config(
+            &config,
+            std::path::Path::new("/tmp/proj"),
+            None,
+            None,
+            false,
+            false,
+        );
+        let prepare = prepare_from_config(&cfg);
+        let names: Vec<&str> = prepare
+            .external_subagents
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert!(
+            names.contains(&"claude-code"),
+            "a `[subagent] claude = \"auto\"` config must resolve through \
+             prepare_from_config on EVERY spawn site; got {names:?}"
+        );
+        assert!(!prepare.external_subagents[0].allow_dangerous);
+
+        // Defaults stay the full-capability production shape the daemon
+        // expects; drivers overlay only their differences on top.
+        assert!(prepare.tools);
+        assert!(prepare.memory);
+        assert!(prepare.web);
+        assert!(prepare.review);
+        assert!(prepare.request_user_input);
+        assert!(prepare.mcp, "mcp follows the config flag");
     }
 
     struct TestMcpTool;
@@ -2304,12 +1857,13 @@ mod tests {
     }
 
     #[test]
-    fn subagent_runtime_knobs_ignore_legacy_timeout_and_floor_concurrency() {
+    fn subagent_runtime_knobs_floor_concurrency() {
         use super::subagent_runtime_knobs;
         use atomcode_config::config::SubAgentConfig;
+        // The legacy `timeout_secs` this test once also ignored is gone from the
+        // schema; `legacy_dead_keys_still_parse` pins that a file carrying it loads.
         let cfg = SubAgentConfig {
             max_concurrent: 0,
-            timeout_secs: 5,
             ..SubAgentConfig::default()
         };
         let (mc, rounds) = subagent_runtime_knobs(&cfg, None);
@@ -2342,246 +1896,6 @@ mod tests {
             "zero is an intentional unbounded override"
         );
         assert_eq!(subagent_runtime_knobs(&cfg, Some("bad")).1, 350);
-    }
-
-    #[test]
-    fn resume_adds_persona_before_legacy_session_context() {
-        let mut snapshot = SessionSnapshot::new(vec![Message::system("SESSION CONTEXT")]);
-
-        reconcile_coding_persona(
-            &mut snapshot,
-            &agent_config("deepseek-v4-flash"),
-            true,
-            true,
-            true,
-            true,
-            false,
-        );
-
-        assert!(snapshot.messages[0]
-            .text
-            .contains("running the deepseek-v4-flash model"));
-        assert_eq!(snapshot.messages[1].text, "SESSION CONTEXT");
-        assert_eq!(snapshot.cache_epoch, 1);
-    }
-
-    #[test]
-    fn provider_reassemble_keeps_the_prepared_todo_capability_gate() {
-        let mut snapshot = SessionSnapshot::new(vec![Message::system("SESSION CONTEXT")]);
-        let cfg = agent_config("deepseek-v4-flash");
-
-        reconcile_coding_persona(&mut snapshot, &cfg, false, true, true, true, false);
-
-        assert!(!snapshot.messages[0].text.contains("## TASK TRACKING"));
-        assert!(snapshot.messages[0]
-            .text
-            .contains("running the deepseek-v4-flash model"));
-    }
-
-    #[test]
-    #[serial_test::serial(offline_verdict)]
-    fn model_switch_replaces_persona_without_duplication() {
-        atomcode_config::config::offline::reset_offline_verdict_for_test();
-        // Remove ATOMCODE_REQUEST_USER_INPUT so the persona is deterministic regardless
-        // of what other tests may have set concurrently (we hold the serial lock, so this
-        // is safe — no other test in this serial group can observe the removal).
-        let _rui_guard = std::env::remove_var("ATOMCODE_REQUEST_USER_INPUT");
-        let mut snapshot = SessionSnapshot::new(vec![
-            Message::system(coding_persona(
-                "old-model",
-                crate::persona::todo_switch_enabled(),
-                crate::persona::request_user_input_switch_enabled(),
-            )),
-            Message::system("SESSION CONTEXT"),
-        ]);
-
-        reconcile_coding_persona(
-            &mut snapshot,
-            &agent_config("deepseek-v4-flash"),
-            true,
-            true,
-            true,
-            true,
-            false,
-        );
-
-        let personas = snapshot
-            .messages
-            .iter()
-            .filter(|message| message.text.starts_with(ATOMCODE_PERSONA_PREFIX))
-            .count();
-        assert_eq!(personas, 1);
-        assert!(snapshot.messages[0]
-            .text
-            .contains("running the deepseek-v4-flash model"));
-        assert!(!snapshot.messages[0].text.contains("old-model"));
-        assert!(!snapshot
-            .messages
-            .iter()
-            .any(|message| message.text.starts_with(MODEL_CHANGE_CONTEXT_PREFIX)));
-        assert_eq!(snapshot.cache_epoch, 1);
-    }
-
-    #[test]
-    #[serial_test::serial(offline_verdict)]
-    fn repeated_model_switch_keeps_system_context_leading() {
-        atomcode_config::config::offline::reset_offline_verdict_for_test();
-        let _rui_guard = std::env::remove_var("ATOMCODE_REQUEST_USER_INPUT");
-        let mut snapshot = SessionSnapshot::new(vec![
-            Message::system(coding_persona(
-                "model-a",
-                crate::persona::todo_switch_enabled(),
-                crate::persona::request_user_input_switch_enabled(),
-            )),
-            Message::system("=== SESSION CONTEXT ===\nworkspace state"),
-            Message::user("what model are you?"),
-            Message::assistant("I am model-a", vec![]),
-        ]);
-
-        reconcile_coding_persona(
-            &mut snapshot,
-            &agent_config("model-b"),
-            true,
-            true,
-            true,
-            true,
-            false,
-        );
-        reconcile_coding_persona(
-            &mut snapshot,
-            &agent_config("model-c"),
-            true,
-            true,
-            true,
-            true,
-            false,
-        );
-
-        assert!(snapshot.messages[0]
-            .text
-            .contains("running the model-c model"));
-        assert_eq!(
-            snapshot.messages[1].text,
-            "=== SESSION CONTEXT ===\nworkspace state"
-        );
-        let first_non_system = snapshot
-            .messages
-            .iter()
-            .position(|message| message.role != Role::System)
-            .expect("user history remains after the leading system block");
-        assert_eq!(first_non_system, 2);
-        assert!(snapshot.messages[first_non_system..]
-            .iter()
-            .all(|message| message.role != Role::System));
-        assert_eq!(
-            snapshot.messages[first_non_system].text,
-            "what model are you?"
-        );
-        assert_eq!(snapshot.messages[first_non_system + 1].text, "I am model-a");
-        assert!(!snapshot
-            .messages
-            .iter()
-            .any(|message| message.text.starts_with(MODEL_CHANGE_CONTEXT_PREFIX)));
-    }
-
-    #[test]
-    #[serial_test::serial(offline_verdict)]
-    fn current_persona_keeps_snapshot_byte_stable() {
-        atomcode_config::config::offline::reset_offline_verdict_for_test();
-        // Remove ATOMCODE_REQUEST_USER_INPUT so the persona is stable for both builds of
-        // the persona string (captured and reconciled).  We hold the serial lock, so this
-        // is safe.
-        let _rui_guard = std::env::remove_var("ATOMCODE_REQUEST_USER_INPUT");
-        let persona = coding_persona(
-            "deepseek-v4-flash",
-            crate::persona::todo_switch_enabled(),
-            crate::persona::request_user_input_switch_enabled(),
-        );
-        let mut snapshot = SessionSnapshot::new(vec![
-            Message::system(persona.clone()),
-            Message::system("SESSION CONTEXT"),
-        ]);
-
-        reconcile_coding_persona(
-            &mut snapshot,
-            &agent_config("deepseek-v4-flash"),
-            true,
-            true,
-            true,
-            true,
-            false,
-        );
-
-        assert_eq!(snapshot.messages[0].text, persona);
-        assert_eq!(snapshot.cache_epoch, 0);
-    }
-
-    #[test]
-    #[serial_test::serial(offline_verdict)]
-    fn language_switch_refreshes_persona_without_model_change_boundary() {
-        use atomcode_config::locale::Locale;
-
-        atomcode_config::config::offline::reset_offline_verdict_for_test();
-        let _rui_guard = std::env::remove_var("ATOMCODE_REQUEST_USER_INPUT");
-        let mut snapshot = SessionSnapshot::new(vec![Message::system(
-            crate::persona::coding_persona_with_language(
-                "model-a",
-                Some(Locale::En),
-                crate::persona::todo_switch_enabled(),
-                crate::persona::request_user_input_switch_enabled(),
-            ),
-        )]);
-        let mut cfg = agent_config("model-a");
-        cfg.preferred_language = Some(Locale::ZhCn);
-
-        reconcile_coding_persona(&mut snapshot, &cfg, true, true, true, true, false);
-
-        assert!(snapshot.messages[0]
-            .text
-            .contains("subject and body in Simplified Chinese"));
-        assert!(!snapshot
-            .messages
-            .iter()
-            .any(|message| message.text.starts_with(MODEL_CHANGE_CONTEXT_PREFIX)));
-        assert_eq!(snapshot.cache_epoch, 1);
-    }
-
-    #[test]
-    #[serial_test::serial(offline_verdict)]
-    fn language_switch_removes_legacy_model_change_boundary() {
-        use atomcode_config::locale::Locale;
-
-        atomcode_config::config::offline::reset_offline_verdict_for_test();
-        let _rui_guard = std::env::remove_var("ATOMCODE_REQUEST_USER_INPUT");
-        let mut snapshot = SessionSnapshot::new(vec![
-            Message::system(coding_persona(
-                "model-a",
-                crate::persona::todo_switch_enabled(),
-                crate::persona::request_user_input_switch_enabled(),
-            )),
-            Message::assistant("I am model-a", vec![]),
-        ]);
-        reconcile_coding_persona(
-            &mut snapshot,
-            &agent_config("model-b"),
-            true,
-            true,
-            true,
-            true,
-            false,
-        );
-        snapshot.messages.push(Message::system(format!(
-            "{MODEL_CHANGE_CONTEXT_PREFIX}\nlegacy transition"
-        )));
-        let mut cfg = agent_config("model-b");
-        cfg.preferred_language = Some(Locale::ZhCn);
-
-        reconcile_coding_persona(&mut snapshot, &cfg, true, true, true, true, false);
-
-        assert!(!snapshot
-            .messages
-            .iter()
-            .any(|message| message.text.starts_with(MODEL_CHANGE_CONTEXT_PREFIX)));
     }
 
     #[tokio::test]
@@ -2623,6 +1937,7 @@ mod tests {
             subagents: SubagentPolicy::Disabled,
             request_user_input: true,
             rate_limit_source: None,
+            front_end: None,
         };
 
         let prepared =
@@ -2637,7 +1952,9 @@ mod tests {
 
     #[tokio::test]
     async fn capability_reload_withdraws_old_mcp_tools_fail_closed() {
+        let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
         let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
         let mut parts = prepare(&cfg, io_free_opts()).await.unwrap();
         parts.registry.register(Arc::new(TestMcpTool));
@@ -2646,13 +1963,14 @@ mod tests {
             .write()
             .unwrap()
             .push("mcp__test__echo".into());
-        let mounted = parts.mount();
-        assert!(mounted.get("mcp__test__echo").is_some());
-
         parts.withdraw_mcp_tools().await;
 
-        assert!(mounted.get("mcp__test__echo").is_none());
+        // What the `mcp-host` row reads: nothing left to publish, and publishing
+        // switched off so a connection still in flight cannot re-add one.
         assert!(parts.mcp_tool_names.read().unwrap().is_empty());
+        assert!(!parts
+            .mcp_publication_enabled
+            .load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -2695,39 +2013,8 @@ mod tests {
             subagents: SubagentPolicy::Disabled,
             request_user_input: true,
             rate_limit_source: None,
+            front_end: None,
         }
-    }
-
-    #[tokio::test]
-    async fn driver_can_disable_request_user_input_at_mount_boundary() {
-        let project = tempfile::tempdir().unwrap();
-        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
-        let mut opts = io_free_opts();
-        opts.request_user_input = false;
-        let parts = prepare(&cfg, opts).await.unwrap();
-
-        assert!(!parts
-            .selected_tool_names()
-            .iter()
-            .any(|name| name == "request_user_input"));
-        assert!(!parts.request_user_input_enabled);
-    }
-
-    #[tokio::test]
-    async fn driver_can_publish_an_empty_tool_catalog() {
-        let project = tempfile::tempdir().unwrap();
-        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
-        let mut opts = io_free_opts();
-        opts.tools = false;
-        let mut parts = prepare(&cfg, opts).await.unwrap();
-
-        assert!(parts.selected_tool_names().is_empty());
-        assert!(parts.mount().defs().is_empty());
-        assert!(!parts.todo_enabled);
-        assert!(!parts.request_user_input_enabled);
-        assert!(parts.review_provider.is_none());
-        assert!(!parts.has_external_subagents);
-        assert!(parts.mcp_registry.is_none());
     }
 
     #[cfg(feature = "atomgit")]
@@ -2736,7 +2023,11 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
         let parts = prepare(&cfg, io_free_opts()).await.unwrap();
-        let names = parts.selected_tool_names();
+        // The field, not an accessor: `selected_tool_names` went with the chain
+        // in `f3a7f048` and this test — behind the `atomgit` feature, so never
+        // compiled by a plain `cargo nextest run -p atomcode-coding` — went on
+        // calling it. A feature nobody builds is a feature nobody tests.
+        let names = parts.tool_names.clone();
 
         for expected in ["atomgit_repo", "atomgit_pr", "atomgit_issue"] {
             assert!(
@@ -2878,7 +2169,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(atomcode_home)]
-    async fn session_bound_reassemble_rejects_an_incomplete_native_aggregate() {
+    async fn a_mount_rejects_an_incomplete_native_aggregate() {
         use atomcode_capabilities::session::SessionStoreError;
 
         let home = tempfile::tempdir().unwrap();
@@ -2892,20 +2183,26 @@ mod tests {
 
         let mut opts = io_free_opts();
         opts.session = SessionMode::Resume(id.into());
-        let mut parts = prepare(&cfg, opts).await.unwrap();
+        let parts = prepare(&cfg, opts.clone()).await.unwrap();
         let provider: Arc<dyn LlmProvider> = Arc::new(CannedProvider);
-        drop(assemble(&mut parts, &cfg, provider.clone()).unwrap());
-        std::fs::remove_file(manager.presentation_path(id).unwrap()).unwrap();
+        crate::runtime::mount(&parts, &cfg, &opts, provider.clone())
+            .await
+            .expect("a complete aggregate mounts")
+            .app
+            .stop();
+        std::fs::remove_file(manager.events_path(id).unwrap()).unwrap();
 
-        let error = match assemble(&mut parts, &cfg, provider) {
-            Ok(_) => panic!("reassemble must reject an incomplete native aggregate"),
+        // Half a session is not a session: rebuilding on one would hand the model
+        // a conversation the store cannot explain.
+        let error = match crate::runtime::mount(&parts, &cfg, &opts, provider).await {
+            Ok(_) => panic!("a mount must reject an incomplete native aggregate"),
             Err(error) => error,
         };
-        assert!(matches!(
-            session_store_error(&error),
-            SessionStoreError::NotFound { path }
-                if path == &manager.presentation_path(id).unwrap()
-        ));
+        assert!(
+            error.contains(&manager.events_path(id).unwrap().display().to_string()),
+            "the failure must name the missing file: {error}"
+        );
+        let _ = std::mem::size_of::<SessionStoreError>();
     }
 
     #[tokio::test]
@@ -2954,7 +2251,10 @@ mod tests {
         assert!(error
             .to_string()
             .contains("does not match the canonical native snapshot"));
-        assert_eq!(manager.load_snapshot(id).unwrap(), canonical);
+        assert_eq!(
+            manager.load_snapshot(id).unwrap().messages,
+            canonical.messages
+        );
     }
 
     #[tokio::test]
@@ -2975,7 +2275,14 @@ mod tests {
             snapshot: canonical.clone(),
         };
         let parts = prepare(&cfg, opts).await.unwrap();
-        assert_eq!(parts.session.unwrap().resume.as_ref(), Some(&canonical));
+        assert_eq!(
+            parts
+                .session
+                .unwrap()
+                .resume
+                .map(|resumed| resumed.messages),
+            Some(canonical.messages)
+        );
     }
 
     #[tokio::test]
@@ -3018,10 +2325,6 @@ mod tests {
             &candidate.credential_shell_grants,
             &previous.credential_shell_grants,
         ));
-        assert!(Arc::ptr_eq(
-            &candidate.bash_allow_all_grants,
-            &previous.bash_allow_all_grants,
-        ));
         assert!(candidate
             .plan_mode
             .load(std::sync::atomic::Ordering::Acquire));
@@ -3030,7 +2333,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(atomcode_home)]
-    async fn prepare_injects_checkpoint_only_for_persistent_sessions() {
+    async fn prepare_gives_a_persistent_session_a_snapshot_writer() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         std::env::set_var("ATOMCODE_HOME", home.path());
@@ -3039,7 +2342,9 @@ mod tests {
         let mut persistent = io_free_opts();
         persistent.session = SessionMode::Fresh;
         let parts = prepare(&cfg, persistent).await.unwrap();
-        assert!(parts.compaction_checkpoint.is_some());
+        // The writer the `session-native` and `native-compaction-checkpoint`
+        // rows call. Without it there is nothing to store a session with.
+        assert!(parts.snapshot_hook().is_some());
         let binding = parts.session.as_ref().unwrap();
         assert_eq!(
             binding.manager.read_meta(&binding.id).unwrap().owner,
@@ -3048,7 +2353,7 @@ mod tests {
         assert!(binding.manager.load_snapshot(&binding.id).is_ok());
 
         let ephemeral = prepare(&cfg, io_free_opts()).await.unwrap();
-        assert!(ephemeral.compaction_checkpoint.is_none());
+        assert!(ephemeral.snapshot_hook().is_none());
     }
 
     #[tokio::test]
@@ -3135,7 +2440,6 @@ mod tests {
             parts.cc_external_hooks.is_none(),
             "no hooks.json ⇒ nothing registered"
         );
-        let baseline_hooks = parts.hooks.len();
 
         // Project .hooks.json present → wired as the middleware handle AND a lifecycle hook.
         let proj = tempfile::tempdir().unwrap();
@@ -3150,11 +2454,8 @@ mod tests {
             parts.cc_external_hooks.is_some(),
             "project .hooks.json ⇒ wired"
         );
-        assert_eq!(
-            parts.hooks.len(),
-            baseline_hooks + 1,
-            "the CC runner is also pushed onto the lifecycle hook chain"
-        );
+        // One instance serves both seams: the `cc-hooks-host` row mounts it as a
+        // lifecycle hook and as tool middleware.
     }
 
     /// A canned provider that reports usage then ends — enough for a telemetry
@@ -3207,10 +2508,10 @@ mod tests {
 
         let mut opts = io_free_opts();
         opts.review = true;
-        let mut parts = prepare(&cfg, opts).await.unwrap();
+        let parts = prepare(&cfg, opts).await.unwrap();
 
         let provider: Arc<dyn LlmProvider> = Arc::new(CannedProvider);
-        let _agent = assemble(&mut parts, &cfg, provider).unwrap();
+        wire_side_providers(&parts, &cfg, &provider);
 
         let slot = parts
             .review_provider
@@ -3220,7 +2521,7 @@ mod tests {
             .read()
             .unwrap()
             .clone()
-            .expect("slot filled at assemble");
+            .expect("the slot is filled with the providers");
         let mut stream = review_provider
             .chat_stream(
                 &[Message::user("review this")],
@@ -3242,154 +2543,6 @@ mod tests {
             llm_chats, 1,
             "review sub-agent LLM round must emit one LlmChat token event"
         );
-    }
-
-    /// A `/login` or `/model` swap updates `cfg.model` and re-runs `assemble` ONLY
-    /// (never `prepare`). The primary turn-level `TelemetryHook` must therefore be
-    /// (re)built at `assemble` so its `LlmChat` envelope reports the CURRENTLY active
-    /// model — not the value frozen at `prepare`. Regression guard for the v2 bug where
-    /// a session that launched with no resolvable provider (model="" + the openai host
-    /// default `api.openai.com`) kept mis-attributing every real post-login round.
-    #[tokio::test]
-    #[serial_test::serial(atomcode_home)]
-    async fn primary_telemetry_hook_tracks_model_swapped_at_assemble() {
-        use atomcode_kernel::agent::AutoRespond;
-        let home = tempfile::tempdir().unwrap();
-        std::env::set_var("ATOMCODE_HOME", home.path());
-
-        let (tel, captured) = atomcode_telemetry::Telemetry::in_memory("test".into());
-        let proj = tempfile::tempdir().unwrap();
-        // Launched in onboarding mode: no resolvable provider ⇒ empty model at prepare.
-        let mut cfg = CodingAgentConfig::new("k", "http://localhost", "", proj.path());
-        cfg.telemetry = Some(tel);
-
-        let mut parts = prepare(&cfg, io_free_opts()).await.unwrap();
-
-        // /login resolves the real provider: cfg picks up the model, assemble re-runs.
-        cfg.model = "swapped-model".to_string();
-        let provider: Arc<dyn LlmProvider> = Arc::new(CannedProvider);
-        let agent = assemble(&mut parts, &cfg, provider).unwrap();
-
-        let _ = agent.run_to_completion("hi", AutoRespond::AllowAll).await;
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let records = captured.lock().await;
-        let chat = records
-            .iter()
-            .find(|r| matches!(r.event, atomcode_telemetry::Event::LlmChat { .. }))
-            .expect("the primary turn must emit one LlmChat");
-        assert_eq!(
-            chat.envelope.model.as_deref(),
-            Some("swapped-model"),
-            "primary TelemetryHook must report the model active at assemble, not the prepare-time one"
-        );
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(atomcode_home)]
-    async fn primary_runtime_mounts_configured_datalog_at_assemble() {
-        use atomcode_kernel::agent::AutoRespond;
-
-        let home = tempfile::tempdir().unwrap();
-        std::env::set_var("ATOMCODE_HOME", home.path());
-        let project = tempfile::tempdir().unwrap();
-        let datalog_root = home.path().join("custom-datalog");
-        let mut cfg =
-            CodingAgentConfig::new("k", "http://localhost", "logged-model", project.path());
-        cfg.datalog.enabled = true;
-        cfg.datalog.dir = Some(datalog_root.display().to_string());
-
-        let mut parts = prepare(&cfg, io_free_opts()).await.unwrap();
-        let provider: Arc<dyn LlmProvider> = Arc::new(CannedProvider);
-        let agent = assemble(&mut parts, &cfg, provider).unwrap();
-        let _ = agent
-            .run_to_completion("record this turn", AutoRespond::AllowAll)
-            .await;
-
-        let project_dir = std::fs::read_dir(&datalog_root)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
-        let files: Vec<_> = std::fs::read_dir(project_dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .collect();
-        let markdown = files
-            .iter()
-            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("md"))
-            .expect("turn markdown");
-        // `.cas.jsonl` shares the `jsonl` extension, so match on the full name.
-        let name_ends = |path: &&std::path::PathBuf, suffix: &str| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(suffix))
-        };
-        let jsonl = files
-            .iter()
-            .find(|p| name_ends(p, ".jsonl") && !name_ends(p, ".cas.jsonl"))
-            .expect("per-round request jsonl");
-        let cas = files
-            .iter()
-            .find(|p| name_ends(p, ".cas.jsonl"))
-            .expect("content-addressed store");
-        assert!(std::fs::read_to_string(markdown)
-            .unwrap()
-            .contains("**Response:**\nlooks good"));
-        let request = std::fs::read_to_string(jsonl).unwrap();
-        assert!(request.contains("\"model\":\"logged-model\""));
-        // v2 records reference message bodies by hash; the prompt text lives once
-        // in the cas store. Rehydrate to confirm the full request is recoverable.
-        let record: serde_json::Value =
-            serde_json::from_str(request.lines().next().unwrap()).unwrap();
-        let index = atomcode_capabilities::datalog::build_cas_index(
-            &std::fs::read_to_string(cas).unwrap(),
-        );
-        let full = atomcode_capabilities::datalog::rehydrate_record(&record, &index);
-        assert!(full["messages"].to_string().contains("record this turn"));
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(atomcode_home)]
-    async fn snapshot_cost_attribution_tracks_model_swapped_at_assemble() {
-        use atomcode_kernel::agent::AutoRespond;
-
-        let home = tempfile::tempdir().unwrap();
-        std::env::set_var("ATOMCODE_HOME", home.path());
-        let project = tempfile::tempdir().unwrap();
-        let mut cfg = CodingAgentConfig::new("k", "http://localhost", "model-a", project.path());
-        cfg.provider_name = "provider-a".into();
-
-        let mut opts = io_free_opts();
-        opts.session = SessionMode::Fresh;
-        let mut parts = prepare(&cfg, opts).await.unwrap();
-        let binding = parts.session.as_ref().unwrap();
-        let manager = binding.manager.clone();
-        let session_id = binding.id.clone();
-
-        let provider: Arc<dyn LlmProvider> = Arc::new(CannedProvider);
-        let first = assemble(&mut parts, &cfg, provider.clone()).unwrap();
-        parts.publish_staged_session().unwrap();
-        let _ = first
-            .run_to_completion("first", AutoRespond::AllowAll)
-            .await;
-
-        cfg.provider_name = "provider-b".into();
-        cfg.model = "model-b".into();
-        let second = assemble(&mut parts, &cfg, provider).unwrap();
-        let _ = second
-            .run_to_completion("second", AutoRespond::AllowAll)
-            .await;
-
-        let report = atomcode_capabilities::session::aggregate_session_cost(
-            &manager.read_meta(&session_id).unwrap(),
-        );
-        assert_eq!(report.models.len(), 2);
-        assert_eq!(report.models[0].provider_id, "provider-a");
-        assert_eq!(report.models[0].model_id, "model-a");
-        assert_eq!(report.models[1].provider_id, "provider-b");
-        assert_eq!(report.models[1].model_id, "model-b");
     }
 
     /// Helper: run `prepare` with `opts.web = web_enabled` (all other optional capabilities
@@ -3518,52 +2671,6 @@ mod tests {
         assert!(
             fetch_result.content.starts_with('Z'),
             "fetched bytes must start with the original content"
-        );
-    }
-
-    /// When no session is present, fetch_output must NOT appear in the assembled tools.
-    #[tokio::test]
-    #[serial_test::serial(atomcode_home)]
-    async fn no_session_means_no_fetch_output_tool() {
-        let home = tempfile::tempdir().unwrap();
-        let project = tempfile::tempdir().unwrap();
-        std::env::set_var("ATOMCODE_HOME", home.path());
-        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
-        // Disabled session: no artifact store, so fetch_output must not be mounted.
-        let mut parts = prepare(&cfg, io_free_opts()).await.unwrap();
-        let provider: Arc<dyn LlmProvider> = Arc::new(CannedProvider);
-        let _agent = assemble(&mut parts, &cfg, provider).unwrap();
-        // After assemble(), parts.mounted_tools is populated by the mount() call inside.
-        let mounted = parts
-            .mounted_tools
-            .as_ref()
-            .expect("mounted_tools must be set after assemble");
-        assert!(
-            mounted.get("fetch_output").is_none(),
-            "fetch_output must not be mounted when no session is present"
-        );
-    }
-
-    /// When a session IS present, fetch_output must appear in the assembled tools.
-    #[tokio::test]
-    #[serial_test::serial(atomcode_home)]
-    async fn session_presence_mounts_fetch_output_tool() {
-        let home = tempfile::tempdir().unwrap();
-        let project = tempfile::tempdir().unwrap();
-        std::env::set_var("ATOMCODE_HOME", home.path());
-        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
-        let mut opts = io_free_opts();
-        opts.session = SessionMode::Fresh;
-        let mut parts = prepare(&cfg, opts).await.unwrap();
-        let provider: Arc<dyn LlmProvider> = Arc::new(CannedProvider);
-        let _agent = assemble(&mut parts, &cfg, provider).unwrap();
-        let mounted = parts
-            .mounted_tools
-            .as_ref()
-            .expect("mounted_tools must be set after assemble");
-        assert!(
-            mounted.get("fetch_output").is_some(),
-            "fetch_output must be mounted when a session is present"
         );
     }
 }

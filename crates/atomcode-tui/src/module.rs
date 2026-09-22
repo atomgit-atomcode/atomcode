@@ -1,0 +1,374 @@
+//! The two kinds of module, and the registries the host finds them in.
+//!
+//! # Why two kinds and not one
+//!
+//! Irreversibility applies to one of them and not the other. A **stream
+//! producer** appends blocks that can never be taken back; a **view module**
+//! is redrawn whole every frame and has no history. Conflating them grows two
+//! opposite bugs: a status bar that starts accumulating history, and a
+//! transcript that gets repainted from scratch. See `docs/adr/0004`.
+//!
+//! # Why the author writes associated functions
+//!
+//! [`View::render`] takes `&State`, not `&self`. A module therefore *cannot*
+//! capture a `Context`, a service handle, a channel or a clock — the signature
+//! makes the "no side effects, no IO, not async" obligation unrepresentable
+//! rather than merely discouraged. The host stores the object-safe
+//! [`ViewObject`] that [`Mounted`] wraps around it.
+
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
+use atomcode_harness::session::SessionEvent;
+
+use crate::block::{Content, StreamWriter};
+use crate::frame::Line;
+use crate::moment::{Moment, Viewport};
+
+/// How much vertical space a module asks for. The host arbitrates; a module
+/// requests, so one module can never blow up the layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Height {
+    /// Exactly this many rows.
+    Fixed(u16),
+    /// At most this many, fewer if it has less to say.
+    Hug(u16),
+    /// Whatever is left.
+    Fill,
+}
+
+/// A view module: state folded from facts, redrawn every frame.
+pub trait View: Send + Sync + 'static {
+    type State: Default + Send + Sync + 'static;
+
+    fn id() -> &'static str;
+
+    /// Fold one committed fact. Pure and order-dependent only on the log, so a
+    /// replay reproduces the state exactly.
+    fn absorb(state: &mut Self::State, fact: &SessionEvent);
+
+    /// Draw. Pure: the same `(state, viewport)` must give the same lines, on
+    /// any machine, at any time. Reading a clock here would leave the whole
+    /// test loop green and untrustworthy — see `docs/adr/0008`; time arrives
+    /// through `viewport.moment`.
+    fn render(state: &Self::State, viewport: &Viewport<'_>) -> Vec<Line>;
+
+    /// How much room to ask for, given what it would be drawing.
+    ///
+    /// The moment and the width are arguments rather than state because the
+    /// composer's height depends on text it does not own: the typed line lives
+    /// in `Moment`, and a module keeping its own copy would be a second home
+    /// for it. Asking from `state` alone is what pinned the composer at one row
+    /// no matter how much was pasted into it.
+    fn height(_state: &Self::State, _moment: &Moment, _width: u16) -> Height {
+        Height::Fill
+    }
+
+    /// Ask to be redrawn on a timer even when no fact arrives. `None` (the
+    /// default) means this module only changes when the conversation does —
+    /// which is what stops an idle screen from burning bandwidth.
+    fn tick() -> Option<Duration> {
+        None
+    }
+}
+
+/// The object-safe face the host stores.
+pub trait ViewObject: Send + Sync {
+    fn id(&self) -> &'static str;
+    fn absorb(&self, fact: &SessionEvent);
+    fn render(&self, viewport: &Viewport<'_>) -> Vec<Line>;
+    fn height(&self, moment: &Moment, width: u16) -> Height;
+    fn tick(&self) -> Option<Duration>;
+    /// Forget everything folded: the screen moved to another session, and a
+    /// view that kept the last one's state would draw it over the new one.
+    fn reset(&self);
+}
+
+/// A [`View`] plus the state it has folded so far.
+pub struct Mounted<V: View> {
+    state: RwLock<V::State>,
+}
+
+impl<V: View> Default for Mounted<V> {
+    fn default() -> Self {
+        Self {
+            state: RwLock::new(V::State::default()),
+        }
+    }
+}
+
+impl<V: View> Mounted<V> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl<V: View> ViewObject for Mounted<V> {
+    fn id(&self) -> &'static str {
+        V::id()
+    }
+    fn absorb(&self, fact: &SessionEvent) {
+        V::absorb(&mut self.state.write().expect("view state poisoned"), fact);
+    }
+    fn render(&self, viewport: &Viewport<'_>) -> Vec<Line> {
+        V::render(&self.state.read().expect("view state poisoned"), viewport)
+    }
+    fn height(&self, moment: &Moment, width: u16) -> Height {
+        V::height(
+            &self.state.read().expect("view state poisoned"),
+            moment,
+            width,
+        )
+    }
+    fn tick(&self) -> Option<Duration> {
+        V::tick()
+    }
+    fn reset(&self) {
+        *self.state.write().expect("view state poisoned") = V::State::default();
+    }
+}
+
+/// A stream producer: turns facts into blocks that can never be taken back.
+pub trait Producer: Send + Sync {
+    fn id(&self) -> &'static str;
+
+    /// Fold one fact into the stream. The writer is the only thing that can
+    /// change it, and it cannot reach a settled block.
+    /// The fact with its sequence number: a producer that has to say what a
+    /// later fact refers to — an undo names the turn it went back to by the
+    /// sequence number of its start — cannot do it from the event alone.
+    fn absorb(&self, logged: &atomcode_harness::session::LoggedEvent, out: &mut StreamWriter<'_>);
+
+    /// Forget what is open: the next fact belongs to another session's stream.
+    fn reset(&self) {}
+    /// Say something first, if this producer has anything to say.
+    ///
+    /// Asked **only when the stream is empty** (`Host::open_conversation`) — a
+    /// fresh session, or a resumed one at the instant it has been described but
+    /// before its history begins to fold in, so the opening sits on top. The
+    /// default is `None`, which is why the producers that existed before this
+    /// needed no change.
+    ///
+    /// The block it returns is emitted and settled at once: an opening has no
+    /// stage at which it is still growing.
+    fn opening(&self, _at: crate::block::Coord, _open: &Opening) -> Option<Arc<dyn Content>> {
+        None
+    }
+}
+
+/// What a producer is handed when asked to open a conversation.
+///
+/// **Data, not handles.** A producer cannot reach the host — its `absorb` gets a
+/// [`StreamWriter`] and nothing else — and it must stay that way: a producer able
+/// to reach the host could do anything, including putting a block into a stream
+/// somebody is already talking in. This is the list of what drawing an opening
+/// block actually needs.
+#[derive(Clone, Default)]
+pub struct Opening {
+    /// The working directory, **already a display string** (home collapsed).
+    ///
+    /// Folded by the caller rather than here: reading the environment is
+    /// `Tui::run`'s business, and a module may not (see `gates/tui-layers.sh`'s
+    /// `os_probes` ratchet, and `docs/adr/0008` for why). Doing it upstream is
+    /// what lets this stay a pure function of its arguments.
+    pub cwd: String,
+    /// The model in use, read now rather than cached: `--model` re-points the
+    /// `llm` row, so a value copied at assembly time could be stale already.
+    pub model: Option<String>,
+    /// The version string this build carries.
+    pub version: &'static str,
+    /// The commands the screen actually has — whatever
+    /// [`Commands::all`](crate::command::Commands::all) returns. A tip naming a
+    /// command that is not there is worse than no tip.
+    pub commands: Vec<crate::command::Command>,
+    /// What the welcome block should say, in the language in force.
+    ///
+    /// **Handed in per opening, not read when the producer mounted.** The
+    /// producer mounts with the tree while the launcher's own rows mount after
+    /// it (`launch::mount_with` appends them), so a `WelcomeWordsSvc` looked up
+    /// in `Welcome::apply` would be there for the screen-only case and absent
+    /// for the product — the one case where a product's own language matters.
+    /// The loop, which builds this, runs *after* the whole tree is up, and
+    /// resolves the seam then.
+    ///
+    /// `None` means a launcher that provides none, and the producer falls back
+    /// to the sentences this crate ships.
+    pub words: Option<Arc<dyn crate::content::WelcomeWords>>,
+}
+
+/// Hand-written because `words` is a trait object and the trait is deliberately
+/// not `Debug`: a launcher's implementation is a language table, and making
+/// every one of them write a `Debug` impl to satisfy a derive here would be the
+/// wrong trade. What a reader of this needs is which language it is, and that is
+/// not knowable from the object.
+impl std::fmt::Debug for Opening {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Opening")
+            .field("cwd", &self.cwd)
+            .field("model", &self.model)
+            .field("version", &self.version)
+            .field("commands", &self.commands)
+            .field("words", &self.words.as_ref().map(|_| "<provided>"))
+            .finish()
+    }
+}
+
+/// Everything mounted, found by id.
+///
+/// Read fresh on every frame rather than snapshotted at start-up — the same
+/// rule the tool catalog follows, and the reason a module mounted mid-turn
+/// appears on the very next frame.
+#[derive(Default)]
+pub struct Modules {
+    views: RwLock<Vec<std::sync::Arc<dyn ViewObject>>>,
+    producers: RwLock<Vec<std::sync::Arc<dyn Producer>>>,
+}
+
+impl Modules {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Two rows claiming one id is an error, not last-write-wins: a layout
+    /// naming that id would be ambiguous, and silently picking one is the worst
+    /// available answer.
+    pub fn add_view(&self, view: std::sync::Arc<dyn ViewObject>) -> Result<(), String> {
+        let mut views = self.views.write().expect("modules poisoned");
+        if views.iter().any(|v| v.id() == view.id()) {
+            return Err(format!(
+                "view module `{}` is already mounted; disable the row that owns it first",
+                view.id()
+            ));
+        }
+        views.push(view);
+        Ok(())
+    }
+
+    pub fn add_producer(&self, p: std::sync::Arc<dyn Producer>) -> Result<(), String> {
+        let mut ps = self.producers.write().expect("modules poisoned");
+        if ps.iter().any(|x| x.id() == p.id()) {
+            return Err(format!("stream producer `{}` is already mounted", p.id()));
+        }
+        ps.push(p);
+        Ok(())
+    }
+
+    pub fn remove_view(&self, id: &str) {
+        self.views
+            .write()
+            .expect("modules poisoned")
+            .retain(|v| v.id() != id);
+    }
+
+    pub fn remove_producer(&self, id: &str) {
+        self.producers
+            .write()
+            .expect("modules poisoned")
+            .retain(|p| p.id() != id);
+    }
+
+    pub fn view(&self, id: &str) -> Option<std::sync::Arc<dyn ViewObject>> {
+        self.views
+            .read()
+            .expect("modules poisoned")
+            .iter()
+            .find(|v| v.id() == id)
+            .cloned()
+    }
+
+    pub fn view_ids(&self) -> Vec<&'static str> {
+        self.views
+            .read()
+            .expect("modules poisoned")
+            .iter()
+            .map(|v| v.id())
+            .collect()
+    }
+
+    pub fn producers(&self) -> Vec<std::sync::Arc<dyn Producer>> {
+        self.producers.read().expect("modules poisoned").clone()
+    }
+
+    pub fn has_view(&self, id: &str) -> bool {
+        self.view(id).is_some()
+    }
+
+    /// The shortest interval any mounted module asked for. `None` when nothing
+    /// animates, and then the host redraws only on facts and input.
+    pub fn tick(&self) -> Option<Duration> {
+        self.views
+            .read()
+            .expect("modules poisoned")
+            .iter()
+            .filter_map(|v| v.tick())
+            .min()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frame::Rect;
+    use crate::moment::Moment;
+    use std::sync::Arc;
+
+    struct Counter;
+    #[derive(Default)]
+    struct Count(u32);
+
+    impl View for Counter {
+        type State = Count;
+        fn id() -> &'static str {
+            "counter"
+        }
+        fn absorb(state: &mut Count, fact: &SessionEvent) {
+            if matches!(fact, SessionEvent::TurnStart { .. }) {
+                state.0 += 1;
+            }
+        }
+        fn render(state: &Count, _vp: &Viewport<'_>) -> Vec<Line> {
+            vec![Line::raw(format!("turns: {}", state.0))]
+        }
+        fn height(_: &Count, _: &Moment, _: u16) -> Height {
+            Height::Fixed(1)
+        }
+    }
+
+    #[test]
+    fn a_view_folds_facts_and_renders_from_what_it_folded() {
+        let m: Arc<dyn ViewObject> = Arc::new(Mounted::<Counter>::new());
+        let moment = Moment::default();
+        let vp = Viewport::new(Rect::sized(20, 1), &moment);
+        assert_eq!(m.render(&vp)[0].plain(), "turns: 0");
+        m.absorb(&SessionEvent::TurnStart { turn: 1 });
+        m.absorb(&SessionEvent::TurnStart { turn: 2 });
+        assert_eq!(m.render(&vp)[0].plain(), "turns: 2");
+        assert_eq!(m.height(&moment, 20), Height::Fixed(1));
+    }
+
+    #[test]
+    fn two_rows_claiming_one_id_is_an_error_not_last_write_wins() {
+        let mods = Modules::new();
+        assert!(mods.add_view(Arc::new(Mounted::<Counter>::new())).is_ok());
+        let err = mods
+            .add_view(Arc::new(Mounted::<Counter>::new()))
+            .unwrap_err();
+        assert!(err.contains("already mounted"), "{err}");
+    }
+
+    #[test]
+    fn unmounting_removes_it_from_the_next_frame() {
+        let mods = Modules::new();
+        mods.add_view(Arc::new(Mounted::<Counter>::new())).unwrap();
+        assert!(mods.has_view("counter"));
+        mods.remove_view("counter");
+        assert!(!mods.has_view("counter"), "read fresh, not snapshotted");
+    }
+
+    #[test]
+    fn nothing_animating_means_no_timer_at_all() {
+        let mods = Modules::new();
+        mods.add_view(Arc::new(Mounted::<Counter>::new())).unwrap();
+        assert_eq!(mods.tick(), None, "an idle screen must not burn bandwidth");
+    }
+}

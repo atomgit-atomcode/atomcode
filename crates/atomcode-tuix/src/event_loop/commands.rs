@@ -3874,6 +3874,7 @@ fn execute_slash_command_impl(
                     .map(|r| {
                         let mut v: Vec<String> = r
                             .user_invocable()
+                            .into_iter()
                             .map(|s| format!("  /skills {:<48}  {}", s.name, s.description))
                             .collect();
                         v.sort();
@@ -4064,7 +4065,7 @@ fn execute_slash_command_impl(
             // `/worklog [date]`: deterministically gather the day's completed turns
             // across ALL projects (with computed agent-active durations), then hand
             // the model a structured recap to fill the 工作内容/时长/问题与评价 table.
-            use chrono::{Local, TimeZone};
+            use chrono::Local;
             let english = matches!(
                 atomcode_config::i18n::current_locale(),
                 atomcode_config::i18n::Locale::En
@@ -4082,22 +4083,11 @@ fn execute_slash_command_impl(
                 renderer.flush();
                 return Ok(());
             };
-            // Local-day [midnight, next-midnight) → epoch ms. `.earliest()` resolves a
-            // DST-gap midnight; the UTC fallback is only for that rare ambiguity.
-            let to_ms = |ndt: chrono::NaiveDateTime| -> i64 {
-                Local
-                    .from_local_datetime(&ndt)
-                    .earliest()
-                    .map(|dt| dt.timestamp_millis())
-                    .unwrap_or_else(|| ndt.and_utc().timestamp_millis())
-            };
-            let after_ms = to_ms(date.and_hms_opt(0, 0, 0).unwrap());
-            let before_ms = to_ms(
-                date.succ_opt()
-                    .unwrap_or(date)
-                    .and_hms_opt(0, 0, 0)
-                    .unwrap(),
-            );
+            // Local-day [midnight, next-midnight) → epoch ms; a DST-gap midnight
+            // resolves to the earliest instant that exists. Shared with the row
+            // that offers `/worklog` on the row-assembled screen, so the two
+            // front ends cannot disagree about which day they are recapping.
+            let (after_ms, before_ms) = atomcode_capabilities::session::local_day_window_ms(date);
             let sessions_root = atomcode_capabilities::session::SessionManager::sessions_root();
             let turns = atomcode_capabilities::session::collect_day_turns(
                 &sessions_root,
@@ -4706,8 +4696,15 @@ fn parse_plugin_arg(s: &str) -> Option<PluginArg> {
 /// Parse a `--scope user|project|local` argument.
 /// Defaults to `User` if missing or unrecognized.
 fn parse_scope_arg(s: &str) -> atomcode_capabilities::plugin::InstallScope {
-    // Accept both `--scope user` and bare `user`.
-    let val = s.strip_prefix("--scope=").unwrap_or(s).trim();
+    // Accept `--scope project`, `--scope=project` and bare `project`. The caller
+    // hands over everything after the plugin name, so the spaced form arrives as
+    // one string — which the `--scope=`-only strip used to turn into user scope.
+    let s = s.trim();
+    let val = s
+        .strip_prefix("--scope=")
+        .or_else(|| s.strip_prefix("--scope").map(str::trim_start))
+        .unwrap_or(s)
+        .trim();
     match val.to_lowercase().as_str() {
         "project" => atomcode_capabilities::plugin::InstallScope::Project,
         "local" => atomcode_capabilities::plugin::InstallScope::Local,
@@ -5642,7 +5639,7 @@ fn build_session_cost_text(ctx: &LoopCtx, state: &UiState) -> String {
     build_cost_report_text(report, &ctx.config, &provider, &ctx.model_name)
 }
 
-fn session_manager_for_cost(
+pub(crate) fn session_manager_for_cost(
     project_bucket: Option<&str>,
     working_dir: &std::path::Path,
 ) -> atomcode_capabilities::session::SessionManager {
@@ -8178,9 +8175,9 @@ mod tests {
     fn review_prompt_uses_explicit_tool_scopes() {
         assert!(review_prompt("").contains(r#"{"scope":{"kind":"working_tree"}}"#));
         assert!(review_prompt("staged").contains(r#"{"scope":{"kind":"staged"}}"#));
-        let range = review_prompt("release/v5.0.9");
+        let range = review_prompt("release/v5.1.0");
         assert!(
-            range.contains(r#"{"scope":{"kind":"range","base":"release/v5.0.9","head":"HEAD"}}"#)
+            range.contains(r#"{"scope":{"kind":"range","base":"release/v5.1.0","head":"HEAD"}}"#)
         );
         assert!(!range.contains(r#"{"base":"#));
     }
@@ -9426,6 +9423,27 @@ mod mcp_subcommand_tests {
             ("b".to_string(), ServerStatus::Disconnected),
         ];
         assert_eq!(count_blocked_untrusted(&servers), 0);
+    }
+
+    #[test]
+    fn plugin_install_scope_reads_every_spelling_the_usage_offers() {
+        use atomcode_capabilities::plugin::InstallScope;
+        for arg in [
+            "--scope project",
+            "--scope=project",
+            "project",
+            "  --scope   project ",
+        ] {
+            assert!(
+                matches!(super::parse_scope_arg(arg), InstallScope::Project),
+                "`{arg}` must install at project scope"
+            );
+        }
+        assert!(matches!(
+            super::parse_scope_arg("--scope local"),
+            InstallScope::Local
+        ));
+        assert!(matches!(super::parse_scope_arg(""), InstallScope::User));
     }
 
     #[test]

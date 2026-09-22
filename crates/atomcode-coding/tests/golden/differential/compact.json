@@ -1,0 +1,18 @@
+[
+  {
+    "kind": "TurnStarted",
+    "detail": ""
+  },
+  {
+    "kind": "Usage",
+    "detail": ""
+  },
+  {
+    "kind": "TurnComplete",
+    "detail": "Stopped"
+  },
+  {
+    "kind": "Compacted",
+    "detail": ""
+  }
+]

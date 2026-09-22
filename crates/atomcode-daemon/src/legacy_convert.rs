@@ -579,6 +579,8 @@ fn convert_legacy_session_with_diagnostic(
         detached_model_usage: Vec::new(),
         detached_unattributed_tokens: 0,
         origin: SessionOrigin::Manual,
+        format_version: 0,
+        parent: None,
     };
     meta.auto_name_from_messages(&snapshot.messages);
 
@@ -1107,6 +1109,31 @@ fn catalog_for_project_in_root(
                 || working_dirs_equivalent(&entry.working_dir, working_dir)
         })
         .collect();
+    SessionManager::collapse_fork_lineages(&mut entries);
+    repair_catalog_names_for_display_in_root(sessions_root, &mut entries);
+    Ok(entries)
+}
+
+/// Fast, single-bucket catalog for the `-c`/resume RESOLUTION path: scans only the
+/// bucket that hashes from `working_dir` — no cross-project walk. Nearly every
+/// session lives in that bucket, so this is the common-case fast path. It does NOT
+/// see legacy sessions parked in a different bucket whose working_dir happens to
+/// match (import/migration edge cases); the `-c`/resume resolver falls back to the
+/// full [`catalog_for_project`] scan when a lookup misses here.
+pub fn catalog_for_bucket(
+    working_dir: &std::path::Path,
+) -> anyhow::Result<Vec<atomcode_capabilities::session::CatalogEntry>> {
+    catalog_for_bucket_in_root(&SessionManager::sessions_root(), working_dir)
+}
+
+fn catalog_for_bucket_in_root(
+    sessions_root: &std::path::Path,
+    working_dir: &std::path::Path,
+) -> anyhow::Result<Vec<atomcode_capabilities::session::CatalogEntry>> {
+    let bucket = SessionManager::project_hash(working_dir);
+    let scan = SessionManager::scan_catalog_bucket(sessions_root, &bucket);
+    report_catalog_diagnostics(&scan.diagnostics);
+    let mut entries = scan.entries;
     SessionManager::collapse_fork_lineages(&mut entries);
     repair_catalog_names_for_display_in_root(sessions_root, &mut entries);
     Ok(entries)
@@ -1774,14 +1801,7 @@ fn validate_project_bucket(project_bucket: &str) -> anyhow::Result<()> {
 }
 
 fn report_catalog_diagnostics(diagnostics: &[atomcode_capabilities::session::CatalogDiagnostic]) {
-    for diagnostic in diagnostics {
-        tracing::warn!(
-            path = %diagnostic.path.display(),
-            kind = ?diagnostic.kind,
-            message = %diagnostic.message,
-            "session catalog entry was skipped"
-        );
-    }
+    crate::warn_catalog_diagnostics(diagnostics);
 }
 
 fn reject_matching_catalog_diagnostic(
@@ -3689,6 +3709,7 @@ mod tests {
             message_count: 0,
             turn_count: 0,
             presence: CatalogPresence::NativeOnly,
+            needs_newer_version: false,
         };
 
         let old = rename_catalog_entry_in_root(dir.path(), &entry, "chosen", false).unwrap();
@@ -3790,6 +3811,7 @@ mod tests {
             message_count: 1,
             turn_count: 0,
             presence: CatalogPresence::NativeOnly,
+            needs_newer_version: false,
         };
 
         let loaded = load_catalog_session_view_in_root(dir.path(), &entry).unwrap();
@@ -4083,6 +4105,7 @@ mod tests {
             message_count: 1,
             turn_count: 0,
             presence: CatalogPresence::NativeOnly,
+            needs_newer_version: false,
         };
 
         let loaded = load_catalog_session_view_in_root(dir.path(), &entry).unwrap();
@@ -4263,6 +4286,7 @@ mod tests {
             message_count: 1,
             turn_count: 0,
             presence: CatalogPresence::NativeOnly,
+            needs_newer_version: false,
         };
 
         let loaded = load_catalog_session_view_in_root(dir.path(), &entry).unwrap();
@@ -4304,6 +4328,7 @@ mod tests {
             message_count: session.messages.len(),
             turn_count: session.turn_stats.len(),
             presence: CatalogPresence::LegacyOnly,
+            needs_newer_version: false,
         };
 
         let loaded = load_catalog_session_view_in_root(dir.path(), &entry).unwrap();
@@ -4339,6 +4364,7 @@ mod tests {
             message_count: session.messages.len(),
             turn_count: session.turn_stats.len(),
             presence: CatalogPresence::LegacyOnly,
+            needs_newer_version: false,
         };
 
         rename_catalog_entry_in_root(dir.path(), &entry, "native-name", false).unwrap();

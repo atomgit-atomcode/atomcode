@@ -1,0 +1,141 @@
+//! The plugin catalog this build ships. Which of them *run* is the config's call.
+
+pub mod agent_loop;
+pub mod agents;
+pub mod ask;
+pub mod capabilities;
+pub mod compaction;
+pub mod findings;
+pub mod handle;
+pub mod llm;
+pub mod loop_policy;
+pub mod opener;
+pub mod persona;
+pub mod policy;
+pub mod policy_rows;
+pub mod reasoning_effort;
+pub mod recall;
+pub mod recovery;
+pub mod registries;
+pub mod self_knowledge;
+pub mod session;
+pub mod session_title;
+pub mod subagent;
+pub mod team;
+pub mod todo_reminder;
+pub mod tool_exec;
+pub mod tools;
+pub mod truncation;
+pub mod ui;
+pub mod ui_jsonrpc;
+pub mod ui_web;
+pub mod world;
+pub mod world_tools;
+
+use std::sync::Arc;
+
+use atomcode_plexus::PluginRegistry;
+
+/// Every plugin compiled into this binary.
+///
+/// The registry is the build's contribution; the config tree is the user's. A
+/// plugin here that no row names is inert — it costs a `HashMap` entry and
+/// nothing else.
+pub fn catalog() -> PluginRegistry {
+    let mut registry = PluginRegistry::new();
+    registry
+        .register(Arc::new(registries::ToolsPlugin))
+        .register(Arc::new(registries::SystemPromptPlugin))
+        .register(Arc::new(registries::OperationsPlugin))
+        .register(Arc::new(registries::CommandsPlugin))
+        .register(Arc::new(agents::AgentsPlugin))
+        .register(Arc::new(session::SessionPlugin))
+        .register(Arc::new(session::SessionProjectionsPlugin))
+        .register(Arc::new(session::SessionPersistenceJsonlPlugin))
+        .register(Arc::new(llm::OpenAiCompatPlugin))
+        .register(Arc::new(llm::AtomcodeConfigPlugin))
+        .register(Arc::new(llm::ReplayPlugin))
+        .register(Arc::new(world::FsLocalPlugin))
+        .register(Arc::new(world::FsReadOnlyPlugin))
+        .register(Arc::new(world::BashLocalPlugin))
+        .register(Arc::new(world_tools::FsWorldToolsPlugin))
+        .register(Arc::new(world_tools::SearchWorldToolsPlugin))
+        .register(Arc::new(opener::OpenerLocalPlugin))
+        .register(Arc::new(opener::OpenFileToolPlugin))
+        .register(Arc::new(world_tools::BashWorldToolPlugin))
+        .register(Arc::new(tools::FsToolsPlugin))
+        .register(Arc::new(tools::SearchToolsPlugin))
+        .register(Arc::new(tools::AstGrepPlugin))
+        .register(Arc::new(tools::BashToolPlugin))
+        .register(Arc::new(capabilities::SkillsPlugin))
+        .register(Arc::new(capabilities::SkillsAdvertPlugin))
+        .register(Arc::new(capabilities::CodeIntelPlugin))
+        .register(Arc::new(capabilities::CodeGraphPlugin))
+        .register(Arc::new(capabilities::WebPlugin::new()))
+        .register(Arc::new(capabilities::ReviewToolPlugin))
+        .register(Arc::new(subagent::ModelCatalogPlugin))
+        .register(Arc::new(llm::LlmUtilitySelectedPlugin))
+        .register(Arc::new(capabilities::MemoryPlugin))
+        .register(Arc::new(capabilities::McpPlugin))
+        .register(Arc::new(findings::FindingsPlugin))
+        .register(Arc::new(subagent::SubagentPlugin))
+        .register(Arc::new(team::TeamPlugin))
+        .register(Arc::new(ask::AskPlugin))
+        .register(Arc::new(todo_reminder::TodoReminderPlugin))
+        .register(Arc::new(recall::RecallPlugin))
+        .register(Arc::new(self_knowledge::SelfKnowledgePlugin))
+        .register(Arc::new(self_knowledge::ProjectInstructionsPlugin))
+        .register(Arc::new(persona::CodingPersonaPlugin))
+        .register(Arc::new(persona::ReviewPersonaPlugin))
+        .register(Arc::new(persona::SecurityPersonaPlugin))
+        .register(Arc::new(agent_loop::AgentLoopPlugin))
+        .register(Arc::new(policy::RepairArgsPlugin))
+        .register(Arc::new(policy::DelegationBoundsPlugin))
+        .register(Arc::new(policy::SensitivePathsPlugin))
+        .register(Arc::new(policy::ApprovalPlugin))
+        .register(Arc::new(policy::ResultCapPlugin))
+        // The approval gradient. Generic by construction — each asks through the
+        // `approval` seam and calls the same L1 decision function the kernel
+        // middleware calls — so they belong in the catalog rather than in one
+        // product's private registry, where only that product could mount them.
+        .register(Arc::new(policy::OpenFileWorkspacePlugin))
+        .register(Arc::new(policy::OutputArtifactPlugin))
+        .register(Arc::new(tool_exec::ParallelToolsPlugin))
+        .register(Arc::new(loop_policy::RoundCapPlugin))
+        .register(Arc::new(loop_policy::RetryPlugin))
+        .register(Arc::new(recovery::RateLimitPlugin))
+        .register(Arc::new(recovery::OverflowPlugin))
+        .register(Arc::new(recovery::RequestTimeoutPlugin))
+        .register(Arc::new(truncation::TruncationPlugin))
+        .register(Arc::new(recovery::ReasoningFilterPlugin))
+        .register(Arc::new(recovery::StreamRecoveryPlugin))
+        .register(Arc::new(loop_policy::CompactionPlugin))
+        .register(Arc::new(compaction::CompactionSummaryPlugin))
+        .register(Arc::new(reasoning_effort::ReasoningEffortPlugin))
+        .register(Arc::new(loop_policy::ToolLoopGuardPlugin))
+        .register(Arc::new(loop_policy::RepeatFusePlugin))
+        .register(Arc::new(policy_rows::TodoPlugin))
+        .register(Arc::new(policy_rows::PermissionsPlugin))
+        .register(Arc::new(policy_rows::PlanModePlugin))
+        .register(Arc::new(session_title::SessionTitlePlugin))
+        .register(Arc::new(session_title::ModelTitlePlugin))
+        .register(Arc::new(session_title::TitleOnFirstPromptPlugin))
+        .register(Arc::new(llm::LlmUtilityOpenAiCompatPlugin))
+        .register(Arc::new(llm::LlmUtilityReplayPlugin))
+        .register(Arc::new(policy_rows::UnattendedQuestionsPlugin))
+        .register(Arc::new(policy_rows::InteractiveApprovalPlugin))
+        .register(Arc::new(policy_rows::TelemetryPlugin))
+        .register(Arc::new(policy_rows::TokenBudgetPlugin))
+        .register(Arc::new(ui::OneShotUiPlugin))
+        .register(Arc::new(ui::ReplUiPlugin))
+        .register(Arc::new(ui::TerminalQuestionsPlugin))
+        .register(Arc::new(ui::QuietUiPlugin))
+        .register(Arc::new(ui_jsonrpc::JsonRpcUiPlugin))
+        .register(Arc::new(handle::AgentHandlePlugin))
+        .register(Arc::new(handle::QuestionsHandlePlugin))
+        .register(Arc::new(ui_web::WebUiPlugin))
+        .register(Arc::new(trace::TracePlugin));
+    registry
+}
+
+pub mod trace;

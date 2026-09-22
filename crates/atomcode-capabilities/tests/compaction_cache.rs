@@ -111,7 +111,9 @@ async fn stub_compaction_keeps_the_wire_prefix_cacheable() {
         .provider(provider)
         .tools(registry().mount(&["echo"]))
         .persona("persona")
-        .compaction(Arc::new(StubCompaction::default()))
+        // Pin keep=1 to exercise the stub-on-old-turn mechanism on this 2-turn history
+        // (the default now keeps 2 recent turns full, which would leave both full here).
+        .compaction(Arc::new(StubCompaction::new(1, true)))
         .compact_threshold(0.5) // fresh util ≈ 0.95 each turn > 0.5 → fires every boundary
         .build()
         .spawn();

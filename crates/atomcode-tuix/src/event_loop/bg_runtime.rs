@@ -33,6 +33,12 @@ pub enum RuntimeEventPayload {
 
 #[derive(Clone, Debug)]
 pub enum DriverEvent {
+    /// One complete line of a `!cmd`'s output, as it happens. The body of the
+    /// command streams through these; `LocalShellFinished` then carries only
+    /// what a person could not already have seen — the exit status.
+    LocalShellLine {
+        line: String,
+    },
     LocalShellFinished {
         output: String,
         failed: bool,

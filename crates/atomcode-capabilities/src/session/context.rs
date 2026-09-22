@@ -16,7 +16,7 @@
 //! legacy session carries none. `/cd` is a NEW SESSION (the driver re-prepares in the new dir),
 //! so `session_start` runs fresh there.
 
-use super::instructions::render_instructions;
+use crate::instructions::render_instructions;
 use async_trait::async_trait;
 use atomcode_kernel::hook::LifecycleHooks;
 use atomcode_kernel::message::{Conversation, Message, Role};
@@ -29,6 +29,10 @@ const CONTEXT_HEADER: &str = "=== SESSION CONTEXT ===";
 /// the base with a blank line). On resume the saved git bytes — from this marker to the end —
 /// are spliced back verbatim so the frozen snapshot survives while env/instructions refresh.
 const GIT_SECTION_SEP: &str = "\n\n=== GIT STATUS";
+
+/// The sentence the git section ends with — where a saved section stops when the
+/// block sits inside a larger prompt. Must match the tail of `git_snapshot`.
+const GIT_SECTION_END: &str = "run `git status` for live state.)";
 
 /// Injects environment + project-instructions + git-status context at session start.
 pub struct SessionContextHook {
@@ -59,6 +63,35 @@ impl SessionContextHook {
     /// explicitly named by project rules without reimplementing precedence.
     pub fn instruction_text(&self) -> String {
         render_instructions(&self.home, &self.working_dir)
+    }
+
+    /// The context block for a session, as a host that holds the prompt itself
+    /// (rather than a conversation this hook inserts into) needs it.
+    ///
+    /// `stored` is text a continued session was saved with — a leading system
+    /// message, or a whole rendered system prompt with this block somewhere in
+    /// it. When it carries a block with a git section, that section is kept
+    /// verbatim and the rest re-rendered: the same freeze [`LifecycleHooks::session_start`]
+    /// applies on resume, for the same prefix-cache reason. Otherwise the block
+    /// is rendered fresh.
+    pub fn block(&self, stored: Option<&str>) -> String {
+        let Some(saved) = stored.and_then(|text| text.find(CONTEXT_HEADER).map(|at| &text[at..]))
+        else {
+            return self.render();
+        };
+        match saved.find(GIT_SECTION_SEP) {
+            Some(sep) => {
+                let git = &saved[sep + 2..];
+                // Inside a whole system prompt the block is followed by other
+                // fragments; the git section ends at its own closing sentence.
+                let git = match git.find(GIT_SECTION_END) {
+                    Some(end) => &git[..end + GIT_SECTION_END.len()],
+                    None => git,
+                };
+                format!("{}\n\n{}", self.render_base(), git)
+            }
+            None => self.render_base(),
+        }
     }
 
     /// Render the full context block. Always non-empty (the env sub-section is
@@ -231,6 +264,41 @@ mod tests {
                 .output()
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn a_block_inside_a_saved_prompt_keeps_its_git_section_and_nothing_after_it() {
+        let d = tempfile::tempdir().unwrap();
+        git_init(d.path());
+        let hook = SessionContextHook::with_home(d.path(), d.path().join("nohome"));
+        let saved_git = "=== GIT STATUS (snapshot at session start, not live) ===\n\
+                         Branch: frozen-branch\nHEAD: abc123 old\n(working tree clean)\n\
+                         (This is a session-start snapshot — run `git status` for live state.)";
+        let saved_prompt = format!(
+            "You are AtomCode\n\n{CONTEXT_HEADER}\nWorking directory: /old\n\n{saved_git}\n\nMEMORY: something else"
+        );
+
+        let block = hook.block(Some(&saved_prompt));
+        assert!(block.starts_with(CONTEXT_HEADER));
+        assert!(
+            block.ends_with(saved_git),
+            "the saved git bytes are kept: {block}"
+        );
+        assert!(
+            !block.contains("MEMORY"),
+            "a fragment after the block is not the block"
+        );
+        assert!(
+            block.contains(&format!(
+                "Working directory: {}",
+                crate::pathnorm::to_display(d.path())
+            )),
+            "env is re-rendered"
+        );
+
+        // Nothing saved, or a saved prompt with no block: fresh.
+        assert_eq!(hook.block(None), hook.render());
+        assert_eq!(hook.block(Some("You are AtomCode")), hook.render());
     }
 
     #[tokio::test]

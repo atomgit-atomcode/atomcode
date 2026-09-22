@@ -119,10 +119,14 @@ fn apply_outcome(
             // char_count is the VL description length — computed BEFORE merging
             // with the caption, so the toast reports the recognised content size.
             let char_count = vl.chars().count();
+            let said = atomcode_config::i18n::t(atomcode_config::i18n::Msg::VisionRecognised {
+                model: &vl_model,
+                text: &vl,
+            });
             let merged = if text.trim().is_empty() {
-                format!("[图片内容（由 {vl_model} 识别）]\n{vl}")
+                said.into_owned()
             } else {
-                format!("{text}\n\n[图片内容（由 {vl_model} 识别）]\n{vl}")
+                format!("{text}\n\n{said}")
             };
             (
                 UserInput {
@@ -136,10 +140,11 @@ fn apply_outcome(
             )
         }
         PreprocessOutcome::Failed { reason } => {
+            let said = atomcode_config::i18n::t(atomcode_config::i18n::Msg::VisionFailed);
             let merged = if text.trim().is_empty() {
-                "[图片识别失败]".to_string()
+                said.into_owned()
             } else {
-                format!("{text}\n\n[图片识别失败]")
+                format!("{text}\n\n{said}")
             };
             (
                 UserInput {

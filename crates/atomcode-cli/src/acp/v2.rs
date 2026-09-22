@@ -16,8 +16,10 @@
 //! `v1_elicitation_wire_deserializes_into_v2_shape`). Not emitted: the v2
 //! display-only terminal surface (`terminal_update`/`terminal_output_chunk`).
 
+use atomcode_kernel::event::AgentCommand;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
 use agent_client_protocol::schema::v2::{
     AgentCapabilities, AgentMessage, AgentThought, AvailableCommandsUpdate,
@@ -44,7 +46,6 @@ use atomcode_capabilities::mcp::config::McpConfigSource;
 use atomcode_capabilities::mcp::{McpServerConfig, McpTransportConfig};
 use atomcode_capabilities::session::SessionManager;
 use atomcode_capabilities::tools::todo::TodoItem;
-use atomcode_coding::{CodingRuntimeHandle, TurnCompletion};
 use atomcode_kernel::event::{AgentEvent, StopReason as KernelStop};
 use atomcode_kernel::message::ImageContent;
 use atomcode_kernel::tool::ToolCall;
@@ -476,7 +477,7 @@ impl TurnWire for V2Wire {
 
     async fn handle_approval_request(
         &mut self,
-        runtime: &CodingRuntimeHandle,
+        commands: &mpsc::UnboundedSender<AgentCommand>,
         req_id: u64,
         payload: serde_json::Value,
         auto_approve: bool,
@@ -505,23 +506,25 @@ impl TurnWire for V2Wire {
             ));
         }
         if auto_approve {
-            let _ = runtime
-                .respond(req_id, serde_json::json!({"decision": "allow"}))
-                .await;
+            let _ = commands.send(AgentCommand::Respond {
+                id: req_id,
+                value: serde_json::json!({"decision": "allow"}),
+            });
         } else if let Err(e) =
-            permission::handle_approval_v2(&self.cx, &self.sid, runtime, req_id, payload).await
+            permission::handle_approval_v2(&self.cx, &self.sid, commands, req_id, payload).await
         {
             eprintln!("acp: v2 approval handling errored ({e}); denying this call, turn continues");
-            let _ = runtime
-                .respond(req_id, serde_json::json!({"decision": "deny"}))
-                .await;
+            let _ = commands.send(AgentCommand::Respond {
+                id: req_id,
+                value: serde_json::json!({"decision": "deny"}),
+            });
         }
         Ok(())
     }
 
     async fn handle_user_input_request(
         &mut self,
-        runtime: &CodingRuntimeHandle,
+        commands: &mpsc::UnboundedSender<AgentCommand>,
         req_id: u64,
         payload: serde_json::Value,
         form_supported: bool,
@@ -533,7 +536,7 @@ impl TurnWire for V2Wire {
         crate::acp::elicitation::handle_request_user_input(
             &self.cx,
             &agent_client_protocol::schema::v1::SessionId::new(self.sid.0.clone()),
-            runtime,
+            commands,
             req_id,
             payload,
             form_supported,
@@ -574,17 +577,17 @@ impl TurnWire for V2Wire {
 
     fn finish(
         &mut self,
-        terminal: Result<TurnCompletion, KernelStop>,
+        terminal: Result<KernelStop, KernelStop>,
         last_error: Option<String>,
         msg_id: &str,
     ) -> Result<(), agent_client_protocol::Error> {
-        let (stop, error_text) = match terminal {
-            Ok(TurnCompletion::Completed { reason, .. }) => (v2_stop_reason(reason), last_error),
-            Ok(TurnCompletion::SnapshotUnavailable { reason, error, .. }) => {
-                (v2_stop_reason(reason), Some(error.message))
-            }
-            Err(stop) => (v2_stop_reason(stop), last_error),
-        };
+        // A terminal is a reason either way; `Err` is the loop giving up on
+        // hearing one. "Finished but not written down" now arrives as
+        // `last_error`, folded in by the driver from what the host pushed.
+        let (stop, error_text) = (
+            v2_stop_reason(terminal.unwrap_or_else(|stop| stop)),
+            last_error,
+        );
         if let Some(text) = error_text {
             let _ = self.notify(SessionUpdate::AgentMessageChunk(ContentChunk::new(
                 ContentBlock::Text(TextContent::new(text)),
@@ -607,8 +610,6 @@ pub(crate) fn build_v2_agent(state: SharedState) -> impl ConnectTo<Client> + 'st
         msg_ids,
         client_elicitation_form,
         config_options,
-        model_resolver,
-        effort_resolver,
     } = state;
     // Each `async move` handler closure captures the shared counter binding by
     // value; hand every handler its own Arc clone so the later handlers still
@@ -675,10 +676,11 @@ pub(crate) fn build_v2_agent(state: SharedState) -> impl ConnectTo<Client> + 'st
                     )?;
                     // Advertise the slash-command surface right after setup
                     // (best-effort, mirroring the v1 chain's reasoning).
+                    let catalog = crate::acp::commands::catalog_of(&sessions, id.0.as_ref()).await;
                     let _ = cx.send_notification(UpdateSessionNotification::new(
                         id,
                         SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(
-                            crate::acp::commands::available_acp_commands_v2(),
+                            crate::acp::commands::available_acp_commands_v2(&catalog),
                         )),
                     ));
                     Ok(())
@@ -884,10 +886,13 @@ pub(crate) fn build_v2_agent(state: SharedState) -> impl ConnectTo<Client> + 'st
                     )?;
                     // Advertise the slash-command surface right after resume
                     // (best-effort, mirroring the v1 chain's reasoning).
+                    let catalog =
+                        crate::acp::commands::catalog_of(&sessions, req.session_id.0.as_ref())
+                            .await;
                     let _ = cx.send_notification(UpdateSessionNotification::new(
                         req.session_id.clone(),
                         SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(
-                            crate::acp::commands::available_acp_commands_v2(),
+                            crate::acp::commands::available_acp_commands_v2(&catalog),
                         )),
                     ));
                     Ok(())
@@ -898,8 +903,6 @@ pub(crate) fn build_v2_agent(state: SharedState) -> impl ConnectTo<Client> + 'st
         .on_receive_request(
             {
                 let sessions = Arc::clone(&sessions);
-                let model_resolver = model_resolver.clone();
-                let effort_resolver = effort_resolver.clone();
                 async move |req: SetSessionConfigOptionRequest,
                             responder,
                             cx: ConnectionTo<Client>| {
@@ -919,13 +922,9 @@ pub(crate) fn build_v2_agent(state: SharedState) -> impl ConnectTo<Client> + 'st
                             req.config_id.0.clone(),
                             v1_value,
                         );
-                    let resolver = model_resolver.as_deref();
-                    let effort = effort_resolver.as_deref();
                     let (catalog, _switched_mode) =
-                        crate::acp::options::apply_session_config_option(
-                            &sessions, &v1_req, resolver, effort,
-                        )
-                        .await?;
+                        crate::acp::options::apply_session_config_option(&sessions, &v1_req)
+                            .await?;
                     // v2 has no separate current_mode_update; the mode switch
                     // (if any) is reflected by the `config_option_update` carrying
                     // the full updated catalog.
@@ -969,10 +968,15 @@ fn prompt_text_v2(req: &PromptRequest) -> (String, Vec<ImageContent>) {
     for block in &req.prompt {
         match block {
             ContentBlock::Text(t) => text.push_str(&t.text),
-            ContentBlock::Image(image) => images.push(ImageContent {
-                media_type: image.mime_type.to_string(),
-                data: image.data.clone(),
-            }),
+            ContentBlock::Image(image) => {
+                // Downscale/re-encode oversized attachments (re-sent every turn).
+                let (media_type, data) =
+                    atomcode_capabilities::image_normalize::normalize_image_base64(
+                        &image.mime_type.to_string(),
+                        &image.data,
+                    );
+                images.push(ImageContent { media_type, data });
+            }
             ContentBlock::ResourceLink(link) => {
                 text.push_str(&format!("[resource: {} ({})]", link.name, link.uri));
             }

@@ -88,6 +88,10 @@ pub fn build_review_agent(cfg: ReviewAgentConfig) -> Result<(Agent, ReportFindin
     // provider watchdog and the kernel watchdog agree instead of the provider cutting
     // a long-thinking review off early with a spurious `[Error: stream idle timeout]`.
     provider_cfg.idle_timeout = cfg.stream_timeout;
+    // Prefill (first byte) gets the separate, larger budget — a slow local model that is
+    // silent before its first byte must not be cut off at the inter-token `stream_timeout`.
+    // Floored at `stream_timeout` so raising the latter never inverts the two.
+    provider_cfg.first_token_timeout = cfg.effective_first_token_timeout();
     let provider = OpenAiCompatProvider::new(provider_cfg)
         .map_err(|e| format!("provider init failed: {}", e.message))?;
     Ok(build_review_agent_with(&cfg, Arc::new(provider)))
@@ -148,6 +152,7 @@ pub fn build_review_agent_with_cancel(
                 .with_allowlist(&cfg.review_paths),
         ))
         .stream_timeout(cfg.stream_timeout)
+        .first_token_timeout(cfg.effective_first_token_timeout())
         .request_timeout(cfg.request_timeout);
     if let Some(policy) = cfg.tool_loop_policy {
         builder = builder.tool_loop_policy(policy);

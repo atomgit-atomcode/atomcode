@@ -555,6 +555,41 @@ impl WorkspaceCheckpoint {
         self.with_process_lock(|| self.diff_locked(before, after))
     }
 
+    /// The unified diff of one file between two trees.
+    ///
+    /// The text rather than a summary, for a front end showing what actually
+    /// changed. `path` is validated as a relative path inside the worktree for
+    /// the same reason [`Self::diff`] validates the ones it reports: a path
+    /// with `..` in it would reach outside the tree this checkpoint owns.
+    ///
+    /// Bounded by git's own `--stat`-less output — a file whose diff is
+    /// enormous is the caller's problem to window, not this layer's to
+    /// truncate, because a truncated diff that does not say it was truncated is
+    /// a lie about the workspace.
+    pub fn diff_text(
+        &self,
+        before: &str,
+        after: &str,
+        path: &str,
+    ) -> Result<String, WorkspaceCheckpointError> {
+        validate_object_id(before)?;
+        validate_object_id(after)?;
+        validate_relative_path(path)?;
+        let _guard = self.guard();
+        self.with_process_lock(|| {
+            let output = self.run_owned([
+                "diff".into(),
+                "--no-renames".into(),
+                "--no-color".into(),
+                before.into(),
+                after.into(),
+                "--".into(),
+                path.into(),
+            ])?;
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        })
+    }
+
     /// Restore only files changed between `before` and `after`.
     ///
     /// The current state of each affected file must still match `after`; this

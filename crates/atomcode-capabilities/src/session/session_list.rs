@@ -85,9 +85,9 @@ impl ListSessionsTool {
         }
 
         format!(
-            "{} session(s) in this project, most recent first:\n{}\n\n(To read the \
-             actual content/decisions of any of these, use `recall` with keywords \
-             from its title.)",
+            "{} session(s) in this project, most recent first:\n{}\n\n(To read one of \
+             these, call `recall` with `session` set to its id and no `query`; add \
+             `query` only to search within it.)",
             rows.len(),
             rows.join("\n")
         )
@@ -115,10 +115,9 @@ impl Tool for ListSessionsTool {
     fn description(&self) -> &str {
         "List THIS project's past conversation sessions — their titles, when they \
          were last active, and size — so you can tell the user what exists or decide \
-         which one to pull from. This only ENUMERATES sessions; to read the actual \
-         content/decisions of one, use `recall` (keyword/topic search across the same \
-         sessions). Read-only. Optional `query` filters by a case-insensitive \
-         substring of the session title."
+         which one to pull from. This only ENUMERATES sessions; to read what was said \
+         in one, use `recall` with `session` set to its id. Read-only. Optional `query` \
+         filters by a case-insensitive substring of the session title."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

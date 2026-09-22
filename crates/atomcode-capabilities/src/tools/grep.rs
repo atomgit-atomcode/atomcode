@@ -5,14 +5,15 @@
 //! are dropped.
 
 use super::read::lenient_usize;
+use super::sensitive_path::is_credential_path;
 use super::{err, is_skip_dir, not_found_hint, ok, resolve_path};
+use crate::world::{FileSystem, LocalFs, SearchLine, SearchQuery};
 use async_trait::async_trait;
 use atomcode_kernel::tool::{Tool, ToolContext, ToolResult};
-use grep::regex::{RegexMatcher, RegexMatcherBuilder};
-use grep::searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
-use ignore::WalkBuilder;
+use grep::regex::RegexMatcherBuilder;
 use serde::Deserialize;
 use serde_json::json;
+use std::sync::Arc;
 
 const DEFAULT_MAX_RESULTS: usize = 50;
 const DEFAULT_CONTEXT: usize = 3;
@@ -21,14 +22,28 @@ const MAX_DISPLAY_LINE: usize = 1000;
 /// Hard upper cap on `max_results` — bounds the in-memory result buffer even if a
 /// caller sends an enormous value.
 const MAX_RESULTS_CAP: usize = 10_000;
-/// Per-file heap cap for the searcher's line buffer. Without it the searcher would
-/// grow the buffer to hold the LONGEST single line — a multi-MB minified bundle or a
-/// one-line giant log would still buffer whole and OOM a small machine. Past this, the
-/// file's search errors and is skipped: the absolute memory guard, independent of the
-/// per-line default.
-const MAX_LINE_BUF_BYTES: usize = 10 * 1024 * 1024;
 
-pub struct GrepTool;
+pub struct GrepTool {
+    /// Where the tree being searched lives. The walk and the per-file search
+    /// are the world's ([`FileSystem::search`]); the pattern, the caps, what to
+    /// skip and how a hit is shown stay here.
+    world: Arc<dyn FileSystem>,
+}
+
+impl Default for GrepTool {
+    fn default() -> Self {
+        Self {
+            world: Arc::new(LocalFs::unfenced()),
+        }
+    }
+}
+
+impl GrepTool {
+    /// Search `world` instead of this machine's disk.
+    pub fn with_world(world: Arc<dyn FileSystem>) -> Self {
+        Self { world }
+    }
+}
 
 #[derive(Deserialize)]
 struct Args {
@@ -84,130 +99,122 @@ impl Tool for GrepTool {
         };
         let raw = a.path.clone().unwrap_or_else(|| ".".to_string());
         let root = resolve_path(&raw, &ctx.working_dir);
-        if tokio::fs::metadata(&root).await.is_err() {
-            return err(format!(
-                "grep: path not found: {}{}",
-                crate::pathnorm::to_display(&root),
-                not_found_hint(&root, &ctx.working_dir).await
-            ));
-        }
+        let walks_a_dir = match self.world.info(&root).await {
+            Ok(m) if m.exists => m.is_dir,
+            // Denied is not missing — see the same note in `read`.
+            Err(e) if e.is_denied() => return err(format!("grep: {e}")),
+            _ => {
+                return err(format!(
+                    "grep: path not found: {}{}",
+                    crate::pathnorm::to_display(&root),
+                    not_found_hint(&root, &ctx.working_dir).await
+                ))
+            }
+        };
         let max = a
             .max_results
             .unwrap_or(DEFAULT_MAX_RESULTS)
             .clamp(1, MAX_RESULTS_CAP);
         let context = a.context.unwrap_or(DEFAULT_CONTEXT).min(MAX_CONTEXT);
 
-        // Smart-case + literal fallback, as a streaming ripgrep matcher.
+        // Smart-case + literal fallback. The decision is made here and the world
+        // gets a final pattern: what counts as a regex is the caller's, not a
+        // property of where the files live.
         let has_upper = a.pattern.chars().any(|c| c.is_uppercase());
-        let matcher = match RegexMatcherBuilder::new()
-            .case_insensitive(!has_upper)
+        let case_insensitive = !has_upper;
+        let pattern = if RegexMatcherBuilder::new()
+            .case_insensitive(case_insensitive)
             .build(&a.pattern)
+            .is_ok()
         {
-            Ok(m) => m,
-            Err(_) => match RegexMatcherBuilder::new()
-                .case_insensitive(!has_upper)
-                .build(&regex::escape(&a.pattern))
+            a.pattern.clone()
+        } else {
+            let literal = regex::escape(&a.pattern);
+            if let Err(e) = RegexMatcherBuilder::new()
+                .case_insensitive(case_insensitive)
+                .build(&literal)
             {
-                Ok(m) => m,
-                Err(e) => return err(format!("grep: invalid pattern '{}': {e}", a.pattern)),
-            },
+                return err(format!("grep: invalid pattern '{}': {e}", a.pattern));
+            }
+            literal
         };
 
+        // A credential store in the AtomCode home (`config.toml` with its api keys,
+        // `auth.toml`, …) is searched only when the call names it — and then the
+        // sensitive-path gate has already asked. A walk that merely passes through
+        // the home must not read it: `grep api_key ~/.atomcode` would otherwise
+        // hand over what `read_file ~/.atomcode/config.toml` asks about. Resolved
+        // on the first file the walk meets, on the walker's own thread.
+        let credential_homes = std::sync::OnceLock::new();
+        let query = SearchQuery {
+            pattern,
+            case_insensitive,
+            context,
+            max_matches: max,
+            skip_dir: Arc::new(is_skip_dir),
+            skip_file: Arc::new(move |path: &std::path::Path| {
+                path.extension()
+                    .map(|x| x.eq_ignore_ascii_case("log"))
+                    .unwrap_or(false)
+                    || (walks_a_dir
+                        && credential_homes
+                            .get_or_init(home_spellings)
+                            .iter()
+                            .any(|home| is_credential_path(path, home)))
+            }),
+        };
         let base = ctx.working_dir.clone();
-        let pattern = a.pattern.clone();
         let display_path = raw.clone();
-        let res =
-            tokio::task::spawn_blocking(move || search(&root, &matcher, max, context, &base)).await;
-        match res {
-            Ok((lines, _, files)) if lines.is_empty() => ok(format!(
-                "No matches found for '{pattern}' in {display_path} ({files} files searched)"
+        let shown_pattern = a.pattern.clone();
+        match self.world.search(&root, &query).await {
+            Ok(result) if result.lines.is_empty() => ok(format!(
+                "No matches found for '{shown_pattern}' in {display_path} ({} files searched)",
+                result.files_searched
             )),
-            Ok((lines, matches, _)) => {
+            Ok(result) => {
+                let lines: Vec<String> = result
+                    .lines
+                    .iter()
+                    .map(|line| render_search_line(line, &base))
+                    .collect();
                 // Cap on the real MATCH count — not total output rows, which also include
                 // context + `--` separators (that over-reported "capped" with any context).
-                let capped = matches >= max;
+                let capped = result.matches >= max;
                 let mut out = lines.join("\n");
                 if capped {
                     out.push_str(&format!("\n\n[Results capped at {max} matches]"));
                 }
                 ok(out)
             }
-            Err(_) => err("grep: search task failed".to_string()),
+            Err(e) => err(format!("grep: {e}")),
         }
     }
 }
 
-/// Returns (formatted match+context lines, match count, files searched). Stops once
-/// `max` matches are collected. Each file is searched by a STREAMING searcher (never
-/// loads the whole file into memory; `heap_limit` caps the per-line buffer), so a huge
-/// file — or a huge single line — can't OOM the process.
-fn search(
-    root: &std::path::Path,
-    matcher: &RegexMatcher,
-    max: usize,
-    context: usize,
-    base: &std::path::Path,
-) -> (Vec<String>, usize, usize) {
-    let mut out: Vec<String> = Vec::new();
-    let mut match_count = 0usize;
-    let mut files_searched = 0usize;
+/// The AtomCode home as a walk may spell it: as configured, and canonical when
+/// that differs — a fenced world walks the canonical path.
+fn home_spellings() -> Vec<std::path::PathBuf> {
+    let home = crate::paths::config_dir();
+    let canonical = home.canonicalize().ok().filter(|real| *real != home);
+    std::iter::once(home).chain(canonical).collect()
+}
 
-    let walk = WalkBuilder::new(root)
-        .hidden(true)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .filter_entry(|e| {
-            // Drop our extra skip-dirs (gitignore already covers most).
-            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                if let Some(name) = e.file_name().to_str() {
-                    return !is_skip_dir(name);
-                }
-            }
-            true
-        })
-        .build();
-
-    let mut searcher = SearcherBuilder::new()
-        .line_number(true)
-        .before_context(context)
-        .after_context(context)
-        // Treat NUL-containing files as binary and stop (ripgrep-standard). Non-UTF-8
-        // text is searched lossily rather than skipped, so ASCII patterns still match in
-        // e.g. a GBK-encoded file (the old whole-file read skipped those entirely).
-        .binary_detection(BinaryDetection::quit(b'\x00'))
-        // Absolute memory guard: cap the per-file line buffer so a single huge line
-        // (minified bundle / one-line log) can't grow the buffer without bound.
-        .heap_limit(Some(MAX_LINE_BUF_BYTES))
-        .build();
-
-    for entry in walk.flatten() {
-        if match_count >= max {
-            break;
+/// `rel:num:content` for a match, `rel-num-content` for context, `--` between
+/// non-contiguous groups — exactly the rows the old in-tool sink emitted, now
+/// rendered from the world's raw lines.
+fn render_search_line(line: &SearchLine, base: &std::path::Path) -> String {
+    let rel = |path: &std::path::Path| {
+        crate::pathnorm::to_display(path.strip_prefix(base).unwrap_or(path))
+    };
+    match line {
+        SearchLine::Match { path, line, text } => {
+            format!("{}:{line}:{}", rel(path), render_line(text))
         }
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
+        SearchLine::Context { path, line, text } => {
+            format!("{}-{line}-{}", rel(path), render_line(text))
         }
-        if path
-            .extension()
-            .map(|x| x.eq_ignore_ascii_case("log"))
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        files_searched += 1;
-        let rel = crate::pathnorm::to_display(path.strip_prefix(base).unwrap_or(path));
-        let sink = GrepSink {
-            rel: &rel,
-            out: &mut out,
-            match_count: &mut match_count,
-            max,
-        };
-        // io / binary / decode errors ⇒ skip the file (same as the old read failure).
-        let _ = searcher.search_path(matcher, path, sink);
+        SearchLine::Break => "--".to_string(),
     }
-    (out, match_count, files_searched)
 }
 
 /// Render a raw line (bytes from the searcher) for display: strip the trailing line
@@ -220,40 +227,6 @@ fn render_line(bytes: &[u8]) -> String {
         line.chars().take(MAX_DISPLAY_LINE).collect::<String>() + "…"
     } else {
         line.to_string()
-    }
-}
-
-/// Sink that formats each match/context line exactly like the previous manual loop:
-/// `rel:num:content` for a match, `rel-num-content` for context, `--` between
-/// non-contiguous groups. Stops a file's search once the global `max` matches is hit.
-struct GrepSink<'a> {
-    rel: &'a str,
-    out: &'a mut Vec<String>,
-    match_count: &'a mut usize,
-    max: usize,
-}
-
-impl<'a> Sink for GrepSink<'a> {
-    type Error = std::io::Error;
-
-    fn matched(&mut self, _s: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, std::io::Error> {
-        let n = mat.line_number().unwrap_or(0);
-        self.out
-            .push(format!("{}:{n}:{}", self.rel, render_line(mat.bytes())));
-        *self.match_count += 1;
-        Ok(*self.match_count < self.max) // stop this file at the cap
-    }
-
-    fn context(&mut self, _s: &Searcher, ctx: &SinkContext<'_>) -> Result<bool, std::io::Error> {
-        let n = ctx.line_number().unwrap_or(0);
-        self.out
-            .push(format!("{}-{n}-{}", self.rel, render_line(ctx.bytes())));
-        Ok(true)
-    }
-
-    fn context_break(&mut self, _s: &Searcher) -> Result<bool, std::io::Error> {
-        self.out.push("--".to_string());
-        Ok(true)
     }
 }
 
@@ -280,7 +253,7 @@ mod tests {
             "fn main() {\n    let TODO = 1;\n    other();\n}\n",
         )
         .unwrap();
-        let r = GrepTool
+        let r = GrepTool::default()
             .execute(r#"{"pattern":"TODO","path":"."}"#, &ctx(d.path()))
             .await;
         assert!(!r.is_error, "{}", r.content);
@@ -295,7 +268,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir(d.path().join("app")).unwrap();
         std::fs::write(d.path().join("app/build.gradle"), "").unwrap();
-        let r = GrepTool
+        let r = GrepTool::default()
             .execute(
                 r#"{"pattern":"Serial","path":"app/src/main/java"}"#,
                 &ctx(d.path()),
@@ -328,7 +301,7 @@ mod tests {
     async fn smart_case_is_insensitive_for_lowercase_pattern() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.txt"), "Hello World\n").unwrap();
-        let r = GrepTool
+        let r = GrepTool::default()
             .execute(r#"{"pattern":"hello"}"#, &ctx(d.path()))
             .await;
         assert!(r.content.contains("a.txt:1:"), "{}", r.content);
@@ -338,7 +311,7 @@ mod tests {
     async fn zero_matches_is_success() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.txt"), "nothing here\n").unwrap();
-        let r = GrepTool
+        let r = GrepTool::default()
             .execute(r#"{"pattern":"absent_xyz"}"#, &ctx(d.path()))
             .await;
         assert!(!r.is_error, "zero matches must be a success: {}", r.content);
@@ -350,7 +323,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.txt"), "value = foo(bar)\n").unwrap();
         // "foo(bar" is an invalid regex (unbalanced paren) → literal fallback finds it.
-        let r = GrepTool
+        let r = GrepTool::default()
             .execute(r#"{"pattern":"foo(bar"}"#, &ctx(d.path()))
             .await;
         assert!(!r.is_error, "{}", r.content);
@@ -370,7 +343,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         std::fs::write(d.path().join("f.txt"), content + "\n").unwrap();
-        let r = GrepTool
+        let r = GrepTool::default()
             .execute(r#"{"pattern":"NEEDLE","context":1}"#, &ctx(d.path()))
             .await;
         assert!(!r.is_error, "{}", r.content);
@@ -411,7 +384,7 @@ mod tests {
         let mut big = "filler line\n".repeat(250_000); // ~3 MB
         big.push_str("HAYSTACK_NEEDLE at the end\n");
         std::fs::write(d.path().join("big.txt"), big).unwrap();
-        let r = GrepTool
+        let r = GrepTool::default()
             .execute(r#"{"pattern":"HAYSTACK_NEEDLE"}"#, &ctx(d.path()))
             .await;
         assert!(!r.is_error, "{}", r.content);
@@ -428,10 +401,10 @@ mod tests {
         // One line LARGER than the heap cap (e.g. a minified bundle). The searcher errors
         // on it and skips it, instead of buffering the whole line into memory (the OOM case).
         let mut giant = String::from("NEEDLE ");
-        giant.push_str(&"x".repeat(MAX_LINE_BUF_BYTES + 1024)); // > cap, no newline
+        giant.push_str(&"x".repeat(crate::world::MAX_LINE_BUF_BYTES + 1024)); // > cap, no newline
         std::fs::write(d.path().join("min.js"), &giant).unwrap();
         std::fs::write(d.path().join("ok.txt"), "NEEDLE\n").unwrap();
-        let r = GrepTool
+        let r = GrepTool::default()
             .execute(r#"{"pattern":"NEEDLE"}"#, &ctx(d.path()))
             .await;
         assert!(!r.is_error, "grep must not error/hang on a giant line");
@@ -461,7 +434,7 @@ mod tests {
             .collect();
         std::fs::write(d.path().join("f.txt"), lines.join("\n") + "\n").unwrap();
         // max_results 10: output rows (23) >= 10 but matches (3) < 10 → must NOT report capped.
-        let r = GrepTool
+        let r = GrepTool::default()
             .execute(
                 r#"{"pattern":"HIT","max_results":10,"context":3}"#,
                 &ctx(d.path()),
@@ -487,7 +460,7 @@ mod tests {
         // A NUL byte ⇒ binary ⇒ the searcher quits and reports nothing for it.
         std::fs::write(d.path().join("blob"), b"\x00 NEEDLE inside binary\n").unwrap();
         std::fs::write(d.path().join("text.txt"), "NEEDLE\n").unwrap();
-        let r = GrepTool
+        let r = GrepTool::default()
             .execute(r#"{"pattern":"NEEDLE"}"#, &ctx(d.path()))
             .await;
         assert!(
@@ -508,7 +481,7 @@ mod tests {
         std::fs::create_dir(d.path().join("target")).unwrap();
         std::fs::write(d.path().join("target/junk.rs"), "NEEDLE\n").unwrap();
         std::fs::write(d.path().join("keep.rs"), "NEEDLE\n").unwrap();
-        let r = GrepTool
+        let r = GrepTool::default()
             .execute(r#"{"pattern":"NEEDLE"}"#, &ctx(d.path()))
             .await;
         assert!(r.content.contains("keep.rs:1:"), "{}", r.content);
@@ -517,5 +490,46 @@ mod tests {
             "target/ should be skipped: {}",
             r.content
         );
+    }
+
+    /// Walking the AtomCode home must not read its credential stores on the way past.
+    /// The sensitive-path gate asks before `read_file ~/.atomcode/config.toml`, and it
+    /// asks before a grep that names that file — but a grep rooted at the home names
+    /// only the directory, so without this every plain `api_key` in `config.toml` (and
+    /// in its hand-made backups) came back as a match line, unasked.
+    #[tokio::test]
+    async fn a_walk_through_the_home_skips_its_credential_stores() {
+        // The crate's `#[ctor]` points `$ATOMCODE_HOME` at a throwaway dir.
+        let home = crate::paths::config_dir();
+        std::fs::create_dir_all(&home).unwrap();
+        let needle = "sk-grep-walk-criterion";
+        let line = format!("api_key = \"{needle}\"\n");
+        // Not `mcp_auth.toml`: this home is shared with the OAuth store's own tests.
+        for store in ["config.toml", "config.toml.bak"] {
+            std::fs::write(home.join(store), &line).unwrap();
+        }
+        // Proof the walk reached the home at all: an ordinary file with the same line.
+        std::fs::write(home.join("grep-walk-criterion.md"), &line).unwrap();
+
+        let args = serde_json::json!({ "pattern": needle, "path": home }).to_string();
+        let r = GrepTool::default().execute(&args, &ctx(&home)).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(
+            r.content.contains("grep-walk-criterion.md:1:"),
+            "the walk must still search the rest of the home: {}",
+            r.content
+        );
+        assert!(
+            !r.content.lines().any(|l| l.starts_with("config.toml")),
+            "config.toml and its copies must not be searched by a walk: {}",
+            r.content
+        );
+
+        // Named outright, the file is searched: asking about it is the gate's call,
+        // and a silent "no matches" after the person allowed it would be a lie.
+        let named = home.join("config.toml");
+        let args = serde_json::json!({ "pattern": needle, "path": named }).to_string();
+        let r = GrepTool::default().execute(&args, &ctx(&home)).await;
+        assert!(r.content.contains(needle), "{}", r.content);
     }
 }

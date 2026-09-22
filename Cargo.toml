@@ -27,8 +27,26 @@ panic = "abort"        # Remove panic unwinding code — saves ~200-500KB
 [profile.test]
 debug = "line-tables-only" # Smaller binaries, faster linker
 
+# workspace 内自己的 crate 也只留行号表(2026-09-18)。默认的 `debug = 2` 会为
+# 这 40 万行自己的代码生成完整 DWARF —— 它进 `.rlib`、进每一个 test binary、
+# 再由链接器串进 160MB 的 debug 二进制里,是 `target/` 体积与链接时间的另一半
+# (量过一次:一个 worktree 的 target 56G,其中 deps 34G、incremental 21G)。
+# **代价说清楚**:panic 与 backtrace 仍有函数名和行号,`profile.test` 本来就是
+# 这一档;失去的是调试器里看局部变量和单步的类型信息。真要单步调试某个 crate,
+# 临时加 `[profile.dev.package.atomcode-xxx] debug = 2` 再编那一个包。
+#
+# 注意:改 profile 会让**所有** worktree 的 target 整体失效,下一次编译是全量。
+[profile.dev]
+debug = "line-tables-only"
+
+# 487 个依赖的完整 DWARF 同理,而开发时几乎不会单步进第三方库 —— 依赖这一档
+# 更进一步,连行号也不留(`debug = 0`),panic 里仍有符号名。
+# `cargo test` 的依赖走 dev profile,所以这条对 test 路径同样生效。
+[profile.dev.package."*"]
+debug = 0
+
 [workspace.package]
-version = "5.0.9"
+version = "5.1.0"
 edition = "2021"
 license = "MIT"
 repository = "https://atomgit.com/atomgit_atomcode/atomcode"

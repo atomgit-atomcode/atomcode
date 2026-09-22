@@ -24,7 +24,7 @@ use atomcode_kernel::agent::Agent;
 // Agent 由 kernel 的运行循环驱动；具体 provider / 工具由上层 L1/L2 注入。
 ```
 
-> 想要实时轨迹？消费 `AgentEvent`（`atomcode-clix` 就是这样打印逐工具进度的）。
+> 想要实时轨迹？消费 `AgentEvent`（`atomcode review` 就是这样打印逐工具进度的）。
 
 ---
 

@@ -108,6 +108,12 @@ pub(crate) mod pathutil;
 #[cfg(any(feature = "plugin", feature = "mcp"))]
 pub mod fs;
 
+/// The execution world: the seam every world-touching tool goes through, so
+/// "read-only" or "in a sandbox" is a property of the world rather than a rule
+/// each tool is asked to respect. See [`world`] for what deliberately does not
+/// route through it.
+pub mod world;
+
 /// Plugin subsystem: loader / installer / marketplace / manifest / trust store.
 /// Faithful port of `core::plugin` as a v2 migration target for the front-ends.
 /// Synchronous (shells out to `git` via `std::process` — no async runtime).
@@ -147,6 +153,12 @@ pub mod setup;
 #[cfg(feature = "tools")]
 pub mod tools;
 
+/// Downscale + re-encode oversized user images (read_file attachments + clipboard
+/// paste) before they enter the conversation, so a huge screenshot can't blow the
+/// per-request body and get re-sent every turn.
+#[cfg(feature = "tools")]
+pub mod image_normalize;
+
 /// `@`-mention infrastructure: token detection + a gitignore-aware project file
 /// index with cross-level substring matching. Shared by the TUI popup and the
 /// daemon `/fs/search` endpoint so the webui picker matches CLI behavior.
@@ -181,12 +193,26 @@ pub mod skills;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 
-/// Session persistence + cross-session recall: a two-tier on-disk store (a per-turn
-/// compacted `<id>.snapshot` for RESUME + an append-only, never-compacted `<id>.jsonl`
-/// transcript for RECALL), driven entirely by kernel seams ([`SnapshotHook`](session::SnapshotHook)
-/// / [`TranscriptHook`](session::TranscriptHook) on the `turn_complete` terminal hook, a
-/// `recall` tool, a current-date injection hook). Wall-clock lives only here (the kernel
-/// is clock-free). Opt-in `session` feature. See [`session`].
+/// Session persistence + cross-session recall: a session is its append-only event log
+/// (`<id>.events`) beside a metadata index, with RESUME replaying the log and RECALL
+/// folding per-turn records out of it; per-turn statistics ride the kernel's
+/// `turn_complete` seam ([`SnapshotHook`](session::SnapshotHook)), `recall` is a tool.
+/// Wall-clock lives only here (the kernel is clock-free). Opt-in `session` feature. See
+/// [`session`].
+/// The three-tier project-instructions loader (`AGENTS.md` / `CLAUDE.md` /
+/// `.atomcode.md`, global + project + user). Pure — paths in, string out, no
+/// dependencies beyond `std::path` — so it is its own feature: a consumer that
+/// wants a repository's standing instructions should not have to take a whole
+/// session-persistence subsystem to get them.
+#[cfg(feature = "instructions")]
+pub mod instructions;
+
+/// Keyword ranking (CJK-bigram aware) shared by anything searchable. Pure and
+/// dependency-free, so a store with its own record shape can rank the same way
+/// `recall` does without adopting `recall`'s records.
+#[cfg(feature = "search")]
+pub mod search;
+
 #[cfg(feature = "session")]
 pub mod session;
 

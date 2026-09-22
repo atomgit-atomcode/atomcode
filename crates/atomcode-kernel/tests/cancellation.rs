@@ -70,11 +70,11 @@ async fn cancel_aborts_a_turn_hung_in_the_stream_open() {
         while let Some(ev) = handle.events.recv().await {
             match ev {
                 // The turn is now in flight and about to block in the open. Cancel.
-                AgentEvent::TurnStarted if !sent_cancel => {
+                AgentEvent::TurnStarted { .. } if !sent_cancel => {
                     sent_cancel = true;
                     handle.commands.send(AgentCommand::Cancel).unwrap();
                 }
-                AgentEvent::TurnComplete { reason: r } => {
+                AgentEvent::TurnComplete { reason: r, .. } => {
                     reason = Some(r);
                     break;
                 }
@@ -426,6 +426,7 @@ async fn shutdown_during_turn_emits_cancel_terminal_and_latest_snapshot() {
             AgentEvent::Cancelled => cancelled = true,
             AgentEvent::TurnComplete {
                 reason: StopReason::Cancelled,
+                ..
             } => completed = true,
             AgentEvent::Snapshot { snapshot: current } => {
                 snapshot = Some(current);
@@ -547,7 +548,7 @@ async fn cancel_unblocks_pending_middleware_request() {
                 AgentEvent::Request { .. } => {
                     handle.commands.send(AgentCommand::Cancel).unwrap();
                 }
-                AgentEvent::TurnComplete { reason: r } => {
+                AgentEvent::TurnComplete { reason: r, .. } => {
                     reason = Some(r);
                     break;
                 }
@@ -613,7 +614,7 @@ async fn cancel_mid_round_halts_the_whole_multi_round_turn() {
     let reason = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         let mut reason: Option<StopReason> = None;
         while let Some(ev) = handle.events.recv().await {
-            if let AgentEvent::TurnComplete { reason: r } = ev {
+            if let AgentEvent::TurnComplete { reason: r, .. } = ev {
                 reason = Some(r);
                 break;
             }
@@ -781,7 +782,7 @@ async fn empty_cancel_rolls_back_even_in_preserve_mode() {
         let mut sent = false;
         while let Some(ev) = handle.events.recv().await {
             match ev {
-                AgentEvent::TurnStarted if !sent => {
+                AgentEvent::TurnStarted { .. } if !sent => {
                     sent = true;
                     handle.commands.send(AgentCommand::Cancel).unwrap();
                 }

@@ -122,7 +122,10 @@ pub(crate) fn build_request_body(
         }
         ToolChoice::Specific(name) => {
             // Responses' named form is flat: no `function` wrapper.
-            body.insert("tool_choice".into(), json!({ "type": "function", "name": name }));
+            body.insert(
+                "tool_choice".into(),
+                json!({ "type": "function", "name": name }),
+            );
         }
         ToolChoice::None => {
             body.insert("tool_choice".into(), json!("none"));
@@ -130,10 +133,7 @@ pub(crate) fn build_request_body(
     }
     if let Some(effort) = options.reasoning_effort {
         if cfg.supports_reasoning_effort {
-            body.insert(
-                "reasoning".into(),
-                json!({ "effort": effort_str(effort) }),
-            );
+            body.insert("reasoning".into(), json!({ "effort": effort_str(effort) }));
         }
     }
     if !tools.is_empty() {
@@ -411,7 +411,11 @@ impl ResponsesSseDecoder {
                     name,
                     // A no-arg call streams no argument bytes; emit `{}` so the kernel
                     // (and the resumed-turn wire) always carries valid JSON, never "".
-                    arguments: if args.trim().is_empty() { "{}".into() } else { args },
+                    arguments: if args.trim().is_empty() {
+                        "{}".into()
+                    } else {
+                        args
+                    },
                 }));
             }
         }
@@ -456,7 +460,10 @@ impl ResponsesSseDecoder {
             // Value directly (no serialize→re-parse round-trip).
             out.push(StreamEvent::Error(ProviderError {
                 retryable: false,
-                message: format!("provider error: {}", super::openai_compat::parse_error_obj(err)),
+                message: format!(
+                    "provider error: {}",
+                    super::openai_compat::parse_error_obj(err)
+                ),
                 http_status: super::openai_compat::inband_error_http_status(err),
                 code: super::openai_compat::error_code(err),
                 retry_after_secs: None,
@@ -669,14 +676,8 @@ impl ResponsesSseDecoder {
 /// `input_tokens` → prompt; `output_tokens` → completion; cached lives in
 /// `input_tokens_details.cached_tokens`.
 fn map_responses_usage(u: &Value) -> TokenUsage {
-    let prompt = u
-        .get("input_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
-    let completion = u
-        .get("output_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
+    let prompt = u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let completion = u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
     let cached = u
         .pointer("/input_tokens_details/cached_tokens")
         .and_then(|v| v.as_u64())
@@ -726,13 +727,7 @@ impl LlmProvider for ResponsesProvider {
         } else {
             options
         };
-        let body = build_request_body(
-            &self.cfg.model,
-            messages,
-            tools,
-            options,
-            &self.cfg,
-        );
+        let body = build_request_body(&self.cfg.model, messages, tools, options, &self.cfg);
         super::wire_dump_request(&self.cfg.model, &body);
         let body_bytes = match serde_json::to_vec(&body) {
             Ok(b) => b,
@@ -752,6 +747,7 @@ impl LlmProvider for ResponsesProvider {
         let api_key = self.cfg.api_key.clone();
         let session_id = self.session_id.get().cloned().unwrap_or_default();
         let idle = self.cfg.idle_timeout;
+        let first_token = self.cfg.first_token_timeout;
         let open_timeout = self.cfg.open_timeout;
         let rate_limit_retry_owner = options.rate_limit_retry_owner;
         let resp = match open_stream(
@@ -789,8 +785,21 @@ impl LlmProvider for ResponsesProvider {
                 let mut pending_metadata = Vec::new();
                 let byte_stream = resp.bytes_stream();
                 futures::pin_mut!(byte_stream);
+                // PHASE-AWARE byte-idle watchdog: prefill (before the first byte of this
+                // (re)opened stream) waits up to `first_token`; after the first byte we
+                // tighten to the inter-token `idle`. See openai_compat for the rationale
+                // (keep-alives flip early but keep resetting; silent prefill gets the full
+                // first-token budget). Reset per (re)open — a reconnect restarts prefill.
+                let mut first_byte_seen = false;
                 loop {
-                    match tokio::time::timeout(idle, byte_stream.next()).await {
+                    match retry::next_chunk_phased(
+                        &mut byte_stream,
+                        first_token,
+                        idle,
+                        &mut first_byte_seen,
+                    )
+                    .await
+                    {
                         Err(_elapsed) => {
                             yield StreamEvent::Error(ProviderError {
                                 retryable: false,
@@ -955,18 +964,24 @@ mod tests {
         let tool = &body["tools"][0];
         assert_eq!(tool["type"], "function");
         assert_eq!(tool["name"], "get_weather");
-        assert!(tool.get("function").is_none(), "no chat-completions wrapper");
+        assert!(
+            tool.get("function").is_none(),
+            "no chat-completions wrapper"
+        );
     }
 
     #[test]
     fn assistant_tool_calls_and_tool_results_map() {
         let msgs = vec![
             Message::user("weather?"),
-            Message::assistant("", vec![ToolCall {
-                id: "call_1".into(),
-                name: "get_weather".into(),
-                arguments: "{\"city\":\"上海\"}".into(),
-            }]),
+            Message::assistant(
+                "",
+                vec![ToolCall {
+                    id: "call_1".into(),
+                    name: "get_weather".into(),
+                    arguments: "{\"city\":\"上海\"}".into(),
+                }],
+            ),
             Message::tool_result("call_1", "{\"temp\":26}", false),
         ];
         let body = build_request_body("m", &msgs, &[], &ChatOptions::default(), &test_cfg());
@@ -1029,13 +1044,7 @@ mod tests {
             max_tokens: Some(1024),
             ..Default::default()
         };
-        let body = build_request_body(
-            "m",
-            &[Message::user("hi")],
-            &[],
-            &opts,
-            &test_cfg(),
-        );
+        let body = build_request_body("m", &[Message::user("hi")], &[], &opts, &test_cfg());
         assert_eq!(body["max_output_tokens"], 1024);
         assert!(body.get("max_tokens").is_none());
     }
@@ -1066,7 +1075,10 @@ mod tests {
             &ChatOptions::default(),
             &test_cfg(),
         );
-        assert_eq!(body["store"], false, "previous_response_id continuation unsupported");
+        assert_eq!(
+            body["store"], false,
+            "previous_response_id continuation unsupported"
+        );
         assert!(body.get("previous_response_id").is_none());
     }
 
@@ -1145,7 +1157,9 @@ mod tests {
         );
         evs.extend(dec.finish());
         // ToolCallDelta fragments surface for live display…
-        assert!(evs.iter().any(|e| matches!(e, StreamEvent::ToolCallDelta { index: 0, .. })));
+        assert!(evs
+            .iter()
+            .any(|e| matches!(e, StreamEvent::ToolCallDelta { index: 0, .. })));
         // …and ONE whole ToolCall is emitted for execution.
         let whole: Vec<_> = evs
             .iter()
@@ -1169,7 +1183,10 @@ mod tests {
              data: {\"response\":{\"status\":\"incomplete\"}}\n\n",
         );
         evs.extend(dec.finish());
-        assert!(matches!(evs.last(), Some(StreamEvent::Done { truncated: true })));
+        assert!(matches!(
+            evs.last(),
+            Some(StreamEvent::Done { truncated: true })
+        ));
     }
 
     #[test]
@@ -1181,7 +1198,10 @@ mod tests {
              data: {\"delta\":\"par\"}\n\n",
         );
         evs.extend(dec.finish());
-        assert!(matches!(evs.last(), Some(StreamEvent::Done { truncated: true })));
+        assert!(matches!(
+            evs.last(),
+            Some(StreamEvent::Done { truncated: true })
+        ));
     }
 
     #[test]
@@ -1192,7 +1212,9 @@ mod tests {
             "event: error\n\
              data: {\"code\":\"rate_limit_exceeded\",\"message\":\"too many requests\"}\n\n",
         );
-        assert!(matches!(&evs[0], StreamEvent::Error(e) if e.code.as_deref() == Some("rate_limit_exceeded")));
+        assert!(
+            matches!(&evs[0], StreamEvent::Error(e) if e.code.as_deref() == Some("rate_limit_exceeded"))
+        );
     }
 
     #[test]
@@ -1242,7 +1264,10 @@ mod tests {
         evs.extend(dec.finish());
         // Unknown item type is tolerated (logged, not fatal) and the stream
         // still terminates with Done.
-        assert!(matches!(evs.last(), Some(StreamEvent::Done { truncated: false })));
+        assert!(matches!(
+            evs.last(),
+            Some(StreamEvent::Done { truncated: false })
+        ));
     }
 
     #[test]
@@ -1258,7 +1283,10 @@ mod tests {
              data: {\"response\":{\"status\":\"completed\"}}\n\n",
         );
         evs.extend(dec.finish());
-        assert!(matches!(evs.last(), Some(StreamEvent::Done { truncated: false })));
+        assert!(matches!(
+            evs.last(),
+            Some(StreamEvent::Done { truncated: false })
+        ));
         assert_eq!(evs.len(), 1, "noise events must not emit kernel events");
     }
 
@@ -1276,14 +1304,19 @@ mod tests {
         }
         evs.extend(dec.finish());
         assert_eq!(
-            evs.iter().filter_map(|e| match e {
-                StreamEvent::TextDelta(t) => Some(t.clone()),
-                _ => None,
-            }).collect::<Vec<_>>()
-              .join(""),
+            evs.iter()
+                .filter_map(|e| match e {
+                    StreamEvent::TextDelta(t) => Some(t.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(""),
             "你好，世界"
         );
-        assert!(matches!(evs.last(), Some(StreamEvent::Done { truncated: false })));
+        assert!(matches!(
+            evs.last(),
+            Some(StreamEvent::Done { truncated: false })
+        ));
     }
 
     #[test]
@@ -1300,8 +1333,13 @@ mod tests {
             evs.extend(dec.feed(&[*b]));
         }
         evs.extend(dec.finish());
-        assert!(evs.iter().any(|e| matches!(e, StreamEvent::TextDelta(t) if t == "hi")));
-        assert!(matches!(evs.last(), Some(StreamEvent::Done { truncated: false })));
+        assert!(evs
+            .iter()
+            .any(|e| matches!(e, StreamEvent::TextDelta(t) if t == "hi")));
+        assert!(matches!(
+            evs.last(),
+            Some(StreamEvent::Done { truncated: false })
+        ));
     }
 
     #[test]
@@ -1321,7 +1359,9 @@ mod tests {
         );
         assert!(
             evs.iter().any(|e| matches!(e, StreamEvent::TextDelta(_)))
-                && evs.iter().any(|e| matches!(e, StreamEvent::ToolCallDelta { .. })),
+                && evs
+                    .iter()
+                    .any(|e| matches!(e, StreamEvent::ToolCallDelta { .. })),
             "decoder must emit text + tool-call content: {evs:?}"
         );
         assert!(
@@ -1386,9 +1426,16 @@ mod tests {
             .await
             .unwrap();
         let events: Vec<StreamEvent> = stream.collect().await;
-        assert!(events.iter().any(|e| matches!(e, StreamEvent::ResponseId(id) if id == "resp_9")));
-        assert!(events.iter().any(|e| matches!(e, StreamEvent::TextDelta(t) if t == "hi there")));
-        assert!(matches!(events.last(), Some(StreamEvent::Done { truncated: false })));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::ResponseId(id) if id == "resp_9")));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::TextDelta(t) if t == "hi there")));
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Done { truncated: false })
+        ));
     }
 
     #[tokio::test]
@@ -1438,7 +1485,10 @@ mod tests {
         let reqs = server.received_requests().await.unwrap();
         assert_eq!(reqs.len(), 1, "exactly one request should hit the wire");
         let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
-        assert_eq!(body["instructions"], "be terse", "system lifts to instructions");
+        assert_eq!(
+            body["instructions"], "be terse",
+            "system lifts to instructions"
+        );
         assert_eq!(body["store"], false, "stateless: store:false");
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["name"], "get_weather");

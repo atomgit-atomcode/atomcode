@@ -147,6 +147,9 @@ fn load_native_command_session(
     }
     let lease = manager.acquire_lease(id)?;
     crate::legacy_convert::converge_session(&manager, &lease)?;
+    // A session's content is its log (`docs/adr/0024`): one stored as a
+    // snapshot becomes one here, once, and every change below is a fact.
+    manager.open_as_events(&lease)?;
     let loaded = manager.load_native_session(id)?;
     Ok(Some(NativeCommandSession {
         manager,
@@ -179,10 +182,12 @@ fn exec_native_undo(session: NativeCommandSession, arg: &str) -> anyhow::Result<
     }
     let target = arg.trim().parse::<usize>().ok();
     let undo = atomcode_coding::runtime::undo_snapshot_to_prompt(&expected_snapshot, target)?;
-    let message_count = undo.snapshot.messages.len();
-    let persisted_message_count = u32::try_from(message_count)?;
-    session.manager.commit_native_runtime_mutation(
-        &session.lease,
+    let persisted_message_count = u32::try_from(undo.snapshot.messages.len())?;
+    let target = undo.snapshot.messages.clone();
+    let manager = &session.manager;
+    let lease = &session.lease;
+    manager.commit_native_runtime_mutation(
+        lease,
         &undo.snapshot,
         move |current_snapshot, meta, presentation| {
             if current_snapshot != &expected_snapshot {
@@ -191,8 +196,15 @@ fn exec_native_undo(session: NativeCommandSession, arg: &str) -> anyhow::Result<
                     message: "session snapshot changed while preparing undo".into(),
                 });
             }
-            meta.turn_stats
-                .retain(|stat| !stat.position_valid || stat.after_message <= message_count);
+            let plan = manager.plan_conversation_change(
+                lease.id(),
+                &target,
+                u64::try_from(atomcode_capabilities::session::now_ms()).unwrap_or(0),
+            )?;
+            let visible = plan.visible_turns();
+            meta.turn_stats.retain(|stat| {
+                !stat.position_valid || stat.turn_id == 0 || visible.contains(&stat.turn_id)
+            });
             let surviving_turn_ids: std::collections::BTreeSet<_> = meta
                 .turn_stats
                 .iter()
@@ -209,7 +221,7 @@ fn exec_native_undo(session: NativeCommandSession, arg: &str) -> anyhow::Result<
                     actual: meta.turn_stats.len(),
                 })?;
             meta.updated_at = atomcode_capabilities::session::now_ms();
-            Ok(())
+            manager.append_events(lease, &plan.change)
         },
     )?;
     Ok(CommandResult::Undo {
@@ -229,10 +241,12 @@ fn commit_native_compaction(
     let expected_snapshot = session.loaded.snapshot;
     let mut snapshot = expected_snapshot.clone();
     snapshot.messages = messages;
-    let message_count = snapshot.messages.len();
-    let persisted_message_count = u32::try_from(message_count)?;
-    session.manager.commit_native_runtime_mutation(
-        &session.lease,
+    let persisted_message_count = u32::try_from(snapshot.messages.len())?;
+    let target = snapshot.messages.clone();
+    let manager = &session.manager;
+    let lease = &session.lease;
+    manager.commit_native_runtime_mutation(
+        lease,
         &snapshot,
         move |current_snapshot, meta, presentation| {
             if current_snapshot != &expected_snapshot {
@@ -241,25 +255,16 @@ fn commit_native_compaction(
                     message: "session snapshot changed while preparing compaction".into(),
                 });
             }
-            if let SnapshotCompactionMutation::Replace {
-                old_start,
-                old_end,
-                new_end,
-            } = mutation
-            {
+            let plan = manager.plan_conversation_change(
+                lease.id(),
+                &target,
+                u64::try_from(atomcode_capabilities::session::now_ms()).unwrap_or(0),
+            )?;
+            if let SnapshotCompactionMutation::Replace { .. } = mutation {
+                let visible = plan.visible_turns();
                 let _ = meta.archive_turn_stats_where(|stat| {
-                    stat.position_valid
-                        && stat.after_message > old_start
-                        && stat.after_message < old_end
+                    stat.position_valid && stat.turn_id != 0 && !visible.contains(&stat.turn_id)
                 });
-                for stat in &mut meta.turn_stats {
-                    if !stat.position_valid {
-                        continue;
-                    }
-                    if stat.after_message >= old_end {
-                        stat.after_message = new_end + stat.after_message.saturating_sub(old_end);
-                    }
-                }
             }
             let surviving_turn_ids: std::collections::BTreeSet<_> = meta
                 .turn_stats
@@ -277,7 +282,7 @@ fn commit_native_compaction(
                     actual: meta.turn_stats.len(),
                 })?;
             meta.updated_at = atomcode_capabilities::session::now_ms();
-            Ok(())
+            manager.append_events(lease, &plan.change)
         },
     )?;
     Ok(())
@@ -967,11 +972,9 @@ mod tests {
         };
         manager.write_presentation(id, &presentation).unwrap();
         let lease = manager.acquire_lease(id).unwrap();
-        let loaded = LoadedSession {
-            snapshot,
-            meta,
-            presentation,
-        };
+        manager.open_as_events(&lease).unwrap();
+        let loaded = manager.load_native_session(id).unwrap();
+        assert_eq!(loaded.snapshot.messages, snapshot.messages);
 
         manager.rename(id, "renamed after load").unwrap();
         manager
@@ -1064,24 +1067,27 @@ mod tests {
                 PresentationEntry {
                     anchor: DisplayAnchor::AfterTurn { turn_id: 2 },
                     role: PresentationRole::Assistant,
+                    text: "summarised".into(),
+                },
+                PresentationEntry {
+                    anchor: DisplayAnchor::AfterTurn { turn_id: 3 },
+                    role: PresentationRole::Assistant,
                     text: "kept".into(),
                 },
             ],
         };
         manager.write_presentation(id, &presentation).unwrap();
         let lease = manager.acquire_lease(id).unwrap();
-        let loaded = LoadedSession {
-            snapshot,
-            meta,
-            presentation,
-        };
+        manager.open_as_events(&lease).unwrap();
+        let loaded = manager.load_native_session(id).unwrap();
+        assert_eq!(loaded.snapshot.messages, snapshot.messages);
 
         manager.rename(id, "renamed after load").unwrap();
         manager
             .append_presentation(
                 id,
                 PresentationEntry {
-                    anchor: DisplayAnchor::AfterTurn { turn_id: 2 },
+                    anchor: DisplayAnchor::AfterTurn { turn_id: 3 },
                     role: PresentationRole::Assistant,
                     text: "late kept".into(),
                 },
@@ -1095,7 +1101,11 @@ mod tests {
                 loaded,
             },
             vec![
-                atomcode_kernel::message::Message::user("summary"),
+                {
+                    let mut summary = atomcode_kernel::message::Message::system("summary");
+                    summary.synthetic = true;
+                    summary
+                },
                 atomcode_kernel::message::Message::user("u3"),
                 atomcode_kernel::message::Message::assistant("a3", Vec::new()),
             ],
@@ -1112,10 +1122,26 @@ mod tests {
         assert_eq!(snapshot.messages.len(), 3);
         assert_eq!(snapshot.turn_counter, 8);
         let meta = manager.read_meta(id).unwrap();
-        assert_eq!(meta.turn_count, 2);
-        assert_eq!(meta.turn_stats[0].after_message, 1);
-        assert_eq!(meta.turn_stats[1].after_message, 3);
-        assert_eq!(meta.detached_unattributed_tokens, 1);
+        // The summarised turns' statistics are archived; the turn the summary
+        // kept stays.
+        assert_eq!(meta.turn_count, 1);
+        assert_eq!(
+            meta.turn_stats
+                .iter()
+                .map(|stat| stat.turn_id)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
+        assert_eq!(meta.detached_unattributed_tokens, 2);
+        // A fact, not a rewrite: the log compacted through the kept turn.
+        assert!(manager
+            .load_events(id)
+            .unwrap()
+            .iter()
+            .any(|logged| matches!(
+                logged.event,
+                atomcode_kernel::session::SessionEvent::Compacted { .. }
+            )));
         assert_eq!(meta.name, "renamed after load");
         assert!(meta.user_renamed);
         let presentation = manager.read_presentation(id).unwrap();

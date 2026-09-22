@@ -29,10 +29,24 @@ async-trait = "0.1"
 atomcode-codingplan = { path = "../atomcode-codingplan" }
 # Config system used directly by the final binary.
 atomcode-config = { path = "../atomcode-config" }
+# The screen's own table, for the glue rows that speak *on* the screen
+# (`tui_*.rs`, the host control). The product's table reaches this crate through
+# `atomcode_config::i18n`, which is the same leaf re-exported.
+atomcode-i18n = { path = "../atomcode-i18n" }
 # Self-update mechanics (leaf crate, extracted from core).
 atomcode-updater = { path = "../atomcode-updater" }
 atomcode-tuix = { path = "../atomcode-tuix" }
+# `atomcode --tui`: the full-screen UI assembled from rows, driving the same runtime
+# through the two front-end contracts (docs/adr/0021, docs/adr/0022).
+atomcode-tui = { path = "../atomcode-tui" }
+# Writing a row. `rows.rs` says a third crate adds a panel with a `View` impl and a
+# row — the row is a `Plugin`, so the launcher that owns one names the trait. Same
+# version the screen builds against (already in this graph through `atomcode-tui`).
+atomcode-plexus = { path = "../atomcode-plexus" }
 atomcode-telemetry = { path = "../atomcode-telemetry" }
+# `atomcode review`:一次性评审一份 diff。原来是 `atomcode-clix` 那个独立二进制,
+# 它的另外两个子命令与这里完全重复,所以整个 crate 删掉、review 搬了过来。
+atomcode-review = { path = "../atomcode-review" }
 atomcode-daemon = { path = "../atomcode-daemon" }
 # ACP (Agent Client Protocol) stdio server — the `atomcode acp` subcommand's engine
 # lives in `src/acp/`. It composes the v2 stack directly, so cli pulls the layers acp
@@ -42,6 +56,10 @@ atomcode-daemon = { path = "../atomcode-daemon" }
 # protocol router keeps the stable v1 chain as the default path.
 agent-client-protocol = { workspace = true, features = ["unstable_protocol_v2", "unstable_elicitation"] }
 atomcode-kernel = { path = "../atomcode-kernel" }
+atomcode-host-api = { path = "../atomcode-host-api" }
+# Direct now that the host-control adapter lives here: it speaks the feed and
+# the plugin tree itself, rather than reaching them through `atomcode-coding`.
+atomcode-harness = { path = "../atomcode-harness" }
 atomcode-coding = { path = "../atomcode-coding", features = ["atomgit"] }
 atomcode-capabilities = { path = "../atomcode-capabilities", features = ["notify", "setup", "plugin", "mcp", "atomgit", "cc-hooks"] }
 atomcode-auth = { path = "../atomcode-auth" }
@@ -93,10 +111,16 @@ winreg = "0.55"
 # Rust, so pulling it in unconditionally on the host side costs ~nothing.
 [dev-dependencies]
 assert_cmd = "2"
+# A scripted provider's stream, for the `--tui` criteria.
+futures = "0.3"
 # Redirect ATOMCODE_HOME to a throwaway temp dir before any test runs (via a
 # #[ctor] in main.rs's #[cfg(test)] module + every tests/*.rs binary) so tests
 # never persist into the developer's real ~/.atomcode.
 atomcode-kernel = { path = "../atomcode-kernel", features = ["test-support"] }
+# 可捕获的内存 telemetry sink,给 `atomcode review` 的计量判据用
+# (它随 `atomcode-clix` 一起搬过来)。
+atomcode-telemetry = { path = "../atomcode-telemetry", features = ["test-util"] }
+async-trait = "0.1"
 ctor = "0.2"
 predicates = "3"
 tempfile = "3"

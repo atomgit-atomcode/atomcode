@@ -321,6 +321,21 @@ fn read_raw_cf_dib() -> Option<Vec<u8>> {
 /// **AltGr** key is delivered as `Ctrl+Alt`, so on the rare keyboard layout
 /// where `AltGr+V` is a printable glyph, that keystroke triggers image-paste
 /// instead of inserting the glyph. Accepted as an inherent cost of the chord.
+/// Build an `ImageContent` from raw image bytes, downscaling/re-encoding oversized
+/// images so a big pasted screenshot can't blow the per-request body (a pasted image is
+/// re-sent on every turn). Falls back to the original bytes/type on any decode failure.
+fn normalized_image_content(media_type: &str, raw: &[u8]) -> ImageContent {
+    let (media_type, data) = match atomcode_capabilities::image_normalize::normalize_image_raw(raw)
+    {
+        Some((mt, out)) => (mt, base64::engine::general_purpose::STANDARD.encode(out)),
+        None => (
+            media_type.to_string(),
+            base64::engine::general_purpose::STANDARD.encode(raw),
+        ),
+    };
+    ImageContent { media_type, data }
+}
+
 fn is_paste_image_chord(
     code: crossterm::event::KeyCode,
     modifiers: crossterm::event::KeyModifiers,
@@ -352,14 +367,7 @@ fn try_paste_clipboard_image() -> Option<(ImageContent, u64)> {
             if let Some(png_data) =
                 encode_rgba_to_png(img.width as u32, img.height as u32, img.bytes.as_ref())
             {
-                let b64 = base64::engine::general_purpose::STANDARD.encode(&png_data);
-                return Some((
-                    ImageContent {
-                        media_type: "image/png".into(),
-                        data: b64,
-                    },
-                    hash,
-                ));
+                return Some((normalized_image_content("image/png", &png_data), hash));
             }
         }
         Err(_e) => {
@@ -376,14 +384,7 @@ fn try_paste_clipboard_image() -> Option<(ImageContent, u64)> {
             {
                 let hash = rgba_fingerprint(w as usize, h as usize, &rgba);
                 if let Some(png_data) = encode_rgba_to_png(w, h, &rgba) {
-                    let b64 = base64::engine::general_purpose::STANDARD.encode(&png_data);
-                    return Some((
-                        ImageContent {
-                            media_type: "image/png".into(),
-                            data: b64,
-                        },
-                        hash,
-                    ));
+                    return Some((normalized_image_content("image/png", &png_data), hash));
                 }
             }
         }
@@ -818,14 +819,7 @@ fn try_attach_image_from_path(text: &str) -> Option<(ImageContent, u64)> {
     }
     let bytes = std::fs::read(path).ok()?;
     let hash = rgba_fingerprint(0, 0, &bytes);
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    Some((
-        ImageContent {
-            media_type: media_type.into(),
-            data: b64,
-        },
-        hash,
-    ))
+    Some((normalized_image_content(media_type, &bytes), hash))
 }
 
 /// Resolve an explicit `@image` reference against the same path roots users
@@ -4043,9 +4037,9 @@ pub struct LoopCtx {
     /// dispatcher as a fallback when the entered name doesn't match a
     /// built-in command.
     pub custom_commands: crate::custom_commands::CustomCommandRegistry,
-    /// Loaded skills (`.claude/skills/*/SKILL.md`, etc.). Same `Arc`
-    /// the agent loop holds, so `reload(...)` there is visible here
-    /// without extra plumbing. Used by the slash-command palette to
+    /// Loaded skills (`.claude/skills/*/SKILL.md`, etc.). The TUI's own copy —
+    /// the runtime loads a separate registry in `prepare`, and `/plugin reload`
+    /// reloads both. Used by the slash-command palette to
     /// surface user-invocable skills, and by the dispatcher to expand
     /// `/skill_name [args]` into a SendMessage.
     pub skill_registry:
@@ -5682,21 +5676,50 @@ mod buffer_tests {
             "expected `(0s · ↑ 12.40K tokens)`, got {active:?}"
         );
         // Under 1s elapsed, no throughput is shown (avoids div-by-zero / wild rates).
-        assert!(!active.contains("tok/s"), "no rate under 1s, got {active:?}");
+        assert!(
+            !active.contains("tok/s"),
+            "no rate under 1s, got {active:?}"
+        );
     }
 
     #[test]
     fn spinner_shows_tok_per_sec_once_a_second_elapses() {
         let mut s = UiState::new();
         s.on_submit();
-        // Backdate the turn start so `turn_elapsed >= 1s`; 40_000 chars ≈ 10K tokens
+        // Backdate the PHASE clock so `phase_elapsed >= 1s`; baseline is captured at
+        // stamp time (0 chars), then 40_000 chars ≈ 10K tokens produced this phase
         // over 10s → 1000 tok/s.
-        s.turn_started_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
+        s.stamp_phase_start(std::time::Instant::now() - std::time::Duration::from_secs(10));
         s.turn_output_chars = 40_000;
         let active = format_spinner_label(&s, 0, None);
         assert!(
-            active.contains("tok/s"),
-            "expected a `tok/s` throughput, got {active:?}"
+            active.contains("1000 tok/s"),
+            "expected `1000 tok/s` throughput, got {active:?}"
+        );
+    }
+
+    #[test]
+    fn spinner_tok_per_sec_is_current_phase_not_diluted_by_whole_turn() {
+        // Regression: the rate must reflect the CURRENT generation phase, not the
+        // whole turn. A long, tool-heavy turn used to divide cumulative output by
+        // total wall time → a diluted "1 tok/s" that swung wildly.
+        let mut s = UiState::new();
+        s.on_submit();
+        // Whole turn has run 600s (mostly tool execution) — the OLD formula would
+        // report ~2 tok/s (1500 tokens / 600s).
+        s.turn_started_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(600));
+        // A fresh generation phase started 3s ago and produced 6000 chars (1500
+        // tokens): baseline is snapshotted at stamp time (0), delta = 6000.
+        s.stamp_phase_start(std::time::Instant::now() - std::time::Duration::from_secs(3));
+        s.turn_output_chars = 6_000;
+        let active = format_spinner_label(&s, 0, None);
+        assert!(
+            active.contains("500 tok/s"),
+            "expected phase-scoped 500 tok/s (1500 tokens / 3s), got {active:?}"
+        );
+        assert!(
+            !active.contains("2 tok/s"),
+            "must NOT use the diluted whole-turn rate, got {active:?}"
         );
     }
 
@@ -6507,7 +6530,11 @@ mod menu_tests {
         use crossterm::event::KeyModifiers;
 
         // Default (shift_tab) preference: plain Tab stays a completion key.
-        assert!(!is_mode_cycle_key(KeyCode::Tab, KeyModifiers::NONE, ShiftTab));
+        assert!(!is_mode_cycle_key(
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+            ShiftTab
+        ));
         assert!(is_mode_cycle_key(
             KeyCode::BackTab,
             KeyModifiers::SHIFT,
@@ -6518,7 +6545,11 @@ mod menu_tests {
             KeyModifiers::NONE,
             ShiftTab
         ));
-        assert!(is_mode_cycle_key(KeyCode::Tab, KeyModifiers::SHIFT, ShiftTab));
+        assert!(is_mode_cycle_key(
+            KeyCode::Tab,
+            KeyModifiers::SHIFT,
+            ShiftTab
+        ));
         assert!(!is_mode_cycle_key(
             KeyCode::BackTab,
             KeyModifiers::SHIFT | KeyModifiers::CONTROL,
@@ -6539,13 +6570,13 @@ mod menu_tests {
         assert!(is_mode_cycle_key(KeyCode::BackTab, KeyModifiers::NONE, Tab));
         // Modified Tab never cycles regardless of preference (would collide
         // with terminal chords / newline aliases).
+        assert!(!is_mode_cycle_key(KeyCode::Tab, KeyModifiers::CONTROL, Tab));
+        // Sanity: the same plain Tab is NOT a cycle key under shift_tab.
         assert!(!is_mode_cycle_key(
             KeyCode::Tab,
-            KeyModifiers::CONTROL,
-            Tab
+            KeyModifiers::NONE,
+            ShiftTab
         ));
-        // Sanity: the same plain Tab is NOT a cycle key under shift_tab.
-        assert!(!is_mode_cycle_key(KeyCode::Tab, KeyModifiers::NONE, ShiftTab));
     }
 
     #[test]
@@ -9709,6 +9740,15 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 &session,
                 false,
             );
+            // Restore the session-cumulative token totals (incl. cache) from the
+            // persisted meta so the status-row cache% shows immediately on `-c`/
+            // `--continue` — this startup path bypasses `commit_native_session_changed`,
+            // so without this the tallies stay 0 until the next turn.
+            // `None` bucket → `for_project(working_dir)`, which is exactly where
+            // `-c`/`--continue` loaded this session from (incl. a contention fork,
+            // stored in the same project bucket) — robust regardless of whether
+            // `current_session_project_bucket` is populated this early at startup.
+            seed_session_token_totals(&mut app.state, None, &ctx.working_dir, &session.id);
             // The runtime was prepared against this exact external session id and
             // snapshot before the TUI started; replay here is display-only.
             // Continue accumulating into the runtime-owned session file. That
@@ -13573,7 +13613,10 @@ mod focus_recovery_tests {
         // The bug: a FocusLost was seen (Some(false)) but no matching FocusGained →
         // the next key/paste must trigger the cold repaint.
         assert!(input_recovers_stale_focus(&key(), Some(false)));
-        assert!(input_recovers_stale_focus(&InputEvent::Paste("x".into()), Some(false)));
+        assert!(input_recovers_stale_focus(
+            &InputEvent::Paste("x".into()),
+            Some(false)
+        ));
     }
 
     #[test]
@@ -15666,7 +15709,7 @@ fn build_skill_menu_items(
     let mut items: Vec<(String, String)> = Vec::new();
     if let Some(reg) = skill_registry {
         if let Ok(reg) = reg.read() {
-            let skills: Vec<_> = reg.user_invocable().collect();
+            let skills: Vec<_> = reg.user_invocable();
             for skill in &skills {
                 let bare = skill
                     .name
@@ -17975,7 +18018,7 @@ pub(crate) fn reload_plugins(ctx: &mut LoopCtx) -> (usize, Vec<String>) {
     let mut warnings = Vec::new();
     if let Ok(mut guard) = ctx.skill_registry.write() {
         warnings = reload_skill_registry(&mut guard, &ctx.working_dir);
-        loaded = guard.all().count();
+        loaded = guard.all().len();
     }
     ctx.custom_commands = crate::custom_commands::CustomCommandRegistry::load(&ctx.working_dir);
     // Hook executor lives on the agent loop. Send a one-shot rebuild signal
@@ -19933,7 +19976,13 @@ mod bypass_approval_tests {
         }
 
         // Non-bash tools MUST NOT get this option.
-        for tool in ["ReadFile", "WriteFile", "EditFile", "SearchReplace", "read_file"] {
+        for tool in [
+            "ReadFile",
+            "WriteFile",
+            "EditFile",
+            "SearchReplace",
+            "read_file",
+        ] {
             let opts = super::build_approval_options(tool, "{}");
             assert!(
                 opts.iter().all(|o| o.kind != ApprovalKind::AllowAlwaysAll),
@@ -23317,7 +23366,7 @@ fn project_kernel_event(
 ) -> Option<AgentEvent> {
     use atomcode_kernel::event::AgentEvent as Kernel;
     match event {
-        Kernel::TurnStarted => Some(AgentEvent::PhaseChange(AgentPhase::Thinking)),
+        Kernel::TurnStarted { .. } => Some(AgentEvent::PhaseChange(AgentPhase::Thinking)),
         Kernel::TextDelta(text) => Some(AgentEvent::TextDelta(text)),
         Kernel::Reasoning(text) => Some(AgentEvent::ReasoningDelta(text)),
         Kernel::ToolCallStreaming {
@@ -23381,6 +23430,7 @@ fn project_kernel_event(
             snapshot: atomcode_kernel::message::SessionSnapshot::new(Vec::new()),
         }),
         Kernel::Warning(message) => Some(AgentEvent::Warning(message)),
+        Kernel::ContextAdded { text, source } => Some(AgentEvent::ContextAdded { text, source }),
         Kernel::ProviderRetry {
             attempt,
             max_attempts,
@@ -24739,13 +24789,22 @@ fn handle_runtime_event(
                 }
             }
         }
+        bg_runtime::RuntimeEventPayload::Driver(bg_runtime::DriverEvent::LocalShellLine {
+            line,
+        }) => {
+            // The `!` shell streams: the person ran it precisely to watch it.
+            renderer.render(UiLine::CommandOutput(line));
+            renderer.flush();
+        }
         bg_runtime::RuntimeEventPayload::Driver(bg_runtime::DriverEvent::LocalShellFinished {
             output,
             failed,
         }) => {
+            // The body already went by line by line; this is only the status
+            // tail, and a clean run with output has none.
             if failed {
                 renderer.render(UiLine::Error(output));
-            } else {
+            } else if !output.is_empty() {
                 renderer.render(UiLine::CommandOutput(output));
             }
             renderer.flush();
@@ -25285,6 +25344,48 @@ fn apply_native_session_changed(
     commit_native_session_changed(session, working_dir, state, renderer, ctx)
 }
 
+/// Sum a persisted session cost report into `(prompt, completion, cached)` token
+/// totals for seeding `UiState`'s session-cumulative tallies on load. `prompt` is
+/// TOTAL input (uncached `input` + `cached_input`) to match the live accumulation
+/// at the Usage-event site, so the status-row cache ratio (`cached / prompt`)
+/// stays consistent before and after a `-c`/resume.
+fn session_token_totals_from_cost(
+    report: &atomcode_capabilities::session::SessionCostReport,
+) -> (usize, usize, usize) {
+    let mut prompt = 0usize;
+    let mut completion = 0usize;
+    let mut cached = 0usize;
+    for model in &report.models {
+        prompt += (model.tokens.input + model.tokens.cached_input) as usize;
+        completion += model.tokens.output as usize;
+        cached += model.tokens.cached_input as usize;
+    }
+    (prompt, completion, cached)
+}
+
+/// Seed `state`'s session-cumulative token totals (incl. cache) from the persisted
+/// meta for `session_id`, so the status-row cache% survives a resume/`-c`/switch
+/// instead of blanking until the next turn (mirrors how `ctx` usage is restored).
+/// Live Usage events accumulate on top of this seed. Best-effort: a missing/
+/// unreadable meta (fresh session, legacy import) leaves the totals untouched.
+fn seed_session_token_totals(
+    state: &mut UiState,
+    project_bucket: Option<&str>,
+    working_dir: &std::path::Path,
+    session_id: &str,
+) {
+    let manager = commands::session_manager_for_cost(project_bucket, working_dir);
+    if let Ok(meta) = manager.read_meta(session_id) {
+        let report = atomcode_capabilities::session::aggregate_session_cost(&meta);
+        let (prompt, completion, cached) = session_token_totals_from_cost(&report);
+        state.prompt_tokens = prompt;
+        state.completion_tokens = completion;
+        state.cached_tokens = cached;
+        // Live path does `total_tokens += u.completion`, so mirror it here.
+        state.total_tokens = completion;
+    }
+}
+
 fn commit_native_session_changed(
     session: Session,
     working_dir: PathBuf,
@@ -25328,6 +25429,15 @@ fn commit_native_session_changed(
     state.prompt_tokens = 0;
     state.completion_tokens = 0;
     state.cached_tokens = 0;
+    // Restore the session-cumulative token totals (incl. cache) from the persisted
+    // meta so the status-row cache% survives a resume/switch instead of blanking
+    // until the next turn — mirroring how `ctx` usage is restored.
+    seed_session_token_totals(
+        state,
+        ctx.current_session_project_bucket.as_deref(),
+        &ctx.working_dir,
+        &session_id,
+    );
     state.last_context = None;
     // Session history can outlive the model that produced it. Establish the
     // current runtime/model window before replay restores persisted usage, so
@@ -25522,47 +25632,218 @@ fn escape_runtime_context(value: &str) -> String {
         .replace('>', "&gt;")
 }
 
-fn run_local_shell_command(command: String, ctx: &LoopCtx) {
-    use atomcode_kernel::tool::Tool;
+/// Wall-clock ceiling for a user-typed `!cmd`. The bridge-era runner used 300s
+/// (a person watching a build tolerates more than the model's 60s default),
+/// and the idle kill in `run_shell` catches the truly stuck case sooner.
+const LOCAL_SHELL_TIMEOUT_SECS: u64 = 300;
 
+/// What a finished `!cmd` leaves behind, given that its body already streamed.
+///
+/// Returns `(tail, context, failed)`: `tail` is the status line the person has
+/// not seen yet (empty on a clean run that printed something); `context` is the
+/// full `<bash-output>` body the model receives on its next turn, framed the way
+/// the model's own `bash` tool frames a result so the two read alike.
+fn format_local_shell_outcome(
+    outcome: &atomcode_capabilities::tools::ShellOutcome,
+) -> (String, String, bool) {
+    use atomcode_capabilities::tools::ShellExit;
+    let stdout = outcome.stdout.trim_end();
+    let stderr = outcome.stderr.trim_end();
+    let mut body = String::new();
+    if !stdout.is_empty() {
+        body.push_str(stdout);
+    }
+    if !stderr.trim().is_empty() {
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str("[stderr]\n");
+        body.push_str(stderr);
+    }
+    let (marker, failed) = match outcome.exit {
+        ShellExit::Exited { code: Some(0), .. } => (String::new(), false),
+        ShellExit::Exited {
+            code: Some(code), ..
+        } => (format!("[exit code {code}]"), true),
+        ShellExit::Exited { code: None, .. } => {
+            ("[process terminated by signal]".to_string(), true)
+        }
+        ShellExit::KilledIdle => (
+            format!(
+                "[command killed after {}s without output]",
+                atomcode_capabilities::tools::bash::SILENT_KILL_SECS
+            ),
+            true,
+        ),
+        ShellExit::KilledTimeout => (
+            format!("[command timed out ({LOCAL_SHELL_TIMEOUT_SECS}s)]"),
+            true,
+        ),
+    };
+    let tail = if marker.is_empty() && body.is_empty() {
+        "(no output)".to_string()
+    } else {
+        marker.clone()
+    };
+    let mut context = body;
+    if !marker.is_empty() {
+        if !context.is_empty() {
+            context.push('\n');
+        }
+        context.push_str(&marker);
+    }
+    if context.is_empty() {
+        context = "(no output)".to_string();
+    }
+    (tail, context, failed)
+}
+
+fn run_local_shell_command(command: String, ctx: &LoopCtx) {
     let working_dir = ctx.working_dir.clone();
     let runtime = ctx.runtime.clone();
     let runtime_id = ctx.foreground_runtime_id;
     let event_tx = ctx.runtime_event_tx.clone();
     tokio::spawn(async move {
-        let tool = atomcode_capabilities::tools::BashTool;
-        let args = serde_json::json!({ "command": command.clone() }).to_string();
-        let tool_ctx = atomcode_kernel::tool::ToolContext {
-            working_dir,
-            cancel: tokio_util::sync::CancellationToken::new(),
-            progress: atomcode_kernel::tool::ProgressSink::noop(),
-            requester: None,
+        // Stream the body as it happens, one complete line per event: a chunk
+        // boundary is a read size, not a line, and a row per half-line would
+        // tear the output.
+        let pending = std::sync::Mutex::new(String::new());
+        let send_line = |line: String| {
+            let _ = event_tx.send(bg_runtime::RuntimeEvent {
+                runtime_id,
+                event: bg_runtime::RuntimeEventPayload::Driver(
+                    bg_runtime::DriverEvent::LocalShellLine { line },
+                ),
+            });
         };
-        let result = tool.execute(&args, &tool_ctx).await;
-        let output = truncate_local_shell_output(result.content);
+        let outcome = atomcode_capabilities::tools::run_shell(
+            &atomcode_capabilities::world::LocalShell,
+            &command,
+            &working_dir,
+            LOCAL_SHELL_TIMEOUT_SECS,
+            |chunk| {
+                let mut buf = pending.lock().unwrap();
+                buf.push_str(chunk);
+                while let Some(nl) = buf.find('\n') {
+                    let line = buf[..nl].to_string();
+                    buf.drain(..=nl);
+                    send_line(line);
+                }
+            },
+        )
+        .await;
+        let rest = std::mem::take(&mut *pending.lock().unwrap());
+        if !rest.is_empty() {
+            send_line(rest);
+        }
+
+        let (tail, content, failed) = format_local_shell_outcome(&outcome);
+        let content = truncate_local_shell_output(content);
         let context = format!(
             "<bash-input>{}</bash-input>\n<bash-output>{}</bash-output>",
             escape_runtime_context(&command),
-            escape_runtime_context(&output)
+            escape_runtime_context(&content)
         );
         let queue_failed = runtime
             .dispatch(atomcode_coding::DriverCommand::QueueLocalContext(
                 atomcode_coding::LocalContextInput { content: context },
             ))
             .is_err();
-        let failed = result.is_error || queue_failed;
         let output = if queue_failed {
-            format!("{output}\n[failed to add shell output to runtime context]")
+            format!("{tail}\n[failed to add shell output to runtime context]")
         } else {
-            output
+            tail
         };
         let _ = event_tx.send(bg_runtime::RuntimeEvent {
             runtime_id,
             event: bg_runtime::RuntimeEventPayload::Driver(
-                bg_runtime::DriverEvent::LocalShellFinished { output, failed },
+                bg_runtime::DriverEvent::LocalShellFinished {
+                    output,
+                    failed: failed || queue_failed,
+                },
             ),
         });
     });
+}
+
+#[cfg(test)]
+mod local_shell_outcome_tests {
+    use super::format_local_shell_outcome;
+    use atomcode_capabilities::tools::{ShellExit, ShellOutcome};
+
+    fn outcome(stdout: &str, stderr: &str, exit: ShellExit) -> ShellOutcome {
+        ShellOutcome {
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+            exit,
+            elapsed_secs: 0.0,
+        }
+    }
+
+    #[test]
+    fn a_clean_run_with_output_leaves_no_tail_but_a_full_context() {
+        let (tail, context, failed) = outcome(
+            "file1\nfile2\n",
+            "",
+            ShellExit::Exited {
+                success: true,
+                code: Some(0),
+            },
+        )
+        .pipe(format_local_shell_outcome);
+        assert!(!failed);
+        assert_eq!(tail, "", "the body already streamed; nothing to add");
+        assert_eq!(context, "file1\nfile2");
+    }
+
+    #[test]
+    fn a_clean_run_with_no_output_says_so() {
+        let (tail, context, failed) = outcome(
+            "",
+            "",
+            ShellExit::Exited {
+                success: true,
+                code: Some(0),
+            },
+        )
+        .pipe(format_local_shell_outcome);
+        assert!(!failed);
+        assert_eq!(tail, "(no output)");
+        assert_eq!(context, "(no output)");
+    }
+
+    #[test]
+    fn a_failure_reports_the_code_and_frames_stderr_like_the_bash_tool() {
+        let (tail, context, failed) = outcome(
+            "partial\n",
+            "boom\n",
+            ShellExit::Exited {
+                success: false,
+                code: Some(2),
+            },
+        )
+        .pipe(format_local_shell_outcome);
+        assert!(failed);
+        assert_eq!(tail, "[exit code 2]");
+        assert_eq!(context, "partial\n[stderr]\nboom\n[exit code 2]");
+    }
+
+    #[test]
+    fn a_kill_is_named_for_its_reason() {
+        let (tail, _, failed) =
+            outcome("", "", ShellExit::KilledTimeout).pipe(format_local_shell_outcome);
+        assert!(failed);
+        assert!(tail.starts_with("[command timed out ("), "{tail}");
+        let (tail, _, _) = outcome("x", "", ShellExit::KilledIdle).pipe(format_local_shell_outcome);
+        assert!(tail.contains("without output"), "{tail}");
+    }
+
+    trait Pipe: Sized {
+        fn pipe<R>(self, f: impl FnOnce(&Self) -> R) -> R {
+            f(&self)
+        }
+    }
+    impl Pipe for ShellOutcome {}
 }
 
 fn handle_undo_success(
@@ -27092,7 +27373,9 @@ fn handle_agent_event(
                     serde_json::from_str::<serde_json::Value>(&call.arguments)
                         .ok()
                         .and_then(|v| {
-                            v.get("command").and_then(|c| c.as_str()).map(str::to_string)
+                            v.get("command")
+                                .and_then(|c| c.as_str())
+                                .map(str::to_string)
                         })
                 })
                 .flatten()
@@ -27480,6 +27763,42 @@ fn handle_agent_event(
             // a terminal. Native kernel diagnostics currently carry an empty
             // snapshot, so this is normally a no-op.
             persist_current_session(ctx, snapshot, renderer);
+        }
+        AgentEvent::ContextAdded { text, source } => {
+            // Model-visible context the person did not type: a delegated
+            // agent's report, a continuation the engine asked for, a memory
+            // block. Muted and labelled, because the ONE thing it must not look
+            // like is the user speaking — that confusion is why the event
+            // exists. Before it, a lead told its own user "your previous
+            // message was actually the subagent's words": the report had
+            // reached the model and nothing else.
+            use atomcode_kernel::event::ContextSource as Src;
+            let label = match &source {
+                Src::Peer { from } => format!(
+                    "{} {from}",
+                    crate::i18n::t(crate::i18n::Msg::ContextFromPeer)
+                ),
+                Src::Memory => crate::i18n::t(crate::i18n::Msg::ContextFromMemory).into_owned(),
+                Src::Reminder => crate::i18n::t(crate::i18n::Msg::ContextFromReminder).into_owned(),
+                Src::Continuation => {
+                    crate::i18n::t(crate::i18n::Msg::ContextFromContinuation).into_owned()
+                }
+                Src::CompactionSummary => {
+                    crate::i18n::t(crate::i18n::Msg::ContextFromCompaction).into_owned()
+                }
+                // `ContextSource` is `#[non_exhaustive]`: a source this build
+                // does not know still gets drawn, unlabelled, rather than
+                // silently dropped. Dropping it is the bug.
+                _ => String::new(),
+            };
+            for line in text.lines() {
+                renderer.render(UiLine::Muted(if label.is_empty() {
+                    format!("↳ {line}")
+                } else {
+                    format!("↳ {label} · {line}")
+                }));
+            }
+            renderer.flush();
         }
         AgentEvent::Warning(w) => {
             // Non-fatal — flush a yellow advisory line and let the turn
@@ -29152,17 +29471,23 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     // has this session burned in total". See render::StatusLine docs.
     let (ctx_used, ctx_window) =
         status_context_usage(state, ctx.config.default_context_window(), !no_provider);
-    // Cache-hit indicator for the status row: the share of the current
-    // turn's prompt tokens served from the provider's prompt cache.
-    // Reuses `turn_token_summary`'s cached-pct math (same denominator /
-    // rounding as the per-turn footer annotation) and inherits its
-    // suppression rule — `None` before the first cached round arrives,
-    // so providers that never report cached tokens keep the row clean.
+    // Cache-hit indicator for the status row: the SESSION-cumulative share of
+    // prompt tokens served from the provider's prompt cache (`cached / prompt`
+    // over the whole session). Uses the session-level tallies — which, unlike the
+    // per-turn `turn_*` ones, are NOT cleared at turn end — so the indicator is
+    // stable across turns and never blanks at idle. These tallies accumulate
+    // live in THIS runtime (reset on session switch, not restored from disk), so
+    // after a resume the figure rebuilds from the next turn — it is NOT sourced
+    // from the persisted session meta that `/cost` aggregates, and the two can
+    // differ until this runtime re-accumulates. Reuses `turn_token_summary`'s
+    // cached-pct math for a consistent denominator/rounding; `None` until the
+    // first cached round lands, so providers that never report cached tokens keep
+    // the row clean.
     let cache_indicator = {
         let (_, cached_pct) = crate::state::turn_token_summary(
-            state.turn_prompt_tokens,
-            state.turn_completion_tokens,
-            state.turn_cached_tokens,
+            state.prompt_tokens,
+            state.completion_tokens,
+            state.cached_tokens,
         );
         cached_pct.map(|pct| format!("cache {}%", pct))
     };
@@ -29591,19 +29916,24 @@ fn format_spinner_label(
         let elapsed = fmt_elapsed(d.as_millis() as u64);
         let tokens = state.turn_output_token_estimate();
         if tokens > 0 {
-            // Live throughput as a "still moving, not hung" signal: the turn's token
-            // total over turn elapsed — a turn AVERAGE (numerator/denominator both
-            // whole-turn, so it's the rate of the `↑ N tokens` count shown). If the
-            // stream hangs it decays toward 0 as elapsed grows. NOTE it is not the
-            // same window as the displayed `phase_elapsed` clock, so on a multi-phase
-            // turn the shown seconds and this rate won't reconcile. Omitted under 1s
-            // to avoid a divide-by-zero and wild early numbers.
-            let rate = state
-                .turn_elapsed()
-                .map(|d| d.as_secs())
-                .filter(|secs| *secs >= 1)
-                .map(|secs| format!(" · {} tok/s", tokens / secs as usize))
-                .unwrap_or_default();
+            // Live throughput as a "still moving, not hung" signal — the rate of the
+            // CURRENT generation phase: tokens produced THIS phase over the SAME
+            // `phase_elapsed` window shown in the clock. Scoping to the phase (not the
+            // whole turn) keeps earlier tool-execution / idle time out of the
+            // denominator, so a tool-heavy turn no longer reads a diluted "1 tok/s"
+            // and the number doesn't swing as phases alternate. Omitted under 1s (to
+            // avoid divide-by-zero / wild early numbers) and when this phase has
+            // produced no output yet (e.g. mid tool execution — show the clock only).
+            let phase_tokens = state.phase_output_token_estimate();
+            // Fractional seconds (not integer `as_secs()`) so the rate doesn't step /
+            // jump as the whole-second boundary ticks over at low elapsed. Gate at 1s
+            // to avoid divide-by-zero / wild early numbers; round for a clean integer.
+            let secs = d.as_secs_f64();
+            let rate = if secs >= 1.0 && phase_tokens > 0 {
+                format!(" · {} tok/s", (phase_tokens as f64 / secs).round() as usize)
+            } else {
+                String::new()
+            };
             out.push_str(&format!(
                 " ({elapsed} · \u{2191} {} tokens{rate})",
                 crate::i18n::fmt_tokens(tokens)
@@ -31853,6 +32183,61 @@ mod tool_bullet_outcome_tests {
         // No failure-class distinction: only success is coloured, so every
         // failure is the same neutral `Failure`.
         assert_eq!(tool_bullet_outcome(false), ToolOutcome::Failure);
+    }
+}
+
+#[cfg(test)]
+mod session_token_seed_tests {
+    use super::session_token_totals_from_cost;
+    use atomcode_capabilities::session::{ModelCostSummary, SessionCostReport, TokenBreakdown};
+
+    #[test]
+    fn sums_prompt_as_uncached_plus_cached_across_models() {
+        let report = SessionCostReport {
+            models: vec![
+                ModelCostSummary {
+                    provider_id: "p".into(),
+                    model_id: "a".into(),
+                    // 20 uncached input + 80 cached input, 10 output.
+                    tokens: TokenBreakdown {
+                        input: 20,
+                        output: 10,
+                        cached_input: 80,
+                    },
+                },
+                ModelCostSummary {
+                    provider_id: "p".into(),
+                    model_id: "b".into(),
+                    tokens: TokenBreakdown {
+                        input: 100,
+                        output: 5,
+                        cached_input: 0,
+                    },
+                },
+            ],
+            unattributed_tokens: 0,
+            total_tokens: 0,
+        };
+        let (prompt, completion, cached) = session_token_totals_from_cost(&report);
+        // prompt = (20+80) + (100+0) = 200; cached = 80; completion = 10+5 = 15.
+        assert_eq!(prompt, 200);
+        assert_eq!(cached, 80);
+        assert_eq!(completion, 15);
+        // Ratio the status row shows on resume: 80 / 200 = 40%.
+        assert_eq!(
+            crate::state::turn_token_summary(prompt, completion, cached).1,
+            Some(40)
+        );
+    }
+
+    #[test]
+    fn empty_report_seeds_zero() {
+        let report = SessionCostReport {
+            models: Vec::new(),
+            unattributed_tokens: 0,
+            total_tokens: 0,
+        };
+        assert_eq!(session_token_totals_from_cost(&report), (0, 0, 0));
     }
 }
 

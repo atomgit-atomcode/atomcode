@@ -106,6 +106,26 @@ impl Default for TodoToolConfig {
     }
 }
 
+/// Which screen `atomcode` opens (`[ui] screen`).
+///
+/// Two screens exist while the row-assembled one replaces the other
+/// (`docs/adr/0012`, `docs/tui-replaces-tuix-plan.md` M6): same runtime, same
+/// sessions, same configuration — only what draws them differs. The setting is
+/// what makes the switch a decision a person makes once, rather than a flag
+/// they have to remember on every launch, and it is what keeps an escape hatch
+/// after the default moves.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Screen {
+    /// The screen this build opens by default. Today that is the classic one.
+    #[default]
+    Default,
+    /// The screen assembled from plugin rows (`atomcode --tui`).
+    Rows,
+    /// The classic screen.
+    Classic,
+}
+
 /// Tool-specific policies. Persisted as `[tools.*]` tables.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -169,29 +189,20 @@ impl Default for LoopConfig {
     }
 }
 
-/// `[subagent]` execution policy for the `task` subagent tool.
+/// `[subagent]` execution policy for the `task` and `team` tools.
 ///
-/// `max_concurrent` and `max_rounds` are the LIVE knobs: `coding::parts` reads them via
-/// `subagent_runtime_knobs` and wires them into `TaskTool`.
-/// The tool's master ON/OFF is the env gate `ATOMCODE_SUBAGENT`
-/// (default ON, opt out with `ATOMCODE_SUBAGENT=0`) — NOT `enabled` here; `enabled`,
-/// `initial_turns`, and `max_turns` are vestigial from the retired `parallel_edit` dispatch
-/// path and are not currently consulted.
+/// `max_concurrent` and `max_rounds` are the live knobs: `coding::parts` reads them
+/// and wires them into `TaskTool` and the team manager. Whether the tools are
+/// mounted at all is the driver's `SubagentPolicy` first, then the env gate
+/// `ATOMCODE_SUBAGENT` (`0`/`false`/`off` turns them off) — there is no config key
+/// for it. The old `enabled`, `initial_turns`, `max_turns` and `timeout_secs` keys
+/// were read by nothing and are gone; a file that still has them parses unchanged
+/// (see `legacy_dead_keys_still_parse`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SubAgentConfig {
-    /// Vestigial: the live master switch is the env gate `ATOMCODE_SUBAGENT` (default ON),
-    /// not this field. Kept for config back-compat.
-    pub enabled: bool,
-    /// Vestigial (retired resilience path); not currently read.
-    pub initial_turns: usize,
-    /// Vestigial (retired resilience path); not currently read.
-    pub max_turns: usize,
     /// Max parallel subagents the `task` tool runs at once (floored to 1). Default 3.
     pub max_concurrent: usize,
-    /// Deprecated compatibility field. Subtasks no longer have a total wall-clock limit;
-    /// provider idle timeouts, `max_rounds`, and explicit cancellation own liveness.
-    pub timeout_secs: u64,
     /// Per-subtask model-round high-water mark. Default 200; `0` means unbounded.
     /// Overridden by `ATOMCODE_SUBAGENT_MAX_ROUNDS` when set.
     pub max_rounds: u32,
@@ -220,12 +231,7 @@ fn default_subagent_level() -> String {
 impl Default for SubAgentConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
-            initial_turns: 4,
-            max_turns: 12,
             max_concurrent: 3,
-            // Retained only so existing config files continue to deserialize unchanged.
-            timeout_secs: 900,
             max_rounds: 200,
             codex: default_subagent_level(),
             claude: default_subagent_level(),
@@ -271,7 +277,10 @@ pub struct Config {
     /// Falls back to `default_provider` when not set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evaluator_provider: Option<String>,
-    /// Default working directory. Saved on /cd, restored on startup.
+    /// The daemon's default working directory: written by a `/cd` request that
+    /// asks for `set_default`, read when the daemon starts (a launch-time
+    /// directory, as `atomcode webui` passes, wins over it). The terminal UI
+    /// neither reads nor writes it.
     pub default_workdir: Option<String>,
     /// Legacy flattened providers. `#[serde(default)]` so a pure new-schema
     /// config (accounts + models only, no `[providers]`) loads (design §4).
@@ -322,10 +331,6 @@ pub struct Config {
     /// LSP integration configuration.
     #[serde(default)]
     pub lsp: LspConfig,
-    /// Automatically commit edited files after each agent turn completes.
-    /// Only applies when working inside a git repository.
-    #[serde(default)]
-    pub auto_commit: bool,
     /// `task` subagent tool policy. Missing from older configs uses the defaults in
     /// [`SubAgentConfig`], including a configurable 200-round high-water mark.
     #[serde(default)]
@@ -503,6 +508,11 @@ pub struct UiConfig {
     /// configs see no behaviour change.
     #[serde(default)]
     pub theme: UiTheme,
+    /// Which screen `atomcode` opens. Missing means this build's default, so
+    /// nobody's launch changes by upgrading into this field; `--tui` and
+    /// `--classic` still win over it for one launch.
+    #[serde(default)]
+    pub screen: Screen,
     /// Auto-copy a rendered code block's raw source to the clipboard when the
     /// AI finishes emitting it. OFF by default — it silently overwrote the
     /// user's clipboard on every code-block reply (issue #699 feedback). Env
@@ -555,6 +565,7 @@ impl Default for UiConfig {
     fn default() -> Self {
         Self {
             theme: UiTheme::default(),
+            screen: Screen::default(),
             auto_copy_code_blocks: default_auto_copy_code_blocks(),
             ai_session_naming: default_ai_session_naming(),
             terminal_status_glyph: default_terminal_status_glyph(),
@@ -736,7 +747,6 @@ impl Default for Config {
             auto_update: true,
             telemetry: Default::default(),
             lsp: Default::default(),
-            auto_commit: false,
             subagent: Default::default(),
             loop_config: Default::default(),
             coding: CodingConfig::default(),
@@ -1530,6 +1540,9 @@ fn project_legacy_model(account_id: &str, p: &ProviderConfig) -> ModelProfileCon
         context_window: p.context_window,
         max_tokens: p.max_tokens,
         capable_model: p.capable_model,
+        // A legacy `[providers.*]` entry has nowhere to write one; the new-schema
+        // `[models.*]` form does.
+        note: None,
         thinking_type: p.thinking_type.clone(),
         thinking_keep: p.thinking_keep.clone(),
         reasoning_history: p.reasoning_history.clone(),
@@ -1979,14 +1992,16 @@ fn render_hooks_json_section() -> String {
     let mut out = String::new();
     out.push_str("\n# Lifecycle hooks — configure in separate JSON files:\n");
     out.push_str("#   ~/.atomcode/hooks.json       (global hooks)\n");
-    out.push_str("#   <project>/.hooks.json         (project hooks, override global by name)\n");
+    out.push_str("#   <project>/.hooks.json         (project hooks — loaded as well; both files' hooks run)\n");
     out.push_str("#\n");
     out.push_str("# Example hooks.json:\n");
     out.push_str("#   {\n");
     out.push_str("#     \"hooks\": {\n");
     out.push_str("#       \"audit-all\": {\n");
     out.push_str("#         \"event\": \"pre_tool_use\",\n");
-    out.push_str("#         \"command\": \"echo \\\"$(date) $ATOMCODE_TOOL_NAME\\\" >> ~/.atomcode/audit.log\"\n");
+    out.push_str(
+        "#         \"command\": \"jq -c '{tool_name, tool_input}' >> ~/.atomcode/audit.log\"\n",
+    );
     out.push_str("#       },\n");
     out.push_str("#       \"block-rm\": {\n");
     out.push_str("#         \"event\": \"pre_tool_use\",\n");
@@ -1997,9 +2012,18 @@ fn render_hooks_json_section() -> String {
     out.push_str("#     }\n");
     out.push_str("#   }\n");
     out.push_str("#\n");
-    out.push_str("# Events: pre_tool_use, post_tool_use, session_start, session_end\n");
-    out.push_str("# Env vars: ATOMCODE_HOOK_EVENT, ATOMCODE_TOOL_NAME, ATOMCODE_HOOK_CONTEXT\n");
-    out.push_str("# PreToolUse stdout: {\"action\":\"allow\"} or {\"action\":\"block\",\"reason\":\"...\"}\n");
+    out.push_str(
+        "# Events (PascalCase or snake_case): PreToolUse, PostToolUse, PostToolUseFailure,\n",
+    );
+    out.push_str("#   SessionStart, SessionEnd, UserPromptSubmit, Stop, StopFailure\n");
+    out.push_str("# matcher: tool names, `|`-separated, `*` as a wildcard (e.g. \"Edit|Write\", \"mcp__github__*\")\n");
+    out.push_str(
+        "# Input: a JSON object on stdin — hook_event_name, session_id, cwd, and tool_name /\n",
+    );
+    out.push_str("#   tool_input for tool events (Claude Code's hook payload)\n");
+    out.push_str("# PreToolUse stdout: {\"action\":\"allow\"} or {\"action\":\"block\",\"reason\":\"...\"},\n");
+    out.push_str("#   or Claude Code's {\"hookSpecificOutput\":{\"permissionDecision\":\"allow|deny|ask\"}};\n");
+    out.push_str("#   exiting with code 2 and a reason also blocks\n");
     out
 }
 
@@ -2284,6 +2308,24 @@ pub enum SeedOutcome {
 mod tests {
     use super::*;
 
+    /// Which screen opens is a setting, and a config that does not mention it
+    /// keeps this build's default — an upgrade must not move anyone's screen
+    /// (`docs/tui-replaces-tuix-plan.md` M6.2).
+    #[test]
+    fn the_screen_is_a_setting_and_a_config_that_says_nothing_keeps_the_default() {
+        let silent: Config = toml::from_str("").unwrap();
+        assert_eq!(silent.ui.screen, Screen::Default);
+
+        let chosen: Config = toml::from_str("[ui]\nscreen = \"rows\"\n").unwrap();
+        assert_eq!(chosen.ui.screen, Screen::Rows);
+        let back: Config = toml::from_str("[ui]\nscreen = \"classic\"\n").unwrap();
+        assert_eq!(back.ui.screen, Screen::Classic);
+
+        // And a `[ui]` about something else does not drag the screen with it.
+        let other: Config = toml::from_str("[ui]\ntheme = \"dark\"\n").unwrap();
+        assert_eq!(other.ui.screen, Screen::Default);
+    }
+
     #[test]
     fn subagent_external_entries_deserialize_with_defaults() {
         let toml = r#"
@@ -2470,7 +2512,10 @@ kind = "claude-code"
         let mut with_rules = Config::default();
         with_rules.permissions.allow = vec!["Bash(git *)".to_string()];
         let text = toml::to_string(&with_rules).unwrap();
-        assert!(text.contains("[permissions]"), "a non-empty table must persist");
+        assert!(
+            text.contains("[permissions]"),
+            "a non-empty table must persist"
+        );
     }
 
     /// `[permissions]` must parse from TOML and default to empty when absent — an older
@@ -3300,7 +3345,6 @@ model = "missing-type"
             auto_update: true,
             telemetry: Default::default(),
             lsp: Default::default(),
-            auto_commit: false,
             subagent: Default::default(),
             loop_config: Default::default(),
             coding: CodingConfig::default(),
@@ -3844,6 +3888,27 @@ reflection_cadence = 7
     }
 
     #[test]
+    fn legacy_dead_keys_still_parse() {
+        // Keys that were parsed and then read by nothing, removed from the schema.
+        // Files in the wild still carry them — config.example.toml shipped them —
+        // and the live values beside them must keep their meaning.
+        let toml_text = r#"
+auto_commit = true
+[providers]
+[subagent]
+enabled = false
+initial_turns = 4
+max_turns = 12
+timeout_secs = 900
+max_concurrent = 5
+max_rounds = 42
+"#;
+        let cfg: Config = toml::from_str(toml_text).expect("dead keys are ignored");
+        assert_eq!(cfg.subagent.max_concurrent, 5);
+        assert_eq!(cfg.subagent.max_rounds, 42);
+    }
+
+    #[test]
     fn notifications_default_when_missing_from_toml() {
         let toml_text = r#"
 default_provider = "claude"
@@ -4006,6 +4071,7 @@ capable_model = 5
                 context_window: 128_000,
                 max_tokens: None,
                 capable_model: None,
+                note: None,
                 retry_max_attempts: None,
                 thinking_type: None,
                 thinking_keep: None,
@@ -4056,6 +4122,7 @@ capable_model = 5
                 context_window: 0, // zero window → error
                 max_tokens: None,
                 capable_model: None,
+                note: None,
                 retry_max_attempts: None,
                 thinking_type: None,
                 thinking_keep: None,

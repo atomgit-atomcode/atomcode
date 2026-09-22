@@ -422,7 +422,12 @@ fn credential_bash_decision(raw_args: &str, command: &str) -> Option<CredentialB
 /// bytes made a cosmetic re-emit of the SAME command — a model retrying with `# attempt 2`
 /// appended — read as a new decision and prompt again, which is the "总是询问" failure this
 /// tree has already fixed twice elsewhere. Unparseable args fall back to the raw bytes.
-fn grant_scope(args: &str) -> String {
+/// The remembered scope for a credential-shell grant: the command, normalized,
+/// so "the same command" is asked about once rather than once per spelling.
+///
+/// `pub` because the harness row keys its grant on the same thing — two shells
+/// that remembered different scopes would ask the person twice for one decision.
+pub fn grant_scope(args: &str) -> String {
     match serde_json::from_str::<BashArgs>(args) {
         Ok(a) => super::bash::normalize_command_for_grant(&a.command),
         Err(_) => args.to_string(),
@@ -500,6 +505,7 @@ impl CredentialBashGate {
             tool: tool.name().to_string(),
             args: call.arguments.clone(),
             reason: None,
+            allow_all_bash: false,
         })
         .unwrap_or(serde_json::Value::Null);
         match PermissionDecision::from_value(&rt.request(APPROVAL_KIND, payload).await) {
@@ -513,6 +519,59 @@ impl CredentialBashGate {
     }
 }
 
+/// What the credential-shell policy says about one call — the judgement alone,
+/// with no opinion about how a person is asked.
+///
+/// The kernel [`ToolMiddleware`] below turns this into a `BeforeOutcome` and does
+/// its own round-trip; the harness `tool-credential-shell` row turns the same
+/// verdict into a delegation to the `approval` seam. Sharing the verdict is what
+/// keeps "which commands count as touching credentials" one answer instead of two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialShellVerdict {
+    /// Not a shell tool, unparseable, no credential access detected, or the
+    /// policy is off — nothing for this gate to say.
+    NotOurs,
+    /// `Strict`: a hard boundary. Block AND end the turn, because retrying
+    /// another shell spelling would be unsafe.
+    DenyTurn,
+    /// `Prompt` with nobody to ask (a subagent / team child runs AutoRespond and
+    /// would approve itself). Fail closed, this call only.
+    Deny,
+    /// `Prompt` with a human in the loop.
+    Ask,
+}
+
+/// The credential-shell verdict for one call.
+///
+/// `has_human` is what separates [`CredentialShellVerdict::Ask`] from
+/// [`CredentialShellVerdict::Deny`]: without someone to answer, a prompt is an
+/// auto-approval wearing a question mark.
+pub fn credential_shell_verdict(
+    policy: CredentialShellPolicy,
+    tool_name: &str,
+    arguments: &str,
+    has_human: bool,
+) -> CredentialShellVerdict {
+    if !super::is_command_shell_tool(tool_name) {
+        return CredentialShellVerdict::NotOurs;
+    }
+    let Ok(args) = serde_json::from_str::<BashArgs>(arguments) else {
+        return CredentialShellVerdict::NotOurs;
+    };
+    // The detected severity (`DenyTurn` vs `DenyCall`) drives only `strict` vs the
+    // detection tests; `Prompt` treats every detection the same (prompt / fail-closed,
+    // never terminating the turn), so a legitimate sensitive read is not interrupted.
+    if credential_bash_decision(arguments, &args.command).is_none() {
+        return CredentialShellVerdict::NotOurs;
+    }
+    match policy {
+        CredentialShellPolicy::Off => CredentialShellVerdict::NotOurs,
+        CredentialShellPolicy::Strict => CredentialShellVerdict::DenyTurn,
+        CredentialShellPolicy::Prompt if has_human => CredentialShellVerdict::Ask,
+        CredentialShellPolicy::Prompt => CredentialShellVerdict::Deny,
+    }
+}
+
 #[async_trait]
 impl ToolMiddleware for CredentialBashGate {
     async fn before(
@@ -521,33 +580,24 @@ impl ToolMiddleware for CredentialBashGate {
         tool: &Arc<dyn Tool>,
         rt: &RequestCtx,
     ) -> BeforeOutcome {
-        if !super::is_command_shell_tool(tool.name()) {
-            return BeforeOutcome::Proceed;
-        }
-        let Ok(args) = serde_json::from_str::<BashArgs>(&call.arguments) else {
-            return BeforeOutcome::Proceed;
-        };
-        // The detected severity (`DenyTurn` vs `DenyCall`) drives only `strict` vs the
-        // detection tests; `Prompt` treats every detection the same (prompt / fail-closed,
-        // never terminating the turn), so a legitimate sensitive read is not interrupted.
-        if credential_bash_decision(&call.arguments, &args.command).is_none() {
-            return BeforeOutcome::Proceed;
-        }
-        match self.policy {
-            // Detection disabled — defer to ordinary tool approval.
-            CredentialShellPolicy::Off => BeforeOutcome::Proceed,
+        // `approval_store` is this shell's stand-in for "there is a human": it is
+        // `None` exactly for the non-interactive children that would auto-approve.
+        match credential_shell_verdict(
+            self.policy,
+            tool.name(),
+            &call.arguments,
+            self.approval_store.is_some(),
+        ) {
+            CredentialShellVerdict::NotOurs => BeforeOutcome::Proceed,
             // Hard boundary: block and terminate the turn. For headless / bypass /
             // high-security deployments that want credentials un-bypassable.
-            CredentialShellPolicy::Strict => BeforeOutcome::deny_turn_with_intervention(
+            CredentialShellVerdict::DenyTurn => BeforeOutcome::deny_turn_with_intervention(
                 CREDENTIAL_BASH_DENIAL_REASON,
                 PolicyIntervention::credential_shell_blocked(),
             ),
-            // Prompt the user (interactive), or fail closed to a call-only deny for a
-            // non-interactive child (which runs AutoRespond::AllowAll and would otherwise
-            // auto-approve itself). Never terminates the turn — a reject ends only this
-            // call; with a human in the loop the user gates each attempt, and `strict`
-            // remains the hard wall for no-human contexts.
-            CredentialShellPolicy::Prompt => match &self.approval_store {
+            // Never terminates the turn — a reject ends only this call.
+            CredentialShellVerdict::Deny => BeforeOutcome::deny(CREDENTIAL_BASH_DENIAL_REASON),
+            CredentialShellVerdict::Ask => match &self.approval_store {
                 Some(store) => self.request_approval(call, tool, rt, store).await,
                 None => BeforeOutcome::deny(CREDENTIAL_BASH_DENIAL_REASON),
             },
@@ -601,7 +651,7 @@ mod tests {
     }
 
     async fn run(gate: &CredentialBashGate, command: &str) -> BeforeOutcome {
-        let tool: Arc<dyn Tool> = Arc::new(BashTool);
+        let tool: Arc<dyn Tool> = Arc::new(BashTool::default());
         let mut call = ToolCall {
             id: "call-1".into(),
             name: "bash".into(),
