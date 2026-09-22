@@ -204,14 +204,12 @@ fn ordinary_line(t: &str, indent: usize, w: u16, base: Style) -> Vec<Line> {
     if t.is_empty() {
         return vec![Line::empty()];
     }
-    if let Some((level, title)) = heading_of(t) {
-        let hashes = "#".repeat(level as usize);
-        return wrap_spans(
-            &inline(title, heading()),
-            w,
-            &format!("{hashes} "),
-            heading(),
-        );
+    if let Some((_level, title)) = heading_of(t) {
+        // The `#` markers are the source's, not the reader's: a rendered heading
+        // is bold and accent-coloured, it does not carry its own `##`. The level
+        // is not drawn apart — bold accent is the whole cue — so `## x` and
+        // `### x` read alike, which is the price of not showing the hashes.
+        return wrap_spans(&inline(title, heading()), w, "", heading());
     }
     if is_rule(t) {
         return vec![Line::styled(RULE.repeat(w as usize), fence())];
@@ -845,7 +843,8 @@ mod tests {
     #[test]
     fn a_heading_or_quote_that_mentions_a_pipe_is_not_a_table_row() {
         let out = plain("## a | b\n> c | d", 40);
-        assert_eq!(out[0], "## a | b");
+        // A heading, drawn without its `##` marker — not a table row.
+        assert_eq!(out[0], "a | b");
         assert_eq!(out[1], "▏ c | d");
     }
 
@@ -922,9 +921,10 @@ mod tests {
     }
 
     #[test]
-    fn headings_and_lists_get_their_own_markers() {
+    fn headings_lose_their_hashes_and_lists_keep_their_markers() {
         let out = plain("## Title\n- one\n2. two", 40);
-        assert_eq!(out[0], "## Title");
+        // The heading is drawn without its `##`; the list markers stay.
+        assert_eq!(out[0], "Title");
         assert_eq!(out[1], "• one");
         assert_eq!(out[2], "2. two");
     }
