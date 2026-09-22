@@ -393,7 +393,9 @@ impl CommandSet for Onboarding {
     }
 
     fn commands(&self) -> Vec<Command> {
-        vec![Command::said(COMMAND, tr(SMsg::CmdAboutOnboarding))]
+        // `/welcome` is what the classic screen called the same walkthrough; the
+        // name people typed there keeps working here.
+        vec![Command::said(COMMAND, tr(SMsg::CmdAboutOnboarding)).with_aliases(&["welcome"])]
     }
 
     fn hidden(&self) -> Vec<Command> {

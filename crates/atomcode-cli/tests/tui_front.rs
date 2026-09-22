@@ -410,3 +410,62 @@ async fn a_command_only_the_classic_screen_has_says_where_it_lives() {
     term.press(atomcode_tui::surface::KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), running).await;
 }
+
+/// `/welcome` — the classic screen's name for re-running the first-run
+/// walkthrough — opens this screen's walkthrough rather than meeting "no such
+/// command" after the default moved.
+#[tokio::test]
+async fn the_classic_name_for_the_walkthrough_still_opens_it() {
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("ATOMCODE_HOME", home.path());
+    let project = tempfile::tempdir().unwrap();
+    let count = Arc::new(Count::default());
+    let config_path = home.path().join("config.toml");
+    let _locale = atomcode_config::i18n::test_lock();
+    atomcode_config::i18n::set_locale(atomcode_config::locale::Locale::ZhCn);
+
+    let front_end = FrontEnd::new();
+    let (start, config) = start(
+        project.path(),
+        &count,
+        SessionMode::Fresh,
+        Some(front_end.clone()),
+    );
+    let runtime = CodingRuntime::start(start).await.expect("starts");
+    let screen = Screen {
+        headless: Some((120, 40)),
+        ..Screen::default()
+    };
+    let mounted = tui_front::mount(runtime, front_end, config, None, &screen, config_path, None)
+        .await
+        .expect("the screen mounts");
+    let term = mounted
+        .app
+        .context()
+        .service::<atomcode_tui::plugin::SurfaceSvc>()
+        .and_then(|surface| surface.as_any_headless())
+        .expect("a headless surface");
+    let ui = mounted.ui.clone();
+    let ctx = mounted.app.context();
+    let running = tokio::spawn(async move {
+        let _ = ui.run(&ctx, None).await;
+    });
+
+    term.type_line("/welcome");
+    let mut screen_text = String::new();
+    for _ in 0..200 {
+        screen_text = term.text();
+        if screen_text.contains("先把这台机器配好") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        screen_text.contains("先把这台机器配好"),
+        "`/welcome` opened the walkthrough:\n{screen_text}"
+    );
+    assert_eq!(count.0.load(Ordering::SeqCst), 0, "not sent as a prompt");
+
+    term.press(atomcode_tui::surface::KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), running).await;
+}
