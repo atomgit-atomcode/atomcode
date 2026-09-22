@@ -1890,7 +1890,7 @@ fn turn_end_note(stop: StopReason, done_index: usize) -> (Glyph, String, Style) 
         // rotates through `DONE_LABELS` the way tuix's does, so consecutive turns
         // read a little differently instead of the same `完成` every time.
         Stopped => (
-            Glyph::Ok,
+            Glyph::Sparkle,
             DONE_LABELS[done_index % DONE_LABELS.len()].to_string(),
             muted(),
         ),
@@ -1993,7 +1993,7 @@ impl Content for TurnEndBlock {
         ])
     }
     /// The turn's outcome and its cost on one light line at the left margin:
-    /// `✓ Nailed it · 2 轮 · 2 工具 · 32.7s · 2.60K tokens · 97% cached`. It used to
+    /// `✻ Nailed it · 2 轮 · 2 工具 · 32.7s · 2.60K tokens · 97% cached`. It used to
     /// be a full-width captioned rule (`───── … ─────`), but a transcript of turns
     /// drew a screen full of ─ boundaries; the glyph and the dim carry the boundary
     /// now, closer to `✻ Crunched for …`.
@@ -2582,9 +2582,10 @@ mod tests {
         let failed = drawn(StopReason::ProviderError);
         assert!(failed.contains("已中断"), "{failed}");
 
-        // Every reason is one of two outcomes, and the mark says which.
+        // Every reason is one of two outcomes, and the mark says which. The clean
+        // end wears the `✻` sparkle; nothing cut short does.
         let mark = |stop| turn_end_note(stop, 0).0;
-        assert_eq!(mark(StopReason::Stopped), Glyph::Ok);
+        assert_eq!(mark(StopReason::Stopped), Glyph::Sparkle);
         for cut in [
             StopReason::Cancelled,
             StopReason::MaxRounds,
@@ -2595,12 +2596,12 @@ mod tests {
             StopReason::ProviderError,
             StopReason::InvariantViolated,
         ] {
-            assert_ne!(mark(cut), Glyph::Ok, "{cut:?} was not a clean end");
+            assert_ne!(mark(cut), Glyph::Sparkle, "{cut:?} was not a clean end");
         }
     }
 
     /// What a turn cost, on the line that closes it, in tuix's shape:
-    /// `✓ Done · 4 轮 · 2 工具 · 32.7s · 4.36K tokens · 99% cached`.
+    /// `✻ Done · 4 轮 · 2 工具 · 32.7s · 4.36K tokens · 99% cached`.
     ///
     /// The figures are a real reading, not invented: a four-round turn whose
     /// last request carried 90659 tokens of context, 90496 of them served from

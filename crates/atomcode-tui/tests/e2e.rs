@@ -985,7 +985,7 @@ async fn typing_during_a_turn_is_folded_into_it_rather_than_queued() {
     // The turn-end caption, which is what the person reads: a clean stop's
     // rotating `DONE_LABELS` verb, `Done` for the first turn. Counted by that
     // caption rather than by a variant name, which the screen no longer shows.
-    let turn_ends = screen.matches("✓ Done").count();
+    let turn_ends = screen.matches("✻ Done").count();
     assert_eq!(turn_ends, 1, "one turn, not two:\n{screen}");
 
     s.term.press(KeyPress::ctrl('d'));

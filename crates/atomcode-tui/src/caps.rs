@@ -297,6 +297,7 @@ fn ascii_for(ch: char) -> Option<&'static str> {
         // status marks
         '\u{2713}' => "v",              // ✓ （✅ ✔ 是宽字符，见下方说明）
         '\u{2717}' | '\u{2718}' => "x", // ✗ ✘
+        '\u{273B}' => "*",              // ✻ 回合收尾标记(窄字符)
         '\u{26A0}' => "!",              // ⚠
         '\u{2139}' | '\u{24D8}' => "i", // ℹ ⓘ
 
@@ -375,6 +376,10 @@ pub enum Glyph {
     Fail,
     Pending,
     Interrupted,
+    /// A turn's clean close — a `✻` sparkle, the way Claude Code leads its
+    /// completion line. Distinct from [`Glyph::Ok`] (the tool-result tick) so the
+    /// turn summary carries a mark of its own rather than borrowing the check.
+    Sparkle,
     Bullet,
     /// Present, but not in force: a tool a person turned off, drawn beside the
     /// filled [`Glyph::Bullet`] of one that is on.
@@ -477,6 +482,7 @@ pub fn glyph(unicode: bool, glyph: Glyph) -> &'static str {
             Fail => "✗",
             Pending => "⋯",
             Interrupted => "—",
+            Sparkle => "✻",
             Bullet => "•",
             Hollow => "○",
             Pointer => "▸",
@@ -499,6 +505,7 @@ pub fn glyph(unicode: bool, glyph: Glyph) -> &'static str {
             Fail => "x",
             Pending => ".",
             Interrupted => "-",
+            Sparkle => "*",
             Bullet => "*",
             Hollow => "o",
             Pointer => ">",
@@ -596,6 +603,7 @@ mod tests {
             Glyph::Fail,
             Glyph::Pending,
             Glyph::Interrupted,
+            Glyph::Sparkle,
             Glyph::Bullet,
             Glyph::Hollow,
             Glyph::Pointer,
@@ -675,6 +683,7 @@ mod tests {
             Glyph::Vertical,
             Glyph::Ok,
             Glyph::Fail,
+            Glyph::Sparkle,
             Glyph::Bullet,
             Glyph::Hollow,
             Glyph::Pointer,

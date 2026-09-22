@@ -536,7 +536,7 @@ type RowOwner = Option<(BlockId, &'static str)>;
 /// screen of six calls separated by five gaps is a screen that no longer shows
 /// what was done in one glance.
 ///
-/// The turn's closing summary is a separator — `✓ Done · 3 轮 · 2 工具` — and gets
+/// The turn's closing summary is a separator — `✻ Done · 3 轮 · 2 工具` — and gets
 /// a row of air on both sides unconditionally. It is the one row that is *about*
 /// the transcript rather than part of it, and pressed against the prose above
 /// and the next question below it stops reading as a boundary and starts
