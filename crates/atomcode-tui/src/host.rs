@@ -1107,6 +1107,8 @@ pub struct Hits {
     tools: Option<Rect>,
     /// And the rewind panel's.
     rewind: Option<Rect>,
+    /// And the resume panel's.
+    resume: Option<Rect>,
     /// Where the slash menu was drawn, so a press or the pointer on a row finds
     /// the command it is on.
     ///
@@ -3140,6 +3142,146 @@ impl Host {
         }
     }
 
+    // ---- the resume panel -----------------------------------------------------
+
+    /// Whether the resume panel is up.
+    pub fn resume_open(&self) -> bool {
+        self.moment
+            .read()
+            .expect("moment poisoned")
+            .resume_panel
+            .is_some()
+    }
+
+    /// Bring the resume panel up (idempotent), putting away any other panel a
+    /// hand works in. `/resume` means "show me the sessions", never "hide them
+    /// if they happen to be up" — so it opens rather than toggles. False only
+    /// when there is nothing to draw it with (the module was not mounted).
+    pub fn open_resume(&self) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        if m.resume_panel.is_some() {
+            return true;
+        }
+        if !self.modules.has_view(crate::modules::resume::ID) {
+            return false;
+        }
+        m.settings_panel = None;
+        if m.providers_panel.take().is_some() {
+            self.providers_secret
+                .lock()
+                .expect("provider secret poisoned")
+                .clear();
+        }
+        m.plugins_panel = None;
+        m.tools_panel = None;
+        m.rewind_panel = None;
+        m.resume_panel = Some(crate::resume::Panel::new());
+        true
+    }
+
+    /// Put the resume panel away. True when it was up.
+    pub fn close_resume(&self) -> bool {
+        self.moment
+            .write()
+            .expect("moment poisoned")
+            .resume_panel
+            .take()
+            .is_some()
+    }
+
+    /// Put the sessions the host answered into the moment, and rest the cursor at
+    /// the top: the list it was pointing into is not the list that came back.
+    pub fn show_resume(&self, view: crate::resume::ResumeView) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let mut changed = false;
+        if m.resume != view {
+            m.resume = view;
+            changed = true;
+        }
+        if let Some(panel) = m.resume_panel.as_mut() {
+            if panel.cursor != 0 {
+                panel.cursor = 0;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Run one key against the resume panel: the panel it writes back, and the
+    /// session to resume when the key asked for one.
+    pub fn resume_key(
+        &self,
+        press: crate::surface::KeyPress,
+    ) -> (bool, Option<crate::resume::Step>) {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let view = m.resume.clone();
+        let Some(panel) = m.resume_panel.as_mut() else {
+            return (false, None);
+        };
+        let before = panel.clone();
+        let step = crate::resume::key(&view, panel, press);
+        let changed = *panel != before;
+        match step {
+            crate::resume::Step::Stay => (changed, None),
+            crate::resume::Step::Close => {
+                m.resume_panel = None;
+                (true, None)
+            }
+            step => (true, Some(step)),
+        }
+    }
+
+    /// The wheel over the resume panel walks its list.
+    pub fn resume_wheel(&self, x: u16, y: u16, by: i32) -> bool {
+        let over = self
+            .hits
+            .lock()
+            .expect("hits poisoned")
+            .resume
+            .is_some_and(|rect| rect.contains(x, y));
+        if !over {
+            return false;
+        }
+        let mut m = self.moment.write().expect("moment poisoned");
+        let rows = match m.resume_panel.as_ref() {
+            Some(panel) => m.resume.rows(panel),
+            None => return false,
+        };
+        let Some(panel) = m.resume_panel.as_mut() else {
+            return false;
+        };
+        let want = match by < 0 {
+            true => panel.cursor.saturating_sub(by.unsigned_abs() as usize),
+            false => panel.cursor.saturating_add(by as usize),
+        };
+        panel.point_at(want, rows);
+        true
+    }
+
+    /// Which row of the list is under the pointer.
+    pub fn resume_row_at(&self, x: u16, y: u16) -> Option<usize> {
+        let rect = *self.hits.lock().expect("hits poisoned").resume.as_ref()?;
+        if !rect.contains(x, y) {
+            return None;
+        }
+        let m = self.moment.read().expect("moment poisoned");
+        let vp = crate::moment::Viewport::new(rect, &m);
+        crate::modules::resume::geometry(&m, &vp).listed_at((y - rect.y) as usize)
+    }
+
+    /// Point the panel at a row. True when it moved.
+    pub fn point_resume_at(&self, row: usize) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let rows = match m.resume_panel.as_ref() {
+            Some(panel) => m.resume.rows(panel),
+            None => return false,
+        };
+        match m.resume_panel.as_mut() {
+            Some(panel) => panel.point_at(row, rows),
+            None => false,
+        }
+    }
+
     /// Run `change`, keeping the reader's place across whatever it did.
     ///
     /// **Measure, change, measure again** — one shape, because the arithmetic is
@@ -3955,6 +4097,7 @@ impl Host {
                         plugins: None,
                         tools: None,
                         rewind: None,
+                        resume: None,
                         menu: None,
                     };
                     *self.last_room.lock().expect("room poisoned") = rect;
@@ -4015,6 +4158,10 @@ impl Host {
                         // And the rewind panel.
                         if id == crate::modules::rewind::ID {
                             self.hits.lock().expect("hits poisoned").rewind = Some(*tail_rect);
+                        }
+                        // And the resume panel, worked with the same pointer.
+                        if id == crate::modules::resume::ID {
+                            self.hits.lock().expect("hits poisoned").resume = Some(*tail_rect);
                         }
                         frame.place(id.clone(), *tail_rect, lines);
                     }
@@ -4680,6 +4827,7 @@ pub const TAIL: &[&str] = &[
     crate::modules::plugins::ID,
     crate::modules::tools::ID,
     crate::modules::rewind::ID,
+    crate::modules::resume::ID,
     crate::modules::ask::ID,
     crate::modules::steering::ID,
 ];

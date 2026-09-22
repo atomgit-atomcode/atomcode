@@ -484,6 +484,15 @@ pub struct Moment {
     /// The rewind panel, while it is up: which turn the arrows are on, which
     /// step it is at, and the rewind that is still on its way there and back.
     pub rewind_panel: Option<crate::rewind::Panel>,
+    /// The sessions that can be resumed, as the host last answered `/resume`.
+    /// Here for the same reason `rewind` is: which sessions exist is a fact of
+    /// the on-disk catalog, not of the log, and `View::render` may not read it —
+    /// so it travels this road (filled by the `/resume` command's own trip). See
+    /// `crate::resume`.
+    pub resume: crate::resume::ResumeView,
+    /// The resume panel, while it is up: which session row the arrows are on and
+    /// what is typed in its search box.
+    pub resume_panel: Option<crate::resume::Panel>,
     /// What the Usage page draws, as the host last answered it.
     ///
     /// Asked for rather than pushed: an allowance window changes on the

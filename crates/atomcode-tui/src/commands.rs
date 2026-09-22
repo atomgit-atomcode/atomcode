@@ -611,50 +611,30 @@ impl CommandSet for SessionCommands {
                         .await
                     {
                         Ok(HostReply::Sessions { sessions }) => {
+                            // Drop the one on screen — resuming the session you
+                            // are already in is a no-op — and hand the rest to the
+                            // panel, which rises over the composer like `/provider`
+                            // rather than a pop-up. The metadata (`N 轮 · 时间 ·
+                            // 目录`) is drawn by the panel from these fields.
                             let live = client.session();
-                            let choices: Vec<crate::overlay::Choice> = sessions
+                            let sessions: Vec<crate::resume::Session> = sessions
                                 .into_iter()
                                 .filter(|stored| stored.id != live)
-                                .map(|stored| {
-                                    crate::overlay::Choice::new(
-                                        format!("/resume {}", stored.id),
-                                        stored.title.clone().unwrap_or_else(|| stored.id.clone()),
-                                    )
-                                    .about(
-                                        if stored.needs_newer_version {
-                                            t(Msg::SessionNeedsNewerVersion { id: &stored.id })
-                                                .into_owned()
-                                        } else {
-                                            // When, and where — the two things a
-                                            // person sorts by when several sessions
-                                            // have the same subject. Both were in
-                                            // `StoredSession` and neither was shown.
-                                            let when = crate::text::when(stored.updated_at);
-                                            match &stored.working_dir {
-                                                Some(dir) => t(Msg::SessionTurnsWhenWhere {
-                                                    turns: stored.turns,
-                                                    when: &when,
-                                                    dir: &crate::text::collapse_home(dir),
-                                                })
-                                                .into_owned(),
-                                                None => t(Msg::SessionTurnsWhen {
-                                                    turns: stored.turns,
-                                                    when: &when,
-                                                })
-                                                .into_owned(),
-                                            }
-                                        },
-                                    )
+                                .map(|stored| crate::resume::Session {
+                                    id: stored.id,
+                                    title: stored.title,
+                                    working_dir: stored.working_dir,
+                                    updated_at: stored.updated_at,
+                                    turns: stored.turns,
+                                    needs_newer_version: stored.needs_newer_version,
                                 })
                                 .collect();
-                            if choices.is_empty() {
+                            if sessions.is_empty() {
                                 Outcome::Said(t(Msg::ResumeNoOthers).into_owned())
                             } else {
-                                Outcome::Open(crate::overlay::Picker::new(
-                                    "resume",
-                                    t(Msg::ResumePickerHint),
-                                    choices,
-                                ))
+                                Outcome::Do(Action::OpenResume(crate::resume::ResumeView::new(
+                                    sessions,
+                                )))
                             }
                         }
                         Ok(other) => Outcome::Refused(format!("{other:?}")),

@@ -1396,6 +1396,10 @@ impl UserInterface for Tui {
                             stale = true;
                             continue;
                         }
+                        if self.host.resume_wheel(x, y, by) {
+                            stale = true;
+                            continue;
+                        }
                         if self.host.providers_wheel(x, y, by) {
                             stale = true;
                             continue;
@@ -1521,6 +1525,18 @@ impl UserInterface for Tui {
                                 if let Some(row) = self.host.rewind_row_at(x, y) {
                                     let _ = self.host.point_rewind_at(row);
                                     self.run_rewind_key(crate::surface::KeyPress::plain(
+                                        crate::surface::Key::Enter,
+                                    ));
+                                    stale = true;
+                                    continue;
+                                }
+                            }
+                            // And the resume panel: a click on a session points
+                            // at it and resumes it, the same as Enter on the row.
+                            if self.host.resume_open() {
+                                if let Some(row) = self.host.resume_row_at(x, y) {
+                                    let _ = self.host.point_resume_at(row);
+                                    self.run_resume_key(crate::surface::KeyPress::plain(
                                         crate::surface::Key::Enter,
                                     ));
                                     stale = true;
@@ -1667,6 +1683,11 @@ impl UserInterface for Tui {
                                     stale |= self.host.point_rewind_at(row);
                                 }
                             }
+                            if self.host.resume_open() {
+                                if let Some(row) = self.host.resume_row_at(x, y) {
+                                    stale |= self.host.point_resume_at(row);
+                                }
+                            }
                             continue;
                         }
                         // Handled above, and never reached.
@@ -1768,6 +1789,12 @@ impl UserInterface for Tui {
                 // and Esc in there means "back a step", then "put it away".
                 Wake::Input(Input::Key(press)) if self.host.rewind_open() => {
                     stale |= self.run_rewind_key(press);
+                }
+                // And the resume panel, on the same terms: at most one of the
+                // panels is ever up, and the one that is owns the keys — so Esc
+                // in here means "put it away", not the composer's double-tap.
+                Wake::Input(Input::Key(press)) if self.host.resume_open() => {
+                    stale |= self.run_resume_key(press);
                 }
                 // A question on screen gets first refusal on every key. It is a
                 // panel riding the tail now, not a modal, so this is the only
@@ -2218,6 +2245,22 @@ impl Tui {
             return changed;
         };
         self.apply_rewind_step(step);
+        true
+    }
+
+    /// One key against the resume panel. The only thing it asks for is a resume,
+    /// dispatched as the command `/resume <id>` already is — so a panel and a
+    /// typed command cannot come to mean different things.
+    fn run_resume_key(&self, press: crate::surface::KeyPress) -> bool {
+        let (changed, asked) = self.host.resume_key(press);
+        let Some(crate::resume::Step::Resume { id }) = asked else {
+            return changed;
+        };
+        let keys = self.wake.lock().expect("wake poisoned").clone();
+        if let Some(keys) = keys {
+            let _ = keys.send(Wake::Chose(Some(format!("/resume {id}"))));
+        }
+        self.host.close_resume();
         true
     }
 
@@ -3700,6 +3743,16 @@ impl Tui {
             Action::ToggleRewind => {
                 drop(m);
                 self.toggle_rewind_panel();
+                return false;
+            }
+            // `/resume` brings the panel up on the sessions it already fetched:
+            // put them in the moment first, then open the panel over them.
+            Action::OpenResume(view) => {
+                drop(m);
+                self.host.show_resume(view);
+                if !self.host.open_resume() {
+                    self.say(&t(Msg::NoResumePanel));
+                }
                 return false;
             }
             Action::LookAt(session) => {

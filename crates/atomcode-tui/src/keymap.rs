@@ -126,6 +126,13 @@ pub enum Action {
     /// it — a double-tap on Esc and `/rewind` with nothing after it — and they
     /// are one implementation because they are one action.
     ToggleRewind,
+    /// Bring the resume panel up on the sessions the host just answered.
+    ///
+    /// Carries its data, unlike the other panels, because that data is a disk
+    /// read: `/resume` makes the trip itself (it is already an async command)
+    /// and hands the answer in, rather than the screen holding a seam it would
+    /// have to pump. One gesture asks for it — `/resume` with nothing after it.
+    OpenResume(crate::resume::ResumeView),
     /// Put this session — the lead, or a member of its team — on screen.
     ///
     /// An action, and the only one carrying a value, for the reason

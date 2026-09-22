@@ -248,6 +248,7 @@ pub enum Msg<'a> {
         why: &'a str,
     },
     NoRewindPanel,
+    NoResumePanel,
     NoRewind,
     ScreenNotConnectedRewind,
 

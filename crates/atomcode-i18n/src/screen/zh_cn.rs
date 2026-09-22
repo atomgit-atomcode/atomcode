@@ -158,6 +158,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::RewindPointsUnreadable { why } => format!("读不到回合：{why}").into(),
         Msg::RewindFailed { why } => format!("没回得去：{why}").into(),
         Msg::NoRewindPanel => "这个屏幕没有回退面板:启动器没有提供 `tui-panel-rewind`".into(),
+        Msg::NoResumePanel => "这个屏幕没有恢复面板:启动器没有提供 `tui-panel-resume`".into(),
         Msg::NoRewind => "这个屏幕回不了会话:启动器没有提供 `tui-rewind`".into(),
         Msg::ScreenNotConnectedRewind => "屏上没有 agent，没有回合可回".into(),
 
