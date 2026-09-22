@@ -778,6 +778,23 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         )
         .into(),
         Msg::CmdAboutClassicOnly => "暂时只在经典界面里有".into(),
+        Msg::CmdAboutProxy => "出站代理：跟随系统、固定当前代理，或不走代理".into(),
+        Msg::ProxyTakes => "[follow_system | default_proxy | no_proxy]".into(),
+        Msg::ProxyPickerTitle { current } => format!("出站代理（现在：{current}）").into(),
+        Msg::ProxyFollowSystemAbout => "用启动时环境里的代理，缺的由系统代理补上（默认）".into(),
+        Msg::ProxyDefaultProxyAbout { captured } => {
+            format!("把这次启动时的代理固定写进配置，以后每次都用它：{captured}").into()
+        }
+        Msg::ProxyNoProxyAbout => "所有出站请求都不走代理".into(),
+        Msg::ProxySet { summary } => format!("出站代理已改为 {summary}，模型连接已重建。").into(),
+        Msg::ProxySetNotReconnected { summary, error } => format!(
+            "出站代理已改为 {summary} 并已保存，但模型连接没有重建（{error}）；下次建连接时生效。"
+        )
+        .into(),
+        Msg::ProxyUnknown { wanted } => {
+            format!("没有叫「{wanted}」的代理模式：可选 follow_system、default_proxy、no_proxy。").into()
+        }
+        Msg::ProxySaveFailed { error } => format!("代理设置没写进配置文件：{error}").into(),
         Msg::SteeringQueued => "将在下一次工具调用后提交的消息（按 Esc 中断并立即发送）".into(),
     }
 }

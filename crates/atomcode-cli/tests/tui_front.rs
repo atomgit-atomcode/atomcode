@@ -469,3 +469,101 @@ async fn the_classic_name_for_the_walkthrough_still_opens_it() {
     term.press(atomcode_tui::surface::KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), running).await;
 }
+
+/// `/proxy` on this screen does what it did on the classic one: the mode is
+/// written to the config file (so the next launch keeps it), and a bare `/proxy`
+/// offers the three modes with the current one marked.
+#[tokio::test]
+async fn the_proxy_mode_is_chosen_here_and_kept_in_the_file() {
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("ATOMCODE_HOME", home.path());
+    let project = tempfile::tempdir().unwrap();
+    let count = Arc::new(Count::default());
+    let config_path = home.path().join("config.toml");
+    std::fs::write(&config_path, "language = \"zh_CN\"\n").unwrap();
+    let _locale = atomcode_config::i18n::test_lock();
+    atomcode_config::i18n::set_locale(atomcode_config::locale::Locale::ZhCn);
+
+    let front_end = FrontEnd::new();
+    let (start, config) = start(
+        project.path(),
+        &count,
+        SessionMode::Fresh,
+        Some(front_end.clone()),
+    );
+    let runtime = CodingRuntime::start(start).await.expect("starts");
+    let screen = Screen {
+        headless: Some((140, 40)),
+        ..Screen::default()
+    };
+    let mounted = tui_front::mount(
+        runtime,
+        front_end,
+        config,
+        None,
+        &screen,
+        config_path.clone(),
+        None,
+    )
+    .await
+    .expect("the screen mounts");
+    let term = mounted
+        .app
+        .context()
+        .service::<atomcode_tui::plugin::SurfaceSvc>()
+        .and_then(|surface| surface.as_any_headless())
+        .expect("a headless surface");
+    let ui = mounted.ui.clone();
+    let ctx = mounted.app.context();
+    let running = tokio::spawn(async move {
+        let _ = ui.run(&ctx, None).await;
+    });
+
+    async fn shows(term: &atomcode_tui::surface::Headless, what: &str) -> String {
+        let mut text = String::new();
+        for _ in 0..200 {
+            text = term.text();
+            if text.contains(what) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        text
+    }
+
+    term.type_line("/proxy no_proxy");
+    let said = shows(&term, "出站代理已改为 no_proxy").await;
+    assert!(said.contains("出站代理已改为 no_proxy"), "{said}");
+    let written = atomcode_config::config::Config::load(&config_path).expect("the file reads");
+    assert_eq!(
+        written.network.proxy.mode,
+        atomcode_config::proxy::ProxyMode::NoProxy,
+        "the mode is kept in the file"
+    );
+    assert_eq!(
+        written.language,
+        Some(atomcode_config::locale::Locale::ZhCn),
+        "and nothing else in the file was lost"
+    );
+
+    term.type_line("/proxy");
+    let offered = shows(&term, "出站代理（现在：no_proxy）").await;
+    assert!(
+        offered.contains("出站代理（现在：no_proxy）"),
+        "a bare `/proxy` offers the modes, saying which is in force:\n{offered}"
+    );
+    for mode in ["follow_system", "default_proxy", "no_proxy"] {
+        assert!(offered.contains(mode), "`{mode}` is offered:\n{offered}");
+    }
+    assert_eq!(
+        count.0.load(Ordering::SeqCst),
+        0,
+        "nothing was sent as a prompt"
+    );
+
+    term.press(atomcode_tui::surface::KeyPress::plain(
+        atomcode_tui::surface::Key::Esc,
+    ));
+    term.press(atomcode_tui::surface::KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), running).await;
+}

@@ -1297,6 +1297,29 @@ pub enum Msg<'a> {
         command: &'a str,
     },
     CmdAboutClassicOnly,
+    CmdAboutProxy,
+    ProxyTakes,
+    ProxyPickerTitle {
+        current: &'a str,
+    },
+    ProxyFollowSystemAbout,
+    ProxyDefaultProxyAbout {
+        captured: &'a str,
+    },
+    ProxyNoProxyAbout,
+    ProxySet {
+        summary: &'a str,
+    },
+    ProxySetNotReconnected {
+        summary: &'a str,
+        error: &'a str,
+    },
+    ProxyUnknown {
+        wanted: &'a str,
+    },
+    ProxySaveFailed {
+        error: &'a str,
+    },
     /// Header above the type-ahead queue: lines typed while a turn runs, folded
     /// in at the next tool-call boundary (or flushed immediately with Esc).
     SteeringQueued,

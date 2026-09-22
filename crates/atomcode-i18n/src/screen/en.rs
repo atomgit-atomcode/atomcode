@@ -800,6 +800,31 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         )
         .into(),
         Msg::CmdAboutClassicOnly => "only on the classic screen for now".into(),
+        Msg::CmdAboutProxy => "outbound proxy: follow the system, pin the current one, or none".into(),
+        Msg::ProxyTakes => "[follow_system | default_proxy | no_proxy]".into(),
+        Msg::ProxyPickerTitle { current } => format!("Outbound proxy (now: {current})").into(),
+        Msg::ProxyFollowSystemAbout => {
+            "the launch environment's proxy, with the system proxy filling gaps (default)".into()
+        }
+        Msg::ProxyDefaultProxyAbout { captured } => {
+            format!("pin the proxy this launch started with into the config: {captured}").into()
+        }
+        Msg::ProxyNoProxyAbout => "no outbound request goes through a proxy".into(),
+        Msg::ProxySet { summary } => {
+            format!("Outbound proxy is now {summary}; the model connection was rebuilt.").into()
+        }
+        Msg::ProxySetNotReconnected { summary, error } => format!(
+            "Outbound proxy is now {summary} and saved, but the model connection was not \
+             rebuilt ({error}); it takes effect on the next connection."
+        )
+        .into(),
+        Msg::ProxyUnknown { wanted } => format!(
+            "No proxy mode called `{wanted}`: follow_system, default_proxy or no_proxy."
+        )
+        .into(),
+        Msg::ProxySaveFailed { error } => {
+            format!("The proxy setting was not written to the config file: {error}").into()
+        }
         Msg::SteeringQueued => {
             "Queued — sent after the next tool call (press Esc to interrupt and send now)".into()
         }

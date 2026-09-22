@@ -110,7 +110,8 @@ impl Tools for ToolsPort {
 
 /// 宿主拒绝的话,说给人听。屏幕那边有一份同样的映射,这里不借它:那是 tui 的
 /// `pub(crate)`,而一个为了共用它而开放的函数,就是为一句话开一条公开面。
-fn said(error: atomcode_host_api::HostError) -> String {
+/// 本 crate 里别的端口(`/proxy`)共用这一份。
+pub(crate) fn said(error: atomcode_host_api::HostError) -> String {
     use atomcode_host_api::HostError;
     match error {
         HostError::Busy { reason } => tr(SMsg::HostBusy { reason: &reason }).into_owned(),
