@@ -1992,18 +1992,17 @@ impl Content for TurnEndBlock {
             ),
         ])
     }
-    /// A divider with the turn's outcome set into it, the way tuix closes a
-    /// turn: `───── ✓ Nailed it · 2 轮 · 2 工具 · 32.7s · 2.60K tokens · 97% cached ─────`.
-    /// A bare line of text at the left margin reads as something that was said; a
-    /// captioned rule reads as a boundary.
+    /// The turn's outcome and its cost on one light line at the left margin:
+    /// `✓ Nailed it · 2 轮 · 2 工具 · 32.7s · 2.60K tokens · 97% cached`. It used to
+    /// be a full-width captioned rule (`───── … ─────`), but a transcript of turns
+    /// drew a screen full of ─ boundaries; the glyph and the dim carry the boundary
+    /// now, closer to `✻ Crunched for …`.
     ///
-    /// What the turn cost is set into that same rule, because the boundary is
-    /// exactly where a person asks "what did that take". It is the *last* thing
-    /// to be added and the first to be dropped: `captioned_rule` throws away a
-    /// caption it cannot place, and how the turn ended is the one thing this
-    /// line is for. So the caption is built widest-first and falls back to the
-    /// outcome alone, with whatever was dropped going under the rule, wrapped —
-    /// the same ladder the cause of a failed turn already climbed.
+    /// The cost rides that same line because its end is exactly where a person asks
+    /// "what did that take". It is the *last* thing added and the first dropped: the
+    /// line is built widest-first and falls back to the outcome alone, with whatever
+    /// did not fit going under it, wrapped — the same ladder the cause of a failed
+    /// turn already climbed.
     fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
         // A turn you stopped yourself closes on the composer, not here: the dim
         // `已中断 · …` line under the field carries it (driven by
@@ -2044,12 +2043,12 @@ impl Content for TurnEndBlock {
             }
         }
 
-        let mut out = vec![crate::el::captioned_rule(
-            &caption,
-            w as usize,
-            muted(),
-            style,
-        )];
+        // A light, left-aligned line rather than a full-width captioned rule: a
+        // screen of ─ boundaries reads as noise, and a turn's end is already set
+        // apart by its outcome glyph and the dim of its cost. The mark and the
+        // figures ride at the margin the way the rule's caption did, minus the
+        // rule — nearer `✻ Crunched for …` than `───── ✓ Done ─────`.
+        let mut out = vec![Line::styled(width::take_width(&caption, w as usize), style)];
         for line in under {
             out.extend(wrapped(&line, w, style, "  "));
         }

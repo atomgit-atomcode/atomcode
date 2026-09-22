@@ -536,7 +536,7 @@ type RowOwner = Option<(BlockId, &'static str)>;
 /// screen of six calls separated by five gaps is a screen that no longer shows
 /// what was done in one glance.
 ///
-/// The turn's closing rule is a separator — `──── ✓ Done · 3 轮 · 2 工具 ────` — and gets
+/// The turn's closing summary is a separator — `✓ Done · 3 轮 · 2 工具` — and gets
 /// a row of air on both sides unconditionally. It is the one row that is *about*
 /// the transcript rather than part of it, and pressed against the prose above
 /// and the next question below it stops reading as a boundary and starts
@@ -545,7 +545,7 @@ type RowOwner = Option<(BlockId, &'static str)>;
 /// The user's message opens a paragraph downwards: the answer starts under a
 /// blank rather than directly under the bar, where it would read as the first
 /// line of what was asked rather than as a reply to it. Nothing is needed above
-/// it, because what is normally there is the closing rule — which now carries
+/// it, because what is normally there is the closing summary — which carries
 /// its own margin.
 ///
 /// One definition, consulted by both the painter and the height the scroll is
@@ -8582,7 +8582,7 @@ mod tests {
         // answer — the same collapse as prose running into a `●` header.
         //
         // `now break it` is the case that pins both halves at once: the turn
-        // above it ends in a closing rule (whose own margin is the row above
+        // above it ends in a closing summary (whose own margin is the row above
         // the bar), and the model's prose begins under the bar.
         let h = fed();
         let rows: Vec<String> = h
@@ -8946,8 +8946,8 @@ mod tests {
     }
 
     #[test]
-    fn the_closing_rule_has_a_row_of_air_on_both_sides() {
-        // The separator is the one row that is *about* the transcript: pressed
+    fn the_closing_summary_has_a_row_of_air_on_both_sides() {
+        // The summary is the one row that is *about* the transcript: pressed
         // against the prose above and the next question below, it reads as one
         // more line of the answer instead of a boundary between two turns.
         let h = fed();
@@ -8959,27 +8959,27 @@ mod tests {
             .iter()
             .map(|l| l.plain())
             .collect();
-        let rule = rows
+        let summary = rows
             .iter()
-            // The first clean turn's closing rule: its outcome rotates through
-            // `DONE_LABELS`, and index 0 is `Done`.
-            .position(|r| r.contains("Done") && r.contains('─'))
-            .expect("the first turn's closing rule");
-        // The prose it closes, a blank, the rule, a blank, the next question.
+            // The first clean turn's closing summary: its outcome rotates through
+            // `DONE_LABELS`, and index 0 is `Done`. A left-aligned line now, no ─.
+            .position(|r| r.contains("Done"))
+            .expect("the first turn's closing summary");
+        // The prose it closes, a blank, the summary, a blank, the next question.
         assert!(
-            rows[rule - 2].contains("Fixed it") && rows[rule + 2].contains("now break it"),
-            "the rule is not between the two turns: {:?}",
-            &rows[rule - 2..=rule + 2]
+            rows[summary - 2].contains("Fixed it") && rows[summary + 2].contains("now break it"),
+            "the summary is not between the two turns: {:?}",
+            &rows[summary - 2..=summary + 2]
         );
         assert!(
-            rows[rule - 1].trim().is_empty(),
-            "no blank between the prose and the rule: {:?}",
-            &rows[rule - 2..=rule]
+            rows[summary - 1].trim().is_empty(),
+            "no blank between the prose and the summary: {:?}",
+            &rows[summary - 2..=summary]
         );
         assert!(
-            rows[rule + 1].trim().is_empty(),
-            "no blank between the rule and the next question: {:?}",
-            &rows[rule..=rule + 2]
+            rows[summary + 1].trim().is_empty(),
+            "no blank between the summary and the next question: {:?}",
+            &rows[summary..=summary + 2]
         );
     }
 
