@@ -1,0 +1,155 @@
+//! Providers for the execution world.
+//!
+//! `fs-local` and `bash-local` are the local machine; `fs-readonly` is the same
+//! disk with writes refused. The implementations live in
+//! `atomcode_capabilities::world`, next to the tools that go through them —
+//! these rows only choose which one to mount.
+//!
+//! There used to be a third seam here, `subprocess` (an argv runner), with the
+//! shell built on top of it so that swapping the process provider relocated
+//! bash. It went when the shell seam became a process handle: "which shell
+//! exists and how is its tree reaped" is one question, answered by one
+//! provider, and an argv seam underneath it had no second consumer — it was
+//! plumbing that existed to make a claim, not to carry anything. The claim
+//! survives, one level up: swap `shell` and bash relocates.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use atomcode_capabilities::world::{LocalFs, LocalShell};
+use atomcode_plexus::{Context, Plugin};
+use serde::Deserialize;
+use serde_json::Value;
+
+use crate::seams::{FileSystem, FsSvc, ShellSvc};
+
+// ---- fs-local -----------------------------------------------------------
+
+#[derive(Debug, Deserialize, Default)]
+struct FsRow {
+    #[serde(default)]
+    root: Option<String>,
+    #[serde(default)]
+    read_only: bool,
+    /// Fence mutations to `root` and leave reads alone.
+    ///
+    /// The boundary a checkout a person stepped into wants: nothing outside it
+    /// gets changed, and everything outside it is still readable. Not a second
+    /// kind of `root` — the same root with the fence applied on one side only.
+    #[serde(default)]
+    writes_only: bool,
+    /// Places outside `root` a mutation may still land.
+    ///
+    /// The machine's temp directory, in practice: a checkout that cannot make a
+    /// scratch file breaks the toolchain without protecting anything.
+    #[serde(default)]
+    also_writable: Vec<String>,
+}
+
+pub struct FsLocalPlugin;
+
+#[async_trait]
+impl Plugin for FsLocalPlugin {
+    fn name(&self) -> &'static str {
+        "fs-local"
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["fs"]
+    }
+    fn description(&self) -> &'static str {
+        "the local disk; fenced to a root only when one is given, and on the write side alone when asked"
+    }
+    async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
+        let row: FsRow = parse(config)?;
+        // No root, no fence. The conversation's own agent works the way the
+        // production stack does: anywhere on the disk, with the approval rows
+        // deciding what it may change and where. A fence is a hard boundary
+        // — nothing above it can talk it into a path — which is what a
+        // delegated member's worktree, a read-only audit or a sandbox wants,
+        // and what a person's main agent, reaching into ~/.cargo or a sibling
+        // repository, does not.
+        //
+        // `writes_only` is the middle case, and the one a checkout wants: the
+        // same root, applied to mutations alone.
+        let world: Arc<dyn FileSystem> = match (row.root.map(PathBuf::from), row.read_only) {
+            (Some(root), true) => Arc::new(LocalFs::read_only(root)),
+            (Some(root), false) if row.writes_only => {
+                let mut world = LocalFs::writes_fenced(root);
+                for dir in &row.also_writable {
+                    world = world.also_writable(dir);
+                }
+                Arc::new(world)
+            }
+            (Some(root), false) => Arc::new(LocalFs::new(root)),
+            (None, true) => Arc::new(LocalFs::read_only_unfenced()),
+            (None, false) => Arc::new(LocalFs::unfenced()),
+        };
+        let _ = ctx.provide::<FsSvc>(world).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+/// The same world with writes refused. A separate row rather than a flag,
+/// because "which world am I in" should be visible in `--dump-config`.
+pub struct FsReadOnlyPlugin;
+
+#[async_trait]
+impl Plugin for FsReadOnlyPlugin {
+    fn name(&self) -> &'static str {
+        "fs-readonly"
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["fs"]
+    }
+    fn description(&self) -> &'static str {
+        "the local disk with every mutation refused"
+    }
+    async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
+        let row: FsRow = parse(config)?;
+        // Read-only is the point of this row; a root is optional, as above.
+        let world: Arc<dyn FileSystem> = match row.root.map(PathBuf::from) {
+            Some(root) => Arc::new(LocalFs::read_only(root)),
+            None => Arc::new(LocalFs::read_only_unfenced()),
+        };
+        let _ = ctx.provide::<FsSvc>(world).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+// ---- bash-local ---------------------------------------------------------
+
+/// This machine's shell — the production spawn, with its tty detach, job
+/// object / process-group reaping and code-page decoding, behind the seam.
+///
+/// No `program` knob: which shell binary a world uses is the world's own
+/// answer (Git Bash vs `cmd.exe` on Windows is *detected*, not configured), and
+/// a row that overrode it would be the assembly deciding a fact for a machine it
+/// may not be running on.
+pub struct BashLocalPlugin;
+
+#[async_trait]
+impl Plugin for BashLocalPlugin {
+    fn name(&self) -> &'static str {
+        "bash-local"
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["shell"]
+    }
+    fn description(&self) -> &'static str {
+        "this machine's shell, with its process tree reaped on kill"
+    }
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        let _ = ctx
+            .provide::<ShellSvc>(Arc::new(LocalShell))
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+fn parse<T: for<'de> Deserialize<'de> + Default>(config: &Value) -> Result<T, String> {
+    if config.is_null() {
+        return Ok(T::default());
+    }
+    serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))
+}

@@ -1,32 +1,41 @@
 //! # atomcode-coding (L2)
 //!
-//! The CODING specialization. It assembles the neutral kernel ([`atomcode_kernel`]) +
-//! capabilities ([`atomcode_capabilities`]) into a runnable coding agent that
-//! **self-corrects** — and it does so with ZERO `atomcode-core` involvement.
+//! The CODING specialization. It assembles the neutral kernel ([`atomcode_kernel`]),
+//! the capabilities ([`atomcode_capabilities`]) and the plugin harness
+//! ([`atomcode_harness`]) into a runnable coding agent that **self-corrects** — and
+//! it does so with ZERO `atomcode-core` involvement.
 //!
-//! NOTE: [`build_coding_agent`] is the MINIMAL sync assembly (tools + codeintel
-//! only). The FULL agent — web/skills/mcp/session persistence/memory wired — is the
-//! two-phase [`prepare`] → [`assemble`] in [`parts`].
+//! Two phases, both public:
 //!
-//! L2 owns three things, all mounted via existing kernel seams (no new kernel surface):
-//! 1. **Assembly** — [`build_coding_agent`]: wires provider + tools + codeintel +
-//!    approval + persona + the verify discipline into a kernel [`Agent`](atomcode_kernel::agent::Agent).
-//! 2. **Persona** — [`persona::coding_persona`]: the coding system prompt.
-//! 3. **Discipline** — [`discipline::VerifyCadenceHook`]: an edit-then-verify
-//!    `offer_continuation` hook (the coding self-correction loop).
+//! 1. [`prepare`] builds the capability graph — tools, skills, MCP, the session
+//!    binding, the approval stores — and hands back [`CodingParts`].
+//! 2. [`runtime::mount`] mounts that graph as a plexus tree and returns the
+//!    [`AgentHandle`](atomcode_kernel::agent::AgentHandle) a driver speaks to. The
+//!    product IS the row list in [`on_harness`] plus the host rows in
+//!    [`host_rows`]; there is no second assembly.
+//!
+//! What this crate owns on top of the neutral parts:
+//! - **the row list** — which rows this product mounts, and the host rows only it
+//!   can build (its session store, its delegation tools, its rate-limit policy);
+//! - **the persona** — [`persona::coding_persona`], the coding system prompt;
+//! - **the discipline** — [`discipline::unverified_edit`], the edit-then-verify
+//!   judgement the `verify-cadence` row acts on.
 //!
 //! ```no_run
 //! # async fn demo() -> Result<(), String> {
-//! use atomcode_coding::{build_coding_agent, CodingAgentConfig};
-//! use atomcode_kernel::agent::AutoRespond;
+//! use atomcode_coding::{prepare, CodingAgentConfig, PrepareOptions};
 //!
-//! let agent = build_coding_agent(CodingAgentConfig::new(
-//!     "sk-...", "https://api.deepseek.com/v1", "deepseek-chat", ".",
-//! ))?;
-//! let outcome = agent.run_to_completion("fix the build", AutoRespond::AllowAll).await;
-//! println!("{}", outcome.text);
+//! let cfg = CodingAgentConfig::new("sk-...", "https://api.deepseek.com/v1", "deepseek-chat", ".");
+//! let opts = PrepareOptions::default();
+//! let parts = prepare(&cfg, opts.clone()).await.map_err(|e| e.to_string())?;
+//! # let provider: std::sync::Arc<dyn atomcode_kernel::provider::LlmProvider> = todo!();
+//! let mounted = atomcode_coding::runtime::mount(&parts, &cfg, &opts, provider).await?;
+//! // `mounted.handle` drives turns; `mounted.app` must outlive it.
 //! # Ok(()) }
 //! ```
+//!
+//! For the whole product with its session lifecycle, `/model`, undo and the rest,
+//! use [`runtime::CodingRuntime`] rather than mounting by hand.
 
 // Redirect ATOMCODE_HOME to a throwaway temp dir before any unit test runs, so the
 // suite can't persist into the developer's real ~/.atomcode (see
@@ -40,28 +49,34 @@ fn _isolate_atomcode_home() {
 pub mod config;
 mod controllers;
 pub mod discipline;
+pub mod front_end;
+pub mod on_harness;
 pub mod parts;
 pub mod persona;
 pub mod plan_mode;
 pub mod plugin_hooks;
+pub mod policy_rows;
 pub mod provider_factory;
 pub mod runtime;
+pub mod session_store;
 pub mod session_title;
 pub mod team;
+mod team_progress;
 pub mod telemetry;
 pub mod vision;
 
-mod assemble;
 mod execution_policy;
+pub mod host_rows;
 mod init_prompt;
 mod mcp_instructions;
+pub mod native_log;
 mod next_prompt_suggestion;
 mod rate_limit;
 mod skill_first;
 pub mod subagent_tiers;
 mod todo;
+mod tool_intent;
 
-pub use assemble::{build_coding_agent, build_coding_agent_with, try_build_coding_agent_with};
 /// The image type carried by [`UserInput`] / [`ImagePreprocessor`], re-exported
 /// so driver crates can implement the hook without naming `atomcode_kernel`.
 pub use atomcode_kernel::message::ImageContent;
@@ -71,10 +86,9 @@ pub use config::{
     TierProvider,
 };
 pub use controllers::{GoalPhase, GoalProgress, GoalTerminal, LoopProgress};
-pub use discipline::VerifyCadenceHook;
 pub use init_prompt::{build_init_prompt, INIT_PROMPT, INIT_PROMPT_ZH_CN};
 pub use parts::{
-    assemble, prepare, prepare_with_plugin_hook_source, prepare_with_plugin_hooks,
+    prepare, prepare_from_config, prepare_with_plugin_hook_source, prepare_with_plugin_hooks,
     subagent_enabled_from_env, CodingParts, PrepareOptions, SessionBinding, SessionMode,
     SubagentPolicy,
 };
@@ -86,16 +100,19 @@ pub use provider_factory::{
     resolve_subagent_tier_thunks, tier_provider_builder, AtomGitProviderAuthenticator,
     CodingProviderFactory, DefaultCodingProviderFactory, ProviderAuthenticator, ProviderBuildError,
 };
-pub use rate_limit::{RateLimitWindow, RateLimitWindowSource};
+pub use rate_limit::{
+    AccountUsage, DayUse, Entitlement, ModelSeries, ModelUse, RateLimitWindow,
+    RateLimitWindowSource,
+};
 pub use runtime::{
     CodingRuntime, CodingRuntimeEvent, CodingRuntimeEvents, CodingRuntimeHandle,
     CodingRuntimeStart, DeferredRuntimeState, DriverCommand, ImagePreprocessor, LocalContextInput,
     McpStatusSnapshot, McpToolsSnapshot, ProviderBootstrap, ProviderUnavailableReason,
-    ReconfigureKind, ReprepareInput, RewindCatalog, RewindResult, RewindScope, RuntimeContextStats,
-    RuntimeError, RuntimeExit, RuntimeExitReason, RuntimeGeneration, RuntimeMode, RuntimePhase,
-    RuntimeRequest, RuntimeSessionInfo, RuntimeSnapshotError, RuntimeStartError, RuntimeStatus,
-    RuntimeTurnStats, RuntimeUnavailable, SequencedRuntimeEvent, SessionChanged, SubmitReceipt,
-    TurnCompletion, UndoResult, UserInput, VisionNotice,
+    ReconfigureKind, RewindCatalog, RewindResult, RewindScope, RuntimeContextStats, RuntimeError,
+    RuntimeExit, RuntimeExitReason, RuntimeGeneration, RuntimeMode, RuntimePhase, RuntimeRequest,
+    RuntimeSessionInfo, RuntimeSnapshotError, RuntimeStartError, RuntimeStatus, RuntimeTurnStats,
+    RuntimeUnavailable, SequencedRuntimeEvent, SessionChanged, SubmitReceipt, TurnCompletion,
+    UndoResult, UserInput, VisionNotice,
 };
 pub use telemetry::{TelemetryHook, ToolTelemetryMiddleware};
 pub use todo::TodoHook;

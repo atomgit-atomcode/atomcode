@@ -166,6 +166,11 @@ impl LlmProvider for AnthropicProvider {
         self.cfg.context_window
     }
 
+    /// The same flag `format_user_message` degrades on.
+    fn supports_vision(&self) -> bool {
+        self.cfg.supports_vision
+    }
+
     fn bind_session_id(&self, session_id: &str) {
         let _ = self.session_id.set(session_id.to_string());
     }
@@ -1295,6 +1300,53 @@ mod tests {
         assert_eq!(blocks[0]["tool_use_id"], "a");
         assert_eq!(blocks[1]["tool_use_id"], "b");
         assert_eq!(blocks[1]["is_error"], true, "tool failure flag is echoed");
+    }
+
+    #[test]
+    fn a_reminder_tail_folds_into_the_tool_results_user_message() {
+        // The shape `merge_consecutive_user` was written for, spelled out: a
+        // mid-turn reminder (`InjectionOrigin::Reminder`) projects to a user
+        // message right after the tool-result run, and Anthropic has no user/user
+        // adjacency — so the two fold into ONE user entry, the note becoming a
+        // text block after the tool_result block. Asserted here because the fold
+        // is what makes the role choice safe on this wire format; on OpenAI's it
+        // stays a separate entry instead.
+        const REMINDER: &str = "<system-reminder>The task list is stale.</system-reminder>";
+        let mut note = Message::user(REMINDER);
+        note.synthetic = true;
+        let msgs = vec![
+            Message::system("persona"),
+            Message::user("go"),
+            Message::assistant(
+                "",
+                vec![ToolCall {
+                    id: "a".into(),
+                    name: "x".into(),
+                    arguments: "{}".into(),
+                }],
+            ),
+            Message::tool_result("a", "ra", false),
+            note,
+        ];
+        let (sys, out) = format_messages(&msgs, false);
+
+        assert_eq!(sys.as_deref(), Some("persona"), "header unchanged");
+        assert_eq!(
+            out.len(),
+            3,
+            "user, assistant, then ONE user holding both blocks: {out:?}"
+        );
+        assert_eq!(out[2]["role"], "user");
+        let blocks = out[2]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2, "tool_result then the reminder text");
+        assert_eq!(blocks[0]["type"], "tool_result");
+        assert_eq!(blocks[0]["tool_use_id"], "a");
+        assert_eq!(blocks[1]["type"], "text");
+        assert_eq!(blocks[1]["text"], REMINDER);
+        assert!(
+            out.iter().all(|v| v["role"] != "system"),
+            "nothing is left as a system message on the wire"
+        );
     }
 
     #[test]

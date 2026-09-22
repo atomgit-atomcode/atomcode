@@ -579,6 +579,8 @@ fn convert_legacy_session_with_diagnostic(
         detached_model_usage: Vec::new(),
         detached_unattributed_tokens: 0,
         origin: SessionOrigin::Manual,
+        format_version: 0,
+        parent: None,
     };
     meta.auto_name_from_messages(&snapshot.messages);
 
@@ -1799,28 +1801,7 @@ fn validate_project_bucket(project_bucket: &str) -> anyhow::Result<()> {
 }
 
 fn report_catalog_diagnostics(diagnostics: &[atomcode_capabilities::session::CatalogDiagnostic]) {
-    // Cap the per-entry detail: a large history with orphaned sidecars / corrupt
-    // legacy files can produce THOUSANDS of these, and each `tracing::warn!` is a
-    // synchronous write to the log file — that alone was a measurable chunk of
-    // `-c`/resume startup. Log a bounded sample, then one summary line.
-    const MAX_DETAIL: usize = 20;
-    for diagnostic in diagnostics.iter().take(MAX_DETAIL) {
-        tracing::warn!(
-            path = %diagnostic.path.display(),
-            kind = ?diagnostic.kind,
-            message = %diagnostic.message,
-            "session catalog entry was skipped"
-        );
-    }
-    if diagnostics.len() > MAX_DETAIL {
-        tracing::warn!(
-            skipped = diagnostics.len(),
-            shown = MAX_DETAIL,
-            "session catalog skipped {} entries ({} shown above)",
-            diagnostics.len(),
-            MAX_DETAIL,
-        );
-    }
+    crate::warn_catalog_diagnostics(diagnostics);
 }
 
 fn reject_matching_catalog_diagnostic(
@@ -3728,6 +3709,7 @@ mod tests {
             message_count: 0,
             turn_count: 0,
             presence: CatalogPresence::NativeOnly,
+            needs_newer_version: false,
         };
 
         let old = rename_catalog_entry_in_root(dir.path(), &entry, "chosen", false).unwrap();
@@ -3829,6 +3811,7 @@ mod tests {
             message_count: 1,
             turn_count: 0,
             presence: CatalogPresence::NativeOnly,
+            needs_newer_version: false,
         };
 
         let loaded = load_catalog_session_view_in_root(dir.path(), &entry).unwrap();
@@ -4122,6 +4105,7 @@ mod tests {
             message_count: 1,
             turn_count: 0,
             presence: CatalogPresence::NativeOnly,
+            needs_newer_version: false,
         };
 
         let loaded = load_catalog_session_view_in_root(dir.path(), &entry).unwrap();
@@ -4302,6 +4286,7 @@ mod tests {
             message_count: 1,
             turn_count: 0,
             presence: CatalogPresence::NativeOnly,
+            needs_newer_version: false,
         };
 
         let loaded = load_catalog_session_view_in_root(dir.path(), &entry).unwrap();
@@ -4343,6 +4328,7 @@ mod tests {
             message_count: session.messages.len(),
             turn_count: session.turn_stats.len(),
             presence: CatalogPresence::LegacyOnly,
+            needs_newer_version: false,
         };
 
         let loaded = load_catalog_session_view_in_root(dir.path(), &entry).unwrap();
@@ -4378,6 +4364,7 @@ mod tests {
             message_count: session.messages.len(),
             turn_count: session.turn_stats.len(),
             presence: CatalogPresence::LegacyOnly,
+            needs_newer_version: false,
         };
 
         rename_catalog_entry_in_root(dir.path(), &entry, "native-name", false).unwrap();

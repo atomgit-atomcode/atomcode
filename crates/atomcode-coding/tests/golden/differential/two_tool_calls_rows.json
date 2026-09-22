@@ -1,0 +1,42 @@
+[
+  {
+    "kind": "TurnStarted",
+    "detail": ""
+  },
+  {
+    "kind": "Usage",
+    "detail": ""
+  },
+  {
+    "kind": "ToolBatchStarted",
+    "detail": ""
+  },
+  {
+    "kind": "ToolStarted",
+    "detail": "read_file"
+  },
+  {
+    "kind": "ToolStarted",
+    "detail": "read_file"
+  },
+  {
+    "kind": "ToolResult",
+    "detail": "error=false"
+  },
+  {
+    "kind": "ToolResult",
+    "detail": "error=false"
+  },
+  {
+    "kind": "ToolBatchCompleted",
+    "detail": ""
+  },
+  {
+    "kind": "Usage",
+    "detail": ""
+  },
+  {
+    "kind": "TurnComplete",
+    "detail": "Stopped"
+  }
+]

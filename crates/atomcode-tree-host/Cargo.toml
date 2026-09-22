@@ -1,0 +1,28 @@
+[package]
+name = "atomcode-tree-host"
+version.workspace = true
+edition = "2021"
+description = "A host for agents the harness mounts from a config tree — the front-end contracts over a plexus App"
+publish = false
+
+[dependencies]
+# The contracts this crate exists to speak. They are why it is not in the
+# harness: a host is a host, and `docs/architecture-target.md` §2 puts the
+# mechanism below the contracts rather than beside them.
+atomcode-host-api = { path = "../atomcode-host-api" }
+atomcode-kernel = { path = "../atomcode-kernel" }
+atomcode-plexus = { path = "../atomcode-plexus" }
+# The trees it mounts, and the seams it reaches them through.
+atomcode-harness = { path = "../atomcode-harness" }
+
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+
+[dev-dependencies]
+atomcode-kernel = { path = "../atomcode-kernel", features = ["test-support"] }
+tokio = { version = "1", features = ["test-util", "rt-multi-thread"] }
+# Redirect ATOMCODE_HOME to a temp dir once per test binary, so a test's
+# session-persistence row cannot write into the developer's real ~/.atomcode.
+ctor = "0.2"
+tempfile = "3"
+serde_json = "1"

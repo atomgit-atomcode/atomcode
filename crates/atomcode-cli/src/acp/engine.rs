@@ -20,14 +20,49 @@ use atomcode_coding::{
 ///
 /// Constructed by the session dispatcher from the ACP `initialize` handshake and
 /// the global provider configuration.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EngineConfig {
     config: CodingAgentConfig,
+    /// How a model id becomes a configuration, when this server was given a way
+    /// to do it.
+    ///
+    /// Here rather than threaded through the session handlers because it is a
+    /// property of the server, not of one session: every session this engine
+    /// spawns resolves models the same way. It reaches the contract as the
+    /// host's `for_model` (`sessions::AcpHost`), which is what
+    /// `HostCommand::SwitchModel` asks of a host.
+    resolve_model: Option<Arc<crate::acp::SessionModelResolver>>,
+}
+
+impl std::fmt::Debug for EngineConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EngineConfig")
+            .field("config", &self.config)
+            .field("resolve_model", &self.resolve_model.is_some())
+            .finish()
+    }
 }
 
 impl EngineConfig {
     pub fn from_coding_config(config: CodingAgentConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            resolve_model: None,
+        }
+    }
+
+    /// Give this engine a way to turn a model id into a configuration.
+    pub fn with_model_resolver(
+        mut self,
+        resolve: Option<Arc<crate::acp::SessionModelResolver>>,
+    ) -> Self {
+        self.resolve_model = resolve;
+        self
+    }
+
+    /// What a session registered from this engine hands the host.
+    pub fn model_resolver(&self) -> Option<Arc<crate::acp::SessionModelResolver>> {
+        self.resolve_model.clone()
     }
 
     /// Build the `CodingAgentConfig` for this session's working directory.
@@ -59,13 +94,21 @@ impl EngineConfig {
 /// `extra_mcp_servers` are client-injected ACP `mcpServers` (stdio), connected
 /// alongside the config-derived catalog; they carry `McpConfigSource::Driver`
 /// and are not project-trust gated.
+/// The front end comes back with the runtime because it has to be handed in
+/// **before** the runtime is built: `front-end-feed` is a row, mounted only
+/// where a front end exists (`coding/src/on_harness.rs`), and it is that row
+/// which fills `FrontEnd::app`. A front end made afterwards — which is what
+/// this channel used to do — connects to the runtime's event stream and gets
+/// turn events, but its `app` is never filled, so every `Subscribe` is refused
+/// and the agent's description never arrives. That is why this channel knew
+/// nothing about the commands its own agent registered.
 pub async fn spawn_session(
     engine: &EngineConfig,
     cwd: PathBuf,
     provider_factory: Option<Arc<dyn CodingProviderFactory>>,
     extra_mcp_servers: Vec<McpServerConfig>,
     session: SessionMode,
-) -> Result<CodingRuntime, RuntimeStartError> {
+) -> Result<(CodingRuntime, Arc<atomcode_coding::front_end::FrontEnd>), RuntimeStartError> {
     let cfg = engine.to_coding_config(cwd);
     let provider_factory = provider_factory.unwrap_or_else(|| {
         Arc::new(DefaultCodingProviderFactory::new(concat!(
@@ -73,10 +116,12 @@ pub async fn spawn_session(
             env!("CARGO_PKG_VERSION")
         )))
     });
-    CodingRuntime::start(CodingRuntimeStart {
+    let front_end = atomcode_coding::front_end::FrontEnd::new();
+    let runtime = CodingRuntime::start(CodingRuntimeStart {
         agent: cfg,
         prepare: PrepareOptions {
             session,
+            front_end: Some(front_end.clone()),
             tools: true,
             subagents: atomcode_coding::SubagentPolicy::Enabled,
             // SDK 2.0.0 的 stable v1 已支持通用 elicitation(表单/URL)。ACP 端通过
@@ -90,7 +135,8 @@ pub async fn spawn_session(
         plugin_hooks: Arc::new(StaticPluginHookSource::default()),
         image_preprocessor: None,
     })
-    .await
+    .await?;
+    Ok((runtime, front_end))
 }
 
 #[cfg(test)]
@@ -209,7 +255,7 @@ mod tests {
         assert!(ids[1].is_some());
         assert_ne!(ids[0], ids[1]);
 
-        first.handle.shutdown().await.unwrap();
-        second.handle.shutdown().await.unwrap();
+        first.0.handle.shutdown().await.unwrap();
+        second.0.handle.shutdown().await.unwrap();
     }
 }

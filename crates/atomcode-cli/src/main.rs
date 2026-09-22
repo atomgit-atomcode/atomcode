@@ -15,6 +15,7 @@ use clap::{ArgGroup, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 
 mod headless_json;
+mod review;
 mod schedule_cmd;
 mod schedule_os;
 mod telemetry_cmd;
@@ -29,6 +30,14 @@ use atomcode::uninstall;
 #[ctor::ctor]
 fn _isolate_atomcode_home() {
     atomcode_kernel::test_support::isolate_home();
+}
+
+/// Which language this binary's own tests assert in — the same reason the lib
+/// says it once (`_tests_assert_in_chinese` in `lib.rs`).
+#[cfg(test)]
+#[ctor::ctor]
+fn _tests_assert_in_chinese() {
+    atomcode_config::i18n::set_locale(atomcode_config::locale::Locale::ZhCn);
 }
 
 use atomcode_capabilities::mcp::{
@@ -158,11 +167,13 @@ fn resume_hint_line(session_id: &str, headless: bool, zh: bool) -> String {
     } else {
         format!("{BIN_NAME} resume {session_id}")
     };
-    if zh {
-        format!("继续此会话，运行：{cmd}")
-    } else {
-        format!("To resume this session, run: {cmd}")
-    }
+    // The wording lives in the table with everything else; `zh` stays a
+    // parameter rather than a read of the global locale because this function
+    // is pure and its two forms are unit-tested side by side.
+    use atomcode_config::i18n::{t_with, Msg};
+    use atomcode_config::locale::Locale;
+    let locale = if zh { Locale::ZhCn } else { Locale::En };
+    t_with(locale, Msg::ResumeHint { cmd: &cmd }).into_owned()
 }
 
 /// What session to resume at launch, unified across `--continue`, `--resume`,
@@ -845,6 +856,39 @@ struct Cli {
         default_value_t = false
     )]
     pub dangerously_skip_permissions: bool,
+
+    /// Use the full-screen UI assembled from plugin rows instead of the default
+    /// one. Same runtime, same sessions. `[ui] screen = "rows"` makes it the
+    /// one that opens without the flag.
+    #[arg(long, conflicts_with = "headless_input")]
+    pub tui: bool,
+
+    /// Open the classic screen for this launch, whatever `[ui] screen` says —
+    /// the escape hatch.
+    #[arg(long, conflicts_with = "tui")]
+    pub classic: bool,
+
+    /// On the row-assembled screen: show the mascot.
+    #[arg(long)]
+    pub mascot: bool,
+
+    /// On the row-assembled screen: `auto` (ask the terminal), `dark` or `light`.
+    #[arg(long, value_name = "THEME")]
+    pub theme: Option<String>,
+
+    /// On the row-assembled screen: leave the mouse to the terminal (its own
+    /// selection works).
+    #[arg(long = "no-mouse")]
+    pub no_mouse: bool,
+
+    /// With --tui: check that the screen's composition is sound, and exit. Needs
+    /// no terminal and no provider.
+    #[arg(long, requires = "tui")]
+    pub audit: bool,
+
+    /// With --tui: print one composed frame of the screen, and exit.
+    #[arg(long, requires = "tui")]
+    pub demo: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
@@ -884,6 +928,12 @@ enum Commands {
     /// codingplan` were folded into the unified `/login` flow.
     #[command(hide = true)]
     Codingplan,
+    /// Review a diff and report structured findings, then exit.
+    ///
+    /// The one-shot form: no session, no screen. `/review` inside a session is
+    /// the same agent reached the other way. Takes a git range, a PR, or a diff
+    /// on stdin — `glab mr diff 5 | atomcode review --diff-file -`.
+    Review(review::ReviewArgs),
     /// Manage MCP server entries in `.mcp.json` (similar to `claude mcp add`)
     #[command(subcommand)]
     Mcp(McpCli),
@@ -1492,6 +1542,51 @@ async fn run() -> Result<i32> {
     }
     // ── End askpass early exit ────────────────────────────────────────────────
 
+    // `--tui --audit` / `--tui --demo` look at the screen alone: no config, no
+    // provider, no session, no terminal.
+    if cli.tui && cli.audit {
+        let screen = atomcode_tui::launch::Screen {
+            headless: Some((80, 24)),
+            ..Default::default()
+        };
+        return Ok(match atomcode_tui::launch::audit(&screen).await {
+            Ok(findings) if findings.is_empty() => {
+                println!("composition is consistent: every declared role matches the running tree");
+                0
+            }
+            Ok(findings) => {
+                for finding in &findings {
+                    let mark = if finding.defect { "✗" } else { "·" };
+                    println!("{mark} {}", finding.text);
+                }
+                let defects = findings.iter().filter(|f| f.defect).count();
+                if defects == 0 {
+                    println!("\nno defects; {} note(s) above", findings.len());
+                    0
+                } else {
+                    1
+                }
+            }
+            Err(why) => {
+                eprintln!("{why}");
+                1
+            }
+        });
+    }
+    if cli.tui && cli.demo {
+        let size = crossterm::terminal::size().unwrap_or((100, 30));
+        return Ok(match atomcode_tui::launch::demo(size).await {
+            Ok(frame) => {
+                print!("{frame}");
+                0
+            }
+            Err(why) => {
+                eprintln!("{why}");
+                1
+            }
+        });
+    }
+
     let is_admin = atomcode_capabilities::process_utils::is_running_as_admin();
 
     // ── Telemetry init ────────────────────────────────────────────────────────
@@ -1888,49 +1983,12 @@ async fn run() -> Result<i32> {
                         );
                         Some(resolver)
                     };
-                let session_effort_resolver: Option<Arc<atomcode::acp::SessionModelResolver>> =
-                    Some({
-                        let base = config.clone();
-                        let provider = cli.provider.clone();
-                        let dir = working_dir.clone();
-                        let skip = cli.dangerously_skip_permissions;
-                        let resolver: Arc<atomcode::acp::SessionModelResolver> = Arc::new(
-                            move |effort: &str| -> Option<atomcode_coding::CodingAgentConfig> {
-                                let mut cfg = base.clone();
-                                let selection = cfg.effective_model_selection()?;
-                                cfg.update_selection_reasoning(&selection, |fields| {
-                                    *fields.reasoning_effort = match effort {
-                                        "off" => None,
-                                        other => Some(other.to_string()),
-                                    };
-                                });
-                                let runtime = runtime_config_from(
-                                    &cfg,
-                                    &dir,
-                                    provider.as_deref(),
-                                    None,
-                                    skip,
-                                    true,
-                                );
-                                if runtime.model.is_empty() {
-                                    return None;
-                                }
-                                Some(runtime.agent_config())
-                            },
-                        );
-                        resolver
-                    });
-                // Flush telemetry before the long-running stdio loop.
-                telemetry
-                    .shutdown(std::time::Duration::from_millis(500))
-                    .await;
                 return atomcode::acp::serve_stdio(atomcode::acp::AcpServeOptions {
                     engine: Some(engine),
                     provider_factory: Some(provider_factory),
                     auto_approve,
                     session_config_options,
                     session_model_resolver,
-                    session_effort_resolver,
                 })
                 .await
                 .map(|_| 0);
@@ -2184,6 +2242,13 @@ async fn run() -> Result<i32> {
         interactive_provider_bootstrap(&runtime_cfg)
     };
     let runtime_start = std::time::Instant::now();
+    // `--tui` reaches the runtime through a front end fed from inside its Apps.
+    // What was asked for now, else what the configuration says — one rule, in
+    // one place (`atomcode::tui_front::screen_for`).
+    let rows_screen = atomcode::tui_front::screen_for(cli.tui, cli.classic, config.ui.screen)
+        == atomcode_config::config::Screen::Rows;
+    let tui_front_end =
+        (rows_screen && !is_headless).then(atomcode_coding::front_end::FrontEnd::new);
     let (native_runtime, native_coding_cfg, continued_session) = spawn_native_cli_runtime(
         &runtime_cfg,
         resume_session_id,
@@ -2194,6 +2259,7 @@ async fn run() -> Result<i32> {
         // TUI-only: the interactive checkpoint replaces the hard round-cap
         // error. Headless (`-p`) keeps the fail-closed hard error (no picker).
         !is_headless,
+        tui_front_end.clone(),
     )
     .await?;
     // The active session id (fresh or resumed) for the on-exit resume hint,
@@ -2433,6 +2499,50 @@ async fn run() -> Result<i32> {
             let (runtime, coding_cfg) = native_tui_runtime
                 .take()
                 .expect("native TUI runtime built above");
+            if let Some(front_end) = tui_front_end {
+                let screen = atomcode_tui::launch::Screen {
+                    mascot: cli.mascot,
+                    theme: cli.theme.clone(),
+                    mouse: !cli.no_mouse,
+                    ..Default::default()
+                };
+                tracing::info!(
+                    target: "atomcode::startup",
+                    stage = "tui_enter",
+                    total_ms = run_start.elapsed().as_millis() as u64,
+                    "handing control to the row-assembled TUI"
+                );
+                // Handed to the adapter rather than stashed on the front end:
+                // the front end was only carrying it for host control's benefit.
+                let host_config: std::sync::Arc<dyn atomcode::host::HostConfig> =
+                    std::sync::Arc::new(atomcode::tui_front::ConfigFile {
+                        path: config_path.clone(),
+                        working_dir: working_dir.clone(),
+                        telemetry: Some(telemetry.clone()),
+                        skip_permissions: cli.dangerously_skip_permissions,
+                        provider_override: cli.provider.clone(),
+                    });
+                let result = atomcode::tui_front::run(
+                    runtime,
+                    front_end,
+                    coding_cfg,
+                    Some(host_config),
+                    &screen,
+                    config_path.clone(),
+                    Some(telemetry.clone()),
+                )
+                .await
+                .map(|()| 0)
+                .map_err(|why| anyhow::anyhow!(why));
+                if let Some(id) = &active_session_id {
+                    println!("\n{}", resume_hint_line(id, false, hint_zh));
+                }
+                // The same flush every other exit path gets below.
+                telemetry
+                    .shutdown(std::time::Duration::from_millis(500))
+                    .await;
+                return result;
+            }
             let provider_selection = coding_cfg.provider_name.clone();
             let tui_runtime = into_tui_native_runtime(runtime, coding_cfg);
             // Same as the headless arm: don't `?` — a TUI run that ends in an
@@ -2814,6 +2924,9 @@ pub(crate) async fn spawn_native_cli_runtime(
     // event loop, so headless (`-p`) callers pass `false` — otherwise the
     // kernel would emit a checkpoint Request with no requester and fail-closed.
     round_cap_checkpoint: bool,
+    // A front end outside the runtime's App (`atomcode --tui`), fed from every
+    // App the runtime builds. `None` when the driver reads the runtime's events.
+    front_end: Option<Arc<atomcode_coding::front_end::FrontEnd>>,
 ) -> anyhow::Result<(
     atomcode_coding::CodingRuntime,
     atomcode_coding::CodingAgentConfig,
@@ -2862,37 +2975,29 @@ pub(crate) async fn spawn_native_cli_runtime(
             None => (atomcode_coding::SessionMode::Fresh, None, None),
         }
     };
-    // External-agent subagents (Claude Code / Codex) from `[[subagent.external]]`.
-    // Interactive TUI ⇒ dangerous (`bypass`) modes are allowed to be configured
-    // (each risky call is still approval-gated); headless/daemon paths pass none.
-    let external_subagents = cfg
-        .subagent_config
-        .as_ref()
-        .map(|c| atomcode_coding::parts::resolve_external_subagents(&c.subagent, true))
-        .unwrap_or_default();
-    let prepare = atomcode_coding::PrepareOptions {
-        subagents: atomcode_coding::SubagentPolicy::Enabled,
-        session,
-        tools: !no_tools,
-        skill_dirs: no_tools.then(Vec::new),
-        plugin_skill_dirs: if no_tools {
-            Vec::new()
-        } else {
-            atomcode_daemon::gather_plugin_skill_dirs_for(&cfg.working_dir)
-        },
-        mcp: cfg.mcp && !no_tools,
-        external_subagents: if no_tools {
-            Vec::new()
-        } else {
-            external_subagents
-        },
-        memory: !no_tools,
-        web: !no_tools,
-        review: !no_tools,
-        request_user_input: !no_tools,
-        rate_limit_source: Some(atomcode_daemon::coding_plan_rate_limit_source()),
-        ..atomcode_coding::PrepareOptions::default()
-    };
+    // Build the driver-neutral half from the runtime config (external-agent
+    // subagents, MCP, full-capability defaults), then overlay what makes THIS
+    // driver different. `no_tools` strips every tool beyond the core; the
+    // CLI serves both interactive and headless spawns, which is why
+    // `prepare_from_config` resolves bypass-downgrade from `cfg.interactive`.
+    let mut prepare = atomcode_coding::prepare_from_config(cfg);
+    if no_tools {
+        prepare.tools = false;
+        prepare.skill_dirs = Some(Vec::new());
+        prepare.plugin_skill_dirs = Vec::new();
+        prepare.mcp = false;
+        prepare.external_subagents = Vec::new();
+        prepare.memory = false;
+        prepare.web = false;
+        prepare.review = false;
+        prepare.request_user_input = false;
+    } else {
+        prepare.plugin_skill_dirs = atomcode_daemon::gather_plugin_skill_dirs_for(&cfg.working_dir);
+    }
+    prepare.subagents = atomcode_coding::SubagentPolicy::Enabled;
+    prepare.session = session;
+    prepare.rate_limit_source = Some(atomcode_daemon::coding_plan_rate_limit_source());
+    prepare.front_end = front_end;
     let start = atomcode_coding::CodingRuntimeStart {
         agent: agent.clone(),
         prepare,
@@ -3134,6 +3239,23 @@ pub(crate) async fn run_native_headless(
                     );
                 }
             }
+            // Model-visible context the person did not type — a delegated
+            // agent's report, a continuation the engine asked for. Shown under
+            // `-v` for the same reason the TUI draws it: without it the model
+            // and the person are reading two different conversations.
+            //
+            // Deliberately NOT added to the JSONL schema here. That stream is a
+            // versioned contract read by other programs, and this session has
+            // already paid for the lesson that a `serde(tag=…)` reader fails
+            // the whole file on a kind it does not know (`SESSION_FORMAT_VERSION`
+            // 1 → 2). Putting it there is a schema decision with a version bump,
+            // not a line added in passing.
+            CodingRuntimeEvent::Agent(KernelEvent::ContextAdded { text, source }) => {
+                if !jsonl && verbose {
+                    close_native_thinking(&mut thinking_line_open);
+                    eprintln!("[context {source:?}] {}", truncate_log_line(&text, 200));
+                }
+            }
             CodingRuntimeEvent::Agent(KernelEvent::ToolResult { result }) => {
                 close_native_thinking(&mut thinking_line_open);
                 if jsonl {
@@ -3239,7 +3361,13 @@ pub(crate) async fn run_native_headless(
                     })?;
                 } else {
                     eprintln!(
-                        "API error {reason}，{backoff_secs} 秒后重试({attempt}/{max_attempts})..."
+                        "{}",
+                        atomcode_config::i18n::t(atomcode_config::i18n::Msg::ApiErrorRetrying {
+                            reason: &reason,
+                            seconds: backoff_secs,
+                            attempt,
+                            max: max_attempts,
+                        })
                     );
                 }
             }
@@ -3533,6 +3661,9 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
         }
         Commands::Telemetry { .. } => {
             unreachable!("Telemetry is handled inline in run() before handle_command")
+        }
+        Commands::Review(args) => {
+            return review::review(args).await;
         }
         Commands::Daemon { .. } => {
             unreachable!("Daemon is handled inline in run() before handle_command")
@@ -4496,6 +4627,7 @@ mod tests {
             message_count: 1,
             turn_count: 1,
             presence: atomcode_capabilities::session::CatalogPresence::NativeOnly,
+            needs_newer_version: false,
         }
     }
 

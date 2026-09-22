@@ -112,7 +112,10 @@ pub use edit::EditFileTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use list::ListDirTool;
-pub use open_file::{open_local_path, OpenFileTool, OpenFileWorkspaceGate};
+pub use open_file::{
+    open_local_path, open_local_url, LocalOpener, OpenFileTool, OpenFileWorkspaceGate, OpenTarget,
+    Opener,
+};
 pub use output_artifact::{
     artifact_id, ArtifactMiddleware, ArtifactStore, FetchOutputTool,
     ARTIFACT_TRUNCATION_MARKER_PREFIX, THRESHOLD_BYTES,
@@ -124,10 +127,12 @@ pub use repair::{repair_tool_args, RepairToolArgsMiddleware};
 pub use report_finding::{Finding, ReportFindingTool};
 pub use search_replace::SearchReplaceTool;
 pub use sensitive_path::{path_is_sensitive, references_sensitive_path, SensitivePathGate};
-pub use task::{
-    subagent_child_middlewares, subagent_child_middlewares_for_policy, team_child_middlewares,
-    team_child_middlewares_for_policy, TaskTool,
-};
+// What is left of `task`: the scope gate the harness's `DelegationBoundsPlugin`
+// puts around a delegated child, and nothing else. The tool itself, its child
+// runner and its middlewares had no production caller — the agent that runs
+// today mounts the harness's own `subagent-in-process` row, which carries its
+// own `task` tool (`harness/src/plugins/subagent.rs`).
+pub use task::delegated_write_violation;
 pub use todo::TodoTool;
 #[cfg(feature = "web")]
 pub use web_fetch::WebFetchTool;
@@ -200,19 +205,19 @@ pub fn register_coding_tools(reg: &mut ToolRegistry) {
 /// provider image encoder.
 pub fn register_coding_tools_with_vision(reg: &mut ToolRegistry, vision: bool) {
     reg.register(Arc::new(ReadFileTool::new(vision)));
-    reg.register(Arc::new(WriteFileTool));
-    reg.register(Arc::new(EditFileTool));
-    reg.register(Arc::new(ListDirTool));
-    reg.register(Arc::new(OpenFileTool));
-    reg.register(Arc::new(BashTool));
+    reg.register(Arc::new(WriteFileTool::default()));
+    reg.register(Arc::new(EditFileTool::default()));
+    reg.register(Arc::new(ListDirTool::default()));
+    reg.register(Arc::new(OpenFileTool::default()));
+    reg.register(Arc::new(BashTool::default()));
     // Background job path for long-running commands (start/poll/kill) — the reference-
     // informed alternative to an ever-larger `timeout` (see tools::bash::background).
-    reg.register(Arc::new(bash::BashStartTool));
+    reg.register(Arc::new(bash::BashStartTool::default()));
     reg.register(Arc::new(bash::BashPollTool));
     reg.register(Arc::new(bash::BashKillTool));
-    reg.register(Arc::new(GrepTool));
-    reg.register(Arc::new(GlobTool));
-    reg.register(Arc::new(SearchReplaceTool));
+    reg.register(Arc::new(GrepTool::default()));
+    reg.register(Arc::new(GlobTool::default()));
+    reg.register(Arc::new(SearchReplaceTool::default()));
     reg.register(Arc::new(AstGrepTool));
     // Gate on ATOMCODE_TODO env var (0/false/off → skip; anything else or absent → register).
     // Mirrors atomcode_core::config::todo_enabled_from_env but inlined here because
@@ -271,7 +276,7 @@ pub fn register_coding_tools_with_vision(reg: &mut ToolRegistry, vision: bool) {
             })
             .unwrap_or(false);
         if !memory_off {
-            reg.register(Arc::new(MemoryTool));
+            reg.register(Arc::new(MemoryTool::new()));
         }
     }
 }
@@ -833,7 +838,7 @@ mod tests {
         );
     }
 
-    /// A `/model` swap re-registers `read_file` (see `coding::parts::assemble`) to refresh
+    /// A `/model` swap re-mounts the row that offers `read_file`, to refresh
     /// its vision flag. This guards the mechanism that fix relies on: re-registering with a
     /// new `vision` value OVERWRITES the prior `read_file`, so a model swap from text→vision
     /// (or vision→text) actually changes how it treats an image — it does not go stale.

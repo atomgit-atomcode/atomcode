@@ -18,8 +18,8 @@ use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
 use atomcode_kernel::message::{Conversation, Message, SessionSnapshot};
 
 use super::rewind::{
-    RewindLedger, RewindPoint, RewindTransactionJournal, WorkspaceRestorePlan, LEDGER_VERSION,
-    TRANSACTION_VERSION,
+    FileChangeSummary, RewindLedger, RewindPoint, RewindTransactionJournal, WorkspaceRestorePlan,
+    LEDGER_VERSION, TRANSACTION_VERSION,
 };
 use super::{
     now_ms, ModelUsageStat, PresentationFile, SessionLease, SessionManager, SessionMeta,
@@ -110,7 +110,7 @@ pub struct SnapshotHook {
 #[derive(Default)]
 struct RewindState {
     checkpoint: Option<Arc<WorkspaceCheckpoint>>,
-    unavailable: Option<String>,
+    unavailable: Option<CodeRewindUnavailable>,
     transaction_unavailable: Option<String>,
     pending: Option<PendingRewindPoint>,
     points: Vec<RewindPoint>,
@@ -122,9 +122,42 @@ struct PendingRewindPoint {
     before_tree: Option<String>,
 }
 
-const CODE_REWIND_DISABLED_REASON: &str =
-    "Code Rewind (workspace file restore) is off by default to protect disk space; \
-     set ATOMCODE_CODE_REWIND=1 to opt in. Conversation Rewind remains available.";
+/// Why the workspace half of a rewind is not on offer.
+///
+/// **A kind, not a sentence.** The two cases are different things to be told:
+/// one is a switch the person can throw, the other is a failure with a cause.
+/// They were both flattened into an English string here, which left every front
+/// end with a sentence it could only pass through — so a Chinese screen said
+/// "代码回不去：Code Rewind (workspace file restore) is off by default…". The
+/// words belong to whoever is talking to the person; this layer says which case
+/// it is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CodeRewindUnavailable {
+    /// Off by default, to protect disk space. The person can opt in with
+    /// `ATOMCODE_CODE_REWIND=1`.
+    NotEnabled,
+    /// Opted in, but the checkpoint could not be set up — with the cause,
+    /// which is a fact about this machine and travels as text.
+    SetupFailed(String),
+}
+
+impl std::fmt::Display for CodeRewindUnavailable {
+    /// For the places inside this crate that need *a* reason string: a
+    /// checkpoint error, a log line. A front end matches on the kind instead.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotEnabled => f.write_str(
+                "Code Rewind (workspace file restore) is off by default to protect disk \
+                 space; set ATOMCODE_CODE_REWIND=1 to opt in. Conversation Rewind remains \
+                 available.",
+            ),
+            Self::SetupFailed(why) => write!(
+                f,
+                "Code Rewind unavailable (ATOMCODE_CODE_REWIND=1 is set but setup failed): {why}"
+            ),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct RewindTransactionReceipt {
@@ -172,13 +205,11 @@ impl SnapshotHook {
                 Ok(cp) => (Some(Arc::new(cp)), None),
                 Err(e) => (
                     None,
-                    Some(format!(
-                    "Code Rewind unavailable (ATOMCODE_CODE_REWIND=1 is set but setup failed): {e}"
-                )),
+                    Some(CodeRewindUnavailable::SetupFailed(e.to_string())),
                 ),
             }
         } else {
-            (None, Some(CODE_REWIND_DISABLED_REASON.to_string()))
+            (None, Some(CodeRewindUnavailable::NotEnabled))
         };
         let points = mgr
             .load_rewind_ledger(&session_id)
@@ -252,7 +283,63 @@ impl SnapshotHook {
             .clone()
     }
 
-    pub fn code_rewind_unavailable(&self) -> Option<String> {
+    /// What this session has changed in the workspace, so far.
+    ///
+    /// From the tree as it stood before the session's first prompt to the tree
+    /// as it stands now — not turn by turn. "What did it do to my code" is a
+    /// question about the whole session; the per-turn view is what rewind
+    /// points are for.
+    ///
+    /// `Err` is why it cannot be answered (no workspace checkpointing, or git
+    /// refused); `Ok(empty)` is a session that has changed nothing, which is a
+    /// different thing and must read differently on screen.
+    pub fn changes(&self) -> Result<Vec<FileChangeSummary>, String> {
+        let (checkpoint, first) = self.diff_ends()?;
+        let now = checkpoint
+            .capture()
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "工作区快照现在取不到".to_string())?;
+        checkpoint.diff(&first, &now).map_err(|e| e.to_string())
+    }
+
+    /// The unified diff of one changed file, over the same two ends.
+    pub fn file_diff(&self, path: &str) -> Result<String, String> {
+        let (checkpoint, first) = self.diff_ends()?;
+        let now = checkpoint
+            .capture()
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "工作区快照现在取不到".to_string())?;
+        checkpoint
+            .diff_text(&first, &now, path)
+            .map_err(|e| e.to_string())
+    }
+
+    /// The checkpoint and the tree this session started from.
+    fn diff_ends(&self) -> Result<(Arc<WorkspaceCheckpoint>, String), String> {
+        let state = self
+            .rewind
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(reason) = &state.unavailable {
+            return Err(reason.to_string());
+        }
+        let checkpoint = state
+            .checkpoint
+            .clone()
+            .ok_or_else(|| "这个会话没有工作区快照".to_string())?;
+        // The oldest point that has one: the earliest state this session ever
+        // saw. A point with no tree is a conversation-only one and says nothing
+        // about files.
+        let first = state
+            .points
+            .iter()
+            .find_map(|point| point.before_tree.clone())
+            .or_else(|| state.pending.as_ref().and_then(|p| p.before_tree.clone()))
+            .ok_or_else(|| "这个会话还没有动过工作区".to_string())?;
+        Ok((checkpoint, first))
+    }
+
+    pub fn code_rewind_unavailable(&self) -> Option<CodeRewindUnavailable> {
         self.rewind
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -283,7 +370,8 @@ impl SnapshotHook {
             WorkspaceCheckpointError::Unsupported(
                 rewind
                     .unavailable
-                    .clone()
+                    .as_ref()
+                    .map(CodeRewindUnavailable::to_string)
                     .unwrap_or_else(|| "code rewind is unavailable".into()),
             )
         })?;
@@ -342,7 +430,8 @@ impl SnapshotHook {
                 WorkspaceCheckpointError::Unsupported(
                     rewind
                         .unavailable
-                        .clone()
+                        .as_ref()
+                        .map(CodeRewindUnavailable::to_string)
                         .unwrap_or_else(|| "code rewind is unavailable".into()),
                 )
             })?;
@@ -770,6 +859,15 @@ impl CompactionCheckpoint for SnapshotHook {
 
 #[async_trait]
 impl LifecycleHooks for SnapshotHook {
+    fn checkpoint_taken(&self) -> Option<String> {
+        self.rewind
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .pending
+            .as_ref()
+            .and_then(|pending| pending.before_tree.clone())
+    }
+
     /// Mark the turn's wall-clock start (for `duration_ms`) and reset per-turn counters.
     async fn user_prompt_submit(&self, _text: &mut String) -> Result<(), String> {
         let mut a = self.lock();

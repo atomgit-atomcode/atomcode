@@ -23,6 +23,36 @@ pub enum McpTransportConfig {
     },
 }
 
+/// How a server is reached, without how to reach it.
+///
+/// [`McpTransportConfig`]'s payload carries headers and OAuth material, so a
+/// listener that only wants to say "this one is a stdio server" must not be
+/// handed the config to find out. This is the discriminant on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpTransportKind {
+    Stdio,
+    Http,
+}
+
+impl McpTransportKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            McpTransportKind::Stdio => "stdio",
+            McpTransportKind::Http => "http",
+        }
+    }
+}
+
+impl McpTransportConfig {
+    /// Which transport this is, with nothing that could authenticate as anyone.
+    pub fn kind(&self) -> McpTransportKind {
+        match self {
+            McpTransportConfig::Stdio { .. } => McpTransportKind::Stdio,
+            McpTransportConfig::Http { .. } => McpTransportKind::Http,
+        }
+    }
+}
+
 /// Authentication configuration for HTTP MCP servers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpHttpAuthConfig {

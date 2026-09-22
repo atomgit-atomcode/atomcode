@@ -41,12 +41,69 @@ pub struct SettingSpec {
     pub apply: ApplyPolicy,
 }
 
+impl SettingSpec {
+    /// The label, in the language in force.
+    ///
+    /// Both labels were here from the start and every caller reached for
+    /// `label_zh`, so an English session read a settings panel in Chinese. One
+    /// accessor rather than three `if` at three call sites: the front ends and
+    /// the host contract all ask the same question.
+    pub fn label(&self) -> &'static str {
+        match crate::i18n::current_locale() {
+            crate::locale::Locale::ZhCn => self.label_zh,
+            crate::locale::Locale::En => self.label_en,
+        }
+    }
+}
+
+/// The catalog as an agent reads it: which file, what each setting accepts, and
+/// when a change takes effect.
+///
+/// Rendered from [`SETTINGS`] itself, next to it, so a setting that is added,
+/// renamed or retired changes this answer without anyone remembering to.
+pub fn describe_catalog(config_file: &std::path::Path) -> String {
+    let mut out = format!(
+        "User settings live in `{}`. {} of them are safely editable; each line is \
+         `id — label (aliases) : accepted values → when it takes effect`.\n\n\
+         Note what is deliberately absent: model, provider, account, endpoint and \
+         credentials are NOT in this catalog — see the `operations` aspect for how \
+         the model is chosen.\n",
+        config_file.display(),
+        SETTINGS.len(),
+    );
+    for spec in SETTINGS {
+        let values = match spec.kind {
+            SettingKind::Boolean => "true | false".to_string(),
+            SettingKind::OptionalBoolean => "true | false | unset".to_string(),
+            SettingKind::Integer { min, max } => format!("{min}..={max}"),
+            SettingKind::Choice(options) => options.join(" | "),
+            SettingKind::Text => "text".to_string(),
+        };
+        out.push_str(&format!(
+            "\n  {} — {} / {}{} : {} → {:?}",
+            spec.id,
+            spec.label_en,
+            spec.label_zh,
+            if spec.aliases.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", spec.aliases.join(", "))
+            },
+            values,
+            spec.apply,
+        ));
+    }
+    out
+}
+
 const TODO_EAGERNESS: &[&str] = &["auto", "preferred", "always"];
 const THEMES: &[&str] = &["auto", "dark", "light"];
 const LANGUAGES: &[&str] = &["auto", "en", "zh_CN"];
 const SHELL_GUARD_POLICIES: &[&str] = &["prompt", "strict", "off"];
 const SUBAGENT_LEVELS: &[&str] = &["off", "read-only", "accept-edits", "auto"];
 const MODE_SWITCH_KEYS: &[&str] = &["shift_tab", "tab"];
+/// `default` is this build's, which is what a person gets back by unsetting it.
+const SCREENS: &[&str] = &["default", "rows", "classic"];
 
 pub static SETTINGS: &[SettingSpec] = &[
     bool_setting(
@@ -161,6 +218,15 @@ pub static SETTINGS: &[SettingSpec] = &[
         aliases: &["task", "agent"],
         kind: SettingKind::Integer { min: 0, max: 10000 },
         apply: ApplyPolicy::CapabilityReprepare,
+    },
+    SettingSpec {
+        id: "ui.screen",
+        path: &["ui", "screen"],
+        label_en: "Screen",
+        label_zh: "界面",
+        aliases: &["tui", "classic", "rows", "界面", "屏幕"],
+        kind: SettingKind::Choice(SCREENS),
+        apply: ApplyPolicy::NextStartup,
     },
     SettingSpec {
         id: "ui.theme",
@@ -349,6 +415,7 @@ impl SettingSpec {
             "subagent.max_rounds" => config.subagent.max_rounds.to_string(),
             "subagent.codex" => config.subagent.codex.clone(),
             "subagent.claude" => config.subagent.claude.clone(),
+            "ui.screen" => format!("{:?}", config.ui.screen).to_lowercase(),
             "ui.theme" => format!("{:?}", config.ui.theme).to_lowercase(),
             "ui.mode_switch_key" => match config.ui.mode_switch_key {
                 crate::config::ModeSwitchKey::ShiftTab => "shift_tab",

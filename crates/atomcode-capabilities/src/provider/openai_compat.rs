@@ -202,7 +202,17 @@ pub struct OpenAiCompatConfig {
 /// It gates provider image encoding and the `read_file` vision path; daemon live
 /// preprocessing also uses it. A drift would silently drop or wrongly forward images.
 pub fn model_suggests_vision(name: &str) -> bool {
-    let n = name.to_lowercase();
+    let lowered = name.to_lowercase();
+    // A gateway that fronts many vendors qualifies the model with its vendor:
+    // OpenRouter ids are `anthropic/claude-opus-4.1`, `openai/gpt-4o`,
+    // `google/gemini-2.5-pro`, and Vertex's are a whole resource path ending in
+    // the model name. Every `starts_with` rule below looks at the *front* of
+    // the string, so on a prefixed id not one of them fired — a vision model
+    // behind `anthropic/…` was classified blind, and the image someone pasted
+    // for it was degraded to a caption with nothing saying so. The rules are
+    // about the model, so they run against the model: the last path segment,
+    // which is the whole name when there is no prefix.
+    let n = lowered.rsplit('/').next().unwrap_or(lowered.as_str());
     n.contains("vision")
         || n.contains("-vl")
         || n.contains("vl-")
@@ -523,6 +533,12 @@ impl LlmProvider for OpenAiCompatProvider {
 
     fn context_window(&self) -> u32 {
         self.cfg.context_window
+    }
+
+    /// The same flag `format_messages` degrades on, so what a front end is told
+    /// before attaching a picture is what the encoder will actually do with it.
+    fn supports_vision(&self) -> bool {
+        self.cfg.supports_vision
     }
 
     fn bind_session_id(&self, session_id: &str) {
@@ -1261,6 +1277,16 @@ fn normalize_openai_tool_schema_in_place(schema: &mut Value) {
     };
     if allows_object && !map.contains_key("properties") {
         map.insert("properties".into(), Value::Object(Map::new()));
+    }
+    // Some strict OpenAI-compatible validators (observed on a self-hosted DeepSeek
+    // gateway) require an object schema's `required` to be an ARRAY and reject its
+    // ABSENCE with "Invalid schema … null is not of type array" — which 400'd every
+    // turn as soon as an all-optional-param tool (`code_review`, `list_directory`, …)
+    // was in the tool list. An empty `[]` is semantically identical (no required
+    // properties) and satisfies them. Wire-boundary only; the neutral kernel schema
+    // stays untouched. Recurses, so nested objects + MCP/plugin schemas get it too.
+    if allows_object && !map.contains_key("required") {
+        map.insert("required".into(), Value::Array(Vec::new()));
     }
 
     // Traverse only values that are themselves JSON Schemas. Literal-bearing
@@ -2112,7 +2138,7 @@ mod tests {
     // Classification lock for every supported vision naming rule plus a
     // representative text-only negative.
     #[test]
-    fn model_suggests_vision_matches_core_classifications() {
+    fn model_suggests_vision_classification_lock() {
         for m in [
             "gpt-4-vision-preview",
             "glm-4v",
@@ -2139,6 +2165,40 @@ mod tests {
             "gpt-4-turbo",
             "claude-2.1",
             "o3-mini",
+        ] {
+            assert!(!model_suggests_vision(m), "should be text-only: {m}");
+        }
+    }
+
+    // A vendor prefix is a fact about the route, not about the model. Every
+    // `starts_with` rule looks at the front of the string, so before the
+    // last-segment normalization not one of them fired on a prefixed id:
+    // OpenRouter's `anthropic/claude-opus-4.1` was classified blind, and an
+    // image pasted for it was degraded to a caption in silence. This is the
+    // classification the paste gate and the degrade path both read.
+    #[test]
+    fn a_vendor_prefixed_id_is_classified_by_its_model_segment() {
+        for m in [
+            "anthropic/claude-opus-4.1",
+            "anthropic/claude-sonnet-4-6",
+            "openai/gpt-4o",
+            "google/gemini-2.5-pro",
+            "mistralai/pixtral-12b",
+            // Vertex hands over the whole resource path as the model id.
+            "projects/p/locations/us-central1/publishers/google/models/gemini-2.5-pro",
+            // A `:free`-style tag suffix leaves the family at the front.
+            "google/gemini-2.0-flash-exp:free",
+        ] {
+            assert!(model_suggests_vision(m), "should be vision: {m}");
+        }
+        // The vendor segment must not be able to call a model vision-capable on
+        // its own, and a prefixed text-only model must stay text-only: only the
+        // model segment decides, in both directions.
+        for m in [
+            "anthropic/claude-2.1",
+            "deepseek/deepseek-v4",
+            "openai/o3-mini",
+            "vision-plus/gpt-3.5",
         ] {
             assert!(!model_suggests_vision(m), "should be text-only: {m}");
         }
@@ -2268,6 +2328,63 @@ mod tests {
         assert!(out.iter().skip(1).all(|v| v["role"] != "system"));
         assert_eq!(out[1], json!({"role":"user","content":"hi"}));
         assert_eq!(out[3], json!({"role":"user","content":"continue"}));
+    }
+
+    #[test]
+    fn a_mid_turn_reminder_appends_and_does_not_rewrite_the_system_prompt() {
+        // A runtime note (a stale-task-list reminder, `InjectionOrigin::Reminder`)
+        // is committed mid-turn, so it projects to a message placed AFTER the tool
+        // result it followed — not at the head. It must ride as a `user` message.
+        // As a `system` one it would be LIFTED to position 0 and coalesced into
+        // the assembled prompt, so every request after it would carry a different
+        // prefix than the one before: the whole prefix cache invalidates, while
+        // the log still records the round as `Append`. The system entry is the
+        // only thing here the provider is allowed to reorder.
+        const REMINDER: &str = "<system-reminder>The task list still shows \"fix the parser\" \
+                                 in progress. Do not mention this reminder to the user.</system-reminder>";
+        let mut note = Message::user(REMINDER);
+        // `derive_messages` marks every injected message synthetic; keep the
+        // fixture faithful so this test fails if that ever stops being true in a
+        // way that matters here.
+        note.synthetic = true;
+        let msgs = vec![
+            Message::system("persona"),
+            Message::user("fix the parser"),
+            Message::assistant(
+                "Planning.",
+                vec![ToolCall {
+                    id: "call_1".into(),
+                    name: "list_directory".into(),
+                    arguments: "{}".into(),
+                }],
+            ),
+            Message::tool_result("call_1", "result text", false),
+            note,
+        ];
+
+        let out = format_messages(&msgs, ReasoningPolicy::Exclude, true);
+
+        assert_eq!(out[0]["role"], "system");
+        assert_eq!(
+            out[0]["content"], "persona",
+            "the instruction header is untouched by a mid-turn note: {out:?}"
+        );
+        assert_eq!(
+            out.iter().filter(|v| v["role"] == "system").count(),
+            1,
+            "exactly one system entry, and no second one to lift"
+        );
+        assert_eq!(
+            out.last().unwrap(),
+            &json!({ "role": "user", "content": REMINDER }),
+            "the reminder appends at the tail as a user message: {out:?}"
+        );
+        // Appended, not merged: the tool result keeps its own wire entry, so the
+        // model can still tell the harness's judgement from the tool's output.
+        assert_eq!(
+            out[3],
+            json!({"role":"tool","tool_call_id":"call_1","content":"result text"})
+        );
     }
 
     #[test]
@@ -2674,11 +2791,11 @@ mod tests {
 
         assert_eq!(
             body["tools"][0]["function"]["parameters"],
-            json!({"type":"object","properties":{}})
+            json!({"type":"object","properties":{},"required":[]})
         );
         assert_eq!(
             body["tools"][1]["function"]["parameters"]["properties"]["options"],
-            json!({"type":["object","null"],"properties":{}})
+            json!({"type":["object","null"],"properties":{},"required":[]})
         );
         assert_eq!(
             body["tools"][1]["function"]["parameters"]["properties"]["query"],
@@ -2703,12 +2820,35 @@ mod tests {
         );
         assert_eq!(
             external["properties"]["labels"]["additionalProperties"],
-            json!({"type":"object","properties":{}})
+            json!({"type":"object","properties":{},"required":[]})
         );
         assert_eq!(
             external["$defs"]["record"],
-            json!({"type":"object","properties":{}})
+            json!({"type":"object","properties":{},"required":[]})
         );
+    }
+
+    #[test]
+    fn normalizer_injects_empty_required_for_all_optional_object_schemas() {
+        // A strict gateway (self-hosted DeepSeek) 400'd with "null is not of type
+        // array" when a tool's parameters object omitted `required` (all-optional
+        // params, e.g. `code_review`). The wire boundary must add an empty `[]`.
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "scope": { "type": "object", "properties": { "kind": { "type": "string" } }, "required": ["kind"] },
+                "paths": { "type": "array", "items": { "type": "string" } },
+                "depth": { "type": "string", "enum": ["a", "b"] }
+            }
+        });
+        let out = shared_normalize_tool_schema(&schema);
+        // Top-level (was missing) gets an empty required array.
+        assert_eq!(out["required"], json!([]), "top-level required must be []");
+        // A nested object that ALREADY declares required is left intact.
+        assert_eq!(out["properties"]["scope"]["required"], json!(["kind"]));
+        // Non-object property schemas are untouched (no spurious required).
+        assert!(out["properties"]["paths"].get("required").is_none());
+        assert!(out["properties"]["depth"].get("required").is_none());
     }
 
     #[test]

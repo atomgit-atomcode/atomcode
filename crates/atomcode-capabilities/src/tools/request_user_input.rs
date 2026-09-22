@@ -31,8 +31,14 @@ fn default_true() -> bool {
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UserInputRequest {
-    pub header: String,
+    /// The question itself — the one thing a caller must supply. Declared before `header`
+    /// so that a call carrying neither is reported as missing `question`: `header` is only
+    /// a label derived from this text (see [`fill_default_header`]), and naming it would
+    /// send the model off to fix a field it never needed to send.
     pub question: String,
+    /// The short label drawn above the question. Still offered as required to the model,
+    /// but repaired from the question when one is dropped (see [`fill_default_header`]).
+    pub header: String,
     pub mode: UserInputMode,
     #[serde(default)]
     pub options: Vec<UserInputOption>,
@@ -101,13 +107,74 @@ fn fill_default_mode(value: &mut serde_json::Value) {
     map.insert("mode".into(), serde_json::Value::String(inferred.into()));
 }
 
+/// How many characters of a question become its derived `header`.
+const HEADER_MAX_CHARS: usize = 24;
+
+/// The short label for a question that arrived without one: its first non-blank line,
+/// trimmed and cut to `HEADER_MAX_CHARS` **characters** — not bytes, so a Chinese question
+/// is never split mid-glyph — with `…` marking the cut.
+///
+/// `None` when there is no question text to derive one from: then the missing `question`
+/// is the field worth reporting, not `header`.
+fn derive_header(question: &str) -> Option<String> {
+    let first = question
+        .lines()
+        .find(|line| !line.trim().is_empty())?
+        .trim();
+    if first.is_empty() {
+        return None;
+    }
+    let mut label: String = first.chars().take(HEADER_MAX_CHARS).collect();
+    if first.chars().count() > HEADER_MAX_CHARS {
+        label.push('…');
+    }
+    Some(label)
+}
+
+/// Fill in a default `header` when the model omits it, sends `null`, or sends something
+/// that is not a usable non-blank string. Like `mode`, this is a required field weak models
+/// drop — and the call would otherwise hard-fail with `missing field 'header'`, even though
+/// `header` is only the short label the panel draws above the question. Derived from the
+/// question (see [`derive_header`]). A usable `header` is left untouched, as is a payload
+/// with no question text to derive one from. No-op on a non-object value.
+fn fill_default_header(value: &mut serde_json::Value) {
+    let serde_json::Value::Object(map) = value else {
+        return;
+    };
+    let usable = map
+        .get("header")
+        .and_then(serde_json::Value::as_str)
+        .map(|header| !header.trim().is_empty())
+        .unwrap_or(false);
+    if usable {
+        return;
+    }
+    let label = map
+        .get("question")
+        .and_then(serde_json::Value::as_str)
+        .and_then(derive_header);
+    if let Some(label) = label {
+        map.insert("header".into(), serde_json::Value::String(label));
+    }
+}
+
+/// Repair the fields a weak model frequently drops, on the raw JSON before deserialization:
+/// `mode` (inferred from `options`) and `header` (derived from the question). A call that
+/// would have hard-failed becomes a usable one. Both the single and the batch path funnel
+/// through here, so a question is repaired the same way wherever it arrived.
+fn fill_defaults(value: &mut serde_json::Value) {
+    fill_default_mode(value);
+    fill_default_header(value);
+}
+
 /// Parse raw tool args into a `UserInputRequest`. A missing `mode` is inferred from
-/// `options` (see [`fill_default_mode`]); choice modes with no options are rejected.
+/// `options` (see [`fill_default_mode`]) and a missing `header` derived from the question
+/// (see [`fill_default_header`]); choice modes with no options are rejected.
 /// Returns a human message on failure (never panics).
 pub fn parse_args(args: &str) -> Result<UserInputRequest, String> {
     let mut value: serde_json::Value = serde_json::from_str(args)
         .map_err(|e| format!("invalid request_user_input arguments: {e}"))?;
-    fill_default_mode(&mut value);
+    fill_defaults(&mut value);
     let mut req: UserInputRequest = serde_json::from_value(value)
         .map_err(|e| format!("invalid request_user_input arguments: {e}"))?;
     // Keep accepting the legacy field for wire compatibility, but a
@@ -120,6 +187,7 @@ pub fn parse_args(args: &str) -> Result<UserInputRequest, String> {
 /// Parse args into 1..=`MAX_QUESTIONS` questions. Accepts a `{ "questions": [...] }`
 /// array (batch) or the flat single-question shape (legacy). The bool is `is_batch`
 /// — the caller uses it to pick the wire shape. Clamps a batch to `MAX_QUESTIONS`.
+/// Every question is repaired the same way [`parse_args`] repairs a lone one.
 pub fn parse_batch(args: &str) -> Result<(Vec<UserInputRequest>, bool), String> {
     let val: serde_json::Value = serde_json::from_str(args)
         .map_err(|e| format!("invalid request_user_input arguments: {e}"))?;
@@ -130,7 +198,7 @@ pub fn parse_batch(args: &str) -> Result<(Vec<UserInputRequest>, bool), String> 
         let mut out = Vec::new();
         for q in qs.iter().take(MAX_QUESTIONS) {
             let mut q = q.clone();
-            fill_default_mode(&mut q);
+            fill_defaults(&mut q);
             let mut req: UserInputRequest = serde_json::from_value(q)
                 .map_err(|e| format!("invalid question in `questions`: {e}"))?;
             req.custom = true;
@@ -395,6 +463,75 @@ mod tests {
     fn omitted_mode_without_options_infers_text() {
         let r = parse_args(r#"{"header":"H","question":"Q?"}"#).unwrap();
         assert_eq!(r.mode, UserInputMode::Text);
+    }
+
+    /// A required field weak models drop, in the flat shape: `header` is only the label the
+    /// panel draws above the question, so derive one rather than hard-failing the call.
+    #[test]
+    fn omitted_header_is_derived_from_the_question() {
+        let r = parse_args(r#"{"question":"Which database?"}"#).unwrap();
+        assert_eq!(r.header, "Which database?");
+        assert_eq!(r.mode, UserInputMode::Text);
+    }
+
+    /// The same repair in the batch shape, per question. A batch used to lose every one of
+    /// its questions to `invalid question in questions: missing field header`.
+    #[test]
+    fn batch_questions_without_headers_get_one_each() {
+        let (reqs, is_batch) = parse_batch(
+            r#"{"questions":[
+                {"question":"First one?","options":[{"label":"A"}]},
+                {"header":"Kept","question":"Second one?"}
+            ]}"#,
+        )
+        .unwrap();
+        assert!(is_batch);
+        assert_eq!(reqs[0].header, "First one?");
+        assert_eq!(reqs[1].header, "Kept", "a usable header is left alone");
+        assert_eq!(reqs[0].mode, UserInputMode::Single);
+    }
+
+    /// Blank, null and non-string: all three are "no header", because a question labelled
+    /// `7` has no label at all.
+    #[test]
+    fn unusable_header_is_replaced_by_the_derived_one() {
+        for args in [
+            r#"{"header":"   ","question":"Q?"}"#,
+            r#"{"header":null,"question":"Q?"}"#,
+            r#"{"header":7,"question":"Q?"}"#,
+        ] {
+            let r = parse_args(args).unwrap_or_else(|e| panic!("{args}: {e}"));
+            assert_eq!(r.header, "Q?", "{args}");
+        }
+    }
+
+    #[test]
+    fn usable_header_is_never_overridden() {
+        let r = parse_args(r#"{"header":"Auth","question":"A much longer question?"}"#).unwrap();
+        assert_eq!(r.header, "Auth");
+    }
+
+    /// The cut counts characters, so a Chinese question is never split mid-glyph.
+    #[test]
+    fn derived_header_cuts_on_char_boundaries() {
+        let question = "这是一个非常长的中文问题需要被截断成一个短标签而且不能把任何一个汉字切开?";
+        let r = parse_args(&format!(r#"{{"question":"{question}"}}"#)).unwrap();
+        assert_eq!(
+            r.header.chars().count(),
+            HEADER_MAX_CHARS + 1,
+            "{:?}",
+            r.header
+        );
+        assert!(r.header.ends_with('…'), "{:?}", r.header);
+    }
+
+    /// Nothing to derive from: the missing `question` is what the caller must hear about,
+    /// not the `header` that was going to be built out of it.
+    #[test]
+    fn without_a_question_the_missing_header_is_not_what_is_reported() {
+        let err = parse_args(r#"{"mode":"text"}"#).unwrap_err();
+        assert!(err.contains("question"), "{err}");
+        assert!(!err.contains("header"), "{err}");
     }
 
     #[test]

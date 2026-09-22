@@ -44,6 +44,14 @@ pub struct ApprovalRequest {
     /// grant (destructive / out-of-workspace / sensitive path).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Whether the driver may offer the session-wide "allow all Bash (incl.
+    /// destructive)" option for THIS call. True only for a non-sensitive bash
+    /// command (see [`crate::tools::Tool::allow_all_group`]); a sensitive target
+    /// leaves it false so the blanket is never even offered — the floor is drawn
+    /// here, not left to the front end. A driver that ignores the flag simply
+    /// never shows the fourth button; answering it when unset fail-closes to deny.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_all_bash: bool,
 }
 
 /// The driver's answer. `decision` is `"allow"` / `"allow_always"` / `"deny"`
@@ -54,6 +62,11 @@ pub struct ApprovalResponse {
     pub decision: String,
     #[serde(default)]
     pub remember: bool,
+    /// `Some("all")` for the session-wide "allow all Bash" answer; `None` otherwise.
+    /// Kept so a re-encoded response round-trips back through
+    /// [`PermissionDecision::from_value`] as the same decision it came from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_scope: Option<String>,
 }
 
 impl ApprovalResponse {
@@ -61,18 +74,30 @@ impl ApprovalResponse {
         Self {
             decision: "allow".into(),
             remember: false,
+            grant_scope: None,
         }
     }
     pub fn allow_always() -> Self {
         Self {
             decision: "allow_always".into(),
             remember: false,
+            grant_scope: None,
+        }
+    }
+    /// The session-wide "allow all Bash (incl. destructive)" answer, in the wire
+    /// shape [`PermissionDecision::from_value`] reads back as [`PermissionDecision::AllowAlwaysAll`].
+    pub fn allow_all_bash() -> Self {
+        Self {
+            decision: "allow".into(),
+            remember: true,
+            grant_scope: Some("all".into()),
         }
     }
     pub fn deny() -> Self {
         Self {
             decision: "deny".into(),
             remember: false,
+            grant_scope: None,
         }
     }
 }
@@ -122,6 +147,10 @@ pub fn parse_permission_decision(s: &str) -> PermissionDecision {
     match s {
         "allow" => PermissionDecision::AllowOnce,
         "always_allow" => PermissionDecision::AllowAlways,
+        // The session-wide "allow all Bash (incl. destructive)" answer. A distinct
+        // wire word (not `allow`+remember+grant_scope) so the daemon's string-keyed
+        // endpoints carry it without growing new fields, mirroring `allow_persist`.
+        "allow_all_bash" => PermissionDecision::AllowAlwaysAll,
         _ => PermissionDecision::Deny,
     }
 }
@@ -188,6 +217,12 @@ impl ApprovalMiddleware {
     /// Convenience: gate with a fresh in-memory store.
     pub fn in_memory() -> Self {
         Self::new(Arc::new(InMemoryPermissionStore::new()))
+    }
+    /// The grant store this gate remembers "always" answers in. Shared so a host
+    /// that answers the same questions through another shell (a harness tree's
+    /// approval seam) remembers into the same set — the key shape is the same.
+    pub fn store(&self) -> Arc<dyn PermissionStore> {
+        Arc::clone(&self.store)
     }
     /// Like [`new`] but with a shared allow-all store consulted for `bash` calls.
     pub fn with_allow_all_store(
@@ -258,6 +293,7 @@ pub async fn request_approval_decision(
         tool: tool_name.to_string(),
         args: call.arguments.clone(),
         reason: None,
+        allow_all_bash: false,
     })
     .unwrap_or(serde_json::Value::Null);
     let response = rt.request(kind, payload).await;
@@ -338,6 +374,54 @@ mod tests {
         );
     }
 
+    /// The daemon's string-keyed endpoints carry the session-wide blanket as its own
+    /// wire word, and it re-encodes (for `/live`) back to the SAME decision — the
+    /// round-trip a driver relies on when a response is projected as an `ApprovalResponse`.
+    #[test]
+    fn allow_all_bash_wire_is_a_distinct_word_that_roundtrips() {
+        assert_eq!(
+            parse_permission_decision("allow_all_bash"),
+            PermissionDecision::AllowAlwaysAll
+        );
+        // `ApprovalResponse::allow_all_bash()` serializes to the shape
+        // `from_value` reads back as `AllowAlwaysAll` (allow + remember + scope "all").
+        let value = serde_json::to_value(ApprovalResponse::allow_all_bash()).unwrap();
+        assert_eq!(value["grant_scope"], "all");
+        assert_eq!(
+            PermissionDecision::from_value(&value),
+            PermissionDecision::AllowAlwaysAll
+        );
+        // The plain answers still omit the scope, so an ordinary allow is never mistaken
+        // for the blanket.
+        let plain = serde_json::to_value(ApprovalResponse::allow_always()).unwrap();
+        assert!(plain.get("grant_scope").is_none());
+    }
+
+    /// The eligibility flag rides the request only when true, so a driver that never
+    /// learned about it sees the same three-answer prompt it always did.
+    #[test]
+    fn approval_request_omits_allow_all_bash_unless_offered() {
+        let off = serde_json::to_value(ApprovalRequest {
+            call_id: "c".into(),
+            tool: "write_file".into(),
+            args: "{}".into(),
+            reason: None,
+            allow_all_bash: false,
+        })
+        .unwrap();
+        assert!(off.get("allow_all_bash").is_none(), "omitted when false: {off}");
+
+        let on = serde_json::to_value(ApprovalRequest {
+            call_id: "c".into(),
+            tool: "bash".into(),
+            args: "{}".into(),
+            reason: None,
+            allow_all_bash: true,
+        })
+        .unwrap();
+        assert_eq!(on["allow_all_bash"], true);
+    }
+
     fn risky_call() -> ToolCall {
         ToolCall {
             id: "1".into(),
@@ -366,7 +450,7 @@ mod tests {
         use crate::tools::edit::EditFileTool;
 
         // edit_file: two DIFFERENT edits collapse to the SAME grant key.
-        let edit: Arc<dyn Tool> = Arc::new(EditFileTool);
+        let edit: Arc<dyn Tool> = Arc::new(EditFileTool::default());
         let a = ToolCall {
             id: "1".into(),
             name: "edit_file".into(),
@@ -386,7 +470,7 @@ mod tests {
         // bash: two DIFFERENT ordinary commands SHARE a grant key. "Always" is a decision
         // about this session's shell, and a per-command key made the option useless — the
         // next command always re-prompted.
-        let bash: Arc<dyn Tool> = Arc::new(BashTool);
+        let bash: Arc<dyn Tool> = Arc::new(BashTool::default());
         let c1 = ToolCall {
             id: "3".into(),
             name: "bash".into(),
@@ -463,7 +547,7 @@ mod tests {
         let rt = RequestCtx::new(tx, Some(Duration::from_millis(50)));
         let store = Arc::new(InMemoryPermissionStore::new());
         let call = risky_call();
-        let tool: Arc<dyn Tool> = Arc::new(WriteFileTool);
+        let tool: Arc<dyn Tool> = Arc::new(WriteFileTool::default());
         store.grant(&ApprovalMiddleware::grant_key(&call, tool.as_ref()));
         let mw = ApprovalMiddleware::new(store);
         let mut c = call;
@@ -478,7 +562,7 @@ mod tests {
         let (tx, _rx) = unbounded_channel::<AgentEvent>();
         let rt = RequestCtx::new(tx, Some(Duration::from_millis(20)));
         let mw = ApprovalMiddleware::in_memory();
-        let tool: Arc<dyn Tool> = Arc::new(WriteFileTool);
+        let tool: Arc<dyn Tool> = Arc::new(WriteFileTool::default());
         let mut call = risky_call();
         let res = mw.before(&mut call, &tool, &rt).await;
         assert!(res.is_deny(), "silent driver must fail closed");
@@ -526,7 +610,7 @@ mod tests {
         );
         // A risky bash_start call is allowed WITHOUT any round-trip (rt would time out → Deny
         // if the bypass did NOT fire — asserting Proceed proves the bypass covers bash_start).
-        let tool: Arc<dyn Tool> = Arc::new(crate::tools::bash::BashStartTool);
+        let tool: Arc<dyn Tool> = Arc::new(crate::tools::bash::BashStartTool::default());
         let mut call = ToolCall {
             id: "2".into(),
             name: "bash_start".into(),
@@ -550,6 +634,7 @@ mod tests {
             tool: "bash".into(),
             args: "{}".into(),
             reason: None,
+            allow_all_bash: false,
         };
         let v = serde_json::to_value(&req).unwrap();
         assert!(v.get("reason").is_none(), "reason omitted when None: {v}");
@@ -600,6 +685,7 @@ mod tests {
             tool: "bash".into(),
             args: "{\"cmd\":\"ls\"}".into(),
             reason: None,
+            allow_all_bash: false,
         })
         .unwrap();
         assert_eq!(
@@ -627,6 +713,7 @@ mod tests {
         let v = serde_json::to_value(ApprovalResponse {
             decision: "allow".into(),
             remember: true,
+            grant_scope: None,
         })
         .unwrap();
         assert_eq!(

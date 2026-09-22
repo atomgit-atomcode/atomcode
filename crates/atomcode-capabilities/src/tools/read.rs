@@ -9,6 +9,7 @@ use atomcode_kernel::tool::{Tool, ToolContext, ToolResult};
 use base64::Engine;
 use serde::Deserialize;
 use serde_json::json;
+use std::sync::Arc;
 
 /// Hard safety ceiling for the current in-memory decoder. Default pagination
 /// controls model-visible output, but decoding still needs the complete file for
@@ -44,14 +45,28 @@ const SKELETON_THRESHOLD: usize = 300;
 /// cannot display" text dead-end. The capability is decided at the coding layer
 /// and passed in as a plain flag — this crate stays model-agnostic (and core-free).
 /// Default `false` (text-only).
-#[derive(Default)]
 pub struct ReadFileTool {
     vision: bool,
+    world: Arc<dyn crate::world::FileSystem>,
+}
+
+impl Default for ReadFileTool {
+    fn default() -> Self {
+        Self::new(false)
+    }
 }
 
 impl ReadFileTool {
     pub fn new(vision: bool) -> Self {
-        Self { vision }
+        Self {
+            vision,
+            world: Arc::new(crate::world::LocalFs::unfenced()),
+        }
+    }
+
+    /// Read through `world` instead of the local disk.
+    pub fn with_world(vision: bool, world: Arc<dyn crate::world::FileSystem>) -> Self {
+        Self { vision, world }
     }
 }
 
@@ -367,9 +382,14 @@ impl Tool for ReadFileTool {
         }
         let path = resolve_path(&a.file_path, &ctx.working_dir);
 
-        let meta = match tokio::fs::metadata(&path).await {
-            Ok(m) => m,
-            Err(_) => {
+        let meta = match self.world.info(&path).await {
+            Ok(m) if m.exists => m,
+            // A refusal is not an absence. Telling the model "no such file"
+            // when the world actually denied it sends it looking for a path
+            // that is right there — and hides the one fact it needs, which is
+            // that this world will not serve it.
+            Err(e) if e.is_denied() => return err(format!("read_file: {e}")),
+            _ => {
                 return err(format!(
                     "Error: no such file: {} (resolved to {}){}",
                     a.file_path,
@@ -379,13 +399,16 @@ impl Tool for ReadFileTool {
             }
         };
 
-        if meta.is_dir() {
+        if meta.is_dir {
             let mut entries = Vec::new();
-            if let Ok(mut rd) = tokio::fs::read_dir(&path).await {
-                while let Ok(Some(e)) = rd.next_entry().await {
-                    let is_dir = e.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
-                    let name = e.file_name().to_string_lossy().to_string();
-                    entries.push(if is_dir { format!("{name}/") } else { name });
+            if let Ok(listed) = self.world.list(&path).await {
+                for e in listed {
+                    let name = e
+                        .path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    entries.push(if e.is_dir { format!("{name}/") } else { name });
                 }
             }
             entries.sort();
@@ -396,20 +419,20 @@ impl Tool for ReadFileTool {
             ));
         }
 
-        if meta.len() > MAX_IN_MEMORY_BYTES {
+        if meta.len > MAX_IN_MEMORY_BYTES {
             return err(format!(
                 "File too large for read_file's in-memory decoder: {} bytes ({:.1} MB; \
                  limit is {:.0} MB). Use grep/list_symbols to locate the relevant content \
                  first; ONLY for a file this oversized is `bash sed -n`/`rg` an acceptable \
                  way to read a bounded range (for normal-sized files always use read_file \
                  with offset/limit).",
-                meta.len(),
-                meta.len() as f64 / 1_048_576.0,
+                meta.len,
+                meta.len as f64 / 1_048_576.0,
                 MAX_IN_MEMORY_BYTES as f64 / 1_048_576.0,
             ));
         }
 
-        let bytes = match tokio::fs::read(&path).await {
+        let bytes = match self.world.read_bytes(&path).await {
             Ok(b) => b,
             Err(e) => {
                 return err(format!(
@@ -424,19 +447,28 @@ impl Tool for ReadFileTool {
             // message, instead of the "cannot display" text dead-end. Gated on
             // `self.vision` (model capability) AND a recognized image type AND a sane
             // size; anything else keeps the existing binary-text + recovery hint.
-            if self.vision && meta.len() <= MAX_IMAGE_BYTES {
+            if self.vision && meta.len <= MAX_IMAGE_BYTES {
                 if let Some(media_type) = image_media_type(&path) {
-                    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                    // Downscale/re-encode oversized images so a huge screenshot doesn't
+                    // blow the per-request body (this image is re-sent on every turn).
+                    // Falls back to the original bytes/type on any decode failure.
+                    let (media_type, data) =
+                        match crate::image_normalize::normalize_image_raw(&bytes) {
+                            Some((mt, out)) => {
+                                (mt, base64::engine::general_purpose::STANDARD.encode(out))
+                            }
+                            None => (
+                                media_type.to_string(),
+                                base64::engine::general_purpose::STANDARD.encode(&bytes),
+                            ),
+                        };
                     return ok_with_images(
                         format!(
                             "[Image: {} ({} bytes) — attached below for the vision model]",
                             a.file_path,
                             bytes.len()
                         ),
-                        vec![ImageContent {
-                            media_type: media_type.to_string(),
-                            data,
-                        }],
+                        vec![ImageContent { media_type, data }],
                     );
                 }
             }
@@ -986,16 +1018,20 @@ mod tests {
 
         assert!(!r.is_error, "{}", r.content);
         // read_file is EXEMPT from the artifact head/tail middleware, so a page is bounded
-        // by its OWN budget and may exceed the generic 16 KiB artifact threshold while
-        // keeping full line-based pagination.
+        // by its OWN budget and keeps full line-based pagination.
         assert!(
             r.content.len() <= MAX_READ_OUTPUT_BYTES,
             "page must stay within the read budget: {} bytes",
             r.content.len()
         );
+        // The page fills a substantial slice of read_file's OWN budget and paginates via
+        // its own mechanism — so it is the read budget bounding the page, not some smaller
+        // cap. (The middleware EXEMPTION itself is tested where the middleware actually
+        // runs: `output_artifact::self_bounding_tool_output_passes_through_whole`; this
+        // test constructs `ReadFileTool::execute` directly, so no middleware is in path.)
         assert!(
-            r.content.len() > crate::tools::output_artifact::THRESHOLD_BYTES,
-            "a wide page now legitimately exceeds the artifact threshold: {} bytes",
+            r.content.len() > MAX_READ_OUTPUT_BYTES / 2,
+            "a wide page should substantially fill the read budget: {} bytes",
             r.content.len()
         );
         assert!(

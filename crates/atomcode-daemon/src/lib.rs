@@ -1549,7 +1549,35 @@ fn catalog_scan_in_root(
     root: &std::path::Path,
 ) -> std::io::Result<atomcode_capabilities::session::CatalogScan> {
     let scan = atomcode_capabilities::session::SessionManager::scan_catalog(root);
-    for diagnostic in &scan.diagnostics {
+    warn_catalog_diagnostics(&scan.diagnostics);
+    Ok(scan)
+}
+
+/// Each skipped catalog entry, logged once per process.
+///
+/// The web UI refreshes the session list every few seconds, and a stale file on
+/// disk is the same stale file on every refresh. Logging all of them each time
+/// put ~30,000 identical warnings into one minute of log, burying anything new.
+/// A problem not seen before is still reported the moment it appears.
+///
+/// The per-call detail is also capped: a large history with orphaned sidecars or
+/// corrupt legacy files can produce THOUSANDS of *distinct* diagnostics on the
+/// first scan, and each `tracing::warn!` is a synchronous write to the log file —
+/// that alone was a measurable chunk of `-c`/resume startup. A bounded sample is
+/// logged, then one summary line.
+pub(crate) fn warn_catalog_diagnostics(
+    diagnostics: &[atomcode_capabilities::session::CatalogDiagnostic],
+) {
+    static REPORTED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<(PathBuf, String)>>,
+    > = std::sync::OnceLock::new();
+    let mut reported = REPORTED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let fresh = first_reports(&mut reported, diagnostics);
+    const MAX_DETAIL: usize = 20;
+    for diagnostic in fresh.iter().take(MAX_DETAIL) {
         tracing::warn!(
             path = %diagnostic.path.display(),
             kind = ?diagnostic.kind,
@@ -1557,7 +1585,58 @@ fn catalog_scan_in_root(
             "session catalog entry was skipped"
         );
     }
-    Ok(scan)
+    if fresh.len() > MAX_DETAIL {
+        tracing::warn!(
+            skipped = fresh.len(),
+            shown = MAX_DETAIL,
+            "session catalog skipped {} entries ({} shown above)",
+            fresh.len(),
+            MAX_DETAIL,
+        );
+    }
+}
+
+/// The diagnostics in `diagnostics` that `reported` has not seen, recording them.
+fn first_reports<'a>(
+    reported: &mut std::collections::HashSet<(PathBuf, String)>,
+    diagnostics: &'a [atomcode_capabilities::session::CatalogDiagnostic],
+) -> Vec<&'a atomcode_capabilities::session::CatalogDiagnostic> {
+    diagnostics
+        .iter()
+        .filter(|diagnostic| reported.insert((diagnostic.path.clone(), diagnostic.message.clone())))
+        .collect()
+}
+
+#[cfg(test)]
+mod catalog_diagnostic_log_tests {
+    use super::first_reports;
+    use atomcode_capabilities::session::{CatalogDiagnostic, CatalogDiagnosticKind};
+
+    fn diagnostic(path: &str, message: &str) -> CatalogDiagnostic {
+        CatalogDiagnostic {
+            project_bucket: None,
+            path: path.into(),
+            kind: CatalogDiagnosticKind::InvalidId,
+            message: message.into(),
+        }
+    }
+
+    #[test]
+    fn a_refresh_repeats_nothing_already_reported_but_a_new_problem_still_is() {
+        let mut reported = Default::default();
+        let first = [diagnostic("/s/a", "bad"), diagnostic("/s/b", "bad")];
+        assert_eq!(first_reports(&mut reported, &first).len(), 2);
+        assert!(
+            first_reports(&mut reported, &first).is_empty(),
+            "the same scan again reports nothing"
+        );
+        let later = [diagnostic("/s/a", "bad"), diagnostic("/s/c", "bad")];
+        let new: Vec<_> = first_reports(&mut reported, &later)
+            .into_iter()
+            .map(|d| d.path.clone())
+            .collect();
+        assert_eq!(new, vec![std::path::PathBuf::from("/s/c")]);
+    }
 }
 
 fn catalog_entry_to_session_summary(
@@ -3483,6 +3562,10 @@ pub enum ChatEvent {
         reason: String,
         call_id: String,
         arguments: String,
+        /// Whether the client may show the session-wide "allow all Bash" button
+        /// for this call. Omitted (false) for everything but a non-sensitive bash.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        allow_all_bash: bool,
     },
     /// The model asks the user a structured question. The browser answers through
     /// `/chat/user-input`, correlated by session and native request id.
@@ -4197,6 +4280,7 @@ impl ChatRuntimeProjector {
                     reason: "Requires approval".into(),
                     call_id: approval.call_id,
                     arguments: approval.args,
+                    allow_all_bash: approval.allow_all_bash,
                 }]
             }
             // Silent, cache-friendly tool-output folding is invisible transcript
@@ -4411,7 +4495,7 @@ impl ChatRuntimeProjector {
                 auto_resuming,
                 server_message,
             }],
-            Agent::TurnStarted
+            Agent::TurnStarted { .. }
             | Agent::ToolCallStreaming { .. }
             | Agent::ToolBatchCompleted { .. }
             | Agent::Request { .. }
@@ -4832,9 +4916,15 @@ async fn process_chat_request(
         let images: Vec<ImageContent> = req
             .images
             .iter()
-            .map(|i| ImageContent {
-                media_type: i.media_type.clone(),
-                data: i.data.clone(),
+            .map(|i| {
+                // Downscale/re-encode oversized attachments before they enter the
+                // conversation (a big image is re-sent every turn — see image_normalize).
+                let (media_type, data) =
+                    atomcode_capabilities::image_normalize::normalize_image_base64(
+                        &i.media_type,
+                        &i.data,
+                    );
+                ImageContent { media_type, data }
             })
             .collect();
         let runtime_text = live_api::preprocess_image_caption(
@@ -6015,6 +6105,7 @@ async fn get_skills(State(state): State<AppState>) -> impl IntoResponse {
     atomcode_capabilities::plugin::loader::reload_skill_registry(&mut registry, &working_dir);
     let skills: Vec<SkillInfo> = registry
         .user_invocable()
+        .into_iter()
         .map(|s| SkillInfo {
             name: s.name.clone(),
             description: s.description.clone(),
@@ -8341,6 +8432,7 @@ mod tests {
             message_count: 0,
             turn_count: 0,
             presence: CatalogPresence::NativeOnly,
+            needs_newer_version: false,
         };
 
         let entries = [entry];

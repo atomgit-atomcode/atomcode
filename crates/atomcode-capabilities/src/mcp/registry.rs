@@ -30,13 +30,38 @@ async fn wait_for_true(receiver: &mut watch::Receiver<bool>) {
     }
 }
 
+/// What is known about a connection attempt besides whether it worked.
+///
+/// Facts about the attempt, not about any one listener's use for them: a screen
+/// can say "stdio, 150ms", a meter can count them. Deliberately not the
+/// [`McpServerConfig`](super::McpServerConfig) itself — that holds headers and
+/// OAuth material, and nothing here needs to authenticate as anyone.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ConnectAttempt {
+    pub transport: super::config::McpTransportKind,
+    pub source: super::config::McpConfigSource,
+    /// Wall time from building the client to the initialization returning.
+    pub duration_ms: u64,
+}
+
 /// Connection status event sent to listeners when servers connect or fail.
 #[derive(Debug, Clone)]
 pub enum McpConnectEvent {
     /// Server connected successfully.
-    Connected { name: String },
+    Connected {
+        name: String,
+        attempt: ConnectAttempt,
+    },
     /// Server connection failed.
-    Failed { name: String, error: String },
+    ///
+    /// `attempt` is `None` when nothing was attempted — a config file that
+    /// would not load fails under the synthetic name `config`, and there is no
+    /// transport, source or duration to report for it.
+    Failed {
+        name: String,
+        error: String,
+        attempt: Option<ConnectAttempt>,
+    },
     /// Non-fatal warning (e.g. tools/list failed after connect).
     Warning { name: String, message: String },
     /// Server withheld because it comes from an untrusted project's `.mcp.json`.
@@ -449,6 +474,8 @@ It cannot override system, user, project, safety, permission, or approval rules.
                     let _ = tx.send(McpConnectEvent::Failed {
                         name: "config".to_string(),
                         error: message.clone(),
+                        // Nothing was dialled, so there is nothing to describe.
+                        attempt: None,
                     });
                 }
                 registry
@@ -513,6 +540,13 @@ It cannot override system, user, project, safety, permission, or approval rules.
                         async move {
                             let name = config.name.clone();
                             let timeout_ms = config.timeout_ms();
+                            // Taken before the client is built, so what is
+                            // reported is the whole attempt and not just the
+                            // handshake — spawning the process is the part that
+                            // fails when a `command` is mistyped.
+                            let transport = config.config.kind();
+                            let source = config.source;
+                            let started = std::time::Instant::now();
                             let mut client: Box<dyn McpClient> = match &config.config {
                                 super::config::McpTransportConfig::Stdio {
                                     command,
@@ -580,6 +614,11 @@ It cannot override system, user, project, safety, permission, or approval rules.
                                     if let Some(tx) = tx {
                                         let _ = tx.send(McpConnectEvent::Connected {
                                             name: name.clone(),
+                                            attempt: ConnectAttempt {
+                                                transport,
+                                                source,
+                                                duration_ms: started.elapsed().as_millis() as u64,
+                                            },
                                         });
                                     }
                                 }
@@ -596,6 +635,11 @@ It cannot override system, user, project, safety, permission, or approval rules.
                                         let _ = tx.send(McpConnectEvent::Failed {
                                             name: name.clone(),
                                             error: error_str.clone(),
+                                            attempt: Some(ConnectAttempt {
+                                                transport,
+                                                source,
+                                                duration_ms: started.elapsed().as_millis() as u64,
+                                            }),
                                         });
                                     }
                                 }

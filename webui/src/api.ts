@@ -26,7 +26,7 @@ export type SSEEvent =
   | { type: 'tool_progress'; id: string; progress: string }
   | { type: 'tool_result'; id: string; name: string; output: string; success: boolean; duration_ms: number }
   | { type: 'tokens'; prompt: number; completion: number; total: number }
-  | { type: 'permission_request'; session_id: string; tool_name: string; reason: string; call_id: string; arguments: unknown }
+  | { type: 'permission_request'; session_id: string; tool_name: string; reason: string; call_id: string; arguments: unknown; allow_all_bash?: boolean }
   | UserInputRequestEvent
   | { type: 'done'; tokens: unknown; tool_calls: unknown; session_id: string; stats?: TurnStats; stop_reason?: string; message?: string }
   | { type: 'stopped' }
@@ -210,7 +210,7 @@ export async function streamChat(
 
 export async function respondPermission(
   sessionId: string,
-  decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist',
+  decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist' | 'allow_all_bash',
   toolName?: string,
 ): Promise<{ success: boolean }> {
   const resp = await fetch('/chat/permission', {
@@ -867,7 +867,7 @@ export type LiveWireEvent =
   | { type: 'warning'; message: string }
   | { type: 'persistence_warning'; message: string }
   | { type: 'rate_limited'; reset_at_display: string; reset_label: string; secs_until_reset: number | null; auto_resuming: boolean; server_message?: string | null }
-  | { type: 'permission_request'; tool_name: string; reason: string; call_id: string; arguments: string }
+  | { type: 'permission_request'; tool_name: string; reason: string; call_id: string; arguments: string; allow_all_bash?: boolean }
   | { type: 'user_input_request'; request_id: number; header: string; question: string; mode: 'single' | 'multiple' | 'text'; options: { label: string; description?: string }[] }
   | { type: 'user_input_resolved'; request_id: number }
   | PolicyInterventionEvent
@@ -1104,7 +1104,7 @@ export async function postLiveReasoningEffort(
 }
 
 export async function postLivePermission(
-  decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist',
+  decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist' | 'allow_all_bash',
   toolName?: string,
 ): Promise<{ accepted: boolean }> {
   const resp = await fetch('/live/permission', {

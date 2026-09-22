@@ -326,8 +326,14 @@ dependencies = [
  "atomcode-codingplan",
  "atomcode-config",
  "atomcode-daemon",
+ "atomcode-harness",
+ "atomcode-host-api",
+ "atomcode-i18n",
  "atomcode-kernel",
+ "atomcode-plexus",
+ "atomcode-review",
  "atomcode-telemetry",
+ "atomcode-tui",
  "atomcode-tuix",
  "atomcode-updater",
  "clap",
@@ -335,6 +341,7 @@ dependencies = [
  "crossterm",
  "ctor",
  "dirs",
+ "futures",
  "is-terminal",
  "libc",
  "mimalloc",
@@ -408,6 +415,7 @@ dependencies = [
  "httpdate",
  "hyper",
  "ignore",
+ "image",
  "libc",
  "regex",
  "reqwest",
@@ -450,39 +458,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "atomcode-clix"
-version = "5.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "atomcode-capabilities",
- "atomcode-coding",
- "atomcode-config",
- "atomcode-kernel",
- "atomcode-review",
- "atomcode-telemetry",
- "clap",
- "futures",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "toml 0.8.23",
-]
-
-[[package]]
 name = "atomcode-coding"
 version = "5.1.0"
 dependencies = [
  "async-trait",
  "atomcode-capabilities",
  "atomcode-config",
+ "atomcode-harness",
  "atomcode-kernel",
+ "atomcode-plexus",
  "atomcode-review",
  "atomcode-telemetry",
  "chrono",
  "ctor",
  "dirs",
+ "fs2",
  "futures",
  "serde",
  "serde_json",
@@ -490,6 +480,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "toml 0.8.23",
  "tracing",
  "uuid",
 ]
@@ -517,6 +508,7 @@ name = "atomcode-config"
 version = "5.1.0"
 dependencies = [
  "anyhow",
+ "atomcode-i18n",
  "atomcode-telemetry",
  "dirs",
  "fs2",
@@ -567,6 +559,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "atomcode-harness"
+version = "5.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "atomcode-capabilities",
+ "atomcode-config",
+ "atomcode-kernel",
+ "atomcode-plexus",
+ "atomcode-review",
+ "axum",
+ "ctor",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "toml 0.8.23",
+]
+
+[[package]]
+name = "atomcode-host-api"
+version = "5.1.0"
+dependencies = [
+ "async-trait",
+ "atomcode-kernel",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "atomcode-i18n"
+version = "5.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "atomcode-kernel"
 version = "5.1.0"
 dependencies = [
@@ -576,6 +608,18 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "atomcode-plexus"
+version = "5.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml 0.8.23",
 ]
 
 [[package]]
@@ -615,6 +659,51 @@ dependencies = [
  "url",
  "uuid",
  "wiremock",
+]
+
+[[package]]
+name = "atomcode-tree-host"
+version = "5.1.0"
+dependencies = [
+ "async-trait",
+ "atomcode-harness",
+ "atomcode-host-api",
+ "atomcode-kernel",
+ "atomcode-plexus",
+ "ctor",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "atomcode-tui"
+version = "5.1.0"
+dependencies = [
+ "arboard",
+ "async-trait",
+ "atomcode-capabilities",
+ "atomcode-harness",
+ "atomcode-host-api",
+ "atomcode-i18n",
+ "atomcode-kernel",
+ "atomcode-plexus",
+ "atomcode-tree-host",
+ "base64",
+ "crossterm",
+ "ctor",
+ "futures",
+ "libc",
+ "png 0.17.16",
+ "qrcode",
+ "rand 0.8.7",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "unicode-segmentation",
+ "unicode-width",
+ "zeroize",
 ]
 
 [[package]]
@@ -953,6 +1042,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "color_quant"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d7b894f5411737b7867f4827955924d7c254fc9f4d91a6aad6b097804b1018b"
+
+[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1062,6 +1157,7 @@ dependencies = [
  "crossterm_winapi",
  "derive_more",
  "document-features",
+ "futures-core",
  "mio",
  "parking_lot",
  "rustix",
@@ -1633,6 +1729,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "gif"
+version = "0.14.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee8cfcc411d9adbbaba82fb72661cc1bcca13e8bba98b364e62b2dba8f960159"
+dependencies = [
+ "color_quant",
+ "weezl",
+]
+
+[[package]]
 name = "globset"
 version = "0.4.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2088,10 +2194,25 @@ checksum = "85ab80394333c02fe689eaf900ab500fbd0c2213da414687ebf995a65d5a6104"
 dependencies = [
  "bytemuck",
  "byteorder-lite",
+ "color_quant",
+ "gif",
+ "image-webp",
  "moxcms",
  "num-traits",
  "png 0.18.1",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
+]
+
+[[package]]
+name = "image-webp"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "525e9ff3e1a4be2fbea1fdf0e98686a6d98b4d8f937e1bf7402245af1909e8c3"
+dependencies = [
+ "byteorder-lite",
+ "quick-error",
 ]
 
 [[package]]

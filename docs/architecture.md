@@ -8,7 +8,7 @@
 coding agent 的统一生产调用链为：
 
 ```text
-CLI / TUI / daemon / background / ACP / clix code
+CLI / TUI / daemon / background / ACP code
                     │
                     ▼
        CodingRuntimeHandle / DriverCommand
@@ -31,7 +31,7 @@ CLI / TUI / daemon / background / ACP / clix code
 
 ```text
 L3  drivers / services
-    atomcode-cli  atomcode-tuix  atomcode-daemon  atomcode-clix  ACP
+    atomcode-cli  atomcode-tuix  atomcode-daemon  ACP
                               │
                               ▼
 L2                     atomcode-coding
@@ -69,7 +69,7 @@ L0                     atomcode-kernel
 | `atomcode-cli` | L3 | 可执行程序入口、参数解析、headless/TUI/ACP 等入口协调 |
 | `atomcode-tuix` | L3 | retained-mode 终端 UI、事件循环、modal、命令与 runtime 事件投影 |
 | `atomcode-daemon` | L3 | HTTP/WebUI/live hub、headless runtime 接入及历史 session 单向导入 |
-| `atomcode-clix` | L3 | 独立 coding CLI driver |
+
 | `atomcode-review` | L2/L3 | 基于 kernel + capabilities 的独立代码审查 agent |
 | `atomcode-telemetry` | service | 遥测事件、配置和上报 |
 | `atomcode-updater` | service | 安装包与版本更新能力 |

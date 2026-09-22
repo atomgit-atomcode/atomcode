@@ -321,6 +321,21 @@ fn read_raw_cf_dib() -> Option<Vec<u8>> {
 /// **AltGr** key is delivered as `Ctrl+Alt`, so on the rare keyboard layout
 /// where `AltGr+V` is a printable glyph, that keystroke triggers image-paste
 /// instead of inserting the glyph. Accepted as an inherent cost of the chord.
+/// Build an `ImageContent` from raw image bytes, downscaling/re-encoding oversized
+/// images so a big pasted screenshot can't blow the per-request body (a pasted image is
+/// re-sent on every turn). Falls back to the original bytes/type on any decode failure.
+fn normalized_image_content(media_type: &str, raw: &[u8]) -> ImageContent {
+    let (media_type, data) = match atomcode_capabilities::image_normalize::normalize_image_raw(raw)
+    {
+        Some((mt, out)) => (mt, base64::engine::general_purpose::STANDARD.encode(out)),
+        None => (
+            media_type.to_string(),
+            base64::engine::general_purpose::STANDARD.encode(raw),
+        ),
+    };
+    ImageContent { media_type, data }
+}
+
 fn is_paste_image_chord(
     code: crossterm::event::KeyCode,
     modifiers: crossterm::event::KeyModifiers,
@@ -352,14 +367,7 @@ fn try_paste_clipboard_image() -> Option<(ImageContent, u64)> {
             if let Some(png_data) =
                 encode_rgba_to_png(img.width as u32, img.height as u32, img.bytes.as_ref())
             {
-                let b64 = base64::engine::general_purpose::STANDARD.encode(&png_data);
-                return Some((
-                    ImageContent {
-                        media_type: "image/png".into(),
-                        data: b64,
-                    },
-                    hash,
-                ));
+                return Some((normalized_image_content("image/png", &png_data), hash));
             }
         }
         Err(_e) => {
@@ -376,14 +384,7 @@ fn try_paste_clipboard_image() -> Option<(ImageContent, u64)> {
             {
                 let hash = rgba_fingerprint(w as usize, h as usize, &rgba);
                 if let Some(png_data) = encode_rgba_to_png(w, h, &rgba) {
-                    let b64 = base64::engine::general_purpose::STANDARD.encode(&png_data);
-                    return Some((
-                        ImageContent {
-                            media_type: "image/png".into(),
-                            data: b64,
-                        },
-                        hash,
-                    ));
+                    return Some((normalized_image_content("image/png", &png_data), hash));
                 }
             }
         }
@@ -818,14 +819,7 @@ fn try_attach_image_from_path(text: &str) -> Option<(ImageContent, u64)> {
     }
     let bytes = std::fs::read(path).ok()?;
     let hash = rgba_fingerprint(0, 0, &bytes);
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    Some((
-        ImageContent {
-            media_type: media_type.into(),
-            data: b64,
-        },
-        hash,
-    ))
+    Some((normalized_image_content(media_type, &bytes), hash))
 }
 
 /// Resolve an explicit `@image` reference against the same path roots users
@@ -4043,9 +4037,9 @@ pub struct LoopCtx {
     /// dispatcher as a fallback when the entered name doesn't match a
     /// built-in command.
     pub custom_commands: crate::custom_commands::CustomCommandRegistry,
-    /// Loaded skills (`.claude/skills/*/SKILL.md`, etc.). Same `Arc`
-    /// the agent loop holds, so `reload(...)` there is visible here
-    /// without extra plumbing. Used by the slash-command palette to
+    /// Loaded skills (`.claude/skills/*/SKILL.md`, etc.). The TUI's own copy —
+    /// the runtime loads a separate registry in `prepare`, and `/plugin reload`
+    /// reloads both. Used by the slash-command palette to
     /// surface user-invocable skills, and by the dispatcher to expand
     /// `/skill_name [args]` into a SendMessage.
     pub skill_registry:
@@ -15715,7 +15709,7 @@ fn build_skill_menu_items(
     let mut items: Vec<(String, String)> = Vec::new();
     if let Some(reg) = skill_registry {
         if let Ok(reg) = reg.read() {
-            let skills: Vec<_> = reg.user_invocable().collect();
+            let skills: Vec<_> = reg.user_invocable();
             for skill in &skills {
                 let bare = skill
                     .name
@@ -18024,7 +18018,7 @@ pub(crate) fn reload_plugins(ctx: &mut LoopCtx) -> (usize, Vec<String>) {
     let mut warnings = Vec::new();
     if let Ok(mut guard) = ctx.skill_registry.write() {
         warnings = reload_skill_registry(&mut guard, &ctx.working_dir);
-        loaded = guard.all().count();
+        loaded = guard.all().len();
     }
     ctx.custom_commands = crate::custom_commands::CustomCommandRegistry::load(&ctx.working_dir);
     // Hook executor lives on the agent loop. Send a one-shot rebuild signal
@@ -23372,7 +23366,7 @@ fn project_kernel_event(
 ) -> Option<AgentEvent> {
     use atomcode_kernel::event::AgentEvent as Kernel;
     match event {
-        Kernel::TurnStarted => Some(AgentEvent::PhaseChange(AgentPhase::Thinking)),
+        Kernel::TurnStarted { .. } => Some(AgentEvent::PhaseChange(AgentPhase::Thinking)),
         Kernel::TextDelta(text) => Some(AgentEvent::TextDelta(text)),
         Kernel::Reasoning(text) => Some(AgentEvent::ReasoningDelta(text)),
         Kernel::ToolCallStreaming {
@@ -23436,6 +23430,7 @@ fn project_kernel_event(
             snapshot: atomcode_kernel::message::SessionSnapshot::new(Vec::new()),
         }),
         Kernel::Warning(message) => Some(AgentEvent::Warning(message)),
+        Kernel::ContextAdded { text, source } => Some(AgentEvent::ContextAdded { text, source }),
         Kernel::ProviderRetry {
             attempt,
             max_attempts,
@@ -24794,13 +24789,22 @@ fn handle_runtime_event(
                 }
             }
         }
+        bg_runtime::RuntimeEventPayload::Driver(bg_runtime::DriverEvent::LocalShellLine {
+            line,
+        }) => {
+            // The `!` shell streams: the person ran it precisely to watch it.
+            renderer.render(UiLine::CommandOutput(line));
+            renderer.flush();
+        }
         bg_runtime::RuntimeEventPayload::Driver(bg_runtime::DriverEvent::LocalShellFinished {
             output,
             failed,
         }) => {
+            // The body already went by line by line; this is only the status
+            // tail, and a clean run with output has none.
             if failed {
                 renderer.render(UiLine::Error(output));
-            } else {
+            } else if !output.is_empty() {
                 renderer.render(UiLine::CommandOutput(output));
             }
             renderer.flush();
@@ -25628,47 +25632,218 @@ fn escape_runtime_context(value: &str) -> String {
         .replace('>', "&gt;")
 }
 
-fn run_local_shell_command(command: String, ctx: &LoopCtx) {
-    use atomcode_kernel::tool::Tool;
+/// Wall-clock ceiling for a user-typed `!cmd`. The bridge-era runner used 300s
+/// (a person watching a build tolerates more than the model's 60s default),
+/// and the idle kill in `run_shell` catches the truly stuck case sooner.
+const LOCAL_SHELL_TIMEOUT_SECS: u64 = 300;
 
+/// What a finished `!cmd` leaves behind, given that its body already streamed.
+///
+/// Returns `(tail, context, failed)`: `tail` is the status line the person has
+/// not seen yet (empty on a clean run that printed something); `context` is the
+/// full `<bash-output>` body the model receives on its next turn, framed the way
+/// the model's own `bash` tool frames a result so the two read alike.
+fn format_local_shell_outcome(
+    outcome: &atomcode_capabilities::tools::ShellOutcome,
+) -> (String, String, bool) {
+    use atomcode_capabilities::tools::ShellExit;
+    let stdout = outcome.stdout.trim_end();
+    let stderr = outcome.stderr.trim_end();
+    let mut body = String::new();
+    if !stdout.is_empty() {
+        body.push_str(stdout);
+    }
+    if !stderr.trim().is_empty() {
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str("[stderr]\n");
+        body.push_str(stderr);
+    }
+    let (marker, failed) = match outcome.exit {
+        ShellExit::Exited { code: Some(0), .. } => (String::new(), false),
+        ShellExit::Exited {
+            code: Some(code), ..
+        } => (format!("[exit code {code}]"), true),
+        ShellExit::Exited { code: None, .. } => {
+            ("[process terminated by signal]".to_string(), true)
+        }
+        ShellExit::KilledIdle => (
+            format!(
+                "[command killed after {}s without output]",
+                atomcode_capabilities::tools::bash::SILENT_KILL_SECS
+            ),
+            true,
+        ),
+        ShellExit::KilledTimeout => (
+            format!("[command timed out ({LOCAL_SHELL_TIMEOUT_SECS}s)]"),
+            true,
+        ),
+    };
+    let tail = if marker.is_empty() && body.is_empty() {
+        "(no output)".to_string()
+    } else {
+        marker.clone()
+    };
+    let mut context = body;
+    if !marker.is_empty() {
+        if !context.is_empty() {
+            context.push('\n');
+        }
+        context.push_str(&marker);
+    }
+    if context.is_empty() {
+        context = "(no output)".to_string();
+    }
+    (tail, context, failed)
+}
+
+fn run_local_shell_command(command: String, ctx: &LoopCtx) {
     let working_dir = ctx.working_dir.clone();
     let runtime = ctx.runtime.clone();
     let runtime_id = ctx.foreground_runtime_id;
     let event_tx = ctx.runtime_event_tx.clone();
     tokio::spawn(async move {
-        let tool = atomcode_capabilities::tools::BashTool;
-        let args = serde_json::json!({ "command": command.clone() }).to_string();
-        let tool_ctx = atomcode_kernel::tool::ToolContext {
-            working_dir,
-            cancel: tokio_util::sync::CancellationToken::new(),
-            progress: atomcode_kernel::tool::ProgressSink::noop(),
-            requester: None,
+        // Stream the body as it happens, one complete line per event: a chunk
+        // boundary is a read size, not a line, and a row per half-line would
+        // tear the output.
+        let pending = std::sync::Mutex::new(String::new());
+        let send_line = |line: String| {
+            let _ = event_tx.send(bg_runtime::RuntimeEvent {
+                runtime_id,
+                event: bg_runtime::RuntimeEventPayload::Driver(
+                    bg_runtime::DriverEvent::LocalShellLine { line },
+                ),
+            });
         };
-        let result = tool.execute(&args, &tool_ctx).await;
-        let output = truncate_local_shell_output(result.content);
+        let outcome = atomcode_capabilities::tools::run_shell(
+            &atomcode_capabilities::world::LocalShell,
+            &command,
+            &working_dir,
+            LOCAL_SHELL_TIMEOUT_SECS,
+            |chunk| {
+                let mut buf = pending.lock().unwrap();
+                buf.push_str(chunk);
+                while let Some(nl) = buf.find('\n') {
+                    let line = buf[..nl].to_string();
+                    buf.drain(..=nl);
+                    send_line(line);
+                }
+            },
+        )
+        .await;
+        let rest = std::mem::take(&mut *pending.lock().unwrap());
+        if !rest.is_empty() {
+            send_line(rest);
+        }
+
+        let (tail, content, failed) = format_local_shell_outcome(&outcome);
+        let content = truncate_local_shell_output(content);
         let context = format!(
             "<bash-input>{}</bash-input>\n<bash-output>{}</bash-output>",
             escape_runtime_context(&command),
-            escape_runtime_context(&output)
+            escape_runtime_context(&content)
         );
         let queue_failed = runtime
             .dispatch(atomcode_coding::DriverCommand::QueueLocalContext(
                 atomcode_coding::LocalContextInput { content: context },
             ))
             .is_err();
-        let failed = result.is_error || queue_failed;
         let output = if queue_failed {
-            format!("{output}\n[failed to add shell output to runtime context]")
+            format!("{tail}\n[failed to add shell output to runtime context]")
         } else {
-            output
+            tail
         };
         let _ = event_tx.send(bg_runtime::RuntimeEvent {
             runtime_id,
             event: bg_runtime::RuntimeEventPayload::Driver(
-                bg_runtime::DriverEvent::LocalShellFinished { output, failed },
+                bg_runtime::DriverEvent::LocalShellFinished {
+                    output,
+                    failed: failed || queue_failed,
+                },
             ),
         });
     });
+}
+
+#[cfg(test)]
+mod local_shell_outcome_tests {
+    use super::format_local_shell_outcome;
+    use atomcode_capabilities::tools::{ShellExit, ShellOutcome};
+
+    fn outcome(stdout: &str, stderr: &str, exit: ShellExit) -> ShellOutcome {
+        ShellOutcome {
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+            exit,
+            elapsed_secs: 0.0,
+        }
+    }
+
+    #[test]
+    fn a_clean_run_with_output_leaves_no_tail_but_a_full_context() {
+        let (tail, context, failed) = outcome(
+            "file1\nfile2\n",
+            "",
+            ShellExit::Exited {
+                success: true,
+                code: Some(0),
+            },
+        )
+        .pipe(format_local_shell_outcome);
+        assert!(!failed);
+        assert_eq!(tail, "", "the body already streamed; nothing to add");
+        assert_eq!(context, "file1\nfile2");
+    }
+
+    #[test]
+    fn a_clean_run_with_no_output_says_so() {
+        let (tail, context, failed) = outcome(
+            "",
+            "",
+            ShellExit::Exited {
+                success: true,
+                code: Some(0),
+            },
+        )
+        .pipe(format_local_shell_outcome);
+        assert!(!failed);
+        assert_eq!(tail, "(no output)");
+        assert_eq!(context, "(no output)");
+    }
+
+    #[test]
+    fn a_failure_reports_the_code_and_frames_stderr_like_the_bash_tool() {
+        let (tail, context, failed) = outcome(
+            "partial\n",
+            "boom\n",
+            ShellExit::Exited {
+                success: false,
+                code: Some(2),
+            },
+        )
+        .pipe(format_local_shell_outcome);
+        assert!(failed);
+        assert_eq!(tail, "[exit code 2]");
+        assert_eq!(context, "partial\n[stderr]\nboom\n[exit code 2]");
+    }
+
+    #[test]
+    fn a_kill_is_named_for_its_reason() {
+        let (tail, _, failed) =
+            outcome("", "", ShellExit::KilledTimeout).pipe(format_local_shell_outcome);
+        assert!(failed);
+        assert!(tail.starts_with("[command timed out ("), "{tail}");
+        let (tail, _, _) = outcome("x", "", ShellExit::KilledIdle).pipe(format_local_shell_outcome);
+        assert!(tail.contains("without output"), "{tail}");
+    }
+
+    trait Pipe: Sized {
+        fn pipe<R>(self, f: impl FnOnce(&Self) -> R) -> R {
+            f(&self)
+        }
+    }
+    impl Pipe for ShellOutcome {}
 }
 
 fn handle_undo_success(
@@ -27588,6 +27763,42 @@ fn handle_agent_event(
             // a terminal. Native kernel diagnostics currently carry an empty
             // snapshot, so this is normally a no-op.
             persist_current_session(ctx, snapshot, renderer);
+        }
+        AgentEvent::ContextAdded { text, source } => {
+            // Model-visible context the person did not type: a delegated
+            // agent's report, a continuation the engine asked for, a memory
+            // block. Muted and labelled, because the ONE thing it must not look
+            // like is the user speaking — that confusion is why the event
+            // exists. Before it, a lead told its own user "your previous
+            // message was actually the subagent's words": the report had
+            // reached the model and nothing else.
+            use atomcode_kernel::event::ContextSource as Src;
+            let label = match &source {
+                Src::Peer { from } => format!(
+                    "{} {from}",
+                    crate::i18n::t(crate::i18n::Msg::ContextFromPeer)
+                ),
+                Src::Memory => crate::i18n::t(crate::i18n::Msg::ContextFromMemory).into_owned(),
+                Src::Reminder => crate::i18n::t(crate::i18n::Msg::ContextFromReminder).into_owned(),
+                Src::Continuation => {
+                    crate::i18n::t(crate::i18n::Msg::ContextFromContinuation).into_owned()
+                }
+                Src::CompactionSummary => {
+                    crate::i18n::t(crate::i18n::Msg::ContextFromCompaction).into_owned()
+                }
+                // `ContextSource` is `#[non_exhaustive]`: a source this build
+                // does not know still gets drawn, unlabelled, rather than
+                // silently dropped. Dropping it is the bug.
+                _ => String::new(),
+            };
+            for line in text.lines() {
+                renderer.render(UiLine::Muted(if label.is_empty() {
+                    format!("↳ {line}")
+                } else {
+                    format!("↳ {label} · {line}")
+                }));
+            }
+            renderer.flush();
         }
         AgentEvent::Warning(w) => {
             // Non-fatal — flush a yellow advisory line and let the turn

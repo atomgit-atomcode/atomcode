@@ -1,0 +1,18 @@
+{
+  "app_version": "0.0.0",
+  "arch": "aarch64",
+  "device_id": "00000000-0000-0000-0000-000000000000",
+  "duration_ms": 20,
+  "error_data": "{\"config_source\":\"driver\",\"duration_ms\":20,\"message\":\"Failed to spawn MCP server: <CWD>/no-such-server\",\"server_name\":\"t\",\"transport\":\"stdio\"}",
+  "error_kind": "execution_failed",
+  "event_id": "mcp_connect",
+  "launch_id": "00000000-0000-0000-0000-000000000000",
+  "locale": "en-US",
+  "os": "macos",
+  "schema_version": 1,
+  "server_name": "t",
+  "session_id": "00000000-0000-0000-0000-000000000000",
+  "success": false,
+  "transport": "stdio",
+  "ts": 0
+}

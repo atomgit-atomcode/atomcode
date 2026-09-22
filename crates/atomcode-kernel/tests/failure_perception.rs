@@ -217,7 +217,7 @@ async fn policy_intervention_precedes_the_authoritative_terminal() {
                     .actions
                     .contains(&PolicyRecoveryAction::CompleteExternally));
             }
-            Ok(Some(AgentEvent::TurnComplete { reason })) => {
+            Ok(Some(AgentEvent::TurnComplete { reason, .. })) => {
                 assert_eq!(reason, StopReason::PolicyDenied);
                 assert!(intervention_seen, "recovery contract must precede terminal");
                 break;
@@ -280,7 +280,7 @@ async fn turn_complete_carries_stop_reason() {
     let mut events = handle.events;
     let mut reason: Option<StopReason> = None;
     while let Some(ev) = events.recv().await {
-        if let AgentEvent::TurnComplete { reason: r } = ev {
+        if let AgentEvent::TurnComplete { reason: r, .. } = ev {
             reason = Some(r);
             break;
         }
@@ -361,7 +361,7 @@ async fn max_rounds_stop_reason() {
     let mut reason: Option<StopReason> = None;
     let driven = tokio::time::timeout(OUTER_GUARD, async {
         while let Some(ev) = events.recv().await {
-            if let AgentEvent::TurnComplete { reason: r } = ev {
+            if let AgentEvent::TurnComplete { reason: r, .. } = ev {
                 reason = Some(r);
                 break;
             }
@@ -454,7 +454,7 @@ async fn turn_end_continuation_fuse_stops_runaway() {
         while let Some(ev) = handle.events.recv().await {
             match ev {
                 AgentEvent::Error { message, .. } => error_msg = Some(message),
-                AgentEvent::TurnComplete { reason: r } => {
+                AgentEvent::TurnComplete { reason: r, .. } => {
                     reason = Some(r);
                     break;
                 }
@@ -499,7 +499,7 @@ async fn turn_end_continuation_fuse_is_configurable() {
     let reason = tokio::time::timeout(OUTER_GUARD, async {
         let mut reason: Option<StopReason> = None;
         while let Some(ev) = handle.events.recv().await {
-            if let AgentEvent::TurnComplete { reason: r } = ev {
+            if let AgentEvent::TurnComplete { reason: r, .. } = ev {
                 reason = Some(r);
                 break;
             }
@@ -541,7 +541,7 @@ async fn cancel_reason() {
         while let Some(ev) = handle.events.recv().await {
             match ev {
                 AgentEvent::Cancelled => saw_marker = true,
-                AgentEvent::TurnComplete { reason: r } => {
+                AgentEvent::TurnComplete { reason: r, .. } => {
                     reason = Some(r);
                     break;
                 }
@@ -565,7 +565,7 @@ async fn cancel_reason() {
 }
 
 // ── A stream timeout ends with StopReason::Timeout ───────────────────────────
-#[tokio::test]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn timeout_reason() {
     let reg = ToolRegistry::new();
     let provider = Arc::new(atomcode_kernel::testkit::SilentStreamProvider::new(vec![
@@ -586,7 +586,7 @@ async fn timeout_reason() {
     let reason = tokio::time::timeout(Duration::from_secs(15), async {
         let mut reason: Option<StopReason> = None;
         while let Some(ev) = handle.events.recv().await {
-            if let AgentEvent::TurnComplete { reason: r } = ev {
+            if let AgentEvent::TurnComplete { reason: r, .. } = ev {
                 reason = Some(r);
                 break;
             }
@@ -664,7 +664,7 @@ async fn round_cap_checkpoint_continue_rearms_then_stop() {
                         })
                         .unwrap();
                 }
-                AgentEvent::TurnComplete { reason } => {
+                AgentEvent::TurnComplete { reason, .. } => {
                     stop = Some(reason);
                     break;
                 }
@@ -718,7 +718,7 @@ async fn round_cap_checkpoint_null_response_stops_fail_closed() {
                         })
                         .unwrap();
                 }
-                AgentEvent::TurnComplete { reason } => {
+                AgentEvent::TurnComplete { reason, .. } => {
                     stop = Some(reason);
                     break;
                 }
@@ -771,7 +771,7 @@ async fn round_cap_checkpoint_cancel_stops_as_cancelled() {
                 AgentEvent::Cancelled => {
                     saw_cancelled_event = true;
                 }
-                AgentEvent::TurnComplete { reason } => {
+                AgentEvent::TurnComplete { reason, .. } => {
                     stop = Some(reason);
                     break;
                 }
@@ -824,7 +824,7 @@ async fn round_cap_checkpoint_off_keeps_hard_error() {
                 AgentEvent::Error { message, .. } if message.contains("max rounds") => {
                     saw_error = true;
                 }
-                AgentEvent::TurnComplete { reason } => {
+                AgentEvent::TurnComplete { reason, .. } => {
                     stop = Some(reason);
                     break;
                 }

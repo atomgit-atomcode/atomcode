@@ -97,9 +97,24 @@ pub fn collect_day_turns(sessions_root: &Path, after_ms: i64, before_ms: i64) ->
             continue;
         }
         sessions_read += 1;
-        let path = sessions_root
-            .join(&entry.project_bucket)
-            .join(format!("{}.jsonl", entry.id));
+        let bucket = sessions_root.join(&entry.project_bucket);
+        let manager = SessionManager::with_root(&bucket);
+        if manager.is_event_session(&entry.id) {
+            let Ok(events) = manager.load_events(&entry.id) else {
+                continue;
+            };
+            for rec in super::events::turn_records(&entry.id, &events) {
+                if out.len() >= MAX_WORKLOG_TURNS {
+                    break;
+                }
+                let in_day = rec.ts >= after_ms && rec.ts < before_ms;
+                if in_day && !rec.undone && !rec.user.trim().is_empty() {
+                    out.push(WorklogTurn::from_record(entry.working_dir.clone(), &rec));
+                }
+            }
+            continue;
+        }
+        let path = bucket.join(format!("{}.jsonl", entry.id));
         let _ = for_each_jsonl_line(&path, |line| {
             if out.len() >= MAX_WORKLOG_TURNS {
                 return Ok(());
@@ -136,6 +151,31 @@ pub fn resolve_worklog_date(arg: &str, today: NaiveDate) -> Option<NaiveDate> {
         [m, d] => NaiveDate::from_ymd_opt(today.year(), m.parse().ok()?, d.parse().ok()?),
         _ => None,
     }
+}
+
+/// The half-open epoch-ms window `[midnight, next midnight)` of `date`, in the
+/// machine's local time zone.
+///
+/// Local rather than UTC because "what did I do today" is asked in the time zone
+/// the person is sitting in. `.earliest()` resolves a midnight that falls in a
+/// DST gap; the UTC fallback is only for the rare ambiguity where that local
+/// time does not exist at all. On a date with no successor the window is empty
+/// rather than wrapping, so a nonsense argument recaps nothing instead of
+/// everything.
+pub fn local_day_window_ms(date: NaiveDate) -> (i64, i64) {
+    use chrono::{Local, TimeZone};
+    let to_ms = |ndt: chrono::NaiveDateTime| -> i64 {
+        Local
+            .from_local_datetime(&ndt)
+            .earliest()
+            .map(|dt| dt.timestamp_millis())
+            .unwrap_or_else(|| ndt.and_utc().timestamp_millis())
+    };
+    let midnight = |d: NaiveDate| d.and_hms_opt(0, 0, 0).expect("midnight exists");
+    (
+        to_ms(midnight(date)),
+        to_ms(midnight(date.succ_opt().unwrap_or(date))),
+    )
 }
 
 fn fmt_duration(ms: i64) -> String {
@@ -370,6 +410,7 @@ mod tests {
             message_count: 1,
             turn_count: 1,
             presence: crate::session::CatalogPresence::NativeOnly,
+            needs_newer_version: false,
         };
         assert!(session_overlaps_day(&e, 150, 300));
         // Session ended (updated=200) far before the window start, beyond the skew.

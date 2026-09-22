@@ -3,16 +3,18 @@
 //! [`recall`](super::recall). Deliberately DATE-only: wall-clock time, context pressure, and
 //! round counters are runtime concerns and are not pushed to the model.
 //!
-//! Two cache-safety disciplines:
-//!   1. **APPEND-ONLY at the tail** — it never mutates the cached prefix (the changing status
-//!      sits AFTER the prefix), so prefix caching is unaffected.
-//!   2. **SKIPPED on a turn's FIRST round** (`round < 2`). On round 1 the tail would sit
-//!      directly after the real user message → a user-after-user pair (rejected by strict
-//!      providers like Anthropic; read as the user's own words by others). Merging it away
-//!      would instead rewrite the (cacheable) user message. From round 2 the tail follows an
-//!      assistant/tool message, so it neither pairs with a user message nor disturbs the
-//!      prefix. Round 1 already receives the frozen date anchor from the persona, so skipping
-//!      this live tail does not remove the model's date awareness.
+//! This is the SOLE current-date source: the persona no longer carries a date anchor, because a
+//! wall-clock date baked into the system prompt sits at the FRONT of the request and re-prefills
+//! the whole cached prefix every time it changes (once per day per session — the
+//! `project_system_prompt_date` cache-poison bug). Moving the date to this tail keeps the system
+//! prefix byte-stable across days while keeping the date fresh every turn.
+//!
+//! Cache-safety discipline: **APPEND-ONLY at the tail** — it never mutates the cached prefix (the
+//! changing date sits AFTER the prefix), so prefix caching is unaffected. It fires on EVERY round,
+//! round 1 included: round 1 must carry the date too (else a first-round `web_search` falls back to
+//! the training year), and the user-after-user pair a round-1 append forms after the real user
+//! message is coalesced by strict providers (Anthropic `merge_consecutive_user`) and accepted by
+//! the rest — being at the tail, it never disturbs the prefix.
 //!
 //! The body is wrapped in `<system-reminder>…</system-reminder>` so the model reads it as
 //! INJECTED CONTEXT, not the user's own words (matching `PlanModeReminderHook`'s convention).
@@ -23,7 +25,7 @@ use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
 use atomcode_kernel::message::Message;
 use chrono::{DateTime, Local};
 
-/// Injects a `<system-reminder>` status tail from round 2 of each turn onward.
+/// Injects a `<system-reminder>` current-date tail on every round of every turn.
 pub struct StatusReminderHook;
 
 impl StatusReminderHook {
@@ -54,12 +56,14 @@ impl Default for StatusReminderHook {
 
 #[async_trait]
 impl LifecycleHooks for StatusReminderHook {
-    async fn pre_request(&self, messages: &mut Vec<Message>, ctx: &TurnCtx) {
-        // Skip a turn's FIRST round (see module doc: avoids a user-after-user pair on the
-        // wire AND prefix churn on the cacheable user message).
-        if ctx.round < 2 {
-            return;
-        }
+    async fn pre_request(&self, messages: &mut Vec<Message>, _ctx: &TurnCtx) {
+        // Every round, INCLUDING the first. The date is no longer carried by the persona
+        // (moving it OUT of the cached system prefix is the whole point — a wall-clock date at
+        // the FRONT of the request re-prefills the entire prefix once per day), so round 1 must
+        // carry it too or a first-round `web_search` falls back to the training year. The
+        // user-after-user pair a round-1 append forms after the user message is coalesced by
+        // strict providers (Anthropic `merge_consecutive_user`) and accepted by the rest;
+        // being at the TAIL, it never disturbs the cached prefix.
         let body = Self::render(Local::now());
         // `render` already returns the canonical wrapper; retain that exact wire text
         // while marking it as runtime-owned rather than human-authored.
@@ -143,14 +147,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skips_round_1_injects_from_round_2() {
+    async fn injects_the_date_tail_from_round_1() {
         let hook = StatusReminderHook::new();
-        // Round 1: nothing injected (avoids user-after-user + keeps the user msg cacheable).
+        // Round 1 too: the date no longer rides the persona (it moved OUT of the cached
+        // system prefix), so every round — the first included — carries it at the tail. The
+        // user-after-user pair a round-1 append forms after the user message is coalesced by
+        // strict providers (Anthropic `merge_consecutive_user`) and accepted by the rest.
         let mut r1 = vec![Message::system("s"), Message::user("hi")];
-        let before = r1.clone();
         hook.pre_request(&mut r1, &ctx(1, 128_000, 0)).await;
-        assert_eq!(r1, before, "round 1 must not inject a reminder");
-        // Round 2: exactly one wrapped tail appended.
+        assert_eq!(r1.len(), 3, "round 1 appends exactly one tail");
+        assert!(r1[2].synthetic, "runtime reminders must carry provenance");
+        assert!(
+            r1[2].text.contains("<system-reminder>") && r1[2].text.contains("Current date"),
+            "round 1 carries the wrapped date: {:?}",
+            r1[2].text
+        );
+        // Round 2: exactly one wrapped tail appended, same as round 1.
         let mut r2 = vec![
             Message::system("s"),
             Message::user("hi"),

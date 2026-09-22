@@ -29,6 +29,15 @@ pub struct RateLimitWindow {
     /// Max model requests allowed in this rolling window (`0`/negative = unknown).
     /// Used to size the `/goal` round budget as a share of the tightest window.
     pub call_limit: i64,
+    /// How many of them are gone, and what share that is (0..=100). `0` when
+    /// the account service did not say.
+    ///
+    /// Carried because a screen cannot work it out: the countdown says when the
+    /// window resets, not how much of it has been spent, and only the account
+    /// service counts requests. It was being dropped here, which is why the
+    /// row-assembled screen could not draw the bar the classic one draws.
+    pub calls_used: i64,
+    pub usage_percent: f64,
 }
 
 /// The most-constraining rolling-window request budget, used to size a single
@@ -46,6 +55,72 @@ pub fn binding_window_call_limit(windows: &[RateLimitWindow]) -> Option<i64> {
         .min()
 }
 
+/// What an account has spent, as the account service counts it.
+///
+/// Neutral of the service that reported it: a span, per-model totals and one
+/// figure per day. The day series is what a chart is drawn from, and it is
+/// carried rather than summarised because summarising it here would fix the
+/// chart's shape in the wrong crate.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AccountUsage {
+    /// The span these figures cover, as the service words it (`YYYY-MM-DD`).
+    pub from: String,
+    pub to: String,
+    /// Per model, biggest first.
+    pub models: Vec<ModelUse>,
+    /// One per day, oldest first.
+    pub daily: Vec<DayUse>,
+    /// The same days split by model — one per entry of `models`, same order,
+    /// each as long as `daily`. Empty when the service does not break them out.
+    pub series: Vec<ModelSeries>,
+    pub total_tokens: u64,
+    pub total_requests: u64,
+}
+
+/// One model's day-by-day tokens, aligned with [`AccountUsage::daily`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelSeries {
+    pub name: String,
+    pub daily: Vec<u64>,
+}
+
+/// One model's share of an account's spend.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ModelUse {
+    pub name: String,
+    pub tokens: u64,
+    pub requests: u64,
+}
+
+/// One day of it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DayUse {
+    /// `YYYY-MM-DD`.
+    pub date: String,
+    pub tokens: u64,
+    pub requests: u64,
+}
+
+/// The entitlement those windows belong to — what the account is subscribed to.
+///
+/// Separate from the windows because the two answer different questions and
+/// expire on different clocks: a window resets in minutes, a plan in years. A
+/// screen that showed only the window can say "you are throttled" and never
+/// "your plan runs out next week".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Entitlement {
+    pub plan: String,
+    /// Whether the service still honours it. Expired plans are still reported —
+    /// a person whose plan lapsed needs to be told that, not shown nothing.
+    pub active: bool,
+    /// `YYYY-MM-DD`, or empty when the service did not say. A claim that has
+    /// not been activated has no date, which is not the same as day zero.
+    pub claimed_at: String,
+    pub expires_at: String,
+    pub remaining_days: i32,
+    pub total_days: i32,
+}
+
 /// Host-owned source for provider-specific quota windows.
 ///
 /// `applies_to` is deliberately part of the source: only the host knows which endpoints carry
@@ -54,6 +129,27 @@ pub fn binding_window_call_limit(windows: &[RateLimitWindow]) -> Option<i64> {
 pub trait RateLimitWindowSource: Send + Sync + std::fmt::Debug {
     fn applies_to(&self, base_url: &str) -> bool;
     async fn fetch_windows(&self) -> Result<Vec<RateLimitWindow>, String>;
+
+    /// What the account has spent, when the service reports it.
+    ///
+    /// Defaulted to "nothing to say" so a source that only knows about windows
+    /// stays valid: this is an account-service feature, not something every
+    /// provider has.
+    async fn fetch_usage(&self) -> Result<Option<AccountUsage>, String> {
+        Ok(None)
+    }
+
+    /// The plan behind the windows, when there is one.
+    ///
+    /// A method of its own rather than a second field on [`Self::fetch_windows`]
+    /// on purpose: `fetch_windows` is on the 429 path, where the answer is
+    /// cached and aged and the plan has no business being. The cost is that a
+    /// host whose plan and windows arrive in one response asks for that
+    /// response twice when a person opens the page — which is the cheap half of
+    /// the trade, since the page is opened by hand and the 429 path is not.
+    async fn fetch_plan(&self) -> Result<Option<Entitlement>, String> {
+        Ok(None)
+    }
 }
 
 /// Skip the network entirely when the last successful fetch is younger than this —
@@ -349,6 +445,8 @@ mod tests {
             seconds_until_reset: secs_until_reset,
             reset_label: "当前窗口结束即重置额度（每 5 小时一个窗口）".into(),
             call_limit: 1000,
+            calls_used: 420,
+            usage_percent: 42.0,
         }
     }
 

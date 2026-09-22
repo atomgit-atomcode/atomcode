@@ -128,6 +128,46 @@ fn classify_llm_error(reason: &str) -> LlmErrorKind {
     }
 }
 
+/// Where in the conversation the adapters currently are.
+///
+/// The correlation chain the envelope carries is
+/// `device -> launch -> session -> turn -> round -> request`, and the first
+/// three are fixed at assembly while the last three change every request. Only
+/// [`TelemetryHook`] is handed a [`TurnCtx`], so it is the one that knows; the
+/// tool middleware is given nothing that says which round it is in
+/// ([`RequestCtx`] carries the event channel and the pending map, and no
+/// position). This is how the second learns it from the first.
+///
+/// Shared by `Arc` between the two, set up together in `runtime::mount` so
+/// there is exactly one of these per mounted tree.
+#[derive(Default)]
+pub struct Position {
+    turn: std::sync::atomic::AtomicU64,
+    round: AtomicU32,
+    request: std::sync::atomic::AtomicU64,
+}
+
+impl Position {
+    /// `0` means "not in a round", which is what `None` on the wire says.
+    fn get(&self) -> (Option<u64>, Option<u32>, Option<u64>) {
+        let zero_is_none = |n: u64| (n != 0).then_some(n);
+        (
+            zero_is_none(self.turn.load(Ordering::Relaxed)),
+            match self.round.load(Ordering::Relaxed) {
+                0 => None,
+                round => Some(round),
+            },
+            zero_is_none(self.request.load(Ordering::Relaxed)),
+        )
+    }
+
+    fn set(&self, ctx: &TurnCtx) {
+        self.turn.store(ctx.turn_id, Ordering::Relaxed);
+        self.round.store(ctx.round, Ordering::Relaxed);
+        self.request.store(ctx.request_id, Ordering::Relaxed);
+    }
+}
+
 /// Shared attribution + emit path for the telemetry adapters. Fixes the
 /// provider/host/model envelope at assembly; both adapters track within its scope.
 #[derive(Clone)]
@@ -179,9 +219,22 @@ impl Attribution {
         }
     }
 
+    /// Emit with no position: the caller is not a round of the main loop.
     async fn emit(&self, event: Event) {
+        self.emit_at(event, (None, None, None)).await;
+    }
+
+    /// Emit from a known place in the conversation.
+    async fn emit_at(&self, event: Event, at: (Option<u64>, Option<u32>, Option<u64>)) {
+        let (turn, round, request) = at;
         let tel = self.telemetry.clone();
-        CurrentContext::scope(self.scope_ctx(), || async move {
+        let ctx = CurrentContext {
+            turn,
+            round,
+            request,
+            ..self.scope_ctx()
+        };
+        CurrentContext::scope(ctx, || async move {
             tel.track(event);
         })
         .await;
@@ -208,6 +261,8 @@ pub struct TelemetryHook {
     last_anchored_tokens: AtomicU32,
     last_tool_result_tokens: AtomicU32,
     last_tool_def_tokens: AtomicU32,
+    /// Where the conversation is, shared with the tool middleware.
+    position: Arc<Position>,
     /// Last error observed via `on_error`, consumed by `turn_complete` to classify a
     /// failed turn. (`on_error` also fires for tool errors, but `turn_complete` only
     /// reads it on a PROVIDER terminal reason — so tool errors never become LlmChat.)
@@ -221,9 +276,11 @@ impl TelemetryHook {
         base_url: &str,
         model: impl Into<String>,
         session_id: Option<&str>,
+        position: Arc<Position>,
     ) -> Self {
         Self {
             attr: Attribution::new(telemetry, vendor, base_url, model, session_id),
+            position,
             last_messages_count: AtomicU32::new(0),
             last_system_tokens: AtomicU32::new(0),
             last_message_tokens: AtomicU32::new(0),
@@ -242,9 +299,13 @@ impl LifecycleHooks for TelemetryHook {
         messages: &[Message],
         tools: &[ToolDef],
         _options: &ChatOptions,
-        _ctx: &TurnCtx,
+        ctx: &TurnCtx,
     ) {
         use atomcode_kernel::message::Role;
+        // The one place either adapter is told where it is. Recorded before the
+        // request goes out, so a tool the response asks for is stamped with the
+        // round that asked for it.
+        self.position.set(ctx);
         self.last_messages_count
             .store(messages.len() as u32, Ordering::Relaxed);
 
@@ -329,7 +390,7 @@ impl LifecycleHooks for TelemetryHook {
             error_kind: None,
             error_data: None,
         };
-        self.attr.emit(event).await;
+        self.attr.emit_at(event, self.position.get()).await;
     }
 
     async fn on_error(&self, error: &str) {
@@ -340,17 +401,36 @@ impl LifecycleHooks for TelemetryHook {
         }
     }
 
-    async fn turn_complete(&self, _convo: &Conversation, reason: &StopReason, _ctx: &TurnCtx) {
+    async fn turn_complete(&self, _convo: &Conversation, reason: &StopReason, ctx: &TurnCtx) {
         let last = self.last_error.lock().ok().and_then(|mut g| g.take());
-        // A round that produced a model response already emitted its LlmChat. Emit an
-        // extra had_error one ONLY for an LLM/provider terminal failure — not normal
-        // stop, cancel, or the round/continuation fuses (those aren't LLM errors).
+        // A round that produced a model response already emitted its LlmChat.
+        // This is the extra one, for a turn that ended WITHOUT an answer and
+        // for a reason worth counting — not normal stop, cancel, or the
+        // round/continuation fuses.
         let kind = match reason {
             StopReason::ProviderError => last
                 .as_deref()
                 .map(classify_llm_error)
                 .unwrap_or(LlmErrorKind::Other),
             StopReason::Timeout => LlmErrorKind::StreamTimeout,
+            // `StopReason::RateLimited` says of itself "Not a failure — already
+            // produced content is preserved", and it is still reported with
+            // `had_error: true`, deliberately:
+            //
+            //   - the wire has ONE shape for "the turn produced no answer, and
+            //     here is why", and `error_kind` is documented as `None` when
+            //     `had_error` is false, so there is no way to send the reason
+            //     without the flag;
+            //   - the alternative is what shipped until now — silence. A person
+            //     who waited out a 429 and gave up looked, in the data, exactly
+            //     like a session where nothing happened. Measured against 5.1.0
+            //     (`scripts/telemetry-parity.py --only rate-limited`): the whole
+            //     turn produced `open_atomcode` and nothing else, on both builds.
+            //
+            // A consumer that wants "failures" without pauses filters on
+            // `error_kind != rate_limited`, which is a filter it can write; it
+            // cannot invent a row that was never sent.
+            StopReason::RateLimited => LlmErrorKind::RateLimited,
             _ => return,
         };
         let event = Event::LlmChat {
@@ -369,7 +449,15 @@ impl LifecycleHooks for TelemetryHook {
             error_kind: Some(kind),
             error_data: last.map(|e| e.chars().take(200).collect()),
         };
-        self.attr.emit(event).await;
+        // The round the turn died on, from the terminal's own context rather
+        // than the shared position: a turn can fail before any request went out,
+        // and then the position still holds the previous turn's.
+        self.attr
+            .emit_at(
+                event,
+                (Some(ctx.turn_id), Some(ctx.round), Some(ctx.request_id)),
+            )
+            .await;
     }
 }
 
@@ -379,9 +467,14 @@ impl LifecycleHooks for TelemetryHook {
 /// approval middleware without touching the approve-what-runs contract.
 pub struct ToolTelemetryMiddleware {
     attr: Attribution,
-    /// call_id → (tool name, start). `ToolResult` carries no name, so it's stamped
-    /// in `before` and looked up in `after`.
-    inflight: StdMutex<HashMap<String, (String, Instant)>>,
+    /// Where the conversation is, written by [`TelemetryHook`] on each request.
+    position: Arc<Position>,
+    /// call_id → (tool name, start, where). `ToolResult` carries no name, so it
+    /// is stamped in `before` and looked up in `after`. The POSITION is stamped
+    /// there too rather than read in `after`: a slow tool can still be running
+    /// when the next round's request goes out, and reading it late would file
+    /// the call under the round that came after the one that asked for it.
+    inflight: StdMutex<HashMap<String, (String, Instant, (Option<u64>, Option<u32>, Option<u64>))>>,
 }
 
 impl ToolTelemetryMiddleware {
@@ -391,9 +484,11 @@ impl ToolTelemetryMiddleware {
         base_url: &str,
         model: impl Into<String>,
         session_id: Option<&str>,
+        position: Arc<Position>,
     ) -> Self {
         Self {
             attr: Attribution::new(telemetry, vendor, base_url, model, session_id),
+            position,
             inflight: StdMutex::new(HashMap::new()),
         }
     }
@@ -408,7 +503,10 @@ impl ToolMiddleware for ToolTelemetryMiddleware {
         _rt: &RequestCtx,
     ) -> BeforeOutcome {
         if let Ok(mut m) = self.inflight.lock() {
-            m.insert(call.id.clone(), (call.name.clone(), Instant::now()));
+            m.insert(
+                call.id.clone(),
+                (call.name.clone(), Instant::now(), self.position.get()),
+            );
         }
         BeforeOutcome::Proceed
     }
@@ -420,7 +518,7 @@ impl ToolMiddleware for ToolTelemetryMiddleware {
     ) -> AfterOutcome {
         // No stamp ⇒ this middleware's `before` never ran (a prior middleware blocked
         // the call); nothing to attribute.
-        let Some((name, started)) = self
+        let Some((name, started, at)) = self
             .inflight
             .lock()
             .ok()
@@ -447,7 +545,7 @@ impl ToolMiddleware for ToolTelemetryMiddleware {
             error_kind,
             error_data: None,
         };
-        self.attr.emit(event).await;
+        self.attr.emit_at(event, at).await;
         AfterOutcome::Proceed
     }
 }
@@ -516,6 +614,11 @@ impl LlmProvider for MeteredProvider {
     fn context_window(&self) -> u32 {
         self.inner.context_window()
     }
+    /// Forwarded, not defaulted: this is a decorator, and answering `false` here
+    /// would tell every front end behind it that a vision model is blind.
+    fn supports_vision(&self) -> bool {
+        self.inner.supports_vision()
+    }
     fn bind_session_id(&self, session_id: &str) {
         self.inner.bind_session_id(session_id);
     }
@@ -583,6 +686,172 @@ impl LlmProvider for MeteredProvider {
     }
 }
 
+// ---- MCP connections -------------------------------------------------------
+
+/// Map an MCP connection error onto a telemetry `McpErrorKind`.
+///
+/// Restored unchanged from the engine that was retired
+/// (`git show f296e6e2^:crates/atomcode-core/src/mcp/registry.rs`), substring
+/// tests and order included. The order is load-bearing — "no such file" also
+/// contains neither "timeout" nor "server", but a message like
+/// `spawn failed: connection refused` is a network error first — and the value
+/// set is what two years of stored rows are bucketed by. A tidier
+/// classification here would silently split every existing series.
+fn classify_mcp_error(error: &str) -> atomcode_telemetry::McpErrorKind {
+    use atomcode_telemetry::McpErrorKind;
+    let e = error.to_lowercase();
+    if e.contains("connection refused") || e.contains("dns") || e.contains("network") {
+        McpErrorKind::NetworkError
+    } else if e.contains("401")
+        || e.contains("403")
+        || e.contains("unauthorized")
+        || e.contains("oauth")
+    {
+        McpErrorKind::AuthError
+    } else if e.contains("not found")
+        || e.contains("no such")
+        || e.contains("path")
+        || e.contains("spawn")
+    {
+        McpErrorKind::ExecutionFailed
+    } else if e.contains("timeout") || e.contains("timed out") {
+        McpErrorKind::Timeout
+    } else if e.contains("server") || e.contains("-326") || e.contains("mcp error") {
+        McpErrorKind::ServerError
+    } else {
+        McpErrorKind::Other
+    }
+}
+
+/// The transport as the wire names it.
+///
+/// `Http` maps to `streamable_http` rather than `sse`, which is what the
+/// retired engine sent for every HTTP server; `sse` has never been emitted.
+fn wire_transport(
+    kind: atomcode_capabilities::mcp::McpTransportKind,
+) -> atomcode_telemetry::McpTransport {
+    use atomcode_capabilities::mcp::McpTransportKind;
+    match kind {
+        McpTransportKind::Stdio => atomcode_telemetry::McpTransport::Stdio,
+        McpTransportKind::Http => atomcode_telemetry::McpTransport::StreamableHttp,
+    }
+}
+
+/// Reports one `McpConnect` per connection attempt, from the neutral events
+/// `atomcode-capabilities` publishes.
+///
+/// # Why it is not in `atomcode-capabilities`
+///
+/// That crate holds no telemetry sink and must not grow one: it is the
+/// reusable capability layer, and a product that embeds it decides for itself
+/// whether anything is metered. So the registry states the fact on a seam and
+/// this, the product, is what turns the fact into a report — the shape
+/// `crates/atomcode-capabilities/src/mcp/mod.rs` has described since the port.
+///
+/// # Parity
+///
+/// Exactly the two cases the retired engine reported: a server that connected
+/// and a server that did not. `BlockedUntrusted` and `Warning` were never
+/// metered and are not metered now — adding them would change what an existing
+/// `mcp_connect` row counts. The envelope is likewise the ambient one, with no
+/// provider/model scope: an MCP connection has nothing to do with the model,
+/// and the retired engine attributed none.
+pub struct McpTelemetry {
+    telemetry: Arc<Telemetry>,
+    /// Where this session runs, so a path in an error message reads as
+    /// `<CWD>/…` rather than naming the person's disk.
+    working_dir: std::path::PathBuf,
+}
+
+impl McpTelemetry {
+    pub fn new(telemetry: Arc<Telemetry>, working_dir: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            telemetry,
+            working_dir: working_dir.into(),
+        }
+    }
+
+    /// The server's own words, made safe to send.
+    ///
+    /// **This is the one deliberate departure from the retired engine**, which
+    /// sent `truncate_head(error, 200)` raw. Two things it therefore sent that
+    /// this does not: the absolute path of whatever failed to spawn — which
+    /// contains the person's username — and, for an HTTP server, whatever a
+    /// transport error quoted back of the request, which can include the
+    /// `Authorization` header. `a0dd5b49` made the same change for tool-call
+    /// failures; this is the MCP half of it.
+    ///
+    /// Redaction runs before truncation, so a secret cannot survive by sitting
+    /// past the 200th character.
+    fn safe_message(&self, error: &str) -> String {
+        let home = atomcode_config::util::real_home_dir();
+        let scrubbed = atomcode_telemetry::scrub::scrub_path(
+            error,
+            home.as_deref(),
+            Some(self.working_dir.as_path()),
+        );
+        atomcode_telemetry::scrub::truncate_head(
+            &atomcode_telemetry::scrub::redact_secrets(&scrubbed),
+            200,
+        )
+    }
+
+    /// Report `event`, if it is one of the two that are reported.
+    pub fn report(&self, event: &atomcode_capabilities::mcp::McpConnectEvent) {
+        use atomcode_capabilities::mcp::McpConnectEvent;
+        let (name, error, attempt) = match event {
+            McpConnectEvent::Connected { name, attempt } => (name, None, *attempt),
+            // A failure with nothing behind it is the config file itself
+            // failing to load, which the retired engine did not meter either.
+            McpConnectEvent::Failed {
+                name,
+                error,
+                attempt: Some(attempt),
+            } => (name, Some(error), *attempt),
+            _ => return,
+        };
+        let transport = wire_transport(attempt.transport);
+        let mut detail = serde_json::json!({
+            "server_name": name,
+            "transport": transport_str(transport),
+            "duration_ms": attempt.duration_ms,
+            "config_source": attempt.source.as_str(),
+        });
+        match error {
+            None => {
+                // Always zero when the retired engine sent it, with a note that
+                // it would be filled in once tools were listed. Kept so the
+                // field does not appear and disappear across builds.
+                detail["tool_count"] = serde_json::json!(0);
+            }
+            Some(error) => {
+                detail["message"] = serde_json::json!(self.safe_message(error));
+            }
+        }
+        self.telemetry.track(Event::McpConnect {
+            server_name: name.clone(),
+            transport,
+            success: error.is_none(),
+            duration_ms: Some(attempt.duration_ms as u32),
+            error_kind: error.map(|error| classify_mcp_error(error)),
+            error_data: Some(detail.to_string()),
+        });
+    }
+}
+
+/// The transport as it appears inside `error_data`.
+///
+/// The envelope's own `transport` field is serialized by serde; this is the
+/// copy the retired engine also wrote into the detail blob, spelled the same
+/// way so the two never disagree.
+fn transport_str(transport: atomcode_telemetry::McpTransport) -> &'static str {
+    match transport {
+        atomcode_telemetry::McpTransport::Stdio => "stdio",
+        atomcode_telemetry::McpTransport::Sse => "sse",
+        atomcode_telemetry::McpTransport::StreamableHttp => "streamable_http",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -597,6 +866,7 @@ mod tests {
             "https://api.example.com/v1",
             "deepseek-v4",
             None,
+            Default::default(),
         );
 
         hook.on_request(
@@ -650,7 +920,7 @@ mod tests {
     async fn breaks_down_prompt_zones() {
         use atomcode_kernel::message::Role;
         let (tel, captured) = Telemetry::in_memory("test".into());
-        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m", None);
+        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m", None, Default::default());
 
         let mut sys = Message::user("you are a helpful coding agent");
         sys.role = Role::System;
@@ -729,11 +999,83 @@ mod tests {
         assert_eq!(apportion(0, 5, [1, 2, 3, 4]), (1, 7, 3, 4));
     }
 
+    /// A turn the host paused for a rate limit is counted.
+    ///
+    /// It used to be silent: `turn_complete` reported only `ProviderError` and
+    /// `Timeout`, and a 429 pause fell into `_ => return`. Measured against
+    /// 5.1.0 the whole turn produced `open_atomcode` and nothing else, on both
+    /// builds — a person who waited and gave up was indistinguishable from a
+    /// session where nothing happened.
+    ///
+    /// Also pins what it is NOT: a plain stop and a cancel stay silent, because
+    /// a turn that ended normally already reported its rounds and a cancelled
+    /// one is not an LLM outcome.
+    #[tokio::test]
+    async fn a_rate_limited_turn_is_counted_and_a_normal_one_is_not() {
+        let (tel, captured) = Telemetry::in_memory("test".into());
+        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m", None, Default::default());
+        let convo = Conversation {
+            messages: Vec::new(),
+            cache_epoch: 0,
+        };
+        let ctx = TurnCtx {
+            turn_id: 4,
+            round: 2,
+            request_id: 9,
+            ..TurnCtx::default()
+        };
+
+        for quiet in [
+            StopReason::Stopped,
+            StopReason::Cancelled,
+            StopReason::MaxRounds,
+        ] {
+            hook.turn_complete(&convo, &quiet, &ctx).await;
+        }
+        // The sink hands records to a task; the module's other tests wait the
+        // same 50ms. Long enough that "nothing arrived" means nothing was sent.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            captured.lock().await.is_empty(),
+            "a turn that stopped, was cancelled or ran out of rounds is not an LLM outcome"
+        );
+
+        hook.turn_complete(&convo, &StopReason::RateLimited, &ctx)
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let records = captured.lock().await;
+        let record = records.first().expect("a paused turn is counted");
+        assert_eq!(records.len(), 1, "exactly one: {records:?}");
+        match &record.event {
+            Event::LlmChat {
+                had_error,
+                error_kind,
+                ..
+            } => {
+                assert!(had_error, "the turn produced no answer");
+                assert!(
+                    matches!(error_kind, Some(LlmErrorKind::RateLimited)),
+                    "a pause must be its own bucket, not Other: {error_kind:?}"
+                );
+            }
+            other => panic!("not an llm_chat: {other:?}"),
+        }
+        // And it says where it happened, like every other metered event.
+        assert_eq!(
+            (
+                record.envelope.turn,
+                record.envelope.round,
+                record.envelope.request
+            ),
+            (Some(4), Some(2), Some(9))
+        );
+    }
+
     #[tokio::test]
     async fn anchors_real_assistant_tokens_in_breakdown() {
         use atomcode_kernel::message::Role;
         let (tel, captured) = Telemetry::in_memory("test".into());
-        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m", None);
+        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m", None, Default::default());
 
         let mut sys = Message::user("system persona");
         sys.role = Role::System;
@@ -798,7 +1140,7 @@ mod tests {
     #[tokio::test]
     async fn no_meta_emits_nothing() {
         let (tel, captured) = Telemetry::in_memory("test".into());
-        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m", None);
+        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m", None, Default::default());
         let mut resp = Message::assistant("hi", vec![]); // meta = None
         hook.on_model_response(&mut resp).await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -808,7 +1150,7 @@ mod tests {
     #[tokio::test]
     async fn provider_error_turn_emits_had_error_llm_chat() {
         let (tel, captured) = Telemetry::in_memory("test".into());
-        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m", None);
+        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m", None, Default::default());
 
         hook.on_error("HTTP 429: rate limited").await;
         hook.turn_complete(
@@ -837,7 +1179,7 @@ mod tests {
     #[tokio::test]
     async fn normal_stop_emits_no_extra_llm_chat() {
         let (tel, captured) = Telemetry::in_memory("test".into());
-        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m", None);
+        let hook = TelemetryHook::new(tel, "openai", "https://x/v1", "m", None, Default::default());
         // A tool error fired on_error, but the turn stopped normally → no LlmChat.
         hook.on_error("tool failed").await;
         hook.turn_complete(
@@ -854,7 +1196,14 @@ mod tests {
     async fn denied_tool_emits_tool_call_denied() {
         use atomcode_kernel::testkit::EchoTool;
         let (tel, captured) = Telemetry::in_memory("test".into());
-        let mw = ToolTelemetryMiddleware::new(tel, "openai", "https://x/v1", "m", None);
+        let mw = ToolTelemetryMiddleware::new(
+            tel,
+            "openai",
+            "https://x/v1",
+            "m",
+            None,
+            Default::default(),
+        );
 
         let tool: Arc<dyn Tool> = Arc::new(EchoTool);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -896,7 +1245,14 @@ mod tests {
     async fn tool_middleware_emits_tool_call() {
         use atomcode_kernel::testkit::EchoTool;
         let (tel, captured) = Telemetry::in_memory("test".into());
-        let mw = ToolTelemetryMiddleware::new(tel, "openai", "https://x/v1", "m", None);
+        let mw = ToolTelemetryMiddleware::new(
+            tel,
+            "openai",
+            "https://x/v1",
+            "m",
+            None,
+            Default::default(),
+        );
 
         let tool: Arc<dyn Tool> = Arc::new(EchoTool);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();

@@ -76,11 +76,20 @@ impl ArtifactStore {
     }
 }
 
-pub const THRESHOLD_BYTES: usize = 16 * 1024;
+pub const THRESHOLD_BYTES: usize = 50 * 1024;
 /// Stable prefix embedded in a conversation-visible result when the complete
 /// tool output was replaced by an artifact-backed head/tail preview.
 pub const ARTIFACT_TRUNCATION_MARKER_PREFIX: &str = "[atomcode: output truncated";
-const PREVIEW_HALF: usize = 4 * 1024;
+/// Head/tail kept inline when an oversized result is spilled. HEAD-HEAVY on purpose:
+/// the START of a command's output (a diff header, an error's first frames, a log's
+/// opening) is usually the more useful half, so the head gets the larger share while a
+/// smaller tail preserves a trailing error/summary line. Sized to the ~50 KB peer
+/// baseline (the previous 16 KB / 4 KB was ~3× tighter than comparable agents, which is
+/// what forced the model to keep working around "output truncated" on ordinary diffs /
+/// logs). `THRESHOLD_BYTES` stays above `HEAD + TAIL` so a truncated result always
+/// shrinks below the original.
+const PREVIEW_HEAD: usize = 32 * 1024;
+const PREVIEW_TAIL: usize = 12 * 1024;
 const MAX_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
 
 /// Largest char-boundary index ≤ n.
@@ -111,26 +120,32 @@ impl ArtifactMiddleware {
     }
 }
 
-#[async_trait::async_trait]
-impl atomcode_kernel::middleware::ToolMiddleware for ArtifactMiddleware {
-    async fn after(
+impl ArtifactMiddleware {
+    /// Spill an oversized result to the store and leave head+tail inline.
+    ///
+    /// The judgement, with no opinion about how it is delivered — the kernel
+    /// `ToolMiddleware::after` below wears one shell, a harness `tools/execute`
+    /// listener wears the other, and both call this. `self_bounds_output` is
+    /// passed as a plain bool rather than the resolved tool so neither shell has
+    /// to agree with the other about how a tool is looked up.
+    pub async fn spill(
         &self,
         result: &mut atomcode_kernel::tool::ToolResult,
-        tool: Option<&Arc<dyn atomcode_kernel::tool::Tool>>,
-    ) -> atomcode_kernel::middleware::AfterOutcome {
+        self_bounds_output: bool,
+    ) {
         // A tool that bounds and structures its own output (e.g. `read_file`: self-capped,
         // 1-based line numbers, pagination) must reach the model WHOLE — head/tail
         // truncation would corrupt it. Read the contract off the resolved tool, so this is
         // robust even if an earlier `before` short-circuited the chain with `Allow`.
-        if tool.is_some_and(|t| t.self_bounds_output()) {
-            return atomcode_kernel::middleware::AfterOutcome::Proceed;
+        if self_bounds_output {
+            return;
         }
         let total = result.content.len();
         if total <= THRESHOLD_BYTES {
-            return atomcode_kernel::middleware::AfterOutcome::Proceed;
+            return;
         }
-        let head_end = head_boundary(&result.content, PREVIEW_HALF);
-        let tail_begin = tail_start(&result.content, PREVIEW_HALF);
+        let head_end = head_boundary(&result.content, PREVIEW_HEAD);
+        let tail_begin = tail_start(&result.content, PREVIEW_TAIL);
         let head = &result.content[..head_end];
         let tail = &result.content[tail_begin..];
 
@@ -143,7 +158,7 @@ Full output unavailable (exceeds {MAX_ARTIFACT_BYTES}-byte artifact ceiling).]\n
                 tail.len()
             );
             result.content = format!("{head}{marker}{tail}");
-            return atomcode_kernel::middleware::AfterOutcome::Proceed;
+            return;
         }
 
         let marker = match self.store.put(result.content.as_bytes()) {
@@ -161,6 +176,20 @@ Full output unavailable (could not be saved).]\n\n",
             ),
         };
         result.content = format!("{head}{marker}{tail}");
+    }
+}
+
+#[async_trait::async_trait]
+impl atomcode_kernel::middleware::ToolMiddleware for ArtifactMiddleware {
+    async fn after(
+        &self,
+        result: &mut atomcode_kernel::tool::ToolResult,
+        tool: Option<&Arc<dyn atomcode_kernel::tool::Tool>>,
+    ) -> atomcode_kernel::middleware::AfterOutcome {
+        // Read the contract off the RESOLVED tool, so this is robust even if an
+        // earlier `before` short-circuited the chain with `Allow`.
+        self.spill(result, tool.is_some_and(|t| t.self_bounds_output()))
+            .await;
         atomcode_kernel::middleware::AfterOutcome::Proceed
     }
 }
@@ -243,7 +272,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = std::sync::Arc::new(super::ArtifactStore::new(dir.path()));
         let mw = super::ArtifactMiddleware::new(store.clone());
-        let big = "x".repeat(20 * 1024);
+        let big = "x".repeat(60 * 1024);
         let mk = || ToolResult {
             call_id: "c".into(),
             content: big.clone(),
@@ -284,7 +313,7 @@ mod tests {
             std::sync::Arc::new(crate::tools::read::ReadFileTool::new(false));
 
         // A large read_file result (over THRESHOLD) must reach the model WHOLE.
-        let big = "x".repeat(40 * 1024);
+        let big = "x".repeat(60 * 1024);
         let mut r = ToolResult {
             call_id: "rc".into(),
             content: big.clone(),

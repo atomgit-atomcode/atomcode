@@ -1,0 +1,79 @@
+[package]
+name = "atomcode-tui"
+version.workspace = true
+edition = "2021"
+description = "A full-screen terminal UI assembled from plugins on atomcode-harness — panels, streams, keymaps and layout are all rows"
+publish = false
+
+[dependencies]
+# The plugin runtime and the agent assembly this UI is a front end for.
+atomcode-plexus = { path = "../atomcode-plexus" }
+atomcode-harness = { path = "../atomcode-harness" }
+# Value types only: SessionEvent carries kernel messages and tool calls.
+atomcode-kernel = { path = "../atomcode-kernel" }
+# What this screen says to a person, in the language they chose. A leaf with no
+# atomcode dependency of its own — which is the whole reason the table lives
+# there and not in `atomcode-config`: the screen is an App apart and may not
+# depend on the product's config crate (`docs/adr/0022` §3), but it still has to
+# read the *same* locale the product reads, or `/language` would move one of
+# them and not the other.
+atomcode-i18n = { path = "../atomcode-i18n" }
+atomcode-host-api = { path = "../atomcode-host-api" }
+# The `tools` feature only, and only for the todo fold: the panel must derive the
+# list the *same* way the tool does (`reduce_todos`), or live, replay and resumed
+# views of the same session would disagree. Already in this build's graph — the
+# UI is a front end for the harness, which mounts these — so this adds no crate
+# that was not compiled anyway; the default `provider` feature (the whole HTTP
+# stack) is deliberately left off.
+atomcode-capabilities = { path = "../atomcode-capabilities", default-features = false, features = [
+    "tools",
+] }
+# Wiping a typed password when the prompt closes (`secret.rs`). The same crate
+# the askpass server holds its cache in, so the secret is zeroized on both ends
+# of the one hop it makes.
+zeroize = "1"
+crossterm = { version = "0.29", features = ["event-stream"] }
+# Reading the clipboard. The surface is the only row allowed to talk to the
+# terminal, and the clipboard is the terminal's — so the platform lives here,
+# behind `Surface::clipboard_image`, and everything above it sees an
+# `ImageContent` and nothing else.
+arboard = "3"
+# arboard hands back raw RGBA; every provider wants an encoded image, so the
+# encode happens once at this boundary rather than in each provider adapter.
+png = "0.17"
+base64 = "0.22"
+qrcode = { version = "0.14", default-features = false }
+unicode-width = "0.2"
+unicode-segmentation = "1"
+# Picking which tips to open a session with. The same version `atomcode-tuix` uses:
+# two front ends on two major versions would put two copies of `rand` in one build
+# and buy nothing. Only the *selection* is random — the seed comes from the working
+# directory, so one directory picks the same tips every render (see
+# `modules::welcome`).
+rand = "0.8"
+async-trait = "0.1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+
+# Reading the terminal's answer to an OSC 11 query needs the tty as a file
+# descriptor with a timeout — `poll` and `read`, which crossterm does not
+# expose. Unix only; elsewhere the theme comes from config or `COLORFGBG`.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+# End to end means against a host. Only the tests reach for one — the screen
+# itself knows neither Host nor Product (`docs/architecture-target.md` §2.5),
+# which is what `gates/layers.sh` checks — and this is the smallest host there
+# is: a tree the harness mounts, answering the same contract the product's
+# runtime answers.
+atomcode-tree-host = { path = "../atomcode-tree-host" }
+atomcode-kernel = { path = "../atomcode-kernel", features = ["test-support"] }
+ctor = "0.2"
+# A real directory for the one criterion that writes a file (`/save`). The
+# session's working root is a path, and a criterion that faked it would be
+# testing the fake.
+tempfile = "3"

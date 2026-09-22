@@ -257,6 +257,8 @@ pub struct CatalogEntry {
     pub message_count: usize,
     pub turn_count: usize,
     pub presence: CatalogPresence,
+    /// Written by a build newer than this one: listed, not resumable here.
+    pub needs_newer_version: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -429,6 +431,18 @@ pub struct SessionMeta {
     /// that sessions written before this field existed deserialize correctly.
     #[serde(default)]
     pub origin: SessionOrigin,
+    /// The session-format version of the last build that wrote this session's
+    /// log and index — what a catalog reads to tell that a session needs a newer
+    /// build without opening its log (`docs/adr/0024` §16). Zero for a session
+    /// stored as a snapshot.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub format_version: u32,
+    /// The session this one was delegated from — a team member's lead, a task
+    /// child's parent — by its session id. Such a session is kept under its
+    /// parent: no catalog, picker or `--continue` offers it on its own, and it
+    /// is found through [`SessionManager::children`] (`docs/adr/0024` §11).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
 }
 
 impl SessionMeta {
@@ -454,7 +468,14 @@ impl SessionMeta {
             detached_model_usage: Vec::new(),
             detached_unattributed_tokens: 0,
             origin: SessionOrigin::Manual,
+            format_version: 0,
+            parent: None,
         }
+    }
+
+    /// Whether a build older than the one that last wrote this session.
+    pub fn needs_newer_version(&self) -> bool {
+        self.format_version > atomcode_kernel::session::SESSION_FORMAT_VERSION
     }
 
     /// Remove turn stats selected by `predicate` while preserving their usage
@@ -674,6 +695,10 @@ fn default_true() -> bool {
 }
 
 fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
+fn is_zero_u32(value: &u32) -> bool {
     *value == 0
 }
 
@@ -944,6 +969,46 @@ impl MetaReadPause {
 }
 
 impl SessionManager {
+    /// The one directory under [`sessions_root`](Self::sessions_root) that is
+    /// not a project bucket: the coding runtime's event journal, kept beside
+    /// the native store and apart from its files so neither writer ever reads
+    /// the other's as its own. The catalog passes over it.
+    ///
+    /// Named here, and used by the runtime that writes it, so the directory and
+    /// the scanner that must not mistake it for a bucket cannot disagree.
+    pub const JOURNAL_DIR: &'static str = "harness";
+
+    /// Whether `path` is an event-journal file rather than one of this store's.
+    ///
+    /// Journals were not always kept under [`Self::JOURNAL_DIR`]: the coding
+    /// runtime before 2026-09-16, and the harness launchers (`harness`, `atui`),
+    /// wrote `<id>.jsonl` straight into project buckets. Hundreds of those are on
+    /// disk, and a reader of native files — `recall`, the catalog — must pass over
+    /// them rather than call its own file corrupt. Recognised by the first record,
+    /// which no native file shares: a journal header (`{"header":…}`), or, in
+    /// journals older than headers, a sequenced event (`{"seq":…,"event":…}`).
+    /// Not a regular file, or unreadable, is `false`: the caller's own checks
+    /// report those.
+    pub fn is_journal_file(path: &Path) -> bool {
+        let Ok(file) = open_read_file(path) else {
+            return false;
+        };
+        let mut first = Vec::new();
+        if BufReader::new(file)
+            .take(MAX_JSONL_LINE_BYTES as u64)
+            .read_until(b'\n', &mut first)
+            .is_err()
+        {
+            return false;
+        }
+        let Ok(serde_json::Value::Object(record)) = serde_json::from_slice(&first) else {
+            return false;
+        };
+        !record.contains_key("turn_id")
+            && (record.contains_key("header")
+                || (record.contains_key("event") && record.contains_key("seq")))
+    }
+
     pub fn sessions_root() -> PathBuf {
         super::config_dir().join("sessions")
     }
@@ -1013,12 +1078,24 @@ impl SessionManager {
     pub fn artifacts_dir(&self, id: &str) -> SessionResult<PathBuf> {
         self.path_for(id, "artifacts")
     }
+    /// An event session's metadata is its index (`<id>.index`); a snapshot
+    /// session's is `<id>.meta`. See [`super::events`].
     pub fn meta_path(&self, id: &str) -> SessionResult<PathBuf> {
-        self.path_for(id, "meta")
+        self.format_path(id, "index", "meta")
     }
-    /// Todo-list sidecar path: `<root>/<id>.todos.json` (sibling of meta/snapshot).
+    /// Todo-list sidecar path: `<root>/<id>.todos.json` (sibling of meta/snapshot),
+    /// `<id>.todos` for an event session.
     pub fn todo_sidecar_path(&self, id: &str) -> SessionResult<PathBuf> {
-        self.path_for(id, "todos.json")
+        self.format_path(id, "todos", "todos.json")
+    }
+    /// The event-session name of a file when `id` is an event session, the
+    /// snapshot-session name otherwise.
+    fn format_path(&self, id: &str, events: &str, snapshot: &str) -> SessionResult<PathBuf> {
+        if self.is_event_session(id) {
+            self.path_for(id, events)
+        } else {
+            self.path_for(id, snapshot)
+        }
     }
     /// Write the todo-list sidecar atomically. Best-effort by callers: a failure
     /// only means the todo panel/anchor may fall back to transcript derivation.
@@ -1057,24 +1134,24 @@ impl SessionManager {
     fn lease_path(&self, id: &str) -> SessionResult<PathBuf> {
         self.path_for(id, "lease")
     }
-    /// The append-only transcript path the [`TranscriptHook`](super::TranscriptHook)
-    /// writes (and the recall tool reads).
+    /// The transcript a session a released build kept — or, for an event
+    /// session, its event log, which replaced the transcript (`docs/adr/0024` §14).
     pub fn jsonl_path(&self, id: &str) -> SessionResult<PathBuf> {
-        self.path_for(id, "jsonl")
+        self.format_path(id, "events", "jsonl")
     }
 
     /// UI-only replay data. This file is intentionally separate from the runtime
     /// snapshot so display-only entries can never enter provider context.
     pub fn presentation_path(&self, id: &str) -> SessionResult<PathBuf> {
-        self.path_for(id, "ui.json")
+        self.format_path(id, "ui", "ui.json")
     }
 
     fn rewind_path(&self, id: &str) -> SessionResult<PathBuf> {
-        self.path_for(id, "rewind.json")
+        self.format_path(id, "rewind", "rewind.json")
     }
 
     fn rewind_transaction_path(&self, id: &str) -> SessionResult<PathBuf> {
-        self.path_for(id, "rewind.txn.json")
+        self.format_path(id, "rewind.txn", "rewind.txn.json")
     }
 
     pub(crate) fn load_rewind_ledger(
@@ -1309,6 +1386,10 @@ impl SessionManager {
     ) -> SessionResult<(LoadedSession, Option<Message>)> {
         self.validate_active_lease(lease)?;
         let mut loaded = self.load_native_session(lease.id())?;
+        // An event session's accepted prompt is already a fact in its log.
+        if self.is_event_session(lease.id()) {
+            return Ok((loaded, None));
+        }
         let inflight = match self.load_inflight_snapshot(lease.id()) {
             Ok(Some(checkpoint)) => checkpoint,
             Ok(None) => return Ok((loaded, None)),
@@ -1355,7 +1436,7 @@ impl SessionManager {
         )
     }
 
-    fn path_for(&self, id: &str, extension: &str) -> SessionResult<PathBuf> {
+    pub(super) fn path_for(&self, id: &str, extension: &str) -> SessionResult<PathBuf> {
         validate_session_id(id)?;
         Ok(self.root.join(format!("{id}.{extension}")))
     }
@@ -1385,7 +1466,13 @@ impl SessionManager {
     }
 
     /// Persist the working-set snapshot (atomic). Overwrites every turn.
+    ///
+    /// An event session's content is its log: there is no snapshot to write,
+    /// and this does nothing.
     pub fn save_snapshot(&self, id: &str, snap: &SessionSnapshot) -> SessionResult<()> {
+        if self.is_event_session(id) {
+            return Ok(());
+        }
         validate_snapshot(snap)?;
         let bytes = serialize_bounded(snap, "snapshot", MAX_SNAPSHOT_BYTES)?;
         self.with_meta_lock(id, || {
@@ -1395,6 +1482,9 @@ impl SessionManager {
     }
 
     pub fn load_snapshot(&self, id: &str) -> SessionResult<SessionSnapshot> {
+        if self.is_event_session(id) {
+            return self.project_snapshot(id);
+        }
         let bytes =
             read_regular_file_bounded(&self.snapshot_path(id)?, "snapshot", MAX_SNAPSHOT_BYTES)?;
         let snapshot: SessionSnapshot = deserialize(&bytes, "snapshot")?;
@@ -1490,7 +1580,7 @@ impl SessionManager {
         })
     }
 
-    fn with_meta_lock<T>(
+    pub(super) fn with_meta_lock<T>(
         &self,
         id: &str,
         operation: impl FnOnce() -> SessionResult<T>,
@@ -1840,7 +1930,14 @@ impl SessionManager {
             });
         }
         let snapshot = self.load_snapshot(id)?;
-        let presentation = self.read_presentation(id)?;
+        let presentation = match self.read_presentation(id) {
+            // An event session has display-only entries only if something added
+            // them.
+            Err(error) if self.is_event_session(id) && error.kind() == io::ErrorKind::NotFound => {
+                PresentationFile::default()
+            }
+            other => other?,
+        };
         Ok(LoadedSession {
             meta,
             snapshot,
@@ -1861,6 +1958,12 @@ impl SessionManager {
         self.validate_active_lease(lease)?;
         self.with_meta_lock(lease.id(), || {
             let id = lease.id();
+            // Nothing of an event session's is missing without its presentation.
+            if self.is_event_session(id) {
+                return self
+                    .load_native_session_unlocked(id)
+                    .map(NativeSessionRepairOutcome::Healthy);
+            }
             let meta = self.read_meta(id)?;
             if meta.owner != StorageOwner::Native {
                 return Err(SessionStoreError::OwnershipConflict {
@@ -1935,6 +2038,11 @@ impl SessionManager {
             base_message_count: source.meta.message_count,
             base_turn_count: source.meta.turn_count,
         });
+        if self.is_event_session(source_id) {
+            self.fork_event_session(source_id, &destination_lease, &meta, now_ms)?;
+            let forked = self.load_native_session(destination_id)?;
+            return Ok((forked, destination_lease));
+        }
         let forked = LoadedSession {
             meta,
             snapshot: source.snapshot,
@@ -2582,9 +2690,16 @@ impl SessionManager {
         validate_snapshot(snapshot)?;
         let snapshot_bytes = serialize_bounded(snapshot, "snapshot", MAX_SNAPSHOT_BYTES)?;
 
+        let events = self.is_event_session(lease.id());
         self.with_meta_lock(lease.id(), || {
-            let (current_snapshot, original_snapshot_bytes) =
-                self.read_snapshot_artifact(lease.id())?;
+            // An event session's content is its log, committed fact by fact as it
+            // happens: what is mutated here is only what sits beside it. Taking
+            // conversation back is a `Rewound` fact, never a rewritten snapshot.
+            let (current_snapshot, original_snapshot_bytes) = if events {
+                (self.project_snapshot(lease.id())?, Vec::new())
+            } else {
+                self.read_snapshot_artifact(lease.id())?
+            };
             let (mut meta, original_meta_bytes) = self.read_meta_artifact(lease.id())?;
             if meta.owner != StorageOwner::Native {
                 return Err(SessionStoreError::OwnershipConflict {
@@ -2593,11 +2708,23 @@ impl SessionManager {
                     operation: "commit native runtime mutation",
                 });
             }
-            let (mut presentation, original_presentation_bytes) =
-                self.read_presentation_artifact(lease.id())?;
+            let (mut presentation, original_presentation_bytes) = if events {
+                match self.read_optional_presentation_artifact(lease.id())? {
+                    Some((presentation, bytes)) => (presentation, Some(bytes)),
+                    None => (PresentationFile::default(), None),
+                }
+            } else {
+                let (presentation, bytes) = self.read_presentation_artifact(lease.id())?;
+                (presentation, Some(bytes))
+            };
             let original_meta = meta.clone();
             let original_presentation = presentation.clone();
             let result = mutate(&current_snapshot, &mut meta, &mut presentation)?;
+            if events {
+                meta.format_version = meta
+                    .format_version
+                    .max(atomcode_kernel::session::SESSION_FORMAT_VERSION);
+            }
             ensure_meta_id(lease.id(), &meta)?;
             if meta.owner != StorageOwner::Native {
                 return Err(SessionStoreError::OwnershipConflict {
@@ -2612,7 +2739,7 @@ impl SessionManager {
                 serialize_pretty_bounded(&presentation, "presentation", MAX_PRESENTATION_BYTES)?;
             let meta_bytes = serialize_pretty_bounded(&meta, "session meta", MAX_META_BYTES)?;
             let mut replacements = Vec::with_capacity(3);
-            if current_snapshot != *snapshot {
+            if !events && current_snapshot != *snapshot {
                 replacements.push(CommitReplacement {
                     artifact: CommitArtifact::Snapshot,
                     path: self.snapshot_path(lease.id())?,
@@ -2624,7 +2751,7 @@ impl SessionManager {
                 replacements.push(CommitReplacement {
                     artifact: CommitArtifact::Presentation,
                     path: self.presentation_path(lease.id())?,
-                    before: Some(original_presentation_bytes),
+                    before: original_presentation_bytes,
                     after: presentation_bytes,
                 });
             }
@@ -2844,14 +2971,34 @@ impl SessionManager {
     /// List all sessions in this project bucket, NEWEST FIRST. Reads ONLY `*.meta`
     /// (never the big snapshot / transcript files); a malformed meta is skipped, not
     /// fatal. Production's `<id>.json` files are ignored (different extension).
+    ///
+    /// A delegated agent's session is not one of them: see [`Self::children`].
     pub fn list(&self) -> Vec<SessionMeta> {
+        self.every_meta()
+            .into_iter()
+            .filter(|meta| meta.parent.is_none())
+            .collect()
+    }
+
+    /// The sessions delegated from `parent` (a session id), newest first.
+    pub fn children(&self, parent: &str) -> Vec<SessionMeta> {
+        self.every_meta()
+            .into_iter()
+            .filter(|meta| meta.parent.as_deref() == Some(parent))
+            .collect()
+    }
+
+    fn every_meta(&self) -> Vec<SessionMeta> {
         let mut out = Vec::new();
         let Ok(rd) = fs::read_dir(&self.root) else {
             return out;
         };
         for entry in rd.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("meta") {
+            if !matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("meta" | "index")
+            ) {
                 continue;
             }
             if let Ok(bytes) = read_regular_file_bounded(&path, "session meta", MAX_META_BYTES) {
@@ -2901,15 +3048,37 @@ impl SessionManager {
     pub fn delete(&self, lease: &SessionLease) -> SessionResult<()> {
         let id = lease.id();
         self.validate_lease(lease)?;
+        // What was delegated from it goes first: nothing would ever offer those
+        // sessions again once it is gone. One another runtime holds is left.
+        let session_id = if self.is_event_session(id) {
+            self.read_event_header(id)
+                .map_or_else(|_| id.to_string(), |header| header.id)
+        } else {
+            id.to_string()
+        };
+        for child in self.children(&session_id) {
+            if let Ok(child_lease) = self.acquire_lease(&child.id) {
+                self.delete(&child_lease)?;
+            }
+        }
         let targets = [
-            self.snapshot_path(id)?,
+            self.path_for(id, "snapshot")?,
             self.inflight_path(id)?,
-            self.rewind_path(id)?,
-            self.rewind_transaction_path(id)?,
-            self.meta_path(id)?,
-            self.jsonl_path(id)?,
-            self.presentation_path(id)?,
+            self.path_for(id, "rewind.json")?,
+            self.path_for(id, "rewind.txn.json")?,
+            self.path_for(id, "meta")?,
+            self.path_for(id, "jsonl")?,
+            self.path_for(id, "ui.json")?,
             self.legacy_path(id)?,
+            // An event session's files. The index goes last: it is the commit
+            // point, and a delete that stopped half way leaves a session the
+            // catalog still shows rather than sidecars nothing owns.
+            self.path_for(id, "events")?,
+            self.path_for(id, "ui")?,
+            self.path_for(id, "rewind")?,
+            self.path_for(id, "rewind.txn")?,
+            self.path_for(id, "todos")?,
+            self.path_for(id, "index")?,
         ];
         for path in &targets {
             validate_delete_target(path)?;
@@ -2925,44 +3094,6 @@ impl SessionManager {
             let _ = fs::remove_dir_all(&dir); // best-effort; absent dir is fine
         }
         Ok(())
-    }
-
-    pub(crate) fn append_jsonl_line(&self, id: &str, line: &[u8]) -> SessionResult<()> {
-        self.ensure_native_writable(id, "append transcript")?;
-        if line.len() > MAX_JSONL_LINE_BYTES {
-            return Err(SessionStoreError::TooLarge {
-                kind: "transcript line",
-                limit: MAX_JSONL_LINE_BYTES,
-                actual: line.len(),
-            });
-        }
-        let path = self.jsonl_path(id)?;
-        fs::create_dir_all(&self.root).map_err(|e| io_at(&self.root, e))?;
-        // Windows security software and indexers can briefly deny an open or
-        // lock while inspecting a newly-updated file. Retry only those
-        // pre-write operations: retrying write_all itself could duplicate a
-        // partially-written JSONL record.
-        let mut file = retry_transient_file_access(|| open_append_file(&path))?;
-        retry_transient_file_access(|| {
-            fs2::FileExt::lock_exclusive(&file).map_err(|e| io_at(&path, e))
-        })?;
-        let current = usize::try_from(file.metadata().map_err(|e| io_at(&path, e))?.len())
-            .unwrap_or(usize::MAX);
-        let next = current
-            .checked_add(line.len())
-            .ok_or(SessionStoreError::TooLarge {
-                kind: "transcript",
-                limit: MAX_JSONL_BYTES,
-                actual: usize::MAX,
-            })?;
-        if next > MAX_JSONL_BYTES {
-            return Err(SessionStoreError::TooLarge {
-                kind: "transcript",
-                limit: MAX_JSONL_BYTES,
-                actual: next,
-            });
-        }
-        file.write_all(line).map_err(|e| io_at(&path, e))
     }
 
     /// Load only `(turn_id, timestamp_ms)` from this session's bounded transcript.
@@ -2983,6 +3114,9 @@ impl SessionManager {
             ts: i64,
         }
 
+        if self.is_event_session(id) {
+            return self.event_turn_timestamps(id);
+        }
         let path = self.jsonl_path(id)?;
         match fs::symlink_metadata(&path) {
             Ok(_) => {}
@@ -3253,7 +3387,13 @@ fn scan_bucket_into(bucket: &str, bucket_path: &Path, out: &mut BucketPartial) {
             .strip_suffix(".snapshot")
             .or_else(|| name.strip_suffix(".jsonl"))
             .or_else(|| name.strip_suffix(".rewind.txn.json"))
-            .or_else(|| name.strip_suffix(".rewind.json"));
+            .or_else(|| name.strip_suffix(".rewind.json"))
+            // An event session's content and sidecars.
+            .or_else(|| name.strip_suffix(".events"))
+            .or_else(|| name.strip_suffix(".rewind.txn"))
+            .or_else(|| name.strip_suffix(".rewind"))
+            .or_else(|| name.strip_suffix(".ui"))
+            .or_else(|| name.strip_suffix(".todos"));
         if let Some(id) = direct_sidecar_id {
             match file_entry.file_type() {
                 Ok(file_type) if file_type.is_file() => {}
@@ -3288,7 +3428,10 @@ fn scan_bucket_into(bucket: &str, bucket_path: &Path, out: &mut BucketPartial) {
                 .or_insert(path);
             continue;
         }
-        let source = if let Some(id) = name.strip_suffix(".meta") {
+        let source = if let Some(id) = name
+            .strip_suffix(".meta")
+            .or_else(|| name.strip_suffix(".index"))
+        {
             Some((id, false))
         } else if name.ends_with(".images.json") || name.ends_with(".todos.json") {
             // Per-session sidecars (image payloads / todo lists), NOT catalog
@@ -3299,12 +3442,14 @@ fn scan_bucket_into(bucket: &str, bucket_path: &Path, out: &mut BucketPartial) {
             None
         } else if let Some(id) = name.strip_suffix(".json") {
             if let Some(presentation_id) = name.strip_suffix(".ui.json") {
-                let has_native_companion = ["meta", "snapshot", "jsonl"].iter().any(|extension| {
-                    bucket_path
-                        .join(format!("{presentation_id}.{extension}"))
-                        .symlink_metadata()
-                        .is_ok()
-                });
+                let has_native_companion = ["meta", "snapshot", "jsonl", "index", "events"]
+                    .iter()
+                    .any(|extension| {
+                        bucket_path
+                            .join(format!("{presentation_id}.{extension}"))
+                            .symlink_metadata()
+                            .is_ok()
+                    });
                 if has_native_companion {
                     None
                 } else {
@@ -3369,7 +3514,7 @@ fn scan_bucket_into(bucket: &str, bucket_path: &Path, out: &mut BucketPartial) {
     }
 }
 
-fn scan_catalog_root(sessions_root: &Path) -> CatalogScan {
+pub(super) fn scan_catalog_root(sessions_root: &Path) -> CatalogScan {
     let mut scan = CatalogScan::default();
     // Phase 1 (serial, cheap): enumerate valid bucket directories. Bucket-level
     // validation diagnostics are produced here; the expensive per-file read + JSON
@@ -3403,6 +3548,9 @@ fn scan_catalog_root(sessions_root: &Path) -> CatalogScan {
         let bucket_path = bucket_entry.path();
         let bucket = match bucket_entry.file_name().into_string() {
             Ok(bucket) if valid_project_bucket(&bucket) => bucket,
+            // Another writer's directory, put here on purpose: not a bucket,
+            // and not a problem to report.
+            Ok(bucket) if bucket == SessionManager::JOURNAL_DIR => continue,
             Ok(bucket) => {
                 scan.diagnostics.push(CatalogDiagnostic {
                     project_bucket: Some(bucket),
@@ -3544,7 +3692,12 @@ fn finalize_catalog_scan(partials: Vec<BucketPartial>, mut scan: CatalogScan) ->
     }
 
     for (key, path) in native_sidecars {
-        if !native_meta_ids.contains(&key) {
+        // A journal written into the bucket is not half of a native session.
+        // Read only for orphans, so a healthy bucket costs no extra IO.
+        if !native_meta_ids.contains(&key)
+            && !(path.extension().is_some_and(|ext| ext == "jsonl")
+                && SessionManager::is_journal_file(&path))
+        {
             scan.diagnostics.push(CatalogDiagnostic {
                 project_bucket: Some(key.0),
                 path,
@@ -3675,7 +3828,10 @@ fn catalog_entry(
     sources: CatalogAggregate,
 ) -> Option<CatalogEntry> {
     match (sources.native, sources.legacy) {
+        // Kept under the session it was delegated from, not listed beside it.
+        (Some(native), _) if native.parent.is_some() => None,
         (Some(native), legacy) => Some(CatalogEntry {
+            needs_newer_version: native.needs_newer_version(),
             id,
             fork_root_id: native.fork_info.as_ref().map(|fork| fork.root_id.clone()),
             name: native.name,
@@ -3702,6 +3858,7 @@ fn catalog_entry(
             message_count: legacy.messages.len(),
             turn_count: legacy.turn_stats.len(),
             presence: CatalogPresence::LegacyOnly,
+            needs_newer_version: false,
         }),
         (None, None) => None,
     }
@@ -3857,7 +4014,7 @@ fn is_windows_device_number(suffix: &str) -> bool {
     matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
 }
 
-fn validate_meta(meta: &SessionMeta) -> SessionResult<()> {
+pub(super) fn validate_meta(meta: &SessionMeta) -> SessionResult<()> {
     validate_session_id(&meta.id)?;
     validate_string("session name", &meta.name, MAX_STORED_STRING_BYTES)?;
     validate_string(
@@ -4014,7 +4171,7 @@ fn serialize_bounded<T: Serialize>(
     Ok(bytes)
 }
 
-fn serialize_pretty_bounded<T: Serialize>(
+pub(super) fn serialize_pretty_bounded<T: Serialize>(
     value: &T,
     kind: &'static str,
     limit: usize,
@@ -4082,7 +4239,7 @@ fn open_read_file(path: &Path) -> SessionResult<File> {
     Ok(file)
 }
 
-fn open_append_file(path: &Path) -> SessionResult<File> {
+pub(super) fn open_append_file(path: &Path) -> SessionResult<File> {
     let mut options = OpenOptions::new();
     // Windows: `append(true)` alone grants only FILE_APPEND_DATA, which is not
     // enough for LockFileEx (requires GENERIC_READ or GENERIC_WRITE) — the
@@ -4130,7 +4287,7 @@ fn acquire_file_lock_until(file: &File, timeout: std::time::Duration) -> io::Res
     }
 }
 
-fn retry_transient_file_access<T>(
+pub(super) fn retry_transient_file_access<T>(
     mut operation: impl FnMut() -> SessionResult<T>,
 ) -> SessionResult<T> {
     for delay_ms in TRANSIENT_FILE_ACCESS_RETRY_DELAYS_MS {
@@ -4238,7 +4395,7 @@ fn no_follow(options: &mut OpenOptions) {
     let _ = options;
 }
 
-fn read_regular_file_bounded(
+pub(super) fn read_regular_file_bounded(
     path: &Path,
     kind: &'static str,
     limit: usize,
@@ -4304,7 +4461,7 @@ pub(crate) fn for_each_jsonl_line(
     Ok((total, lines))
 }
 
-fn io_at(path: &Path, source: io::Error) -> SessionStoreError {
+pub(super) fn io_at(path: &Path, source: io::Error) -> SessionStoreError {
     if source.kind() == io::ErrorKind::NotFound {
         SessionStoreError::NotFound {
             path: path.to_path_buf(),
@@ -4335,7 +4492,7 @@ struct AtomicWriteFailure {
 /// power loss. A crash mid-write never leaves a half-written (corrupt) session file.
 /// The tmp's extension (`…tmp`) is ignored by [`SessionManager::list`]'s `*.meta`
 /// filter, so a leftover tmp from a crash never appears as a session.
-fn atomic_write(path: &Path, bytes: &[u8]) -> SessionResult<()> {
+pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> SessionResult<()> {
     atomic_write_tracked(path, bytes).map_err(|failure| failure.error)
 }
 
@@ -4535,29 +4692,6 @@ mod tests {
         assert_eq!(loaded.messages[0].text, "hello");
     }
 
-    /// Windows 回归测试：transcript 追加必须真实完成 open → lock → append → unlock。
-    /// 曾因 `open_append_file` 仅 `append(true)`（Windows 上只有 FILE_APPEND_DATA），
-    /// `LockFileEx` 要求 GENERIC_READ/GENERIC_WRITE 而必然失败，
-    /// 报 ERROR_ACCESS_DENIED (os error 5)。此问题仅存在于 Windows。
-    #[test]
-    #[cfg(windows)]
-    fn append_jsonl_line_lock_roundtrip_windows() {
-        let dir = tempfile::tempdir().unwrap();
-        let mgr = SessionManager::with_root(dir.path());
-        let id = "s1";
-        let mut payload = br#"{"v":1,"msg":"hello"}"#.to_vec();
-        payload.push(b'\n');
-
-        // 真实代码路径: open_append_file → lock_exclusive → write_all（unlock 随句柄关闭）
-        mgr.append_jsonl_line(id, &payload).unwrap_or_else(|e| {
-            panic!("transcript append must not fail on Windows: {e:?}");
-        });
-
-        // 内容确实被追加写入
-        let written = std::fs::read(mgr.jsonl_path(id).unwrap()).unwrap();
-        assert_eq!(written, payload);
-    }
-
     #[test]
     fn transcript_timestamps_load_without_message_bodies_and_missing_is_empty() {
         let dir = tempfile::tempdir().unwrap();
@@ -4582,7 +4716,7 @@ mod tests {
         });
         let mut bytes = serde_json::to_vec(&line).unwrap();
         bytes.push(b'\n');
-        mgr.append_jsonl_line("s1", &bytes).unwrap();
+        std::fs::write(mgr.jsonl_path("s1").unwrap(), &bytes).unwrap();
 
         let legacy_line = serde_json::json!({
             "v": 1,
@@ -4598,7 +4732,9 @@ mod tests {
         });
         let mut legacy_bytes = serde_json::to_vec(&legacy_line).unwrap();
         legacy_bytes.push(b'\n');
-        mgr.append_jsonl_line("s1", &legacy_bytes).unwrap();
+        let mut transcript = std::fs::read(mgr.jsonl_path("s1").unwrap()).unwrap();
+        transcript.extend_from_slice(&legacy_bytes);
+        std::fs::write(mgr.jsonl_path("s1").unwrap(), transcript).unwrap();
 
         let timestamps = mgr.load_transcript_timestamps("s1").unwrap();
         assert_eq!(timestamps.len(), 2);
@@ -4615,6 +4751,7 @@ mod tests {
         // Missing transcript → empty, not an error.
         assert!(mgr.load_transcript_records("missing").unwrap().is_empty());
 
+        let mut lines: Vec<String> = Vec::new();
         for turn in 1..=3u64 {
             let line = serde_json::json!({
                 "v": 1,
@@ -4628,10 +4765,16 @@ mod tests {
                 "tools": [],
                 "usage": { "prompt": 1, "completion": 2, "cached": 0 }
             });
-            let mut bytes = serde_json::to_vec(&line).unwrap();
-            bytes.push(b'\n');
-            mgr.append_jsonl_line("s1", &bytes).unwrap();
+            lines.push(serde_json::to_string(&line).unwrap());
         }
+        // Written straight to the file rather than through a writer: the one
+        // that used to be here went with `TranscriptHook` (513e7567, the move
+        // to the event log), and this test kept calling it — so the whole
+        // crate's tests stopped compiling, quietly, for as long as nobody ran
+        // them. What is still live is the *reader*, which the daemon's
+        // transcript endpoint serves (`atomcode-daemon/src/lib.rs:2303`), and
+        // the reader is what this is about.
+        std::fs::write(mgr.jsonl_path("s1").unwrap(), lines.join("\n") + "\n").unwrap();
 
         // The FULL trajectory comes back — every turn with its raw bodies, including
         // the early turns a snapshot compaction would have dropped. This is the read
@@ -4842,23 +4985,6 @@ mod tests {
                 actual
             }) if actual == MAX_SNAPSHOT_BYTES + 1
         ));
-    }
-
-    #[test]
-    fn transcript_append_rejects_an_oversized_line_without_creating_a_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let mgr = SessionManager::with_root(dir.path());
-        let line = vec![b'x'; MAX_JSONL_LINE_BYTES + 1];
-
-        assert!(matches!(
-            mgr.append_jsonl_line("s1", &line),
-            Err(SessionStoreError::TooLarge {
-                kind: "transcript line",
-                limit: MAX_JSONL_LINE_BYTES,
-                ..
-            })
-        ));
-        assert!(!mgr.jsonl_path("s1").unwrap().exists());
     }
 
     #[test]
@@ -5892,6 +6018,54 @@ mod tests {
         let third = SessionManager::scan_catalog(root.path());
         assert_eq!(third.entries.len(), 2, "rescan must see the added session");
         assert!(third.entries.iter().any(|e| e.id == "b"));
+    }
+
+    #[test]
+    fn the_journal_directory_is_passed_over_and_a_stray_one_is_still_reported() {
+        // The runtime writes its journal to `<sessions>/harness/<bucket>/`. Every
+        // session-list refresh used to report that directory as a malformed
+        // bucket; a directory that really is stray must still be reported, or
+        // this would be silencing the scanner rather than teaching it.
+        let root = tempfile::tempdir().unwrap();
+        let journal = root
+            .path()
+            .join(SessionManager::JOURNAL_DIR)
+            .join("0123456789abcdef");
+        std::fs::create_dir_all(&journal).unwrap();
+        std::fs::write(journal.join("s.jsonl"), "{\"header\":{}}\n").unwrap();
+        let stray = root.path().join("not-a-bucket");
+        std::fs::create_dir_all(&stray).unwrap();
+
+        let scan = scan_catalog_root(root.path());
+        assert!(scan.entries.is_empty(), "a journal is not a session");
+        let reported: Vec<_> = scan.diagnostics.iter().map(|d| d.path.clone()).collect();
+        assert_eq!(reported, vec![stray]);
+    }
+
+    #[test]
+    fn a_journal_file_inside_a_bucket_is_not_an_orphaned_sidecar() {
+        // Launchers wrote their journals straight into project buckets for months;
+        // each one was reported as half a native session on every list refresh. A
+        // transcript with no metadata is still reported — that one really is.
+        let root = tempfile::tempdir().unwrap();
+        let bucket = root.path().join("0123456789abcdef");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(
+            bucket.join("1789296604064-38002.jsonl"),
+            "{\"header\":{\"id\":\"1789296604064-38002\",\"version\":1}}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            bucket.join("1789000000000-1.jsonl"),
+            "{\"seq\":1,\"event\":{\"kind\":\"turn_start\",\"turn\":1}}\n",
+        )
+        .unwrap();
+        let orphan = bucket.join("5b0e0b8e-0000-4000-8000-000000000000.jsonl");
+        std::fs::write(&orphan, "{\"v\":1,\"ts\":1,\"turn_id\":1}\n").unwrap();
+
+        let scan = scan_catalog_root(root.path());
+        let reported: Vec<_> = scan.diagnostics.iter().map(|d| d.path.clone()).collect();
+        assert_eq!(reported, vec![orphan]);
     }
 
     /// Not a correctness gate — a manual throughput check. Run with:

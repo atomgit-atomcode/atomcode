@@ -1,0 +1,26 @@
+[
+  {
+    "kind": "TurnStarted",
+    "detail": ""
+  },
+  {
+    "kind": "Usage",
+    "detail": ""
+  },
+  {
+    "kind": "Request",
+    "detail": "approval"
+  },
+  {
+    "kind": "ToolResult",
+    "detail": "error=true"
+  },
+  {
+    "kind": "Usage",
+    "detail": ""
+  },
+  {
+    "kind": "TurnComplete",
+    "detail": "Stopped"
+  }
+]

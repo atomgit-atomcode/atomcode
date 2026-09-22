@@ -166,7 +166,7 @@ async fn partial_stream_timeout_continues_once_without_failing_the_turn() {
                     recovered,
                 }) => phases.push((attempt, max_attempts, recovered)),
                 Some(AgentEvent::Error { message, .. }) => errors.push(message),
-                Some(AgentEvent::TurnComplete { reason }) => break reason,
+                Some(AgentEvent::TurnComplete { reason, .. }) => break reason,
                 Some(_) => {}
                 None => panic!("event channel closed before terminal"),
             }
@@ -215,7 +215,7 @@ async fn partial_stream_tool_call_is_preserved_but_never_executed_or_replayed() 
     handle.commands.send(send("go")).unwrap();
     let reason = tokio::time::timeout(OUTER_GUARD, async {
         loop {
-            if let Some(AgentEvent::TurnComplete { reason }) = handle.events.recv().await {
+            if let Some(AgentEvent::TurnComplete { reason, .. }) = handle.events.recv().await {
                 break reason;
             }
         }
@@ -295,7 +295,7 @@ async fn second_partial_stream_timeout_stops_after_the_single_safe_continuation(
         loop {
             match handle.events.recv().await {
                 Some(AgentEvent::Error { message, .. }) => error = Some(message),
-                Some(AgentEvent::TurnComplete { reason }) => break (error, reason),
+                Some(AgentEvent::TurnComplete { reason, .. }) => break (error, reason),
                 Some(_) => {}
                 None => panic!("event channel closed before terminal"),
             }
@@ -416,7 +416,7 @@ async fn tool_call_delta_only_stall_does_not_fire_a_bogus_recovery() {
 // times (with backoff), then clean-fails: on_error + Error (mentions timeout) +
 // TurnComplete — never looping forever, never a bogus success. Slower than (1a)
 // because it walks the full backoff ladder, so it gets a generous guard.
-#[tokio::test]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn stream_timeout_exhausts_retries_then_fails() {
     let reg = ToolRegistry::new();
     let provider = Arc::new(StallThenProvider::new(100, vec![]));

@@ -529,6 +529,9 @@ fn insert_account_models(
                     .unwrap_or_else(|| default_context_window_for(&provider_type)),
                 max_tokens: request.max_tokens,
                 capable_model: None,
+                // Discovery gives a name and a window, never prose about what
+                // the model is for. A person writes that one, or nobody does.
+                note: None,
                 thinking_type: None,
                 thinking_keep: None,
                 reasoning_history: None,

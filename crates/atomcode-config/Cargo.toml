@@ -13,6 +13,9 @@ toml_edit = "0.22"
 anyhow = "1"
 url = "2"
 atomcode-telemetry = { path = "../atomcode-telemetry" }
+# The message tables and the one locale. A leaf with no atomcode dependency of
+# its own, so re-exporting it here does not pull a layer in behind it.
+atomcode-i18n = { path = "../atomcode-i18n" }
 # `real_home_dir` (config_dir resolution): home dir + sudo-aware passwd lookup.
 dirs = "6"
 # Shared config is mutated by TUI and IDE daemon processes concurrently.

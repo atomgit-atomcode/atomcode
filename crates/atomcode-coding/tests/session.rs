@@ -1,0 +1,1479 @@
+//! The session log: projection, compaction boundaries, replay fidelity,
+//! persistence round-trip, and the invariant that keeps a side channel from
+//! growing into the prompt.
+
+use atomcode_harness::agent::{CreateAgent, OnlySession};
+use std::sync::Arc;
+
+use atomcode_harness::seams::{
+    AgentsSvc, SessionPersistenceSvc, SessionProjectionsSvc, StopReason,
+};
+use atomcode_harness::session::{
+    assert_model_visible_is_logged, derive_messages, HeaderReason, InjectionOrigin, LoggedEvent,
+    SessionEvent, SessionLog,
+};
+use atomcode_harness::{bundle, plugins, run_turn};
+use atomcode_kernel::message::{Message, Role};
+use atomcode_kernel::tool::ToolCall;
+use atomcode_plexus::{App, ConfigTree, Layer};
+
+#[ctor::ctor]
+fn _isolate_atomcode_home() {
+    atomcode_kernel::test_support::isolate_home();
+}
+
+fn log_with(events: Vec<SessionEvent>) -> SessionLog {
+    let log = SessionLog::new("t");
+    for event in events {
+        log.append(event);
+    }
+    log
+}
+
+/// A turn the person interrupted: undone, its work is gone from the model's
+/// view and a note stands in; kept, its unanswered calls get a cancelled result
+/// so the next request still pairs every call with an answer.
+#[test]
+fn an_interrupted_turn_is_undone_or_kept_and_always_noted() {
+    let interrupted = |undone: bool| {
+        log_with(vec![
+            SessionEvent::TurnStart { turn: 1 },
+            SessionEvent::UserMessage {
+                turn: 1,
+                text: "first".into(),
+                images: vec![],
+            },
+            SessionEvent::AssistantMessage {
+                turn: 1,
+                round: 1,
+                text: "done".into(),
+                reasoning: String::new(),
+                tool_calls: vec![],
+                reasoning_blocks: Vec::new(),
+                meta: None,
+            },
+            SessionEvent::TurnStart { turn: 2 },
+            SessionEvent::Injected {
+                turn: 2,
+                text: "remembered".into(),
+                origin: InjectionOrigin::Memory,
+            },
+            SessionEvent::UserMessage {
+                turn: 2,
+                text: "second".into(),
+                images: vec![],
+            },
+            SessionEvent::AssistantMessage {
+                turn: 2,
+                round: 1,
+                text: String::new(),
+                reasoning: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                }],
+                reasoning_blocks: Vec::new(),
+                meta: None,
+            },
+            SessionEvent::Interrupted { turn: 2, undone },
+        ])
+    };
+
+    let undone = interrupted(true).derive_messages();
+    let texts: Vec<&str> = undone.iter().map(|m| m.text.as_str()).collect();
+    assert!(texts.contains(&"first"));
+    assert!(
+        !texts.contains(&"second"),
+        "the undone prompt is gone: {texts:?}"
+    );
+    assert!(
+        undone.iter().all(|m| m.tool_calls.is_empty()),
+        "and its calls"
+    );
+    assert!(
+        texts.contains(&"remembered"),
+        "memory is the session's, not the turn's"
+    );
+    assert!(undone.last().unwrap().is_user_interruption());
+
+    let kept = interrupted(false).derive_messages();
+    let texts: Vec<&str> = kept.iter().map(|m| m.text.as_str()).collect();
+    assert!(texts.contains(&"second"), "{texts:?}");
+    let answer = kept
+        .iter()
+        .find(|m| m.tool_call_id.as_deref() == Some("c1"))
+        .expect("the unanswered call gets a result");
+    assert!(answer.is_error && answer.text == "(cancelled)");
+    assert!(kept.last().unwrap().is_user_interruption());
+}
+
+/// What a lead is told about its team is not the work of the turn it landed
+/// in: undoing that turn keeps it, while the turn's own note goes
+/// (`docs/adr/0023` §7).
+#[test]
+fn what_a_lead_is_told_about_its_team_outlives_an_undone_turn() {
+    let log = log_with(vec![
+        SessionEvent::TurnStart { turn: 1 },
+        SessionEvent::UserMessage {
+            turn: 1,
+            text: "go".into(),
+            images: vec![],
+        },
+        SessionEvent::Injected {
+            turn: 1,
+            text: "use the other file".into(),
+            origin: InjectionOrigin::PersonToMember {
+                member: "scout".into(),
+            },
+        },
+        SessionEvent::Injected {
+            turn: 1,
+            text: "[scout finished turn 2: Stopped]\nswitched".into(),
+            origin: InjectionOrigin::TeamNote {
+                member: "scout".into(),
+            },
+        },
+        SessionEvent::Injected {
+            turn: 1,
+            text: "a note for this turn".into(),
+            origin: InjectionOrigin::Reminder,
+        },
+        SessionEvent::Interrupted {
+            turn: 1,
+            undone: true,
+        },
+    ]);
+    let shown = log
+        .derive_messages()
+        .iter()
+        .map(|m| m.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!shown.contains("a note for this turn"), "{shown}");
+    assert!(
+        shown.contains("directly to your team member `scout`")
+            && shown.contains("use the other file"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("about your team member `scout`") && shown.contains("switched"),
+        "{shown}"
+    );
+}
+
+#[test]
+fn the_projection_is_the_only_path_from_facts_to_a_prompt() {
+    let log = log_with(vec![
+        SessionEvent::TurnStart { turn: 1 },
+        SessionEvent::UserMessage {
+            turn: 1,
+            text: "fix the build".into(),
+            images: vec![],
+        },
+        SessionEvent::RequestHeader {
+            turn: 1,
+            round: 1,
+            model: "m".into(),
+            reason: HeaderReason::Series,
+        },
+        // Chunks are logged for replay but are not themselves content.
+        SessionEvent::AssistantChunk {
+            turn: 1,
+            round: 1,
+            delta: "on ".into(),
+            reasoning: false,
+        },
+        SessionEvent::AssistantChunk {
+            turn: 1,
+            round: 1,
+            delta: "it".into(),
+            reasoning: false,
+        },
+        SessionEvent::AssistantMessage {
+            turn: 1,
+            round: 1,
+            text: "on it".into(),
+            reasoning: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                arguments: "{}".into(),
+            }],
+            reasoning_blocks: Vec::new(),
+            meta: None,
+        },
+        SessionEvent::ToolResultLogged {
+            turn: 1,
+            round: 1,
+            call_id: "c1".into(),
+            content: "ok".into(),
+            is_error: false,
+            images: Vec::new(),
+        },
+        SessionEvent::Usage {
+            turn: 1,
+            round: 1,
+            usage: Default::default(),
+        },
+        SessionEvent::TurnEnd {
+            turn: 1,
+            stop: StopReason::Stopped,
+            error: None,
+        },
+    ]);
+
+    let messages = log.derive_messages();
+    let shape: Vec<(Role, &str)> = messages
+        .iter()
+        .map(|m| (m.role.clone(), m.text.as_str()))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            (Role::User, "fix the build"),
+            (Role::Assistant, "on it"),
+            (Role::Tool, "ok"),
+        ],
+        "headers, chunks, usage and turn boundaries are facts, not content"
+    );
+    assert_eq!(
+        messages[1].tool_calls.len(),
+        1,
+        "tool calls survive the projection"
+    );
+}
+
+#[test]
+fn raw_chunks_stay_in_the_log_so_a_replay_is_faithful() {
+    let log = log_with(vec![
+        SessionEvent::AssistantChunk {
+            turn: 1,
+            round: 1,
+            delta: "he".into(),
+            reasoning: false,
+        },
+        SessionEvent::AssistantChunk {
+            turn: 1,
+            round: 1,
+            delta: "llo".into(),
+            reasoning: false,
+        },
+        SessionEvent::AssistantMessage {
+            turn: 1,
+            round: 1,
+            text: "hello".into(),
+            reasoning: String::new(),
+            tool_calls: vec![],
+            reasoning_blocks: Vec::new(),
+            meta: None,
+        },
+    ]);
+    let replayed: String = log
+        .events()
+        .iter()
+        .filter_map(|e| match &e.event {
+            SessionEvent::AssistantChunk {
+                delta, reasoning, ..
+            } if !reasoning => Some(delta.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        replayed, "hello",
+        "a UI can rebuild the stream, not just the result"
+    );
+}
+
+#[test]
+fn a_compaction_boundary_replaces_history_without_erasing_it() {
+    let log = SessionLog::new("t");
+    log.append(SessionEvent::UserMessage {
+        turn: 1,
+        text: "old question".into(),
+        images: vec![],
+    });
+    let boundary = log.append(SessionEvent::AssistantMessage {
+        turn: 1,
+        round: 1,
+        text: "old answer".into(),
+        reasoning: String::new(),
+        tool_calls: vec![],
+        reasoning_blocks: Vec::new(),
+        meta: None,
+    });
+    log.append(SessionEvent::Compacted {
+        turn: 2,
+        through: boundary,
+        summary: "earlier: a question and an answer".into(),
+        from: 0,
+    });
+    log.append(SessionEvent::UserMessage {
+        turn: 2,
+        text: "new question".into(),
+        images: vec![],
+    });
+
+    let messages = log.derive_messages();
+    let texts: Vec<&str> = messages.iter().map(|m| m.text.as_str()).collect();
+    assert_eq!(
+        texts,
+        vec!["earlier: a question and an answer", "new question"],
+        "the model sees the summary; the dropped turns are gone from the prompt"
+    );
+    assert!(
+        messages[0].synthetic,
+        "a summary is harness-authored and must be marked as such"
+    );
+    assert_eq!(
+        log.len(),
+        4,
+        "compaction changes the projection, never the log — replay and audit still see everything"
+    );
+}
+
+fn said(turn: u64, text: &str) -> SessionEvent {
+    SessionEvent::UserMessage {
+        turn,
+        text: text.into(),
+        images: vec![],
+    }
+}
+
+fn answered(turn: u64, text: &str) -> SessionEvent {
+    SessionEvent::AssistantMessage {
+        turn,
+        round: 1,
+        text: text.into(),
+        reasoning: String::new(),
+        tool_calls: vec![],
+        reasoning_blocks: Vec::new(),
+        meta: None,
+    }
+}
+
+/// A compaction that keeps the session's first request folds only what lies
+/// between that request and its boundary — and what an earlier compaction
+/// folded does not come back because a later one keeps a head.
+#[test]
+fn a_compaction_keeps_the_head_it_names_and_never_unfolds_an_earlier_one() {
+    let log = SessionLog::new("t");
+    log.append(said(1, "q1"));
+    let a1 = log.append(answered(1, "a1"));
+    log.append(SessionEvent::Compacted {
+        turn: 2,
+        through: a1,
+        summary: "S1".into(),
+        from: 0,
+    });
+    let q2 = log.append(said(2, "q2"));
+    log.append(answered(2, "a2"));
+    let a3 = {
+        log.append(said(3, "q3"));
+        log.append(answered(3, "a3"))
+    };
+    log.append(SessionEvent::Compacted {
+        turn: 4,
+        through: a3,
+        summary: "S2".into(),
+        from: q2,
+    });
+    log.append(said(4, "q4"));
+
+    let texts: Vec<String> = log.derive_messages().into_iter().map(|m| m.text).collect();
+    assert_eq!(
+        texts,
+        vec!["S2", "q2", "q4"],
+        "the last summary, the head it kept, and what came after"
+    );
+}
+
+/// A rewrite is what the model sees from then on; the log keeps what was said.
+#[test]
+fn a_rewritten_message_is_what_the_model_sees_and_the_log_keeps_the_original() {
+    let log = SessionLog::new("t");
+    log.append(said(1, "q1"));
+    log.append(SessionEvent::AssistantMessage {
+        turn: 1,
+        round: 1,
+        text: String::new(),
+        reasoning: String::new(),
+        tool_calls: vec![ToolCall {
+            id: "c1".into(),
+            name: "grep".into(),
+            arguments: "{}".into(),
+        }],
+        reasoning_blocks: Vec::new(),
+        meta: None,
+    });
+    let result = log.append(SessionEvent::ToolResultLogged {
+        turn: 1,
+        round: 1,
+        call_id: "c1".into(),
+        content: "a very long result".into(),
+        is_error: false,
+        images: vec![],
+    });
+    let question = log.append(said(2, "q2"));
+    log.append(SessionEvent::MessagesRewritten {
+        turn: 2,
+        texts: vec![
+            atomcode_harness::session::RewrittenText {
+                seq: result,
+                text: "[grep ok]".into(),
+            },
+            atomcode_harness::session::RewrittenText {
+                seq: question,
+                text: "q2, cut".into(),
+            },
+        ],
+    });
+
+    let texts: Vec<String> = log.derive_messages().into_iter().map(|m| m.text).collect();
+    assert_eq!(texts, vec!["q1", "", "[grep ok]", "q2, cut"]);
+    assert!(
+        log.events().iter().any(|e| matches!(
+            &e.event,
+            SessionEvent::ToolResultLogged { content, .. } if content == "a very long result"
+        )),
+        "the log still holds what the tool said"
+    );
+}
+
+/// A resumed session is seeded with the summary it was stored with. The next
+/// compaction's summary stands for that one too, so the two are never shown
+/// side by side.
+#[test]
+fn a_seeded_summary_gives_way_to_a_later_compaction() {
+    let log = SessionLog::new("t");
+    log.append(SessionEvent::Injected {
+        turn: 0,
+        text: "SEEDED".into(),
+        origin: InjectionOrigin::CompactionSummary,
+    });
+    let q1 = log.append(said(1, "q1"));
+    let a1 = log.append(answered(1, "a1"));
+    log.append(said(2, "q2"));
+    log.append(SessionEvent::Compacted {
+        turn: 2,
+        through: a1,
+        summary: "LATER".into(),
+        from: q1,
+    });
+
+    let texts: Vec<String> = log.derive_messages().into_iter().map(|m| m.text).collect();
+    assert_eq!(texts, vec!["LATER", "q1", "q2"]);
+}
+
+/// Renumbering moves every reference a compaction makes with the events it
+/// points at: its boundary, the head it keeps, the messages it rewrote.
+#[test]
+fn renumbering_moves_a_compactions_references_with_its_events() {
+    let events = vec![
+        LoggedEvent {
+            seq: 1,
+            event: said(1, "q1"),
+            at: 0,
+        },
+        LoggedEvent {
+            seq: 2,
+            event: answered(1, "a1"),
+            at: 0,
+        },
+        LoggedEvent {
+            seq: 3,
+            event: said(2, "q2"),
+            at: 0,
+        },
+        LoggedEvent {
+            seq: 4,
+            event: SessionEvent::MessagesRewritten {
+                turn: 2,
+                texts: vec![atomcode_harness::session::RewrittenText {
+                    seq: 3,
+                    text: "q2, cut".into(),
+                }],
+            },
+            at: 0,
+        },
+        LoggedEvent {
+            seq: 5,
+            event: SessionEvent::Compacted {
+                turn: 2,
+                through: 2,
+                summary: "S".into(),
+                from: 1,
+            },
+            at: 0,
+        },
+    ];
+    let before: Vec<String> = derive_messages(&events)
+        .into_iter()
+        .map(|m| m.text)
+        .collect();
+    let moved = atomcode_harness::session::renumber(events, 101);
+    let after: Vec<String> = derive_messages(&moved)
+        .into_iter()
+        .map(|m| m.text)
+        .collect();
+    assert_eq!(before, vec!["S", "q1", "q2, cut"]);
+    assert_eq!(after, before, "the same conversation under new numbers");
+}
+
+#[test]
+fn injected_context_is_a_logged_fact_with_provenance() {
+    let log = log_with(vec![
+        SessionEvent::Injected {
+            turn: 1,
+            text: "the user prefers Rust".into(),
+            origin: InjectionOrigin::Memory,
+        },
+        SessionEvent::Injected {
+            turn: 1,
+            text: "keep going".into(),
+            origin: InjectionOrigin::Continuation,
+        },
+    ]);
+    let messages = log.derive_messages();
+    assert_eq!(messages[0].role, Role::System, "memory is context");
+    assert_eq!(messages[1].role, Role::User, "a continuation is a prompt");
+    assert!(messages.iter().all(|m| m.synthetic));
+}
+
+#[test]
+fn a_reminder_rides_as_a_user_message_so_it_never_reaches_the_system_prompt() {
+    // `Role::System` is not a neutral label here: every provider lifts system
+    // messages to position 0 (`openai_compat::push_system_coalesced`,
+    // `anthropic::format_messages_with_vision`), so a mid-turn note projected as
+    // one would rewrite the request prefix from the head down — invalidating the
+    // prefix cache while `RequestHeader` still recorded `Append`. It has to
+    // append where it happened instead, which a user message does.
+    let log = log_with(vec![
+        SessionEvent::UserMessage {
+            turn: 1,
+            text: "fix the parser".into(),
+            images: vec![],
+        },
+        SessionEvent::Injected {
+            turn: 1,
+            text: "<system-reminder>the list is stale</system-reminder>".into(),
+            origin: InjectionOrigin::Reminder,
+        },
+    ]);
+    let messages = log.derive_messages();
+    assert_eq!(
+        messages.last().unwrap().role,
+        Role::User,
+        "a reminder is a note read in place, not an instruction header"
+    );
+    assert!(
+        messages.iter().all(|m| m.role != Role::System),
+        "and nothing about it puts a second system entry in the request"
+    );
+    assert!(
+        messages.last().unwrap().synthetic,
+        "still harness-authored: `first_real_user` must not read it as the person speaking"
+    );
+    // The invariant the loop holds still holds for the new role.
+    assert!(assert_model_visible_is_logged(&log, &messages).is_ok());
+}
+
+#[test]
+fn the_invariant_catches_a_message_that_never_entered_the_log() {
+    let log = log_with(vec![SessionEvent::UserMessage {
+        turn: 1,
+        text: "logged".into(),
+        images: vec![],
+    }]);
+
+    let honest = log.derive_messages();
+    assert!(assert_model_visible_is_logged(&log, &honest).is_ok());
+
+    // What a side channel would look like: content assembled straight into the
+    // request without ever being recorded.
+    let mut smuggled = honest.clone();
+    smuggled.push(Message::user("never logged"));
+    let violations = assert_model_visible_is_logged(&log, &smuggled).unwrap_err();
+    assert_eq!(violations.len(), 1);
+    assert!(violations[0].contains("never logged"));
+}
+
+#[test]
+fn the_assembled_system_prompt_is_exempt_because_it_is_reconstructible() {
+    let log = log_with(vec![SessionEvent::UserMessage {
+        turn: 1,
+        text: "hi".into(),
+        images: vec![],
+    }]);
+    let mut sent = vec![Message::system("you are a coding agent")];
+    sent.extend(log.derive_messages());
+    assert!(
+        assert_model_visible_is_logged(&log, &sent).is_ok(),
+        "the prompt is a pure function of the mounted plugins, not a session fact"
+    );
+}
+
+#[test]
+fn restoring_a_log_preserves_sequence_and_turn_numbering() {
+    let events = vec![
+        LoggedEvent {
+            seq: 7,
+            at: 0,
+            event: SessionEvent::TurnStart { turn: 3 },
+        },
+        LoggedEvent {
+            seq: 8,
+            at: 0,
+            event: SessionEvent::UserMessage {
+                turn: 3,
+                text: "resumed".into(),
+                images: vec![],
+            },
+        },
+    ];
+    let log = SessionLog::new("t");
+    log.restore(events);
+    assert_eq!(log.current_turn(), 3);
+    assert_eq!(
+        log.next_turn(),
+        4,
+        "a resumed session continues its numbering"
+    );
+    assert!(
+        log.events()
+            .iter()
+            .all(|e| e.seq != 8 || matches!(e.event, SessionEvent::UserMessage { .. })),
+        "restored sequence numbers are kept, not re-minted"
+    );
+    assert_eq!(derive_messages(&log.events())[0].text, "resumed");
+}
+
+// ---- through the mounted tree ------------------------------------------
+
+fn tree(extra: &[&str]) -> ConfigTree {
+    let script = r#"
+[[patch]]
+id = "llm"
+name = "llm-replay"
+config = { script = [ { text = "hello from the log" } ] }
+"#;
+    let quiet = r#"
+[[patch]]
+id = "trace"
+config = { stream = false, tools = false, summary = false }
+"#;
+    // A test must not read the developer's real skills or memory.md.
+    let sandbox = std::env::temp_dir().join(format!("plexus-session-scope-{}", std::process::id()));
+    std::fs::create_dir_all(&sandbox).unwrap();
+    let scoped = format!(
+        "[[patch]]\nid = \"skills\"\nconfig = {{ project_root = {root:?}, home = {home:?} }}\n\n\
+         [[patch]]\nid = \"memory\"\nconfig = {{ project_root = {root:?} }}\n",
+        root = sandbox.to_string_lossy(),
+        home = sandbox.to_string_lossy()
+    );
+    let mut layers = vec![
+        atomcode_coding::on_harness::base_layer(),
+        atomcode_coding::on_harness::headless_patch(),
+    ];
+    for src in [script, quiet, scoped.as_str()] {
+        layers.push(Layer::from_toml(src).unwrap());
+    }
+    for src in extra {
+        layers.push(Layer::from_toml(src).unwrap());
+    }
+    ConfigTree::from_layers(layers).unwrap()
+}
+
+#[tokio::test]
+async fn a_turn_records_every_fact_and_folds_the_projections() {
+    let mut app = App::new(plugins::catalog(), tree(&[]));
+    app.start().await.unwrap();
+    run_turn(&app, "say hello").await.unwrap();
+
+    let ctx = app.context();
+    let log = ctx.only_session().unwrap();
+    let kinds: Vec<String> = log
+        .events()
+        .iter()
+        .map(|e| {
+            format!("{:?}", e.event)
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    for expected in [
+        "TurnStart",
+        "UserMessage",
+        "RequestHeader",
+        "AssistantChunk",
+        "AssistantMessage",
+        "TurnEnd",
+    ] {
+        assert!(
+            kinds.iter().any(|k| k == expected),
+            "missing {expected}: {kinds:?}"
+        );
+    }
+
+    let projections = ctx.service::<SessionProjectionsSvc>().unwrap();
+    let boundary = projections.state_of("turnBoundary").unwrap();
+    let turns = boundary["turns"].as_array().unwrap();
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0]["rounds"], 1);
+    assert_eq!(turns[0]["stop"], "Stopped");
+
+    let totals = projections.state_of("tokenTotals").unwrap();
+    assert_eq!(
+        totals["prompt"], 100,
+        "the replay adapter reports usage like a real one"
+    );
+}
+
+#[tokio::test]
+async fn persistence_is_a_listener_and_round_trips_the_log() {
+    let dir = std::env::temp_dir().join(format!("plexus-persist-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let row = format!(
+        "[[patch]]\nid = \"session-persistence-jsonl\"\nconfig = {{ root = {:?} }}\n",
+        dir.to_string_lossy()
+    );
+    let mut app = App::new(plugins::catalog(), tree(&[row.as_str()]));
+    app.start().await.unwrap();
+    run_turn(&app, "persist me").await.unwrap();
+
+    let ctx = app.context();
+    let id = ctx.only_session().unwrap().id().to_string();
+    let store = ctx.service::<SessionPersistenceSvc>().unwrap();
+
+    // The listener writes off the turn's critical path, so give the spawned
+    // appends a moment to land before reading them back.
+    for _ in 0..50 {
+        if store.load(&id).await.map(|e| e.len()).unwrap_or(0) >= 5 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let loaded = store.load(&id).await.unwrap();
+    assert!(
+        loaded.len() >= 5,
+        "the whole turn should be on disk: {loaded:?}"
+    );
+
+    // A fresh log rebuilt from disk projects the same conversation.
+    let restored = SessionLog::new(&id);
+    restored.restore(loaded);
+    assert_eq!(
+        restored.derive_messages()[0].text,
+        "persist me",
+        "the store keeps facts, so any projection can be rebuilt from it"
+    );
+    assert!(store.list().await.unwrap().contains(&id));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn removing_the_persistence_row_leaves_the_loop_unchanged() {
+    let mut app = App::new(
+        plugins::catalog(),
+        tree(&["[[remove]]\nid = \"session-persistence-jsonl\""]),
+    );
+    app.start().await.unwrap();
+    let outcome = run_turn(&app, "no disk").await.unwrap();
+    assert_eq!(outcome.text, "hello from the log");
+    assert!(!app
+        .context()
+        .service_names()
+        .contains(&"session-persistence"));
+}
+
+#[tokio::test]
+async fn the_loop_refuses_to_continue_on_an_unexplainable_prompt() {
+    // A listener that smuggles content into the request without logging it —
+    // exactly the drift the invariant exists to catch.
+    struct Smuggler;
+    #[async_trait::async_trait]
+    impl atomcode_plexus::Waterfall<atomcode_harness::events::AgentRequest> for Smuggler {
+        async fn handle(
+            &self,
+            req: &mut atomcode_harness::events::ModelRequest,
+            next: atomcode_plexus::Next<'_, atomcode_harness::events::AgentRequest>,
+        ) -> Result<atomcode_harness::events::ModelResponse, atomcode_harness::events::RequestError>
+        {
+            req.messages.push(Message::user("smuggled context"));
+            next.run(req).await
+        }
+    }
+
+    let mut app = App::new(plugins::catalog(), tree(&[]));
+    app.start().await.unwrap();
+    let _guard = app
+        .context()
+        .on_waterfall::<atomcode_harness::events::AgentRequest>(Arc::new(Smuggler), false);
+
+    // The invariant runs before the request is dispatched, so this turn is
+    // stopped by the *next* round's check rather than the first.
+    let outcome = run_turn(&app, "go").await.unwrap();
+    assert_eq!(outcome.text, "hello from the log");
+    assert_eq!(
+        outcome.stop,
+        atomcode_harness::seams::StopReason::Stopped,
+        "a single-round turn ends before a second assembly can observe the smuggling"
+    );
+}
+
+// ---- resuming -----------------------------------------------------------
+
+/// A tree pointed at a private harness home, so a resume test cannot see (or
+/// be seen by) any other session on the machine.
+fn resumable(home: &std::path::Path, session_id: Option<&str>, resume: bool) -> ConfigTree {
+    let script = r#"
+[[patch]]
+id = "llm"
+name = "llm-replay"
+config = { script = [ { text = "answered" } ] }
+"#;
+    let quiet =
+        "[[patch]]\nid = \"trace\"\nconfig = { stream = false, tools = false, summary = false }";
+    let sandbox = home.join("work");
+    std::fs::create_dir_all(&sandbox).unwrap();
+    let rows = format!(
+        "[[patch]]\nid = \"skills\"\nconfig = {{ project_root = {work:?}, home = {work:?} }}\n\n\
+         [[patch]]\nid = \"memory\"\nconfig = {{ project_root = {work:?} }}\n\n\
+         [[patch]]\nid = \"session-persistence-jsonl\"\nconfig = {{ root = {root:?} }}\n{id}",
+        work = sandbox.to_string_lossy(),
+        root = home.join("sessions").to_string_lossy(),
+        id = session_id
+            .map(|id| {
+                format!("\n[[patch]]\nid = \"session\"\nconfig = {{ id = {id:?}, resume = {resume} }}\n")
+            })
+            .unwrap_or_default()
+    );
+    let mut layers = vec![
+        atomcode_coding::on_harness::base_layer(),
+        atomcode_coding::on_harness::headless_patch(),
+    ];
+    for src in [script, quiet, rows.as_str()] {
+        layers.push(Layer::from_toml(src).unwrap());
+    }
+    ConfigTree::from_layers(layers).unwrap()
+}
+
+fn resume_home(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("plexus-resume-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Let the fire-and-forget persistence writer land before reading it back.
+async fn settle(app: &App, id: &str, want: usize) {
+    let store = app.context().service::<SessionPersistenceSvc>().unwrap();
+    for _ in 0..50 {
+        if store.load(id).await.map(|e| e.len()).unwrap_or(0) >= want {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_resumed_session_carries_its_history_to_the_model() {
+    let home = resume_home("history");
+    let id = "fixed-id";
+
+    let mut first = App::new(plugins::catalog(), resumable(&home, Some(id), false));
+    first.start().await.unwrap();
+    run_turn(&first, "remember the number 42").await.unwrap();
+    settle(&first, id, 5).await;
+    drop(first);
+
+    let mut second = App::new(plugins::catalog(), resumable(&home, Some(id), true));
+    second.start().await.unwrap();
+    atomcode_harness::create_agent(&second).await.unwrap();
+
+    // The whole point: the model's view is rebuilt from the log, so the second
+    // process sees what the first one said.
+    let projected = second
+        .context()
+        .only_session()
+        .unwrap()
+        .derive_messages()
+        .iter()
+        .map(|m| m.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        projected.contains("remember the number 42"),
+        "a resumed session must carry its history: {projected}"
+    );
+    assert!(projected.contains("answered"));
+}
+
+#[tokio::test]
+async fn a_resumed_session_continues_its_turn_numbering() {
+    let home = resume_home("numbering");
+    let id = "numbered";
+
+    let mut first = App::new(plugins::catalog(), resumable(&home, Some(id), false));
+    first.start().await.unwrap();
+    run_turn(&first, "one").await.unwrap();
+    run_turn(&first, "two").await.unwrap();
+    settle(&first, id, 10).await;
+    drop(first);
+
+    let mut second = App::new(plugins::catalog(), resumable(&home, Some(id), true));
+    second.start().await.unwrap();
+    atomcode_harness::create_agent(&second).await.unwrap();
+    let outcome = run_turn(&second, "three").await.unwrap();
+
+    // Restarting at 1 would give a transcript keyed by (session, turn)
+    // duplicate keys on every resume.
+    assert_eq!(outcome.turn, 3, "numbering must continue, not restart");
+}
+
+#[tokio::test]
+async fn the_turn_boundary_survives_a_round_trip() {
+    let home = resume_home("boundary");
+    let id = "boundaries";
+
+    let mut first = App::new(plugins::catalog(), resumable(&home, Some(id), false));
+    first.start().await.unwrap();
+    run_turn(&first, "one").await.unwrap();
+    settle(&first, id, 5).await;
+    drop(first);
+
+    let mut second = App::new(plugins::catalog(), resumable(&home, Some(id), true));
+    second.start().await.unwrap();
+    atomcode_harness::create_agent(&second).await.unwrap();
+    let turns = second
+        .context()
+        .only_session()
+        .unwrap()
+        .events()
+        .into_iter()
+        .filter(|e| matches!(e.event, SessionEvent::TurnStart { .. }))
+        .count();
+    // `TurnStart` used to be appended directly rather than committed, so it
+    // existed in memory and reached no listener — including the one that
+    // persists. A resumed log was missing every boundary.
+    assert_eq!(
+        turns, 1,
+        "the turn boundary must reach the store like any other fact"
+    );
+}
+
+#[tokio::test]
+async fn resume_is_off_unless_asked_for() {
+    let home = resume_home("off");
+    let id = "not-resumed";
+
+    let mut first = App::new(plugins::catalog(), resumable(&home, Some(id), false));
+    first.start().await.unwrap();
+    run_turn(&first, "the first thing").await.unwrap();
+    settle(&first, id, 5).await;
+    drop(first);
+
+    let mut second = App::new(plugins::catalog(), resumable(&home, Some(id), false));
+    second.start().await.unwrap();
+    atomcode_harness::create_agent(&second).await.unwrap();
+    assert!(
+        second.context().only_session().unwrap().is_empty(),
+        "a new session must not silently inherit an old one"
+    );
+}
+
+#[tokio::test]
+async fn resuming_a_session_that_does_not_exist_starts_a_fresh_one() {
+    let home = resume_home("missing");
+    let mut app = App::new(
+        plugins::catalog(),
+        resumable(&home, Some("never-written"), true),
+    );
+    app.start()
+        .await
+        .expect("a missing session is an empty one, not a failure");
+    let outcome = run_turn(&app, "hello").await.unwrap();
+    assert_eq!(outcome.turn, 1);
+}
+
+#[tokio::test]
+async fn facts_a_plugin_writes_survive_a_resume() {
+    let home = resume_home("plugin-facts");
+    let id = "plugin-written";
+    std::fs::create_dir_all(home.join("work/.atomcode")).unwrap();
+    std::fs::write(
+        home.join("work/.atomcode/memory.md"),
+        "- the user prefers short answers\n",
+    )
+    .unwrap();
+
+    let mut first = App::new(plugins::catalog(), resumable(&home, Some(id), false));
+    first.start().await.unwrap();
+    run_turn(&first, "hello").await.unwrap();
+    settle(&first, id, 6).await;
+
+    let injected_live = first
+        .context()
+        .only_session()
+        .unwrap()
+        .events()
+        .into_iter()
+        .filter(|e| matches!(e.event, SessionEvent::Injected { .. }))
+        .count();
+    assert_eq!(injected_live, 1, "the memory row injected once");
+    drop(first);
+
+    let mut second = App::new(plugins::catalog(), resumable(&home, Some(id), true));
+    second.start().await.unwrap();
+    atomcode_harness::create_agent(&second).await.unwrap();
+    let restored = second.context().only_session().unwrap();
+    let injected_after = restored
+        .events()
+        .into_iter()
+        .filter(|e| matches!(e.event, SessionEvent::Injected { .. }))
+        .count();
+
+    // Every plugin that tells the model something used to `append` directly,
+    // which reaches nothing that learns by listening — so memory injections,
+    // compaction cuts and truncation nudges were all silently missing from a
+    // resumed session while the model still believed it had been told them.
+    assert_eq!(
+        injected_after, 1,
+        "a fact a plugin wrote must reach the store like any other"
+    );
+    assert!(restored
+        .derive_messages()
+        .iter()
+        .any(|m| m.text.contains("short answers")));
+}
+
+// ---- the header: what is true before the first event -------------------
+
+fn lines_of(path: &std::path::Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn the_file_begins_with_a_header_and_the_events_follow() {
+    let home = resume_home("header");
+    let id = "headed";
+    let mut app = App::new(plugins::catalog(), resumable(&home, Some(id), false));
+    app.start().await.unwrap();
+    run_turn(&app, "hello").await.unwrap();
+    settle(&app, id, 5).await;
+
+    let path = app
+        .context()
+        .service::<SessionPersistenceSvc>()
+        .unwrap()
+        .location(id)
+        .unwrap();
+    let lines = lines_of(std::path::Path::new(&path));
+    let header = &lines[0]["header"];
+    assert_eq!(
+        header["id"], id,
+        "first line names the session: {}",
+        lines[0]
+    );
+    assert_eq!(
+        header["version"],
+        atomcode_harness::session::SESSION_FORMAT_VERSION
+    );
+    assert!(header["created_at"].as_u64().unwrap() > 0);
+    assert!(
+        lines[0].get("seq").is_none(),
+        "the header takes no sequence number"
+    );
+    assert!(
+        lines[1].get("seq").is_some(),
+        "and the events start right after"
+    );
+    assert_eq!(
+        lines.iter().filter(|l| l.get("header").is_some()).count(),
+        1,
+        "one header, however many turns"
+    );
+}
+
+#[tokio::test]
+async fn a_file_from_before_headers_still_loads() {
+    let home = resume_home("headless-file");
+    let id = "old-style";
+    let dir = home.join("sessions");
+    // Where files lived before bucketing — the store still reads that path.
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join(format!("{id}.jsonl")),
+        "{\"seq\":1,\"event\":{\"kind\":\"turn_start\",\"turn\":1}}\n\
+         {\"seq\":2,\"event\":{\"kind\":\"user_message\",\"turn\":1,\"text\":\"from before\"}}\n",
+    )
+    .unwrap();
+
+    let mut app = App::new(plugins::catalog(), resumable(&home, Some(id), true));
+    app.start().await.unwrap();
+    let agent = atomcode_harness::create_agent(&app).await.unwrap();
+    assert_eq!(agent.session().len(), 2, "the events were replayed");
+    assert_eq!(agent.session().id(), id, "and the identity is the file's");
+    let store = app.context().service::<SessionPersistenceSvc>().unwrap();
+    assert!(
+        store.header(id).await.unwrap().is_none(),
+        "no header was invented on disk"
+    );
+}
+
+#[tokio::test]
+async fn a_resume_keeps_the_header_the_session_was_created_with() {
+    let home = resume_home("header-kept");
+    let id = "kept";
+    let mut first = App::new(plugins::catalog(), resumable(&home, Some(id), false));
+    first.start().await.unwrap();
+    let born = atomcode_harness::create_agent(&first).await.unwrap();
+    let original = born.session().header().clone();
+    run_turn(&first, "hello").await.unwrap();
+    settle(&first, id, 5).await;
+    drop(first);
+
+    let mut second = App::new(plugins::catalog(), resumable(&home, Some(id), true));
+    second.start().await.unwrap();
+    let back = atomcode_harness::create_agent(&second).await.unwrap();
+    assert_eq!(
+        back.session().header(),
+        &original,
+        "created_at and the rest are the session's, not the process's"
+    );
+}
+
+#[tokio::test]
+async fn a_fork_carries_the_parents_events_under_its_own_name() {
+    let home = resume_home("fork");
+    let mut app = App::new(plugins::catalog(), resumable(&home, Some("parent"), false));
+    app.start().await.unwrap();
+    let parent = atomcode_harness::create_agent(&app).await.unwrap();
+    run_turn(&app, "the parent speaks").await.unwrap();
+    let ctx = app.context();
+    atomcode_harness::session::commit(
+        &ctx,
+        &parent.session(),
+        SessionEvent::Titled {
+            turn: 1,
+            title: "the parent's name".into(),
+            user_set: false,
+        },
+    );
+    assert_eq!(
+        parent.session().title().as_deref(),
+        Some("the parent's name")
+    );
+
+    // Fork-shaped: the child's seed is the parent's whole log so far.
+    let prefix = parent.session().events();
+    let n = prefix.len();
+    let agents = ctx.service::<AgentsSvc>().unwrap();
+    let child = agents
+        .create(
+            &ctx,
+            CreateAgent::new()
+                .id("child")
+                .parent("parent")
+                .seed(prefix, n),
+        )
+        .await
+        .unwrap();
+
+    let child_session = child.session();
+    let header = child_session.header();
+    assert_eq!(header.id, "child");
+    assert_eq!(header.parent.as_deref(), Some("parent"));
+    assert_eq!(header.inherited, n);
+    assert!(header.created_at >= parent.session().header().created_at);
+    assert_eq!(child.session().len(), n, "the events came along");
+    assert!(
+        child.session().title().is_none(),
+        "but the parent's name did not: a title in the inherited prefix is the parent's"
+    );
+    // And the parent's header is untouched by having been forked.
+    assert!(parent.session().header().parent.is_none());
+    assert_eq!(parent.session().header().inherited, 0);
+
+    // The store describes both from their headers. The child's file holds its
+    // header and nothing else yet: inherited events are the parent's to store.
+    let store = ctx.service::<SessionPersistenceSvc>().unwrap();
+    let described = store.describe("child").await.unwrap().unwrap();
+    assert_eq!(described.header.unwrap().parent.as_deref(), Some("parent"));
+    assert!(described.title.is_none());
+    settle(&app, "parent", parent.session().len()).await;
+    let parent_described = store.describe("parent").await.unwrap().unwrap();
+    assert_eq!(parent_described.title.as_deref(), Some("the parent's name"));
+    assert_eq!(parent_described.turns, 1);
+}
+
+// ---- when a record was committed (docs/adr/0024 §14) ----------------------
+
+/// Fills `wall-clock` with an instant that never moves.
+struct PinnedClock(u64);
+
+#[async_trait::async_trait]
+impl atomcode_plexus::Plugin for PinnedClock {
+    fn name(&self) -> &'static str {
+        "test-pinned-clock"
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["wall-clock"]
+    }
+    async fn apply(
+        &self,
+        ctx: &atomcode_plexus::Context,
+        _config: &serde_json::Value,
+    ) -> Result<(), String> {
+        let _ = ctx
+            .provide::<atomcode_harness::seams::WallClockSvc>(Arc::new(
+                atomcode_kernel::clock::FixedWallClock(self.0),
+            ))
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+/// Every record carries the time it was committed — in the log, on the fact
+/// stream, and on disk — from the clock the tree provides; a record written
+/// before times were kept reads back as unknown rather than failing the file.
+#[tokio::test]
+async fn every_record_carries_the_time_it_was_committed() {
+    const AT: u64 = 1_789_000_000_000;
+    let home = resume_home("commit-time");
+    let id = "timed-id";
+    let mut catalog = plugins::catalog();
+    catalog.register(Arc::new(PinnedClock(AT)));
+    let mut tree = resumable(&home, Some(id), false);
+    tree.apply(&Layer::from_toml("[[insert]]\nname = \"test-pinned-clock\"\n").unwrap())
+        .unwrap();
+    let mut app = App::new(catalog, tree);
+    app.start().await.unwrap();
+
+    let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = heard.clone();
+    let _listening = app
+        .context()
+        .on_emit::<atomcode_harness::events::SessionEventCommitted>(move |c| {
+            seen.lock().unwrap().push(c.at);
+        });
+    run_turn(&app, "what time is it").await.unwrap();
+    let logged = app.context().only_session().unwrap().events();
+    assert!(!logged.is_empty());
+    settle(&app, id, logged.len()).await;
+    assert!(logged.iter().all(|e| e.at == AT), "{logged:#?}");
+    let heard = heard.lock().unwrap().clone();
+    assert!(
+        !heard.is_empty() && heard.iter().all(|at| *at == AT),
+        "{heard:?}"
+    );
+    let stored = app
+        .context()
+        .service::<SessionPersistenceSvc>()
+        .unwrap()
+        .load(id)
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), logged.len());
+    assert!(stored.iter().all(|e| e.at == AT), "{stored:#?}");
+
+    // A file from before commit times: same records, no `at`.
+    let location = app
+        .context()
+        .service::<SessionPersistenceSvc>()
+        .unwrap()
+        .location(id)
+        .expect("the store says where");
+    let untimed: String = std::fs::read_to_string(&location)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+            if let Some(object) = value.as_object_mut() {
+                object.remove("at");
+            }
+            format!("{value}\n")
+        })
+        .collect();
+    std::fs::write(&location, untimed).unwrap();
+    let reread = app
+        .context()
+        .service::<SessionPersistenceSvc>()
+        .unwrap()
+        .load(id)
+        .await
+        .unwrap();
+    assert_eq!(reread.len(), logged.len());
+    assert!(reread.iter().all(|e| e.at == 0), "{reread:#?}");
+}
+
+// ---- an undo is a fact (docs/adr/0024 §17) --------------------------------
+
+/// One whole turn: its boundary, a prompt, an answer.
+fn turn_of(
+    log: &SessionLog,
+    turn: u64,
+    said: &str,
+    answered: &str,
+) -> atomcode_harness::session::SeqNo {
+    let start = log.append(SessionEvent::TurnStart { turn });
+    log.append(SessionEvent::UserMessage {
+        turn,
+        text: said.into(),
+        images: vec![],
+    });
+    log.append(SessionEvent::AssistantMessage {
+        turn,
+        round: 1,
+        text: answered.into(),
+        reasoning: String::new(),
+        tool_calls: vec![],
+        reasoning_blocks: Vec::new(),
+        meta: None,
+    });
+    log.append(SessionEvent::TurnEnd {
+        turn,
+        stop: StopReason::Stopped,
+        error: None,
+    });
+    start
+}
+
+fn texts(messages: &[Message]) -> Vec<String> {
+    messages.iter().map(|m| m.text.clone()).collect()
+}
+
+/// Undone to a turn, the model sees exactly what it would if the log had
+/// stopped before that turn — and the log still has everything.
+#[test]
+fn an_undo_projects_what_the_log_held_before_the_undone_turn() {
+    let log = SessionLog::new("t");
+    turn_of(&log, 1, "one", "first");
+    let second = turn_of(&log, 2, "two", "second");
+    turn_of(&log, 3, "three", "third");
+    let before: Vec<LoggedEvent> = log
+        .events()
+        .into_iter()
+        .filter(|e| e.seq < second)
+        .collect();
+    let length = log.len();
+
+    log.append(SessionEvent::Rewound {
+        turn: 3,
+        to: second,
+        scope: atomcode_harness::session::RewindScope::Conversation,
+    });
+
+    assert_eq!(log.derive_messages(), derive_messages(&before));
+    assert_eq!(texts(&log.derive_messages()), vec!["one", "first"]);
+    assert_eq!(
+        log.len(),
+        length + 1,
+        "the undo is added, nothing is removed"
+    );
+
+    // After the undo the session goes on, and the next turn is seen.
+    turn_of(&log, 4, "four", "fourth");
+    assert_eq!(
+        texts(&log.derive_messages()),
+        vec!["one", "first", "four", "fourth"]
+    );
+}
+
+/// A compaction the undo took back no longer counts: the projection falls back
+/// to the history it had replaced. One from before the undone turns still holds.
+#[test]
+fn a_compaction_follows_the_undo_that_contains_it() {
+    let log = SessionLog::new("t");
+    turn_of(&log, 1, "one", "first");
+    let second = turn_of(&log, 2, "two", "second");
+    let through = log.events().last().unwrap().seq;
+    log.append(SessionEvent::Compacted {
+        turn: 3,
+        through,
+        summary: "SUMMARY".into(),
+        from: 0,
+    });
+    turn_of(&log, 3, "three", "third");
+    assert_eq!(
+        texts(&log.derive_messages()),
+        vec!["SUMMARY", "three", "third"]
+    );
+
+    // Undo to turn 2: the compaction came after its start, so it goes too.
+    log.append(SessionEvent::Rewound {
+        turn: 3,
+        to: second,
+        scope: atomcode_harness::session::RewindScope::Conversation,
+    });
+    assert_eq!(texts(&log.derive_messages()), vec!["one", "first"]);
+
+    // A compaction before the undone turns keeps holding.
+    let kept = SessionLog::new("k");
+    turn_of(&kept, 1, "one", "first");
+    let through = kept.events().last().unwrap().seq;
+    kept.append(SessionEvent::Compacted {
+        turn: 2,
+        through,
+        summary: "SUMMARY".into(),
+        from: 0,
+    });
+    let later = turn_of(&kept, 2, "two", "second");
+    turn_of(&kept, 3, "three", "third");
+    kept.append(SessionEvent::Rewound {
+        turn: 3,
+        to: later,
+        scope: atomcode_harness::session::RewindScope::Conversation,
+    });
+    assert_eq!(texts(&kept.derive_messages()), vec!["SUMMARY"]);
+}
+
+/// What stood for the whole session was not the undone turns' to take: a memory
+/// injected during them stays. A rewind of the code alone leaves the
+/// conversation as it was.
+#[test]
+fn an_undo_keeps_what_stands_for_the_session_and_a_code_rewind_keeps_the_conversation() {
+    let log = SessionLog::new("t");
+    turn_of(&log, 1, "one", "first");
+    let second = log.append(SessionEvent::TurnStart { turn: 2 });
+    log.append(SessionEvent::Injected {
+        turn: 2,
+        text: "REMEMBERED".into(),
+        origin: InjectionOrigin::Memory,
+    });
+    log.append(SessionEvent::UserMessage {
+        turn: 2,
+        text: "two".into(),
+        images: vec![],
+    });
+
+    let untouched = log.derive_messages();
+    log.append(SessionEvent::Rewound {
+        turn: 2,
+        to: second,
+        scope: atomcode_harness::session::RewindScope::Code,
+    });
+    assert_eq!(
+        log.derive_messages(),
+        untouched,
+        "code only: the conversation stays"
+    );
+
+    log.append(SessionEvent::Rewound {
+        turn: 2,
+        to: second,
+        scope: atomcode_harness::session::RewindScope::Both,
+    });
+    assert_eq!(
+        texts(&log.derive_messages()),
+        vec!["one", "first", "REMEMBERED"]
+    );
+}

@@ -97,6 +97,9 @@ docs/overflow-compaction-spec.md
 docs/session-persistence-recall-spec.md
 docs/system-prompt-parity-spec.md
 docs/v2-port-backlog.md
+# Generated crate-dependency visualization — regenerated at will, the numbers in
+# it go stale the moment a Cargo.toml moves.
+docs/atomcode-crate-deps.html
 
 # Superpowers plugin state
 .superpowers/

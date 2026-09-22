@@ -35,14 +35,14 @@ use atomcode_kernel::provider::LlmProvider;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::controllers::{
-    classify_followup, evaluate_goal, goal_cap_stop_note, goal_continuation_message,
-    summarize_for_goal, EvalOutcome, FollowupClass, GoalPhase, GoalProgress, GoalResult, GoalState,
-    GoalTerminal, LoopProgress, LoopState, ScheduleWakeupTool, WakeupRequest, MAX_UNPRODUCTIVE,
+    evaluate_goal, goal_cap_stop_note, goal_continuation_message, summarize_for_goal, EvalOutcome,
+    GoalPhase, GoalProgress, GoalResult, GoalState, GoalTerminal, LoopProgress, LoopState,
+    ScheduleWakeupTool, WakeupRequest, MAX_UNPRODUCTIVE,
 };
 use crate::parts::prepare_with_plugin_hook_source_reusing_lease;
 #[cfg(test)]
 use crate::prepare_with_plugin_hook_source;
-use crate::{assemble, CodingAgentConfig, CodingProviderFactory, PluginHookSource, PrepareOptions};
+use crate::{CodingAgentConfig, CodingProviderFactory, PluginHookSource, PrepareOptions};
 
 /// Runtime facts emitted by the coding engine without depending on the legacy
 /// `atomcode-core` driver protocol.
@@ -232,12 +232,90 @@ impl RewindScope {
     }
 }
 
+/// Whether this session is driving itself, and how far it has got.
+///
+/// Read rather than pushed: the runtime already publishes `GoalChanged` /
+/// `LoopChanged` every round, but that stream is the runtime's own and the
+/// screen is not on it.
+///
+/// Answered through host control, the way `McpStatus` is. `docs/adr/0021` §3
+/// puts goal and loop with the capability rows and that is where their
+/// *commands* are — `GoalCommand` is a shim over `RuntimeCommands`. The state
+/// is not theirs: these controllers are runtime-owned (`controllers.rs`: "
+/// Runtime-owned autonomous controllers"), they live as locals of the driver
+/// loop, and reporting what the runtime owns is the host's job. MCP is the same
+/// shape: rows mount the servers, host control reports their state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Autonomy {
+    pub goal: Option<GoalProgress>,
+    pub looping: Option<LoopProgress>,
+}
+
+/// What a session has done to the workspace, for a front end to show.
+///
+/// One shape for both levels of the answer: the list of files, or one file's
+/// diff. Two messages that differed only in which field was filled would be two
+/// round trips to keep in step.
+#[derive(Debug, Clone, Default)]
+pub struct WorkspaceChanges {
+    /// Every file this session changed, with how much.
+    pub files: Vec<atomcode_capabilities::session::FileChangeSummary>,
+    /// The unified diff of the one file that was asked for.
+    pub diff: Option<String>,
+    /// Why there is no answer, when there is none. Not an error: a session with
+    /// no workspace checkpointing is an ordinary session, and the screen has to
+    /// say which of "nothing changed" and "cannot tell" it is.
+    pub unavailable: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RewindCatalog {
     pub generation: RuntimeGeneration,
     pub revision: u64,
     pub points: Vec<RewindPoint>,
-    pub code_unavailable: Option<String>,
+    pub code_unavailable: Option<CodeUnavailable>,
+}
+
+/// Why the workspace half of a rewind is not on offer.
+///
+/// **A kind, not a sentence** — the words belong to whoever is talking to the
+/// person, and a front end that was handed a sentence could only pass it
+/// through in whatever language this crate happened to write it in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CodeUnavailable {
+    /// Off by default, to protect disk space. The person can opt in.
+    NotEnabled,
+    /// This session is not written down, so there is nothing to checkpoint
+    /// against.
+    NoSession,
+    /// Opted in, but the checkpoint could not be set up — with the cause.
+    SetupFailed(String),
+}
+
+impl CodeUnavailable {
+    /// A reason string, for a caller that has nowhere to put the kind.
+    pub fn say(&self) -> String {
+        match self {
+            Self::NotEnabled => {
+                atomcode_capabilities::session::CodeRewindUnavailable::NotEnabled.to_string()
+            }
+            Self::NoSession => "rewind requires a persistent session".to_string(),
+            Self::SetupFailed(why) => {
+                atomcode_capabilities::session::CodeRewindUnavailable::SetupFailed(why.clone())
+                    .to_string()
+            }
+        }
+    }
+}
+
+impl From<atomcode_capabilities::session::CodeRewindUnavailable> for CodeUnavailable {
+    fn from(why: atomcode_capabilities::session::CodeRewindUnavailable) -> Self {
+        use atomcode_capabilities::session::CodeRewindUnavailable as Why;
+        match why {
+            Why::NotEnabled => Self::NotEnabled,
+            Why::SetupFailed(message) => Self::SetupFailed(message),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -577,6 +655,43 @@ impl From<&str> for UserInput {
     }
 }
 
+/// What a capability row asks the runtime to do on a person's word
+/// (`docs/adr/0021` §3, §10).
+///
+/// Narrow on purpose: the row is mounted in the agent's tree and must not grow
+/// a dependency on the whole driver protocol, which is an implementation of the
+/// transition and not a contract (§5). Everything here is something a person
+/// runs from a front end — never a tool the model can reach.
+#[async_trait::async_trait]
+pub trait RuntimeCommands: Send + Sync {
+    /// Work towards `condition` on its own until it holds.
+    async fn start_goal(&self, condition: String) -> Result<(), String>;
+    /// Stop the goal that is running.
+    async fn stop_goal(&self) -> Result<(), String>;
+    /// Leave the goal where it is; it can be taken up again.
+    async fn pause_goal(&self) -> Result<(), String>;
+    /// Run `prompt` again and again until it is stopped.
+    async fn start_loop(&self, prompt: String) -> Result<(), String>;
+    async fn stop_loop(&self) -> Result<(), String>;
+    /// Put `text` in front of the next turn, as the person's own context.
+    async fn queue_local_context(&self, text: String) -> Result<(), String>;
+    /// The policy intervention waiting for a person to say how to go on, if one
+    /// is. The row asks before it resolves: whether there is one, and whether
+    /// what a person typed is among its choices, are the row's two judgements
+    /// to make (`docs/adr/0021` §8) — the host contract has no say in them.
+    async fn pending_policy(&self) -> Option<PolicyIntervention>;
+    /// Go on from the intervention `id` the way `action` says.
+    async fn resolve_policy(&self, id: u64, action: PolicyRecoveryAction) -> Result<(), String>;
+    /// Point the runtime at `directory` — a new session in the same place, with
+    /// everything that belonged to where it ran rebuilt for there.
+    ///
+    /// The runtime's own transition (`docs/adr/0001`), awaited rather than
+    /// raced: a row that had to *make* the directory first (`/worktree`) cannot
+    /// answer a person honestly without knowing whether they got there, and a
+    /// driver-side optimistic `cd` is the thing that ADR refuses.
+    async fn change_directory(&self, directory: std::path::PathBuf) -> Result<(), String>;
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SubmitReceipt {
     Started { generation: u64, turn_id: u64 },
@@ -801,6 +916,18 @@ struct RuntimeResources {
     provider_factory: Arc<dyn CodingProviderFactory>,
     plugin_hooks: Arc<dyn PluginHookSource>,
     parts: crate::CodingParts,
+    /// The mounted tree, on the harness engine. `None` on the chain.
+    ///
+    /// Held, never read: unloading it would tear down every row under a live
+    /// handle. When the harness carries the reassembly paths too, this is what
+    /// `ControlSvc::patch` will be reached through.
+    ///
+    /// Never read ON PURPOSE — it is held for its `Drop`, not its value.
+    harness_app: Option<atomcode_plexus::App>,
+    /// The provider table the `llm` row reads by id. Holding it is what makes a
+    /// `/model` switch a patch rather than a rebuild — see
+    /// `on_harness::ProviderSlots`.
+    harness_providers: Option<Arc<crate::on_harness::ProviderSlots>>,
     wakeup_tx: mpsc::UnboundedSender<WakeupRequest>,
     loop_active: Arc<std::sync::atomic::AtomicBool>,
     image_preprocessor: Option<Arc<dyn ImagePreprocessor>>,
@@ -1373,6 +1500,15 @@ impl CodingRuntimeHandle {
         result.await.map_err(|_| RuntimeError::Unavailable)?
     }
 
+    /// The policy intervention waiting for a person, if one is.
+    pub async fn pending_policy_intervention(&self) -> Option<PolicyIntervention> {
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::PendingPolicyIntervention { done })
+            .ok()?;
+        result.await.ok().flatten()
+    }
+
     pub async fn snapshot(&self) -> Result<Arc<SessionSnapshot>, RuntimeError> {
         Ok(self.snapshot_with_revision().await?.snapshot)
     }
@@ -1438,6 +1574,24 @@ impl CodingRuntimeHandle {
         result.await.map_err(|_| RuntimeError::Unavailable)?
     }
 
+    /// The execution mode in force, as the flags that govern a tool call have it.
+    ///
+    /// `Err` is "this runtime cannot answer" — a stopped or unavailable one. It
+    /// is not "no mode": a coding runtime always has one, and the caller's
+    /// `None` for "a host that does not govern modes at all" is a different
+    /// fact, kept by the host that knows it (`atomcode_host_api::HostReply`).
+    pub async fn mode(&self) -> Result<RuntimeMode, RuntimeError> {
+        let state = self.state.load(Ordering::Acquire);
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::Mode {
+                generation: runtime_state_generation(state),
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
     /// Explicit headless readiness policy. Interactive callers should let MCP
     /// connect in the background and observe new tools from the next turn.
     pub async fn wait_mcp_ready(&self, timeout: std::time::Duration) -> Result<(), RuntimeError> {
@@ -1472,6 +1626,43 @@ impl CodingRuntimeHandle {
             .send(CodingRuntimeControl::McpTools {
                 generation: runtime_state_generation(state),
                 server,
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
+    /// What the model can call right now, what the person turned off, and what
+    /// the tree was configured without (`docs/tool-catalog-policy.md`).
+    pub async fn tool_catalog(
+        &self,
+    ) -> Result<Vec<atomcode_harness::seams::ToolListing>, RuntimeError> {
+        let state = self.state.load(Ordering::Acquire);
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::ToolCatalog {
+                generation: runtime_state_generation(state),
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
+    /// Turn `pattern` off or back on for this session, and answer with the
+    /// catalog as it now is — one round trip, so a screen never renders a
+    /// switch it only assumes was thrown.
+    pub async fn switch_tool(
+        &self,
+        pattern: String,
+        on: bool,
+    ) -> Result<Vec<atomcode_harness::seams::ToolListing>, RuntimeError> {
+        let state = self.state.load(Ordering::Acquire);
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::SwitchTool {
+                generation: runtime_state_generation(state),
+                pattern,
+                on,
                 done,
             })
             .map_err(|_| RuntimeError::Unavailable)?;
@@ -1536,10 +1727,6 @@ impl CodingRuntimeHandle {
             })
             .map_err(|_| RuntimeError::Unavailable)?;
         result.await.map_err(|_| RuntimeError::Unavailable)?
-    }
-
-    pub async fn reprepare(&self, input: ReprepareInput) -> Result<SessionChanged, RuntimeError> {
-        self.reprepare_target(ReprepareTarget::Exact(input)).await
     }
 
     pub async fn fresh_session(&self) -> Result<SessionChanged, RuntimeError> {
@@ -1631,8 +1818,14 @@ impl CodingRuntimeHandle {
         let generation = self.status().generation;
         let original = self.snapshot_with_revision().await?;
         let undo = undo_snapshot_to_prompt(&original.undo_snapshot, nth)?;
-        self.apply_undo(generation, original.revision, original.undo_snapshot, undo)
-            .await
+        self.apply_undo(
+            generation,
+            original.revision,
+            original.undo_snapshot,
+            undo,
+            None,
+        )
+        .await
     }
 
     async fn apply_undo(
@@ -1641,12 +1834,14 @@ impl CodingRuntimeHandle {
         expected_revision: u64,
         original: Arc<SessionSnapshot>,
         undo: SnapshotUndoResult,
+        code_rewound_to: Option<u64>,
     ) -> Result<UndoResult, RuntimeError> {
         let (done, result) = oneshot::channel();
         self.tx
             .send(CodingRuntimeControl::ApplyUndo {
                 generation,
                 expected_revision,
+                code_rewound_to,
                 original,
                 truncated: undo.snapshot,
                 restored_prompt: undo.restored_prompt,
@@ -1664,6 +1859,70 @@ impl CodingRuntimeHandle {
         self.tx
             .send(CodingRuntimeControl::RewindCatalog {
                 generation: runtime_state_generation(state),
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
+    /// Whether this session is driving itself, and how far it has got.
+    pub async fn autonomy(&self) -> Result<Autonomy, RuntimeError> {
+        let state = self.state.load(Ordering::Acquire);
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::Autonomy {
+                generation: runtime_state_generation(state),
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
+    /// What the account has left to spend, window by window.
+    ///
+    /// Best-effort and bounded: the source is a network call, and a person
+    /// asking "how much have I got left" must not be made to wait on it. No
+    /// source, a slow one or a failing one all answer with an empty list, which
+    /// says "this host does not meter" in the only way a front end can act on.
+    /// The account's windows **and** what it has spent, in one round trip.
+    ///
+    /// Together because a screen that shows them shows them on one page, and
+    /// two trips would be two chances for one of them to be a moment stale
+    /// against the other.
+    #[allow(clippy::type_complexity)]
+    pub async fn usage(
+        &self,
+    ) -> Result<
+        (
+            Vec<crate::rate_limit::RateLimitWindow>,
+            Option<crate::rate_limit::Entitlement>,
+            Option<crate::rate_limit::AccountUsage>,
+        ),
+        RuntimeError,
+    > {
+        let state = self.state.load(Ordering::Acquire);
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::Usage {
+                generation: runtime_state_generation(state),
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
+    /// What this session has changed in the workspace — every file, or one
+    /// file's diff.
+    pub async fn workspace_changes(
+        &self,
+        file: Option<String>,
+    ) -> Result<WorkspaceChanges, RuntimeError> {
+        let state = self.state.load(Ordering::Acquire);
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::WorkspaceChanges {
+                generation: runtime_state_generation(state),
+                file,
                 done,
             })
             .map_err(|_| RuntimeError::Unavailable)?;
@@ -1698,7 +1957,10 @@ impl CodingRuntimeHandle {
             .ok_or(RuntimeError::RewindPointUnavailable { turn_id })?;
         if scope.restores_code() {
             if let Some(reason) = catalog.code_unavailable {
-                return Err(RuntimeError::CodeRewindUnavailable(reason));
+                // The error carries a sentence because that is what a
+                // `RuntimeError` is; the *kind* reached the front end on the
+                // catalog, which is where a screen looks.
+                return Err(RuntimeError::CodeRewindUnavailable(reason.say()));
             }
         }
         let original = self.snapshot_with_revision().await?;
@@ -1749,6 +2011,7 @@ impl CodingRuntimeHandle {
                 catalog.revision,
                 original.undo_snapshot,
                 undo,
+                scope.restores_code().then_some(point.turn_id),
             )
             .await
         {
@@ -1981,45 +2244,63 @@ impl CodingRuntime {
             wakeup_tx.clone(),
             Arc::clone(&loop_active),
         )));
+        // Before the mount, because a row mounted in it offers the runtime's own
+        // capabilities as commands (`docs/adr/0021` §3) and needs somewhere to
+        // send them. The channel is usable the moment it exists; the loop that
+        // reads it starts below, and a command that arrives before then waits in
+        // it like any other.
+        let (handle, controls) = coding_runtime_control_channel();
+        parts.set_runtime_commands(Arc::new(handle.clone()));
         let session_id = parts.session.as_ref().map(|binding| binding.id.as_str());
         let session = parts.session.as_ref().map(|binding| RuntimeSessionInfo {
             id: binding.id.clone(),
             resumed: binding.resume.is_some(),
         });
-        let (kernel_agent, unavailable_reason) = match bootstrap {
-            ProviderBootstrap::Unavailable(reason) => (None, Some(reason)),
-            ProviderBootstrap::Required | ProviderBootstrap::RecoverAuthentication => {
-                match provider_factory.build(&agent, session_id) {
-                    Ok(provider) => (
-                        Some(
-                            assemble(&mut parts, &agent, provider)
-                                .map_err(RuntimeStartError::Assemble)?
-                                .spawn(),
-                        ),
-                        None,
-                    ),
-                    Err(crate::ProviderBuildError::Authentication(_))
-                        if bootstrap == ProviderBootstrap::RecoverAuthentication =>
-                    {
-                        (
+        // Mounted only on the harness engine, and kept for exactly one reason:
+        // dropping the `App` unloads every row, and the next command would
+        // reach a conversation whose services are gone. It rides in
+        // `RuntimeResources` with `parts` because it is the same kind of thing —
+        // what a respawn must not lose.
+        let mut harness_app: Option<atomcode_plexus::App> = None;
+        let mut harness_providers: Option<Arc<crate::on_harness::ProviderSlots>> = None;
+        let (kernel_agent, unavailable_reason) =
+            match bootstrap {
+                ProviderBootstrap::Unavailable(reason) => (None, Some(reason)),
+                ProviderBootstrap::Required | ProviderBootstrap::RecoverAuthentication => {
+                    match provider_factory.build(&agent, session_id) {
+                        Ok(provider) => (
+                            Some({
+                                let mounted =
+                                    mount(&parts, &agent, &prepare, provider).await.map_err(
+                                        |e| RuntimeStartError::Assemble(std::io::Error::other(e)),
+                                    )?;
+                                harness_app = Some(mounted.app);
+                                harness_providers = Some(mounted.providers);
+                                mounted.handle
+                            }),
                             None,
-                            Some(ProviderUnavailableReason::AuthenticationRequired),
-                        )
+                        ),
+                        Err(crate::ProviderBuildError::Authentication(_))
+                            if bootstrap == ProviderBootstrap::RecoverAuthentication =>
+                        {
+                            (
+                                None,
+                                Some(ProviderUnavailableReason::AuthenticationRequired),
+                            )
+                        }
+                        Err(crate::ProviderBuildError::SourceBuildGatewayUnsupported {
+                            ..
+                        }) if bootstrap == ProviderBootstrap::RecoverAuthentication => {
+                            (None, Some(ProviderUnavailableReason::UnsupportedBuild))
+                        }
+                        Err(error) => return Err(RuntimeStartError::Provider(error)),
                     }
-                    Err(crate::ProviderBuildError::SourceBuildGatewayUnsupported { .. })
-                        if bootstrap == ProviderBootstrap::RecoverAuthentication =>
-                    {
-                        (None, Some(ProviderUnavailableReason::UnsupportedBuild))
-                    }
-                    Err(error) => return Err(RuntimeStartError::Provider(error)),
                 }
-            }
-        };
+            };
         parts
             .publish_staged_session()
             .map_err(runtime_start_prepare_error)?;
 
-        let (handle, controls) = coding_runtime_control_channel();
         let (raw_event_tx, _raw_events) = mpsc::unbounded_channel();
         let (tagged_event_tx, mut tagged_events) = mpsc::unbounded_channel();
         let adapter = spawn_runtime_owner_with_optional_agent(
@@ -2040,6 +2321,8 @@ impl CodingRuntime {
                 provider_factory,
                 plugin_hooks,
                 parts,
+                harness_app,
+                harness_providers,
                 wakeup_tx,
                 loop_active,
                 image_preprocessor,
@@ -2236,6 +2519,18 @@ pub enum CodingRuntimeControl {
         generation: u64,
         done: oneshot::Sender<Result<RuntimeContextStats, RuntimeError>>,
     },
+    /// The execution mode in force, decoded from the same three flags the
+    /// approval and plan middlewares read.
+    ///
+    /// Read here rather than mirrored onto the handle, deliberately: a second
+    /// copy of "which mode is on" could disagree with the flags that actually
+    /// govern a tool call, and the one a person reads on screen would be the
+    /// copy. Answering through the owner also orders it against `SetMode` on
+    /// the same queue, so a read that follows a set sees it.
+    Mode {
+        generation: u64,
+        done: oneshot::Sender<Result<RuntimeMode, RuntimeError>>,
+    },
     WaitMcpReady {
         generation: u64,
         timeout: std::time::Duration,
@@ -2253,6 +2548,16 @@ pub enum CodingRuntimeControl {
     WithdrawMcpTools {
         generation: u64,
         done: oneshot::Sender<Result<(), RuntimeError>>,
+    },
+    ToolCatalog {
+        generation: u64,
+        done: oneshot::Sender<Result<Vec<atomcode_harness::seams::ToolListing>, RuntimeError>>,
+    },
+    SwitchTool {
+        generation: u64,
+        pattern: String,
+        on: bool,
+        done: oneshot::Sender<Result<Vec<atomcode_harness::seams::ToolListing>, RuntimeError>>,
     },
     QueueLocalContext {
         generation: u64,
@@ -2274,9 +2579,18 @@ pub enum CodingRuntimeControl {
         target: ReprepareTarget,
         done: oneshot::Sender<Result<SessionChanged, RuntimeError>>,
     },
+    /// What a capability row asks before it resolves one: the intervention
+    /// waiting now, or nothing.
+    PendingPolicyIntervention {
+        done: oneshot::Sender<Option<PolicyIntervention>>,
+    },
     ApplyUndo {
         generation: u64,
         expected_revision: u64,
+        /// The turn whose checkpoint the workspace was restored from, when the
+        /// same rewind took the workspace back too: recorded beside the
+        /// conversation's own fact (`docs/adr/0024` §17).
+        code_rewound_to: Option<u64>,
         original: Arc<SessionSnapshot>,
         truncated: SessionSnapshot,
         restored_prompt: String,
@@ -2287,6 +2601,33 @@ pub enum CodingRuntimeControl {
     RewindCatalog {
         generation: u64,
         done: oneshot::Sender<Result<RewindCatalog, RuntimeError>>,
+    },
+    /// Whether a goal or a loop is running, and how far it has got.
+    Autonomy {
+        generation: u64,
+        done: oneshot::Sender<Result<Autonomy, RuntimeError>>,
+    },
+    /// The account's remaining allowance, as rolling windows.
+    Usage {
+        generation: u64,
+        #[allow(clippy::type_complexity)]
+        done: oneshot::Sender<
+            Result<
+                (
+                    Vec<crate::rate_limit::RateLimitWindow>,
+                    Option<crate::rate_limit::Entitlement>,
+                    Option<crate::rate_limit::AccountUsage>,
+                ),
+                RuntimeError,
+            >,
+        >,
+    },
+    /// What this session has changed in the workspace. `file` asks for one
+    /// file's diff text instead of the summary of all of them.
+    WorkspaceChanges {
+        generation: u64,
+        file: Option<String>,
+        done: oneshot::Sender<Result<WorkspaceChanges, RuntimeError>>,
     },
     BeginRewind {
         generation: u64,
@@ -2351,7 +2692,6 @@ pub enum RewindFinalization {
 #[doc(hidden)]
 #[derive(Clone)]
 pub enum ReprepareTarget {
-    Exact(ReprepareInput),
     Reload {
         plugin_skill_dirs: Option<Vec<(std::path::PathBuf, String)>>,
     },
@@ -3117,17 +3457,20 @@ fn spawn_runtime_owner_with_optional_agent(
                     }
                     let mut finish_reason = None;
                     let mut continuation = None;
-                    // GoalResult::Met keeps the goal registered after the turn ends.
-                    // All other finish_reason paths (e.g. evaluator Error) must still clear it.
-                    let mut keep_goal_on_eval = false;
                     match outcome.result {
                         GoalResult::Met(verdict) => {
+                            // Met says it once — phase Satisfied, terminal Met, which is
+                            // what a screen draws as "已达成" — and then the goal is
+                            // CLOSED like every other terminal below. It does not linger
+                            // registered waiting to be re-engaged by the next thing a
+                            // person types: the badge is gone, so a loop that came back
+                            // on its own would be one nobody was told about. `/goal`
+                            // starts another.
                             if let Some(state) = goal.as_mut() {
                                 state.mark_satisfied(verdict);
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
                             }
                             finish_reason = Some(StopReason::Stopped);
-                            keep_goal_on_eval = true;
                         }
                         GoalResult::NotMet(verdict) => {
                             // A round that made ZERO tool calls did nothing but talk. When the
@@ -3200,12 +3543,9 @@ fn spawn_runtime_owner_with_optional_agent(
                     if let Some(reason) = finish_reason {
                         if let Some((turn_id, _held_reason, snapshot, stats)) = held_turn.take() {
                             active_turn = None;
-                            // GoalResult::Met keeps the goal registered (phase=Satisfied);
-                            // other finish_reason paths (e.g. evaluator Error) still clear
-                            // via keep_goal_on_eval=false.
-                            if !keep_goal_on_eval {
-                                goal = None;
-                            }
+                            // Every verdict that ends the goal closes it — Met included.
+                            // The GoalChanged above already said which terminal it was.
+                            goal = None;
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed { turn_id, reason, snapshot, stats }));
                             controls.state.store(runtime_phase_state(generation, RuntimePhase::Ready), Ordering::Release);
                         }
@@ -3380,91 +3720,34 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Busy));
                             continue;
                         }
-                        // A persistent goal (paused at its round cap, OR already
-                        // satisfied) re-engages on the next user message: resume it
-                        // into Pursuing so the follow-up advances the goal and the
-                        // badge shows `◎ <cond> · round 1` again rather than a stale
-                        // "已达成". Only `/goal clear` (or a superseding `/goal`, or an
-                        // error) removes it. Ended/Pursuing are untouched.
+                        // A goal that is NOT done takes the next message as the nudge
+                        // to go on: user-paused (`/goal` with no argument) or paused at
+                        // its round / time cap. It resumes into Pursuing, so the badge
+                        // shows `◎ <cond> · round 1` again, and the message it resumed
+                        // on is that round's prompt.
                         //
-                        // Reuse the budget already derived at goal-START time (stored
-                        // in state.max_rounds): the 5h rolling window can't meaningfully
-                        // change between keypresses, and the extra network round-trip
-                        // (~3 s) blocked the event loop.
-                        // Decide whether/how to re-engage a persistent goal on this
-                        // user message. PausedAtCap (not yet done) always continues its
-                        // original condition. For a Satisfied (done) goal, ask the model
-                        // whether the follow-up CONTINUES it, is a NEW goal, or is just
-                        // chit-chat (NotAGoal → don't re-engage). `decision`: None = leave
-                        // the goal as-is; Some(None) = resume keeping the condition;
-                        // Some(Some(text)) = resume RE-TASKED to the new message.
+                        // A goal that IS done does NOT come back. It was closed when the
+                        // evaluator said so (see the Met arm of the eval outcome) and the
+                        // badge went with it; starting an autonomous loop again is
+                        // `/goal`, which is one word and cannot be guessed wrong.
+                        //
+                        // Nothing here may wait on a model. This is the keypress path:
+                        // what a person typed reaches the agent now, not after a network
+                        // round-trip — the budget is the one derived at goal-START time
+                        // (`state.max_rounds`), and deciding "does this follow-up
+                        // continue the goal?" by asking a classifier here is what used to
+                        // sit on this loop for up to 4s with nothing on screen to say so.
                         let mut recovery_context = None;
-                        let reengage_decision: Option<Option<String>> = match goal
-                            .as_ref()
-                            .map(|state| state.phase)
-                        {
-                            // PausedAtCap intentionally resumes even on an empty submit:
-                            // it isn't done, so any nudge should let it keep going. The
-                            // Satisfied arm below deliberately does NOT — a done goal must
-                            // not be re-tasked by an empty message.
-                            Some(GoalPhase::Paused | GoalPhase::PausedAtCap) => Some(None),
-                            Some(GoalPhase::Satisfied) if input.text.trim().is_empty() => {
-                                // Fast-path: an empty / whitespace-only submit obviously
-                                // isn't a new goal — don't spend a classifier call (or
-                                // block the loop) on it; leave the goal Satisfied.
-                                None
-                            }
-                            Some(GoalPhase::Satisfied) => {
-                                let condition =
-                                    goal.as_ref().map(|s| s.condition.clone()).unwrap_or_default();
-                                let cancel = goal.as_ref().map(|s| s.cancel.clone());
-                                let provider = resources.as_ref().and_then(|runtime| {
-                                    let session_id = runtime
-                                        .parts
-                                        .session
-                                        .as_ref()
-                                        .map(|binding| binding.id.as_str());
-                                    build_goal_evaluator_provider(
-                                        &runtime.provider_factory,
-                                        &runtime.config,
-                                        session_id,
-                                    )
-                                    .ok()
-                                });
-                                match (provider, cancel) {
-                                    (Some(p), Some(c)) => {
-                                        // Awaited inline, so bound it tightly (the classify
-                                        // is a short reply); any timeout/failure resolves to
-                                        // Continuation so a hiccup never drops the goal.
-                                        let classified = tokio::time::timeout(
-                                            std::time::Duration::from_secs(4),
-                                            classify_followup(p, condition, input.text.clone(), c),
-                                        )
-                                        .await
-                                        .unwrap_or(FollowupClass::Continuation);
-                                        match classified {
-                                            FollowupClass::Continuation => Some(None),
-                                            FollowupClass::NewGoal => Some(Some(input.text.clone())),
-                                            FollowupClass::NotAGoal => None,
-                                        }
-                                    }
-                                    _ => Some(None),
-                                }
-                            }
-                            _ => None,
-                        };
-                        if let Some(new_condition) = reengage_decision {
+                        // PausedAtCap and Paused resume even on an empty submit: neither
+                        // is done, so any nudge should let it keep going.
+                        let reengage = matches!(
+                            goal.as_ref().map(|state| state.phase),
+                            Some(GoalPhase::Paused | GoalPhase::PausedAtCap)
+                        );
+                        if reengage {
                             if let Some(state) = goal.as_mut() {
                                 let was_user_paused = state.phase == GoalPhase::Paused;
-                                // Recovery context belongs only to continuing the same
-                                // goal. A substantive new condition is a retask and must
-                                // not inherit progress/tool output from the old goal.
-                                if new_condition.is_none() {
-                                    recovery_context = state.recovery_context();
-                                }
-                                if let Some(condition) = new_condition {
-                                    state.retask(condition);
-                                }
+                                recovery_context = state.recovery_context();
                                 if was_user_paused {
                                     state.resume_paused();
                                 } else {
@@ -3493,6 +3776,45 @@ fn spawn_runtime_owner_with_optional_agent(
                                     .update_from_user_text(&input.text);
                             }
                         }
+                        // A HELD turn is one the agent has already finished — the runtime
+                        // is keeping it open while a controller decides what comes next
+                        // (a goal round's evaluator). A person who types now is not
+                        // steering anything: there is no live turn at the agent to fold
+                        // into, so the message would open one of its own while this
+                        // runtime still claimed the old turn was live. Two things went
+                        // wrong from that: the driver was told `Steered` and then never
+                        // got the `Steered` event that closes a steering panel, and a
+                        // verdict arriving later finished the HELD turn while the agent
+                        // was busy with the person's new one — the screen went idle in
+                        // the middle of work.
+                        //
+                        // So a GOAL's hold ends here: the round is over, its terminal is
+                        // reported, and the message starts a fresh turn. The goal itself
+                        // is untouched and still Pursuing, so the END of that turn
+                        // evaluates and continues it exactly as any other round's would —
+                        // no round is lost. The evaluation now in flight resolves against
+                        // `held_turn.is_none()` and is dropped.
+                        //
+                        // A `/loop`'s hold is NOT ended: what resolves it is a timer, and
+                        // the loop's next round exists only as that pending wakeup —
+                        // dropping it would stop the loop rather than interrupt a round.
+                        // Its own receipt is handled below (no steer acknowledgement is
+                        // registered while a turn is held, because no `Steered` is coming).
+                        let goal_holds_the_turn = goal.as_ref().is_some_and(|state| state.active);
+                        if let Some((turn_id, held_reason, snapshot, stats)) =
+                            goal_holds_the_turn.then(|| held_turn.take()).flatten()
+                        {
+                            active_turn = None;
+                            terminal_reason = None;
+                            let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(
+                                TurnCompletion::Completed {
+                                    turn_id,
+                                    reason: held_reason,
+                                    snapshot,
+                                    stats,
+                                },
+                            ));
+                        }
                         let receipt = if let Some(turn_id) = active_turn {
                             SubmitReceipt::Steered { generation, turn_id }
                         } else {
@@ -3508,7 +3830,13 @@ fn spawn_runtime_owner_with_optional_agent(
                                 turn_id: next_turn_id,
                             }
                         };
-                        let original_steer_input = matches!(receipt, SubmitReceipt::Steered { .. })
+                        // A steer acknowledgement is only owed when the kernel will fold
+                        // this input into a live turn. With the turn HELD the agent has no
+                        // turn to fold into, so no `Steered` will ever arrive — and an
+                        // entry that can never match sits at the head of this FIFO and
+                        // blocks the acknowledgement of every later input behind it.
+                        let original_steer_input = (matches!(receipt, SubmitReceipt::Steered { .. })
+                            && held_turn.is_none())
                             .then(|| input.clone());
                         if !pending_local_context.is_empty() {
                             let prefix = pending_local_context.drain(..).collect::<Vec<_>>().join("\n\n");
@@ -3653,6 +3981,9 @@ fn spawn_runtime_owner_with_optional_agent(
                             }
                         }
                     }
+                    Some(CodingRuntimeControl::PendingPolicyIntervention { done }) => {
+                        let _ = done.send(pending_policy_intervention.clone());
+                    }
                     Some(CodingRuntimeControl::ResolvePolicyIntervention {
                         generation: request_generation,
                         intervention_id,
@@ -3734,9 +4065,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 generation: RuntimeGeneration(generation),
                                 revision: conversation_revision,
                                 points: Vec::new(),
-                                code_unavailable: Some(
-                                    "rewind requires a persistent session".into(),
-                                ),
+                                code_unavailable: Some(CodeUnavailable::NoSession),
                             }));
                             continue;
                         };
@@ -3748,8 +4077,108 @@ fn spawn_runtime_owner_with_optional_agent(
                             generation: RuntimeGeneration(generation),
                             revision: conversation_revision,
                             points: hook.rewind_points(),
-                            code_unavailable: hook.code_rewind_unavailable(),
+                            code_unavailable: hook.code_rewind_unavailable().map(Into::into),
                         }));
+                    }
+                    // The two controllers live as locals of this loop, which is
+                    // why this is a message rather than a field somebody reads:
+                    // a second copy of "is a goal running" is a second answer.
+                    Some(CodingRuntimeControl::Autonomy {
+                        generation: request_generation,
+                        done,
+                    }) => {
+                        if request_generation != generation {
+                            let _ = done.send(Err(RuntimeError::Busy));
+                            continue;
+                        }
+                        let _ = done.send(Ok(Autonomy {
+                            goal: goal.as_ref().map(|state| state.progress()),
+                            looping: loop_state.as_ref().map(|state| state.progress()),
+                        }));
+                    }
+                    // Bounded, and off the loop: the source is an HTTP call,
+                    // and this loop is what every turn goes through. Three
+                    // seconds is the same budget `resolve_goal_round_cap` gives
+                    // it — a person asking what is left waits no longer than a
+                    // goal starting does.
+                    Some(CodingRuntimeControl::Usage {
+                        generation: request_generation,
+                        done,
+                    }) => {
+                        if request_generation != generation {
+                            let _ = done.send(Err(RuntimeError::Busy));
+                            continue;
+                        }
+                        let source = resources
+                            .as_ref()
+                            .and_then(|runtime| runtime.parts.rate_limit_source().cloned());
+                        tokio::spawn(async move {
+                            let Some(source) = source else {
+                                let _ = done.send(Ok((Vec::new(), None, None)));
+                                return;
+                            };
+                            // Asked for together, not one after another: these
+                            // are three separate calls on the same account, and
+                            // a page that waited three times as long to show
+                            // one screen is a page that feels broken. One
+                            // budget each, but they run at once, so the page is
+                            // late by the slowest rather than by the sum.
+                            let budget = std::time::Duration::from_secs(3);
+                            let (windows, plan, spent) = tokio::join!(
+                                tokio::time::timeout(budget, source.fetch_windows()),
+                                tokio::time::timeout(budget, source.fetch_plan()),
+                                tokio::time::timeout(budget, source.fetch_usage()),
+                            );
+                            // Each answer stands or falls on its own: a plan
+                            // the service would not say is not a reason to draw
+                            // no windows.
+                            let windows = windows
+                                .ok()
+                                .and_then(|fetched| fetched.ok())
+                                .unwrap_or_default();
+                            let plan = plan.ok().and_then(|fetched| fetched.ok()).flatten();
+                            let spent = spent.ok().and_then(|fetched| fetched.ok()).flatten();
+                            let _ = done.send(Ok((windows, plan, spent)));
+                        });
+                    }
+                    // Reading only: unlike the rewind catalog this does not
+                    // refuse while a turn is running. Looking at what has
+                    // changed so far is exactly what a person does *while* the
+                    // model works, and nothing here writes.
+                    Some(CodingRuntimeControl::WorkspaceChanges {
+                        generation: request_generation,
+                        file,
+                        done,
+                    }) => {
+                        if request_generation != generation {
+                            let _ = done.send(Err(RuntimeError::Busy));
+                            continue;
+                        }
+                        let Some(runtime) = resources.as_ref() else {
+                            let _ = done.send(Err(RuntimeError::Unavailable));
+                            continue;
+                        };
+                        let Some(hook) = runtime.parts.snapshot_hook() else {
+                            let _ = done.send(Ok(WorkspaceChanges {
+                                unavailable: Some("这个会话不做工作区快照".into()),
+                                ..Default::default()
+                            }));
+                            continue;
+                        };
+                        let answer = match file {
+                            Some(path) => hook.file_diff(&path).map(|diff| WorkspaceChanges {
+                                diff: Some(diff),
+                                ..Default::default()
+                            }),
+                            None => hook.changes().map(|files| WorkspaceChanges {
+                                files,
+                                ..Default::default()
+                            }),
+                        };
+                        let _ = done.send(Ok(answer.unwrap_or_else(|why| WorkspaceChanges {
+                            unavailable: Some(why),
+                            ..Default::default()
+                        })));
                     }
                     Some(CodingRuntimeControl::BeginRewind {
                         generation: request_generation,
@@ -3951,6 +4380,20 @@ fn spawn_runtime_owner_with_optional_agent(
                             }
                         }
                         if !native_protocol || request_generation != generation || !agent_available {
+                            // Which of the three refused is the whole answer to
+                            // "esc did not stop the turn": a stale generation
+                            // means the runtime was rebuilt under the driver, and
+                            // `agent_available == false` means there is no agent
+                            // left to stop. Neither is a bug in the cancel path,
+                            // and without this line a report of the symptom
+                            // cannot be told apart from one that is.
+                            tracing::warn!(
+                                protocol = native_protocol,
+                                requested_generation = request_generation,
+                                current_generation = generation,
+                                agent_available,
+                                "a cancel was refused before it reached the agent"
+                            );
                             let _ = done.send(Err(RuntimeError::Unavailable));
                         } else if let Some((turn_id, _, snapshot, stats)) = held_turn.take() {
                             if let Some(mut state) = goal.take() {
@@ -4147,6 +4590,33 @@ fn spawn_runtime_owner_with_optional_agent(
                         let _ = runtime_event_tx.send(CodingRuntimeEvent::ModeChanged { mode });
                         let _ = done.send(Ok(()));
                     }
+                    Some(CodingRuntimeControl::Mode {
+                        generation: request_generation,
+                        done,
+                    }) => {
+                        let Some(runtime) = resources.as_ref() else {
+                            let _ = done.send(Err(RuntimeError::Unavailable));
+                            continue;
+                        };
+                        if request_generation != generation {
+                            let _ = done.send(Err(RuntimeError::Busy));
+                            continue;
+                        }
+                        // The flags, decoded — not a fourth field that would have
+                        // to be kept in step with them. Plan wins when two are set,
+                        // which cannot happen through `SetMode` (it writes all
+                        // three) but is the safe reading of a tree where it did.
+                        let mode = if runtime.parts.plan_mode.load(Ordering::Acquire) {
+                            RuntimeMode::Plan
+                        } else if runtime.parts.bypass_mode.load(Ordering::Acquire) {
+                            RuntimeMode::Auto
+                        } else if runtime.parts.accept_edits.load(Ordering::Acquire) {
+                            RuntimeMode::AcceptEdits
+                        } else {
+                            RuntimeMode::Build
+                        };
+                        let _ = done.send(Ok(mode));
+                    }
                     Some(CodingRuntimeControl::ContextStats {
                         generation: request_generation,
                         done,
@@ -4226,6 +4696,47 @@ fn spawn_runtime_owner_with_optional_agent(
                             generation: RuntimeGeneration(generation),
                             servers,
                         }));
+                    }
+                    Some(CodingRuntimeControl::ToolCatalog {
+                        generation: request_generation,
+                        done,
+                    }) => {
+                        if request_generation != generation {
+                            let _ = done.send(Err(RuntimeError::Busy));
+                            continue;
+                        }
+                        let listing = resources
+                            .as_ref()
+                            .and_then(|runtime| runtime.parts.tool_catalog())
+                            .map(|catalog| catalog.listing());
+                        // No catalog means no tree is mounted, which is not an
+                        // empty catalog: saying "no tools" would be a lie a
+                        // screen would render.
+                        let _ = done.send(listing.ok_or(RuntimeError::Unavailable));
+                    }
+                    Some(CodingRuntimeControl::SwitchTool {
+                        generation: request_generation,
+                        pattern,
+                        on,
+                        done,
+                    }) => {
+                        if request_generation != generation {
+                            let _ = done.send(Err(RuntimeError::Busy));
+                            continue;
+                        }
+                        let catalog = resources
+                            .as_ref()
+                            .and_then(|runtime| runtime.parts.tool_catalog());
+                        let Some(catalog) = catalog else {
+                            let _ = done.send(Err(RuntimeError::Unavailable));
+                            continue;
+                        };
+                        if on {
+                            catalog.turn_on(&pattern);
+                        } else {
+                            catalog.turn_off(&pattern);
+                        }
+                        let _ = done.send(Ok(catalog.listing()));
                     }
                     Some(CodingRuntimeControl::McpTools {
                         generation: request_generation,
@@ -4347,6 +4858,153 @@ fn spawn_runtime_owner_with_optional_agent(
                             }
                         };
 
+                        // On the harness, a `/model` switch is a patch, not a
+                        // rebuild.
+                        //
+                        // Everything below this branch — stop the agent, verify
+                        // its terminal, fail-close pending requests, reassemble,
+                        // restore the snapshot — exists because the CHAIN has to
+                        // replace one `AgentHandle` with another. Here the handle
+                        // does not change: the provider lives behind the `llm`
+                        // seam, `agent-loop` resolves that seam per turn, and
+                        // `App::patch` remounts only the row whose config moved.
+                        // Rows are sibling fibers under `ROOT_FIBER` and
+                        // `Fibers::unload` cascades to children rather than to
+                        // consumers, so `agent-loop` and `ui-handle` keep running
+                        // across it.
+                        //
+                        // What is NOT skipped is the contract with whoever asked.
+                        // A first attempt at this branch dropped all of it on the
+                        // theory that it belonged to the rebuild; the runtime's
+                        // own tests named every piece, one failure at a time:
+                        // the generation is the RECEIPT `reassemble_provider`
+                        // returns, `controls.state` is what `status()` reads, the
+                        // driver renders four events in order, and a sessionless
+                        // run still has a snapshot to keep.
+                        // `agent.is_some()` is load-bearing. A patch replaces
+                        // what is behind a seam; it cannot bring back an agent
+                        // that was torn down, and `ui-handle` hands its handle
+                        // out exactly once — so after a `DeactivateProvider`
+                        // (what `/logout` does) there is nothing to patch
+                        // underneath. Recovery from that has to rebuild, which
+                        // is the chain path below.
+                        //
+                        // Without this guard the runtime reported Ready after a
+                        // `/logout` → `/login` and then refused every turn with
+                        // `ProviderUnavailable`: the provider had been swapped
+                        // behind a seam nobody was reading.
+                        if agent.is_some() {
+                            if let (Some(app), Some(slots)) = (
+                                runtime.harness_app.as_mut(),
+                                runtime.harness_providers.clone(),
+                            ) {
+                                controls.state.store(
+                                    runtime_phase_state(
+                                        generation,
+                                        RuntimePhase::Reconfiguring,
+                                    ),
+                                    Ordering::Release,
+                                );
+                                let _ = runtime_event_tx.send(
+                                    CodingRuntimeEvent::Reconfiguring {
+                                        operation: ReconfigureKind::Provider,
+                                    },
+                                );
+                                let side_provider = candidate_provider.clone();
+                                if let Err(error) = crate::on_harness::swap_provider_for(
+                                    app,
+                                    slots.as_ref(),
+                                    candidate_provider,
+                                    &next.model,
+                                    Some(&next),
+                                )
+                                .await
+                                {
+                                    // The tree is unchanged on a failed patch, so
+                                    // the old provider is still behind the seam and
+                                    // the session carries on with the model it had.
+                                    controls.state.store(
+                                        runtime_phase_state(
+                                            generation,
+                                            RuntimePhase::Ready,
+                                        ),
+                                        Ordering::Release,
+                                    );
+                                    resources = Some(runtime);
+                                    let _ = done
+                                        .send(Err(RuntimeError::ReconfigureFailed(error)));
+                                    continue;
+                                }
+                                if let Some(config) = refresh_routing {
+                                    crate::provider_factory::refresh_subagent_tiers(
+                                        runtime.provider_factory.clone(),
+                                        &next,
+                                        config.as_ref(),
+                                    );
+                                }
+                                // The reviewer and the subagents follow the model.
+                                let _ = crate::parts::wire_side_providers(
+                                    &runtime.parts,
+                                    &next,
+                                    &side_provider,
+                                );
+                                // Turns from here on are billed to the new model.
+                                // The chain says the same thing from `assemble`,
+                                // which only runs once the swap has succeeded.
+                                if let Some(snapshot) = runtime.parts.snapshot_hook() {
+                                    snapshot.set_model_attribution(&next.provider_name, &next.model);
+                                }
+                                runtime.config = next;
+                                let provider = runtime.config.provider_name.clone();
+                                let model = runtime.config.model.clone();
+                                let reasoning_effort =
+                                    runtime.config.chat_options.reasoning_effort;
+                                let reasoning_effort_applicable =
+                                    runtime.config.supports_reasoning_effort;
+                                resources = Some(runtime);
+                                // A provider is available again. Needed for the
+                                // LOGIN half of `/logout` → `/login`: a plain
+                                // `/model` never leaves these unset, so the first
+                                // version of this branch did not touch them — and
+                                // a recovered runtime then reported Ready while
+                                // refusing every turn as `ProviderUnavailable`.
+                                agent_available = true;
+                                provider_unavailable_reason = None;
+                                controls
+                                    .provider_unavailable_reason
+                                    .store(0, Ordering::Release);
+                                generation = generation.wrapping_add(1);
+                                event_generation.store(generation, Ordering::Release);
+                                pending_steer_acknowledgements.clear();
+                                if active_turn.is_none() {
+                                    controls.state.store(
+                                        runtime_phase_state(generation, RuntimePhase::Ready),
+                                        Ordering::Release,
+                                    );
+                                }
+                                let _ = runtime_event_tx.send(
+                                    CodingRuntimeEvent::ProviderChanged {
+                                        provider: provider.clone(),
+                                        model,
+                                    },
+                                );
+                                let _ = runtime_event_tx.send(
+                                    CodingRuntimeEvent::ReasoningEffortChanged {
+                                        provider,
+                                        effort: reasoning_effort,
+                                        applicable: reasoning_effort_applicable,
+                                    },
+                                );
+                                let _ = runtime_event_tx.send(
+                                    CodingRuntimeEvent::Reconfigured {
+                                        operation: ReconfigureKind::Provider,
+                                    },
+                                );
+                                let _ = done.send(Ok(RuntimeGeneration(generation)));
+                                continue;
+                            }
+                        }
+
                         if let Some(task) = next_prompt_task.take() {
                             task.abort();
                         }
@@ -4438,7 +5096,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         preserve_sessionless_snapshot(&mut runtime, &stop_report);
 
                         let old_config = runtime.config.clone();
-                        match assemble(&mut runtime.parts, &next, candidate_provider) {
+                        match build_agent(&mut runtime, &next, candidate_provider).await {
                             Ok(candidate) => {
                                 if let Some(config) = refresh_routing {
                                     crate::provider_factory::refresh_subagent_tiers(
@@ -4448,7 +5106,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                     );
                                 }
                                 runtime.config = next;
-                                agent = Some(candidate.spawn());
+                                agent = Some(candidate);
                                 generation = generation.wrapping_add(1);
                                 event_generation.store(generation, Ordering::Release);
                                 pending_steer_acknowledgements.clear();
@@ -4509,10 +5167,12 @@ fn spawn_runtime_owner_with_optional_agent(
                             }
                             Err(candidate_error) => {
                                 runtime.config = old_config;
-                                match had_active_agent
-                                    .then(|| assemble_runtime_resources(&mut runtime))
-                                    .transpose()
-                                {
+                                let rollback = if had_active_agent {
+                                    Some(assemble_runtime_resources(&mut runtime).await)
+                                } else {
+                                    None
+                                };
+                                match rollback.transpose() {
                                     Ok(None) => {
                                         agent = None;
                                         agent_available = false;
@@ -4620,6 +5280,156 @@ fn spawn_runtime_owner_with_optional_agent(
                             &mut pending_requests,
                             active_turn.is_some(),
                         );
+                        // On the harness, a logout takes the CREDENTIALS out of
+                        // the tree and leaves the agent where it is.
+                        //
+                        // The chain has to stop the agent because the provider is
+                        // baked into the assembled chain; here it lives behind a
+                        // seam, so revoking it is swapping what is behind that
+                        // seam for something holding nothing. The session, its
+                        // conversation and its handle all survive, which is what
+                        // lets the LOGIN afterwards be another swap rather than a
+                        // rebuild — and therefore what keeps a `/logout` →
+                        // `/login` from quietly moving the session back onto the
+                        // chain for the rest of its life.
+                        let harness_logout = agent.is_some()
+                            && resources
+                                .as_ref()
+                                .is_some_and(|r| r.harness_providers.is_some());
+                        if harness_logout {
+                            let stop_report = {
+                                let live = agent.as_mut().expect("checked above");
+                                quiesce_current_agent(
+                                    live,
+                                    &mut compactions,
+                                    &mut observed_tokens,
+                                    &runtime_event_tx,
+                                    CompactionInterruption::RuntimeReconfigured,
+                                    resources
+                                        .as_ref()
+                                        .map(|runtime| &runtime.parts.team_manager),
+                                    resources.as_ref().and_then(|runtime| {
+                                        runtime.parts.snapshot_persistence_status()
+                                    }),
+                                )
+                                .await
+                            };
+                            if let Some(runtime) = resources.as_mut() {
+                                if let (Some(app), Some(slots)) = (
+                                    runtime.harness_app.as_mut(),
+                                    runtime.harness_providers.clone(),
+                                ) {
+                                    if let Err(error) =
+                                        crate::on_harness::deactivate_provider(app, slots.as_ref())
+                                            .await
+                                    {
+                                        // The tree is unchanged on a failed patch,
+                                        // so the credentials are still in it. Say
+                                        // so rather than reporting a logout that
+                                        // did not happen.
+                                        //
+                                        // The TURN, though, is already over: the
+                                        // quiesce above cancelled it and consumed
+                                        // its `TurnComplete` into `stop_report`,
+                                        // so nothing else will ever end it. Ending
+                                        // it here is not bookkeeping — leaving
+                                        // `active_turn` set while announcing
+                                        // `Ready` makes the next `Submit` a STEER
+                                        // (see the `SubmitReceipt::Steered` branch)
+                                        // into a turn that no longer exists, and
+                                        // the person's message goes nowhere with a
+                                        // spinner that never stops.
+                                        finish_stopped_native_turn(
+                                            &stop_report,
+                                            resources.as_ref(),
+                                            &mut active_turn,
+                                            &mut terminal_reason,
+                                            &mut turn_stats,
+                                            &mut conversation_revision,
+                                            &mut snapshot_waiters,
+                                            &runtime_event_tx,
+                                        );
+                                        controls.state.store(
+                                            runtime_phase_state(
+                                                generation,
+                                                RuntimePhase::Ready,
+                                            ),
+                                            Ordering::Release,
+                                        );
+                                        let _ = done
+                                            .send(Err(RuntimeError::ReconfigureFailed(error)));
+                                        continue;
+                                    }
+                                }
+                                // The reviewer's and the subagents' slots held the
+                                // same credentials; they leave with the seam's.
+                                let _ = crate::parts::wire_side_providers(
+                                    &runtime.parts,
+                                    &runtime.config,
+                                    &crate::on_harness::signed_out_provider(),
+                                );
+                                preserve_sessionless_snapshot(runtime, &stop_report);
+                                if let Some(provider) =
+                                    runtime.config.subagent_fast_provider.as_ref()
+                                {
+                                    provider.reset(Arc::new(|| None));
+                                }
+                                if let Some(provider) =
+                                    runtime.config.subagent_capable_provider.as_ref()
+                                {
+                                    provider.reset(Arc::new(|| None));
+                                }
+                            }
+                            finish_stopped_native_turn(
+                                &stop_report,
+                                resources.as_ref(),
+                                &mut active_turn,
+                                &mut terminal_reason,
+                                &mut turn_stats,
+                                &mut conversation_revision,
+                                &mut snapshot_waiters,
+                                &runtime_event_tx,
+                            );
+                            generation = generation.wrapping_add(1);
+                            event_generation.store(generation, Ordering::Release);
+                            pending_steer_acknowledgements.clear();
+                            agent_available = false;
+                            provider_unavailable_reason = Some(reason);
+                            controls.provider_unavailable_reason.store(
+                                encode_provider_unavailable_reason(Some(reason)),
+                                Ordering::Release,
+                            );
+                            observed_tokens = None;
+                            snapshot_in_flight = false;
+                            controls.state.store(
+                                runtime_phase_state(
+                                    generation,
+                                    RuntimePhase::AwaitingProvider,
+                                ),
+                                Ordering::Release,
+                            );
+                            if let Some(intervention) = pending_policy_intervention.take() {
+                                let _ = runtime_event_tx.send(
+                                    CodingRuntimeEvent::PolicyInterventionCleared {
+                                        intervention_id: intervention.id,
+                                    },
+                                );
+                            }
+                            // `ProviderUnavailable`, not `Reconfigured`: a logout
+                            // is not a reconfiguration that landed, it is a
+                            // capability going away, and the driver renders the
+                            // two differently. `forced` is false because nothing
+                            // was forced — the agent was asked to stop its turn
+                            // and it is still there.
+                            let _ = runtime_event_tx.send(
+                                CodingRuntimeEvent::ProviderUnavailable {
+                                    reason,
+                                    forced: stop_report.forced,
+                                },
+                            );
+                            let _ = done.send(Ok(RuntimeGeneration(generation)));
+                            continue;
+                        }
                         let stop_report = stop_current_agent(
                             &mut agent,
                             &mut compactions,
@@ -4665,6 +5475,33 @@ fn spawn_runtime_owner_with_optional_agent(
                         }
                         if let Some(runtime) = resources.as_mut() {
                             preserve_sessionless_snapshot(runtime, &stop_report);
+                            // The reviewer's and the subagents' slots live on
+                            // `parts` and survive a rebuild on purpose, so losing
+                            // the agent does NOT empty them. A logout taken here
+                            // — which is the state expired credentials leave a
+                            // person in, and therefore the common one — has to
+                            // take the credentials out of them by hand, exactly
+                            // as the branch with a live agent does.
+                            let _ = crate::parts::wire_side_providers(
+                                &runtime.parts,
+                                &runtime.config,
+                                &crate::on_harness::signed_out_provider(),
+                            );
+                            // A tree can outlive the agent: an assemble that fails
+                            // after `mount` leaves the old one in `harness_app`,
+                            // and its `llm` row is still holding the provider it
+                            // captured. Nothing will drive it again, but "nothing
+                            // drives it" is not "the credentials are gone".
+                            if let (Some(app), Some(slots)) = (
+                                runtime.harness_app.as_mut(),
+                                runtime.harness_providers.clone(),
+                            ) {
+                                let _ = crate::on_harness::deactivate_provider(
+                                    app,
+                                    slots.as_ref(),
+                                )
+                                .await;
+                            }
                             if let Some(provider) = runtime.config.subagent_fast_provider.as_ref() {
                                 provider.reset(Arc::new(|| None));
                             }
@@ -4715,6 +5552,41 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;
                         };
+                        // A reload with nothing to reconnect is a re-read, not
+                        // a rebuild (`docs/adr/0022` §2): the skills on disk go
+                        // into the registry the live tree already serves, and
+                        // the catalog the model is told about is re-contributed
+                        // under the same id. Reconnecting is what a rebuild is
+                        // for, so a session with MCP servers still takes that
+                        // route — and so does one mid-turn, which has a request
+                        // in flight against the prompt this would change.
+                        if matches!(
+                            &target,
+                            ReprepareTarget::Reload {
+                                plugin_skill_dirs: None
+                            }
+                        ) && active_turn.is_none()
+                            && !compactions.is_active()
+                            && live_root_agent(&runtime).is_some()
+                            && runtime.parts.mcp_statuses().await.is_empty()
+                        {
+                            if reload_skills_live(&runtime).is_ok() {
+                                let _ = runtime_event_tx.send(
+                                    CodingRuntimeEvent::Reconfiguring {
+                                        operation: ReconfigureKind::Reprepare,
+                                    },
+                                );
+                                let unchanged = session_changed(generation, &runtime);
+                                resources = Some(runtime);
+                                let _ = runtime_event_tx.send(
+                                    CodingRuntimeEvent::Reconfigured {
+                                        operation: ReconfigureKind::Reprepare,
+                                    },
+                                );
+                                let _ = done.send(Ok(unchanged));
+                                continue;
+                            }
+                        }
                         let withdraws_mcp = matches!(
                             &target,
                             ReprepareTarget::Reload { .. } | ReprepareTarget::ReloadConfig(_)
@@ -4811,18 +5683,28 @@ fn spawn_runtime_owner_with_optional_agent(
                             None => prepare_candidate.await.map_err(runtime_prepare_error),
                         };
                         let mut candidate = match candidate_parts {
-                            Ok(parts) => RuntimeResources {
+                            Ok(mut parts) => {
+                                // The person's tool switches are theirs, not this
+                                // tree's: a reprepare must not put back what they
+                                // turned off (`CodingParts::tool_switches`).
+                                parts.adopt_tool_switches(runtime.parts.tool_switches());
+                                RuntimeResources {
                                 config: input.config,
                                 prepare: input.prepare,
                                 provider_factory: runtime.provider_factory.clone(),
                                 plugin_hooks: runtime.plugin_hooks.clone(),
                                 parts,
+                                // Filled by `assemble_runtime_resources` below,
+                                // on whichever engine this runtime runs.
+                                harness_providers: None,
+                                harness_app: None,
                                 wakeup_tx: runtime.wakeup_tx.clone(),
                                 loop_active: Arc::clone(&runtime.loop_active),
                                 // Preserve the injected VL hook across reprepare
                                 // (/model swap, reconfigure).
                                 image_preprocessor: runtime.image_preprocessor.clone(),
-                            },
+                                }
+                            }
                             Err(error) => {
                                 controls.state.store(
                                     runtime_phase_state(generation, previous_phase),
@@ -4855,7 +5737,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         // current agent. A failed fresh/resume/cd transition must leave the
                         // previous runtime executable; rebuilding it as a rollback can fail for
                         // reasons (notably authentication) unrelated to the accepted operation.
-                        let replacement = match assemble_runtime_resources(&mut candidate) {
+                        let replacement = match assemble_runtime_resources(&mut candidate).await {
                             Ok(replacement) => replacement,
                             Err(candidate_error) => {
                                 let cleanup_error =
@@ -4989,6 +5871,15 @@ fn spawn_runtime_owner_with_optional_agent(
                             .set_event_sender(team_event_tx.clone());
                         runtime.parts.team_manager.begin_generation(generation);
                         agent_available = true;
+                        // The rebuild is what a reason stands for: whatever made
+                        // the provider unavailable (NotConfigured included — an
+                        // onboarding login reloads with a configuration that now
+                        // names one) was addressed by building this one, so a
+                        // readiness read after the reprepare must say so.
+                        provider_unavailable_reason = None;
+                        controls
+                            .provider_unavailable_reason
+                            .store(0, Ordering::Release);
                         observed_tokens = None;
                         snapshot_in_flight = false;
                         compaction_suspended = false;
@@ -5027,6 +5918,7 @@ fn spawn_runtime_owner_with_optional_agent(
                     Some(CodingRuntimeControl::ApplyUndo {
                         generation: request_generation,
                         expected_revision,
+                        code_rewound_to,
                         original,
                         truncated,
                         restored_prompt,
@@ -5050,10 +5942,16 @@ fn spawn_runtime_owner_with_optional_agent(
                         if let Some(task) = next_prompt_task.take() {
                             task.abort();
                         }
+                        // With the agent live, the undo is facts in its log and
+                        // nothing is rebuilt (`docs/adr/0022` §2) — as long as
+                        // the log can say the change; see `live_can_say`.
+                        let live = live_root_agent(&runtime)
+                            .filter(|live| live_can_say(live, &truncated.messages));
                         let undo_sidecars = match persist_runtime_undo(
                             &mut runtime,
                             Some(original.as_ref()),
                             &truncated,
+                            live.as_ref(),
                         ) {
                             Ok(sidecars) => sidecars,
                             Err(error) => {
@@ -5105,6 +6003,35 @@ fn spawn_runtime_owner_with_optional_agent(
                         let _ = runtime_event_tx.send(CodingRuntimeEvent::Reconfiguring {
                             operation: ReconfigureKind::Undo,
                         });
+                        if let Some(agent) = live.as_ref() {
+                            let _ = undo_sidecars;
+                            if let Some(turn) = code_rewound_to {
+                                record_code_rewind(agent, turn);
+                            }
+                            generation = generation.wrapping_add(1);
+                            event_generation.store(generation, Ordering::Release);
+                            pending_steer_acknowledgements.clear();
+                            runtime.parts.team_manager.begin_generation(generation);
+                            observed_tokens = None;
+                            conversation_revision = conversation_revision.wrapping_add(1);
+                            let snapshot = Arc::new(truncated);
+                            resources = Some(runtime);
+                            controls.state.store(
+                                runtime_phase_state(generation, RuntimePhase::Ready),
+                                Ordering::Release,
+                            );
+                            let _ = runtime_event_tx.send(CodingRuntimeEvent::Reconfigured {
+                                operation: ReconfigureKind::Undo,
+                            });
+                            let _ = done.send(Ok(UndoResult {
+                                generation: RuntimeGeneration(generation),
+                                snapshot,
+                                restored_prompt,
+                                target_n,
+                                prompts_before,
+                            }));
+                            continue;
+                        }
                         let stop_report = stop_current_agent(
                             &mut agent,
                             &mut compactions,
@@ -5137,7 +6064,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(error));
                             continue;
                         }
-                        match assemble_runtime_resources(&mut runtime) {
+                        match assemble_runtime_resources(&mut runtime).await {
                             Ok(replacement) => {
                                 agent = Some(replacement);
                                 generation = generation.wrapping_add(1);
@@ -5195,7 +6122,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                         },
                                     ));
                                 } else {
-                                    match assemble_runtime_resources(&mut runtime) {
+                                    match assemble_runtime_resources(&mut runtime).await {
                                         Ok(rollback) => {
                                             agent = Some(rollback);
                                             agent_available = true;
@@ -5263,6 +6190,76 @@ fn spawn_runtime_owner_with_optional_agent(
                         let _ = runtime_event_tx.send(CodingRuntimeEvent::Reconfiguring {
                             operation: ReconfigureKind::RestoreSession,
                         });
+                        // Between turns, with the agent live, a restore is facts
+                        // in its log like an undo, and nothing is rebuilt.
+                        let live = (active_turn.is_none() && !compactions.is_active())
+                            .then(|| live_root_agent(&runtime))
+                            .flatten()
+                            .filter(|live| live_can_say(live, &snapshot.messages));
+                        if let Some(live) = live {
+                            let original = current_runtime_snapshot(&runtime)
+                                .or_else(|| runtime.parts.runtime_resume_snapshot());
+                            match persist_runtime_undo(
+                                &mut runtime,
+                                original.as_ref(),
+                                &snapshot,
+                                Some(&live),
+                            ) {
+                                Ok(_) => {
+                                    generation = generation.wrapping_add(1);
+                                    event_generation.store(generation, Ordering::Release);
+                                    pending_steer_acknowledgements.clear();
+                                    runtime.parts.team_manager.begin_generation(generation);
+                                    observed_tokens = None;
+                                    conversation_revision = conversation_revision.wrapping_add(1);
+                                    let changed = session_changed(generation, &runtime);
+                                    resources = Some(runtime);
+                                    controls.state.store(
+                                        runtime_phase_state(generation, RuntimePhase::Ready),
+                                        Ordering::Release,
+                                    );
+                                    let _ = runtime_event_tx.send(
+                                        CodingRuntimeEvent::SessionChanged(changed.clone()),
+                                    );
+                                    if let Some(intervention) = pending_policy_intervention.take()
+                                    {
+                                        let _ = runtime_event_tx.send(
+                                            CodingRuntimeEvent::PolicyInterventionCleared {
+                                                intervention_id: intervention.id,
+                                            },
+                                        );
+                                    }
+                                    let _ = runtime_event_tx.send(
+                                        CodingRuntimeEvent::Reconfigured {
+                                            operation: ReconfigureKind::RestoreSession,
+                                        },
+                                    );
+                                    let _ = done.send(Ok(changed));
+                                }
+                                Err(error) => {
+                                    if error.requires_fail_close() {
+                                        persistence_failure = Some(error.to_string());
+                                        let _ = send_agent_command(&agent, AgentCommand::Shutdown);
+                                        agent = None;
+                                        agent_available = false;
+                                        controls.state.store(
+                                            runtime_phase_state(generation, RuntimePhase::Failed),
+                                            Ordering::Release,
+                                        );
+                                    } else {
+                                        controls.state.store(
+                                            runtime_phase_state(generation, RuntimePhase::Ready),
+                                            Ordering::Release,
+                                        );
+                                    }
+                                    resources = Some(runtime);
+                                    let _ = done.send(Err(RuntimeError::ReconfigureFailed(
+                                        error.to_string(),
+                                    )));
+                                }
+                            }
+                            continue;
+                        }
                         fail_close_pending_requests(
                             &agent,
                             &mut pending_requests,
@@ -5318,9 +6315,11 @@ fn spawn_runtime_owner_with_optional_agent(
                             &mut runtime,
                             original.as_ref(),
                             &snapshot,
+                            None,
                         );
                         let candidate = match persisted.as_ref() {
                             Ok(_) => assemble_runtime_resources(&mut runtime)
+                                .await
                                 .map_err(NativePersistenceError::certain),
                             Err(error) => Err(error.clone()),
                         };
@@ -5395,7 +6394,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                         },
                                     ));
                                 } else {
-                                    match assemble_runtime_resources(&mut runtime) {
+                                    match assemble_runtime_resources(&mut runtime).await {
                                         Ok(rollback) => {
                                             agent = Some(rollback);
                                             agent_available = true;
@@ -5872,7 +6871,10 @@ fn spawn_runtime_owner_with_optional_agent(
                                     },
                                 ));
                             }
-                            AgentEvent::TurnComplete { reason } => {
+                            AgentEvent::TurnComplete { reason, .. } => {
+                                // The tree carries the real cause; this protocol's
+                                // drivers match on the folded set.
+                                let reason = reason.folded_for_runtime_drivers();
                                 pending_steer_acknowledgements.clear();
                                 let persistence_status = resources.as_ref().and_then(|runtime| {
                                     runtime.parts.snapshot_persistence_status()
@@ -6350,7 +7352,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                     );
                                 }
                             }
-                            AgentEvent::TurnStarted => {
+                            AgentEvent::TurnStarted { .. } => {
                                 if let Some(intervention) = pending_policy_intervention.take() {
                                     let _ = runtime_event_tx.send(
                                         CodingRuntimeEvent::PolicyInterventionCleared {
@@ -6364,7 +7366,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                     Ordering::Release,
                                 );
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::Agent(
-                                    AgentEvent::TurnStarted,
+                                    AgentEvent::TurnStarted { turn: None },
                                 ));
                             }
                             event @ AgentEvent::ToolStarted { .. } => {
@@ -6372,14 +7374,14 @@ fn spawn_runtime_owner_with_optional_agent(
                                     turn_stats.tool_call_count.saturating_add(1);
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::Agent(event));
                             }
-                            AgentEvent::Steered { count, inputs } => {
+                            AgentEvent::Steered { count, inputs, .. } => {
                                 let acknowledged = acknowledge_steered_inputs(
                                     &mut pending_steer_acknowledgements,
                                     generation,
                                     &inputs,
                                 );
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::Agent(
-                                    AgentEvent::Steered { count, inputs },
+                                    AgentEvent::Steered { turn: None, count, inputs },
                                 ));
                                 if !acknowledged.is_empty() {
                                     let _ = runtime_event_tx.send(
@@ -6565,7 +7567,18 @@ fn reject_runtime_control(
         CodingRuntimeControl::Shutdown { .. } => {}
         // Fire-and-forget self-send with no waiter: nothing to fail-close.
         CodingRuntimeControl::AdjustGoalRounds { .. } => {}
+        // A question, not a change: a stopping runtime has nothing pending, and
+        // dropping the sender says so to a caller that is asking anyway.
+        CodingRuntimeControl::PendingPolicyIntervention { done } => {
+            let _ = done.send(None);
+        }
         CodingRuntimeControl::Submit { done, .. } => {
+            let _ = done.send(Err(RuntimeError::Unavailable));
+        }
+        // A stopping runtime has no catalog to describe or switch. Fail-closed
+        // like every other awaited control.
+        CodingRuntimeControl::ToolCatalog { done, .. }
+        | CodingRuntimeControl::SwitchTool { done, .. } => {
             let _ = done.send(Err(RuntimeError::Unavailable));
         }
         CodingRuntimeControl::Respond { done, .. }
@@ -6581,6 +7594,11 @@ fn reject_runtime_control(
             let _ = done.send(Err(RuntimeError::Unavailable));
         }
         CodingRuntimeControl::ContextStats { done, .. } => {
+            let _ = done.send(Err(RuntimeError::Unavailable));
+        }
+        // A stopping runtime cannot say which mode it is in either — the flags
+        // belong to a tree that is being torn down.
+        CodingRuntimeControl::Mode { done, .. } => {
             let _ = done.send(Err(RuntimeError::Unavailable));
         }
         CodingRuntimeControl::McpStatus { done, .. } => {
@@ -6603,6 +7621,15 @@ fn reject_runtime_control(
             let _ = done.send(Err(RuntimeError::Unavailable));
         }
         CodingRuntimeControl::RewindCatalog { done, .. } => {
+            let _ = done.send(Err(RuntimeError::Unavailable));
+        }
+        CodingRuntimeControl::WorkspaceChanges { done, .. } => {
+            let _ = done.send(Err(RuntimeError::Unavailable));
+        }
+        CodingRuntimeControl::Autonomy { done, .. } => {
+            let _ = done.send(Err(RuntimeError::Unavailable));
+        }
+        CodingRuntimeControl::Usage { done, .. } => {
             let _ = done.send(Err(RuntimeError::Unavailable));
         }
         CodingRuntimeControl::BeginRewind { done, .. } => {
@@ -6815,7 +7842,6 @@ fn resolve_reprepare_input(
     RuntimeError,
 > {
     match target {
-        ReprepareTarget::Exact(input) => Ok(Some((input, None, None))),
         ReprepareTarget::Reload { plugin_skill_dirs } => {
             let mut prepare = runtime.prepare.clone();
             if let Some(plugin_skill_dirs) = plugin_skill_dirs {
@@ -7065,7 +8091,464 @@ fn build_goal_evaluator_provider(
     factory.build(host, session_id)
 }
 
-fn assemble_runtime_resources(runtime: &mut RuntimeResources) -> Result<AgentHandle, String> {
+/// What a tree needs from the runtime's own state to continue this session.
+///
+/// The same two sources the chain's `assemble` reads: a session-bound runtime
+/// reloads the canonical native aggregate (absent only for a fresh session not
+/// yet published), and a sessionless one continues from the snapshot the
+/// runtime kept in memory.
+fn harness_host_state(
+    parts: &crate::CodingParts,
+    config: &CodingAgentConfig,
+    prepare: &PrepareOptions,
+) -> Result<crate::on_harness::HostState, std::io::Error> {
+    // The system prompt's context block as the session started with it.
+    let (session, stored_prompt) = match &parts.session {
+        Some(binding) => {
+            // A fresh session that has not been published yet has nothing on
+            // disk, and that is the ONE reason its log may be missing here. Any
+            // other absence is half a session, and continuing on half a session
+            // hands the model a conversation the store cannot explain — the
+            // person's history, silently gone.
+            let (resume, context) = match binding.staged_header() {
+                Some(header) => (false, header.context.clone()),
+                None => (
+                    true,
+                    binding
+                        .manager
+                        .read_event_header(&binding.id)
+                        .map_err(std::io::Error::from)?
+                        .context,
+                ),
+            };
+            (
+                crate::host_rows::SessionSeed {
+                    id: Some(binding.id.clone()),
+                    snapshot: None,
+                    stored: Some(crate::session_store::StoredSession {
+                        store: binding.manager.clone(),
+                        lease: binding.lease.clone(),
+                        status: parts.snapshot_persistence_status(),
+                    }),
+                    resume,
+                },
+                context,
+            )
+        }
+        None => {
+            let snapshot = parts.runtime_resume_snapshot();
+            let prompt = snapshot
+                .as_ref()
+                .and_then(atomcode_capabilities::session::events::stored_prompt);
+            (
+                crate::host_rows::SessionSeed {
+                    id: None,
+                    snapshot,
+                    stored: None,
+                    resume: false,
+                },
+                prompt,
+            )
+        }
+    };
+    let session_id = parts.session.as_ref().map(|binding| binding.id.as_str());
+
+    // Everything the chain's `prepare` + `assemble` hang on the kernel agent that
+    // the rows do not already carry, as the same objects.
+    let hooks = crate::host_rows::HostHooks::new();
+    // The current-date tail: a per-turn `<system-reminder>` carrying today's date, appended
+    // AFTER the cached prefix. It is the SOLE date source — the persona no longer bakes a
+    // wall-clock date into the system prompt, because a date at the FRONT of the request
+    // re-prefills the whole cached prefix once per day (the `project_system_prompt_date`
+    // cache-poison bug). Unconditional: every session needs the model to know the date.
+    hooks.insert(
+        "status-reminder",
+        Arc::new(atomcode_capabilities::session::StatusReminderHook::new()),
+    );
+    if let Some(snapshot) = parts.snapshot_hook() {
+        hooks.insert("native-snapshot", snapshot);
+    }
+    let mcp = parts.mcp_publication();
+    if let Some(publication) = &mcp {
+        // Server-scoped instructions for the MCP tools currently mounted, as an
+        // ephemeral request tail — the chain's projection, the same object.
+        hooks.insert(
+            "mcp-instructions",
+            Arc::new(crate::mcp_instructions::McpInstructionsHook::new(
+                Arc::clone(&publication.registry),
+                Arc::clone(&publication.tool_names),
+            )),
+        );
+    }
+    let middleware = crate::host_rows::HostMiddleware::new();
+    if let Some(telemetry) = &config.telemetry {
+        // One per mounted tree, shared by the two adapters: the hook is the only
+        // one the kernel tells where it is, and the tool middleware reads it
+        // from here (`telemetry::Position`).
+        let position = Arc::new(crate::telemetry::Position::default());
+        hooks.insert(
+            "telemetry",
+            Arc::new(crate::telemetry::TelemetryHook::new(
+                telemetry.clone(),
+                config.provider_type.as_str(),
+                &config.base_url,
+                &config.model,
+                session_id,
+                Arc::clone(&position),
+            )),
+        );
+        middleware.insert(
+            "tool-telemetry",
+            Arc::new(crate::telemetry::ToolTelemetryMiddleware::new(
+                telemetry.clone(),
+                config.provider_type.as_str(),
+                &config.base_url,
+                &config.model,
+                session_id,
+                position,
+            )),
+        );
+    }
+    if parts.todo_enabled() {
+        hooks.insert(
+            "todo-eager",
+            Arc::new(crate::todo::TodoEagerHook::new(
+                &config.model,
+                &config.provider_type,
+                config.todo.eager,
+            )),
+        );
+        // The list itself, and the three things the `todo-reminder` row is not:
+        // the anchor + list on EVERY round (the mid-work drift backstop), the
+        // one-shot nudge when the model stops with items still open, and the
+        // `<id>.todos.json` sidecar that lets a compacted session still show its
+        // plan (issue #1503 — the transcript's `todowrite` calls are gone by
+        // then, and vscode's fallback derives from exactly those).
+        //
+        // `todo-reminder` is an observer: it commits a staleness note that rides
+        // the NEXT request. It never continues a turn, so it cannot stand in for
+        // `offer_continuation`, and it never writes the sidecar.
+        hooks.insert(
+            "todo",
+            Arc::new(crate::todo::TodoHook::new(config.working_dir.clone())),
+        );
+    }
+    // The person's `[permissions]` rules decide among the gates, and WHERE they
+    // decide is the whole contract: after every hard boundary, before the
+    // convenience gates and the approval prompt. The `permissions` row states
+    // that position (`CODING_ROWS`), so this only fills it in — no `prepend`,
+    // which would hoist the gate ahead of the boundaries, and
+    // `insert_mounted_by_row` so the middleware table does not ALSO append an
+    // innermost copy. Criteria: `a_permission_allow_rule_cannot_unlock_the_credential_boundary`
+    // and `a_permission_allow_rule_still_skips_the_prompt_it_covers` fail in
+    // opposite directions if this moves either way.
+    let permission_rows = if config.permission_rules.is_empty() {
+        atomcode_plexus::Layer::new()
+    } else {
+        middleware.insert_mounted_by_row(
+            "permission-rules",
+            Arc::new(atomcode_capabilities::tools::PermissionRuleGate::new(
+                config.permission_rules.clone(),
+                parts.shared_cwd.clone(),
+            )),
+        );
+        atomcode_plexus::Layer::new()
+            .swap("permissions", "kernel-middleware")
+            .patch(
+                "permissions",
+                KernelMiddlewarePatch {
+                    middleware: "permission-rules",
+                    prepend: true,
+                },
+            )
+            .map_err(|e| std::io::Error::other(e.to_string()))?
+    };
+    #[cfg(feature = "atomgit")]
+    middleware.insert(
+        "git-push-label",
+        Arc::new(atomcode_capabilities::tools::GitPushLabelMiddleware::new(
+            config.working_dir.clone(),
+        )),
+    );
+    Ok(crate::on_harness::HostState {
+        // None: this runtime mounts the product's own rows and nothing else.
+        // The field is for a host outside this workspace that brings its own.
+        plugins: Vec::new(),
+        session_context: Some(crate::on_harness::HostContext {
+            hook: Arc::new(atomcode_capabilities::session::SessionContextHook::new(
+                &config.working_dir,
+            )),
+            stored: stored_prompt,
+        }),
+        session,
+        hooks: Some(hooks),
+        middleware: Some(middleware),
+        cc_hooks: parts.cc_external_hooks.clone(),
+        tools: parts
+            .extra_tools()
+            .into_iter()
+            .chain(parts.host_only_tools())
+            .collect(),
+        skills: parts.skill_registry(),
+        runtime_commands: parts.runtime_commands.clone(),
+        tool_switches: Some(parts.tool_switches()),
+        tool_catalog_slot: parts.tool_catalog_slot(),
+        mcp,
+        // Both halves or neither: the events only exist when this assembly has
+        // MCP, and `prepare` only started the fan-out when there was a sink.
+        mcp_telemetry: parts.mcp_connect_meter().zip(config.telemetry.clone()).map(
+            |(events, telemetry)| crate::host_rows::McpConnectMeter {
+                events,
+                meter: crate::telemetry::McpTelemetry::new(telemetry, config.working_dir.clone()),
+            },
+        ),
+        rate_limit_source: parts.rate_limit_source().cloned(),
+        front_end: prepare.front_end.clone(),
+        delegated_llm: parts.delegated_provider(),
+        team_events: parts.subagent_knobs().map(|_| {
+            let manager = parts.team_manager.clone();
+            Arc::new(move |event| manager.publish_external(event)) as crate::team_progress::TeamSink
+        }),
+        compaction_checkpoint: parts.snapshot_hook(),
+        summary_provider: Some(parts.side_provider_slot()),
+        model: Some(config.model.clone()),
+        // `from_config` is the one constructor that carries the parsed file along;
+        // a runtime built from a hand-made config was configured by no file.
+        config_file: config
+            .subagent_config
+            .is_some()
+            .then(atomcode_config::Config::default_path),
+        // The same value the persona is written with (`config.preferred_language`),
+        // so the language a row speaks and the language the model is told to
+        // answer in are one decision, not two.
+        language: config.preferred_language,
+        web_search_api_key: config.web_search_api_key.clone(),
+        rows: harness_option_rows(parts, config, prepare)
+            .map_err(std::io::Error::other)?
+            .then(permission_rows),
+        datalog: config.datalog.enabled.then(|| config.datalog.clone()),
+        modes: Some(crate::on_harness::HostModes {
+            modes: atomcode_harness::seams::Modes {
+                plan: Arc::clone(&parts.plan_mode),
+                accept_edits: Arc::clone(&parts.accept_edits),
+            },
+            plan_mcp_grants: Arc::clone(&parts.mcp_plan_grants),
+            approval_grants: parts.approval.store(),
+        }),
+    })
+}
+
+/// A mounted product tree: the handle a driver speaks to, the tree behind it,
+/// and the table its provider lives in.
+///
+/// The tree must outlive the handle. Dropping the `App` unloads every row, and
+/// the next command would reach a conversation whose services are gone.
+pub struct Mounted {
+    pub handle: AgentHandle,
+    pub app: atomcode_plexus::App,
+    pub providers: Arc<crate::on_harness::ProviderSlots>,
+}
+
+/// Mount the product as a tree, continuing `parts`' session.
+///
+/// The one place a tree is built from prepared parts — the runtime does it at
+/// start and on every rebuild (undo, restore, reprepare, a provider coming
+/// back), so the session, the hooks and the rows cannot differ between the first
+/// agent and the next. Public because that assembly IS the product: a test or an
+/// embedder that wants what ships asks for it here rather than rebuilding a
+/// second version of it.
+pub async fn mount(
+    parts: &crate::CodingParts,
+    config: &CodingAgentConfig,
+    prepare: &PrepareOptions,
+    provider: Arc<dyn atomcode_kernel::provider::LlmProvider>,
+) -> Result<Mounted, String> {
+    // Presence follows the same rule the overlay uses: a person who can answer
+    // means asking, nobody means fencing.
+    let presence = if config.is_attended() {
+        crate::on_harness::Presence::Attended
+    } else {
+        crate::on_harness::Presence::Headless
+    };
+    // What the person wrote in `config.toml`, as a layer of its own.
+    let extra = vec![crate::on_harness::config_rows(config)?];
+    // The model catalog, when this host has one. Both halves come from what
+    // `install_subagent_tiers` already put on the config, so the tree and the
+    // chain resolve a selection through the same resolver — including its reset
+    // on `/model`.
+    let models = config
+        .subagent_config
+        .clone()
+        .zip(config.subagent_model_providers.clone())
+        .map(|(model_config, providers)| crate::on_harness::HostModels {
+            config: model_config,
+            providers,
+            current: config.provider_name.clone(),
+        });
+    // The capability graph's own sub-agents — the reviewer, `task`, `team` — run on
+    // this model, billed to the session and metered the way the chain's
+    // `assemble` wires them.
+    let _ = crate::parts::wire_side_providers(parts, config, &provider);
+    let host = harness_host_state(parts, config, prepare).map_err(|error| error.to_string())?;
+    // Turns on this tree are billed to the model it was built for. The chain
+    // stamps the same attribution inside `assemble`.
+    if let Some(snapshot) = parts.snapshot_hook() {
+        snapshot.set_model_attribution(&config.provider_name, &config.model);
+    }
+    let (handle, app, providers) = crate::on_harness::mount_hosted(
+        &config.working_dir,
+        presence,
+        provider,
+        models,
+        host,
+        &extra,
+    )
+    .await?;
+    Ok(Mounted {
+        handle,
+        app,
+        providers,
+    })
+}
+
+/// Build the agent for `config`, replacing whatever tree the runtime held.
+///
+/// Replacing is the point: a rebuilt agent that left the previous tree in
+/// `harness_app` would have a later `/model` patch a tree whose driver loop had
+/// already exited, and a later `/logout` leave the credentials in the agent that
+/// is actually running.
+async fn build_agent(
+    runtime: &mut RuntimeResources,
+    config: &CodingAgentConfig,
+    provider: Arc<dyn atomcode_kernel::provider::LlmProvider>,
+) -> Result<AgentHandle, String> {
+    let mounted = mount(&runtime.parts, config, &runtime.prepare, provider).await?;
+    runtime.harness_app = Some(mounted.app);
+    runtime.harness_providers = Some(mounted.providers);
+    Ok(mounted.handle)
+}
+
+/// Row edits for what this runtime's options switched off, and for the
+/// directory rows resolve against.
+///
+/// Read off what prepare DECIDED (a review provider exists or not, the todo
+/// switch after its environment override) rather than re-deriving it from the
+/// options, so the tree and the capability graph cannot disagree about whether a
+/// capability is on.
+#[derive(serde::Serialize)]
+struct KernelMiddlewarePatch<'a> {
+    middleware: &'a str,
+    prepend: bool,
+}
+
+#[derive(serde::Serialize)]
+struct MemoryPatch<'a> {
+    project_root: &'a std::path::Path,
+    inject: bool,
+}
+
+#[derive(serde::Serialize)]
+struct SubagentRowPatch {
+    max_rounds: u32,
+}
+
+#[derive(serde::Serialize)]
+struct TeamRowPatch<'a> {
+    project_root: &'a std::path::Path,
+    max_members: usize,
+    max_rounds: u32,
+}
+
+#[derive(serde::Serialize)]
+struct AgentLoopOptionsPatch<'a> {
+    working_dir: &'a std::path::Path,
+    undo_cancelled: bool,
+    stream_idle_ms: u128,
+    /// Carried, not left to the row's default: this patch is the last word on
+    /// `agent-loop` in this host, so omitting it would *be* the fuse value — the
+    /// serde default in `harness/plugins/agent_loop.rs`. See
+    /// [`crate::on_harness::RUNAWAY_FUSE_ROUNDS`].
+    max_rounds: u32,
+}
+
+fn harness_option_rows(
+    parts: &crate::CodingParts,
+    config: &CodingAgentConfig,
+    prepare: &PrepareOptions,
+) -> Result<atomcode_plexus::Layer, String> {
+    let wd = config.working_dir.as_path();
+    let mut rows = atomcode_plexus::Layer::new()
+        .when(!prepare.tools, |layer| layer.disable("memory"))
+        .when(!prepare.tools || !prepare.web, |layer| {
+            layer.disable("tool-web")
+        })
+        // The runtime mounts its own `code_review` and `recall` (see
+        // `CodingParts::host_only_tools`) whenever prepare built them; the rows'
+        // versions are different contracts under the same names. Delegation is
+        // the tree's own rows, off when the driver turned it off.
+        .disable("tool-code-review")
+        .when(parts.subagent_knobs().is_none(), |layer| {
+            layer
+                .disable("subagent-in-process")
+                .disable("team-in-process")
+        })
+        .disable("recall")
+        .when(!parts.todo_enabled(), |layer| {
+            layer.disable("tool-todo").disable("todo-reminder")
+        })
+        // The runtime's own `request_user_input` asks the person, when it is on;
+        // the tree's `ask_user` is a narrower contract for the same capability,
+        // and two question tools is one too many either way.
+        .disable("tool-ask");
+
+    // Rows whose directory defaults to the process's cwd, pointed at this
+    // session's working directory instead. A `[[patch]]` replaces a row's whole
+    // config, so each carries every field the row is given elsewhere.
+    //
+    // The chain's `memory` switch is the injection alone; the `memory` tool is
+    // one of the core tools and stays either way.
+    if prepare.tools {
+        rows = rows
+            .patch(
+                "memory",
+                MemoryPatch {
+                    project_root: wd,
+                    inject: prepare.memory,
+                },
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    // `[subagent]`: how long a delegated agent may run, and how many members a
+    // team may hold; roles come from this project and the person's home.
+    if let Some((max_concurrent, max_rounds)) = parts.subagent_knobs() {
+        rows = rows
+            .patch("subagent-in-process", SubagentRowPatch { max_rounds })
+            .map_err(|e| e.to_string())?
+            .patch(
+                "team-in-process",
+                TeamRowPatch {
+                    project_root: wd,
+                    max_members: max_concurrent,
+                    max_rounds,
+                },
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    // Ctrl-C semantics: by default a cancelled turn is undone — its prompt and
+    // partial work leave what the model sees next, as the chain rolls them back.
+    rows.patch(
+        "agent-loop",
+        AgentLoopOptionsPatch {
+            working_dir: wd,
+            undo_cancelled: !config.keep_interrupted_context,
+            stream_idle_ms: config.stream_timeout.as_millis(),
+            max_rounds: crate::on_harness::RUNAWAY_FUSE_ROUNDS,
+        },
+    )
+    .map_err(|e| e.to_string())
+}
+
+async fn assemble_runtime_resources(runtime: &mut RuntimeResources) -> Result<AgentHandle, String> {
     runtime
         .parts
         .register_extra_tool(Arc::new(ScheduleWakeupTool::new(
@@ -7081,9 +8564,8 @@ fn assemble_runtime_resources(runtime: &mut RuntimeResources) -> Result<AgentHan
         .provider_factory
         .build(&runtime.config, session_id)
         .map_err(|error| error.to_string())?;
-    assemble(&mut runtime.parts, &runtime.config, provider)
-        .map(|agent| agent.spawn())
-        .map_err(|error| error.to_string())
+    let config = runtime.config.clone();
+    build_agent(runtime, &config, provider).await
 }
 
 fn preserve_sessionless_snapshot(runtime: &mut RuntimeResources, report: &StopReport) {
@@ -7112,6 +8594,9 @@ struct NativeUndoSidecars {
     turn_stats: Vec<TurnStat>,
     archived_turn_stats: Vec<TurnStat>,
     removed_presentation: Vec<(usize, PresentationEntry)>,
+    /// Where the session's log stood before the change was appended: what a
+    /// rollback cuts it back to.
+    events_mark: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -7135,6 +8620,14 @@ impl NativePersistenceError {
             message: message.into(),
             uncertain_commit: false,
             snapshot_conflict: true,
+        }
+    }
+
+    fn uncertain(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            uncertain_commit: true,
+            snapshot_conflict: false,
         }
     }
 
@@ -7175,26 +8668,216 @@ fn persistence_fail_close_reason(
     }
 }
 
+/// Record that the workspace went back to before `turn` (`docs/adr/0024` §17).
+///
+/// The conversation's own `Rewound` says what the model no longer sees; this one
+/// says what the working tree no longer holds, and the projection leaves the
+/// conversation alone.
+fn record_code_rewind(live: &atomcode_harness::agent::Agent, turn: u64) {
+    use atomcode_harness::session::SessionEvent;
+    let log = live.session();
+    let Some(to) = log.events().iter().find_map(|logged| {
+        matches!(logged.event, SessionEvent::TurnStart { turn: t } if t == turn)
+            .then_some(logged.seq)
+    }) else {
+        return;
+    };
+    atomcode_harness::session::commit(
+        live.ctx(),
+        &log,
+        SessionEvent::Rewound {
+            turn: log.current_turn(),
+            to,
+            scope: atomcode_harness::session::RewindScope::Code,
+        },
+    );
+}
+
+/// Read the skills on disk again, into the registry the live tree is already
+/// serving, and re-render the catalog the model is told about
+/// (`docs/adr/0022` §2).
+///
+/// This is a reload *without* a rebuild: every holder of the registry — the
+/// `use_skill` and `list_skills` tools, the `skills` seam, the slash menu — has
+/// an `Arc` to the one this replaces the contents of, and the prompt fragment is
+/// re-contributed under the same id, which replaces it. A remount would have
+/// taken the whole tree with it, MCP connections and all.
+///
+/// `Err` when the tree has no skills row: there is nothing to re-read into, and
+/// the caller falls back to the rebuild rather than reporting a reload that
+/// reached nothing.
+fn reload_skills_live(runtime: &RuntimeResources) -> Result<usize, ()> {
+    let app = runtime.harness_app.as_ref().ok_or(())?;
+    let ctx = app.context();
+    let registry = ctx
+        .service::<atomcode_harness::seams::SkillsSvc>()
+        .ok_or(())?;
+    // The directories prepare decided on, the same way it decided them: a
+    // driver that named its own is not second-guessed here.
+    let dirs = match runtime.prepare.skill_dirs.clone() {
+        Some(dirs) => dirs,
+        None => {
+            let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+            atomcode_capabilities::skills::runtime_skill_dirs(&home, &runtime.config.working_dir)
+        }
+    };
+    registry.reload_dirs(&dirs, &runtime.prepare.plugin_skill_dirs);
+    // The catalog is ranked against the project's own instruction files, as at
+    // mount — a reload that dropped the ranking would quietly reorder the
+    // prompt prefix.
+    let instructions =
+        atomcode_capabilities::session::SessionContextHook::new(&runtime.config.working_dir)
+            .instruction_text();
+    if let Some(prompts) = ctx.service::<atomcode_harness::seams::SystemPromptSvc>() {
+        let (id, rank) = crate::on_harness::SKILLS_FRAGMENT;
+        match registry.render_catalog_prioritizing(&instructions) {
+            Some(catalog) if !catalog.trim().is_empty() => prompts.contribute(id, rank, catalog),
+            // Every skill is gone: so is what said they were there.
+            _ => prompts.remove(id),
+        }
+    }
+    Ok(registry.len())
+}
+
+#[async_trait::async_trait]
+impl RuntimeCommands for CodingRuntimeHandle {
+    async fn start_goal(&self, condition: String) -> Result<(), String> {
+        CodingRuntimeHandle::start_goal(self, condition)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    async fn stop_goal(&self) -> Result<(), String> {
+        CodingRuntimeHandle::stop_goal(self)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    async fn pause_goal(&self) -> Result<(), String> {
+        CodingRuntimeHandle::pause_goal(self)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    async fn start_loop(&self, prompt: String) -> Result<(), String> {
+        CodingRuntimeHandle::start_loop(self, prompt)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    async fn stop_loop(&self) -> Result<(), String> {
+        CodingRuntimeHandle::stop_loop(self)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    async fn queue_local_context(&self, text: String) -> Result<(), String> {
+        CodingRuntimeHandle::queue_local_context(self, LocalContextInput { content: text })
+            .await
+            .map_err(|error| error.to_string())
+    }
+    async fn pending_policy(&self) -> Option<PolicyIntervention> {
+        self.pending_policy_intervention().await
+    }
+    async fn resolve_policy(&self, id: u64, action: PolicyRecoveryAction) -> Result<(), String> {
+        self.resolve_policy_intervention(id, action)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    async fn change_directory(&self, directory: std::path::PathBuf) -> Result<(), String> {
+        CodingRuntimeHandle::change_directory(self, directory)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// Whether the change from `live`'s log to `target` is one the log can *say* —
+/// an undo or a compaction — rather than a conversation reseeded from outside
+/// it.
+///
+/// A reseed appends the target's own messages as facts, and an unanswered
+/// prompt among them is a prompt the live agent answers: committing one would
+/// make a *restore* send something to the model. So a candidate the log cannot
+/// say goes the other way, through a rebuilt runtime, which is what a
+/// conversation that did not come out of this log always needed.
+fn live_can_say(live: &atomcode_harness::agent::Agent, target: &[Message]) -> bool {
+    use atomcode_harness::session::SessionEvent;
+    atomcode_capabilities::session::events::events_to_become(&live.session().events(), target)
+        .iter()
+        .all(|event| {
+            matches!(
+                event,
+                SessionEvent::Rewound { .. } | SessionEvent::Compacted { .. }
+            )
+        })
+}
+
+/// The conversation's own agent, live in the mounted tree — what a change to
+/// the same session is committed into rather than rebuilt around
+/// (`docs/adr/0022` §2).
+fn live_root_agent(runtime: &RuntimeResources) -> Option<Arc<atomcode_harness::agent::Agent>> {
+    runtime
+        .harness_app
+        .as_ref()?
+        .context()
+        .service::<atomcode_harness::seams::AgentsSvc>()?
+        .list()
+        .into_iter()
+        .find(|agent| agent.parent().is_none())
+}
+
+/// Commit `events` into `live`'s log, in order. The session store appends each
+/// as it is committed; one it could not keep is reported as an uncertain commit.
+fn commit_into_live_log(
+    runtime: &RuntimeResources,
+    live: &atomcode_harness::agent::Agent,
+    events: impl IntoIterator<Item = atomcode_harness::session::SessionEvent>,
+) -> Result<(), NativePersistenceError> {
+    let log = live.session();
+    for event in events {
+        atomcode_harness::session::commit(live.ctx(), &log, event);
+    }
+    match runtime.parts.take_snapshot_persistence_uncertain() {
+        Some(message) => Err(NativePersistenceError::uncertain(message)),
+        None => Ok(()),
+    }
+}
+
+/// Take the stored conversation to `snapshot`, with the facts that make its
+/// projection that (`docs/adr/0024` §17). With a `live` agent they are committed
+/// into its log — every subscriber hears them and nothing is rebuilt; without
+/// one they are appended to the store for a rebuilt tree to replay.
 fn persist_runtime_undo(
     runtime: &mut RuntimeResources,
     expected_snapshot: Option<&SessionSnapshot>,
     snapshot: &SessionSnapshot,
+    live: Option<&Arc<atomcode_harness::agent::Agent>>,
 ) -> Result<Option<NativeUndoSidecars>, NativePersistenceError> {
     let Some(binding) = runtime.parts.session.as_ref() else {
         runtime.parts.set_runtime_resume(snapshot.clone());
+        if let Some(live) = live {
+            let change = atomcode_capabilities::session::events::events_to_become(
+                &live.session().events(),
+                &snapshot.messages,
+            );
+            commit_into_live_log(runtime, live, change)?;
+        }
         return Ok(None);
     };
+    let mut live_change: Vec<atomcode_harness::session::SessionEvent> = Vec::new();
     let message_count = u32::try_from(snapshot.messages.len()).map_err(|_| {
         NativePersistenceError::certain("snapshot message count exceeds native metadata")
     })?;
     let mut snapshot_conflict = false;
+    let events = binding.manager.is_event_session(&binding.id);
     let sidecars = binding
         .manager
         .commit_native_runtime_mutation(
             &binding.lease,
             snapshot,
             |current_snapshot, meta, presentation| {
-                if expected_snapshot.is_some_and(|expected| current_snapshot != expected) {
+                if expected_snapshot.is_some_and(|expected| {
+                    !atomcode_capabilities::session::events::same_conversation(
+                        &current_snapshot.messages,
+                        &expected.messages,
+                    )
+                }) {
                     snapshot_conflict = true;
                     return Err(SessionStoreError::Corrupt {
                         kind: "session mutation conflict",
@@ -7207,10 +8890,30 @@ fn persist_runtime_undo(
                     turn_stats: meta.turn_stats.clone(),
                     archived_turn_stats: Vec::new(),
                     removed_presentation: Vec::new(),
+                    events_mark: None,
                 };
-                sidecars.archived_turn_stats = meta.archive_turn_stats_where(|stat| {
-                    stat.position_valid && stat.after_message > snapshot.messages.len()
-                });
+                // A log session's change is planned first, so the turns it
+                // leaves standing decide which statistics go; it is appended
+                // last, so a failure before that leaves nothing to undo.
+                let plan = events
+                    .then(|| {
+                        binding.manager.plan_conversation_change(
+                            &binding.id,
+                            &snapshot.messages,
+                            u64::try_from(atomcode_capabilities::session::now_ms()).unwrap_or(0),
+                        )
+                    })
+                    .transpose()?;
+                let visible = plan.as_ref().map(|plan| plan.visible_turns());
+                sidecars.archived_turn_stats =
+                    meta.archive_turn_stats_where(|stat| match &visible {
+                        Some(visible) => {
+                            stat.position_valid
+                                && stat.turn_id != 0
+                                && !visible.contains(&stat.turn_id)
+                        }
+                        None => stat.position_valid && stat.after_message > snapshot.messages.len(),
+                    });
                 let surviving_turn_ids: BTreeSet<_> = meta
                     .turn_stats
                     .iter()
@@ -7240,6 +8943,20 @@ fn persist_runtime_undo(
                     }
                 })?;
                 meta.updated_at = atomcode_capabilities::session::now_ms();
+                if let Some(plan) = plan {
+                    if live.is_some() {
+                        live_change = plan
+                            .change
+                            .iter()
+                            .map(|logged| logged.event.clone())
+                            .collect();
+                    } else {
+                        binding
+                            .manager
+                            .append_events(&binding.lease, &plan.change)?;
+                    }
+                    sidecars.events_mark = Some(plan.mark);
+                }
                 Ok(sidecars)
             },
         )
@@ -7250,6 +8967,9 @@ fn persist_runtime_undo(
                 NativePersistenceError::from(error)
             }
         })?;
+    if let Some(live) = live {
+        commit_into_live_log(runtime, live, live_change)?;
+    }
     Ok(Some(sidecars))
 }
 
@@ -7271,6 +8991,7 @@ fn restore_runtime_undo(
         turn_stats,
         archived_turn_stats,
         removed_presentation,
+        events_mark,
     } = sidecars;
     let mut snapshot_conflict = false;
     binding
@@ -7279,7 +9000,10 @@ fn restore_runtime_undo(
             &binding.lease,
             snapshot,
             |current_snapshot, meta, presentation| {
-                if current_snapshot != expected_current_snapshot {
+                if !atomcode_capabilities::session::events::same_conversation(
+                    &current_snapshot.messages,
+                    &expected_current_snapshot.messages,
+                ) {
                     snapshot_conflict = true;
                     return Err(SessionStoreError::Corrupt {
                         kind: "session mutation conflict",
@@ -7296,6 +9020,11 @@ fn restore_runtime_undo(
                         .insert(original_index.min(presentation.entries.len()), entry);
                 }
                 meta.updated_at = atomcode_capabilities::session::now_ms();
+                // Nothing has read the change since it was appended: no agent
+                // ran on it, so it is cut back rather than answered with more.
+                if let Some(mark) = events_mark {
+                    binding.manager.truncate_events(&binding.lease, mark)?;
+                }
                 Ok(())
             },
         )
@@ -7313,12 +9042,22 @@ fn persist_runtime_snapshot(
     snapshot: &SessionSnapshot,
 ) -> Result<(), NativePersistenceError> {
     if let Some(binding) = runtime.parts.session.as_ref() {
+        let events = binding.manager.is_event_session(&binding.id);
         binding
             .manager
             .commit_native_runtime_mutation(
                 &binding.lease,
                 snapshot,
-                |_current_snapshot, _meta, _presentation| Ok(()),
+                |_current_snapshot, _meta, _presentation| {
+                    if events {
+                        binding.manager.append_conversation_change(
+                            &binding.lease,
+                            &snapshot.messages,
+                            u64::try_from(atomcode_capabilities::session::now_ms()).unwrap_or(0),
+                        )?;
+                    }
+                    Ok(())
+                },
             )
             .map_err(NativePersistenceError::from)
     } else {
@@ -7495,6 +9234,80 @@ fn record_stopped_conversation_event(report: &mut StopReport, event: &AgentEvent
     }
 }
 
+/// End whatever the agent is doing and read its conversation back, WITHOUT
+/// taking the handle.
+///
+/// [`stop_current_agent`] is the chain's shape: it `take()`s the handle, sends
+/// `Shutdown` and lets the agent die, because on that engine a provider change
+/// means rebuilding the agent anyway. On the harness the agent is the thing
+/// worth keeping — the provider lives behind a seam and can be swapped under it
+/// — so this cancels the turn instead of ending the agent, and asks for the
+/// snapshot the caller still needs.
+async fn quiesce_current_agent(
+    agent: &mut AgentHandle,
+    compactions: &mut CompactionTracker,
+    observed_tokens: &mut Option<usize>,
+    runtime_event_tx: &RuntimeEventEmitter,
+    reason: CompactionInterruption,
+    team_manager: Option<&crate::team::TeamRunManager>,
+    persistence_status: Option<SnapshotPersistenceStatus>,
+) -> StopReport {
+    // Detached team members are background work started under the credentials
+    // being revoked; a logout must end them for the same reason it ends the
+    // provider.
+    if let Some(manager) = team_manager {
+        manager.stop_all().await;
+    }
+    let mut report = StopReport::default();
+    let _ = agent.commands.send(AgentCommand::Cancel);
+    let _ = agent.commands.send(AgentCommand::Snapshot);
+    let timeout = tokio::time::sleep(std::time::Duration::from_secs(5));
+    tokio::pin!(timeout);
+    loop {
+        tokio::select! {
+            event = agent.events.recv() => match event {
+                Some(event) => {
+                    record_stopped_conversation_event(&mut report, &event);
+                    match handle_compaction_event(
+                        event,
+                        compactions,
+                        observed_tokens,
+                        runtime_event_tx,
+                    ) {
+                        Some(AgentEvent::Usage(meta)) => {
+                            *observed_tokens = Some(meta.used_tokens as usize);
+                        }
+                        Some(AgentEvent::TurnComplete { reason, .. }) => {
+                            report.reason = Some(reason.folded_for_runtime_drivers());
+                        }
+                        Some(AgentEvent::Snapshot { snapshot }) => {
+                            report.snapshot = Some(snapshot);
+                            report.snapshot_after_turn_terminal = report.reason.is_some();
+                            // The snapshot is the last thing asked for, so it is
+                            // also the signal that the agent is quiet again.
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                // The agent ended on its own; nothing more will arrive.
+                None => break,
+            },
+            () = &mut timeout => {
+                // Not fatal and not `forced`: the agent is still alive and the
+                // caller keeps its handle. The snapshot is simply missing, which
+                // `preserve_sessionless_snapshot` already treats as "nothing to
+                // preserve".
+                break;
+            }
+        }
+    }
+    compactions.interrupt_all(reason, runtime_event_tx);
+    emit_terminal_persistence_warnings(persistence_status.as_ref(), runtime_event_tx);
+    report.persistence_failure = persistence_status.and_then(|s| s.take_uncertain_commit());
+    report
+}
+
 async fn stop_current_agent(
     agent: &mut Option<AgentHandle>,
     compactions: &mut CompactionTracker,
@@ -7545,8 +9358,8 @@ async fn stop_current_agent(
                         Some(AgentEvent::Usage(meta)) => {
                             *observed_tokens = Some(meta.used_tokens as usize);
                         }
-                        Some(AgentEvent::TurnComplete { reason }) => {
-                            report.reason = Some(reason);
+                        Some(AgentEvent::TurnComplete { reason, .. }) => {
+                            report.reason = Some(reason.folded_for_runtime_drivers());
                         }
                         Some(AgentEvent::Snapshot { snapshot }) => {
                             report.snapshot = Some(snapshot);
@@ -7572,7 +9385,9 @@ async fn stop_current_agent(
             Some(AgentEvent::Usage(meta)) => {
                 *observed_tokens = Some(meta.used_tokens as usize);
             }
-            Some(AgentEvent::TurnComplete { reason }) => report.reason = Some(reason),
+            Some(AgentEvent::TurnComplete { reason, .. }) => {
+                report.reason = Some(reason.folded_for_runtime_drivers())
+            }
             Some(AgentEvent::Snapshot { snapshot }) => {
                 report.snapshot = Some(snapshot);
                 report.snapshot_after_turn_terminal = report.reason.is_some();
@@ -7602,6 +9417,21 @@ fn emit_terminal_persistence_warnings(
     }
 }
 
+/// End a turn the runtime stopped itself, and end it EXACTLY once.
+///
+/// Every path that quiesces the agent has to reach this, including the ones that
+/// then fail: `quiesce_current_agent` consumes the agent's own `TurnComplete`
+/// into the `StopReport`, so after it runs nothing else will ever finish the
+/// turn. A path that skips this leaves `active_turn` set, and the next `Submit`
+/// becomes a steer into a turn that is gone.
+///
+/// **No criterion covers the failing paths, and that is a known gap.** The only
+/// way to fail the logout patch is for a row to refuse to remount, and nothing a
+/// test can reach makes that happen — the layer is a fixed string and the one
+/// row it touches is `llm`. So these branches are held by construction and by
+/// this comment rather than by a red test; if a way to inject a patch failure
+/// ever appears, the criterion to write is "a failed logout still ends the turn
+/// it cancelled".
 fn finish_stopped_native_turn(
     report: &StopReport,
     resources: Option<&RuntimeResources>,
@@ -8172,6 +10002,8 @@ mod tests {
             seconds_until_reset: 7200,
             reset_label: "5h".into(),
             call_limit,
+            calls_used: 0,
+            usage_percent: 0.0,
         }
     }
 
@@ -8363,9 +10195,11 @@ mod tests {
         release: Arc<std::sync::Barrier>,
     }
 
-    struct DeletePresentationAndFailSecondBuildFactory {
+    /// The second build removes the session's log, then fails: the rebuild
+    /// after a change fails, and so does taking the change back.
+    struct DeleteLogAndFailSecondBuildFactory {
         builds: std::sync::atomic::AtomicUsize,
-        presentation_path: std::path::PathBuf,
+        log_path: std::path::PathBuf,
     }
 
     impl CodingProviderFactory for RecoverableAuthFactory {
@@ -8468,7 +10302,7 @@ mod tests {
         }
     }
 
-    impl CodingProviderFactory for DeletePresentationAndFailSecondBuildFactory {
+    impl CodingProviderFactory for DeleteLogAndFailSecondBuildFactory {
         fn build(
             &self,
             _config: &CodingAgentConfig,
@@ -8479,13 +10313,13 @@ mod tests {
                     vec![],
                 )));
             }
-            std::fs::remove_file(&self.presentation_path).map_err(|error| {
+            std::fs::remove_file(&self.log_path).map_err(|error| {
                 crate::ProviderBuildError::Adapter(format!(
                     "could not arrange rollback persistence failure: {error}"
                 ))
             })?;
             Err(crate::ProviderBuildError::Adapter(
-                "candidate provider failed after presentation removal".into(),
+                "candidate provider failed after the log was removed".into(),
             ))
         }
     }
@@ -8631,54 +10465,6 @@ mod tests {
     /// Satisfied) but the follow-up CLASSIFIER with a configured `Class:` line —
     /// distinguished by the system prompt. Lets a test drive to Satisfied and then
     /// exercise a specific classifier verdict on the next submit.
-    struct ClassifierProvider {
-        class_line: &'static str,
-    }
-    #[async_trait::async_trait]
-    impl LlmProvider for ClassifierProvider {
-        fn model_name(&self) -> &str {
-            "classifier-test-provider"
-        }
-        async fn chat_stream(
-            &self,
-            messages: &[Message],
-            _tools: &[atomcode_kernel::tool::ToolDef],
-            _options: &atomcode_kernel::provider::ChatOptions,
-        ) -> Result<
-            futures::stream::BoxStream<'static, atomcode_kernel::stream::StreamEvent>,
-            atomcode_kernel::stream::ProviderError,
-        > {
-            use atomcode_kernel::stream::StreamEvent;
-            let is_classifier = messages
-                .first()
-                .map(|m| m.text.contains("classify"))
-                .unwrap_or(false);
-            let reply = if is_classifier {
-                self.class_line
-            } else {
-                "Verdict: yes goal met"
-            };
-            Ok(Box::pin(futures::stream::iter(vec![
-                StreamEvent::TextDelta(reply.into()),
-                StreamEvent::Done { truncated: false },
-            ])))
-        }
-    }
-    struct ClassifierProviderFactory {
-        class_line: &'static str,
-    }
-    impl CodingProviderFactory for ClassifierProviderFactory {
-        fn build(
-            &self,
-            _config: &CodingAgentConfig,
-            _session_id: Option<&str>,
-        ) -> Result<Arc<dyn LlmProvider>, crate::ProviderBuildError> {
-            Ok(Arc::new(ClassifierProvider {
-                class_line: self.class_line,
-            }))
-        }
-    }
-
     impl CodingProviderFactory for TierRecordingFactory {
         fn build(
             &self,
@@ -8907,6 +10693,7 @@ mod tests {
                 review: false,
                 subagents: crate::SubagentPolicy::Disabled,
                 rate_limit_source: None,
+                front_end: None,
             },
             provider_factory: Arc::new(TestProviderFactory {
                 fail: fail_provider,
@@ -9051,6 +10838,8 @@ mod tests {
             provider_factory,
             plugin_hooks,
             parts,
+            harness_app: None,
+            harness_providers: None,
             wakeup_tx: wakeup_tx.clone(),
             loop_active: loop_active.clone(),
             image_preprocessor: None,
@@ -9096,6 +10885,7 @@ mod tests {
                     );
                     let event = match terminal {
                         ShutdownPersistenceTerminal::TurnComplete => AgentEvent::TurnComplete {
+                            turn: None,
                             reason: StopReason::Cancelled,
                         },
                         ShutdownPersistenceTerminal::CompactionFailed => {
@@ -9152,6 +10942,8 @@ mod tests {
             provider_factory: start.provider_factory,
             plugin_hooks: start.plugin_hooks,
             parts,
+            harness_app: None,
+            harness_providers: None,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
@@ -9300,6 +11092,8 @@ mod tests {
             provider_factory: start.provider_factory,
             plugin_hooks: start.plugin_hooks,
             parts,
+            harness_app: None,
+            harness_providers: None,
             wakeup_tx,
             loop_active,
             image_preprocessor: None,
@@ -9322,6 +11116,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::Stopped,
             })
             .unwrap();
@@ -9390,6 +11185,8 @@ mod tests {
             provider_factory: start.provider_factory,
             plugin_hooks: start.plugin_hooks,
             parts,
+            harness_app: None,
+            harness_providers: None,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
@@ -9472,6 +11269,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::MaxRounds,
             })
             .unwrap();
@@ -9727,6 +11525,7 @@ mod tests {
 
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::Stopped,
             })
             .unwrap();
@@ -9804,6 +11603,7 @@ mod tests {
 
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::Stopped,
             })
             .unwrap();
@@ -9901,6 +11701,7 @@ mod tests {
         // synthetic prompt. The runtime stores one bounded copy for recovery compact.
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::ProviderError,
             })
             .unwrap();
@@ -9930,6 +11731,7 @@ mod tests {
         for round in 2..=MAX_UNPRODUCTIVE {
             kernel_events
                 .send(AgentEvent::TurnComplete {
+                    turn: None,
                     reason: StopReason::ProviderError,
                 })
                 .unwrap();
@@ -10076,6 +11878,7 @@ mod tests {
         for attempt in 0..2 {
             kernel_events
                 .send(AgentEvent::TurnComplete {
+                    turn: None,
                     reason: StopReason::Stopped,
                 })
                 .unwrap();
@@ -10172,6 +11975,7 @@ mod tests {
             .expect("loop wakeup was not registered");
             kernel_events
                 .send(AgentEvent::TurnComplete {
+                    turn: None,
                     reason: StopReason::Stopped,
                 })
                 .unwrap();
@@ -10248,6 +12052,7 @@ mod tests {
         let _ = runtime_events.recv().await;
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::Stopped,
             })
             .unwrap();
@@ -10306,6 +12111,7 @@ mod tests {
         drop(kernel_commands);
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::Stopped,
             })
             .unwrap();
@@ -10366,6 +12172,7 @@ mod tests {
         drop(kernel_commands);
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::Stopped,
             })
             .unwrap();
@@ -10428,6 +12235,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::Stopped,
             })
             .unwrap();
@@ -10486,6 +12294,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::MaxRounds,
             })
             .unwrap();
@@ -10548,6 +12357,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::ToolLoopDetected,
             })
             .unwrap();
@@ -10651,6 +12461,7 @@ mod tests {
 
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::Stopped,
             })
             .unwrap();
@@ -11452,6 +13263,7 @@ mod tests {
         handle
             .tx
             .send(CodingRuntimeControl::ApplyUndo {
+                code_rewound_to: None,
                 generation: handle.status().generation,
                 expected_revision: original.revision,
                 original: original.snapshot,
@@ -11881,6 +13693,33 @@ mod tests {
         runtime.handle.shutdown().await.unwrap();
     }
 
+    /// Recovery has to hand back a runtime that can actually run a turn.
+    ///
+    /// The scenario above stops at `phase == Ready`, and that is not the same
+    /// claim: a deactivate STOPS the agent, so a recovery path that only put a
+    /// new provider in place would report Ready with nothing behind it. On the
+    /// harness engine that is a live hazard — a model swap there is a patch,
+    /// and a patch cannot bring back an agent that was torn down — so this
+    /// submits after recovering and insists the turn starts.
+    #[tokio::test]
+    async fn a_recovered_runtime_can_actually_run_a_turn() {
+        let runtime = CodingRuntime::start(native_start(false)).await.unwrap();
+        runtime
+            .handle
+            .deactivate_provider(ProviderUnavailableReason::AuthenticationRequired)
+            .await
+            .unwrap();
+        let next = CodingAgentConfig::new("key", "https://example.test/v1", "after-login", ".");
+        runtime.handle.reassemble_provider(next).await.unwrap();
+
+        let receipt = runtime.handle.submit(UserInput::from("after login")).await;
+        assert!(
+            matches!(receipt, Ok(SubmitReceipt::Started { .. })),
+            "a recovered runtime reported Ready but could not start a turn: {receipt:?}"
+        );
+        runtime.handle.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn native_turn_steers_and_finishes_only_after_real_snapshot() {
         let (agent, mut kernel_commands, kernel_events) = fake_agent();
@@ -11913,9 +13752,12 @@ mod tests {
             Some(AgentCommand::SendMessage { text, .. }) if text == "steer"
         ));
 
-        kernel_events.send(AgentEvent::TurnStarted).unwrap();
+        kernel_events
+            .send(AgentEvent::TurnStarted { turn: None })
+            .unwrap();
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::Stopped,
             })
             .unwrap();
@@ -11925,7 +13767,7 @@ mod tests {
         ));
         assert!(matches!(
             runtime_events.recv().await,
-            Some(CodingRuntimeEvent::Agent(AgentEvent::TurnStarted))
+            Some(CodingRuntimeEvent::Agent(AgentEvent::TurnStarted { .. }))
         ));
         assert!(runtime_events.try_recv().is_err());
 
@@ -12005,6 +13847,8 @@ mod tests {
             provider_factory,
             plugin_hooks,
             parts,
+            harness_app: None,
+            harness_providers: None,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
@@ -12038,6 +13882,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::Stopped,
             })
             .unwrap();
@@ -12189,6 +14034,8 @@ mod tests {
             provider_factory,
             plugin_hooks,
             parts,
+            harness_app: None,
+            harness_providers: None,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: pp,
@@ -12458,6 +14305,7 @@ mod tests {
 
         kernel_events
             .send(AgentEvent::Steered {
+                turn: None,
                 count: 1,
                 inputs: vec![atomcode_kernel::event::SteeredInput {
                     text: "VL[before\n[Image #1]\nafter]".into(),
@@ -12594,6 +14442,8 @@ mod tests {
             provider_factory,
             plugin_hooks,
             parts,
+            harness_app: None,
+            harness_providers: None,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
@@ -12618,6 +14468,7 @@ mod tests {
         let _ = kernel_commands.recv().await;
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::ProviderError,
             })
             .unwrap();
@@ -12689,6 +14540,8 @@ mod tests {
             provider_factory: factory.clone(),
             plugin_hooks,
             parts,
+            harness_app: None,
+            harness_providers: None,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
@@ -12708,6 +14561,7 @@ mod tests {
         let _ = kernel_commands.recv().await;
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::Cancelled,
             })
             .unwrap();
@@ -12752,6 +14606,8 @@ mod tests {
             provider_factory,
             plugin_hooks,
             parts,
+            harness_app: None,
+            harness_providers: None,
             wakeup_tx: wakeup_tx.clone(),
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
@@ -12799,6 +14655,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::Stopped,
             })
             .unwrap();
@@ -12874,6 +14731,8 @@ mod tests {
             provider_factory: Arc::new(PendingProviderFactory),
             plugin_hooks,
             parts,
+            harness_app: None,
+            harness_providers: None,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
@@ -12907,6 +14766,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::Stopped,
             })
             .unwrap();
@@ -12983,6 +14843,8 @@ mod tests {
             provider_factory,
             plugin_hooks,
             parts,
+            harness_app: None,
+            harness_providers: None,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
@@ -13051,6 +14913,8 @@ mod tests {
             provider_factory,
             plugin_hooks,
             parts,
+            harness_app: None,
+            harness_providers: None,
             wakeup_tx: wakeup_tx.clone(),
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
@@ -13083,6 +14947,7 @@ mod tests {
         let _ = runtime_events.recv().await;
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::Stopped,
             })
             .unwrap();
@@ -13153,6 +15018,8 @@ mod tests {
             provider_factory,
             plugin_hooks,
             parts,
+            harness_app: None,
+            harness_providers: None,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
@@ -13251,6 +15118,8 @@ mod tests {
             provider_factory: start.provider_factory,
             plugin_hooks: start.plugin_hooks,
             parts,
+            harness_app: None,
+            harness_providers: None,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
@@ -13396,6 +15265,7 @@ mod tests {
                 if matches!(command, AgentCommand::Shutdown) {
                     if emit_verified_terminal {
                         let _ = event_tx.send(AgentEvent::TurnComplete {
+                            turn: None,
                             reason: StopReason::Cancelled,
                         });
                         let _ = event_tx.send(AgentEvent::Snapshot {
@@ -13430,6 +15300,8 @@ mod tests {
             provider_factory: start.provider_factory,
             plugin_hooks: start.plugin_hooks,
             parts,
+            harness_app: None,
+            harness_providers: None,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
@@ -14180,13 +16052,12 @@ mod tests {
         assert_eq!(catalog.points.len(), 1);
         assert_eq!(catalog.points[0].prompt_number, 1);
         assert_eq!(catalog.points[0].prompt_preview, "first rewind prompt");
-        assert!(catalog
-            .code_unavailable
-            .as_deref()
-            // "off by default" is UNIQUE to the disabled reason; the
-            // opted-in-setup-failed error also mentions ATOMCODE_CODE_REWIND, so
-            // that substring can't prove we're in the disabled state.
-            .is_some_and(|reason| reason.contains("off by default")));
+        // The kind, not a substring of a sentence. This used to hunt for
+        // "off by default" — with a comment explaining that the *other* reason
+        // also mentions `ATOMCODE_CODE_REWIND`, so the obvious substring could
+        // not tell the two apart. That was the reason being a sentence; it is a
+        // kind now, and the two states are simply two values.
+        assert_eq!(catalog.code_unavailable, Some(CodeUnavailable::NotEnabled));
 
         let code_error = runtime
             .handle
@@ -14505,6 +16376,7 @@ mod tests {
                 catalog.revision,
                 original.undo_snapshot,
                 undo,
+                None,
             )
             .await
             .unwrap();
@@ -14595,6 +16467,13 @@ mod tests {
         runtime.handle.shutdown().await.unwrap();
     }
 
+    /// A conversation the log cannot say — one with a prompt the session never
+    /// saw — is restored by rebuilding, and a candidate provider that cannot be
+    /// built takes the conversation back to what it was.
+    ///
+    /// The route matters as much as the rollback: see `live_can_say`. A restore
+    /// that committed that prompt as a fact would hand the live agent something
+    /// to answer, which is a restore that talks to the model.
     #[tokio::test]
     async fn failed_sessionless_restore_rolls_back_to_the_original_snapshot() {
         let factory = Arc::new(FailSecondBuildFactory {
@@ -14631,6 +16510,82 @@ mod tests {
             .messages
             .iter()
             .all(|message| message.text != "replacement prompt"));
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    /// A restore the log *can* say — going back to a conversation this session
+    /// already had — is facts in the live log and nothing else: the provider the
+    /// conversation is running on is kept, and the model is not asked anything
+    /// (`docs/adr/0022` §2, `docs/adr/0024` §17).
+    ///
+    /// A rebuild here would close the fact stream every front end is reading
+    /// and build a second provider for a session that never changed.
+    #[tokio::test]
+    async fn a_restore_the_log_can_say_is_facts_and_keeps_the_provider() {
+        let factory = Arc::new(FailSecondBuildFactory {
+            builds: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut start = native_start(false);
+        start.provider_factory = factory.clone();
+        let mut runtime = CodingRuntime::start(start).await.unwrap();
+        let mut after = Vec::new();
+        for text in ["first prompt", "second prompt"] {
+            runtime.handle.submit(UserInput::from(text)).await.unwrap();
+            loop {
+                if let CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
+                    snapshot,
+                    ..
+                }) = runtime.events.recv().await.unwrap().event
+                {
+                    after.push(snapshot);
+                    break;
+                }
+            }
+        }
+        let built = factory.builds.load(Ordering::Acquire);
+        // The conversation as it stood after the first turn: a truncation of the
+        // one that is live, which is what an undo is and what the log says with
+        // one `Rewound`.
+        let candidate = after[0].as_ref().clone();
+
+        runtime
+            .handle
+            .restore_snapshot(candidate)
+            .await
+            .expect("a restore the log can say needs nothing built");
+        assert_eq!(
+            factory.builds.load(Ordering::Acquire),
+            built,
+            "the live session kept the provider it was running on: a second \
+             build is a rebuilt runtime"
+        );
+        let restored = runtime.handle.snapshot().await.unwrap();
+        assert!(
+            restored
+                .messages
+                .iter()
+                .all(|message| message.text != "second prompt"),
+            "the conversation went back: {:#?}",
+            restored.messages
+        );
+        // And nothing was sent: a restore is not a prompt. `TurnStarted` after
+        // the restore is the live agent answering a fact the restore committed.
+        let mut started = Vec::new();
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(300), runtime.events.recv()).await
+        {
+            if matches!(
+                event.event,
+                CodingRuntimeEvent::Agent(AgentEvent::TurnStarted { .. })
+            ) {
+                started.push(event.event);
+            }
+        }
+        assert!(
+            started.is_empty(),
+            "a restore asked the model for something: {started:#?}"
+        );
+        assert_eq!(runtime.handle.status().phase, RuntimePhase::Ready);
         runtime.handle.shutdown().await.unwrap();
     }
 
@@ -14673,6 +16628,7 @@ mod tests {
             .handle
             .tx
             .send(CodingRuntimeControl::ApplyUndo {
+                code_rewound_to: None,
                 generation: runtime.handle.status().generation,
                 expected_revision: original.revision,
                 original: original.snapshot,
@@ -14717,12 +16673,42 @@ mod tests {
             Message::assistant("first answer", Vec::new()),
             Message::user("concurrent prompt"),
         ]);
-        manager.save_snapshot(id, &newer).unwrap();
+        // Another writer's fact lands in the log behind the runtime's back.
+        let stored = manager.load_events(id).unwrap();
+        let next = stored.iter().map(|e| e.seq).max().unwrap_or(0) + 1;
+        let turn = stored.iter().map(|e| e.event.turn()).max().unwrap_or(0) + 1;
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(manager.events_path(id).unwrap())
+            .unwrap();
+        for (seq, event) in [
+            (
+                next,
+                atomcode_kernel::session::SessionEvent::TurnStart { turn },
+            ),
+            (
+                next + 1,
+                atomcode_kernel::session::SessionEvent::UserMessage {
+                    turn,
+                    text: "concurrent prompt".into(),
+                    images: Vec::new(),
+                },
+            ),
+        ] {
+            use std::io::Write;
+            writeln!(
+                log,
+                "{}",
+                serde_json::json!({ "seq": seq, "at": 0, "event": event })
+            )
+            .unwrap();
+        }
         let (done, result) = oneshot::channel();
         runtime
             .handle
             .tx
             .send(CodingRuntimeControl::ApplyUndo {
+                code_rewound_to: None,
                 generation: runtime.handle.status().generation,
                 expected_revision: original.revision,
                 original: original.undo_snapshot,
@@ -14735,7 +16721,7 @@ mod tests {
             .unwrap();
 
         assert!(matches!(result.await.unwrap(), Err(RuntimeError::Busy)));
-        assert_eq!(manager.load_snapshot(id).unwrap(), newer);
+        assert_eq!(manager.load_snapshot(id).unwrap().messages, newer.messages);
         runtime.handle.shutdown().await.unwrap();
     }
 
@@ -14756,73 +16742,25 @@ mod tests {
         start.agent.working_dir = project.path().to_path_buf();
         start.prepare.session = crate::SessionMode::Resume(id.into());
         let runtime = CodingRuntime::start(start).await.unwrap();
-        let presentation_path = manager.presentation_path(id).unwrap();
-        std::fs::remove_file(&presentation_path).unwrap();
+        let log_path = manager.events_path(id).unwrap();
+        std::fs::remove_file(&log_path).unwrap();
 
         let error = runtime.handle.undo_to_prompt(None).await.unwrap_err();
 
         let RuntimeError::ReconfigureFailed(message) = &error else {
-            panic!("expected presentation persistence error, got {error:?}");
+            panic!("expected session log persistence error, got {error:?}");
         };
         assert!(
-            message.contains(presentation_path.to_string_lossy().as_ref()),
-            "expected missing presentation path in error, got {error:?}"
+            message.contains(log_path.to_string_lossy().as_ref()),
+            "expected missing session log path in error, got {error:?}"
         );
         assert_eq!(runtime.handle.status().phase, RuntimePhase::Failed);
         assert_eq!(
             runtime.handle.submit(UserInput::from("must fail")).await,
             Err(RuntimeError::Unavailable)
         );
-        runtime.handle.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(atomcode_home)]
-    async fn native_undo_rollback_persistence_failure_is_sticky() {
-        let home = tempfile::tempdir().unwrap();
-        let project = tempfile::tempdir().unwrap();
-        std::env::set_var("ATOMCODE_HOME", home.path());
-        let id = "undo-rollback-persistence-failure";
-        let manager = atomcode_capabilities::session::SessionManager::for_project(project.path());
-        let snapshot = SessionSnapshot::new(vec![
-            Message::user("first prompt"),
-            Message::assistant("answer", Vec::new()),
-        ]);
-        persist_native_session(&manager, id, project.path(), &snapshot);
-        let mut start = native_start(false);
-        start.agent.working_dir = project.path().to_path_buf();
-        start.prepare.session = crate::SessionMode::Resume(id.into());
-        start.provider_factory = Arc::new(DeletePresentationAndFailSecondBuildFactory {
-            builds: std::sync::atomic::AtomicUsize::new(0),
-            presentation_path: manager.presentation_path(id).unwrap(),
-        });
-        let runtime = CodingRuntime::start(start).await.unwrap();
-
-        // Resume may normalize the live snapshot (for example, refreshing the
-        // current persona) before a turn persists it. Align the canonical CAS
-        // preimage so this test reaches the intended rollback-failure branch.
-        let live_snapshot = runtime.handle.snapshot().await.unwrap();
-        manager.save_snapshot(id, &live_snapshot).unwrap();
-        assert_eq!(
-            live_snapshot.as_ref(),
-            &manager.load_snapshot(id).unwrap(),
-            "live and canonical snapshots must agree before undo"
-        );
-
-        let undo = runtime.handle.undo_to_prompt(None).await;
-        assert!(
-            matches!(
-                &undo,
-                Err(RuntimeError::ReconfigureFailed(message))
-                    if message.contains("snapshot restore failed")
-            ),
-            "unexpected undo result: {undo:?}"
-        );
-        assert_eq!(runtime.handle.status().phase, RuntimePhase::Failed);
-        assert_eq!(
-            runtime.handle.submit(UserInput::from("must fail")).await,
-            Err(RuntimeError::Unavailable)
-        );
+        // Sticky, not just refused once: a runtime that could not prove the
+        // undo was kept does not come back through a reload either.
         assert_eq!(
             runtime.handle.reload_capabilities().await,
             Err(RuntimeError::Unavailable)
@@ -14830,6 +16768,12 @@ mod tests {
         runtime.handle.shutdown().await.unwrap();
     }
 
+    /// The rebuild's own rollback, when *that* cannot be persisted either: the
+    /// runtime stops and stays stopped.
+    ///
+    /// Judged here rather than on the undo route as well, because an undo of the
+    /// live session no longer rebuilds (`live_can_say`) — only a conversation
+    /// the log cannot say still goes that way, and this is it.
     #[tokio::test]
     #[serial_test::serial(atomcode_home)]
     async fn restore_snapshot_rollback_persistence_failure_is_sticky() {
@@ -14843,13 +16787,12 @@ mod tests {
         let mut start = native_start(false);
         start.agent.working_dir = project.path().to_path_buf();
         start.prepare.session = crate::SessionMode::Resume(id.into());
-        start.provider_factory = Arc::new(DeletePresentationAndFailSecondBuildFactory {
+        start.provider_factory = Arc::new(DeleteLogAndFailSecondBuildFactory {
             builds: std::sync::atomic::AtomicUsize::new(0),
-            presentation_path: manager.presentation_path(id).unwrap(),
+            log_path: manager.events_path(id).unwrap(),
         });
         let mut runtime = CodingRuntime::start(start).await.unwrap();
         let live_snapshot = runtime.handle.snapshot().await.unwrap();
-        manager.save_snapshot(id, &live_snapshot).unwrap();
         let mut replacement = live_snapshot.as_ref().clone();
         replacement.messages.push(Message::user("replacement"));
 
@@ -14987,6 +16930,8 @@ mod tests {
             provider_factory,
             plugin_hooks,
             parts,
+            harness_app: None,
+            harness_providers: None,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor,
@@ -14994,10 +16939,14 @@ mod tests {
 
         let mut truncated = original_snapshot.clone();
         truncated.messages.truncate(2);
-        let receipt = persist_runtime_undo(&mut resources, Some(&original_snapshot), &truncated)
-            .unwrap()
-            .expect("native undo must retain a sidecar rollback receipt");
-        assert_eq!(manager.load_snapshot(id).unwrap(), truncated);
+        let receipt =
+            persist_runtime_undo(&mut resources, Some(&original_snapshot), &truncated, None)
+                .unwrap()
+                .expect("native undo must retain a sidecar rollback receipt");
+        assert_eq!(
+            manager.load_snapshot(id).unwrap().messages,
+            truncated.messages
+        );
         let persisted_meta = manager.read_meta(id).unwrap();
         assert_eq!(persisted_meta.turn_stats, vec![original_stats[0].clone()]);
         assert_eq!(persisted_meta.turn_count, 1);
@@ -15041,7 +16990,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(manager.load_snapshot(id).unwrap(), original_snapshot);
+        assert_eq!(
+            manager.load_snapshot(id).unwrap().messages,
+            original_snapshot.messages
+        );
         let restored_meta = manager.read_meta(id).unwrap();
         assert_eq!(restored_meta.owner, StorageOwner::Native);
         assert_eq!(restored_meta.name, "renamed while undo rebuilds");
@@ -15063,15 +17015,22 @@ mod tests {
 
         let mut second_truncated = original_snapshot.clone();
         second_truncated.messages.truncate(2);
-        let second_receipt =
-            persist_runtime_undo(&mut resources, Some(&original_snapshot), &second_truncated)
-                .unwrap()
-                .expect("second native undo must retain a rollback receipt");
+        let second_receipt = persist_runtime_undo(
+            &mut resources,
+            Some(&original_snapshot),
+            &second_truncated,
+            None,
+        )
+        .unwrap()
+        .expect("second native undo must retain a rollback receipt");
         let concurrently_advanced = SessionSnapshot::new(vec![
             Message::user("concurrent"),
             Message::assistant("newer answer", Vec::new()),
         ]);
-        manager.save_snapshot(id, &concurrently_advanced).unwrap();
+        let binding = resources.parts.session.as_ref().unwrap();
+        manager
+            .append_conversation_change(&binding.lease, &concurrently_advanced.messages, 1)
+            .unwrap();
 
         let error = restore_runtime_undo(
             &mut resources,
@@ -15081,7 +17040,10 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.is_snapshot_conflict());
-        assert_eq!(manager.load_snapshot(id).unwrap(), concurrently_advanced);
+        assert_eq!(
+            manager.load_snapshot(id).unwrap().messages,
+            concurrently_advanced.messages
+        );
     }
 
     #[test]
@@ -15197,6 +17159,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::Stopped,
             })
             .unwrap();
@@ -15274,6 +17237,7 @@ mod tests {
         for attempt in 0..2 {
             kernel_events
                 .send(AgentEvent::TurnComplete {
+                    turn: None,
                     reason: StopReason::Stopped,
                 })
                 .unwrap();
@@ -15371,6 +17335,7 @@ mod tests {
         for attempt in 0..2 {
             kernel_events
                 .send(AgentEvent::TurnComplete {
+                    turn: None,
                     reason: StopReason::Stopped,
                 })
                 .unwrap();
@@ -15461,22 +17426,112 @@ mod tests {
         handle.shutdown().await.unwrap();
     }
 
-    // When the goal is Satisfied and the user submits a follow-up, the runtime must
-    // RE-ENGAGE the goal (same as PausedAtCap): resume it into Pursuing (round 0) and
-    // deliver the input as the resumed goal round's user message.
-    #[tokio::test]
-    async fn submit_while_satisfied_reengages_goal_and_delivers_message() {
-        let (
-            handle,
-            mut kernel_commands,
-            kernel_events,
-            mut runtime_events,
-            _wakeup_tx,
-            _loop_active,
-            _adapter,
-        ) = controller_test_runtime(Arc::new(GoalMetProviderFactory)).await;
+    /// A slow classifier: the follow-up question takes a while to answer, the
+    /// way a real model call does. The evaluator's own verdict stays instant so
+    /// only the classifier is being measured.
+    /// A provider that takes its time on every call, the way a real one does.
+    ///
+    /// The negative control for the keypress path: any model call the runtime
+    /// makes *on that path* shows up as time on the clock. Its reply serves the
+    /// goal evaluator, which is the one call that is allowed to be slow — it
+    /// runs spawned, off the owner loop, while the turn is held.
+    struct SlowProvider {
+        delay: std::time::Duration,
+    }
+    #[async_trait::async_trait]
+    impl LlmProvider for SlowProvider {
+        fn model_name(&self) -> &str {
+            "slow-test-provider"
+        }
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[atomcode_kernel::tool::ToolDef],
+            _options: &atomcode_kernel::provider::ChatOptions,
+        ) -> Result<
+            futures::stream::BoxStream<'static, atomcode_kernel::stream::StreamEvent>,
+            atomcode_kernel::stream::ProviderError,
+        > {
+            use atomcode_kernel::stream::StreamEvent;
+            tokio::time::sleep(self.delay).await;
+            Ok(Box::pin(futures::stream::iter(vec![
+                StreamEvent::TextDelta("Verdict: yes goal met".into()),
+                StreamEvent::Done { truncated: false },
+            ])))
+        }
+    }
+    struct SlowProviderFactory {
+        delay: std::time::Duration,
+    }
+    impl CodingProviderFactory for SlowProviderFactory {
+        fn build(
+            &self,
+            _config: &CodingAgentConfig,
+            _session_id: Option<&str>,
+        ) -> Result<Arc<dyn LlmProvider>, crate::ProviderBuildError> {
+            Ok(Arc::new(SlowProvider { delay: self.delay }))
+        }
+    }
 
-        // --- Drive the goal to Satisfied ---
+    /// A provider whose call never returns: the goal's evaluator is still
+    /// thinking, so the turn it is judging stays held.
+    ///
+    /// `built` fires when the runtime asks for an evaluator, which it does on
+    /// the owner loop immediately before holding the turn — the test's proof
+    /// that the hold is in place rather than a race with it.
+    struct NeverAnsweringProviderFactory {
+        built: mpsc::UnboundedSender<()>,
+    }
+    struct NeverAnsweringProvider;
+    #[async_trait::async_trait]
+    impl LlmProvider for NeverAnsweringProvider {
+        fn model_name(&self) -> &str {
+            "never-answering-test-provider"
+        }
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[atomcode_kernel::tool::ToolDef],
+            _options: &atomcode_kernel::provider::ChatOptions,
+        ) -> Result<
+            futures::stream::BoxStream<'static, atomcode_kernel::stream::StreamEvent>,
+            atomcode_kernel::stream::ProviderError,
+        > {
+            std::future::pending().await
+        }
+    }
+    impl CodingProviderFactory for NeverAnsweringProviderFactory {
+        fn build(
+            &self,
+            _config: &CodingAgentConfig,
+            _session_id: Option<&str>,
+        ) -> Result<Arc<dyn LlmProvider>, crate::ProviderBuildError> {
+            let _ = self.built.send(());
+            Ok(Arc::new(NeverAnsweringProvider))
+        }
+    }
+
+    /// Typing while a goal round is being judged starts a turn, it does not
+    /// steer one.
+    ///
+    /// Between rounds the agent has finished and the runtime is HOLDING the
+    /// turn open while the evaluator decides. There is nothing live to fold
+    /// into: a message sent now opens a turn of its own at the agent. Reporting
+    /// it as a steer was a claim about a turn that had already ended, and two
+    /// things followed from it — a driver waiting for the `Steered` that closes
+    /// its steering panel waited forever, and the verdict, arriving later,
+    /// closed the HELD turn while the agent was busy with the person's new one,
+    /// so the screen went idle in the middle of work.
+    ///
+    /// The goal is not harmed by this: it stays Pursuing, and the end of the
+    /// turn this starts evaluates and continues it like any other round's.
+    #[tokio::test]
+    async fn a_message_typed_while_a_goal_round_is_judged_starts_its_own_turn() {
+        let (built_tx, mut built) = mpsc::unbounded_channel();
+        let (handle, mut kernel_commands, kernel_events, mut runtime_events, _w, _l, _a) =
+            controller_test_runtime(Arc::new(NeverAnsweringProviderFactory { built: built_tx }))
+                .await;
+
         handle.start_goal("tests pass").await.unwrap();
         let _ = runtime_events.recv().await; // GoalChanged(active=true)
         handle
@@ -15487,8 +17542,12 @@ mod tests {
             kernel_commands.recv().await,
             Some(AgentCommand::SendMessage { .. })
         ));
+        while built.try_recv().is_ok() {} // anything built while starting up
+                                          // The round ends; the runtime holds the turn and asks the evaluator,
+                                          // which never answers.
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::Stopped,
             })
             .unwrap();
@@ -15498,85 +17557,74 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::Snapshot {
-                snapshot: SessionSnapshot::new(vec![Message::assistant("done", vec![])]),
+                snapshot: SessionSnapshot::new(vec![Message::assistant("round one", vec![])]),
             })
             .unwrap();
 
-        // Wait until TurnFinished (goal Met/Satisfied).
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                match runtime_events.recv().await {
-                    Some(CodingRuntimeEvent::TurnFinished(_)) => break,
-                    Some(_) => {}
-                    None => panic!("events closed before met terminal"),
-                }
-            }
-        })
+        tokio::time::timeout(std::time::Duration::from_secs(5), built.recv())
+            .await
+            .expect("the runtime never asked for an evaluator")
+            .expect("the evaluator channel closed");
+
+        // Nothing is live at the agent now. What a person types opens a turn.
+        let receipt = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handle.submit(UserInput::from("actually, do this first")),
+        )
         .await
-        .expect("satisfied turn did not finish");
-
-        // --- Goal is now Satisfied; submit new message ---
-        let submit_text = "follow-up question";
-        handle.submit(UserInput::from(submit_text)).await.unwrap();
-
-        // Collect until SendMessage; assert no GoalChanged(Pursuing) seen.
-        let mut saw_goal_changed_pursuing = false;
-        let mut saw_send_message_with_input = false;
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                tokio::select! {
-                    // biased: GoalChanged(Pursuing) is emitted before SendMessage.
-                    biased;
-                    event = runtime_events.recv() => {
-                        match event {
-                            Some(CodingRuntimeEvent::GoalChanged(p)) => {
-                                if p.phase == GoalPhase::Pursuing && p.round == 0 {
-                                    saw_goal_changed_pursuing = true;
-                                }
-                            }
-                            Some(_) => {}
-                            None => break,
-                        }
-                    }
-                    cmd = kernel_commands.recv() => {
-                        match cmd {
-                            Some(AgentCommand::SendMessage { text, .. }) => {
-                                if text == submit_text {
-                                    saw_send_message_with_input = true;
-                                }
-                                break;
-                            }
-                            _ => break,
-                        }
-                    }
-                }
-            }
-        })
-        .await
-        .expect("submit after Satisfied did not deliver message within timeout");
-
+        .expect("submit did not answer while the turn was held")
+        .expect("submit was refused while the turn was held");
         assert!(
-            saw_goal_changed_pursuing,
-            "submit while Satisfied must RE-ENGAGE the goal (GoalChanged Pursuing, round=0)"
-        );
-        assert!(
-            saw_send_message_with_input,
-            "submit while Satisfied must deliver the input as the resumed goal round's message"
+            matches!(receipt, SubmitReceipt::Started { .. }),
+            "a held turn has no live turn to steer: {receipt:?}"
         );
 
+        // And the round it was holding is reported finished rather than left
+        // open to be closed later, under the agent's new turn.
+        let mut finished = false;
+        while let Ok(event) = runtime_events.try_recv() {
+            if matches!(event, CodingRuntimeEvent::TurnFinished(_)) {
+                finished = true;
+            }
+        }
+        assert!(finished, "the held round must report its terminal");
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), kernel_commands.recv())
+                .await
+                .expect("the message never reached the agent"),
+            Some(AgentCommand::SendMessage { .. })
+        ));
         handle.shutdown().await.unwrap();
     }
 
-    // Classifier says NEW-GOAL: the satisfied goal re-engages AND re-tasks its
-    // condition to the follow-up (badge shows the NEW question · round 1).
-    #[tokio::test]
-    async fn submit_while_satisfied_new_goal_retasks_condition() {
+    /// A met goal is CLOSED, so the next thing a person says is an ordinary
+    /// turn — and it reaches the agent on the keypress.
+    ///
+    /// Both halves are the criterion, and both come from the same report.
+    ///
+    /// * **At once.** A met goal used to stay registered and put the next
+    ///   message to a classifier ("does this continue the goal?") — awaited on
+    ///   the owner loop, up to 4s. Nothing on screen said so: the composer was
+    ///   already cleared, no fact had been logged for the transcript, and a
+    ///   screen that is idle after a goal ends draws no steering panel either.
+    ///   That was the reported "我说的话一会之后才出现, 出现之前屏幕上没有任何
+    ///   变化". The provider here is slow on every call, so any model call made
+    ///   on the keypress path shows up as time on the clock.
+    /// * **Ordinary.** No `GoalChanged` puts a goal back into `Pursuing`. An
+    ///   autonomous loop that came back on its own would be one nobody was told
+    ///   about — the badge went when the goal was met. `/goal` starts another.
+    ///
+    /// Virtual clock: the delay is never really waited out, and what is measured
+    /// is the runtime's own await rather than the machine.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_met_goal_is_closed_so_the_next_message_is_an_ordinary_turn_at_once() {
         let (handle, mut kernel_commands, kernel_events, mut runtime_events, _w, _l, _a) =
-            controller_test_runtime(Arc::new(ClassifierProviderFactory {
-                class_line: "Class: new-goal",
+            controller_test_runtime(Arc::new(SlowProviderFactory {
+                delay: std::time::Duration::from_secs(3),
             }))
             .await;
-        // --- Drive the goal to Satisfied ---
+
+        // --- Drive the goal to Met ---
         handle.start_goal("tests pass").await.unwrap();
         let _ = runtime_events.recv().await; // GoalChanged(active=true)
         handle
@@ -15589,6 +17637,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::Stopped,
             })
             .unwrap();
@@ -15601,7 +17650,7 @@ mod tests {
                 snapshot: SessionSnapshot::new(vec![Message::assistant("done", vec![])]),
             })
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
             loop {
                 match runtime_events.recv().await {
                     Some(CodingRuntimeEvent::TurnFinished(_)) => break,
@@ -15613,214 +17662,40 @@ mod tests {
         .await
         .expect("satisfied turn did not finish");
 
-        let submit_text = "an entirely different task";
+        // --- The keypress ---
+        let submit_text = "so what about the other half?";
+        let at = tokio::time::Instant::now();
         handle.submit(UserInput::from(submit_text)).await.unwrap();
-
-        let mut saw_retasked_pursuing = false;
-        let mut saw_send_message = false;
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let reached = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
-                tokio::select! {
-                    biased;
-                    event = runtime_events.recv() => match event {
-                        Some(CodingRuntimeEvent::GoalChanged(p)) => {
-                            if p.phase == GoalPhase::Pursuing
-                                && p.round == 0
-                                && p.condition == submit_text
-                            {
-                                saw_retasked_pursuing = true;
-                            }
-                        }
-                        Some(_) => {}
-                        None => break,
-                    },
-                    cmd = kernel_commands.recv() => match cmd {
-                        Some(AgentCommand::SendMessage { text, .. }) => {
-                            saw_send_message = text == submit_text;
-                            break;
-                        }
-                        _ => break,
-                    },
-                }
-            }
-        })
-        .await
-        .expect("new-goal submit did not deliver within timeout");
-
-        assert!(
-            saw_retasked_pursuing,
-            "new-goal must resume Pursuing AND re-task the condition to the new message"
-        );
-        assert!(saw_send_message, "the new message must be delivered");
-        handle.shutdown().await.unwrap();
-    }
-
-    // Classifier says NOT-A-GOAL (chit-chat): the goal is NOT re-engaged — the message
-    // runs as an ordinary turn and no GoalChanged(Pursuing) is emitted.
-    #[tokio::test]
-    async fn submit_while_satisfied_not_a_goal_does_not_reengage() {
-        let (handle, mut kernel_commands, kernel_events, mut runtime_events, _w, _l, _a) =
-            controller_test_runtime(Arc::new(ClassifierProviderFactory {
-                class_line: "Class: not-a-goal",
-            }))
-            .await;
-        // --- Drive the goal to Satisfied ---
-        handle.start_goal("tests pass").await.unwrap();
-        let _ = runtime_events.recv().await; // GoalChanged(active=true)
-        handle
-            .submit(UserInput::from("initial turn"))
-            .await
-            .unwrap();
-        assert!(matches!(
-            kernel_commands.recv().await,
-            Some(AgentCommand::SendMessage { .. })
-        ));
-        kernel_events
-            .send(AgentEvent::TurnComplete {
-                reason: StopReason::Stopped,
-            })
-            .unwrap();
-        assert!(matches!(
-            kernel_commands.recv().await,
-            Some(AgentCommand::Snapshot)
-        ));
-        kernel_events
-            .send(AgentEvent::Snapshot {
-                snapshot: SessionSnapshot::new(vec![Message::assistant("done", vec![])]),
-            })
-            .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                match runtime_events.recv().await {
-                    Some(CodingRuntimeEvent::TurnFinished(_)) => break,
+                match kernel_commands.recv().await {
+                    Some(AgentCommand::SendMessage { text, .. }) if text.contains(submit_text) => {
+                        break tokio::time::Instant::now()
+                    }
                     Some(_) => {}
-                    None => panic!("events closed before met terminal"),
+                    None => panic!("commands closed before the message was forwarded"),
                 }
             }
         })
         .await
-        .expect("satisfied turn did not finish");
+        .expect("the message never reached the agent");
 
-        let submit_text = "thanks!";
-        handle.submit(UserInput::from(submit_text)).await.unwrap();
-
-        let mut saw_goal_changed_pursuing = false;
-        let mut saw_send_message = false;
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            loop {
-                tokio::select! {
-                    biased;
-                    event = runtime_events.recv() => match event {
-                        Some(CodingRuntimeEvent::GoalChanged(p)) => {
-                            if p.phase == GoalPhase::Pursuing {
-                                saw_goal_changed_pursuing = true;
-                            }
-                        }
-                        Some(_) => {}
-                        None => break,
-                    },
-                    cmd = kernel_commands.recv() => match cmd {
-                        Some(AgentCommand::SendMessage { text, .. }) => {
-                            saw_send_message = text == submit_text;
-                            break;
-                        }
-                        _ => break,
-                    },
-                }
-            }
-        })
-        .await
-        .expect("not-a-goal submit did not deliver within timeout");
-
-        assert!(saw_send_message, "the message must run as an ordinary turn");
+        let waited = reached.duration_since(at);
         assert!(
-            !saw_goal_changed_pursuing,
-            "not-a-goal must NOT re-engage the goal (no GoalChanged Pursuing)"
+            waited < std::time::Duration::from_millis(100),
+            "a person's message waited {waited:?} inside the runtime before reaching the agent"
         );
-        handle.shutdown().await.unwrap();
-    }
-
-    // Fast-path: an empty / whitespace-only submit after a Satisfied goal skips the
-    // classifier entirely and does NOT re-engage — no GoalChanged(Pursuing).
-    #[tokio::test]
-    async fn submit_while_satisfied_empty_input_skips_classifier() {
-        let (handle, mut kernel_commands, kernel_events, mut runtime_events, _w, _l, _a) =
-            controller_test_runtime(Arc::new(GoalMetProviderFactory)).await;
-
-        // --- Drive the goal to Satisfied ---
-        handle.start_goal("tests pass").await.unwrap();
-        let _ = runtime_events.recv().await; // GoalChanged(active=true)
-        handle
-            .submit(UserInput::from("initial turn"))
-            .await
-            .unwrap();
-        assert!(matches!(
-            kernel_commands.recv().await,
-            Some(AgentCommand::SendMessage { .. })
-        ));
-        kernel_events
-            .send(AgentEvent::TurnComplete {
-                reason: StopReason::Stopped,
-            })
-            .unwrap();
-        assert!(matches!(
-            kernel_commands.recv().await,
-            Some(AgentCommand::Snapshot)
-        ));
-        kernel_events
-            .send(AgentEvent::Snapshot {
-                snapshot: SessionSnapshot::new(vec![Message::assistant("done", vec![])]),
-            })
-            .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                match runtime_events.recv().await {
-                    Some(CodingRuntimeEvent::TurnFinished(_)) => break,
-                    Some(_) => {}
-                    None => panic!("events closed before met terminal"),
+        let mut reengaged = None;
+        while let Ok(event) = runtime_events.try_recv() {
+            if let CodingRuntimeEvent::GoalChanged(progress) = event {
+                if progress.phase == GoalPhase::Pursuing {
+                    reengaged = Some(progress);
                 }
             }
-        })
-        .await
-        .expect("satisfied turn did not finish");
-
-        // Whitespace-only submit → fast-path, no classifier, no re-engage.
-        handle.submit(UserInput::from("   ")).await.unwrap();
-        let mut saw_goal_changed_pursuing = false;
-        let mut saw_send_message = false;
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            loop {
-                tokio::select! {
-                    biased;
-                    event = runtime_events.recv() => match event {
-                        Some(CodingRuntimeEvent::GoalChanged(p)) => {
-                            if p.phase == GoalPhase::Pursuing {
-                                saw_goal_changed_pursuing = true;
-                            }
-                        }
-                        Some(_) => {}
-                        None => break,
-                    },
-                    cmd = kernel_commands.recv() => match cmd {
-                        Some(AgentCommand::SendMessage { .. }) => {
-                            saw_send_message = true;
-                            break;
-                        }
-                        _ => break,
-                    },
-                }
-            }
-        })
-        .await
-        .expect("empty submit did not deliver within timeout");
-
+        }
         assert!(
-            saw_send_message,
-            "the (empty) message still runs as an ordinary turn"
-        );
-        assert!(
-            !saw_goal_changed_pursuing,
-            "empty input must NOT re-engage the goal (classifier skipped)"
+            reengaged.is_none(),
+            "a met goal must not come back on its own: {reengaged:?}"
         );
         handle.shutdown().await.unwrap();
     }

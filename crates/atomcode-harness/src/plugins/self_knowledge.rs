@@ -1,0 +1,456 @@
+//! What the agent knows about itself.
+//!
+//! A harness assembled at runtime has no fixed feature set, so an agent running
+//! on it cannot answer "what am I made of" from anything baked in at compile
+//! time. Two ways to fix that, and only one of them survives:
+//!
+//! * **Write the composition into the prompt.** The moment it is written down it
+//!   is a second representation of the tree, and the copy is what drifts. This
+//!   is the exact failure `seam_map` was built to avoid — "nothing here is
+//!   hand-maintained, so nothing here can go stale".
+//! * **Give the model a door to the live tree.** The answer is generated from
+//!   the running objects on every call, so it cannot be out of date.
+//!
+//! This row does the second. The prompt fragment it contributes carries only
+//! what is invariant across every session — that the tree is assembled at
+//! runtime and therefore unknowable from training — plus the one behavioural
+//! instruction that matters: when you don't know what you are made of, call the
+//! tool instead of searching the repository and guessing. Guessing is what an
+//! agent does when nobody gave it a door.
+//!
+//! What it deliberately does **not** carry: an identity. "You are X" is the
+//! persona row's sentence, and only one row may own it — see
+//! [`super::persona`]. Nor the session id or log path, which are per-session and
+//! would make the prompt uncacheable across sessions; those are a tool call
+//! away.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use atomcode_kernel::tool::{RiskLevel, Tool, ToolContext, ToolResult};
+use atomcode_plexus::{Context, Plugin};
+use serde_json::{json, Value};
+
+use crate::seams::{Aspect, OperationsSvc, ToolsSvc};
+
+/// Describe a knob this row owns, and take the description away with the row.
+///
+/// The three-role convention applied to documentation: the row that implements
+/// a behaviour is the only one that can describe it without the description
+/// being a guess. A central FAQ would list capabilities that are not mounted
+/// and miss ones that are — which is exactly the failure the agent was already
+/// making on its own.
+pub fn describes(ctx: &Context, topic: &str, rank: i32, text: impl Into<String>) {
+    let Some(ops) = ctx.service::<OperationsSvc>() else {
+        return;
+    };
+    ops.contribute(Aspect::Operations, topic, rank, text.into());
+    let topic = topic.to_string();
+    let ops = ops.clone();
+    let _ = ctx.effect(move || ops.remove(&topic));
+}
+
+/// As [`describes`], for an answer that depends on who asks and when.
+///
+/// `describe` runs on every `describe_self` call with the asking agent's
+/// context — reach its session with [`OnlySession`](crate::agent::OnlySession).
+/// Use it for what a row can only say at call time: which file THIS session is
+/// in, what a model switch changed. Taken away with the row, like the rest.
+pub fn describes_live(
+    ctx: &Context,
+    aspect: Aspect,
+    topic: &str,
+    rank: i32,
+    describe: impl Fn(&Context) -> Option<String> + Send + Sync + 'static,
+) {
+    let Some(ops) = ctx.service::<OperationsSvc>() else {
+        return;
+    };
+    ops.contribute_live(aspect, topic, rank, Arc::new(describe));
+    let topic = topic.to_string();
+    let ops = ops.clone();
+    let _ = ctx.effect(move || ops.remove(&topic));
+}
+
+/// Everything the tool reads, captured as live handles rather than as text.
+///
+/// Holding the `Context` is the point: `service_names()` is re-read on every
+/// call, so a row mounted or dropped after this tool was built still shows up.
+struct Introspect {
+    ctx: Context,
+}
+
+impl Introspect {
+    /// The asking agent's context: inside a turn, the agent whose turn it is;
+    /// outside one — a driver asking on its own — the tree's.
+    fn asking(&self) -> Context {
+        crate::agent::scoped(&self.ctx)
+    }
+
+    /// What the rows say under `aspect`, for whoever is asking.
+    fn told(&self, aspect: Aspect) -> Vec<String> {
+        self.ctx
+            .service::<OperationsSvc>()
+            .map(|ops| ops.render(aspect, &self.asking()))
+            .unwrap_or_default()
+    }
+
+    fn session(&self) -> String {
+        use crate::agent::OnlySession;
+        // Only what the agent's own log is the authority for. Where the session
+        // is kept, when it began and how it is continued belong to whichever
+        // rows keep and continue it — this row cannot know which those are, and
+        // the version that guessed (the persistence slot's file is the store; no
+        // store means memory only) was wrong in the first assembly that kept its
+        // sessions anywhere else.
+        let mut lines = match self.asking().only_session() {
+            Some(log) => {
+                let mut lines = vec![format!("session id: {}", log.id())];
+                if let Some(title) = log.title() {
+                    lines.push(format!("title: {title}"));
+                }
+                lines.push(format!("turn: {}", log.current_turn()));
+                lines.push(format!("events logged so far: {}", log.len()));
+                lines
+            }
+            None => vec!["session: no agent session is visible from here.".to_string()],
+        };
+        let told = self.told(Aspect::Session);
+        if told.is_empty() {
+            lines.push(
+                "where it is kept: no mounted row says — which is not a statement \
+                 that it is unsaved. Do not tell the person it is saved, or that it \
+                 is not, on the strength of this."
+                    .into(),
+            );
+        }
+        lines.extend(told);
+        lines.join("\n")
+    }
+
+    fn services(&self) -> String {
+        let mut names = self.ctx.service_names();
+        names.sort_unstable();
+        format!(
+            "The service slots filled and visible from this agent's realm \
+             ({} of them). A slot is an address; the plugin behind it is a \
+             value the config picked, so the presence of `llm` says a model \
+             adapter is mounted, not which one.\n\n{}",
+            names.len(),
+            names
+                .chunks(6)
+                .map(|c| format!("  {}", c.join(", ")))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    }
+
+    fn operations(&self) -> String {
+        let told = self.told(Aspect::Operations);
+        if told.is_empty() {
+            return "No row has described a knob in this tree.".into();
+        }
+        format!(
+            "How to work this system. Each entry was written by the row that \
+             implements it, so nothing here describes a capability that is \
+             not mounted.\n\n{}",
+            told.join("\n\n")
+        )
+    }
+
+    /// What can be delegated to, as the row that surfaces the catalog says.
+    ///
+    /// This used to render the catalog here and say `task` and `team` take its
+    /// ids — true of the harness's two delegation rows, false of an assembly
+    /// that mounts its own `team` with no `model` at all. Which tools take an id
+    /// is in their descriptions; the list is the catalog row's.
+    fn models(&self) -> String {
+        let told = self.told(Aspect::Models);
+        if told.is_empty() {
+            return "No mounted row describes models to delegate to, so work that is \
+                    delegated runs on this conversation's model unless a tool's own \
+                    description says otherwise."
+                .into();
+        }
+        told.join("\n\n")
+    }
+
+    /// The settings file, as described by whatever read one to configure this
+    /// tree. The catalog used to be rendered here, which told every tree —
+    /// including ones no settings file ever configured — to edit `config.toml`.
+    fn settings(&self) -> String {
+        let told = self.told(Aspect::Settings);
+        if told.is_empty() {
+            return "No mounted row says this tree was configured from a settings file, \
+                    so there is none to point the person at."
+                .into();
+        }
+        told.join("\n\n")
+    }
+
+    fn tools(&self) -> String {
+        let Some(toolbox) = self.ctx.service::<ToolsSvc>() else {
+            return "tools: no tool catalog is mounted.".into();
+        };
+        let defs = toolbox.defs();
+        if defs.is_empty() {
+            return "tools: the catalog is mounted but empty.".into();
+        }
+        let mut out = format!("{} tools are registered right now:\n", defs.len());
+        for def in defs {
+            // One line each: the model already has the full schemas in its
+            // request, so repeating them here would burn context to say
+            // something it can already see.
+            let first = def
+                .description
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("")
+                .trim();
+            out.push_str(&format!("  {} — {}\n", def.name, first));
+        }
+        out
+    }
+}
+
+pub struct DescribeSelf {
+    inner: Introspect,
+}
+
+#[async_trait]
+impl Tool for DescribeSelf {
+    fn name(&self) -> &str {
+        "describe_self"
+    }
+
+    fn description(&self) -> &str {
+        "Report how this agent is actually assembled and how to work it: the \
+         session id and what the rows that keep this session say about it (where \
+         it is stored, how it is continued), which service slots are filled, which tools are registered, \
+         how to change things and add capabilities — model, memory, skills, MCP \
+         servers, plugins, layout — with the files and commands involved \
+         (`aspect: operations`), and the user-settings catalog including language \
+         (`aspect: settings`). Call this FIRST — before you answer, and instead \
+         of guessing or searching the repository — whenever you are asked what you \
+         are, what you are made of, what you can do, which tools or models you \
+         have, how to change or extend something about yourself, which session \
+         this is, or where your own state is kept, and before helping someone \
+         install a skill or an MCP server. This reports YOU, the running agent — \
+         not the project you are working in. Every answer is generated from the \
+         running system, so none of it can be out of date; it is read-only and \
+         cheap, so prefer calling it over answering such a question from memory."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "aspect": {
+                    "type": "string",
+                    "enum": ["session", "services", "tools", "models", "operations", "settings", "all"],
+                    "description": "session = which session this is, and what the rows that keep it say about where and how; services = what is mounted; tools = the live catalog; models = what `task` and `team` may be delegated to, read live; operations = how to change things and add capabilities (model, memory, skills, MCP servers, plugins, layout); settings = the user-settings catalog including language. Defaults to everything but settings."
+                }
+            }
+        })
+    }
+
+    fn risk(&self, _args: &str) -> RiskLevel {
+        RiskLevel::Safe
+    }
+
+    fn read_only_hint(&self) -> bool {
+        true
+    }
+
+    async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
+        // A malformed argument reports everything rather than failing: the tool
+        // exists to answer "what am I", and refusing to answer over a typo in an
+        // optional field would be the one failure mode that matters here.
+        let aspect = serde_json::from_str::<Value>(args)
+            .ok()
+            .and_then(|v| v.get("aspect")?.as_str().map(str::to_string))
+            .unwrap_or_else(|| "all".into());
+
+        let body = match aspect.as_str() {
+            "session" => self.inner.session(),
+            "services" => self.inner.services(),
+            "tools" => self.inner.tools(),
+            "models" => self.inner.models(),
+            "operations" => self.inner.operations(),
+            "settings" => self.inner.settings(),
+            // `all` deliberately omits `settings`: it is a 26-row table that
+            // answers a question nobody asked most of the time, and a default
+            // that dumps everything trains the reader to skim.
+            _ => format!(
+                "{}\n\n{}\n\n{}\n\n{}",
+                self.inner.session(),
+                self.inner.services(),
+                self.inner.tools(),
+                self.inner.operations()
+            ),
+        };
+        ToolResult {
+            call_id: String::new(),
+            content: body,
+            is_error: false,
+            images: Vec::new(),
+        }
+    }
+}
+
+pub struct SelfKnowledgePlugin;
+
+#[async_trait]
+impl Plugin for SelfKnowledgePlugin {
+    fn name(&self) -> &'static str {
+        "self-knowledge"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        // The fragment is the irreducible half — a row that contributes nothing
+        // to the prompt cannot tell the agent to stop guessing.
+        &["system-prompt"]
+    }
+    fn uses(&self) -> &'static [&'static str] {
+        // Everything the tool reports is read at call time and degrades to a
+        // plain statement of absence, so none of it is a hard dependency. That
+        // is what lets this row mount in an eval tree with no catalog and no
+        // store and still be correct about having neither.
+        &["tools", "operations"]
+    }
+    fn description(&self) -> &'static str {
+        "tell the model what it is assembled from, from the live tree"
+    }
+
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        // Deliberately free of anything session-specific.
+        //
+        // The obvious version of this fragment names the session id, so the
+        // agent can answer "who am I" with no round trip. That version is
+        // wrong: a system prompt carrying a per-session value is a different
+        // system prompt for every session, and cross-session prefix caching
+        // dies with it. The prompt says what is true of every AtomCode session;
+        // what is true of *this* one is a tool call away, and one tool call is
+        // very much cheaper than a permanently unique prompt.
+        //
+        // `tests/self_knowledge.rs::the_prompt_stays_identical_across_sessions`
+        // is what keeps this honest.
+        //
+        // Deliberately free of an identity, too — it states a fact about the
+        // agent, never "you are X". Identity belongs to the persona row, which
+        // is the row an assembly swaps: two fragments that both open with "you
+        // are" put two answers to one question in front of the model, and in a
+        // read-only tree the losing one is the whole point of the tree.
+        const INVARIANT: &str = "\
+This agent is assembled at runtime from plugin rows on the plexus kernel. There \
+is no fixed feature set — only the rows the running tree happens to have \
+mounted, which is why you cannot know what you are made of from anything you \
+were trained on.
+
+So when a question is about the running agent — what you are or are made of, \
+what you can do, which tools, models, skills, or MCP servers you have, how to \
+change or extend any of that, which session this is, or where your own state is \
+kept — call `describe_self` FIRST and answer from its report, rather than \
+guessing or searching the repository; do the same before helping someone install \
+a skill or an MCP server. Reading the source of a build is not the same as \
+reading the tree that is running. This is about the running agent, not the \
+project or repository being worked in: \"what does this codebase do\" is answered \
+from the project's own files, not from `describe_self`.";
+
+        // Rank 3: after the persona, before per-tool guidance. What the agent
+        // *is* should be established before what any one tool wants.
+        super::tools::contribute_prompt(ctx, "self-knowledge", 3, INVARIANT);
+
+        describes(
+            ctx,
+            "composition",
+            1,
+            // Only what holds for every tree. Whether the person can change the
+            // rows, and with what, is the launcher's to say — this row used to
+            // teach `[[patch]]` files in an assembly that never reads one.
+            "HOW THIS SYSTEM IS PUT TOGETHER. Every capability is a *row* in a \
+             config tree — model adapter, each tool group, memory, recall, \
+             approval policy, the UI. A row names a plugin from the build's \
+             catalog; the tree says which rows run. Whether and how the rows \
+             can be changed is up to what launched this tree: if it says, its \
+             entry is here too; if nothing here says, do not tell the person \
+             they can.\n\
+             Call `describe_self` with `aspect: services` for what is mounted \
+             right now.",
+        );
+
+        // The tool half is optional so this row can mount in a tree with no
+        // catalog — an eval harness, say — and still say who it is.
+        super::tools::mount_optional(
+            ctx,
+            vec![Arc::new(DescribeSelf {
+                inner: Introspect { ctx: ctx.clone() },
+            })],
+        )?;
+        Ok(())
+    }
+}
+
+// ---- the other half: what the *repository* says --------------------------
+
+/// The project's own standing instructions, as a prompt fragment.
+///
+/// `describe_self` answers "what am I made of" from the live tree. It cannot
+/// answer "what does this repository expect of me" — that is not a runtime fact,
+/// it is a file the repository maintains, and an agent that never reads it will
+/// happily re-derive house rules from scratch every session.
+///
+/// The loader already existed in L1 (`AGENTS.md`, `CLAUDE.md`, `.atomcode.md`,
+/// in that precedence). Nothing here mounted it, which is why an agent running
+/// inside a repository that documents its own gates was still guessing at them.
+///
+/// Unlike the identity fragment this one is deliberately *not* invariant — it is
+/// stable per project, which is the granularity a prompt cache keys on anyway.
+pub struct ProjectInstructionsPlugin;
+
+#[derive(Debug, serde::Deserialize, Default)]
+struct InstructionsRow {
+    /// Workspace root the project tier resolves against.
+    #[serde(default)]
+    project_root: Option<String>,
+    /// Config root the global tier resolves against (`~/.atomcode`).
+    #[serde(default)]
+    home: Option<String>,
+}
+
+#[async_trait]
+impl Plugin for ProjectInstructionsPlugin {
+    fn name(&self) -> &'static str {
+        "project-instructions"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["system-prompt"]
+    }
+    fn description(&self) -> &'static str {
+        "read AGENTS.md / CLAUDE.md / .atomcode.md into the prompt"
+    }
+    async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
+        let row: InstructionsRow = if config.is_null() {
+            InstructionsRow::default()
+        } else {
+            serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
+        };
+        let project = row
+            .project_root
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let home = row
+            .home
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(crate::home);
+
+        let text = atomcode_capabilities::instructions::render_instructions(&home, &project);
+        // A repository with no instructions file contributes nothing rather than
+        // an empty header: a fragment that says nothing still costs a blank line
+        // in every request, and `ids()` would report a contribution that is not
+        // one.
+        if !text.trim().is_empty() {
+            super::tools::contribute_prompt(ctx, "project-instructions", 1, &text);
+        }
+        Ok(())
+    }
+}

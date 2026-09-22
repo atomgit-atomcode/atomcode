@@ -155,6 +155,12 @@ pub struct ModelProfileConfig {
     /// (design §14.2). Higher = more capable; unset ⇒ does not participate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capable_model: Option<i64>,
+    /// What this model is good for, in the deployment's own words. Shown when
+    /// the agent asks what it may delegate to, so a person can write "fast,
+    /// weak at Rust" once instead of watching the model guess from the name.
+    /// Never inferred: an absent note is shown as absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -463,6 +469,31 @@ mod tests {
         .expect("parse auto");
         assert_eq!(auto.supports_vision, None);
         assert!(!toml::to_string(&auto).unwrap().contains("supports_vision"));
+    }
+
+    #[test]
+    fn accepts_images_sees_through_a_vendor_prefixed_model_id() {
+        // OpenRouter and Vertex qualify a model with its vendor, and the config
+        // is where those reach `accepts_images` — which the daemon projects as
+        // a live session's `supports_vision`. Reading the vendor as the family
+        // made every one of these look text-only.
+        let router: ProviderConfig = toml::from_str(
+            r#"
+                type = "openai"
+                model = "anthropic/claude-opus-4.1"
+            "#,
+        )
+        .expect("parse openrouter id");
+        assert!(router.accepts_images());
+
+        let text_only: ProviderConfig = toml::from_str(
+            r#"
+                type = "openai"
+                model = "deepseek/deepseek-v4"
+            "#,
+        )
+        .expect("parse prefixed text-only id");
+        assert!(!text_only.accepts_images());
     }
 
     #[test]

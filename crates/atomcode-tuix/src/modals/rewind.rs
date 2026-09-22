@@ -204,7 +204,7 @@ impl RewindModal {
         }
         if let Some(reason) = &self.catalog.code_unavailable {
             rows.push(DiffPanelRow::new(Vec::new()));
-            rows.push(row(reason, DiffPanelTone::Warning, false));
+            rows.push(row(reason.say(), DiffPanelTone::Warning, false));
         }
         rows
     }
@@ -333,10 +333,9 @@ mod tests {
                 after_tree: Some("b".repeat(40)),
                 files: Vec::new(),
             }],
-            code_unavailable: Some(
-                "Code Rewind is temporarily disabled; conversation Rewind remains available."
-                    .into(),
-            ),
+            code_unavailable: Some(atomcode_coding::runtime::CodeUnavailable::SetupFailed(
+                "Code Rewind is temporarily disabled".into(),
+            )),
         }
     }
 
@@ -350,7 +349,9 @@ mod tests {
     #[test]
     fn code_scopes_are_disabled_when_checkpoint_is_unavailable() {
         let mut catalog = catalog();
-        catalog.code_unavailable = Some("not a git worktree".into());
+        catalog.code_unavailable = Some(atomcode_coding::runtime::CodeUnavailable::SetupFailed(
+            "not a git worktree".into(),
+        ));
         let mut modal = RewindModal::open(catalog);
         modal.stage = Stage::Scope;
         modal.selected_scope = 1;

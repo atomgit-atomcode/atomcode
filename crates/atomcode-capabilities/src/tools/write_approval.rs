@@ -113,6 +113,31 @@ static TEMP_ROOTS: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
         .collect()
 });
 
+// ---- why this gate does not go through [`crate::world`] --------------------
+//
+// The world seam exists so containment is a boundary rather than a rule tools
+// cooperate with, and a gate that canonicalises on the host while the tool it
+// guards writes through a remote world would be checking one machine and
+// permitting another. That argument does not reach these four call sites,
+// because none of them is asking the world a question it owns:
+//
+// * `TEMP_ROOTS` resolves `$TMPDIR` / `/tmp` — the *host's* scratch space, and
+//   the reason a write there needs no prompt. A remote world's temp dir is a
+//   different fact that this exemption is not about.
+// * `canonical_dir_key` computes a session-grant KEY. Like `edit`'s path lock,
+//   it is an identity, not a claim about what is on disk.
+// * `path_in_workspace` / `path_under_any` ask "is this inside the workspace" —
+//   which a fenced world already answers, and answers more strongly: it refuses
+//   at `write_bytes` whatever this gate decided upstream. The two can disagree
+//   (a gate keyed on `cwd`, a world keyed on its configured root), but only in
+//   the safe direction — the gate is upstream, so a write it waves through can
+//   still be denied by the world, never the reverse.
+//
+// So what is left here is approval *UX* policy — when to prompt, what a grant
+// covers — and that is host-local by nature. Containment lives in the world.
+// Threading a world through these would duplicate the world's own check in a
+// second place, which is how two containment rules start disagreeing.
+
 /// True if `raw` (resolved against `cwd`) lands inside ANY of `roots`. Walks the target's
 /// ancestors, canonicalizing the deepest one that EXISTS (so a not-yet-created leaf is
 /// classified by its parent) — canonicalization resolves `..` traversal and symlinks, so a
@@ -247,6 +272,7 @@ impl WriteApprovalGate {
             tool: tool.name().to_string(),
             args: call.arguments.clone(),
             reason: None,
+            allow_all_bash: false,
         })
         .unwrap_or(serde_json::Value::Null);
         PermissionDecision::from_value(&rt.request(&self.kind, payload).await)
@@ -274,6 +300,114 @@ impl WriteApprovalGate {
     }
 }
 
+/// What the write-approval policy says about one call.
+///
+/// The judgement alone — who is asked, and how the answer is remembered, belongs
+/// to whoever wears the shell. The kernel [`ToolMiddleware`] below keeps its own
+/// `PermissionStore`; the harness `tool-write-approval` row hands the same
+/// verdict to the `approval` seam, whose store is shared with every other gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteVerdict {
+    /// Not a write tool — defer to the ordinary flow.
+    NotOurs,
+    /// Authorized without asking, and why.
+    Allow(&'static str),
+    /// Ask a person.
+    Ask {
+        /// Whether "allow always" may be offered.
+        ///
+        /// `false` for a sensitive target (a key, a `.env`): those are asked
+        /// EVERY time. Offering to remember a permission that will be asked for
+        /// again tells the person something untrue about what they just granted.
+        grantable: bool,
+        /// What an `allow always` is remembered against — a canonical path for a
+        /// single-file write, the tool alone for a bulk one. Empty when not
+        /// grantable.
+        scope: String,
+    },
+}
+
+/// The write-approval verdict for one call.
+///
+/// `cwd` is `None` when the caller could not read the working directory (a
+/// poisoned lock). That is not an error, it is a narrower question: relative
+/// targets cannot be resolved, so anything that already looks sensitive in the
+/// raw arguments is asked about un-grantably, and everything else defers.
+pub async fn write_verdict(
+    tool_name: &str,
+    arguments: &str,
+    cwd: Option<&Path>,
+    accept_edits: bool,
+) -> WriteVerdict {
+    if !is_write_tool(tool_name) {
+        return WriteVerdict::NotOurs;
+    }
+    // Cheap raw-args sensitivity check (no cwd needed) — catches absolute / `~`-prefixed
+    // sensitive paths via substring. Done first so even a poisoned cwd lock still prompts them.
+    let raw_sensitive = references_sensitive_path(arguments);
+    let ungrantable = WriteVerdict::Ask {
+        grantable: false,
+        scope: String::new(),
+    };
+    let Some(cwd) = cwd else {
+        return if raw_sensitive {
+            ungrantable
+        } else {
+            WriteVerdict::NotOurs
+        };
+    };
+
+    let targets = write_targets(tool_name, arguments);
+
+    // Sensitive target → ask EVERY time. Classify on the RESOLVED path (catches relative
+    // `.ssh/...`, Windows `..\.ssh\..`, system-protected prefixes that the raw substring
+    // form misses). Checked BEFORE the workspace shortcut so an in-workspace `.env` still asks.
+    if raw_sensitive
+        || targets
+            .iter()
+            .any(|t| path_is_sensitive(&resolve_path(t, cwd)))
+    {
+        return ungrantable;
+    }
+
+    // Auto-accept-edits: a non-sensitive edit auto-approves with NO prompt (sensitive was
+    // handled above and still asks). Only the write tools this gate owns — bash still flows
+    // to the ordinary approval path.
+    if accept_edits {
+        return WriteVerdict::Allow("accept-edits mode");
+    }
+
+    // Classification CANONICALIZES paths (filesystem syscalls). Run it OFF the async worker,
+    // bounded: a workspace on a stalled mount would otherwise block `canonicalize()` for
+    // minutes and freeze the caller's loop. On timeout → "not in workspace, tool-wide scope",
+    // i.e. an ordinary prompt: safe, and never hangs.
+    let (in_workspace, scope) = {
+        let targets = targets.clone();
+        let cwd = cwd.to_path_buf();
+        let name = tool_name.to_string();
+        let fallback = (false, format!("{name}::"));
+        super::run_bounded(super::GATE_FS_TIMEOUT, fallback, move || {
+            let in_ws = !targets.is_empty()
+                && targets.iter().all(|t| {
+                    !t.trim().is_empty()
+                        && (path_in_workspace(t, &cwd) || path_in_temp_dir(t, &cwd))
+                });
+            (in_ws, grant_key(&name, &targets, &cwd))
+        })
+        .await
+    };
+
+    // Entirely in-workspace and non-sensitive → auto-approve. The `!is_empty` + non-blank
+    // guards keep an unparseable / empty-path call from vacuously passing.
+    if in_workspace {
+        return WriteVerdict::Allow("in-workspace write");
+    }
+    WriteVerdict::Ask {
+        grantable: true,
+        scope,
+    }
+}
+
 #[async_trait]
 impl ToolMiddleware for WriteApprovalGate {
     async fn before(
@@ -283,101 +417,46 @@ impl ToolMiddleware for WriteApprovalGate {
         rt: &RequestCtx,
     ) -> BeforeOutcome {
         let name = tool.name();
-        if !is_write_tool(name) {
-            return BeforeOutcome::Proceed; // not ours — defer to the normal flow
-        }
-
-        // Cheap raw-args sensitivity check (no cwd needed) — catches absolute / `~`-prefixed
-        // sensitive paths via substring. Done first so even a poisoned cwd lock still prompts them.
-        let raw_sensitive = references_sensitive_path(&call.arguments);
-
-        // Snapshot the live cwd (read + clone in one statement so the lock guard is NOT held
-        // across an await — the future must stay Send). A poisoned lock means we cannot RESOLVE
-        // relative targets: if the raw args already look sensitive, prompt-without-remembering;
-        // otherwise defer to the generic ApprovalMiddleware (never panic — kernel is panic=abort).
-        let cwd = match self.cwd.read().ok().map(|g| g.clone()) {
-            Some(c) => c,
-            None => {
-                return if raw_sensitive {
-                    self.prompt_unremembered(call, tool, rt).await
-                } else {
-                    BeforeOutcome::Proceed
-                };
-            }
-        };
-
-        let targets = write_targets(name, &call.arguments);
-
-        // (1) Sensitive target → prompt EVERY time, never remembered (v1's un-grantable posture).
-        // Classify on the RESOLVED path (catches RELATIVE `.ssh/...` / Windows `..\.ssh\..` /
-        // system-protected prefixes that the raw substring form misses). Checked BEFORE the
-        // workspace shortcut so an in-workspace `.env` / `id_rsa` still prompts.
-        let sensitive = raw_sensitive
-            || targets
-                .iter()
-                .any(|t| path_is_sensitive(&resolve_path(t, &cwd)));
-        if sensitive {
-            return self.prompt_unremembered(call, tool, rt).await;
-        }
-
-        // Auto-accept-edits mode: a non-sensitive edit auto-approves with NO prompt
-        // (sensitive was handled above and still prompts). This only affects the write
-        // tools this gate owns — bash still flows to ApprovalMiddleware and prompts.
-        // Enforced here in middleware, before the runtime approval seam.
-        if self.accept_edits.load(std::sync::atomic::Ordering::Relaxed) {
-            return BeforeOutcome::Allow {
-                reason: Some("accept-edits mode".into()),
-            };
-        }
-
-        // (2)+(3) classification CANONICALIZES paths (touches the filesystem). Run it OFF the
-        // async worker, bounded: if the workspace lives on a stalled mount (e.g. a hung network
-        // share as the cwd), `canonicalize()` can block for minutes — doing it inline freezes the
-        // kernel's turn loop so even Esc/Ctrl-C can't fire the cancel token. On timeout we degrade
-        // to "not in workspace, tool-wide grant key" → a normal approval prompt (safe, never hangs).
-        let (in_workspace, key) = {
-            let targets = targets.clone();
-            let cwd = cwd.clone();
-            let name = name.to_string();
-            let fallback = (false, format!("{name}::"));
-            super::run_bounded(super::GATE_FS_TIMEOUT, fallback, move || {
-                let in_ws = !targets.is_empty()
-                    && targets.iter().all(|t| {
-                        !t.trim().is_empty()
-                            && (path_in_workspace(t, &cwd) || path_in_temp_dir(t, &cwd))
-                    });
-                (in_ws, grant_key(&name, &targets, &cwd))
-            })
-            .await
-        };
-
-        // (2) Entirely in-workspace, non-sensitive → AUTO-APPROVE, no prompt (v1 parity). The
-        // `!is_empty` + non-blank guards keep an unparseable / empty-path call from vacuously passing.
-        if in_workspace {
-            return BeforeOutcome::Allow {
-                reason: Some("in-workspace write".into()),
-            };
-        }
-
-        // (3) Out-of-workspace (or unparseable) non-sensitive → prompt; "Always" remembers per
-        // canonical path (edit/write) or per tool (bulk/multi-file).
-        if self.store.is_granted(&key) {
-            return BeforeOutcome::Allow {
-                reason: Some("previously granted this session".into()),
-            };
-        }
-        match self.prompt(call, tool, rt).await {
-            PermissionDecision::AllowOnce => BeforeOutcome::Allow {
-                reason: Some("approved once".into()),
+        // Read + clone in one statement so the lock guard is NOT held across an await —
+        // the future must stay Send. A poisoned lock is passed on as "no cwd", which the
+        // verdict reads as "relative targets cannot be resolved" (never panic — kernel is
+        // panic=abort).
+        let cwd = self.cwd.read().ok().map(|g| g.clone());
+        let accept_edits = self.accept_edits.load(std::sync::atomic::Ordering::Relaxed);
+        match write_verdict(name, &call.arguments, cwd.as_deref(), accept_edits).await {
+            WriteVerdict::NotOurs => BeforeOutcome::Proceed,
+            WriteVerdict::Allow(reason) => BeforeOutcome::Allow {
+                reason: Some(reason.into()),
             },
-            PermissionDecision::AllowAlways | PermissionDecision::AllowAlwaysAll => {
-                self.store.grant(&key);
-                BeforeOutcome::Allow {
-                    reason: Some("approved always (this folder)".into()),
+            // Sensitive target: asked every time, never remembered.
+            WriteVerdict::Ask {
+                grantable: false, ..
+            } => self.prompt_unremembered(call, tool, rt).await,
+            WriteVerdict::Ask { scope, .. } => {
+                if self.store.is_granted(&scope) {
+                    return BeforeOutcome::Allow {
+                        reason: Some("previously granted this session".into()),
+                    };
                 }
-            }
-            PermissionDecision::Deny => {
-                BeforeOutcome::deny(format!("denied by approval policy: {name}"))
+                match self.prompt(call, tool, rt).await {
+                    PermissionDecision::AllowOnce => BeforeOutcome::Allow {
+                        reason: Some("approved once".into()),
+                    },
+                    // `AllowAlwaysAll` is the driver's "allow all Bash" option. A write
+                    // gate is not bash, so it takes the same tool-wide grant as
+                    // `AllowAlways` rather than being refused — the decision variant is
+                    // shared across gates, and refusing it here would turn a deliberate
+                    // "always" into a silent deny.
+                    PermissionDecision::AllowAlways | PermissionDecision::AllowAlwaysAll => {
+                        self.store.grant(&scope);
+                        BeforeOutcome::Allow {
+                            reason: Some("approved always (this folder)".into()),
+                        }
+                    }
+                    PermissionDecision::Deny => {
+                        BeforeOutcome::deny(format!("denied by approval policy: {name}"))
+                    }
+                }
             }
         }
     }
@@ -391,10 +470,10 @@ mod tests {
     use tokio::sync::mpsc::unbounded_channel;
 
     fn edit_tool() -> Arc<dyn Tool> {
-        Arc::new(crate::tools::edit::EditFileTool)
+        Arc::new(crate::tools::edit::EditFileTool::default())
     }
     fn write_tool() -> Arc<dyn Tool> {
-        Arc::new(crate::tools::write::WriteFileTool)
+        Arc::new(crate::tools::write::WriteFileTool::default())
     }
 
     /// A driver that never answers → the bounded round-trip times out → Null → Deny. So any

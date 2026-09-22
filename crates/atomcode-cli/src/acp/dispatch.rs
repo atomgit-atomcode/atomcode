@@ -9,9 +9,11 @@
 //! id round-trips to the single native session catalog shared with the
 //! CLI/TUI — no second persistence model.
 
+use atomcode_kernel::event::AgentCommand;
 use std::collections::HashSet;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
 use agent_client_protocol::schema::v1::{
     ContentBlock, ContentChunk, ImageContent as AcpImageContent, MessageId, NewSessionRequest,
@@ -22,10 +24,7 @@ use agent_client_protocol::{Client, ConnectionTo, Error as AcpError, Responder};
 use atomcode_capabilities::mcp::McpServerConfig;
 use atomcode_capabilities::session::CatalogScan;
 use atomcode_capabilities::tools::todo::TodoItem;
-use atomcode_coding::{
-    CodingProviderFactory, CodingRuntimeHandle, RuntimeStartError,
-    SessionMode as CodingSessionMode, TurnCompletion,
-};
+use atomcode_coding::{CodingProviderFactory, RuntimeStartError, SessionMode as CodingSessionMode};
 use atomcode_kernel::event::{AgentEvent, StopReason};
 use atomcode_kernel::message::ImageContent;
 use atomcode_kernel::tool::ToolCall;
@@ -38,7 +37,6 @@ use crate::acp::sessions::{
     Sessions,
 };
 use crate::acp::turn::TurnWire;
-use crate::acp::SessionModelResolver;
 
 fn prompt_terminal(
     stop: StopReason,
@@ -46,19 +44,6 @@ fn prompt_terminal(
 ) -> Result<agent_client_protocol::schema::v1::StopReason, String> {
     crate::acp::translate::stop_reason(stop)
         .map_err(|fallback| last_error.unwrap_or_else(|| fallback.to_string()))
-}
-
-fn prompt_completion_terminal(
-    completion: &TurnCompletion,
-    last_error: Option<String>,
-) -> Result<agent_client_protocol::schema::v1::StopReason, String> {
-    match completion {
-        TurnCompletion::Completed { reason, .. } => prompt_terminal(*reason, last_error),
-        TurnCompletion::SnapshotUnavailable { reason, error, .. } => Err(format!(
-            "{} (turn completion: SnapshotUnavailable, reason: {reason:?})",
-            error.message
-        )),
-    }
 }
 
 // ── session/new handler ───────────────────────────────────────────────────────
@@ -133,7 +118,7 @@ pub async fn spawn_and_register_session(
         )));
     }
     validate_additional_directories(&additional_directories)?;
-    let runtime = crate::acp::engine::spawn_session(
+    let (runtime, front_end) = crate::acp::engine::spawn_session(
         engine,
         cwd.clone(),
         provider_factory,
@@ -145,6 +130,9 @@ pub async fn spawn_and_register_session(
     register_session(
         sessions,
         runtime,
+        front_end,
+        engine.to_coding_config(cwd.clone()),
+        engine.model_resolver(),
         cwd,
         config_options,
         additional_directories,
@@ -245,10 +233,13 @@ pub async fn handle_resume_session(
     )
     .await
     {
-        Ok(runtime) => {
+        Ok((runtime, front_end)) => {
             register_session(
                 sessions,
                 runtime,
+                front_end,
+                engine.to_coding_config(cwd.clone()),
+                engine.model_resolver(),
                 cwd,
                 config_options,
                 additional_directories,
@@ -384,10 +375,13 @@ pub fn prompt_text(req: &PromptRequest) -> (String, Vec<ImageContent>, bool) {
         match block {
             ContentBlock::Text(t) => text.push_str(&t.text),
             ContentBlock::Image(i) => {
-                images.push(ImageContent {
-                    media_type: i.mime_type.clone(),
-                    data: i.data.clone(),
-                });
+                // Downscale/re-encode oversized attachments (re-sent every turn).
+                let (media_type, data) =
+                    atomcode_capabilities::image_normalize::normalize_image_base64(
+                        &i.mime_type,
+                        &i.data,
+                    );
+                images.push(ImageContent { media_type, data });
                 has_attachments = true;
             }
             ContentBlock::ResourceLink(link) => {
@@ -431,8 +425,6 @@ pub async fn run_prompt_turn(
     has_attachments: bool,
     responder: Responder<PromptResponse>,
     auto_approve: bool,
-    model_resolver: Option<&SessionModelResolver>,
-    effort_resolver: Option<&SessionModelResolver>,
     msg_ids: Arc<std::sync::atomic::AtomicU64>,
     elicitation_form: &std::sync::atomic::AtomicBool,
 ) -> Result<(), agent_client_protocol::Error> {
@@ -442,8 +434,6 @@ pub async fn run_prompt_turn(
         sessions: sessions.clone(),
         sid: sid.clone(),
         responder: Some(responder),
-        model_resolver,
-        effort_resolver,
         announced: HashSet::new(),
     };
     crate::acp::turn::run_turn(
@@ -467,15 +457,13 @@ pub async fn run_prompt_turn(
 ///
 /// Owns the v1 `SessionId`, the deferred [`Responder`] (answered exactly once
 /// per turn — on an intercepted slash, an unknown session, a dead kernel, or
-/// the turn terminal), the slash-command resolvers, and the set of tool calls
-/// already announced as `pending` by the approval round-trip.
-struct V1Wire<'a> {
+/// the turn terminal) and the set of tool calls already announced as `pending`
+/// by the approval round-trip.
+struct V1Wire {
     cx: ConnectionTo<Client>,
     sessions: Sessions,
     sid: SessionId,
     responder: Option<Responder<PromptResponse>>,
-    model_resolver: Option<&'a SessionModelResolver>,
-    effort_resolver: Option<&'a SessionModelResolver>,
     /// Tool calls already announced as `pending` by the approval round-trip.
     /// Their `ToolStarted` must UPDATE the pending record to `in_progress`
     /// instead of creating a second one (protocol flow: tool_call pending →
@@ -483,7 +471,7 @@ struct V1Wire<'a> {
     announced: HashSet<String>,
 }
 
-impl TurnWire for V1Wire<'_> {
+impl TurnWire for V1Wire {
     type Update = SessionUpdate;
 
     fn notify(&self, update: Self::Update) -> Result<(), agent_client_protocol::Error> {
@@ -514,8 +502,6 @@ impl TurnWire for V1Wire<'_> {
                     &self.sessions,
                     &self.cx,
                     &self.sid,
-                    self.model_resolver,
-                    self.effort_resolver,
                 )
                 .await
                 {
@@ -550,7 +536,7 @@ impl TurnWire for V1Wire<'_> {
 
     async fn handle_approval_request(
         &mut self,
-        runtime: &CodingRuntimeHandle,
+        commands: &mpsc::UnboundedSender<AgentCommand>,
         req_id: u64,
         payload: serde_json::Value,
         auto_approve: bool,
@@ -586,11 +572,12 @@ impl TurnWire for V1Wire<'_> {
         if auto_approve {
             // `--dangerously-skip-permissions`: auto-allow without round-tripping
             // to the client (which would otherwise make the flag a no-op).
-            let _ = runtime
-                .respond(req_id, serde_json::json!({"decision": "allow"}))
-                .await;
+            let _ = commands.send(AgentCommand::Respond {
+                id: req_id,
+                value: serde_json::json!({"decision": "allow"}),
+            });
         } else if let Err(e) =
-            crate::acp::permission::handle_approval(&self.cx, &self.sid, runtime, req_id, payload)
+            crate::acp::permission::handle_approval(&self.cx, &self.sid, commands, req_id, payload)
                 .await
         {
             // Defense-in-depth: `handle_approval` already fails closed internally
@@ -598,16 +585,17 @@ impl TurnWire for V1Wire<'_> {
             // down (reserved for genuine transport death, NOT an approval
             // hiccup). Deny this call so the kernel unparks, keep the turn.
             eprintln!("acp: approval handling errored ({e}); denying this call, turn continues");
-            let _ = runtime
-                .respond(req_id, serde_json::json!({"decision": "deny"}))
-                .await;
+            let _ = commands.send(AgentCommand::Respond {
+                id: req_id,
+                value: serde_json::json!({"decision": "deny"}),
+            });
         }
         Ok(())
     }
 
     async fn handle_user_input_request(
         &mut self,
-        runtime: &CodingRuntimeHandle,
+        commands: &mpsc::UnboundedSender<AgentCommand>,
         req_id: u64,
         payload: serde_json::Value,
         form_supported: bool,
@@ -618,7 +606,7 @@ impl TurnWire for V1Wire<'_> {
         crate::acp::elicitation::handle_request_user_input(
             &self.cx,
             &self.sid,
-            runtime,
+            commands,
             req_id,
             payload,
             form_supported,
@@ -667,14 +655,14 @@ impl TurnWire for V1Wire<'_> {
 
     fn finish(
         &mut self,
-        terminal: Result<TurnCompletion, StopReason>,
+        terminal: Result<StopReason, StopReason>,
         last_error: Option<String>,
         _msg_id: &str,
     ) -> Result<(), agent_client_protocol::Error> {
-        let response = match terminal {
-            Ok(completion) => prompt_completion_terminal(&completion, last_error),
-            Err(stop) => prompt_terminal(stop, last_error),
-        };
+        // Both arms map the same way: a terminal is a reason. `Err` only means
+        // the loop stopped waiting for one, and its own reason is already the
+        // best it has.
+        let response = prompt_terminal(terminal.unwrap_or_else(|stop| stop), last_error);
         let responder = self
             .responder
             .take()
@@ -962,20 +950,27 @@ mod tests {
         );
     }
 
+    /// A turn whose record could not be written is no longer reported as a
+    /// failed prompt.
+    ///
+    /// It was: `SnapshotUnavailable` became an internal error, so a client was
+    /// told the prompt failed when the model had answered and the turn had
+    /// stopped normally. The contract separates the two (plan 6.3), and the
+    /// driver folds the store's trouble into the turn's text instead —
+    /// `turn::fold_persistence_failure` owns that and has the criterion.
+    /// What is left to pin here is this end: a normal reason stays a normal
+    /// terminal even when something went wrong alongside it.
     #[test]
-    fn snapshot_unavailable_is_acp_failure_even_when_reason_is_stopped() {
-        let completion = TurnCompletion::SnapshotUnavailable {
-            turn_id: 1,
-            reason: StopReason::Stopped,
-            error: atomcode_coding::RuntimeSnapshotError {
-                message: "snapshot failed".into(),
-            },
-            stats: Default::default(),
-        };
-
-        let error = prompt_completion_terminal(&completion, None).unwrap_err();
-        assert!(error.contains("snapshot failed"));
-        assert!(error.contains("Stopped"));
+    fn a_normal_stop_stays_a_normal_terminal() {
+        let stop = prompt_terminal(
+            StopReason::Stopped,
+            Some("这一回合没能存下来:磁盘满了".into()),
+        )
+        .expect("a turn that stopped normally is not a protocol failure");
+        assert_eq!(
+            serde_json::to_value(stop).unwrap(),
+            serde_json::json!("end_turn")
+        );
     }
 
     #[tokio::test]

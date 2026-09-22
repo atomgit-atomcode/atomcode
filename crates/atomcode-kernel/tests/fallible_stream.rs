@@ -450,7 +450,7 @@ async fn interactive_truncation_checkpoint_cancel_uses_cancelled_terminal() {
                 checkpoint_fired = true;
                 handle.commands.send(AgentCommand::Cancel).unwrap();
             }
-            AgentEvent::TurnComplete { reason } => {
+            AgentEvent::TurnComplete { reason, .. } => {
                 stop = Some(reason);
                 break;
             }
@@ -580,7 +580,7 @@ async fn retryable_open_failure_retries_visibly_then_succeeds() {
                 ..
             } => retries.push((attempt, max_attempts)),
             AgentEvent::Error { .. } => errored = true,
-            AgentEvent::TurnComplete { reason } => {
+            AgentEvent::TurnComplete { reason, .. } => {
                 stop = Some(format!("{reason:?}"));
                 break;
             }
@@ -701,7 +701,7 @@ async fn empty_response_is_retried_then_succeeds() {
             AgentEvent::Warning(w) => warnings.push(w),
             AgentEvent::TextDelta(t) => text.push_str(&t),
             AgentEvent::Error { .. } => errored = true,
-            AgentEvent::TurnComplete { reason } => {
+            AgentEvent::TurnComplete { reason, .. } => {
                 stop = Some(format!("{reason:?}"));
                 break;
             }
@@ -760,7 +760,7 @@ async fn empty_response_exhaustion_fails_visibly() {
         match ev {
             AgentEvent::Warning(w) if w.contains("空响应") => retry_notices += 1,
             AgentEvent::Error { message, .. } => error_msg = Some(message),
-            AgentEvent::TurnComplete { reason } => {
+            AgentEvent::TurnComplete { reason, .. } => {
                 stop = Some(format!("{reason:?}"));
                 break;
             }
@@ -823,7 +823,7 @@ async fn malformed_response_retried_with_distinct_notice() {
         match ev {
             AgentEvent::Warning(w) => warnings.push(w),
             AgentEvent::TextDelta(t) => text.push_str(&t),
-            AgentEvent::TurnComplete { reason } => {
+            AgentEvent::TurnComplete { reason, .. } => {
                 stop = Some(format!("{reason:?}"));
                 break;
             }

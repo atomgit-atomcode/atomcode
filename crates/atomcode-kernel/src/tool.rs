@@ -260,6 +260,19 @@ pub trait Tool: Send + Sync {
     fn always_grant_scope(&self, args: &str) -> String {
         args.to_string()
     }
+    /// The "allow all of THIS group this session" family this call belongs to, if
+    /// the person may grant a session-wide blanket for it — `Some("bash")` for an
+    /// ordinary shell command, so an approval panel can offer "本会话允许所有 Bash"
+    /// and a later command in the same group runs without asking. `None` (the
+    /// default) means no such blanket is offered: a call whose target is SENSITIVE
+    /// (credentials, `~/.ssh`, `.env`) returns `None` even for a group that
+    /// otherwise supports it, so the blanket can never cover it — the floor that
+    /// keeps "allow all" from meaning "allow the one thing that must always ask".
+    /// Advisory only: a specialization's approval policy reads it; the kernel never
+    /// gates.
+    fn allow_all_group(&self, _args: &str) -> Option<String> {
+        None
+    }
     /// Lift a policy intervention discovered behind this tool's execution
     /// boundary (for example, a task tool whose child agent hit a hard policy
     /// gate). Implementations may sanitize `result` before it is observed by

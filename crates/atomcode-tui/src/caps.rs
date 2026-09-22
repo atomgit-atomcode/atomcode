@@ -1,0 +1,783 @@
+//! What this terminal can actually do — the first layer's half of the OS shield.
+//!
+//! There are two kinds of platform difference in a TUI and only one of them is
+//! about drawing:
+//!
+//! * **I/O**: key encodings, resize signals, raw mode, bracketed paste, alt
+//!   screen. Shielded by [`Surface`](crate::surface::Surface), which is already
+//!   a row — a headless surface and a terminal surface are swappable.
+//! * **Drawing**: which glyphs render, how many columns they take, how many
+//!   colours there are. That is this file.
+//!
+//! Calling them one layer is how the first kind leaks: key handling never
+//! passes through any box-drawing code, so a shield built only around glyphs
+//! would silently not cover it.
+//!
+//! # Capabilities are injected, never detected in `render`
+//!
+//! Same rule as time (`docs/adr/0008`), for the same reason. A `render` that
+//! read `TERM` would be green on the developer's machine and wrong on the
+//! user's, and no test would say so. Detection happens once, in the surface
+//! row; everything above receives a [`Caps`] value.
+//!
+//! # The downgrade happens at paint, not at composition
+//!
+//! Modules write `✓` and `┌` unconditionally. [`downgrade`] rewrites them on
+//! the way to the terminal when the terminal cannot show them. Putting it here
+//! rather than at every call site is what makes the layering enforceable rather
+//! than aspirational: a module *cannot* get this wrong, because it never had a
+//! choice to make.
+//!
+//! It also fixes a real width bug rather than just a legibility one. `✓`, `─`
+//! and friends are East Asian **Ambiguous**: one column in most terminals, two
+//! in a CJK-configured one. Our width arithmetic assumes one. The ASCII
+//! stand-ins are unambiguously one column, so downgrading makes the assumption
+//! true instead of hoping it is.
+//!
+//! Ported from `atomcode-tuix`'s `glyph.rs` and `TerminalCaps`, which learned
+//! these rules the expensive way (Windows conhost tofu, `LANG=C` in CI).
+
+use std::borrow::Cow;
+
+/// How many colours the terminal has.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Colors {
+    /// No SGR at all — a pipe, a dumb terminal, `NO_COLOR`.
+    None,
+    /// The 16 classic ANSI colours.
+    Ansi16,
+    /// 256 indexed colours.
+    #[default]
+    Ansi256,
+    /// 24-bit.
+    True,
+}
+
+/// Whether this terminal can be shown a picture, and how.
+///
+/// Terminals grew a lot more capable than a grid of characters: 22 emulators
+/// now do images, 9 speak kitty's protocol, 15 speak sixel, and people are
+/// putting 3D viewports and rendered diagrams in them. The pattern that makes
+/// that usable is not "detect and branch at every call site" — it is one
+/// component that asks for a picture and degrades to ASCII where it cannot have
+/// one, which is the same shape as the glyph fallback below.
+///
+/// Detected here only where the environment says so honestly. **Sixel cannot
+/// be**: it needs a DA1 query and a reply, which is I/O — so the terminal
+/// surface may raise this after probing, and this pure function never guesses.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Graphics {
+    /// Characters only.
+    #[default]
+    None,
+    /// DEC sixel. Only ever set by a surface that probed for it.
+    Sixel,
+    /// iTerm2's inline images.
+    ITerm2,
+    /// kitty's protocol: PNG, animation, GPU-accelerated.
+    Kitty,
+}
+
+/// What the terminal on the other end can render.
+/// What a build or a person says about the terminal, over what detection found.
+///
+/// Detection reads the environment, and the environment lies in both
+/// directions: a corporate image ships `TERM=xterm` on an emulator that does
+/// 24-bit colour, and a CI runner claims a colour terminal while rendering into
+/// a log file. `ATOMCODE_ASCII` was the only way to say otherwise, and it
+/// answers one of the three questions — which is why a downstream build that
+/// ships to a fixed fleet of terminals ended up patching detection itself.
+///
+/// Empty by default: nothing overridden, detection stands. Set from the surface
+/// row's config (`unicode`, `colors`, `cell_background`), so a fleet states what
+/// its terminals do once, in the tree, rather than per machine in an
+/// environment variable.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Overrides {
+    pub unicode: Option<bool>,
+    pub colors: Option<Colors>,
+    pub cell_background: Option<bool>,
+}
+
+impl Overrides {
+    /// Whether anything is overridden at all.
+    pub fn any(&self) -> bool {
+        self.unicode.is_some() || self.colors.is_some() || self.cell_background.is_some()
+    }
+
+    /// Put these over `caps`. A field nobody set keeps what was detected.
+    ///
+    /// `palette` is deliberately not overridable: it is a *measurement* of what
+    /// the terminal rendered, and a build asserting a measurement it never took
+    /// is how both unreadable palettes shipped.
+    pub fn over(&self, caps: Caps) -> Caps {
+        Caps {
+            unicode: self.unicode.unwrap_or(caps.unicode),
+            colors: self.colors.unwrap_or(caps.colors),
+            cell_background: self.cell_background.unwrap_or(caps.cell_background),
+            ..caps
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Caps {
+    /// Decorative Unicode (box drawing, `✓`, `▸`) renders rather than tofu.
+    pub unicode: bool,
+    pub colors: Colors,
+    /// The colours the terminal actually renders: its background, and its
+    /// sixteen slots, as measured by the surface row.
+    ///
+    /// Not a light/dark flag. One bit cannot answer "will this be legible" —
+    /// two terminals can both be dark and disagree by half the luminance range,
+    /// and every signal that produces the bit (OSC 11, `COLORFGBG`, a config
+    /// line) can be missing, stale or inverted. Both palettes that shipped
+    /// before this were unreadable, in opposite directions, for exactly that
+    /// reason. What is stored is a measurement; `theme.rs` does arithmetic on
+    /// it.
+    pub palette: crate::theme::Palette,
+    /// Whether the terminal paints a cell's **background** colour.
+    ///
+    /// Not the same question as [`colors`](Self::colors): a terminal can have 256
+    /// of them and still drop the background, and when it does, anything drawn
+    /// with one comes apart. Tuix learned this the hard way — its mascot packs two
+    /// vertical pixels per cell (`▀` with fg above, bg below), and on a bare ssh
+    /// client the glyphs arrived but the backgrounds did not, so the art
+    /// fragmented into its top half. It gates on `modern_emulator`/`jediterm` for
+    /// that reason; those two variables are what a shield can honestly read.
+    ///
+    /// False by default, like everything a terminal has not said. A caller that
+    /// needs it can encode its own gate (a plain foreground glyph always works);
+    /// what it must not do is assume.
+    pub cell_background: bool,
+    /// Pictures, if any. Nothing draws one yet — the field is here because it
+    /// belongs to the shield, and the shield is the thing being built. A
+    /// component that wants a picture will ask this rather than the
+    /// environment.
+    pub graphics: Graphics,
+}
+
+impl Default for Caps {
+    /// Everything on. The default is what a modern terminal does, so a test or
+    /// an embedder that never thinks about this gets the good rendering.
+    fn default() -> Self {
+        Self {
+            unicode: true,
+            colors: Colors::Ansi256,
+            palette: crate::theme::Palette::assumed(crate::theme::Theme::Dark),
+            // What a modern terminal does, which is the whole meaning of this
+            // default. `detect` is where a real answer comes from.
+            cell_background: true,
+            graphics: Graphics::None,
+        }
+    }
+}
+
+impl Caps {
+    /// The plainest terminal: ASCII, no colour. What CI and a pipe get.
+    pub fn plain() -> Self {
+        Self {
+            unicode: false,
+            colors: Colors::None,
+            palette: crate::theme::Palette::assumed(crate::theme::Theme::Dark),
+            cell_background: false,
+            graphics: Graphics::None,
+        }
+    }
+
+    /// Read the environment, then let `overrides` have the last word.
+    pub fn detect_with(overrides: Overrides) -> Self {
+        overrides.over(Self::detect())
+    }
+
+    /// Read the environment. Called once, by the surface row.
+    ///
+    /// The rules are `atomcode-tuix`'s, unchanged — they encode real bug
+    /// reports (legacy conhost showing `□`, `LANG=C` containers), and a second
+    /// set of heuristics would mean the two front ends disagree about the same
+    /// terminal.
+    pub fn detect() -> Self {
+        let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        let term = env("TERM").unwrap_or_default();
+
+        let ascii_forced = env("ATOMCODE_ASCII").is_some_and(|v| v != "0");
+        let posix_locale = ["LC_ALL", "LC_CTYPE", "LANG"]
+            .iter()
+            .filter_map(|k| env(k))
+            .any(|v| {
+                let v = v.to_ascii_uppercase();
+                v == "C" || v == "POSIX" || v.contains("ANSI_X3.4-1968")
+            });
+        // Windows before Terminal: conhost sets neither of these.
+        let legacy_conhost =
+            cfg!(windows) && env("WT_SESSION").is_none() && env("TERM_PROGRAM").is_none();
+
+        let unicode = !(ascii_forced || term == "dumb" || posix_locale || legacy_conhost);
+
+        let colors = if env("NO_COLOR").is_some() || term == "dumb" {
+            Colors::None
+        } else if env("COLORTERM").is_some_and(|v| v.contains("truecolor") || v.contains("24bit")) {
+            Colors::True
+        } else if term.contains("256") || term.contains("kitty") || env("WT_SESSION").is_some() {
+            Colors::Ansi256
+        } else if term.is_empty() {
+            Colors::None
+        } else {
+            Colors::Ansi16
+        };
+
+        // Only what the environment states outright. Kitty and iTerm2 announce
+        // themselves; sixel does not, and a guess here would have a component
+        // send image escapes to a terminal that prints them as garbage.
+        let graphics = if env("KITTY_WINDOW_ID").is_some()
+            || term == "xterm-kitty"
+            || env("TERM_PROGRAM").is_some_and(|v| v == "ghostty" || v == "WezTerm")
+        {
+            Graphics::Kitty
+        } else if env("TERM_PROGRAM").is_some_and(|v| v == "iTerm.app") {
+            Graphics::ITerm2
+        } else {
+            Graphics::None
+        };
+
+        Self {
+            unicode,
+            colors,
+            // Assumed until the surface row measures it. Everything detected
+            // here comes from the environment; asking the terminal what colour
+            // it is is I/O, and belongs to the row that owns the tty.
+            palette: crate::theme::Palette::assumed(crate::theme::Theme::Dark),
+            // The one bit the environment *can* answer, and tuix's answer is kept
+            // verbatim: an emulator that announces itself (or JediTerm, a local
+            // IDE terminal) paints cell backgrounds; a bare ssh client or a
+            // legacy console does not, and art that assumes otherwise fragments.
+            // See the field's docs.
+            cell_background: env("WT_SESSION").is_some()
+                || env("TERM_PROGRAM").is_some()
+                || env("TERM").is_some_and(|t| t.contains("jediterm")),
+            graphics,
+        }
+    }
+
+    /// Rewrite text this terminal cannot render.
+    pub fn text<'a>(&self, text: &'a str) -> Cow<'a, str> {
+        downgrade(text, self.unicode)
+    }
+}
+
+/// Whether this character survives a terminal that has no Unicode.
+///
+/// `true` for ASCII and for the decorative characters [`ascii_for`] rewrites;
+/// `false` for braille and anything else with no stand-in. A **bitmap** has to
+/// ask this: a grid of tofu is not a picture. It is the same reasoning
+/// [`Caps::spinner`] applies to its own set — see [`SPINNER`].
+pub fn has_ascii_stand_in(ch: char) -> bool {
+    ch.is_ascii() || ascii_for(ch).is_some()
+}
+
+/// The ASCII stand-in for one decorative glyph, or `None` to leave it alone.
+///
+/// One display column in, one column out, so alignment survives the swap — the
+/// property that makes this safe to apply after widths were computed.
+///
+/// CJK and ordinary punctuation are deliberately absent: they render fine, and
+/// they are content rather than chrome. Rewriting a user's Chinese because the
+/// terminal is old would be a much worse bug than a `□`.
+///
+/// **Wide characters are absent for the same reason, plus a harder one.** `✅`,
+/// `⌛`, `💡` and the coloured circles are two columns; every ASCII stand-in is
+/// one, so swapping them narrows the line and moves everything to its right —
+/// on precisely the terminals that cannot report the damage back to us. They
+/// could be padded to two, but they should not be here at all: this UI's own
+/// chrome goes through [`Glyph`], whose whole set is verified narrow. A wide
+/// emoji only ever arrives inside text from somewhere else — tool output, a
+/// model's answer — and that is content.
+fn ascii_for(ch: char) -> Option<&'static str> {
+    Some(match ch {
+        // status marks
+        '\u{2713}' => "v",              // ✓ （✅ ✔ 是宽字符，见下方说明）
+        '\u{2717}' | '\u{2718}' => "x", // ✗ ✘
+        '\u{273B}' => "*",              // ✻ 回合收尾标记(窄字符)
+        '\u{26A0}' => "!",              // ⚠
+        '\u{2139}' | '\u{24D8}' => "i", // ℹ ⓘ
+
+        // bullets / circles / diamonds
+        '\u{25CF}' | '\u{25C6}' | '\u{25CE}' => "*", // ● ◆ ◎
+        '\u{25CB}' | '\u{25E6}' | '\u{25C7}' | '\u{25A2}' => "o", // ○ ◦ ◇ ▢
+        '\u{2022}' | '\u{2219}' => "*",              // • ∙
+        // pointers
+        '\u{25B8}' | '\u{25B6}' | '\u{25BA}' | '\u{276F}' => ">", // ▸ ▶ ► ❯
+        '\u{25C2}' | '\u{25C0}' => "<",                           // ◂ ◀
+        // arrows
+        '\u{2192}' | '\u{21D2}' | '\u{21A6}' | '\u{21B3}' | '\u{2794}' | '\u{27A4}' => ">",
+        '\u{2190}' | '\u{21D0}' | '\u{21A9}' | '\u{21B5}' | '\u{23CE}' => "<",
+        '\u{2191}' | '\u{21D1}' => "^",
+        '\u{2193}' | '\u{21D3}' => "v",
+        '\u{2194}' | '\u{21D4}' | '\u{21BB}' | '\u{21BA}' => "~",
+        // ellipsis and middle dot: chrome in this UI, and both ambiguous-width
+        '\u{22EF}' | '\u{2026}' => ".", // ⋯ … — one column in, one out
+        // media / state
+        '\u{23F8}' => "=",
+        '\u{23F9}' => "#",
+        '\u{23F5}' => ">",
+
+        // box drawing
+        '\u{2500}' | '\u{2550}' | '\u{2501}' => "-",
+        '\u{2502}' | '\u{2551}' | '\u{2503}' | '\u{258E}' => "|",
+        '\u{23BD}' | '\u{23BC}' => "_",
+        // `⎿` is a tree-line tail, not a corner; box corners all become `+`
+        // so a frame does not get one corner from each source. The glyph set
+        // and this table are checked against each other.
+        '\u{23BF}' => "`",
+        '\u{2514}' | '\u{2570}' | '\u{250C}' | '\u{2510}' | '\u{2518}' | '\u{251C}'
+        | '\u{2524}' | '\u{252C}' | '\u{2534}' | '\u{253C}' | '\u{256D}' | '\u{256E}'
+        | '\u{256F}' | '\u{2554}' | '\u{2557}' | '\u{255A}' | '\u{255D}' | '\u{2560}'
+        | '\u{2563}' | '\u{2566}' | '\u{2569}' | '\u{256C}' => "+",
+        // blocks / shades
+        '\u{2588}' | '\u{2580}' | '\u{2584}' | '\u{2592}' | '\u{2593}' => "#",
+        '\u{2591}' => ".",
+
+        _ => return None,
+    })
+}
+
+/// Replace decorative glyphs with ASCII when the terminal lacks Unicode.
+///
+/// Borrowed (zero-copy) when nothing needs doing, which is the common case on
+/// every modern terminal — the shield costs a scan, not an allocation.
+pub fn downgrade(text: &str, unicode: bool) -> Cow<'_, str> {
+    if unicode || text.is_ascii() || !text.chars().any(|c| ascii_for(c).is_some()) {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ascii_for(ch) {
+            Some(rep) => out.push_str(rep),
+            None => out.push(ch),
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// The chrome a component asks for by meaning, never by character.
+///
+/// A module writes `Glyph::Ok`, not `'✓'`. That is what lets the ASCII set be
+/// swapped centrally, and what the layering gate checks for: a literal box
+/// character above this layer is the shield having been bypassed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Glyph {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+    Horizontal,
+    Vertical,
+    Ok,
+    Fail,
+    Pending,
+    Interrupted,
+    /// A turn's clean close — a `✻` sparkle, the way Claude Code leads its
+    /// completion line. Distinct from [`Glyph::Ok`] (the tool-result tick) so the
+    /// turn summary carries a mark of its own rather than borrowing the check.
+    Sparkle,
+    Bullet,
+    /// Present, but not in force: a tool a person turned off, drawn beside the
+    /// filled [`Glyph::Bullet`] of one that is on.
+    Hollow,
+    Pointer,
+    /// The prompt marker.
+    ///
+    /// `❯` and not `›` on purpose: `›` is also ordinary punctuation, and the
+    /// downgrade table must leave punctuation alone (rewriting `‹model›` in
+    /// something the model said would be a far worse bug than a `□`). A glyph
+    /// that is only ever chrome can live in both the glyph set and the table,
+    /// and the two are checked against each other.
+    Prompt,
+    Separator,
+    /// The filled part of a scrollbar.
+    Thumb,
+    /// Its unfilled track.
+    Track,
+    /// The marker a tool call opens with.
+    ToolMark,
+    /// The gutter its result hangs from.
+    Gutter,
+    /// Points at what is below the fold.
+    Down,
+    /// This session is paused where it is: `plan` mode, which explores and
+    /// declines to touch. Chrome for the mode badge, so it lives in both tables.
+    Pause,
+    /// This session goes ahead: `accept edits` and `auto`. Drawn twice for the
+    /// one mode that asks nothing at all.
+    Play,
+}
+
+/// The frames a spinner cycles through, one per redraw.
+///
+/// Here rather than in a module because there is one answer to "what does
+/// work in progress look like": two panels cycling two different sets, or the
+/// same set out of phase, is two front ends on one screen. Both callers index
+/// it by `Moment::tick`, so they turn together.
+///
+/// Braille, and deliberately not a [`Glyph`]: the downgrade table trades one
+/// glyph for one ASCII cell, and there is no one-cell ASCII spinner that reads
+/// as motion. These are one column everywhere, which is the property that
+/// matters — a frame two cells wide would move the text beside it every tick.
+///
+/// Which is why the set is chosen by terminal rather than rewritten afterwards:
+/// a column of tofu is not a spinner, and [`Caps::spinner`] is the only way to
+/// take a frame. See [`ASCII_SPINNER`].
+pub const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+
+/// The spinner for a terminal with no Unicode: the oldest one there is.
+///
+/// `- \ | /` rather than braille blanks or ASCII digits: motion is the whole
+/// job of this row, and it is the only property that has to survive the swap.
+/// All four are ASCII, one column, and unambiguous in every font — including
+/// the legacy Windows console, which draws the first set of eight as eight
+/// tofu boxes.
+pub const ASCII_SPINNER: [&str; 4] = ["-", "\\", "|", "/"];
+
+impl Caps {
+    /// The spinner frame for this tick, in a set this terminal can draw.
+    ///
+    /// The one way to take a frame. A module that indexed [`SPINNER`] itself
+    /// would draw braille on a terminal that has already been told to stay
+    /// inside ASCII, and the tofu would arrive on the one row that is *all*
+    /// motion — the downgrade table cannot rescue it (see [`SPINNER`]), so the
+    /// set has to change instead.
+    pub fn spinner(&self, tick: u64) -> &'static str {
+        if self.unicode {
+            SPINNER[(tick as usize) % SPINNER.len()]
+        } else {
+            ASCII_SPINNER[(tick as usize) % ASCII_SPINNER.len()]
+        }
+    }
+
+    pub fn g(&self, glyph: Glyph) -> &'static str {
+        self::glyph(self.unicode, glyph)
+    }
+}
+
+/// A decorative glyph, as a terminal that does or does not do Unicode writes it.
+///
+/// A free function because [`crate::block::ShapeCaps`] needs the same table: a
+/// block cannot hold a whole `Caps` (it also carries the palette), but a glyph
+/// depends on `unicode` alone.
+///
+/// Both tables are **one column in, one column out** — the property that makes
+/// the swap safe to apply after widths were computed, and the reason this set
+/// holds only narrow characters (see [`ascii_for`]).
+pub fn glyph(unicode: bool, glyph: Glyph) -> &'static str {
+    use Glyph::*;
+    if unicode {
+        match glyph {
+            TopLeft => "┌",
+            TopRight => "┐",
+            BottomLeft => "└",
+            BottomRight => "┘",
+            Horizontal => "─",
+            Vertical => "│",
+            Ok => "✓",
+            Fail => "✗",
+            Pending => "⋯",
+            Interrupted => "—",
+            Sparkle => "✻",
+            Bullet => "•",
+            Hollow => "○",
+            Pointer => "▸",
+            Prompt => "❯",
+            Separator => "·",
+            Thumb => "█",
+            Track => "│",
+            ToolMark => "●",
+            Gutter => "⎿",
+            Down => "↓",
+            Pause => "\u{23F8}",
+            Play => "\u{23F5}",
+        }
+    } else {
+        match glyph {
+            TopLeft | TopRight | BottomLeft | BottomRight => "+",
+            Horizontal => "-",
+            Vertical => "|",
+            Ok => "v",
+            Fail => "x",
+            Pending => ".",
+            Interrupted => "-",
+            Sparkle => "*",
+            Bullet => "*",
+            Hollow => "o",
+            Pointer => ">",
+            Prompt => ">",
+            Separator => ".",
+            Thumb => "#",
+            Track => "|",
+            ToolMark => "*",
+            Gutter => "`",
+            Down => "v",
+            Pause => "=",
+            Play => ">",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::width;
+
+    /// A build says what its terminals do, and detection does not get a vote on
+    /// the fields it named — nor on the ones it did not.
+    ///
+    /// The case this is for: a fleet whose `TERM` says `xterm` on emulators that
+    /// do 24-bit colour. Before it, the only thing anyone could say was
+    /// `ATOMCODE_ASCII`, which answers one of the three questions.
+    #[test]
+    fn a_build_can_say_what_its_terminals_do() {
+        let detected = Caps::plain();
+        let nothing = Overrides::default();
+        assert!(!nothing.any());
+        assert_eq!(
+            nothing.over(detected),
+            detected,
+            "nothing said, nothing done"
+        );
+
+        let said = Overrides {
+            colors: Some(Colors::True),
+            ..Default::default()
+        };
+        assert!(said.any());
+        let got = said.over(detected);
+        assert_eq!(got.colors, Colors::True, "what the build said");
+        assert!(
+            !got.unicode,
+            "what it did not say is still what was detected"
+        );
+        assert!(!got.cell_background);
+
+        // And in the other direction: a runner that claims a colour terminal
+        // while rendering into a log file.
+        let quiet = Overrides {
+            unicode: Some(false),
+            colors: Some(Colors::None),
+            cell_background: Some(false),
+        };
+        assert_eq!(quiet.over(Caps::default()), Caps::plain());
+    }
+
+    #[test]
+    fn a_capable_terminal_pays_nothing() {
+        assert!(matches!(
+            downgrade("✓ done · ─────", true),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(downgrade("v done - ok", false), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn chinese_is_content_and_is_never_rewritten() {
+        // The bug this guards against is worse than tofu: silently mangling
+        // what the user actually said because their terminal is old.
+        assert!(matches!(downgrade("写一个网页", false), Cow::Borrowed(_)));
+        assert_eq!(downgrade("✓ 写网页 done", false), "v 写网页 done");
+        let punctuation = "‹model› — 正文… ＋内容";
+        assert_eq!(downgrade(punctuation, false), punctuation.replace('…', "."));
+    }
+
+    #[test]
+    fn every_swap_keeps_the_column_count() {
+        // The property the whole scheme rests on: downgrading may change what a
+        // row says, never how wide it is. A swap that widened a line would move
+        // a border by one column on exactly the terminals that cannot show the
+        // problem to us.
+        for glyph in [
+            Glyph::TopLeft,
+            Glyph::TopRight,
+            Glyph::BottomLeft,
+            Glyph::BottomRight,
+            Glyph::Horizontal,
+            Glyph::Vertical,
+            Glyph::Ok,
+            Glyph::Fail,
+            Glyph::Pending,
+            Glyph::Interrupted,
+            Glyph::Sparkle,
+            Glyph::Bullet,
+            Glyph::Hollow,
+            Glyph::Pointer,
+            Glyph::Prompt,
+            Glyph::Separator,
+            Glyph::Thumb,
+            Glyph::Track,
+            Glyph::ToolMark,
+            Glyph::Gutter,
+            Glyph::Down,
+            Glyph::Pause,
+            Glyph::Play,
+        ] {
+            let rich = Caps::default().g(glyph);
+            let plain = Caps::plain().g(glyph);
+            assert_eq!(
+                width::str_width(rich),
+                width::str_width(plain),
+                "{glyph:?}: {rich:?} is {} cells, {plain:?} is {}",
+                width::str_width(rich),
+                width::str_width(plain)
+            );
+            assert_eq!(width::str_width(plain), 1, "{glyph:?} must be one column");
+        }
+    }
+
+    /// Every character the table knows, so a new entry cannot quietly widen a
+    /// line. There is no list to keep in step: the range walk *is* the list.
+    fn mapped() -> Vec<(char, &'static str)> {
+        (0u32..0x1FFFF)
+            .filter_map(char::from_u32)
+            .filter_map(|c| ascii_for(c).map(|a| (c, a)))
+            .collect()
+    }
+
+    #[test]
+    fn no_swap_in_the_whole_table_changes_a_line_width() {
+        // The invariant the scheme rests on, checked over every entry rather
+        // than over the handful a hand-written list would remember. The first
+        // version of this file mapped `…` to `"..."` — one column becoming
+        // three, which moves every border to its right by two, on exactly the
+        // terminals that cannot report the problem back to us.
+        let mut bad = Vec::new();
+        for (ch, ascii) in mapped() {
+            let before = width::str_width(&ch.to_string());
+            let after = width::str_width(ascii);
+            if before != after {
+                bad.push(format!("{ch:?} ({before}) -> {ascii:?} ({after})"));
+            }
+            if !ascii.is_ascii() {
+                bad.push(format!("{ch:?} -> {ascii:?} is not ASCII"));
+            }
+        }
+        assert!(bad.is_empty(), "width-changing swaps:\n{}", bad.join("\n"));
+    }
+
+    #[test]
+    fn the_table_is_not_empty_so_the_check_above_means_something() {
+        // A range walk that found nothing would make every assertion vacuous.
+        assert!(mapped().len() > 40, "only {} entries", mapped().len());
+    }
+
+    #[test]
+    fn the_two_paths_to_ascii_agree() {
+        // There are two ways a `┌` becomes ASCII: a module asks for
+        // `Glyph::TopLeft` and gets `+`, or a literal `┌` goes through the
+        // downgrade table on its way to the terminal. If they disagree, a box
+        // gets one corner from each and looks broken — which is exactly what
+        // happened: the table mapped `└` to a backtick (good for tree lines,
+        // wrong for a box) while the glyph set said `+`.
+        for glyph in [
+            Glyph::TopLeft,
+            Glyph::TopRight,
+            Glyph::BottomLeft,
+            Glyph::BottomRight,
+            Glyph::Horizontal,
+            Glyph::Vertical,
+            Glyph::Ok,
+            Glyph::Fail,
+            Glyph::Sparkle,
+            Glyph::Bullet,
+            Glyph::Hollow,
+            Glyph::Pointer,
+            Glyph::Prompt,
+            Glyph::Thumb,
+            Glyph::Track,
+            Glyph::Down,
+        ] {
+            let rich = Caps::default().g(glyph);
+            assert_eq!(
+                downgrade(rich, false),
+                Caps::plain().g(glyph),
+                "{glyph:?}: the table and the glyph set disagree about {rich:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_ascii_set_really_is_ascii() {
+        // Otherwise the fallback tofus on exactly the terminal it exists for.
+        for glyph in [Glyph::TopLeft, Glyph::Ok, Glyph::Bullet, Glyph::Pointer] {
+            assert!(Caps::plain().g(glyph).is_ascii(), "{glyph:?}");
+        }
+    }
+
+    #[test]
+    fn a_downgraded_string_is_pure_ascii_for_chrome() {
+        let framed = "┌─ title ─┐ ✓ ▸ • ⋯";
+        let out = downgrade(framed, false);
+        assert!(out.is_ascii(), "{out}");
+    }
+
+    #[test]
+    fn every_spinner_frame_is_one_column() {
+        // The property the choice of braille was made for, checked rather than
+        // asserted in prose: a frame of two cells would shift everything beside
+        // the spinner on every tick, and a frame that renders as nothing would
+        // make the line look like a stuck label.
+        for frame in SPINNER {
+            assert_eq!(
+                crate::width::str_width(frame),
+                1,
+                "{frame:?} is not one cell"
+            );
+            assert_eq!(downgrade(frame, false), frame, "chrome is never rewritten");
+        }
+    }
+
+    #[test]
+    fn a_terminal_without_unicode_is_handed_a_spinner_it_can_draw() {
+        // The braille set is deliberately absent from the downgrade table — it
+        // trades one column for one column, and there is no one-cell ASCII
+        // stand-in that reads as motion. So the *set* has to follow the
+        // terminal, or the shield that exists to stop tofu draws eight of them,
+        // on exactly the terminals it was written for (legacy Windows conhost,
+        // `LANG=C` in a container).
+        let plain = Caps::plain();
+        for tick in 0..24 {
+            let frame = plain.spinner(tick);
+            assert!(
+                frame.is_ascii(),
+                "tick {tick} drew {frame:?} on a terminal with no unicode"
+            );
+            assert_eq!(
+                crate::width::str_width(frame),
+                1,
+                "tick {tick} drew {frame:?}, which is not one cell"
+            );
+        }
+        // Anything that is not an outright no keeps the good set. Stated as an
+        // explicit capability rather than `Caps::detect()`: detection is the
+        // environment's answer, and the test runner sets `TERM=dumb` to keep its
+        // own output stable — asserting the runner's answer would be a test of
+        // nextest, not of this table.
+        let capable = Caps {
+            unicode: true,
+            ..Caps::default()
+        };
+        assert_eq!(
+            capable.spinner(3),
+            SPINNER[3],
+            "a terminal that can draw braille did not get it"
+        );
+    }
+
+    #[test]
+    fn detection_reads_the_environment_once_and_says_what_it_found() {
+        // Not asserting a particular machine's answer — that would be a test of
+        // the developer's shell. Asserting the shape: detection terminates and
+        // produces a usable value.
+        let caps = Caps::detect();
+        assert!(matches!(
+            caps.colors,
+            Colors::None | Colors::Ansi16 | Colors::Ansi256 | Colors::True
+        ));
+    }
+}
