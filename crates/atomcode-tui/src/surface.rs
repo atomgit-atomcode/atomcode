@@ -843,6 +843,21 @@ fn emergency_restore() {
     let _ = crossterm::terminal::disable_raw_mode();
     #[cfg(unix)]
     {
+        // Keys pressed after the screen stopped reading — during the wait for a
+        // turn to stop on the way out, typically — are still queued on the tty,
+        // encoded the way the keyboard mode `LEAVE` just turned off asked for.
+        // Left there, the shell reads them next: ctrl-d arrives as
+        // `ESC[100;5u` and zsh prints `00;5u` at the prompt. They were meant for
+        // this screen, so they go with it.
+        use std::io::IsTerminal;
+        let stdin = std::io::stdin();
+        if stdin.is_terminal() {
+            use std::os::fd::AsRawFd;
+            // SAFETY: stdin's descriptor, borrowed for the length of the call.
+            unsafe {
+                libc::tcflush(stdin.as_raw_fd(), libc::TCIFLUSH);
+            }
+        }
         let original = STDERR_ORIGINAL.swap(-1, Ordering::SeqCst);
         if original >= 0 {
             // SAFETY: `original` is the descriptor `take_stderr` duplicated and
