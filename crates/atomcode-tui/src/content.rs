@@ -1270,8 +1270,11 @@ impl Content for ToolCallBlock {
         }
         let caps = Caps::default();
         let lead = format!("{} ", caps.g(Glyph::ToolMark));
+        // The `●` head carries the call's outcome even folded (green done / red
+        // failed / muted running), the same as the unexplained `summary`; the
+        // reason text stays muted so the dot is the only lit thing on the row.
         let mut rows: Vec<Line> = self
-            .opening_rows(w, &lead, fold(), fold())
+            .opening_rows(w, &lead, self.mark().1, fold())
             .into_iter()
             .take(FOLDED_ROWS)
             .collect();
@@ -1347,17 +1350,21 @@ impl Content for ToolCallBlock {
             String::new()
         };
 
-        // No `●` on a folded call, but the command keeps its column: a screenful
-        // of folded commands reads cleaner without a column of grey dots, while
-        // the command still sits where the expanded head puts it (two cells in),
-        // rather than jumping to the margin. The coloured dot stays on the
-        // EXPANDED call, where it opens the block.
+        // The `●` carries the call's OUTCOME even folded: green when it landed,
+        // red when it failed, muted while it runs — so a screenful of folded
+        // calls says which ones are done and which broke without expanding any of
+        // them. The mark keeps the outcome colour; the name and subject stay
+        // muted (`fold()`), so the row reads as one folded line with a status
+        // dot, not a lit label.
         //
-        // `name(subject)` — the same shape and column as the expanded head, just
-        // without the mark: folding changes how much you see, not what you are
-        // looking at. A verb replaces the tool name when the name is machinery
-        // rather than meaning: `$ cargo test` reads; `bash {"command":…}` does not.
-        let mut spans = vec![Span::styled("  ".to_string(), style)];
+        // `name(subject)` — the same shape and column as the expanded head:
+        // folding changes how much you see, not what you are looking at. A verb
+        // replaces the tool name when the name is machinery rather than meaning:
+        // `$ cargo test` reads; `bash {"command":…}` does not.
+        let mut spans = vec![Span::styled(
+            format!("{} ", Caps::default().g(Glyph::ToolMark)),
+            self.mark().1,
+        )];
         spans.push(Span::styled(name, style));
         if has_subject {
             spans.push(Span::styled(format!("({subject})"), style));
@@ -3089,10 +3096,9 @@ mod tests {
             !lid.contains('\n') && !lid.contains('\r'),
             "the lid is more than one row: {lid:?}"
         );
-        // Still the command, still readable at both ends — and no dot on a
-        // folded call (the coloured one stays on the expanded head).
-        assert!(!lid.contains('●'), "a folded call keeps no dot: {lid:?}");
-        assert!(lid.trim_start().starts_with("$(cd /tmp"), "{lid:?}");
+        // Still the command, still readable at both ends, opened by the status
+        // dot (muted while it runs).
+        assert!(lid.starts_with("● $(cd /tmp"), "{lid:?}");
         assert!(lid.ends_with("PY) · 运行中"), "{lid:?}");
 
         // Expanded: over as many rows as it takes, and every one of them one row.
@@ -3150,9 +3156,8 @@ mod tests {
         // Narrower than the command, so the line is forced to abbreviate.
         let line = c.summary(&crate::block::RenderCtx::bare(48)).plain();
         assert!(line.contains('…'), "nothing was abbreviated: {line:?}");
-        assert!(!line.contains('●'), "a folded call keeps no dot: {line:?}");
         assert!(
-            line.trim_start().starts_with("$(git log"),
+            line.starts_with("● $(git log"),
             "the head of the command is gone: {line:?}"
         );
         assert!(

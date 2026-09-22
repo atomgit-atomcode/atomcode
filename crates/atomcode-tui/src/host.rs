@@ -555,7 +555,11 @@ fn blank_between(upper: &str, lower: &str) -> bool {
     if upper == "turn_end" || lower == "turn_end" {
         return true;
     }
-    if upper == "user" {
+    // A user bar gets air on BOTH sides: after it (its answer starts fresh) and
+    // before it (the bar is where a reader scans for "what did I ask", and it
+    // should not butt up against the previous turn's last line or a compaction
+    // notice — one blank row sets the question apart from what came before).
+    if upper == "user" || lower == "user" {
         return true;
     }
     (upper == "tool_call") != (lower == "tool_call")
@@ -4965,6 +4969,18 @@ mod tests {
         assert!(!h.providers_open());
     }
 
+    /// The question a person typed stands apart on BOTH sides — from what came
+    /// before it (a previous turn's last line, a compaction notice) and from its
+    /// own answer — so the `》` bar is easy to scan back to.
+    #[test]
+    fn a_user_bar_gets_a_blank_row_above_and_below_it() {
+        assert!(blank_between("commands", "user"), "a blank above the user bar");
+        assert!(blank_between("user", "tool_call"), "and below it");
+        // Unrelated neighbours still butt together — the rule is the user bar,
+        // not a blank between everything.
+        assert!(!blank_between("assistant", "assistant"));
+    }
+
     /// Two turns, the second with something long enough to take several rows.
     fn two_turns(h: &Host) {
         let facts = [
@@ -8854,9 +8870,10 @@ mod tests {
             .iter()
             .find(|r| r.contains("cd /Users"))
             .expect("a tool call");
-        // A folded call sits in the expanded head's name column (two cells) but
-        // carries no dot — the coloured mark stays on the expanded call.
-        assert_eq!(leading(call), 2, "the folded call left its column: {call:?}");
+        // A folded call opens with its status dot at the margin (the dot is
+        // content, so the line's own leading whitespace is 0) — the work is not
+        // set in, only its reply is.
+        assert_eq!(leading(call), 0, "the call was set in too: {call:?}");
 
         let notice = rows
             .iter()
