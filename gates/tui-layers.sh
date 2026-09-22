@@ -87,7 +87,13 @@ fi
 # （ansi::encode_with），所以这里写 ┌ 是对的。豁免它，是为了让这条规则说的是
 # 「上层不得绕过原语」，而不是「谁都不许画框」——后者会逼原语层也去问 Caps，
 # 而在 lay(w) 里它拿不到。
-UPPER=$(find "$SRC" -name '*.rs' ! -name caps.rs ! -name surface.rs ! -name el.rs)
+#
+# markdown/table.rs 同理（2026-09-22 补）：`ae10df70` 把 GFM 表格改画成完整网格，
+# 11 个框线字符写成常量——它就是画表格那个框的那一层，降级同样发生在上屏时
+# （每个字符都在 caps::ascii_for 里，table.rs 自带判据钉着 ASCII 降级），而它的
+# 渲染只处理字符串与宽度、拿不到 Caps。当时没改这里，闸门从 17 跳到 28 判红；
+# 豁免它而不是抬基线，理由与 el.rs 一样，基线仍是 17。
+UPPER=$(find "$SRC" -name '*.rs' ! -name caps.rs ! -name surface.rs ! -name el.rs ! -path '*/markdown/table.rs')
 
 echo "→ 屏蔽层之外不得出现字面装饰字符（应走 Caps::g(Glyph::…)）"
 n=$(code_only $UPPER | grep -oE '[┌┐└┘─│├┤┬┴┼✓✗⋯▸•]' | wc -l | tr -d ' ')

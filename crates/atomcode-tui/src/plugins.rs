@@ -899,8 +899,7 @@ fn back(s: &str, at: usize) -> usize {
     let at = snap(s, at);
     s.char_indices()
         .map(|(i, _)| i)
-        .filter(|i| *i < at)
-        .next_back()
+        .rfind(|i| *i < at)
         .unwrap_or(0)
 }
 

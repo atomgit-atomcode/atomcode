@@ -811,8 +811,8 @@ fn allowance_lines(page: Option<&crate::settings::UsagePage>) -> Vec<UsageLine> 
         if !plan.claimed_at.is_empty() || !plan.expires_at.is_empty() {
             out.push(UsageLine::Note(
                 pt(PMsg::UsagePlanClaimedExpires {
-                    claimed: &blank_as_unknown(&plan.claimed_at),
-                    expires: &blank_as_unknown(&plan.expires_at),
+                    claimed: blank_as_unknown(&plan.claimed_at),
+                    expires: blank_as_unknown(&plan.expires_at),
                 })
                 .into_owned(),
             ));

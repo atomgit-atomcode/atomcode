@@ -109,7 +109,7 @@ impl Raster {
             });
         }
         let mut cells = Vec::with_capacity(columns as usize * rows as usize);
-        for (index, chunk) in bytes.chunks_exact(12).enumerate() {
+        for (index, chunk) in bytes.as_chunks::<12>().0.iter().enumerate() {
             let word = |at: usize| {
                 u32::from_le_bytes(chunk[at..at + 4].try_into().expect("a 4-byte window"))
             };

@@ -398,14 +398,10 @@ fn fit_columns(
                 widest = Some(j);
             }
         }
-        match widest {
-            Some(j) => {
-                cols[j] -= 1;
-                total -= 1;
-            }
-            // Unreachable: the floor sum fits, so a shave is always available.
-            None => return None,
-        }
+        // `None` is unreachable: the floor sum fits, so a shave is always available.
+        let j = widest?;
+        cols[j] -= 1;
+        total -= 1;
     }
     Some(cols)
 }

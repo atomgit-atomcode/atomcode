@@ -950,7 +950,7 @@ pub fn rule(left: char, right: char, caption: Option<&str>, w: usize) -> Line {
         text
     };
     let lead = if text.is_empty() { 0 } else { 1 };
-    let tail = inner.saturating_sub(lead + width::str_width(&text)).max(0);
+    let tail = inner.saturating_sub(lead + width::str_width(&text));
     Line::from_spans(vec![Span::styled(
         format!(
             "{left}{}{text}{}{right}",

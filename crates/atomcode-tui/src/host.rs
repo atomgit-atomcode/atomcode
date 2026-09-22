@@ -5228,7 +5228,7 @@ mod tests {
             text: format!("turn {turn}"),
             images: Vec::new(),
         };
-        let facts = vec![
+        let facts = [
             SessionEvent::TurnStart { turn: 1 },
             said(1),
             SessionEvent::TurnStart { turn: 2 },
