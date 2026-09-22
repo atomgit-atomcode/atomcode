@@ -206,7 +206,9 @@ impl View for Live {
             opened = true;
         }
         if opened {
-            used += close_w;
+            // The close needs no more room: its width was reserved in every
+            // step's `need` above, which is the whole reason a figure is never
+            // taken in without space to close the group behind it.
             row.push(El::styled(close.to_string(), muted));
         }
 
