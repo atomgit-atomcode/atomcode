@@ -4128,16 +4128,24 @@ impl Tui {
     fn refresh_menu(&self) {
         let menu = match self.slash_prefix() {
             Some(rest) => {
+                let matches = self.host.commands.matching(&rest);
                 // The level in force, so a command that expands its closed set
                 // (below) can mark the row already chosen — the ✓ the modal used
-                // to carry, now on the inline row.
-                let current_effort = self
-                    .client
-                    .described()
-                    .and_then(|d| d.reasoning_effort)
-                    .map(|level| level.as_str().to_string());
+                // to carry, now on the inline row. Read only when something on
+                // screen actually expands, so the common menus (`/help`,
+                // `/compact`) do not clone the description each keystroke.
+                let current_effort = matches
+                    .iter()
+                    .any(|c| !c.options.is_empty() && c.answers_to(&rest))
+                    .then(|| {
+                        self.client
+                            .described()
+                            .and_then(|d| d.reasoning_effort)
+                            .map(|level| level.as_str().to_string())
+                    })
+                    .flatten();
                 let mut items: Vec<crate::menu::Item> = Vec::new();
-                for c in self.host.commands.matching(&rest) {
+                for c in matches {
                     // A command with a closed set of values, once fully named, is
                     // not one row but one row per value: the menu's own way to
                     // pick an argument, in place of a modal. `{name} {value}`
