@@ -18,7 +18,7 @@ use atomcode_kernel::provider::ReasoningEffort;
 use atomcode_kernel::session::{derive_messages, SessionEvent};
 use atomcode_plexus::Context;
 
-use crate::command::{Command, CommandSet, Commands, Outcome};
+use crate::command::{Command, CommandOption, CommandSet, Commands, Outcome};
 use crate::host::ToolOutput;
 use crate::keymap::Action;
 
@@ -214,7 +214,7 @@ fn take_away_catalogue() -> Vec<Command> {
     vec![
         Command::said_taking("copy", "[N|all]".into(), t(Msg::CmdAboutCopy)),
         Command::said_taking("save", t(Msg::CmdTakesFilename), t(Msg::CmdAboutSave)),
-        Command::said_taking("view", t(Msg::CmdTakesPathRequired), t(Msg::CmdAboutView)),
+        Command::said_taking("view", t(Msg::CmdTakesPathRequired), t(Msg::CmdAboutView)).requiring(),
     ]
 }
 
@@ -345,6 +345,19 @@ impl CommandSet for TakeAwayCommands {
 /// The conversation: what is in it, what to do with it, and which one it is.
 pub struct SessionCommands;
 
+/// The reasoning-effort levels the slash menu offers inline, in place of a
+/// modal: the closed set from the one place that defines it, plus `default`
+/// (leave it to the endpoint). A pick dispatches `/effort <value>`, so this and
+/// a typed `/effort high` reach one implementation.
+fn effort_options() -> Vec<CommandOption> {
+    let mut out: Vec<CommandOption> = atomcode_harness::REASONING_EFFORT_LEVELS
+        .iter()
+        .map(|level| CommandOption::new(*level, t(Msg::EffortAbout)))
+        .collect();
+    out.push(CommandOption::new("default", t(Msg::EffortDefaultAbout)));
+    out
+}
+
 fn session_catalogue() -> Vec<Command> {
     vec![
         Command::said("compact", t(Msg::CmdAboutCompact)),
@@ -357,16 +370,15 @@ fn session_catalogue() -> Vec<Command> {
         // with `/new` as its memorable alias — one row, not two.
         Command::said("session", t(Msg::CmdAboutSession)).with_aliases(&["new"]),
         Command::said_taking("resume", t(Msg::CmdTakesSessionId), t(Msg::CmdAboutResume)),
-        Command::said_taking(
-            "effort",
-            "<low|medium|high|xhigh|max|default>".into(),
-            t(Msg::CmdAboutEffort),
-        ),
+        // A closed set of levels, so the menu offers them inline (one row each,
+        // marked with the one in force) rather than a modal — the same way `/`
+        // shows the commands themselves.
+        Command::said("effort", t(Msg::CmdAboutEffort)).selecting(effort_options()),
         Command::said_taking("undo", t(Msg::CmdTakesTurn), t(Msg::CmdAboutUndo)),
         Command::said_taking("rewind", t(Msg::CmdTakesTurnScope), t(Msg::CmdAboutRewind)),
         Command::said_taking("model", t(Msg::CmdTakesModelId), t(Msg::CmdAboutModel)),
         Command::said("autonomy", t(Msg::CmdAboutAutonomy)),
-        Command::said_taking("rename", t(Msg::CmdTakesName), t(Msg::CmdAboutRename)),
+        Command::said_taking("rename", t(Msg::CmdTakesName), t(Msg::CmdAboutRename)).requiring(),
         Command::said_taking("diff", t(Msg::CmdTakesFile), t(Msg::CmdAboutDiff)),
         Command::said_taking("mode", "[plan|ask|edits|auto]".into(), t(Msg::CmdAboutMode)),
         Command::said_taking("cd", t(Msg::CmdTakesDirectory), t(Msg::CmdAboutCd)),
@@ -659,37 +671,27 @@ impl CommandSet for SessionCommands {
                 // One vocabulary, taken from the place that defines it, so this
                 // command cannot offer a level nothing parses.
                 let levels = atomcode_harness::REASONING_EFFORT_LEVELS;
-                // With nothing after it, the command asks rather than reports:
-                // the levels are a closed set this command already knows, so the
-                // answer is a list to pick from, and picking one dispatches the
-                // command it stands for. A pick is expressed as a command, so
-                // this and a typed `/effort high` reach one implementation.
+                // With nothing after it, the command reports rather than opens a
+                // modal: the levels are offered inline in the slash menu (one row
+                // each — see `effort_options`), so a bare `/effort` that reaches
+                // here is the menu dismissed, and the honest answer is the level
+                // in force and the closed set to type. A pick from the menu
+                // arrives as `/effort <level>`, the branch below.
                 if wanted.is_empty() {
                     let current = client
                         .described()
                         .and_then(|d| d.reasoning_effort)
                         .map(|level| level.as_str().to_string());
-                    let mut choices: Vec<crate::overlay::Choice> = levels
-                        .iter()
-                        .map(|level| {
-                            crate::overlay::Choice::new(
-                                format!("/effort {level}"),
-                                (*level).to_string(),
-                            )
-                            .about(t(Msg::EffortAbout))
-                            .marked(current.as_deref() == Some(*level))
+                    let now = current.as_deref().unwrap_or("default");
+                    let mut all = levels.to_vec();
+                    all.push("default");
+                    return Outcome::Said(
+                        t(Msg::EffortCurrent {
+                            now,
+                            levels: &all.join(", "),
                         })
-                        .collect();
-                    choices.push(
-                        crate::overlay::Choice::new("/effort default", "default")
-                            .about(t(Msg::EffortDefaultAbout))
-                            .marked(current.is_none()),
+                        .into_owned(),
                     );
-                    let title = match &current {
-                        Some(level) => t(Msg::EffortPickerTitle { level }),
-                        None => t(Msg::EffortPickerTitleDefault),
-                    };
-                    return Outcome::Open(crate::overlay::Picker::new("effort", title, choices));
                 }
                 let level = if wanted == "default" {
                     None
@@ -1678,6 +1680,11 @@ impl CommandSet for AgentCatalogCommands {
                 takes: c.usage.map(Into::into),
                 // The agent's own commands carry no aliases.
                 aliases: &[],
+                // Nor a closed set of values to pick from inline.
+                options: Vec::new(),
+                // The agent owns what its own command does with no argument, so
+                // this screen dispatches it bare rather than deciding for it.
+                require_arg: false,
             })
             .collect()
     }
@@ -2707,6 +2714,30 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted.len(), names.len(), "no duplicates: {names:?}");
+    }
+
+    #[test]
+    fn effort_offers_its_levels_inline_not_a_modal() {
+        // The levels are a closed set, so the slash menu expands `/effort` into
+        // one row per level (the way `/` shows commands) instead of a modal. The
+        // registry entry carries them as options — every level plus `default` —
+        // and no `takes` sentence, which is what makes the menu expand rather
+        // than complete-with-a-space.
+        let c = builtin_for_test();
+        let effort = c.find("effort").expect("effort is a command");
+        assert!(
+            effort.takes.is_none(),
+            "no arg sentence: the menu expands the levels instead"
+        );
+        let values: Vec<&str> = effort.options.iter().map(|o| o.value.as_ref()).collect();
+        for level in atomcode_harness::REASONING_EFFORT_LEVELS {
+            assert!(values.contains(&level), "offers `{level}`: {values:?}");
+        }
+        assert_eq!(
+            values.last(),
+            Some(&"default"),
+            "`default` is the last row: {values:?}"
+        );
     }
 
     #[tokio::test]

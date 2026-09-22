@@ -1970,9 +1970,9 @@ async fn tab_completes_the_lit_command_onto_the_line() {
 async fn enter_takes_the_lit_row_and_a_command_that_wants_an_argument_asks() {
     // The return key belongs to the list while the list is up: the row that is
     // lit is the row that is taken. What "taken" means is the command's own
-    // business — `/effort` has a closed set of levels and answers with a panel
-    // to pick from, which is where the second level comes from rather than from
-    // the composer knowing what an argument looks like.
+    // business — `/effort` has a closed set of levels, so taking its row opens
+    // that set inline (one row per level) rather than running bare, and the pick
+    // a person came for is made a level down.
     let dir = scratch("menu-enter");
     let s = start(tree(
         &dir,
@@ -1982,24 +1982,19 @@ async fn enter_takes_the_lit_row_and_a_command_that_wants_an_argument_asks() {
     .await;
     let task = s.open().await;
 
-    // Half a name, a lit row, and one keystroke: the command runs.
+    // Half a name, a lit row, and one keystroke: the levels open inline.
     s.term.type_text("/effo");
     until(&s, "/effort").await;
     s.term.press(KeyPress::plain(Key::Enter));
-    s.quiet().await;
+    until(&s, "effort high").await;
     let screen = s.screen();
     assert!(
-        s.term.last().unwrap().part("effort").is_some(),
-        "enter did not open the level panel:\n{screen}"
+        s.term.last().unwrap().part("menu").is_some(),
+        "enter opened the level list inline:\n{screen}"
     );
     assert!(
-        screen.contains("medium") || screen.contains("high"),
-        "the panel lists the levels:\n{screen}"
-    );
-    // And the line was cleared rather than left holding the prefix.
-    assert!(
-        !screen.contains("/effo "),
-        "the prefix stayed on the line behind the command that ran:\n{screen}"
+        screen.contains("effort high") || screen.contains("effort medium"),
+        "the list shows the levels one per row:\n{screen}"
     );
 
     s.term.press(KeyPress::ctrl('d'));
@@ -2011,6 +2006,8 @@ async fn tab_completes_a_command_that_takes_an_argument_and_leaves_a_space() {
     // What the registry is asked for and the label only shows: a name completed
     // without the space that says "something goes here" leaves the caret in the
     // wrong place, and the person has to type the separator the menu knew about.
+    // `/mode` takes a free word — a mode name — so tab leaves the space;
+    // `/effort`'s closed set does not, opening its values inline instead.
     let dir = scratch("menu-takes");
     let s = start(tree(
         &dir,
@@ -2020,21 +2017,27 @@ async fn tab_completes_a_command_that_takes_an_argument_and_leaves_a_space() {
     .await;
     let task = s.open().await;
 
-    s.term.type_text("/effo");
-    until(&s, "/effort").await;
+    // `mode` sorts before `model`, so it is the lit row the moment both match.
+    s.term.type_text("/mode");
+    until(&s, "/mode").await;
     s.term.press(KeyPress::plain(Key::Tab));
     s.quiet().await;
     assert!(
-        !s.screen().contains("思考强度"),
+        !s.screen().contains("现在是"),
         "tab ran a command that wants an argument:\n{}",
         s.screen()
     );
 
-    // Which leaves the name and a space on the line, so the argument can be
-    // typed and sent the ordinary way.
-    s.term.type_text("high");
-    s.term.press(KeyPress::plain(Key::Enter));
-    until(&s, "思考强度 → high").await;
+    // Which leaves the name and a space on the line: typing the argument reads
+    // as `/mode plan`, not `/modeplan`, so it lands apart from the name and can
+    // be sent the ordinary way.
+    s.term.type_text("plan");
+    s.quiet().await;
+    assert!(
+        s.screen().contains("/mode plan"),
+        "tab left the separating space the closed-set command does not:\n{}",
+        s.screen()
+    );
 
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
@@ -4157,41 +4160,60 @@ async fn the_effort_command_changes_what_requests_ask_for_while_the_screen_runs(
         s.screen()
     );
 
-    // With no argument it asks rather than reports: the levels are a closed set
-    // the command knows, so the answer is a list to pick from — and picking one
-    // dispatches the command it stands for, which is the same path the typed
-    // form above took.
-    s.term.type_line("/effort");
-    s.quiet().await;
-    let panel = s.screen();
+    // With no argument the levels appear inline in the slash menu — one row per
+    // level, the way `/` lists the commands themselves — rather than a modal.
+    // Typed without a return so the menu is still open to pick from; a pick
+    // dispatches `/effort <level>`, the same path the typed form above took.
+    s.term.type_text("/effort");
+    for _ in 0..400 {
+        if s.term.last().map(|f| f.part("menu").is_some()) == Some(true) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let menu = s
+        .term
+        .last()
+        .unwrap()
+        .part("menu")
+        .expect("the levels open inline in the slash menu")
+        .clone();
+    let menu_text = menu
+        .lines
+        .iter()
+        .map(|l| l.plain())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        s.term.last().unwrap().part("effort").is_some(),
-        "the bare command opened the level panel:\n{panel}"
+        menu_text.contains("effort high"),
+        "a row per level:\n{menu_text}"
     );
-    // The level already in force is the one marked, so the list says where the
-    // session stands before anything is picked.
+    // The level already in force (`high`, set just above) is the one marked, so
+    // the list says where the session stands before anything is picked.
     assert!(
-        panel.contains('●'),
-        "the panel marks the level in force:\n{panel}"
+        menu_text.contains('✓'),
+        "the level in force is marked:\n{menu_text}"
     );
 
     // Down to the next level and take it. Which one that is depends on the
-    // order of the table, so the level is read off the drawn row rather than
+    // order of the table, so the level is read off the lit row rather than
     // assumed — the claim is that a pick reaches the same implementation a
-    // typed argument does. The row carries the frame, the cursor and the on/off
-    // mark around its label, so the label is found by asking which known level
-    // the row names rather than by slicing the decoration off the front.
+    // typed argument does. The lit row is the one drawn on the selection
+    // background, so the label is found by asking which known level it names.
     s.term.press(KeyPress::plain(Key::Down));
     s.quiet().await;
+    let bright = Some(atomcode_tui::Color::role(
+        atomcode_tui::theme::Role::PanelSelBg,
+    ));
     let row = s
         .term
         .last()
         .unwrap()
-        .part("effort")
+        .part("menu")
         .unwrap()
         .lines
         .iter()
-        .find(|l| l.plain().contains('▸'))
+        .find(|l| l.spans.first().map(|sp| sp.style.bg) == Some(bright))
         .map(|l| l.plain())
         .expect("a lit row");
     let level = atomcode_harness::REASONING_EFFORT_LEVELS

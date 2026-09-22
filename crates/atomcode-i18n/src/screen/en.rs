@@ -320,6 +320,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::EffortPickerTitleDefault => "reasoning effort · left to the endpoint · enter changes it".into(),
         Msg::EffortUnknown { wanted, levels } => format!("no such effort `{wanted}`; it takes {levels}, default").into(),
         Msg::EffortSet { wanted } => format!("reasoning effort → {wanted}").into(),
+        Msg::EffortCurrent { now, levels } => {
+            format!("reasoning effort · now {now} · pick one: {levels}").into()
+        }
         Msg::UndoLeadOnly => "undo is the lead's: switch back to the lead first".into(),
         Msg::NotATurnNumber { what } => format!("`{what}` is not a turn number").into(),
         Msg::RewindScopeUnknown { what } => format!("`{what}` is not a scope; it takes conversation, code or both").into(),

@@ -298,6 +298,9 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::EffortPickerTitleDefault => "思考强度 · 现在交给端点 · enter 改".into(),
         Msg::EffortUnknown { wanted, levels } => format!("未知强度 `{wanted}`;可选:{levels}, default").into(),
         Msg::EffortSet { wanted } => format!("思考强度 → {wanted}").into(),
+        Msg::EffortCurrent { now, levels } => {
+            format!("思考强度 · 当前 {now} · 可选:{levels}").into()
+        }
         Msg::UndoLeadOnly => "撤销只对主会话:先切回「主」".into(),
         Msg::NotATurnNumber { what } => format!("`{what}` 不是回合号").into(),
         Msg::RewindScopeUnknown { what } => format!("`{what}` 不是范围;可选:对话、代码、全部").into(),

@@ -31,6 +31,42 @@ pub struct Command {
     /// the slash menu, resolves to `name` on dispatch, and renders as
     /// `name (alias)`. Empty for the agent's own commands, which have none.
     pub aliases: &'static [&'static str],
+    /// A closed set of values this command takes, offered inline in the slash
+    /// menu in place of a modal. When the command is fully named the menu
+    /// expands it into one row per option, and picking a row dispatches
+    /// `{name} {value}`. Empty for a command that takes free text or nothing.
+    pub options: Vec<CommandOption>,
+    /// The free-text argument is required and has no useful bare form, so taking
+    /// the row completes the name onto the line (`/rename `) for the argument to
+    /// be typed rather than dispatching it — which would only answer "needs a
+    /// name". Distinct from [`takes`](Self::takes) being set: `/model` and
+    /// `/resume` take an argument too, but running them bare opens a picker, so
+    /// they still dispatch. Only for commands with no closed [`options`] and no
+    /// bare form worth reaching.
+    pub require_arg: bool,
+}
+
+/// One value a command offers to pick inline in the slash menu.
+///
+/// A command with a closed argument set — `/effort`'s levels — lists them here
+/// rather than answering with a modal. The menu expands the command into a row
+/// per option once it is fully named; a pick is dispatched as `{name} {value}`,
+/// so the menu and a typed `/effort high` reach one implementation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandOption {
+    /// The argument this row stands for, dispatched after the command name.
+    pub value: Cow<'static, str>,
+    /// The dim gloss shown after it, in the column a command's `about` is in.
+    pub about: Cow<'static, str>,
+}
+
+impl CommandOption {
+    pub fn new(value: impl Into<Cow<'static, str>>, about: impl Into<Cow<'static, str>>) -> Self {
+        Self {
+            value: value.into(),
+            about: about.into(),
+        }
+    }
 }
 
 impl Command {
@@ -40,6 +76,8 @@ impl Command {
             about: Cow::Borrowed(about),
             takes: None,
             aliases: &[],
+            options: Vec::new(),
+            require_arg: false,
         }
     }
     pub const fn taking(name: &'static str, takes: &'static str, about: &'static str) -> Self {
@@ -48,6 +86,8 @@ impl Command {
             about: Cow::Borrowed(about),
             takes: Some(Cow::Borrowed(takes)),
             aliases: &[],
+            options: Vec::new(),
+            require_arg: false,
         }
     }
     /// The same, described by the language table.
@@ -64,6 +104,8 @@ impl Command {
             about,
             takes: None,
             aliases: &[],
+            options: Vec::new(),
+            require_arg: false,
         }
     }
     /// [`said`](Self::said) for a command that takes something.
@@ -77,12 +119,29 @@ impl Command {
             about,
             takes: Some(takes),
             aliases: &[],
+            options: Vec::new(),
+            require_arg: false,
         }
     }
 
     /// The same command, reachable by these extra names.
     pub const fn with_aliases(mut self, aliases: &'static [&'static str]) -> Self {
         self.aliases = aliases;
+        self
+    }
+
+    /// The same command, but taking its row completes it onto the line for the
+    /// argument to be typed rather than dispatching it bare. See
+    /// [`require_arg`](Self::require_arg).
+    pub fn requiring(mut self) -> Self {
+        self.require_arg = true;
+        self
+    }
+
+    /// The same command, offering a closed set of values inline in the slash
+    /// menu rather than a modal. See [`CommandOption`].
+    pub fn selecting(mut self, options: Vec<CommandOption>) -> Self {
+        self.options = options;
         self
     }
 

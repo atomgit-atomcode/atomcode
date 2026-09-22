@@ -435,6 +435,10 @@ pub enum Msg<'a> {
     EffortSet {
         wanted: &'a str,
     },
+    EffortCurrent {
+        now: &'a str,
+        levels: &'a str,
+    },
     UndoLeadOnly,
     NotATurnNumber {
         what: &'a str,

@@ -4256,14 +4256,35 @@ impl Tui {
     /// One implementation, so the return key and a click cannot disagree about
     /// what the lit row means. The command is dispatched **by name with no
     /// argument**: what a command wants after its name is the command's own
-    /// business, and a row that answers with a picker is the command saying so.
-    /// This screen knows how to lay a list out; it does not know that `/effort`
-    /// takes a level.
+    /// business. This screen knows how to lay a list out; it does not know that
+    /// `/effort` takes a level.
+    ///
+    /// The one exception is a command with a closed set of values: taking its
+    /// row opens that set — one row per value — rather than running it bare,
+    /// because the pick a person came for is a level below. That is [`complete`]
+    /// followed by the menu recomputing into the values, the same as tab. A row
+    /// that already names a value (`effort high`, from that expansion) has no
+    /// options of its own and runs, which is how the level is chosen.
+    ///
+    /// [`complete`]: Self::complete_command
     ///
     /// The line is cleared first, because the line is where the *prefix* was —
     /// leaving `/comp` behind a command that just ran is a composer still holding
     /// half a name, and it would recompute the menu from it.
     fn take_command(&self, name: &str, client: &AgentClient) -> bool {
+        // A command with a closed set opens that set; one whose free-text
+        // argument is required and has no bare form completes onto the line for
+        // the argument to be typed (`/rename `). Both are `complete`, not a bare
+        // dispatch that could only answer "needs an argument".
+        if self
+            .host
+            .commands
+            .find(name)
+            .is_some_and(|c| !c.options.is_empty() || c.require_arg)
+        {
+            self.complete_command(name);
+            return false;
+        }
         {
             let mut m = self.host.moment.write().expect("moment poisoned");
             m.input.clear();
