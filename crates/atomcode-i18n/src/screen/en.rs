@@ -418,6 +418,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::McpPanelTitle => "Manage MCP servers".into(),
         Msg::McpPanelServers { n } => format!("{n} servers").into(),
         Msg::McpPanelEmpty => "No MCP servers configured".into(),
+        Msg::McpPanelNoMatch => "no configured server matches".into(),
         Msg::McpPanelUnavailable => "this build has no MCP panel".into(),
         Msg::McpDetailPending => "Fetching details…".into(),
         // Where a server came from: the product's `/help` names the same two

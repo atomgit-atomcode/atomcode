@@ -630,6 +630,11 @@ pub enum Msg<'a> {
         n: usize,
     },
     McpPanelEmpty,
+    /// The directory has servers, but the filter matched none. Distinct from
+    /// [`Msg::McpPanelEmpty`] on purpose: telling a person "nothing is
+    /// configured" when they are looking at a search box that matched nothing
+    /// is a false statement about their own file.
+    McpPanelNoMatch,
     /// `/mcp` with no argument, when this tree mounted no MCP panel at all. The
     /// row can be left out of a build's layout, and saying so beats a screen
     /// that looks like it did something.
