@@ -385,7 +385,24 @@ async fn a_command_only_the_classic_screen_has_says_where_it_lives() {
         let _ = ui.run(&ctx, None).await;
     });
 
-    for name in atomcode::tui_classic_only::NAMES {
+    for (name, run) in atomcode::tui_elsewhere::IN_THE_CLI {
+        term.type_line(&format!("/{name}"));
+        let expected = format!("/{name} 归命令行");
+        let mut screen_text = String::new();
+        for _ in 0..200 {
+            screen_text = term.text();
+            if screen_text.contains(&expected) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            screen_text.contains(&expected) && screen_text.contains(run),
+            "/{name} says how to run it instead:\n{screen_text}"
+        );
+    }
+
+    for name in atomcode::tui_elsewhere::CLASSIC_ONLY {
         term.type_line(&format!("/{name}"));
         let expected = format!("/{name} 暂时只在经典界面里有");
         let mut screen_text = String::new();

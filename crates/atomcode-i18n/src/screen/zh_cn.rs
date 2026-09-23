@@ -778,6 +778,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         )
         .into(),
         Msg::CmdAboutClassicOnly => "暂时只在经典界面里有".into(),
+        Msg::LivesInTheCli { command, run } => {
+            format!("/{command} 归命令行：退出后运行 `{run}`。").into()
+        }
+        Msg::CmdAboutInTheCli => "归命令行".into(),
         Msg::CmdAboutProxy => "出站代理：跟随系统、固定当前代理，或不走代理".into(),
         Msg::ProxyTakes => "[follow_system | default_proxy | no_proxy]".into(),
         Msg::ProxyPickerTitle { current } => format!("出站代理（现在：{current}）").into(),

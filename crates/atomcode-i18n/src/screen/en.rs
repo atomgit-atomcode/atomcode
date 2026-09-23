@@ -800,6 +800,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         )
         .into(),
         Msg::CmdAboutClassicOnly => "only on the classic screen for now".into(),
+        Msg::LivesInTheCli { command, run } => {
+            format!("/{command} belongs to the command line: quit and run `{run}`.").into()
+        }
+        Msg::CmdAboutInTheCli => "belongs to the command line".into(),
         Msg::CmdAboutProxy => "outbound proxy: follow the system, pin the current one, or none".into(),
         Msg::ProxyTakes => "[follow_system | default_proxy | no_proxy]".into(),
         Msg::ProxyPickerTitle { current } => format!("Outbound proxy (now: {current})").into(),

@@ -1297,6 +1297,13 @@ pub enum Msg<'a> {
         command: &'a str,
     },
     CmdAboutClassicOnly,
+    /// A command this screen does not have because it belongs to the command
+    /// line — `/upgrade` replaces the binary, which a screen inside it cannot.
+    LivesInTheCli {
+        command: &'a str,
+        run: &'a str,
+    },
+    CmdAboutInTheCli,
     CmdAboutProxy,
     ProxyTakes,
     ProxyPickerTitle {

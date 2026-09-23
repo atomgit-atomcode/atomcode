@@ -1511,7 +1511,12 @@ pub struct HelpCommands {
 }
 
 fn help_catalogue() -> Vec<Command> {
-    vec![Command::said("help", t(Msg::CmdAboutHelp))]
+    // `/guide` is what the classic screen called "how do I use this": there it
+    // was a hand-written menu of thirteen lines, plus a skill for a question
+    // with an argument. The menu is what `/help` already is, and the question
+    // half is the `ask` skill, which is a command of its own wherever it is
+    // installed — so the name resolves here rather than growing a second help.
+    vec![Command::said("help", t(Msg::CmdAboutHelp)).with_aliases(&["guide"])]
 }
 
 #[async_trait]
@@ -2755,6 +2760,25 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// The classic screen's name for "how do I use this" reaches the listing
+    /// this screen already has, rather than a second help written from the same
+    /// thirteen lines.
+    #[tokio::test]
+    async fn the_classic_name_for_help_reaches_it() {
+        let c = builtin_for_test();
+        let app = bare();
+        match c.dispatch("/guide", &app.context()).await {
+            Outcome::Said(text) => assert!(text.contains("/help"), "{text}"),
+            other => panic!("{other:?}"),
+        }
+        // One row in the menu, annotated — not a second entry competing with it.
+        assert_eq!(c.all().iter().filter(|c| c.name == "help").count(), 1);
+        assert_eq!(
+            c.find("guide").expect("the alias resolves").display_name(),
+            "help (guide)"
+        );
     }
 
     #[tokio::test]
