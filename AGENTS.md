@@ -121,6 +121,34 @@ wire DTO 展开：
 
 - 修改过程中运行最小相关测试；一个逻辑单元完成后运行受影响 crate 的测试。
 
+### 合之前跑 `bash gates/compile.sh`（按 crate 跑测试看不见的那类腐烂）
+
+**「按 crate 跑 `-p <crate>`」这条规矩，结构上看不见一类腐烂：判据编译不过。**
+2026-09-23 一天之内撞到两处，加上更早的两处，是同一种烂法：
+
+| | 怎么烂的 | 为什么按 crate 跑看不见 |
+|---|---|---|
+| `atomcode-host-api` | 契约加了三个变体，测试里逐变体列举的两处 `match` 没跟着补 | 没人单独跑过这个 crate 的测试 |
+| `atomcode-capabilities` 的 `session/snapshot.rs` | 被测代码把字符串换成枚举，测试还在 `.contains(...)` | **`session` 挂在非默认 feature 下**，`-p atomcode-capabilities`（默认 `provider + tools`）根本不编译那个文件 |
+| `kernel/tests/conformance.rs` | `ToolMiddleware::after` 签名漂移 | 躺了一周，随 v5.0.9 发了出去 |
+| `capabilities` 的 `append_jsonl_line`（H4） | 写的那半删了，测试还在调 | 同第一行 |
+
+第二行是关键：**它不是谁偷懒，是那把尺子量不到**——consumer 开着 feature 编译的东西，
+按 crate 跑的默认 feature 编译不到。
+
+`cargo check --workspace --all-targets` 正好量这个，**CI 里本来就有而且是阻塞的**
+（`check.yml`）。它没挡住上面这些，是因为 **CI 只在 push 时跑，而这套流程会在本地
+连着合好几天才推一次**——那两处腐烂所在的提交，一次都没被推上去过。所以这个脚本不是
+另立一套判据，它就是把同一条闸门搬到本地、**在合之前**跑：
+
+```bash
+bash gates/compile.sh     # 主检出热态 20.7s(2026-09-23 实测)
+```
+
+`check` 不做代码生成也不链接，所以它远比 `nextest run --workspace` 便宜——后者要构建
+91 个测试二进制、一次吃掉 8.5GB 磁盘（本节下面记的那次把磁盘顶到 99%、`target/` 整个
+没了）。**不要把这个闸门改成 `run`。**
+
 ### 提交前必须核 `Cargo.lock`（本机会反复污染它）
 
 **本机每跑一次 `cargo build`，`Cargo.lock` 都会被写进一批公开仓库不该有的私有依赖。**

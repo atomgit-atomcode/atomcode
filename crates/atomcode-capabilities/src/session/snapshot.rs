@@ -1358,10 +1358,12 @@ mod tests {
         assert_eq!(recovered.rewind_points(), vec![point]);
         assert!(recovered
             .code_rewind_unavailable()
-            // "off by default" is UNIQUE to CODE_REWIND_DISABLED_REASON; the
-            // opted-in-setup-failed message also contains "ATOMCODE_CODE_REWIND",
-            // so that substring cannot distinguish the disabled state.
-            .is_some_and(|reason| reason.contains("off by default")));
+            // The KIND, not a substring of its wording. This used to match on
+            // "off by default" because the reason was a string; now it is an
+            // enum, which is what a caller was always meant to branch on —
+            // and a judgement that reads the prose goes red the day somebody
+            // rewords it, which is not a defect.
+            .is_some_and(|reason| matches!(reason, CodeRewindUnavailable::NotEnabled)));
         assert!(recovered
             .rewind
             .lock()
@@ -2223,7 +2225,7 @@ mod tests {
             .code_rewind_unavailable()
             // "off by default" is UNIQUE to the disabled reason (the
             // opted-in-setup-failed error also mentions ATOMCODE_CODE_REWIND).
-            .is_some_and(|reason| reason.contains("off by default")));
+            .is_some_and(|reason| matches!(reason, CodeRewindUnavailable::NotEnabled)));
         assert_eq!(
             manager
                 .load_rewind_ledger("conversation-rewind")
@@ -2302,9 +2304,15 @@ mod tests {
 
     #[test]
     fn disabled_reason_does_not_pin_a_stale_version() {
+        // The wording moved from a constant onto the enum's `Display`; what
+        // the judgement is for did not. A reason that names the release it was
+        // written in goes stale the moment the next one ships, and it is read
+        // by a person deciding whether to opt in.
         assert!(
-            !CODE_REWIND_DISABLED_REASON.contains("v5.0.5"),
-            "CODE_REWIND_DISABLED_REASON must not contain a stale version string"
+            !CodeRewindUnavailable::NotEnabled
+                .to_string()
+                .contains("v5.0.5"),
+            "the disabled reason must not pin a version"
         );
     }
 }
