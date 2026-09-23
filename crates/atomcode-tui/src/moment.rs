@@ -338,6 +338,15 @@ pub struct Moment {
     /// reason [`Moment::history`] is: it is not derivable, and two modules
     /// folding it separately would eventually give two answers.
     pub turn_started: Option<Timestamp>,
+    /// When something last arrived for the turn in flight, on the same clock as
+    /// [`Moment::now`]. `None` between turns.
+    ///
+    /// A turn's elapsed time says how long it has been going; this says how long
+    /// it has been since it last did anything, which is the difference between a
+    /// model that is slow and one that has gone quiet. The inter-token budget is
+    /// minutes long and a stalled stream is recovered from silently, so without
+    /// this the screen has nothing to distinguish the two.
+    pub quiet_since: Option<Timestamp>,
     /// Where the agent is working. Not derivable from the log, which is
     /// exactly what this struct is for.
     pub cwd: String,

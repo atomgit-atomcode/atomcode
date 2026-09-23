@@ -1512,6 +1512,7 @@ impl Host {
         m.scroll = crate::moment::ScrollPos::BOTTOM;
         m.selection = None;
         m.turn_started = None;
+        m.quiet_since = None;
         m.steering.clear();
         // Both belong to the view being left, not the one arriving: the `已中断`
         // note is about a turn this session stopped, and `last_sent` is what to
@@ -1706,9 +1707,12 @@ impl Host {
                 let mut m = self.moment.write().expect("moment poisoned");
                 let now = m.now;
                 m.turn_started = Some(now);
+                m.quiet_since = Some(now);
             }
             SessionEvent::TurnEnd { .. } => {
-                self.moment.write().expect("moment poisoned").turn_started = None;
+                let mut m = self.moment.write().expect("moment poisoned");
+                m.turn_started = None;
+                m.quiet_since = None;
             }
             // The newest wins, which is the whole rule the fact carries. The window
             // title takes any name; the composer pill reads `user_set` to show only
@@ -1720,7 +1724,15 @@ impl Host {
                 m.title = Some(title.clone());
                 m.title_user_set = *user_set;
             }
-            _ => {}
+            // Anything else arriving for the turn in flight is a sign of life —
+            // a chunk, a call, a result. The verb on the live row comes from the
+            // fact; how long it has been since one came is this.
+            _ => {
+                let mut m = self.moment.write().expect("moment poisoned");
+                if m.turn_started.is_some() {
+                    m.quiet_since = Some(m.now);
+                }
+            }
         }
 
         // Pinned while the reader is holding a position: what the fact does to
@@ -5074,6 +5086,51 @@ mod tests {
                 event: fact,
             });
         }
+    }
+
+    /// How long since the turn last did anything is stamped where the facts
+    /// land — the one place that sees both the fact and the reading.
+    ///
+    /// Without it the row can only count the turn's own age, which keeps ticking
+    /// whether or not anything is arriving: a stalled stream and a working model
+    /// read the same.
+    #[test]
+    fn silence_is_measured_from_the_last_fact_of_the_turn() {
+        let h = host();
+        let at = |h: &Host, ms: u64| {
+            h.moment.write().unwrap().now = crate::moment::Timestamp::millis(ms);
+        };
+        let quiet_since = |h: &Host| h.moment.read().unwrap().quiet_since;
+
+        assert_eq!(quiet_since(&h), None, "no turn, nothing to measure");
+        at(&h, 1_000);
+        h.absorb(&SessionEvent::TurnStart { turn: 1 });
+        assert_eq!(
+            quiet_since(&h),
+            Some(crate::moment::Timestamp::millis(1_000))
+        );
+
+        // A fact of the turn is a sign of life, whichever fact it is.
+        at(&h, 9_000);
+        h.absorb(&SessionEvent::AssistantChunk {
+            turn: 1,
+            round: 1,
+            delta: "a".into(),
+            reasoning: false,
+        });
+        assert_eq!(
+            quiet_since(&h),
+            Some(crate::moment::Timestamp::millis(9_000))
+        );
+
+        // And the measure goes with the turn.
+        at(&h, 12_000);
+        h.absorb(&SessionEvent::TurnEnd {
+            turn: 1,
+            stop: atomcode_kernel::event::StopReason::Stopped,
+            error: None,
+        });
+        assert_eq!(quiet_since(&h), None);
     }
 
     /// The working line ("正在等待模型") waits for the turn's first message, so it

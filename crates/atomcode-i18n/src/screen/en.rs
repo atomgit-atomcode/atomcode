@@ -629,6 +629,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::LiveWaiting => "waiting for the model".into(),
         Msg::LiveThinking => "thinking".into(),
         Msg::LiveWriting => "writing".into(),
+        Msg::LiveSilentFor { secs } => format!("nothing new for {secs}s").into(),
         Msg::LiveRunningTools { n } => format!("running {n} tools").into(),
         Msg::LiveElapsed { took } => format!("{took} elapsed").into(),
         Msg::LiveIn { tokens } => format!("in {tokens}").into(),

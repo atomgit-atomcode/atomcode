@@ -604,6 +604,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::LiveWaiting => "正在等待模型".into(),
         Msg::LiveThinking => "正在思考".into(),
         Msg::LiveWriting => "正在回复".into(),
+        Msg::LiveSilentFor { secs } => format!("已 {secs} 秒没有新内容").into(),
         Msg::LiveRunningTools { n } => format!("正在运行 {n} 个工具").into(),
         Msg::LiveElapsed { took } => format!("耗时 {took}").into(),
         Msg::LiveIn { tokens } => format!("入 {tokens}").into(),

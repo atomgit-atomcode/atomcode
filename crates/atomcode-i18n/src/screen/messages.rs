@@ -1012,6 +1012,12 @@ pub enum Msg<'a> {
     LiveWaiting,
     LiveThinking,
     LiveWriting,
+    /// How long the turn in flight has had nothing new, once that is long
+    /// enough to be worth saying. A slow model and a stalled one look identical
+    /// on a row that only counts the turn's own age.
+    LiveSilentFor {
+        secs: u64,
+    },
     LiveRunningTools {
         n: u32,
     },

@@ -335,13 +335,32 @@ fn showing(state: &State, moment: &Moment) -> Option<String> {
 /// would have this row ticking away at a turn that ended with the process. Every
 /// other row shows a record of something that happened; this one is a claim
 /// about now, so it asks whoever owns now.
+/// How long the turn has had nothing new, once that is past [`QUIET_AFTER`].
+///
+/// `None` while something is still arriving (or while tools are running, where
+/// a long wait is the tool's and the row already names it).
+fn quiet_for(state: &State, moment: &Moment) -> Option<u64> {
+    if matches!(state.phase, Phase::Tools) {
+        return None;
+    }
+    let since = moment.quiet_since?;
+    let quiet = moment.now.as_millis().saturating_sub(since.as_millis());
+    (quiet >= QUIET_AFTER_MS).then_some(quiet / 1000)
+}
+
+/// How long a turn may say nothing before the row says so, in milliseconds.
+/// Short enough that a stall is named well inside the inter-token budget that
+/// ends it, long enough that an ordinary prefill or a long reasoning burst
+/// never trips it.
+const QUIET_AFTER_MS: u64 = 30_000;
+
 fn doing(state: &State, moment: &Moment) -> Option<String> {
     state.turn?;
     match moment.activity {
         Activity::Idle => None,
         Activity::Stopping => Some(t(Msg::LiveStopping).into_owned()),
-        Activity::Working => Some(
-            match state.phase {
+        Activity::Working => {
+            let verb = match state.phase {
                 Phase::Waiting => t(Msg::LiveWaiting),
                 Phase::Thinking => t(Msg::LiveThinking),
                 Phase::Writing => t(Msg::LiveWriting),
@@ -352,8 +371,17 @@ fn doing(state: &State, moment: &Moment) -> Option<String> {
                     n: state.running.max(1),
                 }),
             }
-            .into_owned(),
-        ),
+            .into_owned();
+            // A turn's age says how long it has been going. This says how long
+            // since it last did anything — the only thing on screen that tells
+            // a slow model from a stalled one, and the answer to the five
+            // minutes a person spent watching a row that said only "waiting".
+            // Tools are left out: a build that takes two minutes is not silence.
+            Some(match quiet_for(state, moment) {
+                Some(secs) => format!("{verb} · {}", t(Msg::LiveSilentFor { secs })),
+                None => verb,
+            })
+        }
     }
 }
 
@@ -693,6 +721,54 @@ mod tests {
             !line.contains("9s"),
             "no second reading to subtract:\n{line}"
         );
+    }
+
+    /// A turn that has gone quiet says so, and one that is merely working does
+    /// not.
+    ///
+    /// The row's clock counts the turn's age, which keeps ticking whether or not
+    /// anything is arriving — so against a stream that opened and stalled it
+    /// reads exactly like a model that is working. A person watched five minutes
+    /// of that (2026-09-23) before the inter-token budget recovered the stream.
+    #[test]
+    fn a_turn_that_has_gone_quiet_says_how_long_it_has_been() {
+        let state = fold(&[
+            SessionEvent::TurnStart { turn: 1 },
+            SessionEvent::StepStart { turn: 1, step: 1 },
+            SessionEvent::RequestHeader {
+                turn: 1,
+                round: 1,
+                model: "replay".into(),
+                reason: HeaderReason::Series,
+            },
+        ]);
+        let quiet = |ms: u64| {
+            let mut moment = Moment::default().working().at_tick(0);
+            moment.now = Timestamp::millis(ms);
+            moment.turn_started = Some(Timestamp::millis(0));
+            moment.quiet_since = Some(Timestamp::millis(0));
+            line_at(&state, &moment, 80)
+        };
+        // The control: still inside the window, so the row says only what it
+        // always said.
+        let busy = quiet(20_000);
+        assert!(busy.contains("正在等待模型"), "{busy}");
+        assert!(!busy.contains("没有新内容"), "not yet worth saying: {busy}");
+
+        let stalled = quiet(95_000);
+        assert!(
+            stalled.contains("已 95 秒没有新内容"),
+            "a stalled stream must be tellable from a slow one: {stalled}"
+        );
+
+        // Something arriving resets it: 95s into the turn, 2s since the last
+        // chunk, and the row is back to plain working.
+        let mut moving = Moment::default().working().at_tick(0);
+        moving.now = Timestamp::millis(95_000);
+        moving.turn_started = Some(Timestamp::millis(0));
+        moving.quiet_since = Some(Timestamp::millis(93_000));
+        let line = line_at(&state, &moving, 80);
+        assert!(!line.contains("没有新内容"), "{line}");
     }
 
     #[test]
