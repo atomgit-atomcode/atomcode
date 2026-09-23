@@ -51,7 +51,7 @@ pub struct CodingAgentConfig {
     /// Model context window in tokens (forwarded to the provider). Default 128k.
     pub context_window: u32,
     /// Liveness: max byte-idle wait BETWEEN stream events, once the first content byte
-    /// has arrived (inter-token). Default 300s, override via `ATOMCODE_STREAM_TIMEOUT_SECS`.
+    /// has arrived (inter-token). Default 120s, override via `ATOMCODE_STREAM_TIMEOUT_SECS`.
     /// The prefill / first-token wait is governed separately by `first_token_timeout`.
     pub stream_timeout: Duration,
     /// Liveness: max wait for the FIRST content byte (prefill / time-to-first-token).
@@ -815,7 +815,13 @@ fn env_duration_secs(var: &str) -> Option<Duration> {
 /// The default byte-idle stream timeout: `ATOMCODE_STREAM_TIMEOUT_SECS` if set to a valid
 /// positive integer, else 300s. Ported from core's env-configurable liveness knob.
 fn default_stream_timeout() -> Duration {
-    env_duration_secs("ATOMCODE_STREAM_TIMEOUT_SECS").unwrap_or_else(|| Duration::from_secs(300))
+    // Two minutes, not five. A gateway that opens a stream and then goes quiet
+    // is recovered from without loss — the partial output is preserved and the
+    // turn continues — so the budget buys nothing but the wait itself, and the
+    // wait is what a person sits through with no way to tell a slow model from
+    // a dead one. Measured against a real stall (2026-09-23): one token, then
+    // five minutes of silence before the recovery that always worked.
+    env_duration_secs("ATOMCODE_STREAM_TIMEOUT_SECS").unwrap_or_else(|| Duration::from_secs(120))
 }
 /// The default first-token (prefill / TTFB) timeout. An explicit
 /// `ATOMCODE_FIRST_TOKEN_TIMEOUT_SECS` (valid positive integer) wins as-is — a
