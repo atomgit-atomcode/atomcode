@@ -1038,7 +1038,9 @@ impl LlmProvider for SlotProvider {
         self.current().is_some_and(|p| p.supports_vision())
     }
     fn effort_levels(&self) -> Vec<String> {
-        self.current().map(|p| p.effort_levels()).unwrap_or_default()
+        self.current()
+            .map(|p| p.effort_levels())
+            .unwrap_or_default()
     }
     async fn chat_stream(
         &self,

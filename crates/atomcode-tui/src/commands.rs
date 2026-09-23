@@ -214,7 +214,8 @@ fn take_away_catalogue() -> Vec<Command> {
     vec![
         Command::said_taking("copy", "[N|all]".into(), t(Msg::CmdAboutCopy)),
         Command::said_taking("save", t(Msg::CmdTakesFilename), t(Msg::CmdAboutSave)),
-        Command::said_taking("view", t(Msg::CmdTakesPathRequired), t(Msg::CmdAboutView)).requiring(),
+        Command::said_taking("view", t(Msg::CmdTakesPathRequired), t(Msg::CmdAboutView))
+            .requiring(),
     ]
 }
 

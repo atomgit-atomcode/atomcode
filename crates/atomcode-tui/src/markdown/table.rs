@@ -885,7 +885,10 @@ mod tests {
         // The header is told from the body by weight alone: bold, but wearing the
         // body's own foreground rather than the accent hue a heading would.
         assert!(header.style.bold, "the header should be bold");
-        assert_eq!(header.style.fg, base.fg, "the header must not be highlighted");
+        assert_eq!(
+            header.style.fg, base.fg,
+            "the header must not be highlighted"
+        );
         assert!(!body.style.bold, "the body is not bold");
     }
 

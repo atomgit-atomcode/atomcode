@@ -248,7 +248,11 @@ mod tests {
         catalog
             .register(Arc::new(Named("memory")))
             .expect("the built-in takes the name from the skill, not an error");
-        assert_eq!(catalog.kind_of("memory"), Some(false), "the built-in holds it");
+        assert_eq!(
+            catalog.kind_of("memory"),
+            Some(false),
+            "the built-in holds it"
+        );
 
         // Built-in first: the skill yields, no error, the built-in stays.
         let catalog = CommandCatalog::new();
@@ -256,7 +260,11 @@ mod tests {
         catalog
             .register(Arc::new(Skilled("memory")))
             .expect("the skill yields rather than erroring");
-        assert_eq!(catalog.kind_of("memory"), Some(false), "the built-in still holds it");
+        assert_eq!(
+            catalog.kind_of("memory"),
+            Some(false),
+            "the built-in still holds it"
+        );
     }
 
     /// Two skills that resolve to one name: the first keeps it, the second
@@ -269,7 +277,11 @@ mod tests {
         catalog
             .register(Arc::new(Skilled("init")))
             .expect("the second skill yields, not an error");
-        assert_eq!(catalog.kind_of("init"), Some(true), "a skill still holds it");
+        assert_eq!(
+            catalog.kind_of("init"),
+            Some(true),
+            "a skill still holds it"
+        );
         assert_eq!(
             catalog.commands.read().unwrap().len(),
             1,
@@ -286,7 +298,7 @@ mod tests {
         let skill: Arc<dyn CatalogCommand> = Arc::new(Skilled("memory"));
         catalog.register(skill.clone()).unwrap();
         catalog.register(Arc::new(Named("memory"))).unwrap(); // built-in evicts the skill
-        // The skill's row unloads — its removal is by identity (`remove_exact`).
+                                                              // The skill's row unloads — its removal is by identity (`remove_exact`).
         catalog.remove_exact(&skill);
         assert_eq!(
             catalog.kind_of("memory"),
