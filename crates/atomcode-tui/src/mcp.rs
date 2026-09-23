@@ -242,6 +242,18 @@ impl Panel {
                 out.push(Action::Disable);
             }
         }
+        // `Untrust` 是**整项目级**的动作(设计 §5.2):这一台来自项目、而项目还是信任的
+        // (这正是它跑着的原因),它就该够得着。§5.2 把这一个动作挂在列表的项目组标题上,
+        // 面板还没有可选的组标题,所以先挂在每一台项目服务器上——语义一样,位置不同。
+        let project_is_trusted = detail.source == "project" && detail.state != McpState::Untrusted;
+        if project_is_trusted {
+            // 「停用」在每一支里都排最后,所以取消信任插在它前面。
+            let before = match out.last() {
+                Some(Action::Disable) => out.len() - 1,
+                _ => out.len(),
+            };
+            out.insert(before, Action::Untrust);
+        }
         out
     }
 
@@ -437,12 +449,17 @@ mod tests {
         McpView::new(names.iter().copied().map(row).collect())
     }
 
-    /// 一台服务器的详情页,只有状态与认证是这一次要的。
+    /// 一台**用户级**服务器的详情页,只有状态与认证是这一次要的。
     fn detail(state: McpState, auth: Auth) -> McpDetail {
+        detail_from("global", state, auth)
+    }
+
+    /// 同一张详情页,来源也由这一次要的说。
+    fn detail_from(source: &str, state: McpState, auth: Auth) -> McpDetail {
         McpDetail {
             name: "figma".to_string(),
             state,
-            source: "project".to_string(),
+            source: source.to_string(),
             transport: Transport::Http {
                 url: "https://mcp.figma.com/mcp".into(),
             },
@@ -507,5 +524,39 @@ mod tests {
         // Already off: the only way is back on.
         let off = detail(McpState::Disabled, Auth::None);
         assert_eq!(panel.actions(&off), vec![Action::Enable]);
+    }
+
+    /// `Untrust` 是整项目级的动作(设计 §5.2):项目还信任着的时候要够得着,并且排在
+    /// 这一台自己的动作之后、「停用」之前;用户级的那一台与项目信任无关,不给。
+    #[test]
+    fn a_trusted_project_server_can_be_untrusted_and_a_user_level_one_cannot() {
+        let mut panel = Panel::new();
+        panel.level = Level::Detail;
+
+        // 项目信任着——这一台正连着,所以「取消信任」够得着。
+        let project = detail_from(
+            "project",
+            McpState::Connected,
+            Auth::OAuth {
+                authenticated: true,
+            },
+        );
+        let actions = panel.actions(&project);
+        assert!(actions.contains(&Action::Untrust), "{actions:?}");
+        assert_eq!(
+            actions,
+            vec![Action::Logout, Action::Untrust, Action::Disable]
+        );
+
+        // 项目还没被信任:这里该给的是「信任」,不是「取消信任」。
+        let untrusted = detail_from("project", McpState::Untrusted, Auth::None);
+        assert_eq!(
+            panel.actions(&untrusted),
+            vec![Action::Trust, Action::Disable]
+        );
+
+        // 用户级的那一台:项目信任与它无关,一个都不给。
+        let global = detail(McpState::Connected, Auth::None);
+        assert_eq!(panel.actions(&global), vec![Action::Disable]);
     }
 }
