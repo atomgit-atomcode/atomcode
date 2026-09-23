@@ -310,9 +310,9 @@ fn path_openable(path: &str) -> bool {
     }
     let name = path.rsplit('/').next().unwrap_or("");
     match name.rsplit_once('.') {
-        Some((stem, ext)) if !stem.is_empty() => {
-            OPENABLE_EXTENSIONS.iter().any(|e| ext.eq_ignore_ascii_case(e))
-        }
+        Some((stem, ext)) if !stem.is_empty() => OPENABLE_EXTENSIONS
+            .iter()
+            .any(|e| ext.eq_ignore_ascii_case(e)),
         _ => false,
     }
 }
@@ -399,7 +399,17 @@ fn next_path(s: &str) -> Option<(usize, usize)> {
             let trimmed = tail[..end].trim_end_matches(|c: char| {
                 matches!(
                     c,
-                    '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '>' | '"' | '\''
+                    '.' | ','
+                        | ';'
+                        | ':'
+                        | '!'
+                        | '?'
+                        | ')'
+                        | ']'
+                        | '}'
+                        | '>'
+                        | '"'
+                        | '\''
                         | '，'
                         | '。'
                         | '、'
@@ -413,7 +423,10 @@ fn next_path(s: &str) -> Option<(usize, usize)> {
             }
         }
         boundary = c.is_whitespace()
-            || matches!(c, '(' | '[' | '{' | '<' | '"' | '\'' | '（' | '「' | '『' | '【' | '《');
+            || matches!(
+                c,
+                '(' | '[' | '{' | '<' | '"' | '\'' | '（' | '「' | '『' | '【' | '《'
+            );
     }
     None
 }
@@ -1216,7 +1229,10 @@ mod tests {
             "已在默认浏览器打开 /Users/theo/Documents/workspace/atomcode/pelican-bike.html。",
             300,
         );
-        let link = spans.iter().find(|s| s.link.is_some()).expect("a linked run");
+        let link = spans
+            .iter()
+            .find(|s| s.link.is_some())
+            .expect("a linked run");
         assert_eq!(
             link.text,
             "/Users/theo/Documents/workspace/atomcode/pelican-bike.html"
@@ -1230,7 +1246,11 @@ mod tests {
     #[test]
     fn a_path_without_an_openable_extension_stays_plain() {
         // A source file or a directory is not something to open in a browser.
-        for text in ["see /etc/hosts here", "cd /usr/local/bin now", "edit /src/main.rs"] {
+        for text in [
+            "see /etc/hosts here",
+            "cd /usr/local/bin now",
+            "edit /src/main.rs",
+        ] {
             let spans = spans_of(text, 200);
             assert!(
                 spans.iter().all(|s| s.link.is_none()),
