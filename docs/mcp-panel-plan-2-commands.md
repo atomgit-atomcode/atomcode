@@ -376,6 +376,34 @@ Expected: 编译失败，`no variant named 'McpManage' found for enum 'HostComma
     },
 ```
 
+**这个 crate 有四处需要补，不是两处——只加枚举变体会编译不过。** 实测撞出来的（`fix(host-api): 补上三个漏登记的变体` 那个提交就是踩了同一道门）：
+
+1. `HostCommand` 变体（上面那条）
+2. `HostReply` 变体（上面那条）
+3. `commands()` 与 `replies()` 各自末尾的 `for … match`（逐变体列举，**无通配分支**）
+4. **`HostCommand::addressed()`（约 :229-270）**——同样没有通配分支
+
+第 3 处，在各自 match 的末尾分支列表追加：
+
+```rust
+                | HostCommand::McpManage { .. }
+                | HostCommand::McpDetail { .. } => {}
+```
+
+```rust
+                | HostReply::McpRows { .. }
+                | HostReply::McpDetail { .. } => {}
+```
+
+第 4 处，在 `Self::McpTools { session, .. }` 之后追加：
+
+```rust
+            | Self::McpManage { session }
+            | Self::McpDetail { session, .. }
+```
+
+`addressed()` 里取 `Some(session)` 是唯一正确的值：判据 `a_command_on_the_live_session_names_it` 要求**除 `ListSessions` 外每条命令都指向活会话**，而两个新命令都带 `session`。
+
 - [ ] **Step 4: 跑测试，确认通过**
 
 ```bash
