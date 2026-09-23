@@ -883,13 +883,46 @@ mod tests {
         let header = lines[1].spans.iter().find(|s| s.text == "a").unwrap();
         let body = lines[3].spans.iter().find(|s| s.text == "1").unwrap();
         // The header is told from the body by weight alone: bold, but wearing the
-        // body's own foreground rather than the accent hue a heading would.
+        // body's own foreground rather than the accent hue a heading would. The
+        // body's fg is checked too — the old full-`Style` comparison caught a
+        // body cell that turned Accent-blue, and dropping it would let that
+        // regression through unseen.
         assert!(header.style.bold, "the header should be bold");
         assert_eq!(
             header.style.fg, base.fg,
             "the header must not be highlighted"
         );
         assert!(!body.style.bold, "the body is not bold");
+        assert_eq!(
+            body.style.fg, base.fg,
+            "the body must not be highlighted either"
+        );
+    }
+
+    /// The flat records tier styles its header labels the same way the grid
+    /// does: bold, not highlighted. The grid test above only exercises `aligned`
+    /// (the rows fit at width 40); a narrow width drops to `flat`, and without
+    /// this a revert of just that tier's header style would ship unseen.
+    #[test]
+    fn the_flat_tier_header_label_is_bold_and_not_highlighted() {
+        let rows: Vec<String> = ["| key | value |", "|---|---|", "| a | b |"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let base = Style::new();
+        // Width 12 is too narrow for a grid, so the block falls to flat records
+        // (`key：a`), where the label carries the header style.
+        let lines = render(&rows, 12, base).unwrap();
+        let label = lines
+            .iter()
+            .flat_map(|l| &l.spans)
+            .find(|s| s.text == "key")
+            .expect("the header label is drawn in the flat tier");
+        assert!(label.style.bold, "the flat header label should be bold");
+        assert_eq!(
+            label.style.fg, base.fg,
+            "the flat header label must not be highlighted"
+        );
     }
 
     #[test]
