@@ -124,16 +124,12 @@ impl Action {
 }
 
 /// 面包屑所处的层级。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Level {
+    /// 面板升起来时停在这一层。
+    #[default]
     List,
     Detail,
-}
-
-impl Default for Level {
-    fn default() -> Self {
-        Self::List
-    }
 }
 
 /// 目录,以及打开着的那一份详情。

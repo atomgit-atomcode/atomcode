@@ -21,6 +21,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+// The one walked file tree this product has. Shared with the daemon's
+// `/fs/search`, which is what the webui `@` picker asks — see `Tui::files`.
+use atomcode_capabilities::file_index::FileIndex;
 use atomcode_harness::seams::{UiSvc, UserInterface};
 use atomcode_host_api::{HostCommand, HostConnection, HostControl, HostEvent, HostReply};
 use atomcode_kernel::agent::{AgentDescription, AgentStatus};
@@ -506,49 +509,45 @@ impl AgentClient {
 /// A directory is listed with its separator so the next keystroke continues
 /// into it. Bounded, because a repository root can hold thousands of entries
 /// and a menu is a hint, not a file manager.
-fn paths_under(cwd: &str, prefix: &str) -> Vec<crate::menu::Item> {
-    const MOST: usize = 20;
-    let (dir, leaf) = match prefix.rsplit_once('/') {
-        Some((dir, leaf)) => (dir.to_string(), leaf.to_string()),
-        None => (String::new(), prefix.to_string()),
-    };
-    let root = std::path::Path::new(cwd).join(&dir);
-    let Ok(entries) = std::fs::read_dir(&root) else {
+fn paths_under(
+    index: &std::sync::Mutex<Option<(std::path::PathBuf, FileIndex)>>,
+    cwd: &str,
+    prefix: &str,
+) -> Vec<crate::menu::Item> {
+    let mut held = index.lock().expect("file index poisoned");
+    let root = std::path::PathBuf::from(cwd);
+    match held.as_ref() {
+        // `/cd` moved the session. The index is walked from a root, so it is
+        // pointed at the new one rather than rebuilt from scratch — and until
+        // that walk lands, the shallow warm-up still answers.
+        Some((at, built)) if *at != root => built.reset(root.clone()),
+        Some(_) => {}
+        None => {
+            *held = Some((root.clone(), FileIndex::new(root.clone())));
+        }
+    }
+    let Some((at, built)) = held.as_mut() else {
         return Vec::new();
     };
-    let mut out: Vec<crate::menu::Item> = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        // A dot file only when the typist asked for one: `@` in a repository
-        // root would otherwise open with `.git` and `.gitignore`.
-        if name.starts_with('.') && !leaf.starts_with('.') {
-            continue;
-        }
-        if !name.starts_with(&leaf) {
-            continue;
-        }
-        let folder = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        let shown = if dir.is_empty() {
-            name.clone()
-        } else {
-            format!("{dir}/{name}")
-        };
-        let value = if folder {
-            format!("@{shown}/")
-        } else {
-            format!("@{shown}")
-        };
-        let item = crate::menu::Item::new(value.clone(), value);
-        out.push(if folder {
-            item.about(t(Msg::MenuFolder).into_owned())
-        } else {
-            item
-        });
-    }
-    // By what is shown, which is what a person scans.
-    out.sort_by(|a, b| a.label.cmp(&b.label));
-    out.truncate(MOST);
-    out
+    *at = root;
+    // The scope and the filter, split the way the engine splits them: what is
+    // before the last `/` is where to look, what is after it is what to match.
+    let (scope, filter) = atomcode_capabilities::file_index::split_token(prefix);
+    built
+        .filter(&scope, &filter)
+        .into_iter()
+        .map(|entry| {
+            // `Entry::rel_path` already ends in `/` for a directory, which is
+            // exactly what the next keystroke needs to continue into it.
+            let value = format!("@{}", entry.rel_path);
+            let item = crate::menu::Item::new(value.clone(), value);
+            if entry.is_dir {
+                item.about(t(Msg::MenuFolder).into_owned())
+            } else {
+                item
+            }
+        })
+        .collect()
 }
 
 /// The `/effort` rows the menu expands to for a given model: each level the
@@ -863,6 +862,21 @@ pub struct Tui {
     /// When the allowance was last asked about, so it is not asked again for
     /// [`ALLOWANCE_EVERY`]. `None` until the first turn ends.
     allowance_checked: Mutex<Option<std::time::Instant>>,
+    /// The walked file tree behind the `@` menu, and the root it was walked
+    /// from.
+    ///
+    /// **The same index the product's own file search uses**
+    /// (`atomcode_capabilities::file_index`, shared with the daemon's
+    /// `/fs/search` that powers the webui picker) — so what this menu offers,
+    /// what the webui offers and what the tools can see are one answer. A
+    /// second walk here would be a second set of rules about what counts as a
+    /// file in this project, and they would disagree on the day somebody edits
+    /// a `.gitignore`.
+    ///
+    /// Behind a `Mutex` because the index is `RefCell` inside: it is built for
+    /// one owner, and this is that owner. The root travels with it so a `/cd`
+    /// re-points it rather than silently answering from the old tree.
+    files: Mutex<Option<(std::path::PathBuf, FileIndex)>>,
     /// Where the button went down, so a release can tell a click from a drag.
     pressed_at: Mutex<Option<(u16, u16)>>,
     /// The last press's time, cell, and how many presses have landed on that
@@ -4887,7 +4901,7 @@ impl Tui {
                     (m.input.clone(), m.cwd.clone())
                 };
                 match crate::text::being_pathed(&typed) {
-                    Some(prefix) => paths_under(&cwd, prefix),
+                    Some(prefix) => paths_under(&self.files, &cwd, prefix),
                     None => Vec::new(),
                 }
             }
@@ -5481,6 +5495,7 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
             ctx: Mutex::new(None),
             wake: Mutex::new(None),
             allowance_checked: Mutex::new(None),
+            files: Mutex::new(None),
             pressed_at: Mutex::new(None),
             click_streak: Mutex::new(None),
             members: Arc::new(Roster::default()),
@@ -6131,6 +6146,108 @@ mod askpass_tests {
             .mode();
         assert!(mode & 0o111 != 0, "executable: {mode:o}");
         drop(guard);
+    }
+}
+
+#[cfg(test)]
+mod at_menu_tests {
+    use super::*;
+
+    /// Wait for the background walk to land, bounded.
+    ///
+    /// The index answers from a shallow depth-1 warm-up on the first call and
+    /// replaces it when the full walk finishes, so a judgement about anything
+    /// deeper has to let that finish. Bounded so a broken walk fails the test
+    /// rather than hanging it.
+    fn eventually(
+        index: &Mutex<Option<(std::path::PathBuf, FileIndex)>>,
+        cwd: &str,
+        prefix: &str,
+        want: impl Fn(&[crate::menu::Item]) -> bool,
+    ) -> Vec<crate::menu::Item> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let got = paths_under(index, cwd, prefix);
+            if want(&got) {
+                return got;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the walk never produced it: {got:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn labels(items: &[crate::menu::Item]) -> Vec<String> {
+        items.iter().map(|i| i.label.clone()).collect()
+    }
+
+    /// `@` finds a file by name wherever it is, and never offers an ignored one.
+    ///
+    /// Both halves are the point of using the product's own index instead of
+    /// listing a directory: a single-level `read_dir` can only complete what is
+    /// in the folder already typed, and it has no idea what `.gitignore` says —
+    /// so it offers build output and cannot find a file three directories down
+    /// that the person knows the name of.
+    #[test]
+    fn the_at_menu_finds_a_file_by_name_at_any_depth_and_skips_ignored_ones() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src/http/handler")).expect("dirs");
+        std::fs::create_dir_all(root.join("target/debug")).expect("dirs");
+        std::fs::write(root.join(".gitignore"), "target/\n").expect("write");
+        std::fs::write(root.join("src/http/handler/ApplyStockController.java"), "x")
+            .expect("write");
+        std::fs::write(root.join("target/debug/build-junk.java"), "x").expect("write");
+        std::fs::write(root.join("README.md"), "x").expect("write");
+
+        let index = Mutex::new(None);
+        let cwd = root.to_string_lossy().into_owned();
+
+        // Across levels, and case-insensitively: what was typed appears
+        // nowhere in the directory the person is standing in.
+        let found = eventually(&index, &cwd, "applystock", |items| !items.is_empty());
+        assert_eq!(
+            labels(&found),
+            vec!["@src/http/handler/ApplyStockController.java".to_string()],
+            "a file several directories down is found by its name alone"
+        );
+
+        // And the ignored tree is not offered — not the file, not the folder.
+        let all = paths_under(&index, &cwd, "");
+        let shown = labels(&all).join(" ");
+        assert!(
+            !shown.contains("target"),
+            "an ignored directory is not a completion: {shown}"
+        );
+        assert!(shown.contains("README.md"), "{shown}");
+        let junk = paths_under(&index, &cwd, "junk");
+        assert!(labels(&junk).is_empty(), "{junk:?}");
+    }
+
+    /// Changing directory re-points the index rather than answering from the
+    /// tree that was left behind.
+    #[test]
+    fn a_change_of_directory_moves_the_index_with_it() {
+        let first = tempfile::tempdir().expect("tempdir");
+        let second = tempfile::tempdir().expect("tempdir");
+        std::fs::write(first.path().join("only-here.rs"), "x").expect("write");
+        std::fs::write(second.path().join("over-there.rs"), "x").expect("write");
+
+        let index = Mutex::new(None);
+        let here = first.path().to_string_lossy().into_owned();
+        let there = second.path().to_string_lossy().into_owned();
+
+        let found = eventually(&index, &here, "only", |items| !items.is_empty());
+        assert_eq!(labels(&found), vec!["@only-here.rs".to_string()]);
+
+        let moved = eventually(&index, &there, "over", |items| !items.is_empty());
+        assert_eq!(labels(&moved), vec!["@over-there.rs".to_string()]);
+        assert!(
+            labels(&paths_under(&index, &there, "only")).is_empty(),
+            "the directory that was left behind is no longer offered"
+        );
     }
 }
 
