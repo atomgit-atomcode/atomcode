@@ -61,6 +61,11 @@ plexus_service!(ConnectionSvc => Connection, "agent-connection", Seam, "What the
 // Provided by the loop once it exists, so whatever is working outside it can
 // say that what is on screen changed.
 plexus_service!(RepaintSvc => dyn Repaint, "tui-repaint", Seam, "Ask for a frame from outside the loop");
+// And what a trip that is already running has got to. A sign-in takes minutes
+// and every second of it looks the same from the panel — the row says the
+// action's name and cannot know more — so the one running it says which step it
+// is on. Declared by this row and filled by it, like `RepaintSvc`.
+plexus_service!(McpPhaseSvc => dyn McpPhase, "tui-mcp-phase", Seam, "Say which step a running MCP action has reached");
 
 /// The connection a launcher hands the screen, taken once when it runs.
 pub struct Connection(Mutex<Option<HostConnection>>);
@@ -5364,6 +5369,28 @@ impl Repaint for Waker {
     }
 }
 
+/// Said by whatever is running an MCP action outside the loop.
+///
+/// The sign-in is the one that needs it: it opens a browser and waits on a
+/// network, and which of those it is waiting on is the one thing the panel
+/// cannot work out for itself — the row it drew knows the action's name and
+/// nothing more. A panel that cannot tell those apart reads the same whether
+/// the trip is working or wedged.
+pub trait McpPhase: Send + Sync {
+    /// The step the running action has got to, in the panel's own words.
+    /// Ignored when nothing is running: there is then nowhere to put it.
+    fn at(&self, phase: String);
+}
+
+/// The screen's own: the panel lives in its `Moment`.
+struct Phases(Arc<Host>);
+
+impl McpPhase for Phases {
+    fn at(&self, phase: String) {
+        self.0.mcp_phase(phase);
+    }
+}
+
 /// Do what a command answered with.
 ///
 /// One implementation for the two ways a command is reached — typed, and picked
@@ -5616,6 +5643,7 @@ impl Plugin for TuiUiPlugin {
             // launcher's audit is for.
             "tui-team-roster",
             "tui-repaint",
+            "tui-mcp-phase",
         ]
     }
     fn description(&self) -> &'static str {
@@ -5658,6 +5686,11 @@ impl Plugin for TuiUiPlugin {
         // list a member the team panel no longer has a row for.
         let _ = ctx
             .provide::<TeamRosterSvc>(tui.members.clone())
+            .map_err(|e| e.to_string())?;
+        // A sign-in runs outside the loop and takes minutes; what it has got to
+        // goes onto the panel it was started from.
+        let _ = ctx
+            .provide::<McpPhaseSvc>(Arc::new(Phases(host.clone())) as Arc<dyn McpPhase>)
             .map_err(|e| e.to_string())?;
         let tui = Arc::new(tui);
         // The seam anything outside the loop asks for a frame through. Provided

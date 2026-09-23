@@ -54,7 +54,8 @@ pub use config::{
 };
 pub use oauth::{
     login_github_oauth, login_mcp_oauth, login_mcp_oauth_until, refresh_mcp_oauth_token,
-    token_is_expired, McpOAuthLoginOptions, McpOAuthLoginStop, McpOAuthToken, McpTokenStore,
+    token_is_expired, McpOAuthLoginOptions, McpOAuthLoginStop, McpOAuthStep, McpOAuthToken,
+    McpTokenStore,
 };
 pub use registry::{project_trust_key, ConnectAttempt, McpConnectEvent, McpRegistry};
 pub use tool::{mcp_tool_full_name, sanitize_name_segment, McpToolAdapter};

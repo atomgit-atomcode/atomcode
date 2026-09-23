@@ -3680,6 +3680,29 @@ impl Host {
         true
     }
 
+    /// Say which step a running action has got to, leaving the action's own name
+    /// and whether it can be stopped alone — those were settled when the key
+    /// that started it was pressed, and the one running it has no business
+    /// restating them.
+    ///
+    /// Nothing running is not an error: a phase can be reported after the panel
+    /// was closed or the trip already answered, and there is then nowhere to
+    /// put it.
+    pub fn mcp_phase(&self, phase: String) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let Some(panel) = m.mcp_panel.as_mut() else {
+            return false;
+        };
+        let Some(busy) = panel.busy.as_mut() else {
+            return false;
+        };
+        if busy.phase.as_deref() == Some(phase.as_str()) {
+            return false;
+        }
+        busy.phase = Some(phase);
+        true
+    }
+
     /// Say what the last key came to, when it came to something worth reading —
     /// the configuration guard's own words land here (设计 §6).
     pub fn mcp_note(&self, note: Option<String>) -> bool {
@@ -8399,6 +8422,55 @@ mod tests {
             m.mcp_panel.as_ref().expect("it is up").cursor,
             2,
             "光标留在原处"
+        );
+    }
+
+    /// 认证跑着的时候,面板那一行要说它在等什么。
+    ///
+    /// **真渲染一帧**:阶段是画在忙碌行上的,只看 `moment` 里那个字段会漏掉
+    /// 「字段有了、那一行没跟着画出来」——那正是这一处要修的毛病本身(状态在,
+    /// 屏上没有)。
+    #[test]
+    fn the_busy_row_says_which_step_a_sign_in_has_reached() {
+        const PHASE: &str = "正在连接 mcp.linear.app…";
+        let h = host_with_mcp();
+        assert!(h.show_mcp(crate::mcp::McpView::new(vec![server_row("linear")])));
+        assert!(h.toggle_mcp());
+        assert!(h.mcp_busy(Some(crate::mcp::Busy::of(crate::mcp::Action::Login))));
+
+        let drawn = |h: &Host| -> Vec<String> {
+            h.compose((60, 20))
+                .part(crate::modules::mcp::ID)
+                .expect("the panel is drawn")
+                .lines
+                .iter()
+                .map(|line| line.plain())
+                .collect()
+        };
+
+        let before = drawn(&h);
+        assert!(h.mcp_phase(PHASE.to_string()));
+        let after = drawn(&h);
+        let row = after
+            .iter()
+            .position(|line| line.contains(PHASE))
+            .unwrap_or_else(|| panic!("阶段要画在面板上,屏上是这些: {after:?}"));
+        assert_eq!(
+            after[row].replace(PHASE, "").trim_end(),
+            before[row].trim_end(),
+            "阶段是**加在动作名之后**的,不是替掉它: {:?} → {:?}",
+            before[row],
+            after[row]
+        );
+
+        // 同一句话报两次不算变化,不欠一帧。
+        assert!(!h.mcp_phase(PHASE.to_string()));
+        // 收工之后没有地方放它:不是错误,但也不许留在屏上。
+        assert!(h.mcp_busy(None));
+        assert!(!h.mcp_phase("等待浏览器授权…".to_string()));
+        assert!(
+            !drawn(&h).iter().any(|line| line.contains("等待浏览器授权")),
+            "没有活在外面跑的时候,阶段画不出来"
         );
     }
 

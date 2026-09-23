@@ -20,7 +20,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use atomcode_capabilities::mcp::{
     load_mcp_config_including_disabled, login_mcp_oauth_until, McpOAuthLoginOptions,
-    McpOAuthLoginStop, McpServerConfig,
+    McpOAuthLoginStop, McpOAuthStep, McpServerConfig,
 };
 use atomcode_harness::seams::UiSvc;
 use atomcode_host_api::{
@@ -30,7 +30,7 @@ use atomcode_host_api::{
 use atomcode_plexus::{Context, Plugin};
 use atomcode_tui::mcp::{Action, Auth, Mcp, McpDetail, McpState, McpView, Transport};
 use atomcode_tui::module::{Modules, Mounted};
-use atomcode_tui::plugin::{AgentClientSvc, McpSvc, ModulesSvc, RepaintSvc};
+use atomcode_tui::plugin::{AgentClientSvc, McpPhaseSvc, McpSvc, ModulesSvc, RepaintSvc};
 use serde_json::Value;
 
 /// 行的名字,插件和点它的那一层共用一个串。
@@ -105,10 +105,12 @@ impl Drop for McpPort {
     }
 }
 
-/// Sign in to one server: `announce` gets the authorization URL. Blocking —
-/// it waits on a browser — so it is only ever called off the async runtime.
+/// Sign in to one server: `announce` gets each step as it starts. Blocking — it
+/// waits on a browser — so it is only ever called off the async runtime.
 type Login = Arc<
-    dyn Fn(&McpServerConfig, &McpOAuthLoginStop, &dyn Fn(&str)) -> Result<(), String> + Send + Sync,
+    dyn Fn(&McpServerConfig, &McpOAuthLoginStop, &dyn Fn(McpOAuthStep<'_>)) -> Result<(), String>
+        + Send
+        + Sync,
 >;
 
 /// How long a sign-in gives the browser. Long enough for a second factor,
@@ -118,7 +120,7 @@ const SIGN_IN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300)
 fn sign_in_by_browser(
     config: &McpServerConfig,
     stop: &McpOAuthLoginStop,
-    announce: &dyn Fn(&str),
+    announce: &dyn Fn(McpOAuthStep<'_>),
 ) -> Result<(), String> {
     login_mcp_oauth_until(
         config,
@@ -150,6 +152,25 @@ impl McpPort {
         Arc::new(move |line: String| {
             if let Some(ui) = ui.as_ref() {
                 ui.say(&line);
+            }
+            if let Some(repaint) = repaint.as_ref() {
+                repaint.now();
+            }
+        })
+    }
+
+    /// Say which step a running sign-in has got to, on the panel it was started
+    /// from — and paint it now, because that panel is what the person is
+    /// looking at while they wait.
+    ///
+    /// A screen with no panel has nowhere to put it: `McpPhaseSvc` is filled by
+    /// the row that owns the panel, and the sign-in is otherwise the same.
+    fn phaser(&self) -> Arc<dyn Fn(String) + Send + Sync> {
+        let phases = self.ctx.service::<McpPhaseSvc>();
+        let repaint = self.ctx.service::<RepaintSvc>();
+        Arc::new(move |line: String| {
+            if let Some(phases) = phases.as_ref() {
+                phases.at(line);
             }
             if let Some(repaint) = repaint.as_ref() {
                 repaint.now();
@@ -197,6 +218,7 @@ impl Mcp for McpPort {
                 self.login.clone(),
                 stop,
                 self.sayer(),
+                self.phaser(),
             )
             .await;
         };
@@ -234,6 +256,7 @@ async fn sign_in(
     login: Login,
     stop: McpOAuthLoginStop,
     say: Arc<dyn Fn(String) + Send + Sync>,
+    phase: Arc<dyn Fn(String) + Send + Sync>,
 ) -> Result<McpView, String> {
     let working_dir = match control
         .call(HostCommand::Context {
@@ -255,7 +278,16 @@ async fn sign_in(
     let name = server.to_string();
     let cancelled = Arc::clone(&stop.cancel);
     std::thread::spawn(move || {
-        let announce = |url: &str| say(tr(SMsg::McpLoginUrl { server: &name, url }).into_owned());
+        let announce = |step: McpOAuthStep| match step {
+            // 正在连网络:这是最容易被当成卡住的一段,面板上要说出来。
+            McpOAuthStep::Asking { host } => phase(tr(SMsg::McpSignInAsking { host }).into_owned()),
+            // 浏览器这一步两样都要说:链接是可能得自己复制的那一样,阶段是面板
+            // 那一行的短说法。
+            McpOAuthStep::WaitingForBrowser { url } => {
+                say(tr(SMsg::McpLoginUrl { server: &name, url }).into_owned());
+                phase(tr(SMsg::McpSignInWaiting).into_owned());
+            }
+        };
         let _ = done.send(login(&config, &stop, &announce));
     });
     answer
@@ -778,7 +810,10 @@ mod tests {
                     tokio::runtime::Handle::try_current().is_err(),
                     Ordering::Release,
                 );
-                announce(URL);
+                announce(McpOAuthStep::Asking {
+                    host: "mcp.example",
+                });
+                announce(McpOAuthStep::WaitingForBrowser { url: URL });
                 Ok(())
             })
         };
@@ -787,8 +822,13 @@ mod tests {
             let said = Arc::clone(&said);
             Arc::new(move |line| said.lock().unwrap().push(line))
         };
+        let phased = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let phase: Arc<dyn Fn(String) + Send + Sync> = {
+            let phased = Arc::clone(&phased);
+            Arc::new(move |line| phased.lock().unwrap().push(line))
+        };
 
-        sign_in(&host, "s".into(), "remote", login, stop(), say)
+        sign_in(&host, "s".into(), "remote", login, stop(), say, phase)
             .await
             .expect("signed in");
 
@@ -796,6 +836,20 @@ mod tests {
         assert!(
             said.iter().any(|line| line.contains(URL)),
             "the URL is said on the screen, whole: {said:?}"
+        );
+        // The panel's own row: which host is being asked, and then that the wait
+        // is on the browser. Without these the row reads 「认证」 from the first
+        // second to the last, which is what a wedged sign-in looks like too.
+        let phased = phased.lock().unwrap();
+        assert!(
+            phased.iter().any(|line| line.contains("mcp.example")),
+            "the host being asked is reported: {phased:?}"
+        );
+        assert!(
+            phased
+                .iter()
+                .any(|line| *line == tr(SMsg::McpSignInWaiting).into_owned()),
+            "and so is the browser wait: {phased:?}"
         );
         assert!(
             off_the_runtime.load(Ordering::Acquire),
@@ -828,9 +882,17 @@ mod tests {
                 Ok(())
             })
         };
-        let error = sign_in(&host, "s".into(), "remote", login, stop(), Arc::new(|_| {}))
-            .await
-            .expect_err("the reconnect has to wait");
+        let error = sign_in(
+            &host,
+            "s".into(),
+            "remote",
+            login,
+            stop(),
+            Arc::new(|_| {}),
+            Arc::new(|_| {}),
+        )
+        .await
+        .expect_err("the reconnect has to wait");
         assert!(signed.load(Ordering::Acquire), "the sign-in itself ran");
         assert!(
             error.contains("/mcp reload"),
@@ -850,9 +912,17 @@ mod tests {
         let login: Login = Arc::new(|_config, _stop, _announce| {
             panic!("no sign-in for a server that is not configured")
         });
-        let error = sign_in(&host, "s".into(), "nope", login, stop(), Arc::new(|_| {}))
-            .await
-            .expect_err("unknown server");
+        let error = sign_in(
+            &host,
+            "s".into(),
+            "nope",
+            login,
+            stop(),
+            Arc::new(|_| {}),
+            Arc::new(|_| {}),
+        )
+        .await
+        .expect_err("unknown server");
         assert!(error.contains("nope"), "{error}");
         assert_eq!(*host.asked.lock().unwrap(), vec!["Context"], "no reconnect");
     }
@@ -875,9 +945,17 @@ mod tests {
             stop.cancel.store(true, Ordering::Release);
             Err("MCP OAuth login was cancelled before the browser came back".into())
         });
-        let error = sign_in(&host, "s".into(), "remote", login, stop(), Arc::new(|_| {}))
-            .await
-            .expect_err("cancelled");
+        let error = sign_in(
+            &host,
+            "s".into(),
+            "remote",
+            login,
+            stop(),
+            Arc::new(|_| {}),
+            Arc::new(|_| {}),
+        )
+        .await
+        .expect_err("cancelled");
         assert_eq!(error, tr(SMsg::McpSignInCancelled));
         assert_eq!(*host.asked.lock().unwrap(), vec!["Context"], "no reconnect");
     }

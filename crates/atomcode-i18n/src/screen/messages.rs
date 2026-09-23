@@ -960,6 +960,14 @@ pub enum Msg<'a> {
         server: &'a str,
         url: &'a str,
     },
+    /// What a running sign-in is waiting on. Shown on the panel's own row while
+    /// it runs, which without it reads the same from the first second to the
+    /// last — the difference between working and wedged.
+    McpSignInAsking {
+        host: &'a str,
+    },
+    /// …and the other half of the same wait: the browser is open.
+    McpSignInWaiting,
     /// Signing in to a server the config does not define.
     McpServerNotConfigured {
         server: &'a str,

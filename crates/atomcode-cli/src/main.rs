@@ -42,8 +42,8 @@ fn _tests_assert_in_chinese() {
 
 use atomcode_capabilities::mcp::{
     load_mcp_config, login_mcp_oauth, merge_http_oauth_mcp_server_into_json_file,
-    merge_stdio_mcp_server_into_json_file, McpHttpAuthConfig, McpOAuthLoginOptions, McpTokenStore,
-    McpTransportConfig,
+    merge_stdio_mcp_server_into_json_file, McpHttpAuthConfig, McpOAuthLoginOptions, McpOAuthStep,
+    McpTokenStore, McpTransportConfig,
 };
 use atomcode_config::config::Config;
 
@@ -3751,8 +3751,10 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
                     None
                 }
             });
-            // A terminal command: the URL goes to the terminal, as the fallback
-            // for a browser that did not open.
+            // A terminal command: each step goes to the terminal as it starts.
+            // The URL is the one that has to be readable — this is the fallback
+            // for a browser that did not open — but which host is being asked
+            // for metadata is what tells a slow network from a hung one.
             let token = login_mcp_oauth(
                 &server,
                 McpOAuthLoginOptions {
@@ -3760,11 +3762,16 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
                     client_secret_env,
                     scopes,
                 },
-                &|url| {
-                    println!(
-                        "  Browser didn't open? Open the URL below to authorize MCP server {name:?}:"
-                    );
-                    println!("  {url}");
+                &|step| match step {
+                    McpOAuthStep::Asking { host } => {
+                        println!("  Asking {host} for its OAuth metadata...")
+                    }
+                    McpOAuthStep::WaitingForBrowser { url } => {
+                        println!(
+                            "  Browser didn't open? Open the URL below to authorize MCP server {name:?}:"
+                        );
+                        println!("  {url}");
+                    }
                 },
             )?;
             println!(

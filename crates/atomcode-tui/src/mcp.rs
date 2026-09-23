@@ -203,6 +203,11 @@ impl McpView {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Busy {
     pub what: String,
+    /// 这一趟走到哪一步了,由跑那趟活的人报过来(`McpPhaseSvc`)。
+    ///
+    /// 认证要连网络、还要等人开浏览器,几十秒里光有 `what` 分不出是在干活还是卡住了。
+    /// 它只改这一格的字,不碰「能不能叫停」——那是按下回车时就定下的事。
+    pub phase: Option<String>,
     /// 这件事能不能半路叫停。只有等浏览器的认证能:别的动作是一趟很快的往返,
     /// 说「取消」却停不下来,是在骗人。
     pub cancellable: bool,
@@ -215,6 +220,7 @@ impl Busy {
     pub fn of(action: Action) -> Self {
         Self {
             what: action.about(),
+            phase: None,
             cancellable: action == Action::Login,
             cancelling: false,
         }

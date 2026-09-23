@@ -23,6 +23,30 @@ const GITHUB_AUTHORIZE_URL: &str = "https://github.com/login/oauth/authorize";
 const GITHUB_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
 const GITHUB_MCP_RESOURCE: &str = "https://api.githubcopilot.com/mcp/";
 
+/// How long one OAuth request may spend *connecting*.
+///
+/// Spelled out because reqwest's default is `None` (its `connect_timeout` and
+/// `timeout` both start unset), which leaves a host that swallows packets to
+/// the kernel: ~75s of SYN retries on macOS, and that is one candidate URL.
+const OAUTH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long one OAuth request may take end to end — discovery, dynamic client
+/// registration, the token exchange. The wait for the browser is a different
+/// thing and is bounded by [`McpOAuthLoginStop::timeout`].
+const OAUTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The client every request in this module goes through: the process proxy
+/// policy, then the timeouts above.
+fn oauth_client() -> Result<reqwest::blocking::Client> {
+    crate::proxy::apply_blocking_proxy_policy(reqwest::blocking::Client::builder())
+        .connect_timeout(OAUTH_CONNECT_TIMEOUT)
+        .timeout(OAUTH_REQUEST_TIMEOUT)
+        .build()
+        // No `Client::new()` fallback — it panics on TLS/resolver init
+        // failure and `panic = "abort"` turns that into a process kill.
+        .context("failed to build MCP OAuth HTTP client")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpOAuthToken {
     #[serde(default)]
@@ -243,11 +267,7 @@ pub fn refresh_mcp_oauth_token(server_name: &str, token: &McpOAuthToken) -> Resu
         form.push(("resource", resource.clone()));
     }
 
-    let client = crate::proxy::apply_blocking_proxy_policy(reqwest::blocking::Client::builder())
-        .build()
-        // No `Client::new()` fallback — it panics on TLS/resolver init
-        // failure and `panic = "abort"` turns that into a process kill.
-        .context("failed to build MCP OAuth HTTP client")?;
+    let client = oauth_client()?;
     let resp = client
         .post(token_endpoint)
         .header("Accept", "application/json")
@@ -276,18 +296,36 @@ pub fn refresh_mcp_oauth_token(server_name: &str, token: &McpOAuthToken) -> Resu
     Ok(new_token)
 }
 
+/// What a sign-in is doing, told to the caller as it happens.
+///
+/// The authorization URL is one of these because it is the thing a person may
+/// have to copy by hand (a remote shell has no browser to open). The other is
+/// here because these steps have a network and a browser in them, and each can
+/// last as long as a connect timeout or a second factor: a panel that reads
+/// 「认证」 for the whole of one cannot be told apart from a panel that has hung,
+/// which is what a sign-in on a dead network used to look like.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpOAuthStep<'a> {
+    /// About to talk to `host` — asking it where its OAuth lives (RFC 9728 /
+    /// RFC 8414), or trading the code for a token on it.
+    Asking { host: &'a str },
+    /// The browser is open on `url` and the loopback listener is waiting for
+    /// the redirect. Said just *before* it is opened, so it can still be copied
+    /// by someone whose browser never came up.
+    WaitingForBrowser { url: &'a str },
+}
+
 /// Sign in to an OAuth MCP server: open the browser, wait for it to come back,
 /// save the token.
 ///
-/// `announce` is handed the authorization URL before the browser is opened —
-/// the fallback for when it does not open (a remote shell, no desktop). What it
-/// does with it is the caller's business: a terminal command prints it, a
-/// runtime behind a full-screen UI must not, because this process's stdout is
-/// that UI. Nothing in this module writes to stdout or stderr itself.
+/// `announce` is handed each [`McpOAuthStep`] as it starts. What it does with
+/// them is the caller's business: a terminal command prints them, a runtime
+/// behind a full-screen UI must not, because this process's stdout is that UI.
+/// Nothing in this module writes to stdout or stderr itself.
 pub fn login_mcp_oauth(
     server: &McpServerConfig,
     opts: McpOAuthLoginOptions,
-    announce: &dyn Fn(&str),
+    announce: &dyn Fn(McpOAuthStep<'_>),
 ) -> Result<McpOAuthToken> {
     login_mcp_oauth_with(server, opts, None, announce)
 }
@@ -296,12 +334,13 @@ pub fn login_mcp_oauth(
 /// raised, or when the browser has not come back within its timeout.
 ///
 /// Only the wait for the browser is stoppable. The requests around it are
-/// bounded by the HTTP client's own timeouts.
+/// bounded by [`OAUTH_CONNECT_TIMEOUT`] / [`OAUTH_REQUEST_TIMEOUT`], and a host
+/// that cannot be reached ends the walk right there ([`walk_candidates`]).
 pub fn login_mcp_oauth_until(
     server: &McpServerConfig,
     opts: McpOAuthLoginOptions,
     stop: &McpOAuthLoginStop,
-    announce: &dyn Fn(&str),
+    announce: &dyn Fn(McpOAuthStep<'_>),
 ) -> Result<McpOAuthToken> {
     login_mcp_oauth_with(server, opts, Some(stop), announce)
 }
@@ -310,7 +349,7 @@ fn login_mcp_oauth_with(
     server: &McpServerConfig,
     opts: McpOAuthLoginOptions,
     stop: Option<&McpOAuthLoginStop>,
-    announce: &dyn Fn(&str),
+    announce: &dyn Fn(McpOAuthStep<'_>),
 ) -> Result<McpOAuthToken> {
     let (url, auth) = match &server.config {
         McpTransportConfig::Http {
@@ -352,11 +391,10 @@ fn login_mcp_oauth_with(
         );
     }
 
-    let client = crate::proxy::apply_blocking_proxy_policy(reqwest::blocking::Client::builder())
-        .build()
-        // No `Client::new()` fallback — it panics on TLS/resolver init
-        // failure and `panic = "abort"` turns that into a process kill.
-        .context("failed to build MCP OAuth HTTP client")?;
+    let client = oauth_client()?;
+    announce(McpOAuthStep::Asking {
+        host: &host_of(url),
+    });
     let discovered = discover_oauth_metadata(&client, url, &auth)?;
     let (redirect_uri, listener) = bind_callback_listener()?;
     let state = Uuid::new_v4().to_string();
@@ -402,7 +440,9 @@ fn login_mcp_oauth_with(
             .append_pair("resource", resource);
     }
 
-    announce(authorize_url.as_str());
+    announce(McpOAuthStep::WaitingForBrowser {
+        url: authorize_url.as_str(),
+    });
     let _ = open_browser(authorize_url.as_str());
 
     let (code, returned_state) = await_oauth_callback(listener, stop)?;
@@ -424,6 +464,9 @@ fn login_mcp_oauth_with(
         form.push(("resource", resource.clone()));
     }
 
+    announce(McpOAuthStep::Asking {
+        host: &host_of(&discovered.metadata.token_endpoint),
+    });
     let resp = client
         .post(&discovered.metadata.token_endpoint)
         .header("Accept", "application/json")
@@ -449,14 +492,14 @@ fn login_mcp_oauth_with(
     Ok(token)
 }
 
-/// The bring-your-own GitHub OAuth App flow. `announce` gets the authorization
-/// URL, as in [`login_mcp_oauth`].
+/// The bring-your-own GitHub OAuth App flow. `announce` gets the steps, as in
+/// [`login_mcp_oauth`].
 pub fn login_github_oauth(
     server_name: &str,
     client_id: &str,
     client_secret_env: Option<&str>,
     scopes: &[String],
-    announce: &dyn Fn(&str),
+    announce: &dyn Fn(McpOAuthStep<'_>),
 ) -> Result<McpOAuthToken> {
     login_github_oauth_with(
         server_name,
@@ -474,7 +517,7 @@ fn login_github_oauth_with(
     client_secret_env: Option<&str>,
     scopes: &[String],
     stop: Option<&McpOAuthLoginStop>,
-    announce: &dyn Fn(&str),
+    announce: &dyn Fn(McpOAuthStep<'_>),
 ) -> Result<McpOAuthToken> {
     if client_id.trim().is_empty() {
         bail!("GitHub OAuth client id is required");
@@ -512,7 +555,7 @@ fn login_github_oauth_with(
         .append_pair("scope", &scope)
         .append_pair("state", &state);
 
-    announce(url.as_str());
+    announce(McpOAuthStep::WaitingForBrowser { url: url.as_str() });
     let _ = open_browser(url.as_str());
 
     let (code, returned_state) = await_oauth_callback(listener, stop)?;
@@ -520,11 +563,10 @@ fn login_github_oauth_with(
         bail!("OAuth state mismatch");
     }
 
-    let client = crate::proxy::apply_blocking_proxy_policy(reqwest::blocking::Client::builder())
-        .build()
-        // No `Client::new()` fallback — it panics on TLS/resolver init
-        // failure and `panic = "abort"` turns that into a process kill.
-        .context("failed to build MCP OAuth HTTP client")?;
+    announce(McpOAuthStep::Asking {
+        host: &host_of(GITHUB_TOKEN_URL),
+    });
+    let client = oauth_client()?;
     let resp = client
         .post(GITHUB_TOKEN_URL)
         .header("Accept", "application/json")
@@ -560,6 +602,92 @@ struct DiscoveredOAuth {
     resource: Option<String>,
 }
 
+/// What one candidate URL came to.
+enum Unreached {
+    /// The host answered — just not with the document we asked for: a 404, a
+    /// status we will not follow, a body that does not parse. The next path
+    /// shape is worth a try.
+    Missing(anyhow::Error),
+    /// The host never answered: the connection failed, or the request ran out
+    /// of time. Every remaining candidate is that same host on that same
+    /// network, so walking them changes nothing and costs the person the wait.
+    Unreachable(anyhow::Error),
+}
+
+impl Unreached {
+    /// Sort a failed request by whether the host was reached at all.
+    ///
+    /// Only a failure to *reach* it ends the walk early; an HTTP status or an
+    /// unparsable body means we did reach it, and one path shape out of several
+    /// serving the `.well-known` document is exactly what the list is for.
+    fn of(error: reqwest::Error, what: &str, url: &str) -> Self {
+        let reached = !is_unreachable(&error);
+        let error =
+            anyhow::Error::new(error).context(format!("MCP OAuth {what} request failed for {url}"));
+        if reached {
+            Self::Missing(error)
+        } else {
+            Self::Unreachable(error.context(unreachable_advice(url)))
+        }
+    }
+
+    /// The verdict as a plain error, for a caller that has no list to walk.
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::Missing(error) | Self::Unreachable(error) => error,
+        }
+    }
+}
+
+/// Whether a request failed to reach the host at all, as opposed to reaching it
+/// and being told no.
+fn is_unreachable(error: &reqwest::Error) -> bool {
+    error.is_connect() || error.is_timeout()
+}
+
+/// The host of `url`, for naming which one a step is talking to. Falls back to
+/// the whole string: a URL that will not parse is still worth showing.
+fn host_of(url: &str) -> String {
+    Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_string))
+        .unwrap_or_else(|| url.to_string())
+}
+
+/// Said when a host could not be reached. Named for what a person can act on:
+/// their connection, or the proxy this process is told to use.
+fn unreachable_advice(url: &str) -> String {
+    let host = host_of(url);
+    format!(
+        "Could not reach {host}: the network looks unreachable from here, or this host \
+         needs a proxy (set HTTPS_PROXY, or ATOMCODE_PROXY_MODE=no_proxy to stop using one)"
+    )
+}
+
+/// Try candidate URLs in order until one produces the document.
+///
+/// The reason [`Unreached::Unreachable`] returns instead of being recorded: the
+/// discovery has up to ten candidates, and with no explicit timeout each of
+/// them can hang for as long as the kernel takes to give up. A person whose
+/// network is simply down should be told that after the first one, not after
+/// all of them.
+fn walk_candidates<T>(
+    what: &str,
+    candidates: &[String],
+    mut fetch: impl FnMut(&str) -> std::result::Result<T, Unreached>,
+) -> Result<T> {
+    let mut last_missing: Option<anyhow::Error> = None;
+    for url in candidates {
+        match fetch(url) {
+            Ok(document) => return Ok(document),
+            Err(Unreached::Missing(error)) => last_missing = Some(error),
+            Err(Unreached::Unreachable(error)) => return Err(error),
+        }
+    }
+    Err(last_missing
+        .unwrap_or_else(|| anyhow::anyhow!("MCP OAuth: no {what} URL candidate to try")))
+}
+
 fn discover_oauth_metadata(
     client: &reqwest::blocking::Client,
     mcp_url: &str,
@@ -574,29 +702,16 @@ fn discover_oauth_metadata(
     }
 
     let resource_metadata_urls = discover_resource_metadata_urls(client, mcp_url, auth)?;
-    let mut prm: Option<ProtectedResourceMetadata> = None;
-    let mut last_err = None;
-    for url in &resource_metadata_urls {
-        match client
-            .get(url)
-            .header("Accept", "application/json")
-            .send()
-            .and_then(|r| r.error_for_status())
-            .and_then(|r| r.json::<ProtectedResourceMetadata>())
-        {
-            Ok(metadata) => {
-                prm = Some(metadata);
-                break;
-            }
-            Err(e) => last_err = Some((url.clone(), e)),
-        }
-    }
-    let prm: ProtectedResourceMetadata = prm.ok_or_else(|| match last_err {
-        Some((url, e)) => {
-            anyhow::anyhow!("MCP OAuth resource metadata request failed for {url}: {e}")
-        }
-        None => anyhow::anyhow!("MCP OAuth resource metadata: no candidate URL to try"),
-    })?;
+    let prm: ProtectedResourceMetadata =
+        walk_candidates("resource metadata", &resource_metadata_urls, |url| {
+            client
+                .get(url)
+                .header("Accept", "application/json")
+                .send()
+                .and_then(|r| r.error_for_status())
+                .and_then(|r| r.json::<ProtectedResourceMetadata>())
+                .map_err(|error| Unreached::of(error, "resource metadata", url))
+        })?;
     let auth_server = prm.authorization_servers.first().ok_or_else(|| {
         anyhow::anyhow!("MCP OAuth resource metadata has no authorization_servers")
     })?;
@@ -633,25 +748,36 @@ fn discover_resource_metadata_urls(
         "method": "initialize",
         "params": super::types::initialize_params()
     });
-    if let Ok(resp) = client
+    match client
         .post(mcp_url)
         .header("Accept", "application/json, text/event-stream")
         .json(&probe)
         .send()
     {
-        if resp.status() == reqwest::StatusCode::UNAUTHORIZED
-            || resp.status() == reqwest::StatusCode::FORBIDDEN
-        {
-            if let Some(header) = resp
-                .headers()
-                .get(reqwest::header::WWW_AUTHENTICATE)
-                .and_then(|v| v.to_str().ok())
+        Ok(resp) => {
+            if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+                || resp.status() == reqwest::StatusCode::FORBIDDEN
             {
-                if let Some(url) = parse_www_authenticate_resource_metadata(header) {
-                    return Ok(vec![url]);
+                if let Some(header) = resp
+                    .headers()
+                    .get(reqwest::header::WWW_AUTHENTICATE)
+                    .and_then(|v| v.to_str().ok())
+                {
+                    if let Some(url) = parse_www_authenticate_resource_metadata(header) {
+                        return Ok(vec![url]);
+                    }
                 }
             }
         }
+        // This probe is the first request a sign-in makes, and the candidates
+        // below live on this same host — so "cannot reach it" is the answer,
+        // rather than the first of a dozen waits that each end the same way.
+        Err(error) if is_unreachable(&error) => {
+            return Err(Unreached::of(error, "server probe", mcp_url).into_error())
+        }
+        // Reached it and got something else: the status tells us nothing about
+        // where the metadata is, so fall back to the well-known shapes.
+        Err(_) => {}
     }
 
     let candidates = well_known_metadata_urls(mcp_url, "oauth-protected-resource");
@@ -711,34 +837,30 @@ fn fetch_authorization_server_metadata(
     issuer: &str,
 ) -> Result<AuthorizationServerMetadata> {
     if issuer.contains("/.well-known/") {
-        return fetch_metadata_url(client, issuer);
+        return fetch_metadata_url(client, issuer).map_err(Unreached::into_error);
     }
     // Try the RFC 8414 form AND the OIDC form, each across all path shapes.
-    let mut last_err = None;
-    for suffix in ["oauth-authorization-server", "openid-configuration"] {
-        for candidate in well_known_metadata_urls(issuer, suffix) {
-            match fetch_metadata_url(client, &candidate) {
-                Ok(metadata) => return Ok(metadata),
-                Err(e) => last_err = Some(e),
-            }
-        }
-    }
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("No OAuth metadata URL candidates")))
+    let candidates: Vec<String> = ["oauth-authorization-server", "openid-configuration"]
+        .iter()
+        .flat_map(|suffix| well_known_metadata_urls(issuer, suffix))
+        .collect();
+    walk_candidates("authorization server metadata", &candidates, |url| {
+        fetch_metadata_url(client, url)
+    })
 }
 
+/// Read one `.well-known` metadata document, sorted for the walk.
 fn fetch_metadata_url(
     client: &reqwest::blocking::Client,
     url: &str,
-) -> Result<AuthorizationServerMetadata> {
+) -> std::result::Result<AuthorizationServerMetadata, Unreached> {
     client
         .get(url)
         .header("Accept", "application/json")
         .send()
-        .with_context(|| format!("Failed to fetch OAuth authorization server metadata from {url}"))?
-        .error_for_status()
-        .with_context(|| format!("OAuth authorization server metadata request failed for {url}"))?
-        .json()
-        .with_context(|| format!("Failed to parse OAuth authorization server metadata from {url}"))
+        .and_then(|r| r.error_for_status())
+        .and_then(|r| r.json())
+        .map_err(|error| Unreached::of(error, "authorization server metadata", url))
 }
 
 /// What to do when a server needs a client registered by hand: where *this*
@@ -1006,7 +1128,7 @@ fn open_browser(url: &str) -> Result<()> {
 mod tests {
     use super::{
         base64_url_no_pad, login_github_oauth, parse_www_authenticate_resource_metadata,
-        well_known_metadata_urls, McpOAuthToken, McpTokenStore,
+        walk_candidates, well_known_metadata_urls, McpOAuthToken, McpTokenStore, Unreached,
     };
 
     #[test]
@@ -1026,6 +1148,53 @@ mod tests {
             err.contains("RFC 7591") || err.contains("dynamically"),
             "should mention dynamic registration: {err}"
         );
+    }
+
+    /// A host that never answers ends the walk. The remaining candidates are
+    /// that same host on that same network, so walking them decides nothing and
+    /// costs a connect timeout each — which, before the client had any timeout
+    /// at all, is what made a sign-in with no network sit on 「认证」 for minutes
+    /// with nothing to read.
+    #[test]
+    fn a_host_that_never_answers_ends_the_walk_at_once() {
+        let candidates: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        let mut tried: Vec<String> = Vec::new();
+        let walked = walk_candidates("resource metadata", &candidates, |url| {
+            tried.push(url.to_string());
+            Err::<(), _>(Unreached::Unreachable(anyhow::anyhow!("no route to {url}")))
+        });
+        assert!(walked.is_err(), "连不上就该带着原因回去");
+        assert_eq!(tried.len(), 1, "只试第一个,不是把三个都试完");
+        assert_eq!(tried[0], "a");
+    }
+
+    /// Reaching the host and being told "not here" is the case the candidate
+    /// list exists for: the document is served at one path shape out of several.
+    #[test]
+    fn a_host_that_answers_is_walked_past_to_the_next_shape() {
+        let candidates: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        let mut tried: Vec<String> = Vec::new();
+        let walked = walk_candidates("resource metadata", &candidates, |url| {
+            tried.push(url.to_string());
+            match url {
+                "c" => Ok(7),
+                _ => Err(Unreached::Missing(anyhow::anyhow!("HTTP 404 at {url}"))),
+            }
+        });
+        assert_eq!(walked.unwrap(), 7);
+        assert_eq!(tried.len(), 3, "有应答就接着试下一个形状");
+    }
+
+    /// When no shape has it, the failure names the shape tried last — the one a
+    /// person can compare against what their server actually serves.
+    #[test]
+    fn a_walk_that_matches_nothing_reports_the_last_candidate() {
+        let candidates: Vec<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
+        let walked = walk_candidates("resource metadata", &candidates, |url| {
+            Err::<(), _>(Unreached::Missing(anyhow::anyhow!("HTTP 404 at {url}")))
+        });
+        let error = format!("{:#}", walked.unwrap_err());
+        assert!(error.contains("HTTP 404 at b"), "{error}");
     }
 
     #[test]

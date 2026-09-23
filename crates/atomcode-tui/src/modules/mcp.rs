@@ -112,6 +112,18 @@ enum Row<'a> {
     Legend,
 }
 
+/// The busy row: what the action is, then the step it has got to when whoever
+/// is running it has said (nothing says so for a trip that has no phases).
+fn busy_line(panel: &Panel) -> String {
+    let Some(busy) = panel.busy.as_ref() else {
+        return String::new();
+    };
+    match busy.phase.as_deref() {
+        Some(phase) => format!("  {}  {phase}", busy.what),
+        None => format!("  {}", busy.what),
+    }
+}
+
 /// The note, cut into rows of the panel's width (after its two-column indent).
 fn note_rows(panel: &Panel, w: usize) -> Vec<String> {
     match panel.note.as_deref() {
@@ -274,17 +286,7 @@ fn draw(view: &McpView, panel: &Panel, row: Row<'_>, w: usize, caps: Caps) -> Li
             theme::fg(Role::Warning),
         ),
         Row::Busy => Line::styled(
-            width::take_width(
-                &format!(
-                    "  {}",
-                    panel
-                        .busy
-                        .as_ref()
-                        .map(|busy| busy.what.clone())
-                        .unwrap_or_default()
-                ),
-                w,
-            ),
+            width::take_width(&busy_line(panel), w),
             theme::fg(Role::Warning),
         ),
         Row::Legend => Line::styled(

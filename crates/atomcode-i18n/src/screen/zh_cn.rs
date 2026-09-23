@@ -565,6 +565,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::McpLoginUrl { server, url } => {
             format!("正在认证 MCP 服务器 {server}。浏览器没有打开的话,复制这个链接去打开:\n{url}").into()
         }
+        Msg::McpSignInAsking { host } => format!("正在连接 {host}…").into(),
+        Msg::McpSignInWaiting => "等待浏览器授权…".into(),
         Msg::MouseTakenBackAuto => "鼠标被终端收回了,已自动要回;若再次发生,ctrl-o 可手动切换".into(),
         Msg::ScreenNotConnectedProviders => "屏幕还没接上,改不了 provider".into(),
         Msg::NoProviderPort => "这个屏幕没有接 provider:启动器没有提供 `tui-providers`".into(),

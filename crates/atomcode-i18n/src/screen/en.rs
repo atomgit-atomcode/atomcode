@@ -597,6 +597,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::McpLoginUrl { server, url } => {
             format!("Authenticating MCP server {server}. If the browser did not open, open this link:\n{url}").into()
         }
+        Msg::McpSignInAsking { host } => format!("connecting to {host}…").into(),
+        Msg::McpSignInWaiting => "waiting for the browser…".into(),
         Msg::MouseTakenBackAuto => "the terminal took the mouse back; it has been asked for again. If it happens again, ctrl-o switches by hand".into(),
         Msg::ScreenNotConnectedProviders => "the screen is not connected; providers cannot be changed".into(),
         Msg::NoProviderPort => "this screen has no providers: the launcher provided no `tui-providers`".into(),
