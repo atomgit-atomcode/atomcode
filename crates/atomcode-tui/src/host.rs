@@ -1854,8 +1854,10 @@ impl Host {
     pub fn set_activity(&self, activity: crate::moment::Activity) -> bool {
         {
             let m = self.moment.read().expect("moment poisoned");
-            // Fast path: nothing to change and no arm to spend.
-            if m.activity == activity && !m.pending_working {
+            // Fast path: nothing to change, no arm to spend, and no recognising
+            // line to take down (a turn that ended before its first fact leaves
+            // `activity` at Idle but the `正在识别图片` line still up).
+            if m.activity == activity && !m.pending_working && !m.recognizing_image {
                 return false;
             }
         }
@@ -1866,12 +1868,46 @@ impl Host {
         self.pinned(true, || {
             let mut m = self.moment.write().expect("moment poisoned");
             m.pending_working = false;
+            // The recognising line belongs to the gap before the turn; any real
+            // activity decision is the turn arriving or ending, and ends it.
+            visual_changed |= std::mem::take(&mut m.recognizing_image);
             if m.activity != activity {
                 m.activity = activity;
                 visual_changed = true;
             }
         });
         visual_changed
+    }
+
+    /// A picture is being recognised for a text-only model — raise the
+    /// `正在识别图片` line now, before the turn that will carry the message even
+    /// exists. Taken back down by [`Self::settle_working`] (the turn's first
+    /// fact) or [`Self::set_activity`] (the turn ending first).
+    pub fn start_recognizing(&self) -> bool {
+        self.pinned(true, || {
+            self.moment
+                .write()
+                .expect("moment poisoned")
+                .recognizing_image = true;
+        });
+        true
+    }
+
+    /// Recognition is over — the message it was reading is logged now. Takes the
+    /// `正在识别图片` line down whether or not a turn start was armed, so a picture
+    /// steered into a running turn (which arms nothing) still clears it. `false`
+    /// when there was nothing up.
+    pub fn stop_recognizing(&self) -> bool {
+        if !self.moment.read().expect("moment poisoned").recognizing_image {
+            return false;
+        }
+        self.pinned(true, || {
+            self.moment
+                .write()
+                .expect("moment poisoned")
+                .recognizing_image = false;
+        });
+        true
     }
 
     /// A turn has started: remember to raise the working line, but not yet —
@@ -1908,6 +1944,9 @@ impl Host {
         self.pinned(true, || {
             let mut m = self.moment.write().expect("moment poisoned");
             m.pending_working = false;
+            // The turn's first fact is here, so the pre-turn recognising line
+            // hands over to the ordinary working line.
+            m.recognizing_image = false;
             m.activity = crate::moment::Activity::Working;
         });
         true

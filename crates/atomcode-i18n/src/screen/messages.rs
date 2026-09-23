@@ -1056,6 +1056,10 @@ pub enum Msg<'a> {
 
     // ── the live strip and the folded-lines notes (`modules/live.rs`, `host.rs`) ──
     LiveStopping,
+    /// Shown while the runtime's VL helper is turning a pasted picture into text
+    /// for a non-vision model — before the turn's first fact, so the screen is
+    /// not blank during the seconds that recognition takes.
+    LiveRecognizingImage,
     LiveWaiting,
     LiveThinking,
     LiveWriting,

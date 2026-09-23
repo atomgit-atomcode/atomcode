@@ -355,6 +355,12 @@ fn quiet_for(state: &State, moment: &Moment) -> Option<u64> {
 const QUIET_AFTER_MS: u64 = 30_000;
 
 fn doing(state: &State, moment: &Moment) -> Option<String> {
+    // Before the turn even exists: a picture is being recognised for a text-only
+    // model, and the message that starts the turn will not be logged until that
+    // finishes. Say so rather than leave the screen blank for those seconds.
+    if moment.recognizing_image {
+        return Some(t(Msg::LiveRecognizingImage).into_owned());
+    }
     state.turn?;
     match moment.activity {
         Activity::Idle => None,
@@ -788,6 +794,29 @@ mod tests {
         assert_eq!(short(59_999), "59s");
         assert_eq!(short(65_000), "1m05s");
         assert_eq!(short(3_723_000), "1h02m");
+    }
+
+    #[test]
+    fn the_line_says_recognizing_before_the_turn_exists() {
+        // A picture going to a text-only model is recognised before the turn's
+        // message is logged, so there is no turn yet — the line must still speak,
+        // or the screen is blank for the seconds that recognition takes.
+        let state = State::default();
+        let mut moment = Moment::default().at_tick(0);
+        moment.now = Timestamp::millis(0);
+        moment.recognizing_image = true;
+        let line = draw(&state, &moment, 80, 1);
+        assert!(
+            line.iter().any(|l| l.contains("正在识别图片")),
+            "recognising is said before any turn: {line:?}"
+        );
+        // Cleared, the line has nothing to say (no turn either).
+        moment.recognizing_image = false;
+        let blank = draw(&state, &moment, 80, 1);
+        assert!(
+            !blank.iter().any(|l| l.contains("正在识别图片")),
+            "gone once recognition ends: {blank:?}"
+        );
     }
 
     #[test]

@@ -621,6 +621,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── the live strip and the folded-lines notes (`modules/live.rs`, `host.rs`) ──
         Msg::LiveStopping => "正在停止".into(),
+        Msg::LiveRecognizingImage => "正在识别图片".into(),
         Msg::LiveWaiting => "正在等待模型".into(),
         Msg::LiveThinking => "正在思考".into(),
         Msg::LiveWriting => "正在回复".into(),
