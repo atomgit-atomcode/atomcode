@@ -8,7 +8,8 @@ use std::error::Error;
 use std::fmt;
 use std::io;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use tokio_util::sync::CancellationToken;
 
 use atomcode_capabilities::session::snapshot::SnapshotPersistenceStatus;
 use atomcode_capabilities::session::{
@@ -1229,6 +1230,17 @@ pub struct CodingRuntimeHandle {
     state: Arc<AtomicU64>,
     provider_unavailable_reason: Arc<AtomicU8>,
     terminal: watch::Receiver<Option<RuntimeExit>>,
+    /// Fired by [`cancel`](Self::cancel) *before* the command goes on the
+    /// channel, so work the owner is awaiting inside its own loop can see the
+    /// stop it cannot yet read.
+    ///
+    /// The owner reads commands one at a time; anything it awaits in a command's
+    /// arm blocks every command behind it, this one included. Image recognition
+    /// is such an await — a model call with no overall cap — and `esc` under it
+    /// used to sit in the channel for the whole call. The owner puts a fresh
+    /// token here when it handles the cancel, so a stop is only ever held
+    /// against the work it was meant for.
+    stop: Arc<Mutex<CancellationToken>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1527,6 +1539,10 @@ impl CodingRuntimeHandle {
 
     pub async fn cancel(&self) -> Result<(), RuntimeError> {
         let state = self.state.load(Ordering::Acquire);
+        // Before the command, not after: what this stops may be something the
+        // owner is awaiting in its own loop, which is exactly the case where the
+        // command itself cannot be read yet.
+        self.stop.lock().expect("stop poisoned").cancel();
         let (done, result) = oneshot::channel();
         self.tx
             .send(CodingRuntimeControl::Cancel {
@@ -2461,6 +2477,22 @@ pub struct CodingRuntimeControlReceiver {
     state: Arc<AtomicU64>,
     provider_unavailable_reason: Arc<AtomicU8>,
     terminal_tx: watch::Sender<Option<RuntimeExit>>,
+    /// The other end of [`CodingRuntimeHandle::stop`].
+    stop: Arc<Mutex<CancellationToken>>,
+}
+
+impl CodingRuntimeControlReceiver {
+    /// The stop as it stands: cloned before a long await, so firing it later
+    /// reaches that await.
+    fn stop_now(&self) -> CancellationToken {
+        self.stop.lock().expect("stop poisoned").clone()
+    }
+
+    /// Put a fresh one in place — the stop that was asked for has been handled,
+    /// and the next piece of work is not the one it was aimed at.
+    fn stop_handled(&self) {
+        *self.stop.lock().expect("stop poisoned") = CancellationToken::new();
+    }
 }
 
 impl CodingRuntimeControlReceiver {
@@ -2716,18 +2748,21 @@ pub fn coding_runtime_control_channel() -> (CodingRuntimeHandle, CodingRuntimeCo
     // this flag at spawn time when startup produced only a degraded placeholder.
     let state = Arc::new(AtomicU64::new(runtime_state(0, true)));
     let provider_unavailable_reason = Arc::new(AtomicU8::new(0));
+    let stop = Arc::new(Mutex::new(CancellationToken::new()));
     (
         CodingRuntimeHandle {
             tx,
             state: Arc::clone(&state),
             provider_unavailable_reason: Arc::clone(&provider_unavailable_reason),
             terminal,
+            stop: Arc::clone(&stop),
         },
         CodingRuntimeControlReceiver {
             rx,
             state,
             provider_unavailable_reason,
             terminal_tx,
+            stop,
         },
     )
 }
@@ -3873,14 +3908,37 @@ fn spawn_runtime_owner_with_optional_agent(
                                     .as_ref()
                                     .and_then(|r| r.parts.session.as_ref())
                                     .map(|b| b.id.clone());
-                                let (new_input, notice) = pp
-                                    .preprocess(
+                                // Raced against the stop, because this await is
+                                // inside the owner's own loop: a `Cancel` sent
+                                // now sits behind it on the channel, unread, and
+                                // recognition has no overall time cap (only a
+                                // 30s gap-between-chunks one). That is how esc
+                                // under a pasted image did nothing for as long
+                                // as the VL model took.
+                                let stop = controls.stop_now();
+                                let recognised = tokio::select! {
+                                    biased;
+                                    _ = stop.cancelled() => None,
+                                    done = pp.preprocess(
                                         std::mem::take(&mut input.text),
                                         std::mem::take(&mut input.images),
                                         supports_vision,
                                         session_id,
-                                    )
-                                    .await;
+                                    ) => Some(done),
+                                };
+                                let Some((new_input, notice)) = recognised else {
+                                    // Nothing is sent to the agent: the turn the
+                                    // person stopped never reaches it, and the
+                                    // `Cancel` right behind this on the channel
+                                    // ends the turn this arm opened.
+                                    let _ = runtime_event_tx.send(
+                                        CodingRuntimeEvent::VisionPreprocessFailed {
+                                            reason: "stopped before the picture was read".into(),
+                                        },
+                                    );
+                                    let _ = done.send(Ok(receipt));
+                                    continue;
+                                };
                                 input = new_input;
                                 // Surface the outcome as a status line, emitted
                                 // BEFORE SendMessage so it renders right under the
@@ -4381,6 +4439,9 @@ fn spawn_runtime_owner_with_optional_agent(
                         generation: request_generation,
                         done,
                     }) => {
+                        // Whatever the stop reached (or did not), it is answered
+                        // from here on; a fresh one waits for the next.
+                        controls.stop_handled();
                         if native_protocol
                             && request_generation == generation
                             && agent_available
@@ -14024,6 +14085,100 @@ mod tests {
             "{terminal:?}"
         );
         runtime.handle.shutdown().await.unwrap();
+    }
+
+    /// A picture being read is not a reason esc cannot be heard.
+    ///
+    /// Recognition runs inside the owner's own loop, and it is a model call with
+    /// no overall cap — so a `Cancel` sent while a pasted image was being read
+    /// sat unread on the channel for the whole call, and the person watched
+    /// nothing happen. The stop is fired before the command now, which is what
+    /// lets the await see it.
+    #[tokio::test]
+    async fn a_stop_is_heard_while_a_pasted_picture_is_being_read() {
+        struct NeverReads;
+
+        #[async_trait::async_trait]
+        impl ImagePreprocessor for NeverReads {
+            async fn preprocess(
+                &self,
+                _text: String,
+                _images: Vec<atomcode_kernel::message::ImageContent>,
+                _supports_vision: bool,
+                _session_id: Option<String>,
+            ) -> (UserInput, Option<VisionNotice>) {
+                std::future::pending().await
+            }
+        }
+
+        let (agent, mut kernel_commands, _kernel_events) = fake_agent();
+        let (handle, controls) = coding_runtime_control_channel();
+        let (runtime_tx, _runtime_events) = mpsc::unbounded_channel();
+        let (wakeup_tx, wakeup_rx) = mpsc::unbounded_channel();
+        let CodingRuntimeStart {
+            agent: config,
+            prepare,
+            plugin_hooks,
+            provider_factory,
+            ..
+        } = native_start(false);
+        let parts =
+            prepare_with_plugin_hook_source(&config, prepare.clone(), plugin_hooks.as_ref())
+                .await
+                .unwrap();
+        let resources = RuntimeResources {
+            config,
+            prepare,
+            provider_factory,
+            plugin_hooks,
+            parts,
+            harness_app: None,
+            harness_providers: None,
+            wakeup_tx,
+            loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            image_preprocessor: Some(Arc::new(NeverReads)),
+        };
+        let _adapter = spawn_runtime_owner_with_protocol(
+            agent,
+            controls,
+            runtime_tx,
+            true,
+            true,
+            None,
+            Some(resources),
+            Some(wakeup_rx),
+        );
+
+        let submitted = handle.submit(UserInput {
+            text: "what is in this".into(),
+            images: vec![atomcode_kernel::message::ImageContent {
+                media_type: "image/png".into(),
+                data: "x".into(),
+            }],
+        });
+        // The submit itself does not come back until recognition does — it is
+        // the same await. What must not wait is the stop.
+        tokio::pin!(submitted);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), &mut submitted)
+                .await
+                .is_err(),
+            "the control: the picture is still being read"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle.cancel())
+            .await
+            .expect("the stop waited for the picture to be read")
+            .expect("the stop was refused");
+        assert!(
+            kernel_commands.try_recv().is_err()
+                || !matches!(
+                    kernel_commands.try_recv(),
+                    Ok(AgentCommand::SendMessage { .. })
+                ),
+            "the turn the person stopped must not reach the agent"
+        );
+        handle.shutdown().await.unwrap();
     }
 
     /// A turn the agent opened itself is still one a person can stop.
