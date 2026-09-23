@@ -1449,7 +1449,18 @@ impl HostControl for RuntimeControl {
             }
             HostCommand::SignOut { session } => {
                 self.addressed(&session)?;
-                // Credentials first, then the live provider — the same order
+                // Sharing first, and before the credentials: signing out is
+                // "nobody is me any more", and a session still on the hub is
+                // still readable from a phone or a browser by whoever has the
+                // link. Deleting the credentials first would make "I logged
+                // out" and "it is still on my phone" true at the same time —
+                // and this step is the one that can fail.
+                //
+                // Best-effort by construction (`stop_all_sharing` never
+                // errors): a relay child that will not die must not be able to
+                // keep somebody logged in.
+                crate::tui_share::stop_all_sharing();
+                // Credentials, then the live provider — the same order
                 // the classic screen's logout uses: a failure below must not
                 // leave the identity file behind saying otherwise.
                 atomcode_auth::logout().map_err(|error| HostError::Failed {
