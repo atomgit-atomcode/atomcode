@@ -30,6 +30,11 @@ pub enum Key {
     End,
     PageUp,
     PageDown,
+    /// A function key, `F1`..`F12`.
+    ///
+    /// Carried as a number rather than twelve variants: nothing here reasons
+    /// about *which* one, they are only ever looked up in the binding table.
+    F(u8),
 }
 
 /// Modifiers, as a set rather than a bitfield so an assertion reads plainly.
@@ -1667,6 +1672,7 @@ pub fn from_crossterm(event: crossterm::event::Event) -> Option<Input> {
                 KeyCode::End => Key::End,
                 KeyCode::PageUp => Key::PageUp,
                 KeyCode::PageDown => Key::PageDown,
+                KeyCode::F(n) => Key::F(n),
                 _ => return None,
             };
             Some(Input::Key(KeyPress::new(

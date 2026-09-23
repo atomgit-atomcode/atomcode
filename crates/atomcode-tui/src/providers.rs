@@ -130,6 +130,34 @@ impl ProvidersView {
         &self.accounts
     }
 
+    /// The model one step on from the one in use, or one step back.
+    ///
+    /// Its own function, and pure, so "which model is next" can be judged
+    /// without a panel, a port or a running session — the key that asks for it
+    /// cannot be.
+    ///
+    /// `None` when there is nowhere to go: no models configured, or only the
+    /// one already in use. Wraps around, so the key always does something on a
+    /// list of two and never dead-ends on a list of many. With nothing marked
+    /// current — a session on a model that is no longer in the list — it starts
+    /// at the first, which is the only honest answer: the current one is not
+    /// somewhere this list can step from.
+    pub fn model_after(&self, forward: bool) -> Option<&ModelRow> {
+        let models = self.models();
+        if models.len() < 2 {
+            return None;
+        }
+        let at = models.iter().position(|m| m.current);
+        let Some(at) = at else {
+            return models.first();
+        };
+        let next = match forward {
+            true => (at + 1) % models.len(),
+            false => (at + models.len() - 1) % models.len(),
+        };
+        models.get(next)
+    }
+
     pub fn models(&self) -> &[ModelRow] {
         &self.models
     }
@@ -1490,6 +1518,58 @@ mod tests {
             current: false,
             managed: false,
         }
+    }
+
+    /// Stepping between models with one key, in both directions, wrapping.
+    ///
+    /// Judged on the list rather than through the key, because "which model is
+    /// next" is the whole of the decision and the key cannot be run without a
+    /// session, a port and a panel.
+    #[test]
+    fn stepping_through_the_models_goes_both_ways_and_comes_back_round() {
+        let ids = |v: &ProvidersView, forward| v.model_after(forward).map(|m| m.id.clone());
+
+        let mut rows = vec![model("a/1", "a"), model("b/1", "b"), model("b/2", "b")];
+        rows[1].current = true;
+        let v = ProvidersView::new(
+            vec![account("a", 1), account("b", 2)],
+            rows,
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(ids(&v, true), Some("b/2".into()), "forward is the next one");
+        assert_eq!(ids(&v, false), Some("a/1".into()), "back is the one before");
+
+        // From the last one, forward wraps — a key that dead-ends at the end of
+        // the list is a key people press twice and then give up on.
+        let mut rows = vec![model("a/1", "a"), model("b/1", "b")];
+        rows[1].current = true;
+        let v = ProvidersView::new(
+            vec![account("a", 1), account("b", 1)],
+            rows,
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(ids(&v, true), Some("a/1".into()), "it wraps round");
+
+        // Nowhere to go: one model, or none. The key does nothing rather than
+        // switching to the model already in use.
+        let only = vec![model("a/1", "a")];
+        let v = ProvidersView::new(vec![account("a", 1)], only, Vec::new(), Vec::new());
+        assert_eq!(ids(&v, true), None, "one model is nowhere to step");
+        let v = ProvidersView::new(Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        assert_eq!(ids(&v, true), None, "and neither is none");
+
+        // Nothing marked current — a session on a model no longer in the list.
+        // It starts at the first rather than refusing: the current one is not
+        // somewhere this list can step from.
+        let v = ProvidersView::new(
+            vec![account("a", 1), account("b", 1)],
+            vec![model("a/1", "a"), model("b/1", "b")],
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(ids(&v, true), Some("a/1".into()));
     }
 
     fn view() -> ProvidersView {

@@ -123,6 +123,18 @@ pub enum Action {
     /// `/provider` opens (which starts on the 账号 tab) — one surface, not a
     /// second popup that only lists models.
     OpenModels,
+    /// Step to the next configured model, or the previous one.
+    ///
+    /// The one-key form of `/model <id>`, and it runs exactly that — the panel
+    /// switches the same way, so there is one road into a model change rather
+    /// than a second that has to keep agreeing with it.
+    ///
+    /// It **says which model it landed on**, because a key that silently
+    /// changes which model is answering is a key nobody can afford to press by
+    /// accident. Reversible for the same reason: `Shift+F2` steps back.
+    CycleModel {
+        forward: bool,
+    },
     /// Pull the plugins panel up over the composer, or put it away.
     ///
     /// Its own action for the reason [`Action::ToggleProviders`] is one: it has
@@ -302,6 +314,18 @@ impl Keymap for Default_ {
             // one.
             (KeyPress::ctrl('h'), Action::Backspace),
             (KeyPress::ctrl('?'), Action::DeleteForward),
+            // Stepping between configured models without leaving the keyboard.
+            // `F2` because it is what the other front end used and nothing else
+            // here claims it; the list it steps through is the same one
+            // `/model` and the providers panel show.
+            (
+                KeyPress::plain(Key::F(2)),
+                Action::CycleModel { forward: true },
+            ),
+            (
+                KeyPress::new(Key::F(2), Mods::SHIFT),
+                Action::CycleModel { forward: false },
+            ),
             (KeyPress::plain(Key::Left), Action::CaretLeft),
             (KeyPress::plain(Key::Right), Action::CaretRight),
             (KeyPress::plain(Key::Home), Action::CaretHome),
@@ -419,6 +443,25 @@ mod tests {
             keys.resolve(KeyPress::plain(Key::Delete)),
             Some(Action::DeleteForward),
             "the composer had no forward delete at all: Delete was unbound"
+        );
+    }
+
+    /// One key steps to the next model, shifted steps back.
+    ///
+    /// Both directions asserted: a cycle you cannot walk back is one a person
+    /// has to walk all the way round, and on a list of two that is the same
+    /// key twice.
+    #[test]
+    fn f2_steps_between_models_and_shift_f2_steps_back() {
+        let keys = Keys::new();
+        keys.add(&Default_).unwrap();
+        assert_eq!(
+            keys.resolve(KeyPress::plain(Key::F(2))),
+            Some(Action::CycleModel { forward: true })
+        );
+        assert_eq!(
+            keys.resolve(KeyPress::new(Key::F(2), Mods::SHIFT)),
+            Some(Action::CycleModel { forward: false })
         );
     }
 

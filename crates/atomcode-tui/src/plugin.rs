@@ -3763,6 +3763,26 @@ impl Tui {
                 m.input.truncate(at);
                 m.caret = at;
             }
+            Action::CycleModel { forward } => {
+                drop(m);
+                // Read the list fresh: it carries which model is in use, and a
+                // `/model` since the last read would leave a stale answer
+                // stepping from the wrong place.
+                self.refresh_providers();
+                let next = {
+                    let m = self.host.moment.read().expect("moment poisoned");
+                    m.providers.model_after(forward).map(|row| row.id.clone())
+                };
+                // Through `/model`, which is how the panel does it too: one
+                // road into a model change, and it already says what it landed
+                // on. Nothing configured to step to is not an error — it is a
+                // key that has nothing to do, which `/model` says better than
+                // a silent no-op would.
+                if let Some(id) = next {
+                    self.run_command(&format!("/model {id}"));
+                }
+                return false;
+            }
             Action::DeleteWord => {
                 let caret = m.caret;
                 // Safe on the caret's invariant, not on luck: every writer of
