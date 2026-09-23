@@ -920,6 +920,21 @@ pub enum Msg<'a> {
     TurnNotStored {
         message: &'a str,
     },
+    /// A panel login's authorization URL, for when the browser did not open.
+    McpLoginUrl {
+        server: &'a str,
+        url: &'a str,
+    },
+    /// Signing in to a server the config does not define.
+    McpServerNotConfigured {
+        server: &'a str,
+    },
+    /// The sign-in's thread ended without answering.
+    McpSignInLost,
+    /// Signed in, but a turn is running, so the reconnect has to wait.
+    McpSignedInReloadLater {
+        server: &'a str,
+    },
     MouseTakenBackAuto,
     ScreenNotConnectedProviders,
     NoProviderPort,

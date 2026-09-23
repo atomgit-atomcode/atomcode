@@ -14,17 +14,23 @@
 //! `docs/mcp-panel-design.md` §4.2、§6。
 
 use atomcode_i18n::screen::{t as tr, Msg as SMsg};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use atomcode_capabilities::mcp::{
+    load_mcp_config_including_disabled, login_mcp_oauth_until, McpOAuthLoginOptions,
+    McpOAuthLoginStop, McpServerConfig,
+};
+use atomcode_harness::seams::UiSvc;
 use atomcode_host_api::{
-    HostCommand, HostError, HostReply, McpAction, McpAuth, McpServerDetail, McpServerState,
-    McpTransport,
+    HostCommand, HostControl, HostError, HostReply, McpAction, McpAuth, McpServerDetail,
+    McpServerState, McpTransport,
 };
 use atomcode_plexus::{Context, Plugin};
 use atomcode_tui::mcp::{Action, Auth, Mcp, McpDetail, McpState, McpView, Transport};
 use atomcode_tui::module::{Modules, Mounted};
-use atomcode_tui::plugin::{AgentClientSvc, McpSvc, ModulesSvc};
+use atomcode_tui::plugin::{AgentClientSvc, McpSvc, ModulesSvc, RepaintSvc};
 use serde_json::Value;
 
 /// 行的名字,插件和点它的那一层共用一个串。
@@ -58,7 +64,11 @@ impl Plugin for McpRow {
         let m: Arc<Modules> = mods.clone();
         let _ = ctx.effect(move || m.remove_view(id));
         let _ = ctx
-            .provide::<McpSvc>(Arc::new(McpPort { ctx: ctx.clone() }))
+            .provide::<McpSvc>(Arc::new(McpPort {
+                ctx: ctx.clone(),
+                login: Arc::new(sign_in_by_browser),
+                stop: Arc::new(AtomicBool::new(false)),
+            }))
             .map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -70,6 +80,43 @@ impl Plugin for McpRow {
 /// 指向已经没人听的一端。
 struct McpPort {
     ctx: Context,
+    /// How a server is signed in to. The browser flow in production; a test
+    /// hands in one that does not open a browser.
+    login: Login,
+    /// Raised when the port goes away, so a sign-in still waiting on a browser
+    /// gives up instead of holding a thread for a tab nobody will finish.
+    stop: Arc<AtomicBool>,
+}
+
+impl Drop for McpPort {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+    }
+}
+
+/// Sign in to one server: `announce` gets the authorization URL. Blocking —
+/// it waits on a browser — so it is only ever called off the async runtime.
+type Login = Arc<
+    dyn Fn(&McpServerConfig, &McpOAuthLoginStop, &dyn Fn(&str)) -> Result<(), String> + Send + Sync,
+>;
+
+/// How long a sign-in gives the browser. Long enough for a second factor,
+/// short enough that an abandoned tab does not hold a thread all session.
+const SIGN_IN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+fn sign_in_by_browser(
+    config: &McpServerConfig,
+    stop: &McpOAuthLoginStop,
+    announce: &dyn Fn(&str),
+) -> Result<(), String> {
+    login_mcp_oauth_until(
+        config,
+        McpOAuthLoginOptions::for_server(config),
+        stop,
+        announce,
+    )
+    .map(|_token| ())
+    .map_err(|error| format!("{error:#}"))
 }
 
 impl McpPort {
@@ -82,6 +129,21 @@ impl McpPort {
             .control()
             .ok_or_else(|| tr(SMsg::HostHasNoControl).into_owned())?;
         Ok((control, client.root()))
+    }
+
+    /// Say a line on the screen, and paint it now: a sign-in is waiting on the
+    /// person, and the URL is what they are waiting for.
+    fn sayer(&self) -> Arc<dyn Fn(String) + Send + Sync> {
+        let ui = self.ctx.service::<UiSvc>();
+        let repaint = self.ctx.service::<RepaintSvc>();
+        Arc::new(move |line: String| {
+            if let Some(ui) = ui.as_ref() {
+                ui.say(&line);
+            }
+            if let Some(repaint) = repaint.as_ref() {
+                repaint.now();
+            }
+        })
     }
 }
 
@@ -106,16 +168,97 @@ impl Mcp for McpPort {
 
     async fn act(&self, server: &str, action: Action) -> Result<McpView, String> {
         let (control, session) = self.link()?;
+        let Some(action) = wire_action(action) else {
+            let stop = McpOAuthLoginStop {
+                cancel: Arc::clone(&self.stop),
+                timeout: SIGN_IN_TIMEOUT,
+            };
+            return sign_in(
+                control.as_ref(),
+                session,
+                server,
+                self.login.clone(),
+                stop,
+                self.sayer(),
+            )
+            .await;
+        };
         listed(
             control
                 .call(HostCommand::McpAct {
                     session,
                     server: server.to_string(),
-                    action: wire_action(action),
+                    action,
                 })
                 .await,
         )
     }
+}
+
+/// Sign in to `server` on this side, then have the host reconnect with the token.
+///
+/// Not a host command: signing in opens a browser and writes a token, and
+/// touches nothing the running session owns — the same bargain `/openrouter`
+/// strikes (`tui_openrouter.rs`). Two things follow from running it here:
+///
+/// - **the URL is said on the screen** through `say`, where a person can copy
+///   it. This process's stdout *is* the screen, so printing it would land on
+///   top of the frame at the moment it is needed;
+/// - **the browser wait is on a thread of its own**, not the async runtime's:
+///   it can take minutes, and a plain thread is not waited for when the
+///   program exits.
+///
+/// The config is read from where the session works *now* (`Context` answers
+/// it), not from where it started — `/cd` moves it.
+async fn sign_in(
+    control: &dyn HostControl,
+    session: String,
+    server: &str,
+    login: Login,
+    stop: McpOAuthLoginStop,
+    say: Arc<dyn Fn(String) + Send + Sync>,
+) -> Result<McpView, String> {
+    let working_dir = match control
+        .call(HostCommand::Context {
+            session: session.clone(),
+        })
+        .await
+    {
+        Ok(HostReply::Context { working_dir, .. }) => std::path::PathBuf::from(working_dir),
+        Ok(other) => return Err(unexpected(&other)),
+        Err(error) => return Err(crate::tui_tools::said(error)),
+    };
+    let config = load_mcp_config_including_disabled(&working_dir)
+        .map_err(|error| format!("{error:#}"))?
+        .into_iter()
+        .find(|config| config.name == server)
+        .ok_or_else(|| tr(SMsg::McpServerNotConfigured { server }).into_owned())?;
+
+    let (done, answer) = tokio::sync::oneshot::channel();
+    let name = server.to_string();
+    std::thread::spawn(move || {
+        let announce = |url: &str| say(tr(SMsg::McpLoginUrl { server: &name, url }).into_owned());
+        let _ = done.send(login(&config, &stop, &announce));
+    });
+    answer
+        .await
+        .map_err(|_| tr(SMsg::McpSignInLost).into_owned())??;
+
+    // The token is on disk; the session connects with it only when rebuilt.
+    match control
+        .call(HostCommand::Reload {
+            session: session.clone(),
+        })
+        .await
+    {
+        Ok(_) => {}
+        // A turn is running. The sign-in is not lost — say what is left to do.
+        Err(HostError::Busy { .. }) => {
+            return Err(tr(SMsg::McpSignedInReloadLater { server }).into_owned())
+        }
+        Err(error) => return Err(crate::tui_tools::said(error)),
+    }
+    listed(control.call(HostCommand::McpManage { session }).await)
 }
 
 /// `McpManage` 与 `McpAct` 的答复:刷新后的目录(契约里 `McpAct` 就是这么定的)。
@@ -147,16 +290,18 @@ fn unexpected(reply: &HostReply) -> String {
     .into_owned()
 }
 
-/// 屏幕的动作译成契约的动作。六个一一对应——两边取同一个名字、同一件事
-/// (`McpAction` 的 `Enable`/`Disable` 注释钉过方向:名字是人这一侧的)。
-fn wire_action(action: Action) -> McpAction {
+/// 屏幕的动作译成契约的动作。两边取同一个名字、同一件事(`McpAction` 的
+/// `Enable`/`Disable` 注释钉过方向:名字是人这一侧的)。
+///
+/// `None` 是「认证」:它不是宿主命令,在这一侧跑([`sign_in`])。
+fn wire_action(action: Action) -> Option<McpAction> {
     match action {
-        Action::Trust => McpAction::Trust,
-        Action::Untrust => McpAction::Untrust,
-        Action::Login => McpAction::Login,
-        Action::Logout => McpAction::Logout,
-        Action::Enable => McpAction::Enable,
-        Action::Disable => McpAction::Disable,
+        Action::Trust => Some(McpAction::Trust),
+        Action::Untrust => Some(McpAction::Untrust),
+        Action::Login => None,
+        Action::Logout => Some(McpAction::Logout),
+        Action::Enable => Some(McpAction::Enable),
+        Action::Disable => Some(McpAction::Disable),
     }
 }
 
@@ -314,18 +459,19 @@ mod tests {
         }
     }
 
-    /// 六个动作一一对应。写反一个方向,人就按着「停用」把服务器启用了
-    /// (`McpAction` 的注释专门钉过这一点)。
+    /// 五个走宿主的动作一一对应,「认证」不走宿主。写反一个方向,人就按着「停用」
+    /// 把服务器启用了(`McpAction` 的注释专门钉过这一点)。
     #[test]
     fn each_screen_action_translates_to_the_wire_action_of_the_same_name() {
         use atomcode_tui::mcp::Action as A;
         let cases = [
-            (A::Trust, McpAction::Trust),
-            (A::Untrust, McpAction::Untrust),
-            (A::Login, McpAction::Login),
-            (A::Logout, McpAction::Logout),
-            (A::Enable, McpAction::Enable),
-            (A::Disable, McpAction::Disable),
+            (A::Trust, Some(McpAction::Trust)),
+            (A::Untrust, Some(McpAction::Untrust)),
+            // Signed in on this side, never sent as a host command.
+            (A::Login, None),
+            (A::Logout, Some(McpAction::Logout)),
+            (A::Enable, Some(McpAction::Enable)),
+            (A::Disable, Some(McpAction::Disable)),
         ];
         for (screen, wire) in cases {
             assert_eq!(wire_action(screen), wire, "{screen:?}");
@@ -523,5 +669,164 @@ mod tests {
                 reason: "a turn is running".into(),
             }))
         );
+    }
+
+    /// A host that records what it was asked, and answers `Context` with a
+    /// working directory and `Reload` as told.
+    struct SignInHost {
+        working_dir: std::path::PathBuf,
+        reload: Result<HostReply, HostError>,
+        asked: std::sync::Mutex<Vec<&'static str>>,
+    }
+
+    #[async_trait]
+    impl HostControl for SignInHost {
+        async fn call(&self, command: HostCommand) -> Result<HostReply, HostError> {
+            let (name, reply) = match command {
+                HostCommand::Context { .. } => (
+                    "Context",
+                    Ok(HostReply::Context {
+                        window: 0,
+                        used: 0,
+                        model: "m".into(),
+                        working_dir: self.working_dir.to_string_lossy().into_owned(),
+                    }),
+                ),
+                HostCommand::Reload { .. } => ("Reload", self.reload.clone()),
+                HostCommand::McpManage { .. } => {
+                    ("McpManage", Ok(HostReply::McpRows { rows: Vec::new() }))
+                }
+                HostCommand::McpAct { .. } => ("McpAct", Ok(HostReply::Done)),
+                _ => ("other", Ok(HostReply::Done)),
+            };
+            self.asked.lock().unwrap().push(name);
+            reply
+        }
+        fn subscribe(&self) -> tokio::sync::mpsc::UnboundedReceiver<atomcode_host_api::HostEvent> {
+            tokio::sync::mpsc::unbounded_channel().1
+        }
+    }
+
+    /// A project whose `.mcp.json` has one OAuth server, `remote`.
+    fn project_with_an_oauth_server() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".mcp.json"),
+            r#"{"mcpServers":{"remote":{"url":"https://example.invalid/mcp","auth":{"type":"oauth"}}}}"#,
+        )
+        .unwrap();
+        dir
+    }
+
+    fn stop() -> McpOAuthLoginStop {
+        McpOAuthLoginStop {
+            cancel: Arc::new(AtomicBool::new(false)),
+            timeout: std::time::Duration::from_secs(5),
+        }
+    }
+
+    const URL: &str = "https://auth.example.invalid/authorize?state=s1";
+
+    /// Signing in from the panel says the URL on the screen and reconnects.
+    ///
+    /// The URL used to be `println!`ed by the library, which behind
+    /// `atomcode --tui` wrote it over the frame; here it has to reach the
+    /// screen's own `say`, whole. The browser wait has to be off the async
+    /// runtime — it can take minutes — and the token only reaches the session
+    /// through the `Reload` that follows it.
+    #[tokio::test]
+    async fn signing_in_says_the_url_on_the_screen_and_reconnects() {
+        let project = project_with_an_oauth_server();
+        let host = SignInHost {
+            working_dir: project.path().to_path_buf(),
+            reload: Ok(HostReply::Done),
+            asked: Default::default(),
+        };
+        let off_the_runtime = Arc::new(AtomicBool::new(false));
+        let login: Login = {
+            let off_the_runtime = Arc::clone(&off_the_runtime);
+            Arc::new(move |config, _stop, announce| {
+                assert_eq!(config.name, "remote", "the server asked about is signed in");
+                off_the_runtime.store(
+                    tokio::runtime::Handle::try_current().is_err(),
+                    Ordering::Release,
+                );
+                announce(URL);
+                Ok(())
+            })
+        };
+        let said = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let say: Arc<dyn Fn(String) + Send + Sync> = {
+            let said = Arc::clone(&said);
+            Arc::new(move |line| said.lock().unwrap().push(line))
+        };
+
+        sign_in(&host, "s".into(), "remote", login, stop(), say)
+            .await
+            .expect("signed in");
+
+        let said = said.lock().unwrap();
+        assert!(
+            said.iter().any(|line| line.contains(URL)),
+            "the URL is said on the screen, whole: {said:?}"
+        );
+        assert!(
+            off_the_runtime.load(Ordering::Acquire),
+            "the browser wait ran on the async runtime, where it holds a worker"
+        );
+        assert_eq!(
+            *host.asked.lock().unwrap(),
+            vec!["Context", "Reload", "McpManage"],
+            "where the session works, then the reconnect, then the list after it"
+        );
+    }
+
+    /// A sign-in that finishes while a turn runs keeps the token and says what
+    /// is left to do — not a bare "busy" that reads as if it had failed.
+    #[tokio::test]
+    async fn a_sign_in_during_a_turn_keeps_the_token_and_says_to_reload() {
+        let project = project_with_an_oauth_server();
+        let host = SignInHost {
+            working_dir: project.path().to_path_buf(),
+            reload: Err(HostError::Busy {
+                reason: "a turn is running".into(),
+            }),
+            asked: Default::default(),
+        };
+        let signed = Arc::new(AtomicBool::new(false));
+        let login: Login = {
+            let signed = Arc::clone(&signed);
+            Arc::new(move |_config, _stop, _announce| {
+                signed.store(true, Ordering::Release);
+                Ok(())
+            })
+        };
+        let error = sign_in(&host, "s".into(), "remote", login, stop(), Arc::new(|_| {}))
+            .await
+            .expect_err("the reconnect has to wait");
+        assert!(signed.load(Ordering::Acquire), "the sign-in itself ran");
+        assert!(
+            error.contains("/mcp reload"),
+            "it says how to finish: {error}"
+        );
+    }
+
+    /// A server the config does not define is refused before any browser opens.
+    #[tokio::test]
+    async fn signing_in_to_an_unknown_server_opens_nothing() {
+        let project = project_with_an_oauth_server();
+        let host = SignInHost {
+            working_dir: project.path().to_path_buf(),
+            reload: Ok(HostReply::Done),
+            asked: Default::default(),
+        };
+        let login: Login = Arc::new(|_config, _stop, _announce| {
+            panic!("no sign-in for a server that is not configured")
+        });
+        let error = sign_in(&host, "s".into(), "nope", login, stop(), Arc::new(|_| {}))
+            .await
+            .expect_err("unknown server");
+        assert!(error.contains("nope"), "{error}");
+        assert_eq!(*host.asked.lock().unwrap(), vec!["Context"], "no reconnect");
     }
 }

@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
@@ -975,8 +975,12 @@ async fn mcp_rows_of(runtime: &RuntimeResources) -> Result<Vec<crate::parts::Mcp
 }
 
 /// Run one panel action against the live tree: the six things a person can do to
-/// a configured MCP server (`docs/mcp-panel-design.md` §5.2) — all but `Login`,
-/// which waits on a browser and so runs off the owner loop (see the `McpAct` arm).
+/// a configured MCP server (`docs/mcp-panel-design.md` §5.2), bar signing in.
+///
+/// Signing in is not here: it opens a browser and writes a token, and touches
+/// nothing the runtime owns, so it is the front end's to run beside the screen
+/// (`cli/tui_mcp.rs`) — the way `/openrouter` authorises — followed by the same
+/// `/mcp reload` any config change takes.
 ///
 /// The failure is a `String` because it is carried to the front end verbatim: a
 /// refused config write must arrive with the guard's own words rather than a
@@ -984,7 +988,7 @@ async fn mcp_rows_of(runtime: &RuntimeResources) -> Result<Vec<crate::parts::Mcp
 ///
 /// This writes the state; it does not reconnect. Every action but `Disable` is
 /// followed by a capability reload from [`CodingRuntimeHandle::mcp_act`], which is
-/// what makes a trust, a token or an enabled entry reach the session.
+/// what makes a trust or an enabled entry reach the session.
 ///
 /// Order is the point where trust or auth change: the tools come off the session
 /// BEFORE the state they were authorised under is changed — the fail-closed order
@@ -1022,7 +1026,6 @@ async fn apply_mcp_action(
                 .map(|_| ())
                 .map_err(|e| format!("{e:#}"))
         }
-        McpAction::Login => Err("an MCP login is run by the owner loop, not in place".to_string()),
         McpAction::Disable => {
             crate::parts::mcp_set_enabled(&runtime.config.working_dir, &server, false).await?;
             // Take THIS server's tools off the session — by their published
@@ -1055,33 +1058,6 @@ async fn apply_mcp_action(
         }
     }
 }
-
-/// Logins still waiting on a browser, stopped when the owner that started them
-/// goes away — so quitting mid-login does not wait on a tab nobody will finish.
-#[derive(Default)]
-struct McpLoginsInFlight(Vec<Arc<AtomicBool>>);
-
-impl McpLoginsInFlight {
-    fn start(&mut self) -> Arc<AtomicBool> {
-        self.0.retain(|flag| Arc::strong_count(flag) > 1);
-        let flag = Arc::new(AtomicBool::new(false));
-        self.0.push(Arc::clone(&flag));
-        flag
-    }
-}
-
-impl Drop for McpLoginsInFlight {
-    fn drop(&mut self) {
-        for flag in &self.0 {
-            flag.store(true, Ordering::Release);
-        }
-    }
-}
-
-/// How long a panel login gives the browser. Long enough to sign in somewhere
-/// that asks for a second factor; short enough that an abandoned tab is not held
-/// open for the rest of the session.
-const MCP_LOGIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 struct NextPromptSuggestionOutcome {
     generation: u64,
@@ -1830,16 +1806,14 @@ impl CodingRuntimeHandle {
     /// Answers when it is done — call [`mcp_rows`](Self::mcp_rows) for the state it
     /// left behind.
     ///
-    /// Trust, a token and an enabled entry are read when the graph is prepared, and
+    /// Trust and an enabled entry are read when the graph is prepared, and
     /// untrust and sign-out take every MCP tool off; so every action but `Disable`
     /// is followed by the same capability reload `/mcp reload` runs. Without it the
     /// panel would show the server exactly as it was — untrusted after 信任,
     /// disconnected after 启用 — and the person would take the action for a no-op.
     ///
-    /// Those five answer [`RuntimeError::Busy`] while a turn is running (both the
+    /// Those four answer [`RuntimeError::Busy`] while a turn is running (both the
     /// withdrawal and the rebuild wait for an idle session); `Disable` runs mid-turn.
-    /// A login can outlast the turn it started beside: if a turn is running by the
-    /// time the browser comes back, the token is kept and the answer says so.
     pub async fn mcp_act(
         &self,
         server: String,
@@ -3405,8 +3379,6 @@ fn spawn_runtime_owner_with_optional_agent(
         // `Enable` to give back. Owned here rather than by the parts because a
         // rebuild replaces the parts and the person's switches outlive it.
         let mut mcp_disable_holds: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        // Panel logins waiting on a browser; stopped when this task ends.
-        let mut mcp_logins = McpLoginsInFlight::default();
         if agent_available {
             replay_pending_resume_prompt(
                 &agent,
@@ -5160,7 +5132,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         // (untrust, sign out) — the security-reducing mutation
                         // `withdraw_mcp_tools` awaits an idle terminal for — or only
                         // reaches the session through the rebuild that follows it
-                        // (trust, sign in, enable), which a running turn refuses. So
+                        // (trust, enable), which a running turn refuses. So
                         // they take the same refusal up front, rather than writing
                         // the change and then failing to apply it. `Disable` holds
                         // tools back in place and runs mid-turn (design §5.4).
@@ -5175,54 +5147,6 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;
                         };
-                        if action == crate::parts::McpAction::Login {
-                            // A login waits on a browser, for as long as a person
-                            // takes. It runs beside this loop, never in it: the loop
-                            // has submits, cancels, approvals and a shutdown to
-                            // answer meanwhile. The token lands in the store; the
-                            // rebuild that connects with it is the handle's to ask.
-                            let config = match atomcode_capabilities::mcp::load_mcp_config_including_disabled(
-                                &runtime.config.working_dir,
-                            ) {
-                                Ok(configs) => configs.into_iter().find(|c| c.name == server),
-                                Err(error) => {
-                                    let _ = done.send(Err(RuntimeError::ReconfigureFailed(
-                                        format!("{error:#}"),
-                                    )));
-                                    continue;
-                                }
-                            };
-                            let Some(config) = config else {
-                                let _ = done.send(Err(RuntimeError::ReconfigureFailed(format!(
-                                    "MCP server '{server}' is not configured"
-                                ))));
-                                continue;
-                            };
-                            let stop = atomcode_capabilities::mcp::McpOAuthLoginStop {
-                                cancel: mcp_logins.start(),
-                                timeout: MCP_LOGIN_TIMEOUT,
-                            };
-                            let options =
-                                atomcode_capabilities::mcp::McpOAuthLoginOptions::for_server(&config);
-                            tokio::spawn(async move {
-                                let login = tokio::task::spawn_blocking(move || {
-                                    atomcode_capabilities::mcp::login_mcp_oauth_until(
-                                        &config, options, &stop,
-                                    )
-                                })
-                                .await;
-                                let _ = done.send(match login {
-                                    Ok(Ok(_token)) => Ok(()),
-                                    Ok(Err(error)) => {
-                                        Err(RuntimeError::ReconfigureFailed(format!("{error:#}")))
-                                    }
-                                    Err(join) => {
-                                        Err(RuntimeError::ReconfigureFailed(join.to_string()))
-                                    }
-                                });
-                            });
-                            continue;
-                        }
                         let outcome =
                             apply_mcp_action(runtime, server, action, &mut mcp_disable_holds).await;
                         let _ = done.send(match outcome {
@@ -16131,8 +16055,8 @@ mod tests {
         assert_eq!(untrust, Err(RuntimeError::Busy));
         let logout = handle.mcp_act("srv".into(), McpAction::Logout).await;
         assert_eq!(logout, Err(RuntimeError::Busy));
-        // And the three that only a rebuild can apply.
-        for action in [McpAction::Trust, McpAction::Login, McpAction::Enable] {
+        // And the two that only a rebuild can apply.
+        for action in [McpAction::Trust, McpAction::Enable] {
             assert_eq!(
                 handle.mcp_act("srv".into(), action).await,
                 Err(RuntimeError::Busy),
@@ -16157,77 +16081,6 @@ mod tests {
             "a mid-turn disable still writes the flag: {text}"
         );
 
-        handle.shutdown().await.unwrap();
-    }
-
-    /// A panel login waits on a browser; the runtime does not wait with it.
-    ///
-    /// The login used to run inside the owner loop, so while a person looked for
-    /// the tab — or after they closed it for good — nothing else the loop owns
-    /// was answered: not a submit, not a cancel, not a shutdown. Here the server
-    /// the login talks to takes the request and never answers, which holds the
-    /// login open; a control round trip made meanwhile has to come back.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[serial_test::serial(atomcode_home)]
-    async fn a_panel_login_waiting_on_its_server_does_not_hold_the_runtime() {
-        use crate::parts::McpAction;
-        use std::time::Duration;
-
-        let home = tempfile::tempdir().unwrap();
-        std::env::set_var("ATOMCODE_HOME", home.path());
-
-        // An OAuth server that accepts and never answers, until released.
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let (seen_tx, seen_rx) = std::sync::mpsc::channel::<()>();
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let server = std::thread::spawn(move || {
-            let (held, _) = listener.accept().unwrap();
-            let _ = seen_tx.send(());
-            let _ = release_rx.recv();
-            drop(held);
-            drop(listener);
-        });
-
-        let project = tempfile::tempdir().unwrap();
-        std::fs::write(
-            project.path().join(".mcp.json"),
-            format!(
-                r#"{{"mcpServers":{{"remote":{{"url":"http://127.0.0.1:{port}/mcp","auth":{{"type":"oauth"}}}}}}}}"#
-            ),
-        )
-        .unwrap();
-        let mut start = native_start(false);
-        start.agent.working_dir = project.path().to_path_buf();
-        let runtime = CodingRuntime::start(start).await.unwrap();
-        let handle = runtime.handle.clone();
-
-        let login = tokio::spawn({
-            let handle = handle.clone();
-            async move { handle.mcp_act("remote".into(), McpAction::Login).await }
-        });
-        tokio::task::spawn_blocking(move || seen_rx.recv_timeout(Duration::from_secs(10)))
-            .await
-            .unwrap()
-            .expect("the login reached its server");
-
-        let probe = tokio::time::timeout(Duration::from_secs(5), handle.mcp_rows()).await;
-        assert!(
-            probe.is_ok(),
-            "the runtime answered nothing while a login was waiting on its server"
-        );
-        assert!(!login.is_finished(), "the login is still waiting");
-
-        release_tx.send(()).unwrap();
-        server.join().unwrap();
-        let outcome = tokio::time::timeout(Duration::from_secs(30), login)
-            .await
-            .expect("a login whose server went away ends")
-            .unwrap();
-        assert!(
-            matches!(outcome, Err(RuntimeError::ReconfigureFailed(_))),
-            "and says why: {outcome:?}"
-        );
         handle.shutdown().await.unwrap();
     }
 

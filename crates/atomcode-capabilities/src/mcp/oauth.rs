@@ -274,11 +274,20 @@ pub fn refresh_mcp_oauth_token(server_name: &str, token: &McpOAuthToken) -> Resu
     Ok(new_token)
 }
 
+/// Sign in to an OAuth MCP server: open the browser, wait for it to come back,
+/// save the token.
+///
+/// `announce` is handed the authorization URL before the browser is opened —
+/// the fallback for when it does not open (a remote shell, no desktop). What it
+/// does with it is the caller's business: a terminal command prints it, a
+/// runtime behind a full-screen UI must not, because this process's stdout is
+/// that UI. Nothing in this module writes to stdout or stderr itself.
 pub fn login_mcp_oauth(
     server: &McpServerConfig,
     opts: McpOAuthLoginOptions,
+    announce: &dyn Fn(&str),
 ) -> Result<McpOAuthToken> {
-    login_mcp_oauth_with(server, opts, None)
+    login_mcp_oauth_with(server, opts, None, announce)
 }
 
 /// [`login_mcp_oauth`], but giving up when `stop` says so: when its flag is
@@ -290,14 +299,16 @@ pub fn login_mcp_oauth_until(
     server: &McpServerConfig,
     opts: McpOAuthLoginOptions,
     stop: &McpOAuthLoginStop,
+    announce: &dyn Fn(&str),
 ) -> Result<McpOAuthToken> {
-    login_mcp_oauth_with(server, opts, Some(stop))
+    login_mcp_oauth_with(server, opts, Some(stop), announce)
 }
 
 fn login_mcp_oauth_with(
     server: &McpServerConfig,
     opts: McpOAuthLoginOptions,
     stop: Option<&McpOAuthLoginStop>,
+    announce: &dyn Fn(&str),
 ) -> Result<McpOAuthToken> {
     let (url, auth) = match &server.config {
         McpTransportConfig::Http {
@@ -335,6 +346,7 @@ fn login_mcp_oauth_with(
                 &opts.scopes
             },
             stop,
+            announce,
         );
     }
 
@@ -386,11 +398,7 @@ fn login_mcp_oauth_with(
             .append_pair("resource", resource);
     }
 
-    println!(
-        "  Browser didn't open? Open the URL below to authorize MCP server '{}':",
-        server.name
-    );
-    println!("  {}", authorize_url);
+    announce(authorize_url.as_str());
     let _ = open_browser(authorize_url.as_str());
 
     let (code, returned_state) = await_oauth_callback(listener, stop)?;
@@ -437,13 +445,23 @@ fn login_mcp_oauth_with(
     Ok(token)
 }
 
+/// The bring-your-own GitHub OAuth App flow. `announce` gets the authorization
+/// URL, as in [`login_mcp_oauth`].
 pub fn login_github_oauth(
     server_name: &str,
     client_id: &str,
     client_secret_env: Option<&str>,
     scopes: &[String],
+    announce: &dyn Fn(&str),
 ) -> Result<McpOAuthToken> {
-    login_github_oauth_with(server_name, client_id, client_secret_env, scopes, None)
+    login_github_oauth_with(
+        server_name,
+        client_id,
+        client_secret_env,
+        scopes,
+        None,
+        announce,
+    )
 }
 
 fn login_github_oauth_with(
@@ -452,6 +470,7 @@ fn login_github_oauth_with(
     client_secret_env: Option<&str>,
     scopes: &[String],
     stop: Option<&McpOAuthLoginStop>,
+    announce: &dyn Fn(&str),
 ) -> Result<McpOAuthToken> {
     if client_id.trim().is_empty() {
         bail!("GitHub OAuth client id is required");
@@ -489,8 +508,7 @@ fn login_github_oauth_with(
         .append_pair("scope", &scope)
         .append_pair("state", &state);
 
-    println!("  Browser didn't open? Open the URL below to authorize GitHub MCP:");
-    println!("  {}", url);
+    announce(url.as_str());
     let _ = open_browser(url.as_str());
 
     let (code, returned_state) = await_oauth_callback(listener, stop)?;
@@ -963,7 +981,7 @@ mod tests {
         // when it's missing the error must POINT the user at the plain discovery
         // login (which needs no secret) instead of dead-ending. Bails before any
         // network/browser work, so this is a pure error-shape check.
-        let err = login_github_oauth("espressif-documentation", "cid", None, &[])
+        let err = login_github_oauth("espressif-documentation", "cid", None, &[], &|_| {})
             .unwrap_err()
             .to_string();
         assert!(
@@ -1221,5 +1239,36 @@ mod tests {
         std::env::remove_var("ATOMCODE_GITHUB_MCP_CLIENT_ID");
         assert_eq!(github.client_id.as_deref(), Some("gh-client"));
         assert_eq!(other.client_id, None);
+    }
+
+    /// This module never writes to the terminal itself.
+    ///
+    /// A login runs inside `atomcode --tui` too, where this process's stdout is
+    /// the full-screen UI: a `println!` of the authorization URL landed on top
+    /// of whatever was drawn there, staggered by raw mode and left behind by a
+    /// renderer that only repaints what it changed — at exactly the moment the
+    /// person needed to copy that URL. Where the URL goes is the caller's
+    /// (`announce`). Read off the source rather than by capturing output: the
+    /// print sits after network discovery, which a test cannot reach offline.
+    #[test]
+    fn a_login_leaves_the_terminal_to_its_caller() {
+        let source = include_str!("oauth.rs");
+        let body = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the module has a body before its tests");
+        for forbidden in [
+            "println!",
+            "print!(",
+            "eprintln!",
+            "eprint!(",
+            "stdout()",
+            "stderr()",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "oauth.rs writes to the terminal itself (`{forbidden}`); hand the text to `announce`"
+            );
+        }
     }
 }

@@ -1499,11 +1499,13 @@ pub async fn mcp_row_facts(
 /// What a person can do to one MCP server. This crate's own copy, not
 /// `atomcode_host_api::McpAction`: the wire type lives above this layer
 /// (`cli/host.rs` maps between them, the way it maps `McpRowFacts` → `McpRow`).
+///
+/// Signing in is not one of them: it runs on the front end's side, because it
+/// waits on a browser and writes only a token (`cli/tui_mcp.rs`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum McpAction {
     Trust,
     Untrust,
-    Login,
     Logout,
     /// Remove `disabled` from the file that defines it.
     Enable,
@@ -1514,7 +1516,7 @@ pub enum McpAction {
 impl McpAction {
     /// Whether the change only reaches the session through a rebuild.
     ///
-    /// Trust, a token and a config entry are all read when the graph is
+    /// Trust and a config entry are both read when the graph is
     /// prepared, so writing them changes nothing until it is prepared again —
     /// and withdrawing (untrust, sign out) takes every MCP tool off, which only
     /// a rebuild puts back for the servers that are still allowed. `Disable` is

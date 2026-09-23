@@ -571,6 +571,15 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         // ── the host loop: what it says while it works (`plugin.rs`) ──
         Msg::SwitchedToSession { session } => format!("switched to session {session}").into(),
         Msg::TurnNotStored { message } => format!("this turn could not be stored: {message}").into(),
+        Msg::McpServerNotConfigured { server } => format!("no MCP server named {server} is configured").into(),
+        Msg::McpSignInLost => "the sign-in ended without an answer".into(),
+        Msg::McpSignedInReloadLater { server } => format!(
+            "signed in to {server} and saved the token; a turn is running, so run /mcp reload when it ends to connect it"
+        )
+        .into(),
+        Msg::McpLoginUrl { server, url } => {
+            format!("Authenticating MCP server {server}. If the browser did not open, open this link:\n{url}").into()
+        }
         Msg::MouseTakenBackAuto => "the terminal took the mouse back; it has been asked for again. If it happens again, ctrl-o switches by hand".into(),
         Msg::ScreenNotConnectedProviders => "the screen is not connected; providers cannot be changed".into(),
         Msg::NoProviderPort => "this screen has no providers: the launcher provided no `tui-providers`".into(),

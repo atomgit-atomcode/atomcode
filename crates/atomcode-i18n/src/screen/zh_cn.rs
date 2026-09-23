@@ -543,6 +543,14 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         // ── the host loop: what it says while it works (`plugin.rs`) ──
         Msg::SwitchedToSession { session } => format!("已切换到会话 {session}").into(),
         Msg::TurnNotStored { message } => format!("这一回合没能存下来:{message}").into(),
+        Msg::McpServerNotConfigured { server } => format!("配置里没有 MCP 服务器 {server}").into(),
+        Msg::McpSignInLost => "认证中途断了,没有拿到结果".into(),
+        Msg::McpSignedInReloadLater { server } => {
+            format!("{server} 已认证,凭据已保存;当前有回合在跑,结束后执行 /mcp reload 连接它").into()
+        }
+        Msg::McpLoginUrl { server, url } => {
+            format!("正在认证 MCP 服务器 {server}。浏览器没有打开的话,复制这个链接去打开:\n{url}").into()
+        }
         Msg::MouseTakenBackAuto => "鼠标被终端收回了,已自动要回;若再次发生,ctrl-o 可手动切换".into(),
         Msg::ScreenNotConnectedProviders => "屏幕还没接上,改不了 provider".into(),
         Msg::NoProviderPort => "这个屏幕没有接 provider:启动器没有提供 `tui-providers`".into(),

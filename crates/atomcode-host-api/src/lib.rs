@@ -881,6 +881,12 @@ pub struct McpServerDetail {
 
 /// What a person can do to one MCP server from the management panel.
 ///
+/// Signing in is not a host command. It opens a browser and writes a token —
+/// nothing a running session owns — so a front end runs it on its own side and
+/// then asks for [`HostCommand::Reload`], the way a provider's browser
+/// authorisation is done; a host command for it would have to hold a reply
+/// open for as long as a person takes in a browser.
+///
 /// `Enable` and `Disable` are named from the person's point of view, not the
 /// file's: **`Disable` writes `disabled: true`, `Enable` removes that key.**
 /// Getting this backwards silently inverts every switch in the panel, so the
@@ -892,9 +898,6 @@ pub enum McpAction {
     Trust,
     /// Withdraw that trust. The project's tools come off the session first.
     Untrust,
-    /// Run the OAuth flow for this server. Blocks until it ends — it waits on a
-    /// browser, so it can take minutes.
-    Login,
     /// Forget the stored token for this server. Its tools come off first.
     Logout,
     /// Let this server run again: remove `disabled` from the file that defines it.
