@@ -118,7 +118,26 @@ webui 四个入口还是裸的。
 
 > 判据基线上已经有红的时候，新判据是加在一片红上的。这一批最先做。
 
-- [ ] **P0-0 两条基线红判据**。交接文档记的，**本轮未复跑**，第一步是复现：
+- [x] **P0-0 两条基线红判据**（2026-09-23）。复现属实,两条**都是判据自己的问题,
+      产品没有坏** —— 而两条错法不同,都值得记:
+      - `an_oversized_tool_result_…`:判据写着「16 KiB 是门槛,40000 字节越得过去」,
+        而 `69fdc7cae` 把预算放宽到 50 KiB(理由正当:模型在普通 diff 上反复撞
+        「输出被截断」)。**行没坏、放宽也没错,是判据在拿一个已经不存在的数字量**,
+        于是它红着说功能坏了。改成**从常量本身取尺寸**(`THRESHOLD_BYTES + 8 KiB`),
+        以后预算改成多少都越得过去。
+      - `a_stopped_reply_is_kept_as_far_as_it_got`:它比的是**整份请求**,而
+        `StatusReminderHook` 每一轮都在请求**末尾**追加一条带日期的
+        `<system-reminder>`(它的模块说明写了为什么在末尾:日期放进系统前缀会
+        每天把整个缓存前缀顶掉)。**末尾的注入永远不可能是后一次请求的前缀** ——
+        这里它正好占着 `answer 3` 后来的位置,于是读起来像「resume 把回复弄丢了」。
+        改成两侧都先把注入滤掉(`reminder::is_system_reminder`,现成的),比的才是
+        对话本身。顺带加了一条**非空断言**:滤器要是把什么都滤掉,两个空表比下来
+        照样绿。
+      两条各证伪:关掉截断 → 第一条红(而它的阴性对照
+      `a_small_tool_result_is_left_alone` 仍绿);只给 resume 那一侧多插一条 →
+      第二条红,报的正是「a resume changed the conversation」。
+      `cargo nextest run -p atomcode-coding`:859 全过。
+      原文:交接文档记的，**本轮未复跑**，第一步是复现：
       `coding/tests/mechanism_rows.rs::an_oversized_tool_result_is_shown_head_and_tail_and_saved_whole`
       （疑似 09-21 放宽工具输出预算后，判据的输入不再算超长）、
       `coding/tests/runtime_criteria.rs::a_stopped_reply_is_kept_as_far_as_it_got`

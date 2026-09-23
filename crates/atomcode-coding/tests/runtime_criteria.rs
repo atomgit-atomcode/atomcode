@@ -2175,10 +2175,34 @@ async fn a_stopped_reply_is_kept_as_far_as_it_got() {
         );
 
         if keep {
-            let before: Vec<Message> = seen
-                .into_iter()
-                .filter(|m| m.role != Role::System)
-                .collect();
+            // What is compared is the **conversation**, so the per-round
+            // injections come out of both sides.
+            //
+            // `StatusReminderHook` appends a `<system-reminder>` carrying the
+            // date to the *tail* of every request (its module says why: a date
+            // in the system prefix re-prefills the whole cached prefix once a
+            // day). A tail injection is never a prefix of a later request —
+            // here it sat where `answer 3` later does — so a request captured
+            // whole can only be compared to another one after both have had
+            // their injections taken out. Judging the raw payloads made this
+            // read as "resume lost the reply", which is not what happened and
+            // not what this is for.
+            let conversation = |messages: Vec<Message>| -> Vec<Message> {
+                messages
+                    .into_iter()
+                    .filter(|m| m.role != Role::System)
+                    .filter(|m| !atomcode_capabilities::reminder::is_system_reminder(&m.text))
+                    .collect()
+            };
+            let before = conversation(seen);
+            // The filter takes out injections, not the conversation. Without
+            // this, a predicate that matched everything would leave two empty
+            // lists and the comparison below would pass for free.
+            assert!(
+                before.iter().any(|m| m.text == "third")
+                    && before.iter().any(|m| m.is_user_interruption()),
+                "the filter took out more than the injections: {before:?}"
+            );
             runtime.handle.shutdown().await.unwrap();
             let _ = runtime.task.await;
             let mut resumed = CodingRuntime::start(start(
@@ -2189,11 +2213,7 @@ async fn a_stopped_reply_is_kept_as_far_as_it_got() {
             .await
             .unwrap();
             turn(&mut resumed, "fourth").await;
-            let after: Vec<Message> = recorder
-                .last_request()
-                .into_iter()
-                .filter(|m| m.role != Role::System)
-                .collect();
+            let after = conversation(recorder.last_request());
             assert_eq!(
                 after[..before.len()],
                 before[..],

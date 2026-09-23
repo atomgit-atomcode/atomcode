@@ -760,9 +760,21 @@ async fn spilled(dir: &std::path::Path, command: &str) -> (String, PathBuf) {
 #[tokio::test]
 async fn an_oversized_tool_result_is_shown_head_and_tail_and_saved_whole() {
     let dir = scratch("artifact-big");
-    // 16 KiB is the threshold; 40 000 bytes clears it without approaching the
-    // 4 MiB artifact ceiling (which is a different branch, with no artifact id).
-    let (text, artifacts) = spilled(&dir, "printf 'x%.0s' $(seq 1 40000)").await;
+    // Sized **from the threshold itself**, not from a number typed beside it.
+    //
+    // It used to say "16 KiB is the threshold; 40 000 bytes clears it". Then
+    // `69fdc7cae` widened the budget to 50 KiB — for a good reason, the model
+    // was working around "output truncated" on ordinary diffs — and 40 000
+    // bytes stopped being oversized. Nothing was wrong with the row and
+    // nothing was wrong with the widening; the judgement had simply been
+    // measuring against a number that no longer existed, and it went red
+    // saying the feature was broken. Read the constant and it cannot happen
+    // again: whatever the budget becomes, this is over it.
+    //
+    // Comfortably over, and still far from the 4 MiB artifact ceiling — that
+    // is a different branch, with no artifact id.
+    let oversized = atomcode_capabilities::tools::output_artifact::THRESHOLD_BYTES + 8 * 1024;
+    let (text, artifacts) = spilled(&dir, &format!("printf 'x%.0s' $(seq 1 {oversized})")).await;
     assert!(
         text.contains("output truncated"),
         "an oversized result says it was cut: {}",
