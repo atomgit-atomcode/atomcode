@@ -391,6 +391,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::McpPanelTitle => "管理 MCP 服务器".into(),
         Msg::McpPanelServers { n } => format!("{n} 个服务器").into(),
         Msg::McpPanelEmpty => "没有配置任何 MCP 服务器".into(),
+        Msg::McpPanelUnavailable => "这个构建没挂 MCP 面板".into(),
         Msg::McpDetailPending => "正在取详情…".into(),
         // 服务器从哪儿来:产品表的 `/help` 来源列说的是同样两个地方,所以这两句读
         // 它的措辞,不在这儿再写一遍(`tests/tables.rs`)。

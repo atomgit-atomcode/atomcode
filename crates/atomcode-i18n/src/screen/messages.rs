@@ -630,6 +630,10 @@ pub enum Msg<'a> {
         n: usize,
     },
     McpPanelEmpty,
+    /// `/mcp` with no argument, when this tree mounted no MCP panel at all. The
+    /// row can be left out of a build's layout, and saying so beats a screen
+    /// that looks like it did something.
+    McpPanelUnavailable,
     /// The detail page, drawn the moment `Enter` is pressed and filled when the
     /// round trip comes back.
     McpDetailPending,
