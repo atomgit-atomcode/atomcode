@@ -465,8 +465,43 @@ impl Stream {
         self.slots.is_empty()
     }
 
+    /// Where `id` sits, or `None` if this stream never handed that id out.
+    ///
+    /// **The lookup is O(1), and that is the point.** Ids are handed out one
+    /// per [`StreamWriter::open`] from a counter that starts at 1 and never
+    /// reuses a number, and nothing removes a slot — so a block's position *is*
+    /// its id minus one. Scanning for it instead turned every `settle` into a
+    /// pass over the whole conversation, which is quadratic over a replay: the
+    /// transcript settles a block per `emit`, so a session with a few thousand
+    /// facts paid a few million slot visits. That was most of the cost of
+    /// switching to another session (`plugin.rs::look_at` replays the log).
+    ///
+    /// Kept as one checked accessor rather than `id.0 - 1` at each call site:
+    /// a stream that ever gained a hole, a reused id or a second source of
+    /// slots would answer `None` here rather than read the wrong block, and the
+    /// position is what the counter and the vec have to agree about.
+    fn position_of(&self, id: BlockId) -> Option<usize> {
+        let at = usize::try_from(id.0.checked_sub(1)?).ok()?;
+        self.slots
+            .get(at)
+            .is_some_and(|slot| slot.block().id == id)
+            .then_some(at)
+    }
+
+    /// The slot `id` names, when it is `Live` and `producer`'s to change.
+    ///
+    /// The same rule [`StreamWriter::amend`] documents: a settled block, a
+    /// stranger's block and a block that does not exist are all `None`.
+    fn live_at(&mut self, id: BlockId, producer: &'static str) -> Option<&mut Slot> {
+        let at = self.position_of(id)?;
+        match &self.slots[at] {
+            Slot::Live(block, _) if block.producer == producer => Some(&mut self.slots[at]),
+            _ => None,
+        }
+    }
+
     pub fn get(&self, id: BlockId) -> Option<&Slot> {
-        self.slots.iter().find(|s| s.block().id == id)
+        self.position_of(id).map(|at| &self.slots[at])
     }
 
     /// The settled prefix's fingerprints, in order. The value the freeze
@@ -527,50 +562,56 @@ impl StreamWriter<'_> {
     /// producer. `false` if it has settled, does not exist, or is someone
     /// else's — never a panic, and never a silent write to a frozen block.
     pub fn amend(&mut self, id: BlockId, content: Arc<dyn Content>) -> bool {
-        for slot in self.stream.slots.iter_mut() {
-            if let Slot::Live(b, _) = slot {
-                if b.id == id && b.producer == self.producer {
-                    b.content = content;
-                    return true;
-                }
-            }
-        }
-        false
+        let Some(Slot::Live(block, _)) = self.stream.live_at(id, self.producer) else {
+            return false;
+        };
+        block.content = content;
+        true
     }
 
     /// Freeze a block. Idempotent, and a no-op for someone else's.
     pub fn settle(&mut self, id: BlockId) -> bool {
-        for slot in self.stream.slots.iter_mut() {
-            if let Slot::Live(b, _) = slot {
-                if b.id == id && b.producer == self.producer {
-                    // `Live` is owned, so this moves rather than clones.
-                    let placeholder = Slot::Settled(Settled::new(Arc::new(Block {
-                        id,
-                        at: b.at,
-                        producer: b.producer,
-                        content: b.content.clone(),
-                    })));
-                    *slot = placeholder;
-                    return true;
-                }
+        let Some(at) = self.stream.position_of(id) else {
+            return false;
+        };
+        let producer = self.producer;
+        let slot = &mut self.stream.slots[at];
+        match slot {
+            Slot::Live(b, _) if b.producer == producer => {
+                // `Live` is owned, so this moves rather than clones.
+                let placeholder = Slot::Settled(Settled::new(Arc::new(Block {
+                    id,
+                    at: b.at,
+                    producer: b.producer,
+                    content: b.content.clone(),
+                })));
+                *slot = placeholder;
+                true
             }
+            _ => false,
         }
-        false
     }
 
     /// Settle everything this producer still has open. For the end of a turn.
     pub fn settle_all(&mut self) {
-        let live: Vec<BlockId> = self
-            .stream
-            .slots
-            .iter()
-            .filter_map(|s| match s {
-                Slot::Live(b, _) if b.producer == self.producer => Some(b.id),
-                _ => None,
-            })
-            .collect();
-        for id in live {
-            self.settle(id);
+        // One pass over the stream, converting in place. Settling them one at a
+        // time through [`StreamWriter::settle`] would look each up again and
+        // scan the conversation once per open block — quadratic in the number
+        // of calls left running, which is what a turn that ends with a batch of
+        // them pays.
+        let producer = self.producer;
+        for slot in self.stream.slots.iter_mut() {
+            if let Slot::Live(b, _) = slot {
+                if b.producer == producer {
+                    let settled = Slot::Settled(Settled::new(Arc::new(Block {
+                        id: b.id,
+                        at: b.at,
+                        producer: b.producer,
+                        content: b.content.clone(),
+                    })));
+                    *slot = settled;
+                }
+            }
         }
     }
 
@@ -740,6 +781,72 @@ mod tests {
         w.settle(b);
         let order: Vec<_> = s.slots().iter().map(|s| s.block().id).collect();
         assert_eq!(order, vec![a, b, c], "emission order is frozen");
+    }
+
+    /// **按 id 找块,找到的必须是那个块 —— 而捷径给出的答案必须和扫描一样。**
+    ///
+    /// `get` / `amend` / `settle` 从「扫全表」改成「位置就是 id 减一」。这条捷径
+    /// 依赖两件只有这里知道的事:`open` 每调用一次就从 1 起的计数器里取一个号,
+    /// 以及没有任何东西删槽位。所以这里把两件事都量出来:每个槽位的位置必须等于
+    /// 它自己 block 的 id 减一;每个 id(包括**没发出去过的**)经捷径得到的块,必须
+    /// 和线性扫描得到的是同一个。
+    ///
+    /// 阴性对照是后半句里那些超出流长度的 id:一个只按 `id - 1` 下标取值、不做
+    /// 校验的实现会在这些 id 上答出别的块或撒谎答有 —— 那正是「便宜的那个」会
+    /// 安静改错块的那类 bug。
+    #[test]
+    fn the_shortcut_finds_the_block_a_scan_would_find() {
+        let mut s = Stream::new();
+        // One writer at a time — a `StreamWriter` holds the stream mutably, so
+        // the interleaving is written as a sequence rather than as two handles.
+        // Two producers, interleaved, with some settled and some still open:
+        // a stream whose live set has holes in it.
+        let a = s.writer("calls").open(Coord::new(1, 1), text("call a"));
+        s.writer("notes").emit(Coord::new(1, 1), text("a note"));
+        let b = s.writer("calls").open(Coord::new(1, 1), text("call b"));
+        s.writer("notes")
+            .emit(Coord::new(1, 2), text("another note"));
+        let c = s.writer("calls").open(Coord::new(1, 2), text("call c"));
+        assert!(s.writer("calls").amend(a, text("call a, amended")));
+        assert!(s.writer("calls").settle(b));
+
+        // The invariant the shortcut is built on, checked rather than assumed.
+        for (at, slot) in s.slots().iter().enumerate() {
+            assert_eq!(
+                Stream::position_of(&s, slot.block().id),
+                Some(at),
+                "a slot's position must be its block's id minus one"
+            );
+        }
+
+        // Every id the stream handed out, and three it did not.
+        for n in 1..=(s.len() as u64 + 3) {
+            let id = BlockId(n);
+            let scanned = s
+                .slots()
+                .iter()
+                .find(|slot| slot.block().id == id)
+                .map(|slot| slot.block().id);
+            assert_eq!(
+                s.get(id).map(|slot| slot.block().id),
+                scanned,
+                "b{n} resolved to a different block than a scan of the same stream"
+            );
+        }
+
+        // And the amendment landed on `a`, not on the neighbour the id could
+        // have been confused with.
+        let said = |id: BlockId| {
+            s.get(id)
+                .expect("the block")
+                .block()
+                .content
+                .lines(&crate::block::RenderCtx::bare(80))[0]
+                .plain()
+        };
+        assert_eq!(said(a), "call a, amended");
+        assert!(s.get(b).expect("the block").is_settled(), "b settled");
+        assert_eq!(said(c), "call c");
     }
 
     #[test]

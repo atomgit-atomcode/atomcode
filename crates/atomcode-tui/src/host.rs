@@ -1254,6 +1254,16 @@ pub struct Host {
     /// instead of one somebody has to remember — and the two revisions are
     /// bumped by every writer, not by the call sites that happen to exist today.
     row_index: Mutex<RowIndex>,
+    /// Which block a tool call opened, by call id.
+    ///
+    /// [`Host::fold_finished_call`] needs the block a result belongs to, and
+    /// the stream is indexed by [`BlockId`], not by call id. Searching for it
+    /// there was a pass over the whole conversation **per result**, which a
+    /// replay pays once per call in the log — the second quadratic term in
+    /// switching sessions. Filled as blocks appear (a fold may append a batch
+    /// of calls at once) and cleared with the stream, because a call id is the
+    /// session's own.
+    call_blocks: Mutex<std::collections::HashMap<String, BlockId>>,
 }
 
 /// The cached layout of the stream's rows, top to bottom.
@@ -1452,6 +1462,7 @@ impl Host {
                 skip_from: Vec::new(),
                 total: 0,
             }),
+            call_blocks: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -1499,6 +1510,12 @@ impl Host {
             skip_from: Vec::new(),
             total: 0,
         };
+        // The call ids went with the blocks: nothing is left for a result of
+        // this session to fold, and an id from it must not reach into the next.
+        self.call_blocks
+            .lock()
+            .expect("call blocks poisoned")
+            .clear();
         for producer in self.modules.producers() {
             producer.reset();
         }
@@ -1756,14 +1773,12 @@ impl Host {
     /// shows a call that finished under another mode as one row. A hand
     /// fold/unfold still wins (see [`Presentation::fold_finished`]).
     fn fold_finished_call(&self, call_id: &str) {
-        let id = {
-            let stream = self.stream.read().expect("stream poisoned");
-            stream.slots().iter().find_map(|s| {
-                let b = s.block();
-                (b.content.as_tool_call().map(|t| t.call_id.as_str()) == Some(call_id))
-                    .then_some(b.id)
-            })
-        };
+        let id = self
+            .call_blocks
+            .lock()
+            .expect("call blocks poisoned")
+            .get(call_id)
+            .copied();
         if let Some(id) = id {
             self.presentation
                 .write()
@@ -1779,11 +1794,26 @@ impl Host {
     /// "measure, change, measure again", and the change is this.
     fn fold(&self, logged: &LoggedEvent) {
         let fact = &logged.event;
+        // What this fold appended, remembered as blocks rather than as calls:
+        // a fact may open several at once (one per tool call in a message).
+        let mut opened: Vec<(String, BlockId)> = Vec::new();
         {
             let mut stream = self.stream.write().expect("stream poisoned");
+            let before = stream.len();
             for p in self.modules.producers() {
                 let mut w = stream.writer(p.id());
                 p.absorb(logged, &mut w);
+            }
+            for slot in &stream.slots()[before..] {
+                if let Some(call) = slot.block().content.as_tool_call() {
+                    opened.push((call.call_id.clone(), slot.block().id));
+                }
+            }
+        }
+        if !opened.is_empty() {
+            let mut calls = self.call_blocks.lock().expect("call blocks poisoned");
+            for (call_id, id) in opened {
+                calls.insert(call_id, id);
             }
         }
         for id in self.modules.view_ids() {
@@ -7555,6 +7585,103 @@ mod tests {
             "  一格滚轮 {:.3}ms",
             t.elapsed().as_secs_f64() * 1000.0 / 20.0
         );
+    }
+
+    /// **切到另一个会话要多久,以及这份时间花在哪。**
+    ///
+    /// `plugin.rs::look_at` 做的事是 `switch_view()` 加把该会话已知的每条事实
+    /// 重新 `absorb_logged` 一遍,然后画一帧。这条标尺把它拆成三段量:`Plugin`
+    /// 那侧的两份事实克隆(经 `Client::events` 与 `look_at` 的返回值)、重放、
+    /// 重放后第一帧。按日志前缀量是因为只有它能分辨线性与二次。
+    ///
+    /// 2026-09-23 实测(debug,`~/.atomcode/sessions` 里最大的那份日志,5703 条
+    /// 事实 / 2288 个槽位)。**这台机器是共享的,同一份代码两次跑能差一倍**,所以
+    /// 数字只当量级看:
+    ///
+    /// ```text
+    ///                            改前        改后
+    /// 重放 5703 条事实          84.6ms  →  19.8ms   ← 二次项没了(见下)
+    /// 同一份的曲线(事件数翻倍)  2.0 / 8.6 / 27.5 / 84.6
+    ///                           → 1.7 / 3.3 / 7.6 / 19.8
+    /// 首帧(重建行索引)      53–89ms  →  53–89ms   ← 没动:那一半要留住块
+    /// 一份事实深拷贝             2.6ms               ← 两次,不是大头
+    /// ```
+    ///
+    /// 改前「重放」随事件数超线性:4 倍输入涨 10.7 倍(而改后 4 倍输入涨 11.6 倍
+    /// 的那次里,首帧占了大头 —— 逐个数字都要和同一次跑里的对照比才有意义)。
+    /// 那份超线性来自两个全表扫描:`StreamWriter::settle`(每个 `emit` 都扫一遍,
+    /// 而 transcript 每个块都 `emit`)与 `Host::fold_finished_call`(每个工具结果
+    /// 扫一遍找它的调用块)。两处都改成了索引,见 `block.rs` 的 `position_of` 与
+    /// `host.rs` 的 `call_blocks`;改完这两条曲线都贴着线性。
+    ///
+    /// **首帧没动,而且它是现在的大头。** 重放重建了每一个 `Slot`,于是每个块
+    /// 自己的「量过多宽多少行」缓存都是空的,行索引只好把整段会话重渲染一遍
+    /// —— 线性,但每块要过一次 markdown。要省掉它就得留住块,也就是按 0023 §3
+    /// 「屏幕上每个会话一条流」把整屏按会话缓存下来,是另一件事。
+    ///
+    /// 这条标尺不是闸门(既有 `measure_the_frame_cost_of_a_real_session` 说了
+    /// 为什么):没人喂它日志时它什么都不说,喂了也只打印数字,只断言「读进去的
+    /// 不是空的」—— 一份量了个空屏的数字比没有数字更坏。
+    #[test]
+    fn measure_the_switch_replay_cost() {
+        use std::time::Instant;
+        let Ok(path) = std::env::var("ATOMCODE_PERF_LOG") else {
+            return;
+        };
+        use std::io::BufRead;
+        let mut facts = Vec::new();
+        for line in std::io::BufReader::new(std::fs::File::open(&path).expect("open")).lines() {
+            let Ok(line) = line else { continue };
+            if line.trim().is_empty() || line.contains("\"header\"") {
+                continue;
+            }
+            let Ok(rec) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            let (Some(seq), Some(at)) = (rec["seq"].as_u64(), rec["at"].as_u64()) else {
+                continue;
+            };
+            let Some(ev) = rec.get("event") else { continue };
+            let Ok(event) = serde_json::from_value::<SessionEvent>(ev.clone()) else {
+                continue;
+            };
+            facts.push(atomcode_harness::session::LoggedEvent { seq, at, event });
+        }
+        let total = facts.len();
+        assert!(total > 0, "{path} carried no facts");
+        // The front end's own per-switch cost: `Plugin::look_at` clones the
+        // followed session's facts and `mark_undone` clones them again through
+        // `Client::events`. Measured because it is the first suspect a person
+        // reaches for, and the figure is what rules it out.
+        let t = Instant::now();
+        let clone = facts.clone();
+        println!(
+            "  深拷贝 {total} 条事实: {:.1}ms ({} 条)",
+            t.elapsed().as_secs_f64() * 1000.0,
+            clone.len()
+        );
+        let h = host();
+        let size = (80u16, 24u16);
+        for size_ in [total / 8, total / 4, total / 2, total] {
+            // First paint a frame, so `last_room` is set and the pin takes the
+            // same road it takes in the real loop.
+            let _ = h.compose(size);
+            let t_all = Instant::now();
+            h.switch_view();
+            let t = Instant::now();
+            for f in &facts[..size_] {
+                h.absorb_logged(f);
+            }
+            let replay = t.elapsed().as_secs_f64() * 1000.0;
+            let t = Instant::now();
+            let _ = h.compose(size);
+            let paint = t.elapsed().as_secs_f64() * 1000.0;
+            println!(
+                "  {size_:>5} 事件 → {:>4} 槽位: 重放 {replay:>7.1}ms + 首帧 {paint:>7.1}ms = {:.1}ms",
+                h.stream.read().unwrap().slots().len(),
+                t_all.elapsed().as_secs_f64() * 1000.0
+            );
+        }
     }
 
     /// **跳转画出来的，必须和逐格走动画出来的一模一样。**
