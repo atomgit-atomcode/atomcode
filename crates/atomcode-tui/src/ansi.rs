@@ -689,8 +689,14 @@ mod tests {
             }],
         );
         let s = encode(&f);
-        assert!(!s.contains("\x1b]8;;"), "no OSC 8 for a control-char URL: {s:?}");
-        assert!(!s.contains("pwned"), "the injection never reaches output: {s:?}");
+        assert!(
+            !s.contains("\x1b]8;;"),
+            "no OSC 8 for a control-char URL: {s:?}"
+        );
+        assert!(
+            !s.contains("pwned"),
+            "the injection never reaches output: {s:?}"
+        );
         assert!(s.contains("click"), "the label still draws");
     }
 

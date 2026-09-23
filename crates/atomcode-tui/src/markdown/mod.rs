@@ -360,7 +360,17 @@ fn next_url(s: &str) -> Option<(usize, usize)> {
         let trimmed = tail[..end].trim_end_matches(|c: char| {
             matches!(
                 c,
-                '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '>' | '"' | '\''
+                '.' | ','
+                    | ';'
+                    | ':'
+                    | '!'
+                    | '?'
+                    | ')'
+                    | ']'
+                    | '}'
+                    | '>'
+                    | '"'
+                    | '\''
                     | '，'
                     | '。'
                     | '、'
@@ -1028,7 +1038,10 @@ mod tests {
         // The model's own example: a bare issue URL in prose is pulled out into a
         // span that both reads as a link (styled) and carries the URL for OSC 8.
         let spans = spans_of("see https://atomgit.com/x/atomcode/issues/1565 now", 200);
-        let link = spans.iter().find(|s| s.link.is_some()).expect("a linked run");
+        let link = spans
+            .iter()
+            .find(|s| s.link.is_some())
+            .expect("a linked run");
         assert_eq!(link.text, "https://atomgit.com/x/atomcode/issues/1565");
         assert_eq!(
             link.link.as_deref(),
@@ -1040,7 +1053,10 @@ mod tests {
             .filter(|s| s.link.is_none())
             .map(|s| s.text.as_str())
             .collect();
-        assert!(prose.contains("see") && prose.contains("now"), "prose: {prose:?}");
+        assert!(
+            prose.contains("see") && prose.contains("now"),
+            "prose: {prose:?}"
+        );
     }
 
     #[test]
@@ -1048,7 +1064,10 @@ mod tests {
         // `(https://…/1565).` — the closing paren and period are the sentence's,
         // not the URL's.
         let spans = spans_of("(https://atomgit.com/x/issues/1565).", 200);
-        let link = spans.iter().find(|s| s.link.is_some()).expect("a linked run");
+        let link = spans
+            .iter()
+            .find(|s| s.link.is_some())
+            .expect("a linked run");
         assert_eq!(
             link.link.as_deref(),
             Some("https://atomgit.com/x/issues/1565")
@@ -1058,10 +1077,7 @@ mod tests {
     #[test]
     fn a_file_url_is_a_link_a_bare_scheme_is_not() {
         let spans = spans_of("open file:///tmp/report.html or just file://", 200);
-        let links: Vec<&str> = spans
-            .iter()
-            .filter_map(|s| s.link.as_deref())
-            .collect();
+        let links: Vec<&str> = spans.iter().filter_map(|s| s.link.as_deref()).collect();
         assert_eq!(links, ["file:///tmp/report.html"], "{spans:?}");
     }
 
@@ -1077,13 +1093,22 @@ mod tests {
     #[test]
     fn a_markdown_link_carries_its_url_when_openable_and_not_otherwise() {
         let openable = spans_of("see [docs](https://example.com/p)", 200);
-        let a = openable.iter().find(|s| s.text == "docs").expect("the label");
+        let a = openable
+            .iter()
+            .find(|s| s.text == "docs")
+            .expect("the label");
         assert_eq!(a.link.as_deref(), Some("https://example.com/p"));
 
         // A relative destination stays styled-as-a-link but inert (nowhere to open).
         let relative = spans_of("see [guide](./guide.md)", 200);
-        let b = relative.iter().find(|s| s.text == "guide").expect("the label");
-        assert!(b.link.is_none(), "a relative link is not an OSC 8 hyperlink");
+        let b = relative
+            .iter()
+            .find(|s| s.text == "guide")
+            .expect("the label");
+        assert!(
+            b.link.is_none(),
+            "a relative link is not an OSC 8 hyperlink"
+        );
     }
 
     #[test]
