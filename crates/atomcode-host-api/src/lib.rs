@@ -139,6 +139,17 @@ pub enum HostCommand {
     /// One configured server in full, for the detail page. `server` is the
     /// configured key, not a tool name.
     McpDetail { session: String, server: String },
+    /// Do one thing to one configured MCP server (`docs/mcp-panel-design.md`
+    /// §4.1).
+    ///
+    /// Answers with the refreshed list rather than this one server, because half
+    /// of these change the whole project's picture — trust is project-wide. A
+    /// caller that stays on a detail page re-reads that server with `McpDetail`.
+    McpAct {
+        session: String,
+        server: String,
+        action: McpAction,
+    },
     /// Everything in `session`'s tool catalog and what is true of each: on, off
     /// because the person said so, or absent because the tree was configured
     /// without it (`docs/tool-catalog-policy.md`).
@@ -255,6 +266,7 @@ impl HostCommand {
             | Self::McpTools { session, .. }
             | Self::McpManage { session }
             | Self::McpDetail { session, .. }
+            | Self::McpAct { session, .. }
             | Self::ToolCatalog { session }
             | Self::SwitchTool { session, .. }
             | Self::WithdrawMcpTools { session }
@@ -867,6 +879,30 @@ pub struct McpServerDetail {
     pub config_path: Option<String>,
 }
 
+/// What a person can do to one MCP server from the management panel.
+///
+/// `Enable` and `Disable` are named from the person's point of view, not the
+/// file's: **`Disable` writes `disabled: true`, `Enable` removes that key.**
+/// Getting this backwards silently inverts every switch in the panel, so the
+/// mapping is spelled out here once.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum McpAction {
+    /// Trust this project, so its `.mcp.json` servers may connect at all.
+    Trust,
+    /// Withdraw that trust. The project's tools come off the session first.
+    Untrust,
+    /// Run the OAuth flow for this server. Blocks until it ends — it waits on a
+    /// browser, so it can take minutes.
+    Login,
+    /// Forget the stored token for this server. Its tools come off first.
+    Logout,
+    /// Let this server run again: remove `disabled` from the file that defines it.
+    Enable,
+    /// Switch this server off: write `disabled: true` into that file.
+    Disable,
+}
+
 /// One stored session, as a picker shows it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredSession {
@@ -1105,6 +1141,11 @@ mod tests {
                 session: "a".into(),
                 server: "fs".into(),
             },
+            HostCommand::McpAct {
+                session: "a".into(),
+                server: "fs".into(),
+                action: McpAction::Disable,
+            },
             HostCommand::WithdrawMcpTools {
                 session: "a".into(),
             },
@@ -1180,6 +1221,7 @@ mod tests {
                 | HostCommand::McpTools { .. }
                 | HostCommand::McpManage { .. }
                 | HostCommand::McpDetail { .. }
+                | HostCommand::McpAct { .. }
                 | HostCommand::ToolCatalog { .. }
                 | HostCommand::SwitchTool { .. }
                 | HostCommand::WithdrawMcpTools { .. }
