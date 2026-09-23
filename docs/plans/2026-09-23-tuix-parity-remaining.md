@@ -29,6 +29,33 @@
 | askpass 没接（09-18 清单的 P0-1） | 已接：`tui/src/plugin.rs:625-669`，启动于 `:994` |
 | `/build` 映射错了（`"ask"` 而不是 `"edits"`） | 没错：`RuntimeMode::Build` 就是默认的 ask 档(`coding/src/runtime.rs:400-408`)，Build 与 Ask 是同一个模式的两个名字 |
 
+### 0.1b 2026-09-24 又报错两条 —— 以及为什么，和怎么才不会有第三次
+
+| 报的 | 实际在哪 |
+|---|---|
+| `/memory` `/remember` `/forget` 没了 | **在 harness 里**：`harness/src/plugins/capabilities.rs:800-830`，memory 行挂载时无条件注册三条，走的就是模型用的那个 `memory` 工具（注释写着「a second implementation would agree until one of them changed」） |
+| `/init` 没了 | **在 coding 里**：`coding/src/host_rows.rs:2447-2527` 的 `InitPlugin`/`InitCommand`，提示词构造 `crate::build_init_prompt` 也早在 `coding/src/init_prompt.rs`（含自定义提示词文件与体积上限） |
+
+**错法**：grep 只认了 `Command::said("x")` 和 `name: "x"` 两种形状，而新栈的命令
+**有四种注册形状**，其中两种还是跨行的——`grep` 逐行，跨行那两种从门底下过去了：
+
+```
+Command::said(_taking)?("x", …)          tui 自己的命令
+on_the_session(\n    "x",  …)             coding 的 CatalogCommand      ← 跨行
+CommandDescription { name: "x".into() }   harness 的 CatalogCommand
+COMMAND: &str = "x"                       cli 的面板行
+```
+
+**以后要点名单就别再 grep 了**，用跨行扫描一次点完（这次的写法记在本节末）。
+一次点完的结果是：
+
+> **tuix 的 60 条命令表，新栈只差 3 条**：`background` / `bg`（同一个功能的两个名字，
+> 用户已排除）与 `upgrade`（已判不做，与 CLI 重复）。
+>
+> **在「命令名」这个粒度上，除 `/bg` 外已经补齐了。** 剩下的缺口全部是**深度**：
+> 子命令、语义、健壮性——也就是 P2 那一节。这条结论值得单独记，因为它把
+> 「还差多少」从一个开放问题变成了一张有限清单。
+
 ### 0.2 新前端**更深**的，不要"对齐回去"
 
 代码块语法色（tuix 的 syntect 早已整体移除，`tuix/src/highlight/mod.rs:1-16` 自述）、
