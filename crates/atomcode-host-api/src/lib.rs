@@ -1105,7 +1105,9 @@ mod tests {
                 | HostCommand::Readiness { .. }
                 | HostCommand::ResetSetting { .. }
                 | HostCommand::ToolCatalog { .. }
-                | HostCommand::SwitchTool { .. } => {}
+                | HostCommand::SwitchTool { .. }
+                | HostCommand::PreviewSession { .. }
+                | HostCommand::DeleteSession { .. } => {}
             }
         }
         all
@@ -1334,7 +1336,8 @@ mod tests {
                 | HostReply::Identity { .. }
                 | HostReply::Sources { .. }
                 | HostReply::ToolCatalog { .. }
-                | HostReply::Readiness { .. } => {}
+                | HostReply::Readiness { .. }
+                | HostReply::SessionPreview { .. } => {}
             }
         }
         all
