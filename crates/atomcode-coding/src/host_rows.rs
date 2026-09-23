@@ -3431,6 +3431,34 @@ mod tests {
         );
     }
 
+    /// `git` 那一档**不经过会话快照**,所以「这个会话不做工作区快照」
+    /// 永远不是它没有答案的理由。
+    ///
+    /// **读源码,而不是跑一次。** 要跑它得起一个真运行时、真仓库,那是在判
+    /// git 装没装;这里唯一还没钉住的东西是那个分支在**问快照之前**。
+    /// 会判红的改法正是没有它的样子:没有工作区快照的会话里 `/diff git`
+    /// 会被拒绝,而它本来只需要一个 git。
+    #[test]
+    fn the_checkout_scope_answers_without_a_session_snapshot() {
+        let source = include_str!("runtime.rs");
+        // 只看 `/diff` 那一条命令的处理臂:`snapshot_hook()` 在别的命令里也用,
+        // 从整份文件里 find 第一个会量到无关的那一处。
+        let arm = source
+            .find("Some(CodingRuntimeControl::WorkspaceChanges {")
+            .expect("那条命令要在");
+        let arm = &source[arm..];
+        let at = arm
+            .find("if scope == WorkspaceScope::Git {")
+            .expect("git 那一档要在");
+        let snapshot = arm
+            .find("let Some(hook) = runtime.parts.snapshot_hook() else {")
+            .expect("快照那一档要在");
+        assert!(
+            at < snapshot,
+            "git 档要排在问快照之前,否则没有快照的会话答不了它"
+        );
+    }
+
     /// 只记下 `/loop` 拿什么起过的运行时。
     #[derive(Default)]
     struct Looped {

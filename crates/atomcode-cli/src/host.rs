@@ -1355,6 +1355,10 @@ impl HostControl for RuntimeControl {
                                     added: file.additions,
                                     removed: file.deletions,
                                     binary: file.binary,
+                                    // A rewind point compares two trees; there
+                                    // is no index in that question to ask.
+                                    change: None,
+                                    staged: false,
                                 })
                                 .collect(),
                             code: point.before_tree.is_some(),
@@ -1858,18 +1862,41 @@ impl HostControl for RuntimeControl {
                     current: Some(self.config.lock().expect("config poisoned").model.clone()),
                 })
             }
-            HostCommand::Changes { session, file } => {
+            HostCommand::Changes {
+                session,
+                file,
+                scope,
+            } => {
                 self.addressed(&session)?;
-                let changes = self.handle.workspace_changes(file).await.map_err(refused)?;
+                let changes = self
+                    .handle
+                    .workspace_changes(file, workspace_scope(scope))
+                    .await
+                    .map_err(refused)?;
+                // `states` runs parallel to `files` and is empty from a scope
+                // that has none — `zip` on a short side would silently drop
+                // every file, so it is indexed and defaulted instead.
+                let states = changes.states;
                 Ok(HostReply::Changes {
                     files: changes
                         .files
                         .into_iter()
-                        .map(|f| atomcode_host_api::ChangedFile {
+                        .enumerate()
+                        .map(|(at, f)| atomcode_host_api::ChangedFile {
                             path: f.path,
                             added: f.additions,
                             removed: f.deletions,
                             binary: f.binary,
+                            change: states
+                                .get(at)
+                                .copied()
+                                .flatten()
+                                .map(|(status, _)| file_change(status)),
+                            staged: states
+                                .get(at)
+                                .copied()
+                                .flatten()
+                                .is_some_and(|(_, staged)| staged),
                         })
                         .collect(),
                     diff: changes.diff,
@@ -2004,6 +2031,32 @@ pub fn readiness_for(reason: Option<ProviderUnavailableReason>) -> HostReply {
         ready: false,
         why: Some(why.into()),
         fix: fix.map(str::to_string),
+    }
+}
+
+/// The runtime's word for a `/diff` scope, from the contract's.
+fn workspace_scope(scope: atomcode_host_api::ChangeScope) -> atomcode_coding::WorkspaceScope {
+    match scope {
+        atomcode_host_api::ChangeScope::Session => atomcode_coding::WorkspaceScope::Session,
+        atomcode_host_api::ChangeScope::Workspace => atomcode_coding::WorkspaceScope::Git,
+    }
+}
+
+/// And what a file's state is called on the wire.
+fn file_change(
+    status: atomcode_capabilities::worktree_status::Status,
+) -> atomcode_host_api::FileChange {
+    use atomcode_capabilities::worktree_status::Status as S;
+    use atomcode_host_api::FileChange as C;
+    match status {
+        S::Added => C::Added,
+        S::Modified => C::Modified,
+        S::Deleted => C::Deleted,
+        S::Renamed => C::Renamed,
+        S::Copied => C::Copied,
+        S::Untracked => C::Untracked,
+        S::Conflicted => C::Conflicted,
+        S::Other => C::Other,
     }
 }
 

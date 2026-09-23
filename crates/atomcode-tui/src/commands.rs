@@ -595,6 +595,28 @@ fn session_catalogue() -> Vec<Command> {
 /// settings seam hands one to the runtime after writing a file, and its failure
 /// has to read the same as every other host failure. One renderer, so one error
 /// does not get two wordings depending on which path it came back along.
+/// The word for what happened to a file, and whether it is staged.
+///
+/// A pure function so the listing's wording can be judged without a host, a
+/// repository or a session — and so the two facts are joined in exactly one
+/// place. Staged **and** modified since is its own word, because a commit made
+/// from that state takes something other than what is on screen, and that is
+/// the single most expensive thing this listing can fail to say.
+fn change_word(change: atomcode_host_api::FileChange, staged: bool) -> Msg<'static> {
+    use atomcode_host_api::FileChange as C;
+    match (change, staged) {
+        (C::Untracked, _) => Msg::DiffUntracked,
+        (C::Conflicted, _) => Msg::DiffConflicted,
+        (C::Added, true) => Msg::DiffAddedStaged,
+        (C::Added, false) => Msg::DiffAdded,
+        (C::Deleted, true) => Msg::DiffDeletedStaged,
+        (C::Deleted, false) => Msg::DiffDeleted,
+        (C::Renamed, _) | (C::Copied, _) => Msg::DiffRenamed,
+        (C::Modified, true) => Msg::DiffModifiedStaged,
+        (C::Modified, false) | (C::Other, _) => Msg::DiffModified,
+    }
+}
+
 pub(crate) fn refusal(error: HostError) -> String {
     match error {
         HostError::Busy { reason } => t(Msg::HostBusy { reason: &reason }).into_owned(),
@@ -1237,12 +1259,26 @@ impl CommandSet for SessionCommands {
                     Ok(control) => control,
                     Err(refusal) => return refusal,
                 };
-                let wanted = args.trim();
+                // `git` is a word, not a path: the two questions `/diff`
+                // answers are "what did this agent do" (the default, the more
+                // frequently useful one in a coding session) and "how dirty is
+                // my tree" — and the second is the one you want before
+                // committing. A file called `git` in the working directory is
+                // still reachable as `./git`, which is the ordinary way to
+                // disambiguate a name from a word.
+                let (scope, wanted) = match args.trim() {
+                    "git" => (atomcode_host_api::ChangeScope::Workspace, ""),
+                    rest => match rest.strip_prefix("git ") {
+                        Some(path) => (atomcode_host_api::ChangeScope::Workspace, path.trim()),
+                        None => (atomcode_host_api::ChangeScope::Session, rest),
+                    },
+                };
                 let file = (!wanted.is_empty()).then(|| wanted.to_string());
                 match control
                     .call(HostCommand::Changes {
                         session: root.clone(),
                         file: file.clone(),
+                        scope,
                     })
                     .await
                 {
@@ -1276,19 +1312,33 @@ impl CommandSet for SessionCommands {
                         let choices = files
                             .into_iter()
                             .map(|f| {
-                                let about = if f.binary {
+                                let counts = if f.binary {
                                     t(Msg::DiffBinary).into_owned()
                                 } else {
                                     format!("+{} -{}", f.added, f.removed)
                                 };
-                                // The value is the command that opens it, so a
-                                // pick and a typed `/diff <path>` reach the same
-                                // implementation.
-                                crate::overlay::Choice::new(
-                                    format!("/diff {}", f.path),
-                                    f.path.clone(),
-                                )
-                                .about(about)
+                                // What happened to it, when the scope knows —
+                                // and whether it is staged, because "what a
+                                // commit would take" and "what it would leave"
+                                // is the question this listing is usually read
+                                // for.
+                                let about = match f.change {
+                                    None => counts,
+                                    Some(change) => {
+                                        format!("{} · {counts}", t(change_word(change, f.staged)))
+                                    }
+                                };
+                                // The value is the command that opens it, and
+                                // it carries the scope: a row picked out of a
+                                // `git` listing has to open the `git` diff of
+                                // that file, not the session's.
+                                let open = match scope {
+                                    atomcode_host_api::ChangeScope::Workspace => {
+                                        format!("/diff git {}", f.path)
+                                    }
+                                    _ => format!("/diff {}", f.path),
+                                };
+                                crate::overlay::Choice::new(open, f.path.clone()).about(about)
                             })
                             .collect();
                         Outcome::Open(crate::overlay::Picker::new(
@@ -2677,6 +2727,113 @@ mod tests {
         );
     }
 
+    /// `/diff git` asks the other question, and a row picked out of that
+    /// listing opens the same one.
+    ///
+    /// **The scope has to travel with the row.** Each row's value is the
+    /// command that opens it, so a `git` listing whose rows said `/diff <path>`
+    /// would show the *session's* diff of a file the person picked out of the
+    /// checkout's list — the same file, silently a different answer.
+    #[tokio::test]
+    async fn diff_git_asks_about_the_checkout_and_its_rows_stay_in_that_scope() {
+        use atomcode_host_api::ChangeScope;
+        let host = Arc::new(Recording::default());
+        host.replies.lock().unwrap().extend([
+            Ok(HostReply::Changes {
+                files: vec![atomcode_host_api::ChangedFile {
+                    path: "src/a.rs".into(),
+                    added: 2,
+                    removed: 1,
+                    binary: false,
+                    change: Some(atomcode_host_api::FileChange::Modified),
+                    staged: true,
+                }],
+                diff: None,
+                unavailable: None,
+            }),
+            Ok(HostReply::Changes {
+                files: Vec::new(),
+                diff: Some("@@ -1 +1 @@\n-a\n+b\n".into()),
+                unavailable: None,
+            }),
+        ]);
+        let (app, _client, all) = following(&host);
+
+        let picker = match all.dispatch("/diff git", &app.context()).await {
+            Outcome::Open(picker) => picker,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(picker.id(), "diff");
+        // The row says what it is and whether it is staged — the difference
+        // between what a commit would take and what it would leave.
+        let moment = crate::moment::Moment::default();
+        let vp = crate::moment::Viewport::new(crate::frame::Rect::sized(70, 12), &moment);
+        let drawn = picker
+            .render(&vp)
+            .iter()
+            .map(|line| line.plain())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            drawn.contains("改过") && drawn.contains("已暂存"),
+            "{drawn}"
+        );
+
+        // **Picking the row is what carries the scope**, and the value is where
+        // it lives — not the label, which is just the path either way. Judged
+        // by pressing Enter on it, because that is the only thing that reads
+        // the value at all.
+        let picked = picker.key(crate::surface::KeyPress::plain(crate::surface::Key::Enter));
+        assert_eq!(
+            picked,
+            crate::overlay::Step::Chose("/diff git src/a.rs".into()),
+            "a row listed from the checkout opens the checkout's diff of it, \
+             not the session's — same file, silently a different answer"
+        );
+
+        // And that command is the one that asks.
+        match all.dispatch("/diff git src/a.rs", &app.context()).await {
+            Outcome::Open(reader) => assert_eq!(reader.id(), "view"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            *host.asked.lock().unwrap(),
+            vec![
+                HostCommand::Changes {
+                    session: "lead".into(),
+                    file: None,
+                    scope: ChangeScope::Workspace,
+                },
+                HostCommand::Changes {
+                    session: "lead".into(),
+                    file: Some("src/a.rs".into()),
+                    scope: ChangeScope::Workspace,
+                },
+            ]
+        );
+    }
+
+    /// Staged **and** changed again since is its own word.
+    ///
+    /// A commit made from that state takes something other than what is on
+    /// screen, and that is the most expensive thing this listing can fail to
+    /// say. Judged as a pure function so the wording needs no host, no
+    /// repository and no session to reach.
+    #[test]
+    fn a_file_staged_and_edited_again_says_both() {
+        use atomcode_host_api::FileChange as C;
+        assert_eq!(change_word(C::Modified, true), Msg::DiffModifiedStaged);
+        assert_eq!(change_word(C::Modified, false), Msg::DiffModified);
+        assert_eq!(change_word(C::Added, true), Msg::DiffAddedStaged);
+        assert_eq!(change_word(C::Deleted, true), Msg::DiffDeletedStaged);
+        // Untracked is neither: git has never heard of the file, so "staged"
+        // has nothing to be true of.
+        assert_eq!(change_word(C::Untracked, false), Msg::DiffUntracked);
+        assert_eq!(change_word(C::Untracked, true), Msg::DiffUntracked);
+        // A letter this build does not know still reads as a change.
+        assert_eq!(change_word(C::Other, false), Msg::DiffModified);
+    }
+
     /// `/diff` answers the most-asked question of a coding session at two
     /// depths: which files, then what changed in one.
     ///
@@ -2695,12 +2852,16 @@ mod tests {
                         added: 12,
                         removed: 3,
                         binary: false,
+                        change: None,
+                        staged: false,
                     },
                     atomcode_host_api::ChangedFile {
                         path: "logo.png".into(),
                         added: 0,
                         removed: 0,
                         binary: true,
+                        change: None,
+                        staged: false,
                     },
                 ],
                 diff: None,
@@ -2750,18 +2911,22 @@ mod tests {
                 HostCommand::Changes {
                     session: lead(),
                     file: None,
+                    scope: atomcode_host_api::ChangeScope::Session,
                 },
                 HostCommand::Changes {
                     session: lead(),
                     file: Some("src/parser.rs".into()),
+                    scope: atomcode_host_api::ChangeScope::Session,
                 },
                 HostCommand::Changes {
                     session: lead(),
                     file: None,
+                    scope: atomcode_host_api::ChangeScope::Session,
                 },
                 HostCommand::Changes {
                     session: lead(),
                     file: None,
+                    scope: atomcode_host_api::ChangeScope::Session,
                 },
             ]
         );

@@ -113,6 +113,7 @@ pub use runtime::{
     RuntimeMode, RuntimePhase, RuntimeRequest, RuntimeSessionInfo, RuntimeSnapshotError,
     RuntimeStartError, RuntimeStatus, RuntimeTurnStats, RuntimeUnavailable, SequencedRuntimeEvent,
     SessionChanged, SubmitReceipt, TurnCompletion, UndoResult, UserInput, VisionNotice,
+    WorkspaceScope,
 };
 pub use telemetry::{TelemetryHook, ToolTelemetryMiddleware};
 pub use todo::TodoHook;

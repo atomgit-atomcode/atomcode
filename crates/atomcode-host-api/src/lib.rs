@@ -208,6 +208,10 @@ pub enum HostCommand {
         session: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         file: Option<String>,
+        /// Which two things to compare. Omitted is [`ChangeScope::Session`],
+        /// so a front end that predates this asks what it always asked.
+        #[serde(default, skip_serializing_if = "ChangeScope::is_default")]
+        scope: ChangeScope,
     },
     /// How much of the model's context this session is using.
     ///
@@ -669,7 +673,64 @@ pub struct ProviderChoice {
     pub about: String,
 }
 
-/// One file a session changed.
+/// What a request for changes is asking about.
+///
+/// **One command with a scope, not two commands.** Both are "what has changed
+/// here" — they differ in what "here" is, and a front end showing one has to be
+/// able to offer the other without learning a second command's name
+/// (`docs/adr/0021`: a question asked at two depths is one question).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeScope {
+    /// What this session did: the workspace as it was before its first prompt,
+    /// against now. The default, because in a coding session it is the more
+    /// frequently useful of the two — "what did this agent touch".
+    ///
+    /// A session with no workspace checkpointing cannot answer it, and says so
+    /// through `unavailable`.
+    #[default]
+    Session,
+    /// What the workspace has that the host has not taken in: everything
+    /// outstanding, whoever did it and whenever — including work done before
+    /// this session opened and work a person did by hand.
+    ///
+    /// Named for the workspace rather than for whatever keeps it, because a
+    /// host that is not driving a repository can still be asked this and can
+    /// still answer "I cannot tell" — which is the rule this whole contract is
+    /// held to (`tests/contract.rs`). What a front end *calls* it is the front
+    /// end's own business; the screen says `/diff git`.
+    ///
+    /// **It needs no session history**, which is why `unavailable` for "this
+    /// session keeps no snapshots" belongs to [`Session`](Self::Session) alone.
+    Workspace,
+}
+
+impl ChangeScope {
+    fn is_default(&self) -> bool {
+        matches!(self, Self::Session)
+    }
+}
+
+/// What happened to a file, in the words a person uses rather than git's
+/// letters.
+///
+/// `Other` rather than an error for a letter this build does not know: a future
+/// git must be able to add one without making the whole listing refuse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileChange {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    Copied,
+    /// Not in the index: a file git has never been told about.
+    Untracked,
+    Conflicted,
+    Other,
+}
+
+/// One file a session — or the checkout — changed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangedFile {
     /// Relative to the working directory.
@@ -679,6 +740,16 @@ pub struct ChangedFile {
     /// A file with no line counts to give. Shown as changed, not as `+0 -0`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub binary: bool,
+    /// What happened to it, when the answer knows. `None` from a scope that
+    /// only counts lines — the session's own diff is a comparison of two trees
+    /// and has no index to ask about.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change: Option<FileChange>,
+    /// Whether any of it is in the index. The two sections a listing is split
+    /// into, and the difference between what a commit would take and what it
+    /// would leave behind.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub staged: bool,
 }
 
 /// How much an agent may do before it asks.
@@ -1209,6 +1280,7 @@ mod tests {
             HostCommand::Changes {
                 session: "a".into(),
                 file: Some("src/parser.rs".into()),
+                scope: ChangeScope::Workspace,
             },
             HostCommand::Providers {
                 session: "a".into(),
@@ -1323,6 +1395,8 @@ mod tests {
                         added: 12,
                         removed: 3,
                         binary: false,
+                        change: Some(FileChange::Modified),
+                        staged: true,
                     }],
                     code: true,
                 }],
@@ -1436,6 +1510,8 @@ mod tests {
                     added: 12,
                     removed: 3,
                     binary: false,
+                    change: Some(FileChange::Modified),
+                    staged: false,
                 }],
                 diff: Some("@@ -1 +1 @@\n-a\n+b\n".into()),
                 unavailable: None,

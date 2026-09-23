@@ -383,6 +383,24 @@ pub enum Msg<'a> {
     NoClipboard,
     NoAgent,
     NoHost,
+    /// One file's state in a `/diff` listing.
+    DiffAdded,
+    /// One file's state in a `/diff` listing.
+    DiffAddedStaged,
+    /// One file's state in a `/diff` listing.
+    DiffModified,
+    /// One file's state in a `/diff` listing.
+    DiffModifiedStaged,
+    /// One file's state in a `/diff` listing.
+    DiffDeleted,
+    /// One file's state in a `/diff` listing.
+    DiffDeletedStaged,
+    /// One file's state in a `/diff` listing.
+    DiffRenamed,
+    /// One file's state in a `/diff` listing.
+    DiffUntracked,
+    /// One file's state in a `/diff` listing.
+    DiffConflicted,
     /// `/paste` found neither a picture nor text there.
     ClipboardHasNothing,
     /// A slash command was sent with pictures attached. No command takes

@@ -114,6 +114,12 @@ pub mod fs;
 /// route through it.
 pub mod world;
 
+/// What the person's own checkout looks like right now, as git sees it — the
+/// other half of `/diff`. Distinct from [`session::rewind`]'s shadow repository
+/// in every way that matters: this one reads the repository the person works
+/// in.
+pub mod worktree_status;
+
 /// Plugin subsystem: loader / installer / marketplace / manifest / trust store.
 /// Faithful port of `core::plugin` as a v2 migration target for the front-ends.
 /// Synchronous (shells out to `git` via `std::process` — no async runtime).

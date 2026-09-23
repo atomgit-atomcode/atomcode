@@ -247,6 +247,20 @@ impl RewindScope {
     }
 }
 
+/// Which two things `/diff` compares.
+///
+/// The runtime's own word for it; [`atomcode_host_api::ChangeScope`] is the
+/// wire's, and the mapping between them is the host adapter's — a runtime that
+/// imported the contract would be a runtime that could only serve one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WorkspaceScope {
+    /// Before this session's first prompt, against now.
+    #[default]
+    Session,
+    /// The checkout, against `HEAD`.
+    Git,
+}
+
 /// Whether this session is driving itself, and how far it has got.
 ///
 /// Read rather than pushed: the runtime already publishes `GoalChanged` /
@@ -275,12 +289,69 @@ pub struct Autonomy {
 pub struct WorkspaceChanges {
     /// Every file this session changed, with how much.
     pub files: Vec<atomcode_capabilities::session::FileChangeSummary>,
+    /// What each of them is, when the scope knows — the `git` scope reads an
+    /// index and so can say `staged`/`modified`; the session's own diff is two
+    /// trees compared and has no index to ask.
+    ///
+    /// Parallel to `files` rather than folded into `FileChangeSummary` because
+    /// that type is the checkpoint store's, and the checkpoint store has no
+    /// opinion about anybody's index.
+    pub states: Vec<Option<(atomcode_capabilities::worktree_status::Status, bool)>>,
     /// The unified diff of the one file that was asked for.
     pub diff: Option<String>,
     /// Why there is no answer, when there is none. Not an error: a session with
     /// no workspace checkpointing is an ordinary session, and the screen has to
     /// say which of "nothing changed" and "cannot tell" it is.
     pub unavailable: Option<String>,
+}
+
+/// The checkout's own changes, as [`WorkspaceScope::Git`] asks for them.
+///
+/// Every failure is an answer rather than an error: `/diff git` outside a
+/// repository has to **say** so, because an empty list reads as "nothing
+/// changed" and that is a different thing to be told.
+fn git_workspace_changes(at: &std::path::Path, file: Option<&str>) -> WorkspaceChanges {
+    use atomcode_capabilities::worktree_status as git;
+    if let Some(path) = file {
+        return match git::file_diff(at, path) {
+            Ok(diff) => WorkspaceChanges {
+                diff: Some(diff),
+                ..Default::default()
+            },
+            Err(why) => WorkspaceChanges {
+                unavailable: Some(why),
+                ..Default::default()
+            },
+        };
+    }
+    match git::read(at) {
+        Ok(found) => {
+            let mut files = Vec::with_capacity(found.len());
+            let mut states = Vec::with_capacity(found.len());
+            for (file, added, removed, binary) in found {
+                states.push(
+                    file.unstaged
+                        .or(file.staged)
+                        .map(|status| (status, file.is_staged())),
+                );
+                files.push(atomcode_capabilities::session::FileChangeSummary {
+                    path: file.path,
+                    additions: added,
+                    deletions: removed,
+                    binary,
+                });
+            }
+            WorkspaceChanges {
+                files,
+                states,
+                ..Default::default()
+            }
+        }
+        Err(why) => WorkspaceChanges {
+            unavailable: Some(why),
+            ..Default::default()
+        },
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2140,6 +2211,7 @@ impl CodingRuntimeHandle {
     pub async fn workspace_changes(
         &self,
         file: Option<String>,
+        scope: WorkspaceScope,
     ) -> Result<WorkspaceChanges, RuntimeError> {
         let state = self.state.load(Ordering::Acquire);
         let (done, result) = oneshot::channel();
@@ -2147,6 +2219,7 @@ impl CodingRuntimeHandle {
             .send(CodingRuntimeControl::WorkspaceChanges {
                 generation: runtime_state_generation(state),
                 file,
+                scope,
                 done,
             })
             .map_err(|_| RuntimeError::Unavailable)?;
@@ -2897,6 +2970,8 @@ pub enum CodingRuntimeControl {
     /// What this session has changed in the workspace. `file` asks for one
     /// file's diff text instead of the summary of all of them.
     WorkspaceChanges {
+        /// Which two things to compare.
+        scope: WorkspaceScope,
         generation: u64,
         file: Option<String>,
         done: oneshot::Sender<Result<WorkspaceChanges, RuntimeError>>,
@@ -4477,6 +4552,7 @@ fn spawn_runtime_owner_with_optional_agent(
                     Some(CodingRuntimeControl::WorkspaceChanges {
                         generation: request_generation,
                         file,
+                        scope,
                         done,
                     }) => {
                         if request_generation != generation {
@@ -4487,6 +4563,14 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;
                         };
+                        // The checkout's own answer needs no session history —
+                        // only git — which is why "this session does not keep
+                        // snapshots" is never its reason for having none.
+                        if scope == WorkspaceScope::Git {
+                            let at = runtime.config.working_dir.clone();
+                            let _ = done.send(Ok(git_workspace_changes(&at, file.as_deref())));
+                            continue;
+                        }
                         let Some(hook) = runtime.parts.snapshot_hook() else {
                             let _ = done.send(Ok(WorkspaceChanges {
                                 unavailable: Some("这个会话不做工作区快照".into()),
