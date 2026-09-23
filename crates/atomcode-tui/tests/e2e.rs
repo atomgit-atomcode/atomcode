@@ -3854,6 +3854,72 @@ async fn cancel_all_stops_every_members_turn_and_keeps_the_team() {
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
 
+/// Back on a lead that is still working, esc stops it.
+///
+/// Looking at a member empties the screen's activity, and coming back only
+/// restored it for members the roster knew to be working — never for the lead.
+/// While a member is on screen the lead's turn events are not drawn, so nothing
+/// else put it back either: the lead read as idle, and esc armed the idle
+/// double-tap (a second press opened the rewind panel) instead of stopping it.
+#[tokio::test]
+async fn esc_stops_a_lead_that_is_still_working_after_looking_at_a_member() {
+    let dir = scratch("esc-after-member");
+    let script = replay(
+        r#"{ text = "Delegating.", calls = [ { name = "team", args = { action = "delegate", name = "scout", role = "explorer", task = "look around" } } ] },
+           { text = "Delegated." },
+           { text = "Working.", calls = [ { name = "bash", args = { command = "sleep 5" } } ] },
+           { text = "LEAD-FINISHED" }"#,
+    );
+    // A member that never answers: busy for the whole test, and never reporting
+    // back into the lead's script.
+    let member = format!(
+        "[[insert]]\nname = \"team-in-process\"\nconfig = {{ project_root = {dir:?} }}\n\n\
+         [[insert]]\nid = \"llm-utility\"\nname = \"test-stalling-utility\"\n",
+        dir = dir.to_string_lossy(),
+    );
+    let s = start(tree(&dir, &script, &[&member])).await;
+    let task = s.open().await;
+
+    s.term.type_line("have someone look around");
+    until(&s, "Delegated.").await;
+    s.quiet().await;
+    s.term.type_line("now take your time");
+    until(&s, "Working.").await;
+
+    s.term.press(KeyPress::plain(Key::Tab));
+    until(&s, "Enter 切换").await;
+    s.term.press(KeyPress::plain(Key::Down));
+    s.term.press(KeyPress::plain(Key::Enter));
+    until(&s, "正在看 scout").await;
+    s.term.press(KeyPress::plain(Key::Tab));
+    until(&s, "Enter 切换").await;
+    s.term.press(KeyPress::plain(Key::Up));
+    s.term.press(KeyPress::plain(Key::Enter));
+    until(&s, "Delegated.").await;
+
+    s.term.press(KeyPress::plain(Key::Esc));
+    for _ in 0..80 {
+        if s.screen().contains("已中断") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        s.screen().contains("已中断"),
+        "esc on the lead did not stop its turn:\n{}",
+        s.screen()
+    );
+    s.quiet().await;
+    assert!(
+        !s.screen().contains("LEAD-FINISHED"),
+        "the lead ran on past the stop:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
 /// A team whose member speaks for itself, so its screen is recognisably its own.
 fn team_with_a_talking_member(dir: &Path) -> (String, String) {
     let script = replay(

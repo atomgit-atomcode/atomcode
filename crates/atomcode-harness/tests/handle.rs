@@ -706,6 +706,63 @@ async fn a_stop_right_behind_a_message_stops_that_message_s_turn() {
     }
 }
 
+/// A turn that is being stopped does not get to ask.
+///
+/// The stop refuses the questions already waiting. One asked *after* it — a
+/// hook that was still running when the person pressed stop finishes, and the
+/// call it gated goes to approval — used to go out to the driver and wait for
+/// an answer from someone who had already said stop, holding the turn (and the
+/// screen's "stopping") open until they answered it.
+#[tokio::test]
+async fn a_turn_being_stopped_does_not_get_to_ask() {
+    use atomcode_harness::seams::{AgentsSvc, ApprovalSvc, Decision, ToolsSvc};
+
+    let dir = scratch("ask-after-stop");
+    let app = start(tree(&dir, &replay(r#"{ text = "unused" }"#), &[])).await;
+    let mut handle = handle_of(&app);
+    let agent = app
+        .context()
+        .service::<AgentsSvc>()
+        .unwrap()
+        .list()
+        .into_iter()
+        .next()
+        .expect("the handle drives an agent");
+    // Where a late hook leaves things: the turn is stopping, and a call it
+    // gated is about to be decided.
+    agent.begin_turn();
+    agent.interrupt();
+
+    let ctx = agent.ctx().clone();
+    let tool = ctx
+        .service::<ToolsSvc>()
+        .unwrap()
+        .get("write_file")
+        .expect("write_file is mounted");
+    let policy = ctx.service::<ApprovalSvc>().unwrap();
+    let call = atomcode_kernel::tool::ToolCall {
+        id: "late".into(),
+        name: "write_file".into(),
+        arguments: r#"{"file_path":"out.txt","content":"x"}"#.into(),
+    };
+    let decided = tokio::time::timeout(
+        Duration::from_secs(2),
+        atomcode_harness::agent::as_agent(ctx, async move { policy.decide(&call, &tool).await }),
+    )
+    .await;
+    assert!(
+        matches!(decided, Ok(Decision::Deny(_))),
+        "a stopping turn's question must be refused, not left waiting: {decided:?}"
+    );
+    let said = collect_for(&mut handle, Duration::from_millis(100)).await;
+    assert!(
+        !names(&said).contains(&"Request"),
+        "and nobody is asked it: {:?}",
+        names(&said)
+    );
+    agent.end_turn();
+}
+
 #[tokio::test]
 async fn shutdown_closes_the_stream_and_ends_the_task() {
     let dir = scratch("shutdown");
