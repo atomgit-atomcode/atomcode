@@ -686,7 +686,14 @@ pub trait RuntimeCommands: Send + Sync {
     /// Leave the goal where it is; it can be taken up again.
     async fn pause_goal(&self) -> Result<(), String>;
     /// Run `prompt` again and again until it is stopped.
-    async fn start_loop(&self, prompt: String) -> Result<(), String>;
+    ///
+    /// `every` is the person's own cadence, in seconds. `None` leaves the
+    /// pacing to the model — it asks for the next round with `schedule_wakeup`,
+    /// and a round it does not ask after is the end of the loop. With a cadence
+    /// the rounds keep coming whether the model asks or not, which is what
+    /// "every five minutes" means and the reason the two are one command rather
+    /// than two.
+    async fn start_loop(&self, prompt: String, every: Option<u32>) -> Result<(), String>;
     async fn stop_loop(&self) -> Result<(), String>;
     /// Put `text` in front of the next turn, as the person's own context.
     async fn queue_local_context(&self, text: String) -> Result<(), String>;
@@ -1576,6 +1583,10 @@ impl CodingRuntimeHandle {
                 CodingRuntimeControl::StartLoop {
                     generation,
                     prompt,
+                    // The driver protocol carries no cadence, so this is the
+                    // model-paced form. A driver that wants the other one asks
+                    // through `RuntimeCommands`, where the cadence lives.
+                    every: None,
                     done,
                 }
             }
@@ -2321,13 +2332,18 @@ impl CodingRuntimeHandle {
         result.await.map_err(|_| RuntimeError::Unavailable)?
     }
 
-    pub async fn start_loop(&self, prompt: impl Into<String>) -> Result<(), RuntimeError> {
+    pub async fn start_loop(
+        &self,
+        prompt: impl Into<String>,
+        every: Option<u32>,
+    ) -> Result<(), RuntimeError> {
         let state = self.state.load(Ordering::Acquire);
         let (done, result) = oneshot::channel();
         self.tx
             .send(CodingRuntimeControl::StartLoop {
                 generation: runtime_state_generation(state),
                 prompt: prompt.into(),
+                every,
                 done,
             })
             .map_err(|_| RuntimeError::Unavailable)?;
@@ -2927,6 +2943,8 @@ pub enum CodingRuntimeControl {
         done: oneshot::Sender<Result<(), RuntimeError>>,
     },
     StartLoop {
+        /// The person's own cadence, in seconds; `None` leaves it to the model.
+        every: Option<u32>,
         generation: u64,
         prompt: String,
         done: oneshot::Sender<Result<(), RuntimeError>>,
@@ -6973,7 +6991,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         }
                         let _ = done.send(Ok(()));
                     }
-                    Some(CodingRuntimeControl::StartLoop { generation: request_generation, prompt, done }) => {
+                    Some(CodingRuntimeControl::StartLoop { generation: request_generation, prompt, every, done }) => {
                         if !native_protocol || request_generation != generation || compaction_suspended {
                             let _ = done.send(Err(RuntimeError::Busy));
                             continue;
@@ -7004,7 +7022,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         while wakeup_rx.try_recv().is_ok() {}
                         if let Some(runtime) = resources.as_ref() {
                             next_controller_id = next_controller_id.wrapping_add(1);
-                            let next = LoopState::new(next_controller_id, prompt, runtime.config.loop_max_rounds);
+                            let next = LoopState::new(next_controller_id, prompt, runtime.config.loop_max_rounds).every(every);
                             runtime.loop_active.store(true, Ordering::Release);
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::LoopChanged(next.progress()));
                             loop_state = Some(next);
@@ -7698,7 +7716,12 @@ fn spawn_runtime_owner_with_optional_agent(
                                         }
                                     } else if let Some(state) = loop_state.as_mut().filter(|state| state.active) {
                                         if reason == StopReason::Stopped {
-                                            if let Some(wakeup) = pending_wakeup.take() {
+                                            // The person's cadence, or failing
+                                            // that whatever the model asked for
+                                            // — `LoopState::next_round` owns
+                                            // that choice so there is one
+                                            // answer to "when is the next one".
+                                            if let Some(wakeup) = state.next_round(pending_wakeup.take()) {
                                                 let cancel = state.cancel.clone();
                                                 let controller_id = state.id;
                                                 let tx = loop_fire_tx.clone();
@@ -9210,8 +9233,8 @@ impl RuntimeCommands for CodingRuntimeHandle {
             .await
             .map_err(|error| error.to_string())
     }
-    async fn start_loop(&self, prompt: String) -> Result<(), String> {
-        CodingRuntimeHandle::start_loop(self, prompt)
+    async fn start_loop(&self, prompt: String, every: Option<u32>) -> Result<(), String> {
+        CodingRuntimeHandle::start_loop(self, prompt, every)
             .await
             .map_err(|error| error.to_string())
     }
@@ -11207,7 +11230,7 @@ mod tests {
                 if condition == "tests pass"
         ));
 
-        runtime.handle.start_loop("watch CI").await.unwrap();
+        runtime.handle.start_loop("watch CI", None).await.unwrap();
         assert!(matches!(
             next_native_event(&mut runtime).await,
             CodingRuntimeEvent::GoalChanged(GoalProgress { active: false, .. })
@@ -12395,7 +12418,7 @@ mod tests {
         )
         .await;
 
-        handle.start_loop("watch CI").await.unwrap();
+        handle.start_loop("watch CI", None).await.unwrap();
         let _ = runtime_events.recv().await;
         handle
             .submit(UserInput::from("initial turn"))
@@ -12496,7 +12519,7 @@ mod tests {
             _adapter,
         ) = controller_test_runtime(Arc::new(TestProviderFactory { fail: false })).await;
 
-        handle.start_loop("watch CI").await.unwrap();
+        handle.start_loop("watch CI", None).await.unwrap();
         handle.submit(UserInput::from("first round")).await.unwrap();
         assert!(matches!(
             kernel_commands.recv().await,
@@ -12626,7 +12649,7 @@ mod tests {
             _adapter,
         ) = controller_test_runtime(Arc::new(TestProviderFactory { fail: false })).await;
 
-        handle.start_loop("watch CI").await.unwrap();
+        handle.start_loop("watch CI", None).await.unwrap();
         let _ = runtime_events.recv().await;
         handle
             .submit(UserInput::from("initial turn"))
@@ -12745,7 +12768,7 @@ mod tests {
             _adapter,
         ) = controller_test_runtime(Arc::new(TestProviderFactory { fail: false })).await;
 
-        handle.start_loop("watch CI").await.unwrap();
+        handle.start_loop("watch CI", None).await.unwrap();
         let _ = runtime_events.recv().await;
         handle
             .submit(UserInput::from("initial turn"))
@@ -13108,7 +13131,7 @@ mod tests {
             _adapter,
         ) = controller_test_runtime(Arc::new(TestProviderFactory { fail: false })).await;
 
-        handle.start_loop("watch CI").await.unwrap();
+        handle.start_loop("watch CI", None).await.unwrap();
         assert!(matches!(
             runtime_events.recv().await,
             Some(CodingRuntimeEvent::LoopChanged(LoopProgress {
@@ -14457,7 +14480,7 @@ mod tests {
             _adapter,
         ) = controller_test_runtime(Arc::new(TestProviderFactory { fail: false })).await;
 
-        handle.start_loop("watch CI").await.unwrap();
+        handle.start_loop("watch CI", None).await.unwrap();
         handle.submit(UserInput::from("first round")).await.unwrap();
         assert!(matches!(
             kernel_commands.recv().await,
@@ -15575,7 +15598,7 @@ mod tests {
             Some(wakeup_rx),
         );
 
-        handle.start_loop("watch CI").await.unwrap();
+        handle.start_loop("watch CI", None).await.unwrap();
         assert!(matches!(
             runtime_events.recv().await,
             Some(CodingRuntimeEvent::LoopChanged(LoopProgress {
@@ -15734,7 +15757,7 @@ mod tests {
 
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                match handle.start_loop("watch CI").await {
+                match handle.start_loop("watch CI", None).await {
                     Ok(()) => break,
                     Err(RuntimeError::Busy) => tokio::task::yield_now().await,
                     Err(error) => panic!("unexpected start_loop error: {error}"),
@@ -15882,7 +15905,7 @@ mod tests {
             Some(wakeup_rx),
         );
 
-        handle.start_loop("watch CI").await.unwrap();
+        handle.start_loop("watch CI", None).await.unwrap();
         let _ = runtime_events.recv().await;
         handle
             .submit(UserInput::from("initial turn"))

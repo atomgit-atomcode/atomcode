@@ -1456,7 +1456,7 @@ async fn a_loop_turn_can_schedule_its_next_pass() {
             .await
             .unwrap();
 
-    runtime.handle.start_loop("watch").await.unwrap();
+    runtime.handle.start_loop("watch", None).await.unwrap();
     runtime
         .handle
         .submit(UserInput::from("tick"))

@@ -355,6 +355,14 @@ pub(crate) struct LoopState {
     started_at: Instant,
     pub last_reason: Option<String>,
     pub cancel: CancellationToken,
+    /// The person's own cadence, in seconds.
+    ///
+    /// `None` is the model-paced loop this runtime has always had: a round ends,
+    /// and the loop goes on only if the model asked for another with
+    /// `schedule_wakeup`. With a cadence the next round is due whether it asked
+    /// or not — which is the whole difference, and why it is a field rather
+    /// than a second controller.
+    pub every: Option<u32>,
 }
 
 impl LoopState {
@@ -368,6 +376,35 @@ impl LoopState {
             started_at: Instant::now(),
             last_reason: None,
             cancel: CancellationToken::new(),
+            every: None,
+        }
+    }
+
+    /// The same loop, run on the person's cadence.
+    pub fn every(mut self, seconds: Option<u32>) -> Self {
+        self.every = seconds;
+        self
+    }
+
+    /// What starts the next round when this one ends, if anything does.
+    ///
+    /// **The person's cadence wins over the model's request**, and that is the
+    /// point of having said it: a loop told to run every five minutes that a
+    /// model could pull to thirty seconds is not a loop the person set the
+    /// cadence of. The model-paced loop is the one where they did not.
+    ///
+    /// `asked` is what the model requested this round, and it is taken by value
+    /// so a caller cannot go on holding a wakeup this decided to drop.
+    pub fn next_round(&self, asked: Option<WakeupRequest>) -> Option<WakeupRequest> {
+        match self.every {
+            Some(delay_seconds) => Some(WakeupRequest {
+                delay_seconds,
+                // The loop's own sentence, not whatever the model would rather
+                // do next: `/loop <this>` said what every round is.
+                prompt: self.label.clone(),
+                reason: "on the cadence you set".into(),
+            }),
+            None => asked,
         }
     }
 

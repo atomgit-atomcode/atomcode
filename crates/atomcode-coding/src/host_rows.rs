@@ -2740,6 +2740,38 @@ impl atomcode_harness::commands::CatalogCommand for LoopCommand {
     }
 }
 
+/// 固定间隔的上下界,秒。
+///
+/// 下界 10 秒:比这更密的不是「一遍遍地做」,是一个烧账号的循环 —— 每一轮都是
+/// 一次完整的模型请求。上界一天:再长就不是循环了,是定时任务,该由外面的
+/// scheduler 管,而这个进程不保证还活着(重启不恢复)。
+const LOOP_EVERY_MIN: u32 = 10;
+const LOOP_EVERY_MAX: u32 = 86_400;
+
+/// `/loop 5m <每轮要做的事>` 的前半:第一个词是不是一个间隔。
+///
+/// `30s` / `5m` / `1h`,越界与不认识的写法都是 `None` —— 那时它就是这句话的
+/// 第一个词,而不是一个被吃掉的间隔。
+///
+/// 后缀用 `strip_suffix` 而不是按字节切:每轮要做的事经常是中文,
+/// `split_at(len-1)` 会切在字符中间(`gates/tui-string-slice.sh` 记着这个仓库
+/// 为它死过四次)。
+fn every_seconds(word: &str) -> Option<u32> {
+    let (digits, per) = if let Some(d) = word.strip_suffix('s') {
+        (d, 1)
+    } else if let Some(d) = word.strip_suffix('m') {
+        (d, 60)
+    } else if let Some(d) = word.strip_suffix('h') {
+        (d, 3600)
+    } else {
+        return None;
+    };
+    let secs = digits.parse::<u32>().ok()?.checked_mul(per)?;
+    (LOOP_EVERY_MIN..=LOOP_EVERY_MAX)
+        .contains(&secs)
+        .then_some(secs)
+}
+
 /// `/loop` 的全部实体。提成函数的理由同 [`run_goal`]。
 async fn run_loop(
     runtime: &Arc<dyn crate::runtime::RuntimeCommands>,
@@ -2749,20 +2781,47 @@ async fn run_loop(
         match args.trim() {
             "" => Err("要一句话:每轮做什么。".into()),
             // 同 `/goal`:问「怎么用」的绝不能把东西跑起来。
-            word if means_help(word) => Ok("/loop <每轮要做的事> —— 一遍遍地做,直到收工。\n\
+            word if means_help(word) => Ok("/loop <每轮要做的事> —— 一遍遍地做,直到收工;\n\
+                 \u{20}   下一轮什么时候开始,由模型自己安排(schedule_wakeup)。\n\
+                 /loop 5m <每轮要做的事> —— 改成固定间隔(30s / 5m / 1h,10 秒到一天)。\n\
                  /loop stop(或 off/clear/cancel/reset/none)—— 收工。\n\
-                 跑到第几轮了,状态行一直在说。"
+                 跑到第几轮了,状态行一直在说。重启不恢复。"
                 .into()),
             // 同 `/goal`:收工的几种说法都认,理由也一样。
             word if means_stop(word) => {
                 runtime.stop_loop().await?;
                 Ok("循环停了。".into())
             }
-            prompt => {
-                runtime.start_loop(prompt.to_string()).await?;
-                Ok(format!("每轮都做:{prompt}"))
+            rest => {
+                let (first, tail) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+                let (prompt, every) = match every_seconds(first) {
+                    Some(secs) => (tail.trim(), Some(secs)),
+                    None => (rest, None),
+                };
+                if prompt.is_empty() {
+                    return Err(format!("`{first}` 是多久,可是每轮做什么?"));
+                }
+                // 循环一条 `/loop` 就是循环这个循环。它不会是谁想要的,
+                // 而它的代价是每一轮都再开一个。
+                if prompt.split_whitespace().next() == Some("/loop") {
+                    return Err("`/loop` 不能循环它自己。".into());
+                }
+                runtime.start_loop(prompt.to_string(), every).await?;
+                Ok(match every {
+                    None => format!("每轮都做:{prompt}"),
+                    Some(secs) => format!("每 {} 做一次:{prompt}", spoken_every(secs)),
+                })
             }
         }
+    }
+}
+
+/// 一个间隔,按人写它的方式说回去。
+fn spoken_every(secs: u32) -> String {
+    match secs {
+        s if s % 3600 == 0 => format!("{} 小时", s / 3600),
+        s if s % 60 == 0 => format!("{} 分钟", s / 60),
+        s => format!("{s} 秒"),
     }
 }
 
@@ -3267,6 +3326,153 @@ mod tests {
         );
     }
 
+    /// `/loop 5m <每轮要做的事>` 的解析,包括它**不**该认的那些。
+    ///
+    /// 反面才是理由:名单要是宽到吃掉第一个词,`/loop 5m 之内把测试跑绿` 里的
+    /// 「5m」就成了间隔,而人写的是一句话的开头。所以只认 `30s/5m/1h` 这三种
+    /// 后缀、只认纯数字、还要落在 10 秒到一天之间 —— 越界的写法退回去当词。
+    #[test]
+    fn an_interval_is_read_only_when_it_really_is_one() {
+        assert_eq!(super::every_seconds("30s"), Some(30));
+        assert_eq!(super::every_seconds("5m"), Some(300));
+        assert_eq!(super::every_seconds("1h"), Some(3600));
+        for word in [
+            "5",    // 没有单位
+            "m",    // 没有数字
+            "5x",   // 不认识的单位
+            "-5m",  // 负数
+            "5s",   // 低于下界:每 5 秒一次是在烧账号
+            "48h",  // 高于上界:那是定时任务
+            "每天", // 不是这个写法
+            "5米",  // 多字节后缀,按字节切会切在字符中间
+        ] {
+            assert_eq!(super::every_seconds(word), None, "{word:?} 不是间隔");
+        }
+    }
+
+    /// 人说了间隔,那间隔就是节奏 —— 模型这一轮要的不算。
+    ///
+    /// 这条是这个功能的全部意思:一个被告知「每五分钟一次」的循环,
+    /// 要是模型能把它拽到三十秒,那这个节奏就不是人定的。反过来,
+    /// 没说间隔的时候仍然是模型自己安排(它不要,循环就结束)。
+    #[test]
+    fn the_cadence_a_person_set_wins_over_what_the_model_asked_for() {
+        use crate::controllers::{LoopState, WakeupRequest};
+        let asked = WakeupRequest {
+            delay_seconds: 30,
+            prompt: "别的事".into(),
+            reason: "模型自己要的".into(),
+        };
+
+        let paced = LoopState::new(1, "看一眼 CI".into(), 0).every(Some(300));
+        let next = paced.next_round(Some(asked.clone())).expect("还有下一轮");
+        assert_eq!(next.delay_seconds, 300, "人定的间隔");
+        assert_eq!(next.prompt, "看一眼 CI", "每轮做的还是那句话");
+        // 而且模型一次都不要的时候,下一轮照样来 —— 没有间隔的循环这时就结束了。
+        assert!(paced.next_round(None).is_some(), "节奏不靠模型开口");
+
+        let self_paced = LoopState::new(2, "看一眼 CI".into(), 0);
+        assert_eq!(
+            self_paced.next_round(Some(asked)).map(|w| w.delay_seconds),
+            Some(30),
+            "没说间隔时,模型自己安排"
+        );
+        assert!(
+            self_paced.next_round(None).is_none(),
+            "而它不要下一轮,循环就到此为止"
+        );
+    }
+
+    /// 接线:间隔真的传到运行时,而不只是被解析出来。
+    #[tokio::test]
+    async fn a_loop_with_a_cadence_passes_it_to_the_runtime() {
+        let runtime = std::sync::Arc::new(Looped::default());
+        let dynamic: Arc<dyn crate::runtime::RuntimeCommands> = runtime.clone();
+
+        super::run_loop(&dynamic, "5m 看一眼 CI")
+            .await
+            .expect("起了");
+        super::run_loop(&dynamic, "看一眼 CI").await.expect("起了");
+        assert_eq!(
+            *runtime.started.lock().unwrap(),
+            vec![
+                ("看一眼 CI".to_string(), Some(300)),
+                ("看一眼 CI".to_string(), None),
+            ],
+            "带间隔的把间隔带过去了,不带的仍然是模型自己安排"
+        );
+
+        // 间隔后面没话,和循环它自己,都不许起。
+        assert!(super::run_loop(&dynamic, "5m").await.is_err());
+        assert!(super::run_loop(&dynamic, "/loop 看一眼").await.is_err());
+        assert_eq!(runtime.started.lock().unwrap().len(), 2, "两条都没起");
+    }
+
+    /// 驱动循环决定「下一轮什么时候开始」时,走的是 `LoopState::next_round`。
+    ///
+    /// **读源码,而不是跑一次。** 要看见固定间隔真的把下一轮开起来,得等满一个
+    /// 间隔,而下界是 10 秒 —— 那条判据判的是时钟走没走,不是这个决定对不对,
+    /// 而决定本身上面那条已经钉死了。这条钉的是唯一还没钉住的东西:
+    /// 那个决定有没有被用上。
+    ///
+    /// 会判红的改法正是当初的写法:回到 `if let Some(wakeup) = pending_wakeup.take()`
+    /// —— 那样固定间隔会被解析、被存进 `LoopState`,然后在模型不开口的那一轮
+    /// 静静地什么都不做,循环就结束了。人看到的是「每 5 分钟做一次」之后跑了一轮。
+    #[test]
+    fn the_driver_loop_asks_the_loop_when_the_next_round_is_due() {
+        let source = include_str!("runtime.rs");
+        assert!(
+            source.contains("state.next_round(pending_wakeup.take())"),
+            "回合结束时要问 LoopState 下一轮什么时候开始"
+        );
+        assert!(
+            !source.contains("if let Some(wakeup) = pending_wakeup.take()"),
+            "不能绕过 next_round 直接拿模型要的那个 —— 人定的节奏会被跳过"
+        );
+    }
+
+    /// 只记下 `/loop` 拿什么起过的运行时。
+    #[derive(Default)]
+    struct Looped {
+        started: std::sync::Mutex<Vec<(String, Option<u32>)>>,
+    }
+
+    #[async_trait]
+    impl crate::runtime::RuntimeCommands for Looped {
+        async fn start_loop(&self, prompt: String, every: Option<u32>) -> Result<(), String> {
+            self.started.lock().unwrap().push((prompt, every));
+            Ok(())
+        }
+        async fn start_goal(&self, _: String) -> Result<(), String> {
+            unreachable!("not this command")
+        }
+        async fn stop_goal(&self) -> Result<(), String> {
+            unreachable!("not this command")
+        }
+        async fn pause_goal(&self) -> Result<(), String> {
+            unreachable!("not this command")
+        }
+        async fn stop_loop(&self) -> Result<(), String> {
+            unreachable!("not this command")
+        }
+        async fn queue_local_context(&self, _: String) -> Result<(), String> {
+            unreachable!("not this command")
+        }
+        async fn pending_policy(&self) -> Option<atomcode_kernel::event::PolicyIntervention> {
+            None
+        }
+        async fn resolve_policy(
+            &self,
+            _: u64,
+            _: atomcode_kernel::event::PolicyRecoveryAction,
+        ) -> Result<(), String> {
+            unreachable!("not this command")
+        }
+        async fn change_directory(&self, _: std::path::PathBuf) -> Result<(), String> {
+            unreachable!("not this command")
+        }
+    }
+
     /// A runtime that only remembers where it was pointed.
     ///
     /// The whole claim of `/worktree` is that it *goes* somewhere, and where it
@@ -3290,7 +3496,7 @@ mod tests {
         async fn pause_goal(&self) -> Result<(), String> {
             unreachable!("not this command")
         }
-        async fn start_loop(&self, _: String) -> Result<(), String> {
+        async fn start_loop(&self, _: String, _: Option<u32>) -> Result<(), String> {
             unreachable!("not this command")
         }
         async fn stop_loop(&self) -> Result<(), String> {
