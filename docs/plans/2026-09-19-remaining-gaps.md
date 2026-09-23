@@ -190,10 +190,15 @@ FrontEnd 再传进 prepare 的，所以它一直是对的。
 ### E. 自用与翻默认
 
 - [ ] **E1 真模型冒烟**：codingplan-crypto 临时拷贝流程，跑完还原，**绝不提交**
-- [ ] **E2 翻 `Screen::Default`**：`cli/src/lib.rs:112` 一行，`:361-371` 的断言同步改，
+- [x] **E2 翻 `Screen::Default`**(2026-09-23,`screen_for` 里 `Screen::Default => Screen::Rows`
+      一处;`--classic` 与 `[ui] screen = "classic"` 是逃生口,headless 不受影响)。原文:：`cli/src/lib.rs:112` 一行，`:361-371` 的断言同步改，
       tuix 留 `--classic` soak
 
 ### F. 删（E 之后）
+
+> **2026-09-23**:F1 的前置「共享当前终端会话那一组」已经补齐,见
+> [`docs/handoff-tui-default-2026-09-23.md`](../handoff-tui-default-2026-09-23.md)。
+> `tui_elsewhere::CLASSIC_ONLY` 现在是空的。
 
 - [ ] **F1 删 tuix**：`main.rs` 的 26 处 `--classic` 分支（**唯一真卡点**）+ workspace member
       + `cli/Cargo.toml:21,34` 的 `distro-pm` 转发。daemon 那 4 行、`acp/commands.rs:5`
@@ -357,8 +362,11 @@ FrontEnd 再传进 prepare 的，所以它一直是对的。
       位文案的判据并成一条「每一页都自己画」。没有占位的占位机制，是被自己的测试养
       活着的第二套画法。
       判据 3 条（tui 2 + cli 1），证伪 6 种。
-- [ ] G2 `/resume` 预览 + 搜索 + 删除 —— 给 `overlay.rs:32` 的 `Overlay` trait 加 preview
-      概念，不是单做一个特化 picker（否则 `/rewind`、`/model` 将来要同样的东西时再加一次）
+- [x] **G2 `/resume` 预览 + 删除**(2026-09-23)。搜索本来就有。原计划写的是「给 `Overlay`
+      trait 加 preview 概念」——**没这么做**:`/resume` 早已不是 overlay 而是面板(`afa2f04d`),
+      所以预览是面板底下的几行,删除是面板里按两次 Delete(唯一会扔东西的手势)。
+      契约加 `DeleteSession` 与 `PreviewSession`;预览从会话日志里读,不打开那个会话;
+      被撤回的回合不算。异步两条规矩:每行只问一次、答案回来时人走开了就作废。
 - [~] **G3 这条记错了（2026-09-20 用判据核实）。** 原文写「只在内存里，重启即丢」，
       依据是那个 push 点——但没看它**从哪儿** push：历史是从**事实**折出来的
       （`tui/host.rs` 的 `Host::fold`，`SessionEvent::UserMessage` 那一支），而
@@ -379,7 +387,14 @@ FrontEnd 再传进 prepare 的，所以它一直是对的。
       干等的那个状态。
       **做它本身越了序**：G 节按决策排在翻默认之后、按自用暴露的顺序做，这条是
       在那个顺序之外做的（小、已验证、不挡任何东西）。不认可就 revert。
-- [ ] G5 `/view` 搜索 + 语法色 ｜ G6 `/model` 分组与能力标注 ｜ G7 `/cd` 书签
+- [~] **G5 `/view` 搜索 + 语法色 —— 用户 2026-09-23 判定不做**。
+- [x] **G6 `/model` 分组**(2026-09-23):一个账号一条不可选的小标题,光标跳过它、
+      鼠标不接它;下钻进某个账号时不画标题。顺带修了一个真 bug——切到模型页那一刻
+      光标停在标题上,回车没反应。「能力标注」仍取决于宿主往 `about` 里放什么,未做。
+- [x] **G7 `/cd` 书签**(2026-09-23):标过的目录排最前,其次是最近在里面干过活的
+      (从会话目录折出来,不另存),然后才是浏览。`/cd pin|unpin`,书签存 `[ui] cd_bookmarks`。
+      顺带修了一个真 bug——裸 `/cd` 原来拿**会话 id** 当路径去读(`client.root()` 不是
+      工作目录),所以它基本只会报「读不了」。
 
 ### J. `/plugin`（2026-09-20，推翻决策 9 的后半）
 
