@@ -1727,6 +1727,64 @@ async fn configured_request_options_reach_the_provider_and_follow_a_model_switch
     runtime.handle.shutdown().await.unwrap();
 }
 
+/// A model switch is something the model is told happened, not only who it is now.
+///
+/// The persona's identity line follows the switch, so the model always knows the
+/// model it is. What it cannot know from that is that the conversation above was
+/// written by another one — "did I just switch?" had no answer. The switch is
+/// said once, where it happened: after the last turn on the old model and before
+/// the first message on the new one. Choosing the model already in use changes
+/// nothing, so it says nothing.
+///
+/// Negative control: drop the `note_model_switch` call from the patch branch of
+/// `ReassembleProvider` and the second request carries no such line.
+async fn a_model_switch_is_told_to_the_model_where_it_happened() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let start = start(env.project.path(), &recorder, SessionMode::Fresh);
+    let same = start.agent.clone();
+    let mut next = start.agent.clone();
+    next.model = "recorder-two".into();
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+
+    turn(&mut runtime, "hello").await;
+    runtime.handle.reassemble_provider(same).await.unwrap();
+    runtime.handle.reassemble_provider(next).await.unwrap();
+    turn(&mut runtime, "again").await;
+
+    let seen = recorder.last_turn_request();
+    let told: Vec<usize> = seen
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role != Role::System && m.text.contains("switched from"))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        told.len(),
+        1,
+        "the switch is said once, and choosing the same model says nothing: {seen:#?}"
+    );
+    let note = &seen[told[0]];
+    assert!(
+        note.text.contains("from `recorder` to `recorder-two`") && note.synthetic,
+        "the note names the model it switched from and is not the person's word: {note:#?}"
+    );
+    let again = seen
+        .iter()
+        .rposition(|m| m.role == Role::User && m.text == "again")
+        .expect("the second turn's message");
+    let first_reply = seen
+        .iter()
+        .position(|m| m.role == Role::Assistant)
+        .expect("the first turn's reply");
+    assert!(
+        first_reply < told[0] && told[0] < again,
+        "the switch belongs between the old model's reply and the new model's first message: \
+         {seen:#?}"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
 /// The UI language does not reach the persona.
 ///
 /// `language = "zh_CN"` in `config.toml` chooses what the front end is drawn in.
@@ -4391,6 +4449,7 @@ mod criteria {
         the_catalog_is_the_skills_the_driver_named,
         memory_is_shown_only_when_switched_on,
         configured_request_options_reach_the_provider_and_follow_a_model_switch,
+        a_model_switch_is_told_to_the_model_where_it_happened,
         the_ui_language_does_not_reach_the_persona,
         a_permission_rule_refuses_what_it_denies,
         a_round_budget_ends_the_turn,

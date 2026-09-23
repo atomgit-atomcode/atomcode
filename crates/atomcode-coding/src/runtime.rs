@@ -5474,6 +5474,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 if let Some(snapshot) = runtime.parts.snapshot_hook() {
                                     snapshot.set_model_attribution(&next.provider_name, &next.model);
                                 }
+                                note_model_switch(&runtime, &runtime.config, &next);
                                 runtime.config = next;
                                 let provider = runtime.config.provider_name.clone();
                                 let model = runtime.config.model.clone();
@@ -5625,6 +5626,9 @@ fn spawn_runtime_owner_with_optional_agent(
                                 }
                                 runtime.config = next;
                                 agent = Some(candidate);
+                                // Before the pending prompt is replayed, so the
+                                // note precedes the first message on the new model.
+                                note_model_switch(&runtime, &old_config, &runtime.config);
                                 generation = generation.wrapping_add(1);
                                 event_generation.store(generation, Ordering::Release);
                                 pending_steer_acknowledgements.clear();
@@ -9381,6 +9385,39 @@ fn live_root_agent(runtime: &RuntimeResources) -> Option<Arc<atomcode_harness::a
         .list()
         .into_iter()
         .find(|agent| agent.parent().is_none())
+}
+
+/// Tell the conversation's agent that its model changed.
+///
+/// The persona's identity line already follows a switch, so the model knows
+/// what it is now; what it cannot tell from that is that the replies above were
+/// written by another model. `note` puts that where it happened — into the log
+/// at once when idle, ahead of the next turn when one is running — as a logged
+/// fact, so a resumed session still says it. Choosing the model already in use
+/// changes nothing and says nothing.
+fn note_model_switch(runtime: &RuntimeResources, from: &CodingAgentConfig, to: &CodingAgentConfig) {
+    if from.provider_name == to.provider_name && from.model == to.model {
+        return;
+    }
+    let Some(agent) = live_root_agent(runtime) else {
+        return;
+    };
+    let name = |config: &CodingAgentConfig| {
+        if from.provider_name == to.provider_name {
+            format!("`{}`", config.model)
+        } else {
+            format!("`{}` (provider {})", config.model, config.provider_name)
+        }
+    };
+    let (from, to) = (name(from), name(to));
+    agent.note(
+        format!(
+            "<system-reminder>The model for this conversation was switched from {from} to \
+             {to}. The replies above this point were written by {from}; from here on you \
+             are {to}.</system-reminder>"
+        ),
+        atomcode_harness::session::InjectionOrigin::Reminder,
+    );
 }
 
 /// Commit `events` into `live`'s log, in order. The session store appends each
@@ -17668,7 +17705,18 @@ mod tests {
             .await
             .unwrap();
         let after_second_reassemble = runtime.handle.snapshot().await.unwrap();
-        assert_eq!(visible(&before), visible(&after_second_reassemble));
+        // The conversation is kept whole; what follows it is only the two
+        // switches, each told to the model where it happened.
+        let after = visible(&after_second_reassemble);
+        let (kept, added) = after.split_at(visible(&before).len().min(after.len()));
+        assert_eq!(visible(&before), kept);
+        assert_eq!(added.len(), 2, "{added:#?}");
+        assert!(
+            added
+                .iter()
+                .all(|message| message.synthetic && message.text.contains("switched from")),
+            "{added:#?}"
+        );
         let persona = after_second_reassemble
             .messages
             .iter()
