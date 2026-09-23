@@ -15,6 +15,11 @@ use atomcode_coding::{
 };
 use atomcode_harness::session::SessionEvent;
 use atomcode_host_api::{HostCommand, HostConnection, HostError, HostEvent, HostReply};
+// The two `/mcp` criteria below spawn a `sh` server, so they are `#[cfg(unix)]`
+// — and their wire types are gated the same way, because a Windows build would
+// otherwise fire unused_imports for them.
+#[cfg(unix)]
+use atomcode_host_api::{McpAuth, McpServerState, McpTransport};
 use atomcode_kernel::event::{AgentCommand, AgentEvent};
 use atomcode_kernel::message::{Message, Role};
 use atomcode_kernel::provider::{ChatOptions, LlmProvider, ReasoningEffort};
@@ -173,6 +178,104 @@ async fn connected_full(
     config: Option<Arc<dyn atomcode::host::HostConfig>>,
     skill_dirs: Vec<std::path::PathBuf>,
 ) -> (HostConnection, Arc<FrontEnd>) {
+    started(env, subagents, config, skill_dirs, false).await
+}
+
+/// `connected_full`, with MCP on and one project server behind it.
+///
+/// The two `/mcp` criteria are about a session that HAS servers, so the server
+/// here is a real one: `fs` in the project's own `.mcp.json` — the file both
+/// answers are expected to point back at — with a stdio server behind it that
+/// offers one tool. That means trusting the project, and the trust is this
+/// test's own store (`ATOMCODE_MCP_TRUST_STORE`), never the machine's.
+#[cfg(unix)]
+async fn connected_mcp(env: &Env) -> (HostConnection, Arc<FrontEnd>) {
+    std::fs::write(
+        env.project.path().join(".mcp.json"),
+        serde_json::json!({
+            "mcpServers": {
+                "fs": {
+                    "command": "sh",
+                    "args": ["-c", MCP_SERVER_SCRIPT],
+                    "timeout_ms": 10_000,
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    // The store is a file under this test's own home, so the machine's real
+    // trust store is neither read nor written; `#[serial]` on the two tests
+    // below keeps them from racing each other on the variable.
+    std::env::set_var(
+        "ATOMCODE_MCP_TRUST_STORE",
+        env._home.path().join("mcp_trust.json"),
+    );
+    atomcode_capabilities::mcp::trust::trust_project(env.project.path()).unwrap();
+
+    started(env, SubagentPolicy::Disabled, None, Vec::new(), true).await
+}
+
+/// A minimal MCP server over stdio, one `echo` tool, as the script `sh -c` runs.
+///
+/// A script rather than capabilities' test binary — cargo only builds that for
+/// that crate's tests — and inline rather than a file of its own, so a test that
+/// spawns it has nothing to clean up.
+#[cfg(unix)]
+const MCP_SERVER_SCRIPT: &str = r#"while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"fs","version":"0"}}}\n' "$id" ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"echo back","inputSchema":{"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}}]}}\n' "$id" ;;
+    *'"method":"tools/call"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"echo:from-server"}]}}\n' "$id" ;;
+    *'"id":'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+  esac
+done"#;
+
+/// The tools `McpTools` says this server has on the model, once they are there.
+///
+/// The runtime is up before its servers are: `CodingRuntime::start` returns with
+/// the connection still in flight, and a server's tools are published when it
+/// lands. So this waits rather than reads, and fails on the test's own terms
+/// instead of on a bare timeout.
+#[cfg(unix)]
+async fn tools_on_the_model(
+    connection: &HostConnection,
+    session: &str,
+    server: &str,
+) -> Vec<String> {
+    // 15s: longer than the connect timeout the file sets (10s), so a slow but
+    // healthy connect is not outrun by this wait, and short enough that a broken
+    // one fails inside the default 30s slow-test threshold.
+    for _ in 0..150 {
+        let listed = connection
+            .control
+            .call(HostCommand::McpTools {
+                session: session.into(),
+                server: server.into(),
+            })
+            .await;
+        if let Ok(HostReply::McpTools { tools }) = listed {
+            if !tools.is_empty() {
+                return tools;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("`{server}` never put a tool on the model");
+}
+
+async fn started(
+    env: &Env,
+    subagents: SubagentPolicy,
+    config: Option<Arc<dyn atomcode::host::HostConfig>>,
+    skill_dirs: Vec<std::path::PathBuf>,
+    mcp: bool,
+) -> (HostConnection, Arc<FrontEnd>) {
     // The configuration source goes to `connect`, not onto the front end: the
     // front end no longer carries it (2026-09-18, the adapter moved here).
     let host_config = config;
@@ -192,7 +295,7 @@ async fn connected_full(
             tools: true,
             skill_dirs: Some(skill_dirs),
             plugin_skill_dirs: Vec::new(),
-            mcp: false,
+            mcp,
             extra_mcp_servers: Vec::new(),
             external_subagents: Vec::new(),
             memory: false,
@@ -1964,6 +2067,123 @@ async fn mcp_and_a_reload_are_host_controls_on_the_live_session() {
     ));
     connection.commands.send(message("still here")).unwrap();
     through_turn(&mut connection).await;
+}
+
+/// `/mcp`'s list: every configured server, with where it came from and how many
+/// tools the model got from it.
+///
+/// `McpStatus` cannot answer this: it reports only what the running session
+/// actually has, so a server switched off in the file is not in it at all — and
+/// the tool count is the model's, not the file's.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial]
+async fn mcp_manage_lists_servers_with_source_and_tool_count() {
+    let env = env();
+    let (connection, _front_end) = connected_mcp(&env).await;
+    let session = connection.session.clone();
+
+    // The count this asserts on is the model's own, read from the session that
+    // has it — so this waits for the connection rather than sleeping past it.
+    let tools = tools_on_the_model(&connection, &session, "fs").await;
+
+    let Ok(HostReply::McpRows { rows }) = connection
+        .control
+        .call(HostCommand::McpManage {
+            session: session.clone(),
+        })
+        .await
+    else {
+        panic!("the management list answers with rows");
+    };
+    let row = rows
+        .iter()
+        .find(|row| row.name == "fs")
+        .unwrap_or_else(|| panic!("the `.mcp.json` server is listed: {rows:#?}"));
+    assert_eq!(
+        row.source, "project",
+        "it came from this project's own file"
+    );
+    assert_eq!(
+        row.state,
+        McpServerState::Connected,
+        "the server that answered is the state the row reports"
+    );
+    assert_eq!(
+        row.tool_count,
+        tools.len(),
+        "the row counts what the model has: {tools:?}"
+    );
+    // The file it is defined in, so a screen can say where the switch lives.
+    let defined_in = env.project.path().join(".mcp.json").display().to_string();
+    assert_eq!(
+        row.config_path.as_deref(),
+        Some(defined_in.as_str()),
+        "the row says which file it is defined in"
+    );
+}
+
+/// `/mcp`'s detail: how that server is reached, and whether it authenticates —
+/// the two things a person reads before deciding whether to touch it.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial]
+async fn mcp_detail_reports_transport_and_auth() {
+    let env = env();
+    let (connection, _front_end) = connected_mcp(&env).await;
+    let session = connection.session.clone();
+    // The same session the list test judges, so "the same server" is the server
+    // that is actually up rather than one the mapping invented.
+    let tools = tools_on_the_model(&connection, &session, "fs").await;
+
+    let Ok(HostReply::McpDetail { detail }) = connection
+        .control
+        .call(HostCommand::McpDetail {
+            session: session.clone(),
+            server: "fs".into(),
+        })
+        .await
+    else {
+        panic!("the detail answers");
+    };
+    assert_eq!(detail.name, "fs");
+    match &detail.transport {
+        McpTransport::Stdio { command, args, .. } => {
+            assert_eq!(command, "sh", "the program the file names");
+            assert!(!args.is_empty(), "and the arguments it is run with");
+        }
+        other => panic!("a `command` in the file is a stdio server: {other:?}"),
+    }
+    assert!(
+        matches!(&detail.auth, McpAuth::None),
+        "this entry configures no OAuth: {:?}",
+        detail.auth
+    );
+    assert_ne!(
+        detail.state,
+        McpServerState::Disabled,
+        "it is enabled in the file"
+    );
+    assert_eq!(
+        detail.tool_count,
+        tools.len(),
+        "the detail counts what the model has: {tools:?}"
+    );
+    let defined_in = env.project.path().join(".mcp.json").display().to_string();
+    assert_eq!(detail.config_path.as_deref(), Some(defined_in.as_str()));
+
+    // A name nothing configures is `NotFound` rather than a page of blanks: the
+    // list is where a person finds the names that do exist.
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::McpDetail {
+                session,
+                server: "not-a-server".into(),
+            })
+            .await,
+        Err(HostError::NotFound)
+    );
 }
 
 /// Every reason a provider cannot serve has an answer for the person, and only
