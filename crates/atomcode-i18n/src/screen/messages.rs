@@ -1360,6 +1360,7 @@ pub enum Msg<'a> {
     AppWasNotOn,
     AppPairTitle,
     AppPairScan,
+    AppPairType,
     /// 取中继客户端要先登录(它在受保护的 release 里)。
     RelayNeedsLogin,
     RelayUnsupportedPlatform {

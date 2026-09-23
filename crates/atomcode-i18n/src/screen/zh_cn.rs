@@ -812,7 +812,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::AppStopped => "手机已经连不到这个会话了。".into(),
         Msg::AppWasNotOn => "本来手机就连不到。".into(),
         Msg::AppPairTitle => "配对手机".into(),
-        Msg::AppPairScan => "用 App 扫这张码,或者手打下面这行。".into(),
+        Msg::AppPairScan => "在 GitCode App 里:首页 → AtomCode → 扫一扫,对准这张码。".into(),
+        Msg::AppPairType => "扫不了的话,把这串口令粘进 App:".into(),
         Msg::RelayNeedsLogin => "中继客户端要从登录后的 release 里取——先 /login".into(),
         Msg::RelayUnsupportedPlatform { os, arch, dir } => {
             format!("{os}/{arch} 没有发布中继客户端——自己编一个放到 {dir}").into()

@@ -54,6 +54,9 @@ pub use runtime_host::{
     gather_plugin_skill_dirs_for, installed_plugin_hook_source,
 };
 pub(crate) mod live_api;
+// 远端那一侧的「模式」徽标就是这个值。启动器(新 tui 的共享)要能核对它确实跟着
+// 这台机器上的会话走——读得到才判得了。
+pub use live_api::live_current_approval_mode;
 pub use live_api::live_set_mode;
 pub use live_api::live_set_working_dir;
 pub use live_api::live_switch_session;

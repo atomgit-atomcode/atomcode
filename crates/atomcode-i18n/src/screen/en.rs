@@ -839,7 +839,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::AppStopped => "The phone app can no longer reach this session.".into(),
         Msg::AppWasNotOn => "It was not reachable from the phone.".into(),
         Msg::AppPairTitle => "Pair the phone".into(),
-        Msg::AppPairScan => "Scan this in the app, or type the line below.".into(),
+        Msg::AppPairScan => "In the GitCode app: home → AtomCode → scan this code.".into(),
+        Msg::AppPairType => "Or paste this pairing password into the app:".into(),
         Msg::RelayNeedsLogin => {
             "the relay client is fetched from a signed-in release — run /login first".into()
         }

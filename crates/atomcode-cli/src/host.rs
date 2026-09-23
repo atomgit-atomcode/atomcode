@@ -166,6 +166,10 @@ pub fn connect(
             // 共享着的话,网页端照这条事件画。挂没挂在那一侧判断,这里不设第二个
             // 开关——两个「现在共享着吗」的答案迟早会不一致。
             crate::tui_share::publish(&sequenced);
+            // 模式换了也要单独说一声,理由同 attach:远端的徽标读的是那个全局值。
+            if let CodingRuntimeEvent::ModeChanged { mode } = &sequenced.event {
+                crate::tui_share::mode_changed(*mode);
+            }
             match sequenced.event {
                 CodingRuntimeEvent::RuntimeStopped(_) => break,
                 CodingRuntimeEvent::SessionChanged(changed) => {

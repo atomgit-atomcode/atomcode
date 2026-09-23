@@ -2262,6 +2262,35 @@ model = "vendor-a"
         }
     }
     assert!(echoed, "the viewer sees what was typed here");
+    // 远端那一侧的「模式」徽标读的是 daemon 里的一个全局值,不是事件流。挂上时
+    // 它就该对,之后跟着换——否则手机上写着 build,而这台机器在 plan 里。
+    assert_eq!(
+        atomcode_daemon::live_current_approval_mode(),
+        atomcode_coding::RuntimeMode::Build,
+        "挂上时就是这个会话真正在的模式"
+    );
+    connection
+        .control
+        .call(HostCommand::SetMode {
+            session: connection.session.clone(),
+            mode: atomcode_host_api::Mode::Plan,
+        })
+        .await
+        .expect("switching mode");
+    let mut badge = atomcode_daemon::live_current_approval_mode();
+    for _ in 0..50 {
+        if badge == atomcode_coding::RuntimeMode::Plan {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        badge = atomcode_daemon::live_current_approval_mode();
+    }
+    assert_eq!(
+        badge,
+        atomcode_coding::RuntimeMode::Plan,
+        "换了模式,远端的徽标跟着换"
+    );
+
     assert!(events > 1, "and the turn it started: {events} events");
 
     assert!(

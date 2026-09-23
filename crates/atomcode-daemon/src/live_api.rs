@@ -52,7 +52,7 @@ pub(crate) struct LiveGoalSnapshot {
 
 /// 读取当前生效的审批模式。`pub(crate)` 以便 `/chat` 路径（非 sync webui）也据此
 /// 选择 PermissionDecider——否则模式 pill 只在 sync 模式生效。
-pub(crate) fn live_current_approval_mode() -> ApprovalMode {
+pub fn live_current_approval_mode() -> ApprovalMode {
     *LIVE_APPROVAL_MODE.lock().unwrap_or_else(|e| e.into_inner())
 }
 

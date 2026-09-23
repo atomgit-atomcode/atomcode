@@ -89,6 +89,12 @@ pub async fn attach(config_path: &std::path::Path) -> Result<(), String> {
     )
     .map_err(|error| format!("{error:?}"))?;
     *bound().lock().expect("binding poisoned") = Some(binding);
+    // 远端那边的「模式」徽标读的是 daemon 里的一个全局值,不是事件流。挂上时先
+    // 把当前模式告诉它,否则手机和网页顶上写的是默认值——看着像你没在 plan 里,
+    // 而你在。
+    if let Ok(mode) = handle.mode().await {
+        atomcode_daemon::live_set_mode(mode);
+    }
     Ok(())
 }
 
@@ -113,6 +119,14 @@ pub fn publish(event: &SequencedRuntimeEvent) {
         return;
     };
     let _ = atomcode_daemon::native_live::publish(binding, event.clone());
+}
+
+/// 模式换了,远端的徽标跟着换。没共享就什么也不做。
+pub fn mode_changed(mode: atomcode_coding::RuntimeMode) {
+    if !sharing() {
+        return;
+    }
+    atomcode_daemon::live_set_mode(mode);
 }
 
 /// 终端里打的这句话,让网页端也看见。
@@ -487,6 +501,25 @@ mod tests {
         }
     }
 
+    /// **码里是原串,手输的是它的 base64**:App 的扫一扫读链接本身,手输框收的是
+    /// 经典界面称作「口令」的那串 base64。印反了,扫得出来的人没事,扫不出来的人
+    /// 配不上对——这正是只有手输的人才会撞上的那种错。
+    #[test]
+    fn the_password_is_the_link_encoded_not_the_link() {
+        let uri = pair_uri("https://relay.example", "tok-1", None);
+        let password = password_for(&uri);
+        assert_ne!(password, uri, "口令不是链接本身");
+        use base64::Engine;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(password.as_bytes())
+            .expect("口令是 base64");
+        assert_eq!(
+            String::from_utf8(decoded).expect("解出来是文本"),
+            uri,
+            "解开之后正是那条配对链接"
+        );
+    }
+
     /// 手机扫到的那串里,地址和机器名都得是编码过的——里面有 `:` `/` 和中文时,
     /// 不编码就是另一个链接。
     #[test]
@@ -520,14 +553,29 @@ mod tests {
     }
 }
 
+/// 手输配对用的那串「口令」:配对链接的 base64。与经典界面同一个形状——App 认的
+/// 是这个,不是链接本身。
+pub(crate) fn password_for(uri: &str) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(uri.as_bytes())
+}
+
 /// 扫码配对那一屏:一张码、底下是同一串文字(码扫不出来时还能手打)。
 ///
 /// 用向导而不是回一行字:二维码是一张位图,得按格子画,而且码要用扫码器认得的
 /// 颜色——不是主题色(`docs/adr/0027`)。向导已经为登录那一步把这件事做对了。
 fn pairing_overlay(uri: String) -> Arc<atomcode_tui::wizard::Wizard> {
     use atomcode_tui::wizard::{StepDef, StepKind, Wizard};
-    let mut step = StepDef::new("pair", tr(SMsg::AppPairTitle), StepKind::Note)
-        .saying(vec![tr(SMsg::AppPairScan).into_owned(), uri.clone()]);
+    // **码里是原串,手输的是它的 base64**。两者不是一回事:App 的「扫一扫」读
+    // `atomcode-link://pair?…` 本身,而它的手输框收的是经典界面称作「口令」的
+    // 那串 base64。印错一个,扫得出来的人没事,扫不出来的人配不上对。
+    let password = password_for(&uri);
+    let mut step = StepDef::new("pair", tr(SMsg::AppPairTitle), StepKind::Note).saying(vec![
+        tr(SMsg::AppPairScan).into_owned(),
+        String::new(),
+        tr(SMsg::AppPairType).into_owned(),
+        password,
+    ]);
     if let Some(code) = atomcode_tui::qr::code(&uri) {
         step = step.showing(code);
     }
