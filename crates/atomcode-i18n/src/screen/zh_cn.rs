@@ -280,6 +280,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CopiedLines { lines } => format!("复制了 {lines} 行").into(),
         Msg::SaveNothingYet => "这段对话还没有内容可存".into(),
         Msg::SavedTo { path } => format!("存到 {path}").into(),
+        Msg::SaveWouldOverwrite { path } => format!("{path} 已经在那儿了,而且不是 .md —— 换个名字,或者自己先删掉").into(),
         Msg::SaveFailed { error } => format!("存不下:{error}").into(),
         Msg::AllowanceNear { label, percent } => format!("{label}额度已用 {percent}%").into(),
         Msg::AllowanceNearWithReset {

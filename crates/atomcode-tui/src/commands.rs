@@ -314,7 +314,7 @@ fn view_file_within(
 
 fn take_away_catalogue() -> Vec<Command> {
     vec![
-        Command::said_taking("copy", "[N|all]".into(), t(Msg::CmdAboutCopy)),
+        Command::said_taking("copy", "[N|all|msg]".into(), t(Msg::CmdAboutCopy)),
         Command::said_taking("save", t(Msg::CmdTakesFilename), t(Msg::CmdAboutSave)),
         Command::said_taking("view", t(Msg::CmdTakesPathRequired), t(Msg::CmdAboutView))
             .requiring(),
@@ -339,7 +339,24 @@ impl CommandSet for TakeAwayCommands {
             // and dragging across a wrapped terminal is how it ends up with
             // line numbers and gutters in it.
             "copy" => {
-                let blocks = code_blocks(&last_answer(&client.events()));
+                let answer = last_answer(&client.events());
+                // `msg` takes the whole reply, prose and all — the other half of
+                // what people do with an answer. A block is for running; the
+                // whole message is for pasting into an issue or a review, and
+                // that is exactly the case where dragging across a wrapped
+                // terminal picks up gutters and fold marks.
+                if args.trim() == "msg" {
+                    if answer.trim().is_empty() {
+                        return Outcome::Refused(t(Msg::CopyNoBlocks).into_owned());
+                    }
+                    let Some(surface) = ctx.service::<crate::plugin::SurfaceSvc>() else {
+                        return Outcome::Refused(t(Msg::NoClipboard).into_owned());
+                    };
+                    let lines = answer.lines().count();
+                    surface.copy(&answer);
+                    return Outcome::Said(t(Msg::CopiedLines { lines }).into_owned());
+                }
+                let blocks = code_blocks(&answer);
                 if blocks.is_empty() {
                     return Outcome::Refused(t(Msg::CopyNoBlocks).into_owned());
                 }
@@ -395,6 +412,25 @@ impl CommandSet for TakeAwayCommands {
                 } else {
                     std::path::Path::new(&client.root()).join(path)
                 };
+                // **An existing file that this command did not write is not
+                // overwritten.** `/save` produces markdown; a `.md` target is
+                // therefore a previous save being replaced, which is what a
+                // person means by saving again. Any other extension is a file
+                // that came from somewhere else — `/save Cargo.toml` would
+                // destroy it, silently, with a transcript. Refusing costs one
+                // retype; the other way round costs the file.
+                let markdown = path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
+                if path.exists() && !markdown {
+                    return Outcome::Refused(
+                        t(Msg::SaveWouldOverwrite {
+                            path: &crate::text::collapse_home(&path.display().to_string()),
+                        })
+                        .into_owned(),
+                    );
+                }
                 match std::fs::write(&path, text) {
                     Ok(()) => Outcome::Said(
                         t(Msg::SavedTo {
@@ -3006,6 +3042,90 @@ mod tests {
             written.contains("## 模型") && written.contains("写好了"),
             "{written}"
         );
+    }
+
+    /// `/save` does not write over a file it did not write.
+    ///
+    /// The failure this rules out is losing work to a typo: `/save Cargo.toml`
+    /// replaces a source file with a transcript, silently, and the only notice
+    /// is the success line. A `.md` target is a previous save being replaced,
+    /// which is what saving again means.
+    #[tokio::test]
+    async fn save_refuses_to_overwrite_a_file_it_did_not_write() {
+        let (app, all, _surface) = answered("写好了");
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let source = dir.path().join("Cargo.toml");
+        std::fs::write(&source, "[package]\nname = \"mine\"\n").expect("write");
+        match all
+            .dispatch(&format!("/save {}", source.display()), &app.context())
+            .await
+        {
+            Outcome::Refused(_) => {}
+            other => panic!("a source file must survive a typo: {other:?}"),
+        }
+        assert!(
+            std::fs::read_to_string(&source)
+                .expect("still there")
+                .contains("name = \"mine\""),
+            "and it is untouched"
+        );
+
+        // Saving again over a previous save is the ordinary case and goes
+        // through — refusing that would make the command usable once.
+        let again = dir.path().join("notes.md");
+        std::fs::write(&again, "old").expect("write");
+        match all
+            .dispatch(&format!("/save {}", again.display()), &app.context())
+            .await
+        {
+            Outcome::Said(_) => {}
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            !std::fs::read_to_string(&again)
+                .expect("read")
+                .contains("old"),
+            "the previous save was replaced"
+        );
+
+        // A path that is not there yet is written, whatever its extension.
+        let fresh = dir.path().join("fresh.txt");
+        match all
+            .dispatch(&format!("/save {}", fresh.display()), &app.context())
+            .await
+        {
+            Outcome::Said(_) => {}
+            other => panic!("{other:?}"),
+        }
+        assert!(fresh.exists());
+    }
+
+    /// `/copy msg` takes the whole reply, not just the code in it.
+    ///
+    /// The other half of what people do with an answer: a block is for
+    /// running, the message is for pasting into an issue or a review — and
+    /// that is exactly when dragging across a wrapped terminal picks up
+    /// gutters and fold marks.
+    #[tokio::test]
+    async fn copy_msg_takes_the_whole_reply_prose_and_all() {
+        let (app, all, surface) = answered("先说一句,然后:\n\n```rs\nfn main() {}\n```\n");
+        match all.dispatch("/copy msg", &app.context()).await {
+            Outcome::Said(_) => {}
+            other => panic!("{other:?}"),
+        }
+        let copied = surface.clipboard_text().expect("something was copied");
+        assert!(copied.contains("先说一句"), "the prose is in it: {copied}");
+        assert!(copied.contains("fn main"), "and the code: {copied}");
+
+        // And the block form still copies only the block, or the two would be
+        // one command with a confusing argument.
+        match all.dispatch("/copy", &app.context()).await {
+            Outcome::Said(_) => {}
+            other => panic!("{other:?}"),
+        }
+        let block = surface.clipboard_text().expect("copied");
+        assert!(!block.contains("先说一句"), "{block}");
     }
 
     /// `/paste` is the typed way in to what ctrl-v does, for the terminals and

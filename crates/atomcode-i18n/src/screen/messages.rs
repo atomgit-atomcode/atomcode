@@ -403,6 +403,10 @@ pub enum Msg<'a> {
     SavedTo {
         path: &'a str,
     },
+    /// Refused: the target is a file this command did not write.
+    SaveWouldOverwrite {
+        path: &'a str,
+    },
     SaveFailed {
         error: &'a str,
     },

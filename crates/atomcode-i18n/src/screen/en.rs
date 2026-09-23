@@ -307,6 +307,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CopiedLines { lines } => format!("copied {lines} lines").into(),
         Msg::SaveNothingYet => "there is nothing in this conversation to save yet".into(),
         Msg::SavedTo { path } => format!("saved to {path}").into(),
+        Msg::SaveWouldOverwrite { path } => format!("{path} already exists and is not a .md — pick another name, or remove it first").into(),
         Msg::SaveFailed { error } => format!("could not save: {error}").into(),
         Msg::AllowanceNear { label, percent } => format!("{label} {percent}% used").into(),
         Msg::AllowanceNearWithReset {

@@ -2636,6 +2636,15 @@ impl atomcode_harness::commands::CatalogCommand for WorklogCommand {
     }
 }
 
+/// 「收工」的几种说法。
+///
+/// `/goal` 与 `/loop` 共用一份:一个人想停下自主循环的时候,不该还要先想起
+/// 这里用的是哪个词。这几个词没有一个可能是真的目标或真的每轮任务 ——
+/// 谁也不会把「达成 cancel」当成目标 —— 所以认它们不会吃掉一条真指令。
+fn means_stop(arg: &str) -> bool {
+    matches!(arg, "stop" | "off" | "clear" | "cancel" | "reset" | "none")
+}
+
 struct GoalCommand(Arc<dyn crate::runtime::RuntimeCommands>);
 
 #[async_trait]
@@ -2657,7 +2666,10 @@ impl atomcode_harness::commands::CatalogCommand for GoalCommand {
     ) -> Result<String, String> {
         match args.trim() {
             "" => Err("要一个条件:达成什么才算完。".into()),
-            "stop" => {
+            // 收工的几种说法都认。一个人想停下自主循环的时候,不该还要先想起
+            // 这里用的是哪个词 —— 而这几个词没有一个可能是真条件:谁也不会把
+            // 「达成 cancel」当成目标。
+            word if means_stop(word) => {
                 self.0.stop_goal().await?;
                 Ok("目标停了。".into())
             }
@@ -2694,7 +2706,8 @@ impl atomcode_harness::commands::CatalogCommand for LoopCommand {
     ) -> Result<String, String> {
         match args.trim() {
             "" => Err("要一句话:每轮做什么。".into()),
-            "stop" => {
+            // 同 `/goal`:收工的几种说法都认,理由也一样。
+            word if means_stop(word) => {
                 self.0.stop_loop().await?;
                 Ok("循环停了。".into())
             }
@@ -3137,6 +3150,27 @@ mod tests {
 
         super::remove_worktree(&root, "busy", true).expect("forced");
         assert!(!at.exists(), "forced, it is gone");
+    }
+
+    /// 停下自主循环的几种说法都认,而真的目标不会被当成「停」。
+    ///
+    /// 这条判据的反面才是它存在的理由:名单要是宽到吃掉一条真指令,
+    /// `/goal 清理 cancel 分支` 就会变成「把目标停掉」,而人看到的是一句
+    /// 「目标停了」——一个说了反话的回执。
+    #[test]
+    fn every_way_of_saying_stop_is_understood_and_nothing_else_is() {
+        for word in ["stop", "off", "clear", "cancel", "reset", "none"] {
+            assert!(super::means_stop(word), "{word} 该被当成收工");
+        }
+        for real in [
+            "",
+            "pause",
+            "把测试跑绿",
+            "cancel 掉那个订单接口的重试",
+            "stop the bleeding in the parser",
+        ] {
+            assert!(!super::means_stop(real), "{real:?} 是一条真指令,不是收工");
+        }
     }
 
     /// A runtime that only remembers where it was pointed.
