@@ -3844,7 +3844,11 @@ impl Tui {
                     // The column is kept, the way a text editor keeps it:
                     // moving down and back up lands where it started.
                     let to = if up { row - 1 } else { row + 1 };
-                    m.caret = input::offset_at(&m.input, to, col, w);
+                    let landed = input::offset_at(&m.input, to, col, w);
+                    // Vertical movement maps by column and can land between a
+                    // marker's characters; snap it out so the chip invariant holds
+                    // for Up/Down too, not only the horizontal arrows.
+                    m.caret = crate::attach::snap_caret_out_of_marker(&m.input, landed);
                 } else if up {
                     recall_back(&mut m);
                 } else {

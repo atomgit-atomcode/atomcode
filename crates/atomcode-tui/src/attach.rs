@@ -93,6 +93,26 @@ pub fn marker_spans(text: &str) -> Vec<std::ops::Range<usize>> {
     marker_hits(text).into_iter().map(|(span, _)| span).collect()
 }
 
+/// Move a caret that landed **strictly inside** an `[Image #N]` out to the nearer
+/// edge of that marker, so the chip invariant holds for every caret writer — not
+/// just the horizontal arrows. Vertical movement and a click map by visual column
+/// and can land between a marker's characters; this is what they run their result
+/// through. A caret already on a marker boundary (or outside every marker) is
+/// returned unchanged.
+pub fn snap_caret_out_of_marker(text: &str, caret: usize) -> usize {
+    for span in marker_spans(text) {
+        if span.start < caret && caret < span.end {
+            // The nearer edge, so the caret barely moves.
+            return if caret - span.start <= span.end - caret {
+                span.start
+            } else {
+                span.end
+            };
+        }
+    }
+    caret
+}
+
 /// What the composer is holding between submits.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Attachments {
