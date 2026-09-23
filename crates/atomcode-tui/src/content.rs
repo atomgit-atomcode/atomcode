@@ -3003,11 +3003,21 @@ mod tests {
             "count on the name line: {}",
             naming.plain()
         );
-        let text: String = lines.iter().map(|l| l.plain()).collect::<Vec<_>>().join("\n");
-        assert!(text.contains("- old") && text.contains("+ new"), "diff rows: {text}");
+        let text: String = lines
+            .iter()
+            .map(|l| l.plain())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("- old") && text.contains("+ new"),
+            "diff rows: {text}"
+        );
         let red = Some(crate::frame::Color::role(Role::DiffRemove));
         assert!(
-            lines.iter().flat_map(|l| &l.spans).any(|s| s.style.fg == red),
+            lines
+                .iter()
+                .flat_map(|l| &l.spans)
+                .any(|s| s.style.fg == red),
             "a removed row is red"
         );
     }
@@ -3030,14 +3040,21 @@ mod tests {
             "count on the name line: {}",
             naming.plain()
         );
-        let text: String = lines.iter().map(|l| l.plain()).collect::<Vec<_>>().join("\n");
+        let text: String = lines
+            .iter()
+            .map(|l| l.plain())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             text.contains("+ <h1>hi</h1>") && text.contains("+ bye"),
             "the written content as additions: {text}"
         );
         let green = Some(crate::frame::Color::role(Role::DiffAdd));
         assert!(
-            lines.iter().flat_map(|l| &l.spans).any(|s| s.style.fg == green),
+            lines
+                .iter()
+                .flat_map(|l| &l.spans)
+                .any(|s| s.style.fg == green),
             "an added row is green"
         );
     }

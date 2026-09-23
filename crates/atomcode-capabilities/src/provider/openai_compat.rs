@@ -2765,8 +2765,7 @@ mod tests {
         // is the same V4 thinking family and still rejects a forced tool_choice. A
         // literal `contains("deepseek-v4")` gate missed the rename and would have
         // sent the rejected control parameter (a 400 on strict gateways).
-        let cfg =
-            OpenAiCompatConfig::new("k", "https://llm-api.atomgit.com/v1", "deepseek-flash");
+        let cfg = OpenAiCompatConfig::new("k", "https://llm-api.atomgit.com/v1", "deepseek-flash");
         let opts = ChatOptions {
             tool_choice: ToolChoice::Specific("todowrite".into()),
             ..Default::default()
@@ -2789,7 +2788,10 @@ mod tests {
     fn supports_tool_choice_excludes_only_v4_thinking_family() {
         assert!(!supports_tool_choice("deepseek-flash"), "rename — the fix");
         assert!(!supports_tool_choice("deepseek-v4-flash"));
-        assert!(!supports_tool_choice("deepseek-v5"), "future version parses >= 4");
+        assert!(
+            !supports_tool_choice("deepseek-v5"),
+            "future version parses >= 4"
+        );
         assert!(
             supports_tool_choice("deepseek-r1"),
             "reasoner is not the V4 thinking family; it keeps tool_choice"

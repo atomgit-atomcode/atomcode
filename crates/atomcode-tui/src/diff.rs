@@ -73,10 +73,7 @@ fn render(entries: &[Entry], w: u16, indent: &str) -> Rendered {
     let gutter = gutter_width(entries);
     let added = entries.iter().filter(|e| e.kind == Kind::Add).count();
     let removed = entries.iter().filter(|e| e.kind == Kind::Del).count();
-    let lines = entries
-        .iter()
-        .map(|e| row(e, gutter, indent, w))
-        .collect();
+    let lines = entries.iter().map(|e| row(e, gutter, indent, w)).collect();
     Rendered {
         lines,
         added,
@@ -254,9 +251,18 @@ mod tests {
         assert_eq!(r.removed, 1);
         let rows = texts(&r);
         // context(1) + del(1) + add(2) + context(3) — line numbers off the hunk.
-        assert!(rows[0].contains("1") && rows[0].contains("keep"), "{rows:?}");
-        assert!(rows[1].contains("2") && rows[1].contains("- old line"), "{rows:?}");
-        assert!(rows[2].contains("2") && rows[2].contains("+ new line"), "{rows:?}");
+        assert!(
+            rows[0].contains("1") && rows[0].contains("keep"),
+            "{rows:?}"
+        );
+        assert!(
+            rows[1].contains("2") && rows[1].contains("- old line"),
+            "{rows:?}"
+        );
+        assert!(
+            rows[2].contains("2") && rows[2].contains("+ new line"),
+            "{rows:?}"
+        );
     }
 
     #[test]
@@ -268,7 +274,10 @@ mod tests {
         let red = Some(Color::role(Role::DiffRemove));
         let green = Some(Color::role(Role::DiffAdd));
         assert!(del.spans.iter().any(|s| s.style.fg == red), "del is red");
-        assert!(add.spans.iter().any(|s| s.style.fg == green), "add is green");
+        assert!(
+            add.spans.iter().any(|s| s.style.fg == green),
+            "add is green"
+        );
     }
 
     #[test]
@@ -284,8 +293,14 @@ mod tests {
         assert_eq!(r.added, 3);
         assert_eq!(r.removed, 0);
         let rows = texts(&r);
-        assert!(rows[0].contains("1") && rows[0].contains("+ line one"), "{rows:?}");
-        assert!(rows[2].contains("3") && rows[2].contains("+ line three"), "{rows:?}");
+        assert!(
+            rows[0].contains("1") && rows[0].contains("+ line one"),
+            "{rows:?}"
+        );
+        assert!(
+            rows[2].contains("3") && rows[2].contains("+ line three"),
+            "{rows:?}"
+        );
     }
 
     #[test]
@@ -293,7 +308,10 @@ mod tests {
         let output = "@@ -1,1 +1,1 @@\n+a\n@@ -9,1 +9,1 @@\n+b";
         let r = render_edit(output, 80, "", 200).unwrap();
         let rows = texts(&r);
-        assert!(rows.iter().any(|l| l.contains('\u{22ee}')), "a ⋮ gap: {rows:?}");
+        assert!(
+            rows.iter().any(|l| l.contains('\u{22ee}')),
+            "a ⋮ gap: {rows:?}"
+        );
         assert_eq!(r.added, 2);
     }
 

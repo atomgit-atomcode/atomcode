@@ -150,7 +150,10 @@ impl Attachments {
     /// The bytes of image `n`, for reopening it — from the composer or from a
     /// sent line in the history. `None` if no such number was ever added.
     pub fn image_at(&self, n: usize) -> Option<&ImageContent> {
-        self.gallery.iter().find(|p| p.marker == n).map(|p| &p.image)
+        self.gallery
+            .iter()
+            .find(|p| p.marker == n)
+            .map(|p| &p.image)
     }
 
     /// Hand over what this text still refers to, and forget all of it.
@@ -260,7 +263,9 @@ pub fn image_from_path(text: &str) -> Option<ImageContent> {
         match atomcode_capabilities::image_normalize::normalize_image_raw(&bytes) {
             Some((mt, out)) => (mt, base64::engine::general_purpose::STANDARD.encode(out)),
             None => (
-                sniff_media_type(&bytes).unwrap_or(ext_media_type).to_string(),
+                sniff_media_type(&bytes)
+                    .unwrap_or(ext_media_type)
+                    .to_string(),
                 base64::engine::general_purpose::STANDARD.encode(&bytes),
             ),
         };
@@ -367,11 +372,23 @@ mod tests {
     fn the_gallery_keeps_bytes_reachable_after_send_and_clear() {
         let mut a = Attachments::new();
         let m = a.add(img("one"));
-        assert_eq!(a.image_at(1), Some(&img("one")), "reachable while composing");
+        assert_eq!(
+            a.image_at(1),
+            Some(&img("one")),
+            "reachable while composing"
+        );
         let _ = a.take_shown(&format!("sent {m}"));
-        assert_eq!(a.image_at(1), Some(&img("one")), "still reachable after send");
+        assert_eq!(
+            a.image_at(1),
+            Some(&img("one")),
+            "still reachable after send"
+        );
         a.clear();
-        assert_eq!(a.image_at(1), Some(&img("one")), "clearing the composer keeps it");
+        assert_eq!(
+            a.image_at(1),
+            Some(&img("one")),
+            "clearing the composer keeps it"
+        );
         assert_eq!(a.image_at(9), None, "a number never added has no image");
     }
 
@@ -383,7 +400,11 @@ mod tests {
         let open2 = text.find("[Image #2]").unwrap();
         let open10 = text.find("[Image #10]").unwrap();
         assert_eq!(marker_at_offset(text, open2), Some(2), "on the `[`");
-        assert_eq!(marker_at_offset(text, open2 + 5), Some(2), "inside the span");
+        assert_eq!(
+            marker_at_offset(text, open2 + 5),
+            Some(2),
+            "inside the span"
+        );
         assert_eq!(
             marker_at_offset(text, open2 + "[Image #2]".len() - 1),
             Some(2),
@@ -394,7 +415,11 @@ mod tests {
             None,
             "just past the span is text again"
         );
-        assert_eq!(marker_at_offset(text, open10 + 6), Some(10), "two-digit number");
+        assert_eq!(
+            marker_at_offset(text, open10 + 6),
+            Some(10),
+            "two-digit number"
+        );
         assert_eq!(marker_at_offset(text, 0), None, "on the leading 看");
         assert_eq!(marker_at_offset("no markers", 3), None);
     }
@@ -404,10 +429,20 @@ mod tests {
     #[test]
     fn media_type_is_sniffed_from_the_bytes() {
         assert_eq!(sniff_media_type(b"\x89PNG\r\n\x1a\n..."), Some("image/png"));
-        assert_eq!(sniff_media_type(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("image/jpeg"));
+        assert_eq!(
+            sniff_media_type(&[0xFF, 0xD8, 0xFF, 0xE0]),
+            Some("image/jpeg")
+        );
         assert_eq!(sniff_media_type(b"GIF89a..."), Some("image/gif"));
-        assert_eq!(sniff_media_type(b"RIFF\0\0\0\0WEBPVP8 "), Some("image/webp"));
-        assert_eq!(sniff_media_type(b"not an image"), None, "unknown → fall back to ext");
+        assert_eq!(
+            sniff_media_type(b"RIFF\0\0\0\0WEBPVP8 "),
+            Some("image/webp")
+        );
+        assert_eq!(
+            sniff_media_type(b"not an image"),
+            None,
+            "unknown → fall back to ext"
+        );
         assert_eq!(sniff_media_type(b""), None, "empty never panics");
     }
 
@@ -446,7 +481,10 @@ mod tests {
         std::fs::write(&png, b"bytes").unwrap();
 
         assert!(image_from_path("just some prose").is_none(), "prose");
-        assert!(image_from_path("snap.png").is_none(), "relative path is ambiguous");
+        assert!(
+            image_from_path("snap.png").is_none(),
+            "relative path is ambiguous"
+        );
         assert!(
             image_from_path(dir.path().join("notes.txt").to_str().unwrap()).is_none(),
             "non-image extension"
