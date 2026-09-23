@@ -58,11 +58,13 @@
             names.contains(&"panel-test-off"),
             "the management list shows disabled servers: {names:?}"
         );
-        assert!(listed
-            .iter()
-            .find(|c| c.name == "panel-test-off")
-            .unwrap()
-            .disabled);
+        assert!(
+            listed
+                .iter()
+                .find(|c| c.name == "panel-test-off")
+                .unwrap()
+                .disabled
+        );
 
         let loaded = load_mcp_config(dir.path()).unwrap();
         let names: Vec<&str> = loaded.iter().map(|c| c.name.as_str()).collect();
