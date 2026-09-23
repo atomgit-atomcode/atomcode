@@ -703,6 +703,10 @@ impl LlmProvider for ResponsesProvider {
         self.cfg.context_window
     }
 
+    fn effort_levels(&self) -> Vec<String> {
+        self.cfg.effort_levels.clone()
+    }
+
     fn bind_session_id(&self, session_id: &str) {
         let _ = self.session_id.set(session_id.to_string());
     }

@@ -82,6 +82,10 @@ pub struct OllamaConfig {
     /// Disable TLS certificate verification (self-signed / internal gateways).
     /// Mirrors core's `ProviderConfig::skip_tls_verify`. Default false.
     pub skip_tls_verify: bool,
+    /// Reasoning-effort levels this endpoint exposes; empty = no such control.
+    /// Coding assembly fills it from config, reported via
+    /// [`LlmProvider::effort_levels`].
+    pub effort_levels: Vec<String>,
 }
 
 impl OllamaConfig {
@@ -102,6 +106,7 @@ impl OllamaConfig {
             retry: RetryPolicy::default(),
             user_agent: None,
             skip_tls_verify: false,
+            effort_levels: Vec::new(),
         }
     }
 }
@@ -159,6 +164,10 @@ impl LlmProvider for OllamaProvider {
     /// The same flag `format_messages_with_vision` gates the `images` array on.
     fn supports_vision(&self) -> bool {
         self.cfg.supports_vision
+    }
+
+    fn effort_levels(&self) -> Vec<String> {
+        self.cfg.effort_levels.clone()
     }
 
     fn bind_session_id(&self, session_id: &str) {

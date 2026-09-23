@@ -25,6 +25,12 @@ pub struct CodingAgentConfig {
     /// Kept separate from `chat_options.reasoning_effort`: API-default effort is
     /// still a supported endpoint with no per-call value.
     pub supports_reasoning_effort: bool,
+    /// The reasoning-effort LEVELS this endpoint exposes, canonical order.
+    /// **Empty when the endpoint has no reasoning-effort control** (i.e.
+    /// `!supports_reasoning_effort`); otherwise every level the config allows
+    /// (all of them when unrestricted). Surfaced to `AgentDescription` so the
+    /// TUI `/effort` menu and the webui selector offer the same set.
+    pub effort_levels: Vec<String>,
     /// Preferred language for natural-language commit subjects and bodies.
     /// `None` means follow the current conversation language.
     pub preferred_language: Option<Locale>,
@@ -481,6 +487,10 @@ impl CodingRuntimeConfig {
                 self.reasoning_effort.as_deref(),
                 self.reasoning_effort_levels.as_deref(),
             );
+        config.effort_levels = effort_levels_for(
+            config.supports_reasoning_effort,
+            self.reasoning_effort_levels.as_deref(),
+        );
         config.preferred_language = self.preferred_language;
         config.todo = self.todo.clone();
         config.provider_name = self.provider_name.clone();
@@ -519,6 +529,21 @@ impl CodingRuntimeConfig {
     }
 }
 
+/// The reasoning-effort levels to advertise for an endpoint: the config's
+/// allowed set when it has an effort control, else empty (no reasoning-effort
+/// control — a front end offers only "leave it to the endpoint"). One place, so
+/// every `CodingAgentConfig` builder agrees, and the set matches the webui's.
+pub(crate) fn effort_levels_for(supports: bool, declared_levels: Option<&[String]>) -> Vec<String> {
+    if supports {
+        atomcode_config::config::allowed_effort_levels(declared_levels)
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
 pub fn apply_provider_config(
     config: &mut CodingAgentConfig,
     provider: &atomcode_config::config::provider::ProviderConfig,
@@ -538,6 +563,10 @@ pub fn apply_provider_config(
     );
     config.supports_reasoning_effort = atomcode_config::config::endpoint_supports_reasoning_effort(
         provider.reasoning_effort.as_deref(),
+        provider.reasoning_effort_levels.as_deref(),
+    );
+    config.effort_levels = effort_levels_for(
+        config.supports_reasoning_effort,
         provider.reasoning_effort_levels.as_deref(),
     );
     config.provider_type = provider.provider_type.clone();
@@ -930,6 +959,7 @@ impl CodingAgentConfig {
             provider_name: model.clone(),
             supports_vision: atomcode_capabilities::provider::model_suggests_vision(&model),
             supports_reasoning_effort: false,
+            effort_levels: Vec::new(),
             model,
             preferred_language: None,
             todo: Default::default(),

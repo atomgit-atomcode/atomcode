@@ -117,6 +117,7 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                 ac.first_token_timeout = cfg.first_token_timeout;
                 ac.max_tokens = default_max_tokens(cfg.context_window);
                 ac.supports_vision = cfg.supports_vision;
+                ac.effort_levels = cfg.effort_levels.clone();
                 ac.thinking = cfg.thinking_enabled.unwrap_or(false);
                 ac.user_agent = Some(ua.clone());
                 ac.skip_tls_verify = cfg.skip_tls_verify;
@@ -138,6 +139,7 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                 oc.num_ctx =
                     parse_ollama_num_ctx(std::env::var("ATOMCODE_OLLAMA_NUM_CTX").ok().as_deref());
                 oc.supports_vision = cfg.supports_vision;
+                oc.effort_levels = cfg.effort_levels.clone();
                 oc.think = cfg.thinking_enabled.unwrap_or(false);
                 oc.user_agent = Some(ua.clone());
                 oc.skip_tls_verify = cfg.skip_tls_verify;
@@ -155,6 +157,7 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                 pc.idle_timeout = cfg.stream_timeout;
                 pc.first_token_timeout = cfg.first_token_timeout;
                 pc.supports_vision = cfg.supports_vision;
+                pc.effort_levels = cfg.effort_levels.clone();
                 pc.max_tokens = Some(default_max_tokens(cfg.context_window));
                 pc.supports_reasoning_effort = supports_reasoning_effort(cfg);
                 pc.reasoning_policy =
@@ -177,6 +180,7 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                 pc.idle_timeout = cfg.stream_timeout;
                 pc.first_token_timeout = cfg.first_token_timeout;
                 pc.supports_vision = cfg.supports_vision;
+                pc.effort_levels = cfg.effort_levels.clone();
                 pc.max_tokens = Some(default_max_tokens(cfg.context_window));
                 // An explicit per-model default is also an explicit capability
                 // declaration. CodingPlan's DeepSeek V4 Flash predates server-side
@@ -284,6 +288,10 @@ pub fn derive_tier_config(
         provider.reasoning_effort.as_deref(),
         provider.reasoning_effort_levels.as_deref(),
     );
+    tier.effort_levels = crate::config::effort_levels_for(
+        tier.supports_reasoning_effort,
+        provider.reasoning_effort_levels.as_deref(),
+    );
     tier.thinking_enabled = provider.thinking_enabled;
     tier.user_agent = provider.user_agent.clone();
     tier.skip_tls_verify = provider.skip_tls_verify;
@@ -337,6 +345,10 @@ pub fn derive_tier_config_from_resolved(
     );
     tier.supports_reasoning_effort = atomcode_config::config::endpoint_supports_reasoning_effort(
         resolved.reasoning_effort.as_deref(),
+        resolved.reasoning_effort_levels.as_deref(),
+    );
+    tier.effort_levels = crate::config::effort_levels_for(
+        tier.supports_reasoning_effort,
         resolved.reasoning_effort_levels.as_deref(),
     );
     tier.thinking_enabled = resolved.thinking_enabled;

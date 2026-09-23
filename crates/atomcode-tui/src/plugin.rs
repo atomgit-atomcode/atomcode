@@ -540,6 +540,24 @@ fn paths_under(cwd: &str, prefix: &str) -> Vec<crate::menu::Item> {
     out
 }
 
+/// The `/effort` rows the menu expands to for a given model: each level the
+/// model exposes, then `default` (leave it to the endpoint). An EMPTY `levels`
+/// — a model with no reasoning-effort control — yields only `default`, which is
+/// the whole point of reading them from the description rather than a fixed set.
+///
+/// The order is the description's (already canonical); `default` is last so the
+/// "no opinion" row sits at the bottom, under the concrete levels.
+fn effort_menu_options(levels: &[String]) -> Vec<crate::command::CommandOption> {
+    levels
+        .iter()
+        .map(|level| crate::command::CommandOption::new(level.clone(), t(Msg::EffortAbout)))
+        .chain(std::iter::once(crate::command::CommandOption::new(
+            "default",
+            t(Msg::EffortDefaultAbout),
+        )))
+        .collect()
+}
+
 /// Lines the conversation moves per wheel notch.
 ///
 /// One, not three. The terminal already sends one event per notch, so three
@@ -4129,21 +4147,21 @@ impl Tui {
         let menu = match self.slash_prefix() {
             Some(rest) => {
                 let matches = self.host.commands.matching(&rest);
-                // The level in force, so a command that expands its closed set
-                // (below) can mark the row already chosen — the ✓ the modal used
-                // to carry, now on the inline row. Read only when something on
-                // screen actually expands, so the common menus (`/help`,
-                // `/compact`) do not clone the description each keystroke.
-                let current_effort = matches
+                // The agent's description, for a command that expands its closed
+                // set (below): the effort in force marks the ✓ row, and the
+                // model's OWN levels are the rows offered. Read only when
+                // something on screen actually expands, so the common menus
+                // (`/help`, `/compact`) do not clone the description each
+                // keystroke.
+                let described = matches
                     .iter()
                     .any(|c| !c.options.is_empty() && c.answers_to(&rest))
-                    .then(|| {
-                        self.client
-                            .described()
-                            .and_then(|d| d.reasoning_effort)
-                            .map(|level| level.as_str().to_string())
-                    })
+                    .then(|| self.client.described())
                     .flatten();
+                let current_effort = described
+                    .as_ref()
+                    .and_then(|d| d.reasoning_effort)
+                    .map(|level| level.as_str().to_string());
                 let mut items: Vec<crate::menu::Item> = Vec::new();
                 for c in matches {
                     // A command with a closed set of values, once fully named, is
@@ -4151,7 +4169,20 @@ impl Tui {
                     // pick an argument, in place of a modal. `{name} {value}`
                     // dispatches the command the row stands for.
                     if !c.options.is_empty() && c.answers_to(&rest) {
-                        for opt in &c.options {
+                        // `/effort`'s values are the MODEL's, not a fixed set: a
+                        // model with no reasoning control offers only `default`,
+                        // a restricted one offers exactly its declared levels.
+                        // Until the model has described itself the static set is
+                        // the fallback. Any other closed-set command uses its own.
+                        let opts = if c.name == "effort" {
+                            match described.as_ref() {
+                                Some(d) => effort_menu_options(&d.effort_levels),
+                                None => c.options.clone(),
+                            }
+                        } else {
+                            c.options.clone()
+                        };
+                        for opt in &opts {
                             // Effort's `default` is "leave it to the endpoint",
                             // i.e. no level set — so `default` is the marked row
                             // exactly when nothing is in force.
@@ -5031,6 +5062,31 @@ impl Plugin for HeadlessSurfacePlugin {
             .provide::<SurfaceSvc>(Headless::new(row.width, row.height))
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod effort_menu_tests {
+    use super::effort_menu_options;
+
+    #[test]
+    fn a_model_with_no_reasoning_control_offers_only_default() {
+        // Empty levels — the description of a model that cannot reason — is the
+        // whole point of reading them off the model: the menu collapses to the
+        // one row that means "leave it to the endpoint".
+        let opts = effort_menu_options(&[]);
+        let values: Vec<&str> = opts.iter().map(|o| o.value.as_ref()).collect();
+        assert_eq!(values, ["default"], "only `default`: {values:?}");
+    }
+
+    #[test]
+    fn a_restricted_model_offers_exactly_its_levels_then_default() {
+        // The model's OWN set, in its order, with `default` appended — not the
+        // full ladder. A model that supports `low`/`high` must not offer
+        // `medium`/`xhigh`/`max`.
+        let opts = effort_menu_options(&["low".to_string(), "high".to_string()]);
+        let values: Vec<&str> = opts.iter().map(|o| o.value.as_ref()).collect();
+        assert_eq!(values, ["low", "high", "default"], "{values:?}");
     }
 }
 

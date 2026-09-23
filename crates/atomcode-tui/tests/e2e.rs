@@ -141,6 +141,26 @@ fn replay(steps: &str) -> String {
     format!("[[patch]]\nid = \"llm\"\nname = \"llm-replay\"\nconfig = {{ script = [ {steps} ] }}\n")
 }
 
+/// The scripted model, plus the reasoning-effort levels it claims to expose —
+/// so the `/effort` menu has levels to offer. The screen reads what a model
+/// supports off its description (`effort_levels`, a model capability like
+/// `supports_vision`); a model that declares none collapses the menu to
+/// `default` alone, on purpose.
+fn replay_effort(steps: &str, levels: &[&str]) -> String {
+    let list = levels
+        .iter()
+        .map(|l| format!("\"{l}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "[[patch]]\nid = \"llm\"\nname = \"llm-replay\"\nconfig = \
+         {{ script = [ {steps} ], effort_levels = [ {list} ] }}\n"
+    )
+}
+
+/// Every reasoning-effort level, for a test that wants the full menu.
+const ALL_EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
 /// The same screen as [`tree`], but with a session that persists and can be
 /// resumed — pointed at a private `home` so one test cannot see (or be seen by)
 /// any session on the machine.
@@ -1976,7 +1996,7 @@ async fn enter_takes_the_lit_row_and_a_command_that_wants_an_argument_asks() {
     let dir = scratch("menu-enter");
     let s = start(tree(
         &dir,
-        &replay(r#"{ text = "ok" }"#),
+        &replay_effort(r#"{ text = "ok" }"#, ALL_EFFORT_LEVELS),
         &["[[remove]]\nid = \"tui-panel-welcome\"\n"],
     ))
     .await;
@@ -4175,7 +4195,7 @@ async fn the_effort_command_changes_what_requests_ask_for_while_the_screen_runs(
     let spy = "[[insert]]\nname = \"test-effort-spy\"\n";
     let s = start(tree(
         &dir,
-        &replay(r#"{ text = "ok" }, { text = "ok" }"#),
+        &replay_effort(r#"{ text = "ok" }, { text = "ok" }"#, ALL_EFFORT_LEVELS),
         &[spy],
     ))
     .await;

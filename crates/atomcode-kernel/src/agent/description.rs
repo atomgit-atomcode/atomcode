@@ -64,6 +64,16 @@ pub struct AgentDescription {
     /// the endpoint's own default stands.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// The reasoning-effort LEVELS this agent's model exposes, in canonical
+    /// order (a subset of `low`/`medium`/`high`/`xhigh`/`max`). **Empty means
+    /// the model has no reasoning-effort control at all** — a front end offers
+    /// only "leave it to the endpoint". A non-empty list is exactly what a
+    /// person may pick from; an unrestricted model that supports effort lists
+    /// them all. Derived from config (`allowed_effort_levels` gated by
+    /// `endpoint_supports_reasoning_effort`), so it is the same set the webui
+    /// selector shows. Additive on the wire — an older reader ignores it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effort_levels: Vec<String>,
     /// Whether the agent can compact its conversation.
     #[serde(default)]
     pub compaction: bool,

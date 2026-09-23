@@ -482,6 +482,8 @@ impl Plugin for LlmUtilityReplayPlugin {
                 // Nothing is attached to a side call, so this slot has no
                 // pictures to carry whatever the conversation model can do.
                 vision: false,
+                // Nor does a side call (a title) offer an effort menu.
+                effort_levels: Vec::new(),
                 // A side call has no conversation to compact, so no consumer
                 // reads this slot's window.
                 context_window: row.context_window.unwrap_or(128_000),
@@ -503,6 +505,13 @@ struct ReplayRow {
     /// and this is the only tree the tests and `--offline` ever mount.
     #[serde(default)]
     supports_vision: bool,
+    /// The reasoning-effort levels the stand-in claims to expose. Empty by
+    /// default — a scripted model honestly supports none — so a tree that wants
+    /// to exercise the `/effort` menu declares them, the same knob-not-constant
+    /// reasoning as `supports_vision`: no offline tree can reach a model-aware
+    /// effort menu otherwise.
+    #[serde(default)]
+    effort_levels: Vec<String>,
     /// How large a window the stand-in claims. `None` keeps the built-in
     /// 128k. Same reasoning as `supports_vision` above: the window is what the
     /// compaction trigger divides by, so without a knob here no offline tree
@@ -540,6 +549,7 @@ struct ReplayProvider {
     script: Vec<ReplayStep>,
     cursor: std::sync::atomic::AtomicUsize,
     vision: bool,
+    effort_levels: Vec<String>,
     context_window: u32,
 }
 
@@ -555,6 +565,10 @@ impl LlmProvider for ReplayProvider {
 
     fn supports_vision(&self) -> bool {
         self.vision
+    }
+
+    fn effort_levels(&self) -> Vec<String> {
+        self.effort_levels.clone()
     }
 
     async fn chat_stream(
@@ -662,6 +676,7 @@ impl Plugin for ReplayPlugin {
                 script: row.script,
                 cursor: std::sync::atomic::AtomicUsize::new(0),
                 vision: row.supports_vision,
+                effort_levels: row.effort_levels,
                 context_window: window,
             }))
             .map_err(|e| e.to_string())?;

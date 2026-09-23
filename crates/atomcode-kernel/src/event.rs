@@ -694,6 +694,7 @@ mod tests {
             context_window: Some(131_072),
             supports_vision: true,
             reasoning_effort: Some(ReasoningEffort::Low),
+            effort_levels: vec!["low".into(), "high".into()],
             compaction: true,
             commands: vec![crate::agent::CommandDescription {
                 name: "stop".into(),

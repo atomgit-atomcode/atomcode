@@ -765,6 +765,10 @@ impl Agent {
                 context_window: model.as_ref().map(|m| m.context_window()),
                 supports_vision: model.as_ref().is_some_and(|m| m.supports_vision()),
                 reasoning_effort: None,
+                // A model capability, read off the mounted provider exactly like
+                // `supports_vision`: empty when nothing is mounted or the model
+                // has no reasoning-effort control, else the levels it exposes.
+                effort_levels: model.as_ref().map(|m| m.effort_levels()).unwrap_or_default(),
                 compaction: self.ctx.service::<CompactionSvc>().is_some(),
                 commands: self
                     .ctx

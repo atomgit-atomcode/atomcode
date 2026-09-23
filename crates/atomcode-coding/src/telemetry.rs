@@ -619,6 +619,11 @@ impl LlmProvider for MeteredProvider {
     fn supports_vision(&self) -> bool {
         self.inner.supports_vision()
     }
+    /// Forwarded for the same reason: a decorator that dropped it would collapse
+    /// every model behind it to "no effort levels".
+    fn effort_levels(&self) -> Vec<String> {
+        self.inner.effort_levels()
+    }
     fn bind_session_id(&self, session_id: &str) {
         self.inner.bind_session_id(session_id);
     }

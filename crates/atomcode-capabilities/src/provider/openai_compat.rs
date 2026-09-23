@@ -196,6 +196,12 @@ pub struct OpenAiCompatConfig {
     /// every construction site — including ACP/review/clix and coding assembly —
     /// is correct without extra wiring.
     pub supports_vision: bool,
+    /// The reasoning-effort levels this endpoint exposes, canonical order.
+    /// Empty (the `new()` default) means no reasoning-effort control, so a front
+    /// end offers only "leave it to the endpoint"; coding assembly fills it from
+    /// the model's config. Reported through [`LlmProvider::effort_levels`] so a
+    /// menu can offer exactly what the model supports.
+    pub effort_levels: Vec<String>,
 }
 
 /// Canonical native-stack heuristic for whether a model name looks vision-capable.
@@ -264,6 +270,7 @@ impl OpenAiCompatConfig {
             user_agent: None,
             skip_tls_verify: false,
             supports_vision,
+            effort_levels: Vec::new(),
         }
     }
 }
@@ -539,6 +546,10 @@ impl LlmProvider for OpenAiCompatProvider {
     /// before attaching a picture is what the encoder will actually do with it.
     fn supports_vision(&self) -> bool {
         self.cfg.supports_vision
+    }
+
+    fn effort_levels(&self) -> Vec<String> {
+        self.cfg.effort_levels.clone()
     }
 
     fn bind_session_id(&self, session_id: &str) {

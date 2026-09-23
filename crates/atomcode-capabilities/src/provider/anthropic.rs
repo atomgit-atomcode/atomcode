@@ -86,6 +86,10 @@ pub struct AnthropicConfig {
     /// Disable TLS certificate verification (self-signed / internal gateways).
     /// Mirrors core's `ProviderConfig::skip_tls_verify`. Default false.
     pub skip_tls_verify: bool,
+    /// Reasoning-effort levels this endpoint exposes; empty = no such control.
+    /// Coding assembly fills it from config, reported via
+    /// [`LlmProvider::effort_levels`].
+    pub effort_levels: Vec<String>,
 }
 
 impl AnthropicConfig {
@@ -112,6 +116,7 @@ impl AnthropicConfig {
             retry: RetryPolicy::default(),
             user_agent: None,
             skip_tls_verify: false,
+            effort_levels: Vec::new(),
         }
     }
 }
@@ -169,6 +174,10 @@ impl LlmProvider for AnthropicProvider {
     /// The same flag `format_user_message` degrades on.
     fn supports_vision(&self) -> bool {
         self.cfg.supports_vision
+    }
+
+    fn effort_levels(&self) -> Vec<String> {
+        self.cfg.effort_levels.clone()
     }
 
     fn bind_session_id(&self, session_id: &str) {
