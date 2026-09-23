@@ -374,8 +374,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::McpConnecting => "连接中".into(),
         Msg::McpConnected => "已连接".into(),
         Msg::McpUntrusted => "未信任项目,未启动".into(),
+        Msg::McpNeedsAuthentication => "需要认证".into(),
         Msg::McpFailed { message } => format!("失败:{message}").into(),
         Msg::McpDisconnected => "已断开".into(),
+        Msg::McpDisabled => "配置里已停用".into(),
         Msg::McpUnknownState => "未知".into(),
         Msg::McpWithdrawn => "已撤下全部 MCP 工具".into(),
         Msg::McpNeedsServerName => "要一个服务器名:/mcp tools <服务器>".into(),
@@ -468,9 +470,11 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StatusWindowResetsIn { duration } => format!(" · {duration}后重置").into(),
         Msg::McpTallyFailed { n } => format!("{n} 个连不上").into(),
         Msg::McpTallyUntrusted { n } => format!("{n} 个等信任").into(),
+        Msg::McpTallyNeedsAuthentication { n } => format!("{n} 个待认证").into(),
         Msg::McpTallyConnecting { n } => format!("{n} 个连接中").into(),
         Msg::McpTallyConnected { n } => format!("{n} 个已连接").into(),
         Msg::McpTallyOff { n } => format!("{n} 个没连").into(),
+        Msg::McpTallyDisabled { n } => format!("{n} 个已停用").into(),
         Msg::StatsNotKept => "这个宿主不记账".into(),
 
         // ── the account's figures (`modules/settings.rs`) ──

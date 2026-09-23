@@ -605,10 +605,12 @@ pub enum Msg<'a> {
     McpConnecting,
     McpConnected,
     McpUntrusted,
+    McpNeedsAuthentication,
     McpFailed {
         message: &'a str,
     },
     McpDisconnected,
+    McpDisabled,
     McpUnknownState,
     McpWithdrawn,
     McpNeedsServerName,
@@ -810,6 +812,9 @@ pub enum Msg<'a> {
     McpTallyUntrusted {
         n: usize,
     },
+    McpTallyNeedsAuthentication {
+        n: usize,
+    },
     McpTallyConnecting {
         n: usize,
     },
@@ -817,6 +822,9 @@ pub enum Msg<'a> {
         n: usize,
     },
     McpTallyOff {
+        n: usize,
+    },
+    McpTallyDisabled {
         n: usize,
     },
     StatsNotKept,

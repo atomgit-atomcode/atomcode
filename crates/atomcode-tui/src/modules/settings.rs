@@ -971,9 +971,11 @@ fn mcp_tally(servers: &[atomcode_host_api::McpServer]) -> String {
     };
     let failed = count(|state| matches!(state, McpServerState::Failed { .. }));
     let untrusted = count(|state| matches!(state, McpServerState::Untrusted));
+    let needs_auth = count(|state| matches!(state, McpServerState::NeedsAuthentication));
     let connecting = count(|state| matches!(state, McpServerState::Connecting));
     let connected = count(|state| matches!(state, McpServerState::Connected));
     let off = count(|state| matches!(state, McpServerState::Disconnected));
+    let disabled = count(|state| matches!(state, McpServerState::Disabled));
     let mut parts = Vec::new();
     // What needs doing first, because that is what the count is for.
     if failed > 0 {
@@ -981,6 +983,9 @@ fn mcp_tally(servers: &[atomcode_host_api::McpServer]) -> String {
     }
     if untrusted > 0 {
         parts.push(t(Msg::McpTallyUntrusted { n: untrusted }).into_owned());
+    }
+    if needs_auth > 0 {
+        parts.push(t(Msg::McpTallyNeedsAuthentication { n: needs_auth }).into_owned());
     }
     if connecting > 0 {
         parts.push(t(Msg::McpTallyConnecting { n: connecting }).into_owned());
@@ -990,6 +995,11 @@ fn mcp_tally(servers: &[atomcode_host_api::McpServer]) -> String {
     }
     if off > 0 {
         parts.push(t(Msg::McpTallyOff { n: off }).into_owned());
+    }
+    // A server switched off on purpose is still listed, after the ones that
+    // merely lost their connection: the count is the way to the switch.
+    if disabled > 0 {
+        parts.push(t(Msg::McpTallyDisabled { n: disabled }).into_owned());
     }
     format!("{} · /mcp", parts.join(" · "))
 }
@@ -3283,6 +3293,14 @@ mod tests {
                         message: "x".into(),
                     },
                 },
+                McpServer {
+                    name: "c".into(),
+                    state: McpServerState::NeedsAuthentication,
+                },
+                McpServer {
+                    name: "d".into(),
+                    state: McpServerState::Disabled,
+                },
             ],
             sources: Vec::new(),
         });
@@ -3307,6 +3325,14 @@ mod tests {
             mcp.find("连不上").unwrap() < mcp.find("已连接").unwrap(),
             "what needs doing comes first: {mcp:?}"
         );
+        assert!(
+            mcp.find("待认证").unwrap() < mcp.find("已连接").unwrap(),
+            "a server waiting for a sign-in needs doing too: {mcp:?}"
+        );
+        assert!(
+            mcp.find("已连接").unwrap() < mcp.find("已停用").unwrap(),
+            "a deliberate off is counted last: {mcp:?}"
+        );
 
         // Nobody signed in is an answer, not a gap: a build that runs on a key
         // in a file works fine, and a blank row reads as a question the host
@@ -3324,6 +3350,74 @@ mod tests {
         assert!(
             shown.contains("没有挂模型"),
             "and that nothing is mounted: {shown}"
+        );
+    }
+
+    /// A server that is configured but has no usable token is waiting on a
+    /// person, so it is counted with what needs doing — not silently dropped
+    /// out of the tally, which is the one thing this line is read for.
+    #[test]
+    fn a_server_needing_authentication_is_counted() {
+        use atomcode_host_api::{McpServer, McpServerState};
+        let page = status_page(crate::settings::StatusPage {
+            mcp: vec![
+                McpServer {
+                    name: "fs".into(),
+                    state: McpServerState::Connected,
+                },
+                McpServer {
+                    name: "figma".into(),
+                    state: McpServerState::NeedsAuthentication,
+                },
+            ],
+            ..Default::default()
+        });
+        let shown = drawn(&page, 92, 30).join("\n");
+        let mcp = shown
+            .lines()
+            .find(|line| line.contains("MCP"))
+            .unwrap_or_else(|| panic!("{shown}"));
+        assert!(
+            mcp.contains("1 个待认证"),
+            "a server waiting for authentication is counted: {mcp:?}"
+        );
+        assert!(
+            mcp.find("待认证").unwrap() < mcp.find("已连接").unwrap(),
+            "and counted before the ones that are fine: {mcp:?}"
+        );
+    }
+
+    /// A server switched off in its config file is counted too, and last: it is
+    /// not broken, but it is the row that has to stay reachable to switch back
+    /// on.
+    #[test]
+    fn a_disabled_server_is_counted() {
+        use atomcode_host_api::{McpServer, McpServerState};
+        let page = status_page(crate::settings::StatusPage {
+            mcp: vec![
+                McpServer {
+                    name: "fs".into(),
+                    state: McpServerState::Connected,
+                },
+                McpServer {
+                    name: "figma".into(),
+                    state: McpServerState::Disabled,
+                },
+            ],
+            ..Default::default()
+        });
+        let shown = drawn(&page, 92, 30).join("\n");
+        let mcp = shown
+            .lines()
+            .find(|line| line.contains("MCP"))
+            .unwrap_or_else(|| panic!("{shown}"));
+        assert!(
+            mcp.contains("1 个已停用"),
+            "a server switched off in its config file is counted: {mcp:?}"
+        );
+        assert!(
+            mcp.find("已停用").unwrap() > mcp.find("已连接").unwrap(),
+            "and counted after the ones that are connected: {mcp:?}"
         );
     }
 

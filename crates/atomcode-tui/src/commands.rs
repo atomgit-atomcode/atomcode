@@ -1501,10 +1501,12 @@ impl CommandSet for SessionCommands {
                                         S::Connecting => t(Msg::McpConnecting),
                                         S::Connected => t(Msg::McpConnected),
                                         S::Untrusted => t(Msg::McpUntrusted),
+                                        S::NeedsAuthentication => t(Msg::McpNeedsAuthentication),
                                         S::Failed { message } => {
                                             t(Msg::McpFailed { message: &message })
                                         }
                                         S::Disconnected => t(Msg::McpDisconnected),
+                                        S::Disabled => t(Msg::McpDisabled),
                                         _ => t(Msg::McpUnknownState),
                                     };
                                     format!("{} · {state}", server.name)
@@ -2062,6 +2064,51 @@ mod tests {
                 HostCommand::SignOut { session: lead() },
                 HostCommand::SignIn { session: lead() },
             ]
+        );
+    }
+
+    /// `/mcp` names what each server is doing, including the two states that
+    /// are not connection outcomes at all: an HTTP server with no token to
+    /// authenticate with, and one switched off in its config file. The
+    /// wildcard is for a state this build does not know; it must not be what
+    /// says these two.
+    #[tokio::test]
+    async fn mcp_names_the_server_waiting_for_auth_and_the_one_switched_off() {
+        use atomcode_host_api::{McpServer, McpServerState};
+        let host = Arc::new(Recording::default());
+        host.replies
+            .lock()
+            .unwrap()
+            .push_back(Ok(HostReply::McpServers {
+                servers: vec![
+                    McpServer {
+                        name: "figma".into(),
+                        state: McpServerState::NeedsAuthentication,
+                    },
+                    McpServer {
+                        name: "fs".into(),
+                        state: McpServerState::Disabled,
+                    },
+                ],
+            }));
+        let (app, _client, all) = following(&host);
+        let said = match all.dispatch("/mcp", &app.context()).await {
+            Outcome::Said(said) => said,
+            other => panic!("/mcp must say what the servers are: {other:?}"),
+        };
+        let lines: Vec<&str> = said.lines().collect();
+        assert_eq!(lines.len(), 2, "{said:?}");
+        assert!(
+            lines[0].starts_with("figma") && lines[0].ends_with("需要认证"),
+            "the server with no usable token has to say so: {said:?}"
+        );
+        assert!(
+            lines[1].starts_with("fs") && lines[1].ends_with("配置里已停用"),
+            "the server switched off in its config file has to say so: {said:?}"
+        );
+        assert!(
+            !said.contains("未知"),
+            "neither state is unknown to this build: {said:?}"
         );
     }
 

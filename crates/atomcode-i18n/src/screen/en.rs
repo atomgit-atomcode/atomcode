@@ -401,8 +401,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::McpConnecting => "connecting".into(),
         Msg::McpConnected => "connected".into(),
         Msg::McpUntrusted => "untrusted project — not started".into(),
+        Msg::McpNeedsAuthentication => "needs authentication".into(),
         Msg::McpFailed { message } => format!("failed: {message}").into(),
         Msg::McpDisconnected => "disconnected".into(),
+        Msg::McpDisabled => "disabled in its config file".into(),
         Msg::McpUnknownState => "unknown".into(),
         Msg::McpWithdrawn => "every MCP tool was withdrawn".into(),
         Msg::McpNeedsServerName => "it needs a server name: /mcp tools <server>".into(),
@@ -495,9 +497,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StatusWindowResetsIn { duration } => format!(" · resets in {duration}").into(),
         Msg::McpTallyFailed { n } => format!("{n} cannot connect").into(),
         Msg::McpTallyUntrusted { n } => format!("{n} awaiting trust").into(),
+        Msg::McpTallyNeedsAuthentication { n } => format!("{n} awaiting authentication").into(),
         Msg::McpTallyConnecting { n } => format!("{n} connecting").into(),
         Msg::McpTallyConnected { n } => format!("{n} connected").into(),
         Msg::McpTallyOff { n } => format!("{n} not connected").into(),
+        Msg::McpTallyDisabled { n } => format!("{n} disabled").into(),
         Msg::StatsNotKept => "this host keeps no account".into(),
 
         // ── the account's figures (`modules/settings.rs`) ──
