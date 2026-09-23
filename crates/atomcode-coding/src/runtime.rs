@@ -193,6 +193,20 @@ pub struct McpToolsSnapshot {
     pub available: Vec<String>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct McpRowsSnapshot {
+    pub generation: RuntimeGeneration,
+    pub rows: Vec<crate::parts::McpRowFacts>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct McpDetailSnapshot {
+    pub generation: RuntimeGeneration,
+    /// `None` when no configured server has that key. Not an error: a screen
+    /// says "no such server" and lists what there is.
+    pub detail: Option<crate::parts::McpRowFacts>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionChanged {
     pub generation: RuntimeGeneration,
@@ -934,6 +948,31 @@ struct RuntimeResources {
     image_preprocessor: Option<Arc<dyn ImagePreprocessor>>,
 }
 
+/// The `/mcp` panel's rows for the tree mounted right now: every configured server
+/// (disabled ones included) joined with the live statuses and this session's tool
+/// counts.
+///
+/// One helper for the list and the detail arm, so the two cannot disagree about
+/// the same server. `None` registry — no tree, MCP off — is no rows, not an error.
+async fn mcp_rows_of(runtime: &RuntimeResources) -> Vec<crate::parts::McpRowFacts> {
+    let counts: Vec<(String, usize)> = runtime
+        .parts
+        .mcp_statuses()
+        .await
+        .into_iter()
+        .map(|(name, _)| {
+            let n = runtime.parts.mcp_tools_for_server(&name).len();
+            (name, n)
+        })
+        .collect();
+    match &runtime.parts.mcp_registry {
+        Some(registry) => {
+            crate::parts::mcp_row_facts(&runtime.config.working_dir, registry, &counts).await
+        }
+        None => Vec::new(),
+    }
+}
+
 struct NextPromptSuggestionOutcome {
     generation: u64,
     revision: u64,
@@ -1640,6 +1679,35 @@ impl CodingRuntimeHandle {
         let (done, result) = oneshot::channel();
         self.tx
             .send(CodingRuntimeControl::McpTools {
+                generation: runtime_state_generation(state),
+                server,
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
+    /// The management list: every configured server — disabled ones included —
+    /// with the live status, source, config path, transport, auth and tool count.
+    pub async fn mcp_rows(&self) -> Result<McpRowsSnapshot, RuntimeError> {
+        let state = self.state.load(Ordering::Acquire);
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::McpRows {
+                generation: runtime_state_generation(state),
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
+    /// One configured server in full. An unknown key answers `detail == None`,
+    /// not an error.
+    pub async fn mcp_detail(&self, server: String) -> Result<McpDetailSnapshot, RuntimeError> {
+        let state = self.state.load(Ordering::Acquire);
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::McpDetail {
                 generation: runtime_state_generation(state),
                 server,
                 done,
@@ -2576,6 +2644,19 @@ pub enum CodingRuntimeControl {
         generation: u64,
         server: String,
         done: oneshot::Sender<Result<McpToolsSnapshot, RuntimeError>>,
+    },
+    /// The panel's list: every configured server — disabled ones included — with
+    /// the live status, source, config path, transport, auth and tool count.
+    McpRows {
+        generation: u64,
+        done: oneshot::Sender<Result<McpRowsSnapshot, RuntimeError>>,
+    },
+    /// One configured server in full. An unknown key answers `detail == None`,
+    /// which is not an error.
+    McpDetail {
+        generation: u64,
+        server: String,
+        done: oneshot::Sender<Result<McpDetailSnapshot, RuntimeError>>,
     },
     WithdrawMcpTools {
         generation: u64,
@@ -4856,6 +4937,46 @@ fn spawn_runtime_owner_with_optional_agent(
                             status,
                             tools,
                             available,
+                        }));
+                    }
+                    Some(CodingRuntimeControl::McpRows {
+                        generation: request_generation,
+                        done,
+                    }) => {
+                        if request_generation != generation {
+                            let _ = done.send(Err(RuntimeError::Busy));
+                            continue;
+                        }
+                        let Some(runtime) = resources.as_ref() else {
+                            let _ = done.send(Err(RuntimeError::Unavailable));
+                            continue;
+                        };
+                        let rows = mcp_rows_of(runtime).await;
+                        let _ = done.send(Ok(McpRowsSnapshot {
+                            generation: RuntimeGeneration(generation),
+                            rows,
+                        }));
+                    }
+                    Some(CodingRuntimeControl::McpDetail {
+                        generation: request_generation,
+                        server,
+                        done,
+                    }) => {
+                        if request_generation != generation {
+                            let _ = done.send(Err(RuntimeError::Busy));
+                            continue;
+                        }
+                        let Some(runtime) = resources.as_ref() else {
+                            let _ = done.send(Err(RuntimeError::Unavailable));
+                            continue;
+                        };
+                        let detail = mcp_rows_of(runtime)
+                            .await
+                            .into_iter()
+                            .find(|row| row.name == server);
+                        let _ = done.send(Ok(McpDetailSnapshot {
+                            generation: RuntimeGeneration(generation),
+                            detail,
                         }));
                     }
                     Some(CodingRuntimeControl::WithdrawMcpTools {
@@ -7737,6 +7858,12 @@ fn reject_runtime_control(
             let _ = done.send(Err(RuntimeError::Unavailable));
         }
         CodingRuntimeControl::McpTools { done, .. } => {
+            let _ = done.send(Err(RuntimeError::Unavailable));
+        }
+        CodingRuntimeControl::McpRows { done, .. } => {
+            let _ = done.send(Err(RuntimeError::Unavailable));
+        }
+        CodingRuntimeControl::McpDetail { done, .. } => {
             let _ = done.send(Err(RuntimeError::Unavailable));
         }
         CodingRuntimeControl::WithdrawMcpTools { done, .. } => {

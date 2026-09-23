@@ -89,8 +89,8 @@ pub use controllers::{GoalPhase, GoalProgress, GoalTerminal, LoopProgress};
 pub use init_prompt::{build_init_prompt, INIT_PROMPT, INIT_PROMPT_ZH_CN};
 pub use parts::{
     prepare, prepare_from_config, prepare_with_plugin_hook_source, prepare_with_plugin_hooks,
-    subagent_enabled_from_env, CodingParts, PrepareOptions, SessionBinding, SessionMode,
-    SubagentPolicy,
+    subagent_enabled_from_env, CodingParts, McpRowFacts, PrepareOptions, SessionBinding,
+    SessionMode, SubagentPolicy,
 };
 pub use persona::coding_persona;
 pub use plan_mode::PlanModeGate;
@@ -107,12 +107,12 @@ pub use rate_limit::{
 pub use runtime::{
     CodingRuntime, CodingRuntimeEvent, CodingRuntimeEvents, CodingRuntimeHandle,
     CodingRuntimeStart, DeferredRuntimeState, DriverCommand, ImagePreprocessor, LocalContextInput,
-    McpStatusSnapshot, McpToolsSnapshot, ProviderBootstrap, ProviderUnavailableReason,
-    ReconfigureKind, RewindCatalog, RewindResult, RewindScope, RuntimeContextStats, RuntimeError,
-    RuntimeExit, RuntimeExitReason, RuntimeGeneration, RuntimeMode, RuntimePhase, RuntimeRequest,
-    RuntimeSessionInfo, RuntimeSnapshotError, RuntimeStartError, RuntimeStatus, RuntimeTurnStats,
-    RuntimeUnavailable, SequencedRuntimeEvent, SessionChanged, SubmitReceipt, TurnCompletion,
-    UndoResult, UserInput, VisionNotice,
+    McpDetailSnapshot, McpRowsSnapshot, McpStatusSnapshot, McpToolsSnapshot, ProviderBootstrap,
+    ProviderUnavailableReason, ReconfigureKind, RewindCatalog, RewindResult, RewindScope,
+    RuntimeContextStats, RuntimeError, RuntimeExit, RuntimeExitReason, RuntimeGeneration,
+    RuntimeMode, RuntimePhase, RuntimeRequest, RuntimeSessionInfo, RuntimeSnapshotError,
+    RuntimeStartError, RuntimeStatus, RuntimeTurnStats, RuntimeUnavailable, SequencedRuntimeEvent,
+    SessionChanged, SubmitReceipt, TurnCompletion, UndoResult, UserInput, VisionNotice,
 };
 pub use telemetry::{TelemetryHook, ToolTelemetryMiddleware};
 pub use todo::TodoHook;
