@@ -355,13 +355,15 @@ fn quiet_for(state: &State, moment: &Moment) -> Option<u64> {
 const QUIET_AFTER_MS: u64 = 30_000;
 
 fn doing(state: &State, moment: &Moment) -> Option<String> {
-    // Before the turn even exists: a picture is being recognised for a text-only
-    // model, and the message that starts the turn will not be logged until that
-    // finishes. Say so rather than leave the screen blank for those seconds.
-    if moment.recognizing_image {
-        return Some(t(Msg::LiveRecognizingImage).into_owned());
+    // No turn yet: the only thing to say is that a picture is being recognised
+    // for a text-only model (the message that opens the turn is not logged until
+    // that finishes). Once the turn DOES exist, its own status wins — a lingering
+    // flag must never keep saying 正在识别图片 over the model's writing output.
+    if state.turn.is_none() {
+        return moment
+            .recognizing_image
+            .then(|| t(Msg::LiveRecognizingImage).into_owned());
     }
-    state.turn?;
     match moment.activity {
         Activity::Idle => None,
         Activity::Stopping => Some(t(Msg::LiveStopping).into_owned()),

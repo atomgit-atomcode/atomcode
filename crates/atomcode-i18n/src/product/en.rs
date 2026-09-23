@@ -1166,6 +1166,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdWelcomeDescription => "Re-run the onboarding wizard".into(),
         Msg::VisionPreprocessSuccess { char_count } =>
             format!("✓ VL recognised image, returned {char_count} chars").into(),
+        Msg::VlCaptionExpandHint => "click to expand".into(),
         Msg::VisionPreprocessFailed { reason } =>
             format!("VL preprocessing failed: {reason} · continuing text-only this turn; images restored, retry to re-run recognition").into(),
         Msg::TurnSummary { done, turn_count, tool_call_count, duration, total_tokens, cached_pct } =>

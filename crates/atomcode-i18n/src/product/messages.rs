@@ -1463,6 +1463,10 @@ pub enum Msg<'a> {
         char_count: usize,
     },
 
+    /// The dim hint on the folded VL-caption block's one-row summary, so it reads
+    /// as something that opens (the recognition is folded away behind it).
+    VlCaptionExpandHint,
+
     /// VL preprocessing failed — shown as a warning. `reason` is the underlying
     /// error; the driver restores the images so the user can retry.
     VisionPreprocessFailed {

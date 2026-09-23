@@ -597,13 +597,20 @@ pub struct VlCaptionBlock {
 
 impl VlCaptionBlock {
     /// The one-line stand-in: the localized "recognised, N chars" line with its
-    /// `✓` swapped for the fold dot and the model named.
+    /// `✓` swapped for the fold dot and the model named. The dot carries the
+    /// outcome — green for a good recognition, the way a finished tool call's `●`
+    /// does — while the detail stays muted.
     fn head_line(&self, ctx: &RenderCtx) -> Line {
         let n = self.text.chars().count();
         let base = pt(PMsg::VisionPreprocessSuccess { char_count: n });
         let body = base.trim_start_matches('✓').trim_start();
-        let text = format!("{} {}  {}", ctx.caps.g(Glyph::ToolMark), body, self.model);
-        Line::styled(width::take_width(&text, ctx.width as usize), muted())
+        let mark = ctx.caps.g(Glyph::ToolMark);
+        let rest = format!(" {body}  {}", self.model);
+        let room = (ctx.width as usize).saturating_sub(width::str_width(mark));
+        Line::from_spans(vec![
+            Span::styled(mark.to_string(), ok()),
+            Span::styled(width::take_width(&rest, room), muted()),
+        ])
     }
 }
 
@@ -620,9 +627,15 @@ impl Content for VlCaptionBlock {
         out.extend(wrapped(&self.text, ctx.width, muted(), "  "));
         out
     }
-    /// Folded: just the head line.
+    /// Folded: the head line with a dim `点击展开` tail, so a reader who does not
+    /// know the row opens finds out it does.
     fn summary(&self, ctx: &RenderCtx) -> Line {
-        self.head_line(ctx)
+        let mut line = self.head_line(ctx);
+        let hint = format!("  {}", pt(PMsg::VlCaptionExpandHint));
+        if line.width() + width::str_width(&hint) <= ctx.width as usize {
+            line.spans.push(Span::styled(hint, muted()));
+        }
+        line
     }
 }
 
@@ -2363,6 +2376,13 @@ mod tests {
         assert!(
             !head.contains("line two"),
             "the body is hidden when folded: {head}"
+        );
+        // The dot carries the outcome: green for a good recognition.
+        assert_eq!(
+            folded[0].spans[0].style.fg,
+            Some(Color::role(crate::theme::Role::Success)),
+            "the ● is green: {:?}",
+            folded[0].spans[0]
         );
         // Open: the head plus the recognised text.
         let open = block.lines(&ctx);

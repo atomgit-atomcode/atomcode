@@ -1838,11 +1838,18 @@ impl Host {
         // here because this is where facts land, and consecutive repeats are
         // dropped the way every shell drops them.
         if let SessionEvent::UserMessage { text, .. } = fact {
+            // Recall the WORDS, not the picture. For a text-only model the runtime
+            // folds a VL recognition into the message so the model can read it;
+            // that is not what the person typed, and an up-arrow must not drop a
+            // 997-char image description back into the composer.
+            let typed = crate::content::split_vl_caption(text)
+                .map(|(said, ..)| said)
+                .unwrap_or_else(|| text.clone());
             let mut m = self.moment.write().expect("moment poisoned");
-            if !text.trim().is_empty()
-                && m.history.last().map(String::as_str) != Some(text.as_str())
+            if !typed.trim().is_empty()
+                && m.history.last().map(String::as_str) != Some(typed.as_str())
             {
-                m.history.push(text.clone());
+                m.history.push(typed);
             }
         }
     }
@@ -10551,6 +10558,29 @@ mod tests {
             images: Vec::new(),
         });
         assert_eq!(h.moment.read().unwrap().history, history, "{history:?}");
+    }
+
+    #[test]
+    fn history_recalls_the_words_not_the_folded_vl_caption() {
+        // A picture sent to a text-only model logs the person's words PLUS the VL
+        // recognition the runtime folds in so the model can read it. An up-arrow
+        // must bring back the words, not a 997-char image description.
+        let h = host();
+        let said = crate::i18n::product::t(crate::i18n::product::Msg::VisionRecognised {
+            model: "qwen-vl",
+            text: "a very long recognised description of a screenshot",
+        })
+        .into_owned();
+        h.absorb(&SessionEvent::UserMessage {
+            text: format!("[Image #1] 看看这是啥？\n\n{said}"),
+            turn: 1,
+            images: Vec::new(),
+        });
+        assert_eq!(
+            h.moment.read().unwrap().history,
+            vec!["[Image #1] 看看这是啥？".to_string()],
+            "recall the typed words, not the folded caption"
+        );
     }
 
     #[test]
