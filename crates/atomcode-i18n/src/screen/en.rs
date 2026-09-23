@@ -290,7 +290,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::NoClipboard => "this screen has no clipboard".into(),
         Msg::NoAgent => "this screen is not connected to an agent".into(),
         Msg::NoHost => "this screen is not connected to a host".into(),
-        Msg::ClipboardHasNoText => "there is no text on the clipboard; `/paste <path>` pastes a file instead".into(),
+        Msg::ClipboardHasNothing => "there is nothing on the clipboard to paste; `/paste <path>` takes a file instead — a picture attaches, anything else goes in as text".into(),
         Msg::FileIsEmpty { path } => format!("{path} is empty").into(),
         Msg::FileUnreadable { path, error } => format!("cannot read {path}: {error}").into(),
         Msg::KeysHelp => "enter sends · shift+enter a new line (or ctrl-j) · ctrl-d quits · ctrl-w deletes a word\n\

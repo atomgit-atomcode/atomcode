@@ -103,6 +103,17 @@ pub enum Action {
     /// typed. A no-op when there is none — the key is also how a person finds
     /// out that there is none.
     AttachImage,
+    /// `/paste`: put what is in the clipboard — or in the named file — into the
+    /// composer, **as whatever it is**: a picture attaches, anything else goes
+    /// in as text.
+    ///
+    /// One action over both sources because `/paste` is one thing a person
+    /// means ("put that in here") and the source is its argument. And not
+    /// [`Action::AttachImage`] with a fallback, because `Ctrl+V` must never
+    /// paste text: on a terminal with no bracketed paste that chord arrives as
+    /// a literal `\x16`, and the terminal's own paste is already the way text
+    /// gets in.
+    PasteFrom(Option<String>),
     /// Pull the settings panel up over the composer, or put it away if it is
     /// already up.
     ///

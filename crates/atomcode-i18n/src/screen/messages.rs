@@ -383,7 +383,8 @@ pub enum Msg<'a> {
     NoClipboard,
     NoAgent,
     NoHost,
-    ClipboardHasNoText,
+    /// `/paste` found neither a picture nor text there.
+    ClipboardHasNothing,
     FileIsEmpty {
         path: &'a str,
     },

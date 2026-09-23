@@ -4383,6 +4383,54 @@ impl Tui {
                 };
                 m.insert_image(image);
             }
+            // `/paste`, from the clipboard or from a named file. A picture
+            // attaches; anything else goes in as text — and which it is is
+            // decided here, where the clipboard lives, so it is read once.
+            Action::PasteFrom(from) => {
+                drop(m);
+                let found = match from.as_deref() {
+                    None => crate::attach::from_clipboard(self.surface.as_ref())
+                        .ok_or_else(|| t(Msg::ClipboardHasNothing).into_owned()),
+                    Some(path) => {
+                        let full = crate::commands::view_path(
+                            path,
+                            &client.root(),
+                            crate::text::home_dir().as_deref(),
+                        );
+                        match crate::attach::from_file(&full) {
+                            Ok(Some(found)) => Ok(found),
+                            Ok(None) => Err(t(Msg::FileIsEmpty { path }).into_owned()),
+                            Err(error) => Err(t(Msg::FileUnreadable {
+                                path,
+                                error: &error.to_string(),
+                            })
+                            .into_owned()),
+                        }
+                    }
+                };
+                match found {
+                    Err(why) => self.say_refused(&why),
+                    Ok(crate::attach::Pasted::Text(text)) => {
+                        return self.act(Action::Paste(text), client)
+                    }
+                    Ok(crate::attach::Pasted::Picture(image)) => {
+                        // The same gate the key goes through, and it has to be
+                        // here too: this is a second door onto attaching, and a
+                        // door that skipped the check would attach a picture to
+                        // a session that has nowhere to send it.
+                        if let Err(reason) = images_reach_the_model(client) {
+                            self.say_refused(&reason);
+                            return false;
+                        }
+                        self.host
+                            .moment
+                            .write()
+                            .expect("moment poisoned")
+                            .insert_image(image);
+                    }
+                }
+                return false;
+            }
             Action::Cancel => {
                 // A turn in flight: Ctrl+C stops it and clears any pending quit —
                 // the same live-line pin a turn's start gets (this is the third

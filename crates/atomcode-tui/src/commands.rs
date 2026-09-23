@@ -56,7 +56,7 @@ impl CommandSet for ScreenCommands {
     fn commands(&self) -> Vec<Command> {
         screen_catalogue()
     }
-    async fn run(&self, name: &str, args: &str, ctx: &Context) -> Outcome {
+    async fn run(&self, name: &str, args: &str, _ctx: &Context) -> Outcome {
         match name {
             "quit" | "exit" => Outcome::Do(Action::Quit),
             "reasoning" => Outcome::Do(Action::ToggleFold("reasoning")),
@@ -77,31 +77,14 @@ impl CommandSet for ScreenCommands {
             // always arrive: Windows terminals hand the paste to the key layer
             // as a keystroke, and some platforms have no clipboard this process
             // can read at all. With a path it does not need one.
+            // Resolved by the handler rather than here, so the clipboard is
+            // read once: `clipboard_image` decodes bytes, and asking it "is
+            // there one?" here and "give it to me" there would decode twice —
+            // and could get two different answers if the clipboard changed in
+            // between.
             "paste" => match args.trim() {
-                "" => {
-                    let Some(surface) = ctx.service::<crate::plugin::SurfaceSvc>() else {
-                        return Outcome::Refused(t(Msg::NoClipboard).into_owned());
-                    };
-                    match surface.clipboard_text() {
-                        Some(text) if !text.is_empty() => Outcome::Do(Action::Paste(text)),
-                        // Not an error. "There is nothing in it" is how a person
-                        // finds out there is nothing in it.
-                        _ => Outcome::Refused(t(Msg::ClipboardHasNoText).into_owned()),
-                    }
-                }
-                path => match std::fs::read_to_string(path) {
-                    Ok(text) if text.is_empty() => {
-                        Outcome::Refused(t(Msg::FileIsEmpty { path }).into_owned())
-                    }
-                    Ok(text) => Outcome::Do(Action::Paste(text)),
-                    Err(error) => Outcome::Refused(
-                        t(Msg::FileUnreadable {
-                            path,
-                            error: &error.to_string(),
-                        })
-                        .into_owned(),
-                    ),
-                },
+                "" => Outcome::Do(Action::PasteFrom(None)),
+                path => Outcome::Do(Action::PasteFrom(Some(path.to_string()))),
             },
             "config" => Outcome::Do(Action::ToggleSettings),
             "provider" => Outcome::Do(Action::ToggleProviders),
@@ -223,16 +206,22 @@ const VIEW_MAX_LINES: usize = 1000;
 /// two million; wrapping it fills the screen with a single row of the file.
 const VIEW_MAX_LINE: usize = 2000;
 
-/// Which file `/view <typed>` means.
+/// Which file a typed path means — for `/view`, and for `/paste <path>`.
 ///
 /// Its own function because it is a decision with three inputs and one right
 /// answer, and the alternative is judging it through a command dispatch that
-/// would have to own the machine's home directory to say anything.
+/// would have to own the machine's home directory to say anything. Shared by
+/// the two commands that take a path rather than copied, so `~/shot.png` and
+/// `~/notes.md` cannot come to mean files in two different places.
 ///
 /// `~/…` is expanded **before** the absolute test, not after: an unexpanded
 /// `~/notes.md` is a relative path, so it would be joined onto the working
 /// directory and the refusal would name a file nobody meant.
-fn view_path(typed: &str, root: &str, home: Option<&std::path::Path>) -> std::path::PathBuf {
+pub(crate) fn view_path(
+    typed: &str,
+    root: &str,
+    home: Option<&std::path::Path>,
+) -> std::path::PathBuf {
     let expanded = crate::text::expand_home_with(typed, home);
     let path = std::path::Path::new(&expanded);
     if path.is_absolute() {
@@ -3135,47 +3124,33 @@ mod tests {
         assert!(!block.contains("先说一句"), "{block}");
     }
 
-    /// `/paste` is the typed way in to what ctrl-v does, for the terminals and
-    /// the platforms where ctrl-v never arrives. With a path it does not need a
-    /// clipboard at all.
+    /// `/paste` names its source and nothing else.
+    ///
+    /// **Thinner than it was, on purpose.** It used to read the clipboard here
+    /// and hand back `Action::Paste(text)`; that is why the command was
+    /// text-only, and why a clipboard picture had no road on a terminal that
+    /// eats ctrl-v. Resolving the source moved to the handler, where the
+    /// clipboard is read once and a picture can attach — so what is left to
+    /// judge here is the routing, and the substance is judged in
+    /// `attach::{from_clipboard, from_file}` and by the two `e2e` judgements
+    /// that press the keys.
     #[tokio::test]
-    async fn paste_reaches_the_composer_from_the_clipboard_or_from_a_file() {
+    async fn paste_names_its_source_and_leaves_the_reading_to_the_handler() {
         let app = bare();
-        let surface = crate::surface::Headless::new(80, 24);
-        let _ = app
-            .context()
-            .provide::<crate::plugin::SurfaceSvc>(surface.clone());
         let all = Arc::new(Commands::new());
         let _ = all.add(Arc::new(ScreenCommands));
 
-        // Nothing in it is an answer, not a failure — and it says what else to
-        // try.
-        match all.dispatch("/paste", &app.context()).await {
-            Outcome::Refused(why) => assert!(why.contains("路径"), "{why}"),
-            other => panic!("{other:?}"),
-        }
-
-        {
-            use crate::surface::Surface as _;
-            surface.copy("从剪贴板来的");
-        }
         assert_eq!(
             all.dispatch("/paste", &app.context()).await,
-            Outcome::Do(Action::Paste("从剪贴板来的".into()))
+            Outcome::Do(Action::PasteFrom(None)),
+            "no argument is the clipboard"
         );
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let file = dir.path().join("note.txt");
-        std::fs::write(&file, "从文件来的").expect("write");
         assert_eq!(
-            all.dispatch(&format!("/paste {}", file.display()), &app.context())
-                .await,
-            Outcome::Do(Action::Paste("从文件来的".into()))
+            all.dispatch("/paste ~/shot.png", &app.context()).await,
+            Outcome::Do(Action::PasteFrom(Some("~/shot.png".into()))),
+            "a path is passed through as typed: expanding it needs a home \
+             directory, and that is the handler's to know"
         );
-        assert!(matches!(
-            all.dispatch("/paste /nowhere/at/all", &app.context()).await,
-            Outcome::Refused(_)
-        ));
     }
 
     use atomcode_plexus::{App, ConfigTree, PluginRegistry};

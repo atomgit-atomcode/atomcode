@@ -1437,6 +1437,52 @@ async fn esc_out_of_a_search_gives_the_draft_back() {
     task.abort();
 }
 
+/// `/paste` is the way in for a clipboard picture on a terminal that eats
+/// `Ctrl+V` — Windows Terminal, PuTTY. Typed as a command, so nothing in the
+/// key layer can swallow it.
+///
+/// Pressed rather than unit-judged because this command was **text-only** until
+/// now: the `attach` judgements next to `from_clipboard` all pass with the
+/// command still returning `Action::Paste`, which is exactly how the only road
+/// to a clipboard picture on Windows came to be the one chord Windows eats.
+#[tokio::test]
+async fn slash_paste_attaches_the_clipboard_picture() {
+    let dir = scratch("slash-paste-image");
+    let s = start(tree(&dir, &replay_vision(r#"{ text = "ok" }"#, false), &[])).await;
+    let task = s.open().await;
+    s.quiet().await;
+    s.term.set_clipboard_image(screenshot("slash-paste"));
+
+    // No Ctrl+V anywhere: this is the road for a terminal that has none.
+    s.term.type_line("/paste");
+    s.quiet().await;
+    assert!(
+        s.screen().contains("[Image #1]"),
+        "`/paste` attached the clipboard picture:\n{}",
+        s.screen()
+    );
+    task.abort();
+}
+
+/// And with no picture there, `/paste` is still the text command it was.
+#[tokio::test]
+async fn slash_paste_still_pastes_text_when_there_is_no_picture() {
+    let dir = scratch("slash-paste-text");
+    let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    let task = s.open().await;
+    s.quiet().await;
+    s.term.set_clipboard_text("a line someone copied");
+
+    s.term.type_line("/paste");
+    s.quiet().await;
+    assert!(
+        s.screen().contains("a line someone copied"),
+        "text still goes in as text:\n{}",
+        s.screen()
+    );
+    task.abort();
+}
+
 #[tokio::test]
 async fn an_idle_draft_takes_two_taps_of_esc_to_clear() {
     let dir = scratch("esc-idle-clear");

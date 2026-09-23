@@ -264,8 +264,6 @@ const MAX_PATH_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
 /// than [`MAX_PATH_IMAGE_BYTES`]. A bare relative `snap.png` is deliberately
 /// rejected — typed at the prompt it is ambiguous between text and attachment.
 pub fn image_from_path(text: &str) -> Option<ImageContent> {
-    use base64::Engine as _;
-
     let trimmed = text.trim();
     if trimmed.is_empty() || trimmed.contains('\n') {
         return None;
@@ -297,6 +295,25 @@ pub fn image_from_path(text: &str) -> Option<ImageContent> {
     if !path.is_absolute() {
         return None;
     }
+    load_image_file(path)
+}
+
+/// The picture at `path`, when the path names a picture that is there and small
+/// enough. Nothing else is checked — where the path came from, and whether it
+/// was unambiguous, is the caller's question.
+///
+/// Split from [`image_from_path`] because the two callers disagree about
+/// exactly one rule and agree about all the rest. A path arriving in a **paste**
+/// has to be unambiguously a path (absolute, quoted, `file://`) or prose that
+/// merely mentions `notes.png` becomes an attachment. A path arriving as the
+/// argument of **`/paste`** carries no such ambiguity: the person typed a
+/// command whose argument is a file, so `snap.png` in the working directory is
+/// what they meant. Everything after that — the extensions, the ceiling, the
+/// re-encode, sniffing the media type from the bytes rather than trusting the
+/// suffix — is one answer, and this is where it lives.
+pub fn load_image_file(path: &std::path::Path) -> Option<ImageContent> {
+    use base64::Engine as _;
+
     let ext_media_type = match path
         .extension()
         .and_then(|e| e.to_str())
@@ -355,6 +372,56 @@ pub fn image_for_paste(text: &str, surface: &dyn crate::surface::Surface) -> Opt
         return surface.clipboard_image();
     }
     None
+}
+
+/// What `/paste` found to put in the composer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Pasted {
+    Picture(ImageContent),
+    Text(String),
+}
+
+/// What `/paste` with no argument gets: the picture the clipboard is holding,
+/// or failing that its text.
+///
+/// **The picture comes first, and that order is the whole point of the
+/// command.** Text already has three roads into the composer — typing, the
+/// terminal's own paste, a bracketed paste — while a clipboard *picture* has
+/// exactly one, `Ctrl+V`, and that is the chord Windows Terminal, PuTTY and a
+/// handful of others swallow before this process ever sees it. On those
+/// terminals the picture had no road at all. A clipboard holding both (a macOS
+/// pasteboard routinely does) is a clipboard something was copied *into*, and
+/// what was copied was the picture.
+///
+/// That is the opposite of [`image_for_paste`]'s rule, deliberately: a
+/// *bracketed paste* carrying text is that text, because grabbing the picture
+/// there would silently drop what the person actually pasted. Here they asked
+/// for the picture by name.
+pub fn from_clipboard(surface: &dyn crate::surface::Surface) -> Option<Pasted> {
+    if let Some(image) = surface.clipboard_image() {
+        return Some(Pasted::Picture(image));
+    }
+    match surface.clipboard_text() {
+        Some(text) if !text.is_empty() => Some(Pasted::Text(text)),
+        _ => None,
+    }
+}
+
+/// What `/paste <path>` gets: the picture at that path, or its text.
+///
+/// `Ok(None)` is an empty file — a state, not a failure. `Err` is the file not
+/// being readable at all, which is the only thing worth an error.
+///
+/// **A relative path counts here**, unlike in a paste ([`load_image_file`] says
+/// why): `/paste shot.png` in the working directory is unambiguous, and it is
+/// the other half of the Windows fallback — the half for a screenshot that was
+/// saved to a file rather than left on the clipboard.
+pub fn from_file(path: &std::path::Path) -> Result<Option<Pasted>, std::io::Error> {
+    if let Some(image) = load_image_file(path) {
+        return Ok(Some(Pasted::Picture(image)));
+    }
+    let text = std::fs::read_to_string(path)?;
+    Ok((!text.is_empty()).then_some(Pasted::Text(text)))
 }
 
 /// A `file://` URL as a local path: scheme (and optional `localhost` host)
@@ -686,6 +753,80 @@ mod tests {
         assert!(
             image_for_paste("just some prose", empty.as_ref()).is_none(),
             "no image anywhere ⇒ text"
+        );
+    }
+
+    /// `/paste` prefers the picture, and that order is the reason the command
+    /// is worth having: text already has three roads into the composer, a
+    /// clipboard picture has one — `Ctrl+V` — and that is the chord Windows
+    /// Terminal and PuTTY swallow.
+    #[test]
+    fn paste_takes_the_picture_first_even_when_there_is_text_beside_it() {
+        let surface = crate::surface::Headless::new(10, 2);
+        surface.set_clipboard_image(ImageContent {
+            media_type: "image/png".into(),
+            data: "QUJD".into(),
+        });
+        surface.set_clipboard_text("a caption someone copied earlier");
+        assert_eq!(
+            from_clipboard(surface.as_ref()),
+            Some(Pasted::Picture(ImageContent {
+                media_type: "image/png".into(),
+                data: "QUJD".into(),
+            })),
+            "a multi-type pasteboard is one something was copied INTO, and what \
+             was copied was the picture"
+        );
+    }
+
+    #[test]
+    fn paste_falls_back_to_text_and_then_to_nothing() {
+        let surface = crate::surface::Headless::new(10, 2);
+        surface.set_clipboard_text("some prose");
+        assert_eq!(
+            from_clipboard(surface.as_ref()),
+            Some(Pasted::Text("some prose".into()))
+        );
+        let empty = crate::surface::Headless::new(10, 2);
+        assert_eq!(
+            from_clipboard(empty.as_ref()),
+            None,
+            "nothing in it is an answer, not a failure"
+        );
+    }
+
+    /// The other half of the Windows fallback: a screenshot that was saved to a
+    /// file rather than left on the clipboard. **A relative path counts here**,
+    /// where in a paste it would be ambiguous prose.
+    #[test]
+    fn paste_of_a_path_attaches_a_picture_and_reads_anything_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("shot.png");
+        std::fs::write(&png, b"\x89PNG not-really-but-has-the-extension").unwrap();
+        assert!(
+            matches!(from_file(&png), Ok(Some(Pasted::Picture(_)))),
+            "a named picture file attaches"
+        );
+        // The same path as a *paste payload* is still not an attachment — the
+        // rule that separates the two callers of `load_image_file`.
+        assert!(
+            image_from_path("shot.png").is_none(),
+            "a bare relative path in a paste stays prose"
+        );
+
+        let notes = dir.path().join("notes.txt");
+        std::fs::write(&notes, "two lines\nof prose").unwrap();
+        assert_eq!(
+            from_file(&notes).unwrap(),
+            Some(Pasted::Text("two lines\nof prose".into()))
+        );
+
+        let blank = dir.path().join("blank.txt");
+        std::fs::write(&blank, "").unwrap();
+        assert_eq!(from_file(&blank).unwrap(), None, "empty is a state");
+        assert!(
+            from_file(&dir.path().join("nope.txt")).is_err(),
+            "unreadable is the only error"
         );
     }
 
