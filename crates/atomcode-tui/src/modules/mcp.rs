@@ -52,7 +52,7 @@ impl View for Mcp {
         }
         let view = &vp.moment.mcp;
         let caps = vp.moment.caps;
-        layout(view, panel, vp.rect.h as usize)
+        layout(view, panel, vp.rect.h as usize, w)
             .into_iter()
             .map(|row| draw(view, panel, row, w, caps))
             .collect()
@@ -70,7 +70,7 @@ impl View for Mcp {
         let mut open = panel.clone();
         open.query.clear();
         Height::Hug(
-            layout(&moment.mcp, &open, usize::MAX)
+            layout(&moment.mcp, &open, usize::MAX, width as usize)
                 .len()
                 .min(u16::MAX as usize) as u16,
         )
@@ -102,13 +102,29 @@ enum Row<'a> {
     Label(String, String),
     /// 详情层:第 `at` 个动作。
     Action(usize, Action),
-    Note,
+    /// One row of the note, already cut to the width: a note is how a refusal
+    /// reaches the person (a config guard, a sign-in that cannot work), and its
+    /// second half is usually the part that says what to do about it — so it
+    /// wraps rather than being clipped at the edge.
+    Note(String),
     Busy,
     Blank,
     Legend,
 }
 
-fn layout<'a>(view: &'a McpView, panel: &'a Panel, h: usize) -> Vec<Row<'a>> {
+/// The note, cut into rows of the panel's width (after its two-column indent).
+fn note_rows(panel: &Panel, w: usize) -> Vec<String> {
+    match panel.note.as_deref() {
+        Some(note) => note
+            .split('\n')
+            .flat_map(|line| width::wrap(line, w.saturating_sub(2).max(1)))
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+fn layout<'a>(view: &'a McpView, panel: &'a Panel, h: usize, w: usize) -> Vec<Row<'a>> {
+    let note = note_rows(panel, w);
     let mut rows = vec![Row::Rule, Row::Header];
     if panel.busy.is_some() {
         rows.push(Row::Blank);
@@ -128,7 +144,7 @@ fn layout<'a>(view: &'a McpView, panel: &'a Panel, h: usize) -> Vec<Row<'a>> {
             } else {
                 // 分组标题也占行,先把它们的数从上限里扣掉:窗口是给服务器算的,而屏上
                 // 画出来的是服务器**加**标题。
-                let frame = rows.len() + 2 + usize::from(panel.note.is_some());
+                let frame = rows.len() + 2 + note.len();
                 let cap = h
                     .saturating_sub(frame + distinct_sources(&listed))
                     .min(MOST);
@@ -176,9 +192,7 @@ fn layout<'a>(view: &'a McpView, panel: &'a Panel, h: usize) -> Vec<Row<'a>> {
             None => rows.push(Row::Pending),
         },
     }
-    if panel.note.is_some() {
-        rows.push(Row::Note);
-    }
+    rows.extend(note.into_iter().map(Row::Note));
     rows.push(Row::Blank);
     rows.push(Row::Legend);
     rows
@@ -255,8 +269,8 @@ fn draw(view: &McpView, panel: &Panel, row: Row<'_>, w: usize, caps: Caps) -> Li
         ),
         Row::Label(label, value) => label_line(&label, &value, w),
         Row::Action(at, action) => action_line(at, action, at == panel.cursor, w, caps),
-        Row::Note => Line::styled(
-            width::take_width(&format!("  {}", panel.note.clone().unwrap_or_default()), w),
+        Row::Note(text) => Line::styled(
+            width::take_width(&format!("  {text}"), w),
             theme::fg(Role::Warning),
         ),
         Row::Busy => Line::styled(
@@ -378,8 +392,15 @@ fn action_line(at: usize, action: Action, here: bool, w: usize, caps: Caps) -> L
 
 /// 底下那行按键图例:两级各一句,有活在跑的时候是第三句(设计 §5.3、§5.4)。
 fn legend(panel: &Panel) -> String {
-    if panel.busy.is_some() {
-        return t(Msg::McpLegendBusy).into_owned();
+    if let Some(busy) = panel.busy.as_ref() {
+        return if busy.cancelling {
+            t(Msg::McpLegendCancelling)
+        } else if busy.cancellable {
+            t(Msg::McpLegendBusy)
+        } else {
+            t(Msg::McpLegendBusyHide)
+        }
+        .into_owned();
     }
     match panel.level {
         Level::List => t(Msg::McpLegendList).into_owned(),
@@ -452,7 +473,7 @@ pub fn geometry(moment: &Moment, vp: &Viewport<'_>) -> Geometry {
             header: None,
         };
     };
-    let rows = layout(&moment.mcp, panel, vp.rect.h as usize);
+    let rows = layout(&moment.mcp, panel, vp.rect.h as usize, vp.rect.w as usize);
     Geometry {
         header: rows.iter().position(|row| matches!(row, Row::Header)),
         rows: rows
@@ -527,6 +548,47 @@ mod tests {
     /// 一屏画出来的东西,一行一句。断言对着它看。
     fn text_of(lines: &[Line]) -> Vec<String> {
         lines.iter().map(line_text).collect()
+    }
+
+    /// A note longer than the panel is wrapped, not clipped.
+    ///
+    /// Found at a real terminal: a server with no dynamic client registration
+    /// answered with a sentence whose second half says what to add to the
+    /// config, and the panel cut it at the right edge — the half that told the
+    /// person what to do was the half they could not see. Every word of the
+    /// note has to be on screen, and no row may run past the width.
+    #[test]
+    fn a_note_longer_than_the_panel_is_wrapped_not_clipped() {
+        let view = McpView::new(vec![row(
+            "github",
+            "global",
+            McpState::NeedsAuthentication,
+            0,
+        )]);
+        let note = "MCP OAuth requires a pre-registered client_id because the authorization \
+                    server does not support dynamic client registration (RFC 7591). Add a \
+                    pre-registered client_id to the server's auth block";
+        let panel = Panel {
+            note: Some(note.to_string()),
+            ..Panel::new()
+        };
+        let w = 48;
+        let text = text_of(&render_list(&view, &panel, w));
+        assert!(
+            text.iter().all(|l| crate::width::str_width(l) <= w),
+            "no row runs past the width: {text:?}"
+        );
+        let shown: String = text.join(" ");
+        for word in note.split_whitespace() {
+            assert!(
+                shown.contains(word),
+                "`{word}` of the note is on screen: {text:?}"
+            );
+        }
+        assert!(
+            shown.contains("auth block"),
+            "the end of the note, where it says what to do, is on screen: {text:?}"
+        );
     }
 
     #[test]

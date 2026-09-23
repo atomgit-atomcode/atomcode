@@ -207,6 +207,22 @@ impl McpView {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Busy {
     pub what: String,
+    /// 这件事能不能半路叫停。只有等浏览器的认证能:别的动作是一趟很快的往返,
+    /// 说「取消」却停不下来,是在骗人。
+    pub cancellable: bool,
+    /// 已经叫停了,在等它真的停下来。
+    pub cancelling: bool,
+}
+
+impl Busy {
+    /// 为 `action` 起的那一趟。
+    pub fn of(action: Action) -> Self {
+        Self {
+            what: action.about(),
+            cancellable: action == Action::Login,
+            cancelling: false,
+        }
+    }
 }
 
 /// 面板开着的时候。
@@ -310,13 +326,23 @@ pub enum Step {
     OpenDetail { server: String },
     /// 对这一个服务器做这一件事。
     Act { server: String, action: Action },
+    /// 叫停正在跑的那一件(只有认证会发它)。停没停下来,由那一趟自己的回答说。
+    Cancel,
 }
 
 /// 一次按键。纯函数:面板改自己,要外面做的事从返回值出去。
 pub fn key(view: &McpView, panel: &mut Panel, press: KeyPress) -> Step {
     // 有活在跑:只认 Esc。别的键按下去会派出第二次动作,而第一次还没回来。
-    if panel.busy.is_some() {
+    //
+    // 能叫停的(认证)第一下 Esc 是叫停,面板留着等它真停下来、把结果说出来;
+    // 第二下才收起——万一那一趟迟迟不回,人不能被关在一个只认 Esc 的面板里。
+    // 叫不停的,一下就收起,和原来一样。
+    if let Some(busy) = panel.busy.as_mut() {
         return match (press.key, press.mods) {
+            (Key::Esc, _) if busy.cancellable && !busy.cancelling => {
+                busy.cancelling = true;
+                Step::Cancel
+            }
             (Key::Esc, _) => {
                 panel.busy = None;
                 Step::Close
@@ -433,9 +459,7 @@ fn detail_key(view: &McpView, panel: &mut Panel, press: KeyPress) -> Step {
                 return Step::Stay;
             };
             let server = detail.name.clone();
-            panel.busy = Some(Busy {
-                what: action.about(),
-            });
+            panel.busy = Some(Busy::of(action));
             Step::Act { server, action }
         }
         _ => Step::Stay,
@@ -472,6 +496,10 @@ pub trait Mcp: Send + Sync {
     /// 做一件事,答的是**之后**的目录——屏上画的是发生过的事,不是自己以为
     /// 发生了的事(与 `/toolbox` 的 `switch` 同一个道理)。
     async fn act(&self, server: &str, action: Action) -> Result<McpView, String>;
+
+    /// 叫停正在跑的认证。停下来的那一趟 `act` 自己回答(一个错误,说它被取消了);
+    /// 没有在跑的就什么也不做。
+    fn cancel(&self) {}
 }
 
 #[cfg(test)]
@@ -607,5 +635,30 @@ mod tests {
         // 用户级的那一台:项目信任与它无关,一个都不给。
         let global = detail(McpState::Connected, Auth::None);
         assert_eq!(panel.actions(&global), vec![Action::Disable]);
+    }
+
+    /// 认证在跑:第一下 Esc 是叫停,面板留着;第二下才收起。叫不停的一下就收起。
+    #[test]
+    fn escape_stops_a_sign_in_first_and_puts_the_panel_away_second() {
+        let view = view_of(&["figma"]);
+        let mut panel = Panel::new();
+        panel.level = Level::Detail;
+        panel.busy = Some(Busy::of(Action::Login));
+
+        assert_eq!(key(&view, &mut panel, press(Key::Esc)), Step::Cancel);
+        assert!(
+            panel.busy.as_ref().is_some_and(|busy| busy.cancelling),
+            "still running, now being stopped"
+        );
+        assert_eq!(
+            key(&view, &mut panel, press(Key::Esc)),
+            Step::Close,
+            "a second Esc never leaves a person shut in a panel that will not answer"
+        );
+
+        // Nothing to stop: one Esc puts it away, as it always did.
+        let mut quick = Panel::new();
+        quick.busy = Some(Busy::of(Action::Disable));
+        assert_eq!(key(&view, &mut quick, press(Key::Esc)), Step::Close);
     }
 }

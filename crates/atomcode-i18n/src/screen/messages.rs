@@ -671,6 +671,12 @@ pub enum Msg<'a> {
     McpLegendList,
     McpLegendDetail,
     McpLegendBusy,
+    /// Something is running that cannot be stopped midway; Esc only hides it.
+    McpLegendBusyHide,
+    /// A cancel was asked for; waiting for it to stop.
+    McpLegendCancelling,
+    /// A panel sign-in was cancelled before the browser came back.
+    McpSignInCancelled,
 
     // ── the toolbox and the plugins (`commands.rs`) ──
     CmdTakesToolbox,

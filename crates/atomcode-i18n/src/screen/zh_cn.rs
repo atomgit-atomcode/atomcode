@@ -420,6 +420,9 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::McpLegendList => "↑/↓ 移动 · Enter 详情 · Esc 关闭".into(),
         Msg::McpLegendDetail => "↑/↓ 移动 · Enter 执行 · Esc 返回".into(),
         Msg::McpLegendBusy => "Esc 取消".into(),
+        Msg::McpLegendBusyHide => "Esc 收起".into(),
+        Msg::McpLegendCancelling => "正在取消… · Esc 收起".into(),
+        Msg::McpSignInCancelled => "认证已取消".into(),
 
         // ── the toolbox and the plugins (`commands.rs`) ──
         Msg::CmdTakesToolbox => "[off <名字或 mcp__server__*> | on <同上>]".into(),

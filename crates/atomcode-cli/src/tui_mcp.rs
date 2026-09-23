@@ -67,7 +67,7 @@ impl Plugin for McpRow {
             .provide::<McpSvc>(Arc::new(McpPort {
                 ctx: ctx.clone(),
                 login: Arc::new(sign_in_by_browser),
-                stop: Arc::new(AtomicBool::new(false)),
+                signing_in: std::sync::Mutex::new(None),
             }))
             .map_err(|e| e.to_string())?;
         Ok(())
@@ -83,14 +83,25 @@ struct McpPort {
     /// How a server is signed in to. The browser flow in production; a test
     /// hands in one that does not open a browser.
     login: Login,
-    /// Raised when the port goes away, so a sign-in still waiting on a browser
-    /// gives up instead of holding a thread for a tab nobody will finish.
-    stop: Arc<AtomicBool>,
+    /// The stop flag of the sign-in running now. Its own flag per sign-in, so
+    /// a cancel stops that one and the next starts clean. Raised by
+    /// [`Mcp::cancel`], and when the port goes away — a sign-in still waiting on
+    /// a browser then gives up instead of holding a thread for a tab nobody
+    /// will finish.
+    signing_in: std::sync::Mutex<Option<Arc<AtomicBool>>>,
+}
+
+impl McpPort {
+    fn raise_stop(&self) {
+        if let Some(flag) = self.signing_in.lock().expect("sign-in poisoned").as_ref() {
+            flag.store(true, Ordering::Release);
+        }
+    }
 }
 
 impl Drop for McpPort {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
+        self.raise_stop();
     }
 }
 
@@ -149,6 +160,10 @@ impl McpPort {
 
 #[async_trait]
 impl Mcp for McpPort {
+    fn cancel(&self) {
+        self.raise_stop();
+    }
+
     async fn list(&self) -> Result<McpView, String> {
         let (control, session) = self.link()?;
         listed(control.call(HostCommand::McpManage { session }).await)
@@ -169,8 +184,10 @@ impl Mcp for McpPort {
     async fn act(&self, server: &str, action: Action) -> Result<McpView, String> {
         let (control, session) = self.link()?;
         let Some(action) = wire_action(action) else {
+            let cancel = Arc::new(AtomicBool::new(false));
+            *self.signing_in.lock().expect("sign-in poisoned") = Some(Arc::clone(&cancel));
             let stop = McpOAuthLoginStop {
-                cancel: Arc::clone(&self.stop),
+                cancel,
                 timeout: SIGN_IN_TIMEOUT,
             };
             return sign_in(
@@ -236,13 +253,23 @@ async fn sign_in(
 
     let (done, answer) = tokio::sync::oneshot::channel();
     let name = server.to_string();
+    let cancelled = Arc::clone(&stop.cancel);
     std::thread::spawn(move || {
         let announce = |url: &str| say(tr(SMsg::McpLoginUrl { server: &name, url }).into_owned());
         let _ = done.send(login(&config, &stop, &announce));
     });
     answer
         .await
-        .map_err(|_| tr(SMsg::McpSignInLost).into_owned())??;
+        .map_err(|_| tr(SMsg::McpSignInLost).into_owned())?
+        .map_err(|error| {
+            // Stopped because the person asked: say that in their words, not
+            // the library's account of an interrupted wait.
+            if cancelled.load(Ordering::Acquire) {
+                tr(SMsg::McpSignInCancelled).into_owned()
+            } else {
+                error
+            }
+        })?;
 
     // The token is on disk; the session connects with it only when rebuilt.
     match control
@@ -827,6 +854,31 @@ mod tests {
             .await
             .expect_err("unknown server");
         assert!(error.contains("nope"), "{error}");
+        assert_eq!(*host.asked.lock().unwrap(), vec!["Context"], "no reconnect");
+    }
+
+    /// A sign-in the person cancelled says it was cancelled, in their words.
+    ///
+    /// The login gives up when its stop flag is raised (`Esc` on the panel);
+    /// what comes back is the library's account of an interrupted wait, which is
+    /// not what the person did. And nothing is reconnected: there is no token.
+    #[tokio::test]
+    async fn a_cancelled_sign_in_says_so_and_reconnects_nothing() {
+        let project = project_with_an_oauth_server();
+        let host = SignInHost {
+            working_dir: project.path().to_path_buf(),
+            reload: Ok(HostReply::Done),
+            asked: Default::default(),
+        };
+        let login: Login = Arc::new(|_config, stop, _announce| {
+            // What the person does while the browser is open.
+            stop.cancel.store(true, Ordering::Release);
+            Err("MCP OAuth login was cancelled before the browser came back".into())
+        });
+        let error = sign_in(&host, "s".into(), "remote", login, stop(), Arc::new(|_| {}))
+            .await
+            .expect_err("cancelled");
+        assert_eq!(error, tr(SMsg::McpSignInCancelled));
         assert_eq!(*host.asked.lock().unwrap(), vec!["Context"], "no reconnect");
     }
 }

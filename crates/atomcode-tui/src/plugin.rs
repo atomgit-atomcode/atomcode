@@ -2621,6 +2621,12 @@ impl Tui {
             self.host.mcp_note(Some(t(Msg::NoMcpPort).into_owned()));
             return;
         };
+        // A cancel is a word to the sign-in already out there, not a trip of its
+        // own: that trip answers for itself when it stops.
+        if let Step::Cancel = step {
+            port.cancel();
+            return;
+        }
         let host = self.host.clone();
         let keys = self.wake.lock().expect("wake poisoned").clone();
         tokio::spawn(async move {
@@ -2660,7 +2666,7 @@ impl Tui {
                         }
                     }
                 }
-                Step::Stay | Step::Close => {}
+                Step::Stay | Step::Close | Step::Cancel => {}
             }
             if let Some(keys) = keys {
                 let _ = keys.send(Wake::Fact);
@@ -6093,6 +6099,83 @@ mod mcp_panel_tests {
     fn note(host: &Arc<Host>) -> Option<String> {
         let m = host.moment.read().expect("moment poisoned");
         m.mcp_panel.as_ref().and_then(|panel| panel.note.clone())
+    }
+
+    /// A port whose sign-in waits until it is cancelled, and counts the cancels.
+    struct SlowSignIn {
+        cancels: Arc<std::sync::atomic::AtomicUsize>,
+        stopped: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl crate::mcp::Mcp for SlowSignIn {
+        async fn list(&self) -> Result<crate::mcp::McpView, String> {
+            FakeMcp.list().await
+        }
+
+        async fn detail(&self, server: &str) -> Result<crate::mcp::McpDetail, String> {
+            FakeMcp.detail(server).await
+        }
+
+        /// Waits the way a browser sign-in does, until it is told to stop.
+        async fn act(
+            &self,
+            _server: &str,
+            _action: crate::mcp::Action,
+        ) -> Result<crate::mcp::McpView, String> {
+            self.stopped.notified().await;
+            Err("认证已取消".to_string())
+        }
+
+        fn cancel(&self) {
+            self.cancels
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.stopped.notify_one();
+        }
+    }
+
+    /// `Esc` during a sign-in stops the sign-in, and the panel stays to say so.
+    ///
+    /// Found at a real terminal: the legend said `Esc 取消`, and `Esc` only put
+    /// the panel away — the sign-in went on waiting on the browser, and its end
+    /// was said to nobody. The first `Esc` has to reach the port's `cancel`, and
+    /// the panel has to still be there when the sign-in answers.
+    #[tokio::test]
+    async fn escape_during_a_sign_in_cancels_it_and_the_panel_says_so() {
+        let (host, tui, mut woken) = screen();
+        let cancels = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        with_port_of(
+            &tui,
+            Arc::new(SlowSignIn {
+                cancels: Arc::clone(&cancels),
+                stopped: Arc::new(tokio::sync::Notify::new()),
+            }),
+        );
+        tui.act(Action::ToggleMcp, &tui.client);
+        landed(&mut woken).await;
+        tui.run_mcp_key(KeyPress::plain(Key::Enter));
+        landed(&mut woken).await;
+        // 1. 认证 — the one action on a server waiting for authentication.
+        tui.run_mcp_key(KeyPress::plain(Key::Enter));
+
+        tui.run_mcp_key(KeyPress::plain(Key::Esc));
+        assert_eq!(
+            cancels.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the first Esc reached the sign-in"
+        );
+        assert!(host.mcp_open(), "and the panel stayed to hear how it ended");
+        landed(&mut woken).await;
+
+        assert!(host.mcp_open(), "still up when the sign-in answered");
+        assert_eq!(note(&host).as_deref(), Some("认证已取消"), "and it says so");
+        let m = host.moment.read().expect("moment poisoned");
+        assert!(
+            m.mcp_panel
+                .as_ref()
+                .is_some_and(|panel| panel.busy.is_none()),
+            "nothing is running any more"
+        );
     }
 
     /// The command half is in `commands.rs` — it can only ask. This is the half

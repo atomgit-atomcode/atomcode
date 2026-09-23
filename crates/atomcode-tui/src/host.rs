@@ -8203,9 +8203,7 @@ mod tests {
         assert!(h.toggle_mcp());
 
         assert!(h.point_mcp_at(2), "空着的时候指针走得动");
-        assert!(h.mcp_busy(Some(crate::mcp::Busy {
-            what: "认证".to_string(),
-        })));
+        assert!(h.mcp_busy(Some(crate::mcp::Busy::of(crate::mcp::Action::Login))));
         assert!(!h.point_mcp_at(1), "执行期间指针不许挪光标");
         assert!(!h.mcp_click(1), "也不许动手");
         let m = h.moment.read().expect("moment poisoned");

@@ -448,6 +448,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::McpLegendList => "↑/↓ move · Enter details · Esc close".into(),
         Msg::McpLegendDetail => "↑/↓ move · Enter run · Esc back".into(),
         Msg::McpLegendBusy => "Esc cancel".into(),
+        Msg::McpLegendBusyHide => "Esc hide".into(),
+        Msg::McpLegendCancelling => "cancelling… · Esc hide".into(),
+        Msg::McpSignInCancelled => "sign-in cancelled".into(),
 
         // ── the toolbox and the plugins (`commands.rs`) ──
         Msg::CmdTakesToolbox => "[off <name or mcp__server__*> | on <the same>]".into(),
