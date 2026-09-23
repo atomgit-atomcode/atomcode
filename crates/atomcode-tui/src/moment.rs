@@ -452,6 +452,12 @@ pub struct Moment {
     /// `已中断 · …` line under the composer, and is cleared the moment the next
     /// turn starts — screen state, not a fact, the same as the rest here.
     pub interrupted: bool,
+    /// A picture is being turned into text by the VL helper for a non-vision
+    /// model, and the turn's first fact has not arrived yet. Drives the live
+    /// line's `正在识别图片` while that recognition runs — otherwise the screen is
+    /// blank for the seconds it takes. Screen state, cleared the moment the turn
+    /// materialises or ends.
+    pub recognizing_image: bool,
     /// The mounted cell-grid bitmaps, **as of the frame this moment was taken
     /// for**.
     ///

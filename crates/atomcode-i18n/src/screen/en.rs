@@ -703,6 +703,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── the live strip and the folded-lines notes (`modules/live.rs`, `host.rs`) ──
         Msg::LiveStopping => "stopping".into(),
+        Msg::LiveRecognizingImage => "recognizing image".into(),
         Msg::LiveWaiting => "waiting for the model".into(),
         Msg::LiveThinking => "thinking".into(),
         Msg::LiveWriting => "writing".into(),

@@ -3423,6 +3423,16 @@ impl Tui {
                 // facts (`TurnStart`/`TurnEnd`/`Titled`) draw nothing, so they do
                 // not spend the arm — otherwise the spinner would settle on the
                 // `TurnStart` that the log writes *before* the message.
+                // The message whose picture was being recognised is logged now,
+                // so the pre-turn `正在识别图片` line is done — cleared here rather
+                // than only in `settle_working` because a picture steered into a
+                // running turn arms no start for that to spend.
+                if matches!(
+                    committed.event,
+                    atomcode_kernel::session::SessionEvent::UserMessage { .. }
+                ) {
+                    self.host.stop_recognizing();
+                }
                 if matches!(
                     committed.event,
                     atomcode_kernel::session::SessionEvent::UserMessage { .. }
@@ -3492,6 +3502,9 @@ impl Tui {
             }
             AgentEvent::Rejected { command, error } => {
                 self.client.answered(&command);
+                // A send that never became a turn produces no message fact to
+                // take the `正在识别图片` line down; do it here.
+                self.host.stop_recognizing();
                 self.say_refused(&t(Msg::NotDelivered {
                     error: &format!("{error:?}"),
                 }));
@@ -3644,6 +3657,10 @@ impl Tui {
                 true
             }
             AgentEvent::Error { message, .. } => {
+                // An error can end the turn before its message is ever logged, so
+                // the pre-turn recognising line has nothing to take it down — do
+                // it here (a no-op when nothing is being recognised).
+                self.host.stop_recognizing();
                 // Said always; the line below it only when the agent is not
                 // working. Not every error ends a turn — a `/cancel-all` refused
                 // by an idle member, a mid-turn cost warning, a persistence
@@ -3705,6 +3722,10 @@ impl Tui {
     /// [`Activity::Stopping`]: crate::moment::Activity::Stopping
     fn stop_turn(&self, client: &AgentClient) {
         client.cancel();
+        // A stop during the pre-turn recognising gap has no turn to stop yet, but
+        // the `正在识别图片` line still has to come down (activity is Idle there, so
+        // the `Working` branch below would never reach it).
+        self.host.stop_recognizing();
         let working = self.host.moment.read().expect("moment poisoned").activity
             == crate::moment::Activity::Working;
         if working {
@@ -3963,7 +3984,15 @@ impl Tui {
                     m.interrupted = false;
                     m.turn_in_flight()
                 };
+                // A picture bound for a text-only model is turned into text by the
+                // VL helper before the turn opens; show `正在识别图片` until the
+                // turn's first fact arrives, so the screen is not blank meanwhile.
+                let recognizing = !images.is_empty()
+                    && client.described().is_some_and(|d| !d.supports_vision);
                 client.send(text.clone(), images);
+                if recognizing {
+                    self.host.start_recognizing();
+                }
                 if steering {
                     self.host.add_steering(&text);
                 }
