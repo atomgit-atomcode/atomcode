@@ -68,8 +68,9 @@ struct Watch {
     /// Calls that came back an error. A rejected plan is not a plan.
     failed: HashSet<String>,
     /// The step the list was last touched at, and the step it was last
-    /// mentioned at — so a reminder that went unheeded does not repeat every
-    /// step until the turn ends.
+    /// mentioned at. A reminder is said once per stretch of silence: when
+    /// `reminded_at` is past `touched_at` it has been said, and it is not said
+    /// again until the list moves.
     touched_at: u32,
     reminded_at: u32,
 }
@@ -111,17 +112,23 @@ fn stale(watch: &Watch) -> Option<Stale> {
     (left > 0).then_some(Stale::Idle(left))
 }
 
-fn reminder(stale: &Stale, quiet_steps: u32) -> String {
+/// No step count and no "still": a task that takes twenty steps is not late, and
+/// a note that reads like a charge gets a defence. On 2026-09-22 a model that
+/// was told "has not been updated for 3 … 6 … 21 steps" while it chased one
+/// regression restated its whole diagnosis after nearly every one of the seven
+/// notes, to show it was still on the task. The note says what to do if the
+/// list is wrong and that nothing is owed if it is right.
+fn reminder(stale: &Stale) -> String {
     let body = match stale {
         Stale::Doing(what) => format!(
-            "The task list still shows \"{what}\" in progress, and has not been updated for \
-             {quiet_steps} steps. If it is done, mark it completed \
+            "The task list shows \"{what}\" in progress. If that is finished, mark it completed \
              (`{{\"action\":\"update\",\"id\":N,\"status\":\"completed\"}}`); if you moved on to \
-             something else, mark that one in progress; if the plan changed, send the new list."
+             something else, mark that one in progress; if the plan changed, send the new list. \
+             If it is still what you are doing, that is fine — carry on."
         ),
         Stale::Idle(left) => format!(
-            "The task list has {left} unfinished task(s) and none of them is marked in progress, \
-             {quiet_steps} steps after it was last touched. Mark what you are working on \
+            "The task list has {left} unfinished task(s) and none of them is marked in progress. \
+             Mark what you are working on \
              (`{{\"action\":\"update\",\"id\":N,\"status\":\"in_progress\"}}`), or send a new list \
              if the plan changed."
         ),
@@ -201,13 +208,17 @@ impl Plugin for TodoReminderPlugin {
                     SessionEvent::StepEnd { turn, step, .. } => {
                         let step = *step;
                         let quiet = step.saturating_sub(watch.touched_at);
-                        let since_said = step.saturating_sub(watch.reminded_at);
-                        if quiet < row.after_steps || since_said < row.after_steps {
+                        // Once per stretch of silence. The list rides every
+                        // request already; what this adds is one sentence when
+                        // it has gone quiet, and repeating that sentence every
+                        // few steps of a long task only reads as pressure.
+                        let said = watch.reminded_at > watch.touched_at;
+                        if quiet < row.after_steps || said {
                             None
                         } else {
                             stale(watch).map(|stale| {
                                 watch.reminded_at = step;
-                                (*turn, reminder(&stale, quiet))
+                                (*turn, reminder(&stale))
                             })
                         }
                     }
@@ -320,10 +331,17 @@ mod tests {
 
     #[test]
     fn the_reminder_names_the_task_and_stays_out_of_the_conversation() {
-        let text = reminder(&Stale::Doing("fix the parser".into()), 4);
+        let text = reminder(&Stale::Doing("fix the parser".into()));
         assert!(text.starts_with("<system-reminder>"), "{text}");
         assert!(text.contains("fix the parser"), "{text}");
-        assert!(text.contains("4 steps"), "{text}");
+        assert!(
+            !text.contains("steps") && !text.contains("still shows"),
+            "a long task is not late — no step count, no \"still\": {text}"
+        );
+        assert!(
+            text.contains("that is fine"),
+            "and nothing is owed when the list is right: {text}"
+        );
         assert!(text.contains("status\\\":\\\"completed") || text.contains("completed"));
         assert!(
             text.contains("Do not mention this reminder"),

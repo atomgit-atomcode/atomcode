@@ -474,3 +474,184 @@ id = "approval"
         "what is left is exactly what the surviving rows mounted"
     );
 }
+
+// ---- the list (`todo-reminder`) --------------------------------------------
+//
+// Moved here from `atomcode-coding/tests/ask_and_todo.rs`: coding keeps this row
+// off (its own `TodoHook` says the same thing, once, without logging it), so the
+// row's criteria belong to the tree that mounts it.
+
+fn replay(steps: &str) -> String {
+    format!("[[patch]]\nid = \"llm\"\nname = \"llm-replay\"\nconfig = {{ script = [ {steps} ] }}\n")
+}
+
+/// Room for a long task: the tree's six rounds end these scripts early. A patch
+/// replaces the row's whole config, so the working directory comes along.
+fn rounds(root: &std::path::Path) -> String {
+    format!(
+        "[[patch]]\nid = \"agent-loop\"\nconfig = {{ max_rounds = 20, working_dir = {:?} }}\n",
+        root.to_string_lossy()
+    )
+}
+
+/// What the harness told the model about the list without the person saying it.
+fn task_list_notes(app: &App) -> Vec<String> {
+    app.context()
+        .only_session()
+        .unwrap()
+        .events()
+        .into_iter()
+        .filter_map(|e| match e.event {
+            SessionEvent::Injected {
+                text,
+                origin: InjectionOrigin::Reminder,
+                ..
+            } if text.contains("task list") => Some(text),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Plan two tasks, then work for three steps without touching the list.
+///
+/// `list_directory` is the filler on purpose: it is safe, it always succeeds,
+/// and it is exactly the shape of the work that makes a model forget — read
+/// something, read something else, read something else.
+const FORGETS: &str = r#"{ text = "Planning.", calls = [ { name = "todowrite", args = { todos = [ { content = "read the parser", status = "in_progress" }, { content = "fix the parser", status = "pending" } ] } } ] },
+   { text = "Looking.", calls = [ { name = "list_directory", args = { path = "." } } ] },
+   { text = "Still looking.", calls = [ { name = "list_directory", args = { path = "." } } ] },
+   { text = "And again.", calls = [ { name = "list_directory", args = { path = "." } } ] },
+   { text = "Done." }"#;
+
+#[tokio::test]
+async fn a_list_that_stopped_describing_the_work_is_said_so_once() {
+    let dir = scratch("stale");
+    let after_two = "[[patch]]\nid = \"todo-reminder\"\nconfig = { after_steps = 2 }";
+    let mut app = App::new(
+        plugins::catalog(),
+        tree(&dir, &replay(FORGETS), &[after_two, &rounds(&dir)]),
+    );
+    app.start().await.unwrap();
+    run_turn(&app, "fix the parser").await.unwrap();
+
+    let said = task_list_notes(&app);
+    assert!(
+        !said.is_empty(),
+        "three steps of silence with a task in progress is stale"
+    );
+    assert!(
+        said[0].contains("read the parser"),
+        "it names the task the list still claims: {}",
+        said[0]
+    );
+    assert!(
+        said[0].contains("<system-reminder>") && said[0].contains("Do not mention"),
+        "and it is machinery, not something to read aloud: {}",
+        said[0]
+    );
+    // Spacing, not silence: a reminder every step is noise, and noise is what a
+    // model learns to skip.
+    assert!(
+        said.len() <= 2,
+        "one reminder per stretch of silence, not one per step: {said:?}"
+    );
+}
+
+/// A task that takes many steps is told about its list once, not every few
+/// steps — and moving the list starts a new stretch.
+///
+/// The row used to repeat itself every `after_steps` of silence. On one real
+/// regression hunt that was seven notes ("not updated for 3 … 21 steps"), and
+/// the model answered nearly each one by restating its whole diagnosis to show
+/// it was still on the task.
+#[tokio::test]
+async fn a_long_task_is_reminded_once_per_stretch_of_silence() {
+    let long = r#"{ text = "Planning.", calls = [ { name = "todowrite", args = { todos = [ { content = "read the parser", status = "in_progress" }, { content = "fix the parser", status = "pending" } ] } } ] },
+       { text = "1", calls = [ { name = "glob", args = { pattern = "*.step1" } } ] },
+       { text = "2", calls = [ { name = "glob", args = { pattern = "*.step2" } } ] },
+       { text = "3", calls = [ { name = "glob", args = { pattern = "*.step3" } } ] },
+       { text = "4", calls = [ { name = "glob", args = { pattern = "*.step4" } } ] },
+       { text = "5", calls = [ { name = "glob", args = { pattern = "*.step5" } } ] },
+       { text = "6", calls = [ { name = "glob", args = { pattern = "*.step6" } } ] },
+       { text = "7", calls = [ { name = "glob", args = { pattern = "*.step7" } } ] },
+       { text = "Moving on.", calls = [ { name = "todowrite", args = { action = "update", id = 1, status = "completed" } }, { name = "todowrite", args = { action = "update", id = 2, status = "in_progress" } } ] },
+       { text = "8", calls = [ { name = "glob", args = { pattern = "*.step8" } } ] },
+       { text = "9", calls = [ { name = "glob", args = { pattern = "*.step9" } } ] },
+       { text = "10", calls = [ { name = "glob", args = { pattern = "*.step10" } } ] },
+       { text = "11", calls = [ { name = "glob", args = { pattern = "*.step11" } } ] },
+       { text = "Done." }"#;
+    let dir = scratch("long");
+    let after_two = "[[patch]]\nid = \"todo-reminder\"\nconfig = { after_steps = 2 }";
+    let mut app = App::new(
+        plugins::catalog(),
+        tree(&dir, &replay(long), &[after_two, &rounds(&dir)]),
+    );
+    app.start().await.unwrap();
+    let out = run_turn(&app, "fix the parser").await.unwrap();
+    assert_eq!(out.text, "Done.", "the whole script ran");
+
+    // Only this row's notes: other rows (the repeat fuse) inject reminders too.
+    // The filler calls differ from each other so that the fuse stays out of it.
+    let said: Vec<String> = task_list_notes(&app)
+        .into_iter()
+        .filter(|text| text.contains("task list"))
+        .collect();
+    assert_eq!(
+        said.len(),
+        2,
+        "seven quiet steps, a move, four more: one note per stretch: {said:?}"
+    );
+    assert!(said[0].contains("read the parser"), "{}", said[0]);
+    assert!(
+        said[1].contains("fix the parser"),
+        "the second stretch is about the item it moved to: {}",
+        said[1]
+    );
+}
+
+#[tokio::test]
+async fn a_list_kept_up_to_date_is_never_mentioned() {
+    // The same work, with the model doing what the tool asked of it. Nothing
+    // about this turn is worth a sentence.
+    let keeps_up = r#"{ text = "Planning.", calls = [ { name = "todowrite", args = { todos = [ { content = "read the parser", status = "in_progress" } ] } } ] },
+       { text = "Looking.", calls = [ { name = "list_directory", args = { path = "." } } ] },
+       { text = "Done that.", calls = [ { name = "todowrite", args = { action = "update", id = 1, status = "completed" } } ] },
+       { text = "Finished." }"#;
+    let dir = scratch("tidy");
+    let after_two = "[[patch]]\nid = \"todo-reminder\"\nconfig = { after_steps = 2 }";
+    let mut app = App::new(
+        plugins::catalog(),
+        tree(&dir, &replay(keeps_up), &[after_two, &rounds(&dir)]),
+    );
+    app.start().await.unwrap();
+    run_turn(&app, "fix the parser").await.unwrap();
+
+    assert!(
+        task_list_notes(&app).is_empty(),
+        "a list that is true says nothing: {:?}",
+        task_list_notes(&app)
+    );
+}
+
+#[tokio::test]
+async fn a_session_that_never_planned_is_left_alone() {
+    // The row must not become a nag about using `todowrite` at all. A one-line
+    // fix does not need a plan, and the tool says so itself.
+    let dir = scratch("no-plan");
+    let never = r#"{ text = "Looking.", calls = [ { name = "list_directory", args = { path = "." } } ] },
+       { text = "Looking.", calls = [ { name = "list_directory", args = { path = "." } } ] },
+       { text = "Looking.", calls = [ { name = "list_directory", args = { path = "." } } ] },
+       { text = "Done." }"#;
+    let after_two = "[[patch]]\nid = \"todo-reminder\"\nconfig = { after_steps = 2 }";
+    let mut app = App::new(
+        plugins::catalog(),
+        tree(&dir, &replay(never), &[after_two, &rounds(&dir)]),
+    );
+    app.start().await.unwrap();
+    run_turn(&app, "look around").await.unwrap();
+    assert!(
+        task_list_notes(&app).is_empty(),
+        "{:?}",
+        task_list_notes(&app)
+    );
+}

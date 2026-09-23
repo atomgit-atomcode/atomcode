@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use atomcode_capabilities::reminder::synthetic_system_reminder;
 use atomcode_capabilities::session::manager::{SessionManager, TodoSidecarItem};
 use atomcode_capabilities::tools::todo::{
-    derive_current_todos, is_todo_plan, render_todos_numbered, TodoItem, TodoStatus,
+    derive_current_todos, is_todo_call, is_todo_plan, render_todos_numbered, TodoItem, TodoStatus,
 };
 use atomcode_kernel::event::StopReason;
 use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
@@ -303,52 +303,110 @@ fn managed_todos_this_turn(convo: &Conversation) -> bool {
     })
 }
 
-/// The mid-work "reconcile your pointer" anchor prepended to the per-request reminder.
-/// Weak models DRIFT: they leave `in_progress` on a task they already finished or moved
-/// past (e.g. still on #4 while actually editing #6's code), or work with nothing marked
-/// in_progress at all. The full numbered list is already injected below, but the
-/// in_progress status is just a `[~]` glyph buried in it — low salience for weak models.
-/// This surfaces the current pointer as an explicit imperative every turn so the model
-/// re-confronts it BEFORE acting. Deterministic: reads only the derived state, never
-/// guesses which task the model "should" be on.
-/// - An `in_progress` task → name its `#<id>` + title and force a reconcile.
-/// - No `in_progress` but open (pending) items remain → tell it to mark what it's on.
-/// - Otherwise (all completed) → `None` (nothing to reconcile; don't add noise).
+/// Where the list stands, stated — not a demand to check it.
+///
+/// Weak models drift (leave `in_progress` on a task they finished, or work with nothing
+/// marked), and the `[~]` glyph in the list below is low-salience, so the current item is
+/// named on its own line. It used to be an imperative — ">> You are currently ON task #N.
+/// Before your NEXT action, reconcile: …" — and a demand to check before every action is a
+/// demand to be seen checking: on a task that legitimately spans many steps there is
+/// nothing to change, so the only visible way to comply is to say so. deepseek-flash did,
+/// in 13–45% of its replies across four long sessions (2026-09-21..23: "Pointer is accurate
+/// — still #6", "任务指针准确，继续"); the word "pointer" in those replies came from this
+/// line and nowhere else. A permission-to-stay-quiet sentence riding beside the imperative
+/// (09-19) did not stop it — the command was the stronger of the two.
+///
+/// Drift after a stretch of silence is named once, by [`todo_quiet_note`]; this line only
+/// states the fact.
+/// - An `in_progress` task → its `#<id>` and title.
+/// - Nothing in progress but items open → that fact.
+/// - All completed → `None`.
 /// `id` is the 1-based position, matching `render_todos_numbered`.
-fn todo_anchor_line(todos: &[TodoItem]) -> Option<String> {
+fn todo_status_line(todos: &[TodoItem]) -> Option<String> {
     if let Some(i) = todos
         .iter()
         .position(|t| t.status == TodoStatus::InProgress)
     {
-        return Some(format!(
-            ">> You are currently ON task #{} \"{}\". Before your NEXT action, reconcile: if it \
-is actually DONE, mark it completed now (`{{\"action\":\"update\",\"id\":{},\"status\":\"completed\"}}`); \
-if you have moved on to a DIFFERENT task, switch in_progress to THAT id FIRST. Do not leave \
-in_progress pointing at a task you are no longer working on.",
-            i + 1,
-            todos[i].content,
-            i + 1
-        ));
+        return Some(format!("In progress: #{} \"{}\".", i + 1, todos[i].content));
     }
-    if todos.iter().any(|t| t.status == TodoStatus::Pending) {
-        return Some(
-            ">> NOTHING is in_progress but tasks remain. Before you act, mark the task you are \
-actually working on as in_progress (`{\"action\":\"update\",\"id\":<id>,\"status\":\"in_progress\"}`)."
-                .to_string(),
-        );
-    }
-    None
+    let open = todos
+        .iter()
+        .filter(|t| t.status == TodoStatus::Pending)
+        .count();
+    (open > 0).then(|| format!("Nothing is marked in progress; {open} item(s) still open."))
 }
 
-/// The silent half of the anchor's demand. Reconciling the pointer can legitimately
-/// conclude "nothing to change", and without permission to say nothing the model reports
-/// the check back as prose ("#3 is accurate — mid-task"), which turns an injected reminder
-/// into part of the conversation. `todo-reminder`'s injection
-/// (`atomcode-harness/src/plugins/todo_reminder.rs`) has closed with
-/// "Do not mention this reminder to the user." all along; this one was missing it.
-const TODO_NO_REPLY: &str = "This is injected context, not a message to answer: if the pointer \
-above is already accurate, say nothing about it and keep working — never report that you checked \
-the list, and never repeat it back to the user.";
+/// What the list is, and the one rule about talking about it. The list is shown to the
+/// person by the front end, so its state is never news: the model changes it with a call
+/// when the work moves and otherwise leaves it alone — in its text as well as its calls.
+const TODO_LIST_HEADER: &str = "Current task list — the person sees it in the UI, so it needs \
+no comment from you: never write about which item you are on or whether the list is up to \
+date. Change it with a call only when an item actually finishes, you switch to another item, \
+or the plan changes.";
+
+/// Steps without touching the list after which it is named once as possibly stale.
+///
+/// Not zero-tolerance: reading a file, grepping and editing between two status updates is
+/// ordinary work. The same threshold the harness's `todo-reminder` row defaults to — this
+/// hook is what says it in coding, which keeps that row off (see `CODING_ROWS`).
+const TODO_QUIET_STEPS: usize = 3;
+
+/// How many tool-using steps the model has taken since it last touched the list, counted
+/// inside the current real-user turn — a new message from the person starts it over, as the
+/// list was true when the last turn ended and the person has spoken since. Injected messages
+/// are all `synthetic` in the projection, so only the person's own words reset it.
+fn quiet_steps(messages: &[Message]) -> usize {
+    let start = messages
+        .iter()
+        .rposition(|m| m.role == Role::User && !m.synthetic)
+        .unwrap_or(0);
+    let turn = &messages[start..];
+    let since = turn
+        .iter()
+        .rposition(|m| m.tool_calls.iter().any(|c| is_todo_call(&c.name)))
+        .map_or(0, |i| i + 1);
+    turn[since..]
+        .iter()
+        .filter(|m| m.role == Role::Assistant && !m.tool_calls.is_empty())
+        .count()
+}
+
+/// Said once, on the one request where the list has gone exactly [`TODO_QUIET_STEPS`] steps
+/// untouched — the tail is rebuilt every request, so "once" needs no state, and nothing about
+/// it reaches the log.
+///
+/// Before, two voices said this: the per-request line demanded a check every round, and the
+/// harness's `todo-reminder` committed "has not been updated for N steps" every three steps
+/// into the log, where each note then stayed in every later request. One long regression hunt
+/// (2026-09-22) collected seven of them, and the model restated its whole diagnosis after
+/// nearly each one to show it was still on the task. Now it is this sentence, once per
+/// stretch, with no step count and an explicit "that is fine" for a task that is just long.
+fn todo_quiet_note(todos: &[TodoItem], quiet: usize) -> Option<String> {
+    if quiet != TODO_QUIET_STEPS {
+        return None;
+    }
+    if let Some(i) = todos
+        .iter()
+        .position(|t| t.status == TodoStatus::InProgress)
+    {
+        let id = i + 1;
+        return Some(format!(
+            "The list has not moved for a few steps. If #{id} is finished, mark it completed \
+(`{{\"action\":\"update\",\"id\":{id},\"status\":\"completed\"}}`); if you moved on, mark that \
+item in progress; if the plan changed, send the new list. If #{id} is what you are doing, that \
+is fine — carry on."
+        ));
+    }
+    todos
+        .iter()
+        .any(|t| t.status == TodoStatus::Pending)
+        .then(|| {
+            "Nothing has been marked in progress for a few steps. Mark the item you are working \
+on (`{\"action\":\"update\",\"id\":<id>,\"status\":\"in_progress\"}`), or send a new list if \
+the plan changed."
+                .to_string()
+        })
+}
 
 /// The static "how to drive the list with `todowrite`" rules. These are CONSTANT
 /// guidance — the model already has them from the persona and from the round right
@@ -407,24 +465,22 @@ impl LifecycleHooks for TodoHook {
         }
         // ASCII-safe body (the model doesn't need glyph prettiness; the TUI renders
         // the pretty version). Tail-append so the cached prefix is preserved.
-        // The anchor line (mid-work drift backstop) leads, so the current in_progress
-        // pointer is the first thing the model sees — above the list and the rules.
-        // The no-reply rule rides with the anchor (and only with it): the anchor is what
-        // asks for a reconcile, so that is where the permission to stay quiet belongs —
-        // a settled list carries neither and says nothing about a check nobody asked for.
-        // The anchor + list ride EVERY round (the per-round drift backstop); the static
-        // drive rules ride ONLY right after a (re)plan, to stop wasting cache re-sending
-        // constant guidance every execution round.
-        let anchor = todo_anchor_line(&todos)
-            .map(|a| format!("{a}\n\n{TODO_NO_REPLY}\n\n"))
-            .unwrap_or_default();
+        // Header, status line and list ride EVERY round; the static drive rules ride
+        // ONLY right after a (re)plan, to stop wasting cache re-sending constant
+        // guidance every execution round.
         let rules = if just_wrote_full_list(messages) {
             TODO_DRIVE_RULES
         } else {
             ""
         };
+        let status = todo_status_line(&todos)
+            .map(|s| format!("\n{s}"))
+            .unwrap_or_default();
+        let note = todo_quiet_note(&todos, quiet_steps(messages))
+            .map(|n| format!(" {n}"))
+            .unwrap_or_default();
         let body = format!(
-            "{anchor}Current task list (each line is `#<id> <task>`) — keep it accurate and finish it:{rules}\n{}",
+            "{TODO_LIST_HEADER}{rules}\n{status}{note}\n{}",
             render_todos_numbered(&todos, false)
         );
         messages.push(synthetic_system_reminder(&body));
@@ -560,7 +616,7 @@ mod tests {
         );
 
         // An execution round whose most recent action was a single `todo` update: the
-        // rules are OMITTED (cache win), but the anchor + list still ride every round.
+        // rules are OMITTED (cache win), but the header + list still ride every round.
         let mut exec = vec![
             Message::user("go"),
             todowrite_msg(list),
@@ -575,7 +631,7 @@ mod tests {
             "drive rules must NOT repeat on execution rounds:\n{after_update}"
         );
         assert!(
-            after_update.contains("Current task list"),
+            after_update.contains(TODO_LIST_HEADER),
             "list header still rides every round:\n{after_update}"
         );
 
@@ -599,7 +655,7 @@ mod tests {
         );
     }
 
-    // ---- mid-work drift backstop: the anchor line ------------------------------------------
+    // ---- the status line: stated, never a demand to check -------------------------------
 
     fn item(content: &str, status: TodoStatus) -> TodoItem {
         TodoItem {
@@ -608,116 +664,196 @@ mod tests {
         }
     }
 
+    /// The words that turned the per-round tail into something to answer. A demand to
+    /// check before every action is a demand to be seen checking: deepseek-flash replied
+    /// "Pointer is accurate — still #6" to it in up to 45% of its rounds.
+    const DEMANDS_A_CHECK: [&str; 5] = [
+        "reconcile",
+        "pointer",
+        "Before your NEXT action",
+        "Before you act",
+        "FIRST",
+    ];
+
+    async fn tail_for(list: &str) -> String {
+        let mut msgs = vec![
+            Message::user("do it"),
+            todowrite_msg(list),
+            // An ordinary execution round: the drive rules are not riding.
+            Message::assistant(
+                "",
+                vec![ToolCall {
+                    id: "r".into(),
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                }],
+            ),
+        ];
+        TodoHook::default()
+            .pre_request(&mut msgs, &TurnCtx::default())
+            .await;
+        msgs.last().unwrap().text.clone()
+    }
+
+    #[tokio::test]
+    async fn the_tail_states_where_the_list_stands_and_asks_for_no_check() {
+        for (state, list) in [
+            (
+                "a task in progress",
+                r#"{"todos":[{"content":"first","status":"completed"},{"content":"do the thing","status":"in_progress"},{"content":"later","status":"pending"}]}"#,
+            ),
+            (
+                "open items, none in progress",
+                r#"{"todos":[{"content":"first","status":"completed"},{"content":"second","status":"pending"}]}"#,
+            ),
+        ] {
+            let text = tail_for(list).await;
+            for demand in DEMANDS_A_CHECK {
+                assert!(
+                    !text.contains(demand),
+                    "{state}: the tail must state the list, not demand a check ({demand:?}): {text}"
+                );
+            }
+            assert!(
+                text.contains(TODO_LIST_HEADER),
+                "{state}: and it says the list needs no comment: {text}"
+            );
+        }
+    }
+
     #[test]
-    fn anchor_names_in_progress_id_and_title() {
-        // #2 is in_progress → anchor must name that exact id + title and force a reconcile.
+    fn the_status_line_names_the_item_in_progress() {
         let todos = vec![
             item("first", TodoStatus::Completed),
             item("do the thing", TodoStatus::InProgress),
             item("later", TodoStatus::Pending),
         ];
-        let a = todo_anchor_line(&todos).expect("in_progress → anchor");
-        assert!(a.contains("#2"), "must name the 1-based id: {a}");
-        assert!(a.contains("do the thing"), "must name the title: {a}");
-        assert!(
-            a.contains("reconcile") && a.contains("moved on"),
-            "must force reconcile: {a}"
-        );
+        let s = todo_status_line(&todos).expect("in_progress → status line");
+        assert!(s.contains("#2"), "the 1-based id: {s}");
+        assert!(s.contains("do the thing"), "the title: {s}");
     }
 
     #[test]
-    fn anchor_when_nothing_in_progress_but_open_items_remain() {
-        // No in_progress, but a pending item exists → tell the model to mark what it's on.
+    fn the_status_line_says_when_nothing_is_in_progress() {
         let todos = vec![
             item("first", TodoStatus::Completed),
             item("second", TodoStatus::Pending),
         ];
-        let a = todo_anchor_line(&todos).expect("open + no in_progress → anchor");
-        assert!(a.contains("NOTHING is in_progress"), "{a}");
-        assert!(a.contains("in_progress"), "must tell it to mark one: {a}");
+        let s = todo_status_line(&todos).expect("open + nothing in progress → status line");
+        assert!(s.contains("Nothing is marked in progress"), "{s}");
+        assert!(s.contains('1'), "and how many are open: {s}");
     }
 
     #[test]
-    fn no_anchor_when_all_completed() {
-        // Everything done → nothing to reconcile; don't add noise.
+    fn a_settled_list_has_no_status_line() {
         let todos = vec![
             item("a", TodoStatus::Completed),
             item("b", TodoStatus::Completed),
         ];
-        assert!(todo_anchor_line(&todos).is_none());
+        assert!(todo_status_line(&todos).is_none());
     }
 
     #[tokio::test]
-    async fn pre_request_prepends_anchor_for_in_progress() {
-        let mut msgs = vec![
-            Message::user("do it"),
-            todowrite_msg(r#"{"todos":[{"content":"step one","status":"in_progress"}]}"#),
-        ];
+    async fn the_status_line_sits_between_the_header_and_the_list() {
+        let text = tail_for(r#"{"todos":[{"content":"step one","status":"in_progress"}]}"#).await;
+        let header = text.find(TODO_LIST_HEADER).expect("header");
+        let status = text.find("In progress: #1").expect("status line");
+        let list = text.find("1. step one").expect("list");
+        assert!(header < status && status < list, "{text}");
+    }
+
+    // ---- once per stretch of silence ----------------------------------------------------
+
+    fn step() -> Message {
+        Message::assistant(
+            "",
+            vec![ToolCall {
+                id: "s".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            }],
+        )
+    }
+
+    const DOING: &str = r#"{"todos":[{"content":"read the parser","status":"in_progress"},{"content":"fix the parser","status":"pending"}]}"#;
+
+    async fn tail(mut msgs: Vec<Message>) -> String {
         TodoHook::default()
             .pre_request(&mut msgs, &TurnCtx::default())
             .await;
-        let last = &msgs[msgs.len() - 1];
-        assert!(
-            last.text.contains("currently ON task #1"),
-            "anchor must lead: {}",
-            last.text
+        msgs.last().unwrap().text.clone()
+    }
+
+    fn after_plan(steps: usize) -> Vec<Message> {
+        let mut msgs = vec![Message::user("fix the parser"), todowrite_msg(DOING)];
+        msgs.extend((0..steps).map(|_| step()));
+        msgs
+    }
+
+    const NOTE: &str = "has not moved for a few steps";
+
+    #[tokio::test]
+    async fn a_quiet_list_is_named_once_not_every_round() {
+        let said: Vec<usize> = {
+            let mut said = Vec::new();
+            for steps in 0..=8 {
+                if tail(after_plan(steps)).await.contains(NOTE) {
+                    said.push(steps);
+                }
+            }
+            said
+        };
+        assert_eq!(
+            said,
+            vec![TODO_QUIET_STEPS],
+            "eight quiet steps: the note rides exactly one request"
         );
+        let text = tail(after_plan(TODO_QUIET_STEPS)).await;
         assert!(
-            last.text.contains("step one"),
-            "anchor must name the task: {}",
-            last.text
+            text.contains("#1") && text.contains("that is fine"),
+            "{text}"
         );
-        // The anchor precedes the list body.
-        let anchor_at = last.text.find("currently ON task").unwrap();
-        let list_at = last.text.find("Current task list").unwrap();
+        let note = todo_quiet_note(
+            &[item("read the parser", TodoStatus::InProgress)],
+            TODO_QUIET_STEPS,
+        )
+        .unwrap();
         assert!(
-            anchor_at < list_at,
-            "anchor must come before the list: {}",
-            last.text
+            !note.contains(&format!("{TODO_QUIET_STEPS} steps")),
+            "a long task is not late — no step count: {note}"
         );
     }
 
     #[tokio::test]
-    async fn a_correct_pointer_is_not_reported_back() {
-        // The anchor asks the model to reconcile its pointer, and "already correct" is a
-        // legitimate outcome — without explicit permission to stay quiet the model answers
-        // anyway, and the answer is a reminder that has become part of the conversation.
-        let mut msgs = vec![
-            Message::user("do it"),
-            todowrite_msg(r#"{"todos":[{"content":"step one","status":"in_progress"}]}"#),
-        ];
-        TodoHook::default()
-            .pre_request(&mut msgs, &TurnCtx::default())
-            .await;
-        let text = &msgs.last().unwrap().text;
+    async fn touching_the_list_starts_a_new_stretch() {
+        let mut msgs = after_plan(5);
+        msgs.push(todo_update_msg(
+            r#"{"action":"update","id":1,"status":"completed"}"#,
+        ));
+        msgs.push(todo_update_msg(
+            r#"{"action":"update","id":2,"status":"in_progress"}"#,
+        ));
+        msgs.extend((0..TODO_QUIET_STEPS).map(|_| step()));
+        let text = tail(msgs).await;
         assert!(
-            text.contains(TODO_NO_REPLY),
-            "the reconcile must come with permission to say nothing: {text}"
+            text.contains(NOTE) && text.contains("#2"),
+            "the new stretch is about the item it moved to: {text}"
         );
-        // It talks about the anchor's check, so it rides between anchor and list.
-        let anchor_at = text.find("currently ON task").expect("anchor leads");
-        let rule_at = text.find(TODO_NO_REPLY).expect("no-reply rule");
-        let list_at = text.find("Current task list").expect("list follows");
-        assert!(anchor_at < rule_at && rule_at < list_at, "{text}");
     }
 
     #[tokio::test]
-    async fn a_settled_list_carries_no_reconcile_rule() {
-        // Every item completed → no anchor, so nothing asked for a check and nothing
-        // needs to excuse one. The rule must not ride along as dead weight.
-        let mut msgs = vec![
-            Message::user("do it"),
-            todowrite_msg(r#"{"todos":[{"content":"done","status":"completed"}]}"#),
-        ];
-        TodoHook::default()
-            .pre_request(&mut msgs, &TurnCtx::default())
-            .await;
-        let text = &msgs.last().unwrap().text;
-        assert!(
-            text.contains("Current task list"),
-            "list still rides: {text}"
-        );
-        assert!(!text.contains(TODO_NO_REPLY), "no check, no rule: {text}");
+    async fn the_person_speaking_starts_a_new_stretch_and_a_note_does_not() {
+        // Five quiet steps last turn, then the person says something: two steps into
+        // the new turn is not three.
+        let mut msgs = after_plan(5);
+        msgs.push(Message::assistant("done for now", vec![]));
+        msgs.push(Message::user("and the lexer?"));
+        msgs.extend((0..2).map(|_| step()));
+        assert!(!tail(msgs.clone()).await.contains(NOTE));
+        // An injected note in between is not the person: it does not reset the count.
+        msgs.push(synthetic_system_reminder("Current date: 2026-09-23 (Wed)"));
+        msgs.push(step());
+        assert!(tail(msgs).await.contains(NOTE));
     }
 
     #[tokio::test]

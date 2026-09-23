@@ -8350,16 +8350,15 @@ fn harness_host_state(
                 config.todo.eager,
             )),
         );
-        // The list itself, and the three things the `todo-reminder` row is not:
-        // the anchor + list on EVERY round (the mid-work drift backstop), the
-        // one-shot nudge when the model stops with items still open, and the
-        // `<id>.todos.json` sidecar that lets a compacted session still show its
-        // plan (issue #1503 — the transcript's `todowrite` calls are gone by
-        // then, and vscode's fallback derives from exactly those).
+        // Everything the model is told about its list: the list and where it
+        // stands on EVERY request, one note when it has gone quiet for a few
+        // steps, the one-shot nudge when the model stops with items still open,
+        // and the `<id>.todos.json` sidecar that lets a compacted session still
+        // show its plan (issue #1503 — the transcript's `todowrite` calls are
+        // gone by then, and vscode's fallback derives from exactly those).
         //
-        // `todo-reminder` is an observer: it commits a staleness note that rides
-        // the NEXT request. It never continues a turn, so it cannot stand in for
-        // `offer_continuation`, and it never writes the sidecar.
+        // The harness's `todo-reminder` row says the quiet-list note too, so
+        // `CODING_ROWS` keeps it off: one voice, and none of it in the log.
         hooks.insert(
             "todo",
             Arc::new(crate::todo::TodoHook::new(config.working_dir.clone())),
@@ -8625,9 +8624,7 @@ fn harness_option_rows(
                 .disable("team-in-process")
         })
         .disable("recall")
-        .when(!parts.todo_enabled(), |layer| {
-            layer.disable("tool-todo").disable("todo-reminder")
-        })
+        .when(!parts.todo_enabled(), |layer| layer.disable("tool-todo"))
         // The runtime's own `request_user_input` asks the person, when it is on;
         // the tree's `ask_user` is a narrower contract for the same capability,
         // and two question tools is one too many either way.

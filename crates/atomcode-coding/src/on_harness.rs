@@ -260,10 +260,15 @@ name = "recall"
 [[insert]]
 name = "tool-todo"
 
-# The list only helps while it is true, and a tool description is the furthest
-# thing in the prompt from the step being taken.
+# Off here, on purpose: coding's `TodoHook` (host-mounted beside `tool-todo`, under
+# the same switch) already puts the list at the tail of every request and names a
+# stretch of silence once. Two voices on one list is what made the model answer
+# the list instead of doing the work — and this row's notes are committed to the
+# log, so each one stays in every request after it. The row is listed so a patch
+# can still turn it on.
 [[insert]]
 name = "todo-reminder"
+disabled = true
 
 # Asking is a capability, not a manner. Without a tool for it the agent has two
 # moves when a decision is the person's — guess, or stop — and it guesses,

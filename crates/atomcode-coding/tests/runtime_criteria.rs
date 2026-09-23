@@ -85,6 +85,22 @@ impl Recorder {
     }
 }
 
+/// Steps of digging after the plan, before the long task stops.
+const DIG_STEPS: usize = 6;
+
+/// When the person's last word was `plan and dig`, the tool-using steps since.
+fn dig_steps(messages: &[Message]) -> Option<usize> {
+    let at = messages
+        .iter()
+        .rposition(|m| m.role == Role::User && !m.synthetic)?;
+    (messages[at].text == "plan and dig").then(|| {
+        messages[at..]
+            .iter()
+            .filter(|m| m.role == Role::Assistant && !m.tool_calls.is_empty())
+            .count()
+    })
+}
+
 fn is_summary_request(request: &[Message]) -> bool {
     request.first().is_some_and(|m| {
         m.text
@@ -143,6 +159,33 @@ impl LlmProvider for RecordingProvider {
                 code: Some("context_length_exceeded".into()),
                 retry_after_secs: None,
             });
+        }
+        // A long task: plan, dig for a while without touching the list, stop.
+        if let Some(steps) = dig_steps(messages) {
+            let event = match steps {
+                0 => StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: "todowrite".into(),
+                    arguments: serde_json::json!({
+                        "todos": [
+                            { "content": "dig through the parser", "status": "in_progress" },
+                            { "content": "write it up", "status": "pending" },
+                        ],
+                    })
+                    .to_string(),
+                }),
+                // A different pattern each step, so the repeat fuse stays out of it.
+                s if s <= DIG_STEPS => StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: "grep".into(),
+                    arguments: serde_json::json!({ "pattern": format!("dig{s}") }).to_string(),
+                }),
+                _ => StreamEvent::TextDelta("dug".into()),
+            };
+            return Ok(Box::pin(futures::stream::iter(vec![
+                event,
+                StreamEvent::Done { truncated: false },
+            ])));
         }
         let first = match last {
             Some(m) if m.role == Role::User && m.text.starts_with("read ") => {
@@ -1341,6 +1384,64 @@ async fn an_eager_todo_reminder_rides_the_first_request() {
             .is_some_and(|m| m.synthetic && m.text.contains("todowrite")),
         "the first request's tail: {:?}",
         first.last()
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// A long task hears about its quiet list once, from one voice, and none of it
+/// is kept.
+///
+/// Two voices used to say this: the per-request tail demanded a check every
+/// round, and the harness's `todo-reminder` committed "has not been updated for
+/// N steps" into the log every three steps, where each note stayed in every
+/// later request. deepseek-flash answered them — "Pointer is accurate — still
+/// #6" in up to 45% of its replies, and one diagnosis restated after nearly
+/// each of seven notes. Here: six quiet steps, one note, on one request.
+async fn a_quiet_task_list_is_named_once_by_one_voice() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let start = start(env.project.path(), &recorder, SessionMode::Fresh);
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+
+    turn(&mut runtime, "plan and dig").await;
+
+    let requests: Vec<Vec<Message>> = recorder
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| dig_steps(request).is_some())
+        .cloned()
+        .collect();
+    // At least: stopping with the list still open earns one more round from the
+    // completion nudge, which is its own business.
+    assert!(
+        requests.len() >= DIG_STEPS + 2,
+        "the plan, the digging and the answer all ran: {} requests",
+        requests.len()
+    );
+    let noted: Vec<usize> = requests
+        .iter()
+        .enumerate()
+        .filter(|(_, request)| {
+            request
+                .iter()
+                .any(|m| m.text.contains("has not moved for a few steps"))
+        })
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        noted.len(),
+        1,
+        "one note for one stretch, not one per round (requests {noted:?})"
+    );
+    let harness_voice = requests
+        .iter()
+        .flatten()
+        .find(|m| m.text.contains("The task list shows") || m.text.contains("The task list has"));
+    assert!(
+        harness_voice.is_none(),
+        "the harness row said it too, and into the log: {harness_voice:?}"
     );
     runtime.handle.shutdown().await.unwrap();
 }
@@ -4252,6 +4353,7 @@ mod criteria {
         a_stop_hook_is_pointed_at_the_sessions_log,
         the_datalog_is_written_when_it_is_on,
         an_eager_todo_reminder_rides_the_first_request,
+        a_quiet_task_list_is_named_once_by_one_voice,
         a_loop_turn_can_schedule_its_next_pass,
         a_strict_credential_refusal_ends_the_turn_with_a_choice,
         a_permission_allow_rule_cannot_unlock_the_credential_boundary,
