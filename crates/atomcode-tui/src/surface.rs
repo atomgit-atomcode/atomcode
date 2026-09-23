@@ -1627,6 +1627,85 @@ impl Drop for Terminal {
 }
 
 /// Translate a crossterm event. `None` for events this UI has no use for.
+/// How long to wait for a second keystroke before deciding a lone one was lone.
+///
+/// A person typing at 200 words a minute puts ~60ms between characters; a
+/// terminal replaying a paste as keystrokes puts well under one. 4ms is far
+/// enough below the first and above the second that the two never meet — which
+/// matters more than it sounds, because getting it wrong in the generous
+/// direction means a fast typist's `hi<Enter>` is read as a paste and never
+/// sent.
+pub const BURST_PENDING: std::time::Duration = std::time::Duration::from_millis(4);
+
+/// And how long to wait once a second one has arrived — i.e. once this really
+/// is a burst.
+///
+/// Wider than [`BURST_PENDING`] on Windows because a paste there arrives as
+/// several stdin records and the terminal takes a few milliseconds to translate
+/// each: the gap to bridge is between records, not between characters. Nothing
+/// is at stake in widening it, because by now there is no other explanation for
+/// what is arriving.
+#[cfg(target_os = "windows")]
+pub const BURST_ACTIVE: std::time::Duration = std::time::Duration::from_millis(15);
+#[cfg(not(target_os = "windows"))]
+pub const BURST_ACTIVE: std::time::Duration = std::time::Duration::from_millis(4);
+
+/// The most characters gathered into one synthesised paste.
+pub const BURST_CAP: usize = 8192;
+
+/// The character a key event would contribute to a paste, if it could be part
+/// of one.
+///
+/// Enter is `\n` and Tab is `\t` — a terminal with no bracketed paste sends a
+/// pasted newline as the Enter key, which is the whole reason this exists. A
+/// chord is never part of a paste: `Ctrl+K` in the middle of a burst is a
+/// person interrupting it, not text.
+pub fn burst_char(event: &crossterm::event::Event) -> Option<char> {
+    use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+    let Event::Key(k) = event else { return None };
+    if k.kind != KeyEventKind::Press {
+        return None;
+    }
+    if k.modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+    {
+        return None;
+    }
+    match k.code {
+        KeyCode::Char(c) => Some(c),
+        KeyCode::Enter => Some('\n'),
+        KeyCode::Tab => Some('\t'),
+        _ => None,
+    }
+}
+
+/// Whether a run of keystrokes that arrived too fast to be typed is a paste.
+///
+/// **It has to contain a newline.** That is not a heuristic about what pastes
+/// look like, it is the whole of the damage being prevented: a single-line
+/// paste replayed as keystrokes simply types itself and no harm is done, while
+/// a multi-line one **submits every line as its own message** — the person
+/// pastes twenty lines and sends twenty messages, and there is no undoing that
+/// from the composer.
+///
+/// The one false positive worth excluding is an IME: JetBrains' terminal
+/// commits each candidate as a character followed by Enter, which arrives as
+/// exactly this shape. Three or more lines averaging a character each is that
+/// and nothing else — a real paste of three lines has words in them.
+pub fn is_paste_burst(chars: &[char]) -> bool {
+    if chars.len() < 2 {
+        return false;
+    }
+    let newlines = chars.iter().filter(|c| **c == '\n').count();
+    if newlines == 0 || !chars.iter().any(|c| !c.is_whitespace()) {
+        return false;
+    }
+    let lines = newlines + 1;
+    let printed = chars.len() - newlines;
+    // Mean of one character per line or less: an IME's candidates, not prose.
+    !(lines >= 3 && printed <= lines)
+}
+
 pub fn from_crossterm(event: crossterm::event::Event) -> Option<Input> {
     use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
     use crossterm::event::{MouseButton, MouseEventKind};
@@ -1887,6 +1966,114 @@ mod tests {
         // Solarized light and dark, the two that a naive average gets wrong.
         assert_eq!(theme((0xfd, 0xf6, 0xe3)), Theme::Light);
         assert_eq!(theme((0x00, 0x2b, 0x36)), Theme::Dark);
+    }
+
+    /// A run of keystrokes is a paste only when a newline is in it — because a
+    /// newline is the whole of the damage.
+    ///
+    /// The reverse is what this really pins: **too eager and a fast typist's
+    /// `hi<Enter>` stops being sent**, which is worse than the bug. So a run
+    /// with no newline is never a paste however long it is, and a single
+    /// keystroke never is either.
+    #[test]
+    fn a_burst_is_a_paste_only_when_a_newline_is_in_it() {
+        let run = |s: &str| is_paste_burst(&s.chars().collect::<Vec<_>>());
+        assert!(run("one\ntwo"), "two lines is the case this exists for");
+        assert!(run("fn main() {\n    todo!()\n}"), "pasted code");
+        assert!(run("a\n"), "a line and its newline");
+
+        assert!(!run("hello"), "no newline: typing it does no harm");
+        assert!(!run("h"), "one keystroke is a keystroke");
+        assert!(!run(""), "nothing is nothing");
+        assert!(!run("\n\n"), "whitespace alone carries nothing to paste");
+    }
+
+    /// The one false positive worth excluding: an IME that commits each
+    /// candidate as a character and an Enter.
+    ///
+    /// It arrives in exactly the shape a paste does — fast, with newlines — and
+    /// swallowing it would make Chinese input impossible to submit in
+    /// JetBrains' terminal. Told apart by density: three or more lines
+    /// averaging a character each is nobody's paste.
+    #[test]
+    fn an_ime_committing_one_character_per_line_is_not_a_paste() {
+        let run = |s: &str| is_paste_burst(&s.chars().collect::<Vec<_>>());
+        assert!(!run("好\n的\n吗\n"), "an IME's candidates");
+        assert!(!run("a\nb\nc\n"));
+        // And the thing it must not take with it: three real lines.
+        assert!(run("好的\n可以\n没问题\n"), "three real lines are a paste");
+        assert!(run("one\ntwo\nthree"), "and so are these");
+    }
+
+    /// What a keystroke contributes to a burst — and what never does.
+    ///
+    /// Enter is `\n` because that is how a terminal with no bracketed paste
+    /// sends a pasted newline; a chord is nothing, because `Ctrl+C` in the
+    /// middle of a burst is a person stopping it.
+    #[test]
+    fn only_a_plain_keystroke_can_be_part_of_a_paste() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+        let press = |code, mods| Event::Key(KeyEvent::new(code, mods));
+        assert_eq!(
+            burst_char(&press(KeyCode::Char('x'), KeyModifiers::NONE)),
+            Some('x')
+        );
+        assert_eq!(
+            burst_char(&press(KeyCode::Char('X'), KeyModifiers::SHIFT)),
+            Some('X'),
+            "shift is how a capital is typed, not a chord"
+        );
+        assert_eq!(
+            burst_char(&press(KeyCode::Enter, KeyModifiers::NONE)),
+            Some('\n')
+        );
+        assert_eq!(
+            burst_char(&press(KeyCode::Tab, KeyModifiers::NONE)),
+            Some('\t')
+        );
+
+        assert_eq!(
+            burst_char(&press(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            None
+        );
+        assert_eq!(
+            burst_char(&press(KeyCode::Char('c'), KeyModifiers::ALT)),
+            None
+        );
+        assert_eq!(
+            burst_char(&press(KeyCode::Char('c'), KeyModifiers::SUPER)),
+            None
+        );
+        assert_eq!(burst_char(&press(KeyCode::Esc, KeyModifiers::NONE)), None);
+        assert_eq!(burst_char(&Event::Resize(80, 24)), None);
+        // A release is not a keystroke — Windows sends one after every press,
+        // and reading it as a character would double every pasted letter.
+        let release = Event::Key(KeyEvent::new_with_kind(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        ));
+        assert_eq!(burst_char(&release), None);
+    }
+
+    /// The window that tells a typist from a terminal replaying a paste has to
+    /// sit between the two, and nearer the fast end.
+    ///
+    /// Not a tautology: it is the one number in this whole mechanism, and
+    /// widening it past a typist's gap is what would break submitting.
+    #[test]
+    fn the_burst_window_is_well_under_the_gap_between_typed_characters() {
+        // 200 words a minute is about 16 characters a second: ~60ms apart.
+        let fastest_typist = std::time::Duration::from_millis(60);
+        assert!(
+            BURST_PENDING * 4 < fastest_typist,
+            "the window has to be far enough under a typist's gap that jitter \
+             cannot close it: {BURST_PENDING:?} vs {fastest_typist:?}"
+        );
+        assert!(
+            BURST_ACTIVE >= BURST_PENDING,
+            "confirming only ever widens it"
+        );
     }
 
     #[test]

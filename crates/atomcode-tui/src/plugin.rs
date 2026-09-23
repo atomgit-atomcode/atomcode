@@ -5671,12 +5671,97 @@ fn sanitize_paste(text: &str) -> String {
     crate::text::for_buffer(text)
 }
 
+/// Read the terminal, gathering keystroke bursts that are really a paste.
+///
+/// **Why this is not just a loop over events.** A terminal without bracketed
+/// paste — Windows Terminal on an older conhost, PuTTY, a few others — replays
+/// a paste as the keystrokes it would have taken to type it. Every newline in
+/// it is the Enter key, and Enter in the composer sends. Pasting twenty lines
+/// there sent twenty messages, one per line, and nothing about that is
+/// recoverable once it has happened.
+///
+/// So characters that arrive too fast to have been typed are held and asked
+/// about together (`crate::surface::is_paste_burst`). The window is 4ms, an
+/// order of magnitude under the gap between two characters a person types and
+/// an order above the gap inside a replayed paste — see
+/// [`crate::surface::BURST_PENDING`] for why the direction of that error
+/// matters.
+///
+/// **The original events are held, not the characters**, and replayed
+/// unchanged when the run turns out not to be a paste. Rebuilding a key event
+/// from its character would be a second answer to what a keystroke is, sitting
+/// next to `from_crossterm` and free to disagree with it.
 async fn read_input(wake: mpsc::UnboundedSender<Wake>) {
     use futures::StreamExt;
-    let mut events = crossterm::event::EventStream::new();
-    while let Some(Ok(event)) = events.next().await {
-        if let Some(input) = crate::surface::from_crossterm(event) {
-            if wake.send(Wake::Input(input)).is_err() {
+    let events = crossterm::event::EventStream::new().filter_map(|read| async { read.ok() });
+    futures::pin_mut!(events);
+    pump_input(events, wake).await;
+}
+
+/// [`read_input`] over any stream of terminal events.
+///
+/// Split from the reader so the gathering can be judged: the terminal's own
+/// stream needs a tty, and what is worth judging here is not that crossterm
+/// reads — it is the timing decision, and a judgement that cannot supply the
+/// timing judges nothing. Everything above is one line of plumbing.
+async fn pump_input<S>(mut events: S, wake: mpsc::UnboundedSender<Wake>)
+where
+    S: futures::Stream<Item = crossterm::event::Event> + Unpin,
+{
+    use futures::StreamExt;
+    let forward = |event| -> bool {
+        match crate::surface::from_crossterm(event) {
+            Some(input) => wake.send(Wake::Input(input)).is_ok(),
+            // Not an event this screen has a use for; the reader lives on.
+            None => true,
+        }
+    };
+    while let Some(event) = events.next().await {
+        let Some(first) = crate::surface::burst_char(&event) else {
+            if !forward(event) {
+                break;
+            }
+            continue;
+        };
+        let mut held: Vec<(char, crossterm::event::Event)> = vec![(first, event)];
+        let mut after: Option<crossterm::event::Event> = None;
+        // The wider window opens only once a second character has confirmed
+        // there is something to bridge: until then a lone keystroke must not
+        // pay for the paste case.
+        let mut confirmed = false;
+        while held.len() < crate::surface::BURST_CAP {
+            let window = if confirmed {
+                crate::surface::BURST_ACTIVE
+            } else {
+                crate::surface::BURST_PENDING
+            };
+            let Ok(next) = tokio::time::timeout(window, events.next()).await else {
+                break; // quiet: whatever this was, it is over
+            };
+            let Some(next) = next else { break };
+            match crate::surface::burst_char(&next) {
+                Some(c) => {
+                    held.push((c, next));
+                    confirmed = true;
+                }
+                None => {
+                    after = Some(next);
+                    break;
+                }
+            }
+        }
+        let chars: Vec<char> = held.iter().map(|(c, _)| *c).collect();
+        let sent = if crate::surface::is_paste_burst(&chars) {
+            wake.send(Wake::Input(Input::Paste(chars.into_iter().collect())))
+                .is_ok()
+        } else {
+            held.into_iter().all(|(_, event)| forward(event))
+        };
+        if !sent {
+            break;
+        }
+        if let Some(event) = after {
+            if !forward(event) {
                 break;
             }
         }
@@ -6875,6 +6960,124 @@ mod mcp_panel_tests {
             note(&host),
             Some(t(Msg::NoMcpPort).into_owned()),
             "the panel says what is missing"
+        );
+    }
+}
+
+#[cfg(test)]
+mod paste_burst_tests {
+    use super::*;
+    use crate::surface::{Input, Key, KeyPress};
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use futures::StreamExt as _;
+
+    fn press(c: char) -> Event {
+        Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+    }
+    fn enter() -> Event {
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    }
+
+    /// Feed `script` — each event with the gap that precedes it — through the
+    /// real pump, and collect what the screen was told.
+    ///
+    /// **Real time, deliberately.** The gap between two characters IS the
+    /// judgement here: "60ms apart is a person typing" is a claim that has to
+    /// be tested by really waiting 60ms. On a virtual clock the pump's timeout
+    /// and the script's gap are two timers with no relationship to each other,
+    /// and the assertion would pass or fail on which one tokio picked — green
+    /// while saying nothing (`AGENTS.md`, 测试与构建命令: the lower-bound kind
+    /// of assertion is the one not to convert). The whole file below costs
+    /// under a fifth of a second.
+    async fn pumped(script: Vec<(u64, Event)>) -> Vec<Input> {
+        let events = futures::stream::unfold(script.into_iter(), |mut rest| async move {
+            let (gap_ms, event) = rest.next()?;
+            tokio::time::sleep(std::time::Duration::from_millis(gap_ms)).await;
+            Some((event, rest))
+        })
+        .fuse();
+        futures::pin_mut!(events);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        super::pump_input(events, tx).await;
+        let mut seen = Vec::new();
+        while let Ok(Wake::Input(input)) = rx.try_recv() {
+            seen.push(input);
+        }
+        seen
+    }
+
+    /// **The bug this exists for.** A terminal with no bracketed paste replays
+    /// a paste as keystrokes, and every newline in it is the Enter key — so
+    /// pasting three lines sent three messages, one per line, with nothing to
+    /// undo them from the composer.
+    #[tokio::test]
+    async fn a_paste_replayed_as_keystrokes_arrives_as_one_paste() {
+        // Real pasted lines. Not `a\nb\nc` — that is three lines averaging one
+        // character, which is an IME's candidates and is excluded on purpose
+        // (see `surface::is_paste_burst`). Writing the fixture that way is how
+        // this judgement first went red, and it was right to.
+        let text = "one\ntwo\nthree";
+        let script: Vec<(u64, Event)> = text
+            .chars()
+            .map(|c| (0u64, if c == '\n' { enter() } else { press(c) }))
+            .collect();
+        assert_eq!(
+            pumped(script).await,
+            vec![Input::Paste(text.into())],
+            "one paste, not thirteen keystrokes — and not three submits"
+        );
+    }
+
+    /// And the failure that would be worse: typing `hi` then Enter has to stay
+    /// three keystrokes, or a fast typist can no longer send anything.
+    #[tokio::test]
+    async fn typing_a_line_and_pressing_enter_is_still_three_keystrokes() {
+        let seen = pumped(vec![(0, press('h')), (60, press('i')), (60, enter())]).await;
+        assert_eq!(
+            seen,
+            vec![
+                Input::Key(KeyPress::ch('h')),
+                Input::Key(KeyPress::ch('i')),
+                Input::Key(KeyPress::plain(Key::Enter)),
+            ],
+            "typed at a human's pace, nothing is gathered"
+        );
+    }
+
+    /// A run with no newline is left as the keystrokes it was, however fast:
+    /// typing it does no harm, and gathering it would swallow a `/` that was
+    /// about to open the menu.
+    #[tokio::test]
+    async fn a_fast_run_with_no_newline_is_still_keystrokes() {
+        let seen = pumped(vec![(0, press('a')), (0, press('b')), (0, press('c'))]).await;
+        assert_eq!(
+            seen,
+            vec![
+                Input::Key(KeyPress::ch('a')),
+                Input::Key(KeyPress::ch('b')),
+                Input::Key(KeyPress::ch('c')),
+            ]
+        );
+    }
+
+    /// What ends a burst is passed on, not eaten: Escape in the middle of a
+    /// paste is a person stopping it, and it has to arrive.
+    #[tokio::test]
+    async fn the_key_that_ended_a_burst_still_arrives() {
+        let stop = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let seen = pumped(vec![
+            (0, press('a')),
+            (0, enter()),
+            (0, press('b')),
+            (0, stop),
+        ])
+        .await;
+        assert_eq!(
+            seen,
+            vec![
+                Input::Paste("a\nb".into()),
+                Input::Key(KeyPress::plain(Key::Esc)),
+            ]
         );
     }
 }
