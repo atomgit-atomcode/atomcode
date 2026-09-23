@@ -561,10 +561,15 @@ fn yes() -> bool {
 pub fn register_skill_commands(ctx: &Context, registry: &Arc<SkillRegistry>) -> Result<(), String> {
     crate::commands::register(ctx, Arc::new(ListSkills(registry.clone())))?;
     for skill in registry.user_invocable() {
-        // A name a command already has is left alone rather than refused:
-        // a skill called `compact` must not take the host's `/compact`
-        // away, and a mount that failed over it would take the whole tree
-        // down for a file someone dropped in a directory.
+        // A cheap early skip when the name is already taken — a skill called
+        // `compact` must not take the host's `/compact`. The catalog is the
+        // real arbiter, not this line: `RunSkill::is_skill()` makes a skill
+        // yield to a built-in of the same name in either registration order and
+        // never error (see `CommandCatalog::register`), so a skill that raced
+        // ahead of its built-in — the `/memory` case, where skills mount before
+        // the memory row — is still evicted rather than crashing the tree. This
+        // skip only saves registering-then-yielding when the built-in got there
+        // first.
         if catalog_has(ctx, &bare_name(&skill.name)) {
             continue;
         }
@@ -612,6 +617,13 @@ impl crate::commands::CatalogCommand for RunSkill {
         }
         agent.send(text);
         Ok(format!("按 `{}` 开始", bare_name(&self.0.name)))
+    }
+
+    // Generated from a SKILL.md on disk: it yields its name to any built-in of
+    // the same name so a skill called `memory` cannot take `/memory` or break
+    // the assembly. Still reachable through `use_skill`.
+    fn is_skill(&self) -> bool {
+        true
     }
 }
 
