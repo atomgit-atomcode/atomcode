@@ -3227,6 +3227,15 @@ impl Tui {
                         AgentStatus::Working => Activity::Working,
                         AgentStatus::Stopping => Activity::Stopping,
                     });
+                } else if on_screen && status == AgentStatus::Idle && self.client.settled() {
+                    // The lead's own line is moved by its turn events, which say
+                    // more than a status does — but only while they arrive. When
+                    // one does not, the claim on screen (正在停止, most of all)
+                    // has nothing to take it back, and it stood until the next
+                    // turn. The agent saying it is idle, with nothing sent to it
+                    // still unclaimed, is the backstop: the screen never keeps
+                    // insisting on work the agent says is over.
+                    changed |= self.set_activity(crate::moment::Activity::Idle);
                 }
                 changed
             }
@@ -3329,7 +3338,20 @@ impl Tui {
                 true
             }
             AgentEvent::Error { message, .. } => {
-                self.set_activity(Activity::Idle);
+                // Said always; the line below it only when the agent is not
+                // working. Not every error ends a turn — a `/cancel-all` refused
+                // by an idle member, a mid-turn cost warning, a persistence
+                // warning — and writing "idle" over a turn that is still running
+                // takes the spinner (and the 停止中) off a screen with work on
+                // it. The claim is only ever lowered here, never raised: raising
+                // it belongs to the turn's own first fact.
+                let working = matches!(
+                    self.client.status_of(&self.client.session()),
+                    Some(AgentStatus::Working) | Some(AgentStatus::Stopping)
+                );
+                if !working {
+                    self.set_activity(Activity::Idle);
+                }
                 self.say_refused(&message);
                 true
             }

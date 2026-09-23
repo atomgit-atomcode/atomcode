@@ -3857,6 +3857,139 @@ async fn cancel_all_stops_every_members_turn_and_keeps_the_team() {
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
 
+/// An error is said without taking the line off work that is still running.
+///
+/// Not every error ends a turn: a `/cancel-all` refused by an idle member, a
+/// mid-turn cost warning, a persistence warning. Writing "idle" over any of
+/// them took the spinner off a screen with a turn on it — and with it went the
+/// answer to "is a turn running", which is what esc and the steering panel are
+/// read against.
+#[tokio::test]
+async fn an_error_mid_turn_does_not_take_the_working_line_away() {
+    let dir = scratch("error-mid-turn");
+    let script = replay(
+        r#"{ text = "Working.", calls = [ { name = "bash", args = { command = "sleep 2" } } ] },
+           { text = "Done." }"#,
+    );
+    let (s, agent_said) = start_with_agent_events(tree(&dir, &script, &[])).await;
+    let task = s.open().await;
+
+    s.term.type_line("go");
+    until(&s, "Working.").await;
+    agent_said
+        .send(atomcode_kernel::event::AgentEvent::Error {
+            message: "本回合已经花了不少".into(),
+            http_status: None,
+            code: None,
+            retryable: None,
+        })
+        .unwrap();
+    until(&s, "本回合已经花了不少").await;
+    // The turn's own row, not the transcript: a tool call's line says 运行中
+    // whatever the screen believes about the turn.
+    let live = part_text(&s, "live");
+    assert!(
+        live.contains("正在等待模型")
+            || live.contains("正在思考")
+            || live.contains("正在回复")
+            || live.contains("正在运行"),
+        "the turn is still running, and its own row must still say so: {live:?}"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+/// A stop the agent has finished does not go on saying 正在停止.
+///
+/// The words are a claim about now, and only a turn event takes them back — so
+/// a turn whose end never reaches the screen (a runtime that answered the stop
+/// and then said nothing more, which is the shape of the report this came from)
+/// left them standing until the next turn. The agent saying it is idle, with
+/// nothing sent to it unclaimed, is the backstop.
+#[tokio::test]
+async fn a_stop_the_agent_finished_does_not_keep_saying_it_is_stopping() {
+    let dir = scratch("stopping-stuck");
+    let script = replay(
+        r#"{ text = "Working.", calls = [ { name = "bash", args = { command = "sleep 2" } } ] },
+           { text = "Done." }"#,
+    );
+    // A connection that swallows the stop and loses the turn's ending — the two
+    // halves of the report this came from. Everything else (the facts, the
+    // status the agent announces) arrives as it does in life.
+    let s = start_with_connection(tree(&dir, &script, &[]), |connection| {
+        let atomcode_host_api::HostConnection {
+            session,
+            commands,
+            mut events,
+            control,
+        } = connection;
+        let (sent, mut typed) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(command) = typed.recv().await {
+                if matches!(command, atomcode_kernel::event::AgentCommand::Cancel) {
+                    continue;
+                }
+                if commands.send(command).is_err() {
+                    break;
+                }
+            }
+        });
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                if matches!(
+                    event,
+                    atomcode_kernel::event::AgentEvent::TurnComplete { .. }
+                        | atomcode_kernel::event::AgentEvent::Cancelled
+                ) {
+                    continue;
+                }
+                if tx.send(event).is_err() {
+                    break;
+                }
+            }
+        });
+        atomcode_host_api::HostConnection {
+            session,
+            commands: sent,
+            events: rx,
+            control,
+        }
+    })
+    .await;
+    let task = s.open().await;
+
+    s.term.type_line("go");
+    until(&s, "Working.").await;
+    s.term.press(KeyPress::plain(Key::Esc));
+    until(&s, "正在停止").await;
+
+    // The agent finishes the turn it was never told to stop, and says it is
+    // idle. Nothing else will say so: the ending was dropped.
+    for _ in 0..200 {
+        if s.client().settled() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(s.client().settled(), "the agent never went idle");
+
+    // What is typed now opens a fresh turn, so it is not steering — and a screen
+    // still claiming 停止中 reads it as exactly that, and shows it in the panel
+    // as work the model is about to be handed.
+    s.term.type_line("again");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let steering = part_text(&s, "steering");
+    assert!(
+        !steering.contains("again"),
+        "a stale stopping claim made a fresh turn look like steering: {steering:?}"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
 /// Back on a lead that is still working, esc stops it.
 ///
 /// Looking at a member empties the screen's activity, and coming back only
@@ -3941,6 +4074,21 @@ fn team_with_a_talking_member(dir: &Path) -> (String, String) {
         dir = dir.to_string_lossy(),
     );
     (script, team)
+}
+
+/// One named region of the last frame, as plain text: the rows a module drew.
+fn part_text(s: &Session, part: &str) -> String {
+    s.term
+        .last()
+        .and_then(|frame| frame.part(part).cloned())
+        .map(|part| {
+            part.lines
+                .iter()
+                .map(|l| l.plain())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
 }
 
 fn panel_text(s: &Session) -> String {
