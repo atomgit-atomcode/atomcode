@@ -1785,6 +1785,164 @@ async fn a_model_switch_is_told_to_the_model_where_it_happened() {
     runtime.handle.shutdown().await.unwrap();
 }
 
+/// The notes the model was given about what the person did, containing `needle`.
+fn told<'a>(seen: &'a [Message], needle: &str) -> Vec<&'a Message> {
+    seen.iter()
+        .filter(|m| m.role != Role::System && m.synthetic && m.text.contains(needle))
+        .collect()
+}
+
+/// A change of reasoning effort or of thinking is told the way a model switch
+/// is: it changes how the next answer is produced, and nothing else the model
+/// reads says it happened.
+///
+/// Negative control: drop the effort or thinking clause from `told::reconfigured`
+/// and its assertion fails.
+async fn a_reasoning_change_is_told() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut start = start(env.project.path(), &recorder, SessionMode::Fresh);
+    start.agent.supports_reasoning_effort = true;
+    start.agent.chat_options.reasoning_effort =
+        Some(atomcode_kernel::provider::ReasoningEffort::High);
+    let mut lower = start.agent.clone();
+    lower.chat_options.reasoning_effort = Some(atomcode_kernel::provider::ReasoningEffort::Low);
+    let mut thinking = lower.clone();
+    thinking.thinking_enabled = Some(true);
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+
+    turn(&mut runtime, "hello").await;
+    runtime.handle.reassemble_provider(lower).await.unwrap();
+    runtime.handle.reassemble_provider(thinking).await.unwrap();
+    turn(&mut runtime, "again").await;
+
+    let seen = recorder.last_turn_request();
+    assert_eq!(
+        told(&seen, "reasoning effort was changed from high to low").len(),
+        1,
+        "{seen:#?}"
+    );
+    assert_eq!(
+        told(&seen, "Extended thinking was turned on").len(),
+        1,
+        "{seen:#?}"
+    );
+    assert!(
+        told(&seen, "model for this conversation was switched").is_empty(),
+        "the model did not change, so no switch is told: {seen:#?}"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// A change of execution mode is told — above all leaving plan mode, which is
+/// when the standing plan reminder goes quiet and the model may start writing.
+/// Choosing the mode already in force says nothing.
+///
+/// Negative control: drop the `tell` from the `SetMode` branch and no mode note
+/// arrives.
+async fn a_mode_switch_is_told() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+            .await
+            .unwrap();
+
+    turn(&mut runtime, "hello").await;
+    runtime.handle.set_mode(RuntimeMode::Build).await.unwrap();
+    runtime.handle.set_mode(RuntimeMode::Plan).await.unwrap();
+    turn(&mut runtime, "look around").await;
+    runtime.handle.set_mode(RuntimeMode::Build).await.unwrap();
+    turn(&mut runtime, "now do it").await;
+
+    let seen = recorder.last_turn_request();
+    let notes = told(&seen, "mode to");
+    assert_eq!(notes.len(), 2, "{seen:#?}");
+    assert!(
+        notes[0].text.contains("from build mode to plan mode"),
+        "{:?}",
+        notes[0].text
+    );
+    assert!(
+        notes[1].text.contains("from plan mode to build mode")
+            && notes[1].text.contains("you may edit files"),
+        "{:?}",
+        notes[1].text
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// Turning a tool off, reloading and withdrawing MCP tools are each told once.
+/// A reload withdraws MCP tools on its way to putting them back; that step is
+/// not told as a withdrawal.
+///
+/// Negative control: have `reload_capabilities_with_plugin_skills` withdraw with
+/// `tell: true` and the reload arrives with a withdrawal beside it.
+async fn a_change_to_the_tools_is_told() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+            .await
+            .unwrap();
+
+    turn(&mut runtime, "hello").await;
+    runtime
+        .handle
+        .switch_tool("write_file".into(), false)
+        .await
+        .unwrap();
+    runtime.handle.reload_capabilities().await.unwrap();
+    turn(&mut runtime, "again").await;
+
+    let seen = recorder.last_turn_request();
+    assert_eq!(
+        told(&seen, "turned off the tools matching `write_file`").len(),
+        1,
+        "{seen:#?}"
+    );
+    assert_eq!(told(&seen, "reloaded plugins").len(), 1, "{seen:#?}");
+    assert!(
+        told(&seen, "withdrew every MCP tool").is_empty(),
+        "a reload was told as a withdrawal: {seen:#?}"
+    );
+
+    runtime.handle.withdraw_mcp_tools().await.unwrap();
+    turn(&mut runtime, "and again").await;
+    let seen = recorder.last_turn_request();
+    assert_eq!(told(&seen, "withdrew every MCP tool").len(), 1, "{seen:#?}");
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// `/undo` takes the conversation back and leaves the files: the model is told
+/// the files stayed, or it would redo or deny edits that are still on disk.
+///
+/// Negative control: drop the note from the live branch of `ApplyUndo` and the
+/// next request says nothing about it.
+async fn an_undo_is_told_that_the_files_stayed() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+            .await
+            .unwrap();
+
+    turn(&mut runtime, "hello").await;
+    turn(&mut runtime, "second").await;
+    runtime.handle.undo_to_prompt(None).await.unwrap();
+    turn(&mut runtime, "third").await;
+
+    let seen = recorder.last_turn_request();
+    assert_eq!(
+        user_texts(&seen),
+        vec!["hello".to_string(), "third".to_string()],
+        "{seen:#?}"
+    );
+    let notes = told(&seen, "were NOT reverted");
+    assert_eq!(notes.len(), 1, "{seen:#?}");
+    runtime.handle.shutdown().await.unwrap();
+}
+
 /// The UI language does not reach the persona.
 ///
 /// `language = "zh_CN"` in `config.toml` chooses what the front end is drawn in.
@@ -4450,6 +4608,10 @@ mod criteria {
         memory_is_shown_only_when_switched_on,
         configured_request_options_reach_the_provider_and_follow_a_model_switch,
         a_model_switch_is_told_to_the_model_where_it_happened,
+        a_reasoning_change_is_told,
+        a_mode_switch_is_told,
+        a_change_to_the_tools_is_told,
+        an_undo_is_told_that_the_files_stayed,
         the_ui_language_does_not_reach_the_persona,
         a_permission_rule_refuses_what_it_denies,
         a_round_budget_ends_the_turn,

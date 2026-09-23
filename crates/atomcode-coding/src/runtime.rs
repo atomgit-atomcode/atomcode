@@ -1966,11 +1966,18 @@ impl CodingRuntimeHandle {
     /// mutable config, trust, or auth state. Security-reducing mutations must
     /// await this terminal before changing those inputs.
     pub async fn withdraw_mcp_tools(&self) -> Result<(), RuntimeError> {
+        self.send_withdraw_mcp_tools(true).await
+    }
+
+    /// `tell`: whether the model is told the person withdrew them. A reload
+    /// withdraws on its way to putting them back, and says so itself.
+    async fn send_withdraw_mcp_tools(&self, tell: bool) -> Result<(), RuntimeError> {
         let state = self.state.load(Ordering::Acquire);
         let (done, result) = oneshot::channel();
         self.tx
             .send(CodingRuntimeControl::WithdrawMcpTools {
                 generation: runtime_state_generation(state),
+                tell,
                 done,
             })
             .map_err(|_| RuntimeError::Unavailable)?;
@@ -2048,7 +2055,7 @@ impl CodingRuntimeHandle {
         &self,
         plugin_skill_dirs: Option<Vec<(std::path::PathBuf, String)>>,
     ) -> Result<SessionChanged, RuntimeError> {
-        self.withdraw_mcp_tools().await?;
+        self.send_withdraw_mcp_tools(false).await?;
         self.reprepare_target(ReprepareTarget::Reload { plugin_skill_dirs })
             .await
     }
@@ -2889,6 +2896,8 @@ pub enum CodingRuntimeControl {
     },
     WithdrawMcpTools {
         generation: u64,
+        /// Whether the model is told (see [`crate::told`]).
+        tell: bool,
         done: oneshot::Sender<Result<(), RuntimeError>>,
     },
     ToolCatalog {
@@ -4729,6 +4738,12 @@ fn spawn_runtime_owner_with_optional_agent(
                             )));
                             continue;
                         };
+                        // Only the files went back: the conversation above still
+                        // describes edits that are no longer on disk.
+                        let code_only = (outcome == RewindFinalization::Commit
+                            && !receipt.takes_back_conversation()
+                            && !receipt.restored_files().is_empty())
+                        .then(|| receipt.restored_files().to_vec());
                         let result = tokio::task::spawn_blocking(move || match outcome {
                             RewindFinalization::Commit => hook.commit_rewind(receipt),
                             RewindFinalization::Compensate => hook.compensate_rewind(receipt),
@@ -4769,6 +4784,12 @@ fn spawn_runtime_owner_with_optional_agent(
                             agent = None;
                             let _ = done.send(Err(RuntimeError::ReconfigureFailed(message)));
                             continue;
+                        }
+                        if let Some(files) = code_only {
+                            tell(
+                                runtime,
+                                Some(crate::told::code_restored_conversation_kept(&files)),
+                            );
                         }
                         if controls.state.load(Ordering::Acquire)
                             == runtime_phase_state(generation, RuntimePhase::Reconfiguring)
@@ -5011,6 +5032,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Busy));
                             continue;
                         }
+                        let before = current_mode(&runtime.parts);
                         runtime.parts.plan_mode.store(
                             matches!(mode, RuntimeMode::Plan),
                             Ordering::Release,
@@ -5023,6 +5045,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             matches!(mode, RuntimeMode::AcceptEdits),
                             Ordering::Release,
                         );
+                        tell(runtime, crate::told::mode_changed(before, mode));
                         let _ = runtime_event_tx.send(CodingRuntimeEvent::ModeChanged { mode });
                         let _ = done.send(Ok(()));
                     }
@@ -5038,20 +5061,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Busy));
                             continue;
                         }
-                        // The flags, decoded — not a fourth field that would have
-                        // to be kept in step with them. Plan wins when two are set,
-                        // which cannot happen through `SetMode` (it writes all
-                        // three) but is the safe reading of a tree where it did.
-                        let mode = if runtime.parts.plan_mode.load(Ordering::Acquire) {
-                            RuntimeMode::Plan
-                        } else if runtime.parts.bypass_mode.load(Ordering::Acquire) {
-                            RuntimeMode::Auto
-                        } else if runtime.parts.accept_edits.load(Ordering::Acquire) {
-                            RuntimeMode::AcceptEdits
-                        } else {
-                            RuntimeMode::Build
-                        };
-                        let _ = done.send(Ok(mode));
+                        let _ = done.send(Ok(current_mode(&runtime.parts)));
                     }
                     Some(CodingRuntimeControl::ContextStats {
                         generation: request_generation,
@@ -5172,6 +5182,9 @@ fn spawn_runtime_owner_with_optional_agent(
                         } else {
                             catalog.turn_off(&pattern);
                         }
+                        if let Some(runtime) = resources.as_ref() {
+                            tell(runtime, Some(crate::told::tool_switched(&pattern, on)));
+                        }
                         let _ = done.send(Ok(catalog.listing()));
                     }
                     Some(CodingRuntimeControl::McpTools {
@@ -5269,8 +5282,12 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;
                         };
+                        let said = crate::told::mcp_acted(&server, action);
                         let outcome =
                             apply_mcp_action(runtime, server, action, &mut mcp_disable_holds).await;
+                        if outcome.is_ok() {
+                            tell(runtime, Some(said));
+                        }
                         let _ = done.send(match outcome {
                             Ok(()) => Ok(()),
                             Err(message) => Err(RuntimeError::ReconfigureFailed(message)),
@@ -5278,6 +5295,7 @@ fn spawn_runtime_owner_with_optional_agent(
                     }
                     Some(CodingRuntimeControl::WithdrawMcpTools {
                         generation: request_generation,
+                        tell: told,
                         done,
                     }) => {
                         if request_generation != generation
@@ -5292,6 +5310,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             continue;
                         };
                         runtime.parts.withdraw_mcp_tools().await;
+                        tell(runtime, told.then(crate::told::mcp_withdrawn));
                         let _ = done.send(Ok(()));
                     }
                     Some(CodingRuntimeControl::QueueLocalContext {
@@ -5474,7 +5493,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 if let Some(snapshot) = runtime.parts.snapshot_hook() {
                                     snapshot.set_model_attribution(&next.provider_name, &next.model);
                                 }
-                                note_model_switch(&runtime, &runtime.config, &next);
+                                tell(&runtime, crate::told::reconfigured(&runtime.config, &next));
                                 runtime.config = next;
                                 let provider = runtime.config.provider_name.clone();
                                 let model = runtime.config.model.clone();
@@ -5628,7 +5647,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 agent = Some(candidate);
                                 // Before the pending prompt is replayed, so the
                                 // note precedes the first message on the new model.
-                                note_model_switch(&runtime, &old_config, &runtime.config);
+                                tell(&runtime, crate::told::reconfigured(&old_config, &runtime.config));
                                 generation = generation.wrapping_add(1);
                                 event_generation.store(generation, Ordering::Release);
                                 pending_steer_acknowledgements.clear();
@@ -6074,6 +6093,14 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;
                         };
+                        // What the model is told once this lands: a reload, or
+                        // what a reloaded config changed. A new session is not
+                        // told anything — it has no conversation above it.
+                        let reloaded_from = match &target {
+                            ReprepareTarget::Reload { .. } => Some(None),
+                            ReprepareTarget::ReloadConfig(_) => Some(Some(runtime.config.clone())),
+                            _ => None,
+                        };
                         // A reload with nothing to reconnect is a re-read, not
                         // a rebuild (`docs/adr/0022` §2): the skills on disk go
                         // into the registry the live tree already serves, and
@@ -6093,6 +6120,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             && runtime.parts.mcp_statuses().await.is_empty()
                         {
                             if reload_skills_live(&runtime).is_ok() {
+                                tell(&runtime, Some(crate::told::reloaded()));
                                 let _ = runtime_event_tx.send(
                                     CodingRuntimeEvent::Reconfiguring {
                                         operation: ReconfigureKind::Reprepare,
@@ -6411,6 +6439,13 @@ fn spawn_runtime_owner_with_optional_agent(
                         ) {
                             ai_name_attempted = false;
                         }
+                        match reloaded_from {
+                            Some(None) => tell(&runtime, Some(crate::told::reloaded())),
+                            Some(Some(before)) => {
+                                tell(&runtime, crate::told::reconfigured(&before, &runtime.config))
+                            }
+                            None => {}
+                        }
                         let changed = session_changed(generation, &runtime);
                         let cwd = runtime.config.working_dir.clone();
                         resources = Some(runtime);
@@ -6529,6 +6564,15 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = undo_sidecars;
                             if let Some(turn) = code_rewound_to {
                                 record_code_rewind(agent, turn);
+                            } else {
+                                // Rides with the next message rather than being
+                                // committed now: the snapshot handed back below is
+                                // the conversation as it now stands, and a note
+                                // committed after it would make it stale at once.
+                                agent.inject(
+                                    crate::told::conversation_rewound_code_kept(),
+                                    atomcode_harness::session::InjectionOrigin::Reminder,
+                                );
                             }
                             generation = generation.wrapping_add(1);
                             event_generation.store(generation, Ordering::Release);
@@ -6597,6 +6641,17 @@ fn spawn_runtime_owner_with_optional_agent(
                                 observed_tokens = None;
                                 snapshot_in_flight = false;
                                 let snapshot = Arc::new(truncated);
+                                // With the next message, as on the live branch.
+                                if let Some(agent) = code_rewound_to
+                                    .is_none()
+                                    .then(|| live_root_agent(&runtime))
+                                    .flatten()
+                                {
+                                    agent.inject(
+                                        crate::told::conversation_rewound_code_kept(),
+                                        atomcode_harness::session::InjectionOrigin::Reminder,
+                                    );
+                                }
                                 resources = Some(runtime);
                                 controls.state.store(
                                     runtime_phase_state(generation, RuntimePhase::Ready),
@@ -9387,37 +9442,34 @@ fn live_root_agent(runtime: &RuntimeResources) -> Option<Arc<atomcode_harness::a
         .find(|agent| agent.parent().is_none())
 }
 
-/// Tell the conversation's agent that its model changed.
+/// Tell the conversation's agent what the person just did (see [`crate::told`]).
 ///
-/// The persona's identity line already follows a switch, so the model knows
-/// what it is now; what it cannot tell from that is that the replies above were
-/// written by another model. `note` puts that where it happened — into the log
-/// at once when idle, ahead of the next turn when one is running — as a logged
-/// fact, so a resumed session still says it. Choosing the model already in use
-/// changes nothing and says nothing.
-fn note_model_switch(runtime: &RuntimeResources, from: &CodingAgentConfig, to: &CodingAgentConfig) {
-    if from.provider_name == to.provider_name && from.model == to.model {
+/// `note` puts it where it happened — into the log at once when idle, ahead of
+/// the next turn when one is running — as a logged fact, so a resumed session
+/// still says it. `None` is a change that says nothing.
+fn tell(runtime: &RuntimeResources, said: Option<String>) {
+    let Some(said) = said else {
         return;
+    };
+    if let Some(agent) = live_root_agent(runtime) {
+        agent.note(said, atomcode_harness::session::InjectionOrigin::Reminder);
     }
-    let Some(agent) = live_root_agent(runtime) else {
-        return;
-    };
-    let name = |config: &CodingAgentConfig| {
-        if from.provider_name == to.provider_name {
-            format!("`{}`", config.model)
-        } else {
-            format!("`{}` (provider {})", config.model, config.provider_name)
-        }
-    };
-    let (from, to) = (name(from), name(to));
-    agent.note(
-        format!(
-            "<system-reminder>The model for this conversation was switched from {from} to \
-             {to}. The replies above this point were written by {from}; from here on you \
-             are {to}.</system-reminder>"
-        ),
-        atomcode_harness::session::InjectionOrigin::Reminder,
-    );
+}
+
+/// The execution mode, decoded from the three flags `SetMode` writes — not a
+/// fourth field that would have to be kept in step with them. Plan wins when two
+/// are set, which cannot happen through `SetMode` (it writes all three) but is
+/// the safe reading of a tree where it did.
+fn current_mode(parts: &crate::CodingParts) -> RuntimeMode {
+    if parts.plan_mode.load(Ordering::Acquire) {
+        RuntimeMode::Plan
+    } else if parts.bypass_mode.load(Ordering::Acquire) {
+        RuntimeMode::Auto
+    } else if parts.accept_edits.load(Ordering::Acquire) {
+        RuntimeMode::AcceptEdits
+    } else {
+        RuntimeMode::Build
+    }
 }
 
 /// Commit `events` into `live`'s log, in order. The session store appends each

@@ -179,6 +179,11 @@ impl RewindTransactionReceipt {
             .map(|receipt| receipt.restored_files.as_slice())
             .unwrap_or_default()
     }
+
+    /// Whether this rewind takes the conversation back too, or only the files.
+    pub fn takes_back_conversation(&self) -> bool {
+        self.target_snapshot.is_some()
+    }
 }
 
 #[derive(Clone)]

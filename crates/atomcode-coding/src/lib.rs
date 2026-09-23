@@ -63,6 +63,7 @@ pub mod session_title;
 pub mod team;
 mod team_progress;
 pub mod telemetry;
+mod told;
 pub mod vision;
 
 mod execution_policy;
