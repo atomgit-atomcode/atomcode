@@ -553,6 +553,11 @@ struct OllamaNdjsonDecoder {
     tool_index: u32,
     truncated: bool,
     done: bool,
+    /// A model served here without think-parsing writes its reasoning into
+    /// `content` as `<think>…</think>` — Ollama's own `thinking` field below is
+    /// the parsed path, and this is the unparsed one. Per decoder, so an
+    /// unclosed block cannot reach the next response.
+    think: super::reasoning::InlineThink,
 }
 
 impl OllamaNdjsonDecoder {
@@ -562,6 +567,7 @@ impl OllamaNdjsonDecoder {
             tool_index: 0,
             truncated: false,
             done: false,
+            think: super::reasoning::InlineThink::new(),
         }
     }
 
@@ -586,10 +592,28 @@ impl OllamaNdjsonDecoder {
     fn finish(&mut self) -> Vec<StreamEvent> {
         let mut out = Vec::new();
         if !self.done {
+            out.extend(self.held_back());
             out.push(StreamEvent::Done {
                 truncated: self.truncated,
             });
             self.done = true;
+        }
+        out
+    }
+
+    /// Whatever the stripper is still holding, on the way out.
+    ///
+    /// Both ways a stream ends go through here: a `done:true` line and a
+    /// transport EOF. An unclosed `<think>` means the block never ended, and
+    /// showing nothing at all would be worse than showing it as thinking.
+    fn held_back(&mut self) -> Vec<StreamEvent> {
+        let held = self.think.flush();
+        let mut out = Vec::new();
+        if !held.visible.is_empty() {
+            out.push(StreamEvent::TextDelta(held.visible));
+        }
+        if !held.reasoning.is_empty() {
+            out.push(StreamEvent::Reasoning(held.reasoning));
         }
         out
     }
@@ -614,7 +638,13 @@ impl OllamaNdjsonDecoder {
         if let Some(msg) = v.get("message") {
             if let Some(c) = msg.get("content").and_then(|c| c.as_str()) {
                 if !c.is_empty() {
-                    out.push(StreamEvent::TextDelta(c.to_string()));
+                    let split = self.think.feed(c);
+                    if !split.visible.is_empty() {
+                        out.push(StreamEvent::TextDelta(split.visible));
+                    }
+                    if !split.reasoning.is_empty() {
+                        out.push(StreamEvent::Reasoning(split.reasoning));
+                    }
                 }
             }
             // Thinking models: plain-text reasoning, no signature.
@@ -664,6 +694,7 @@ impl OllamaNdjsonDecoder {
                     cached: 0,
                 }));
             }
+            out.extend(self.held_back());
             out.push(StreamEvent::Done {
                 truncated: self.truncated,
             });
@@ -895,6 +926,51 @@ mod tests {
 
     fn nd(v: Value) -> String {
         format!("{v}\n")
+    }
+
+    /// A model served without think-parsing writes its reasoning into
+    /// `content`. It must come out of the reasoning channel all the same —
+    /// otherwise the tags are simply printed in the middle of the answer.
+    ///
+    /// Judged through the decoder, not through `InlineThink`: the stripper has
+    /// its own tests, and those stay green whether or not this adapter ever
+    /// calls it.
+    #[test]
+    fn a_think_block_in_content_arrives_as_reasoning() {
+        let mut d = OllamaNdjsonDecoder::new();
+        let mut ev = Vec::new();
+        // Split mid-tag, the way a stream really arrives.
+        for chunk in ["<think>weigh", "ing it up</th", "ink>the answer"] {
+            ev.extend(d.feed(
+                nd(json!({"message":{"role":"assistant","content":chunk},"done":false})).as_bytes(),
+            ));
+        }
+        ev.extend(
+            d.feed(nd(json!({"message":{"role":"assistant","content":""},"done":true})).as_bytes()),
+        );
+        // Not an exact event sequence: reasoning streams out a delta per chunk,
+        // and how the chunks fall is the network's business, not this
+        // judgement's. What matters is which channel each part came out of.
+        assert!(
+            !kinds(&ev).contains(&"malformed"),
+            "nothing was mangled: {ev:?}"
+        );
+        let said: String = ev
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        let thought: String = ev
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Reasoning(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(said, "the answer", "no tags reach the answer");
+        assert_eq!(thought, "weighing it up", "and the thinking is kept");
     }
 
     #[test]

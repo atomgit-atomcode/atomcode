@@ -1598,6 +1598,10 @@ struct SseDecoder {
     response_model_seen: bool,
     seen_finish: bool,
     tool_call_delta_count: usize,
+    /// Reasoning that arrived in the content channel, for a model whose serving
+    /// layer has no reasoning parser configured. Per decoder, so an unclosed
+    /// block cannot reach the next response — see [`InlineThink`].
+    think: super::reasoning::InlineThink,
 }
 
 impl SseDecoder {
@@ -1612,6 +1616,7 @@ impl SseDecoder {
             response_model_seen: false,
             seen_finish: false,
             tool_call_delta_count: 0,
+            think: super::reasoning::InlineThink::new(),
         }
     }
 
@@ -1647,6 +1652,16 @@ impl SseDecoder {
         let mut out = Vec::new();
         if self.done {
             return out;
+        }
+        // Whatever the stripper was still holding: an unclosed `<think>` means
+        // the block never ended, and showing nothing would be worse than
+        // showing it as the thinking it is.
+        let held = self.think.flush();
+        if !held.visible.is_empty() {
+            out.push(StreamEvent::TextDelta(held.visible));
+        }
+        if !held.reasoning.is_empty() {
+            out.push(StreamEvent::Reasoning(held.reasoning));
         }
         for (id, name, args) in std::mem::take(&mut self.tool_calls) {
             // A tool call with NO function name is UNDISPATCHABLE: executors resolve tools
@@ -1752,7 +1767,16 @@ impl SseDecoder {
         };
         if let Some(c) = choice.delta.content {
             if !c.is_empty() {
-                out.push(StreamEvent::TextDelta(c));
+                // A `<think>` block here is reasoning that came down the wrong
+                // channel; it goes out of the right one rather than to the
+                // screen. Ordinary content passes through untouched.
+                let split = self.think.feed(&c);
+                if !split.visible.is_empty() {
+                    out.push(StreamEvent::TextDelta(split.visible));
+                }
+                if !split.reasoning.is_empty() {
+                    out.push(StreamEvent::Reasoning(split.reasoning));
+                }
             }
         }
         if let Some(r) = choice.delta.reasoning_content {
@@ -3150,6 +3174,44 @@ mod tests {
                 StreamEvent::Malformed => "malformed",
             })
             .collect()
+    }
+
+    /// A gateway whose reasoning parser is not configured passes `<think>`
+    /// straight through in `content`. It must still reach the reasoning
+    /// channel — the same place the parsed path puts it — rather than being
+    /// printed in the middle of the answer.
+    ///
+    /// Judged through the decoder, not through `InlineThink`: the stripper has
+    /// its own tests, and those stay green whether or not this adapter ever
+    /// calls it.
+    #[test]
+    fn a_think_block_in_content_arrives_as_reasoning() {
+        let mut d = SseDecoder::new();
+        let mut ev = Vec::new();
+        // Split mid-tag, the way a stream really arrives.
+        for chunk in ["<think>weigh", "ing it up</th", "ink>the answer"] {
+            ev.extend(d.feed(line(json!({"choices":[{"delta":{"content":chunk}}]})).as_bytes()));
+        }
+        ev.extend(
+            d.feed(line(json!({"choices":[{"delta":{},"finish_reason":"stop"}]})).as_bytes()),
+        );
+        ev.extend(d.feed(b"data: [DONE]\n"));
+        let said: String = ev
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        let thought: String = ev
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Reasoning(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(said, "the answer", "no tags reach the answer: {ev:?}");
+        assert_eq!(thought, "weighing it up", "and the thinking is kept");
     }
 
     #[test]

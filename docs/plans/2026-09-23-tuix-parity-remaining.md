@@ -247,7 +247,14 @@ webui 四个入口还是裸的。
       判据：阈值上下穿越各一次、冷却真的生效（虚拟时钟，见 AGENTS.md）、
       取不到答案时**不画**而不是画成 0。
 
-- [ ] **P1-3 内联 `<think>` 剥离**（决策 2 已定：provider adapter）。
+- [x] **P1-3 内联 `<think>` 剥离**（2026-09-23,决策 2 已定:provider adapter）。
+      按计划做的,落在 `provider/reasoning.rs` 的入站那半(`InlineThink`),
+      两个适配器各接一处 + 各自的收尾点放掉 held 住的。
+      **实现时被判据抓到一个真 bug**:第一版在**发出标签前面的正文之前**就决定了
+      要不要剥,于是 `seen_visible` 还是假的 —— `models emit <think> tags…` 被当成
+      块开头,整句后半截被吞掉。改成先发前面的正文、再决定,正是那条判据要防的事。
+      判据 7(单元)+ 2(适配器各一条,钉接线——单元那 7 条在适配器不调它时照样绿)。
+      两个适配器各摘掉一次,各自判红;`capabilities` 956 全过、`coding` 859 全过。
 
       **不是"剥掉丢弃"，是把错投进 content 的 reasoning 搬回 reasoning 通道**——
       和 kernel 对"整个答案掉进 reasoning_content"那一例做的是同一件事的镜像
