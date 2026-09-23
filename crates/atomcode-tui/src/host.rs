@@ -5110,6 +5110,7 @@ pub const TAIL: &[&str] = &[
     crate::modules::providers::ID,
     crate::modules::plugins::ID,
     crate::modules::tools::ID,
+    crate::modules::mcp::ID,
     crate::modules::rewind::ID,
     crate::modules::resume::ID,
     crate::modules::ask::ID,
@@ -10977,6 +10978,33 @@ mod tests {
         assert!(
             h.compose((80, 24)).part("mascot").is_some(),
             "the registry is read fresh, not snapshotted"
+        );
+    }
+
+    #[test]
+    fn a_panel_a_person_opened_has_somewhere_on_the_frame_to_be_drawn() {
+        // The failure this guards is silent and total, which is why it needed a
+        // person at a real terminal to find it: a panel module can be mounted,
+        // accepted by `Host::toggle_mcp`'s `has_view` check, and have its state
+        // open — the other panels even step aside — while `TAIL` never names
+        // it. Then the layout tree has no rect for it, `render` is never
+        // called, and the screen shows nothing at all; the keys still route to
+        // the panel (`Wake::Input`'s arms ask `mcp_open()`), so the person sees
+        // a screen that has stopped answering until Escape clears the state.
+        //
+        // No assertion on `moment.mcp_panel` can see that: the state is
+        // exactly right. Only a composed frame can, so this one mounts the
+        // module **by hand** rather than off `TAIL` — a fixture built from
+        // `TAIL` would go on passing while the shipped arrangement lost the
+        // panel, which is the whole trap.
+        let h = fed();
+        h.modules
+            .add_view(Arc::new(Mounted::<crate::modules::mcp::Mcp>::new()))
+            .unwrap();
+        assert!(h.toggle_mcp(), "the panel opens");
+        assert!(
+            h.compose((80, 24)).part(crate::modules::mcp::ID).is_some(),
+            "a panel that is open has to be somewhere on the frame"
         );
     }
 }
