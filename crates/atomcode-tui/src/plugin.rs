@@ -97,6 +97,9 @@ plexus_service!(PluginsSvc => dyn crate::plugins::Plugins, "tui-plugins", Seam, 
 // (`docs/adr/0022` §3) — so it arrives over a seam like everything else.
 plexus_service!(ToolCatalogSvc => dyn crate::tools::Tools, "tui-tools", Seam, "The tool catalog a person can look at and switch, one tool at a time");
 plexus_service!(RewindSvc => dyn crate::rewind::Rewind, "tui-rewind", Seam, "The turns this session can be taken back to, and the taking back");
+// Throwing a stored session away: the store is on disk and this crate does not
+// reach disks (`docs/adr/0022` §3), so the panel asks over a seam.
+plexus_service!(ResumeSvc => dyn crate::resume::Resume, "tui-resume-store", Seam, "Throwing away a stored session the resume panel lists");
 // And the seed installation, on the same terms: unpacking the embedded seeds,
 // scanning the project and locking a file are the launcher's to do — this crate
 // keeps its `atomcode-capabilities` features down to `tools` on purpose, and
@@ -2308,6 +2311,10 @@ impl Tui {
     /// typed command cannot come to mean different things.
     fn run_resume_key(&self, press: crate::surface::KeyPress) -> bool {
         let (changed, asked) = self.host.resume_key(press);
+        if let Some(crate::resume::Step::Delete { id }) = asked {
+            self.delete_session(id);
+            return true;
+        }
         let Some(crate::resume::Step::Resume { id }) = asked else {
             return changed;
         };
@@ -2317,6 +2324,39 @@ impl Tui {
         }
         self.host.close_resume();
         true
+    }
+
+    /// Throw a stored session away, once the panel has asked twice.
+    ///
+    /// The panel stays up: deleting is something a person does to a list they
+    /// are still reading, unlike resuming, which is the end of the list's job.
+    /// The row goes when the host says it is gone — not before, or a failed
+    /// delete would leave the screen showing a session that is still there.
+    fn delete_session(&self, id: String) {
+        let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
+            self.host
+                .say(t(Msg::ScreenNotConnectedRewind).into_owned(), true);
+            return;
+        };
+        let Some(port) = ctx.service::<crate::plugin::ResumeSvc>() else {
+            self.host.say(t(Msg::NoResumeStore).into_owned(), true);
+            return;
+        };
+        let host = self.host.clone();
+        let keys = self.wake.lock().expect("wake poisoned").clone();
+        tokio::spawn(async move {
+            let said = match port.delete(&id).await {
+                Ok(()) => {
+                    host.forget_resume(&id);
+                    t(Msg::ResumeDeleted { id: &id }).into_owned()
+                }
+                Err(why) => t(Msg::ResumeDeleteFailed { why: &why }).into_owned(),
+            };
+            host.say(said, true);
+            if let Some(keys) = keys {
+                let _ = keys.send(Wake::Fact);
+            }
+        });
     }
 
     /// Send one rewind over the seam.

@@ -188,7 +188,10 @@ fn session_line(
     } else {
         "  ".to_string()
     };
-    let meta = if session.needs_newer_version {
+    // 待删的那一行说的是「再按一次」,不是它有几回合:此刻人要读的就是这一句。
+    let meta = if panel.armed.as_deref() == Some(session.id.as_str()) {
+        t(Msg::ResumeDeleteArmed).into_owned()
+    } else if session.needs_newer_version {
         t(Msg::SessionNeedsNewerVersion { id: &session.id }).into_owned()
     } else {
         let when = crate::text::when(session.updated_at);
@@ -206,7 +209,10 @@ fn session_line(
             .into_owned(),
         }
     };
-    let heading_style = if session.needs_newer_version {
+    let armed = panel.armed.as_deref() == Some(session.id.as_str());
+    let heading_style = if armed {
+        base.under(theme::fg(Role::Error))
+    } else if session.needs_newer_version {
         base.under(theme::fg(Role::Muted))
     } else {
         base.under(theme::fg(Role::PanelFg))

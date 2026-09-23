@@ -179,6 +179,13 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::RewindPointsUnreadable { why } => format!("the turns could not be read: {why}").into(),
         Msg::RewindFailed { why } => format!("it did not go back: {why}").into(),
         Msg::NoRewindPanel => "this screen has no rewind panel: the launcher provided no `tui-panel-rewind`".into(),
+        Msg::NoResumeStore => {
+            "this screen cannot throw a session away: the launcher provided no `tui-resume-store`"
+                .into()
+        }
+        Msg::ResumeDeleteArmed => "Delete again to throw it away".into(),
+        Msg::ResumeDeleted { id } => format!("Session {id} is gone").into(),
+        Msg::ResumeDeleteFailed { why } => format!("It was not deleted: {why}").into(),
         Msg::NoResumePanel => "this screen has no resume panel: the launcher provided no `tui-panel-resume`".into(),
         Msg::NoRewind => "this screen cannot go back: the launcher provided no `tui-rewind`".into(),
         Msg::ScreenNotConnectedRewind => "no agent on screen, so there are no turns to go back through".into(),
@@ -311,7 +318,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SessionTurnsWhenWhere { turns, when, dir } => format!("{turns} turns · {when} · {dir}").into(),
         Msg::SessionTurnsWhen { turns, when } => format!("{turns} turns · {when}").into(),
         Msg::ResumeNoOthers => "there is no other stored session".into(),
-        Msg::ResumePickerHint => "back to which session · enter opens it".into(),
+        Msg::ResumePickerHint => "back to which session · enter opens it · Delete throws it away".into(),
 
         // ── reasoning effort, undo and rewind (`commands.rs`) ──
         Msg::EffortAbout => "this session's reasoning effort".into(),

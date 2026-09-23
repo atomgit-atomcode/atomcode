@@ -249,6 +249,16 @@ pub enum Msg<'a> {
     },
     NoRewindPanel,
     NoResumePanel,
+    /// The launcher mounted the panel but no way to throw a session away.
+    NoResumeStore,
+    /// On the row a second Delete would throw away.
+    ResumeDeleteArmed,
+    ResumeDeleted {
+        id: &'a str,
+    },
+    ResumeDeleteFailed {
+        why: &'a str,
+    },
     NoRewind,
     ScreenNotConnectedRewind,
 

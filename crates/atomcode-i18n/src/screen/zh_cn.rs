@@ -158,6 +158,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::RewindPointsUnreadable { why } => format!("读不到回合：{why}").into(),
         Msg::RewindFailed { why } => format!("没回得去：{why}").into(),
         Msg::NoRewindPanel => "这个屏幕没有回退面板:启动器没有提供 `tui-panel-rewind`".into(),
+        Msg::NoResumeStore => "这个屏幕删不掉会话:启动器没有提供 `tui-resume-store`".into(),
+        Msg::ResumeDeleteArmed => "再按一次 Delete 删掉它".into(),
+        Msg::ResumeDeleted { id } => format!("会话 {id} 已删除").into(),
+        Msg::ResumeDeleteFailed { why } => format!("没删掉:{why}").into(),
         Msg::NoResumePanel => "这个屏幕没有恢复面板:启动器没有提供 `tui-panel-resume`".into(),
         Msg::NoRewind => "这个屏幕回不了会话:启动器没有提供 `tui-rewind`".into(),
         Msg::ScreenNotConnectedRewind => "屏上没有 agent，没有回合可回".into(),
@@ -289,7 +293,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SessionTurnsWhenWhere { turns, when, dir } => format!("{turns} 轮 · {when} · {dir}").into(),
         Msg::SessionTurnsWhen { turns, when } => format!("{turns} 轮 · {when}").into(),
         Msg::ResumeNoOthers => "没有别的存下的会话".into(),
-        Msg::ResumePickerHint => "回到哪个会话 · enter 打开".into(),
+        Msg::ResumePickerHint => "回到哪个会话 · enter 打开 · Delete 删掉".into(),
 
         // ── reasoning effort, undo and rewind (`commands.rs`) ──
         Msg::EffortAbout => "这个会话的思考强度".into(),

@@ -786,6 +786,43 @@ impl RuntimeControl {
         Ok(HostReply::SessionChanged { session })
     }
 
+    /// Throw a stored session away.
+    ///
+    /// **The lease is what refuses the live one**, and it is the only guard
+    /// here that is worth having: a session being had — by this runtime or by
+    /// another — is one whose lease cannot be acquired, so it comes back
+    /// `SessionInUse` without this function knowing which runtime holds it. An
+    /// explicit "is it mine?" check in front of it was written first and taken
+    /// back out: removing it changed no answer (`a_stored_session_is_deleted_
+    /// but_never_the_live_one` stayed green), which is the definition of code
+    /// no criterion can see.
+    ///
+    /// Everything delegated from it goes with it: the store's own `delete`
+    /// takes the children first, because nothing would ever offer those
+    /// sessions again once the parent is gone.
+    fn delete_stored(&self, session: &str) -> Result<(), HostError> {
+        use atomcode_capabilities::session::SessionManager;
+        // Which project's store it is in: sessions are kept per working
+        // directory, and the one being deleted is usually not this session's.
+        let scan = SessionManager::scan_all();
+        let entry = scan
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == session)
+            .ok_or(HostError::NotFound)?;
+        let manager = SessionManager::for_project(&entry.working_dir);
+        // The lease is the other runtime's answer to "is anyone using this?":
+        // one held elsewhere fails here rather than deleting under it.
+        let lease = manager
+            .acquire_lease(session)
+            .map_err(|_| HostError::SessionInUse {
+                id: session.to_string(),
+            })?;
+        manager.delete(&lease).map_err(|error| HostError::Failed {
+            message: error.to_string(),
+        })
+    }
+
     fn list(&self, working_dir: Option<String>) -> Vec<StoredSession> {
         use atomcode_capabilities::session::SessionManager;
         let scan = SessionManager::scan_all();
@@ -944,6 +981,10 @@ impl HostControl for RuntimeControl {
             HostCommand::ListSessions { working_dir } => Ok(HostReply::Sessions {
                 sessions: self.list(working_dir),
             }),
+            HostCommand::DeleteSession { session } => {
+                self.delete_stored(&session)?;
+                Ok(HostReply::Done)
+            }
             HostCommand::Undo {
                 session,
                 turn,

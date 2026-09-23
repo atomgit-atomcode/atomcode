@@ -43,6 +43,13 @@ pub enum HostCommand {
     /// The stored sessions a person could resume, newest first — those of one
     /// working directory, or all of them.
     ListSessions { working_dir: Option<String> },
+    /// Throw a stored session away, with whatever was delegated from it.
+    ///
+    /// Not addressed at a live session the way the rest are: the argument is a
+    /// session on disk, which is usually *not* the one running. The host
+    /// refuses the one that is — a person cannot mean "delete the conversation
+    /// I am having", and a half-deleted live session is the worst of both.
+    DeleteSession { session: String },
     /// Take the conversation back to before the person's message that opened
     /// `turn` — the last one they sent, when none is named — and hand that
     /// message back (`docs/adr/0024` §17). `based_on` is the last fact the
@@ -250,7 +257,9 @@ impl HostCommand {
             | Self::Thinking { session }
             | Self::SetThinking { session, .. }
             | Self::Readiness { session } => Some(session),
-            Self::ListSessions { .. } => None,
+            // Addressed at a stored session, not the live one — see the
+            // variant's own note.
+            Self::ListSessions { .. } | Self::DeleteSession { .. } => None,
         }
     }
 }

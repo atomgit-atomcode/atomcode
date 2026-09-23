@@ -2072,3 +2072,76 @@ async fn a_listed_turn_says_which_files_it_changed() {
         "the turn that wrote a file says which one: {points:#?}"
     );
 }
+
+/// Throwing a stored session away — what the resume panel's second Delete does.
+///
+/// Two refusals matter more than the deletion itself: the session being had is
+/// refused (a runtime is writing to those files, and a person cannot have meant
+/// "delete the conversation I am in"), and a name nothing stored is `NotFound`
+/// rather than a silent success.
+#[tokio::test]
+async fn a_stored_session_is_deleted_but_never_the_live_one() {
+    let env = env();
+    let mut connection = connected(&env).await;
+    let live = connection.session.clone();
+    connection.commands.send(message("first words")).unwrap();
+    through_turn(&mut connection).await;
+
+    // A second session, so there is one to delete that is not the live one.
+    let Ok(HostReply::SessionChanged { session: second }) = connection
+        .control
+        .call(HostCommand::NewSession {
+            session: live.clone(),
+        })
+        .await
+    else {
+        panic!("a new session");
+    };
+    let _ = quiet(&mut connection).await;
+    connection.commands.send(subscribe(&second)).unwrap();
+    connection.commands.send(message("second words")).unwrap();
+    through_turn(&mut connection).await;
+
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::DeleteSession {
+                session: second.clone(),
+            })
+            .await,
+        Err(HostError::SessionInUse { id: second.clone() }),
+        "the session being had is refused"
+    );
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::DeleteSession {
+                session: "nothing-stored-under-this".into(),
+            })
+            .await,
+        Err(HostError::NotFound),
+        "and a name nothing stored is not a silent success"
+    );
+
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::DeleteSession {
+                session: live.clone(),
+            })
+            .await,
+        Ok(HostReply::Done),
+        "the one that is only on disk goes"
+    );
+    let Ok(HostReply::Sessions { sessions }) = connection
+        .control
+        .call(HostCommand::ListSessions { working_dir: None })
+        .await
+    else {
+        panic!("a listing");
+    };
+    assert!(
+        !sessions.iter().any(|s| s.id == live),
+        "and it is gone from the listing: {sessions:#?}"
+    );
+}

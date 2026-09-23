@@ -3218,6 +3218,32 @@ impl Host {
         changed
     }
 
+    /// Take a session out of the list the panel is showing.
+    ///
+    /// Called when the host said it is gone. The screen does not ask for the
+    /// list again: it was just told what changed, and a second answer to the
+    /// same question is another chance for the two to disagree. The cursor
+    /// stays where it is (clamped by the drawing), so the next Delete is aimed
+    /// at the row that moved up — which is why arming is cleared here too.
+    pub fn forget_resume(&self, id: &str) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let left: Vec<crate::resume::Session> = m
+            .resume
+            .sessions()
+            .iter()
+            .filter(|session| session.id != id)
+            .cloned()
+            .collect();
+        if left.len() == m.resume.sessions().len() {
+            return false;
+        }
+        m.resume = crate::resume::ResumeView::new(left);
+        if let Some(panel) = m.resume_panel.as_mut() {
+            panel.armed = None;
+        }
+        true
+    }
+
     /// Run one key against the resume panel: the panel it writes back, and the
     /// session to resume when the key asked for one.
     pub fn resume_key(
