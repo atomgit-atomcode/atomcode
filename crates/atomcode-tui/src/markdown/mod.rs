@@ -27,11 +27,13 @@ mod table;
 /// argument — one site, one decision.)
 pub(super) const RULE: &str = "─";
 
-/// The left gutter bar of a fenced code block. A thin block, not a box vertical:
-/// it reads as a coloured margin beside the code rather than another drawn line,
-/// which is the whole point of dropping the rules. `caps::ascii_for` downgrades it
-/// to `|` where Unicode is unavailable.
-pub(super) const CODE_BAR: &str = "▏";
+/// The left gutter prefix — a thin block bar and a space — shared by blockquotes
+/// and fenced code blocks: a coloured margin down the side that sets a block apart
+/// without drawing another line. One const so the glyph lives in a single place
+/// (as `RULE` above does), while the COLOUR stays the caller's: accent for a quote
+/// callout, muted for code. `caps::ascii_for` downgrades the bar to `|` where
+/// Unicode is unavailable.
+pub(super) const GUTTER_BAR: &str = "▏ ";
 
 fn code() -> Style {
     // Inline code is a COOL accent, not a warning colour. Highlighting every
@@ -225,7 +227,7 @@ fn ordinary_line(t: &str, indent: usize, w: u16, base: Style) -> Vec<Line> {
         // but render the quoted TEXT as body (`base`, like an ordinary paragraph) — the
         // text sharing `quote()`'s Accent with `heading()` made a `>` line read as a
         // heading and lowered readability on a full sentence. Inline code still highlights.
-        return wrap_spans(&inline(b, base), w, "▏ ", quote());
+        return wrap_spans(&inline(b, base), w, GUTTER_BAR, quote());
     }
     if let Some((marker, b)) = list_item(t) {
         let lead = format!("{}{marker} ", " ".repeat(indent));
@@ -701,9 +703,8 @@ pub(crate) fn wrap_spans(spans: &[Span], w: u16, prefix: &str, prefix_style: Sty
 /// stacks several blocks (the "横线太多" complaint). The peers that keep command
 /// output light do the same: a single left bar, never a box.
 fn code_block(lines: &[String], lang: &str, w: u16) -> Vec<Line> {
-    // `▏ ` — a bar and a space, in the muted fence colour. Downgrades to `| ` on a
-    // terminal without Unicode (see `caps::ascii_for`), exactly as `RULE` does.
-    let bar = || Span::styled(format!("{CODE_BAR} "), fence());
+    // The shared gutter bar, here in the muted fence colour (a quote uses accent).
+    let bar = || Span::styled(GUTTER_BAR, fence());
     let mut out = Vec::new();
     if !lang.is_empty() {
         out.push(
