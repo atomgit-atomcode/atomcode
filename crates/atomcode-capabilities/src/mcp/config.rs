@@ -251,6 +251,59 @@ pub fn config_path_for_source(
     }
 }
 
+/// Turn one configured server off or back on, in the file that defines it.
+///
+/// Turning off writes `disabled: true`. Turning on **removes** the key rather than writing
+/// `false`, so an enabled entry reads exactly like one that never carried it
+/// (`McpServerEntry::disabled` is `#[serde(default)]`).
+///
+/// Bails, leaving the file byte-identical, when the file carries JSONC comments (see
+/// [`read_json_for_rewrite`]) or when it does not define `server_key`. This edits an existing
+/// entry; it never adds a server.
+pub fn set_mcp_server_disabled_in_json_file(
+    path: &Path,
+    server_key: &str,
+    disabled: bool,
+) -> Result<()> {
+    if server_key.is_empty() {
+        bail!("MCP server name must not be empty");
+    }
+
+    let mut root: Value = read_json_for_rewrite(path)?;
+
+    let root_obj = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("MCP config root must be a JSON object"))?;
+
+    // Merge the legacy `servers` key into `mcpServers` first, so the edit lands on the entry
+    // a reader would resolve — and is written back in one place.
+    let mut servers = collect_merged_mcp_server_maps(root_obj);
+    let entry = servers.get_mut(server_key).ok_or_else(|| {
+        anyhow::anyhow!(
+            "MCP server '{server_key}' is not defined in {}",
+            path.display()
+        )
+    })?;
+    let entry_obj = entry
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("MCP server '{server_key}' entry is not an object"))?;
+
+    if disabled {
+        entry_obj.insert("disabled".to_string(), Value::Bool(true));
+    } else {
+        entry_obj.remove("disabled");
+    }
+
+    root_obj.insert("mcpServers".to_string(), Value::Object(servers));
+    root_obj.remove("servers");
+
+    let text = serde_json::to_string_pretty(&root).context("Failed to serialize MCP config")?;
+    std::fs::write(path, format!("{text}\n"))
+        .with_context(|| format!("Failed to write MCP config to {}", path.display()))?;
+
+    Ok(())
+}
+
 /// Blank out `//` and `/* … */` comments so a JSONC-flavoured config parses.
 ///
 /// Editors (VS Code, Cursor) and our own `.mcp.json.example` all treat this file as
@@ -1163,6 +1216,69 @@ mod tests {
             config_path_for_source(dir.path(), McpConfigSource::Driver),
             None,
             "a driver-supplied server was never read from a file, so there is none to edit"
+        );
+    }
+
+    #[test]
+    fn a_disabled_server_is_written_and_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(".mcp.json");
+        std::fs::write(
+            &target,
+            r#"{"mcpServers":{"srv":{"command":"npx","args":["-y","a"]}}}"#,
+        )
+        .unwrap();
+
+        set_mcp_server_disabled_in_json_file(&target, "srv", true).unwrap();
+
+        let configs = load_config_file(&target, McpConfigSource::Project).unwrap();
+        assert_eq!(configs.len(), 1);
+        assert!(configs[0].disabled, "the flag must survive a reload");
+
+        set_mcp_server_disabled_in_json_file(&target, "srv", false).unwrap();
+
+        let configs = load_config_file(&target, McpConfigSource::Project).unwrap();
+        assert!(!configs[0].disabled);
+        let text = std::fs::read_to_string(&target).unwrap();
+        assert!(
+            !text.contains("disabled"),
+            "enabling removes the key instead of writing false: {text}"
+        );
+    }
+
+    #[test]
+    fn disabling_a_server_the_file_does_not_define_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(".mcp.json");
+        let original = r#"{"mcpServers":{"srv":{"command":"npx"}}}"#;
+        std::fs::write(&target, original).unwrap();
+
+        let error = set_mcp_server_disabled_in_json_file(&target, "nope", true).unwrap_err();
+        assert!(
+            error.to_string().contains("not defined"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            original,
+            "a refused write must leave the file byte-identical"
+        );
+    }
+
+    #[test]
+    fn a_server_under_the_legacy_servers_key_can_still_be_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(".mcp.json");
+        std::fs::write(&target, r#"{"servers":{"srv":{"command":"npx"}}}"#).unwrap();
+
+        set_mcp_server_disabled_in_json_file(&target, "srv", true).unwrap();
+
+        let configs = load_config_file(&target, McpConfigSource::Project).unwrap();
+        assert!(configs[0].disabled);
+        let text = std::fs::read_to_string(&target).unwrap();
+        assert!(
+            !text.contains("\"servers\""),
+            "the legacy key is folded into mcpServers, same as the other writers: {text}"
         );
     }
 }
