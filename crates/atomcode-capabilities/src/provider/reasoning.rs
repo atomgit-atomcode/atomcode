@@ -259,7 +259,10 @@ mod tests {
             ReasoningPolicy::derive("qwen3-max", ""),
             ReasoningPolicy::Preserve
         );
-        assert_eq!(ReasoningPolicy::derive("qwq-32b", ""), ReasoningPolicy::Preserve);
+        assert_eq!(
+            ReasoningPolicy::derive("qwq-32b", ""),
+            ReasoningPolicy::Preserve
+        );
     }
 
     #[test]

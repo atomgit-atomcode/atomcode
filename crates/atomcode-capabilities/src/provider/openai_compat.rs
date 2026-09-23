@@ -2653,8 +2653,14 @@ mod tests {
         empty.reasoning = Some(String::new());
         let out = format_messages(&[with, no, empty], ReasoningPolicy::Preserve, true);
         assert_eq!(out[0]["reasoning_content"], "because");
-        assert!(out[1].get("reasoning_content").is_none(), "no reasoning → nothing");
-        assert!(out[2].get("reasoning_content").is_none(), "empty reasoning → nothing");
+        assert!(
+            out[1].get("reasoning_content").is_none(),
+            "no reasoning → nothing"
+        );
+        assert!(
+            out[2].get("reasoning_content").is_none(),
+            "empty reasoning → nothing"
+        );
     }
 
     #[test]
