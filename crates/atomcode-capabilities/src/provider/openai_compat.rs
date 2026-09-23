@@ -1354,17 +1354,27 @@ fn normalize_openai_tool_schema_children(children: &mut Value) {
 /// DeepSeek V4 thinking models reject the `tool_choice` control parameter while
 /// still accepting tools in auto mode. This is a model protocol constraint, not an
 /// endpoint property: compatible gateways and fallback routes enforce it too.
+///
+/// The family test is version-parsed (shared with the reasoning-policy classifier)
+/// rather than a literal `contains("deepseek-v4")`, so the rename
+/// `deepseek-v4.1-flash` → `deepseek-flash` and a future `deepseek-v5` are still
+/// recognized instead of silently regaining the rejected parameter.
 fn supports_tool_choice(model: &str) -> bool {
     let model = model.trim().to_ascii_lowercase().replace(['_', ' '], "-");
-    !model.contains("deepseek-v4")
+    !super::reasoning::deepseek_thinking_v4_plus(&model)
 }
 
 /// Legacy model-name hint for DeepSeek V4. New runtime construction must prefer
 /// the concrete endpoint capability carried by [`OpenAiCompatConfig`]; identical
 /// model ids can expose different controls behind different gateways.
 pub fn reason_effort_applicable(model: &str) -> bool {
-    // Only DeepSeek-V4 takes a top-level `reasoning_effort`; others reject/ignore it.
-    model.to_ascii_lowercase().contains("deepseek-v4")
+    // Only the DeepSeek-V4 thinking family takes a top-level `reasoning_effort`;
+    // others reject/ignore it. Version-parsed (shared with the reasoning-policy
+    // classifier) so the `deepseek-flash` rename and future versions still match.
+    // Same `_`/space normalization as `supports_tool_choice` so both agree on a
+    // model id that arrives with underscores or spaces.
+    let model = model.trim().to_ascii_lowercase().replace(['_', ' '], "-");
+    super::reasoning::deepseek_thinking_v4_plus(&model)
 }
 
 /// True when an OPEN failure is a 400 specifically complaining about
@@ -2747,6 +2757,56 @@ mod tests {
             body.get("tool_choice").is_none(),
             "DeepSeek V4 thinking mode rejects forced tool_choice through proxy gateways too"
         );
+    }
+
+    #[test]
+    fn renamed_deepseek_flash_omits_unsupported_tool_choice() {
+        // `deepseek-v4.1-flash` was renamed to the versionless `deepseek-flash`; it
+        // is the same V4 thinking family and still rejects a forced tool_choice. A
+        // literal `contains("deepseek-v4")` gate missed the rename and would have
+        // sent the rejected control parameter (a 400 on strict gateways).
+        let cfg =
+            OpenAiCompatConfig::new("k", "https://llm-api.atomgit.com/v1", "deepseek-flash");
+        let opts = ChatOptions {
+            tool_choice: ToolChoice::Specific("todowrite".into()),
+            ..Default::default()
+        };
+        let body = build_request_body(
+            "deepseek-flash",
+            &[Message::user("hi")],
+            &[],
+            &opts,
+            &cfg,
+            ReasoningPolicy::Include,
+        );
+        assert!(
+            body.get("tool_choice").is_none(),
+            "renamed deepseek-flash is the V4 thinking family and must not receive forced tool_choice"
+        );
+    }
+
+    #[test]
+    fn supports_tool_choice_excludes_only_v4_thinking_family() {
+        assert!(!supports_tool_choice("deepseek-flash"), "rename — the fix");
+        assert!(!supports_tool_choice("deepseek-v4-flash"));
+        assert!(!supports_tool_choice("deepseek-v5"), "future version parses >= 4");
+        assert!(
+            supports_tool_choice("deepseek-r1"),
+            "reasoner is not the V4 thinking family; it keeps tool_choice"
+        );
+        assert!(supports_tool_choice("gpt-4o"));
+        assert!(supports_tool_choice("kimi-k2"));
+    }
+
+    #[test]
+    fn reason_effort_applicable_tracks_v4_family_including_rename() {
+        assert!(reason_effort_applicable("deepseek-v4-flash"));
+        assert!(reason_effort_applicable("deepseek-flash"), "the rename");
+        assert!(reason_effort_applicable("deepseek-v5"));
+        // Same `_`/space normalization as supports_tool_choice, so the two agree.
+        assert!(reason_effort_applicable("deepseek_flash"));
+        assert!(!reason_effort_applicable("deepseek-r1"));
+        assert!(!reason_effort_applicable("gpt-4o"));
     }
 
     #[test]

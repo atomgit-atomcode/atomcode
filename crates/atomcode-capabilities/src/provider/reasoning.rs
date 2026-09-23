@@ -122,7 +122,7 @@ impl ReasoningPolicy {
 /// older parse below 4 and fall through; `deepseek-coder-v2` has no `deepseek-v`
 /// run at all. The caller has already excluded the R1/reasoner forbidders, so
 /// only the V4+ requirers reach this.
-fn deepseek_thinking_v4_plus(m: &str) -> bool {
+pub(crate) fn deepseek_thinking_v4_plus(m: &str) -> bool {
     if m.contains("deepseek-flash") {
         return true;
     }
