@@ -151,6 +151,7 @@ impl Tool for GrepTool {
             case_insensitive,
             context,
             max_matches: max,
+            cancel: ctx.cancel.clone(),
             skip_dir: Arc::new(is_skip_dir),
             skip_file: Arc::new(move |path: &std::path::Path| {
                 path.extension()
@@ -166,7 +167,15 @@ impl Tool for GrepTool {
         let base = ctx.working_dir.clone();
         let display_path = raw.clone();
         let shown_pattern = a.pattern.clone();
-        match self.world.search(&root, &query).await {
+        let searched = self.world.search(&root, &query).await;
+        // The walk gives back what it had when it saw the stop, which is not an
+        // answer to what was asked: a "no matches" from a search that was cut
+        // short reads to the model as a fact about the tree. Said the way `bash`
+        // says it.
+        if ctx.cancel.is_cancelled() {
+            return err("grep: cancelled before completion.".to_string());
+        }
+        match searched {
             Ok(result) if result.lines.is_empty() => ok(format!(
                 "No matches found for '{shown_pattern}' in {display_path} ({} files searched)",
                 result.files_searched
@@ -243,6 +252,31 @@ mod tests {
             progress: atomcode_kernel::tool::ProgressSink::noop(),
             requester: None,
         }
+    }
+
+    /// A stopped turn's search does not answer out of what it had.
+    ///
+    /// The walk is synchronous on the blocking pool, so nothing but the walk
+    /// itself can observe a stop: before it looked, `grep` over a big tree kept
+    /// the turn (and the screen's 正在停止) up for as long as the tree took, and
+    /// then answered as though nothing had happened.
+    #[tokio::test]
+    async fn a_stopped_search_is_refused_rather_than_answered_from_half_a_tree() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("a.rs"),
+            "let TODO = 1;
+",
+        )
+        .unwrap();
+        let mut ctx = ctx(d.path());
+        ctx.cancel = CancellationToken::new();
+        ctx.cancel.cancel();
+        let r = GrepTool::default()
+            .execute(r#"{"pattern":"TODO","path":"."}"#, &ctx)
+            .await;
+        assert!(r.is_error, "{}", r.content);
+        assert!(r.content.contains("cancelled"), "{}", r.content);
     }
 
     #[tokio::test]

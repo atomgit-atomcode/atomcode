@@ -194,7 +194,11 @@ async fn sr_scan(
     let skip: crate::world::SkipDir = Arc::new(is_skip_dir);
     let mut modified = Vec::new();
     let mut scanned = 0usize;
-    for path in world.walk(root, &skip).await? {
+    // Not the turn's stop: this walk decides which files get rewritten, and one
+    // cut halfway through is a replace half applied — worse than one that
+    // finishes. Stopping a turn is cooperative, and this is a step that finishes.
+    let finishes = tokio_util::sync::CancellationToken::new();
+    for path in world.walk(root, &skip, &finishes).await? {
         if let Some(g) = glob_filter {
             if !g.is_match(&path, root) {
                 continue;

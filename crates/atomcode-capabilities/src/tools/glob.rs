@@ -116,22 +116,32 @@ impl Tool for GlobTool {
         let wd = ctx.working_dir.clone();
         let pattern = a.pattern.clone();
         let skip: crate::world::SkipDir = Arc::new(is_skip_dir);
-        let res = self.world.walk(&base, &skip).await.map(|files| {
-            let mut hits: Vec<String> = Vec::new();
-            for path in files {
-                // Match the path RELATIVE to the base (standard glob semantics).
-                let rel = path.strip_prefix(&base).unwrap_or(&path);
-                if matcher.is_match(rel) {
-                    // Display relative to the working dir for usable paths.
-                    let shown =
-                        crate::pathnorm::to_display(path.strip_prefix(&wd).unwrap_or(&path));
-                    hits.push(shown);
+        let res = self
+            .world
+            .walk(&base, &skip, &ctx.cancel)
+            .await
+            .map(|files| {
+                let mut hits: Vec<String> = Vec::new();
+                for path in files {
+                    // Match the path RELATIVE to the base (standard glob semantics).
+                    let rel = path.strip_prefix(&base).unwrap_or(&path);
+                    if matcher.is_match(rel) {
+                        // Display relative to the working dir for usable paths.
+                        let shown =
+                            crate::pathnorm::to_display(path.strip_prefix(&wd).unwrap_or(&path));
+                        hits.push(shown);
+                    }
                 }
-            }
-            hits.sort();
-            hits
-        });
+                hits.sort();
+                hits
+            });
 
+        // A walk that was stopped gives back what it had, and "no files matching"
+        // out of half a tree is a claim about the tree that is not true. Said the
+        // way `bash` says it.
+        if ctx.cancel.is_cancelled() {
+            return err("glob: cancelled before completion.".to_string());
+        }
         match res {
             Ok(hits) if hits.is_empty() => ok(format!("No files matching \"{pattern}\"")),
             Ok(mut hits) => {
@@ -239,6 +249,23 @@ mod tests {
             progress: atomcode_kernel::tool::ProgressSink::noop(),
             requester: None,
         }
+    }
+
+    /// A stopped turn's walk does not answer out of what it had — the same
+    /// reason as `grep`'s: half a tree is not a fact about the tree, and the
+    /// walk is the only thing in a position to notice the stop.
+    #[tokio::test]
+    async fn a_stopped_walk_is_refused_rather_than_answered_from_half_a_tree() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.rs"), "").unwrap();
+        let mut ctx = ctx(d.path());
+        ctx.cancel = CancellationToken::new();
+        ctx.cancel.cancel();
+        let r = GlobTool::default()
+            .execute(r#"{"pattern":"*.rs"}"#, &ctx)
+            .await;
+        assert!(r.is_error, "{}", r.content);
+        assert!(r.content.contains("cancelled"), "{}", r.content);
     }
 
     /// Same recovery clue as `grep`/`list_directory` — glob failed on the identical guessed

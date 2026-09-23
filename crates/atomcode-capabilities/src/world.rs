@@ -72,6 +72,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 // ---- errors and value types ---------------------------------------------
 
@@ -170,6 +171,9 @@ pub struct SearchQuery {
     pub max_matches: usize,
     pub skip_dir: SkipDir,
     pub skip_file: SkipFile,
+    /// The caller's stop, as for [`Fs::walk`]: a search over a big tree is the
+    /// other thing here that a person can be left waiting on.
+    pub cancel: CancellationToken,
 }
 
 /// One line of a search result, **undecoded** — the world's bytes, for the
@@ -267,10 +271,24 @@ pub trait FileSystem: Send + Sync {
     /// This is the primitive `glob` and `grep` walk with. Before it existed
     /// they walked the host disk directly and were the two tools a fenced world
     /// could not contain.
-    async fn walk(&self, root: &Path, skip_dir: &SkipDir) -> Result<Vec<PathBuf>, FsError> {
+    ///
+    /// `cancel` is the caller's stop: a walk is the one thing here that can run
+    /// for minutes on a large tree, and a person who pressed stop should not
+    /// wait out the rest of it. A cancelled walk gives back what it had when it
+    /// noticed — the caller decides whether that is an answer or a refusal.
+    /// Callers with nothing to stop pass a token nobody cancels.
+    async fn walk(
+        &self,
+        root: &Path,
+        skip_dir: &SkipDir,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<PathBuf>, FsError> {
         let mut files = Vec::new();
         let mut pending = vec![root.to_path_buf()];
         while let Some(dir) = pending.pop() {
+            if cancel.is_cancelled() {
+                break;
+            }
             let mut subdirs = Vec::new();
             for entry in self.list(&dir).await? {
                 let name = entry
@@ -309,8 +327,8 @@ pub trait FileSystem: Send + Sync {
         let matcher = build_matcher(query)?;
         let mut searcher = build_searcher(query.context);
         let mut result = SearchResult::default();
-        for path in self.walk(root, &query.skip_dir).await? {
-            if result.matches >= query.max_matches {
+        for path in self.walk(root, &query.skip_dir, &query.cancel).await? {
+            if result.matches >= query.max_matches || query.cancel.is_cancelled() {
                 break;
             }
             if (query.skip_file)(&path) {
@@ -899,12 +917,21 @@ impl FileSystem for LocalFs {
     /// root outside it is refused before a single entry is read. Runs on the
     /// blocking pool because the `ignore` crate is synchronous.
     #[cfg(feature = "tools")]
-    async fn walk(&self, root: &Path, skip_dir: &SkipDir) -> Result<Vec<PathBuf>, FsError> {
+    async fn walk(
+        &self,
+        root: &Path,
+        skip_dir: &SkipDir,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<PathBuf>, FsError> {
         let root = self.resolve(root)?;
         let skip_dir = Arc::clone(skip_dir);
+        // Checked on the walker's own thread, per entry: this is a synchronous
+        // walk on the blocking pool, so nothing else in it can observe a stop.
+        let cancel = cancel.clone();
         tokio::task::spawn_blocking(move || {
             Ok(local_walker(&root, skip_dir)
                 .flatten()
+                .take_while(|_| !cancel.is_cancelled())
                 .map(|entry| entry.into_path())
                 .filter(|path| path.is_file())
                 .collect())
@@ -926,7 +953,7 @@ impl FileSystem for LocalFs {
             let mut result = SearchResult::default();
             let mut searcher = build_searcher(query.context);
             for entry in local_walker(&root, Arc::clone(&query.skip_dir)).flatten() {
-                if result.matches >= query.max_matches {
+                if result.matches >= query.max_matches || query.cancel.is_cancelled() {
                     break;
                 }
                 let path = entry.path();
@@ -1361,7 +1388,10 @@ mod tests {
         }
         let world = Memory(m);
         let skip: SkipDir = Arc::new(|name: &str| name == "target");
-        let mut found = world.walk(Path::new("/"), &skip).await.unwrap();
+        let mut found = world
+            .walk(Path::new("/"), &skip, &CancellationToken::new())
+            .await
+            .unwrap();
         found.sort();
         assert_eq!(
             found,
@@ -1392,7 +1422,10 @@ mod tests {
         let fs = LocalFs::new(dir.join("inside"));
 
         let skip: SkipDir = Arc::new(|name: &str| name == "target");
-        let mut found = fs.walk(Path::new("."), &skip).await.unwrap();
+        let mut found = fs
+            .walk(Path::new("."), &skip, &CancellationToken::new())
+            .await
+            .unwrap();
         found.sort();
         assert_eq!(
             found,
@@ -1401,8 +1434,49 @@ mod tests {
         );
         // The fence applies to a walk exactly as to a read: a root outside it is
         // refused, not walked.
-        let err = fs.walk(Path::new(".."), &skip).await.unwrap_err();
+        let err = fs
+            .walk(Path::new(".."), &skip, &CancellationToken::new())
+            .await
+            .unwrap_err();
         assert!(err.is_denied(), "{err}");
+    }
+
+    /// A walk nobody is waiting for stops where it is.
+    ///
+    /// The walk runs synchronously on the blocking pool, so it is the only
+    /// thing in a position to notice a stop: without this it scanned the whole
+    /// tree after the person had pressed stop, and the turn stayed open for as
+    /// long as that took.
+    #[cfg(feature = "tools")]
+    #[tokio::test]
+    async fn a_walk_the_caller_stopped_goes_no_further() {
+        let dir = scratch("walk-stop");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        for name in ["a.rs", "b.rs", "c.rs"] {
+            std::fs::write(dir.join("src").join(name), "").unwrap();
+        }
+        let fs = LocalFs::new(&dir);
+        let skip: SkipDir = Arc::new(|_: &str| false);
+
+        let running = CancellationToken::new();
+        assert_eq!(
+            fs.walk(Path::new("."), &skip, &running)
+                .await
+                .unwrap()
+                .len(),
+            3,
+            "the negative control: nothing was stopped, so everything is walked"
+        );
+
+        let stopped = CancellationToken::new();
+        stopped.cancel();
+        assert!(
+            fs.walk(Path::new("."), &skip, &stopped)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a stopped walk kept going"
+        );
     }
 
     #[tokio::test]
