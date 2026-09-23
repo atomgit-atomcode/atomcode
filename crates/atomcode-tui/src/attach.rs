@@ -30,53 +30,19 @@ fn marker(n: usize) -> String {
     format!("[Image #{n}]")
 }
 
-/// Every marker number in this text, in the order it appears.
+/// Every `[Image #N]` marker in `text`: its byte span (from `[` through the
+/// closing `]`, half-open) and its number, in order. The one scanner the marker
+/// helpers below share, rather than three copies of the same walk.
 ///
-/// Used to label what was sent, where the log carries the images but the
-/// numbers only survive inside the text the person typed.
-pub(crate) fn markers_in(text: &str) -> Vec<usize> {
+/// Every cut is on a boundary by construction: `find` answers with a byte index
+/// that is one, `OPEN` is ASCII, and `digits` was taken from the front as ASCII
+/// digits. The text is what a person typed, so it is routinely Chinese —
+/// arithmetic on it is exactly what killed the TUI four times (see
+/// `gates/tui-string-slice.sh`).
+fn marker_hits(text: &str) -> Vec<(std::ops::Range<usize>, usize)> {
     const OPEN: &str = "[Image #";
-    let mut out = Vec::new();
-    let mut rest = text;
-    // Every cut below is on a boundary by construction: `find` answers with a
-    // byte index that is one, `OPEN` is ASCII, and `digits` was taken from the
-    // front as ASCII digits. The text being scanned is what a person typed, so
-    // it is routinely Chinese — arithmetic on it is exactly what killed the
-    // TUI four times (see `gates/tui-string-slice.sh`).
-    #[allow(
-        clippy::string_slice,
-        reason = "`find` returns a boundary and `OPEN` is ASCII"
-    )]
-    while let Some(at) = rest.find(OPEN) {
-        let after = &rest[at + OPEN.len()..];
-        let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
-        #[allow(
-            clippy::string_slice,
-            reason = "ASCII digits taken from the front: their byte length is a boundary"
-        )]
-        let after_digits = &after[digits.len()..];
-        if !digits.is_empty() && after_digits.starts_with(']') {
-            if let Ok(n) = digits.parse() {
-                out.push(n);
-            }
-        }
-        rest = &rest[at + OPEN.len()..];
-    }
-    out
-}
-
-/// The image number whose `[Image #N]` marker covers byte offset `off`, if any.
-///
-/// This is what turns a click into "open image N": a caret offset in the
-/// composer, or a byte offset into a logged line, lands somewhere in the text,
-/// and a click that lands inside a marker's span is a request to open that
-/// picture rather than to move the caret. `None` for a click anywhere else, so
-/// ordinary text is untouched.
-pub fn marker_at_offset(text: &str, off: usize) -> Option<usize> {
-    const OPEN: &str = "[Image #";
+    let mut hits = Vec::new();
     let mut from = 0;
-    // Same boundary reasoning as `markers_in`: `find` answers on a boundary,
-    // `OPEN` is ASCII, and the digits were taken from the front as ASCII.
     #[allow(
         clippy::string_slice,
         reason = "`find` returns a boundary, `OPEN` is ASCII, digits are ASCII"
@@ -87,15 +53,44 @@ pub fn marker_at_offset(text: &str, off: usize) -> Option<usize> {
         let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
         let after_digits = &after[digits.len()..];
         if !digits.is_empty() && after_digits.starts_with(']') {
-            // The half-open span from `[` through the closing `]`.
-            let end = at + OPEN.len() + digits.len() + 1;
-            if (at..end).contains(&off) {
-                return digits.parse().ok();
+            if let Ok(n) = digits.parse() {
+                let end = at + OPEN.len() + digits.len() + 1;
+                hits.push((at..end, n));
             }
         }
         from = at + OPEN.len();
     }
-    None
+    hits
+}
+
+/// Every marker number in this text, in the order it appears.
+///
+/// Used to label what was sent, where the log carries the images but the
+/// numbers only survive inside the text the person typed.
+pub(crate) fn markers_in(text: &str) -> Vec<usize> {
+    marker_hits(text).into_iter().map(|(_, n)| n).collect()
+}
+
+/// The image number whose `[Image #N]` marker covers byte offset `off`, if any.
+///
+/// This is what turns a click into "open image N": a caret offset in the
+/// composer, or a byte offset into a logged line, lands somewhere in the text,
+/// and a click that lands inside a marker's span is a request to open that
+/// picture rather than to move the caret. `None` for a click anywhere else, so
+/// ordinary text is untouched.
+pub fn marker_at_offset(text: &str, off: usize) -> Option<usize> {
+    marker_hits(text)
+        .into_iter()
+        .find(|(span, _)| span.contains(&off))
+        .map(|(_, n)| n)
+}
+
+/// The byte span of every `[Image #N]` marker in `text`, in order. Editing
+/// treats each as one atomic unit: one backspace deletes the whole marker, the
+/// arrows step over it, and the caret never lands inside it — the "an image is a
+/// chip, not ten characters" behaviour.
+pub fn marker_spans(text: &str) -> Vec<std::ops::Range<usize>> {
+    marker_hits(text).into_iter().map(|(span, _)| span).collect()
 }
 
 /// What the composer is holding between submits.
@@ -476,6 +471,19 @@ mod tests {
         );
         assert_eq!(marker_at_offset(text, 0), None, "on the leading 看");
         assert_eq!(marker_at_offset("no markers", 3), None);
+    }
+
+    // Spans cover each marker whole, so editing can treat it as one chip.
+    #[test]
+    fn marker_spans_cover_each_marker_whole() {
+        let text = "a [Image #2] b [Image #10] c";
+        let spans = marker_spans(text);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(&text[spans[0].clone()], "[Image #2]");
+        assert_eq!(&text[spans[1].clone()], "[Image #10]");
+        assert!(marker_spans("no markers").is_empty());
+        // A malformed `[Image #]` is not a span (no digits).
+        assert!(marker_spans("[Image #]").is_empty());
     }
 
     // The media type follows the bytes, not the extension: a mislabeled file is

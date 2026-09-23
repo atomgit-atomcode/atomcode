@@ -3731,31 +3731,54 @@ impl Tui {
             }
             Action::Backspace => {
                 if m.caret > 0 {
-                    let mut at = m.caret - 1;
-                    while at > 0 && !m.input.is_char_boundary(at) {
-                        at -= 1;
+                    // A whole `[Image #N]` deletes as one chip: the caret sitting
+                    // just past it (`caret == end`) — or, defensively, inside it —
+                    // removes the marker, and since the text no longer mentions it,
+                    // its attachment goes too (checked at send by `take_shown`).
+                    if let Some(span) = crate::attach::marker_spans(&m.input)
+                        .into_iter()
+                        .find(|s| s.start < m.caret && m.caret <= s.end)
+                    {
+                        m.input.replace_range(span.clone(), "");
+                        m.caret = span.start;
+                    } else {
+                        let mut at = m.caret - 1;
+                        while at > 0 && !m.input.is_char_boundary(at) {
+                            at -= 1;
+                        }
+                        m.input.remove(at);
+                        m.caret = at;
                     }
-                    m.input.remove(at);
-                    m.caret = at;
                 }
             }
             Action::DeleteWord => {
-                let caret = m.caret;
-                // Safe on the caret's invariant, not on luck: every writer of
-                // `m.caret` above lands it on a character boundary — insert
-                // adds `len_utf8`, the arrows and backspace walk to
-                // `is_char_boundary`, a click goes through
-                // `input::offset_at`, which adds the byte length of a
-                // `take_width` prefix. Add a sixth writer and it must do the
-                // same, or this is where it panics.
-                #[allow(
-                    clippy::string_slice,
-                    reason = "the caret is kept on a character boundary by every writer of it"
-                )]
-                let head = m.input[..caret].trim_end();
-                let cut = head.rfind(' ').map(|i| i + 1).unwrap_or(0);
-                m.input.replace_range(cut..caret, "");
-                m.caret = cut;
+                // A marker is one word: Ctrl+W with the caret just past (or inside)
+                // an `[Image #N]` removes the whole chip, never the `7]` tail that
+                // the space inside the marker would otherwise cut back to.
+                if let Some(span) = crate::attach::marker_spans(&m.input)
+                    .into_iter()
+                    .find(|s| s.start < m.caret && m.caret <= s.end)
+                {
+                    m.input.replace_range(span.clone(), "");
+                    m.caret = span.start;
+                } else {
+                    let caret = m.caret;
+                    // Safe on the caret's invariant, not on luck: every writer of
+                    // `m.caret` above lands it on a character boundary — insert
+                    // adds `len_utf8`, the arrows and backspace walk to
+                    // `is_char_boundary`, a click goes through
+                    // `input::offset_at`, which adds the byte length of a
+                    // `take_width` prefix. Add a sixth writer and it must do the
+                    // same, or this is where it panics.
+                    #[allow(
+                        clippy::string_slice,
+                        reason = "the caret is kept on a character boundary by every writer of it"
+                    )]
+                    let head = m.input[..caret].trim_end();
+                    let cut = head.rfind(' ').map(|i| i + 1).unwrap_or(0);
+                    m.input.replace_range(cut..caret, "");
+                    m.caret = cut;
+                }
             }
             Action::Clear => {
                 m.input.clear();
@@ -3769,11 +3792,20 @@ impl Tui {
                 m.caret = 0;
             }
             Action::CaretLeft => {
-                let mut at = m.caret.saturating_sub(1);
-                while at > 0 && !m.input.is_char_boundary(at) {
-                    at -= 1;
+                // Step over an `[Image #N]` as one chip rather than into it — the
+                // caret must never land between a marker's characters.
+                if let Some(span) = crate::attach::marker_spans(&m.input)
+                    .into_iter()
+                    .find(|s| s.start < m.caret && m.caret <= s.end)
+                {
+                    m.caret = span.start;
+                } else {
+                    let mut at = m.caret.saturating_sub(1);
+                    while at > 0 && !m.input.is_char_boundary(at) {
+                        at -= 1;
+                    }
+                    m.caret = at;
                 }
-                m.caret = at;
             }
             Action::CaretRight => {
                 // At the end of the line, right takes the ghost — the shell
@@ -3782,11 +3814,19 @@ impl Tui {
                 if accept_ghost(&mut m) {
                     return false;
                 }
-                let mut at = (m.caret + 1).min(m.input.len());
-                while at < m.input.len() && !m.input.is_char_boundary(at) {
-                    at += 1;
+                // Step over an `[Image #N]` as one chip.
+                if let Some(span) = crate::attach::marker_spans(&m.input)
+                    .into_iter()
+                    .find(|s| s.start <= m.caret && m.caret < s.end)
+                {
+                    m.caret = span.end;
+                } else {
+                    let mut at = (m.caret + 1).min(m.input.len());
+                    while at < m.input.len() && !m.input.is_char_boundary(at) {
+                        at += 1;
+                    }
+                    m.caret = at;
                 }
-                m.caret = at;
             }
             Action::CaretHome => m.caret = 0,
             Action::CaretEnd => m.caret = m.input.len(),
