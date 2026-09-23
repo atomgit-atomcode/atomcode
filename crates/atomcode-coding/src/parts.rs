@@ -2129,7 +2129,10 @@ mod tests {
         let facts = futures::executor::block_on(mcp_row_facts(dir.path(), &registry, &[]));
         let row = facts.iter().find(|f| f.name == "off").expect("listed");
         assert!(row.disabled, "the flag reaches the row");
-        assert_eq!(row.tool_count, 0, "a disabled server put nothing on the model");
+        assert_eq!(
+            row.tool_count, 0,
+            "a disabled server put nothing on the model"
+        );
     }
 
     /// `prepare` with all optional capabilities OFF — keeps the call I/O-free (no MCP
