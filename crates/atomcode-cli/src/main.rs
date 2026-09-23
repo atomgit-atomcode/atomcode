@@ -376,7 +376,7 @@ fn scan_argv_for_lang() -> Option<String> {
 /// any read/parse failure falls back to defaults, matching the per-field
 /// helpers it replaces.
 struct PreScanConfig {
-    language: Option<atomcode_tuix::i18n::Locale>,
+    language: Option<atomcode_config::i18n::Locale>,
     brand_name: String,
     oauth_provider_name: String,
 }
@@ -416,7 +416,7 @@ fn scan_config_pre() -> PreScanConfig {
 /// This replaces the default Cli::parse() flow so that --help output
 /// respects the current locale (set by scan_argv_for_lang above).
 fn build_i18n_command() -> clap::Command {
-    use atomcode_tuix::i18n::{t, Msg};
+    use atomcode_config::i18n::{t, Msg};
 
     let cmd = Cli::command();
 
@@ -1484,8 +1484,8 @@ async fn run() -> Result<i32> {
     // in one read + parse, not three independent scans.
     let pre_scan = scan_config_pre();
     let pre_locale =
-        atomcode_tuix::i18n::resolve_initial_locale(pre_lang.as_deref(), pre_scan.language);
-    atomcode_tuix::i18n::set_locale(pre_locale);
+        atomcode_config::i18n::resolve_initial_locale(pre_lang.as_deref(), pre_scan.language);
+    atomcode_config::i18n::set_locale(pre_locale);
 
     // Build the clap Command with i18n-injected about/help text, then parse.
     // Check if --help or -h was requested by scanning argv.
@@ -2098,8 +2098,8 @@ async fn run() -> Result<i32> {
     // a language key) to honour config-over-env priority.
     if config.language.is_some() {
         let locale =
-            atomcode_tuix::i18n::resolve_initial_locale(cli.lang.as_deref(), config.language);
-        atomcode_tuix::i18n::set_locale(locale);
+            atomcode_config::i18n::resolve_initial_locale(cli.lang.as_deref(), config.language);
+        atomcode_config::i18n::set_locale(locale);
     }
 
     // ── i18n brand/OAuth names ──
@@ -2298,7 +2298,7 @@ async fn run() -> Result<i32> {
                 .map(|source_id| (source_id, session.id.as_str()))
         })
         .map(|(source_id, fork_id)| {
-            atomcode_tuix::i18n::t(atomcode_tuix::i18n::Msg::SessionBusyForked {
+            atomcode_config::i18n::t(atomcode_config::i18n::Msg::SessionBusyForked {
                 source_id,
                 fork_id,
             })
@@ -2893,7 +2893,7 @@ pub(crate) fn runtime_config_from(
         interactive,
     );
     // The process locale has already resolved CLI `--lang` > config > env.
-    runtime.preferred_language = Some(atomcode_tuix::i18n::current_locale());
+    runtime.preferred_language = Some(atomcode_config::i18n::current_locale());
     runtime
 }
 
