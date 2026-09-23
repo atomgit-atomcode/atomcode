@@ -3150,7 +3150,33 @@ impl Tui {
                     atomcode_kernel::session::SessionEvent::UserMessage { .. }
                         | atomcode_kernel::session::SessionEvent::AssistantMessage { .. }
                 ) {
-                    self.host.settle_working();
+                    if !self.host.settle_working() {
+                        // Nothing was armed — the turn's start has not reached
+                        // this screen yet. The facts come by the feed and the
+                        // start by the runtime, two roads with no order between
+                        // them, and when the fact wins, the arm that follows
+                        // waits for a fact that has already gone by: the line
+                        // stayed down for the whole turn. It cost a person five
+                        // minutes of blank screen against a model that had
+                        // opened its stream and gone quiet.
+                        //
+                        // The agent's own status is the other half, and it comes
+                        // by the same road as the facts, ahead of them (it is set
+                        // when the turn opens) — so it is here, and it is true.
+                        // Raised only from idle, and only on a fact, so the row
+                        // still lands under the message the arm existed to
+                        // protect, and a stop in progress is not written over.
+                        let idle = self.host.moment.read().expect("moment poisoned").activity
+                            == Activity::Idle;
+                        if idle
+                            && matches!(
+                                self.client.status_of(&self.client.session()),
+                                Some(AgentStatus::Working)
+                            )
+                        {
+                            self.set_activity(Activity::Working);
+                        }
+                    }
                 }
                 true
             }

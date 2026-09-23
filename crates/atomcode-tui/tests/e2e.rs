@@ -3910,6 +3910,78 @@ async fn a_model_that_has_not_answered_yet_says_it_is_being_waited_for() {
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
 
+/// The waiting row rises even when the turn's start arrives after its first fact.
+///
+/// The facts come by the feed and the turn's start by the runtime: two roads,
+/// no order between them. With the fact first, the arm that followed waited for
+/// a fact that had already gone by — so the row never rose, and against a model
+/// that had opened its stream and gone quiet (five minutes of inter-token
+/// budget) the screen said nothing at all for the whole turn. Reported
+/// 2026-09-23: "5 分钟里屏幕底下没有「正在等待模型」那一行在转".
+#[tokio::test]
+async fn the_waiting_row_rises_even_when_the_turns_start_arrives_late() {
+    let dir = scratch("late-turn-started");
+    let stalling = "[[patch]]\nid = \"llm\"\nname = \"test-stalling-llm\"\n";
+    // The start held back a second, so the fact is certain to win the race.
+    let s = start_with_connection(
+        tree(&dir, &replay(r#"{ text = "unused" }"#), &[stalling]),
+        |connection| {
+            let atomcode_host_api::HostConnection {
+                session,
+                commands,
+                mut events,
+                control,
+            } = connection;
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                while let Some(event) = events.recv().await {
+                    if matches!(
+                        event,
+                        atomcode_kernel::event::AgentEvent::TurnStarted { .. }
+                    ) {
+                        let late = tx.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            let _ = late.send(event);
+                        });
+                        continue;
+                    }
+                    if tx.send(event).is_err() {
+                        break;
+                    }
+                }
+            });
+            atomcode_host_api::HostConnection {
+                session,
+                commands,
+                events: rx,
+                control,
+            }
+        },
+    )
+    .await;
+    let task = s.open().await;
+
+    s.term.type_line("怎么做微调 ？");
+    until(&s, "怎么做微调").await;
+    // Well inside the second the start is held for: what raises the row here is
+    // the fact plus what the agent says it is doing, not the start.
+    for _ in 0..20 {
+        if part_text(&s, "live").contains("正在等待模型") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let live = part_text(&s, "live");
+    assert!(
+        live.contains("正在等待模型"),
+        "the turn's own message is drawn and the agent says it is working, so the row is owed: {live:?}"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
 /// An error is said without taking the line off work that is still running.
 ///
 /// Not every error ends a turn: a `/cancel-all` refused by an idle member, a
