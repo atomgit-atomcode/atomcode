@@ -131,6 +131,14 @@ pub enum HostCommand {
     McpStatus { session: String },
     /// The tools one MCP server put on `session`'s model (A11).
     McpTools { session: String, server: String },
+    /// Every configured MCP server for `session`, **disabled ones included**,
+    /// with what a management screen groups and counts by
+    /// (`docs/mcp-panel-design.md` §4.1). Distinct from `McpStatus`, which
+    /// reports only what the running session actually has.
+    McpManage { session: String },
+    /// One configured server in full, for the detail page. `server` is the
+    /// configured key, not a tool name.
+    McpDetail { session: String, server: String },
     /// Everything in `session`'s tool catalog and what is true of each: on, off
     /// because the person said so, or absent because the tree was configured
     /// without it (`docs/tool-catalog-policy.md`).
@@ -245,6 +253,8 @@ impl HostCommand {
             | Self::Rename { session, .. }
             | Self::McpStatus { session }
             | Self::McpTools { session, .. }
+            | Self::McpManage { session }
+            | Self::McpDetail { session, .. }
             | Self::ToolCatalog { session }
             | Self::SwitchTool { session, .. }
             | Self::WithdrawMcpTools { session }
@@ -312,6 +322,12 @@ pub enum HostReply {
     /// them by.
     McpTools {
         tools: Vec<String>,
+    },
+    McpRows {
+        rows: Vec<McpRow>,
+    },
+    McpDetail {
+        detail: McpServerDetail,
     },
     /// The tool catalog, as a screen offering the switch needs it.
     ToolCatalog {
@@ -1082,6 +1098,13 @@ mod tests {
                 session: "a".into(),
                 server: "fs".into(),
             },
+            HostCommand::McpManage {
+                session: "a".into(),
+            },
+            HostCommand::McpDetail {
+                session: "a".into(),
+                server: "fs".into(),
+            },
             HostCommand::WithdrawMcpTools {
                 session: "a".into(),
             },
@@ -1155,6 +1178,8 @@ mod tests {
                 | HostCommand::Rename { .. }
                 | HostCommand::McpStatus { .. }
                 | HostCommand::McpTools { .. }
+                | HostCommand::McpManage { .. }
+                | HostCommand::McpDetail { .. }
                 | HostCommand::ToolCatalog { .. }
                 | HostCommand::SwitchTool { .. }
                 | HostCommand::WithdrawMcpTools { .. }
@@ -1251,6 +1276,30 @@ mod tests {
             },
             HostReply::McpTools {
                 tools: vec!["fs__read".into(), "fs__write".into()],
+            },
+            HostReply::McpRows {
+                rows: vec![McpRow {
+                    name: "fs".into(),
+                    state: McpServerState::Connected,
+                    source: "project".into(),
+                    tool_count: 3,
+                    config_path: Some("/w/.mcp.json".into()),
+                }],
+            },
+            HostReply::McpDetail {
+                detail: McpServerDetail {
+                    name: "fs".into(),
+                    state: McpServerState::Disabled,
+                    source: "project".into(),
+                    transport: McpTransport::Stdio {
+                        command: "npx".into(),
+                        args: vec!["-y".into(), "srv".into()],
+                        timeout_ms: None,
+                    },
+                    auth: McpAuth::None,
+                    tool_count: 0,
+                    config_path: Some("/w/.mcp.json".into()),
+                },
             },
             HostReply::Settings {
                 settings: vec![Setting {
@@ -1390,6 +1439,8 @@ mod tests {
                 | HostReply::RewindPoints { .. }
                 | HostReply::McpServers { .. }
                 | HostReply::McpTools { .. }
+                | HostReply::McpRows { .. }
+                | HostReply::McpDetail { .. }
                 | HostReply::Settings { .. }
                 | HostReply::Models { .. }
                 | HostReply::Changes { .. }
