@@ -528,6 +528,7 @@ mod tests {
         let mut a = Attachments::new();
         let m1 = a.add(img("one")); // [Image #1]
         let m2 = a.add(img("two")); // [Image #2]
+
         // Both were "sent"; the send queue drains but the gallery keeps them.
         let _ = a.take_shown(&format!("{m1} {m2}"));
 
