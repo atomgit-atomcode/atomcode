@@ -989,14 +989,15 @@ Expected: 编译失败（`tui_mcp.rs` 还不存在）。
 
 - [ ] **Step 3: 实现**
 
-`crates/atomcode-tui/src/plugin.rs` 加：
+`crates/atomcode-tui/src/plugin.rs` 加**一条宏**，不是结构体——**更正（初稿写错了）**：初稿写的是 `pub struct McpSvc(pub Arc<dyn crate::mcp::Mcp>);`，那样满足不了它自己的两处调用点（`provide::<McpSvc>(Arc::new(McpPort{..}))` 与 Task 6 的 `ctx.service::<McpSvc>()`）。这个文件里所有 seam 都是宏形状（`plugin.rs:98` 起）：
 
 ```rust
-/// The MCP management port, filled by whoever can reach the host control
-/// contract — the same shape as [`ToolCatalogSvc`] and for the same reason
-/// (`docs/adr/0022` §3).
-pub struct McpSvc(pub Arc<dyn crate::mcp::Mcp>);
+plexus_service!(McpSvc => dyn crate::mcp::Mcp, "tui-mcp", Seam, "The MCP servers a person can look at, drill into and change");
 ```
+
+名字 `"tui-mcp"` 与 `tui_mcp.rs` 里那一行的 `provides()` 必须一致，否则端口挂上了也没人认得出。
+
+**这个文件归计划 3 的 Task 4**（它在本层范围内），不在 Task 5 的写者手里。
 
 `crates/atomcode-cli/src/tui_mcp.rs`：插件行 `McpRow`（`name()` = `"tui-panel-mcp"`，`inject()` = `["tui-modules"]`，`provides()` = `["tui-mcp"]`，`apply()` 里 `mods.add_view(Mounted::<atomcode_tui::modules::mcp::Mcp>::new())` 并 `provide::<McpSvc>(Arc::new(McpPort { ctx: ctx.clone() }))`），以及：
 
