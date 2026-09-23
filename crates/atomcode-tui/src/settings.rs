@@ -215,6 +215,24 @@ impl SettingsView {
 pub struct Edit {
     pub id: String,
     pub value: String,
+    /// Where the next character goes, as a byte offset into `value`.
+    ///
+    /// The field opens with the current value in it, so without a caret to
+    /// move, changing `8080` to `9090` is four backspaces and four digits —
+    /// the field is prefilled and then behaves as if it were not.
+    pub caret: usize,
+}
+
+impl Edit {
+    /// Open the field on `value`, caret at the end.
+    ///
+    /// At the end rather than at the start: the value is already right more
+    /// often than it is wrong, and what a person usually wants is to append or
+    /// to back over the tail of it.
+    pub fn opening(id: String, value: String) -> Self {
+        let caret = value.len();
+        Self { id, value, caret }
+    }
 }
 
 /// Which page of the panel is showing.
@@ -592,15 +610,49 @@ pub fn key(view: &SettingsView, panel: &mut Panel, press: crate::surface::KeyPre
                 },
                 None => Step::Stay,
             },
+            // The caret moves the way it moves in every other field on this
+            // screen — the same five functions the provider forms use
+            // (`crate::text`). Without them the field is prefilled with the
+            // current value and then makes you back over all of it.
+            (Key::Left, _) => {
+                if let Some(edit) = panel.editing.as_mut() {
+                    edit.caret = crate::text::step_caret(&edit.value, edit.caret, false);
+                }
+                Step::Stay
+            }
+            (Key::Right, _) => {
+                if let Some(edit) = panel.editing.as_mut() {
+                    edit.caret = crate::text::step_caret(&edit.value, edit.caret, true);
+                }
+                Step::Stay
+            }
+            (Key::Home, _) => {
+                if let Some(edit) = panel.editing.as_mut() {
+                    edit.caret = 0;
+                }
+                Step::Stay
+            }
+            (Key::End, _) => {
+                if let Some(edit) = panel.editing.as_mut() {
+                    edit.caret = edit.value.len();
+                }
+                Step::Stay
+            }
             (Key::Backspace, _) => {
                 if let Some(edit) = panel.editing.as_mut() {
-                    edit.value.pop();
+                    crate::text::backspace_at(&mut edit.value, &mut edit.caret);
+                }
+                Step::Stay
+            }
+            (Key::Delete, _) => {
+                if let Some(edit) = panel.editing.as_mut() {
+                    crate::text::delete_at(&mut edit.value, &mut edit.caret);
                 }
                 Step::Stay
             }
             (Key::Char(c), Mods::NONE) | (Key::Char(c), Mods::SHIFT) => {
                 if let Some(edit) = panel.editing.as_mut() {
-                    edit.value.push(c);
+                    crate::text::insert_at(&mut edit.value, &mut edit.caret, c);
                 }
                 Step::Stay
             }
@@ -726,10 +778,7 @@ pub fn key(view: &SettingsView, panel: &mut Panel, press: crate::surface::KeyPre
                 return Step::Stay;
             };
             if row.kind.needs_typing() {
-                panel.editing = Some(Edit {
-                    id: row.id.clone(),
-                    value: row.value.clone(),
-                });
+                panel.editing = Some(Edit::opening(row.id.clone(), row.value.clone()));
                 Step::Stay
             } else {
                 match row.kind.cycled(&row.value) {
@@ -995,11 +1044,78 @@ mod tests {
         );
         assert_eq!(
             panel.editing,
-            Some(Edit {
-                id: "b.second".into(),
-                value: "50".into()
-            }),
+            Some(Edit::opening("b.second".into(), "50".into())),
             "so the field opens with the value that is there"
+        );
+    }
+
+    /// The field is prefilled with the value that is there, so it has to be
+    /// editable *in place*. Without a caret to move, "prefilled" buys nothing:
+    /// changing `8080` to `9090` is four backspaces and four digits, which is
+    /// what it would have been with an empty field.
+    #[test]
+    fn the_open_field_can_be_edited_anywhere_in_it_not_only_at_the_end() {
+        let view = view();
+        let mut panel = Panel::new();
+        panel.cursor = 1;
+        key(&view, &mut panel, KeyPress::plain(Key::Enter));
+        assert_eq!(
+            panel.editing.as_ref().map(|e| (e.value.as_str(), e.caret)),
+            Some(("50", 2)),
+            "it opens on the value, caret at the end"
+        );
+
+        // Home, then type: the new character lands at the front.
+        key(&view, &mut panel, KeyPress::plain(Key::Home));
+        key(&view, &mut panel, KeyPress::ch('1'));
+        assert_eq!(
+            panel.editing.as_ref().map(|e| e.value.as_str()),
+            Some("150"),
+            "typing goes in at the caret, not at the end"
+        );
+
+        // `150`, caret after the `1`. Right puts it on the `0`, and delete
+        // takes the character it is on — not the one behind it.
+        key(&view, &mut panel, KeyPress::plain(Key::Right));
+        key(&view, &mut panel, KeyPress::plain(Key::Delete));
+        assert_eq!(
+            panel.editing.as_ref().map(|e| e.value.as_str()),
+            Some("15"),
+            "delete takes the character the caret is on"
+        );
+
+        // And backspace still takes the one before it — from the middle now.
+        key(&view, &mut panel, KeyPress::plain(Key::Left));
+        key(&view, &mut panel, KeyPress::plain(Key::Backspace));
+        assert_eq!(
+            panel.editing.as_ref().map(|e| (e.value.as_str(), e.caret)),
+            Some(("5", 0)),
+            "backspace works from the middle, and the caret follows it"
+        );
+
+        // End puts it back at the tail, where appending works as it always did.
+        key(&view, &mut panel, KeyPress::plain(Key::End));
+        key(&view, &mut panel, KeyPress::ch('9'));
+        assert_eq!(panel.editing.as_ref().map(|e| e.value.as_str()), Some("59"));
+    }
+
+    /// While the field has the keyboard, `Delete` is a character — not the
+    /// "restore this setting's default" gesture the list binds it to. One key,
+    /// two meanings, told apart by whether a field is open; getting it wrong
+    /// throws away a setting while someone is editing a different one.
+    #[test]
+    fn delete_edits_the_field_rather_than_resetting_the_row_under_it() {
+        let view = view();
+        let mut panel = Panel::new();
+        panel.cursor = 1;
+        key(&view, &mut panel, KeyPress::plain(Key::Enter));
+        key(&view, &mut panel, KeyPress::plain(Key::Home));
+        let step = key(&view, &mut panel, KeyPress::plain(Key::Delete));
+        assert_eq!(step, Step::Stay, "nothing was reset");
+        assert_eq!(
+            panel.editing.as_ref().map(|e| e.value.as_str()),
+            Some("0"),
+            "it edited the text instead"
         );
     }
 

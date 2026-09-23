@@ -397,7 +397,7 @@ fn rows_for(
             Some(edit) if edit.id == row.id => rows.push(Row::Editing {
                 label: row.label.clone(),
                 value: edit.value.clone(),
-                caret: edit.value.len(),
+                caret: edit.caret,
             }),
             _ => rows.push(Row::Setting { index: i }),
         }
@@ -3901,10 +3901,7 @@ mod tests {
         );
 
         let mut editing = Panel::new();
-        editing.editing = Some(Edit {
-            id: "coding.max_rounds".into(),
-            value: "60".into(),
-        });
+        editing.editing = Some(Edit::opening("coding.max_rounds".into(), "60".into()));
         let while_editing = legend(&editing);
         assert!(while_editing.iter().any(|(k, w)| *k == "⏎" && *w == "保存"));
         assert!(
@@ -3916,10 +3913,7 @@ mod tests {
     #[test]
     fn a_row_being_edited_is_drawn_as_the_field_in_its_own_place() {
         let mut panel = Panel::new();
-        panel.editing = Some(Edit {
-            id: "coding.max_rounds".into(),
-            value: "123".into(),
-        });
+        panel.editing = Some(Edit::opening("coding.max_rounds".into(), "123".into()));
         let rows = drawn(&moment(Some(panel), two()), 70, 14);
         let at = rows
             .iter()
@@ -3930,6 +3924,33 @@ mod tests {
             .position(|l| l.contains("单回合最大轮数"))
             .expect("the row it belongs to is where it was");
         assert_eq!(at, label, "the field stands where the row stood");
+    }
+
+    /// The caret is drawn where the edit says it is — not always at the end.
+    ///
+    /// Its own judgement because the field's keys and the field's picture are
+    /// two places: keys that move a caret nobody draws leave a person typing
+    /// into a line that looks unchanged, which is worse than not moving at all.
+    #[test]
+    fn the_drawn_caret_sits_where_the_edit_says_it_does() {
+        let mut panel = Panel::new();
+        let mut edit = Edit::opening("coding.max_rounds".into(), "123".into());
+        edit.caret = 1; // on the `2`
+        panel.editing = Some(edit);
+        let m = moment(Some(panel), two());
+        let line = lines(&m, 70, 14)
+            .into_iter()
+            .find(|l| l.plain().contains("123"))
+            .expect("the value being typed is on screen");
+        let block = line
+            .spans
+            .iter()
+            .find(|span| span.style.reverse)
+            .expect("the caret is a reversed cell, and it has to be somewhere");
+        assert_eq!(
+            block.text, "2",
+            "the caret sits on the character it is on, not past the end"
+        );
     }
 
     #[test]

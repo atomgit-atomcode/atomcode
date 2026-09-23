@@ -27,6 +27,8 @@
 use std::sync::Arc;
 
 use crate::surface::{Key, KeyPress, Mods};
+// The one set of caret moves every single-line field on this screen shares.
+use crate::text::{backspace_at, delete_at, insert_at, snap, step_caret};
 
 /// A protocol a provider speaks, as the launcher offers it.
 ///
@@ -1420,61 +1422,6 @@ pub fn paste(panel: &mut Panel, secret: &mut String, text: &str) -> bool {
             panel.cursor = 0;
             true
         }
-    }
-}
-
-/// `at`, snapped back to a character boundary.
-///
-/// Every path that moves a caret keeps it on one; this is the belt to that
-/// braces, on the functions that slice — a byte offset from the middle of a
-/// multi-byte character would panic.
-fn snap(text: &str, at: usize) -> usize {
-    let at = at.min(text.len());
-    (0..=at)
-        .rev()
-        .find(|i| text.is_char_boundary(*i))
-        .unwrap_or(0)
-}
-
-fn insert_at(text: &mut String, caret: &mut usize, c: char) {
-    let at = snap(text, *caret);
-    text.insert(at, c);
-    *caret = at + c.len_utf8();
-}
-
-/// Take out the character before the caret.
-fn backspace_at(text: &mut String, caret: &mut usize) {
-    let at = snap(text, *caret);
-    let Some(previous) = text[..at].chars().next_back() else {
-        return;
-    };
-    let from = at - previous.len_utf8();
-    text.remove(from);
-    *caret = from;
-}
-
-/// Take out the character the caret is on.
-fn delete_at(text: &mut String, caret: &mut usize) {
-    let at = snap(text, *caret);
-    if at < text.len() {
-        text.remove(at);
-    }
-    *caret = at;
-}
-
-fn step_caret(text: &str, caret: usize, forward: bool) -> usize {
-    let at = snap(text, caret);
-    match forward {
-        true => text[at..]
-            .chars()
-            .next()
-            .map(|c| at + c.len_utf8())
-            .unwrap_or(at),
-        false => text[..at]
-            .chars()
-            .next_back()
-            .map(|c| at - c.len_utf8())
-            .unwrap_or(0),
     }
 }
 

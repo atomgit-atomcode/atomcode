@@ -400,6 +400,74 @@ pub(crate) fn home_dir() -> Option<std::path::PathBuf> {
         .filter(|p| !p.as_os_str().is_empty())
 }
 
+// ── one line of text with a caret in it ──────────────────────────────────────
+//
+// Every single-line field on this screen edits a `String` and a byte offset
+// into it, and they must all agree on what the arrow keys do. These five were
+// written for the provider forms (`crate::providers`) and lived there until
+// the settings panel needed the same five — at which point "the same five"
+// had to stop meaning "typed out twice".
+//
+// Byte offsets, not character indices, because the callers slice with them;
+// [`snap`] is what keeps that safe.
+
+/// `at`, snapped back to a character boundary.
+///
+/// Every path that moves a caret keeps it on one; this is the belt to that
+/// braces, on the functions that slice — a byte offset from the middle of a
+/// multi-byte character would panic.
+pub(crate) fn snap(text: &str, at: usize) -> usize {
+    let at = at.min(text.len());
+    (0..=at)
+        .rev()
+        .find(|i| text.is_char_boundary(*i))
+        .unwrap_or(0)
+}
+
+/// Put `c` in at the caret, and step the caret over it.
+pub(crate) fn insert_at(text: &mut String, caret: &mut usize, c: char) {
+    let at = snap(text, *caret);
+    text.insert(at, c);
+    *caret = at + c.len_utf8();
+}
+
+/// Take out the character before the caret.
+pub(crate) fn backspace_at(text: &mut String, caret: &mut usize) {
+    let at = snap(text, *caret);
+    let Some(previous) = text[..at].chars().next_back() else {
+        return;
+    };
+    let from = at - previous.len_utf8();
+    text.remove(from);
+    *caret = from;
+}
+
+/// Take out the character the caret is on.
+pub(crate) fn delete_at(text: &mut String, caret: &mut usize) {
+    let at = snap(text, *caret);
+    if at < text.len() {
+        text.remove(at);
+    }
+    *caret = at;
+}
+
+/// The caret, one character further along — or where it was, at either end.
+pub(crate) fn step_caret(text: &str, caret: usize, forward: bool) -> usize {
+    let at = snap(text, caret);
+    match forward {
+        true => text[at..]
+            .chars()
+            .next()
+            .map(|c| at + c.len_utf8())
+            .unwrap_or(at),
+        false => text[..at]
+            .chars()
+            .next_back()
+            .map(|c| at - c.len_utf8())
+            .unwrap_or(0),
+    }
+}
+
 /// Consume one escape sequence, if the cursor is sitting on the `ESC` that
 /// begins one.
 ///
