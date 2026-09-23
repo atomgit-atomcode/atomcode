@@ -2,9 +2,11 @@
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -50,6 +52,50 @@ pub struct McpOAuthLoginOptions {
     pub client_secret_env: Option<String>,
     pub scopes: Vec<String>,
 }
+
+impl McpOAuthLoginOptions {
+    /// The options a login started with nothing but the server's name should use.
+    ///
+    /// A GitHub-provider server has no dynamic client registration to fall back
+    /// on, so its client id comes from `ATOMCODE_GITHUB_MCP_CLIENT_ID` — the same
+    /// rule `atomcode mcp login` applies when no `--client-id` is given. Everything
+    /// else is left to the server's own `auth` block.
+    pub fn for_server(server: &McpServerConfig) -> Self {
+        let is_github = matches!(
+            &server.config,
+            McpTransportConfig::Http {
+                auth: Some(McpHttpAuthConfig::OAuth(auth)),
+                ..
+            } if auth.provider.as_deref() == Some("github")
+        );
+        Self {
+            client_id: if is_github {
+                std::env::var("ATOMCODE_GITHUB_MCP_CLIENT_ID").ok()
+            } else {
+                None
+            },
+            client_secret_env: None,
+            scopes: Vec::new(),
+        }
+    }
+}
+
+/// How a login that is not the only thing running gives up.
+///
+/// The browser half of a login is open-ended: a person can close the tab and
+/// never come back, and the callback listener would wait on them forever. A
+/// terminal command can afford that (Ctrl-C ends the process); a runtime that
+/// has other work to answer cannot, so it hands over a flag to raise when it
+/// shuts down and a bound on how long the browser gets.
+#[derive(Debug, Clone)]
+pub struct McpOAuthLoginStop {
+    pub cancel: Arc<AtomicBool>,
+    pub timeout: Duration,
+}
+
+/// How often a stoppable wait looks at its flag. Short enough that a shutdown
+/// is not held up noticeably, long enough not to spin.
+const CALLBACK_POLL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct McpAuthFile {
@@ -232,6 +278,27 @@ pub fn login_mcp_oauth(
     server: &McpServerConfig,
     opts: McpOAuthLoginOptions,
 ) -> Result<McpOAuthToken> {
+    login_mcp_oauth_with(server, opts, None)
+}
+
+/// [`login_mcp_oauth`], but giving up when `stop` says so: when its flag is
+/// raised, or when the browser has not come back within its timeout.
+///
+/// Only the wait for the browser is stoppable. The requests around it are
+/// bounded by the HTTP client's own timeouts.
+pub fn login_mcp_oauth_until(
+    server: &McpServerConfig,
+    opts: McpOAuthLoginOptions,
+    stop: &McpOAuthLoginStop,
+) -> Result<McpOAuthToken> {
+    login_mcp_oauth_with(server, opts, Some(stop))
+}
+
+fn login_mcp_oauth_with(
+    server: &McpServerConfig,
+    opts: McpOAuthLoginOptions,
+    stop: Option<&McpOAuthLoginStop>,
+) -> Result<McpOAuthToken> {
     let (url, auth) = match &server.config {
         McpTransportConfig::Http {
             url,
@@ -258,7 +325,7 @@ pub fn login_mcp_oauth(
         && opts.client_id.is_some()
     {
         let client_secret_env = opts.client_secret_env.or(auth.client_secret_env.clone());
-        return login_github_oauth(
+        return login_github_oauth_with(
             &server.name,
             opts.client_id.as_deref().unwrap_or_default(),
             client_secret_env.as_deref(),
@@ -267,6 +334,7 @@ pub fn login_mcp_oauth(
             } else {
                 &opts.scopes
             },
+            stop,
         );
     }
 
@@ -325,7 +393,7 @@ pub fn login_mcp_oauth(
     println!("  {}", authorize_url);
     let _ = open_browser(authorize_url.as_str());
 
-    let (code, returned_state) = await_oauth_callback(listener)?;
+    let (code, returned_state) = await_oauth_callback(listener, stop)?;
     if returned_state != state {
         bail!("OAuth state mismatch");
     }
@@ -375,6 +443,16 @@ pub fn login_github_oauth(
     client_secret_env: Option<&str>,
     scopes: &[String],
 ) -> Result<McpOAuthToken> {
+    login_github_oauth_with(server_name, client_id, client_secret_env, scopes, None)
+}
+
+fn login_github_oauth_with(
+    server_name: &str,
+    client_id: &str,
+    client_secret_env: Option<&str>,
+    scopes: &[String],
+    stop: Option<&McpOAuthLoginStop>,
+) -> Result<McpOAuthToken> {
     if client_id.trim().is_empty() {
         bail!("GitHub OAuth client id is required");
     }
@@ -415,7 +493,7 @@ pub fn login_github_oauth(
     println!("  {}", url);
     let _ = open_browser(url.as_str());
 
-    let (code, returned_state) = await_oauth_callback(listener)?;
+    let (code, returned_state) = await_oauth_callback(listener, stop)?;
     if returned_state != state {
         bail!("OAuth state mismatch");
     }
@@ -714,10 +792,59 @@ fn bind_callback_listener() -> Result<(String, TcpListener)> {
     Ok((format!("http://127.0.0.1:{}/callback", port), listener))
 }
 
-fn await_oauth_callback(listener: TcpListener) -> Result<(String, String)> {
-    let (mut stream, _) = listener
-        .accept()
-        .context("Failed to accept OAuth callback")?;
+/// Wait for the browser to come back to the callback listener.
+///
+/// Without `stop` this is a plain blocking `accept`, which is what a terminal
+/// command wants. With one, the listener is polled so the wait can end when the
+/// flag is raised or the timeout runs out — and the connection that does arrive
+/// gets a read timeout, because a client that connects and never sends would
+/// otherwise hold the same wait open one step later.
+fn accept_callback(listener: &TcpListener, stop: Option<&McpOAuthLoginStop>) -> Result<TcpStream> {
+    let Some(stop) = stop else {
+        let (stream, _) = listener
+            .accept()
+            .context("Failed to accept OAuth callback")?;
+        return Ok(stream);
+    };
+    listener
+        .set_nonblocking(true)
+        .context("Failed to poll the OAuth callback listener")?;
+    let deadline = Instant::now() + stop.timeout;
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                // An accepted socket inherits non-blocking mode on some
+                // platforms; the read below wants to block, with a bound.
+                stream
+                    .set_nonblocking(false)
+                    .context("Failed to read OAuth callback")?;
+                stream
+                    .set_read_timeout(Some(stop.timeout.min(Duration::from_secs(30))))
+                    .context("Failed to read OAuth callback")?;
+                return Ok(stream);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if stop.cancel.load(Ordering::Acquire) {
+                    bail!("MCP OAuth login was cancelled before the browser came back");
+                }
+                if Instant::now() >= deadline {
+                    bail!(
+                        "MCP OAuth login timed out after {}s waiting for the browser",
+                        stop.timeout.as_secs()
+                    );
+                }
+                std::thread::sleep(CALLBACK_POLL);
+            }
+            Err(error) => return Err(error).context("Failed to accept OAuth callback"),
+        }
+    }
+}
+
+fn await_oauth_callback(
+    listener: TcpListener,
+    stop: Option<&McpOAuthLoginStop>,
+) -> Result<(String, String)> {
+    let mut stream = accept_callback(&listener, stop)?;
     let mut buf = [0_u8; 4096];
     let n = stream
         .read(&mut buf)
@@ -973,5 +1100,126 @@ mod tests {
                 "rewriting an existing OAuth token store must tighten its permissions"
             );
         }
+    }
+
+    /// A login waiting on a browser gives up when its owner says to.
+    ///
+    /// The wait for the callback is the one step of a login with no natural end:
+    /// a person who closes the tab never comes back. Whoever runs a login beside
+    /// other work has to be able to end it, or a shutdown waits on that tab.
+    #[test]
+    fn a_login_waiting_on_the_browser_ends_when_it_is_cancelled() {
+        use super::{accept_callback, McpOAuthLoginStop};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let stop = McpOAuthLoginStop {
+            cancel: Arc::new(AtomicBool::new(false)),
+            timeout: Duration::from_secs(60),
+        };
+        let flag = Arc::clone(&stop.cancel);
+        let raiser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            flag.store(true, Ordering::Release);
+        });
+        let started = Instant::now();
+        let error = accept_callback(&listener, Some(&stop))
+            .expect_err("nobody came back, and the wait was cancelled");
+        raiser.join().unwrap();
+        assert!(
+            error.to_string().contains("cancelled"),
+            "the reason says it was cancelled: {error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "it ended soon after the flag, not at the timeout: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// And when nobody cancels it, the browser gets a bounded time.
+    #[test]
+    fn a_login_waiting_on_the_browser_times_out() {
+        use super::{accept_callback, McpOAuthLoginStop};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let stop = McpOAuthLoginStop {
+            cancel: Arc::new(AtomicBool::new(false)),
+            timeout: Duration::from_millis(300),
+        };
+        let error = accept_callback(&listener, Some(&stop))
+            .expect_err("nobody came back within the timeout");
+        assert!(
+            error.to_string().contains("timed out"),
+            "the reason says it timed out: {error}"
+        );
+    }
+
+    /// A browser that does come back is still accepted while the wait is
+    /// stoppable — the poll must not turn a real callback away.
+    #[test]
+    fn a_stoppable_wait_still_takes_the_callback() {
+        use super::{await_oauth_callback, McpOAuthLoginStop};
+        use std::io::Write;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let browser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            stream
+                .write_all(b"GET /callback?code=c0de&state=s7 HTTP/1.1\r\nHost: x\r\n\r\n")
+                .unwrap();
+        });
+        let stop = McpOAuthLoginStop {
+            cancel: Arc::new(AtomicBool::new(false)),
+            timeout: Duration::from_secs(10),
+        };
+        let (code, state) = await_oauth_callback(listener, Some(&stop)).unwrap();
+        browser.join().unwrap();
+        assert_eq!((code.as_str(), state.as_str()), ("c0de", "s7"));
+    }
+
+    /// A GitHub-provider server takes its client id from the environment, the way
+    /// `atomcode mcp login` does when none is given; any other server leaves it to
+    /// discovery.
+    #[test]
+    #[serial_test::serial(github_mcp_client_id)]
+    fn the_github_client_id_comes_from_the_environment_for_a_github_server_only() {
+        use super::McpOAuthLoginOptions;
+        use crate::mcp::config::{
+            McpConfigSource, McpHttpAuthConfig, McpOAuthConfig, McpServerConfig, McpTransportConfig,
+        };
+
+        let server = |provider: Option<&str>| McpServerConfig {
+            name: "gh".into(),
+            config: McpTransportConfig::Http {
+                url: "https://example.invalid/mcp".into(),
+                headers: Default::default(),
+                auth: Some(McpHttpAuthConfig::OAuth(McpOAuthConfig {
+                    provider: provider.map(str::to_string),
+                    ..Default::default()
+                })),
+                timeout_ms: None,
+            },
+            disabled: false,
+            trust: false,
+            auto_approve: Vec::new(),
+            source: McpConfigSource::User,
+        };
+        std::env::set_var("ATOMCODE_GITHUB_MCP_CLIENT_ID", "gh-client");
+        let github = McpOAuthLoginOptions::for_server(&server(Some("github")));
+        let other = McpOAuthLoginOptions::for_server(&server(None));
+        std::env::remove_var("ATOMCODE_GITHUB_MCP_CLIENT_ID");
+        assert_eq!(github.client_id.as_deref(), Some("gh-client"));
+        assert_eq!(other.client_id, None);
     }
 }
