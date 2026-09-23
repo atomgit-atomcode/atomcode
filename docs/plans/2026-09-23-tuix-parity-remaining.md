@@ -225,7 +225,13 @@ webui 四个入口还是裸的。
 
 ### P1 — 真缺口（P0 之后，彼此独立）
 
-- [ ] **P1-1 `/mcp` 面板**。**设计已就绪，不用再设计**：未合分支 `feat/mcp-panel`
+- [x] **P1-1 `/mcp` 面板**（2026-09-23,**由另一个会话做的**,`feat/mcp-panel`
+      已合入 `c4250b98b`)。落地形状与设计一致:`tui/src/mcp.rs` + `modules/mcp.rs`,
+      契约上 `McpManage` / `McpDetail` / `McpAct`,cli 侧端口,`/mcp` 无参升起面板。
+      合入后又跟了几轮真机修(鼠标命中、TAIL 排位、要点两次才动手、取消信任够得着)。
+      下面这段是做之前写的缺口描述,留作记录。
+
+      原文:**设计已就绪，不用再设计**：未合分支 `feat/mcp-panel`
       （两个提交，`docs/mcp-panel-design.md`）已经定好边界、三条新命令
       （`McpManage` / `McpDetail` / `McpAct{Trust,Untrust,Login,Logout,Enable,Disable}`）、
       `McpServerState` 加两个变体、停用项读取路径、注释守卫的失败语义、11 条判据与
