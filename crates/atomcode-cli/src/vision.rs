@@ -49,15 +49,44 @@ impl ImagePreprocessor for VlImagePreprocessor {
         }
         let config = match Config::load(&Config::default_path()) {
             Ok(c) => c,
-            Err(_) => return (UserInput { text, images }, None),
+            // Past `should_skip` there ARE images and the model is text-only, so a
+            // passthrough here would drop them silently — the very thing this path
+            // exists to prevent. If the config cannot be read there is no VL helper
+            // to reach either: clear the bytes and say so.
+            Err(_) => {
+                return apply_outcome(
+                    text,
+                    images,
+                    PreprocessOutcome::Failed {
+                        reason: "no vision: the model does not accept images and the \
+                                 configuration could not be read to find a \
+                                 vision_preprocessor_provider"
+                            .to_string(),
+                    },
+                )
+            }
         };
-        // Nothing configured (None or empty) ⇒ pass through unchanged (Skipped).
+        // Non-vision main model AND no VL helper configured: the bytes cannot
+        // reach the model, and the adapter would drop them silently. Fold the
+        // failure marker + clear the images (same as an unresolvable helper
+        // below), so a pasted picture never vanishes without a word — the
+        // guarantee the new TUI's paste-time gate used to give, now enforced on
+        // the turn (the gate no longer refuses a text-only model, since a
+        // configured or `/codingplan`-auto-detected VL helper may caption it).
         let Some(vl_name) = config
             .vision_preprocessor_provider
             .clone()
             .filter(|s| !s.is_empty())
         else {
-            return (UserInput { text, images }, None);
+            return apply_outcome(
+                text,
+                images,
+                PreprocessOutcome::Failed {
+                    reason: "no vision: the model does not accept images and no \
+                             vision_preprocessor_provider is configured"
+                        .to_string(),
+                },
+            );
         };
         // Resolve through the boundary so a new-schema / folded-CodingPlan VL
         // selection (no longer in `config.providers`) still resolves. Absent ⇒

@@ -580,6 +580,86 @@ impl Content for UserSaid {
     }
 }
 
+/// The VL (vision) caption of a picture a text-only model was asked about.
+///
+/// A text-only model "sees" a pasted picture only as the block of text a VL
+/// helper recognised, which the runtime folds into the user message so the model
+/// reads it (`[图片内容（由 X 识别）]\n…`). Shown in full that recognition buries the
+/// conversation, so the transcript pulls it out into this block: folded by
+/// default to one line (`● VL 识别图片成功，返回 N chars  model`) and opened on a
+/// click, the way a finished tool call folds. The words are the VL helper's, not
+/// the person's, so they are drawn muted.
+#[derive(Debug)]
+pub struct VlCaptionBlock {
+    pub model: String,
+    pub text: String,
+}
+
+impl VlCaptionBlock {
+    /// The one-line stand-in: the localized "recognised, N chars" line with its
+    /// `✓` swapped for the fold dot and the model named.
+    fn head_line(&self, ctx: &RenderCtx) -> Line {
+        let n = self.text.chars().count();
+        let base = pt(PMsg::VisionPreprocessSuccess { char_count: n });
+        let body = base.trim_start_matches('✓').trim_start();
+        let text = format!("{} {}  {}", ctx.caps.g(Glyph::ToolMark), body, self.model);
+        Line::styled(width::take_width(&text, ctx.width as usize), muted())
+    }
+}
+
+impl Content for VlCaptionBlock {
+    fn kind(&self) -> &'static str {
+        "vl_caption"
+    }
+    fn content_hash(&self) -> ContentHash {
+        hash_of(&["vl_caption", &self.model, &self.text])
+    }
+    /// Open: the head line, then the recognised text, muted and indented.
+    fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+        let mut out = vec![self.head_line(ctx)];
+        out.extend(wrapped(&self.text, ctx.width, muted(), "  "));
+        out
+    }
+    /// Folded: just the head line.
+    fn summary(&self, ctx: &RenderCtx) -> Line {
+        self.head_line(ctx)
+    }
+}
+
+/// Split a user message into what the person typed and the VL caption the
+/// runtime folded in, when there is one. `None` for an ordinary message.
+///
+/// Locale-robust: the marker's fixed parts are read from the very i18n string
+/// that wrote it ([`PMsg::VisionRecognised`]), so a translated marker still
+/// splits — there is no hardcoded `[图片内容` prefix to drift.
+pub fn split_vl_caption(text: &str) -> Option<(String, String, String)> {
+    const MODEL: &str = "\u{1}";
+    const BODY: &str = "\u{2}";
+    let tmpl = pt(PMsg::VisionRecognised {
+        model: MODEL,
+        text: BODY,
+    })
+    .into_owned();
+    let (pre, rest) = tmpl.split_once(MODEL)?;
+    let (mid, suf) = rest.split_once(BODY)?;
+    // A marker with no fixed prefix or separator could match anything.
+    if pre.is_empty() || mid.is_empty() {
+        return None;
+    }
+    // `rfind`, not `find`: the runtime APPENDS the marker to the end of the
+    // message, so the last occurrence is the real one — a person who typed the
+    // prefix themselves earlier does not steal the split.
+    let start = text.rfind(pre)?;
+    let after_pre = &text[start + pre.len()..];
+    let (model, after_model) = after_pre.split_once(mid)?;
+    let caption = after_model.strip_suffix(suf).unwrap_or(after_model);
+    Some((
+        text[..start].trim_end().to_string(),
+        model.to_string(),
+        caption.to_string(),
+    ))
+}
+
 /// What the model said. Grows while the block is live.
 #[derive(Debug, Default)]
 pub struct ModelSaid(pub String);
@@ -2179,6 +2259,66 @@ impl Content for TurnEndBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_vl_caption_pulls_the_recognition_out_of_a_user_message() {
+        // Built exactly as the runtime does: the person's words, a blank line,
+        // then the VL marker (locale-round-tripped so the test is not a hardcode).
+        let said = pt(PMsg::VisionRecognised {
+            model: "qwen-vl",
+            text: "a long recognised description",
+        })
+        .into_owned();
+        let msg = format!("[Image #1] 这个是啥？\n\n{said}");
+        let (before, model, caption) =
+            split_vl_caption(&msg).expect("the caption is split out");
+        assert_eq!(before, "[Image #1] 这个是啥？");
+        assert_eq!(model, "qwen-vl");
+        assert_eq!(caption, "a long recognised description");
+        // An ordinary message has none.
+        assert!(split_vl_caption("just a question").is_none());
+        // A caption with no user words folds to an empty `before`.
+        let (before, ..) = split_vl_caption(&said).expect("marker-only splits too");
+        assert!(before.is_empty(), "no words before the marker: {before:?}");
+        // A person who typed the marker prefix themselves does not steal the
+        // split: the runtime's marker is the one appended at the end.
+        let decoy = pt(PMsg::VisionRecognised {
+            model: "decoy",
+            text: "typed by the user",
+        })
+        .into_owned();
+        let real = pt(PMsg::VisionRecognised {
+            model: "real-vl",
+            text: "the actual recognition",
+        })
+        .into_owned();
+        let msg = format!("quoting {decoy}\n\n{real}");
+        let (_, model, caption) = split_vl_caption(&msg).expect("splits at the last marker");
+        assert_eq!(model, "real-vl", "the appended marker wins, not the typed one");
+        assert_eq!(caption, "the actual recognition");
+    }
+
+    #[test]
+    fn a_vl_caption_block_folds_to_one_row_and_opens_to_the_recognition() {
+        let block = VlCaptionBlock {
+            model: "qwen-vl".into(),
+            text: "line one\nline two\nline three".into(),
+        };
+        let ctx = crate::block::RenderCtx::bare(80);
+        // Folded: one row, the `●` head naming the model and the char count.
+        let folded = block.summary_lines(&ctx);
+        assert_eq!(folded.len(), 1, "folds to a single row: {folded:?}");
+        let head = folded[0].plain();
+        assert!(head.contains("qwen-vl"), "names the model: {head}");
+        assert!(!head.contains("line two"), "the body is hidden when folded: {head}");
+        // Open: the head plus the recognised text.
+        let open = block.lines(&ctx);
+        assert!(open.len() > 1, "opens to more than the head: {open:?}");
+        assert!(
+            open.iter().any(|l| l.plain().contains("line two")),
+            "the recognition is there when opened"
+        );
+    }
 
     fn welcome() -> WelcomeBlock {
         WelcomeBlock {

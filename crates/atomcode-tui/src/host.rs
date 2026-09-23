@@ -202,6 +202,10 @@ impl Presentation {
             // a reader sees what actually ran, and a folded lid over a single call
             // hid its result behind a clip. A run can still be folded by hand.
             ("tool_call", Showing::Open),
+            // A VL image caption folds to its one-row `● VL 识别…` summary: the
+            // recognition is the model's crutch for a picture it cannot see, not
+            // the conversation, so it stays out of the way until a click asks.
+            ("vl_caption", Showing::Folded),
         ];
         by_kind.extend(
             crate::content::ENVIRONMENTAL_INJECTIONS

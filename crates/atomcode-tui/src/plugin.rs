@@ -3559,14 +3559,19 @@ impl Tui {
     /// Open attached image `n` in the person's desktop viewer, the way clicking a
     /// file does. `image` is its bytes when the caller still had them in hand
     /// (a composer click); `None` means look them up in the session gallery (a
-    /// click on a sent line in the history). Either way the bytes are written to a
-    /// temp file once — reused on later clicks — and handed to the [`OpenerSvc`]
-    /// the tui bundle already provides for `open_file`.
+    /// click on a sent line in the history). The bytes are written to a temp file
+    /// once — reused on later clicks — and opened on this machine's desktop.
+    ///
+    /// The opener is [`LocalOpener`] directly, **not** the `OpenerSvc` seam: that
+    /// service is mounted in the agent runtime's plexus context, and this front
+    /// end has its own — requiring it here fails ("no opener"). Direct is also the
+    /// honest answer, because a person clicking in a full-screen terminal *is*
+    /// sitting at the machine the picture should open on.
     ///
     /// Best-effort by design: the failures a person can do anything about (no
-    /// bytes, cannot write the file, no opener) are said out loud; the open
-    /// itself runs off-thread, since `act` is not async and a desktop launcher
-    /// must not block the render loop.
+    /// bytes, cannot write the file) are said out loud; the open itself runs
+    /// off-thread, since `act` is not async and a desktop launcher must not block
+    /// the render loop.
     fn preview_image(&self, n: usize, image: Option<atomcode_kernel::message::ImageContent>) {
         let path = match self.image_temp_file(n, image) {
             Ok(path) => path,
@@ -3575,22 +3580,12 @@ impl Tui {
                 return;
             }
         };
-        let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
-            return;
-        };
-        let opener = match ctx.require::<atomcode_harness::seams::OpenerSvc>() {
-            Ok(opener) => opener,
-            Err(_) => {
-                let reason = t(Msg::NoOpener);
-                self.say_refused(&t(Msg::ImagePreviewFailed { reason: &reason }));
-                return;
-            }
-        };
         // Off the render loop: launching Preview.app (`open`, `xdg-open`, …) is a
         // process spawn, and `act` returns to paint. A failure here is rare and
         // not actionable, so it is left to the opener's own logging.
         tokio::spawn(async move {
-            let _ = opener
+            use atomcode_capabilities::tools::Opener as _;
+            let _ = atomcode_capabilities::tools::LocalOpener
                 .open(&atomcode_capabilities::tools::OpenTarget::Path(path))
                 .await;
         });
@@ -3813,12 +3808,24 @@ impl Tui {
             }
             Action::Backspace => {
                 if m.caret > 0 {
-                    let mut at = m.caret - 1;
-                    while at > 0 && !m.input.is_char_boundary(at) {
-                        at -= 1;
+                    // A whole `[Image #N]` deletes as one chip: the caret sitting
+                    // just past it (`caret == end`) — or, defensively, inside it —
+                    // removes the marker, and since the text no longer mentions it,
+                    // its attachment goes too (checked at send by `take_shown`).
+                    if let Some(span) = crate::attach::marker_spans(&m.input)
+                        .into_iter()
+                        .find(|s| s.start < m.caret && m.caret <= s.end)
+                    {
+                        m.input.replace_range(span.clone(), "");
+                        m.caret = span.start;
+                    } else {
+                        let mut at = m.caret - 1;
+                        while at > 0 && !m.input.is_char_boundary(at) {
+                            at -= 1;
+                        }
+                        m.input.remove(at);
+                        m.caret = at;
                     }
-                    m.input.remove(at);
-                    m.caret = at;
                 }
             }
             Action::DeleteForward => {
@@ -3861,22 +3868,33 @@ impl Tui {
                 return false;
             }
             Action::DeleteWord => {
-                let caret = m.caret;
-                // Safe on the caret's invariant, not on luck: every writer of
-                // `m.caret` above lands it on a character boundary — insert
-                // adds `len_utf8`, the arrows and backspace walk to
-                // `is_char_boundary`, a click goes through
-                // `input::offset_at`, which adds the byte length of a
-                // `take_width` prefix. Add a sixth writer and it must do the
-                // same, or this is where it panics.
-                #[allow(
-                    clippy::string_slice,
-                    reason = "the caret is kept on a character boundary by every writer of it"
-                )]
-                let head = m.input[..caret].trim_end();
-                let cut = head.rfind(' ').map(|i| i + 1).unwrap_or(0);
-                m.input.replace_range(cut..caret, "");
-                m.caret = cut;
+                // A marker is one word: Ctrl+W with the caret just past (or inside)
+                // an `[Image #N]` removes the whole chip, never the `7]` tail that
+                // the space inside the marker would otherwise cut back to.
+                if let Some(span) = crate::attach::marker_spans(&m.input)
+                    .into_iter()
+                    .find(|s| s.start < m.caret && m.caret <= s.end)
+                {
+                    m.input.replace_range(span.clone(), "");
+                    m.caret = span.start;
+                } else {
+                    let caret = m.caret;
+                    // Safe on the caret's invariant, not on luck: every writer of
+                    // `m.caret` above lands it on a character boundary — insert
+                    // adds `len_utf8`, the arrows and backspace walk to
+                    // `is_char_boundary`, a click goes through
+                    // `input::offset_at`, which adds the byte length of a
+                    // `take_width` prefix. Add a sixth writer and it must do the
+                    // same, or this is where it panics.
+                    #[allow(
+                        clippy::string_slice,
+                        reason = "the caret is kept on a character boundary by every writer of it"
+                    )]
+                    let head = m.input[..caret].trim_end();
+                    let cut = head.rfind(' ').map(|i| i + 1).unwrap_or(0);
+                    m.input.replace_range(cut..caret, "");
+                    m.caret = cut;
+                }
             }
             Action::Clear => {
                 m.input.clear();
@@ -3890,11 +3908,20 @@ impl Tui {
                 m.caret = 0;
             }
             Action::CaretLeft => {
-                let mut at = m.caret.saturating_sub(1);
-                while at > 0 && !m.input.is_char_boundary(at) {
-                    at -= 1;
+                // Step over an `[Image #N]` as one chip rather than into it — the
+                // caret must never land between a marker's characters.
+                if let Some(span) = crate::attach::marker_spans(&m.input)
+                    .into_iter()
+                    .find(|s| s.start < m.caret && m.caret <= s.end)
+                {
+                    m.caret = span.start;
+                } else {
+                    let mut at = m.caret.saturating_sub(1);
+                    while at > 0 && !m.input.is_char_boundary(at) {
+                        at -= 1;
+                    }
+                    m.caret = at;
                 }
-                m.caret = at;
             }
             Action::CaretRight => {
                 // At the end of the line, right takes the ghost — the shell
@@ -3903,11 +3930,19 @@ impl Tui {
                 if accept_ghost(&mut m) {
                     return false;
                 }
-                let mut at = (m.caret + 1).min(m.input.len());
-                while at < m.input.len() && !m.input.is_char_boundary(at) {
-                    at += 1;
+                // Step over an `[Image #N]` as one chip.
+                if let Some(span) = crate::attach::marker_spans(&m.input)
+                    .into_iter()
+                    .find(|s| s.start <= m.caret && m.caret < s.end)
+                {
+                    m.caret = span.end;
+                } else {
+                    let mut at = (m.caret + 1).min(m.input.len());
+                    while at < m.input.len() && !m.input.is_char_boundary(at) {
+                        at += 1;
+                    }
+                    m.caret = at;
                 }
-                m.caret = at;
             }
             Action::CaretHome => m.caret = 0,
             Action::CaretEnd => m.caret = m.input.len(),
@@ -3925,7 +3960,11 @@ impl Tui {
                     // The column is kept, the way a text editor keeps it:
                     // moving down and back up lands where it started.
                     let to = if up { row - 1 } else { row + 1 };
-                    m.caret = input::offset_at(&m.input, to, col, w);
+                    let landed = input::offset_at(&m.input, to, col, w);
+                    // Vertical movement maps by column and can land between a
+                    // marker's characters; snap it out so the chip invariant holds
+                    // for Up/Down too, not only the horizontal arrows.
+                    m.caret = crate::attach::snap_caret_out_of_marker(&m.input, landed);
                 } else if up {
                     recall_back(&mut m);
                 } else {
@@ -3941,16 +3980,20 @@ impl Tui {
                 drop(m);
                 // A pasted image-*file* path is an attachment intent, not prose:
                 // WeChat/iTerm2 save the clipboard image to a temp file and paste
-                // its path, and Finder drag types the path. Load the bytes now and
-                // drop in an `[Image #N]` marker instead of leaving the raw path in
-                // the composer (the reported "全部展示成路径"). Reading at paste time
-                // keeps the attachment self-contained. Anything that is not
-                // unambiguously an image path falls through to the text path.
-                if let Some(image) = crate::attach::image_from_path(&text) {
-                    // Decide the destination before attaching: a model that would
-                    // drop the bytes says so now, while the person still has the
-                    // file, rather than after they have typed about a picture that
-                    // never left.
+                // its path, and Finder drag/copy types the path (or a `file://`
+                // URL). Load the bytes now and drop in an `[Image #N]` marker
+                // instead of leaving the raw path in the composer (the reported
+                // "全部展示成路径"). And Cmd+V — swallowed by the terminal, so it
+                // never reaches the `AttachImage` key Ctrl+V is bound to — arrives
+                // here as a paste whose text is not a path; `image_for_paste` then
+                // recovers the picture straight from the clipboard, so Cmd+V
+                // attaches a screenshot the same as Ctrl+V. Reading at paste time
+                // keeps the attachment self-contained. Anything that is neither a
+                // path nor a clipboard image falls through to the text path.
+                if let Some(image) = crate::attach::image_for_paste(&text, self.surface.as_ref()) {
+                    // Only a conversation with no model at all has nowhere to put a
+                    // picture; a text-only model has the runtime caption it (a
+                    // configured or auto-detected VL helper) or say so on send.
                     if let Err(reason) = images_reach_the_model(client) {
                         self.say_refused(&reason);
                         return false;
@@ -3975,10 +4018,9 @@ impl Tui {
                 return false;
             }
             Action::AttachImage => {
-                // The destination is decided before the clipboard is even read.
-                // A model that would drop the bytes has to say so now, while the
-                // person is still holding the screenshot, rather than after they
-                // have typed a question about a picture that never left.
+                // Refused only when there is no model at all; a text-only model
+                // has the runtime caption the image (a configured or auto-detected
+                // VL helper) or report on send that it could not.
                 if let Err(reason) = images_reach_the_model(client) {
                     drop(m);
                     self.say_refused(&reason);
@@ -4061,11 +4103,8 @@ impl Tui {
                 // hit map is per-row, not per-cell, so the block-level answer —
                 // open the image the message holds — is the one available here;
                 // a message is one screenshot in the overwhelmingly common case.
-                // Only intercept when the bytes are actually in hand: a marker
-                // whose image is gone (a `resume`d session's gallery is empty, or
-                // the text merely contains the `[Image #N]` characters) falls
-                // through rather than popping a refusal on every click.
-                for n in self.host.image_markers_at(id) {
+                let markers = self.host.image_markers_at(id);
+                for &n in &markers {
                     let image = self
                         .host
                         .moment
@@ -4078,6 +4117,17 @@ impl Tui {
                         self.preview_image(n, Some(image));
                         return false;
                     }
+                }
+                // A block that carries a picture is an image message, and the only
+                // reason a user line is clickable at all — so the click is an
+                // open-the-picture gesture, never a fold. When the bytes are gone
+                // (a `resume`d session's gallery is empty, or the text merely
+                // contains the `[Image #N]` characters) it is a no-op: folding a
+                // person's own message on click would be a surprise. Only blocks
+                // with no picture (a tool call, a reasoning block) fall through to
+                // the fold below.
+                if !markers.is_empty() {
+                    return false;
                 }
                 // Anchor the block that was clicked, not the bottom of the
                 // conversation. A block that grows pushes its own header off
@@ -5137,30 +5187,24 @@ fn recall_forward(m: &mut crate::moment::Moment) {
     m.caret = m.input.len();
 }
 
-/// Whether a picture attached to this conversation would actually reach the
-/// model. `Err` is the reason it would not, phrased for the person.
+/// Whether a picture attached to this conversation has somewhere to go. `Err` is
+/// the reason it does not, phrased for the person.
 ///
-/// The agent's own description is the only thing that can answer: an adapter
-/// that cannot carry image content degrades it to a plain-text caption, which
-/// is the right compromise for a conversation being *resumed* on a text-only
-/// model and a silent loss for a screenshot someone pasted a moment ago.
-/// Nothing in the screen could tell those apart, which is why the question is
-/// asked of what the agent said about itself instead of guessed from a name.
+/// A picture reaches ANY mounted model: a vision model takes the bytes, and a
+/// text-only one has them turned into a caption by the runtime's VL preprocessor
+/// — a configured `vision_preprocessor_provider`, or the one `/codingplan`
+/// auto-detects from the managed model list (the "default vision"). The paste is
+/// therefore not refused for a text-only model the way it once was: whether the
+/// caption succeeded, or there was no VL helper to make one, is the turn's
+/// business, reported on send (the runtime clears the images and says so rather
+/// than dropping them silently). Deciding it here — before the runtime is even
+/// consulted — is what wrongly refused a text-only model that DID have a helper.
 ///
-/// Not knowing yet is refused rather than waved through: a picture with no
-/// known destination is not sent by omission.
-///
-/// This runs when the picture is taken, not when the message is sent, so it
-/// rests on one assumption: that the model cannot change between the two. A
-/// change arrives as a new description, and a person switching models in the
-/// middle of writing about a picture is the case that would break it.
+/// The one thing still refused is no model at all: a picture with no destination
+/// whatsoever is not sent by omission.
 fn images_reach_the_model(client: &AgentClient) -> Result<(), String> {
     match client.described() {
-        Some(described) if described.supports_vision => Ok(()),
-        Some(described) => Err(t(Msg::ModelCannotSeeImages {
-            model: &described.model.unwrap_or_default(),
-        })
-        .into_owned()),
+        Some(_) => Ok(()),
         None => Err(t(Msg::ModelUnknownForImages).into_owned()),
     }
 }

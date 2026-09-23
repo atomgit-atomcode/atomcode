@@ -93,7 +93,10 @@ pub struct GitPin {
     pub branch: Option<String>,
     #[serde(default)]
     pub tag: Option<String>,
-    #[serde(default)]
+    /// Commit-ish pin. Claude Code's marketplace schema spells this `sha`
+    /// (the CANNBot catalog uses it to pin a Skill submodule commit), so the
+    /// two names are the same field — `commit` wins if both are present.
+    #[serde(default, alias = "sha")]
     pub commit: Option<String>,
     #[serde(default, rename = "ref")]
     pub git_ref: Option<String>,
@@ -428,6 +431,23 @@ mod tests {
                 assert_eq!(url, "openclaw/openclaw");
                 assert_eq!(path, ".agents/skills/autoreview");
                 assert_eq!(pin.git_ref.as_deref(), Some("main"));
+            }
+            other => panic!("expected External::GitSubdir, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_git_subdir_sha_as_commit_pin() {
+        // Claude Code's marketplace schema names the commit pin `sha`; the
+        // CANNBot catalog uses it (git-subdir + path + sha) to pin Skills.
+        let raw = r#"{"name":"mp","plugins":[{"name":"p","source":{
+            "source":"git-subdir","url":"https://gitcode.com/cann/cannbot-skills.git",
+            "path":"ops","sha":"9ae606b331085597f05b67cfa165f2dcd3369a2e"}}]}"#;
+        let m: MarketplaceManifest = serde_json::from_str(raw).unwrap();
+        match &m.plugins[0].source {
+            PluginSource::External(ExternalSource::GitSubdir { pin, .. }) => {
+                assert_eq!(pin.commit.as_deref(), Some("9ae606b331085597f05b67cfa165f2dcd3369a2e"));
+                assert!(pin.git_ref.is_none());
             }
             other => panic!("expected External::GitSubdir, got {other:?}"),
         }

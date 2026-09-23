@@ -847,10 +847,15 @@ fn screenshot(tag: &str) -> atomcode_kernel::message::ImageContent {
 }
 
 #[tokio::test]
-async fn a_picture_pasted_for_a_blind_model_is_refused_where_it_was_typed() {
-    // The failure this exists to prevent: the screen says `[Image #1]`, the log
-    // records it, the encoder drops the bytes, and the model answers as if
-    // nothing had been attached — with nobody having said so.
+async fn a_picture_pasted_for_a_text_model_attaches_for_the_runtime_to_handle() {
+    // The paste is no longer refused at the keystroke. A text-only model has the
+    // runtime's VL preprocessor caption the image — a configured, or a
+    // `/codingplan`-auto-detected "default vision", helper — or, failing that,
+    // fold a marker and clear the bytes on send; the "never sent quietly"
+    // guarantee moved from here to the turn (see `atomcode-cli`'s
+    // `VlImagePreprocessor`). This harness mounts no preprocessor (it is the
+    // harness's own host, not the coding runtime), so it checks only what the
+    // screen does at paste time: the picture attaches, and nothing is refused.
     let dir = scratch("blind-paste");
     let s = start(tree(&dir, &replay_vision(r#"{ text = "ok" }"#, false), &[])).await;
     let task = s.open().await;
@@ -861,21 +866,12 @@ async fn a_picture_pasted_for_a_blind_model_is_refused_where_it_was_typed() {
 
     let screen = s.screen();
     assert!(
-        screen.contains("看不了图片"),
-        "the refusal names the model, on screen:\n{screen}"
+        screen.contains("[Image #1]"),
+        "the picture attaches; the runtime decides its fate on send:\n{screen}"
     );
     assert!(
-        !screen.contains("[Image #1]"),
-        "nothing was attached, so no marker was written:\n{screen}"
-    );
-    // And it is refused before anything is typed: a composer holding nothing
-    // cannot later send a picture nobody can see.
-    s.term.type_line("看这个");
-    s.quiet().await;
-    assert_eq!(
-        images_sent(&s),
-        vec![0],
-        "the turn ran with the text alone, and the log says zero images"
+        !screen.contains("看不了图片"),
+        "a text-only model is no longer refused at paste time:\n{screen}"
     );
 
     s.term.press(KeyPress::ctrl('d'));
