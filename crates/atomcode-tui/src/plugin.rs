@@ -96,6 +96,11 @@ plexus_service!(PluginsSvc => dyn crate::plugins::Plugins, "tui-plugins", Seam, 
 // a fact of the running tree, which this crate may not reach into
 // (`docs/adr/0022` §3) — so it arrives over a seam like everything else.
 plexus_service!(ToolCatalogSvc => dyn crate::tools::Tools, "tui-tools", Seam, "The tool catalog a person can look at and switch, one tool at a time");
+// And the MCP servers, on the same terms and for the same reason: which servers
+// exist, whether this project is trusted, and what changing one means are the
+// running tree's answers, and this crate may not reach into it (`docs/adr/0022`
+// §3). The name here is the one the launcher's row declares in its `provides()`.
+plexus_service!(McpSvc => dyn crate::mcp::Mcp, "tui-mcp", Seam, "The MCP servers a person can look at, drill into and change");
 plexus_service!(RewindSvc => dyn crate::rewind::Rewind, "tui-rewind", Seam, "The turns this session can be taken back to, and the taking back");
 // Throwing a stored session away: the store is on disk and this crate does not
 // reach disks (`docs/adr/0022` §3), so the panel asks over a seam.
