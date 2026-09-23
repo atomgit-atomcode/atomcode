@@ -158,6 +158,41 @@ fn lay(input: &str, caret: usize, body: usize) -> (Vec<String>, (usize, usize), 
     (rows, at, starts)
 }
 
+/// Split one drawn row of the composer at its `[Image #N]` markers, drawing each
+/// marker in the theme accent so an attached image reads as one coloured chip
+/// rather than ten plain characters.
+///
+/// Scans the row itself rather than mapping the whole field's spans through the
+/// wrap, so a marker split across a wrap boundary is simply left plain (harmless)
+/// instead of risking an off-by-one into the non-ASCII text a person typed.
+fn image_chip_segments(row: &str) -> Vec<crate::el::El> {
+    use crate::el::El;
+    let spans = crate::attach::marker_spans(row);
+    if spans.is_empty() {
+        return vec![El::raw(row.to_string())];
+    }
+    let chip = theme::fg(Role::Accent);
+    let mut out = Vec::new();
+    let mut cursor = 0;
+    // Every cut is a marker edge (ASCII `[` / `]`) or a prior one, so it lands on
+    // a char boundary even when the text between markers is Chinese.
+    #[allow(
+        clippy::string_slice,
+        reason = "marker spans are ASCII edges; every cut is a char boundary"
+    )]
+    for span in spans {
+        if span.start > cursor {
+            out.push(El::raw(row[cursor..span.start].to_string()));
+        }
+        out.push(El::styled(row[span.start..span.end].to_string(), chip));
+        cursor = span.end;
+    }
+    if cursor < row.len() {
+        out.push(El::raw(row[cursor..].to_string()));
+    }
+    out
+}
+
 /// What the field is showing, and where the caret sits in it.
 ///
 /// Usually the line being typed. While a password is being asked
@@ -350,7 +385,11 @@ impl View for Input {
             // The typed text is the terminal's own foreground — what you are
             // composing is the one thing on this screen you are actively working
             // on, so it reads at full strength, not dimmed.
-            let mut row = vec![El::styled(lead, arrow), El::raw(piece.clone())];
+            let mut row = vec![El::styled(lead, arrow)];
+            // An attached image reads as one coloured chip, not ten plain
+            // characters — the codex effect, and the visual half of the "a marker
+            // is one atomic unit" behaviour the editing keys already enforce.
+            row.extend(image_chip_segments(piece));
             // The rest of something already said, dim, on the last row of what
             // is typed — pressing right takes it. Only there, because that is
             // where the caret is when a completion means anything. Never while
@@ -595,6 +634,31 @@ mod tests {
             text.style.fg, None,
             "the typed text uses the default ink: {row:?}"
         );
+    }
+
+    /// An attached image reads as one coloured chip: the whole `[Image #N]` is a
+    /// single span in the theme accent, and the text around it keeps the default
+    /// ink — the codex effect, and the visual half of "a marker is atomic".
+    #[test]
+    fn an_image_marker_is_a_coloured_chip() {
+        let m = Moment::default().typing("[Image #1] hi");
+        let row = &Input::render(&State::default(), &Viewport::new(Rect::sized(40, 3), &m))[1];
+        let chip = row
+            .spans
+            .iter()
+            .find(|s| s.text == "[Image #1]")
+            .expect("the whole marker is one span");
+        assert_eq!(
+            chip.style.fg,
+            theme::fg(Role::Accent).fg,
+            "the marker is the theme accent, not default ink: {row:?}"
+        );
+        let after = row
+            .spans
+            .iter()
+            .find(|s| s.text.contains("hi"))
+            .expect("the trailing text is drawn");
+        assert_eq!(after.style.fg, None, "ordinary text keeps the default ink");
     }
 
     #[test]
