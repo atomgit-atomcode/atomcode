@@ -2175,10 +2175,21 @@ async fn a_stopped_reply_is_kept_as_far_as_it_got() {
         );
 
         if keep {
-            let before: Vec<Message> = seen
+            let mut before: Vec<Message> = seen
                 .into_iter()
                 .filter(|m| m.role != Role::System)
                 .collect();
+            // The request ends with the date reminder `StatusReminderHook` appends
+            // to every request: ephemeral, never stored, so a resumed session has
+            // the reply to "third" where this one had it. It is not part of the
+            // conversation, so it is not what a resume has to reproduce — the same
+            // rule `cache_prefix.rs::without_date_tail` applies.
+            if before
+                .last()
+                .is_some_and(|m| m.role == Role::User && m.text.contains("Current date:"))
+            {
+                before.pop();
+            }
             runtime.handle.shutdown().await.unwrap();
             let _ = runtime.task.await;
             let mut resumed = CodingRuntime::start(start(

@@ -760,9 +760,13 @@ async fn spilled(dir: &std::path::Path, command: &str) -> (String, PathBuf) {
 #[tokio::test]
 async fn an_oversized_tool_result_is_shown_head_and_tail_and_saved_whole() {
     let dir = scratch("artifact-big");
-    // 16 KiB is the threshold; 40 000 bytes clears it without approaching the
-    // 4 MiB artifact ceiling (which is a different branch, with no artifact id).
-    let (text, artifacts) = spilled(&dir, "printf 'x%.0s' $(seq 1 40000)").await;
+    // Sized off the threshold itself rather than a number copied from it: when
+    // the threshold went from 16 KiB to 50 KiB, a hard-coded 40 000 bytes quietly
+    // stopped clearing it and this test went red for a reason that had nothing
+    // to do with the row. 20 000 bytes over still stays far below the 4 MiB
+    // artifact ceiling (a different branch, with no artifact id).
+    let size = atomcode_capabilities::tools::THRESHOLD_BYTES + 20_000;
+    let (text, artifacts) = spilled(&dir, &format!("printf 'x%.0s' $(seq 1 {size})")).await;
     assert!(
         text.contains("output truncated"),
         "an oversized result says it was cut: {}",
