@@ -1494,6 +1494,51 @@ pub async fn mcp_row_facts(
         .collect()
 }
 
+/// What a person can do to one MCP server. This crate's own copy, not
+/// `atomcode_host_api::McpAction`: the wire type lives above this layer
+/// (`cli/host.rs` maps between them, the way it maps `McpRowFacts` → `McpRow`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum McpAction {
+    Trust,
+    Untrust,
+    Login,
+    Logout,
+    /// Remove `disabled` from the file that defines it.
+    Enable,
+    /// Write `disabled: true` into that file.
+    Disable,
+}
+
+/// Write one server's on/off flag into the file that defines it.
+///
+/// Resolves the file from the server's *source*, so the edit lands where a
+/// reader would resolve it. Bails when the server is not configured at all, and
+/// when the file carries comments (`set_mcp_server_disabled_in_json_file`'s
+/// guard) — the caller surfaces that text verbatim.
+pub async fn mcp_set_enabled(
+    working_dir: &std::path::Path,
+    server: &str,
+    enabled: bool,
+) -> Result<(), String> {
+    // All three live in `mcp::config`. `set_mcp_server_disabled_in_json_file` is
+    // not re-exported from `atomcode_capabilities::mcp` (the module's re-export
+    // list has never carried it), so they are taken from where they are defined.
+    use atomcode_capabilities::mcp::config::{
+        config_path_for_source, load_mcp_config_including_disabled,
+        set_mcp_server_disabled_in_json_file,
+    };
+
+    let configs = load_mcp_config_including_disabled(working_dir).map_err(|e| e.to_string())?;
+    let config = configs
+        .iter()
+        .find(|c| c.name == server)
+        .ok_or_else(|| format!("MCP server '{server}' is not configured"))?;
+    let path = config_path_for_source(working_dir, config.source)
+        .ok_or_else(|| format!("MCP server '{server}' has no config file to edit"))?;
+
+    set_mcp_server_disabled_in_json_file(&path, server, !enabled).map_err(|e| format!("{e:#}"))
+}
+
 /// Fill the providers this capability graph's own sub-agents run on, for `cfg`'s
 /// model: the reviewer's and the subagent host tier's slots, the fast/capable tier
 /// cells and the named-model resolver — each billed to this session's detached
@@ -2133,6 +2178,28 @@ mod tests {
             row.tool_count, 0,
             "a disabled server put nothing on the model"
         );
+    }
+
+    #[test]
+    fn disabling_a_server_writes_the_flag_and_enabling_removes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(".mcp.json");
+        std::fs::write(
+            &target,
+            r#"{"mcpServers":{"srv":{"command":"npx","args":["-y","x"]}}}"#,
+        )
+        .unwrap();
+
+        futures::executor::block_on(mcp_set_enabled(dir.path(), "srv", false)).unwrap();
+        let text = std::fs::read_to_string(&target).unwrap();
+        assert!(
+            text.contains("\"disabled\": true"),
+            "off writes the flag: {text}"
+        );
+
+        futures::executor::block_on(mcp_set_enabled(dir.path(), "srv", true)).unwrap();
+        let text = std::fs::read_to_string(&target).unwrap();
+        assert!(!text.contains("disabled"), "on removes the key: {text}");
     }
 
     /// `prepare` with all optional capabilities OFF — keeps the call I/O-free (no MCP
