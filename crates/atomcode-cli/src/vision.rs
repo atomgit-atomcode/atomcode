@@ -51,13 +51,27 @@ impl ImagePreprocessor for VlImagePreprocessor {
             Ok(c) => c,
             Err(_) => return (UserInput { text, images }, None),
         };
-        // Nothing configured (None or empty) ⇒ pass through unchanged (Skipped).
+        // Non-vision main model AND no VL helper configured: the bytes cannot
+        // reach the model, and the adapter would drop them silently. Fold the
+        // failure marker + clear the images (same as an unresolvable helper
+        // below), so a pasted picture never vanishes without a word — the
+        // guarantee the new TUI's paste-time gate used to give, now enforced on
+        // the turn (the gate no longer refuses a text-only model, since a
+        // configured or `/codingplan`-auto-detected VL helper may caption it).
         let Some(vl_name) = config
             .vision_preprocessor_provider
             .clone()
             .filter(|s| !s.is_empty())
         else {
-            return (UserInput { text, images }, None);
+            return apply_outcome(
+                text,
+                images,
+                PreprocessOutcome::Failed {
+                    reason: "no vision: the model does not accept images and no \
+                             vision_preprocessor_provider is configured"
+                        .to_string(),
+                },
+            );
         };
         // Resolve through the boundary so a new-schema / folded-CodingPlan VL
         // selection (no longer in `config.providers`) still resolves. Absent ⇒

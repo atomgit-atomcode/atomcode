@@ -3836,10 +3836,9 @@ impl Tui {
                 // keeps the attachment self-contained. Anything that is neither a
                 // path nor a clipboard image falls through to the text path.
                 if let Some(image) = crate::attach::image_for_paste(&text, self.surface.as_ref()) {
-                    // Decide the destination before attaching: a model that would
-                    // drop the bytes says so now, while the person still has the
-                    // file, rather than after they have typed about a picture that
-                    // never left.
+                    // Only a conversation with no model at all has nowhere to put a
+                    // picture; a text-only model has the runtime caption it (a
+                    // configured or auto-detected VL helper) or say so on send.
                     if let Err(reason) = images_reach_the_model(client) {
                         self.say_refused(&reason);
                         return false;
@@ -3864,10 +3863,9 @@ impl Tui {
                 return false;
             }
             Action::AttachImage => {
-                // The destination is decided before the clipboard is even read.
-                // A model that would drop the bytes has to say so now, while the
-                // person is still holding the screenshot, rather than after they
-                // have typed a question about a picture that never left.
+                // Refused only when there is no model at all; a text-only model
+                // has the runtime caption the image (a configured or auto-detected
+                // VL helper) or report on send that it could not.
                 if let Err(reason) = images_reach_the_model(client) {
                     drop(m);
                     self.say_refused(&reason);
@@ -5026,30 +5024,24 @@ fn recall_forward(m: &mut crate::moment::Moment) {
     m.caret = m.input.len();
 }
 
-/// Whether a picture attached to this conversation would actually reach the
-/// model. `Err` is the reason it would not, phrased for the person.
+/// Whether a picture attached to this conversation has somewhere to go. `Err` is
+/// the reason it does not, phrased for the person.
 ///
-/// The agent's own description is the only thing that can answer: an adapter
-/// that cannot carry image content degrades it to a plain-text caption, which
-/// is the right compromise for a conversation being *resumed* on a text-only
-/// model and a silent loss for a screenshot someone pasted a moment ago.
-/// Nothing in the screen could tell those apart, which is why the question is
-/// asked of what the agent said about itself instead of guessed from a name.
+/// A picture reaches ANY mounted model: a vision model takes the bytes, and a
+/// text-only one has them turned into a caption by the runtime's VL preprocessor
+/// — a configured `vision_preprocessor_provider`, or the one `/codingplan`
+/// auto-detects from the managed model list (the "default vision"). The paste is
+/// therefore not refused for a text-only model the way it once was: whether the
+/// caption succeeded, or there was no VL helper to make one, is the turn's
+/// business, reported on send (the runtime clears the images and says so rather
+/// than dropping them silently). Deciding it here — before the runtime is even
+/// consulted — is what wrongly refused a text-only model that DID have a helper.
 ///
-/// Not knowing yet is refused rather than waved through: a picture with no
-/// known destination is not sent by omission.
-///
-/// This runs when the picture is taken, not when the message is sent, so it
-/// rests on one assumption: that the model cannot change between the two. A
-/// change arrives as a new description, and a person switching models in the
-/// middle of writing about a picture is the case that would break it.
+/// The one thing still refused is no model at all: a picture with no destination
+/// whatsoever is not sent by omission.
 fn images_reach_the_model(client: &AgentClient) -> Result<(), String> {
     match client.described() {
-        Some(described) if described.supports_vision => Ok(()),
-        Some(described) => Err(t(Msg::ModelCannotSeeImages {
-            model: &described.model.unwrap_or_default(),
-        })
-        .into_owned()),
+        Some(_) => Ok(()),
         None => Err(t(Msg::ModelUnknownForImages).into_owned()),
     }
 }
