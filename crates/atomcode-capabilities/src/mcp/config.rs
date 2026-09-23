@@ -235,6 +235,22 @@ pub fn load_mcp_config_including_disabled(project_dir: &Path) -> Result<Vec<McpS
     merge_configs(project_dir)
 }
 
+/// The file a server of this source is read from and written back to.
+///
+/// `None` for [`McpConfigSource::Driver`]: those servers arrive over the wire (an ACP client
+/// injecting `mcpServers` in `session/new`) and have no file to edit. A caller that is about
+/// to report "disabled" must treat `None` as "not applicable", not as "not found".
+pub fn config_path_for_source(
+    project_dir: &Path,
+    source: McpConfigSource,
+) -> Option<std::path::PathBuf> {
+    match source {
+        McpConfigSource::User => Some(crate::mcp::util::config_dir().join("mcp.json")),
+        McpConfigSource::Project => Some(project_dir.join(".mcp.json")),
+        McpConfigSource::Driver => None,
+    }
+}
+
 /// Blank out `//` and `/* … */` comments so a JSONC-flavoured config parses.
 ///
 /// Editors (VS Code, Cursor) and our own `.mcp.json.example` all treat this file as
@@ -1128,6 +1144,26 @@ mod tests {
             "the runtime load still withholds it: {names:?}"
         );
         assert!(names.contains(&"panel-test-on"));
+    }
+
+    #[test]
+    fn a_driver_server_has_no_config_file_to_write() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            config_path_for_source(dir.path(), McpConfigSource::Project),
+            Some(dir.path().join(".mcp.json")),
+            "a project server lives in the project root"
+        );
+        assert!(
+            config_path_for_source(dir.path(), McpConfigSource::User).is_some(),
+            "a user server lives under ATOMCODE_HOME"
+        );
+        assert_eq!(
+            config_path_for_source(dir.path(), McpConfigSource::Driver),
+            None,
+            "a driver-supplied server was never read from a file, so there is none to edit"
+        );
     }
 }
 
