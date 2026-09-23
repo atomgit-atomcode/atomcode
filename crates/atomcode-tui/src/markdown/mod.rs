@@ -277,7 +277,109 @@ fn list_item(t: &str) -> Option<(String, &str)> {
     None
 }
 
-/// Split one line into styled runs: `code`, **bold**, *italic*, [text](url).
+/// The URL schemes a terminal can open on click, so a link becomes an OSC 8
+/// hyperlink. `mailto:`/relative/anchor destinations stay styled-but-inert —
+/// this tree does not send them anywhere.
+const OPENABLE_SCHEMES: [&str; 3] = ["https://", "http://", "file://"];
+
+/// True when `url` is a destination a terminal can open (see [`OPENABLE_SCHEMES`]).
+fn openable(url: &str) -> bool {
+    OPENABLE_SCHEMES
+        .iter()
+        .any(|scheme| url.len() > scheme.len() && url.starts_with(scheme))
+}
+
+/// Push `text` as spans, pulling any bare openable URL into its own clickable
+/// run (styled with [`link`], carrying the URL for OSC 8) and leaving the rest
+/// as `base` text.
+fn push_linkified(text: &str, base: Style, out: &mut Vec<Span>) {
+    let mut rest = text;
+    while let Some((start, len)) = next_url(rest) {
+        if start > 0 {
+            #[allow(
+                clippy::string_slice,
+                reason = "`start` is a byte offset from `find`, always a char boundary"
+            )]
+            out.push(Span::styled(rest[..start].to_string(), base));
+        }
+        #[allow(
+            clippy::string_slice,
+            reason = "`start`/`len` are char-boundary byte offsets from `next_url`"
+        )]
+        let url = &rest[start..start + len];
+        out.push(Span::linked(url.to_string(), link(), url.to_string()));
+        #[allow(
+            clippy::string_slice,
+            reason = "`start + len` is a char boundary — the URL's end from `next_url`"
+        )]
+        {
+            rest = &rest[start + len..];
+        }
+    }
+    if !rest.is_empty() {
+        out.push(Span::styled(rest.to_string(), base));
+    }
+}
+
+/// The first bare openable URL in `s`, as `(byte offset, byte length)`.
+///
+/// A URL runs from its scheme to the first whitespace or control char, then has
+/// trailing sentence punctuation trimmed (`https://x/issues/5).` → the URL, not
+/// the `).`). A rare URL that genuinely ends in one of those characters loses
+/// it — the accepted cost of not needing a full grammar. `None` when nothing but
+/// a bare scheme is present (`https://` with no host is not a link).
+fn next_url(s: &str) -> Option<(usize, usize)> {
+    // Scan forward: a scheme that trims to a non-openable candidate (a bare
+    // `https://` with no host) must not hide a real URL later in the same run, so
+    // a dud advances the cursor rather than ending the search.
+    let mut cursor = 0;
+    while cursor < s.len() {
+        #[allow(
+            clippy::string_slice,
+            reason = "`cursor` is 0 or one past an ASCII scheme byte — a char boundary"
+        )]
+        let ahead = &s[cursor..];
+        let start = OPENABLE_SCHEMES
+            .iter()
+            .filter_map(|scheme| ahead.find(scheme).map(|i| cursor + i))
+            .min()?;
+        #[allow(
+            clippy::string_slice,
+            reason = "`start` is a byte offset from `find`, always a char boundary"
+        )]
+        let tail = &s[start..];
+        let end = tail
+            .char_indices()
+            .find(|(_, c)| c.is_whitespace() || c.is_control())
+            .map(|(i, _)| i)
+            .unwrap_or(tail.len());
+        #[allow(
+            clippy::string_slice,
+            reason = "`end` is a char boundary from `char_indices`"
+        )]
+        let trimmed = tail[..end].trim_end_matches(|c: char| {
+            matches!(
+                c,
+                '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '>' | '"' | '\''
+                    | '，'
+                    | '。'
+                    | '、'
+                    | '」'
+                    | '』'
+                    | '）'
+            )
+        });
+        if openable(trimmed) {
+            return Some((start, trimmed.len()));
+        }
+        // Past this scheme's first byte (ASCII, so a boundary) to find the next.
+        cursor = start + 1;
+    }
+    None
+}
+
+/// Split one line into styled runs: `code`, **bold**, *italic*, [text](url), and
+/// bare `http(s)://` / `file://` URLs.
 fn inline(text: &str, base: Style) -> Vec<Span> {
     let mut out: Vec<Span> = Vec::new();
     let mut buf = String::new();
@@ -286,7 +388,9 @@ fn inline(text: &str, base: Style) -> Vec<Span> {
 
     let flush = |buf: &mut String, out: &mut Vec<Span>| {
         if !buf.is_empty() {
-            out.push(Span::styled(std::mem::take(buf), base));
+            // Bare `http(s)://` / `file://` runs are pulled out of plain text into
+            // clickable link spans; everything else stays `base` text.
+            push_linkified(&std::mem::take(buf), base, out);
         }
     };
 
@@ -331,7 +435,16 @@ fn inline(text: &str, base: Style) -> Vec<Span> {
                         if let Some(paren) = find(&chars, close + 2, ')') {
                             flush(&mut buf, &mut out);
                             let label: String = chars[i + 1..close].iter().collect();
-                            out.push(Span::styled(label, link()));
+                            let url: String = chars[close + 2..paren].iter().collect();
+                            // The label is always styled as a link; it becomes a
+                            // clickable OSC 8 hyperlink only when the destination is
+                            // one a terminal can open (a relative/anchor markdown
+                            // link stays styled-but-inert).
+                            out.push(if openable(&url) {
+                                Span::linked(label, link(), url)
+                            } else {
+                                Span::styled(label, link())
+                            });
                             i = paren + 1;
                             continue;
                         }
@@ -443,10 +556,10 @@ pub(crate) fn wrap_spans(spans: &[Span], w: u16, prefix: &str, prefix_style: Sty
                             rest = &rest[piece.len()..];
                         }
                         used += width::str_width(&piece);
-                        current.push(Span::styled(piece, span.style));
+                        current.push(span.recut(piece));
                     }
                 } else {
-                    current.push(Span::styled(word.to_string(), span.style));
+                    current.push(span.recut(word.to_string()));
                     used += ww;
                 }
             }
@@ -900,6 +1013,77 @@ mod tests {
     fn a_link_shows_its_text_not_its_url() {
         let out = plain("see [the docs](https://example.com/very/long)", 80);
         assert_eq!(out[0], "see the docs");
+    }
+
+    /// The spans a run of text produced, flattened across the wrapped lines.
+    fn spans_of(text: &str, width: u16) -> Vec<Span> {
+        render(text, width, Style::new())
+            .into_iter()
+            .flat_map(|l| l.spans)
+            .collect()
+    }
+
+    #[test]
+    fn a_bare_url_becomes_a_clickable_link_run() {
+        // The model's own example: a bare issue URL in prose is pulled out into a
+        // span that both reads as a link (styled) and carries the URL for OSC 8.
+        let spans = spans_of("see https://atomgit.com/x/atomcode/issues/1565 now", 200);
+        let link = spans.iter().find(|s| s.link.is_some()).expect("a linked run");
+        assert_eq!(link.text, "https://atomgit.com/x/atomcode/issues/1565");
+        assert_eq!(
+            link.link.as_deref(),
+            Some("https://atomgit.com/x/atomcode/issues/1565")
+        );
+        // The prose around it stays ordinary text, not swallowed into the link.
+        let prose: String = spans
+            .iter()
+            .filter(|s| s.link.is_none())
+            .map(|s| s.text.as_str())
+            .collect();
+        assert!(prose.contains("see") && prose.contains("now"), "prose: {prose:?}");
+    }
+
+    #[test]
+    fn trailing_sentence_punctuation_stays_out_of_the_url() {
+        // `(https://…/1565).` — the closing paren and period are the sentence's,
+        // not the URL's.
+        let spans = spans_of("(https://atomgit.com/x/issues/1565).", 200);
+        let link = spans.iter().find(|s| s.link.is_some()).expect("a linked run");
+        assert_eq!(
+            link.link.as_deref(),
+            Some("https://atomgit.com/x/issues/1565")
+        );
+    }
+
+    #[test]
+    fn a_file_url_is_a_link_a_bare_scheme_is_not() {
+        let spans = spans_of("open file:///tmp/report.html or just file://", 200);
+        let links: Vec<&str> = spans
+            .iter()
+            .filter_map(|s| s.link.as_deref())
+            .collect();
+        assert_eq!(links, ["file:///tmp/report.html"], "{spans:?}");
+    }
+
+    #[test]
+    fn a_bare_scheme_does_not_hide_a_later_real_url() {
+        // A dud first candidate (`https://` with no host) must not end the scan:
+        // the real URL after it is still found.
+        let spans = spans_of("the scheme is https:// e.g. https://real.example/x", 200);
+        let links: Vec<&str> = spans.iter().filter_map(|s| s.link.as_deref()).collect();
+        assert_eq!(links, ["https://real.example/x"], "{spans:?}");
+    }
+
+    #[test]
+    fn a_markdown_link_carries_its_url_when_openable_and_not_otherwise() {
+        let openable = spans_of("see [docs](https://example.com/p)", 200);
+        let a = openable.iter().find(|s| s.text == "docs").expect("the label");
+        assert_eq!(a.link.as_deref(), Some("https://example.com/p"));
+
+        // A relative destination stays styled-as-a-link but inert (nowhere to open).
+        let relative = spans_of("see [guide](./guide.md)", 200);
+        let b = relative.iter().find(|s| s.text == "guide").expect("the label");
+        assert!(b.link.is_none(), "a relative link is not an OSC 8 hyperlink");
     }
 
     #[test]

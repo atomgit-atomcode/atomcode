@@ -332,17 +332,43 @@ fn write_line(out: &mut String, line: &Line, width: u16, caps: crate::caps::Caps
         // Swap first, then measure nothing: every substitution is the same
         // number of columns, so the clipping above stays correct.
         let text = caps.text(&clipped);
-        let codes = if caps.colors == crate::caps::Colors::None {
+        let plain = caps.colors == crate::caps::Colors::None;
+        let codes = if plain {
             String::new()
         } else {
             sgr(&span.style, caps)
         };
+        // OSC 8 wraps the run this span actually drew (after clipping), so a
+        // supporting terminal makes exactly the visible text clickable and one
+        // that does not ignores the sequence, leaving it merely styled. Gated
+        // with the SGR gate: a terminal we send no styling to is a terminal we
+        // do not hand escapes. See `docs/adr/0025`.
+        //
+        // The URL is REFUSED (drawn styled-but-inert) when it carries any control
+        // byte: one inside the OSC 8 payload would end the escape early and inject
+        // terminal commands — the same break-out `set_title` guards against, and
+        // this URL is raw model text (a markdown `[x](…)` destination is not run
+        // through `for_screen` the way `span.text` is). Both the open and the
+        // close key off this one binding, so they can never fall out of balance.
+        let hyperlink = span
+            .link
+            .as_deref()
+            .filter(|_| !plain)
+            .filter(|url| !url.bytes().any(|b| b < 0x20 || b == 0x7f));
+        if let Some(url) = hyperlink {
+            out.push_str("\x1b]8;;");
+            out.push_str(url);
+            out.push_str("\x1b\\");
+        }
         if codes.is_empty() {
             out.push_str(&text);
         } else {
             out.push_str(&codes);
             out.push_str(&text);
             out.push_str("\x1b[0m");
+        }
+        if hyperlink.is_some() {
+            out.push_str("\x1b]8;;\x1b\\");
         }
     }
 }
@@ -611,6 +637,61 @@ mod tests {
         assert!(s.starts_with(SYNC_BEGIN));
         assert!(s.contains("\x1b[1;1Htop"));
         assert!(s.contains("\x1b[3;3Hbottom"), "row 3, column 3");
+    }
+
+    #[test]
+    fn a_linked_span_is_wrapped_in_an_osc_8_hyperlink() {
+        let url = "https://atomgit.com/x/atomcode/issues/1565";
+        let mut f = Frame::new(60, 1);
+        f.place(
+            "a",
+            Rect::new(0, 0, 60, 1),
+            vec![Line {
+                spans: vec![Span::linked("issue 1565", Style::new().underline(), url)],
+            }],
+        );
+        let s = encode(&f);
+        assert!(
+            s.contains(&format!("\x1b]8;;{url}\x1b\\")),
+            "opens the hyperlink with the URL: {s:?}"
+        );
+        assert!(s.contains("\x1b]8;;\x1b\\"), "closes the hyperlink: {s:?}");
+        // Opener, then the visible text, then closer — in that order.
+        let open = s.find(&format!("\x1b]8;;{url}")).unwrap();
+        let text = s.find("issue 1565").unwrap();
+        let close = s.rfind("\x1b]8;;\x1b\\").unwrap();
+        assert!(open < text && text < close, "wrong order: {s:?}");
+    }
+
+    #[test]
+    fn plain_text_emits_no_hyperlink() {
+        let mut f = Frame::new(20, 1);
+        f.place("a", Rect::new(0, 0, 20, 1), vec![Line::raw("no link here")]);
+        let s = encode(&f);
+        assert!(!s.contains("\x1b]8;;"), "no OSC 8 for plain text: {s:?}");
+    }
+
+    #[test]
+    fn a_link_url_with_control_bytes_is_refused_not_injected() {
+        // A URL carrying a control byte (ESC/BEL) would close the OSC 8 payload
+        // early and inject terminal commands. It is drawn styled-but-inert — no
+        // hyperlink at all — and the injection bytes never reach the terminal.
+        let mut f = Frame::new(30, 1);
+        f.place(
+            "a",
+            Rect::new(0, 0, 30, 1),
+            vec![Line {
+                spans: vec![Span::linked(
+                    "click",
+                    Style::new().underline(),
+                    "http://a\x1b]0;pwned\x07b",
+                )],
+            }],
+        );
+        let s = encode(&f);
+        assert!(!s.contains("\x1b]8;;"), "no OSC 8 for a control-char URL: {s:?}");
+        assert!(!s.contains("pwned"), "the injection never reaches output: {s:?}");
+        assert!(s.contains("click"), "the label still draws");
     }
 
     #[test]

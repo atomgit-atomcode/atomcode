@@ -6,6 +6,7 @@
 //! checked against a real terminal emulator's cell grid (the external oracle).
 
 use std::fmt;
+use std::sync::Arc;
 
 /// A rectangle in cells. Origin is top-left, `(0, 0)`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -192,6 +193,13 @@ impl Color {
 pub struct Span {
     pub text: String,
     pub style: Style,
+    /// A URL this run points at, emitted as an OSC 8 terminal hyperlink so a
+    /// supporting terminal makes it clickable (and ignored by one that does not,
+    /// leaving the run merely styled). `None` for ordinary text — the common
+    /// case. `Arc` so cloning a span into the repaint diff stays cheap; it feeds
+    /// the row fingerprint (derived `Hash`), so a link that appears or changes
+    /// repaints its row like any other attribute.
+    pub link: Option<Arc<str>>,
 }
 
 impl Span {
@@ -199,12 +207,33 @@ impl Span {
         Self {
             text: text.into(),
             style: Style::new(),
+            link: None,
         }
     }
     pub fn styled(text: impl Into<String>, style: Style) -> Self {
         Self {
             text: text.into(),
             style,
+            link: None,
+        }
+    }
+    /// A run that points at `url`, drawn with `style` and made clickable via
+    /// OSC 8 on a terminal that supports it. See [`Span::link`].
+    pub fn linked(text: impl Into<String>, style: Style, url: impl Into<Arc<str>>) -> Self {
+        Self {
+            text: text.into(),
+            style,
+            link: Some(url.into()),
+        }
+    }
+    /// This span's style and link, with new text — for a wrapper that re-cuts a
+    /// run into width-sized pieces without dropping its attributes (a link that
+    /// wrapped across two rows stays a link on both).
+    pub fn recut(&self, text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            style: self.style,
+            link: self.link.clone(),
         }
     }
     /// Display width in cells, which is not the byte length and not the char
