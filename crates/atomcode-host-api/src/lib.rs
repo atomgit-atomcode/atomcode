@@ -771,6 +771,15 @@ pub enum McpServerState {
     Connected,
     /// Not started: the project is not trusted.
     Untrusted,
+    /// HTTP with OAuth auth, and no usable token stored for this server. Derived
+    /// by the runtime from the token store, not reported by the connection: the
+    /// connection is never attempted without credentials to try.
+    NeedsAuthentication,
+    /// `disabled: true` in the file that defines it. The server is not started
+    /// and is not in the running session's catalog — it is listed so the switch
+    /// back on is reachable (`crates/atomcode-capabilities/src/mcp/config.rs:212`
+    /// filters these out of the runtime's own read).
+    Disabled,
     Failed {
         message: String,
     },
@@ -1162,6 +1171,14 @@ mod tests {
                     McpServer {
                         name: "c".into(),
                         state: McpServerState::Disconnected,
+                    },
+                    McpServer {
+                        name: "needs-auth".into(),
+                        state: McpServerState::NeedsAuthentication,
+                    },
+                    McpServer {
+                        name: "off".into(),
+                        state: McpServerState::Disabled,
                     },
                 ],
             },
