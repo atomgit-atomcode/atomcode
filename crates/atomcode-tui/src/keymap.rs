@@ -83,6 +83,12 @@ pub enum Action {
     /// lid, then the whole thing, then — for a kind that may be hidden — off
     /// the screen.
     ToggleFold(&'static str),
+    /// Put a kind in a named state, rather than stepping it on — what
+    /// `/team show` and `/todo hide` are, for the same reason
+    /// [`Action::SetToolOutput`] exists: a named state has to mean the same
+    /// thing wherever it is typed, and a toggle means the opposite of itself
+    /// every other time.
+    SetFold(&'static str, crate::host::Showing),
     /// Set a tool call's output mode by name, rather than stepping to the next
     /// one. `/tools group` has to mean the same thing wherever it is typed;
     /// [`ToggleFold`](Self::ToggleFold) on `tool_call` means "the next one",

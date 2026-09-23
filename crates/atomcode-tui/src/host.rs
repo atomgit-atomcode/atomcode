@@ -274,6 +274,23 @@ impl Presentation {
             .unwrap_or_default()
     }
 
+    /// Put a kind in a named state, rather than stepping it on.
+    ///
+    /// Public for the reason [`set_tool_output`](Self::set_tool_output) is: a
+    /// typed command may **name** the state it wants, and a toggle would make
+    /// `/team show` mean "show" or "hide" depending on where it started. A
+    /// person who cannot see the panel (or a keybinding file, or a second
+    /// screen they just resumed onto) has no way to know where it started.
+    pub fn show_as(&mut self, kind: &'static str, to: Showing) {
+        if self.showing(kind) == to {
+            return;
+        }
+        self.set(kind, to);
+        // The same reason `toggle` does it: a per-block choice was made against
+        // a different default and is no longer what anyone asked for.
+        self.by_block.clear();
+    }
+
     fn set(&mut self, kind: &'static str, to: Showing) {
         match self.by_kind.iter_mut().find(|(k, _)| *k == kind) {
             Some(entry) => entry.1 = to,

@@ -2645,6 +2645,18 @@ fn means_stop(arg: &str) -> bool {
     matches!(arg, "stop" | "off" | "clear" | "cancel" | "reset" | "none")
 }
 
+/// 「怎么用」的几种说法。
+///
+/// 和 [`means_stop`] 一样两条命令共用,而理由更硬一层:不认它的话,
+/// `/goal help` 会**把「help」当成一个目标条件开始干**,`/loop help` 会
+/// 每轮都做一件叫 help 的事。一个字面上在问「怎么用」的输入,
+/// 绝不能反而把东西跑起来 —— 这和打错一个参数就静默切换面板是同一类事故。
+///
+/// 这几个写法没有一个可能是真条件或真任务:没人会把「达成 --help」当成目标。
+fn means_help(arg: &str) -> bool {
+    matches!(arg, "help" | "?" | "-h" | "--help")
+}
+
 struct GoalCommand(Arc<dyn crate::runtime::RuntimeCommands>);
 
 #[async_trait]
@@ -2664,21 +2676,41 @@ impl atomcode_harness::commands::CatalogCommand for GoalCommand {
         _agent: Arc<atomcode_harness::agent::Agent>,
         args: &str,
     ) -> Result<String, String> {
+        run_goal(&self.0, args).await
+    }
+}
+
+/// `/goal` 的全部实体。
+///
+/// 提成函数的理由同 [`run_worktree`]:命令本身用不着 agent,而判据要证明的
+/// 恰恰是「**没有**去叫运行时」——`/goal help` 不许把目标跑起来。
+/// 走 `CatalogCommand::run` 的话要先造一个真 agent,那是在判别的东西之外。
+async fn run_goal(
+    runtime: &Arc<dyn crate::runtime::RuntimeCommands>,
+    args: &str,
+) -> Result<String, String> {
+    {
         match args.trim() {
             "" => Err("要一个条件:达成什么才算完。".into()),
+            // 问「怎么用」的绝不能把东西跑起来,见 `means_help`。
+            word if means_help(word) => Ok("/goal <要达成的条件> —— 自己干到它成立为止。\n\
+                 /goal stop(或 off/clear/cancel/reset/none)—— 收工。\n\
+                 /goal pause —— 先搁着,接着说话就继续。\n\
+                 干到哪一轮了,状态行一直在说。"
+                .into()),
             // 收工的几种说法都认。一个人想停下自主循环的时候,不该还要先想起
             // 这里用的是哪个词 —— 而这几个词没有一个可能是真条件:谁也不会把
             // 「达成 cancel」当成目标。
             word if means_stop(word) => {
-                self.0.stop_goal().await?;
+                runtime.stop_goal().await?;
                 Ok("目标停了。".into())
             }
             "pause" => {
-                self.0.pause_goal().await?;
+                runtime.pause_goal().await?;
                 Ok("目标先搁着,还可以接着干。".into())
             }
             condition => {
-                self.0.start_goal(condition.to_string()).await?;
+                runtime.start_goal(condition.to_string()).await?;
                 Ok(format!("开始干,直到:{condition}"))
             }
         }
@@ -2704,15 +2736,30 @@ impl atomcode_harness::commands::CatalogCommand for LoopCommand {
         _agent: Arc<atomcode_harness::agent::Agent>,
         args: &str,
     ) -> Result<String, String> {
+        run_loop(&self.0, args).await
+    }
+}
+
+/// `/loop` 的全部实体。提成函数的理由同 [`run_goal`]。
+async fn run_loop(
+    runtime: &Arc<dyn crate::runtime::RuntimeCommands>,
+    args: &str,
+) -> Result<String, String> {
+    {
         match args.trim() {
             "" => Err("要一句话:每轮做什么。".into()),
+            // 同 `/goal`:问「怎么用」的绝不能把东西跑起来。
+            word if means_help(word) => Ok("/loop <每轮要做的事> —— 一遍遍地做,直到收工。\n\
+                 /loop stop(或 off/clear/cancel/reset/none)—— 收工。\n\
+                 跑到第几轮了,状态行一直在说。"
+                .into()),
             // 同 `/goal`:收工的几种说法都认,理由也一样。
             word if means_stop(word) => {
-                self.0.stop_loop().await?;
+                runtime.stop_loop().await?;
                 Ok("循环停了。".into())
             }
             prompt => {
-                self.0.start_loop(prompt.to_string()).await?;
+                runtime.start_loop(prompt.to_string()).await?;
                 Ok(format!("每轮都做:{prompt}"))
             }
         }
@@ -3171,6 +3218,53 @@ mod tests {
         ] {
             assert!(!super::means_stop(real), "{real:?} 是一条真指令,不是收工");
         }
+    }
+
+    /// 问「怎么用」的绝不能把东西跑起来。
+    ///
+    /// 这条判据的反面同样是它存在的理由,而且已经发生过:不认 `help` 的时候,
+    /// `/goal help` 会**开始朝着一个叫「help」的条件干活**,回执还写着
+    /// 「开始干,直到:help」—— 人问了一句怎么用,得到的是一个跑起来的自主循环。
+    #[test]
+    fn asking_how_to_use_it_never_starts_it() {
+        for word in ["help", "?", "-h", "--help"] {
+            assert!(super::means_help(word), "{word} 是在问怎么用");
+        }
+        for real in [
+            "",
+            "stop",
+            "把 --help 的输出补全",
+            "写一份 help 文档",
+            "helper 类拆出来",
+        ] {
+            assert!(
+                !super::means_help(real),
+                "{real:?} 是一条真指令,不是在问用法"
+            );
+        }
+    }
+
+    /// 接线:`/goal help` 与 `/loop help` 真的走到底,而且**没有**叫运行时。
+    ///
+    /// 上面那条只钉了 `means_help` 这个函数 —— 命令的 `match` 里不写这一臂,
+    /// 它照样全绿。这条钉的是那一臂:`Pointed` 的 `start_goal`/`start_loop`
+    /// 是 `unreachable!`,所以「问用法反而跑起来」会当场炸,而不是悄悄发生。
+    #[tokio::test]
+    async fn goal_and_loop_answer_a_help_without_starting_anything() {
+        let runtime: Arc<dyn crate::runtime::RuntimeCommands> = pointed();
+        for word in ["help", "?", "-h", "--help"] {
+            let said = super::run_goal(&runtime, word).await.expect(word);
+            assert!(said.contains("/goal"), "它说的是用法:{said}");
+            let said = super::run_loop(&runtime, word).await.expect(word);
+            assert!(said.contains("/loop"), "它说的是用法:{said}");
+        }
+        // 而一条真指令仍然照常往下走(这里就是 `unreachable!` 的那一条,
+        // 所以只断言它确实到了运行时那一步)。
+        let panicked = std::panic::AssertUnwindSafe(super::run_goal(&runtime, "把测试跑绿"));
+        assert!(
+            futures::FutureExt::catch_unwind(panicked).await.is_err(),
+            "一条真条件必须走到运行时去"
+        );
     }
 
     /// A runtime that only remembers where it was pointed.

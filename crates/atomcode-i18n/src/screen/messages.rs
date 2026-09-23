@@ -385,6 +385,11 @@ pub enum Msg<'a> {
     NoHost,
     /// `/paste` found neither a picture nor text there.
     ClipboardHasNothing,
+    /// `/team` or `/todo` with a word neither of them knows.
+    FoldUsage {
+        name: &'a str,
+        other: &'a str,
+    },
     FileIsEmpty {
         path: &'a str,
     },

@@ -263,6 +263,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::NoClipboard => "这块屏幕没有剪贴板".into(),
         Msg::NoAgent => "这块屏幕没接上 agent".into(),
         Msg::NoHost => "这块屏幕没接上宿主".into(),
+        Msg::FoldUsage { name, other } =>
+            format!("`/{name} {other}`?它只认:不带参数(切换)、`show`、`hide`").into(),
         Msg::ClipboardHasNothing => "剪贴板里没有能贴的东西;`/paste 路径` 可以贴一个文件 —— 是图就当附件,别的当文字".into(),
         Msg::FileIsEmpty { path } => format!("{path} 是空的").into(),
         Msg::FileUnreadable { path, error } => format!("读不了 {path}:{error}").into(),

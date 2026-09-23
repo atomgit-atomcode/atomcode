@@ -70,9 +70,16 @@ impl CommandSet for ScreenCommands {
             },
             "mouse" => Outcome::Do(Action::ToggleMouse),
             // The two panels a person toggles by name. Same gesture the fold
-            // keys are, so a command and a key share one implementation.
-            "todo" => Outcome::Do(Action::ToggleFold("todo")),
-            "team" => Outcome::Do(Action::ToggleFold("team")),
+            // keys are, so a command and a key share one implementation — and
+            // with a state named, the flat setter, because a toggle means the
+            // opposite of itself every other time.
+            //
+            // The bare form stays a toggle: that is the gesture, and it is what
+            // a person who can see the panel means. `show`/`hide` are for
+            // everyone who cannot — a script, a keybinding, a session just
+            // resumed onto a second screen.
+            "todo" => fold_command("todo", args),
+            "team" => fold_command("team", args),
             // A typed way in to the thing ctrl-v does, because ctrl-v does not
             // always arrive: Windows terminals hand the paste to the key layer
             // as a keystroke, and some platforms have no clipboard this process
@@ -205,6 +212,28 @@ const VIEW_MAX_LINES: usize = 1000;
 /// The most characters kept from one line. A minified bundle is one line of
 /// two million; wrapping it fills the screen with a single row of the file.
 const VIEW_MAX_LINE: usize = 2000;
+
+/// `/team` and `/todo`: the bare toggle, or a named state.
+///
+/// **An argument nobody recognises is refused, not ignored.** Both commands
+/// used to drop `args` on the floor, so `/team stauts` toggled the panel — a
+/// typo that did something, which is the one thing a typo must never do. That
+/// is the bug this shape fixes; the named states are what it fixes it with.
+///
+/// `hide` is [`Showing::Folded`] rather than gone: neither panel is hideable
+/// ([`crate::host::Showing`] — only reasoning and the environment's injections
+/// are), so one row is as far away as they go. Named `hide` anyway, because
+/// that is the word people reach for and the panel does go away as a thing you
+/// read.
+fn fold_command(kind: &'static str, args: &str) -> Outcome {
+    use crate::host::Showing;
+    match args.trim().to_ascii_lowercase().as_str() {
+        "" | "toggle" => Outcome::Do(Action::ToggleFold(kind)),
+        "show" | "open" => Outcome::Do(Action::SetFold(kind, Showing::Open)),
+        "hide" | "fold" | "close" => Outcome::Do(Action::SetFold(kind, Showing::Folded)),
+        other => Outcome::Refused(t(Msg::FoldUsage { name: kind, other }).into_owned()),
+    }
+}
 
 /// Which file a typed path means — for `/view`, and for `/paste <path>`.
 ///
@@ -3150,6 +3179,78 @@ mod tests {
             Outcome::Do(Action::PasteFrom(Some("~/shot.png".into()))),
             "a path is passed through as typed: expanding it needs a home \
              directory, and that is the handler's to know"
+        );
+    }
+
+    /// `/team` and `/todo` take a named state, and refuse a word they do not
+    /// know.
+    ///
+    /// **The refusal is the point.** `args` used to be dropped on the floor, so
+    /// `/team stauts` toggled the panel: a typo that did something. The named
+    /// states are the other half — `show` has to mean show, and a toggle means
+    /// the opposite of itself every other time, which is unusable from a script
+    /// or from a session just resumed onto another screen.
+    #[tokio::test]
+    async fn team_and_todo_take_a_named_state_and_refuse_anything_else() {
+        use crate::host::Showing;
+        let app = bare();
+        let all = Arc::new(Commands::new());
+        let _ = all.add(Arc::new(ScreenCommands));
+
+        for name in ["team", "todo"] {
+            assert!(
+                matches!(
+                    all.dispatch(&format!("/{name}"), &app.context()).await,
+                    Outcome::Do(Action::ToggleFold(_))
+                ),
+                "/{name} bare is still the toggle"
+            );
+            for word in ["show", "open"] {
+                assert!(
+                    matches!(
+                        all.dispatch(&format!("/{name} {word}"), &app.context())
+                            .await,
+                        Outcome::Do(Action::SetFold(_, Showing::Open))
+                    ),
+                    "/{name} {word}"
+                );
+            }
+            for word in ["hide", "fold", "close"] {
+                assert!(
+                    matches!(
+                        all.dispatch(&format!("/{name} {word}"), &app.context())
+                            .await,
+                        Outcome::Do(Action::SetFold(_, Showing::Folded))
+                    ),
+                    "/{name} {word}"
+                );
+            }
+            match all
+                .dispatch(&format!("/{name} stauts"), &app.context())
+                .await
+            {
+                Outcome::Refused(why) => {
+                    assert!(why.contains("show") && why.contains("hide"), "{why}")
+                }
+                other => panic!("a typo must never act: {other:?}"),
+            }
+        }
+    }
+
+    /// And a named state is flat: asking twice for the same one leaves it
+    /// there, where a toggle would have taken it away again.
+    #[test]
+    fn asking_for_a_state_twice_leaves_it_in_that_state() {
+        use crate::host::{Presentation, Showing};
+        let mut p = Presentation::default_folds();
+        p.show_as("team", Showing::Folded);
+        p.show_as("team", Showing::Folded);
+        assert_eq!(p.showing("team"), Showing::Folded);
+        p.toggle("team");
+        assert_eq!(
+            p.showing("team"),
+            Showing::Open,
+            "and the toggle still steps"
         );
     }
 
