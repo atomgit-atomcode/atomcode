@@ -1535,6 +1535,12 @@ impl Host {
         m.turn_started = None;
         m.quiet_since = None;
         m.steering.clear();
+        // The `正在识别图片` line belongs to a picture sent into the view being
+        // left; carried across it would claim the arriving conversation is
+        // recognising one it never saw. (Its own message fact clears it in the
+        // common case, but that fact is dropped for an off-screen session, so
+        // the switch is what takes it down here.)
+        m.recognizing_image = false;
         // Both belong to the view being left, not the one arriving: the `已中断`
         // note is about a turn this session stopped, and `last_sent` is what to
         // hand back on the next Escape. Carried across a `/clear` or a member
