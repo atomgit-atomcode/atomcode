@@ -702,6 +702,9 @@ pub enum Msg<'a> {
         lines: &'a str,
     },
     NoPluginPort,
+    /// The MCP panel has no port: this build mounted the screen without the
+    /// launcher's `tui-mcp` row. The sibling of [`Msg::NoToolCatalog`].
+    NoMcpPort,
     /// `takes` for `/setup`: what a person may type after it.
     CmdTakesSetup,
     /// `/setup`'s line in `/help` and in the slash menu.

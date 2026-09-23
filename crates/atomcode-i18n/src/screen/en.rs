@@ -464,6 +464,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PluginNoSuch { typed } => format!("there is no plugin called {typed}").into(),
         Msg::PluginAmbiguous { name, lines } => format!("there are several called {name}; say which one:\n{lines}").into(),
         Msg::NoPluginPort => "this screen has no plugins: the launcher provided no `tui-plugins`".into(),
+        Msg::NoMcpPort => "this screen has no MCP port: the launcher provided no `tui-mcp`".into(),
         Msg::CmdTakesSetup => "[focus area, e.g. hooks, mcp, skills, all]".into(),
         Msg::CmdAboutSetup => "analyze this project, install the seed skill, and recommend which automations to set up".into(),
         Msg::NoSetupPort => "this screen installs no seeds: the launcher provided no `tui-setup`, so there is nothing to unseal".into(),

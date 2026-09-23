@@ -436,6 +436,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PluginNoSuch { typed } => format!("没有叫 {typed} 的插件").into(),
         Msg::PluginAmbiguous { name, lines } => format!("有好几个叫 {name} 的,说清是哪个:\n{lines}").into(),
         Msg::NoPluginPort => "这个屏幕没有接插件:启动器没有提供 `tui-plugins`".into(),
+        Msg::NoMcpPort => "这个屏幕没有接 MCP:启动器没有提供 `tui-mcp`".into(),
         Msg::CmdTakesSetup => "[focus area,例如 hooks、mcp、skills、all]".into(),
         Msg::CmdAboutSetup => "分析这个项目、装好种子 skill,然后给出该配哪些自动化的建议".into(),
         Msg::NoSetupPort => "这个屏幕没有接种子安装:启动器没有提供 `tui-setup`,所以它装不了种子".into(),
