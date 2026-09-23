@@ -1717,6 +1717,10 @@ pub enum Msg<'a> {
     /// and trailing newlines baked in.
     BgHelp,
     /// Prefix on the person's own line in a stored session's preview.
+    /// 预览开头那一行:这个会话最后用的是哪个模型。
+    PreviewModel {
+        model: &'a str,
+    },
     PreviewSaid,
     /// Prefix on the agent's line in the same preview.
     PreviewAnswered,

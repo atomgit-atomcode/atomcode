@@ -50,7 +50,7 @@ impl View for Resume {
         let preview = preview_of(vp.moment, view, panel);
         layout(view, panel, preview, vp.rect.h as usize)
             .into_iter()
-            .map(|row| draw(view, panel, preview, row, w, caps))
+            .map(|row| draw(view, panel, preview, row, w, caps, &vp.moment.lead))
             .collect()
     }
 
@@ -187,6 +187,8 @@ fn draw(
     row: Row,
     w: usize,
     caps: crate::caps::Caps,
+    // `current`:此刻开着的那个会话,用来在列表里认出它自己。
+    current: &str,
 ) -> Line {
     match row {
         Row::Rule => panel_edge(w, caps),
@@ -203,7 +205,7 @@ fn draw(
             width::take_width(&format!("  ↑{above} ↓{below}"), w),
             theme::fg(Role::Muted),
         ),
-        Row::Session(at) => session_line(view, panel, at, w, caps),
+        Row::Session(at) => session_line(view, panel, at, w, caps, current),
         Row::PreviewWaiting => Line::styled(
             format!("  {}", t(Msg::ResumePreviewWaiting)),
             theme::fg(Role::Muted),
@@ -233,6 +235,7 @@ fn session_line(
     at: usize,
     w: usize,
     caps: crate::caps::Caps,
+    current: &str,
 ) -> Line {
     let listed = view.listed(panel);
     let Some(session) = listed.get(at).and_then(|&index| view.sessions().get(index)) else {
@@ -269,6 +272,13 @@ fn session_line(
             })
             .into_owned(),
         }
+    };
+    // 这一条就是正开着的那个会话。说出来,因为「恢复我正在用的这个」是一次
+    // 无谓的重建:同一段对话会被重放一遍,而屏幕上本来就是它。
+    let meta = if session.id == current {
+        format!("{meta}  {}", t(Msg::RewindPanelCurrent))
+    } else {
+        meta
     };
     let armed = panel.armed.as_deref() == Some(session.id.as_str());
     let heading_style = if armed {
@@ -348,9 +358,31 @@ mod tests {
         preview: Option<Option<&Vec<String>>>,
         w: usize,
     ) -> Vec<String> {
+        text_as(view, panel, preview, w, "")
+    }
+
+    /// 同上,但说明「此刻开着的是哪个会话」。
+    fn text_as(
+        view: &ResumeView,
+        panel: &Panel,
+        preview: Option<Option<&Vec<String>>>,
+        w: usize,
+        current: &str,
+    ) -> Vec<String> {
         layout(view, panel, preview, 40)
             .into_iter()
-            .map(|row| draw(view, panel, preview, row, w, crate::caps::Caps::default()).plain())
+            .map(|row| {
+                draw(
+                    view,
+                    panel,
+                    preview,
+                    row,
+                    w,
+                    crate::caps::Caps::default(),
+                    current,
+                )
+                .plain()
+            })
             .collect()
     }
 
@@ -363,6 +395,30 @@ mod tests {
         let shown = text_with(&view, &panel, Some(Some(&lines)), 60).join("\n");
         assert!(shown.contains("把错误处理改一遍"), "{shown}");
         assert!(shown.contains("改完了"), "{shown}");
+    }
+
+    /// 正开着的那个会话,在列表里说出来。
+    ///
+    /// 「恢复我正在用的这个」是一次无谓的重建:同一段对话被重放一遍,而屏幕上
+    /// 本来就是它。列表不说,人就只能靠标题去认——而标题正是最容易重名的那一项。
+    #[test]
+    fn the_session_already_open_says_so_in_the_list() {
+        let (view, panel) = (view(), Panel::new());
+        let shown = text_as(&view, &panel, None, 60, "bbb").join("\n");
+        let marked: Vec<&str> = shown
+            .lines()
+            .filter(|line| line.contains("（当前）"))
+            .collect();
+        assert_eq!(marked.len(), 1, "只有一行是当前会话:{shown}");
+        assert!(
+            marked[0].contains("死代码扫描"),
+            "而且是那一条:{:?}",
+            marked[0]
+        );
+
+        // 不在列表里的会话:一行都不标,而不是退回去标第一条。
+        let none = text_as(&view, &panel, None, 60, "somewhere-else").join("\n");
+        assert!(!none.contains("（当前）"), "{none}");
     }
 
     /// 还没问到的时候说一句,而不是先空着再突然长出几行。
@@ -389,7 +445,7 @@ mod tests {
     fn text(view: &ResumeView, panel: &Panel, w: usize) -> Vec<String> {
         layout(view, panel, None, 40)
             .into_iter()
-            .map(|row| draw(view, panel, None, row, w, crate::caps::Caps::default()).plain())
+            .map(|row| draw(view, panel, None, row, w, crate::caps::Caps::default(), "").plain())
             .collect()
     }
 

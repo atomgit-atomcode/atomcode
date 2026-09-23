@@ -1044,6 +1044,21 @@ fn preview_of(session: &str) -> Result<Vec<String>, HostError> {
         .map_err(|error| HostError::Failed {
             message: error.to_string(),
         })?;
+    // Which model this conversation was with — the first thing a person checks
+    // when deciding whether to go back to it.
+    //
+    // **The model, not "provider - model"** as the other front end showed: the
+    // provider is not a fact anywhere. `RequestHeader` carries the model, the
+    // session index carries neither, so a provider here would have to be
+    // guessed from the model's name. Saying the half that is recorded beats
+    // inventing the half that is not.
+    //
+    // The LAST header, because a session that switched models ended on the one
+    // it would resume from.
+    let model = logged.iter().rev().find_map(|entry| match &entry.event {
+        atomcode_kernel::session::SessionEvent::RequestHeader { model, .. } => Some(model.clone()),
+        _ => None,
+    });
     let records = events::turn_records(session, &logged);
     let kept: Vec<_> = records
         .iter()
@@ -1052,6 +1067,12 @@ fn preview_of(session: &str) -> Result<Vec<String>, HostError> {
         .take(TURNS)
         .collect();
     let mut lines = Vec::new();
+    if let Some(model) = &model {
+        lines.push(
+            atomcode_i18n::product::t(atomcode_i18n::product::Msg::PreviewModel { model })
+                .into_owned(),
+        );
+    }
     for record in kept.into_iter().rev() {
         for (who, text) in [
             (atomcode_i18n::product::Msg::PreviewSaid, &record.user),

@@ -1313,6 +1313,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
                 .into(),
 
         // ── /bg (background sessions) ──
+        Msg::PreviewModel { model } => format!("model: {model}").into(),
         Msg::PreviewSaid => "you:".into(),
         Msg::PreviewAnswered => "it:".into(),
         Msg::BgHelp =>

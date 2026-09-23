@@ -1274,6 +1274,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
                 .into(),
 
         // ── /bg（后台会话）──
+        Msg::PreviewModel { model } => format!("模型:{model}").into(),
         Msg::PreviewSaid => "你:".into(),
         Msg::PreviewAnswered => "它:".into(),
         Msg::BgHelp =>

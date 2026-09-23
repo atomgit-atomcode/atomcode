@@ -2469,6 +2469,23 @@ async fn a_stored_session_says_what_it_last_talked_about() {
         lines.len() >= 2,
         "and both halves of the exchange: {lines:#?}"
     );
+    // Which model it was with, first — the thing a person checks before
+    // deciding to go back to a conversation. Read off the log's own
+    // `RequestHeader`, so a session that switched models shows the one it
+    // ended on. (The PROVIDER is deliberately absent: it is not a fact
+    // anywhere, and guessing one from the model's name would be inventing it.)
+    let asked_model = env
+        .script
+        .requests
+        .lock()
+        .unwrap()
+        .first()
+        .map(|(model, _)| model.clone())
+        .expect("a request went out");
+    assert!(
+        lines[0].contains(&asked_model),
+        "the model leads the preview (wanted {asked_model}): {lines:#?}"
+    );
 
     assert_eq!(
         connection
