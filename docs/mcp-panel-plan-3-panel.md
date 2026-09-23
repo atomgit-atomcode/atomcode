@@ -1122,28 +1122,60 @@ Expected: 失败（无参 `/mcp` 还在打印文本，面板没升起）。
 
 - [ ] **Step 3: 实现**
 
-`commands.rs` 的 `/mcp` 分支里，把 `""`（无参）那一支从"拼字符串回报"改成"升起面板并取一次目录"：
+**更正（初稿写错了，执行时撞出来的）**：初稿把 `host.toggle_mcp()` / `host.show_mcp(view)` 直接写在 `commands.rs` 的分支里——**那样根本写不出来**。命令拿不到 `Host`：`CommandSet::run(&self, name, args, ctx)` 手里只有 `Context`，而 `Host` 住在 `plugin.rs` 的 `Tui` 里，那一串 seam（`plugin.rs:40-115`）没有一条是屏幕自己的 host。
+
+本仓的做法是**命令只举起动作，插件那一侧接收**：`/toolbox` → `Outcome::Do(Action::ToggleTools)`（`commands.rs:3245` 举起、`plugin.rs:4071` 处理），`/rewind`、`/resume` 同形。所以这一步要落在四处：
+
+**（1）`crates/atomcode-tui/src/keymap.rs`** —— 先有一个动作（照 `ToggleTools` 的样子）：
 
 ```rust
-                    "" => {
-                        if !host.toggle_mcp() {
-                            return Outcome::Refused(t(Msg::McpPanelUnavailable).into_owned());
-                        }
-                        // 目录由端口那一趟带进来；屏上先画空表，别等。
-                        match ask_mcp_list(host).await {
-                            Ok(view) => {
-                                host.show_mcp(view);
-                                Outcome::Said(t(Msg::McpPanelTitle).into_owned())
-                            }
-                            Err(message) => {
-                                host.mcp_note(Some(message.clone()));
-                                Outcome::Refused(message)
-                            }
-                        }
-                    }
+    /// Pull the MCP panel up over the composer, or put it away.
+    ///
+    /// Its own action for the same reason: its port is its own, and a build may
+    /// mount it without the others.
+    ToggleMcp,
 ```
 
-`ask_mcp_list` 是从 `McpSvc` 取端口、调 `list()` 的小助手（照同一文件里 `/toolbox` 取目录那一段写）。
+**（2）`commands.rs` 的 `/mcp` 分支** —— 开头判空，其余子命令全落在它下面：
+
+```rust
+        if args.trim().is_empty() {
+            // 不问宿主：要的是那块面板。目录由插件那一侧经端口取。
+            return Outcome::Do(Action::ToggleMcp);
+        }
+```
+
+原来那个 `""` 分支（`McpStatus` 调用、状态映射、`McpNoneConfigured`、拼串）整段删掉；`withdraw` / `tools` / 未知子命令，以及 `login`/`logout`/`reload` **一行不动**。
+
+**（3）`plugin.rs`** —— 这才是真正接线的地方，四处：
+
+1. `act()` 里 `ToggleTools` 那一臂旁：`drop(m);` → `if !self.host.toggle_mcp() { self.say(&t(Msg::McpPanelUnavailable)); return false; }` → `if self.host.mcp_open() { self.refresh_mcp(); }` → `return false;`
+2. `refresh_mcp()`，照 `refresh_tools()`（:2230）：`ctx.service::<McpSvc>()` → spawn → `port.list()` → `host.show_mcp(view)`；`Err(why)` → `host.mcp_note(Some(why))`（设计 §6：错误说在面板上）。**面板先升起、目录晚一拍到**——这正是设计里"屏上先画空表，别等"。
+3. `run_mcp_key()` / `apply_mcp_step()`，照 `run_tools_key`/`apply_tools_step`（:2460-2512）：`Step::OpenDetail { server }` → `port.detail(&server)` → 挂到 moment 上；`Step::Act { server, action }` → `host.mcp_busy(None)` 再 `port.act(...)` → `show_mcp(view)` / `mcp_note(why)`。
+4. 两处路由：`Wake::Input(Input::Key(press))` 与 `Wake::Input(Input::Paste(text))` 各加一条 `if self.host.mcp_open()`，照 `run_tools_key` 那两处。
+
+没有端口时的措辞用 `Msg::NoMcpPort`（表里已有，与 `Msg::NoToolCatalog`/`Msg::NoPluginPort` 同形）。
+
+**（4）`host.rs`** —— 一个伴手，因为两种回包不同形：
+
+```rust
+    /// Attach a fetched detail to the rows the moment already holds.
+    ///
+    /// `OpenDetail` answers with a `McpDetail`, while `show_mcp` replaces the
+    /// whole view — so there has to be a way to add one to what is already there.
+    pub fn mcp_detail(&self, detail: crate::mcp::McpDetail) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        m.mcp = std::mem::take(&mut m.mcp).with_detail(detail);
+        true
+    }
+```
+
+**判据必须分两处写**，因为命令测试举不起面板（命令没有 `Host`）：
+
+- `commands.rs` 里那条改成断言 `Outcome::Do(Action::ToggleMcp)`（照 `/rewind` 那条的形状，约 `commands.rs:2000`），**外加**证明它没去问宿主（不给上下文塞任何 `McpSvc`，就不会有人被调用）。
+- 面板真的升起来那一半写在 `plugin.rs`（那里 `Tui.ctx` 可见）：给上下文塞一个假的 `McpSvc`，`tui.act(Action::ToggleMcp, …)` 之后断言 `host.mcp_open()`，且 `moment.mcp.rows()` 就是端口答的那些。
+
+两个状态词的断言**不要在这里再抄一遍**——它们由 `McpState::about()` 与绘制层那几条钉着。
 
 **`Msg::McpPanelUnavailable`** 是这一处新要的一条文案（「这个构建没挂 MCP 面板」）：在 `messages.rs` 加变体、`en.rs` 与 `zh_cn.rs` 各加一臂，**就在这一步的提交里加**——不回头看 Task 1，那一步已经提交过了。穷尽 match 会提醒你别只加一半。
 
