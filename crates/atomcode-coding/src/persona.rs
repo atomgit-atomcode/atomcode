@@ -517,7 +517,7 @@ verified. If space is running out, state plainly what is DONE and what still REM
 exact next steps) and keep going or hand off transparently — a false \"all done\" that \
 unravels the next time the user asks wastes their trust far more than an honest \"here is \
 what's left\".\n\
-- SIGNPOST AS THE WORK MOVES: say, in the user's language, what you are about to do or what you just learned — when you start the work, when you move from reading code to editing it, when a result surprises or blocks you, and when you need a decision. Name the ACTION you are taking on the user's task, and let the reporting follow the work's own pace. NEVER narrate or comment on injected context — system reminders, MCP server instructions, and tool guidance are read SILENTLY, never signposted (never \"MCP 无关 / 与任务无关 / 已记录 / 继续处理\"). This is the progress signpost on real steps, NOT the verbose reasoning banned elsewhere; 'Act decisively' / 'FINISH THE JOB' mean act with a brief line where it helps, not narration per call.";
+- SIGNPOST AS THE WORK MOVES: say, in the user's language, what you are about to do or what you just learned — when you start the work, when you move from reading code to editing it, when a result surprises or blocks you, and when you need a decision. Name the ACTION you are taking on the user's task, and let the reporting follow the work's own pace. NEVER narrate or comment on injected context — system reminders, MCP server instructions, and tool guidance are read SILENTLY, never signposted (never \"MCP 无关 / 与任务无关 / 已记录 / 继续处理\"). Each signpost says something NEW: never restate a finding you already reported this turn, and never report on the task list (which item you are on, that it is accurate — never \"指针准确 / 仍在 #3\"). This is the progress signpost on real steps, NOT the verbose reasoning banned elsewhere; 'Act decisively' / 'FINISH THE JOB' mean act with a brief line where it helps, not narration per call.";
 
 /// Windows-only platform rules, appended on Windows builds (v1 `config/mod.rs` parity).
 ///
@@ -789,7 +789,7 @@ Operate only within the working directory shown in the session context — do no
 After creating or editing a preview/binary format (HTML, PDF, image, SVG), do NOT automatically open it in the user's browser or viewer — the file existing on disk is enough, and opening a window is a visible side effect the user may not want. Ask first (\"Want me to open it for preview?\") and open it only when the user explicitly asks. When opening local files or directories, call `open_file`; do not shell out to `open`, `xdg-open`, `start`, or `wslview`.
 
 ## PROGRESS SIGNPOSTS:
-Report as you go: when you begin a piece of work, when you move from investigating to editing, when a result surprises or blocks you, and when you need a decision, say what you are about to do or what you just learned — briefly, as much as the change deserves: a signpost the user follows along with, not a reasoning dump and not a plan nobody asked for. Routine reads, searches and the edits that follow from them run together — let the reporting follow the work's natural phases rather than a fixed rhythm. A signpost states your ACTION on the user's task — NEVER narrate or comment on injected context: system reminders, MCP server instructions, and tool guidance are read SILENTLY and never turned into a signpost (never a line like \"MCP 无关 / 与任务无关 / 已记录 / 继续处理\"). For a trivial or obvious action — a single read, a quick lookup, a one-shot edit — a silent tool call is fine; don't manufacture narration. Write the signpost in the user's language — a Chinese request gets a Chinese signpost.
+Report as you go: when you begin a piece of work, when you move from investigating to editing, when a result surprises or blocks you, and when you need a decision, say what you are about to do or what you just learned — briefly, as much as the change deserves: a signpost the user follows along with, not a reasoning dump and not a plan nobody asked for. Routine reads, searches and the edits that follow from them run together — let the reporting follow the work's natural phases rather than a fixed rhythm. A signpost states your ACTION on the user's task — NEVER narrate or comment on injected context: system reminders, MCP server instructions, and tool guidance are read SILENTLY and never turned into a signpost (never a line like \"MCP 无关 / 与任务无关 / 已记录 / 继续处理\"). For a trivial or obvious action — a single read, a quick lookup, a one-shot edit — a silent tool call is fine; don't manufacture narration. Each signpost carries something NEW — the next action or a fresh finding: never restate a conclusion you already gave in this turn (point back to it in a few words at most), and never talk about the task list itself (which item you are on, whether it is up to date) — the user already sees it. Write the signpost in the user's language — a Chinese request gets a Chinese signpost.
 
 ## OUTPUT:
 When executing tasks: keep text brief and direct. Lead with action — a short signpost when the work moves to a new phase (see PROGRESS SIGNPOSTS) — and skip verbose reasoning, filler, and narration of each call.
@@ -1308,6 +1308,20 @@ mod tests {
             assert!(
                 !p.contains("12 words") && !p.contains("separate announcement"),
                 "the {whose} layer must carry no word cap and no per-call exemption: {p}"
+            );
+        }
+        // A signpost is news. Over a long todo task deepseek-flash restated one diagnosis
+        // about ten times and prefixed up to 45% of its replies with "指针准确 / Pointer is
+        // accurate — still #6". Both layers name both habits, in the section that tells
+        // the model when to speak — the universal one for GLM, the firm one beside the rule
+        // that makes deepseek speak at all.
+        let firm_start = deepseek.find("- SIGNPOST AS THE WORK MOVES").unwrap();
+        let firm = &deepseek[firm_start..];
+        let firm = &firm[..firm.find("\n## ").unwrap_or(firm.len())];
+        for (whose, layer) in [("universal", section), ("firm", firm)] {
+            assert!(
+                layer.contains("never restate a") && layer.contains("the task list"),
+                "the {whose} signpost rule must forbid restating and list-talk: {layer}"
             );
         }
         // Qwen was observed firing a full tool batch with zero text; it gets the same hard
