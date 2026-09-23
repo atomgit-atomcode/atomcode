@@ -3825,12 +3825,17 @@ impl Tui {
                 drop(m);
                 // A pasted image-*file* path is an attachment intent, not prose:
                 // WeChat/iTerm2 save the clipboard image to a temp file and paste
-                // its path, and Finder drag types the path. Load the bytes now and
-                // drop in an `[Image #N]` marker instead of leaving the raw path in
-                // the composer (the reported "全部展示成路径"). Reading at paste time
-                // keeps the attachment self-contained. Anything that is not
-                // unambiguously an image path falls through to the text path.
-                if let Some(image) = crate::attach::image_from_path(&text) {
+                // its path, and Finder drag/copy types the path (or a `file://`
+                // URL). Load the bytes now and drop in an `[Image #N]` marker
+                // instead of leaving the raw path in the composer (the reported
+                // "全部展示成路径"). And Cmd+V — swallowed by the terminal, so it
+                // never reaches the `AttachImage` key Ctrl+V is bound to — arrives
+                // here as a paste whose text is not a path; `image_for_paste` then
+                // recovers the picture straight from the clipboard, so Cmd+V
+                // attaches a screenshot the same as Ctrl+V. Reading at paste time
+                // keeps the attachment self-contained. Anything that is neither a
+                // path nor a clipboard image falls through to the text path.
+                if let Some(image) = crate::attach::image_for_paste(&text, self.surface.as_ref()) {
                     // Decide the destination before attaching: a model that would
                     // drop the bytes says so now, while the person still has the
                     // file, rather than after they have typed about a picture that

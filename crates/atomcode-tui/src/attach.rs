@@ -233,7 +233,11 @@ pub fn image_from_path(text: &str) -> Option<ImageContent> {
     // Backslash before any other char is left alone — no other escape form
     // occurs in real-world drag pastes.
     let unescaped = unquoted.replace("\\ ", " ");
-    let path = std::path::Path::new(unescaped.trim());
+    // A `file://` URL (Finder copy / Cmd+V of a saved file) becomes its plain
+    // local path; a bare path is left as-is.
+    let from_url = from_file_url(unescaped.trim());
+    let candidate = from_url.as_deref().unwrap_or(unescaped.as_str());
+    let path = std::path::Path::new(candidate.trim());
     if !path.is_absolute() {
         return None;
     }
@@ -270,6 +274,56 @@ pub fn image_from_path(text: &str) -> Option<ImageContent> {
             ),
         };
     Some(ImageContent { media_type, data })
+}
+
+/// The image a paste should attach: a file path the text names, else the picture
+/// the clipboard is holding.
+///
+/// Cmd+V is swallowed by the terminal and arrives as a bracketed paste (never the
+/// `AttachImage` key Ctrl+V is bound to), so a screenshot pasted with Cmd+V is not
+/// a path at all — it has to be recovered from the live clipboard, the same bytes
+/// Ctrl+V reads. A Finder-copied file, by contrast, pastes its path, which
+/// [`image_from_path`] handles.
+///
+/// The clipboard is consulted ONLY when the paste carried no text of its own: a
+/// pure image arrives as an empty bracketed paste, while a paste WITH text is
+/// that text. macOS pasteboards are multi-type — a text selection can sit beside
+/// an image — and grabbing that image would silently drop what was typed, so a
+/// non-empty paste is always kept as text (Ctrl+V remains the way to force the
+/// image).
+pub fn image_for_paste(text: &str, surface: &dyn crate::surface::Surface) -> Option<ImageContent> {
+    if let Some(image) = image_from_path(text) {
+        return Some(image);
+    }
+    if text.trim().is_empty() {
+        return surface.clipboard_image();
+    }
+    None
+}
+
+/// A `file://` URL as a local path: scheme (and optional `localhost` host)
+/// stripped and percent-escapes decoded, or `None` when `s` is not one. macOS
+/// puts a `file://` URL on the pasteboard for a Finder-copied file, and one whose
+/// path has spaces arrives percent-encoded (`%20`).
+fn from_file_url(s: &str) -> Option<String> {
+    let rest = s.strip_prefix("file://")?;
+    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    let bytes = rest.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    Some(String::from_utf8_lossy(&out).into_owned())
 }
 
 /// The media type named by an image's magic bytes, or `None` when the bytes do
@@ -469,6 +523,53 @@ mod tests {
         assert!(
             image_from_path(&spaced.display().to_string().replace(' ', "\\ ")).is_some(),
             "shell-escaped spaces are unescaped"
+        );
+    }
+
+    // macOS Finder-copy (and Cmd+V of a saved file) pastes a `file://` URL, and
+    // one with spaces arrives percent-encoded. Both name a real image file and
+    // must attach the same as a bare path.
+    #[test]
+    fn a_file_url_attaches_and_percent_decodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a b.png");
+        std::fs::write(&file, b"bytes").unwrap();
+        let encoded = file.display().to_string().replace(' ', "%20");
+        assert!(
+            image_from_path(&format!("file://{encoded}")).is_some(),
+            "percent-encoded file:// URL attaches"
+        );
+        let plain = dir.path().join("c.png");
+        std::fs::write(&plain, b"bytes").unwrap();
+        assert!(
+            image_from_path(&format!("file://{}", plain.display())).is_some(),
+            "unencoded file:// URL attaches"
+        );
+    }
+
+    // Cmd+V is swallowed by the terminal and arrives as a bracketed paste, not
+    // the `AttachImage` key, so a screenshot pasted with Cmd+V has to be
+    // recovered from the live clipboard — the same bytes Ctrl+V reads.
+    #[test]
+    fn a_paste_recovers_the_clipboard_image_when_the_text_is_not_a_path() {
+        let surface = crate::surface::Headless::new(10, 2);
+        surface.set_clipboard_image(ImageContent {
+            media_type: "image/png".into(),
+            data: "QUJD".into(),
+        });
+        let got = image_for_paste("", surface.as_ref()).expect("clipboard image recovered");
+        assert_eq!(got.data, "QUJD", "the paste took the clipboard image");
+        // A paste that carried its OWN text is that text: a clipboard image beside
+        // it on a multi-type pasteboard must not silently replace what was typed.
+        assert!(
+            image_for_paste("here is a paragraph", surface.as_ref()).is_none(),
+            "non-empty paste text is kept, not swapped for the clipboard image"
+        );
+        // With nothing in the clipboard, prose stays prose.
+        let empty = crate::surface::Headless::new(10, 2);
+        assert!(
+            image_for_paste("just some prose", empty.as_ref()).is_none(),
+            "no image anywhere ⇒ text"
         );
     }
 
