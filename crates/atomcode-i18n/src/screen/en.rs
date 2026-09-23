@@ -191,6 +191,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CdPinned { dir } => format!("{dir} is marked — /cd offers it first").into(),
         Msg::CdUnpinned { dir } => format!("{dir} is no longer marked").into(),
         Msg::ResumeDeleteArmed => "Delete again to throw it away".into(),
+        Msg::ResumePreviewWaiting => "reading what it last talked about…".into(),
         Msg::ResumeDeleted { id } => format!("Session {id} is gone").into(),
         Msg::ResumeDeleteFailed { why } => format!("It was not deleted: {why}").into(),
         Msg::NoResumePanel => "this screen has no resume panel: the launcher provided no `tui-panel-resume`".into(),

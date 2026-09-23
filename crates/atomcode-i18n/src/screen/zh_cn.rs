@@ -165,6 +165,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CdPinned { dir } => format!("{dir} 已标上——`/cd` 会先给它").into(),
         Msg::CdUnpinned { dir } => format!("{dir} 的标记取消了").into(),
         Msg::ResumeDeleteArmed => "再按一次 Delete 删掉它".into(),
+        Msg::ResumePreviewWaiting => "正在读它最后聊了什么…".into(),
         Msg::ResumeDeleted { id } => format!("会话 {id} 已删除").into(),
         Msg::ResumeDeleteFailed { why } => format!("没删掉:{why}").into(),
         Msg::NoResumePanel => "这个屏幕没有恢复面板:启动器没有提供 `tui-panel-resume`".into(),

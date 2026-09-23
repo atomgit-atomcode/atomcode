@@ -2145,3 +2145,63 @@ async fn a_stored_session_is_deleted_but_never_the_live_one() {
         "and it is gone from the listing: {sessions:#?}"
     );
 }
+
+/// What a stored session last talked about — the resume panel's preview.
+///
+/// Read out of the log, not by opening the session: looking at a conversation
+/// must not start it. Both halves of the exchange, and the person's own words
+/// are what tell them whether this is the one.
+#[tokio::test]
+async fn a_stored_session_says_what_it_last_talked_about() {
+    let env = env();
+    let mut connection = connected(&env).await;
+    let first = connection.session.clone();
+    connection
+        .commands
+        .send(message("port the quantizer to the NPU"))
+        .unwrap();
+    through_turn(&mut connection).await;
+
+    // Move off it, so what is previewed is a session on disk rather than the
+    // live one.
+    let Ok(HostReply::SessionChanged { session: _ }) = connection
+        .control
+        .call(HostCommand::NewSession {
+            session: first.clone(),
+        })
+        .await
+    else {
+        panic!("a new session");
+    };
+    let _ = quiet(&mut connection).await;
+
+    let Ok(HostReply::SessionPreview { lines }) = connection
+        .control
+        .call(HostCommand::PreviewSession {
+            session: first.clone(),
+        })
+        .await
+    else {
+        panic!("a preview");
+    };
+    let shown = lines.join("\n");
+    assert!(
+        shown.contains("port the quantizer to the NPU"),
+        "the person's own words are in it: {shown}"
+    );
+    assert!(
+        lines.len() >= 2,
+        "and both halves of the exchange: {lines:#?}"
+    );
+
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::PreviewSession {
+                session: "nothing-stored-under-this".into(),
+            })
+            .await,
+        Err(HostError::NotFound),
+        "a name nothing stored is not an empty preview"
+    );
+}

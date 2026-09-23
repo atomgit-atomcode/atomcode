@@ -1274,6 +1274,8 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
                 .into(),
 
         // ── /bg（后台会话）──
+        Msg::PreviewSaid => "你:".into(),
+        Msg::PreviewAnswered => "它:".into(),
         Msg::BgHelp =>
             "  /bg                 将当前会话放到后台，打开新的前台会话\n  /bg list            列出后台会话\n  /bg <N>             恢复第 N 号后台会话\n  /bg drop <N>        丢弃第 N 号后台会话\n  /bg help            显示此帮助\n".into(),
         Msg::BgListEmpty => "  没有后台会话。\n".into(),

@@ -1313,6 +1313,8 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
                 .into(),
 
         // ── /bg (background sessions) ──
+        Msg::PreviewSaid => "you:".into(),
+        Msg::PreviewAnswered => "it:".into(),
         Msg::BgHelp =>
             "  /bg                 Send current session to background and open a new foreground\n  /bg list            List background sessions\n  /bg <N>             Resume background slot N\n  /bg drop <N>        Drop background slot N\n  /bg help            Show this help\n".into(),
         Msg::BgListEmpty => "  No background sessions.\n".into(),

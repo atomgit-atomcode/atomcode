@@ -47,9 +47,10 @@ impl View for Resume {
         }
         let view = &vp.moment.resume;
         let caps = vp.moment.caps;
-        layout(view, panel, vp.rect.h as usize)
+        let preview = preview_of(vp.moment, view, panel);
+        layout(view, panel, preview, vp.rect.h as usize)
             .into_iter()
-            .map(|row| draw(view, panel, row, w, caps))
+            .map(|row| draw(view, panel, preview, row, w, caps))
             .collect()
     }
 
@@ -63,9 +64,14 @@ impl View for Resume {
             return Height::Hug(0);
         }
         Height::Hug(
-            layout(&moment.resume, panel, usize::MAX)
-                .len()
-                .min(u16::MAX as usize) as u16,
+            layout(
+                &moment.resume,
+                panel,
+                preview_of(moment, &moment.resume, panel),
+                usize::MAX,
+            )
+            .len()
+            .min(u16::MAX as usize) as u16,
         )
     }
 }
@@ -90,10 +96,33 @@ enum Row {
         above: usize,
         below: usize,
     },
+    /// 选中那个会话最后聊的一句,第几行。
+    Preview(usize),
+    /// 还没问到。
+    PreviewWaiting,
     Legend,
 }
 
-fn layout(view: &ResumeView, panel: &Panel, h: usize) -> Vec<Row> {
+/// 选中那个会话的预览,照这个模块要的样子:`None` 没有,`Some(None)` 正在问,
+/// `Some(Some(lines))` 是答案。只有当它问的正是**现在选中的**那个会话时才算数。
+fn preview_of<'a>(
+    moment: &'a Moment,
+    view: &ResumeView,
+    panel: &Panel,
+) -> Option<Option<&'a Vec<String>>> {
+    let (asked, lines) = moment.resume_preview.as_ref()?;
+    let listed = view.listed(panel);
+    let at = listed.get(panel.cursor)?;
+    let selected = view.sessions().get(*at)?;
+    (&selected.id == asked).then_some(lines.as_ref())
+}
+
+fn layout(
+    view: &ResumeView,
+    panel: &Panel,
+    preview: Option<Option<&Vec<String>>>,
+    h: usize,
+) -> Vec<Row> {
     let mut rows = vec![
         Row::Rule,
         Row::Header,
@@ -124,6 +153,18 @@ fn layout(view: &ResumeView, panel: &Panel, h: usize) -> Vec<Row> {
             rows.push(Row::Session(at));
         }
     }
+    // 选中那个会话最后聊了什么。列表下面、图例上面:它说的是「这一行是不是我要
+    // 找的那个会话」,所以贴着列表;而它是读的,不是操作的,所以不进列表本身。
+    match preview {
+        Some(None) => rows.push(Row::PreviewWaiting),
+        Some(Some(lines)) if !lines.is_empty() => {
+            rows.push(Row::Blank);
+            for at in 0..lines.len() {
+                rows.push(Row::Preview(at));
+            }
+        }
+        _ => {}
+    }
     rows.push(Row::Blank);
     rows.push(Row::Legend);
     rows
@@ -139,7 +180,14 @@ fn window(len: usize, cursor: usize, room: usize) -> (usize, usize) {
     (from, from + room)
 }
 
-fn draw(view: &ResumeView, panel: &Panel, row: Row, w: usize, caps: crate::caps::Caps) -> Line {
+fn draw(
+    view: &ResumeView,
+    panel: &Panel,
+    preview: Option<Option<&Vec<String>>>,
+    row: Row,
+    w: usize,
+    caps: crate::caps::Caps,
+) -> Line {
     match row {
         Row::Rule => panel_edge(w, caps),
         Row::Header => Line::from_spans(chrome::header_parts(NAME, &[], usize::MAX).0).truncate(w),
@@ -156,6 +204,19 @@ fn draw(view: &ResumeView, panel: &Panel, row: Row, w: usize, caps: crate::caps:
             theme::fg(Role::Muted),
         ),
         Row::Session(at) => session_line(view, panel, at, w, caps),
+        Row::PreviewWaiting => Line::styled(
+            format!("  {}", t(Msg::ResumePreviewWaiting)),
+            theme::fg(Role::Muted),
+        )
+        .truncate(w),
+        Row::Preview(at) => {
+            let said = preview
+                .flatten()
+                .and_then(|lines| lines.get(at))
+                .cloned()
+                .unwrap_or_default();
+            Line::styled(format!("  {said}"), theme::fg(Role::Muted)).truncate(w)
+        }
         Row::Legend => Line::styled(
             format!("  {}", t(Msg::ResumePickerHint)),
             theme::fg(Role::Muted),
@@ -241,7 +302,12 @@ pub fn geometry(moment: &Moment, vp: &Viewport<'_>) -> Geometry {
     let Some(panel) = moment.resume_panel.as_ref() else {
         return Geometry { rows: Vec::new() };
     };
-    let rows = layout(&moment.resume, panel, vp.rect.h as usize);
+    let rows = layout(
+        &moment.resume,
+        panel,
+        preview_of(moment, &moment.resume, panel),
+        vp.rect.h as usize,
+    );
     Geometry {
         rows: rows
             .into_iter()
@@ -276,10 +342,54 @@ mod tests {
         ])
     }
 
-    fn text(view: &ResumeView, panel: &Panel, w: usize) -> Vec<String> {
-        layout(view, panel, 40)
+    fn text_with(
+        view: &ResumeView,
+        panel: &Panel,
+        preview: Option<Option<&Vec<String>>>,
+        w: usize,
+    ) -> Vec<String> {
+        layout(view, panel, preview, 40)
             .into_iter()
-            .map(|row| draw(view, panel, row, w, crate::caps::Caps::default()).plain())
+            .map(|row| draw(view, panel, preview, row, w, crate::caps::Caps::default()).plain())
+            .collect()
+    }
+
+    /// 选中一个会话,它最后聊的几句就在列表底下——列表说得出「什么时候、几回合」,
+    /// 说不出「聊的是什么」,而后者才是人认出「就是这个」的依据。
+    #[test]
+    fn the_selected_session_shows_what_it_last_talked_about() {
+        let (view, panel) = (view(), Panel::new());
+        let lines = vec!["你: 把错误处理改一遍".to_string(), "它: 改完了".to_string()];
+        let shown = text_with(&view, &panel, Some(Some(&lines)), 60).join("\n");
+        assert!(shown.contains("把错误处理改一遍"), "{shown}");
+        assert!(shown.contains("改完了"), "{shown}");
+    }
+
+    /// 还没问到的时候说一句,而不是先空着再突然长出几行。
+    #[test]
+    fn a_preview_on_its_way_says_so() {
+        let (view, panel) = (view(), Panel::new());
+        let shown = text_with(&view, &panel, Some(None), 60).join("\n");
+        assert!(shown.contains("正在读"), "{shown}");
+    }
+
+    /// 没有预览时,面板和从前一模一样:这一块是加出来的,不是把列表挤掉的。
+    #[test]
+    fn with_no_preview_the_panel_is_what_it_was() {
+        let (view, panel) = (view(), Panel::new());
+        let without = text_with(&view, &panel, None, 60);
+        let lines = vec!["你: 一句".to_string()];
+        let with = text_with(&view, &panel, Some(Some(&lines)), 60);
+        assert!(with.len() > without.len(), "{with:?}");
+        for row in &without {
+            assert!(with.contains(row), "原来那些行都还在:{row}");
+        }
+    }
+
+    fn text(view: &ResumeView, panel: &Panel, w: usize) -> Vec<String> {
+        layout(view, panel, None, 40)
+            .into_iter()
+            .map(|row| draw(view, panel, None, row, w, crate::caps::Caps::default()).plain())
             .collect()
     }
 

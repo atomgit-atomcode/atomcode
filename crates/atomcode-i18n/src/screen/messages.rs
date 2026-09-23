@@ -263,6 +263,8 @@ pub enum Msg<'a> {
     },
     /// On the row a second Delete would throw away.
     ResumeDeleteArmed,
+    /// While the last words of the selected session are being fetched.
+    ResumePreviewWaiting,
     ResumeDeleted {
         id: &'a str,
     },

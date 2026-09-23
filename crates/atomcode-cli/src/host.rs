@@ -846,6 +846,68 @@ impl RuntimeControl {
     }
 }
 
+/// The last few exchanges of a stored session, for someone deciding whether to
+/// come back to it.
+///
+/// Read from the log the session already keeps — the same door `/worklog` and
+/// recall read it through — rather than by opening the session: looking at a
+/// conversation must not start it.
+///
+/// **What a row cannot say is what it was about.** The list already gives the
+/// name, the age and the turn count; the words are what tell a person whether
+/// this is the one. Both halves of each exchange, oldest of the shown ones
+/// first, so it reads the way the conversation ran.
+///
+/// Undone turns are left out: they were taken back, and a preview that shows
+/// them describes a conversation that no longer exists.
+fn preview_of(session: &str) -> Result<Vec<String>, HostError> {
+    use atomcode_capabilities::session::{events, SessionManager};
+    /// How many exchanges. Enough to recognise a conversation, few enough to
+    /// read at a glance while walking the list.
+    const TURNS: usize = 3;
+    /// One line each: a preview that wraps is a preview that hides the row
+    /// under it.
+    const WIDE: usize = 160;
+
+    let scan = SessionManager::scan_all();
+    let entry = scan
+        .entries
+        .into_iter()
+        .find(|entry| entry.id == session)
+        .ok_or(HostError::NotFound)?;
+    let manager = SessionManager::for_project(&entry.working_dir);
+    let logged = manager
+        .load_events(session)
+        .map_err(|error| HostError::Failed {
+            message: error.to_string(),
+        })?;
+    let records = events::turn_records(session, &logged);
+    let kept: Vec<_> = records
+        .iter()
+        .filter(|record| !record.undone)
+        .rev()
+        .take(TURNS)
+        .collect();
+    let mut lines = Vec::new();
+    for record in kept.into_iter().rev() {
+        for (who, text) in [
+            (atomcode_i18n::product::Msg::PreviewSaid, &record.user),
+            (
+                atomcode_i18n::product::Msg::PreviewAnswered,
+                &record.assistant,
+            ),
+        ] {
+            let first = text.lines().find(|line| !line.trim().is_empty());
+            let Some(first) = first else {
+                continue;
+            };
+            let said: String = first.trim().chars().take(WIDE).collect();
+            lines.push(format!("{} {said}", atomcode_i18n::product::t(who)));
+        }
+    }
+    Ok(lines)
+}
+
 /// The files a coding session is configured from, grouped the way a person
 /// looks for them.
 ///
@@ -985,6 +1047,9 @@ impl HostControl for RuntimeControl {
                 self.delete_stored(&session)?;
                 Ok(HostReply::Done)
             }
+            HostCommand::PreviewSession { session } => Ok(HostReply::SessionPreview {
+                lines: preview_of(&session)?,
+            }),
             HostCommand::Undo {
                 session,
                 turn,

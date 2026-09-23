@@ -3239,6 +3239,48 @@ impl Host {
         changed
     }
 
+    /// The session the arrows are on, if the panel is up.
+    pub fn resume_selected(&self) -> Option<String> {
+        let m = self.moment.read().expect("moment poisoned");
+        let panel = m.resume_panel.as_ref()?;
+        let listed = m.resume.listed(panel);
+        let at = listed.get(panel.cursor)?;
+        m.resume.sessions().get(*at).map(|s| s.id.clone())
+    }
+
+    /// Which session still needs its last words fetched, and mark it as being
+    /// fetched.
+    ///
+    /// Answered once per session: walking the list with the arrow held down
+    /// would otherwise ask for the same one on every repeat, and each answer
+    /// would arrive to overwrite the last.
+    pub fn resume_preview_wanted(&self) -> Option<String> {
+        let selected = self.resume_selected()?;
+        let mut m = self.moment.write().expect("moment poisoned");
+        if m.resume_preview
+            .as_ref()
+            .is_some_and(|(shown, _)| shown == &selected)
+        {
+            return None;
+        }
+        m.resume_preview = Some((selected.clone(), None));
+        Some(selected)
+    }
+
+    /// The words came back. Kept only while the arrows are still on that
+    /// session — an answer for a row a person has already walked past is an
+    /// answer to a question they are no longer asking.
+    pub fn show_resume_preview(&self, id: &str, lines: Vec<String>) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        match m.resume_preview.as_mut() {
+            Some((shown, slot)) if shown == id => {
+                *slot = Some(lines);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Take a session out of the list the panel is showing.
     ///
     /// Called when the host said it is gone. The screen does not ask for the
@@ -3259,6 +3301,7 @@ impl Host {
             return false;
         }
         m.resume = crate::resume::ResumeView::new(left);
+        m.resume_preview = None;
         if let Some(panel) = m.resume_panel.as_mut() {
             panel.armed = None;
         }
@@ -3283,6 +3326,7 @@ impl Host {
             crate::resume::Step::Stay => (changed, None),
             crate::resume::Step::Close => {
                 m.resume_panel = None;
+                m.resume_preview = None;
                 (true, None)
             }
             step => (true, Some(step)),

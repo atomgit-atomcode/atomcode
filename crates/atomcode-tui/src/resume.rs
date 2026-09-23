@@ -129,6 +129,8 @@ impl Panel {
 #[async_trait::async_trait]
 pub trait Resume: Send + Sync {
     async fn delete(&self, id: &str) -> Result<(), String>;
+    /// 这个会话最后聊了什么,几行,最旧的在前。看一眼不算打开它。
+    async fn preview(&self, id: &str) -> Result<Vec<String>, String>;
 }
 
 /// 一次按键让面板的主人去做什么。与 [`crate::rewind::Step`] 同形。

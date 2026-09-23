@@ -43,6 +43,10 @@ pub enum HostCommand {
     /// The stored sessions a person could resume, newest first — those of one
     /// working directory, or all of them.
     ListSessions { working_dir: Option<String> },
+    /// The last few exchanges of a stored session, for someone deciding whether
+    /// to come back to it. Answered from the log the session already keeps —
+    /// nothing is opened or resumed by asking.
+    PreviewSession { session: String },
     /// Throw a stored session away, with whatever was delegated from it.
     ///
     /// Not addressed at a live session the way the rest are: the argument is a
@@ -259,7 +263,9 @@ impl HostCommand {
             | Self::Readiness { session } => Some(session),
             // Addressed at a stored session, not the live one — see the
             // variant's own note.
-            Self::ListSessions { .. } | Self::DeleteSession { .. } => None,
+            Self::ListSessions { .. }
+            | Self::DeleteSession { .. }
+            | Self::PreviewSession { .. } => None,
         }
     }
 }
@@ -277,6 +283,11 @@ pub enum HostReply {
     },
     Sessions {
         sessions: Vec<StoredSession>,
+    },
+    /// What a stored session last talked about: a few lines, newest last,
+    /// already in the order a person reads them.
+    SessionPreview {
+        lines: Vec<String>,
     },
     /// An undo or a rewind went through. `prompt` is the person's message the
     /// conversation went back to before — for where they type, to edit and

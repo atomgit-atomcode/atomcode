@@ -1716,6 +1716,10 @@ pub enum Msg<'a> {
     /// Help text for `/bg help`. Multi-line string with leading indent
     /// and trailing newlines baked in.
     BgHelp,
+    /// Prefix on the person's own line in a stored session's preview.
+    PreviewSaid,
+    /// Prefix on the agent's line in the same preview.
+    PreviewAnswered,
     /// Empty state for `/bg list`.
     BgListEmpty,
     /// Table header for `/bg list`. Trailing newline baked in.

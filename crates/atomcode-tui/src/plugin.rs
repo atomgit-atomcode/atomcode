@@ -2318,6 +2318,8 @@ impl Tui {
             self.delete_session(id);
             return true;
         }
+        // 走到哪一行,就去问那一行最后聊了什么。
+        self.fetch_resume_preview();
         let Some(crate::resume::Step::Resume { id }) = asked else {
             return changed;
         };
@@ -2327,6 +2329,32 @@ impl Tui {
         }
         self.host.close_resume();
         true
+    }
+
+    /// Ask what the selected session last talked about.
+    ///
+    /// 每行只问一次(`resume_preview_wanted` 认这件事),答案回来时人若已经走到
+    /// 别的行上就作废——按住方向键翻一遍列表不该让屏幕上闪过一串别人的对话。
+    fn fetch_resume_preview(&self) {
+        let Some(id) = self.host.resume_preview_wanted() else {
+            return;
+        };
+        let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
+            return;
+        };
+        let Some(port) = ctx.service::<crate::plugin::ResumeSvc>() else {
+            return;
+        };
+        let host = self.host.clone();
+        let keys = self.wake.lock().expect("wake poisoned").clone();
+        tokio::spawn(async move {
+            let lines = port.preview(&id).await.unwrap_or_default();
+            if host.show_resume_preview(&id, lines) {
+                if let Some(keys) = keys {
+                    let _ = keys.send(Wake::Fact);
+                }
+            }
+        });
     }
 
     /// Throw a stored session away, once the panel has asked twice.
@@ -3152,33 +3180,32 @@ impl Tui {
                     committed.event,
                     atomcode_kernel::session::SessionEvent::UserMessage { .. }
                         | atomcode_kernel::session::SessionEvent::AssistantMessage { .. }
-                ) {
-                    if !self.host.settle_working() {
-                        // Nothing was armed — the turn's start has not reached
-                        // this screen yet. The facts come by the feed and the
-                        // start by the runtime, two roads with no order between
-                        // them, and when the fact wins, the arm that follows
-                        // waits for a fact that has already gone by: the line
-                        // stayed down for the whole turn. It cost a person five
-                        // minutes of blank screen against a model that had
-                        // opened its stream and gone quiet.
-                        //
-                        // The agent's own status is the other half, and it comes
-                        // by the same road as the facts, ahead of them (it is set
-                        // when the turn opens) — so it is here, and it is true.
-                        // Raised only from idle, and only on a fact, so the row
-                        // still lands under the message the arm existed to
-                        // protect, and a stop in progress is not written over.
-                        let idle = self.host.moment.read().expect("moment poisoned").activity
-                            == Activity::Idle;
-                        if idle
-                            && matches!(
-                                self.client.status_of(&self.client.session()),
-                                Some(AgentStatus::Working)
-                            )
-                        {
-                            self.set_activity(Activity::Working);
-                        }
+                ) && !self.host.settle_working()
+                {
+                    // Nothing was armed — the turn's start has not reached
+                    // this screen yet. The facts come by the feed and the
+                    // start by the runtime, two roads with no order between
+                    // them, and when the fact wins, the arm that follows
+                    // waits for a fact that has already gone by: the line
+                    // stayed down for the whole turn. It cost a person five
+                    // minutes of blank screen against a model that had
+                    // opened its stream and gone quiet.
+                    //
+                    // The agent's own status is the other half, and it comes
+                    // by the same road as the facts, ahead of them (it is set
+                    // when the turn opens) — so it is here, and it is true.
+                    // Raised only from idle, and only on a fact, so the row
+                    // still lands under the message the arm existed to
+                    // protect, and a stop in progress is not written over.
+                    let idle = self.host.moment.read().expect("moment poisoned").activity
+                        == Activity::Idle;
+                    if idle
+                        && matches!(
+                            self.client.status_of(&self.client.session()),
+                            Some(AgentStatus::Working)
+                        )
+                    {
+                        self.set_activity(Activity::Working);
                     }
                 }
                 true
@@ -3919,7 +3946,11 @@ impl Tui {
                 self.host.show_resume(view);
                 if !self.host.open_resume() {
                     self.say(&t(Msg::NoResumePanel));
+                    return false;
                 }
+                // 开着就去问第一行聊了什么:等人按一下方向键才显示,等于第一眼
+                // 看到的永远是空的。
+                self.fetch_resume_preview();
                 return false;
             }
             Action::LookAt(session) => {

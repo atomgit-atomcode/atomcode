@@ -62,8 +62,38 @@ struct ResumePort {
     ctx: Context,
 }
 
+impl ResumePort {
+    async fn control(&self) -> Result<Arc<dyn atomcode_host_api::HostControl>, String> {
+        let client = self
+            .ctx
+            .service::<AgentClientSvc>()
+            .ok_or_else(|| tr(SMsg::HostUnavailable).into_owned())?;
+        client
+            .control()
+            .ok_or_else(|| tr(SMsg::HostHasNoControl).into_owned())
+    }
+}
+
 #[async_trait]
 impl atomcode_tui::resume::Resume for ResumePort {
+    async fn preview(&self, id: &str) -> Result<Vec<String>, String> {
+        match self
+            .control()
+            .await?
+            .call(HostCommand::PreviewSession {
+                session: id.to_string(),
+            })
+            .await
+        {
+            Ok(atomcode_host_api::HostReply::SessionPreview { lines }) => Ok(lines),
+            Ok(other) => Err(tr(SMsg::HostSaidSomethingElse {
+                reply: &format!("{other:?}"),
+            })
+            .into_owned()),
+            Err(error) => Err(crate::tui_tools::said(error)),
+        }
+    }
+
     async fn delete(&self, id: &str) -> Result<(), String> {
         let client = self
             .ctx

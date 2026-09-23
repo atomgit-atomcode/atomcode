@@ -581,6 +581,12 @@ pub struct Moment {
     /// The resume panel, while it is up: which session row the arrows are on and
     /// what is typed in its search box.
     pub resume_panel: Option<crate::resume::Panel>,
+    /// 选中那个会话最后聊了什么。`None` 是还没问到(或问不出来),
+    /// `Some(id, None)` 是正在问,`Some(id, Some(lines))` 是答案。
+    ///
+    /// 放在这儿而不是面板里:面板是纯数据、每一键重算一次,而这个是异步回来的,
+    /// 且要能认出「答案回来时人已经走到别的行上了」——那时它作废。
+    pub resume_preview: Option<(String, Option<Vec<String>>)>,
     /// What the Usage page draws, as the host last answered it.
     ///
     /// Asked for rather than pushed: an allowance window changes on the
