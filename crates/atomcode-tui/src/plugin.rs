@@ -4191,8 +4191,12 @@ impl Tui {
                                 None => opt.value == "default",
                             };
                             let shown = format!("{} {}", c.name, opt.value);
+                            // The mark goes through the capability table: on a
+                            // terminal that draws `✓` as a box, this menu is
+                            // where a person reads which level is in force
+                            // (`gates/tui-layers.sh`, literal_glyphs).
                             let label = if active {
-                                format!("{shown} ✓")
+                                format!("{shown} {}", self.surface.caps().g(crate::caps::Glyph::Ok))
                             } else {
                                 shown.clone()
                             };
@@ -4209,7 +4213,8 @@ impl Tui {
                         None => c.display_name(),
                     };
                     items.push(
-                        crate::menu::Item::new(c.name.to_string(), label).about(c.about.to_string()),
+                        crate::menu::Item::new(c.name.to_string(), label)
+                            .about(c.about.to_string()),
                     );
                 }
                 items
