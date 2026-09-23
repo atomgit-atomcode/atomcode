@@ -830,6 +830,42 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdAboutSync => "share this session without opening anything (off to stop)".into(),
         Msg::SyncTakes => "[off]".into(),
         Msg::CmdAboutDesktop => "open the desktop app".into(),
+        Msg::CmdAboutApp => "share this session with the phone app (stop to end)".into(),
+        Msg::AppTakes => "[stop]".into(),
+        Msg::AppRelayDisabled => "remote access is off in this deployment (ATOMCODE_ENABLE_RELAY=0)".into(),
+        Msg::AppRelayNotStarted { error, path } => {
+            format!("the relay client would not start ({error}); tried `{path}`").into()
+        }
+        Msg::AppStopped => "The phone app can no longer reach this session.".into(),
+        Msg::AppWasNotOn => "It was not reachable from the phone.".into(),
+        Msg::AppPairTitle => "Pair the phone".into(),
+        Msg::AppPairScan => "Scan this in the app, or type the line below.".into(),
+        Msg::RelayNeedsLogin => {
+            "the relay client is fetched from a signed-in release — run /login first".into()
+        }
+        Msg::RelayUnsupportedPlatform { os, arch, dir } => format!(
+            "no relay client is published for {os}/{arch} — build one and put it in {dir}"
+        )
+        .into(),
+        Msg::RelayDownloadOff { dir } => format!(
+            "automatic download is off (ATOMCODE_RELAY_CLIENT_SKIP_DOWNLOAD=1) — put the relay client in {dir}"
+        )
+        .into(),
+        Msg::RelayDownloadFailed {
+            error,
+            dir,
+            releases,
+            install,
+        } => format!(
+            "the relay client could not be downloaded: {error}\n\n\
+             Get it yourself:\n\
+             1. open {releases}\n\
+             2. download the binary for this platform\n\
+             3. save it as {dir}/atomcode-relay-client and make it executable\n\
+             4. run /app again\n\n\
+             Or in one line:\n{install}"
+        )
+        .into(),
         Msg::ShareStarted => "This session is shared — a browser or the phone app sees the same conversation.".into(),
         Msg::ShareStopped => "This session is no longer shared.".into(),
         Msg::ShareWasNotOn => "It was not being shared.".into(),

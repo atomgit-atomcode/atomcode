@@ -140,6 +140,141 @@ fn resolved_selection(config: &atomcode_config::config::Config) -> (String, Stri
         .unwrap_or_default()
 }
 
+// ---- 给手机:中继 + 配对链接 ----------------------------------------------
+
+/// 跑着的那个中继客户端子进程。`/app stop` 靠它把进程收掉;进程退出不代表共享结束,
+/// 所以它和绑定分开记。
+fn relay_child() -> &'static Mutex<Option<tokio::process::Child>> {
+    static CHILD: OnceLock<Mutex<Option<tokio::process::Child>>> = OnceLock::new();
+    CHILD.get_or_init(|| Mutex::new(None))
+}
+
+/// 中继地址推出两样:拨号用的 ws、手机用的 https 根。与经典界面同一套推法。
+pub(crate) fn relay_urls(base: &str) -> (String, String) {
+    let trimmed = base.trim().trim_end_matches('/');
+    let https_base = if let Some(rest) = trimmed.strip_prefix("wss://") {
+        format!("https://{}", rest.trim_end_matches("/ws/daemon"))
+    } else if let Some(rest) = trimmed.strip_prefix("ws://") {
+        format!("http://{}", rest.trim_end_matches("/ws/daemon"))
+    } else {
+        trimmed.to_string()
+    };
+    let ws = if let Some(rest) = https_base.strip_prefix("https://") {
+        format!("wss://{rest}/ws/daemon")
+    } else if let Some(rest) = https_base.strip_prefix("http://") {
+        format!("ws://{rest}/ws/daemon")
+    } else {
+        format!("wss://{https_base}/ws/daemon")
+    };
+    (ws, https_base)
+}
+
+/// URL 里放得下的写法。手机扫到的是这串,所以编码错一个字节就配不上对。
+pub(crate) fn escaped(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() * 3);
+    for byte in text.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// 手机扫的那串。
+pub(crate) fn pair_uri(https_base: &str, token: &str, machine: Option<&str>) -> String {
+    let machine = machine
+        .map(|name| format!("&m={}", escaped(name)))
+        .unwrap_or_default();
+    format!(
+        "atomcode-link://pair?r={}&t={token}{machine}",
+        escaped(https_base)
+    )
+}
+
+/// 起 App 那一侧:本机 server + 中继客户端,返回手机要扫的那串。
+async fn start_for_phone(config_path: &std::path::Path) -> Result<String, String> {
+    if !atomcode_config::endpoints::relay_enabled() {
+        return Err(tr(SMsg::AppRelayDisabled).into_owned());
+    }
+    // 先把旧的收掉:两个中继客户端连同一个 token,手机连上的是哪一个说不准。
+    stop_for_phone();
+    let signed_in = atomcode_auth::oauth::get_stored_auth();
+    let (_host, port) = atomcode_daemon::ensure_app_server(
+        "127.0.0.1",
+        atomcode_daemon::APP_DEFAULT_PORT,
+        signed_in.as_ref().map(|auth| auth.user.id.clone()),
+    )
+    .await?;
+    let token = match &signed_in {
+        Some(auth) => format!("{}.{}", auth.user.id, uuid::Uuid::new_v4().simple()),
+        None => format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        ),
+    };
+    let (ws, https_base) = relay_urls(atomcode_config::endpoints::relay_url());
+    let machine = std::env::var("HOSTNAME")
+        .ok()
+        .filter(|name| !name.is_empty());
+    let binary = crate::relay::ensure_relay_client_bin()?;
+    let mut command = tokio::process::Command::new(&binary);
+    command
+        .arg("run")
+        .arg("--relay")
+        .arg(&ws)
+        .arg("--token")
+        .arg(&token)
+        .arg("--daemon")
+        .arg(format!("http://127.0.0.1:{port}"))
+        .arg("--supervise-daemon")
+        .arg("false")
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Some(name) = &machine {
+        command.arg("--machine-name").arg(name);
+    }
+    if let Some(secret) = std::env::var("ATOMCODE_APP_RELAY_SECRET")
+        .ok()
+        .or_else(|| std::env::var("ATOM_RELAY_REGISTER_SECRET").ok())
+        .filter(|secret| !secret.is_empty())
+    {
+        command.arg("--register-secret").arg(secret);
+    }
+    let child = command.spawn().map_err(|error| {
+        tr(SMsg::AppRelayNotStarted {
+            error: &error.to_string(),
+            path: &binary,
+        })
+        .into_owned()
+    })?;
+    *relay_child().lock().expect("relay child poisoned") = Some(child);
+    // 挂上要排在最后:挂不上就把刚拉起来的收掉,不留一个连着中继、却不共享任何
+    // 会话的进程。
+    if let Err(why) = attach(config_path).await {
+        stop_for_phone();
+        return Err(why);
+    }
+    Ok(pair_uri(&https_base, &token, machine.as_deref()))
+}
+
+/// 收掉中继客户端和 App server。返回是否真有东西被收掉。
+fn stop_for_phone() -> bool {
+    let child = relay_child().lock().expect("relay child poisoned").take();
+    let killed = match child {
+        Some(mut child) => {
+            let _ = child.start_kill();
+            true
+        }
+        None => false,
+    };
+    atomcode_daemon::stop_app_server() || killed
+}
+
 // ---- 命令 -------------------------------------------------------------------
 
 /// 行的名字。
@@ -195,6 +330,7 @@ impl atomcode_tui::command::CommandSet for ShareCommands {
         vec![
             Command::said_taking("webui", tr(SMsg::WebuiTakes), tr(SMsg::CmdAboutWebui)),
             Command::said_taking("sync", tr(SMsg::SyncTakes), tr(SMsg::CmdAboutSync)),
+            Command::said_taking("app", tr(SMsg::AppTakes), tr(SMsg::CmdAboutApp)),
             Command::said("desktop", tr(SMsg::CmdAboutDesktop)),
         ]
     }
@@ -216,6 +352,21 @@ impl atomcode_tui::command::CommandSet for ShareCommands {
             },
             "sync" => match attach(&self.config_path).await {
                 Ok(()) => Outcome::Said(tr(SMsg::ShareStarted).into_owned()),
+                Err(why) => Outcome::Refused(why),
+            },
+            "app" if args == "stop" => {
+                let stopped = stop_for_phone();
+                let _ = detach();
+                Outcome::Said(
+                    match stopped {
+                        true => tr(SMsg::AppStopped),
+                        false => tr(SMsg::AppWasNotOn),
+                    }
+                    .into_owned(),
+                )
+            }
+            "app" => match start_for_phone(&self.config_path).await {
+                Ok(uri) => Outcome::Open(pairing_overlay(uri)),
                 Err(why) => Outcome::Refused(why),
             },
             "webui" if args == "stop" => {
@@ -302,6 +453,58 @@ fn open_desktop() -> String {
 mod tests {
     use super::*;
 
+    /// 中继给的是一个地址,拨号要 ws、手机要 https ——从同一个地址推出来,而不是
+    /// 让人配两遍。
+    #[test]
+    fn one_relay_address_gives_both_the_dial_and_the_phones_url() {
+        for (given, ws, https) in [
+            (
+                "wss://relay.example/ws/daemon",
+                "wss://relay.example/ws/daemon",
+                "https://relay.example",
+            ),
+            (
+                "https://relay.example",
+                "wss://relay.example/ws/daemon",
+                "https://relay.example",
+            ),
+            (
+                "ws://127.0.0.1:8080/ws/daemon",
+                "ws://127.0.0.1:8080/ws/daemon",
+                "http://127.0.0.1:8080",
+            ),
+            (
+                "relay.example/",
+                "wss://relay.example/ws/daemon",
+                "relay.example",
+            ),
+        ] {
+            assert_eq!(
+                relay_urls(given),
+                (ws.to_string(), https.to_string()),
+                "{given}"
+            );
+        }
+    }
+
+    /// 手机扫到的那串里,地址和机器名都得是编码过的——里面有 `:` `/` 和中文时,
+    /// 不编码就是另一个链接。
+    #[test]
+    fn what_the_phone_scans_survives_slashes_and_spaces() {
+        let uri = pair_uri("https://relay.example:8443", "tok-1", Some("我的 Mac"));
+        assert!(uri.starts_with("atomcode-link://pair?r="), "{uri}");
+        assert!(uri.contains("https%3A%2F%2Frelay.example%3A8443"), "{uri}");
+        assert!(uri.contains("&t=tok-1"), "{uri}");
+        assert!(
+            uri.contains("&m=%E6%88%91%E7%9A%84%20Mac"),
+            "机器名编码过:{uri}"
+        );
+        assert!(
+            !pair_uri("https://r", "t", None).contains("&m="),
+            "没有机器名就不写这一段"
+        );
+    }
+
     /// 默认只听本机。把一台能改你代码的机器暴露到网上是一个决定,不是默认值。
     #[test]
     fn sharing_stays_on_this_machine_unless_asked_otherwise() {
@@ -315,4 +518,24 @@ mod tests {
         assert_eq!(bind_host("--host"), "127.0.0.1");
         assert_eq!(bind_host("--host="), "127.0.0.1");
     }
+}
+
+/// 扫码配对那一屏:一张码、底下是同一串文字(码扫不出来时还能手打)。
+///
+/// 用向导而不是回一行字:二维码是一张位图,得按格子画,而且码要用扫码器认得的
+/// 颜色——不是主题色(`docs/adr/0027`)。向导已经为登录那一步把这件事做对了。
+fn pairing_overlay(uri: String) -> Arc<atomcode_tui::wizard::Wizard> {
+    use atomcode_tui::wizard::{StepDef, StepKind, Wizard};
+    let mut step = StepDef::new("pair", tr(SMsg::AppPairTitle), StepKind::Note)
+        .saying(vec![tr(SMsg::AppPairScan).into_owned(), uri.clone()]);
+    if let Some(code) = atomcode_tui::qr::code(&uri) {
+        step = step.showing(code);
+    }
+    Wizard::new(
+        "app-pair",
+        tr(SMsg::AppPairTitle),
+        vec![step],
+        Box::new(|_| {}),
+        "app-paired",
+    )
 }

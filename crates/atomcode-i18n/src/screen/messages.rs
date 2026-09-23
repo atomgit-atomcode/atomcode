@@ -1349,6 +1349,33 @@ pub enum Msg<'a> {
     CmdAboutSync,
     SyncTakes,
     CmdAboutDesktop,
+    CmdAboutApp,
+    AppTakes,
+    AppRelayDisabled,
+    AppRelayNotStarted {
+        error: &'a str,
+        path: &'a str,
+    },
+    AppStopped,
+    AppWasNotOn,
+    AppPairTitle,
+    AppPairScan,
+    /// 取中继客户端要先登录(它在受保护的 release 里)。
+    RelayNeedsLogin,
+    RelayUnsupportedPlatform {
+        os: &'a str,
+        arch: &'a str,
+        dir: &'a str,
+    },
+    RelayDownloadOff {
+        dir: &'a str,
+    },
+    RelayDownloadFailed {
+        error: &'a str,
+        dir: &'a str,
+        releases: &'a str,
+        install: &'a str,
+    },
     ShareStarted,
     ShareStopped,
     ShareWasNotOn,

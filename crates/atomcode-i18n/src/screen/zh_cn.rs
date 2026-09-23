@@ -803,6 +803,39 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdAboutSync => "共享这个会话,但什么也不打开(off 停止)".into(),
         Msg::SyncTakes => "[off]".into(),
         Msg::CmdAboutDesktop => "打开桌面端".into(),
+        Msg::CmdAboutApp => "把这个会话共享给手机 App(stop 结束)".into(),
+        Msg::AppTakes => "[stop]".into(),
+        Msg::AppRelayDisabled => "本部署关掉了远程访问(ATOMCODE_ENABLE_RELAY=0)".into(),
+        Msg::AppRelayNotStarted { error, path } => {
+            format!("中继客户端没启动起来({error});试过的路径是 `{path}`").into()
+        }
+        Msg::AppStopped => "手机已经连不到这个会话了。".into(),
+        Msg::AppWasNotOn => "本来手机就连不到。".into(),
+        Msg::AppPairTitle => "配对手机".into(),
+        Msg::AppPairScan => "用 App 扫这张码,或者手打下面这行。".into(),
+        Msg::RelayNeedsLogin => "中继客户端要从登录后的 release 里取——先 /login".into(),
+        Msg::RelayUnsupportedPlatform { os, arch, dir } => {
+            format!("{os}/{arch} 没有发布中继客户端——自己编一个放到 {dir}").into()
+        }
+        Msg::RelayDownloadOff { dir } => format!(
+            "自动下载关着(ATOMCODE_RELAY_CLIENT_SKIP_DOWNLOAD=1)——把中继客户端放到 {dir}"
+        )
+        .into(),
+        Msg::RelayDownloadFailed {
+            error,
+            dir,
+            releases,
+            install,
+        } => format!(
+            "中继客户端没下下来:{error}\n\n\
+             自己装:\n\
+             1. 打开 {releases}\n\
+             2. 下对应平台的那个 binary\n\
+             3. 存成 {dir}/atomcode-relay-client 并加上可执行权限\n\
+             4. 重新 /app\n\n\
+             或者一行装好:\n{install}"
+        )
+        .into(),
         Msg::ShareStarted => "这个会话已共享——浏览器或手机上看到的是同一段对话。".into(),
         Msg::ShareStopped => "已停止共享这个会话。".into(),
         Msg::ShareWasNotOn => "本来就没有在共享。".into(),

@@ -32,9 +32,10 @@ pub const ROW: &str = "tui-elsewhere";
 
 /// 还只在经典界面里的命令。
 ///
-/// `/webui`、`/sync`、`/desktop` 已于 2026-09-23 在这块屏幕上做出来(`tui_share`),
-/// 从这里拿掉了;剩 `/app`(扫码给手机)那一条。
-pub const CLASSIC_ONLY: &[&str] = &["app"];
+/// 2026-09-23 清空了:`/webui`、`/sync`、`/app`、`/desktop` 都在这块屏幕上做出来了
+/// (`tui_share`)。空着是它该有的样子——F1 删 tuix 之前必须是空的。留着这张表和
+/// 它的判据,是因为下一次「屏幕还差点什么」时,这里是说清楚它在哪的地方。
+pub const CLASSIC_ONLY: &[&str] = &[];
 
 /// 归命令行的命令，以及在命令行里怎么运行它。
 pub const IN_THE_CLI: &[(&str, &str)] = &[("upgrade", "atomcode upgrade")];

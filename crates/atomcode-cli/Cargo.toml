@@ -70,6 +70,9 @@ crossterm = "0.29"
 tokio = { version = "1", features = ["full"] }
 url = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+# `/app` 的中继客户端:下载时读流、校验 sha256(随 relay.rs 从 tuix 搬来)。
+futures = "0.3"
+sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 toml_edit = "0.22"

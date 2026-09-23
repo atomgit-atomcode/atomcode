@@ -28,6 +28,7 @@ fn _tests_assert_in_chinese() {
 #[cfg(unix)]
 pub mod askpass;
 pub mod desktop;
+pub mod relay;
 pub mod tui_command_meter;
 pub mod tui_elsewhere;
 pub mod tui_login;
