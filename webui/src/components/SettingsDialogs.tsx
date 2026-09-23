@@ -682,6 +682,8 @@ function ProviderFormDialog({
   const [baseUrl, setBaseUrl] = useState(editing?.base_url ?? initialPreset?.default_base_url ?? '');
   const [apiKey, setApiKey] = useState('');
   const [contextWindow, setContextWindow] = useState<number>(editing?.context_window ?? 128000);
+  // '' = 自动判定；'include'/'exclude' = 显式覆盖是否把上一轮思维链回传给模型。
+  const [reasoningHistory, setReasoningHistory] = useState<string>(editing?.reasoning_history ?? '');
   const [setDefault, setSetDefault] = useState(editing?.is_default ?? false);
   const [saving, setSaving] = useState(false);
   const [discovering, setDiscovering] = useState(false);
@@ -741,6 +743,10 @@ function ProviderFormDialog({
           ...(apiKey.trim() ? { api_key: apiKey.trim() } : {}),
           // AtomGit 上下文窗口由平台锁定，不下发该字段。
           ...(isAtomGit ? {} : { context_window: contextWindow }),
+          // 仅在改动时下发：'' → null(清空回自动),否则传值。
+          ...((reasoningHistory || null) !== (editing?.reasoning_history ?? null)
+            ? { reasoning_history: reasoningHistory || null }
+            : {}),
         });
         // PATCH 不处理默认项：若勾选且原本非默认，单独设默认（用新名，改名后旧 key 已不存在）。
         if (setDefault && !editing?.is_default) {
@@ -755,6 +761,7 @@ function ProviderFormDialog({
           ...(apiKey.trim() ? { api_key: apiKey.trim() } : {}),
           context_window: contextWindow,
           set_default: setDefault || undefined,
+          ...(reasoningHistory ? { reasoning_history: reasoningHistory } : {}),
         });
       }
       onSaved();
@@ -934,6 +941,19 @@ function ProviderFormDialog({
           {isAtomGit && (
             <span class="field-hint">{t('settings.contextWindowLocked')}</span>
           )}
+        </div>
+        <div class="add-model-field">
+          <label class="add-model-label">{t('settings.reasoningHistory')}</label>
+          <Select
+            value={reasoningHistory}
+            options={[
+              { value: '', label: t('settings.reasoningHistoryAuto') },
+              { value: 'preserve', label: t('settings.reasoningHistoryPreserve') },
+              { value: 'exclude', label: t('settings.reasoningHistoryExclude') },
+            ]}
+            onChange={(v) => setReasoningHistory(v)}
+          />
+          <span class="field-hint">{t('settings.reasoningHistoryHint')}</span>
         </div>
         <div class="add-model-field">
           <label class="add-model-label">{t('settings.baseUrl')}</label>

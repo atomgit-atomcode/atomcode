@@ -1159,13 +1159,26 @@ fn format_messages(
                         .collect();
                     obj.insert("tool_calls".into(), json!(tcs));
                 }
-                if policy == ReasoningPolicy::Include {
-                    let echo = m
-                        .reasoning
-                        .as_deref()
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or(REASONING_PLACEHOLDER);
-                    obj.insert("reasoning_content".into(), json!(echo));
+                match policy {
+                    // Requires a non-empty value on every assistant message: echo
+                    // the reasoning, or the placeholder when none was captured.
+                    ReasoningPolicy::Include => {
+                        let echo = m
+                            .reasoning
+                            .as_deref()
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or(REASONING_PLACEHOLDER);
+                        obj.insert("reasoning_content".into(), json!(echo));
+                    }
+                    // Retain the train of thought without noise: echo only when this
+                    // turn actually produced reasoning; send nothing otherwise (no
+                    // placeholder), so a non-thinking turn adds no `reasoning_content`.
+                    ReasoningPolicy::Preserve => {
+                        if let Some(r) = m.reasoning.as_deref().filter(|s| !s.is_empty()) {
+                            obj.insert("reasoning_content".into(), json!(r));
+                        }
+                    }
+                    ReasoningPolicy::Exclude => {}
                 }
                 out.push(Value::Object(obj));
             }
@@ -2627,6 +2640,21 @@ mod tests {
         with.reasoning = Some("because".into());
         let out = format_messages(&[with], ReasoningPolicy::Exclude, true);
         assert!(out[0].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn reasoning_preserve_echoes_only_when_present() {
+        // GLM/Qwen: keep the thought on turns that had one, add nothing (NOT the
+        // placeholder) on turns that did not — retention without noise.
+        let mut with = Message::assistant("ans", vec![]);
+        with.reasoning = Some("because".into());
+        let no = Message::assistant("ans2", vec![]);
+        let mut empty = Message::assistant("ans3", vec![]);
+        empty.reasoning = Some(String::new());
+        let out = format_messages(&[with, no, empty], ReasoningPolicy::Preserve, true);
+        assert_eq!(out[0]["reasoning_content"], "because");
+        assert!(out[1].get("reasoning_content").is_none(), "no reasoning → nothing");
+        assert!(out[2].get("reasoning_content").is_none(), "empty reasoning → nothing");
     }
 
     #[test]

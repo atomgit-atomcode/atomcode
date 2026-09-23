@@ -232,6 +232,22 @@ pub(crate) struct CreateProviderRequest {
     pub set_default: bool,
 }
 
+/// Deserialize a `null`-able optional field as a double `Option`, so the handler
+/// can tell "field absent" (keep) from "field present and null" (clear).
+///
+/// Plain serde collapses both to `None` for `Option<Option<T>>` — JSON `null`
+/// resolves the *outer* Option to `None`, so a client that sends `null` to reset
+/// a field back to auto is silently ignored. With
+/// `#[serde(default, deserialize_with = "double_option")]`: absent ⇒ `None`
+/// (keep), `null` ⇒ `Some(None)` (clear), value ⇒ `Some(Some(v))` (set).
+fn double_option<'de, T, D>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Deserialize::deserialize(de).map(Some)
+}
+
 /// PATCH /providers/:name - Partially update a provider.
 #[derive(Debug, Deserialize)]
 pub(crate) struct PatchProviderRequest {
@@ -260,6 +276,10 @@ pub(crate) struct PatchProviderRequest {
     pub thinking_budget: Option<Option<u32>>,
     pub thinking_type: Option<Option<String>>,
     pub thinking_keep: Option<Option<String>>,
+    /// `null` here means "clear back to auto-detect" — distinct from omitting the
+    /// field ("keep"). Needs [`double_option`]; plain serde would fold `null`
+    /// into `None` and silently drop the reset.
+    #[serde(default, deserialize_with = "double_option")]
     pub reasoning_history: Option<Option<String>>,
     pub reasoning_effort: Option<Option<String>>,
     pub skip_tls_verify: Option<bool>,
@@ -1863,6 +1883,29 @@ mod tests {
                 .map(|entry| entry.id)
                 .collect::<Vec<_>>(),
             vec!["a", "z"]
+        );
+    }
+
+    // The webui sends `reasoning_history: null` to reset a provider back to
+    // auto-detect. `double_option` must distinguish that (clear) from an absent
+    // field (keep) — plain serde folds both to `None` and drops the reset, so
+    // "改回自动" would silently do nothing. absent ⇒ keep, null ⇒ clear, value ⇒ set.
+    #[test]
+    fn reasoning_history_null_clears_but_absent_keeps() {
+        let keep: PatchProviderRequest =
+            serde_json::from_value(serde_json::json!({ "model": "x" })).unwrap();
+        assert_eq!(keep.reasoning_history, None, "absent ⇒ keep (no write)");
+
+        let clear: PatchProviderRequest =
+            serde_json::from_value(serde_json::json!({ "reasoning_history": null })).unwrap();
+        assert_eq!(clear.reasoning_history, Some(None), "null ⇒ clear to auto");
+
+        let set: PatchProviderRequest =
+            serde_json::from_value(serde_json::json!({ "reasoning_history": "exclude" })).unwrap();
+        assert_eq!(
+            set.reasoning_history,
+            Some(Some("exclude".to_string())),
+            "value ⇒ set"
         );
     }
 }

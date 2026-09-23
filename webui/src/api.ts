@@ -419,6 +419,11 @@ export interface ProviderInfo {
   requires_login?: boolean;
   is_default: boolean;
   context_window?: number;
+  /** Whether prior-turn reasoning (思维链) is echoed back to the model:
+   * `"preserve"` (echo only turns that had it) / `"exclude"`, or absent/null =
+   * auto-detect from the model. (`"include"` — always echo, placeholder when
+   * missing — is also accepted but reserved for auto-detected models.) */
+  reasoning_history?: string | null;
 }
 
 export interface ProviderAccountInfo {
@@ -601,6 +606,8 @@ export interface CreateProviderBody {
   base_url?: string;
   context_window?: number;
   set_default?: boolean;
+  /** `"preserve"` / `"exclude"`; omit for auto-detect. */
+  reasoning_history?: string;
 }
 
 export async function createProvider(body: CreateProviderBody): Promise<unknown> {
@@ -672,6 +679,8 @@ export interface UpdateProviderBody {
   api_key?: string;
   base_url?: string;
   context_window?: number;
+  // `"preserve"`/`"exclude"` 覆盖；传 null 清空(回到自动判定);省略=保持不变。
+  reasoning_history?: string | null;
 }
 
 /** PATCH /providers/:name —— 部分更新已有 provider（可改名：body.name 传新名）。 */

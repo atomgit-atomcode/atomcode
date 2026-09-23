@@ -34,18 +34,28 @@ pub const REASONING_PLACEHOLDER: &str = "·";
 /// Whether a model echoes prior-turn `reasoning_content` back on the next request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReasoningPolicy {
-    /// Echo `reasoning_content` on assistant messages (placeholder if missing).
+    /// Echo `reasoning_content` on **every** assistant message, sending
+    /// [`REASONING_PLACEHOLDER`] when none was captured. For models that REJECT a
+    /// missing/empty `reasoning_content` on tool-call turns (DeepSeek-V4/Flash,
+    /// Moonshot/Kimi/MiMo) — the wire contract, not a preference.
     Include,
-    /// Never echo `reasoning_content`.
+    /// Echo `reasoning_content` **only on turns that actually produced it**, and
+    /// send nothing when a turn had none — no placeholder. For models that
+    /// tolerate omission but benefit from keeping their train of thought across
+    /// rounds (GLM, Qwen): retention without the `·` noise on non-thinking turns.
+    /// This mirrors oh-my-pi's "replay only when reasoning is present".
+    Preserve,
+    /// Never echo `reasoning_content`. For models that FORBID it (DeepSeek-R1/
+    /// reasoner, HTTP 400 if sent) and as the minimal default for plain models.
     Exclude,
 }
 
 impl ReasoningPolicy {
     /// Parse the user-facing `reasoning_history` config value into an explicit
     /// override. `None`/empty ⇒ `Ok(None)` (caller falls back to [`derive`]);
-    /// `"include"`/`"exclude"` (case/space-insensitive) ⇒ the matching policy; any
-    /// other value is a typo and fails fast — mirrors `atomcode-core`'s load-time
-    /// validation so a bad config errors the same way on either engine.
+    /// `"include"`/`"preserve"`/`"exclude"` (case/space-insensitive) ⇒ the matching
+    /// policy; any other value is a typo and fails fast — mirrors `atomcode-core`'s
+    /// load-time validation so a bad config errors the same way on either engine.
     ///
     /// [`derive`]: ReasoningPolicy::derive
     pub fn from_config(value: Option<&str>) -> Result<Option<Self>, String> {
@@ -53,10 +63,11 @@ impl ReasoningPolicy {
             None => Ok(None),
             Some(s) if s.is_empty() => Ok(None),
             Some(s) if s == "include" => Ok(Some(ReasoningPolicy::Include)),
+            Some(s) if s == "preserve" => Ok(Some(ReasoningPolicy::Preserve)),
             Some(s) if s == "exclude" => Ok(Some(ReasoningPolicy::Exclude)),
             Some(other) => Err(format!(
-                "invalid `reasoning_history` value {other:?} — expected \"include\" or \
-                 \"exclude\" (unset = auto-detect)"
+                "invalid `reasoning_history` value {other:?} — expected \"include\", \
+                 \"preserve\", or \"exclude\" (unset = auto-detect)"
             )),
         }
     }
@@ -71,8 +82,11 @@ impl ReasoningPolicy {
         if m.contains("deepseek-reasoner") || m.contains("deepseek-r1") {
             // DeepSeek V3 family: rejects echoed reasoning_content (400).
             ReasoningPolicy::Exclude
-        } else if m.contains("deepseek-v4") {
-            // DeepSeek V4 thinking mode: REQUIRES reasoning_content on tool-call turns.
+        } else if deepseek_thinking_v4_plus(&m) {
+            // DeepSeek V4-and-newer thinking family: REQUIRES reasoning_content on
+            // tool-call turns. Version-parsed rather than a `contains("deepseek-v4")`
+            // literal so a future `deepseek-v5` does not silently regress to dropping
+            // reasoning the way the `deepseek-v4.1-flash` → `deepseek-flash` rename did.
             ReasoningPolicy::Include
         } else if m.starts_with("kimi-")
             || m.starts_with("moonshot")
@@ -84,10 +98,45 @@ impl ReasoningPolicy {
         {
             // Moonshot/Kimi/MiMo: require reasoning_content on every assistant tool_call.
             ReasoningPolicy::Include
+        } else if m.contains("glm") || m.contains("qwen") || m.contains("qwq") {
+            // GLM / Qwen thinking models: they tolerate omission (no 400 either
+            // way), but keeping the reasoning across rounds preserves the train of
+            // thought — the "原地打转、想完就忘" symptom. `Preserve` echoes it only
+            // on turns that actually produced it (no `·` placeholder), so a
+            // non-thinking turn adds nothing. Mirrors oh-my-pi's GLM handling.
+            ReasoningPolicy::Preserve
         } else {
-            // GLM and normal OpenAI models: safe default — nothing to echo.
+            // Plain OpenAI-style models: safe minimal default — nothing to echo.
+            // (A non-reasoning model produces no `reasoning_content` anyway.)
             ReasoningPolicy::Exclude
         }
+    }
+}
+
+/// Whether `m` (already lowercased) names a DeepSeek **V4-or-newer** thinking
+/// model — `deepseek-v4`, `deepseek-v4.1-flash`, a future `deepseek-v5`, … — or
+/// the versionless `deepseek-flash` (the official rename of `deepseek-v4.1-flash`).
+///
+/// The version is read from the digits right after `deepseek-v`, so the match
+/// tracks the family forward without a per-release code change. `deepseek-v3` and
+/// older parse below 4 and fall through; `deepseek-coder-v2` has no `deepseek-v`
+/// run at all. The caller has already excluded the R1/reasoner forbidders, so
+/// only the V4+ requirers reach this.
+fn deepseek_thinking_v4_plus(m: &str) -> bool {
+    if m.contains("deepseek-flash") {
+        return true;
+    }
+    match m.split("deepseek-v").nth(1) {
+        Some(rest) => {
+            let ver: u32 = rest
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .unwrap_or(0);
+            ver >= 4
+        }
+        None => false,
     }
 }
 
@@ -104,6 +153,34 @@ mod tests {
         assert_eq!(
             ReasoningPolicy::derive("DeepSeek-V4", ""),
             ReasoningPolicy::Include
+        );
+        // The official rename of `deepseek-v4.1-flash` — no longer contains
+        // `deepseek-v4`, but is the same thinking family and must still Include.
+        assert_eq!(
+            ReasoningPolicy::derive("deepseek-flash", ""),
+            ReasoningPolicy::Include
+        );
+        assert_eq!(
+            ReasoningPolicy::derive("DeepSeek-Flash", ""),
+            ReasoningPolicy::Include
+        );
+        // Version-parsed, so a future release Includes without a code change.
+        assert_eq!(
+            ReasoningPolicy::derive("deepseek-v5", ""),
+            ReasoningPolicy::Include
+        );
+        assert_eq!(
+            ReasoningPolicy::derive("deepseek-v4.1-flash", ""),
+            ReasoningPolicy::Include
+        );
+        // …but the pre-V4 family and unrelated `-v` models do NOT Include.
+        assert_eq!(
+            ReasoningPolicy::derive("deepseek-v3", ""),
+            ReasoningPolicy::Exclude
+        );
+        assert_eq!(
+            ReasoningPolicy::derive("deepseek-coder-v2", ""),
+            ReasoningPolicy::Exclude
         );
     }
 
@@ -161,6 +238,10 @@ mod tests {
             Ok(Some(ReasoningPolicy::Include))
         );
         assert_eq!(
+            ReasoningPolicy::from_config(Some("preserve")),
+            Ok(Some(ReasoningPolicy::Preserve))
+        );
+        assert_eq!(
             ReasoningPolicy::from_config(Some(" Exclude ")),
             Ok(Some(ReasoningPolicy::Exclude))
         );
@@ -168,11 +249,22 @@ mod tests {
     }
 
     #[test]
-    fn glm_and_default_exclude() {
+    fn glm_and_qwen_preserve() {
+        // GLM / Qwen: retain the train of thought (echoed only when a turn had it).
         assert_eq!(
             ReasoningPolicy::derive("glm-5.1", "https://open.bigmodel.cn/api/paas/v4"),
-            ReasoningPolicy::Exclude
+            ReasoningPolicy::Preserve
         );
+        assert_eq!(
+            ReasoningPolicy::derive("qwen3-max", ""),
+            ReasoningPolicy::Preserve
+        );
+        assert_eq!(ReasoningPolicy::derive("qwq-32b", ""), ReasoningPolicy::Preserve);
+    }
+
+    #[test]
+    fn plain_models_and_default_exclude() {
+        // A non-reasoning OpenAI model produces no reasoning_content anyway.
         assert_eq!(
             ReasoningPolicy::derive("gpt-4o", "https://api.openai.com/v1"),
             ReasoningPolicy::Exclude
