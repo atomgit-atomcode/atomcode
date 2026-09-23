@@ -407,6 +407,21 @@ pub enum Msg<'a> {
         error: &'a str,
     },
     ViewWhichFile,
+    ViewNotText {
+        path: &'a str,
+    },
+    /// Said in the viewer's title, where it stays visible however far the
+    /// reader scrolls — a notice on the last line is one a person meets only
+    /// if they reach the end, and the whole point is that they cannot.
+    ViewTooBig {
+        mb: u64,
+    },
+    ViewOnlyFirstLines {
+        lines: usize,
+    },
+    ViewLongLinesCut {
+        lines: usize,
+    },
 
     // ── the conversation's own commands (`commands.rs`) ──
     LookWhichSession,

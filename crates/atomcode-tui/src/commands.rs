@@ -210,6 +210,108 @@ fn showinject(what: &str) -> Result<Action, String> {
 /// ([`CommandSet::overrides`]).
 pub struct TakeAwayCommands;
 
+/// The most of a file `/view` will read into memory.
+///
+/// A cap and not a preference: without one, `/view` on a multi-gigabyte log
+/// reads the whole thing into a `String` before anyone can press anything.
+/// The three caps below are the ones `atomcode-tuix` settled on, kept because
+/// their job is to be large enough that nobody meets them by accident.
+const VIEW_MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// The most lines it will show. Past this the file is a haystack, not a read.
+const VIEW_MAX_LINES: usize = 1000;
+/// The most characters kept from one line. A minified bundle is one line of
+/// two million; wrapping it fills the screen with a single row of the file.
+const VIEW_MAX_LINE: usize = 2000;
+
+/// Which file `/view <typed>` means.
+///
+/// Its own function because it is a decision with three inputs and one right
+/// answer, and the alternative is judging it through a command dispatch that
+/// would have to own the machine's home directory to say anything.
+///
+/// `~/…` is expanded **before** the absolute test, not after: an unexpanded
+/// `~/notes.md` is a relative path, so it would be joined onto the working
+/// directory and the refusal would name a file nobody meant.
+fn view_path(typed: &str, root: &str, home: Option<&std::path::Path>) -> std::path::PathBuf {
+    let expanded = crate::text::expand_home_with(typed, home);
+    let path = std::path::Path::new(&expanded);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::path::Path::new(root).join(path)
+    }
+}
+
+/// A file as `/view` will show it, and what had to be left out to show it.
+struct Viewed {
+    body: String,
+    /// The file was longer than [`VIEW_MAX_BYTES`], so this is its opening.
+    at_byte_cap: bool,
+    /// Lines past [`VIEW_MAX_LINES`] were dropped.
+    at_line_cap: bool,
+    /// How many lines were cut at [`VIEW_MAX_LINE`].
+    long_lines: usize,
+}
+
+/// Read a file for `/view`, bounded on all three axes.
+///
+/// Returns `Ok(None)` for a file that is not text. A binary opened in a text
+/// viewer is not a degraded read — it is a screenful of garbage plus whatever
+/// escape sequences happened to be in it, so it is refused by name instead.
+/// (`crate::text::for_screen` would strip those on the way out; this refuses
+/// earlier because "here are 8MB of nothing" is not worth drawing.)
+///
+/// **NUL first, then lossy.** The byte cap can land mid-character, and a file
+/// that is merely not-UTF-8 (a latin-1 README) still reads fine with
+/// replacement characters — so invalid UTF-8 alone is not the test. An embedded
+/// NUL is: no text file has one, every binary does.
+fn view_file(path: &std::path::Path) -> std::io::Result<Option<Viewed>> {
+    view_file_within(path, VIEW_MAX_BYTES, VIEW_MAX_LINES, VIEW_MAX_LINE)
+}
+
+/// [`view_file`] with the three caps passed in, so each one can be judged
+/// against a file of a few bytes instead of one of eight megabytes.
+fn view_file_within(
+    path: &std::path::Path,
+    max_bytes: u64,
+    max_lines: usize,
+    max_line: usize,
+) -> std::io::Result<Option<Viewed>> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    // One past the cap, so "exactly at the cap" and "longer than the cap" are
+    // distinguishable without a second trip to the filesystem.
+    std::io::Read::take(file, max_bytes + 1).read_to_end(&mut bytes)?;
+    let at_byte_cap = bytes.len() as u64 > max_bytes;
+    if at_byte_cap {
+        bytes.truncate(max_bytes as usize);
+    }
+    if bytes.contains(&0) {
+        return Ok(None);
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let mut body = String::new();
+    let mut long_lines = 0;
+    let mut lines = text.lines();
+    for line in lines.by_ref().take(max_lines) {
+        if line.chars().count() > max_line {
+            long_lines += 1;
+            let keep: String = line.chars().take(max_line).collect();
+            body.push_str(&keep);
+        } else {
+            body.push_str(line);
+        }
+        body.push('\n');
+    }
+    Ok(Some(Viewed {
+        body,
+        at_byte_cap,
+        at_line_cap: lines.next().is_some(),
+        long_lines,
+    }))
+}
+
 fn take_away_catalogue() -> Vec<Command> {
     vec![
         Command::said_taking("copy", "[N|all]".into(), t(Msg::CmdAboutCopy)),
@@ -316,19 +418,47 @@ impl CommandSet for TakeAwayCommands {
                 if path.is_empty() {
                     return Outcome::Refused(t(Msg::ViewWhichFile).into_owned());
                 }
-                let full = std::path::Path::new(path);
-                let full = if full.is_absolute() {
-                    full.to_path_buf()
-                } else {
-                    std::path::Path::new(&client.root()).join(full)
-                };
-                match std::fs::read_to_string(&full) {
+                let full = view_path(path, &client.root(), crate::text::home_dir().as_deref());
+                let shown = crate::text::collapse_home(&full.display().to_string());
+                match view_file(&full) {
                     // Read here rather than in the overlay: an overlay draws
                     // under the same rule a view module does — pure, no IO.
-                    Ok(text) => Outcome::Open(crate::overlay::Reading::new(
-                        crate::text::collapse_home(&full.display().to_string()),
-                        &text,
-                    )),
+                    Ok(Some(seen)) => {
+                        // What was left out rides in the title, not on the last
+                        // line: the reader who needs to know is the one who
+                        // never reaches the end.
+                        let mut notes = Vec::new();
+                        if seen.at_byte_cap {
+                            notes.push(
+                                t(Msg::ViewTooBig {
+                                    mb: VIEW_MAX_BYTES / (1024 * 1024),
+                                })
+                                .into_owned(),
+                            );
+                        } else if seen.at_line_cap {
+                            notes.push(
+                                t(Msg::ViewOnlyFirstLines {
+                                    lines: VIEW_MAX_LINES,
+                                })
+                                .into_owned(),
+                            );
+                        }
+                        if seen.long_lines > 0 {
+                            notes.push(
+                                t(Msg::ViewLongLinesCut {
+                                    lines: seen.long_lines,
+                                })
+                                .into_owned(),
+                            );
+                        }
+                        let title = if notes.is_empty() {
+                            shown
+                        } else {
+                            format!("{shown} ({})", notes.join(" · "))
+                        };
+                        Outcome::Open(crate::overlay::Reading::new(title, &seen.body))
+                    }
+                    Ok(None) => Outcome::Refused(t(Msg::ViewNotText { path: &shown }).into_owned()),
                     Err(error) => Outcome::Refused(
                         t(Msg::FileUnreadable {
                             path,
@@ -2736,6 +2866,115 @@ mod tests {
             all.dispatch("/view /nowhere/at/all", &app.context()).await,
             Outcome::Refused(_)
         ));
+    }
+
+    /// A file too long to show is shown as far as it goes — **and the title
+    /// says so**. A viewer that silently stops at line 1000 is a viewer that
+    /// tells you the file ends there.
+    #[tokio::test]
+    async fn view_clips_a_long_file_and_the_title_says_how_far_it_got() {
+        let (app, all, _surface) = answered("好了");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("long.log");
+        let body: String = (0..VIEW_MAX_LINES + 500)
+            .map(|i| format!("line {i}\n"))
+            .collect();
+        std::fs::write(&file, body).expect("write");
+        match all
+            .dispatch(&format!("/view {}", file.display()), &app.context())
+            .await
+        {
+            Outcome::Open(overlay) => {
+                let title = overlay.title();
+                assert!(
+                    title.contains(&VIEW_MAX_LINES.to_string()),
+                    "the title must say how much is missing: {title}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// `/view ~/notes.md` means the file in the home directory — the path a
+    /// person types is the path this screen printed at them.
+    ///
+    /// Judged here rather than through a dispatch, because a dispatch would
+    /// have to own the machine's `HOME` to have an opinion.
+    #[test]
+    fn view_resolves_a_typed_tilde_before_deciding_it_is_relative() {
+        let home = std::path::Path::new("/home/me");
+        assert_eq!(
+            view_path("~/notes.md", "/work/proj", Some(home)),
+            std::path::PathBuf::from("/home/me/notes.md"),
+            "an unexpanded ~ is relative, and would land under the working dir"
+        );
+        // The two paths that were already right stay right.
+        assert_eq!(
+            view_path("/etc/hosts", "/work/proj", Some(home)),
+            std::path::PathBuf::from("/etc/hosts")
+        );
+        assert_eq!(
+            view_path("src/main.rs", "/work/proj", Some(home)),
+            std::path::PathBuf::from("/work/proj/src/main.rs")
+        );
+    }
+
+    /// The three caps, each judged against a file of a few bytes rather than
+    /// one of eight megabytes — which is what `view_file_within` is for.
+    #[test]
+    fn each_cap_leaves_its_own_mark() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Lines: two kept of four, and it admits there were more.
+        let lines = dir.path().join("lines.txt");
+        std::fs::write(&lines, "a\nb\nc\nd\n").expect("write");
+        let seen = view_file_within(&lines, 1024, 2, 100)
+            .expect("read")
+            .expect("text");
+        assert_eq!(seen.body, "a\nb\n");
+        assert!(seen.at_line_cap, "it stopped early and must say so");
+        assert!(!seen.at_byte_cap);
+
+        // Bytes: the read stops, and that is a different notice from the line
+        // cap because the count of what is missing is unknown, not merely large.
+        let big = dir.path().join("big.txt");
+        std::fs::write(&big, "0123456789abcdef").expect("write");
+        let seen = view_file_within(&big, 8, 100, 100)
+            .expect("read")
+            .expect("text");
+        assert_eq!(seen.body, "01234567\n");
+        assert!(seen.at_byte_cap);
+
+        // Columns: the long line is cut, kept, and counted — one line of a
+        // minified bundle must not become the whole screen.
+        let wide = dir.path().join("wide.js");
+        std::fs::write(&wide, "short\n".to_string() + &"x".repeat(50)).expect("write");
+        let seen = view_file_within(&wide, 1024, 100, 10)
+            .expect("read")
+            .expect("text");
+        assert_eq!(seen.long_lines, 1, "the cut lines are counted");
+        assert_eq!(
+            seen.body.lines().last().map(str::len),
+            Some(10),
+            "cut to the cap, not dropped"
+        );
+    }
+
+    /// A binary is refused by name, not drawn. Opening one in a text viewer
+    /// fills the screen with nothing and whatever escapes happened to be in it.
+    #[tokio::test]
+    async fn view_refuses_a_file_that_is_not_text() {
+        let (app, all, _surface) = answered("好了");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("a.png");
+        std::fs::write(&file, [0x89, b'P', b'N', b'G', 0x00, 0x1a, 0x0a]).expect("write");
+        match all
+            .dispatch(&format!("/view {}", file.display()), &app.context())
+            .await
+        {
+            Outcome::Refused(_) => {}
+            other => panic!("a binary must not be drawn: {other:?}"),
+        }
     }
 
     /// `/save` writes the conversation as markdown, beside the code the session

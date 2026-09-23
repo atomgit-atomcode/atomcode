@@ -309,6 +309,13 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SavedTo { path } => format!("saved to {path}").into(),
         Msg::SaveFailed { error } => format!("could not save: {error}").into(),
         Msg::ViewWhichFile => "which file? `/view <path>`".into(),
+        Msg::ViewNotText { path } => format!("{path} is not a text file").into(),
+        Msg::ViewTooBig { mb } => format!("first {mb} MB").into(),
+        Msg::ViewOnlyFirstLines { lines } => format!("first {lines} lines").into(),
+        Msg::ViewLongLinesCut { lines } => match lines {
+            1 => "1 long line cut".into(),
+            n => format!("{n} long lines cut").into(),
+        },
 
         // ── the conversation's own commands (`commands.rs`) ──
         Msg::LookWhichSession => "switch to which session?".into(),

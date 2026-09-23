@@ -353,6 +353,41 @@ pub fn collapse_home_with(path: &str, home: Option<&std::path::Path>) -> String 
     }
 }
 
+/// `~` and `~/…` written back out as the home directory — the inverse of
+/// [`collapse_home`], for a path a person **typed**.
+///
+/// Here because a person types what they read, and what they read is `~/…`:
+/// this screen prints every path that way. Without this, `/view ~/notes.md`
+/// is not absolute, so it gets joined onto the working directory and the
+/// answer is "cannot read it" — a refusal that blames the file for a path
+/// nobody ever meant.
+///
+/// **Only a leading `~` as its own segment.** `~foo` is another person's home
+/// in shell syntax and this does not resolve those, so it is left alone rather
+/// than guessed at; `a/~/b` is a real (if odd) relative path and is not ours to
+/// rewrite. With no home directory to expand against, the path comes back as it
+/// was — the caller's "cannot read it" is then the honest answer.
+pub fn expand_home_with(path: &str, home: Option<&std::path::Path>) -> String {
+    let rest = if path == "~" {
+        Some("")
+    } else {
+        path.strip_prefix("~/").or_else(|| {
+            // Windows types `~\…`. Checked separately so a unix path containing
+            // a backslash is not mistaken for one.
+            (std::path::MAIN_SEPARATOR != '/')
+                .then(|| path.strip_prefix(&format!("~{}", std::path::MAIN_SEPARATOR)))
+                .flatten()
+        })
+    };
+    let (Some(rest), Some(home)) = (rest, home) else {
+        return path.to_string();
+    };
+    if rest.is_empty() {
+        return home.to_string_lossy().into_owned();
+    }
+    home.join(rest).to_string_lossy().into_owned()
+}
+
 /// The person's home directory, from the two variables that say so.
 ///
 /// `HOME` on unix, `USERPROFILE` on Windows. Empty is treated as absent: a set
@@ -589,6 +624,30 @@ mod tests {
             collapse_home_with("/tmp/a", Some(std::path::Path::new("/"))),
             "/tmp/a"
         );
+    }
+
+    /// A person types the path back the way this screen printed it, so `~/…`
+    /// has to mean what it looks like. Unexpanded it is not absolute, gets
+    /// joined onto the working directory, and the answer is "cannot read it".
+    #[test]
+    fn a_typed_tilde_becomes_the_home_directory() {
+        let home = std::path::Path::new("/home/me");
+        assert_eq!(
+            expand_home_with("~/notes.md", Some(home)),
+            "/home/me/notes.md"
+        );
+        assert_eq!(expand_home_with("~", Some(home)), "/home/me");
+
+        // `~foo` is another person's home in shell syntax and this does not
+        // resolve those — guessing would open the wrong file silently.
+        assert_eq!(expand_home_with("~other/a", Some(home)), "~other/a");
+        // Not a leading segment: a real, if odd, relative path.
+        assert_eq!(expand_home_with("a/~/b", Some(home)), "a/~/b");
+        // Nothing to expand against: unchanged, so the caller's "cannot read
+        // it" stays the honest answer rather than becoming a wrong path.
+        assert_eq!(expand_home_with("~/notes.md", None), "~/notes.md");
+        // Untouched paths pass through whatever the home is.
+        assert_eq!(expand_home_with("/tmp/a", Some(home)), "/tmp/a");
     }
 
     #[test]

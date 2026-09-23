@@ -282,6 +282,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SavedTo { path } => format!("存到 {path}").into(),
         Msg::SaveFailed { error } => format!("存不下:{error}").into(),
         Msg::ViewWhichFile => "要看哪个文件?`/view 路径`".into(),
+        Msg::ViewNotText { path } => format!("{path} 不是文本文件").into(),
+        Msg::ViewTooBig { mb } => format!("只读了开头 {mb} MB").into(),
+        Msg::ViewOnlyFirstLines { lines } => format!("只显示前 {lines} 行").into(),
+        Msg::ViewLongLinesCut { lines } => format!("{lines} 行过长已截断").into(),
 
         // ── the conversation's own commands (`commands.rs`) ──
         Msg::LookWhichSession => "要切到哪个会话?".into(),
