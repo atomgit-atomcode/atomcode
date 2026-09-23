@@ -262,6 +262,41 @@ pub fn expand_pastes(text: &str, pastes: &[String]) -> String {
     out
 }
 
+/// How much of an allowance window is gone, for the status row.
+///
+/// The window **nearest its limit**, not all of them: the one that will stop
+/// the work first is the only one a glance can act on, and the rest are on the
+/// usage page for whoever wants them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Allowance {
+    /// What the host calls this window — "5 小时", "每周".
+    pub label: String,
+    /// Whole percent spent, 0..=100.
+    pub percent: u8,
+    /// Seconds until it comes back. `0` when nothing is waiting.
+    pub resets_in_seconds: i64,
+}
+
+impl Allowance {
+    /// The window nearest its limit, out of what the host answered.
+    ///
+    /// Pure, and over the contract's own type, so "which window matters" can be
+    /// judged without a host or a network. A window the host cannot put a
+    /// number on is skipped rather than counted as zero — saying "0% used"
+    /// because nobody knew would be inventing an answer.
+    pub fn nearest(windows: &[atomcode_host_api::UsageWindow]) -> Option<Self> {
+        windows
+            .iter()
+            .filter_map(|w| w.used_percent.map(|percent| (w, percent)))
+            .max_by_key(|(_, percent)| *percent)
+            .map(|(w, percent)| Self {
+                label: w.label.clone(),
+                percent: percent.min(100),
+                resets_in_seconds: w.resets_in_seconds,
+            })
+    }
+}
+
 /// The non-derivable half of what a module renders from.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Moment {
@@ -469,6 +504,20 @@ pub struct Moment {
     /// a fact about the conversation, it is the state of something running
     /// beside it. `None` is "not driving itself".
     pub autonomy: Option<atomcode_host_api::Running>,
+    /// The allowance window nearest its limit, as of the last check.
+    ///
+    /// Polled rather than pushed, and that is forced: an allowance moves on the
+    /// account's clock, not on anything this session does, so there is nothing
+    /// to subscribe to. The check is made after a turn ends and no more often
+    /// than [`crate::plugin::ALLOWANCE_EVERY`] — a question asked on the
+    /// account costs a round trip, and the answer only matters at the rate a
+    /// person can spend it.
+    ///
+    /// Kept whatever the figure is, so the decision about *when it is worth
+    /// saying* stays in the drawing, where it can be judged without a network
+    /// (`crate::modules::status`). `None` is "never got an answer" — a host
+    /// that meters nothing, or a check that has not happened yet.
+    pub allowance: Option<Allowance>,
     /// How much this session may do without asking, as the host last said.
     ///
     /// Here for the reason [`Moment::autonomy`] is: an execution mode is not a

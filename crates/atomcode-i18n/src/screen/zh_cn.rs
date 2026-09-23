@@ -281,6 +281,12 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SaveNothingYet => "这段对话还没有内容可存".into(),
         Msg::SavedTo { path } => format!("存到 {path}").into(),
         Msg::SaveFailed { error } => format!("存不下:{error}").into(),
+        Msg::AllowanceNear { label, percent } => format!("{label}额度已用 {percent}%").into(),
+        Msg::AllowanceNearWithReset {
+            label,
+            percent,
+            resets_in,
+        } => format!("{label}额度已用 {percent}% · {resets_in}后恢复").into(),
         Msg::ViewWhichFile => "要看哪个文件?`/view 路径`".into(),
         Msg::ViewNotText { path } => format!("{path} 不是文本文件").into(),
         Msg::ViewTooBig { mb } => format!("只读了开头 {mb} MB").into(),

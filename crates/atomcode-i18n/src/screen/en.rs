@@ -308,6 +308,12 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SaveNothingYet => "there is nothing in this conversation to save yet".into(),
         Msg::SavedTo { path } => format!("saved to {path}").into(),
         Msg::SaveFailed { error } => format!("could not save: {error}").into(),
+        Msg::AllowanceNear { label, percent } => format!("{label} {percent}% used").into(),
+        Msg::AllowanceNearWithReset {
+            label,
+            percent,
+            resets_in,
+        } => format!("{label} {percent}% used · back in {resets_in}").into(),
         Msg::ViewWhichFile => "which file? `/view <path>`".into(),
         Msg::ViewNotText { path } => format!("{path} is not a text file").into(),
         Msg::ViewTooBig { mb } => format!("first {mb} MB").into(),

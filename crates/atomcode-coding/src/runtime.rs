@@ -1908,6 +1908,7 @@ impl CodingRuntimeHandle {
     #[allow(clippy::type_complexity)]
     pub async fn usage(
         &self,
+        windows_only: bool,
     ) -> Result<
         (
             Vec<crate::rate_limit::RateLimitWindow>,
@@ -1921,6 +1922,7 @@ impl CodingRuntimeHandle {
         self.tx
             .send(CodingRuntimeControl::Usage {
                 generation: runtime_state_generation(state),
+                windows_only,
                 done,
             })
             .map_err(|_| RuntimeError::Unavailable)?;
@@ -2642,6 +2644,9 @@ pub enum CodingRuntimeControl {
     /// The account's remaining allowance, as rolling windows.
     Usage {
         generation: u64,
+        /// Fetch the windows alone, as the host contract's field of the same
+        /// name asks: one call on the account instead of three.
+        windows_only: bool,
         #[allow(clippy::type_complexity)]
         done: oneshot::Sender<
             Result<
@@ -4171,6 +4176,7 @@ fn spawn_runtime_owner_with_optional_agent(
                     // goal starting does.
                     Some(CodingRuntimeControl::Usage {
                         generation: request_generation,
+                        windows_only,
                         done,
                     }) => {
                         if request_generation != generation {
@@ -4192,6 +4198,20 @@ fn spawn_runtime_owner_with_optional_agent(
                             // budget each, but they run at once, so the page is
                             // late by the slowest rather than by the sum.
                             let budget = std::time::Duration::from_secs(3);
+                            // The cheap form asks for the windows and stops
+                            // there. It exists for the periodic check, which
+                            // wants "how much is left" and nothing else —
+                            // asking the other two on a timer would triple the
+                            // traffic to say the same thing.
+                            if windows_only {
+                                let windows = tokio::time::timeout(budget, source.fetch_windows())
+                                    .await
+                                    .ok()
+                                    .and_then(|fetched| fetched.ok())
+                                    .unwrap_or_default();
+                                let _ = done.send(Ok((windows, None, None)));
+                                return;
+                            }
                             let (windows, plan, spent) = tokio::join!(
                                 tokio::time::timeout(budget, source.fetch_windows()),
                                 tokio::time::timeout(budget, source.fetch_plan()),

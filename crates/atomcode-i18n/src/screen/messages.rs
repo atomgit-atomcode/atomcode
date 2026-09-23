@@ -406,6 +406,16 @@ pub enum Msg<'a> {
     SaveFailed {
         error: &'a str,
     },
+    /// The status row, once an allowance window is close to spent.
+    AllowanceNear {
+        label: &'a str,
+        percent: u8,
+    },
+    AllowanceNearWithReset {
+        label: &'a str,
+        percent: u8,
+        resets_in: &'a str,
+    },
     ViewWhichFile,
     ViewNotText {
         path: &'a str,

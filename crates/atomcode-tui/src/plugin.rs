@@ -675,6 +675,13 @@ async fn answer_prompts(
     }
 }
 
+/// The least time between two questions about the allowance.
+///
+/// The figure only moves when a turn spends something, and the question costs a
+/// round trip on the account — so it is asked after a turn and then held off
+/// for this long. The number is the one `atomcode-tuix` settled on.
+pub const ALLOWANCE_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// How many wakes are answered before a frame is owed regardless.
 ///
 /// The loop paints when the queue has run dry, so a burst of wakes — a turn
@@ -848,6 +855,9 @@ pub struct Tui {
     /// is not known until then.
     ctx: Mutex<Option<Context>>,
     wake: Mutex<Option<mpsc::UnboundedSender<Wake>>>,
+    /// When the allowance was last asked about, so it is not asked again for
+    /// [`ALLOWANCE_EVERY`]. `None` until the first turn ends.
+    allowance_checked: Mutex<Option<std::time::Instant>>,
     /// Where the button went down, so a release can tell a click from a drag.
     pressed_at: Mutex<Option<(u16, u16)>>,
     /// The last press's time, cell, and how many presses have landed on that
@@ -2703,7 +2713,8 @@ impl Tui {
                     session: session.clone()
                 }),
                 ask(HostCommand::Usage {
-                    session: session.clone()
+                    session: session.clone(),
+                    windows_only: false,
                 }),
                 ask(HostCommand::Sources {
                     session: session.clone()
@@ -2759,6 +2770,63 @@ impl Tui {
         });
     }
 
+    /// Ask how much allowance is left, at most this often.
+    ///
+    /// Tied to a turn ending rather than to a timer, and then held to this
+    /// interval: a turn is when the figure can have moved, and the question
+    /// costs a round trip on the account. Idle, nothing is asked at all.
+    fn check_allowance(&self) {
+        let now = std::time::Instant::now();
+        {
+            let mut last = self.allowance_checked.lock().expect("allowance poisoned");
+            if last.is_some_and(|at| now.duration_since(at) < ALLOWANCE_EVERY) {
+                return;
+            }
+            // Stamped before the answer comes back, not after: two turns
+            // finishing inside the interval must not both send a question
+            // while the first is still in flight.
+            *last = Some(now);
+        }
+        let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
+            return;
+        };
+        let Some(control) = self.client.control() else {
+            return;
+        };
+        let session = self.client.session();
+        let host = self.host.clone();
+        let repaint = ctx.service::<RepaintSvc>();
+        tokio::spawn(async move {
+            // The cheap form — the windows and nothing else. The plan behind
+            // them and what has been spent are two more round trips, and
+            // neither is on this row.
+            let windows = match control
+                .call(HostCommand::Usage {
+                    session,
+                    windows_only: true,
+                })
+                .await
+            {
+                Ok(HostReply::Usage { windows, .. }) => windows,
+                // A host that will not say leaves the row as it was. Blanking
+                // it on a failed question would read as "you are back to zero".
+                _ => return,
+            };
+            let nearest = crate::moment::Allowance::nearest(&windows);
+            let changed = {
+                let mut m = host.moment.write().expect("moment poisoned");
+                let changed = m.allowance != nearest;
+                m.allowance = nearest;
+                changed
+            };
+            if changed {
+                if let Some(repaint) = repaint {
+                    repaint.now();
+                }
+            }
+        });
+    }
+
     /// Ask the host what the Usage page shows, and repaint when it answers.
     ///
     /// Asked rather than waited for: an allowance window moves on the server's
@@ -2795,7 +2863,13 @@ impl Tui {
                 }),
                 _ => None,
             };
-            let (windows, plan, stats) = match control.call(HostCommand::Usage { session }).await {
+            let (windows, plan, stats) = match control
+                .call(HostCommand::Usage {
+                    session,
+                    windows_only: false,
+                })
+                .await
+            {
                 Ok(HostReply::Usage {
                     windows,
                     plan,
@@ -3366,6 +3440,9 @@ impl Tui {
             // the key (`Action::Escape`), and an internal cancel must not.
             AgentEvent::TurnComplete { .. } | AgentEvent::Cancelled => {
                 self.host.clear_steering();
+                // A turn just spent some of the allowance, so this is the
+                // moment the figure changed. Rate-limited inside.
+                self.check_allowance();
                 self.set_activity(Activity::Idle)
             }
             AgentEvent::Steered { .. } => {
@@ -5132,6 +5209,7 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
             surface,
             ctx: Mutex::new(None),
             wake: Mutex::new(None),
+            allowance_checked: Mutex::new(None),
             pressed_at: Mutex::new(None),
             click_streak: Mutex::new(None),
             members: Arc::new(Roster::default()),

@@ -204,7 +204,22 @@ pub enum HostCommand {
     /// conversation cost, this says what the account may still do and when a
     /// spent window comes back. A host that meters nothing answers with an
     /// empty list — which is an answer, not a failure.
-    Usage { session: String },
+    Usage {
+        session: String,
+        /// Ask for the windows alone.
+        ///
+        /// **The cheap form: one call on the account instead of three.** The
+        /// full answer carries the plan behind the windows and what has been
+        /// spent, and each is a separate round trip — right for a page a person
+        /// opened, wrong for something asked on a timer. A periodic check that
+        /// wanted only "how much is left" would otherwise triple the cost of
+        /// asking.
+        ///
+        /// Defaults to false, so a caller that does not know about this gets
+        /// what it always got.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        windows_only: bool,
+    },
     /// Whether `session`'s requests carry thinking at all, as a setting to read.
     Thinking { session: String },
     /// Turn thinking on or off for `session` from now on.
@@ -257,7 +272,7 @@ impl HostCommand {
             | Self::Providers { session }
             | Self::Autonomy { session }
             | Self::Context { session }
-            | Self::Usage { session }
+            | Self::Usage { session, .. }
             | Self::Thinking { session }
             | Self::SetThinking { session, .. }
             | Self::Readiness { session } => Some(session),
@@ -993,6 +1008,11 @@ mod tests {
             },
             HostCommand::Usage {
                 session: "a".into(),
+                windows_only: false,
+            },
+            HostCommand::Usage {
+                session: "a".into(),
+                windows_only: true,
             },
             HostCommand::Context {
                 session: "a".into(),
@@ -1065,6 +1085,8 @@ mod tests {
                 | HostCommand::Resume { .. }
                 | HostCommand::SetReasoningEffort { .. }
                 | HostCommand::ListSessions { .. }
+                | HostCommand::PreviewSession { .. }
+                | HostCommand::DeleteSession { .. }
                 | HostCommand::Undo { .. }
                 | HostCommand::RewindPoints { .. }
                 | HostCommand::Rewind { .. }
@@ -1302,6 +1324,7 @@ mod tests {
                 HostReply::Done
                 | HostReply::SessionChanged { .. }
                 | HostReply::Sessions { .. }
+                | HostReply::SessionPreview { .. }
                 | HostReply::Undone { .. }
                 | HostReply::RewindPoints { .. }
                 | HostReply::McpServers { .. }

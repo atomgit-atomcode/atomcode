@@ -177,6 +177,18 @@ impl View for Status {
         if let Some(text) = &autonomy {
             reserved += width::str_width(text) + sep_w;
         }
+        // How much allowance is left, but only once it is close enough to
+        // change what a person does. Below that it is a number nobody acts on,
+        // and a row that always carries one has that much less room for the
+        // things that change.
+        let allowance = vp
+            .moment
+            .allowance
+            .as_ref()
+            .and_then(|left| allowance_badge(left).map(|text| (text, left.percent)));
+        if let Some((text, _)) = &allowance {
+            reserved += width::str_width(text) + sep_w;
+        }
 
         // Prefer the description's model — the configured name the welcome shows
         // — over the folded one from the last `RequestHeader`. The description is
@@ -250,6 +262,18 @@ impl View for Status {
         if let Some(text) = autonomy {
             row.push(El::styled(sep_text.clone(), dim));
             row.push(El::styled(text, theme::fg(Role::Accent)));
+        }
+        if let Some((text, percent)) = allowance {
+            row.push(El::styled(sep_text.clone(), dim));
+            // Warning while there is still room to change course; error once
+            // there is not. The same two steps the usage page's bar takes, so
+            // one glance and the other agree about how bad it is.
+            let role = if percent >= ALLOWANCE_SPENT {
+                Role::Error
+            } else {
+                Role::Warning
+            };
+            row.push(El::styled(text, theme::fg(role)));
         }
         if let Some((text, style)) = activity {
             row.push(El::styled(sep_text.clone(), dim));
@@ -443,6 +467,44 @@ fn mode_badge(
 /// named rather than assumed (`goal` vs `loop`), because which one is running
 /// is the first thing a person wants to know and the host is free to add a
 /// third.
+/// From here on, how much allowance is left is worth a place on the row.
+///
+/// Below it the figure is one nobody acts on — the work is not going to stop
+/// today — and the row's space is better spent on what changes. The two steps
+/// are the ones `atomcode-tuix` settled on.
+const ALLOWANCE_NEAR: u8 = 80;
+/// From here on it is not a warning any more.
+const ALLOWANCE_SPENT: u8 = 95;
+
+/// What the row says about the allowance, or `None` when it says nothing.
+///
+/// Its own function, and pure, so the whole decision — *whether* to speak, and
+/// what with — is judged without a host, a network or a frame.
+fn allowance_badge(left: &crate::moment::Allowance) -> Option<String> {
+    if left.percent < ALLOWANCE_NEAR {
+        return None;
+    }
+    // The countdown only when there is one: a window with nothing waiting
+    // would otherwise read as "comes back in 0 seconds", which is the opposite
+    // of what it means.
+    let back = (left.resets_in_seconds > 0)
+        .then(|| crate::text::spoken_duration(left.resets_in_seconds as u64));
+    Some(
+        match back {
+            Some(back) => t(Msg::AllowanceNearWithReset {
+                label: &left.label,
+                percent: left.percent,
+                resets_in: &back,
+            }),
+            None => t(Msg::AllowanceNear {
+                label: &left.label,
+                percent: left.percent,
+            }),
+        }
+        .into_owned(),
+    )
+}
+
 fn autonomy_badge(running: &atomcode_host_api::Running) -> String {
     let kind = if running.kind == "goal" {
         t(Msg::StatusGoal)
@@ -583,6 +645,73 @@ mod tests {
             .first()
             .map(|l| l.plain())
             .unwrap_or_default()
+    }
+
+    /// The allowance is only spoken about once it is close to spent.
+    ///
+    /// The whole point is that it is silent the rest of the time: a row that
+    /// always carried the figure would be one more thing to read past, and it
+    /// would stop meaning anything when it mattered.
+    #[test]
+    fn the_allowance_is_only_said_once_it_is_worth_saying() {
+        let left = |percent, resets| crate::moment::Allowance {
+            label: "5 小时".into(),
+            percent,
+            resets_in_seconds: resets,
+        };
+        assert_eq!(allowance_badge(&left(0, 0)), None, "fresh: nothing to say");
+        assert_eq!(
+            allowance_badge(&left(ALLOWANCE_NEAR - 1, 0)),
+            None,
+            "one short of the step is still nothing to say"
+        );
+
+        let near = allowance_badge(&left(ALLOWANCE_NEAR, 0)).expect("at the step it speaks");
+        assert!(near.contains("80"), "it says how much: {near}");
+        assert!(near.contains("5 小时"), "and which window: {near}");
+
+        // With a reset to report it says when it comes back; without one it
+        // must not, or it reads as "back in 0 seconds".
+        let waiting = allowance_badge(&left(90, 3600)).expect("speaks");
+        assert!(
+            waiting.len() > near.len() && waiting.contains("90"),
+            "it adds when the window comes back: {waiting}"
+        );
+
+        // Spent is still said — it is the one figure that changes what happens
+        // next. The colour is the row's business; the words are the same.
+        assert!(allowance_badge(&left(100, 60)).is_some());
+    }
+
+    /// Which of several windows the row talks about: the one that will stop the
+    /// work first.
+    #[test]
+    fn the_window_nearest_its_limit_is_the_one_reported() {
+        use atomcode_host_api::UsageWindow;
+        let window = |label: &str, percent: Option<u8>| UsageWindow {
+            label: label.into(),
+            exhausted: false,
+            resets_at: String::new(),
+            resets_in_seconds: 60,
+            window_seconds: 0,
+            used_percent: percent,
+            calls_used: None,
+            call_limit: None,
+        };
+        let nearest = crate::moment::Allowance::nearest(&[
+            window("每周", Some(20)),
+            window("5 小时", Some(91)),
+            window("每日", Some(45)),
+        ])
+        .expect("one of them is nearest");
+        assert_eq!(nearest.label, "5 小时");
+        assert_eq!(nearest.percent, 91);
+
+        // A window the host could not put a number on is skipped, not counted
+        // as zero: "0% used" nobody said is an invented answer.
+        let unknown = crate::moment::Allowance::nearest(&[window("每周", None)]);
+        assert_eq!(unknown, None);
+        assert_eq!(crate::moment::Allowance::nearest(&[]), None);
     }
 
     /// Every mode but the default says which one it is, and the default says

@@ -1509,9 +1509,13 @@ impl HostControl for RuntimeControl {
             // reach the meter" and "there is no meter" look the same to a person
             // — neither is a number — and making this fail would make `/usage`
             // the one command that breaks when the network hiccups.
-            HostCommand::Usage { session } => {
+            HostCommand::Usage {
+                session,
+                windows_only,
+            } => {
                 self.addressed(&session)?;
-                let (windows, plan, spent) = self.handle.usage().await.map_err(refused)?;
+                let (windows, plan, spent) =
+                    self.handle.usage(windows_only).await.map_err(refused)?;
                 Ok(HostReply::Usage {
                     plan: plan.map(|plan| atomcode_host_api::Entitlement {
                         plan: plan.plan,

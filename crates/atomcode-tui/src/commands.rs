@@ -1330,7 +1330,13 @@ impl CommandSet for SessionCommands {
                     Ok(control) => control,
                     Err(refusal) => return refusal,
                 };
-                match control.call(HostCommand::Usage { session: root }).await {
+                match control
+                    .call(HostCommand::Usage {
+                        session: root,
+                        windows_only: false,
+                    })
+                    .await
+                {
                     Ok(HostReply::Usage { windows, .. }) if windows.is_empty() => {
                         Outcome::Said(t(Msg::UsageNotCounted).into_owned())
                     }
@@ -2346,10 +2352,12 @@ mod tests {
             *host.asked.lock().unwrap(),
             vec![
                 HostCommand::Usage {
-                    session: "lead".into()
+                    session: "lead".into(),
+                    windows_only: false,
                 },
                 HostCommand::Usage {
-                    session: "lead".into()
+                    session: "lead".into(),
+                    windows_only: false,
                 },
             ]
         );
