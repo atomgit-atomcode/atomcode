@@ -711,6 +711,14 @@ impl ToolCallBlock {
         matches!(self.outcome, Outcome::Failed(_))
     }
 
+    /// Whether this call is still running. The host pulses a running call's `●`
+    /// mark (white↔grey) so a live call reads apart from a finished one at a
+    /// glance — presentation applied where the tick lives, not here (the mark
+    /// this block draws is a still colour; `RenderCtx` carries no phase).
+    pub fn is_running(&self) -> bool {
+        matches!(self.outcome, Outcome::Pending)
+    }
+
     pub fn pending(
         call_id: impl Into<String>,
         name: impl Into<String>,
@@ -868,6 +876,53 @@ impl ToolCallBlock {
     }
 
     /// `⎿ what came back` — the line under the head.
+    /// A write/edit call's change as a coloured diff — `edit_file`'s own unified
+    /// diff, or `write_file`'s content as all-additions — when it succeeded and
+    /// there is a change worth colouring. `None` for every other call and state,
+    /// which then renders its result as text.
+    fn diff_view(&self, w: u16) -> Option<crate::diff::Rendered> {
+        const MAX: usize = 400;
+        // The indent the plain result body uses too, so folding one for the other
+        // does not shift the column.
+        let indent = "     ";
+        let Outcome::Ok(output) = &self.outcome else {
+            return None;
+        };
+        match self.name.as_str() {
+            "edit_file" => crate::diff::render_edit(output, w, indent, MAX),
+            "write_file" => {
+                let content = serde_json::from_str::<serde_json::Value>(&self.args)
+                    .ok()?
+                    .get("content")?
+                    .as_str()?
+                    .to_string();
+                if content.trim().is_empty() {
+                    return None;
+                }
+                Some(crate::diff::render_written(&content, w, indent, MAX))
+            }
+            _ => None,
+        }
+    }
+
+    /// ` (+N -M)` — the change's shape, appended after the file on the naming
+    /// line: `+N` green, `-M` red, the parens dim.
+    fn diff_count_spans(&self, added: usize, removed: usize) -> Vec<Span> {
+        vec![
+            Span::styled(" (".to_string(), muted()),
+            Span::styled(
+                format!("+{added}"),
+                Style::new().fg(Color::role(Role::DiffAdd)),
+            ),
+            Span::styled(" ".to_string(), muted()),
+            Span::styled(
+                format!("-{removed}"),
+                Style::new().fg(Color::role(Role::DiffRemove)),
+            ),
+            Span::styled(")".to_string(), muted()),
+        ]
+    }
+
     fn note_line(&self, w: u16) -> Line {
         let (note, note_style) = outcome_note(&self.outcome);
         Line::from_spans(vec![
@@ -1206,6 +1261,21 @@ impl Content for ToolCallBlock {
             Outcome::Ok(s) | Outcome::Failed(s) => s.as_str(),
             _ => "",
         };
+        // A write/edit shows its change as a coloured, line-numbered diff rather
+        // than the raw result text — the same shape the other front end draws.
+        // The `(+N -M)` count rides the line that NAMES the call (the last opening
+        // row: the subject line when the model gave a reason, the head otherwise),
+        // right after the file, and the line is re-clipped so the suffix cannot
+        // push it past the width.
+        if let Some(diff) = self.diff_view(w) {
+            if let Some(mut last) = out.pop() {
+                last.spans
+                    .extend(self.diff_count_spans(diff.added, diff.removed));
+                out.push(last.truncate(w as usize));
+            }
+            out.extend(diff.lines);
+            return out;
+        }
         let non_empty = body.lines().filter(|l| !l.trim().is_empty()).count();
         let gutter = format!("{}{} ", " ".repeat(GUTTER), caps.g(Glyph::Gutter));
         match non_empty {
@@ -2874,6 +2944,67 @@ mod tests {
     }
 
     #[test]
+    fn an_edit_file_call_renders_a_coloured_diff() {
+        let block = ToolCallBlock {
+            call_id: "c".into(),
+            name: "edit_file".into(),
+            args: r#"{"file_path":"a.rs"}"#.into(),
+            outcome: Outcome::Ok(
+                "Edited a.rs (1 replacement)\n@@ -1,2 +1,2 @@\n keep\n-old\n+new".into(),
+            ),
+        };
+        let lines = block.lines(&crate::block::RenderCtx::bare(80));
+        // The `(+N -M)` count rides the naming line, right after the file — not a
+        // separate summary row.
+        let naming = lines
+            .iter()
+            .find(|l| l.plain().contains("EditFile"))
+            .expect("the naming line");
+        assert!(
+            naming.plain().contains("(+1 -1)"),
+            "count on the name line: {}",
+            naming.plain()
+        );
+        let text: String = lines.iter().map(|l| l.plain()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("- old") && text.contains("+ new"), "diff rows: {text}");
+        let red = Some(crate::frame::Color::role(Role::DiffRemove));
+        assert!(
+            lines.iter().flat_map(|l| &l.spans).any(|s| s.style.fg == red),
+            "a removed row is red"
+        );
+    }
+
+    #[test]
+    fn a_write_file_call_renders_its_content_as_green_additions() {
+        let block = ToolCallBlock {
+            call_id: "c".into(),
+            name: "write_file".into(),
+            args: r#"{"file_path":"a.html","content":"<h1>hi</h1>\nbye"}"#.into(),
+            outcome: Outcome::Ok("Wrote a.html".into()),
+        };
+        let lines = block.lines(&crate::block::RenderCtx::bare(80));
+        let naming = lines
+            .iter()
+            .find(|l| l.plain().contains("WriteFile"))
+            .expect("the naming line");
+        assert!(
+            naming.plain().contains("(+2 -0)"),
+            "count on the name line: {}",
+            naming.plain()
+        );
+        let text: String = lines.iter().map(|l| l.plain()).collect::<Vec<_>>().join("\n");
+        assert!(
+            text.contains("+ <h1>hi</h1>") && text.contains("+ bye"),
+            "the written content as additions: {text}"
+        );
+        let green = Some(crate::frame::Color::role(Role::DiffAdd));
+        assert!(
+            lines.iter().flat_map(|l| &l.spans).any(|s| s.style.fg == green),
+            "an added row is green"
+        );
+    }
+
+    #[test]
     fn the_hash_ignores_width_and_folding_but_not_the_words() {
         let a = ModelSaid("hello".into());
         assert_eq!(a.content_hash(), a.content_hash());
@@ -2937,6 +3068,25 @@ mod tests {
             let block =
                 ToolCallBlock::pending("c", "read_file", r#"{"file_path":"a.rs"}"#).with(done);
             assert_ne!(block.mark().1.fg, warn, "{:?}", block.mark());
+        }
+    }
+
+    /// `is_running` is what the host asks to decide whether to pulse a call's
+    /// mark: true only while the call is in flight, false the moment any outcome
+    /// lands.
+    #[test]
+    fn is_running_is_true_only_while_the_call_is_in_flight() {
+        let live = ToolCallBlock::pending("c", "read_file", r#"{"file_path":"a.rs"}"#);
+        assert!(live.is_running(), "a pending call is running");
+        for done in [
+            Outcome::Ok("20 行".into()),
+            Outcome::Failed("no such file".into()),
+            Outcome::Interrupted,
+        ] {
+            assert!(
+                !live.with(done).is_running(),
+                "a finished call is not running"
+            );
         }
     }
 

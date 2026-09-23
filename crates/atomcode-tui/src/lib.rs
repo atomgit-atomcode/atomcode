@@ -51,6 +51,7 @@ pub mod command;
 pub mod commands;
 pub mod conformance;
 pub mod content;
+pub mod diff;
 pub mod el;
 pub mod frame;
 pub mod host;
