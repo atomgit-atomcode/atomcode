@@ -49,7 +49,22 @@ impl ImagePreprocessor for VlImagePreprocessor {
         }
         let config = match Config::load(&Config::default_path()) {
             Ok(c) => c,
-            Err(_) => return (UserInput { text, images }, None),
+            // Past `should_skip` there ARE images and the model is text-only, so a
+            // passthrough here would drop them silently — the very thing this path
+            // exists to prevent. If the config cannot be read there is no VL helper
+            // to reach either: clear the bytes and say so.
+            Err(_) => {
+                return apply_outcome(
+                    text,
+                    images,
+                    PreprocessOutcome::Failed {
+                        reason: "no vision: the model does not accept images and the \
+                                 configuration could not be read to find a \
+                                 vision_preprocessor_provider"
+                            .to_string(),
+                    },
+                )
+            }
         };
         // Non-vision main model AND no VL helper configured: the bytes cannot
         // reach the model, and the adapter would drop them silently. Fold the
