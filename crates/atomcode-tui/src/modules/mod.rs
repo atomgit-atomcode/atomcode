@@ -4,6 +4,7 @@ pub mod ask;
 pub mod chrome;
 pub mod input;
 pub mod live;
+pub mod mcp;
 pub mod plugins;
 pub mod providers;
 pub mod raster;
