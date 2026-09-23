@@ -385,6 +385,11 @@ pub enum Msg<'a> {
     NoHost,
     /// `/paste` found neither a picture nor text there.
     ClipboardHasNothing,
+    /// A slash command was sent with pictures attached. No command takes
+    /// them, so they went nowhere — and that has to be said.
+    CommandCarriesNoPictures {
+        count: usize,
+    },
     /// `/team` or `/todo` with a word neither of them knows.
     FoldUsage {
         name: &'a str,

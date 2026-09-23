@@ -290,6 +290,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::NoClipboard => "this screen has no clipboard".into(),
         Msg::NoAgent => "this screen is not connected to an agent".into(),
         Msg::NoHost => "this screen is not connected to a host".into(),
+        Msg::CommandCarriesNoPictures { count } =>
+            format!("a command carries no pictures, so the {count} attached went nowhere; send them in a message instead").into(),
         Msg::FoldUsage { name, other } =>
             format!("`/{name} {other}`? it takes nothing (toggle), `show`, or `hide`").into(),
         Msg::ClipboardHasNothing => "there is nothing on the clipboard to paste; `/paste <path>` takes a file instead — a picture attaches, anything else goes in as text".into(),

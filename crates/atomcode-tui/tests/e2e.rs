@@ -1483,6 +1483,38 @@ async fn slash_paste_still_pastes_text_when_there_is_no_picture() {
     task.abort();
 }
 
+/// A picture attached to a **command** goes nowhere, and the screen says so.
+///
+/// No command carries pictures, and the submit path drains them off the
+/// composer before it decides the line was a command — so a screenshot attached
+/// and then `/goal 照着这张图做` vanished with no word about it, which is the
+/// one thing the attachment subsystem exists to prevent. Until some command
+/// does carry them, being told is the fix.
+#[tokio::test]
+async fn a_picture_attached_to_a_command_is_not_dropped_in_silence() {
+    let dir = scratch("command-with-picture");
+    let s = start(tree(&dir, &replay_vision(r#"{ text = "ok" }"#, true), &[])).await;
+    let task = s.open().await;
+    s.quiet().await;
+
+    // The command first, then the picture: a marker in front of the slash would
+    // make the line ordinary prose, which is a different thing entirely.
+    s.term.type_text("/keys ");
+    s.term.set_clipboard_image(screenshot("for-a-command"));
+    s.term.press(KeyPress::ctrl('v'));
+    s.quiet().await;
+    assert!(s.screen().contains("[Image #1]"), "{}", s.screen());
+
+    s.term.press(KeyPress::plain(Key::Enter));
+    s.quiet().await;
+    let screen = s.screen();
+    assert!(
+        screen.contains("命令带不了图片"),
+        "the screen says the picture went nowhere:\n{screen}"
+    );
+    task.abort();
+}
+
 #[tokio::test]
 async fn an_idle_draft_takes_two_taps_of_esc_to_clear() {
     let dir = scratch("esc-idle-clear");

@@ -4088,6 +4088,18 @@ impl Tui {
                 // is NOT a command: it reaches the model untouched instead of
                 // erroring with "没有 /Users/… 这条命令".
                 if crate::command::looks_like_command(&text) {
+                    // A command carries no pictures — no command takes them —
+                    // and `take_shown` above has already drained them off the
+                    // composer. Until one does, **say so**: a screenshot
+                    // attached and then silently dropped is the failure this
+                    // whole subsystem exists to prevent (`attach.rs`: what was
+                    // written and what was attached are decided together), and
+                    // the person's next question is "did it see the picture?".
+                    if !images.is_empty() {
+                        self.say_refused(&t(Msg::CommandCarriesNoPictures {
+                            count: images.len(),
+                        }));
+                    }
                     self.run_command(&text);
                     return false;
                 }
