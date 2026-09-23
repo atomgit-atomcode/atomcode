@@ -3821,6 +3821,13 @@ impl Tui {
                 // turn's first fact arrives, so the screen is not blank meanwhile.
                 let recognizing = !images.is_empty()
                     && client.described().is_some_and(|d| !d.supports_vision);
+                // Persist the sent images to the content-addressed cache so a
+                // later arrow-up (or a resumed session) can re-attach their bytes
+                // instead of a bare marker. Best-effort, off the moment lock; the
+                // bytes are already normalised, so nothing here re-inflates.
+                for image in &images {
+                    crate::image_cache::write(image);
+                }
                 client.send(text.clone(), images);
                 if recognizing {
                     self.host.start_recognizing();
@@ -5198,6 +5205,10 @@ fn recall_back(m: &mut crate::moment::Moment) {
     };
     m.history_at = Some(at);
     m.input = m.history[at].clone();
+    // Re-attach any `[Image #N]` this line refers to (renumbered to fresh
+    // markers) so a recalled image is actually sent — and re-recognised — again
+    // rather than reaching the model as a bare placeholder.
+    m.attachments.rehydrate_recalled(&mut m.input);
     m.caret = m.input.len();
 }
 
@@ -5209,6 +5220,10 @@ fn recall_forward(m: &mut crate::moment::Moment) {
     if at + 1 < m.history.len() {
         m.history_at = Some(at + 1);
         m.input = m.history[at + 1].clone();
+        // Re-attach the images this recalled line refers to (see `recall_back`).
+        // Not on the draft branch below: that is the person's own in-progress
+        // text, whose markers are already live and must not be renumbered.
+        m.attachments.rehydrate_recalled(&mut m.input);
     } else {
         m.history_at = None;
         m.input = std::mem::take(&mut m.draft);
