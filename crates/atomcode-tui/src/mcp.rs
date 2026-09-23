@@ -227,6 +227,12 @@ pub struct Panel {
     pub detail_for: Option<String>,
     /// 进详情之前光标停在列表的哪一行,退回来时站回原处。
     pub list_at: usize,
+    /// 上一次点击落在**哪一级的哪一行**。
+    ///
+    /// 鼠标按两次才算动手(见 `Host::mcp_click`),而「同一个格」不能只比行号:
+    /// 进出详情会让同一格底下换一套东西——列表第 8 行是第 3 台服务器,详情第 8 行
+    /// 是第 1 个动作。只比行号的话,双击里落空的那一下就会变成一次危险动作。
+    pub clicked: Option<(Level, usize)>,
 }
 
 impl Panel {

@@ -1581,18 +1581,22 @@ impl UserInterface for Tui {
                                     continue;
                                 }
                             }
-                            // And the MCP panel: a click points at the row and
-                            // presses Enter on it — the two presses a keyboard
-                            // makes, so a click can never reach further than a
-                            // key can. On the list that opens a server; on a
-                            // server's page it runs the action under the
-                            // pointer.
+                            // And the MCP panel: a click points at the row, and
+                            // only a second click on the **same level and row**
+                            // presses Enter — the same discipline the keyboard
+                            // has, since the actions down here include 停用 and
+                            // 登出. The level matters as much as the row: going
+                            // in and out of a server puts different things under
+                            // the same cell, so comparing rows alone would let
+                            // the second half of a double click land on an
+                            // action that was not on screen for the first half.
                             if self.host.mcp_open() {
                                 if let Some(row) = self.host.mcp_row_at(x, y) {
-                                    let _ = self.host.point_mcp_at(row);
-                                    self.run_mcp_key(crate::surface::KeyPress::plain(
-                                        crate::surface::Key::Enter,
-                                    ));
+                                    if self.host.mcp_click(row) {
+                                        self.run_mcp_key(crate::surface::KeyPress::plain(
+                                            crate::surface::Key::Enter,
+                                        ));
+                                    }
                                     stale = true;
                                     continue;
                                 }
