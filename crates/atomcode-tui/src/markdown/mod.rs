@@ -289,28 +289,55 @@ fn openable(url: &str) -> bool {
         .any(|scheme| url.len() > scheme.len() && url.starts_with(scheme))
 }
 
-/// Push `text` as spans, pulling any bare openable URL into its own clickable
-/// run (styled with [`link`], carrying the URL for OSC 8) and leaving the rest
-/// as `base` text.
+/// File extensions a bare ABSOLUTE path must end in to become a `file://` link —
+/// pages and media a terminal can hand to a browser or default viewer. A path
+/// without one of these (a source file, a directory) is left as plain text: this
+/// affordance is for "open the thing you just generated", not every path.
+const OPENABLE_EXTENSIONS: &[&str] = &[
+    "html", "htm", "pdf", "svg", "png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "ico", "mp4",
+    "webm",
+];
+
+/// True when `path` is an absolute path ending in an [`OPENABLE_EXTENSIONS`]
+/// name — the only local paths this tree turns into `file://` links, so a bare
+/// `/etc/hosts` or `/usr/bin` never becomes one.
+fn path_openable(path: &str) -> bool {
+    if !path.starts_with('/') {
+        return false;
+    }
+    let name = path.rsplit('/').next().unwrap_or("");
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => {
+            OPENABLE_EXTENSIONS.iter().any(|e| ext.eq_ignore_ascii_case(e))
+        }
+        _ => false,
+    }
+}
+
+/// Push `text` as spans, pulling any bare openable link (a web/`file://` URL or
+/// an absolute openable path) into its own clickable run — styled with [`link`],
+/// carrying the OSC 8 target — and leaving the rest as `base` text.
 fn push_linkified(text: &str, base: Style, out: &mut Vec<Span>) {
     let mut rest = text;
-    while let Some((start, len)) = next_url(rest) {
+    while let Some((start, len, target)) = next_link(rest) {
         if start > 0 {
             #[allow(
                 clippy::string_slice,
-                reason = "`start` is a byte offset from `find`, always a char boundary"
+                reason = "`start` is a char-boundary byte offset from `next_link`"
             )]
             out.push(Span::styled(rest[..start].to_string(), base));
         }
         #[allow(
             clippy::string_slice,
-            reason = "`start`/`len` are char-boundary byte offsets from `next_url`"
+            reason = "`start`/`len` are char-boundary byte offsets from `next_link`"
         )]
-        let url = &rest[start..start + len];
-        out.push(Span::linked(url.to_string(), link(), url.to_string()));
+        let shown = rest[start..start + len].to_string();
+        // The shown text is the link as written; the OSC 8 target is the URL it
+        // stands for (itself for a URL, `file://`+path for an absolute path).
+        out.push(Span::linked(shown, link(), target));
         #[allow(
             clippy::string_slice,
-            reason = "`start + len` is a char boundary — the URL's end from `next_url`"
+            reason = "`start + len` is a char boundary — the link's end from `next_link`"
         )]
         {
             rest = &rest[start + len..];
@@ -319,6 +346,73 @@ fn push_linkified(text: &str, base: Style, out: &mut Vec<Span>) {
     if !rest.is_empty() {
         out.push(Span::styled(rest.to_string(), base));
     }
+}
+
+/// The first bare link in `s` — a scheme URL or an absolute openable path,
+/// whichever comes first — as `(byte offset, byte length, osc8_target)`.
+///
+/// The shown text is `s[offset..offset+len]`; the OSC 8 target is the URL itself
+/// for a scheme link, or `file://` prepended for a path. A `file://` URL wins
+/// over the path inside it (it starts earlier), so the two never double-link.
+fn next_link(s: &str) -> Option<(usize, usize, String)> {
+    let url = next_url(s);
+    let path = next_path(s);
+    #[allow(
+        clippy::string_slice,
+        reason = "offsets/lengths from next_url/next_path are char boundaries"
+    )]
+    match (url, path) {
+        (Some((us, ul)), Some((ps, _))) if us <= ps => Some((us, ul, s[us..us + ul].to_string())),
+        (_, Some((ps, pl))) => Some((ps, pl, format!("file://{}", &s[ps..ps + pl]))),
+        (Some((us, ul)), None) => Some((us, ul, s[us..us + ul].to_string())),
+        (None, None) => None,
+    }
+}
+
+/// The first bare absolute openable path in `s`, as `(byte offset, byte length)`.
+///
+/// A path starts at a `/` sitting at a word boundary (start of string, or after
+/// whitespace/an opener) so `and/or.html` or a `//` mid-token is not mistaken for
+/// one, runs to the first whitespace/control, has trailing sentence punctuation
+/// trimmed, and must end in an [`OPENABLE_EXTENSIONS`] name. `None` otherwise.
+fn next_path(s: &str) -> Option<(usize, usize)> {
+    let mut boundary = true;
+    for (i, c) in s.char_indices() {
+        if c == '/' && boundary {
+            #[allow(
+                clippy::string_slice,
+                reason = "`i` is a byte offset from `char_indices`, a char boundary"
+            )]
+            let tail = &s[i..];
+            let end = tail
+                .char_indices()
+                .find(|(_, c)| c.is_whitespace() || c.is_control())
+                .map(|(j, _)| j)
+                .unwrap_or(tail.len());
+            #[allow(
+                clippy::string_slice,
+                reason = "`end` is a char boundary from `char_indices`"
+            )]
+            let trimmed = tail[..end].trim_end_matches(|c: char| {
+                matches!(
+                    c,
+                    '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '>' | '"' | '\''
+                        | '，'
+                        | '。'
+                        | '、'
+                        | '」'
+                        | '』'
+                        | '）'
+                )
+            });
+            if path_openable(trimmed) {
+                return Some((i, trimmed.len()));
+            }
+        }
+        boundary = c.is_whitespace()
+            || matches!(c, '(' | '[' | '{' | '<' | '"' | '\'' | '（' | '「' | '『' | '【' | '《');
+    }
+    None
 }
 
 /// The first bare openable URL in `s`, as `(byte offset, byte length)`.
@@ -1109,6 +1203,59 @@ mod tests {
             b.link.is_none(),
             "a relative link is not an OSC 8 hyperlink"
         );
+    }
+
+    #[test]
+    fn a_generated_absolute_path_becomes_a_file_link() {
+        // The screenshot case: the agent reports where it wrote a page, and that
+        // bare absolute path is clickable — shown as written, opened as `file://`.
+        let spans = spans_of(
+            "已在默认浏览器打开 /Users/theo/Documents/workspace/atomcode/pelican-bike.html。",
+            300,
+        );
+        let link = spans.iter().find(|s| s.link.is_some()).expect("a linked run");
+        assert_eq!(
+            link.text,
+            "/Users/theo/Documents/workspace/atomcode/pelican-bike.html"
+        );
+        assert_eq!(
+            link.link.as_deref(),
+            Some("file:///Users/theo/Documents/workspace/atomcode/pelican-bike.html")
+        );
+    }
+
+    #[test]
+    fn a_path_without_an_openable_extension_stays_plain() {
+        // A source file or a directory is not something to open in a browser.
+        for text in ["see /etc/hosts here", "cd /usr/local/bin now", "edit /src/main.rs"] {
+            let spans = spans_of(text, 200);
+            assert!(
+                spans.iter().all(|s| s.link.is_none()),
+                "no link for {text:?}: {spans:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_slash_mid_word_is_not_a_path() {
+        // `and/or.html` / a relative `docs/x.png` is not an absolute path — the
+        // leading slash must sit at a word boundary.
+        for text in ["pick and/or.html today", "at docs/guide.png ok"] {
+            let spans = spans_of(text, 200);
+            assert!(
+                spans.iter().all(|s| s.link.is_none()),
+                "no link for {text:?}: {spans:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_url_does_not_double_link_its_inner_path() {
+        // `file:///a/b.html` is one link (the URL), not the URL plus the `/a/b.html`
+        // inside it.
+        let spans = spans_of("open file:///a/b.html", 200);
+        let links: Vec<&str> = spans.iter().filter_map(|s| s.link.as_deref()).collect();
+        assert_eq!(links, ["file:///a/b.html"], "{spans:?}");
     }
 
     #[test]
