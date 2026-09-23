@@ -805,6 +805,22 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         }
         Msg::CmdAboutInTheCli => "belongs to the command line".into(),
         Msg::CmdAboutSchedule => "the scheduled tasks, and when each runs next".into(),
+        Msg::CmdAboutOpenRouter => "connect OpenRouter's free models".into(),
+        Msg::OpenRouterTakes => "[api key]".into(),
+        Msg::OpenRouterConnecting => "Connecting OpenRouter…".into(),
+        Msg::OpenRouterAuthorise { url } => {
+            format!("Authorise in the browser. If it did not open: {url}").into()
+        }
+        Msg::OpenRouterNoAnswer => "No answer from the browser — cancelled or timed out.".into(),
+        Msg::OpenRouterNoFreeModels => "OpenRouter returned no free models.".into(),
+        Msg::OpenRouterConnected { added, default } => {
+            format!("OpenRouter is connected: {added} free model(s) added, `{default}` is the one in force.").into()
+        }
+        Msg::OpenRouterNotReloaded { error } => format!(
+            "OpenRouter is connected and saved, but this session was not reloaded ({error}); it takes effect on the next launch."
+        )
+        .into(),
+        Msg::OpenRouterFailed { error } => format!("OpenRouter was not connected: {error}").into(),
         Msg::ScheduleNone => {
             "Nothing is scheduled. `atomcode schedule add` sets one up.".into()
         }

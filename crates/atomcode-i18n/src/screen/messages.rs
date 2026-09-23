@@ -1305,6 +1305,24 @@ pub enum Msg<'a> {
     },
     CmdAboutInTheCli,
     CmdAboutSchedule,
+    CmdAboutOpenRouter,
+    OpenRouterTakes,
+    OpenRouterConnecting,
+    OpenRouterAuthorise {
+        url: &'a str,
+    },
+    OpenRouterNoAnswer,
+    OpenRouterNoFreeModels,
+    OpenRouterConnected {
+        added: usize,
+        default: &'a str,
+    },
+    OpenRouterNotReloaded {
+        error: &'a str,
+    },
+    OpenRouterFailed {
+        error: &'a str,
+    },
     ScheduleNone,
     ScheduleTaskLine {
         id: &'a str,

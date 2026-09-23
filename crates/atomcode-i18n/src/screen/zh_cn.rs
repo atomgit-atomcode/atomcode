@@ -783,6 +783,21 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         }
         Msg::CmdAboutInTheCli => "归命令行".into(),
         Msg::CmdAboutSchedule => "排了哪些定时任务，各自下次什么时候跑".into(),
+        Msg::CmdAboutOpenRouter => "接上 OpenRouter 的免费模型".into(),
+        Msg::OpenRouterTakes => "[api key]".into(),
+        Msg::OpenRouterConnecting => "正在接 OpenRouter…".into(),
+        Msg::OpenRouterAuthorise { url } => {
+            format!("去浏览器里授权。没自动打开的话:{url}").into()
+        }
+        Msg::OpenRouterNoAnswer => "浏览器那边没有回应——取消了,或者超时了。".into(),
+        Msg::OpenRouterNoFreeModels => "OpenRouter 没有返回可用的免费模型。".into(),
+        Msg::OpenRouterConnected { added, default } => {
+            format!("OpenRouter 接上了:新增 {added} 个免费模型,当前用的是 `{default}`。").into()
+        }
+        Msg::OpenRouterNotReloaded { error } => {
+            format!("OpenRouter 接上并已保存,但这次会话没重载({error});下次启动生效。").into()
+        }
+        Msg::OpenRouterFailed { error } => format!("OpenRouter 没接上:{error}").into(),
         Msg::ScheduleNone => "还没有定时任务。用 `atomcode schedule add` 排一个。".into(),
         Msg::ScheduleTaskLine {
             id,

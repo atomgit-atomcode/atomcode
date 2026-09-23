@@ -31,6 +31,7 @@ pub mod tui_command_meter;
 pub mod tui_elsewhere;
 pub mod tui_login;
 pub mod tui_onboarding;
+pub mod tui_openrouter;
 pub mod tui_plugins;
 pub mod tui_providers;
 pub mod tui_proxy;
@@ -116,6 +117,7 @@ pub mod tui_front {
             crate::tui_elsewhere::row_layer(),
             crate::tui_proxy::row_layer(),
             crate::tui_schedule::row_layer(),
+            crate::tui_openrouter::row_layer(),
         ];
         let mut rows: Vec<Arc<dyn atomcode_plexus::Plugin>> = vec![
             Arc::new(crate::tui_settings::SettingsRow),
@@ -140,6 +142,9 @@ pub mod tui_front {
                 config_path: config_path.clone(),
             }),
             Arc::new(crate::tui_schedule::ScheduleRow),
+            Arc::new(crate::tui_openrouter::OpenRouterRow {
+                config_path: config_path.clone(),
+            }),
         ];
         // The eighth row, and only when there is something to count into:
         // a launch with telemetry off has no such row at all, which is what

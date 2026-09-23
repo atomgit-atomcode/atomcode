@@ -647,3 +647,49 @@ async fn scheduled_tasks_are_listed_here() {
     term.press(atomcode_tui::surface::KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), running).await;
 }
+
+/// Every command this launcher mounts is in the menu `/help` prints. One
+/// criterion for all of them, because the way any of these rows breaks is the
+/// same: the row stops being mounted and nothing says so.
+#[tokio::test]
+async fn the_launchers_own_commands_are_in_the_menu() {
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("ATOMCODE_HOME", home.path());
+    let project = tempfile::tempdir().unwrap();
+    let count = Arc::new(Count::default());
+    let config_path = home.path().join("config.toml");
+    let _locale = atomcode_config::i18n::test_lock();
+    atomcode_config::i18n::set_locale(atomcode_config::locale::Locale::ZhCn);
+
+    let front_end = FrontEnd::new();
+    let (start, config) = start(
+        project.path(),
+        &count,
+        SessionMode::Fresh,
+        Some(front_end.clone()),
+    );
+    let runtime = CodingRuntime::start(start).await.expect("starts");
+    let screen = Screen {
+        headless: Some((160, 60)),
+        ..Screen::default()
+    };
+    let mounted = tui_front::mount(runtime, front_end, config, None, &screen, config_path, None)
+        .await
+        .expect("the screen mounts");
+    let commands = mounted
+        .app
+        .context()
+        .service::<atomcode_tui::plugin::CommandsSvc>()
+        .expect("the command registry");
+    let offered: Vec<String> = commands
+        .all()
+        .into_iter()
+        .map(|c| c.name.into_owned())
+        .collect();
+    for name in ["proxy", "schedule", "openrouter", "onboarding", "config"] {
+        assert!(
+            offered.contains(&name.to_string()),
+            "`/{name}` is mounted: {offered:?}"
+        );
+    }
+}
