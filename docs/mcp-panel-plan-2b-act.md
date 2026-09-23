@@ -421,10 +421,14 @@ fn to_mcp_action(action: McpAction) -> atomcode_coding::parts::McpAction {
                 action,
             } => {
                 self.addressed(&session)?;
-                self.handle
-                    .mcp_act(server, to_mcp_action(action))
-                    .await
-                    .map_err(refused)?;
+                let Some(action) = to_mcp_action(action) else {
+                    // `unknown_action()` 是你在这个文件里加的小助手，返回
+                    // `HostError::Failed` 配本文件已有的那条「这个宿主还不会做
+                    // 那件事」文案（`main.rs` 的兜底用的是同一句；文案名以那两个
+                    // 文件里的实际为准）。
+                    return Err(unknown_action());
+                };
+                self.handle.mcp_act(server, action).await.map_err(refused)?;
                 // Answer with the refreshed list — what happened, not what was
                 // asked for. The write path's own `mcp_rows()` is the same one
                 // the list uses, so the two cannot disagree.
@@ -435,7 +439,26 @@ fn to_mcp_action(action: McpAction) -> atomcode_coding::parts::McpAction {
             }
 ```
 
-`McpAction` 是 `#[non_exhaustive]`：`to_mcp_action` 的 `match` 会因此需要一个兜底分支。**不要**加 `_ =>`——加变体时你要的是编译错误，不是它悄悄落到某个默认动作上。改成在函数签名上收窄：接受 `&McpAction` 并让 `match` 穷尽失败即报错（`#[non_exhaustive]` 只约束**外部** crate，仓内仍可穷尽匹配，这里正是仓内）。
+**更正（初稿写错了，执行时撞出来的）**：初稿说「`#[non_exhaustive]` 只约束外部 crate，仓内仍可穷尽匹配，这里正是仓内」——**不对**。`McpAction` 声明在 `atomcode-host-api`，而 `crates/atomcode-cli/src/host.rs` 是**另一个 crate**，所以 `#[non_exhaustive]` 在这里确实生效，兜底分支是**必须**的。（初稿同一段前半句自己也写着"需要一个兜底分支"，前后打了一架。）
+
+但兜底**不能悄悄挑一个动作**。把映射做成可失败的：
+
+```rust
+fn to_mcp_action(action: McpAction) -> Option<atomcode_coding::parts::McpAction> {
+    match action {
+        McpAction::Trust => Some(atomcode_coding::parts::McpAction::Trust),
+        McpAction::Untrust => Some(atomcode_coding::parts::McpAction::Untrust),
+        McpAction::Login => Some(atomcode_coding::parts::McpAction::Login),
+        McpAction::Logout => Some(atomcode_coding::parts::McpAction::Logout),
+        McpAction::Enable => Some(atomcode_coding::parts::McpAction::Enable),
+        McpAction::Disable => Some(atomcode_coding::parts::McpAction::Disable),
+        // 这个构建还不认识的动作:**拒绝**,不落到附近那一个上。
+        _ => None,
+    }
+}
+```
+
+`None` 在分发臂里就是一次拒绝。措辞用本文件已有的「这个宿主还不会做那件事」一类（`main.rs` 里那句 `HostError::Failed { message }` 的兜底就是它）；若找不到合适的，就往 i18n 表加一条，别硬套一句意思不对的。
 
 - [ ] **Step 4: 跑测试，确认通过**
 
