@@ -3941,7 +3941,14 @@ impl Tui {
                 // model gets the whole paste — put the bodies back before
                 // anything reads the text.
                 let text = crate::moment::expand_pastes(&m.input, &m.pastes);
-                let text = text.trim().to_string();
+                let mut text = text.trim().to_string();
+                // A recalled line's markers point at images only the gallery still
+                // holds — the send queue drained on their first submit. Re-attach
+                // them under fresh numbers (`[Image #old]`→`[Image #new]`) so the
+                // picture is sent, and re-recognised, again. Done once here at
+                // submit rather than on every recall keystroke; freshly-attached
+                // markers already on the queue are left alone.
+                m.attachments.rehydrate_recalled(&mut text);
                 // Take the pictures the text still shows before the text is
                 // cleared: what was written and what was attached have to be
                 // decided together, or an attachment can outlive the marker
@@ -5389,10 +5396,6 @@ fn recall_back(m: &mut crate::moment::Moment) {
     };
     m.history_at = Some(at);
     m.input = m.history[at].clone();
-    // Re-attach any `[Image #N]` this line refers to (renumbered to fresh
-    // markers) so a recalled image is actually sent — and re-recognised — again
-    // rather than reaching the model as a bare placeholder.
-    m.attachments.rehydrate_recalled(&mut m.input);
     m.caret = m.input.len();
 }
 
@@ -5404,10 +5407,6 @@ fn recall_forward(m: &mut crate::moment::Moment) {
     if at + 1 < m.history.len() {
         m.history_at = Some(at + 1);
         m.input = m.history[at + 1].clone();
-        // Re-attach the images this recalled line refers to (see `recall_back`).
-        // Not on the draft branch below: that is the person's own in-progress
-        // text, whose markers are already live and must not be renumbered.
-        m.attachments.rehydrate_recalled(&mut m.input);
     } else {
         m.history_at = None;
         m.input = std::mem::take(&mut m.draft);

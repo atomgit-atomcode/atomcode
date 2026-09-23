@@ -174,20 +174,33 @@ impl Attachments {
             .map(|p| &p.image)
     }
 
-    /// Re-attach the images an arrow-up'd history line refers to, under FRESH
-    /// marker numbers, and rewrite the line to use them — so a recalled image is
-    /// actually sent (and, for a text-only model, re-recognised) again rather than
-    /// reaching the model as a bare `[Image #N]` placeholder.
+    /// Re-attach the images a recalled line refers to, under FRESH marker
+    /// numbers, and rewrite the line to use them — so a recalled image is actually
+    /// sent (and, for a text-only model, re-recognised) again rather than reaching
+    /// the model as a bare `[Image #N]` placeholder.
     ///
-    /// Each still-known `[Image #old]` becomes `[Image #new]` (the renumber the
-    /// classic front end does, which is why the marker "becomes some other
-    /// number"), with its bytes pushed back onto the send queue. Returns the
-    /// numbers whose bytes are gone (a resumed session's in-memory gallery is
-    /// empty, or the marker was typed as literal text) — their markers are left
-    /// as-is for the caller to note.
+    /// Called **once, at submit** — not on every recall keystroke, which would
+    /// re-clone the image on each arrow press (the history line is never mutated,
+    /// so it keeps handing back the old markers). A marker whose bytes are already
+    /// on the send queue (a freshly-attached image this compose) is left alone;
+    /// the same marker twice in one line is handled once.
+    ///
+    /// Each still-known recalled `[Image #old]` becomes `[Image #new]` (the
+    /// renumber the classic front end does, which is why the marker "becomes some
+    /// other number"). Returns the numbers whose bytes are gone (a resumed
+    /// session's in-memory gallery is empty, or the marker was typed as literal
+    /// text) — their markers are left as-is for the caller to note.
     pub fn rehydrate_recalled(&mut self, line: &mut String) -> Vec<usize> {
+        use std::collections::HashSet;
+        // Markers already going this submit are fresh attachments, not recalls —
+        // re-adding them would send (and cache) the same picture twice.
+        let queued: HashSet<usize> = self.images.iter().map(|p| p.marker).collect();
+        let mut handled: HashSet<usize> = HashSet::new();
         let mut missing = Vec::new();
         for old in markers_in(line) {
+            if queued.contains(&old) || !handled.insert(old) {
+                continue;
+            }
             match self.image_at(old).cloned() {
                 Some(image) => {
                     let fresh = self.add(image);
@@ -545,6 +558,24 @@ mod tests {
         let mut gone = "stale [Image #99] here".to_string();
         assert_eq!(a.rehydrate_recalled(&mut gone), vec![99]);
         assert_eq!(gone, "stale [Image #99] here", "left as-is for the caller");
+    }
+
+    // A freshly-attached image is already on the send queue, so submit-time
+    // rehydration must leave it alone — re-adding would send/cache it twice — and
+    // the same marker twice in one line is handled once, not duplicated.
+    #[test]
+    fn rehydrate_leaves_queued_markers_and_deduplicates() {
+        let mut a = Attachments::new();
+        let fresh = a.add(img("fresh")); // [Image #1], still on the send queue
+        let mut line = format!("{fresh} and {fresh} again");
+        let missing = a.rehydrate_recalled(&mut line);
+        assert!(missing.is_empty());
+        assert_eq!(line, "[Image #1] and [Image #1] again", "queued marker untouched");
+        assert_eq!(
+            a.take_shown(&line),
+            vec![img("fresh")],
+            "the one queued image is sent once, not duplicated"
+        );
     }
 
     // Spans cover each marker whole, so editing can treat it as one chip.

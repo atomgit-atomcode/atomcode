@@ -65,25 +65,36 @@ fn path_for(dir: &std::path::Path, hash: u64, media_type: &str) -> std::path::Pa
 /// hash. Idempotent — a content-addressed file that exists is left alone. Every
 /// failure is swallowed.
 pub fn write(img: &ImageContent) {
-    use base64::Engine as _;
-    let Some(dir) = cache_dir() else { return };
-    let path = path_for(&dir, hash(img), &img.media_type);
-    if path.exists() {
-        return;
-    }
-    let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(img.data.as_bytes()) else {
-        return;
-    };
-    if std::fs::create_dir_all(&dir).is_ok() {
-        let _ = std::fs::write(&path, &raw);
+    if let Some(dir) = cache_dir() {
+        write_to(&dir, img);
     }
 }
 
 /// Read an image's bytes back from the cache by content hash, for re-attaching a
 /// recalled or resumed image. `None` when the file is gone.
 pub fn read(hash: u64, media_type: &str) -> Option<Vec<u8>> {
-    let dir = cache_dir()?;
-    std::fs::read(path_for(&dir, hash, media_type)).ok()
+    read_from(&cache_dir()?, hash, media_type)
+}
+
+/// The `write`/`read` bodies against an explicit directory — the seam that keeps
+/// the tests off the process-global `ATOMCODE_HOME` env (a data race with any
+/// concurrent `getenv`).
+fn write_to(dir: &std::path::Path, img: &ImageContent) {
+    use base64::Engine as _;
+    let path = path_for(dir, hash(img), &img.media_type);
+    if path.exists() {
+        return;
+    }
+    let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(img.data.as_bytes()) else {
+        return;
+    };
+    if std::fs::create_dir_all(dir).is_ok() {
+        let _ = std::fs::write(&path, &raw);
+    }
+}
+
+fn read_from(dir: &std::path::Path, hash: u64, media_type: &str) -> Option<Vec<u8>> {
+    std::fs::read(path_for(dir, hash, media_type)).ok()
 }
 
 #[cfg(test)]
@@ -119,22 +130,24 @@ mod tests {
     #[test]
     fn write_then_read_round_trips_the_real_bytes() {
         use base64::Engine as _;
+        // A scratch dir passed in directly — no process-global env mutation, so
+        // this cannot race a concurrent `getenv` in another test thread.
         let dir = tempfile::tempdir().unwrap();
-        // Point the cache at a scratch home for this test only.
-        std::env::set_var("ATOMCODE_HOME", dir.path());
         let raw = b"\x89PNG\r\n\x1a\nsome-bytes";
         let content = ImageContent {
             media_type: "image/png".into(),
             data: base64::engine::general_purpose::STANDARD.encode(raw),
         };
-        write(&content);
-        let got = read(hash(&content), &content.media_type).expect("the bytes were cached");
+        write_to(dir.path(), &content);
+        let got =
+            read_from(dir.path(), hash(&content), &content.media_type).expect("the bytes cached");
         assert_eq!(got, raw, "the raw (decoded) bytes round-trip");
+        // Idempotent: a second write of the same content is a no-op, not a churn.
+        write_to(dir.path(), &content);
         assert_eq!(
-            read(0xdead_beef, "image/png"),
+            read_from(dir.path(), 0xdead_beef, "image/png"),
             None,
             "an unknown hash is a miss, not a panic"
         );
-        std::env::remove_var("ATOMCODE_HOME");
     }
 }
