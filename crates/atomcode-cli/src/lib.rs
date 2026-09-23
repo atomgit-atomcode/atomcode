@@ -32,6 +32,7 @@ pub mod tui_elsewhere;
 pub mod tui_login;
 pub mod tui_onboarding;
 pub mod tui_openrouter;
+pub mod tui_places;
 pub mod tui_plugins;
 pub mod tui_providers;
 pub mod tui_proxy;
@@ -118,6 +119,7 @@ pub mod tui_front {
             crate::tui_proxy::row_layer(),
             crate::tui_schedule::row_layer(),
             crate::tui_openrouter::row_layer(),
+            crate::tui_places::row_layer(),
         ];
         let mut rows: Vec<Arc<dyn atomcode_plexus::Plugin>> = vec![
             Arc::new(crate::tui_settings::SettingsRow),
@@ -143,6 +145,9 @@ pub mod tui_front {
             }),
             Arc::new(crate::tui_schedule::ScheduleRow),
             Arc::new(crate::tui_openrouter::OpenRouterRow {
+                config_path: config_path.clone(),
+            }),
+            Arc::new(crate::tui_places::PlacesRow {
                 config_path: config_path.clone(),
             }),
         ];

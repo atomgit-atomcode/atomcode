@@ -100,6 +100,9 @@ plexus_service!(RewindSvc => dyn crate::rewind::Rewind, "tui-rewind", Seam, "The
 // Throwing a stored session away: the store is on disk and this crate does not
 // reach disks (`docs/adr/0022` §3), so the panel asks over a seam.
 plexus_service!(ResumeSvc => dyn crate::resume::Resume, "tui-resume-store", Seam, "Throwing away a stored session the resume panel lists");
+// The directories a person marked to come back to: kept in the launcher's
+// configuration file, which this crate does not read.
+plexus_service!(PlacesSvc => dyn crate::places::Places, "tui-places", Seam, "The directories a person marked for `/cd` to offer first");
 // And the seed installation, on the same terms: unpacking the embedded seeds,
 // scanning the project and locking a file are the launcher's to do — this crate
 // keeps its `atomcode-capabilities` features down to `tools` on purpose, and

@@ -251,6 +251,16 @@ pub enum Msg<'a> {
     NoResumePanel,
     /// The launcher mounted the panel but no way to throw a session away.
     NoResumeStore,
+    /// The launcher mounted no place to keep `/cd` bookmarks.
+    NoPlaces,
+    CdBookmarked,
+    CdRecent,
+    CdPinned {
+        dir: &'a str,
+    },
+    CdUnpinned {
+        dir: &'a str,
+    },
     /// On the row a second Delete would throw away.
     ResumeDeleteArmed,
     ResumeDeleted {

@@ -183,6 +183,13 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "this screen cannot throw a session away: the launcher provided no `tui-resume-store`"
                 .into()
         }
+        Msg::NoPlaces => {
+            "this screen cannot keep bookmarks: the launcher provided no `tui-places`".into()
+        }
+        Msg::CdBookmarked => "marked".into(),
+        Msg::CdRecent => "worked in recently".into(),
+        Msg::CdPinned { dir } => format!("{dir} is marked — /cd offers it first").into(),
+        Msg::CdUnpinned { dir } => format!("{dir} is no longer marked").into(),
         Msg::ResumeDeleteArmed => "Delete again to throw it away".into(),
         Msg::ResumeDeleted { id } => format!("Session {id} is gone").into(),
         Msg::ResumeDeleteFailed { why } => format!("It was not deleted: {why}").into(),
@@ -235,7 +242,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdAboutRename => "give this session another name".into(),
         Msg::CmdAboutDiff => "what this session did to the workspace; with no file it lists the changed ones to pick from".into(),
         Msg::CmdAboutMode => "change what gets asked: plan looks without touching, ask asks first, edits writes files without asking, auto asks nothing; with no argument it says which one is on".into(),
-        Msg::CmdAboutCd => "work in another directory; this starts a new session".into(),
+        Msg::CmdAboutCd => "work in another directory (starts a new session); pin / unpin marks the ones you come back to".into(),
         Msg::CmdAboutPlan => "look without touching (same as /mode plan)".into(),
         Msg::CmdAboutBuild => "ask before touching (same as /mode ask)".into(),
         Msg::CmdAboutAuto => "ask nothing (same as /mode auto)".into(),
@@ -263,7 +270,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdTakesTurnScope => "[turn [conversation|code|both]]".into(),
         Msg::CmdTakesModelId => "[model id]".into(),
         Msg::CmdTakesName => "<name>".into(),
-        Msg::CmdTakesDirectory => "<directory>".into(),
+        Msg::CmdTakesDirectory => "<directory | pin | unpin>".into(),
         Msg::CmdTakesMcp => "[tools <server>|withdraw]".into(),
         Msg::CmdTakesLanguage => "[language]".into(),
 

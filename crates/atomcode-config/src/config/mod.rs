@@ -605,6 +605,14 @@ pub struct UiConfig {
     /// change takes effect immediately.
     #[serde(default)]
     pub mode_switch_key: ModeSwitchKey,
+    /// Directories a person marked to come back to, newest first — what `/cd`
+    /// offers before it offers anything it found by looking around.
+    ///
+    /// A list rather than a settings-catalogue entry: the catalogue is one
+    /// value per key (a person types it), and this one is written by the
+    /// gesture that marks a directory, never by hand.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cd_bookmarks: Vec<String>,
 }
 
 impl Default for UiConfig {
@@ -621,6 +629,7 @@ impl Default for UiConfig {
             brand_name: default_brand_name(),
             oauth_provider_name: default_oauth_provider_name(),
             mode_switch_key: ModeSwitchKey::default(),
+            cd_bookmarks: Vec::new(),
         }
     }
 }

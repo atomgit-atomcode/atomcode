@@ -861,21 +861,58 @@ impl CommandSet for SessionCommands {
             }
             "cd" => {
                 let directory = args.trim();
+                // `pin` / `unpin`:标一个目录,或取消。带目录就是它,不带就是
+                // 现在这个——人多半是干着干着决定「这地方以后还要来」。
+                if let Some(rest) = directory
+                    .strip_prefix("pin")
+                    .or_else(|| directory.strip_prefix("unpin"))
+                {
+                    let pinning = directory.starts_with("pin");
+                    let where_ = match rest.trim() {
+                        "" => client.root(),
+                        named => named.to_string(),
+                    };
+                    let Some(places) = ctx.service::<crate::plugin::PlacesSvc>() else {
+                        return Outcome::Refused(t(Msg::NoPlaces).into_owned());
+                    };
+                    let done = match pinning {
+                        true => places.pin(&where_).await,
+                        false => places.unpin(&where_).await,
+                    };
+                    let shown = crate::text::collapse_home(&where_);
+                    return match (done, pinning) {
+                        (Ok(()), true) => {
+                            Outcome::Said(t(Msg::CdPinned { dir: &shown }).into_owned())
+                        }
+                        (Ok(()), false) => {
+                            Outcome::Said(t(Msg::CdUnpinned { dir: &shown }).into_owned())
+                        }
+                        (Err(why), _) => Outcome::Refused(why),
+                    };
+                }
                 // Nothing typed, or a directory named but not the last word:
                 // browse from there. tuix had a picker for this
                 // (`modals/dir_picker.rs`); what a person needs of it is to see
                 // what is under here and step into it, which is a list whose
                 // picks are this command again.
                 if directory.is_empty() || directory.ends_with('/') {
-                    let from = if directory.is_empty() {
-                        client.root()
-                    } else if std::path::Path::new(directory).is_absolute() {
+                    // 从哪儿开始浏览。**要问宿主要工作目录**:`client.root()` 是
+                    // 这块屏幕跟着的**会话 id**,不是目录——裸 `/cd` 曾经拿它当路径
+                    // 去读,于是只会报「读不了」,相对路径也拼在会话 id 上。
+                    let from = if std::path::Path::new(directory).is_absolute() {
                         directory.to_string()
                     } else {
-                        std::path::Path::new(&client.root())
-                            .join(directory)
-                            .display()
-                            .to_string()
+                        let Some(here) = working_dir(control.clone(), client.root()).await else {
+                            return Outcome::Refused(t(Msg::NoHost).into_owned());
+                        };
+                        if directory.is_empty() {
+                            here
+                        } else {
+                            std::path::Path::new(&here)
+                                .join(directory)
+                                .display()
+                                .to_string()
+                        }
                     };
                     // The trailing slash was the gesture ("browse here"), not
                     // part of the place. Left on, the row that says "stay here"
@@ -890,6 +927,33 @@ impl CommandSet for SessionCommands {
                         }
                     };
                     let mut choices: Vec<crate::overlay::Choice> = Vec::new();
+                    // 标下的地方排在最前,其次是最近干活的目录:这两样是「我要去
+                    // 哪儿」的答案,而底下那半是「这儿有什么」。只在最外面那一屏
+                    // 给——走进子目录之后再列一遍,等于每一层都把同样的东西说一遍。
+                    if directory.is_empty() {
+                        let pinned = match ctx.service::<crate::plugin::PlacesSvc>() {
+                            Some(places) => places.bookmarks().await,
+                            None => Vec::new(),
+                        };
+                        for dir in &pinned {
+                            choices.push(
+                                crate::overlay::Choice::new(
+                                    format!("/cd {dir}"),
+                                    crate::text::collapse_home(dir),
+                                )
+                                .about(t(Msg::CdBookmarked)),
+                            );
+                        }
+                        for dir in recent_places(control.clone(), &from, &pinned).await {
+                            choices.push(
+                                crate::overlay::Choice::new(
+                                    format!("/cd {dir}"),
+                                    crate::text::collapse_home(&dir),
+                                )
+                                .about(t(Msg::CdRecent)),
+                            );
+                        }
+                    }
                     // Up first: a browser you cannot back out of is a trap.
                     if let Some(up) = std::path::Path::new(&from).parent() {
                         choices.push(
@@ -1504,6 +1568,61 @@ impl CommandSet for SessionCommands {
             _ => Outcome::Quiet,
         }
     }
+}
+
+/// 这个会话现在在哪个目录里干活。
+///
+/// 问宿主,不看屏幕自己记的东西:目录是运行中那棵树的事实,`/cd` 改的也是它
+/// (`docs/adr/0022` §3)。
+async fn working_dir(
+    control: Option<std::sync::Arc<dyn atomcode_host_api::HostControl>>,
+    session: String,
+) -> Option<String> {
+    let control = control?;
+    match control.call(HostCommand::Context { session }).await {
+        Ok(HostReply::Context { working_dir, .. }) => Some(working_dir),
+        _ => None,
+    }
+}
+
+/// 最近干活的那几个目录,最新的在前。
+///
+/// 从宿主的会话目录折出来,不另存一份:会话本来就记着它是在哪儿跑的,而「最近去过
+/// 哪儿」正是这句话的另一种读法。现在这个目录和已经标下的目录不再重复出现——
+/// 一份清单里同一个地方出现两次,人得先分辨它们是不是同一个。
+async fn recent_places(
+    control: Option<std::sync::Arc<dyn atomcode_host_api::HostControl>>,
+    here: &str,
+    pinned: &[String],
+) -> Vec<String> {
+    /// 列几个。多到要翻页的「最近」就不是最近了。
+    const MOST: usize = 5;
+    let Some(control) = control else {
+        return Vec::new();
+    };
+    let Ok(HostReply::Sessions { sessions }) = control
+        .call(HostCommand::ListSessions { working_dir: None })
+        .await
+    else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for session in sessions {
+        let Some(dir) = session.working_dir else {
+            continue;
+        };
+        if dir == here || pinned.iter().any(|already| already == &dir) {
+            continue;
+        }
+        if out.iter().any(|already| already == &dir) {
+            continue;
+        }
+        out.push(dir);
+        if out.len() == MOST {
+            break;
+        }
+    }
+    out
 }
 
 /// `/help`, which has to know about everything, so it holds the registry.
@@ -2761,6 +2880,98 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// `/cd` 先给「我要去哪儿」的答案,再给「这儿有什么」:标过的目录排最前,
+    /// 其次是最近在里面干过活的,最后才是当前目录底下的东西。
+    #[tokio::test]
+    async fn cd_offers_marked_places_then_recent_ones() {
+        struct Marked;
+        #[async_trait]
+        impl crate::places::Places for Marked {
+            async fn bookmarks(&self) -> Vec<String> {
+                vec!["/w/marked".to_string()]
+            }
+            async fn pin(&self, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+            async fn unpin(&self, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let here = tempfile::tempdir().unwrap();
+        std::fs::create_dir(here.path().join("under-here")).unwrap();
+        let host = Arc::new(Recording::default());
+        // 先问工作目录,再问会话目录。
+        host.replies
+            .lock()
+            .unwrap()
+            .push_back(Ok(HostReply::Context {
+                window: 1,
+                used: 0,
+                model: "m".into(),
+                working_dir: here.path().display().to_string(),
+            }));
+        host.replies
+            .lock()
+            .unwrap()
+            .push_back(Ok(HostReply::Sessions {
+                sessions: vec![
+                    atomcode_host_api::StoredSession {
+                        id: "one".into(),
+                        title: None,
+                        working_dir: Some("/w/recent".into()),
+                        created_at: 0,
+                        updated_at: 2,
+                        turns: 1,
+                        needs_newer_version: false,
+                    },
+                    atomcode_host_api::StoredSession {
+                        id: "two".into(),
+                        title: None,
+                        working_dir: Some("/w/marked".into()),
+                        created_at: 0,
+                        updated_at: 1,
+                        turns: 1,
+                        needs_newer_version: false,
+                    },
+                ],
+            }));
+        let (app, _client, all) = following(&host);
+        let _ = app
+            .context()
+            .provide::<crate::plugin::PlacesSvc>(Arc::new(Marked));
+        let Outcome::Open(picker) = all.dispatch("/cd", &app.context()).await else {
+            panic!("a picker");
+        };
+        assert_eq!(picker.id(), "cd");
+        let text = picker
+            .render(&crate::moment::Viewport::new(
+                crate::frame::Rect::sized(80, 20),
+                &crate::moment::Moment::default(),
+            ))
+            .iter()
+            .map(|line| line.plain())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let marked = text
+            .find("/w/marked")
+            .unwrap_or_else(|| panic!("标过的在里面:{text}"));
+        let recent = text
+            .find("/w/recent")
+            .unwrap_or_else(|| panic!("最近去过的在里面:{text}"));
+        assert!(marked < recent, "标过的排在最近去过的前面:\n{text}");
+        assert_eq!(
+            text.matches("/w/marked").count(),
+            1,
+            "同一个地方只出现一次——它既是标过的又是最近去过的:\n{text}"
+        );
+        // 而底下浏览的是**宿主说的工作目录**,不是这块屏幕跟着的会话 id:
+        // 裸 `/cd` 曾经拿会话 id 当路径去读,于是只会报「读不了」。
+        assert!(
+            text.contains("under-here"),
+            "浏览的是当前工作目录底下的东西:\n{text}"
+        );
     }
 
     /// The classic screen's name for "how do I use this" reaches the listing

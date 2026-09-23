@@ -65,6 +65,7 @@ pub mod module;
 pub mod modules;
 pub mod moment;
 pub mod overlay;
+pub mod places;
 pub mod plugin;
 pub mod plugins;
 pub mod providers;
