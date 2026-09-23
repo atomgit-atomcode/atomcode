@@ -32,7 +32,7 @@
 | `atomcode-capabilities::mcp` | ① 一条**含停用项**的读取路径 ② `set_…_disabled()` 写入器 | 配置读写是 capabilities 的活；写入器已有两个先例（`config.rs:451`、`config.rs:499`）可照抄，连注释守卫一起沿用 |
 | `atomcode-coding::runtime` | 信任/取消信任、登录/登出、改停用的操作与状态 | 运行中状态归 runtime；AGENTS.md 要求"操作运行中状态的行为必须通过 runtime 定义清楚的命令、事件和终态" |
 | `atomcode-cli/src/host.rs` | 实现新增的 host 命令 | host 是 driver 与 runtime 之间的实现层 |
-| `atomcode-host-api` | 新增命令与回包，**只增不改** | `McpStatus` 另有消费者（`crates/atomcode-tui/src/plugin.rs:2702` 的设置页查询），动它会牵连设置页与测试 |
+| `atomcode-host-api` | 新增命令与回包，**只增不改**——含给 `McpServerState` 加两个变体（纯增，见 §4.3） | `McpStatus` 另有消费者（`crates/atomcode-tui/src/plugin.rs:2702` 的设置页查询），动它会牵连设置页与测试 |
 | `atomcode-tui` | 新面板 `src/modules/mcp.rs`；`/mcp` 无参时打开它 | 面板家族的统一住址（`crates/atomcode-tui/src/resume.rs:3`：`/config` `/provider` `/plugin` `/toolbox` `/rewind` 同一件事） |
 
 **必须钉死的区分**：面板的「停用」是**持久**的（写 `mcp.json` 的 `disabled: true`），而已有的
@@ -69,7 +69,7 @@ McpAct    { session, server, action }    → action ∈ { Trust, Untrust, Login,
 AtomCode **没有**"Dynamically configured"这种情况——没有插件提供的 MCP 服务器。服务器要么来自某个文件，
 要么根本不存在。
 
-### 4.3 唯一一处要动已有公共类型
+### 4.3 唯一一处对已有类型的改动——纯增，不破坏兼容
 
 要显示 `⚠ needs authentication` 和 `○ disabled`，必须给 `McpServerState`（`crates/atomcode-host-api/src/lib.rs:769`）
 加两个变体：`NeedsAuthentication`、`Disabled`。
@@ -109,9 +109,12 @@ Ok(merged.into_values().filter(|c| !c.disabled).collect())
 | 状态 | 动作 |
 | --- | --- |
 | 未认证 | `认证` / `停用` |
-| 已连接 | `停用` |
+| 已认证 | `登出` / `停用` |
 | 未信任（项目） | `信任` / `停用` |
 | 已停用 | `启用` |
+
+`Trust` / `Untrust` 是**整项目级**的，不属于单个服务器：列表层在项目组标题上给出这一个动作，
+详情页只在"未信任"状态下提供 `信任`，作为同一个项目级动作的快捷入口。
 
 ### 5.3 按键
 
@@ -121,7 +124,9 @@ Ok(merged.into_values().filter(|c| !c.disabled).collect())
 ### 5.4 动作之后怎么刷新
 
 - **`停用`**：写配置 → 会话内撤下该服务器的工具 → **回到列表层**（状态变了，停在"已停用"的详情页没意义）
-- **`认证`**：OAuth 要跳浏览器，TUI 里无法内联完成 → 显示"等待浏览器完成…"中间态，完成后刷新详情
+- **`认证`**：OAuth 要跳浏览器，TUI 里无法内联完成。整段流程由一条 host 命令承载
+  （发起 → 等回调 → 返回终态）；期间面板显示"等待浏览器完成…"，允许 `Esc` 退回列表，流程在后台继续。
+  **v1 不做进度推送**——回到列表或重新进入详情时重新查询即可（见 §8）
 - **`信任`**：整项目级，执行后项目内服务器开始连接 → 显示"连接中"，不阻塞界面
 
 ## 6. 失败语义
@@ -160,6 +165,7 @@ Ok(merged.into_values().filter(|c| !c.disabled).collect())
 - **不在面板里逐个开关工具**——那是 `/toolbox` 的活，面板只报工具数
 - **不改 `McpStatus` / `McpServers` 现有类型**——另有消费者
 - **不做会话内启停**——`SwitchTool` 已经存在且语义不同（§3）
+- **不做认证进度推送**——v1 靠重新查询，不做事件订阅
 
 ## 9. 风险与未决
 
@@ -168,4 +174,4 @@ Ok(merged.into_values().filter(|c| !c.disabled).collect())
 | `McpServerState` 加变体会牵动仓内 `match` | 受影响 crate 跑全测；这是本次唯一"改已有类型"的动作 |
 | 面板写配置会碰到用户的 `mcp.json` | 沿用已有注释守卫；失败必须显示，不静默 |
 | 认证要跳浏览器，TUI 无法内联 | 用"等待浏览器完成…"中间态；不改认证实现 |
-| 工具数是新数据 | 从会话工具目录按 `mcp__<server>__*` 前缀数；不新增连接 |
+| 工具数是新数据 | **口径取"模型实际拿到的"**：数会话工具目录里 `mcp__<server>__*` 前缀的工具。不新增连接；被 `SwitchTool` 关掉的不计入——这与截图（服务器自报数量）口径不同，是刻意的 |
