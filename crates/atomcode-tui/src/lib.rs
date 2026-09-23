@@ -61,6 +61,7 @@ pub mod keymap;
 pub mod launch;
 pub mod layout;
 pub mod markdown;
+pub mod mcp;
 pub mod menu;
 pub mod module;
 pub mod modules;

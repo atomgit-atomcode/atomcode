@@ -32,6 +32,7 @@ pub mod relay;
 pub mod tui_command_meter;
 pub mod tui_elsewhere;
 pub mod tui_login;
+pub mod tui_mcp;
 pub mod tui_onboarding;
 pub mod tui_openrouter;
 pub mod tui_places;
@@ -113,6 +114,7 @@ pub mod tui_front {
             crate::tui_providers::row_layer(),
             crate::tui_plugins::row_layer(),
             crate::tui_tools::row_layer(),
+            crate::tui_mcp::row_layer(),
             crate::tui_rewind::row_layer(),
             crate::tui_resume::row_layer(),
             crate::tui_onboarding::row_layer(),
@@ -132,6 +134,7 @@ pub mod tui_front {
                 config_path: config_path.clone(),
             }),
             Arc::new(crate::tui_tools::ToolsRow),
+            Arc::new(crate::tui_mcp::McpRow),
             Arc::new(crate::tui_rewind::RewindRow),
             Arc::new(crate::tui_resume::ResumeRow),
             Arc::new(crate::tui_onboarding::OnboardingRow {

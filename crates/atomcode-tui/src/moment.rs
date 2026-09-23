@@ -621,6 +621,17 @@ pub struct Moment {
     /// The rewind panel, while it is up: which turn the arrows are on, which
     /// step it is at, and the rewind that is still on its way there and back.
     pub rewind_panel: Option<crate::rewind::Panel>,
+    /// The MCP servers this tree has, as the host last answered it.
+    ///
+    /// Here for the reason [`Moment::tools`] is: which servers exist, and whether
+    /// this project is trusted, is a fact of the running tree — not of the log —
+    /// and `View::render` may not ask the tree anything, so it travels this road
+    /// or none. See `crate::mcp`.
+    pub mcp: crate::mcp::McpView,
+    /// The MCP panel, while it is up: which of the two levels it is at, which
+    /// server or action the arrows are on, what it has to say about the last key,
+    /// and the action that is still on its way there and back.
+    pub mcp_panel: Option<crate::mcp::Panel>,
     /// The sessions that can be resumed, as the host last answered `/resume`.
     /// Here for the same reason `rewind` is: which sessions exist is a fact of
     /// the on-disk catalog, not of the log, and `View::render` may not read it —

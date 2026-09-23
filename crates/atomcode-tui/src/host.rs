@@ -1113,6 +1113,8 @@ pub struct Hits {
     plugins: Option<Rect>,
     /// And the tools panel's.
     tools: Option<Rect>,
+    /// And the MCP panel's.
+    mcp: Option<Rect>,
     /// And the rewind panel's.
     rewind: Option<Rect>,
     /// And the resume panel's.
@@ -2151,6 +2153,7 @@ impl Host {
                 }
                 m.plugins_panel = None;
                 m.rewind_panel = None;
+                m.mcp_panel = None;
                 m.settings_panel = Some(crate::settings::Panel::new());
                 true
             }
@@ -2426,6 +2429,7 @@ impl Host {
                 m.plugins_panel = None;
                 m.tools_panel = None;
                 m.rewind_panel = None;
+                m.mcp_panel = None;
                 m.providers_panel = Some(crate::providers::Panel::new());
                 true
             }
@@ -2700,6 +2704,7 @@ impl Host {
                 }
                 m.tools_panel = None;
                 m.rewind_panel = None;
+                m.mcp_panel = None;
                 m.plugins_panel = Some(crate::plugins::Panel::new());
                 true
             }
@@ -2893,6 +2898,7 @@ impl Host {
                         .clear();
                 }
                 m.rewind_panel = None;
+                m.mcp_panel = None;
                 m.tools_panel = Some(crate::tools::Panel::new());
                 true
             }
@@ -3030,6 +3036,91 @@ impl Host {
         }
     }
 
+    /// Which row of the MCP panel is under the pointer.
+    ///
+    /// 列表层是**服务器**的第几行,详情层是**动作**的第几行——正是 `Panel::cursor`
+    /// 在两级上各自的含义,所以 `point_mcp_at` 能把它直接交给 `point_at`。
+    pub fn mcp_row_at(&self, x: u16, y: u16) -> Option<usize> {
+        let rect = *self.hits.lock().expect("hits poisoned").mcp.as_ref()?;
+        if !rect.contains(x, y) {
+            return None;
+        }
+        let m = self.moment.read().expect("moment poisoned");
+        let vp = crate::moment::Viewport::new(rect, &m);
+        crate::modules::mcp::geometry(&m, &vp).row_at((y - rect.y) as usize)
+    }
+
+    /// Point the MCP panel at a row. True when it moved.
+    ///
+    /// 两级不是同一个索引空间:光标在列表层走服务器、在详情层走动作,所以夹的
+    /// 上界要照当前这一级算。
+    pub fn point_mcp_at(&self, row: usize) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let rows = {
+            let Some(panel) = m.mcp_panel.as_ref() else {
+                return false;
+            };
+            // 有动作在外面跑着:指针不许挪光标,和键盘一致(`key` 在 busy 时只认
+            // Esc)。挪了不会发出动作,但屏上的高亮和状态对不上。
+            if panel.busy.is_some() {
+                return false;
+            }
+            match panel.level {
+                crate::mcp::Level::List => m.mcp.listed(panel).len(),
+                crate::mcp::Level::Detail => {
+                    let Some(detail) = m.mcp.detail_for(panel.detail_for.as_deref()) else {
+                        return false;
+                    };
+                    panel.actions(detail).len()
+                }
+            }
+        };
+        match m.mcp_panel.as_mut() {
+            Some(panel) => panel.point_at(row, rows),
+            None => false,
+        }
+    }
+
+    /// 一次点击,返回**要不要动手**(按 Enter)。
+    ///
+    /// 两次才算动手,而且必须**同级同行**——照 rewind 面板的办法:这一层下面的动作
+    /// 里有停用、登出、取消信任,单击就执行太便宜了。而「同级同行」不是多余的严:
+    /// 进出详情会让同一格底下换一套东西(列表第 8 行是第 3 台服务器,详情第 8 行是
+    /// 第 1 个动作),只比行号的话,双击列表那一格、第二下正好落在一个**还没画出来**
+    /// 的动作行上——那就是一条单击执行危险动作的路。
+    pub fn mcp_click(&self, row: usize) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let (level, server, cap) = {
+            let Some(panel) = m.mcp_panel.as_ref() else {
+                return false;
+            };
+            // 有动作在外面跑着:指针不动手,和键盘一致。
+            if panel.busy.is_some() {
+                return false;
+            }
+            match panel.level {
+                crate::mcp::Level::List => (panel.level, None, m.mcp.listed(panel).len()),
+                crate::mcp::Level::Detail => {
+                    let Some(detail) = m.mcp.detail_for(panel.detail_for.as_deref()) else {
+                        return false;
+                    };
+                    // 哪一台是身份的一部分:A 的第 0 行和 B 的第 0 行不是同一个动作。
+                    let server = Some(detail.name.clone());
+                    (panel.level, server, panel.actions(detail).len())
+                }
+            }
+        };
+        let Some(panel) = m.mcp_panel.as_mut() else {
+            return false;
+        };
+        let here = (level, server, row);
+        let again = panel.clicked.as_ref() == Some(&here);
+        panel.point_at(row, cap);
+        // 要动手了:记下的那一下就算用掉了,不能给下一次单击当背书。
+        panel.clicked = if again { None } else { Some(here) };
+        again
+    }
+
     // ---- the rewind panel ---------------------------------------------------
     //
     // The fifth panel, and deliberately the same dozen methods as the other
@@ -3065,6 +3156,7 @@ impl Host {
                         .expect("provider secret poisoned")
                         .clear();
                 }
+                m.mcp_panel = None;
                 m.rewind_panel = Some(crate::rewind::Panel::new());
                 true
             }
@@ -3241,6 +3333,7 @@ impl Host {
         m.plugins_panel = None;
         m.tools_panel = None;
         m.rewind_panel = None;
+        m.mcp_panel = None;
         m.resume_panel = Some(crate::resume::Panel::new());
         true
     }
@@ -3416,6 +3509,178 @@ impl Host {
             Some(panel) => panel.point_at(row, rows),
             None => false,
         }
+    }
+
+    // ---- the MCP panel ------------------------------------------------------
+    //
+    // The same methods the panels above have — open, close, put an answer in,
+    // say what is in flight, route one key — and the same bargain when there is
+    // no module mounted to draw it with. No `row_at` and no wheel to go with
+    // them: 设计 §8 leaves the mouse out of this panel on purpose, so there is
+    // nothing here for a click to land on.
+
+    /// Whether the MCP panel is up.
+    pub fn mcp_open(&self) -> bool {
+        self.moment
+            .read()
+            .expect("moment poisoned")
+            .mcp_panel
+            .is_some()
+    }
+
+    /// Pull the MCP panel up, or put it away. True when it changed.
+    pub fn toggle_mcp(&self) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        match m.mcp_panel.take() {
+            Some(_) => true,
+            None => {
+                // Nothing to draw it with is a refusal, not an empty panel — the
+                // same bargain the panels above strike.
+                if !self.modules.has_view(crate::modules::mcp::ID) {
+                    return false;
+                }
+                // 面板家族是互斥的:升起一块,别的落下去(同 [`Host::toggle_tools`])。
+                m.settings_panel = None;
+                m.plugins_panel = None;
+                if m.providers_panel.take().is_some() {
+                    self.providers_secret
+                        .lock()
+                        .expect("provider secret poisoned")
+                        .clear();
+                }
+                m.rewind_panel = None;
+                m.tools_panel = None;
+                m.resume_panel = None;
+                m.mcp_panel = Some(crate::mcp::Panel::new());
+                true
+            }
+        }
+    }
+
+    /// Put the MCP panel away. True when it was up.
+    pub fn close_mcp(&self) -> bool {
+        self.moment
+            .write()
+            .expect("moment poisoned")
+            .mcp_panel
+            .take()
+            .is_some()
+    }
+
+    /// Put what the port answered into the moment. True when it changed.
+    pub fn show_mcp(&self, view: crate::mcp::McpView) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        if m.mcp == view {
+            return false;
+        }
+        m.mcp = view;
+        true
+    }
+
+    /// Attach a fetched detail to the rows the moment already holds.
+    ///
+    /// `OpenDetail` answers with a `McpDetail` while [`Host::show_mcp`] replaces
+    /// the whole view, so there has to be a way to add one to what is already
+    /// there without asking the host for the list again.
+    pub fn mcp_detail(&self, detail: crate::mcp::McpDetail) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        // 只收**面板正在等的那一台**。一次慢往返回来时,人可能已经退到列表、把面板
+        // 关了,或者早就换了别的一台;照单挂上去就是把别人的页面盖到当前这一页上,
+        // 而这一页上的动作会打到那一台——停用、登出、取消信任都是破坏性的。
+        let Some(panel) = m.mcp_panel.as_ref() else {
+            return false;
+        };
+        if panel.level != crate::mcp::Level::Detail
+            || panel.detail_for.as_deref() != Some(detail.name.as_str())
+        {
+            return false;
+        }
+        m.mcp = std::mem::take(&mut m.mcp).with_detail(detail);
+        true
+    }
+
+    /// 面板是不是还停在**这一台**的详情页上。
+    ///
+    /// 动作回来的那一趟用它决定要不要再取一次详情:面板已经退到列表或关掉了,
+    /// 这一趟就不该发——发了也没人看,还白搭一次往返。
+    pub fn mcp_awaiting_detail(&self, server: &str) -> bool {
+        let m = self.moment.read().expect("moment poisoned");
+        m.mcp_panel.as_ref().is_some_and(|p| {
+            p.level == crate::mcp::Level::Detail && p.detail_for.as_deref() == Some(server)
+        })
+    }
+
+    /// Say that an action is on its way there and back, or that it landed.
+    pub fn mcp_busy(&self, busy: Option<crate::mcp::Busy>) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let Some(panel) = m.mcp_panel.as_mut() else {
+            return false;
+        };
+        if panel.busy == busy {
+            return false;
+        }
+        panel.busy = busy;
+        true
+    }
+
+    /// Say what the last key came to, when it came to something worth reading —
+    /// the configuration guard's own words land here (设计 §6).
+    pub fn mcp_note(&self, note: Option<String>) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let Some(panel) = m.mcp_panel.as_mut() else {
+            return false;
+        };
+        if panel.note == note {
+            return false;
+        }
+        panel.note = note;
+        true
+    }
+
+    /// Run one key against the MCP panel: the panel it writes back, and the work
+    /// to send over the seam when the key asked for some.
+    ///
+    /// This is the seam [`Host::tools_key`] is: the panel's own `Stay` and
+    /// `Close` are absorbed here, and `OpenDetail`/`Act` come back out because
+    /// this layer has never heard of a host command (`docs/adr/0022` §3).
+    pub fn mcp_key(&self, press: crate::surface::KeyPress) -> (bool, Option<crate::mcp::Step>) {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let view = m.mcp.clone();
+        let Some(panel) = m.mcp_panel.as_mut() else {
+            return (false, None);
+        };
+        let before = panel.clone();
+        let step = crate::mcp::key(&view, panel, press);
+        // 指针指过的那一格,到这儿就作废,只要这一下做了两件事之一:
+        //
+        // - 把光标挪了地方:两只手共用一个光标,键盘动过它,鼠标上一次指着的那一格
+        //   就不该再算「同一格」;
+        // - 发出了一次动作(`busy` 从无到有):那一下就用掉了,不能给下一次单击当背书。
+        //
+        // 收在这一处,不写在 `detail_key` 的执行分支里:键盘的**每一次按键**都从这里
+        // 过(鼠标点下去之后那一趟也走它,`run_mcp_key`),所以以后再加执行入口也不会漏。
+        if panel.cursor != before.cursor || (before.busy.is_none() && panel.busy.is_some()) {
+            panel.clicked = None;
+        }
+        let changed = *panel != before;
+        match step {
+            crate::mcp::Step::Stay => (changed, None),
+            crate::mcp::Step::Close => {
+                m.mcp_panel = None;
+                (true, None)
+            }
+            step => (true, Some(step)),
+        }
+    }
+
+    /// Put a paste into the MCP panel's search box: a server name is exactly the
+    /// thing that arrives by paste, and the composer is not on screen.
+    pub fn mcp_paste(&self, text: &str) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let Some(panel) = m.mcp_panel.as_mut() else {
+            return false;
+        };
+        crate::mcp::paste(panel, text)
     }
 
     /// Run `change`, keeping the reader's place across whatever it did.
@@ -4262,6 +4527,7 @@ impl Host {
                         providers: None,
                         plugins: None,
                         tools: None,
+                        mcp: None,
                         rewind: None,
                         resume: None,
                         menu: None,
@@ -4320,6 +4586,11 @@ impl Host {
                         // And the tools panel.
                         if id == crate::modules::tools::ID {
                             self.hits.lock().expect("hits poisoned").tools = Some(*tail_rect);
+                        }
+                        // And the MCP panel, which rides the same tail and is
+                        // worked with the same pointer.
+                        if id == crate::modules::mcp::ID {
+                            self.hits.lock().expect("hits poisoned").mcp = Some(*tail_rect);
                         }
                         // And the rewind panel.
                         if id == crate::modules::rewind::ID {
@@ -5005,6 +5276,7 @@ pub const TAIL: &[&str] = &[
     crate::modules::providers::ID,
     crate::modules::plugins::ID,
     crate::modules::tools::ID,
+    crate::modules::mcp::ID,
     crate::modules::rewind::ID,
     crate::modules::resume::ID,
     crate::modules::ask::ID,
@@ -5224,6 +5496,46 @@ mod tests {
         let h = host();
         assert!(!h.toggle_providers());
         assert!(!h.providers_open());
+    }
+
+    /// A host with the MCP panel's module mounted, as a launcher that filled the
+    /// seam gives it.
+    fn host_with_mcp() -> Host {
+        let mods = Arc::new(Modules::new());
+        mods.add_view(Arc::new(Mounted::<status::Status>::new()))
+            .unwrap();
+        mods.add_view(Arc::new(Mounted::<crate::modules::mcp::Mcp>::new()))
+            .unwrap();
+        Host::new(mods, default_layout())
+    }
+
+    /// The MCP panel is one of the family: raising it puts whoever else is up
+    /// away, and one Escape from the list is what brings it down.
+    #[test]
+    fn the_mcp_panel_is_mutually_exclusive_with_the_others() {
+        let h = host_with_mcp();
+        assert!(!h.mcp_open());
+
+        assert!(h.toggle_settings(), "something is up to displace");
+        assert!(h.toggle_mcp(), "opening it is a change");
+        assert!(h.mcp_open(), "it is up");
+        // 面板是一件事的不同块:升起一块,别的就该落下去。
+        assert!(!h.settings_open(), "the settings panel stepped aside");
+
+        // 列表层一次 Esc 就是关掉,而且不欠外面任何活。
+        let (changed, step) = h.mcp_key(crate::surface::KeyPress::plain(crate::surface::Key::Esc));
+        assert!(changed, "a key that closed it is a change to the screen");
+        assert!(step.is_none(), "closing is the panel's own business");
+        assert!(!h.mcp_open());
+    }
+
+    /// A panel with no module to draw it is refused rather than opened empty —
+    /// the contract `/mcp` reads when it tells the person why nothing came up.
+    #[test]
+    fn a_screen_without_the_mcp_module_refuses_to_open_it() {
+        let h = host();
+        assert!(!h.toggle_mcp());
+        assert!(!h.mcp_open());
     }
 
     /// The question a person typed stands apart on BOTH sides — from what came
@@ -7879,6 +8191,280 @@ mod tests {
             rows_at_rest,
             "and the rows under the eyes are the ones that were there"
         );
+    }
+
+    fn server_row(name: &str) -> crate::mcp::McpRow {
+        crate::mcp::McpRow {
+            name: name.to_string(),
+            state: crate::mcp::McpState::Connected,
+            source: "project".to_string(),
+            tool_count: 1,
+            config_path: None,
+        }
+    }
+
+    fn server_page(name: &str) -> crate::mcp::McpDetail {
+        crate::mcp::McpDetail {
+            name: name.to_string(),
+            state: crate::mcp::McpState::Connected,
+            source: "project".to_string(),
+            transport: crate::mcp::Transport::Http {
+                url: "https://example.invalid/mcp".to_string(),
+            },
+            auth: crate::mcp::Auth::None,
+            tool_count: 1,
+            config_path: None,
+        }
+    }
+
+    /// 指针落在一台服务器上时,面板要指到那一台。
+    ///
+    /// 坐标不能算:面板骑在对话流尾部,画在第几行由它下面那些模块多高决定,所以
+    /// 坐标只能从**这一帧**里问——和设置面板那条是同一个道理。
+    #[test]
+    fn a_click_on_a_server_reads_the_row_the_frame_drew() {
+        let h = host_with_mcp();
+        assert!(h.show_mcp(crate::mcp::McpView::new(vec![
+            server_row("alpha"),
+            server_row("beta"),
+        ])));
+        assert!(h.toggle_mcp());
+
+        let frame = h.compose((80, 24));
+        let part = frame
+            .part(crate::modules::mcp::ID)
+            .expect("the panel is drawn");
+        let rect = part.rect;
+        let drawn: Vec<String> = part.lines.iter().map(|l| l.plain()).collect();
+
+        // 画出来的每一行服务器都答它自己的序号,而且两台都点得到。
+        let mut seen: Vec<usize> = Vec::new();
+        for (at, text) in drawn.iter().enumerate() {
+            if let Some(i) = h.mcp_row_at(rect.x + 1, rect.y + at as u16) {
+                assert!(!seen.contains(&i), "row {at} answers {i}, already seen");
+                seen.push(i);
+                let wanted = if i == 0 { "alpha" } else { "beta" };
+                assert!(
+                    text.contains(wanted),
+                    "row {at} answers {i} but draws {text:?}"
+                );
+            }
+        }
+        assert_eq!(seen.len(), 2, "两台都点得到:\n{}", drawn.join("\n"));
+
+        // 点第二台,光标就走过去。
+        assert!(h.point_mcp_at(1));
+        let m = h.moment.read().expect("moment poisoned");
+        assert_eq!(
+            m.mcp_panel.as_ref().expect("it is up").cursor,
+            1,
+            "指针把光标挪到点中的那一行"
+        );
+    }
+
+    /// 换了级之后,同一个行号底下是**别的东西**——那一下不许动手。
+    ///
+    /// 这是鼠标最该有的一条,而且是这轮鼠标支持自己带出来的:单击就执行太便宜了
+    /// (这一层下面的动作里有停用、登出、取消信任),所以两次才算;而「同一个格」
+    /// 不能只比行号——列表第 8 行是第 3 台服务器,详情第 8 行是第 1 个动作,进出详情
+    /// 会让同一格底下换一套东西。双击里落空的那一下,就是这样落到一个**第一下时还
+    /// 没画出来**的动作行上的。
+    ///
+    /// 判据钉的是规则本身(换级之后同一行号也不再算「同一个格」),不靠布局算术:
+    /// 那份算术会随服务器数量变化,靠它就成了碰运气的判据。
+    #[test]
+    fn a_click_after_the_level_changed_only_points() {
+        let h = host_with_mcp();
+        assert!(h.show_mcp(crate::mcp::McpView::new(vec![
+            server_row("alpha"),
+            server_row("beta"),
+            server_row("gamma"),
+        ])));
+        assert!(h.toggle_mcp());
+
+        // 第一下只指着。
+        assert!(!h.mcp_click(0), "第一下只指着,不动手");
+        // 第二下:同一级同一行,才算动手——而这一级下 Enter 的意思是「进详情」。
+        assert!(h.mcp_click(0), "同一格再点一下,才按 Enter");
+        let (_, step) = h.mcp_key(crate::surface::KeyPress::plain(crate::surface::Key::Enter));
+        assert!(
+            matches!(step, Some(crate::mcp::Step::OpenDetail { .. })),
+            "这一级按下 Enter 是进详情,不是动作"
+        );
+        assert_eq!(
+            h.moment
+                .read()
+                .expect("moment poisoned")
+                .mcp_panel
+                .as_ref()
+                .expect("it is up")
+                .level,
+            crate::mcp::Level::Detail,
+            "已经在详情页了"
+        );
+
+        // 详情到了,这一级下才真有动作可指(`mcp_click` 在详情没到时一律拒绝——那
+        // 是防「拿别人的动作去打」的守卫)。
+        assert!(
+            h.mcp_detail(server_page("alpha")),
+            "面板在等 alpha,这一份收下"
+        );
+
+        // 关键的一下:同一个行号,但底下已经是动作行了。只许指着。
+        assert!(
+            !h.mcp_click(0),
+            "换了级,同一个行号底下是别的东西——这一下要是动手,双击的第二下就执行了动作"
+        );
+        // 盯着同一个动作再点一次,这才动手。
+        assert!(h.mcp_click(0), "盯着同一个动作再点一次,才算动手");
+    }
+
+    /// 执行期间指针不许挪光标。
+    ///
+    /// 键盘在 busy 时只认 Esc;指针此前不受限,于是往返跑着的时候高亮会跟着指针走,
+    /// 屏上的样子和状态对不上。不会发出动作,但一样是在骗人。
+    #[test]
+    fn the_pointer_does_not_move_the_panel_while_an_action_is_out() {
+        let h = host_with_mcp();
+        assert!(h.show_mcp(crate::mcp::McpView::new(vec![
+            server_row("alpha"),
+            server_row("beta"),
+            server_row("gamma"),
+        ])));
+        assert!(h.toggle_mcp());
+
+        assert!(h.point_mcp_at(2), "空着的时候指针走得动");
+        assert!(h.mcp_busy(Some(crate::mcp::Busy {
+            what: "认证".to_string(),
+        })));
+        assert!(!h.point_mcp_at(1), "执行期间指针不许挪光标");
+        assert!(!h.mcp_click(1), "也不许动手");
+        let m = h.moment.read().expect("moment poisoned");
+        assert_eq!(
+            m.mcp_panel.as_ref().expect("it is up").cursor,
+            2,
+            "光标留在原处"
+        );
+    }
+
+    /// 换了一台服务器之后,单击不许执行。
+    ///
+    /// 这是「只写不清」那个洞:`clicked` 若只记级别和行号,在 A 的详情页点过第 0 行
+    /// (只指着),再用键盘换到 B,A 记下的那一下会替 B 的第 0 个动作背书——单击就执行。
+    #[test]
+    fn a_click_after_another_server_took_the_page_does_not_act() {
+        let h = host_with_mcp();
+        assert!(h.show_mcp(crate::mcp::McpView::new(vec![
+            server_row("alpha"),
+            server_row("beta"),
+        ])));
+        assert!(h.toggle_mcp());
+
+        // 进 alpha 的详情:两下,第一下指着、第二下才是 Enter。
+        assert!(!h.mcp_click(0), "第一下只指着");
+        assert!(h.mcp_click(0), "同一格再点一下,才按 Enter");
+        let (_, step) = h.mcp_key(crate::surface::KeyPress::plain(crate::surface::Key::Enter));
+        assert!(matches!(step, Some(crate::mcp::Step::OpenDetail { .. })));
+        assert!(h.mcp_detail(server_page("alpha")), "alpha 的详情到了");
+
+        // 在 alpha 的详情页点一下第 0 个动作:只指着,执行不到。
+        assert!(!h.mcp_click(0), "第一下只指着");
+        assert_eq!(
+            h.moment
+                .read()
+                .expect("moment poisoned")
+                .mcp_panel
+                .as_ref()
+                .and_then(|p| p.clicked.clone()),
+            Some((crate::mcp::Level::Detail, Some("alpha".to_string()), 0)),
+            "指针此刻指着 alpha 的第 0 个动作"
+        );
+
+        // 退回列表,用**键盘**换到 beta,再进它的详情——键盘这一路不替指针背书。
+        let _ = h.mcp_key(crate::surface::KeyPress::plain(crate::surface::Key::Esc));
+        let _ = h.mcp_key(crate::surface::KeyPress::plain(crate::surface::Key::Down));
+        let (_, step) = h.mcp_key(crate::surface::KeyPress::plain(crate::surface::Key::Enter));
+        assert!(
+            matches!(step, Some(crate::mcp::Step::OpenDetail { ref server }) if server == "beta"),
+            "已经进了 beta 的详情"
+        );
+        assert!(h.mcp_detail(server_page("beta")), "beta 的详情到了");
+
+        // 关键的一下:只许指着。它要是返回 true,B 的动作就被单击执行了。
+        assert!(
+            !h.mcp_click(0),
+            "换了服务器,同一个行号底下是别人的动作——单击不许执行"
+        );
+        // 盯着 beta 的第 0 个动作再点一次,这才动手。
+        assert!(h.mcp_click(0), "盯着同一个动作再点一次,才算动手");
+    }
+
+    /// 刚执行完的那一下不算「还指着」:要再点一次才算。
+    ///
+    /// 同一个洞的另一半:`clicked` 若在执行后留着,动作执行完、动作表跟着刷新
+    /// (取消信任 → 信任),同一个行号底下已经是另一个动作了,而单击仍然会执行它。
+    #[test]
+    fn an_action_that_just_ran_has_to_be_pointed_at_again() {
+        let h = host_with_mcp();
+        assert!(h.show_mcp(crate::mcp::McpView::new(vec![
+            server_row("alpha"),
+            server_row("beta"),
+        ])));
+        assert!(h.toggle_mcp());
+
+        // 进 alpha 的详情。
+        assert!(!h.mcp_click(0), "第一下只指着");
+        assert!(h.mcp_click(0), "第二下才按 Enter");
+        let _ = h.mcp_key(crate::surface::KeyPress::plain(crate::surface::Key::Enter));
+        assert!(h.mcp_detail(server_page("alpha")), "alpha 的详情到了");
+
+        // 第 0 个动作:两下才动。
+        assert!(!h.mcp_click(0), "第一下只指着");
+        assert!(h.mcp_click(0), "第二下才动手");
+        // 那一下用掉了。动作表跟着刷新之后,同一个行号底下已经是别的动作了。
+        assert!(
+            !h.mcp_click(0),
+            "刚执行完,这一下只算指着——不然刷出来的新动作会被单击执行"
+        );
+        assert!(h.mcp_click(0), "再点一次才算动手");
+    }
+
+    /// 用键盘执行过动作之后,指针那一次也算用掉了。
+    ///
+    /// 上一条只走了鼠标执行那一趟;而「先用鼠标选中、再用键盘确认」是很自然的操作:
+    /// 单击第 0 行(只选中)→ 按 Enter 执行 → 详情刷新成新的动作表 → 此时单击第 0 行
+    /// 若还算「同一格」,单击一次就执行了刷出来的新动作。
+    #[test]
+    fn an_action_run_from_the_keyboard_also_spends_the_click() {
+        let h = host_with_mcp();
+        assert!(h.show_mcp(crate::mcp::McpView::new(vec![
+            server_row("alpha"),
+            server_row("beta"),
+        ])));
+        assert!(h.toggle_mcp());
+
+        // 进 alpha 的详情:两下,第一下指着、第二下才是 Enter。
+        assert!(!h.mcp_click(0), "第一下只指着");
+        assert!(h.mcp_click(0), "同一格再点一下,才按 Enter");
+        let _ = h.mcp_key(crate::surface::KeyPress::plain(crate::surface::Key::Enter));
+        assert!(h.mcp_detail(server_page("alpha")), "alpha 的详情到了");
+
+        // 鼠标只选中第 0 个动作。
+        assert!(!h.mcp_click(0), "第一下只指着");
+        // 键盘确认——「鼠标选、键盘确认」是很自然的操作。
+        let (_, step) = h.mcp_key(crate::surface::KeyPress::plain(crate::surface::Key::Enter));
+        assert!(
+            matches!(step, Some(crate::mcp::Step::Act { .. })),
+            "键盘把动作发出去了"
+        );
+
+        // 动作落地,详情刷新:同一台服务器、同一个行号,底下已经是别的动作了。
+        assert!(h.mcp_busy(None));
+        assert!(h.mcp_detail(server_page("alpha")));
+
+        // 此刻单击第 0 行:只许指着——不然刷出来的新动作会被单击执行。
+        assert!(!h.mcp_click(0), "键盘执行过那一次,指针的记录已经用掉了");
+        assert!(h.mcp_click(0), "再点一次才算动手");
     }
 
     fn lines_of(frame: &Frame, part: &str) -> Vec<String> {
@@ -10929,6 +11515,33 @@ mod tests {
         assert!(
             h.compose((80, 24)).part("mascot").is_some(),
             "the registry is read fresh, not snapshotted"
+        );
+    }
+
+    #[test]
+    fn a_panel_a_person_opened_has_somewhere_on_the_frame_to_be_drawn() {
+        // The failure this guards is silent and total, which is why it needed a
+        // person at a real terminal to find it: a panel module can be mounted,
+        // accepted by `Host::toggle_mcp`'s `has_view` check, and have its state
+        // open — the other panels even step aside — while `TAIL` never names
+        // it. Then the layout tree has no rect for it, `render` is never
+        // called, and the screen shows nothing at all; the keys still route to
+        // the panel (`Wake::Input`'s arms ask `mcp_open()`), so the person sees
+        // a screen that has stopped answering until Escape clears the state.
+        //
+        // No assertion on `moment.mcp_panel` can see that: the state is
+        // exactly right. Only a composed frame can, so this one mounts the
+        // module **by hand** rather than off `TAIL` — a fixture built from
+        // `TAIL` would go on passing while the shipped arrangement lost the
+        // panel, which is the whole trap.
+        let h = fed();
+        h.modules
+            .add_view(Arc::new(Mounted::<crate::modules::mcp::Mcp>::new()))
+            .unwrap();
+        assert!(h.toggle_mcp(), "the panel opens");
+        assert!(
+            h.compose((80, 24)).part(crate::modules::mcp::ID).is_some(),
+            "a panel that is open has to be somewhere on the frame"
         );
     }
 }

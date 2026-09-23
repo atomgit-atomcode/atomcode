@@ -384,8 +384,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::McpConnecting => "连接中".into(),
         Msg::McpConnected => "已连接".into(),
         Msg::McpUntrusted => "未信任项目,未启动".into(),
+        Msg::McpNeedsAuthentication => "需要认证".into(),
         Msg::McpFailed { message } => format!("失败:{message}").into(),
         Msg::McpDisconnected => "已断开".into(),
+        Msg::McpDisabled => "配置里已停用".into(),
         Msg::McpUnknownState => "未知".into(),
         Msg::McpWithdrawn => "已撤下全部 MCP 工具".into(),
         Msg::McpNeedsServerName => "要一个服务器名:/mcp tools <服务器>".into(),
@@ -394,6 +396,40 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::Reloaded => "已重新读取 skills、MCP 与配置".into(),
         Msg::SignedOut => "已登出;/login 重新登录".into(),
         Msg::SignedIn => "已登录".into(),
+
+        // ── MCP 面板 (`mcp.rs`、`modules/mcp.rs`) ──
+        Msg::McpPanelTitle => "管理 MCP 服务器".into(),
+        Msg::McpPanelServers { n } => format!("{n} 个服务器").into(),
+        Msg::McpPanelEmpty => "没有配置任何 MCP 服务器".into(),
+        Msg::McpPanelNoMatch => "没有配置中的服务器匹配".into(),
+        Msg::McpPanelUnavailable => "这个构建没挂 MCP 面板".into(),
+        Msg::McpDetailPending => "正在取详情…".into(),
+        // 服务器从哪儿来:产品表的 `/help` 来源列说的是同样两个地方,所以这两句读
+        // 它的措辞,不在这儿再写一遍(`tests/tables.rs`)。
+        Msg::McpGroupGlobal => {
+            crate::product::t_with(crate::Locale::ZhCn, crate::product::Msg::HelpSourceGlobal)
+        }
+        Msg::McpGroupProject => {
+            crate::product::t_with(crate::Locale::ZhCn, crate::product::Msg::HelpSourceProject)
+        }
+        Msg::McpGroupDriver => "外部传入".into(),
+        Msg::McpLabelState => "状态".into(),
+        Msg::McpLabelAuth => "认证".into(),
+        Msg::McpLabelEndpoint => "地址".into(),
+        Msg::McpLabelSource => "来源".into(),
+        Msg::McpLabelTools { n } => format!("工具 {n} 个").into(),
+        Msg::McpAuthNone => "不需要".into(),
+        Msg::McpAuthAuthenticated => "已认证".into(),
+        Msg::McpAuthNotAuthenticated => "未认证".into(),
+        Msg::McpActionTrust => "信任这个项目".into(),
+        Msg::McpActionUntrust => "取消信任".into(),
+        Msg::McpActionLogin => "认证".into(),
+        Msg::McpActionLogout => "登出".into(),
+        Msg::McpActionEnable => "启用".into(),
+        Msg::McpActionDisable => "停用".into(),
+        Msg::McpLegendList => "↑/↓ 移动 · Enter 详情 · Esc 关闭".into(),
+        Msg::McpLegendDetail => "↑/↓ 移动 · Enter 执行 · Esc 返回".into(),
+        Msg::McpLegendBusy => "Esc 取消".into(),
 
         // ── the toolbox and the plugins (`commands.rs`) ──
         Msg::CmdTakesToolbox => "[off <名字或 mcp__server__*> | on <同上>]".into(),
@@ -410,6 +446,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PluginNoSuch { typed } => format!("没有叫 {typed} 的插件").into(),
         Msg::PluginAmbiguous { name, lines } => format!("有好几个叫 {name} 的,说清是哪个:\n{lines}").into(),
         Msg::NoPluginPort => "这个屏幕没有接插件:启动器没有提供 `tui-plugins`".into(),
+        Msg::NoMcpPort => "这个屏幕没有接 MCP:启动器没有提供 `tui-mcp`".into(),
         Msg::CmdTakesSetup => "[focus area,例如 hooks、mcp、skills、all]".into(),
         Msg::CmdAboutSetup => "分析这个项目、装好种子 skill,然后给出该配哪些自动化的建议".into(),
         Msg::NoSetupPort => "这个屏幕没有接种子安装:启动器没有提供 `tui-setup`,所以它装不了种子".into(),
@@ -478,9 +515,11 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StatusWindowResetsIn { duration } => format!(" · {duration}后重置").into(),
         Msg::McpTallyFailed { n } => format!("{n} 个连不上").into(),
         Msg::McpTallyUntrusted { n } => format!("{n} 个等信任").into(),
+        Msg::McpTallyNeedsAuthentication { n } => format!("{n} 个待认证").into(),
         Msg::McpTallyConnecting { n } => format!("{n} 个连接中").into(),
         Msg::McpTallyConnected { n } => format!("{n} 个已连接").into(),
         Msg::McpTallyOff { n } => format!("{n} 个没连").into(),
+        Msg::McpTallyDisabled { n } => format!("{n} 个已停用").into(),
         Msg::StatsNotKept => "这个宿主不记账".into(),
 
         // ── the account's figures (`modules/settings.rs`) ──

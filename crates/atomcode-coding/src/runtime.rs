@@ -193,6 +193,20 @@ pub struct McpToolsSnapshot {
     pub available: Vec<String>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct McpRowsSnapshot {
+    pub generation: RuntimeGeneration,
+    pub rows: Vec<crate::parts::McpRowFacts>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct McpDetailSnapshot {
+    pub generation: RuntimeGeneration,
+    /// `None` when no configured server has that key. Not an error: a screen
+    /// says "no such server" and lists what there is.
+    pub detail: Option<crate::parts::McpRowFacts>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionChanged {
     pub generation: RuntimeGeneration,
@@ -934,6 +948,110 @@ struct RuntimeResources {
     image_preprocessor: Option<Arc<dyn ImagePreprocessor>>,
 }
 
+/// The `/mcp` panel's rows for the tree mounted right now: every configured server
+/// (disabled ones included) joined with the live statuses and this session's tool
+/// counts.
+///
+/// One helper for the list and the detail arm, so the two cannot disagree about
+/// the same server. `None` registry — no tree, MCP off — is no rows, not an error.
+async fn mcp_rows_of(runtime: &RuntimeResources) -> Vec<crate::parts::McpRowFacts> {
+    let counts: Vec<(String, usize)> = runtime
+        .parts
+        .mcp_statuses()
+        .await
+        .into_iter()
+        .map(|(name, _)| {
+            let n = runtime.parts.mcp_tools_for_server(&name).len();
+            (name, n)
+        })
+        .collect();
+    match &runtime.parts.mcp_registry {
+        Some(registry) => {
+            crate::parts::mcp_row_facts(&runtime.config.working_dir, registry, &counts).await
+        }
+        None => Vec::new(),
+    }
+}
+
+/// Run one panel action against the live tree: the six things a person can do to
+/// a configured MCP server (`docs/mcp-panel-design.md` §5.2).
+///
+/// The failure is a `String` because it is carried to the front end verbatim: a
+/// refused config write must arrive with the guard's own words rather than a
+/// generic failure (§6). The caller wraps it in `RuntimeError::ReconfigureFailed`.
+///
+/// Order is the point where trust or auth change: the tools come off the session
+/// BEFORE the state they were authorised under is changed, and nothing is rebuilt
+/// afterwards — the fail-closed order `CodingParts::withdraw_mcp_tools` documents
+/// for `/mcp reload`, `/mcp untrust` and `/mcp logout`.
+async fn apply_mcp_action(
+    runtime: &mut RuntimeResources,
+    server: String,
+    action: crate::parts::McpAction,
+) -> Result<(), String> {
+    use crate::parts::McpAction;
+    use atomcode_capabilities::mcp::load_mcp_config_including_disabled;
+
+    match action {
+        McpAction::Trust => {
+            atomcode_capabilities::mcp::trust::trust_project(&runtime.config.working_dir)
+                .map_err(|e| format!("{e:#}"))
+        }
+        McpAction::Untrust => {
+            // Fail-closed, in this order: the tools come off
+            // BEFORE the trust that lets them connect is
+            // withdrawn (`parts.rs:1312-1321`).
+            runtime.parts.withdraw_mcp_tools().await;
+            atomcode_capabilities::mcp::trust::untrust_project(&runtime.config.working_dir)
+                .map(|_| ())
+                .map_err(|e| format!("{e:#}"))
+        }
+        McpAction::Logout => {
+            runtime.parts.withdraw_mcp_tools().await;
+            atomcode_capabilities::mcp::McpTokenStore::default()
+                .delete_token(&server)
+                .map(|_| ())
+                .map_err(|e| format!("{e:#}"))
+        }
+        McpAction::Login => {
+            // Blocking: it waits on a browser. The token is
+            // saved by `login_mcp_oauth` itself.
+            let config = load_mcp_config_including_disabled(&runtime.config.working_dir)
+                .map_err(|e| format!("{e:#}"))?
+                .into_iter()
+                .find(|c| c.name == server)
+                .ok_or_else(|| format!("MCP server '{server}' is not configured"))?;
+            tokio::task::block_in_place(|| {
+                atomcode_capabilities::mcp::login_mcp_oauth(
+                    &config,
+                    atomcode_capabilities::mcp::McpOAuthLoginOptions {
+                        client_id: None,
+                        client_secret_env: None,
+                        scopes: Vec::new(),
+                    },
+                )
+            })
+            .map(|_| ())
+            .map_err(|e| format!("{e:#}"))
+        }
+        McpAction::Disable | McpAction::Enable => {
+            let enabled = action == McpAction::Enable;
+            crate::parts::mcp_set_enabled(&runtime.config.working_dir, &server, enabled).await?;
+            if !enabled {
+                // Take THIS server's tools off the session —
+                // by their published names, not by a glob
+                // (sanitised names can carry a hash suffix).
+                if let Some(catalog) = runtime.parts.tool_catalog() {
+                    for name in runtime.parts.mcp_tools_for_server(&server) {
+                        catalog.turn_off(&name);
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 struct NextPromptSuggestionOutcome {
     generation: u64,
     revision: u64,
@@ -1642,6 +1760,59 @@ impl CodingRuntimeHandle {
             .send(CodingRuntimeControl::McpTools {
                 generation: runtime_state_generation(state),
                 server,
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
+    /// The management list: every configured server — disabled ones included —
+    /// with the live status, source, config path, transport, auth and tool count.
+    pub async fn mcp_rows(&self) -> Result<McpRowsSnapshot, RuntimeError> {
+        let state = self.state.load(Ordering::Acquire);
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::McpRows {
+                generation: runtime_state_generation(state),
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
+    /// One configured server in full. An unknown key answers `detail == None`,
+    /// not an error.
+    pub async fn mcp_detail(&self, server: String) -> Result<McpDetailSnapshot, RuntimeError> {
+        let state = self.state.load(Ordering::Acquire);
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::McpDetail {
+                generation: runtime_state_generation(state),
+                server,
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
+    /// Do one thing to one configured MCP server. Answers when it is done — call
+    /// [`mcp_rows`](Self::mcp_rows) for the state it left behind.
+    ///
+    /// `Untrust` and `Logout` answer [`RuntimeError::Busy`] while a turn is
+    /// running: they withdraw the tools first, which waits for an idle session.
+    /// The other four run mid-turn.
+    pub async fn mcp_act(
+        &self,
+        server: String,
+        action: crate::parts::McpAction,
+    ) -> Result<(), RuntimeError> {
+        let state = self.state.load(Ordering::Acquire);
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::McpAct {
+                generation: runtime_state_generation(state),
+                server,
+                action,
                 done,
             })
             .map_err(|_| RuntimeError::Unavailable)?;
@@ -2578,6 +2749,30 @@ pub enum CodingRuntimeControl {
         generation: u64,
         server: String,
         done: oneshot::Sender<Result<McpToolsSnapshot, RuntimeError>>,
+    },
+    /// The panel's list: every configured server — disabled ones included — with
+    /// the live status, source, config path, transport, auth and tool count.
+    McpRows {
+        generation: u64,
+        done: oneshot::Sender<Result<McpRowsSnapshot, RuntimeError>>,
+    },
+    /// One configured server in full. An unknown key answers `detail == None`,
+    /// which is not an error.
+    McpDetail {
+        generation: u64,
+        server: String,
+        done: oneshot::Sender<Result<McpDetailSnapshot, RuntimeError>>,
+    },
+    /// Do one thing to one configured server:
+    /// `docs/mcp-panel-design.md` §5.2's six actions. A refusal (unknown server,
+    /// uneditable config, OAuth failure) answers `ReconfigureFailed` carrying the
+    /// reason verbatim; `Untrust` and `Logout` answer `Busy` while a turn is
+    /// running, because they withdraw the tools before changing trust or auth.
+    McpAct {
+        generation: u64,
+        server: String,
+        action: crate::parts::McpAction,
+        done: oneshot::Sender<Result<(), RuntimeError>>,
     },
     WithdrawMcpTools {
         generation: u64,
@@ -4877,6 +5072,78 @@ fn spawn_runtime_owner_with_optional_agent(
                             tools,
                             available,
                         }));
+                    }
+                    Some(CodingRuntimeControl::McpRows {
+                        generation: request_generation,
+                        done,
+                    }) => {
+                        if request_generation != generation {
+                            let _ = done.send(Err(RuntimeError::Busy));
+                            continue;
+                        }
+                        let Some(runtime) = resources.as_ref() else {
+                            let _ = done.send(Err(RuntimeError::Unavailable));
+                            continue;
+                        };
+                        let rows = mcp_rows_of(runtime).await;
+                        let _ = done.send(Ok(McpRowsSnapshot {
+                            generation: RuntimeGeneration(generation),
+                            rows,
+                        }));
+                    }
+                    Some(CodingRuntimeControl::McpDetail {
+                        generation: request_generation,
+                        server,
+                        done,
+                    }) => {
+                        if request_generation != generation {
+                            let _ = done.send(Err(RuntimeError::Busy));
+                            continue;
+                        }
+                        let Some(runtime) = resources.as_ref() else {
+                            let _ = done.send(Err(RuntimeError::Unavailable));
+                            continue;
+                        };
+                        let detail = mcp_rows_of(runtime)
+                            .await
+                            .into_iter()
+                            .find(|row| row.name == server);
+                        let _ = done.send(Ok(McpDetailSnapshot {
+                            generation: RuntimeGeneration(generation),
+                            detail,
+                        }));
+                    }
+                    Some(CodingRuntimeControl::McpAct {
+                        generation: request_generation,
+                        server,
+                        action,
+                        done,
+                    }) => {
+                        // Withdrawing the tools is the security-reducing mutation
+                        // `withdraw_mcp_tools` awaits an idle terminal for, so the
+                        // two actions that withdraw take the same refusal as the
+                        // dedicated control. The other four do not withdraw —
+                        // `Disable` only takes tools away, and switching a tool
+                        // mid-session is the point (design §5.4) — so they run.
+                        let withdraws = matches!(
+                            action,
+                            crate::parts::McpAction::Untrust | crate::parts::McpAction::Logout
+                        );
+                        if request_generation != generation
+                            || (withdraws && (compaction_suspended || active_turn.is_some()))
+                        {
+                            let _ = done.send(Err(RuntimeError::Busy));
+                            continue;
+                        }
+                        let Some(runtime) = resources.as_mut() else {
+                            let _ = done.send(Err(RuntimeError::Unavailable));
+                            continue;
+                        };
+                        let outcome = apply_mcp_action(runtime, server, action).await;
+                        let _ = done.send(match outcome {
+                            Ok(()) => Ok(()),
+                            Err(message) => Err(RuntimeError::ReconfigureFailed(message)),
+                        });
                     }
                     Some(CodingRuntimeControl::WithdrawMcpTools {
                         generation: request_generation,
@@ -7757,6 +8024,15 @@ fn reject_runtime_control(
             let _ = done.send(Err(RuntimeError::Unavailable));
         }
         CodingRuntimeControl::McpTools { done, .. } => {
+            let _ = done.send(Err(RuntimeError::Unavailable));
+        }
+        CodingRuntimeControl::McpRows { done, .. } => {
+            let _ = done.send(Err(RuntimeError::Unavailable));
+        }
+        CodingRuntimeControl::McpDetail { done, .. } => {
+            let _ = done.send(Err(RuntimeError::Unavailable));
+        }
+        CodingRuntimeControl::McpAct { done, .. } => {
             let _ = done.send(Err(RuntimeError::Unavailable));
         }
         CodingRuntimeControl::WithdrawMcpTools { done, .. } => {
@@ -15691,6 +15967,93 @@ mod tests {
         assert_eq!(handle.reload_capabilities().await, Err(RuntimeError::Busy));
         assert_eq!(handle.status().phase, RuntimePhase::InTurn);
         assert!(runtime_events.try_recv().is_err());
+
+        handle.shutdown().await.unwrap();
+    }
+
+    /// The other half of that rule: only the actions that WITHDRAW wait for an
+    /// idle session. `Disable` takes tools away rather than widening anything, and
+    /// a mid-session switch is the point (design §5.4), so it runs mid-turn the
+    /// way `SwitchTool` already does.
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn mcp_act_withdraws_reject_an_active_turn_but_a_disable_goes_through() {
+        use crate::parts::McpAction;
+
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        // `native_start` hands out "." as the working dir; this test's `Disable`
+        // writes `.mcp.json`, so the project is a temp dir rather than the crate's
+        // own directory.
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join(".mcp.json"),
+            r#"{"mcpServers":{"srv":{"command":"npx","args":["-y","x"]}}}"#,
+        )
+        .unwrap();
+
+        let (agent, mut kernel_commands, _kernel_events) = fake_agent();
+        let (handle, controls) = coding_runtime_control_channel();
+        let (runtime_tx, _runtime_events) = mpsc::unbounded_channel();
+        let (wakeup_tx, wakeup_rx) = mpsc::unbounded_channel();
+        let CodingRuntimeStart {
+            agent: mut config,
+            mut prepare,
+            provider_factory,
+            plugin_hooks,
+            ..
+        } = native_start(false);
+        config.working_dir = project.path().to_path_buf();
+        prepare.session = crate::SessionMode::Fresh;
+        let parts =
+            prepare_with_plugin_hook_source(&config, prepare.clone(), plugin_hooks.as_ref())
+                .await
+                .unwrap();
+        let resources = RuntimeResources {
+            config,
+            prepare,
+            provider_factory,
+            plugin_hooks,
+            parts,
+            harness_app: None,
+            harness_providers: None,
+            wakeup_tx,
+            loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            image_preprocessor: None,
+        };
+        let _adapter = spawn_runtime_owner_with_protocol(
+            agent,
+            controls,
+            runtime_tx,
+            true,
+            true,
+            None,
+            Some(resources),
+            Some(wakeup_rx),
+        );
+
+        handle.submit(UserInput::from("active")).await.unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { .. })
+        ));
+
+        // Both withdrawing actions take the refusal the dedicated control takes.
+        let untrust = handle.mcp_act("srv".into(), McpAction::Untrust).await;
+        assert_eq!(untrust, Err(RuntimeError::Busy));
+        let logout = handle.mcp_act("srv".into(), McpAction::Logout).await;
+        assert_eq!(logout, Err(RuntimeError::Busy));
+
+        // The non-withdrawing one goes through: the flag reached the file.
+        handle
+            .mcp_act("srv".into(), McpAction::Disable)
+            .await
+            .unwrap();
+        let text = std::fs::read_to_string(project.path().join(".mcp.json")).unwrap();
+        assert!(
+            text.contains("\"disabled\": true"),
+            "a mid-turn disable still writes the flag: {text}"
+        );
 
         handle.shutdown().await.unwrap();
     }

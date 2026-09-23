@@ -653,6 +653,137 @@ fn runtime_mode(mode: atomcode_host_api::Mode) -> atomcode_coding::RuntimeMode {
     }
 }
 
+/// The state a management screen draws, derived from the runtime's facts.
+///
+/// `Disabled` and `NeedsAuthentication` are derived here rather than reported by
+/// the connection, because neither is a connection outcome: one is the file's
+/// `disabled: true`, the other is whether the token store holds a usable token —
+/// and a server with no credentials is never attempted, so there is no status to
+/// report it.
+fn to_mcp_state(facts: &atomcode_coding::McpRowFacts) -> atomcode_host_api::McpServerState {
+    use atomcode_capabilities::mcp::ServerStatus;
+    use atomcode_host_api::McpServerState;
+    if facts.disabled {
+        return McpServerState::Disabled;
+    }
+    if facts.oauth && !facts.authenticated {
+        return McpServerState::NeedsAuthentication;
+    }
+    match &facts.status {
+        ServerStatus::Connecting => McpServerState::Connecting,
+        ServerStatus::Connected => McpServerState::Connected,
+        ServerStatus::BlockedUntrusted => McpServerState::Untrusted,
+        ServerStatus::Failed(message) => McpServerState::Failed {
+            message: message.clone(),
+        },
+        ServerStatus::Disconnected => McpServerState::Disconnected,
+    }
+}
+
+/// How a server is reached, and nothing else about it: the capability types
+/// carry a stdio server's `env` and an HTTP server's `headers`, which are where
+/// credentials live, and neither belongs on a screen.
+fn to_mcp_transport(facts: &atomcode_coding::McpRowFacts) -> atomcode_host_api::McpTransport {
+    use atomcode_capabilities::mcp::McpTransportKind;
+    use atomcode_host_api::McpTransport;
+    match facts.transport {
+        McpTransportKind::Stdio => {
+            let (command, args) = facts.command.clone().unwrap_or_default();
+            McpTransport::Stdio {
+                command,
+                args,
+                timeout_ms: None,
+            }
+        }
+        McpTransportKind::Http => McpTransport::Http {
+            url: facts.url.clone().unwrap_or_default(),
+            timeout_ms: None,
+        },
+    }
+}
+
+/// Whether it authenticates, and whether it currently can.
+fn to_mcp_auth(facts: &atomcode_coding::McpRowFacts) -> atomcode_host_api::McpAuth {
+    use atomcode_host_api::McpAuth;
+    if facts.oauth {
+        McpAuth::OAuth {
+            authenticated: facts.authenticated,
+        }
+    } else {
+        McpAuth::None
+    }
+}
+
+/// The wire action onto the runtime's own.
+///
+/// Two enums, one table: `atomcode-coding` does not depend on the contract crate,
+/// so each layer keeps its own copy and this is where they meet — the same split
+/// as `McpRowFacts` → `McpRow`, read the other way.
+///
+/// `None` is "this build does not know that action". `McpAction` is
+/// `#[non_exhaustive]` and is declared in a different crate, so a front end built
+/// against a newer contract can name one this binary has never heard of — and
+/// **every one of these writes into the person's file**, so folding an unknown
+/// one onto a neighbouring action would perform the wrong write. The caller
+/// refuses instead of mapping it.
+fn to_mcp_action(
+    action: atomcode_host_api::McpAction,
+) -> Option<atomcode_coding::parts::McpAction> {
+    use atomcode_coding::parts::McpAction as Runtime;
+    use atomcode_host_api::McpAction;
+    match action {
+        McpAction::Trust => Some(Runtime::Trust),
+        McpAction::Untrust => Some(Runtime::Untrust),
+        McpAction::Login => Some(Runtime::Login),
+        McpAction::Logout => Some(Runtime::Logout),
+        McpAction::Enable => Some(Runtime::Enable),
+        McpAction::Disable => Some(Runtime::Disable),
+        // The wildcard `#[non_exhaustive]` requires. It maps nothing: see above.
+        _ => None,
+    }
+}
+
+/// The file a server is defined in, when one is. `None` is a driver-supplied
+/// server, which never had a file — not "not found".
+fn mcp_config_path(facts: &atomcode_coding::McpRowFacts) -> Option<String> {
+    facts
+        .config_path
+        .as_ref()
+        .map(|path| path.display().to_string())
+}
+
+/// One row of the list: the facts a screen groups and counts by.
+fn to_mcp_row(facts: atomcode_coding::McpRowFacts) -> atomcode_host_api::McpRow {
+    use atomcode_host_api::McpRow;
+    let state = to_mcp_state(&facts);
+    let config_path = mcp_config_path(&facts);
+    McpRow {
+        name: facts.name,
+        state,
+        source: facts.source.as_str().to_string(),
+        tool_count: facts.tool_count,
+        config_path,
+    }
+}
+
+/// Everything the detail page shows about one server.
+fn to_mcp_detail(facts: atomcode_coding::McpRowFacts) -> atomcode_host_api::McpServerDetail {
+    use atomcode_host_api::McpServerDetail;
+    let state = to_mcp_state(&facts);
+    let transport = to_mcp_transport(&facts);
+    let auth = to_mcp_auth(&facts);
+    let config_path = mcp_config_path(&facts);
+    McpServerDetail {
+        name: facts.name,
+        state,
+        source: facts.source.as_str().to_string(),
+        transport,
+        auth,
+        tool_count: facts.tool_count,
+        config_path,
+    }
+}
+
 fn translate(event: CodingRuntimeEvent) -> Option<AgentEvent> {
     match event {
         CodingRuntimeEvent::Agent(event) => Some(event),
@@ -1228,6 +1359,53 @@ impl HostControl for RuntimeControl {
                             },
                         })
                         .collect(),
+                })
+            }
+            // The panel's list: every configured server, disabled ones included,
+            // with the live status and this session's tool counts. `McpStatus`
+            // answers a different question — it reports only what the running
+            // session actually has, so a server that is switched off is not in
+            // it at all.
+            HostCommand::McpManage { session } => {
+                self.addressed(&session)?;
+                let rows = self.handle.mcp_rows().await.map_err(refused)?;
+                Ok(HostReply::McpRows {
+                    rows: rows.rows.into_iter().map(to_mcp_row).collect(),
+                })
+            }
+            // One configured server in full, for the detail page. An unknown key
+            // is `NotFound`, not an empty page: the name is what the person asked
+            // about, and `McpManage` is where the real names are.
+            HostCommand::McpDetail { session, server } => {
+                self.addressed(&session)?;
+                let snapshot = self.handle.mcp_detail(server).await.map_err(refused)?;
+                snapshot
+                    .detail
+                    .map(|facts| HostReply::McpDetail {
+                        detail: to_mcp_detail(facts),
+                    })
+                    .ok_or(HostError::NotFound)
+            }
+            // One thing to one configured server. The answer is the refreshed
+            // list rather than a bare success — what happened, not what was asked
+            // for — and it is the same `mcp_rows()` the read path uses, so the
+            // page and the action cannot disagree about the server it changed.
+            HostCommand::McpAct {
+                session,
+                server,
+                action,
+            } => {
+                self.addressed(&session)?;
+                // A `#[non_exhaustive]` action this build cannot name is refused
+                // rather than rounded to a neighbour: the call below writes into
+                // the person's file.
+                let action = to_mcp_action(action).ok_or_else(|| HostError::Failed {
+                    message: "this build does not know that MCP action".into(),
+                })?;
+                self.handle.mcp_act(server, action).await.map_err(refused)?;
+                let rows = self.handle.mcp_rows().await.map_err(refused)?;
+                Ok(HostReply::McpRows {
+                    rows: rows.rows.into_iter().map(to_mcp_row).collect(),
                 })
             }
             HostCommand::Settings { session } => {

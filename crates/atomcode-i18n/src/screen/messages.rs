@@ -630,10 +630,12 @@ pub enum Msg<'a> {
     McpConnecting,
     McpConnected,
     McpUntrusted,
+    McpNeedsAuthentication,
     McpFailed {
         message: &'a str,
     },
     McpDisconnected,
+    McpDisabled,
     McpUnknownState,
     McpWithdrawn,
     McpNeedsServerName,
@@ -646,6 +648,54 @@ pub enum Msg<'a> {
     Reloaded,
     SignedOut,
     SignedIn,
+
+    // ── the MCP panel (`mcp.rs`, `modules/mcp.rs`) ──
+    McpPanelTitle,
+    McpPanelServers {
+        n: usize,
+    },
+    McpPanelEmpty,
+    /// The directory has servers, but the filter matched none. Distinct from
+    /// [`Msg::McpPanelEmpty`] on purpose: telling a person "nothing is
+    /// configured" when they are looking at a search box that matched nothing
+    /// is a false statement about their own file.
+    McpPanelNoMatch,
+    /// `/mcp` with no argument, when this tree mounted no MCP panel at all. The
+    /// row can be left out of a build's layout, and saying so beats a screen
+    /// that looks like it did something.
+    McpPanelUnavailable,
+    /// The detail page, drawn the moment `Enter` is pressed and filled when the
+    /// round trip comes back.
+    McpDetailPending,
+    /// The three values the host uses for where a server came from: `"global"`,
+    /// `"project"`, `"driver"`. A value it does not know is drawn as it is.
+    McpGroupGlobal,
+    McpGroupProject,
+    McpGroupDriver,
+    /// The detail page's table: four labels, and how many tools are mounted.
+    McpLabelState,
+    McpLabelAuth,
+    McpLabelEndpoint,
+    McpLabelSource,
+    McpLabelTools {
+        n: usize,
+    },
+    /// What the detail page says about credentials.
+    McpAuthNone,
+    McpAuthAuthenticated,
+    McpAuthNotAuthenticated,
+    /// The six things an action can be.
+    McpActionTrust,
+    McpActionUntrust,
+    McpActionLogin,
+    McpActionLogout,
+    McpActionEnable,
+    McpActionDisable,
+    /// The key legend: on the list, on the detail page, and while a round trip
+    /// is out.
+    McpLegendList,
+    McpLegendDetail,
+    McpLegendBusy,
 
     // ── the toolbox and the plugins (`commands.rs`) ──
     CmdTakesToolbox,
@@ -677,6 +727,9 @@ pub enum Msg<'a> {
         lines: &'a str,
     },
     NoPluginPort,
+    /// The MCP panel has no port: this build mounted the screen without the
+    /// launcher's `tui-mcp` row. The sibling of [`Msg::NoToolCatalog`].
+    NoMcpPort,
     /// `takes` for `/setup`: what a person may type after it.
     CmdTakesSetup,
     /// `/setup`'s line in `/help` and in the slash menu.
@@ -835,6 +888,9 @@ pub enum Msg<'a> {
     McpTallyUntrusted {
         n: usize,
     },
+    McpTallyNeedsAuthentication {
+        n: usize,
+    },
     McpTallyConnecting {
         n: usize,
     },
@@ -842,6 +898,9 @@ pub enum Msg<'a> {
         n: usize,
     },
     McpTallyOff {
+        n: usize,
+    },
+    McpTallyDisabled {
         n: usize,
     },
     StatsNotKept,

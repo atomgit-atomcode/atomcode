@@ -47,13 +47,14 @@ mod util;
 
 pub use client::{McpClient, McpToolInfo};
 pub use config::{
-    load_mcp_config, merge_http_oauth_mcp_server_into_json_file,
-    merge_stdio_mcp_server_into_json_file, McpHttpAuthConfig, McpOAuthConfig, McpServerConfig,
-    McpTransportConfig, McpTransportKind,
+    config_path_for_source, load_mcp_config, load_mcp_config_including_disabled,
+    merge_http_oauth_mcp_server_into_json_file, merge_stdio_mcp_server_into_json_file,
+    McpConfigSource, McpHttpAuthConfig, McpOAuthConfig, McpServerConfig, McpTransportConfig,
+    McpTransportKind,
 };
 pub use oauth::{
-    login_github_oauth, login_mcp_oauth, refresh_mcp_oauth_token, McpOAuthLoginOptions,
-    McpOAuthToken, McpTokenStore,
+    login_github_oauth, login_mcp_oauth, refresh_mcp_oauth_token, token_is_expired,
+    McpOAuthLoginOptions, McpOAuthToken, McpTokenStore,
 };
 pub use registry::{project_trust_key, ConnectAttempt, McpConnectEvent, McpRegistry};
 pub use tool::{mcp_tool_full_name, sanitize_name_segment, McpToolAdapter};

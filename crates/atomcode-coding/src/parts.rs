@@ -1400,6 +1400,145 @@ impl CodingParts {
     }
 }
 
+/// One configured MCP server, as a management list needs it: the file's static
+/// config joined with what the running session actually has.
+#[derive(Clone, Debug, PartialEq)]
+pub struct McpRowFacts {
+    pub name: String,
+    pub disabled: bool,
+    pub source: atomcode_capabilities::mcp::McpConfigSource,
+    pub config_path: Option<std::path::PathBuf>,
+    pub transport: atomcode_capabilities::mcp::McpTransportKind,
+    /// The stdio program and its args, when this is a stdio server. Never
+    /// carries env: that is where a stdio server's own secrets live.
+    pub command: Option<(String, Vec<String>)>,
+    /// The endpoint, when this is an HTTP server. Never carries headers: those
+    /// may hold `Authorization: Bearer …`.
+    pub url: Option<String>,
+    /// The server authenticates by OAuth (so `authenticated` means something).
+    pub oauth: bool,
+    /// A usable token is stored for it.
+    pub authenticated: bool,
+    pub status: atomcode_capabilities::mcp::ServerStatus,
+    pub tool_count: usize,
+}
+
+/// Join the configured servers (disabled ones included) with the live session.
+///
+/// The registry and the tool counts are arguments rather than ambient reads, so
+/// the join can be tested against a registry that never connected to anything.
+pub async fn mcp_row_facts(
+    working_dir: &std::path::Path,
+    registry: &atomcode_capabilities::mcp::McpRegistry,
+    tool_counts: &[(String, usize)],
+) -> Vec<McpRowFacts> {
+    use atomcode_capabilities::mcp::{
+        config_path_for_source, load_mcp_config_including_disabled, token_is_expired,
+        McpHttpAuthConfig, McpTokenStore, McpTransportConfig, ServerStatus,
+    };
+    use std::collections::HashMap;
+
+    // A malformed file is the connection path's to report; a management list
+    // must not turn it into "no servers configured".
+    let configs = load_mcp_config_including_disabled(working_dir).unwrap_or_default();
+    let live: HashMap<String, ServerStatus> =
+        registry.server_statuses().await.into_iter().collect();
+    let counts: HashMap<&str, usize> = tool_counts.iter().map(|(n, c)| (n.as_str(), *c)).collect();
+    let tokens = McpTokenStore::default();
+
+    configs
+        .into_iter()
+        .map(|config| {
+            let (command, url) = match &config.config {
+                McpTransportConfig::Stdio { command, args, .. } => {
+                    (Some((command.clone(), args.clone())), None)
+                }
+                McpTransportConfig::Http { url, .. } => (None, Some(url.clone())),
+            };
+            let oauth = matches!(
+                &config.config,
+                McpTransportConfig::Http {
+                    auth: Some(McpHttpAuthConfig::OAuth(_)),
+                    ..
+                }
+            );
+            let authenticated = oauth
+                && matches!(tokens.load_token(&config.name), Ok(Some(t)) if !token_is_expired(&t));
+            let disabled = config.disabled;
+            McpRowFacts {
+                config_path: config_path_for_source(working_dir, config.source),
+                status: if disabled {
+                    // Not in the tree: the session has no status for it, and
+                    // must not be asked for one.
+                    ServerStatus::Disconnected
+                } else {
+                    live.get(&config.name)
+                        .cloned()
+                        .unwrap_or(ServerStatus::Disconnected)
+                },
+                tool_count: if disabled {
+                    0
+                } else {
+                    counts.get(config.name.as_str()).copied().unwrap_or(0)
+                },
+                transport: config.config.kind(),
+                command,
+                url,
+                disabled,
+                oauth,
+                authenticated,
+                name: config.name,
+                source: config.source,
+            }
+        })
+        .collect()
+}
+
+/// What a person can do to one MCP server. This crate's own copy, not
+/// `atomcode_host_api::McpAction`: the wire type lives above this layer
+/// (`cli/host.rs` maps between them, the way it maps `McpRowFacts` → `McpRow`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum McpAction {
+    Trust,
+    Untrust,
+    Login,
+    Logout,
+    /// Remove `disabled` from the file that defines it.
+    Enable,
+    /// Write `disabled: true` into that file.
+    Disable,
+}
+
+/// Write one server's on/off flag into the file that defines it.
+///
+/// Resolves the file from the server's *source*, so the edit lands where a
+/// reader would resolve it. Bails when the server is not configured at all, and
+/// when the file carries comments (`set_mcp_server_disabled_in_json_file`'s
+/// guard) — the caller surfaces that text verbatim.
+pub async fn mcp_set_enabled(
+    working_dir: &std::path::Path,
+    server: &str,
+    enabled: bool,
+) -> Result<(), String> {
+    // All three live in `mcp::config`. `set_mcp_server_disabled_in_json_file` is
+    // not re-exported from `atomcode_capabilities::mcp` (the module's re-export
+    // list has never carried it), so they are taken from where they are defined.
+    use atomcode_capabilities::mcp::config::{
+        config_path_for_source, load_mcp_config_including_disabled,
+        set_mcp_server_disabled_in_json_file,
+    };
+
+    let configs = load_mcp_config_including_disabled(working_dir).map_err(|e| e.to_string())?;
+    let config = configs
+        .iter()
+        .find(|c| c.name == server)
+        .ok_or_else(|| format!("MCP server '{server}' is not configured"))?;
+    let path = config_path_for_source(working_dir, config.source)
+        .ok_or_else(|| format!("MCP server '{server}' has no config file to edit"))?;
+
+    set_mcp_server_disabled_in_json_file(&path, server, !enabled).map_err(|e| format!("{e:#}"))
+}
+
 /// Fill the providers this capability graph's own sub-agents run on, for `cfg`'s
 /// model: the reviewer's and the subagent host tier's slots, the fast/capable tier
 /// cells and the named-model resolver — each billed to this session's detached
@@ -2015,6 +2154,52 @@ mod tests {
 
         assert_eq!(parts.mcp_tools_for_server("docs space"), vec![alias]);
         assert!(parts.mcp_tools_for_server("docs-space").is_empty());
+    }
+
+    #[test]
+    fn a_disabled_server_is_listed_but_has_no_tools() {
+        // A disabled entry is in the file but not in the tree. The management
+        // list has to show it — otherwise the switch back on is unreachable —
+        // while its tool count stays zero, because the session never got any.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".mcp.json"),
+            r#"{"mcpServers":{
+                "off": {"command":"npx","args":["-y","x"],"disabled":true}
+            }}"#,
+        )
+        .unwrap();
+
+        let registry = std::sync::Arc::new(McpRegistry::new());
+        let facts = futures::executor::block_on(mcp_row_facts(dir.path(), &registry, &[]));
+        let row = facts.iter().find(|f| f.name == "off").expect("listed");
+        assert!(row.disabled, "the flag reaches the row");
+        assert_eq!(
+            row.tool_count, 0,
+            "a disabled server put nothing on the model"
+        );
+    }
+
+    #[test]
+    fn disabling_a_server_writes_the_flag_and_enabling_removes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(".mcp.json");
+        std::fs::write(
+            &target,
+            r#"{"mcpServers":{"srv":{"command":"npx","args":["-y","x"]}}}"#,
+        )
+        .unwrap();
+
+        futures::executor::block_on(mcp_set_enabled(dir.path(), "srv", false)).unwrap();
+        let text = std::fs::read_to_string(&target).unwrap();
+        assert!(
+            text.contains("\"disabled\": true"),
+            "off writes the flag: {text}"
+        );
+
+        futures::executor::block_on(mcp_set_enabled(dir.path(), "srv", true)).unwrap();
+        let text = std::fs::read_to_string(&target).unwrap();
+        assert!(!text.contains("disabled"), "on removes the key: {text}");
     }
 
     /// `prepare` with all optional capabilities OFF — keeps the call I/O-free (no MCP

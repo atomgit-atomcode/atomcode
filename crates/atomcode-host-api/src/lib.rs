@@ -131,6 +131,25 @@ pub enum HostCommand {
     McpStatus { session: String },
     /// The tools one MCP server put on `session`'s model (A11).
     McpTools { session: String, server: String },
+    /// Every configured MCP server for `session`, **disabled ones included**,
+    /// with what a management screen groups and counts by
+    /// (`docs/mcp-panel-design.md` §4.1). Distinct from `McpStatus`, which
+    /// reports only what the running session actually has.
+    McpManage { session: String },
+    /// One configured server in full, for the detail page. `server` is the
+    /// configured key, not a tool name.
+    McpDetail { session: String, server: String },
+    /// Do one thing to one configured MCP server (`docs/mcp-panel-design.md`
+    /// §4.1).
+    ///
+    /// Answers with the refreshed list rather than this one server, because half
+    /// of these change the whole project's picture — trust is project-wide. A
+    /// caller that stays on a detail page re-reads that server with `McpDetail`.
+    McpAct {
+        session: String,
+        server: String,
+        action: McpAction,
+    },
     /// Everything in `session`'s tool catalog and what is true of each: on, off
     /// because the person said so, or absent because the tree was configured
     /// without it (`docs/tool-catalog-policy.md`).
@@ -260,6 +279,9 @@ impl HostCommand {
             | Self::Rename { session, .. }
             | Self::McpStatus { session }
             | Self::McpTools { session, .. }
+            | Self::McpManage { session }
+            | Self::McpDetail { session, .. }
+            | Self::McpAct { session, .. }
             | Self::ToolCatalog { session }
             | Self::SwitchTool { session, .. }
             | Self::WithdrawMcpTools { session }
@@ -327,6 +349,12 @@ pub enum HostReply {
     /// them by.
     McpTools {
         tools: Vec<String>,
+    },
+    McpRows {
+        rows: Vec<McpRow>,
+    },
+    McpDetail {
+        detail: McpServerDetail,
     },
     /// The tool catalog, as a screen offering the switch needs it.
     ToolCatalog {
@@ -786,10 +814,108 @@ pub enum McpServerState {
     Connected,
     /// Not started: the project is not trusted.
     Untrusted,
+    /// HTTP with OAuth auth, and no usable token stored for this server. Derived
+    /// by the runtime from the token store, not reported by the connection: the
+    /// connection is never attempted without credentials to try.
+    NeedsAuthentication,
+    /// `disabled: true` in the file that defines it. The server is not started
+    /// and is not in the running session's catalog — it is listed so the switch
+    /// back on is reachable (`crates/atomcode-capabilities/src/mcp/config.rs:212`
+    /// filters these out of the runtime's own read).
+    Disabled,
     Failed {
         message: String,
     },
     Disconnected,
+}
+
+/// How a server is reached, with nothing that could authenticate as anyone.
+///
+/// Deliberately not `atomcode_capabilities::mcp::McpTransportConfig`: that type's
+/// payload carries headers and OAuth material, and a screen showing "this one is
+/// an HTTP server" has no business holding them.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum McpTransport {
+    Stdio {
+        command: String,
+        args: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+    },
+    Http {
+        url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+    },
+}
+
+/// Whether a server authenticates, and whether it currently can.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum McpAuth {
+    /// The transport authenticates by nothing the person manages here.
+    None,
+    OAuth {
+        /// A usable token is stored for this server.
+        authenticated: bool,
+    },
+}
+
+/// One row of the `/mcp` list, as a screen draws it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpRow {
+    pub name: String,
+    pub state: McpServerState,
+    /// `McpConfigSource::as_str()` — `"global"`, `"project"` or `"driver"`.
+    /// A plain string rather than the enum: the capability type is not this
+    /// crate's to publish, and a screen only groups by it.
+    pub source: String,
+    /// Tools this server has on the session's model, by the names the model
+    /// calls them by. Zero for a server that is disabled or not connected.
+    pub tool_count: usize,
+    /// The file it is defined in, when it is backed by one. `None` for a
+    /// driver-supplied server, which never had a file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_path: Option<String>,
+}
+
+/// Everything the `/mcp` detail page shows about one server.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServerDetail {
+    pub name: String,
+    pub state: McpServerState,
+    /// See [`McpRow::source`].
+    pub source: String,
+    pub transport: McpTransport,
+    pub auth: McpAuth,
+    pub tool_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_path: Option<String>,
+}
+
+/// What a person can do to one MCP server from the management panel.
+///
+/// `Enable` and `Disable` are named from the person's point of view, not the
+/// file's: **`Disable` writes `disabled: true`, `Enable` removes that key.**
+/// Getting this backwards silently inverts every switch in the panel, so the
+/// mapping is spelled out here once.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum McpAction {
+    /// Trust this project, so its `.mcp.json` servers may connect at all.
+    Trust,
+    /// Withdraw that trust. The project's tools come off the session first.
+    Untrust,
+    /// Run the OAuth flow for this server. Blocks until it ends — it waits on a
+    /// browser, so it can take minutes.
+    Login,
+    /// Forget the stored token for this server. Its tools come off first.
+    Logout,
+    /// Let this server run again: remove `disabled` from the file that defines it.
+    Enable,
+    /// Switch this server off: write `disabled: true` into that file.
+    Disable,
 }
 
 /// One stored session, as a picker shows it.
@@ -1028,6 +1154,18 @@ mod tests {
                 session: "a".into(),
                 server: "fs".into(),
             },
+            HostCommand::McpManage {
+                session: "a".into(),
+            },
+            HostCommand::McpDetail {
+                session: "a".into(),
+                server: "fs".into(),
+            },
+            HostCommand::McpAct {
+                session: "a".into(),
+                server: "fs".into(),
+                action: McpAction::Disable,
+            },
             HostCommand::WithdrawMcpTools {
                 session: "a".into(),
             },
@@ -1103,6 +1241,9 @@ mod tests {
                 | HostCommand::Rename { .. }
                 | HostCommand::McpStatus { .. }
                 | HostCommand::McpTools { .. }
+                | HostCommand::McpManage { .. }
+                | HostCommand::McpDetail { .. }
+                | HostCommand::McpAct { .. }
                 | HostCommand::ToolCatalog { .. }
                 | HostCommand::SwitchTool { .. }
                 | HostCommand::WithdrawMcpTools { .. }
@@ -1118,7 +1259,9 @@ mod tests {
                 | HostCommand::Readiness { .. }
                 | HostCommand::ResetSetting { .. }
                 | HostCommand::ToolCatalog { .. }
-                | HostCommand::SwitchTool { .. } => {}
+                | HostCommand::SwitchTool { .. }
+                | HostCommand::PreviewSession { .. }
+                | HostCommand::DeleteSession { .. } => {}
             }
         }
         all
@@ -1185,10 +1328,42 @@ mod tests {
                         name: "c".into(),
                         state: McpServerState::Disconnected,
                     },
+                    McpServer {
+                        name: "needs-auth".into(),
+                        state: McpServerState::NeedsAuthentication,
+                    },
+                    McpServer {
+                        name: "off".into(),
+                        state: McpServerState::Disabled,
+                    },
                 ],
             },
             HostReply::McpTools {
                 tools: vec!["fs__read".into(), "fs__write".into()],
+            },
+            HostReply::McpRows {
+                rows: vec![McpRow {
+                    name: "fs".into(),
+                    state: McpServerState::Connected,
+                    source: "project".into(),
+                    tool_count: 3,
+                    config_path: Some("/w/.mcp.json".into()),
+                }],
+            },
+            HostReply::McpDetail {
+                detail: McpServerDetail {
+                    name: "fs".into(),
+                    state: McpServerState::Disabled,
+                    source: "project".into(),
+                    transport: McpTransport::Stdio {
+                        command: "npx".into(),
+                        args: vec!["-y".into(), "srv".into()],
+                        timeout_ms: None,
+                    },
+                    auth: McpAuth::None,
+                    tool_count: 0,
+                    config_path: Some("/w/.mcp.json".into()),
+                },
             },
             HostReply::Settings {
                 settings: vec![Setting {
@@ -1329,6 +1504,8 @@ mod tests {
                 | HostReply::RewindPoints { .. }
                 | HostReply::McpServers { .. }
                 | HostReply::McpTools { .. }
+                | HostReply::McpRows { .. }
+                | HostReply::McpDetail { .. }
                 | HostReply::Settings { .. }
                 | HostReply::Models { .. }
                 | HostReply::Changes { .. }
@@ -1340,7 +1517,8 @@ mod tests {
                 | HostReply::Identity { .. }
                 | HostReply::Sources { .. }
                 | HostReply::ToolCatalog { .. }
-                | HostReply::Readiness { .. } => {}
+                | HostReply::Readiness { .. }
+                | HostReply::SessionPreview { .. } => {}
             }
         }
         all
@@ -1462,5 +1640,51 @@ mod tests {
             };
             assert_eq!(command.addressed(), expected, "{command:?}");
         }
+    }
+
+    #[test]
+    fn a_transport_crossing_the_wire_carries_no_credentials() {
+        // The config it is built from holds headers and OAuth material
+        // (`caps::mcp::McpTransportConfig`). The wire type must not.
+        let http = McpTransport::Http {
+            url: "https://mcp.example.com/mcp".into(),
+            timeout_ms: Some(60_000),
+        };
+        let json = serde_json::to_string(&http).unwrap();
+        for leaked in ["header", "authorization", "client_secret", "token"] {
+            assert!(
+                !json.to_lowercase().contains(leaked),
+                "the wire type must not carry {leaked}: {json}"
+            );
+        }
+        let back: McpTransport = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, http);
+    }
+
+    #[test]
+    fn a_row_and_a_detail_survive_the_wire() {
+        let row = McpRow {
+            name: "context7".into(),
+            state: McpServerState::Connected,
+            source: "global".into(),
+            tool_count: 8,
+            config_path: Some("/home/u/.atomcode/mcp.json".into()),
+        };
+        let detail = McpServerDetail {
+            name: "figma".into(),
+            state: McpServerState::NeedsAuthentication,
+            source: "project".into(),
+            transport: McpTransport::Http {
+                url: "https://mcp.figma.com/mcp".into(),
+                timeout_ms: Some(60_000),
+            },
+            auth: McpAuth::OAuth {
+                authenticated: false,
+            },
+            tool_count: 0,
+            config_path: None,
+        };
+        crosses(&row);
+        crosses(&detail);
     }
 }

@@ -414,8 +414,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::McpConnecting => "connecting".into(),
         Msg::McpConnected => "connected".into(),
         Msg::McpUntrusted => "untrusted project — not started".into(),
+        Msg::McpNeedsAuthentication => "needs authentication".into(),
         Msg::McpFailed { message } => format!("failed: {message}").into(),
         Msg::McpDisconnected => "disconnected".into(),
+        Msg::McpDisabled => "disabled in its config file".into(),
         Msg::McpUnknownState => "unknown".into(),
         Msg::McpWithdrawn => "every MCP tool was withdrawn".into(),
         Msg::McpNeedsServerName => "it needs a server name: /mcp tools <server>".into(),
@@ -424,6 +426,41 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::Reloaded => "the skills, the MCP servers and the config were read again".into(),
         Msg::SignedOut => "signed out; /login signs in again".into(),
         Msg::SignedIn => "signed in".into(),
+
+        // ── the MCP panel (`mcp.rs`, `modules/mcp.rs`) ──
+        Msg::McpPanelTitle => "Manage MCP servers".into(),
+        Msg::McpPanelServers { n } => format!("{n} servers").into(),
+        Msg::McpPanelEmpty => "No MCP servers configured".into(),
+        Msg::McpPanelNoMatch => "no configured server matches".into(),
+        Msg::McpPanelUnavailable => "this build has no MCP panel".into(),
+        Msg::McpDetailPending => "Fetching details…".into(),
+        // Where a server came from: the product's `/help` names the same two
+        // places in its source column, so these read its words instead of
+        // writing them a second time (`tests/tables.rs`).
+        Msg::McpGroupGlobal => {
+            crate::product::t_with(crate::Locale::En, crate::product::Msg::HelpSourceGlobal)
+        }
+        Msg::McpGroupProject => {
+            crate::product::t_with(crate::Locale::En, crate::product::Msg::HelpSourceProject)
+        }
+        Msg::McpGroupDriver => "Supplied by the client".into(),
+        Msg::McpLabelState => "Status".into(),
+        Msg::McpLabelAuth => "Auth".into(),
+        Msg::McpLabelEndpoint => "Endpoint".into(),
+        Msg::McpLabelSource => "Config location".into(),
+        Msg::McpLabelTools { n } => format!("{n} tools").into(),
+        Msg::McpAuthNone => "Not required".into(),
+        Msg::McpAuthAuthenticated => "authenticated".into(),
+        Msg::McpAuthNotAuthenticated => "not authenticated".into(),
+        Msg::McpActionTrust => "Trust this project".into(),
+        Msg::McpActionUntrust => "Untrust".into(),
+        Msg::McpActionLogin => "Authenticate".into(),
+        Msg::McpActionLogout => "Sign out".into(),
+        Msg::McpActionEnable => "Enable".into(),
+        Msg::McpActionDisable => "Disable".into(),
+        Msg::McpLegendList => "↑/↓ move · Enter details · Esc close".into(),
+        Msg::McpLegendDetail => "↑/↓ move · Enter run · Esc back".into(),
+        Msg::McpLegendBusy => "Esc cancel".into(),
 
         // ── the toolbox and the plugins (`commands.rs`) ──
         Msg::CmdTakesToolbox => "[off <name or mcp__server__*> | on <the same>]".into(),
@@ -440,6 +477,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::PluginNoSuch { typed } => format!("there is no plugin called {typed}").into(),
         Msg::PluginAmbiguous { name, lines } => format!("there are several called {name}; say which one:\n{lines}").into(),
         Msg::NoPluginPort => "this screen has no plugins: the launcher provided no `tui-plugins`".into(),
+        Msg::NoMcpPort => "this screen has no MCP port: the launcher provided no `tui-mcp`".into(),
         Msg::CmdTakesSetup => "[focus area, e.g. hooks, mcp, skills, all]".into(),
         Msg::CmdAboutSetup => "analyze this project, install the seed skill, and recommend which automations to set up".into(),
         Msg::NoSetupPort => "this screen installs no seeds: the launcher provided no `tui-setup`, so there is nothing to unseal".into(),
@@ -508,9 +546,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StatusWindowResetsIn { duration } => format!(" · resets in {duration}").into(),
         Msg::McpTallyFailed { n } => format!("{n} cannot connect").into(),
         Msg::McpTallyUntrusted { n } => format!("{n} awaiting trust").into(),
+        Msg::McpTallyNeedsAuthentication { n } => format!("{n} awaiting authentication").into(),
         Msg::McpTallyConnecting { n } => format!("{n} connecting").into(),
         Msg::McpTallyConnected { n } => format!("{n} connected").into(),
         Msg::McpTallyOff { n } => format!("{n} not connected").into(),
+        Msg::McpTallyDisabled { n } => format!("{n} disabled").into(),
         Msg::StatsNotKept => "this host keeps no account".into(),
 
         // ── the account's figures (`modules/settings.rs`) ──
