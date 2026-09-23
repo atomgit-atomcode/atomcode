@@ -1963,7 +1963,13 @@ mod tests {
         assert!(prepared.unwrap().is_ok());
     }
 
+    // Serialized like every other `ATOMCODE_HOME` mutator in this file: it sets
+    // the process-global var, so running beside another home-sensitive test (e.g.
+    // `a_mount_rejects_an_incomplete_native_aggregate`, which resolves a persisted
+    // session under its OWN home) races — its home leaks in and the neighbor's
+    // `prepare` fails to find the session. The missing guard was a latent flake.
     #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
     async fn capability_reload_withdraws_old_mcp_tools_fail_closed() {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
@@ -2100,6 +2106,46 @@ mod tests {
                 "non-atomgit tool must be present when atomgit is disabled: {expected} in {names:?}"
             );
         }
+    }
+
+    #[cfg(feature = "atomgit")]
+    #[tokio::test]
+    #[serial_test::serial(atomgit_env)]
+    async fn atomgit_guidance_is_carried_by_the_mounted_tools_when_enabled() {
+        // The link the other tests leave open: the persona body no longer teaches
+        // `## ATOMGIT TOOLS:` — the block is contributed by `HostBuiltTools::apply`,
+        // which iterates `host_only_tools` and asks `host_tool_guidance` for each.
+        // So the real end-to-end claim is "when the switch mounts the tools, those
+        // SAME tools carry the guidance". Reproduce that iteration here: on ⇒ a
+        // mounted host tool yields the AtomGit block; off ⇒ none does, so the
+        // prompt and the catalog cannot desync. Serialized with the env-mutating
+        // switch tests so a leaked `ATOMCODE_ATOMGIT=0` cannot make the on-case a
+        // false negative.
+        let project = tempfile::tempdir().unwrap();
+
+        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
+        assert!(cfg.atomgit_enabled, "default on");
+        let parts = prepare(&cfg, io_free_opts()).await.unwrap();
+        let carried_on = parts
+            .host_only_tools()
+            .iter()
+            .filter_map(|tool| crate::persona::host_tool_guidance(tool.name()))
+            .any(|(key, text)| key == "atomgit" && text.contains("## ATOMGIT TOOLS:"));
+        assert!(
+            carried_on,
+            "enabled ⇒ a mounted host tool must carry the AtomGit guidance"
+        );
+
+        let mut off_cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
+        off_cfg.atomgit_enabled = false;
+        let off_parts = prepare(&off_cfg, io_free_opts()).await.unwrap();
+        let carried_off = off_parts.host_only_tools().iter().any(|tool| {
+            crate::persona::host_tool_guidance(tool.name()).is_some_and(|(key, _)| key == "atomgit")
+        });
+        assert!(
+            !carried_off,
+            "disabled ⇒ no mounted tool may carry the AtomGit guidance"
+        );
     }
 
     #[cfg(feature = "atomgit")]
