@@ -31,7 +31,10 @@ use serde_json::Value;
 pub const ROW: &str = "tui-elsewhere";
 
 /// 还只在经典界面里的命令。
-pub const CLASSIC_ONLY: &[&str] = &["webui", "sync", "app", "desktop"];
+///
+/// `/webui`、`/sync`、`/desktop` 已于 2026-09-23 在这块屏幕上做出来(`tui_share`),
+/// 从这里拿掉了;剩 `/app`(扫码给手机)那一条。
+pub const CLASSIC_ONLY: &[&str] = &["app"];
 
 /// 归命令行的命令，以及在命令行里怎么运行它。
 pub const IN_THE_CLI: &[(&str, &str)] = &[("upgrade", "atomcode upgrade")];

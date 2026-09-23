@@ -797,6 +797,18 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("/{command} 归命令行：退出后运行 `{run}`。").into()
         }
         Msg::CmdAboutInTheCli => "归命令行".into(),
+        Msg::ShareNoModel => "还没有配好模型——先 /login 或 /model".into(),
+        Msg::CmdAboutWebui => "把这个会话共享给浏览器(lan 暴露到局域网;stop 结束)".into(),
+        Msg::WebuiTakes => "[lan | --host <地址> | stop]".into(),
+        Msg::CmdAboutSync => "共享这个会话,但什么也不打开(off 停止)".into(),
+        Msg::SyncTakes => "[off]".into(),
+        Msg::CmdAboutDesktop => "打开桌面端".into(),
+        Msg::ShareStarted => "这个会话已共享——浏览器或手机上看到的是同一段对话。".into(),
+        Msg::ShareStopped => "已停止共享这个会话。".into(),
+        Msg::ShareWasNotOn => "本来就没有在共享。".into(),
+        Msg::DesktopOpening { name, path } => format!("正在打开 {name}({path})").into(),
+        Msg::DesktopLaunchFailed { path, error } => format!("{path} 没能启动:{error}").into(),
+        Msg::DesktopNotInstalled { url } => format!("这台机器上没装桌面端——{url}").into(),
         Msg::CmdAboutSchedule => "排了哪些定时任务，各自下次什么时候跑".into(),
         Msg::CmdAboutOpenRouter => "接上 OpenRouter 的免费模型".into(),
         Msg::OpenRouterTakes => "[api key]".into(),

@@ -27,6 +27,7 @@ fn _tests_assert_in_chinese() {
 
 #[cfg(unix)]
 pub mod askpass;
+pub mod desktop;
 pub mod tui_command_meter;
 pub mod tui_elsewhere;
 pub mod tui_login;
@@ -41,6 +42,7 @@ pub mod tui_rewind;
 pub mod tui_schedule;
 pub mod tui_settings;
 pub mod tui_setup;
+pub mod tui_share;
 pub mod tui_tools;
 pub mod tui_welcome_words;
 pub mod uninstall;
@@ -120,6 +122,7 @@ pub mod tui_front {
             crate::tui_schedule::row_layer(),
             crate::tui_openrouter::row_layer(),
             crate::tui_places::row_layer(),
+            crate::tui_share::row_layer(),
         ];
         let mut rows: Vec<Arc<dyn atomcode_plexus::Plugin>> = vec![
             Arc::new(crate::tui_settings::SettingsRow),
@@ -148,6 +151,9 @@ pub mod tui_front {
                 config_path: config_path.clone(),
             }),
             Arc::new(crate::tui_places::PlacesRow {
+                config_path: config_path.clone(),
+            }),
+            Arc::new(crate::tui_share::ShareRow {
                 config_path: config_path.clone(),
             }),
         ];

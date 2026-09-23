@@ -1342,6 +1342,27 @@ pub enum Msg<'a> {
         run: &'a str,
     },
     CmdAboutInTheCli,
+    /// Sharing a session needs a model to be configured first.
+    ShareNoModel,
+    CmdAboutWebui,
+    WebuiTakes,
+    CmdAboutSync,
+    SyncTakes,
+    CmdAboutDesktop,
+    ShareStarted,
+    ShareStopped,
+    ShareWasNotOn,
+    DesktopOpening {
+        name: &'a str,
+        path: &'a str,
+    },
+    DesktopLaunchFailed {
+        path: &'a str,
+        error: &'a str,
+    },
+    DesktopNotInstalled {
+        url: &'a str,
+    },
     CmdAboutSchedule,
     CmdAboutOpenRouter,
     OpenRouterTakes,

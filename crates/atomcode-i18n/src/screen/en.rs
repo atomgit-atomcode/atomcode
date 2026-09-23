@@ -824,6 +824,22 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("/{command} belongs to the command line: quit and run `{run}`.").into()
         }
         Msg::CmdAboutInTheCli => "belongs to the command line".into(),
+        Msg::ShareNoModel => "no model is configured yet — run /login or /model first".into(),
+        Msg::CmdAboutWebui => "share this session with a browser (lan to expose it; stop to end)".into(),
+        Msg::WebuiTakes => "[lan | --host <addr> | stop]".into(),
+        Msg::CmdAboutSync => "share this session without opening anything (off to stop)".into(),
+        Msg::SyncTakes => "[off]".into(),
+        Msg::CmdAboutDesktop => "open the desktop app".into(),
+        Msg::ShareStarted => "This session is shared — a browser or the phone app sees the same conversation.".into(),
+        Msg::ShareStopped => "This session is no longer shared.".into(),
+        Msg::ShareWasNotOn => "It was not being shared.".into(),
+        Msg::DesktopOpening { name, path } => format!("Opening {name} ({path})").into(),
+        Msg::DesktopLaunchFailed { path, error } => {
+            format!("{path} would not start: {error}").into()
+        }
+        Msg::DesktopNotInstalled { url } => {
+            format!("The desktop app is not installed here — {url}").into()
+        }
         Msg::CmdAboutSchedule => "the scheduled tasks, and when each runs next".into(),
         Msg::CmdAboutOpenRouter => "connect OpenRouter's free models".into(),
         Msg::OpenRouterTakes => "[api key]".into(),

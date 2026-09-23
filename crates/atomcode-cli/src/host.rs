@@ -163,6 +163,9 @@ pub fn connect(
     tokio::spawn(async move {
         let _task = task;
         while let Some(sequenced) = runtime_events.recv().await {
+            // 共享着的话,网页端照这条事件画。挂没挂在那一侧判断,这里不设第二个
+            // 开关——两个「现在共享着吗」的答案迟早会不一致。
+            crate::tui_share::publish(&sequenced);
             match sequenced.event {
                 CodingRuntimeEvent::RuntimeStopped(_) => break,
                 CodingRuntimeEvent::SessionChanged(changed) => {
@@ -329,12 +332,32 @@ pub fn connect(
     });
 
     let session = control.session.lock().expect("session poisoned").clone();
+    // 共享(`/webui` / `/sync` / `/app`)要的是这个 runtime 的句柄,而句柄不在
+    // 宿主契约里——它是产品的东西。接上时交给那一层,它自己判断现在共享没有。
+    crate::tui_share::remember(control.clone());
+
     Ok(HostConnection {
         session,
         commands,
         events,
         control,
     })
+}
+
+impl crate::tui_share::Live for RuntimeControl {
+    fn handle(&self) -> atomcode_coding::CodingRuntimeHandle {
+        self.handle.clone()
+    }
+    fn session(&self) -> String {
+        self.session.lock().expect("session poisoned").clone()
+    }
+    fn working_dir(&self) -> std::path::PathBuf {
+        self.config
+            .lock()
+            .expect("config poisoned")
+            .working_dir
+            .clone()
+    }
 }
 
 /// What happened to a command: taken, or refused and why.
@@ -461,11 +484,17 @@ async fn run(
         (command_error(error), Some(message))
     };
     match command {
-        AgentCommand::SendMessage { text, images } => handle
-            .submit(UserInput { text, images })
-            .await
-            .map(|_| None)
-            .map_err(refused),
+        AgentCommand::SendMessage { text, images } => {
+            let input = UserInput { text, images };
+            // 终端里打的这句,网页端是从 hub 的「输入被接受」看到的——不回显,
+            // 那边就只见回答不见问题。提交成功才回显:没送出去的话不该出现在
+            // 别人的屏幕上。
+            let sent = handle.submit(input.clone()).await;
+            if sent.is_ok() {
+                crate::tui_share::echo_local_input(&input);
+            }
+            sent.map(|_| None).map_err(refused)
+        }
         AgentCommand::SendMessageWithContext {
             text,
             images,

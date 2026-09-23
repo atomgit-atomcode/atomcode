@@ -2205,3 +2205,68 @@ async fn a_stored_session_says_what_it_last_talked_about() {
         "a name nothing stored is not an empty preview"
     );
 }
+
+/// `/sync`: this session, shared. A viewer that joins the hub sees the same
+/// conversation — the words typed here included.
+///
+/// The three joints are what this pins: the runtime is handed to the hub (so a
+/// viewer can join at all), its events reach the hub (so the viewer sees the
+/// turn), and what is typed here is echoed (so the viewer sees the question,
+/// not only the answer). The last one is the one that goes quietly wrong: the
+/// browser learns about a person's own message from the hub, never from the
+/// facts.
+#[tokio::test]
+async fn a_shared_session_is_the_same_conversation_for_a_viewer() {
+    let env = env();
+    // A configuration with a model in it: sharing names the selection the hub
+    // binds, and a runtime with none has nothing to share.
+    let config_path = env._home.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+default_model = "custom/a"
+
+[provider_accounts.custom]
+provider = "openai-compatible"
+base_url = "https://example.invalid/v1"
+api_key = "k"
+
+[models."custom/a"]
+account = "custom"
+model = "vendor-a"
+"#,
+    )
+    .unwrap();
+
+    let mut connection = connected(&env).await;
+    atomcode::tui_share::attach(&config_path)
+        .await
+        .expect("the session is shared");
+    assert!(atomcode::tui_share::sharing());
+
+    // A viewer joins, the way the browser does.
+    let join = atomcode_daemon::native_live::join().expect("a viewer can join");
+    let mut seen = join.receiver;
+
+    connection.commands.send(message("shared words")).unwrap();
+    through_turn(&mut connection).await;
+
+    let mut echoed = false;
+    let mut events = 0usize;
+    while let Ok(observation) = seen.try_recv() {
+        events += 1;
+        if let atomcode_daemon::live_hub::LiveViewEvent::InputAccepted { input, .. } =
+            &observation.event
+        {
+            echoed |= input.text == "shared words";
+        }
+    }
+    assert!(echoed, "the viewer sees what was typed here");
+    assert!(events > 1, "and the turn it started: {events} events");
+
+    assert!(
+        atomcode::tui_share::detach().expect("stops"),
+        "and it can be stopped"
+    );
+    assert!(!atomcode::tui_share::sharing());
+}
