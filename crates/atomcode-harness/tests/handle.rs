@@ -706,6 +706,108 @@ async fn a_stop_right_behind_a_message_stops_that_message_s_turn() {
     }
 }
 
+/// A compaction whose summary never comes back, mounted as a row so the pump
+/// can be watched with one in flight.
+struct NeverSummarises;
+
+#[async_trait::async_trait]
+impl atomcode_harness::seams::Compaction for NeverSummarises {
+    fn describe(&self) -> String {
+        "never answers".into()
+    }
+    async fn compact(
+        &self,
+        _log: &atomcode_harness::session::SessionLog,
+        _ask: &atomcode_harness::seams::CompactionAsk,
+    ) -> Option<atomcode_harness::seams::CompactionDecision> {
+        std::future::pending().await
+    }
+}
+
+struct NeverSummarisesRow;
+
+#[async_trait::async_trait]
+impl atomcode_plexus::Plugin for NeverSummarisesRow {
+    fn name(&self) -> &'static str {
+        "test-never-summarises"
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["compaction"]
+    }
+    async fn apply(
+        &self,
+        ctx: &atomcode_plexus::Context,
+        _config: &serde_json::Value,
+    ) -> Result<(), String> {
+        let _ = ctx
+            .provide::<atomcode_harness::seams::CompactionSvc>(std::sync::Arc::new(NeverSummarises))
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+/// A summary can be stopped, and the pump goes on reading while one is written.
+///
+/// `/compact` used to run inside the pump: for as long as the model took, the
+/// pump read no commands at all — so the one command that could stop it could
+/// not even be taken off the channel, and everything behind it (a snapshot the
+/// runtime waits on for its own terminal) waited too.
+#[tokio::test]
+async fn a_summary_is_stoppable_and_the_pump_keeps_reading_while_it_runs() {
+    let dir = scratch("compact-stop");
+    let mut registry = plugins::catalog();
+    registry.register(std::sync::Arc::new(NeverSummarisesRow));
+    let tree = tree(
+        &dir,
+        &replay(r#"{ text = "unused" }"#),
+        &[r#"[[patch]]
+id = "compaction-tail"
+name = "test-never-summarises"
+"#],
+    );
+    let mut app = App::new(registry, tree);
+    app.start().await.expect("must mount");
+    let mut handle = handle_of(&app);
+
+    handle
+        .commands
+        .send(AgentCommand::Compact { focus: None })
+        .unwrap();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), handle.events.recv()).await {
+            Ok(Some(AgentEvent::CompactionStarted { .. })) => break,
+            Ok(Some(_)) => continue,
+            other => panic!("the compaction never started: {other:?}"),
+        }
+    }
+
+    // Read while it is being written: a snapshot queued behind it, and the stop.
+    handle.commands.send(AgentCommand::Snapshot).unwrap();
+    handle.commands.send(AgentCommand::Cancel).unwrap();
+
+    let mut said = Vec::new();
+    let mut stopped = false;
+    let mut snapshotted = false;
+    while let Ok(Some(event)) =
+        tokio::time::timeout(Duration::from_secs(5), handle.events.recv()).await
+    {
+        match event {
+            AgentEvent::CompactionFailed { .. } => stopped = true,
+            AgentEvent::Snapshot { .. } => snapshotted = true,
+            other => said.push(other),
+        }
+        if stopped && snapshotted {
+            break;
+        }
+    }
+    assert!(stopped, "the summary was never stopped: {:?}", names(&said));
+    assert!(
+        snapshotted,
+        "the snapshot queued behind it was never answered: {:?}",
+        names(&said)
+    );
+}
+
 /// A turn that is being stopped does not get to ask.
 ///
 /// The stop refuses the questions already waiting. One asked *after* it — a

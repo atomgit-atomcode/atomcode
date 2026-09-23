@@ -48,6 +48,7 @@ use atomcode_plexus::{Context, Plugin};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
 use crate::agent::{Agent, MessageOrigin};
 use crate::events::{AgentInfo, InboxInserted, SessionEventCommitted};
@@ -1072,9 +1073,12 @@ pub fn command_member(
             }
             let events = events.clone();
             let member = target.ctx().clone();
+            // Under the member's own stop: `command_member`'s cancel is how a
+            // person stops that member, and a summary it is writing is its work.
+            let stop = target.cancel_token();
             tokio::spawn(async move {
                 let reporting = std::sync::atomic::AtomicBool::new(false);
-                compact(&member, &events, focus, &reporting).await;
+                compact(&member, &events, focus, &reporting, &stop).await;
             });
             Ok(Some(None))
         }
@@ -1172,10 +1176,31 @@ fn spawn_turn(
     })
 }
 
+/// Start a compaction beside the pump rather than inside it, and hand back the
+/// stop that reaches it.
+///
+/// Inside, the pump read no commands while the summary was in flight: the one
+/// command that could have stopped it could not even be taken off the channel.
+fn spawn_compaction(
+    ctx: &Context,
+    events: &mpsc::UnboundedSender<AgentEvent>,
+    focus: Option<String>,
+    reporting: &Arc<std::sync::atomic::AtomicBool>,
+    stop: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    let ctx = ctx.clone();
+    let events = events.clone();
+    let reporting = reporting.clone();
+    let token = stop.clone();
+    tokio::spawn(async move { compact(&ctx, &events, focus, &reporting, &token).await })
+}
+
 /// What the pump woke up for.
 enum Woke {
     Command(Option<AgentCommand>),
     TurnDone,
+    /// The compaction running between turns finished — or was stopped.
+    CompactionDone,
     /// Something reached the inbox from somewhere other than a command — a
     /// peer, a timer, a goal controller.
     Inbox,
@@ -1256,11 +1281,15 @@ async fn pump(
     // `messages=0` where the reference replied with `messages=4`.
     let mut snapshots_waiting = 0usize;
     let mut compactions_waiting: Vec<Option<String>> = Vec::new();
+    // The compaction running between turns, and the stop that reaches it.
+    let mut compacting: Option<tokio::task::JoinHandle<()>> = None;
+    let mut compaction_stop: Option<CancellationToken> = None;
 
     loop {
         let woke = tokio::select! {
             command = commands.recv() => Woke::Command(command),
             _ = finished(&mut turn) => Woke::TurnDone,
+            _ = finished(&mut compacting) => Woke::CompactionDone,
             _ = woke_rx.recv() => Woke::Inbox,
         };
 
@@ -1269,8 +1298,23 @@ async fn pump(
                 turn = None;
                 // A stop held for the turn that just ended is not the next one's.
                 agent.settle_cancel();
-                for focus in std::mem::take(&mut compactions_waiting) {
-                    compact(&ctx, &events, focus, &manual_compaction).await;
+                // What was queued behind the turn runs next, in order: a
+                // compaction first (it rewrites what a snapshot would describe),
+                // then the snapshots, then whatever is in the inbox. Each waits
+                // on the one before through this loop rather than inside it, so
+                // the pump keeps reading commands — including the stop.
+                if !compactions_waiting.is_empty() {
+                    let focus = compactions_waiting.remove(0);
+                    let stop = CancellationToken::new();
+                    compacting = Some(spawn_compaction(
+                        &ctx,
+                        &events,
+                        focus,
+                        &manual_compaction,
+                        stop.clone(),
+                    ));
+                    compaction_stop = Some(stop);
+                    continue;
                 }
                 for _ in 0..std::mem::take(&mut snapshots_waiting) {
                     send_snapshot(&ctx, &events);
@@ -1282,11 +1326,36 @@ async fn pump(
                 }
                 continue;
             }
+            // The same three, one step further along.
+            Woke::CompactionDone => {
+                compacting = None;
+                compaction_stop = None;
+                if !compactions_waiting.is_empty() {
+                    let focus = compactions_waiting.remove(0);
+                    let stop = CancellationToken::new();
+                    compacting = Some(spawn_compaction(
+                        &ctx,
+                        &events,
+                        focus,
+                        &manual_compaction,
+                        stop.clone(),
+                    ));
+                    compaction_stop = Some(stop);
+                    continue;
+                }
+                for _ in 0..std::mem::take(&mut snapshots_waiting) {
+                    send_snapshot(&ctx, &events);
+                }
+                if turn.is_none() && agent.inbox().has_waking_input() {
+                    turn = Some(spawn_turn(driver.clone(), agent.clone()));
+                }
+                continue;
+            }
             // The same rule as after a turn: a message starts one, an
             // injection alone waits for one. A command's own message arrives
             // here as well, harmlessly — the turn it started is already running.
             Woke::Inbox => {
-                if turn.is_none() && agent.inbox().has_waking_input() {
+                if turn.is_none() && compacting.is_none() && agent.inbox().has_waking_input() {
                     turn = Some(spawn_turn(driver.clone(), agent.clone()));
                 }
                 continue;
@@ -1391,6 +1460,21 @@ async fn pump(
                 } else {
                     reject(atomcode_kernel::event::CommandError::NotRunning);
                 }
+                // Between turns there may be no turn to stop and a summary in
+                // flight all the same — `/compact`, then a change of mind. It is
+                // stopped, and what was queued behind it is dropped with it: the
+                // person asked for the work to end, not to go on one item later.
+                if let Some(stop) = &compaction_stop {
+                    stop.cancel();
+                }
+                for focus in std::mem::take(&mut compactions_waiting) {
+                    let _ = events.send(AgentEvent::CompactionFailed {
+                        trigger: CompactTrigger::Manual { focus },
+                        error: atomcode_kernel::checkpoint::CompactionCheckpointError::new(
+                            "stopped before it started",
+                        ),
+                    });
+                }
                 // The driver's cancel is a person's: the turn's end records it.
                 // For the turn this pump started, whether or not it has opened
                 // yet — one spawned a moment ago still reads as idle.
@@ -1416,10 +1500,10 @@ async fn pump(
             }
             AgentCommand::Snapshot => {
                 accept(None);
-                // Queued while a turn is in flight; answered the moment it
-                // ends. Answering now would describe a conversation that is
-                // still being written.
-                if turn.is_some() {
+                // Queued while a turn — or a compaction — is in flight; answered
+                // the moment it ends. Answering now would describe a
+                // conversation that is still being written.
+                if turn.is_some() || compacting.is_some() {
                     snapshots_waiting += 1;
                 } else {
                     send_snapshot(&ctx, &events);
@@ -1430,11 +1514,21 @@ async fn pump(
                 accept(None);
                 // Behind the turn, like a snapshot and for the same reason:
                 // rewriting the conversation while a round is mid-flight
-                // compacts a history the turn is still appending to.
-                if turn.is_some() {
+                // compacts a history the turn is still appending to. Behind a
+                // compaction too — two summaries of one conversation, written at
+                // once, are two different conversations.
+                if turn.is_some() || compacting.is_some() {
                     compactions_waiting.push(focus);
                 } else {
-                    compact(&ctx, &events, focus, &manual_compaction).await;
+                    let stop = CancellationToken::new();
+                    compacting = Some(spawn_compaction(
+                        &ctx,
+                        &events,
+                        focus,
+                        &manual_compaction,
+                        stop.clone(),
+                    ));
+                    compaction_stop = Some(stop);
                 }
                 continue;
             }
@@ -1515,8 +1609,10 @@ async fn pump(
 
         // Everything that falls through here queued work. A turn already
         // running claims it at its next step — that is what steering is — so a
-        // second one must not be started.
-        if turn.is_none() {
+        // second one must not be started; nor is one started over a compaction,
+        // which is rewriting the history the turn would read. `CompactionDone`
+        // picks it up.
+        if turn.is_none() && compacting.is_none() {
             turn = Some(spawn_turn(driver.clone(), agent.clone()));
         }
     }
@@ -1525,6 +1621,9 @@ async fn pump(
     // that is never coming. The other order deadlocks — a tool waiting on
     // approval never observes the cancel.
     agent.cancel();
+    if let Some(stop) = &compaction_stop {
+        stop.cancel();
+    }
     if owns_answers {
         asker.close();
     } else {
@@ -1543,6 +1642,7 @@ async fn compact(
     events: &mpsc::UnboundedSender<AgentEvent>,
     focus: Option<String>,
     reporting: &std::sync::atomic::AtomicBool,
+    stop: &CancellationToken,
 ) {
     let trigger = CompactTrigger::Manual {
         focus: focus.clone(),
@@ -1584,7 +1684,24 @@ async fn compact(
             .unwrap_or(0),
         used_tokens: super::loop_policy::last_prompt_tokens(&log),
     };
-    let decision = compaction.compact(&log, &ask).await;
+    // A summary is a model call, and it is the one piece of work between turns
+    // that a person can be left waiting on: stopping has to reach it, or a
+    // `/compact` they changed their mind about holds the screen at 正在停止 for
+    // a whole round-trip. Nothing is applied on a stop — the history is
+    // byte-identical, which is what makes abandoning it safe.
+    let decision = tokio::select! {
+        biased;
+        _ = stop.cancelled() => {
+            let _ = events.send(AgentEvent::CompactionFailed {
+                trigger,
+                error: atomcode_kernel::checkpoint::CompactionCheckpointError::new(
+                    "stopped before it finished",
+                ),
+            });
+            return;
+        }
+        decided = compaction.compact(&log, &ask) => decided,
+    };
     let committed = match decision {
         Some(decision) => {
             reporting.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -2089,6 +2206,95 @@ pub fn question_payload(question: &str, options: &[String]) -> Value {
             .collect::<Vec<_>>(),
         "custom": true,
     })
+}
+
+#[cfg(test)]
+mod compaction_tests {
+    use super::*;
+
+    /// A compaction whose summary never comes back — the shape of a slow model
+    /// call, which is what a `/compact` is.
+    struct NeverSummarises;
+
+    #[async_trait]
+    impl crate::seams::Compaction for NeverSummarises {
+        fn describe(&self) -> String {
+            "never answers".into()
+        }
+        async fn compact(
+            &self,
+            _log: &crate::session::SessionLog,
+            _ask: &crate::seams::CompactionAsk,
+        ) -> Option<crate::seams::CompactionDecision> {
+            std::future::pending().await
+        }
+    }
+
+    fn realm(session: &str) -> (atomcode_plexus::App, Context) {
+        let app = atomcode_plexus::App::new(
+            atomcode_plexus::PluginRegistry::new(),
+            atomcode_plexus::ConfigTree::empty(),
+        );
+        let ctx = app.context();
+        let _ = ctx
+            .provide::<SessionSvc>(Arc::new(crate::session::SessionLog::new(session)))
+            .unwrap();
+        let _ = ctx
+            .provide::<crate::seams::CompactionSvc>(Arc::new(NeverSummarises))
+            .unwrap();
+        (app, ctx)
+    }
+
+    /// A summary the person stopped ends, and says so.
+    ///
+    /// The negative control is the same call without the stop: it is still
+    /// waiting when the test gives up, which is what a person used to watch —
+    /// `/compact`, a change of mind, and 正在停止 for the length of a model
+    /// round-trip (and, before the pump ran this beside itself, a pump that
+    /// could not even read the stop off its channel).
+    #[tokio::test]
+    async fn a_summary_the_person_stopped_ends_and_says_so() {
+        let (_app, ctx) = realm("lead");
+        let reporting = std::sync::atomic::AtomicBool::new(false);
+
+        let (events, mut heard) = mpsc::unbounded_channel();
+        let running = CancellationToken::new();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                compact(&ctx, &events, None, &reporting, &running),
+            )
+            .await
+            .is_err(),
+            "the control: a summary nobody stopped is still being written"
+        );
+
+        let (events, mut heard_after) = mpsc::unbounded_channel();
+        let stopped = CancellationToken::new();
+        stopped.cancel();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            compact(&ctx, &events, None, &reporting, &stopped),
+        )
+        .await
+        .expect("a stopped summary must not keep the caller waiting");
+
+        assert!(matches!(
+            heard.try_recv(),
+            Ok(AgentEvent::CompactionStarted { .. })
+        ));
+        assert!(matches!(
+            heard_after.try_recv(),
+            Ok(AgentEvent::CompactionStarted { .. })
+        ));
+        assert!(
+            matches!(
+                heard_after.try_recv(),
+                Ok(AgentEvent::CompactionFailed { .. })
+            ),
+            "a compaction that did not happen is said, not silently dropped"
+        );
+    }
 }
 
 #[cfg(test)]
