@@ -3987,8 +3987,8 @@ impl Tui {
                 // A picture bound for a text-only model is turned into text by the
                 // VL helper before the turn opens; show `正在识别图片` until the
                 // turn's first fact arrives, so the screen is not blank meanwhile.
-                let recognizing = !images.is_empty()
-                    && client.described().is_some_and(|d| !d.supports_vision);
+                let recognizing =
+                    !images.is_empty() && client.described().is_some_and(|d| !d.supports_vision);
                 client.send(text.clone(), images);
                 if recognizing {
                     self.host.start_recognizing();

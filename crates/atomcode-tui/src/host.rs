@@ -1906,7 +1906,12 @@ impl Host {
     /// steered into a running turn (which arms nothing) still clears it. `false`
     /// when there was nothing up.
     pub fn stop_recognizing(&self) -> bool {
-        if !self.moment.read().expect("moment poisoned").recognizing_image {
+        if !self
+            .moment
+            .read()
+            .expect("moment poisoned")
+            .recognizing_image
+        {
             return false;
         }
         self.pinned(true, || {
