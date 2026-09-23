@@ -3859,6 +3859,7 @@ impl Host {
         scroll: usize,
         caps: crate::block::ShapeCaps,
         activity: crate::moment::Activity,
+        tick: u64,
     ) -> (Vec<Line>, Vec<RowOwner>) {
         let stream = self.stream.read().expect("stream poisoned");
         let pres = self.presentation.read().expect("presentation poisoned");
@@ -4075,6 +4076,28 @@ impl Host {
                     lines
                 }
             };
+            // A tool call still running pulses its `●` mark white↔grey, so a live
+            // call reads apart from a finished one at a glance. Presentation, not
+            // content: the block draws a still mark (`RenderCtx` carries no phase,
+            // by design), and the pulse is laid on here — the same layer that dims
+            // an undone block — where the injected tick legitimately lives. Only
+            // the dim half of the cycle restyles the mark; the bright half is the
+            // mark as drawn, so a still frame (tick 0) is the ordinary colour and
+            // a lid (its own liveness indicator) is left alone.
+            const PULSE_TICKS: u64 = 4; // ~440ms a phase at the ~110ms animation tick
+            let lines = if lid.is_none()
+                && !entry.undone
+                && (tick / PULSE_TICKS) % 2 == 1
+                && block.content.as_tool_call().is_some_and(|c| c.is_running())
+            {
+                let mut rows = (*lines).clone();
+                if let Some(first) = rows.first_mut() {
+                    *first = first.restyle(0, 1, |_| crate::theme::fg(crate::theme::Role::Muted));
+                }
+                Arc::new(rows)
+            } else {
+                lines
+            };
             if lines.is_empty() {
                 continue;
             }
@@ -4192,6 +4215,7 @@ impl Host {
                         pane.block_scroll,
                         caps,
                         moment.activity,
+                        moment.tick,
                     );
                     *self.hits.lock().expect("hits poisoned") = Hits {
                         rect: pane.block_rect,
@@ -5046,6 +5070,66 @@ mod tests {
         mods.add_view(Arc::new(Mounted::<input::Input>::new()))
             .unwrap();
         Host::new(mods, default_layout())
+    }
+
+    fn mark_fg_of(h: &Host, tick: u64) -> Option<crate::frame::Color> {
+        let caps = crate::block::ShapeCaps::of(&crate::caps::Caps::default());
+        let (lines, _) =
+            h.stream_lines(Rect::sized(80, 20), 0, caps, crate::moment::Activity::Working, tick);
+        // The call's opening row is the one naming the file; its first span is
+        // the `●` mark, whose colour the pulse moves.
+        lines
+            .iter()
+            .find(|l| l.plain().contains("a.rs"))
+            .and_then(|l| l.spans.first())
+            .map(|s| s.style.fg)?
+    }
+
+    fn emit_call(h: &Host, outcome: Option<crate::content::Outcome>) {
+        let call = crate::content::ToolCallBlock::pending("c1", "read_file", r#"{"file_path":"a.rs"}"#);
+        let call = match outcome {
+            Some(o) => call.with(o),
+            None => call,
+        };
+        h.stream
+            .write()
+            .expect("stream poisoned")
+            .writer("bench")
+            .emit(crate::block::Coord::default(), Arc::new(call));
+    }
+
+    /// A running tool call pulses its `●` mark white↔grey, so a live call reads
+    /// apart from a finished one at a glance.
+    ///
+    /// The block itself draws a still mark — its render is phase-free by design
+    /// (`RenderCtx` carries no tick) — and the host lays the pulse on from the
+    /// injected tick. So the mark's colour differs between the bright and dim
+    /// halves of the cycle, and the dim half is the muted grey.
+    #[test]
+    fn a_running_tool_call_pulses_its_mark_between_ticks() {
+        let h = host();
+        emit_call(&h, None);
+        let bright = mark_fg_of(&h, 0);
+        let dim = mark_fg_of(&h, 4);
+        assert_ne!(bright, dim, "the mark must pulse between the two halves");
+        assert_eq!(
+            dim,
+            Some(crate::frame::Color::role(crate::theme::Role::Muted)),
+            "the dim half of the cycle is grey"
+        );
+    }
+
+    /// A finished call does not pulse: presentation only moves the mark of a
+    /// call still in flight, so a landed one is the same colour at every tick.
+    #[test]
+    fn a_finished_tool_call_does_not_pulse() {
+        let h = host();
+        emit_call(&h, Some(crate::content::Outcome::Ok("ok".into())));
+        assert_eq!(
+            mark_fg_of(&h, 0),
+            mark_fg_of(&h, 4),
+            "a finished call's mark is steady across ticks"
+        );
     }
 
     /// Switching the view leaves no `已中断` note or `last_sent` prompt behind
