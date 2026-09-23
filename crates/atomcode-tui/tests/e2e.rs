@@ -76,6 +76,7 @@ fn agent_catalog() -> PluginRegistry {
     c.register(Arc::new(EffortSpyRow));
     c.register(Arc::new(EchoCommandRow));
     c.register(Arc::new(StallingUtilityRow));
+    c.register(Arc::new(StallingModelRow));
     c
 }
 
@@ -3807,6 +3808,26 @@ impl atomcode_kernel::provider::LlmProvider for Stalling {
     }
 }
 
+/// The same stand-in on the conversation's own model slot: a request that is
+/// accepted and then says nothing, which is what a stalled gateway looks like.
+struct StallingModelRow;
+
+#[async_trait]
+impl Plugin for StallingModelRow {
+    fn name(&self) -> &'static str {
+        "test-stalling-llm"
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["llm"]
+    }
+    async fn apply(&self, ctx: &Context, _config: &serde_json::Value) -> Result<(), String> {
+        let _ = ctx
+            .provide::<atomcode_harness::seams::LlmSvc>(Arc::new(Stalling))
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
 struct StallingUtilityRow;
 
 #[async_trait]
@@ -3852,6 +3873,38 @@ async fn cancel_all_stops_every_members_turn_and_keeps_the_team() {
     s.term.type_line("/cancel-all");
     until(&s, "1 个成员").await;
     until(&s, "Cancelled").await;
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+/// A model that has not answered yet is said to be being waited for.
+///
+/// The inter-token budget is five minutes: a gateway that opens a stream and
+/// then goes quiet leaves the screen with nothing new to draw for that long.
+/// What must not happen is the screen looking like nothing was asked — the row
+/// that says 正在等待模型, with its clock, is the whole difference between
+/// "slow" and "stuck".
+#[tokio::test]
+async fn a_model_that_has_not_answered_yet_says_it_is_being_waited_for() {
+    let dir = scratch("waiting-line");
+    let stalling = "[[patch]]\nid = \"llm\"\nname = \"test-stalling-llm\"\n";
+    let s = start(tree(&dir, &replay(r#"{ text = "unused" }"#), &[stalling])).await;
+    let task = s.open().await;
+
+    s.term.type_line("怎么做微调 ？");
+    until(&s, "怎么做微调").await;
+    for _ in 0..80 {
+        if part_text(&s, "live").contains("正在等待模型") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let live = part_text(&s, "live");
+    assert!(
+        live.contains("正在等待模型"),
+        "a turn waiting on the model must say so: {live:?}"
+    );
 
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
