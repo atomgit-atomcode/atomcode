@@ -1789,6 +1789,12 @@ impl UserInterface for Tui {
                 Wake::Input(Input::Paste(text)) if self.host.tools_open() => {
                     stale |= self.host.tools_paste(&text);
                 }
+                // And a paste while the MCP panel is up, on the same terms: a
+                // server name is exactly the thing that arrives by paste, and
+                // falling through would put it in a composer nobody can see.
+                Wake::Input(Input::Paste(text)) if self.host.mcp_open() => {
+                    stale |= self.host.mcp_paste(&text);
+                }
                 Wake::Input(Input::Paste(text)) => {
                     quit = self.act(Action::Paste(text), &client);
                     stale = true;
@@ -1844,6 +1850,11 @@ impl UserInterface for Tui {
                 // four is ever up (`Host::toggle_tools`).
                 Wake::Input(Input::Key(press)) if self.host.tools_open() => {
                     stale |= self.run_tools_key(press);
+                }
+                // And the MCP panel, on the same terms: at most one of the family
+                // is ever up (`Host::toggle_mcp`).
+                Wake::Input(Input::Key(press)) if self.host.mcp_open() => {
+                    stale |= self.run_mcp_key(press);
                 }
                 // And the rewind panel, on the same terms: at most one of the
                 // five is ever up (`Host::toggle_rewind`). Above the composer
@@ -2254,6 +2265,41 @@ impl Tui {
         });
     }
 
+    /// Ask what the MCP servers are, and put them on the panel.
+    ///
+    /// Out on a task rather than awaited here, for the reason
+    /// [`Tui::refresh_tools`] gives: it is a round trip to the running tree, and
+    /// the panel opens now — an empty table for the beat it takes, not a
+    /// composer that will not take a key.
+    fn refresh_mcp(&self) {
+        let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
+            self.host
+                .mcp_note(Some(t(Msg::ScreenNotConnectedAgent).into_owned()));
+            return;
+        };
+        let Some(port) = ctx.service::<crate::plugin::McpSvc>() else {
+            self.host.mcp_note(Some(t(Msg::NoMcpPort).into_owned()));
+            return;
+        };
+        let host = self.host.clone();
+        let keys = self.wake.lock().expect("wake poisoned").clone();
+        tokio::spawn(async move {
+            match port.list().await {
+                Ok(view) => {
+                    host.show_mcp(view);
+                }
+                // 读不到的目录说在面板上,不静默:一张空表读起来像「一台都没有」
+                // (设计 §6)。
+                Err(why) => {
+                    host.mcp_note(Some(why));
+                }
+            }
+            if let Some(keys) = keys {
+                let _ = keys.send(Wake::Fact);
+            }
+        });
+    }
+
     /// Ask the host which turns this session can go back to, and put the answer
     /// on the panel.
     ///
@@ -2504,6 +2550,74 @@ impl Tui {
                 Err(why) => {
                     host.tools_note(Some(t(Msg::SwitchFailed { why: &why }).into_owned()));
                 }
+            }
+            if let Some(keys) = keys {
+                let _ = keys.send(Wake::Fact);
+            }
+        });
+    }
+
+    /// Run one key against the MCP panel, and act on what it asked for.
+    ///
+    /// **True when a frame is owed.**
+    fn run_mcp_key(&self, press: crate::surface::KeyPress) -> bool {
+        let (changed, asked) = self.host.mcp_key(press);
+        let Some(step) = asked else {
+            return changed;
+        };
+        self.apply_mcp_step(step);
+        true
+    }
+
+    /// Send one look, or one action, over the seam.
+    ///
+    /// The two answers are not the same shape. A detail is one server's page and
+    /// goes onto the rows the panel already has ([`Host::mcp_detail`]); an action
+    /// answers with the directory **after** it happened — trust is a whole-project
+    /// fact, so the list is the more useful answer either way, and the panel draws
+    /// what happened rather than what was asked for.
+    ///
+    /// `Stay` and `Close` never arrive here: [`crate::mcp::key`] keeps those to
+    /// itself, and [`Host::mcp_key`] has already acted on them.
+    fn apply_mcp_step(&self, step: crate::mcp::Step) {
+        use crate::mcp::Step;
+        let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
+            self.host.mcp_busy(None);
+            self.host
+                .mcp_note(Some(t(Msg::ScreenNotConnectedAgent).into_owned()));
+            return;
+        };
+        let Some(port) = ctx.service::<crate::plugin::McpSvc>() else {
+            self.host.mcp_busy(None);
+            self.host.mcp_note(Some(t(Msg::NoMcpPort).into_owned()));
+            return;
+        };
+        let host = self.host.clone();
+        let keys = self.wake.lock().expect("wake poisoned").clone();
+        tokio::spawn(async move {
+            match step {
+                Step::OpenDetail { server } => match port.detail(&server).await {
+                    Ok(detail) => {
+                        host.mcp_detail(detail);
+                    }
+                    Err(why) => {
+                        host.mcp_note(Some(why));
+                    }
+                },
+                Step::Act { server, action } => {
+                    let done = port.act(&server, action).await;
+                    // The panel first: whatever happened, it is over.
+                    host.mcp_busy(None);
+                    match done {
+                        Ok(view) => {
+                            host.show_mcp(view);
+                        }
+                        Err(why) => {
+                            host.mcp_note(Some(why));
+                        }
+                    }
+                }
+                Step::Stay | Step::Close => {}
             }
             if let Some(keys) = keys {
                 let _ = keys.send(Wake::Fact);
@@ -4079,6 +4193,22 @@ impl Tui {
                 // finished connecting since last time has changed it.
                 if self.host.tools_open() {
                     self.refresh_tools();
+                }
+                return false;
+            }
+            Action::ToggleMcp => {
+                drop(m);
+                // Refused rather than silently opening a panel with no module to
+                // draw it, the same as the three above.
+                if !self.host.toggle_mcp() {
+                    self.say(&t(Msg::McpPanelUnavailable));
+                    return false;
+                }
+                // Read when the panel opens, never per frame: which servers exist,
+                // and whether this project is trusted, is a fact of the running
+                // tree that changes without anything on this screen doing it.
+                if self.host.mcp_open() {
+                    self.refresh_mcp();
                 }
                 return false;
             }
@@ -5748,5 +5878,205 @@ mod askpass_tests {
             .mode();
         assert!(mode & 0o111 != 0, "executable: {mode:o}");
         drop(guard);
+    }
+}
+
+#[cfg(test)]
+mod mcp_panel_tests {
+    use super::*;
+    use crate::module::Mounted;
+    use crate::surface::{Key, KeyPress};
+    use atomcode_plexus::{App, ConfigTree, PluginRegistry};
+
+    /// A port with one server, a page for it, and an action that lands.
+    struct FakeMcp;
+
+    fn server(state: crate::mcp::McpState) -> crate::mcp::McpRow {
+        crate::mcp::McpRow {
+            name: "figma".to_string(),
+            state,
+            source: "project".to_string(),
+            tool_count: 3,
+            config_path: None,
+        }
+    }
+
+    #[async_trait]
+    impl crate::mcp::Mcp for FakeMcp {
+        async fn list(&self) -> Result<crate::mcp::McpView, String> {
+            Ok(crate::mcp::McpView::new(vec![server(
+                crate::mcp::McpState::NeedsAuthentication,
+            )]))
+        }
+
+        async fn detail(&self, server: &str) -> Result<crate::mcp::McpDetail, String> {
+            Ok(crate::mcp::McpDetail {
+                name: server.to_string(),
+                state: crate::mcp::McpState::NeedsAuthentication,
+                source: "project".to_string(),
+                transport: crate::mcp::Transport::Http {
+                    url: "https://mcp.figma.com/mcp".to_string(),
+                },
+                auth: crate::mcp::Auth::OAuth {
+                    authenticated: false,
+                },
+                tool_count: 3,
+                config_path: Some("/tmp/example/.mcp.json".to_string()),
+            })
+        }
+
+        /// The action lands: the server comes back connected, which is the one
+        /// difference the screen can see for itself.
+        async fn act(
+            &self,
+            _server: &str,
+            _action: crate::mcp::Action,
+        ) -> Result<crate::mcp::McpView, String> {
+            Ok(crate::mcp::McpView::new(vec![server(
+                crate::mcp::McpState::Connected,
+            )]))
+        }
+    }
+
+    /// A screen with the MCP panel's module mounted and a wake channel on it:
+    /// what a bare `/mcp` needs, plus the door the answer comes back through.
+    fn screen() -> (Arc<Host>, Tui, mpsc::UnboundedReceiver<Wake>) {
+        let (host, tui) = assemble(Headless::new(80, 24));
+        host.modules
+            .add_view(Arc::new(Mounted::<crate::modules::mcp::Mcp>::new()))
+            .unwrap();
+        let (wake, woken) = mpsc::unbounded_channel();
+        *tui.wake.lock().expect("wake poisoned") = Some(wake);
+        (host, tui, woken)
+    }
+
+    /// Fill the seam the launcher's row fills, the way the loop hands it over.
+    fn with_port(tui: &Tui) {
+        let app = App::new(PluginRegistry::new(), ConfigTree::default());
+        let _ = app.context().provide::<McpSvc>(Arc::new(FakeMcp));
+        *tui.ctx.lock().expect("ctx poisoned") = Some(app.context());
+    }
+
+    /// A context with nothing in it: the screen is up, the seam was never filled.
+    fn without_port(tui: &Tui) {
+        let app = App::new(PluginRegistry::new(), ConfigTree::default());
+        *tui.ctx.lock().expect("ctx poisoned") = Some(app.context());
+    }
+
+    /// A round trip is on its own task, so the test waits for the same thing the
+    /// loop does: the wake it sends when it is done.
+    async fn landed(woken: &mut mpsc::UnboundedReceiver<Wake>) {
+        let woke = tokio::time::timeout(std::time::Duration::from_secs(5), woken.recv()).await;
+        assert!(
+            matches!(woke, Ok(Some(Wake::Fact))),
+            "the round trip came back and said so"
+        );
+    }
+
+    fn note(host: &Arc<Host>) -> Option<String> {
+        let m = host.moment.read().expect("moment poisoned");
+        m.mcp_panel.as_ref().and_then(|panel| panel.note.clone())
+    }
+
+    /// The command half is in `commands.rs` — it can only ask. This is the half
+    /// that says the panel really rose, and on the directory the port answered.
+    #[tokio::test]
+    async fn the_mcp_panel_opens_on_the_directory_the_port_answered() {
+        let (host, tui, mut woken) = screen();
+        with_port(&tui);
+
+        assert!(
+            !tui.act(Action::ToggleMcp, &tui.client),
+            "opening a panel is not quitting"
+        );
+        assert!(host.mcp_open(), "the panel is up, not a printed list");
+        landed(&mut woken).await;
+
+        let m = host.moment.read().expect("moment poisoned");
+        let rows = m.mcp.rows();
+        assert_eq!(rows.len(), 1, "what the port answered: {rows:?}");
+        assert_eq!(rows[0].name, "figma");
+        assert_eq!(rows[0].state, crate::mcp::McpState::NeedsAuthentication);
+    }
+
+    /// `Enter` on a server asks the port for its page, and the page is hung on
+    /// the rows the panel already has — the list is not asked for again.
+    #[tokio::test]
+    async fn drilling_into_a_server_puts_its_detail_on_the_panel() {
+        let (host, tui, mut woken) = screen();
+        with_port(&tui);
+        tui.act(Action::ToggleMcp, &tui.client);
+        landed(&mut woken).await;
+
+        assert!(
+            tui.run_mcp_key(KeyPress::plain(Key::Enter)),
+            "a key that asked for a page owes a frame"
+        );
+        landed(&mut woken).await;
+
+        let m = host.moment.read().expect("moment poisoned");
+        assert_eq!(
+            m.mcp_panel.as_ref().map(|panel| panel.level),
+            Some(crate::mcp::Level::Detail)
+        );
+        assert_eq!(
+            m.mcp.detail().map(|detail| detail.name.as_str()),
+            Some("figma")
+        );
+        assert_eq!(
+            m.mcp.detail().map(|detail| detail.tool_count),
+            Some(3),
+            "and it is the page the port sent, not a stub built here"
+        );
+    }
+
+    /// One action: it goes out over the seam, and what comes back is the
+    /// directory **after** it — not this screen's guess at what it did.
+    #[tokio::test]
+    async fn an_action_goes_over_the_seam_and_the_refreshed_list_comes_back() {
+        let (host, tui, mut woken) = screen();
+        with_port(&tui);
+        tui.act(Action::ToggleMcp, &tui.client);
+        landed(&mut woken).await;
+        // 先钻进去:动作在详情层,而光标落在第一个动作上(待认证 → 认证)。
+        tui.run_mcp_key(KeyPress::plain(Key::Enter));
+        landed(&mut woken).await;
+
+        assert!(
+            tui.run_mcp_key(KeyPress::plain(Key::Enter)),
+            "a key that asked for an action owes a frame"
+        );
+        landed(&mut woken).await;
+
+        let m = host.moment.read().expect("moment poisoned");
+        assert!(
+            m.mcp_panel
+                .as_ref()
+                .is_some_and(|panel| panel.busy.is_none()),
+            "the round trip is over and the panel is not waiting any more"
+        );
+        assert_eq!(
+            m.mcp.rows()[0].state,
+            crate::mcp::McpState::Connected,
+            "the list is what the port said afterwards"
+        );
+    }
+
+    /// A build with the panel and no port behind it says so **on the panel**: an
+    /// empty table would read as "no servers are configured", which is a
+    /// statement about the person's own file (设计 §6).
+    #[tokio::test]
+    async fn a_screen_without_the_port_says_why_the_table_is_empty() {
+        let (host, tui, _woken) = screen();
+        without_port(&tui);
+
+        tui.act(Action::ToggleMcp, &tui.client);
+
+        assert!(host.mcp_open());
+        assert_eq!(
+            note(&host),
+            Some(t(Msg::NoMcpPort).into_owned()),
+            "the panel says what is missing"
+        );
     }
 }

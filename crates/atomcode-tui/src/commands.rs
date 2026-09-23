@@ -1483,40 +1483,18 @@ impl CommandSet for SessionCommands {
                 }
             }
             "mcp" => {
+                // 无参要的是那块面板,不是一列文本(设计 §5.1):它读的端口是面板自己的,
+                // 而命令这一层连不上宿主——所以举起动作,由插件那一侧升起它(`/toolbox`
+                // 同形)。有参的那几支照旧,面板是给无参调用的人的。
+                let rest = args.trim();
+                if rest.is_empty() {
+                    return Outcome::Do(Action::ToggleMcp);
+                }
                 let control = match host(control) {
                     Ok(control) => control,
                     Err(refused) => return refused,
                 };
-                match args.trim() {
-                    "" => match control.call(HostCommand::McpStatus { session: root }).await {
-                        Ok(HostReply::McpServers { servers }) if servers.is_empty() => {
-                            Outcome::Said(t(Msg::McpNoneConfigured).into_owned())
-                        }
-                        Ok(HostReply::McpServers { servers }) => Outcome::Said(
-                            servers
-                                .into_iter()
-                                .map(|server| {
-                                    use atomcode_host_api::McpServerState as S;
-                                    let state = match server.state {
-                                        S::Connecting => t(Msg::McpConnecting),
-                                        S::Connected => t(Msg::McpConnected),
-                                        S::Untrusted => t(Msg::McpUntrusted),
-                                        S::NeedsAuthentication => t(Msg::McpNeedsAuthentication),
-                                        S::Failed { message } => {
-                                            t(Msg::McpFailed { message: &message })
-                                        }
-                                        S::Disconnected => t(Msg::McpDisconnected),
-                                        S::Disabled => t(Msg::McpDisabled),
-                                        _ => t(Msg::McpUnknownState),
-                                    };
-                                    format!("{} · {state}", server.name)
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n"),
-                        ),
-                        Ok(other) => Outcome::Refused(format!("{other:?}")),
-                        Err(error) => Outcome::Refused(refusal(error)),
-                    },
+                match rest {
                     "withdraw" => match control
                         .call(HostCommand::WithdrawMcpTools { session: root })
                         .await
@@ -2027,16 +2005,10 @@ mod tests {
     async fn model_mcp_reload_and_signing_in_and_out_are_asked_of_the_host() {
         let host = Arc::new(Recording::default());
         let (app, client, all) = following(&host);
-        host.replies.lock().unwrap().extend([
-            Ok(HostReply::Done),
-            Ok(HostReply::McpServers {
-                servers: Vec::new(),
-            }),
-        ]);
+        host.replies.lock().unwrap().extend([Ok(HostReply::Done)]);
         let _ = client.look_at("lead/scout");
         for line in [
             "/model glm-5",
-            "/mcp",
             "/mcp withdraw",
             "/reload",
             "/logout",
@@ -2058,7 +2030,6 @@ mod tests {
                     session: lead(),
                     model: "glm-5".into(),
                 },
-                HostCommand::McpStatus { session: lead() },
                 HostCommand::WithdrawMcpTools { session: lead() },
                 HostCommand::Reload { session: lead() },
                 HostCommand::SignOut { session: lead() },
@@ -2067,48 +2038,28 @@ mod tests {
         );
     }
 
-    /// `/mcp` names what each server is doing, including the two states that
-    /// are not connection outcomes at all: an HTTP server with no token to
-    /// authenticate with, and one switched off in its config file. The
-    /// wildcard is for a state this build does not know; it must not be what
-    /// says these two.
+    /// `/mcp` with nothing after it raises the panel — it prints no list of
+    /// servers, and it asks the host for nothing: the directory arrives over the
+    /// panel's own port.
+    ///
+    /// The two states that list used to spell out are `McpState::about()`'s words,
+    /// and the drawing layer's tests pin them where they are drawn. The half that
+    /// says the panel really is up lives in `plugin.rs` — a command holds no host,
+    /// so it cannot raise one itself.
     #[tokio::test]
-    async fn mcp_names_the_server_waiting_for_auth_and_the_one_switched_off() {
-        use atomcode_host_api::{McpServer, McpServerState};
+    async fn mcp_with_no_argument_asks_for_the_panel() {
         let host = Arc::new(Recording::default());
-        host.replies
-            .lock()
-            .unwrap()
-            .push_back(Ok(HostReply::McpServers {
-                servers: vec![
-                    McpServer {
-                        name: "figma".into(),
-                        state: McpServerState::NeedsAuthentication,
-                    },
-                    McpServer {
-                        name: "fs".into(),
-                        state: McpServerState::Disabled,
-                    },
-                ],
-            }));
         let (app, _client, all) = following(&host);
-        let said = match all.dispatch("/mcp", &app.context()).await {
-            Outcome::Said(said) => said,
-            other => panic!("/mcp must say what the servers are: {other:?}"),
-        };
-        let lines: Vec<&str> = said.lines().collect();
-        assert_eq!(lines.len(), 2, "{said:?}");
         assert!(
-            lines[0].starts_with("figma") && lines[0].ends_with("需要认证"),
-            "the server with no usable token has to say so: {said:?}"
+            matches!(
+                all.dispatch("/mcp", &app.context()).await,
+                Outcome::Do(Action::ToggleMcp)
+            ),
+            "/mcp with no argument routes to the panel"
         );
         assert!(
-            lines[1].starts_with("fs") && lines[1].ends_with("配置里已停用"),
-            "the server switched off in its config file has to say so: {said:?}"
-        );
-        assert!(
-            !said.contains("未知"),
-            "neither state is unknown to this build: {said:?}"
+            host.asked.lock().unwrap().is_empty(),
+            "opening the panel asks the host for nothing"
         );
     }
 

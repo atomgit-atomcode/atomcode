@@ -3450,6 +3450,17 @@ impl Host {
         true
     }
 
+    /// Attach a fetched detail to the rows the moment already holds.
+    ///
+    /// `OpenDetail` answers with a `McpDetail` while [`Host::show_mcp`] replaces
+    /// the whole view, so there has to be a way to add one to what is already
+    /// there without asking the host for the list again.
+    pub fn mcp_detail(&self, detail: crate::mcp::McpDetail) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        m.mcp = std::mem::take(&mut m.mcp).with_detail(detail);
+        true
+    }
+
     /// Say that an action is on its way there and back, or that it landed.
     pub fn mcp_busy(&self, busy: Option<crate::mcp::Busy>) -> bool {
         let mut m = self.moment.write().expect("moment poisoned");
