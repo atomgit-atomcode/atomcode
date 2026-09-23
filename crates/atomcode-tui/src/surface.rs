@@ -748,6 +748,10 @@ impl Terminal {
         arm_panic_restore(stderr.as_ref().map(|held| held.original));
         #[cfg(not(unix))]
         arm_panic_restore(None);
+        // The other way out: killed rather than unwound, where no hook and no
+        // `Drop` runs at all.
+        #[cfg(unix)]
+        arm_signal_restore();
         Ok(Self {
             raw: true,
             state: std::sync::atomic::AtomicU8::new(pointer_state(pointer)),
@@ -868,6 +872,96 @@ fn emergency_restore() {
             }
         }
     }
+}
+
+/// The signals that take a process out without unwinding it.
+///
+/// Named here and read by the handler-arming below; the judgement names them
+/// again rather than reading this, so dropping one from the list is a red test
+/// and not a shorter loop that still passes.
+#[cfg(unix)]
+const FATAL_SIGNALS: [libc::c_int; 3] = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP];
+
+/// Give the screen back when the process is **killed** rather than unwound.
+///
+/// A panic unwinds and `Drop` runs; `SIGTERM` (a `kill`, a supervisor, a
+/// shutting-down system), `SIGHUP` (the terminal window closed, the ssh link
+/// dropped) and an external `SIGINT` do neither. The kernel takes the process
+/// out and what is left behind is a terminal still in raw mode, still on the
+/// alternate screen, still reporting mouse movement: a shell a person cannot
+/// see themselves type into, and the usual fix is to close the window.
+///
+/// **Everything in the handler must be async-signal-safe**, which is why it
+/// does not call [`emergency_restore`]. That one locks stdout and goes through
+/// crossterm; a signal arriving while this process already holds the stdout
+/// lock would deadlock *inside* the handler, turning a bad exit into a hung
+/// one. `write`, `tcgetattr` and `tcsetattr` are on POSIX's list, and a
+/// lock-free atomic is sound to touch. Allocating and formatting are not, so
+/// the bytes go out exactly as the constants hold them.
+///
+/// **The terminal is put back to sane, not to byte-identical.** Restoring what
+/// was there would mean stashing a `termios` before raw mode and reading it
+/// from the handler; flipping the four flags that matter (`ICANON`/`ECHO`/
+/// `ISIG`/`IEXTEN`, plus `ICRNL`/`IXON`/`OPOST`) needs no stashed state and
+/// leaves a terminal a person can use. On this path the process is dying
+/// anyway; "usable" is the whole of the goal.
+#[cfg(unix)]
+extern "C" fn on_fatal_signal(sig: libc::c_int) {
+    use std::sync::atomic::Ordering;
+    // The same one-shot the panic hook and `restore` race for: whoever gets
+    // here first gives the screen back, and nobody does it twice.
+    if SCREEN_HELD.swap(false, Ordering::SeqCst) {
+        // SAFETY: writes of a fixed byte range to fd 1, and a termios round
+        // trip on fd 0. All four calls are async-signal-safe; none of them
+        // allocates, locks or unwinds.
+        unsafe {
+            for bytes in [
+                ansi::MOUSE_OFF.as_bytes(),
+                ansi::RESTORE_TITLE.as_bytes(),
+                ansi::LEAVE.as_bytes(),
+            ] {
+                libc::write(libc::STDOUT_FILENO, bytes.as_ptr().cast(), bytes.len());
+            }
+            let mut tty: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(libc::STDIN_FILENO, &mut tty) == 0 {
+                tty.c_lflag |= libc::ICANON | libc::ECHO | libc::ISIG | libc::IEXTEN;
+                tty.c_iflag |= libc::ICRNL | libc::IXON;
+                tty.c_oflag |= libc::OPOST;
+                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &tty);
+            }
+        }
+    }
+    // Then die of the signal that was sent, rather than of this handler: put
+    // the default disposition back and raise it again. Whatever started this
+    // process is owed the truth about how it ended — a `kill` that came back
+    // as exit code 0 would be a lie to a supervisor, and to `$?`.
+    //
+    // SAFETY: both calls are async-signal-safe, and this is the last thing
+    // this process does.
+    unsafe {
+        libc::signal(sig, libc::SIG_DFL);
+        libc::raise(sig);
+    }
+}
+
+/// Install [`on_fatal_signal`] for each of [`FATAL_SIGNALS`], once.
+#[cfg(unix)]
+fn arm_signal_restore() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: a zeroed `sigaction` with a handler and an empty mask is the
+        // documented way to install one; the struct is never read again.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = on_fatal_signal as *const () as libc::sighandler_t;
+            libc::sigemptyset(&mut action.sa_mask);
+            // No `SA_RESTART`: the handler re-raises and the process ends, so
+            // there is no interrupted call left to resume.
+            for sig in FATAL_SIGNALS {
+                libc::sigaction(sig, &action, std::ptr::null_mut());
+            }
+        }
+    });
 }
 
 /// Point stderr at a file for as long as this UI owns the screen.
@@ -1597,6 +1691,34 @@ pub fn from_crossterm(event: crossterm::event::Event) -> Option<Input> {
 mod tests {
     use super::*;
     use crate::frame::{Line, Rect};
+
+    /// Being killed still gives the screen back.
+    ///
+    /// The three named here rather than read from [`FATAL_SIGNALS`]: a test
+    /// that looped over the same constant would stay green when a signal was
+    /// dropped from it, which is the one change this exists to catch. `SIGHUP`
+    /// is the one people forget and the one that fires when a terminal window
+    /// is closed or an ssh link drops.
+    ///
+    /// What is judged is that a handler of ours is installed. That the handler
+    /// then restores the tty cannot be judged from in here — it ends by
+    /// re-raising, so the process that asserted it would be gone.
+    #[cfg(unix)]
+    #[test]
+    fn a_kill_signal_is_caught_so_the_terminal_is_given_back() {
+        arm_signal_restore();
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            // SAFETY: querying the current disposition; a null `act` changes
+            // nothing.
+            let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+            unsafe { libc::sigaction(sig, std::ptr::null(), &mut current) };
+            assert_eq!(
+                current.sa_sigaction, on_fatal_signal as *const () as libc::sighandler_t,
+                "signal {sig} is still on its default disposition: \
+                 killed this way, the terminal is left raw and on the alternate screen"
+            );
+        }
+    }
 
     #[test]
     fn a_headless_surface_keeps_every_frame_not_just_the_last() {

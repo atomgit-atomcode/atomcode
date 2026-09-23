@@ -185,7 +185,20 @@ webui 四个入口还是裸的。
       判据：登出后 `sharing()` 为假、relay 子进程不在了；注意顺序——凭据先删的理由
       （失败时不能留下一个说"还登着"的身份文件）对共享同样成立，收共享应排在删凭据**之前**。
 
-- [ ] **P0-4 被信号杀掉时恢复终端**。`tui`/`cli` 全仓没有 SIGTERM/SIGINT/SIGHUP 处理，
+- [x] **P0-4 被信号杀掉时恢复终端**（2026-09-23）。两处与原计划不同:
+      - **没有复用 `emergency_restore()`**:它锁 stdout、走 crossterm,信号在本进程
+        已经持有 stdout 锁时到达,就会**死在处理器里**——把一次难看的退出变成一次
+        挂住。处理器里只用 `write` / `tcgetattr` / `tcsetattr`(POSIX 的安全名单)
+        和一个无锁原子,字节按常量原样发。
+      - **终端恢复成「能用」而不是「一模一样」**:要还原原样得在进 raw 之前藏一份
+        `termios` 再从处理器里读它;把那七个标志位翻回来不需要任何藏起来的状态。
+        这条路上进程反正要死了,能用就是全部目标。
+      处理器最后**恢复默认处置再重新 raise**:`kill` 过来的必须仍然看起来像被 kill,
+      否则对 supervisor 和 `$?` 都是撒谎。
+      两条判据:信号名单**在判据里重写一遍**而不是读那个常量(读常量的话,从名单里
+      删掉一个信号只会让循环变短、照样绿);以及一条读源码的,钉住 `enter()` 两个
+      hook 都装——`Terminal::enter` 要真 tty,跑不了,而处理器自己那条判据是自己
+      arm 的,产品里没人 arm 它也照样绿。各证伪一次。1064 全过。`tui`/`cli` 全仓没有 SIGTERM/SIGINT/SIGHUP 处理，
       只有 panic hook 与 Drop（`tui/src/surface.rs:809-843`）——`kill` 一下或直接关掉
       终端窗口，终端留在 raw mode / Kitty 键盘协议没弹栈。
       对面是 `tuix/src/signal_restore.rs:44-99`（`libc::sigaction`，async-signal-safe）。

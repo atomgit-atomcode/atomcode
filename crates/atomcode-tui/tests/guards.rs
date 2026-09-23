@@ -148,3 +148,31 @@ fn nothing_is_printed_after_the_screen_is_given_back() {
         "the exit stops at the screen: no transcript is printed into the shell's buffer"
     );
 }
+
+/// Taking the screen arms the restore for *both* ways of losing it.
+///
+/// `Terminal::enter` needs a real tty, so what it does cannot be judged by
+/// calling it; the handler's own judgement (`surface::tests`) arms the signals
+/// itself and so would stay green if nothing ever armed them in the product.
+/// This reads the one function that takes the screen and checks both hooks are
+/// put up there — the panic path, which was always there, and the signal path,
+/// which was not: a `kill` or a closed terminal window left the tty raw, on the
+/// alternate screen, still reporting the mouse.
+#[test]
+fn taking_the_screen_arms_both_ways_of_giving_it_back() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/surface.rs");
+    let text = std::fs::read_to_string(&src).expect("surface.rs");
+    let enter = text
+        .split_once("pub fn enter(")
+        .expect("Terminal::enter is where the screen is taken")
+        .1;
+    // The function ends where the next one begins.
+    let enter = enter.split("\n    /// ").next().unwrap_or(enter);
+    for armed in ["arm_panic_restore", "arm_signal_restore"] {
+        assert!(
+            enter.contains(armed),
+            "`enter` does not arm `{armed}`: the screen is taken with one of \
+             the two ways of losing it unhandled"
+        );
+    }
+}
