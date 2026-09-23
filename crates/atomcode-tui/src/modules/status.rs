@@ -178,9 +178,15 @@ impl View for Status {
             reserved += width::str_width(text) + sep_w;
         }
 
-        // Prefer the folded model (what a request actually ran on); before the
-        // first turn that is empty, so fall back to the description's model — the
-        // real name the welcome already shows — and only then to the brand.
+        // Prefer the description's model — the configured name the welcome shows
+        // — over the folded one from the last `RequestHeader`. The description is
+        // moved the instant a model is switched (`AgentEvent::Described` writes
+        // `moment.model`), so the row follows a switch straight away; the folded
+        // name only refreshes when the next request actually goes out. Trusting
+        // the folded one as primary left the row a model behind after a switch —
+        // and stuck there when the next turn errored (e.g. a bad key) before its
+        // header ever went out. The folded name is the fallback for before the
+        // first description arrives, and the brand is the last resort.
         //
         // The thinking level rides on the model, as `model [high]`, the shape
         // tuix draws: it is a property of how *this* model is driven, not a
@@ -188,10 +194,10 @@ impl View for Status {
         // about nothing. Nothing is appended when the session has no opinion —
         // the endpoint's default stands, and the row does not invent a level
         // nobody configured.
-        let mut model_str = if !state.model.is_empty() {
-            state.model.clone()
-        } else if !vp.moment.model.is_empty() {
+        let mut model_str = if !vp.moment.model.is_empty() {
             vp.moment.model.clone()
+        } else if !state.model.is_empty() {
+            state.model.clone()
         } else {
             "atomcode".to_string()
         };
@@ -989,6 +995,38 @@ mod tests {
         assert!(
             !line.contains("atomcode"),
             "the brand is only the last resort: {line:?}"
+        );
+    }
+
+    /// Switching the model moves the footer at once, not a turn later.
+    ///
+    /// The folded name (`state.model`) is what the *last* request ran on; the
+    /// description (`moment.model`) is what the session is configured to now,
+    /// and a switch moves it immediately. The row must follow the description,
+    /// or it sits a model behind after a switch — and stays there when the next
+    /// turn errors (a bad key, say) before a fresh request header ever goes out.
+    #[test]
+    fn a_switched_model_shows_at_once_even_before_the_next_request() {
+        // A prior turn ran on grok, so the folded name is set…
+        let st = State {
+            model: "grok-4.6".into(),
+            ..Default::default()
+        };
+        // …then the person switched to deepseek: the description moved, but no
+        // request has gone out on it yet (the folded name is still grok).
+        let m = Moment {
+            model: "AtomGit-deepseek-flash".into(),
+            cwd: "~/w".into(),
+            ..Default::default()
+        };
+        let line = Status::render(&st, &Viewport::new(Rect::sized(120, 1), &m))[0].plain();
+        assert!(
+            line.contains("AtomGit-deepseek-flash"),
+            "the row must follow the switch at once: {line:?}"
+        );
+        assert!(
+            !line.contains("grok-4.6"),
+            "the stale folded model must not shadow the switch: {line:?}"
         );
     }
 
