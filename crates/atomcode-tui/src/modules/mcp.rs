@@ -236,10 +236,17 @@ fn draw(view: &McpView, panel: &Panel, row: Row<'_>, w: usize, caps: Caps) -> Li
             width::take_width(&format!("  ↑{above} ↓{below}"), w),
             theme::fg(Role::Muted),
         ),
-        // 过滤到一台都不剩时说的也是这一句:表里没有第二种「空」的说法,而
-        // 上面的搜索框里摆着人刚打的字,那才是这里为什么空着。
+        // 空有两种,说的不是一件事:一台都没配置,还是过滤之后一台都不剩。对着一个
+        // 匹配不到东西的搜索框说「没有配置」,是在说人家自己文件的事——说错了。
         Row::Nothing => Line::styled(
-            width::take_width(&t(Msg::McpPanelEmpty), w),
+            width::take_width(
+                &if view.rows().is_empty() {
+                    t(Msg::McpPanelEmpty)
+                } else {
+                    t(Msg::McpPanelNoMatch)
+                },
+                w,
+            ),
             theme::fg(Role::Muted),
         ),
         Row::Pending => Line::styled(
@@ -514,6 +521,11 @@ mod tests {
         line.plain()
     }
 
+    /// 一屏画出来的东西,一行一句。断言对着它看。
+    fn text_of(lines: &[Line]) -> Vec<String> {
+        lines.iter().map(line_text).collect()
+    }
+
     #[test]
     fn the_list_groups_by_source_and_the_detail_numbers_its_actions() {
         let view = McpView::new(vec![
@@ -550,6 +562,31 @@ mod tests {
             "动作带编号: {text:?}"
         );
         assert!(text.iter().any(|l| l.contains("认证")), "动作名: {text:?}");
+    }
+
+    /// 空有两种,说的不是一件事:一台都没配置,还是过滤之后一台都不剩。对着一个
+    /// 匹配不到东西的搜索框说「没有配置」,是在说人家自己文件的事——说错了。
+    #[test]
+    fn an_empty_directory_and_a_filter_that_matched_nothing_say_different_things() {
+        let empty = t(Msg::McpPanelEmpty).into_owned();
+        let no_match = t(Msg::McpPanelNoMatch).into_owned();
+
+        // 一台都没配置:说的是这件事。
+        let none = render_list(&McpView::new(Vec::new()), &Panel::new(), 60);
+        let text = text_of(&none);
+        assert!(text.iter().any(|l| l.contains(&empty)), "{text:?}");
+        assert!(!text.iter().any(|l| l.contains(&no_match)), "{text:?}");
+
+        // 目录里有服务器,只是过滤没匹配上:说的是匹配,不是配置。
+        let view = McpView::new(vec![row("figma", "project", McpState::Connected, 3)]);
+        let panel = Panel {
+            query: "nothing-matches-this".to_string(),
+            ..Panel::new()
+        };
+        let lines = render_list(&view, &panel, 60);
+        let text = text_of(&lines);
+        assert!(text.iter().any(|l| l.contains(&no_match)), "{text:?}");
+        assert!(!text.iter().any(|l| l.contains(&empty)), "{text:?}");
     }
 
     /// 每一行都不能比它拿到的宽度更宽:宽一格就是压在旁边的东西上。名字里带中日韩
