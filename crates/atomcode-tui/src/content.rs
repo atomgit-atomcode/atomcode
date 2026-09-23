@@ -1264,11 +1264,20 @@ impl Content for ToolCallBlock {
         let lead = format!("{} ", caps.g(Glyph::ToolMark));
         // A todo update is a state marker, not a command worth reading: when the
         // model gave it an intent, that phrase is the whole row — the
-        // `● 待办("action":…)` line and its 运行中/完成 note are dropped, so a run
-        // of todos reads as its own summaries instead of a wall of JSON. An update
+        // `● 待办("action":…)` line and its 运行中 note are dropped, so a run of
+        // todos reads as its own summaries instead of a wall of JSON. An update
         // with no intent keeps the ordinary shape: the args are then all it has to
         // say, and the caller was fine either way.
-        if self.is_todo() && self.reason().is_some() {
+        //
+        // Only while running or done cleanly: a FAILED or INTERRUPTED update
+        // keeps the full shape so its `失败 · <error>` / `已中断` note is not
+        // swallowed — a todo that did not apply is exactly what the reader (and
+        // the model, re-reading) must be told, and the red dot alone does not say
+        // what broke.
+        if self.is_todo()
+            && self.reason().is_some()
+            && matches!(self.outcome, Outcome::Pending | Outcome::Ok(_))
+        {
             return self.head(w, &lead, self.mark().1, self.name_style());
         }
         let mut out = self.opening_rows(w, &lead, self.mark().1, self.name_style());
@@ -1361,13 +1370,18 @@ impl Content for ToolCallBlock {
         }
         let caps = Caps::default();
         let lead = format!("{} ", caps.g(Glyph::ToolMark));
-        // A todo update folds to the same single intent row it opens as — there
-        // is no `待办(args)` line or result to leave out (see `lines`), so its
-        // folded and open shapes are one and the same, recessed to the fold grey.
-        // (Reaching here means it has an intent; without one it took the branch
-        // above and shows its args like any other unexplained call.)
-        if self.is_todo() {
-            return self.head(w, &lead, self.mark().1, fold());
+        // A todo update folds to the intent row it opens as — there is no
+        // `待办(args)` line or result to leave out (see `lines`), recessed to the
+        // fold grey and capped like any other fold so a paragraph-length intent
+        // cannot grow the wall it was meant to shrink. The outcome guard matches
+        // `lines`: a failed/interrupted update keeps the full shape below so its
+        // note survives folding too.
+        if self.is_todo() && matches!(self.outcome, Outcome::Pending | Outcome::Ok(_)) {
+            return self
+                .head(w, &lead, self.mark().1, fold())
+                .into_iter()
+                .take(FOLDED_ROWS)
+                .collect();
         }
         // The `●` head carries the call's outcome even folded (green done / red
         // failed / muted running), the same as the unexplained `summary`; the
@@ -3154,6 +3168,29 @@ mod tests {
         assert!(
             text.contains("Todo"),
             "an unexplained todo keeps the ordinary call shape: {text:?}"
+        );
+    }
+
+    /// A todo update that FAILED keeps the full shape so its error is not
+    /// swallowed by the intent-only collapse: the collapse is for running/clean
+    /// updates, and a todo that did not apply is exactly what the reader — and
+    /// the model re-reading — must be told.
+    #[test]
+    fn a_failed_todo_update_still_shows_its_error() {
+        let call = ToolCallBlock::pending(
+            "c",
+            "todo",
+            r#"{"intent":"标记 #5 完成","action":"update","id":5,"status":"done"}"#,
+        )
+        .with(Outcome::Failed("未知的任务 id 5".into()));
+        let text: String = call
+            .lines(&crate::block::RenderCtx::bare(80))
+            .iter()
+            .map(|l| l.plain())
+            .collect();
+        assert!(
+            text.contains("未知的任务 id 5"),
+            "the failure text must survive the todo collapse: {text:?}"
         );
     }
 
