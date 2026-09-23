@@ -5074,8 +5074,13 @@ mod tests {
 
     fn mark_fg_of(h: &Host, tick: u64) -> Option<crate::frame::Color> {
         let caps = crate::block::ShapeCaps::of(&crate::caps::Caps::default());
-        let (lines, _) =
-            h.stream_lines(Rect::sized(80, 20), 0, caps, crate::moment::Activity::Working, tick);
+        let (lines, _) = h.stream_lines(
+            Rect::sized(80, 20),
+            0,
+            caps,
+            crate::moment::Activity::Working,
+            tick,
+        );
         // The call's opening row is the one naming the file; its first span is
         // the `●` mark, whose colour the pulse moves.
         lines
@@ -5086,7 +5091,8 @@ mod tests {
     }
 
     fn emit_call(h: &Host, outcome: Option<crate::content::Outcome>) {
-        let call = crate::content::ToolCallBlock::pending("c1", "read_file", r#"{"file_path":"a.rs"}"#);
+        let call =
+            crate::content::ToolCallBlock::pending("c1", "read_file", r#"{"file_path":"a.rs"}"#);
         let call = match outcome {
             Some(o) => call.with(o),
             None => call,

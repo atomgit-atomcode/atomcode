@@ -3159,9 +3159,15 @@ mod tests {
         let lines = call.lines(&crate::block::RenderCtx::bare(80));
         assert_eq!(lines.len(), 1, "a todo update is one row: {lines:?}");
         let row = lines[0].plain();
-        assert!(row.contains("转向 sha pin 兼容"), "the intent is the row: {row:?}");
+        assert!(
+            row.contains("转向 sha pin 兼容"),
+            "the intent is the row: {row:?}"
+        );
         assert!(!row.contains("action"), "the raw args are gone: {row:?}");
-        assert!(!row.contains("in_progress"), "the status json is gone: {row:?}");
+        assert!(
+            !row.contains("in_progress"),
+            "the status json is gone: {row:?}"
+        );
         // Folded is that same single row — nothing to leave out.
         let folded = call.summary_lines(&crate::block::RenderCtx::bare(80));
         assert_eq!(folded.len(), 1, "folds to the one row: {folded:?}");
@@ -3173,8 +3179,11 @@ mod tests {
     /// unexplained call.
     #[test]
     fn a_todo_update_without_an_intent_keeps_its_args() {
-        let call =
-            ToolCallBlock::pending("c", "todo", r#"{"action":"update","id":5,"status":"completed"}"#);
+        let call = ToolCallBlock::pending(
+            "c",
+            "todo",
+            r#"{"action":"update","id":5,"status":"completed"}"#,
+        );
         let text: String = call
             .lines(&crate::block::RenderCtx::bare(80))
             .iter()
