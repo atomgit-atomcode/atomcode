@@ -217,6 +217,19 @@ pub enum HostCommand {
     /// it had seen, which is not the same number — the host packs a system
     /// prompt, instructions and tool definitions the screen never sees.
     Context { session: String },
+    /// What this person has typed into this project before, newest first.
+    ///
+    /// **Folded from the sessions' own logs, not a second store.** A session's
+    /// conversation is its event log (`docs/adr/0024`), and what was typed is
+    /// part of it — so the history a composer arrows back through is a *read*
+    /// over those logs rather than a file kept alongside them. A separate
+    /// file is what the other front end kept, and it drifts the moment a turn
+    /// is undone: the words stay in the history after the conversation stops
+    /// having them.
+    ///
+    /// Scoped to the project the session works in, which is how the sessions
+    /// are stored anyway. `limit` caps what comes back, newest first.
+    History { session: String, limit: u32 },
     /// What the account has left to spend, as rolling windows.
     ///
     /// Separate from the token counts a turn reports: those say what this
@@ -294,6 +307,7 @@ impl HostCommand {
             | Self::Providers { session }
             | Self::Autonomy { session }
             | Self::Context { session }
+            | Self::History { session, .. }
             | Self::Usage { session, .. }
             | Self::Thinking { session }
             | Self::SetThinking { session, .. }
@@ -399,6 +413,10 @@ pub enum HostReply {
         /// Where the session works. Part of the same answer because "what am I
         /// carrying" and "what am I carrying it over" are asked together.
         working_dir: String,
+    },
+    /// What was typed into this project before, newest first and de-duplicated.
+    History {
+        entries: Vec<String>,
     },
     /// What the account has left, window by window. Empty for a host that
     /// meters nothing.
@@ -1135,6 +1153,10 @@ mod tests {
             HostCommand::Models {
                 session: "a".into(),
             },
+            HostCommand::History {
+                session: "a".into(),
+                limit: 200,
+            },
             HostCommand::Usage {
                 session: "a".into(),
                 windows_only: false,
@@ -1228,6 +1250,7 @@ mod tests {
                 | HostCommand::ListSessions { .. }
                 | HostCommand::PreviewSession { .. }
                 | HostCommand::DeleteSession { .. }
+                | HostCommand::History { .. }
                 | HostCommand::Undo { .. }
                 | HostCommand::RewindPoints { .. }
                 | HostCommand::Rewind { .. }
@@ -1503,6 +1526,7 @@ mod tests {
                 | HostReply::SessionChanged { .. }
                 | HostReply::Sessions { .. }
                 | HostReply::SessionPreview { .. }
+                | HostReply::History { .. }
                 | HostReply::Undone { .. }
                 | HostReply::RewindPoints { .. }
                 | HostReply::McpServers { .. }

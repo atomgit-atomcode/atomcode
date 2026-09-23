@@ -2499,6 +2499,58 @@ async fn a_stored_session_says_what_it_last_talked_about() {
     );
 }
 
+/// What was typed into this project before comes back on the up-arrow, even
+/// from a session that has since been closed.
+///
+/// The gap this closes: a new session started in the same project knew nothing
+/// about what had been typed into it yesterday, so the history began empty
+/// every morning. Folded from the sessions own logs rather than kept in a file
+/// beside them, which is what makes an undone turn stay undone here.
+#[tokio::test]
+async fn what_was_typed_in_this_project_before_is_offered_again() {
+    let env = env();
+    let mut connection = connected(&env).await;
+    let first = connection.session.clone();
+
+    connection
+        .commands
+        .send(message("teach the parser about raw strings"))
+        .unwrap();
+    through_turn(&mut connection).await;
+
+    let Ok(HostReply::SessionChanged { session: second }) = connection
+        .control
+        .call(HostCommand::NewSession {
+            session: first.clone(),
+        })
+        .await
+    else {
+        panic!("a new session");
+    };
+    let _ = quiet(&mut connection).await;
+    connection.commands.send(message("now the lexer")).unwrap();
+    through_turn(&mut connection).await;
+
+    let Ok(HostReply::History { entries }) = connection
+        .control
+        .call(HostCommand::History {
+            session: second.clone(),
+            limit: 200,
+        })
+        .await
+    else {
+        panic!("a history");
+    };
+    assert!(
+        entries.iter().any(|line| line.contains("raw strings")),
+        "the earlier session's line is offered: {entries:#?}"
+    );
+    assert!(
+        !entries.iter().any(|line| line.contains("now the lexer")),
+        "and this session's own is not, the composer already folds it: {entries:#?}"
+    );
+}
+
 /// `/sync`: this session, shared. A viewer that joins the hub sees the same
 /// conversation — the words typed here included.
 ///

@@ -686,6 +686,13 @@ async fn answer_prompts(
 /// for this long. The number is the one `atomcode-tuix` settled on.
 pub const ALLOWANCE_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The most lines of history to bring in from this project's other sessions.
+///
+/// The number the other front end settled on for its own history file. This is
+/// a list walked with one key, so what is past a couple of hundred is past
+/// finding this way.
+pub const HISTORY_MOST: u32 = 200;
+
 /// How many wakes are answered before a frame is owed regardless.
 ///
 /// The loop paints when the queue has run dry, so a burst of wakes — a turn
@@ -862,6 +869,9 @@ pub struct Tui {
     /// When the allowance was last asked about, so it is not asked again for
     /// [`ALLOWANCE_EVERY`]. `None` until the first turn ends.
     allowance_checked: Mutex<Option<std::time::Instant>>,
+    /// Whether this project's older sessions have been folded into the history
+    /// yet. Once per screen.
+    history_asked: Mutex<bool>,
     /// The walked file tree behind the `@` menu, and the root it was walked
     /// from.
     ///
@@ -2957,6 +2967,69 @@ impl Tui {
     /// Tied to a turn ending rather than to a timer, and then held to this
     /// interval: a turn is when the figure can have moved, and the question
     /// costs a round trip on the account. Idle, nothing is asked at all.
+    /// Bring in what was typed into this project's other sessions, once.
+    ///
+    /// **Older than everything this session has**, so it goes in front: the
+    /// arrow keys walk back in time, and a line from yesterday must not sit
+    /// between two from this afternoon.
+    ///
+    /// Asked once per screen, and only when somebody actually reaches for the
+    /// history — the answer is a walk over the project's session logs, and
+    /// spending it on a person who never presses Up is spending it for nothing.
+    fn ask_for_older_history(&self) {
+        {
+            let mut asked = self.history_asked.lock().expect("history poisoned");
+            if *asked {
+                return;
+            }
+            *asked = true;
+        }
+        let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
+            return;
+        };
+        let Some(control) = self.client.control() else {
+            return;
+        };
+        let session = self.client.session();
+        let host = self.host.clone();
+        let repaint = ctx.service::<RepaintSvc>();
+        tokio::spawn(async move {
+            let entries = match control
+                .call(HostCommand::History {
+                    session,
+                    limit: HISTORY_MOST,
+                })
+                .await
+            {
+                Ok(HostReply::History { entries }) => entries,
+                _ => return,
+            };
+            if entries.is_empty() {
+                return;
+            }
+            let mut m = host.moment.write().expect("moment poisoned");
+            let already: std::collections::HashSet<String> = m.history.iter().cloned().collect();
+            let older: Vec<String> = entries
+                .into_iter()
+                .rev()
+                .filter(|line| !already.contains(line))
+                .collect();
+            if older.is_empty() {
+                return;
+            }
+            if let Some(at) = m.history_at.as_mut() {
+                *at += older.len();
+            }
+            let mut merged = older;
+            merged.append(&mut m.history);
+            m.history = merged;
+            drop(m);
+            if let Some(repaint) = repaint {
+                repaint.now();
+            }
+        });
+    }
+
     fn check_allowance(&self) {
         let now = std::time::Instant::now();
         {
@@ -4191,7 +4264,16 @@ impl Tui {
                     // for Up/Down too, not only the horizontal arrows.
                     m.caret = crate::attach::snap_caret_out_of_marker(&m.input, landed);
                 } else if up {
+                    // 第一次往回翻的时候,把这个项目里别的会话打过的东西也拿来。
+                    // 拿一次,而且只在有人真的去翻历史时才拿 —— 开机就扫一遍
+                    // 项目的会话日志,是在替从不按上箭头的人付钱。
+                    let first = m.history_at.is_none();
                     recall_back(&mut m);
+                    if first {
+                        drop(m);
+                        self.ask_for_older_history();
+                        return false;
+                    }
                 } else {
                     recall_forward(&mut m);
                 }
@@ -5495,6 +5577,7 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
             ctx: Mutex::new(None),
             wake: Mutex::new(None),
             allowance_checked: Mutex::new(None),
+            history_asked: Mutex::new(false),
             files: Mutex::new(None),
             pressed_at: Mutex::new(None),
             click_streak: Mutex::new(None),

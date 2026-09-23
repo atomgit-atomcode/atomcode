@@ -1009,6 +1009,62 @@ impl RuntimeControl {
     }
 }
 
+/// What this person has typed into this project before, newest first.
+///
+/// **Folded from the logs, never a second store.** What was typed is part of a
+/// session's conversation, and a session's conversation is its event log
+/// (`docs/adr/0024`). The other front end kept a file of its own beside them,
+/// which is why undoing a turn there left the words in the history after the
+/// conversation stopped having them — this cannot drift, because there is
+/// nothing to drift from.
+///
+/// Scoped to the project, which is how sessions are stored anyway
+/// (`sessions/<project_hash>`), and skipping the live session: the composer
+/// already folds that one as it happens, and offering the same lines twice is
+/// how a history stops being a list of distinct things.
+///
+/// **Undone turns are not offered.** A turn that was taken back is not
+/// something this conversation said, and the arrow keys are how a person
+/// re-sends something — re-sending a retracted instruction is the one outcome
+/// worth ruling out.
+fn typed_before(here: &std::path::Path, skip: &str, limit: usize) -> Vec<String> {
+    use atomcode_capabilities::session::{events, SessionManager};
+    let manager = SessionManager::for_project(here);
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    // Newest session first, so the most recent thing typed is the first thing
+    // an up-arrow reaches.
+    let mut sessions = manager.list_visible();
+    sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    for meta in sessions {
+        if out.len() >= limit {
+            break;
+        }
+        if meta.id == skip {
+            continue;
+        }
+        let Ok(logged) = manager.load_events(&meta.id) else {
+            continue;
+        };
+        for record in events::turn_records(&meta.id, &logged).into_iter().rev() {
+            if out.len() >= limit {
+                break;
+            }
+            if record.undone {
+                continue;
+            }
+            let said = record.user.trim();
+            if said.is_empty() {
+                continue;
+            }
+            if seen.insert(said.to_string()) {
+                out.push(said.to_string());
+            }
+        }
+    }
+    out
+}
+
 /// The last few exchanges of a stored session, for someone deciding whether to
 /// come back to it.
 ///
@@ -1234,6 +1290,21 @@ impl HostControl for RuntimeControl {
             HostCommand::PreviewSession { session } => Ok(HostReply::SessionPreview {
                 lines: preview_of(&session)?,
             }),
+            HostCommand::History { session, limit } => {
+                self.addressed(&session)?;
+                // Where this session works, from the runtime rather than from
+                // the process: the sessions of a project are stored under it,
+                // and `/cd` moves it.
+                let here = self
+                    .handle
+                    .context_stats()
+                    .await
+                    .map_err(refused)?
+                    .working_dir;
+                Ok(HostReply::History {
+                    entries: typed_before(&here, &session, limit as usize),
+                })
+            }
             HostCommand::Undo {
                 session,
                 turn,
