@@ -3943,11 +3943,8 @@ impl Tui {
                 // hit map is per-row, not per-cell, so the block-level answer —
                 // open the image the message holds — is the one available here;
                 // a message is one screenshot in the overwhelmingly common case.
-                // Only intercept when the bytes are actually in hand: a marker
-                // whose image is gone (a `resume`d session's gallery is empty, or
-                // the text merely contains the `[Image #N]` characters) falls
-                // through rather than popping a refusal on every click.
-                for n in self.host.image_markers_at(id) {
+                let markers = self.host.image_markers_at(id);
+                for &n in &markers {
                     let image = self
                         .host
                         .moment
@@ -3960,6 +3957,17 @@ impl Tui {
                         self.preview_image(n, Some(image));
                         return false;
                     }
+                }
+                // A block that carries a picture is an image message, and the only
+                // reason a user line is clickable at all — so the click is an
+                // open-the-picture gesture, never a fold. When the bytes are gone
+                // (a `resume`d session's gallery is empty, or the text merely
+                // contains the `[Image #N]` characters) it is a no-op: folding a
+                // person's own message on click would be a surprise. Only blocks
+                // with no picture (a tool call, a reasoning block) fall through to
+                // the fold below.
+                if !markers.is_empty() {
+                    return false;
                 }
                 // Anchor the block that was clicked, not the bottom of the
                 // conversation. A block that grows pushes its own header off
