@@ -714,6 +714,35 @@ fn to_mcp_auth(facts: &atomcode_coding::McpRowFacts) -> atomcode_host_api::McpAu
     }
 }
 
+/// The wire action onto the runtime's own.
+///
+/// Two enums, one table: `atomcode-coding` does not depend on the contract crate,
+/// so each layer keeps its own copy and this is where they meet — the same split
+/// as `McpRowFacts` → `McpRow`, read the other way.
+///
+/// `None` is "this build does not know that action". `McpAction` is
+/// `#[non_exhaustive]` and is declared in a different crate, so a front end built
+/// against a newer contract can name one this binary has never heard of — and
+/// **every one of these writes into the person's file**, so folding an unknown
+/// one onto a neighbouring action would perform the wrong write. The caller
+/// refuses instead of mapping it.
+fn to_mcp_action(
+    action: atomcode_host_api::McpAction,
+) -> Option<atomcode_coding::parts::McpAction> {
+    use atomcode_coding::parts::McpAction as Runtime;
+    use atomcode_host_api::McpAction;
+    match action {
+        McpAction::Trust => Some(Runtime::Trust),
+        McpAction::Untrust => Some(Runtime::Untrust),
+        McpAction::Login => Some(Runtime::Login),
+        McpAction::Logout => Some(Runtime::Logout),
+        McpAction::Enable => Some(Runtime::Enable),
+        McpAction::Disable => Some(Runtime::Disable),
+        // The wildcard `#[non_exhaustive]` requires. It maps nothing: see above.
+        _ => None,
+    }
+}
+
 /// The file a server is defined in, when one is. `None` is a driver-supplied
 /// server, which never had a file — not "not found".
 fn mcp_config_path(facts: &atomcode_coding::McpRowFacts) -> Option<String> {
@@ -1356,6 +1385,28 @@ impl HostControl for RuntimeControl {
                         detail: to_mcp_detail(facts),
                     })
                     .ok_or(HostError::NotFound)
+            }
+            // One thing to one configured server. The answer is the refreshed
+            // list rather than a bare success — what happened, not what was asked
+            // for — and it is the same `mcp_rows()` the read path uses, so the
+            // page and the action cannot disagree about the server it changed.
+            HostCommand::McpAct {
+                session,
+                server,
+                action,
+            } => {
+                self.addressed(&session)?;
+                // A `#[non_exhaustive]` action this build cannot name is refused
+                // rather than rounded to a neighbour: the call below writes into
+                // the person's file.
+                let action = to_mcp_action(action).ok_or_else(|| HostError::Failed {
+                    message: "this build does not know that MCP action".into(),
+                })?;
+                self.handle.mcp_act(server, action).await.map_err(refused)?;
+                let rows = self.handle.mcp_rows().await.map_err(refused)?;
+                Ok(HostReply::McpRows {
+                    rows: rows.rows.into_iter().map(to_mcp_row).collect(),
+                })
             }
             HostCommand::Settings { session } => {
                 self.addressed(&session)?;

@@ -15,11 +15,11 @@ use atomcode_coding::{
 };
 use atomcode_harness::session::SessionEvent;
 use atomcode_host_api::{HostCommand, HostConnection, HostError, HostEvent, HostReply};
-// The two `/mcp` criteria below spawn a `sh` server, so they are `#[cfg(unix)]`
-// — and their wire types are gated the same way, because a Windows build would
+// The `/mcp` criteria below spawn a `sh` server, so they are `#[cfg(unix)]` —
+// and their wire types are gated the same way, because a Windows build would
 // otherwise fire unused_imports for them.
 #[cfg(unix)]
-use atomcode_host_api::{McpAuth, McpServerState, McpTransport};
+use atomcode_host_api::{McpAction, McpAuth, McpServerState, McpTransport};
 use atomcode_kernel::event::{AgentCommand, AgentEvent};
 use atomcode_kernel::message::{Message, Role};
 use atomcode_kernel::provider::{ChatOptions, LlmProvider, ReasoningEffort};
@@ -183,8 +183,8 @@ async fn connected_full(
 
 /// `connected_full`, with MCP on and one project server behind it.
 ///
-/// The two `/mcp` criteria are about a session that HAS servers, so the server
-/// here is a real one: `fs` in the project's own `.mcp.json` — the file both
+/// The `/mcp` criteria are about a session that HAS servers, so the server here
+/// is a real one: `fs` in the project's own `.mcp.json` — the file both
 /// answers are expected to point back at — with a stdio server behind it that
 /// offers one tool. That means trusting the project, and the trust is this
 /// test's own store (`ATOMCODE_MCP_TRUST_STORE`), never the machine's.
@@ -2183,6 +2183,62 @@ async fn mcp_detail_reports_transport_and_auth() {
             })
             .await,
         Err(HostError::NotFound)
+    );
+}
+
+/// `/mcp`'s switch: disabling a server writes the file it is defined in, and
+/// takes its tools off the session.
+///
+/// The answer is the refreshed list rather than a receipt, so this judges what
+/// the action left behind — and the write is claimed from disk rather than from
+/// the interface: a page that said "off" while the file still said "on" would
+/// switch the server straight back on at the next start.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial]
+async fn mcp_act_disable_writes_config_and_withdraws() {
+    let env = env();
+    let (connection, _front_end) = connected_mcp(&env).await;
+    let session = connection.session.clone();
+    // A tool on the model is the premise of "withdraws": switching off a server
+    // that never connected would make the zero below mean nothing.
+    let tools = tools_on_the_model(&connection, &session, "fs").await;
+
+    let defined_in = env.project.path().join(".mcp.json");
+    // The scaffolding wrote this entry enabled, so the flag found afterwards is
+    // this action's writing and not a fixture's.
+    let before: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&defined_in).unwrap()).unwrap();
+    assert_eq!(before["mcpServers"]["fs"]["disabled"].as_bool(), None);
+
+    let Ok(HostReply::McpRows { rows }) = connection
+        .control
+        .call(HostCommand::McpAct {
+            session: session.clone(),
+            server: "fs".into(),
+            action: McpAction::Disable,
+        })
+        .await
+    else {
+        panic!("the action answers with the refreshed list");
+    };
+    let row = rows
+        .iter()
+        .find(|row| row.name == "fs")
+        .unwrap_or_else(|| panic!("the `.mcp.json` server is still listed: {rows:#?}"));
+    assert_eq!(row.state, McpServerState::Disabled);
+    assert_eq!(
+        row.tool_count, 0,
+        "no tool of it is on the model after the switch: {tools:?}"
+    );
+
+    // On disk: the other half of the claim, and the half a restart reads.
+    let written = std::fs::read_to_string(&defined_in).expect("the file it was defined in");
+    let after: serde_json::Value = serde_json::from_str(&written).expect("still JSON");
+    assert_eq!(
+        after["mcpServers"]["fs"]["disabled"].as_bool(),
+        Some(true),
+        "the switch reached the file: {written}"
     );
 }
 
