@@ -211,13 +211,37 @@ impl ProvidersView {
                 out.push(Listed::Add);
             }
             Tab::Models => {
-                for (i, m) in self.models.iter().enumerate() {
-                    if panel.drill.as_deref().is_some_and(|only| only != m.account) {
+                // 按账号分组:一个账号一条不可选的小标题,它的模型跟在下面。
+                // 平铺过的那版在多账号下读不出「这个模型是谁家的」——行里写着
+                // 账号,但十几行里找同一个账号要靠眼睛扫。下钻到某个账号时不画
+                // 标题:那时整张列表都是它的,再写一遍是废话。
+                let mut groups: Vec<&str> = Vec::new();
+                for m in self.models.iter() {
+                    if !groups.contains(&m.account.as_str()) {
+                        groups.push(&m.account);
+                    }
+                }
+                for account in groups {
+                    let mut under: Vec<usize> = Vec::new();
+                    for (i, m) in self.models.iter().enumerate() {
+                        if m.account != account {
+                            continue;
+                        }
+                        if panel.drill.as_deref().is_some_and(|only| only != m.account) {
+                            continue;
+                        }
+                        if hit(&[&m.id, &m.model, &m.account]) {
+                            under.push(i);
+                        }
+                    }
+                    // 筛空了的组不留标题:一个空标题说的是「这里什么都没有」。
+                    if under.is_empty() {
                         continue;
                     }
-                    if hit(&[&m.id, &m.model, &m.account]) {
-                        out.push(Listed::Model(i));
+                    if panel.drill.is_none() {
+                        out.push(Listed::Group(under[0]));
                     }
+                    out.extend(under.into_iter().map(Listed::Model));
                 }
                 // Nowhere to put a new model is a row that would open a form
                 // with no account to hang it on.
@@ -230,13 +254,80 @@ impl ProvidersView {
     }
 }
 
+impl ProvidersView {
+    /// 把光标落到一行能停的行上。
+    ///
+    /// 换页、下钻、改筛选词之后都要走一趟:模型页的第一行是账号的小标题,
+    /// 而亮着的那一行必须是人真能对它做点什么的行——否则屏幕上亮着一条分界线,
+    /// 回车没反应。
+    pub fn settle_cursor(&self, panel: &mut Panel) {
+        let listed = self.listed(panel);
+        panel.cursor = settle(&listed, panel.cursor);
+    }
+}
+
 /// One row of the list, as everything that walks the list sees it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Listed {
     Account(usize),
     Model(usize),
+    /// An account's name, over the models that belong to it — carried as the
+    /// index of the first of them, so this stays `Copy` and the name is read
+    /// where it is drawn. Not selectable: the cursor walks past it, because
+    /// there is nothing to do to a heading.
+    Group(usize),
     /// The virtual last row that opens the add form.
     Add,
+}
+
+impl Listed {
+    /// Whether the cursor may rest here.
+    pub fn selectable(&self) -> bool {
+        !matches!(self, Listed::Group(_))
+    }
+}
+
+/// 从 `from` 往 `step` 方向找下一个能停的行;没有就停在原地。
+fn walk(listed: &[Listed], from: usize, down: bool) -> usize {
+    let mut at = from;
+    loop {
+        let next = match down {
+            true => at + 1,
+            false => match at.checked_sub(1) {
+                Some(next) => next,
+                None => return from,
+            },
+        };
+        match listed.get(next) {
+            None => return from,
+            Some(row) if row.selectable() => return next,
+            Some(_) => at = next,
+        }
+    }
+}
+
+/// 从 `from` 起(含)第一个能停的行;底下没有就往上找。
+fn settle(listed: &[Listed], from: usize) -> usize {
+    if listed.get(from).is_some_and(Listed::selectable) {
+        return from;
+    }
+    let below = listed
+        .iter()
+        .enumerate()
+        .skip(from)
+        .find(|(_, row)| row.selectable())
+        .map(|(at, _)| at);
+    below
+        .or_else(|| {
+            listed
+                .iter()
+                .enumerate()
+                .take(from)
+                .filter(|(_, row)| row.selectable())
+                .map(|(at, _)| at)
+                .next_back()
+        })
+        .unwrap_or(from)
 }
 
 /// Which list is showing.
@@ -729,6 +820,8 @@ impl Panel {
             return false;
         }
         self.tab = tab;
+        // 0 行未必停得住(模型页第一行是账号的小标题),真正的落点由
+        // `point_at`/`walk` 夹住;这里先归零,列表一画就会被带到第一个能停的行。
         self.cursor = 0;
         self.query.clear();
         self.drill = None;
@@ -870,30 +963,40 @@ fn leave_form(panel: &mut Panel, secret: &mut String) {
 
 fn list_key(view: &ProvidersView, panel: &mut Panel, secret: &mut String, press: KeyPress) -> Step {
     let listed = view.listed(panel);
+    // 光标可能正停在一条不可选的小标题上:换页、改筛选词都会把它留在那儿。
+    // 先挪到能停的行再看这一键——否则在模型页上一按回车什么也不发生,而屏幕上
+    // 明明有一行亮着。
+    if listed
+        .get(panel.cursor)
+        .is_some_and(|row| !row.selectable())
+    {
+        panel.cursor = settle(&listed, panel.cursor);
+    }
     let at = listed.get(panel.cursor).copied();
     let armed = panel.pending_delete.take();
     match (press.key, press.mods) {
         (Key::Esc, _) | (Key::Char('c'), Mods::CTRL) => Step::Close,
         (Key::Tab, _) | (Key::BackTab, _) => {
             panel.show(panel.tab.other());
+            view.settle_cursor(panel);
             Step::Stay
         }
         (Key::Left, _) => {
             panel.show(Tab::Accounts);
+            view.settle_cursor(panel);
             Step::Stay
         }
         (Key::Right, _) => {
             panel.show(Tab::Models);
+            view.settle_cursor(panel);
             Step::Stay
         }
         (Key::Up, _) => {
-            panel.cursor = panel.cursor.saturating_sub(1);
+            panel.cursor = walk(&listed, panel.cursor, false);
             Step::Stay
         }
         (Key::Down, _) => {
-            if panel.cursor + 1 < listed.len() {
-                panel.cursor += 1;
-            }
+            panel.cursor = walk(&listed, panel.cursor, true);
             Step::Stay
         }
         // Add, on the tab that is showing. ctrl-a rather than a letter, because
@@ -908,6 +1011,8 @@ fn list_key(view: &ProvidersView, panel: &mut Panel, secret: &mut String, press:
         }
         (Key::Char('d'), Mods::CTRL) => delete_key(view, panel, at, armed),
         (Key::Enter, _) => match at {
+            // 光标停不到小标题上,所以这一支只为穷尽而写。
+            Some(Listed::Group(_)) => Step::Stay,
             Some(Listed::Add) => {
                 begin_add(view, panel, secret);
                 Step::Stay
@@ -966,6 +1071,7 @@ fn begin_edit(view: &ProvidersView, panel: &mut Panel, secret: &mut String, at: 
     secret.clear();
     panel.pending_delete = None;
     panel.form = match at {
+        Some(Listed::Group(_)) => None,
         Some(Listed::Account(i)) => view
             .accounts()
             .get(i)
@@ -990,6 +1096,7 @@ fn delete_key(
     armed: Option<String>,
 ) -> Step {
     let (id, account, managed) = match at {
+        Some(Listed::Group(_)) => return Step::Stay,
         Some(Listed::Account(i)) => match view.accounts().get(i) {
             // An offer that was never configured has nothing to delete.
             Some(row) => (row.id.clone(), true, row.managed || !row.configured),
@@ -1848,7 +1955,11 @@ mod tests {
         );
         let mut panel = Panel::new();
         panel.tab = Tab::Models;
-        assert_eq!(view.listed(&panel), vec![Listed::Model(0)]);
+        assert_eq!(
+            view.listed(&panel),
+            vec![Listed::Group(0), Listed::Model(0)],
+            "模型按账号分组:一条小标题,底下是它的模型"
+        );
     }
 
     /// A pasted line goes into the field with the keyboard, and only its first
@@ -1887,6 +1998,78 @@ mod tests {
         assert_eq!(list.query, "loc");
     }
 
+    /// 模型按账号分组,而不是平铺一张表:多账号时「这个模型是谁家的」要能一眼
+    /// 看出来,而不是在十几行里扫同一个账号名。
+    #[test]
+    fn models_are_grouped_under_the_account_they_belong_to() {
+        let view = view();
+        let mut panel = Panel::new();
+        panel.tab = Tab::Models;
+        let listed = view.listed(&panel);
+        let groups = listed
+            .iter()
+            .filter(|row| matches!(row, Listed::Group(_)))
+            .count();
+        assert!(groups >= 2, "一个账号一条小标题:{listed:?}");
+        // 每条小标题底下紧跟的都是它自己账号的模型。
+        let mut under: Option<String> = None;
+        for row in &listed {
+            match row {
+                Listed::Group(first) => {
+                    under = Some(view.models()[*first].account.clone());
+                }
+                Listed::Model(i) => {
+                    if let Some(account) = under.as_deref() {
+                        assert_eq!(
+                            view.models()[*i].account,
+                            account,
+                            "模型跟在自己账号的小标题下:{listed:?}"
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// 小标题停不住:上下键从它上面走过去,回车不会落在一条分界线上。
+    #[test]
+    fn the_cursor_walks_past_a_heading() {
+        let view = view();
+        let mut panel = Panel::new();
+        let mut secret = String::new();
+        run(&view, &mut panel, &mut secret, &[press(Key::Right)]);
+        let listed = view.listed(&panel);
+        // 走一遍整张列表,光标一次都不该停在小标题上。
+        for _ in 0..listed.len() {
+            assert!(
+                listed[panel.cursor].selectable(),
+                "停在了小标题上:{:?} 第 {} 行",
+                listed,
+                panel.cursor
+            );
+            run(&view, &mut panel, &mut secret, &[press(Key::Down)]);
+        }
+        for _ in 0..listed.len() {
+            assert!(listed[panel.cursor].selectable());
+            run(&view, &mut panel, &mut secret, &[press(Key::Up)]);
+        }
+    }
+
+    /// 下钻到一个账号之后不画小标题:那时整张列表都是它的,再写一遍是废话。
+    #[test]
+    fn drilling_into_one_account_drops_the_headings() {
+        let view = view();
+        let mut panel = Panel::new();
+        panel.tab = Tab::Models;
+        panel.drill = Some(view.models()[0].account.clone());
+        let listed = view.listed(&panel);
+        assert!(
+            !listed.iter().any(|row| matches!(row, Listed::Group(_))),
+            "{listed:?}"
+        );
+    }
+
     #[test]
     fn the_filter_matches_what_a_person_can_see() {
         let view = view();
@@ -1895,6 +2078,10 @@ mod tests {
         assert_eq!(view.listed(&panel), vec![Listed::Account(1), Listed::Add]);
         panel.tab = Tab::Models;
         panel.query = "local/b".into();
-        assert_eq!(view.listed(&panel), vec![Listed::Model(2), Listed::Add]);
+        assert_eq!(
+            view.listed(&panel),
+            vec![Listed::Group(2), Listed::Model(2), Listed::Add],
+            "筛剩一个模型时,它那一组的小标题还在;筛空了的组连标题一起不画"
+        );
     }
 }

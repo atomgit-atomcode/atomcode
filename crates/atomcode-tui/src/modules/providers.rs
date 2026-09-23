@@ -281,6 +281,14 @@ fn listed_line(
         "  ".to_string()
     };
     let (mark, label, about, dim) = match what {
+        // 一组的小标题:账号的名字,暗一档,没有标记也没有右侧说明——它不是
+        // 一行可以做点什么的东西,是一条分界。
+        Listed::Group(first) => {
+            let Some(row) = view.models().get(first) else {
+                return Line::empty();
+            };
+            (" ".to_string(), row.account.clone(), String::new(), true)
+        }
         Listed::Add => (
             " ".to_string(),
             match panel.tab {
@@ -358,7 +366,7 @@ fn listed_line(
             == match what {
                 Listed::Account(i) => view.accounts().get(i).map(|r| r.id.as_str()),
                 Listed::Model(i) => view.models().get(i).map(|r| r.id.as_str()),
-                Listed::Add => None,
+                Listed::Group(_) | Listed::Add => None,
             }
     });
     let label_room = w.saturating_sub(LEAD + 2).clamp(LABEL_MIN, LABEL_MAX);
@@ -711,12 +719,15 @@ pub fn geometry(moment: &Moment, vp: &Viewport<'_>) -> Geometry {
         };
     };
     let rows = layout(&moment.providers, panel, vp.rect.h as usize);
+    // 小标题不接鼠标:点它既不该选中它(停不住),也不该顺手把它底下那个模型
+    // 换上——点一条分界线不是在挑东西。
+    let listed = moment.providers.listed(panel);
     Geometry {
         header: rows.iter().position(|row| *row == Row::Header),
         rows: rows
             .into_iter()
             .map(|row| match row {
-                Row::Listed(at) => Some(at),
+                Row::Listed(at) if listed.get(at).is_some_and(|row| row.selectable()) => Some(at),
                 _ => None,
             })
             .collect(),

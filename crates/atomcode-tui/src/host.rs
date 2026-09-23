@@ -2512,11 +2512,13 @@ impl Host {
     /// thing left to do is.
     pub fn walk_into_provider(&self, account: &str) -> bool {
         let mut m = self.moment.write().expect("moment poisoned");
+        let view = m.providers.clone();
         let Some(panel) = m.providers_panel.as_mut() else {
             return false;
         };
         panel.show(crate::providers::Tab::Models);
         panel.drill = Some(account.to_string());
+        view.settle_cursor(panel);
         true
     }
 
@@ -2540,8 +2542,15 @@ impl Host {
     /// Show a list, by index. True when it moved.
     pub fn show_providers_tab(&self, tab: crate::providers::Tab) -> bool {
         let mut m = self.moment.write().expect("moment poisoned");
+        // The view first: the models list opens on an account's heading, which
+        // is not a row the cursor may rest on.
+        let view = m.providers.clone();
         match m.providers_panel.as_mut() {
-            Some(panel) => panel.show(tab),
+            Some(panel) => {
+                let moved = panel.show(tab);
+                view.settle_cursor(panel);
+                moved
+            }
             None => false,
         }
     }
