@@ -3384,6 +3384,134 @@ impl Host {
         }
     }
 
+    // ---- the MCP panel ------------------------------------------------------
+    //
+    // The same methods the panels above have — open, close, put an answer in,
+    // say what is in flight, route one key — and the same bargain when there is
+    // no module mounted to draw it with. No `row_at` and no wheel to go with
+    // them: 设计 §8 leaves the mouse out of this panel on purpose, so there is
+    // nothing here for a click to land on.
+
+    /// Whether the MCP panel is up.
+    pub fn mcp_open(&self) -> bool {
+        self.moment
+            .read()
+            .expect("moment poisoned")
+            .mcp_panel
+            .is_some()
+    }
+
+    /// Pull the MCP panel up, or put it away. True when it changed.
+    pub fn toggle_mcp(&self) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        match m.mcp_panel.take() {
+            Some(_) => true,
+            None => {
+                // Nothing to draw it with is a refusal, not an empty panel — the
+                // same bargain the panels above strike.
+                if !self.modules.has_view(crate::modules::mcp::ID) {
+                    return false;
+                }
+                // 面板家族是互斥的:升起一块,别的落下去(同 [`Host::toggle_tools`])。
+                m.settings_panel = None;
+                m.plugins_panel = None;
+                if m.providers_panel.take().is_some() {
+                    self.providers_secret
+                        .lock()
+                        .expect("provider secret poisoned")
+                        .clear();
+                }
+                m.rewind_panel = None;
+                m.tools_panel = None;
+                m.resume_panel = None;
+                m.mcp_panel = Some(crate::mcp::Panel::new());
+                true
+            }
+        }
+    }
+
+    /// Put the MCP panel away. True when it was up.
+    pub fn close_mcp(&self) -> bool {
+        self.moment
+            .write()
+            .expect("moment poisoned")
+            .mcp_panel
+            .take()
+            .is_some()
+    }
+
+    /// Put what the port answered into the moment. True when it changed.
+    pub fn show_mcp(&self, view: crate::mcp::McpView) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        if m.mcp == view {
+            return false;
+        }
+        m.mcp = view;
+        true
+    }
+
+    /// Say that an action is on its way there and back, or that it landed.
+    pub fn mcp_busy(&self, busy: Option<crate::mcp::Busy>) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let Some(panel) = m.mcp_panel.as_mut() else {
+            return false;
+        };
+        if panel.busy == busy {
+            return false;
+        }
+        panel.busy = busy;
+        true
+    }
+
+    /// Say what the last key came to, when it came to something worth reading —
+    /// the configuration guard's own words land here (设计 §6).
+    pub fn mcp_note(&self, note: Option<String>) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let Some(panel) = m.mcp_panel.as_mut() else {
+            return false;
+        };
+        if panel.note == note {
+            return false;
+        }
+        panel.note = note;
+        true
+    }
+
+    /// Run one key against the MCP panel: the panel it writes back, and the work
+    /// to send over the seam when the key asked for some.
+    ///
+    /// This is the seam [`Host::tools_key`] is: the panel's own `Stay` and
+    /// `Close` are absorbed here, and `OpenDetail`/`Act` come back out because
+    /// this layer has never heard of a host command (`docs/adr/0022` §3).
+    pub fn mcp_key(&self, press: crate::surface::KeyPress) -> (bool, Option<crate::mcp::Step>) {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let view = m.mcp.clone();
+        let Some(panel) = m.mcp_panel.as_mut() else {
+            return (false, None);
+        };
+        let before = panel.clone();
+        let step = crate::mcp::key(&view, panel, press);
+        let changed = *panel != before;
+        match step {
+            crate::mcp::Step::Stay => (changed, None),
+            crate::mcp::Step::Close => {
+                m.mcp_panel = None;
+                (true, None)
+            }
+            step => (true, Some(step)),
+        }
+    }
+
+    /// Put a paste into the MCP panel's search box: a server name is exactly the
+    /// thing that arrives by paste, and the composer is not on screen.
+    pub fn mcp_paste(&self, text: &str) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let Some(panel) = m.mcp_panel.as_mut() else {
+            return false;
+        };
+        crate::mcp::paste(panel, text)
+    }
+
     /// Run `change`, keeping the reader's place across whatever it did.
     ///
     /// **Measure, change, measure again** — one shape, because the arithmetic is
@@ -5190,6 +5318,46 @@ mod tests {
         let h = host();
         assert!(!h.toggle_providers());
         assert!(!h.providers_open());
+    }
+
+    /// A host with the MCP panel's module mounted, as a launcher that filled the
+    /// seam gives it.
+    fn host_with_mcp() -> Host {
+        let mods = Arc::new(Modules::new());
+        mods.add_view(Arc::new(Mounted::<status::Status>::new()))
+            .unwrap();
+        mods.add_view(Arc::new(Mounted::<crate::modules::mcp::Mcp>::new()))
+            .unwrap();
+        Host::new(mods, default_layout())
+    }
+
+    /// The MCP panel is one of the family: raising it puts whoever else is up
+    /// away, and one Escape from the list is what brings it down.
+    #[test]
+    fn the_mcp_panel_is_mutually_exclusive_with_the_others() {
+        let h = host_with_mcp();
+        assert!(!h.mcp_open());
+
+        assert!(h.toggle_settings(), "something is up to displace");
+        assert!(h.toggle_mcp(), "opening it is a change");
+        assert!(h.mcp_open(), "it is up");
+        // 面板是一件事的不同块:升起一块,别的就该落下去。
+        assert!(!h.settings_open(), "the settings panel stepped aside");
+
+        // 列表层一次 Esc 就是关掉,而且不欠外面任何活。
+        let (changed, step) = h.mcp_key(crate::surface::KeyPress::plain(crate::surface::Key::Esc));
+        assert!(changed, "a key that closed it is a change to the screen");
+        assert!(step.is_none(), "closing is the panel's own business");
+        assert!(!h.mcp_open());
+    }
+
+    /// A panel with no module to draw it is refused rather than opened empty —
+    /// the contract `/mcp` reads when it tells the person why nothing came up.
+    #[test]
+    fn a_screen_without_the_mcp_module_refuses_to_open_it() {
+        let h = host();
+        assert!(!h.toggle_mcp());
+        assert!(!h.mcp_open());
     }
 
     /// The question a person typed stands apart on BOTH sides — from what came
