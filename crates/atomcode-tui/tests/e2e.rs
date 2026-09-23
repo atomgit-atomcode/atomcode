@@ -1287,6 +1287,57 @@ async fn esc_keeps_a_typed_draft_and_does_not_hand_the_prompt_back() {
 /// On an idle screen a draft takes two taps of Esc to clear — the first arms,
 /// the second clears — so a stray press does not wipe what you were writing.
 #[tokio::test]
+async fn the_shell_line_editing_chords_work_on_a_real_draft() {
+    // The table says which action each chord resolves to; this says the
+    // actions do anything. Bound to a handler that was never written, every
+    // one of these keys is silently dead — which is what `Delete` was.
+    let dir = scratch("line-editing");
+    let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    let task = s.open().await;
+    s.quiet().await;
+
+    s.term.type_text("alpha omega");
+    s.quiet().await;
+
+    // ctrl-a to the start, then Delete takes the character the caret is on.
+    s.term.press(KeyPress::ctrl('a'));
+    s.term.press(KeyPress::plain(Key::Delete));
+    s.quiet().await;
+    assert!(
+        s.screen().contains("lpha omega"),
+        "ctrl-a went to the start and Delete took the character there:\n{}",
+        s.screen()
+    );
+
+    // ^H is what some terminals send for backspace. At the start there is
+    // nothing behind the caret, so it must be a no-op rather than an error.
+    s.term.press(KeyPress::ctrl('h'));
+    s.quiet().await;
+    assert!(s.screen().contains("lpha omega"), "{}", s.screen());
+
+    // ctrl-e to the end, then ^H takes the character behind it.
+    s.term.press(KeyPress::ctrl('e'));
+    s.term.press(KeyPress::ctrl('h'));
+    s.quiet().await;
+    assert!(
+        s.screen().contains("lpha omeg") && !s.screen().contains("lpha omega"),
+        "ctrl-e went to the end and ^H backspaced there:\n{}",
+        s.screen()
+    );
+
+    // ctrl-a then ctrl-k cuts everything from the caret on.
+    s.term.press(KeyPress::ctrl('a'));
+    s.term.press(KeyPress::ctrl('k'));
+    s.quiet().await;
+    assert!(
+        !s.screen().contains("lpha omeg"),
+        "ctrl-k cut the rest of the line:\n{}",
+        s.screen()
+    );
+    task.abort();
+}
+
+#[tokio::test]
 async fn an_idle_draft_takes_two_taps_of_esc_to_clear() {
     let dir = scratch("esc-idle-clear");
     let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;

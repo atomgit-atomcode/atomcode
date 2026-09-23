@@ -18,7 +18,21 @@ pub enum Action {
     Submit,
     Insert(char),
     Backspace,
+    /// Take out the character the caret is on.
+    ///
+    /// The composer had no forward delete at all until this: `Delete` was
+    /// unbound, so the key did nothing and the only way to remove the character
+    /// ahead of the caret was to step over it and press backspace.
+    DeleteForward,
     DeleteWord,
+    /// Take out everything from the caret to the end.
+    ///
+    /// To the end of the **buffer**, which is where [`Action::CaretEnd`] goes —
+    /// the pair has to agree, or `ctrl-k` deletes to somewhere `ctrl-e` does not
+    /// go and neither key can be reasoned about. (A multi-line draft is one
+    /// buffer here; `Home`/`End` answer the same way, and changing that is a
+    /// change to those keys, not something to smuggle in with this one.)
+    DeleteToEnd,
     Clear,
     CaretLeft,
     CaretRight,
@@ -269,6 +283,25 @@ impl Keymap for Default_ {
             (KeyPress::ctrl('d'), Action::Quit),
             (KeyPress::ctrl('u'), Action::Clear),
             (KeyPress::ctrl('w'), Action::DeleteWord),
+            // The rest of the line-editing reflexes every shell has. They were
+            // missing, so the muscle memory landed on nothing: ctrl-a and
+            // ctrl-e are documented in the keys help as "go to the start / the
+            // end" everywhere else a person types, and ctrl-k is how a line is
+            // cut short. Bound to the SAME actions `Home` and `End` already
+            // use, rather than to line-relative ones — two answers to "where
+            // does the caret go" is how they stop agreeing.
+            (KeyPress::ctrl('a'), Action::CaretHome),
+            (KeyPress::ctrl('e'), Action::CaretEnd),
+            (KeyPress::ctrl('k'), Action::DeleteToEnd),
+            (KeyPress::plain(Key::Delete), Action::DeleteForward),
+            // What SSH, PuTTY and a few terminal emulators send instead of the
+            // keys above: the physical Backspace arrives as `^H` and Delete as
+            // `^?`. Unbound, backspace simply stops working over those links —
+            // and it is the key a person presses most. `^H` IS backspace in
+            // ASCII, so this is the meaning of the chord rather than a guess at
+            // one.
+            (KeyPress::ctrl('h'), Action::Backspace),
+            (KeyPress::ctrl('?'), Action::DeleteForward),
             (KeyPress::plain(Key::Left), Action::CaretLeft),
             (KeyPress::plain(Key::Right), Action::CaretRight),
             (KeyPress::plain(Key::Home), Action::CaretHome),
@@ -361,6 +394,50 @@ mod tests {
         let keys = Keys::new();
         keys.add(&Default_).unwrap();
         assert_eq!(keys.len(), Default_.bindings().len());
+    }
+
+    /// The line-editing reflexes every shell answers to.
+    ///
+    /// `ctrl-a` / `ctrl-e` are asserted to resolve to the **same** actions
+    /// `Home` / `End` do, rather than to actions of their own: two ways to ask
+    /// where the caret goes is how the two answers start to differ.
+    #[test]
+    fn the_shell_line_editing_chords_are_bound() {
+        let keys = Keys::new();
+        keys.add(&Default_).unwrap();
+
+        let home = keys.resolve(KeyPress::plain(Key::Home));
+        let end = keys.resolve(KeyPress::plain(Key::End));
+        assert_eq!(keys.resolve(KeyPress::ctrl('a')), home, "ctrl-a is Home");
+        assert_eq!(keys.resolve(KeyPress::ctrl('e')), end, "ctrl-e is End");
+        assert_eq!(
+            keys.resolve(KeyPress::ctrl('k')),
+            Some(Action::DeleteToEnd),
+            "ctrl-k cuts the rest of the line"
+        );
+        assert_eq!(
+            keys.resolve(KeyPress::plain(Key::Delete)),
+            Some(Action::DeleteForward),
+            "the composer had no forward delete at all: Delete was unbound"
+        );
+    }
+
+    /// What SSH and PuTTY send instead. Unbound, backspace stops working over
+    /// those links — and it is the key pressed most.
+    #[test]
+    fn the_ascii_control_forms_of_backspace_and_delete_still_work() {
+        let keys = Keys::new();
+        keys.add(&Default_).unwrap();
+        assert_eq!(
+            keys.resolve(KeyPress::ctrl('h')),
+            Some(Action::Backspace),
+            "^H is backspace in ASCII, and is what some terminals send for it"
+        );
+        assert_eq!(
+            keys.resolve(KeyPress::ctrl('?')),
+            Some(Action::DeleteForward),
+            "^? is what they send for Delete"
+        );
     }
 
     #[test]

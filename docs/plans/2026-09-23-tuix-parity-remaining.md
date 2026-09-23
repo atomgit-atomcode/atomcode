@@ -304,7 +304,20 @@ webui 四个入口还是裸的。
       `an_unclosed_think_block_does_not_swallow_the_next_stream`（新流新状态）、
       `the_carry_never_grows_past_the_cap`。每条摘掉被测代码证伪一次。
 
-- [ ] **P1-4 键位补一批**（同一片区域，一次改完）：
+- [~] **P1-4 键位补一批**（同一片区域，一次改完）。**行编辑那三条已做**
+      （2026-09-23）,`F2` 仍未做,见该条下面的注。
+      做的时候又发现一条清单上没有的:**`Delete` 根本没绑**,composer 从来就没有
+      前向删除——要删光标后面那个字,只能先跨过去再退格。一起补了,因为它和
+      `ctrl-k` 是同一片肌肉记忆。
+      `ctrl-a`/`ctrl-e` 绑到 `Home`/`End` **已经用的那两个 action**,不新开
+      line-relative 的:光标该去哪有两个答案,就是它们开始各说各话的时候。
+      (这一版 `Home`/`End` 是**整段缓冲**的首尾;要改成按行是改那两个键,
+      不该夹带在这条里。)
+      判据 3:两条钉表(键位解析成哪个 action)、一条 e2e 钉接线——只钉表的话,
+      handler 没写的键是静默死的,而 `Delete` 正是这样死了很久。
+      三处破坏各判红:拿掉 `ctrl-a` 绑定、拿掉 `ctrl-h` 绑定、把 `DeleteToEnd`
+      的 handler 清空。1067 全过(基线 1064→1067)。
+      原文:
       - `F2` / `Shift+F2` 循环切模型——对面挂在闲置按键路径(`tuix/src/modals/model_picker.rs:28-37`)，
         新前端 `keymap.rs` 一个 F 键都没绑，**无替代**；
       - `Ctrl+A` / `Ctrl+E` / `Ctrl+K`——行首、行尾、删到行尾，三个都没有

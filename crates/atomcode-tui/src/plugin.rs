@@ -3744,6 +3744,25 @@ impl Tui {
                     m.caret = at;
                 }
             }
+            Action::DeleteForward => {
+                // The character the caret is ON, which is the one after it in
+                // byte order. Walk to the next boundary rather than assuming
+                // one byte: a `中` is three.
+                let at = m.caret.min(m.input.len());
+                if at < m.input.len() {
+                    let mut end = at + 1;
+                    while end < m.input.len() && !m.input.is_char_boundary(end) {
+                        end += 1;
+                    }
+                    m.input.replace_range(at..end, "");
+                    m.caret = at;
+                }
+            }
+            Action::DeleteToEnd => {
+                let at = m.caret.min(m.input.len());
+                m.input.truncate(at);
+                m.caret = at;
+            }
             Action::DeleteWord => {
                 let caret = m.caret;
                 // Safe on the caret's invariant, not on luck: every writer of
