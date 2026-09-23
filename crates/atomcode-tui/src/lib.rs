@@ -78,6 +78,7 @@ pub mod region;
 pub mod resume;
 pub mod rewind;
 pub mod rows;
+pub mod search;
 pub mod secret;
 pub mod settings;
 pub mod setup;

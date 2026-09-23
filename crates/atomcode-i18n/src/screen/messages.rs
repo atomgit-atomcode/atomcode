@@ -149,6 +149,17 @@ pub enum Msg<'a> {
         nth: usize,
         total: usize,
     },
+    /// The `Ctrl+R` search, with a hit: which of the history it landed on.
+    InputSearchNth {
+        query: &'a str,
+        nth: usize,
+        total: usize,
+    },
+    /// The same search with nothing matching — a state, not an error, so it is
+    /// said in the same place and the same colour.
+    InputSearchNone {
+        query: &'a str,
+    },
     /// The dim line under the composer after you stop a turn yourself.
     ComposerInterrupted,
 

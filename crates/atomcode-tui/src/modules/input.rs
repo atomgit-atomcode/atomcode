@@ -57,10 +57,46 @@ fn note_shown(moment: &crate::moment::Moment) -> bool {
 
 fn history_caption(moment: &crate::moment::Moment) -> Option<String> {
     let total = moment.history.len();
+    // A search says where it is in the same place, and instead: two counters on
+    // one shoulder would be two answers to "which one am I looking at". While
+    // one is up the composer holds a *hit*, not a browsing position, and
+    // `crate::search` keeps `history_at` at `None` to make that so.
+    if let Some(search) = moment.search.as_ref() {
+        let query = ellipsize(&search.query, SEARCH_QUERY_CELLS);
+        return Some(match search.at {
+            Some(at) => t(Msg::InputSearchNth {
+                query: &query,
+                nth: total.saturating_sub(at),
+                total,
+            })
+            .into_owned(),
+            None => t(Msg::InputSearchNone { query: &query }).into_owned(),
+        });
+    }
     moment.history_at.map(|at| {
         let nth = total.saturating_sub(at);
         t(Msg::InputHistoryNth { nth, total }).into_owned()
     })
+}
+
+/// The most of a search query the shoulder will show.
+///
+/// A query is typed, so it has no bound of its own — and this caption shares a
+/// rule with the session name. A long one is cut rather than allowed to push
+/// the name off: what a person needs to see here is the last few characters
+/// they typed, and they can see the whole of it in the hit below.
+const SEARCH_QUERY_CELLS: usize = 24;
+
+/// `text`, cut to `cells` with a trailing ellipsis when it did not fit.
+///
+/// Measured in cells rather than characters, because a query can be pasted and
+/// a CJK query is twice as wide as it is long.
+fn ellipsize(text: &str, cells: usize) -> String {
+    if crate::width::str_width(text) <= cells {
+        return text.to_string();
+    }
+    let kept = crate::width::take_width(text, cells.saturating_sub(1));
+    format!("{kept}…")
 }
 
 /// Rows the rules above and below the field eat, and cells the prompt eats.

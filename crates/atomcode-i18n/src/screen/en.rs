@@ -119,6 +119,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         // ── the input line ──
         Msg::InputAnswerKeys => "enter to send · esc to withhold".into(),
         Msg::InputHistoryNth { nth, total } => format!("history {nth}/{total}").into(),
+        Msg::InputSearchNth { query, nth, total } =>
+            format!("search '{query}' {nth}/{total}").into(),
+        Msg::InputSearchNone { query } => format!("search '{query}' no match").into(),
         Msg::ComposerInterrupted => "Interrupted · what next?".into(),
 
         // ── the status bar ──
@@ -294,7 +297,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
              esc in order: drop the selection -> clear the composer -> stop the turn · ctrl-c stops the turn outright\n\
              up/down move the caret, and page through history once at the end · click to put the caret where you clicked\n\
              pgup/pgdn and the wheel scroll the conversation\n\
-             ctrl-r reasoning (one line / in full / folded, cycles) · ctrl-t tool output (all / one summary each / summarised in groups, cycles) · ctrl-l redraws\n\
+             alt-r reasoning (one line / in full / folded, cycles) · ctrl-t tool output (all / one summary each / summarised in groups, cycles) · ctrl-l redraws\n\
+             ctrl-r searches what you have typed in this project before; type to narrow, ctrl-r again for older, enter takes it, esc gives your draft back\n\
              shift+tab steps to the next execution mode (plan/ask/edits/auto; with no completion menu up) · set ui.mode_switch_key=tab in /config to cycle with tab instead, leaving tab for completion\n\
              /showinject [name] injected context (hidden by default; all of them with no name, `all` includes peers' reports)\n\
              drag to select and copy · esc drops the selection · click a thought or a tool call to fold or open that one\n\
@@ -634,7 +638,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ImageGone => "that image is no longer available".into(),
         Msg::ImageCorrupt => "the image data is corrupt".into(),
         Msg::MouseTaken => "the mouse is taken: drag to select and copy, click a thought or a tool call to fold it, wheel to scroll, esc to drop the selection".into(),
-        Msg::MouseHandedBack => "the mouse is the terminal's: use its own selection (which reaches into the scrollback). Fold with ctrl-t, reasoning with ctrl-r (hidden by default), scroll with pgup/pgdn, ctrl-o takes the mouse back".into(),
+        Msg::MouseHandedBack => "the mouse is the terminal's: use its own selection (which reaches into the scrollback). Fold with ctrl-t, reasoning with alt-r (hidden by default), scroll with pgup/pgdn, ctrl-o takes the mouse back".into(),
         Msg::NoProviderPanel => "this screen has no provider panel: the launcher provided no `tui-panel-providers`".into(),
         Msg::NoPluginPanel => "this screen has no plugin panel: the launcher provided no `tui-panel-plugins`".into(),
         Msg::NoToolPanel => "this screen has no tool panel: the launcher provided no `tui-panel-tools`".into(),

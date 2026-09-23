@@ -3852,6 +3852,19 @@ impl Host {
         !self.menu.read().expect("menu poisoned").is_empty()
     }
 
+    /// Whether a `Ctrl+R` reverse search is up.
+    ///
+    /// Asked before every other key route, because a search owns the keyboard
+    /// while it is up — including the letters, which is what separates it from
+    /// the slash menu ([`crate::menu::Slash::owns`]).
+    pub fn searching(&self) -> bool {
+        self.moment
+            .read()
+            .expect("moment poisoned")
+            .search
+            .is_some()
+    }
+
     /// What the slash menu has lit, as it would be handed over.
     ///
     /// One reader for the return key, tab, and a click on a row, so completing

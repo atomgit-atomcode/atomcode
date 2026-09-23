@@ -98,6 +98,9 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         // ── 输入行 ──
         Msg::InputAnswerKeys => "enter 送出 · esc 不给".into(),
         Msg::InputHistoryNth { nth, total } => format!("历史 {nth}/{total}").into(),
+        Msg::InputSearchNth { query, nth, total } =>
+            format!("搜索 '{query}' {nth}/{total}").into(),
+        Msg::InputSearchNone { query } => format!("搜索 '{query}' 无匹配").into(),
         Msg::ComposerInterrupted => "已中断 · 接下来做什么？".into(),
 
         // ── 状态栏 ──
@@ -267,7 +270,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
              esc 依次:取消选中 -> 清空输入 -> 停止当轮 · ctrl-c 直接停止当轮\n\
              上/下 在输入里移动游标,到头则翻历史 · 点击输入框定位游标\n\
              pgup/pgdn 与滚轮滚动对话\n\
-             ctrl-r 思考(一行/全文/收起,循环) · ctrl-t 工具输出(全部/单个摘要/成组摘要,循环) · ctrl-l 重画屏幕\n\
+             alt-r 思考(一行/全文/收起,循环) · ctrl-t 工具输出(全部/单个摘要/成组摘要,循环) · ctrl-l 重画屏幕\n\
+             ctrl-r 搜索这个项目里以前打过的东西;继续打字缩小范围,再按 ctrl-r 往更老翻,enter 接受,esc 还回草稿\n\
              shift+tab 切下一个执行模式(plan/ask/edits/auto;没有补全菜单时) · /config 里 ui.mode_switch_key=tab 可改用 tab 切、tab 则只用于补全\n\
              /showinject [名字] 环境注入(默认不显示;不带名字则全部,all 含同伴报告)\n\
              拖动选中并复制 · esc 取消选中 · 点击思考或工具调用折叠展开那一个\n\
@@ -602,7 +606,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ImageGone => "这张图已经找不到了".into(),
         Msg::ImageCorrupt => "图片数据损坏".into(),
         Msg::MouseTaken => "鼠标已收回:拖动选中并复制,点击思考或工具调用折叠展开那一个,滚轮滚动,esc 取消选中".into(),
-        Msg::MouseHandedBack => "鼠标已交还终端:改用终端自己的框选(可跨 scrollback)。折叠用 ctrl-t,思考用 ctrl-r(默认不显示),滚动用 pgup/pgdn,ctrl-o 收回鼠标".into(),
+        Msg::MouseHandedBack => "鼠标已交还终端:改用终端自己的框选(可跨 scrollback)。折叠用 ctrl-t,思考用 alt-r(默认不显示),滚动用 pgup/pgdn,ctrl-o 收回鼠标".into(),
         Msg::NoProviderPanel => "这个屏幕没有 provider 面板:启动器没有提供 `tui-panel-providers`".into(),
         Msg::NoPluginPanel => "这个屏幕没有插件面板:启动器没有提供 `tui-panel-plugins`".into(),
         Msg::NoToolPanel => "这个屏幕没有工具面板:启动器没有提供 `tui-panel-tools`".into(),

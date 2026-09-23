@@ -339,6 +339,14 @@ pub struct Moment {
     /// The draft that was set aside to go browsing, so leaving the history
     /// gives it back rather than losing it.
     pub draft: String,
+    /// The `Ctrl+R` reverse search, while one is up. `None` the rest of the
+    /// time, which is most of it.
+    ///
+    /// Here rather than in [`crate::search`] as a static for the reason
+    /// everything else on this struct is here: the screen is drawn from one
+    /// value, so what is typed into the search and what the composer shows
+    /// cannot come to disagree.
+    pub search: Option<crate::search::Search>,
     /// Pictures the composer is holding, waiting for the message that carries
     /// them. Not a fact until it is sent: a screenshot attached and then
     /// deleted is a gesture, not a thing that happened.
@@ -887,6 +895,43 @@ impl Moment {
         self.activity != Activity::Idle || self.pending_working
     }
 
+    /// Put this project's older history in front of what this session has said,
+    /// and move everything that points into the list by as much. `true` when
+    /// anything was actually added.
+    ///
+    /// `older` is oldest-first, the same order [`history`](Self::history) is in.
+    /// Lines already present are dropped rather than duplicated: this session's
+    /// own lines are in the project's logs too, and a history that showed the
+    /// last thing twice would make Up feel broken.
+    ///
+    /// **One method rather than three statements at the call site**, and that is
+    /// the whole point of it: the list grows at the *front*, so every index into
+    /// it is wrong afterwards — the browsing position and the search's hit both.
+    /// Two of those were once two lines next to each other, which is a shape
+    /// where adding a third index means remembering to come back here. Nobody
+    /// remembers. Now the arithmetic and the indices live together and a
+    /// judgement can hold them to it.
+    pub fn history_grew_older(&mut self, older: Vec<String>) -> bool {
+        let already: std::collections::HashSet<&String> = self.history.iter().collect();
+        let mut older: Vec<String> = older
+            .into_iter()
+            .filter(|line| !already.contains(line))
+            .collect();
+        if older.is_empty() {
+            return false;
+        }
+        let grew = older.len();
+        if let Some(at) = self.history_at.as_mut() {
+            *at += grew;
+        }
+        if let Some(search) = self.search.as_mut() {
+            search.shift_by(grew);
+        }
+        older.append(&mut self.history);
+        self.history = older;
+        true
+    }
+
     /// Insert a pasted block at the caret. A block past the fold threshold
     /// ([`PASTE_FOLD_LINES`]/[`PASTE_FOLD_CHARS`]) folds into a `[Pasted #N …]`
     /// marker — the body kept in [`pastes`](Self::pastes), the composer left
@@ -1081,6 +1126,35 @@ mod tests {
         assert_eq!(m.input, "hi there");
         assert!(m.pastes.is_empty(), "nothing folded");
         assert_eq!(m.caret, "hi there".len());
+    }
+
+    #[test]
+    fn older_history_goes_in_front_and_takes_every_index_with_it() {
+        let mut m = Moment::default();
+        m.history = vec!["mine one".into(), "mine two".into()];
+        m.history_at = Some(1); // browsing the newest of this session's two
+        assert!(m.history_grew_older(vec!["older one".into(), "older two".into()]));
+        assert_eq!(
+            m.history,
+            vec!["older one", "older two", "mine one", "mine two"],
+            "the project's older lines go in FRONT: the list is oldest-first"
+        );
+        assert_eq!(
+            m.history_at,
+            Some(3),
+            "and what was being browsed is still what is being browsed"
+        );
+    }
+
+    #[test]
+    fn a_line_this_session_already_said_is_not_listed_twice() {
+        let mut m = Moment::default();
+        m.history = vec!["cargo fmt".into()];
+        assert!(m.history_grew_older(vec!["git log".into(), "cargo fmt".into()]));
+        assert_eq!(m.history, vec!["git log", "cargo fmt"]);
+        // And an answer that adds nothing says so, so the caller can skip the
+        // repaint rather than redraw the same list.
+        assert!(!m.history_grew_older(vec!["cargo fmt".into()]));
     }
 
     #[test]

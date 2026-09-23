@@ -135,6 +135,13 @@ pub enum Action {
     CycleModel {
         forward: bool,
     },
+    /// Open a reverse search over the input history (`Ctrl+R`).
+    ///
+    /// An action of its own rather than a mode the composer keeps, because what
+    /// it opens takes every key for as long as it is up — see
+    /// [`crate::search`]. Pressing it *while* a search is up is the search's
+    /// own business ("one further back") and never reaches here.
+    SearchHistory,
     /// Pull the plugins panel up over the composer, or put it away.
     ///
     /// Its own action for the reason [`Action::ToggleProviders`] is one: it has
@@ -342,7 +349,25 @@ impl Keymap for Default_ {
             // wheel — which now moves a line a notch, so nothing was lost.
             (KeyPress::plain(Key::Up), Action::CaretUp),
             (KeyPress::plain(Key::Down), Action::CaretDown),
-            (KeyPress::ctrl('r'), Action::ToggleFold("reasoning")),
+            // `Ctrl+R` is the reverse-search chord in every shell there has
+            // ever been, and the history it searches is now project-wide — so
+            // it goes where the reflex already points. The reasoning fold keeps
+            // its mnemonic letter and moves one modifier over: `Alt+R`. A
+            // person who learned the old chord finds the new one by the same
+            // letter, which is the cheapest a moved binding gets.
+            (KeyPress::ctrl('r'), Action::SearchHistory),
+            (
+                KeyPress::new(
+                    Key::Char('r'),
+                    Mods {
+                        ctrl: false,
+                        alt: true,
+                        shift: false,
+                        cmd: false,
+                    },
+                ),
+                Action::ToggleFold("reasoning"),
+            ),
             (KeyPress::ctrl('t'), Action::ToggleFold("tool_call")),
             // Ctrl+V, and the alternate Windows Terminal sends instead. A
             // terminal with no bracketed-paste support delivers a screenshot

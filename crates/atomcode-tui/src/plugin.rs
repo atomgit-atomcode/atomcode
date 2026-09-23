@@ -1947,6 +1947,20 @@ impl UserInterface for Tui {
                     quit = self.answer_question(press);
                     stale = true;
                 }
+                // A reverse search owns the keyboard while it is up — the
+                // letters included, which is what makes it a mode rather than a
+                // list like the slash menu below. Above the menu because the
+                // composer holds the *hit* while searching, and a hit that
+                // happens to start with `/` would otherwise open a menu that
+                // then ate the search's arrows.
+                //
+                // The keys it does not answer for close it and are then applied
+                // the ordinary way, inside `run_search_key` — so nobody has to
+                // learn a way out of it. See `crate::search`.
+                Wake::Input(Input::Key(press)) if self.host.searching() => {
+                    quit = self.run_search_key(press, &client);
+                    stale = true;
+                }
                 // The slash menu, above the ordinary bindings for the keys it
                 // owns — and only those. It is a list with a lit row, so up/down
                 // walk it, tab completes onto the line, and esc puts it away.
@@ -2981,6 +2995,27 @@ impl Tui {
     /// Asked once per screen, and only when somebody actually reaches for the
     /// history — the answer is a walk over the project's session logs, and
     /// spending it on a person who never presses Up is spending it for nothing.
+    /// One key while the reverse search is up. `true` to quit.
+    ///
+    /// The `Left` arm is the reason this is a function and not a match arm: a
+    /// key the search does not answer for has to run the ordinary way, and the
+    /// ordinary way is two lines that already exist at the bottom of the key
+    /// routing. Duplicated here rather than restructured, because a match arm
+    /// cannot fall through to the next one.
+    fn run_search_key(&self, press: crate::surface::KeyPress, client: &AgentClient) -> bool {
+        let step = {
+            let mut m = self.host.moment.write().expect("moment poisoned");
+            crate::search::key(&mut m, press)
+        };
+        match step {
+            crate::search::Step::Took => false,
+            crate::search::Step::Left => match self.keys.resolve(press) {
+                Some(action) => self.act(action, client),
+                None => false,
+            },
+        }
+    }
+
     fn ask_for_older_history(&self) {
         {
             let mut asked = self.history_asked.lock().expect("history poisoned");
@@ -3013,21 +3048,11 @@ impl Tui {
                 return;
             }
             let mut m = host.moment.write().expect("moment poisoned");
-            let already: std::collections::HashSet<String> = m.history.iter().cloned().collect();
-            let older: Vec<String> = entries
-                .into_iter()
-                .rev()
-                .filter(|line| !already.contains(line))
-                .collect();
-            if older.is_empty() {
+            // `entries` is newest-first; the history is oldest-first.
+            let older: Vec<String> = entries.into_iter().rev().collect();
+            if !m.history_grew_older(older) {
                 return;
             }
-            if let Some(at) = m.history_at.as_mut() {
-                *at += older.len();
-            }
-            let mut merged = older;
-            merged.append(&mut m.history);
-            m.history = merged;
             drop(m);
             if let Some(repaint) = repaint {
                 repaint.now();
@@ -4253,6 +4278,16 @@ impl Tui {
             // Inside the text they move the caret; at its edge they hand over
             // to the history. That is what an arrow key does in a shell, and
             // the composer is now tall enough for the first half to matter.
+            Action::SearchHistory => {
+                crate::search::begin(&mut m);
+                drop(m);
+                // The other moment the project's older history is worth paying
+                // for — the same reason as the first press of Up, and the same
+                // one-shot latch, so pressing both costs one scan and not two.
+                // A search over this session's four lines is not a search.
+                self.ask_for_older_history();
+                return false;
+            }
             Action::CaretUp | Action::CaretDown => {
                 use crate::modules::input;
                 let up = matches!(action, Action::CaretUp);

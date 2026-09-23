@@ -1333,6 +1333,110 @@ async fn the_shell_line_editing_chords_work_on_a_real_draft() {
     task.abort();
 }
 
+/// `Ctrl+R` finds a thing said earlier by a word that was in it, and Enter only
+/// accepts it into the composer.
+///
+/// The unit judgements in `crate::search` all call the mode directly, so every
+/// one of them stays green with the chord unbound and the routing arm missing —
+/// the way `Delete` was silently dead for months. This is the one that presses
+/// the key.
+#[tokio::test]
+async fn ctrl_r_finds_an_earlier_line_by_a_word_in_it() {
+    let dir = scratch("reverse-search");
+    let s = start(tree(
+        &dir,
+        &replay(r#"{ text = "a" }, { text = "b" }, { text = "c" }"#),
+        &[],
+    ))
+    .await;
+    let task = s.open().await;
+    s.quiet().await;
+
+    // Three things said, so there is a history with a word to find in it.
+    s.term.type_line("run the parser tests");
+    s.quiet().await;
+    s.term.type_line("fix the width arithmetic");
+    s.quiet().await;
+    s.term.type_line("check the parser again");
+    s.quiet().await;
+
+    // Open the search and type a word that is in two of them.
+    s.term.press(KeyPress::ctrl('r'));
+    s.term.type_text("parser");
+    s.quiet().await;
+    let screen = s.screen();
+    assert!(
+        screen.contains("搜索 'parser'"),
+        "the shoulder says what is being searched for:\n{screen}"
+    );
+    assert!(
+        screen.contains("check the parser again"),
+        "and the composer shows the newest hit:\n{screen}"
+    );
+
+    // Again steps to the older of the two.
+    s.term.press(KeyPress::ctrl('r'));
+    s.quiet().await;
+    assert!(
+        s.screen().contains("run the parser tests"),
+        "a second Ctrl+R steps further back:\n{}",
+        s.screen()
+    );
+
+    // Enter accepts it. It must NOT send: the reply to a fourth turn would be
+    // on screen if it had, and the search caption must be gone.
+    s.term.press(KeyPress::plain(Key::Enter));
+    s.quiet().await;
+    let screen = s.screen();
+    assert!(
+        !screen.contains("搜索 '"),
+        "accepting closes the search:\n{screen}"
+    );
+    assert!(
+        screen.contains("run the parser tests"),
+        "and leaves the hit in the composer to edit:\n{screen}"
+    );
+    task.abort();
+}
+
+/// Esc out of a search gives back the draft it was opened over. A chord pressed
+/// by accident has to cost nothing — that is the whole reason the draft is
+/// stashed rather than overwritten.
+#[tokio::test]
+async fn esc_out_of_a_search_gives_the_draft_back() {
+    let dir = scratch("reverse-search-esc");
+    let s = start(tree(
+        &dir,
+        &replay(r#"{ text = "a" }, { text = "b" }"#),
+        &[],
+    ))
+    .await;
+    let task = s.open().await;
+    s.quiet().await;
+
+    s.term.type_line("something said earlier");
+    s.quiet().await;
+
+    s.term.type_text("half a thought");
+    s.quiet().await;
+    s.term.press(KeyPress::ctrl('r'));
+    s.quiet().await;
+    assert!(
+        s.screen().contains("something said earlier"),
+        "the search opened on the newest entry:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::plain(Key::Esc));
+    s.quiet().await;
+    assert!(
+        s.screen().contains("half a thought"),
+        "Esc gave the draft back:\n{}",
+        s.screen()
+    );
+    task.abort();
+}
+
 #[tokio::test]
 async fn an_idle_draft_takes_two_taps_of_esc_to_clear() {
     let dir = scratch("esc-idle-clear");
