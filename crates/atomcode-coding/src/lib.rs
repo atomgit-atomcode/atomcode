@@ -92,7 +92,7 @@ pub use parts::{
     subagent_enabled_from_env, CodingParts, PrepareOptions, SessionBinding, SessionMode,
     SubagentPolicy,
 };
-pub use persona::{coding_persona, coding_persona_with_language, commit_language_guidance};
+pub use persona::coding_persona;
 pub use plan_mode::PlanModeGate;
 pub use plugin_hooks::{PluginHookSource, StaticPluginHookSource};
 pub use provider_factory::{

@@ -1727,8 +1727,13 @@ async fn configured_request_options_reach_the_provider_and_follow_a_model_switch
     runtime.handle.shutdown().await.unwrap();
 }
 
-/// A preferred language reaches the persona.
-async fn the_preferred_language_reaches_the_persona() {
+/// The UI language does not reach the persona.
+///
+/// `language = "zh_CN"` in `config.toml` chooses what the front end is drawn in.
+/// It used to be turned into "write commit messages in Simplified Chinese" in
+/// the system prompt as well, deciding a repository's history from a display
+/// setting. Commits follow the conversation, and a project rule overrides that.
+async fn the_ui_language_does_not_reach_the_persona() {
     let env = env();
     let recorder = Arc::new(Recorder::default());
     let mut start = start(env.project.path(), &recorder, SessionMode::Fresh);
@@ -1737,10 +1742,15 @@ async fn the_preferred_language_reaches_the_persona() {
 
     turn(&mut runtime, "hello").await;
 
-    let guidance =
-        atomcode_coding::commit_language_guidance(Some(atomcode_config::locale::Locale::ZhCn));
     let shown = system_text(&recorder.last_request());
-    assert!(shown.contains(guidance), "{shown}");
+    assert!(
+        !shown.contains("Simplified Chinese"),
+        "the UI language decided the commit language: {shown}"
+    );
+    assert!(
+        shown.contains("commit message to the user's current conversation language"),
+        "commits follow the conversation: {shown}"
+    );
     runtime.handle.shutdown().await.unwrap();
 }
 
@@ -4361,7 +4371,7 @@ mod criteria {
         the_catalog_is_the_skills_the_driver_named,
         memory_is_shown_only_when_switched_on,
         configured_request_options_reach_the_provider_and_follow_a_model_switch,
-        the_preferred_language_reaches_the_persona,
+        the_ui_language_does_not_reach_the_persona,
         a_permission_rule_refuses_what_it_denies,
         a_round_budget_ends_the_turn,
         an_mcp_servers_tools_are_offered_and_run,

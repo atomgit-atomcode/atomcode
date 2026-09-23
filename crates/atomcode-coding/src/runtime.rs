@@ -8449,9 +8449,9 @@ fn harness_host_state(
             .subagent_config
             .is_some()
             .then(atomcode_config::Config::default_path),
-        // The same value the persona is written with (`config.preferred_language`),
-        // so the language a row speaks and the language the model is told to
-        // answer in are one decision, not two.
+        // The UI language, for the rows that write words of their own (the
+        // `/worklog` and `/init` templates). The persona does not read it: what
+        // the model answers and commits in follows the conversation.
         language: config.preferred_language,
         web_search_api_key: config.web_search_api_key.clone(),
         rows: harness_option_rows(parts, config, prepare)

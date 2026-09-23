@@ -643,19 +643,10 @@ name = "ui-handle"
 /// that the row had no way to be told which backend to use — the person's
 /// `[web_search] provider = "duckduckgo"` would have been read by the chain and
 /// silently dropped by the tree.
-/// The `persona-atomcode` row's config for a model and a language.
+/// The `persona-atomcode` row's config: the model its identity line names.
 #[derive(serde::Serialize)]
 struct PersonaPatch<'a> {
     model: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    language: Option<atomcode_config::locale::Locale>,
-}
-
-fn persona_config(
-    model: &str,
-    language: Option<atomcode_config::locale::Locale>,
-) -> PersonaPatch<'_> {
-    PersonaPatch { model, language }
 }
 
 /// Rows whose config follows the running model — patched at mount and again on
@@ -828,14 +819,6 @@ pub fn config_rows(cfg: &crate::CodingAgentConfig) -> Result<Layer, String> {
     use atomcode_capabilities::tools::CredentialShellPolicy;
 
     let mut out = model_rows(cfg)?;
-    if cfg.preferred_language.is_some() {
-        out = out
-            .patch(
-                "persona-atomcode",
-                persona_config(&cfg.model, cfg.preferred_language),
-            )
-            .map_err(|e| e.to_string())?;
-    }
     // With the checkpoint, a front end that draws the question is asked before a
     // turn is cut off by its budget or ends with its answer cut off.
     if cfg.round_cap_checkpoint {
@@ -1212,12 +1195,7 @@ pub async fn swap_provider_for(
     };
     let mut layer = Layer::new()
         .patch("llm", LlmInjectedRow { provider_id: &id })
-        .and_then(|layer| {
-            layer.patch(
-                "persona-atomcode",
-                persona_config(model, config.and_then(|c| c.preferred_language)),
-            )
-        })
+        .and_then(|layer| layer.patch("persona-atomcode", PersonaPatch { model }))
         .and_then(|layer| layer.patch("tool-code-review", CodeReviewModelPatch { model }))
         .map_err(|e| restore(e.to_string()))?;
     if let Some(config) = config {
@@ -2811,10 +2789,6 @@ struct PersonaRow {
     /// quiet lie in the first line the model reads.
     #[serde(default)]
     model: String,
-    /// The language commit messages and the like are written in, when the
-    /// person chose one.
-    #[serde(default)]
-    language: Option<atomcode_config::locale::Locale>,
 }
 
 #[async_trait]
@@ -2865,7 +2839,7 @@ impl Plugin for CodingPersonaPlugin {
         // rather than of the `ATOMCODE_MEMORY_TOOL` / `ATOMCODE_REQUEST_USER_INPUT` envs the
         // chain reads, which cannot see a tree that failed to mount the tool. See
         // `coding_persona_rows`.
-        let text = crate::persona::coding_persona_rows(&model, row.language, &has);
+        let text = crate::persona::coding_persona_rows(&model, &has);
         // Rank 0, and an id of this row's own: the identity line goes first,
         // and the generic row it replaces is removed by `CODING_ROWS` rather
         // than overwritten here.
