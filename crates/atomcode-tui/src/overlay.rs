@@ -92,6 +92,18 @@ pub struct Picker {
     all: RwLock<Vec<Choice>>,
     filter: RwLock<String>,
     cursor: RwLock<usize>,
+    /// What `Enter` means when the filter matches nothing: this, with `{}`
+    /// replaced by what was typed.
+    ///
+    /// Without it a filter that matches nothing is a dead end — the keys do
+    /// nothing and the only way on is to close the list and type the command
+    /// out. That is exactly the case where a person already knows the answer
+    /// and the list does not have it: `/cd` into a directory that is neither
+    /// bookmarked, nor recent, nor under the one being browsed.
+    ///
+    /// `None` for a list where the choices are the only answers — picking a
+    /// model that is not configured is not a thing a person can mean.
+    typed_means: RwLock<Option<String>>,
 }
 
 impl Picker {
@@ -102,7 +114,17 @@ impl Picker {
             all: RwLock::new(choices),
             filter: RwLock::new(String::new()),
             cursor: RwLock::new(0),
+            typed_means: RwLock::new(None),
         })
+    }
+
+    /// Let `Enter` on an unmatched filter mean `template` with `{}` filled in.
+    ///
+    /// See [`Picker::typed_means`]. Opt-in per list, because for most lists
+    /// what was typed is a search and nothing else.
+    pub fn accepting_typed(self: Arc<Self>, template: impl Into<String>) -> Arc<Self> {
+        *self.typed_means.write().expect("picker poisoned") = Some(template.into());
+        self
     }
 
     /// Replace the list, keeping the filter. For a picker whose contents change
@@ -392,7 +414,17 @@ impl Overlay for Picker {
             }
             (Key::Enter, _) => match self.selected() {
                 Some(c) => Step::Chose(c.value),
-                None => Step::Stay,
+                // Nothing matched. If this list said what typing means, that
+                // is what it means; otherwise the key stays dead rather than
+                // inventing a pick.
+                None => {
+                    let typed = self.filter.read().expect("picker poisoned").clone();
+                    let means = self.typed_means.read().expect("picker poisoned").clone();
+                    match means.filter(|_| !typed.trim().is_empty()) {
+                        Some(template) => Step::Chose(template.replace("{}", typed.trim())),
+                        None => Step::Stay,
+                    }
+                }
             },
             (Key::Backspace, _) => {
                 self.filter.write().expect("picker poisoned").pop();
@@ -597,6 +629,54 @@ mod tests {
                 Choice::new("c", "gamma").about("third"),
             ],
         )
+    }
+
+    /// A list that says what typing means is not a dead end when nothing
+    /// matches.
+    ///
+    /// The case: `/cd` into a directory that is neither bookmarked, nor
+    /// recent, nor under the one being browsed. Every row filters away, and
+    /// before this the keys simply stopped working — the only way on was to
+    /// close the list and type the command out, which is the one thing a
+    /// person who already knows the path should not have to do.
+    #[test]
+    fn a_list_can_say_what_typing_something_it_does_not_have_means() {
+        let p = picker().accepting_typed("/cd {}");
+        for ch in "/srv/deploy".chars() {
+            p.key(KeyPress::ch(ch));
+        }
+        assert!(p.visible().is_empty(), "nothing in the list matches it");
+        assert_eq!(
+            p.key(KeyPress::plain(Key::Enter)),
+            Step::Chose("/cd /srv/deploy".into()),
+            "what was typed is what it means"
+        );
+
+        // A match still wins: the list answering is not overridden by the
+        // text that found it.
+        let p = picker().accepting_typed("/cd {}");
+        p.key(KeyPress::ch('a'));
+        assert_eq!(p.key(KeyPress::plain(Key::Enter)), Step::Chose("a".into()));
+
+        // And an empty filter means nothing — `Enter` on a list scrolled to
+        // nowhere must not dispatch a command with a blank in it.
+        let p = picker().accepting_typed("/cd {}");
+        p.key(KeyPress::ch('z'));
+        p.key(KeyPress::plain(Key::Backspace));
+        assert!(matches!(p.key(KeyPress::plain(Key::Enter)), Step::Chose(v) if v == "a"));
+    }
+
+    /// A list that did not say so stays dead, which is the point of it being
+    /// opt-in: picking a model nobody configured is not a thing a person can
+    /// mean, and a command built from a typo is worse than a key that waits.
+    #[test]
+    fn a_list_that_said_nothing_still_refuses_what_it_does_not_have() {
+        let p = picker();
+        for ch in "nowhere".chars() {
+            p.key(KeyPress::ch(ch));
+        }
+        assert!(p.visible().is_empty());
+        assert_eq!(p.key(KeyPress::plain(Key::Enter)), Step::Stay);
     }
 
     /// Work that lands late closes the modal it was about, and no other.

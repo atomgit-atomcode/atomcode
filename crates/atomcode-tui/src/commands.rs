@@ -1170,13 +1170,20 @@ impl CommandSet for SessionCommands {
                         )
                         .about(crate::text::collapse_home(&from)),
                     );
-                    return Outcome::Open(crate::overlay::Picker::new(
-                        "cd",
-                        t(Msg::CdPickerHint {
-                            here: &crate::text::collapse_home(&from),
-                        }),
-                        choices,
-                    ));
+                    return Outcome::Open(
+                        crate::overlay::Picker::new(
+                            "cd",
+                            t(Msg::CdPickerHint {
+                                here: &crate::text::collapse_home(&from),
+                            }),
+                            choices,
+                        )
+                        // 打出来的那一条也算数。书签、最近、以及这一层底下的
+                        // 东西答的是「我要去哪儿」的常见一半;另一半是人本来就
+                        // 知道路径 —— 而那时候列表里一条都不会匹配,回车此前是
+                        // 个死键,只能关掉列表重打一遍命令。
+                        .accepting_typed("/cd {}"),
+                    );
                 }
                 let control = match host(control) {
                     Ok(control) => control,
@@ -3336,6 +3343,17 @@ mod tests {
         assert!(
             text.contains("under-here"),
             "浏览的是当前工作目录底下的东西:\n{text}"
+        );
+
+        // 人本来就知道路径的那一半:列表里一条都不匹配时,回车去的就是打出来的
+        // 那个地方。此前这是个死键,只能关掉列表重打一遍命令。
+        for ch in "/srv/deploy".chars() {
+            picker.key(crate::surface::KeyPress::ch(ch));
+        }
+        assert_eq!(
+            picker.key(crate::surface::KeyPress::plain(crate::surface::Key::Enter)),
+            crate::overlay::Step::Chose("/cd /srv/deploy".into()),
+            "打出来的路径就是要去的地方"
         );
     }
 
