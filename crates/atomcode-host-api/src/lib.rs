@@ -786,6 +786,71 @@ pub enum McpServerState {
     Disconnected,
 }
 
+/// How a server is reached, with nothing that could authenticate as anyone.
+///
+/// Deliberately not `atomcode_capabilities::mcp::McpTransportConfig`: that type's
+/// payload carries headers and OAuth material, and a screen showing "this one is
+/// an HTTP server" has no business holding them.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum McpTransport {
+    Stdio {
+        command: String,
+        args: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+    },
+    Http {
+        url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+    },
+}
+
+/// Whether a server authenticates, and whether it currently can.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum McpAuth {
+    /// The transport authenticates by nothing the person manages here.
+    None,
+    OAuth {
+        /// A usable token is stored for this server.
+        authenticated: bool,
+    },
+}
+
+/// One row of the `/mcp` list, as a screen draws it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpRow {
+    pub name: String,
+    pub state: McpServerState,
+    /// `McpConfigSource::as_str()` — `"global"`, `"project"` or `"driver"`.
+    /// A plain string rather than the enum: the capability type is not this
+    /// crate's to publish, and a screen only groups by it.
+    pub source: String,
+    /// Tools this server has on the session's model, by the names the model
+    /// calls them by. Zero for a server that is disabled or not connected.
+    pub tool_count: usize,
+    /// The file it is defined in, when it is backed by one. `None` for a
+    /// driver-supplied server, which never had a file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_path: Option<String>,
+}
+
+/// Everything the `/mcp` detail page shows about one server.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServerDetail {
+    pub name: String,
+    pub state: McpServerState,
+    /// See [`McpRow::source`].
+    pub source: String,
+    pub transport: McpTransport,
+    pub auth: McpAuth,
+    pub tool_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_path: Option<String>,
+}
+
 /// One stored session, as a picker shows it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredSession {
@@ -1459,5 +1524,51 @@ mod tests {
             };
             assert_eq!(command.addressed(), expected, "{command:?}");
         }
+    }
+
+    #[test]
+    fn a_transport_crossing_the_wire_carries_no_credentials() {
+        // The config it is built from holds headers and OAuth material
+        // (`caps::mcp::McpTransportConfig`). The wire type must not.
+        let http = McpTransport::Http {
+            url: "https://mcp.example.com/mcp".into(),
+            timeout_ms: Some(60_000),
+        };
+        let json = serde_json::to_string(&http).unwrap();
+        for leaked in ["header", "authorization", "client_secret", "token"] {
+            assert!(
+                !json.to_lowercase().contains(leaked),
+                "the wire type must not carry {leaked}: {json}"
+            );
+        }
+        let back: McpTransport = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, http);
+    }
+
+    #[test]
+    fn a_row_and_a_detail_survive_the_wire() {
+        let row = McpRow {
+            name: "context7".into(),
+            state: McpServerState::Connected,
+            source: "global".into(),
+            tool_count: 8,
+            config_path: Some("/home/u/.atomcode/mcp.json".into()),
+        };
+        let detail = McpServerDetail {
+            name: "figma".into(),
+            state: McpServerState::NeedsAuthentication,
+            source: "project".into(),
+            transport: McpTransport::Http {
+                url: "https://mcp.figma.com/mcp".into(),
+                timeout_ms: Some(60_000),
+            },
+            auth: McpAuth::OAuth {
+                authenticated: false,
+            },
+            tool_count: 0,
+            config_path: None,
+        };
+        crosses(&row);
+        crosses(&detail);
     }
 }
