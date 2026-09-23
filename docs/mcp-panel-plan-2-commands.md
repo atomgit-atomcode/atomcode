@@ -480,7 +480,7 @@ EOF
 - [ ] **Step 2: 跑它，确认失败**
 
 ```bash
-cargo nextest run -p atomcode-coding --features mcp a_disabled_server_is_listed_but_has_no_tools
+cargo nextest run -p atomcode-coding a_disabled_server_is_listed_but_has_no_tools
 ```
 
 Expected: 编译失败，`cannot find function 'mcp_row_facts' in this scope`。
@@ -492,6 +492,11 @@ Expected: 编译失败，`cannot find function 'mcp_row_facts' in this scope`。
 ```rust
 /// One configured MCP server, as a management list needs it: the file's static
 /// config joined with what the running session actually has.
+///
+/// The derives are not decoration: `McpRowsSnapshot` / `McpDetailSnapshot` derive
+/// `Clone, Debug, PartialEq` over this type, so without them the snapshots do not
+/// compile. No `Eq`: `McpConfigSource` has none.
+#[derive(Clone, Debug, PartialEq)]
 pub struct McpRowFacts {
     pub name: String,
     pub disabled: bool,
@@ -584,12 +589,20 @@ pub async fn mcp_row_facts(
 }
 ```
 
-若 `McpTokenStore` / `token_is_expired` 没从 `atomcode_capabilities::mcp` 重导出，就在 `crates/atomcode-capabilities/src/mcp/mod.rs` 的 `pub use` 清单里补上（同一个 crate 的小补齐，本任务一并提交）。
+`crates/atomcode-capabilities/src/mcp/mod.rs` 的 `pub use` 清单要补**四个**符号——计划初稿只提了两个，漏掉的两个会让本步的代码解析不了（Step 3 里它们都是不带路径直接用的）：
+
+| 符号 | 出自 | 初稿提到了吗 |
+| --- | --- | --- |
+| `token_is_expired` | `oauth` | 提了 |
+| `McpTokenStore` | `oauth` | 提了（其实早已导出） |
+| `config_path_for_source` | `config` | **漏了**——计划 1 只把它加进 `config.rs`，没进导出清单 |
+| `load_mcp_config_including_disabled` | `config` | **漏了**，同上 |
+| `McpConfigSource` | `config` | **漏了**，同上 |
 
 - [ ] **Step 4: 跑测试，确认通过**
 
 ```bash
-cargo nextest run -p atomcode-coding --features mcp a_disabled_server_is_listed_but_has_no_tools
+cargo nextest run -p atomcode-coding a_disabled_server_is_listed_but_has_no_tools
 ```
 
 Expected: PASS。
@@ -614,7 +627,9 @@ pub struct McpDetailSnapshot {
 }
 ```
 
-> `runtime.rs` 与 `parts.rs` 同属 `atomcode-coding`，所以这里是 `crate::parts::McpRowFacts`。同一个类型 Task 5 的 `cli/host.rs` 也要命名，所以它必须是 `pub`，并由 `crates/atomcode-coding/src/lib.rs` 重导出为 `atomcode_coding::McpRowFacts`——**不要**依赖 `parts` 模块本身的可见性，那个今天不是公开的。
+> `runtime.rs` 与 `parts.rs` 同属 `atomcode-coding`，所以这里是 `crate::parts::McpRowFacts`。
+>
+> **更正（初稿写错了）**：初稿说"`parts` 今天不是公开的"——**不对**，`crates/atomcode-coding/src/lib.rs:54` 就是 `pub mod parts;`，`atomcode_coding::parts::mcp_row_facts` 本来就能命名。根上再导出一次 `McpRowFacts` 仍然要做，理由不同：Task 5 的 `cli/host.rs` 用的是 `atomcode_coding::McpRowFacts` 这个短名字。
 
 `CodingRuntimeControl`（:2571 附近）加两条：
 
@@ -659,10 +674,16 @@ pub struct McpDetailSnapshot {
 
 handle 方法照 `mcp_status()`（:1626）的形状加 `mcp_rows()` 与 `mcp_detail(server: String)`。
 
+**还有一处闸门，计划初稿完全没提——执行时撞出来的（E0004）：**
+
+`reject_runtime_control`（`runtime.rs:7811`）是又一个**没有通配分支**的 `CodingRuntimeControl` 穷尽 match（关机／持久化失败时统一拒绝控制命令）。两条新命令必须在这里也各加一臂，照 `McpStatus`/`McpTools` 那两臂的写法，各自 `done.send(Err(RuntimeError::Unavailable))`——**fail-closed**，不是放行。
+
+同理，详情那条臂计划只写了"同上"：**不要把 join 抄两遍**，把它提成一个 `mcp_rows_of(&RuntimeResources)` 私有函数供两条臂共用，列表与详情才不会对同一个服务器给出不同说法。
+
 - [ ] **Step 6: 跑测试并提交**
 
 ```bash
-cargo nextest run -p atomcode-coding --features mcp
+cargo nextest run -p atomcode-coding
 git add crates/atomcode-coding/src/parts.rs crates/atomcode-coding/src/runtime.rs crates/atomcode-capabilities/src/mcp/mod.rs
 git commit -F - <<'EOF'
 feat(coding): 面板要的列表与详情,在运行时做一次 join
@@ -824,7 +845,7 @@ EOF
 
 ```bash
 cargo nextest run -p atomcode-host-api
-cargo nextest run -p atomcode-coding --features mcp
+cargo nextest run -p atomcode-coding
 cargo nextest run -p atomcode-cli --features mcp
 ```
 
