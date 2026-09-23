@@ -570,7 +570,10 @@ mod tests {
         let mut line = format!("{fresh} and {fresh} again");
         let missing = a.rehydrate_recalled(&mut line);
         assert!(missing.is_empty());
-        assert_eq!(line, "[Image #1] and [Image #1] again", "queued marker untouched");
+        assert_eq!(
+            line, "[Image #1] and [Image #1] again",
+            "queued marker untouched"
+        );
         assert_eq!(
             a.take_shown(&line),
             vec![img("fresh")],
