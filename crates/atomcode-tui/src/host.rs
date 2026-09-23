@@ -4737,6 +4737,19 @@ impl Host {
         self.hits.lock().expect("hits poisoned").at(x, y)
     }
 
+    /// The `[Image #N]` numbers the block carries, for a click that landed on
+    /// it — so clicking a sent message that has a screenshot opens the picture,
+    /// the same gesture the composer supports for a marker still being typed.
+    /// Empty for every block but a user message, and for one that carries none.
+    pub fn image_markers_at(&self, id: BlockId) -> Vec<usize> {
+        self.stream
+            .read()
+            .expect("stream poisoned")
+            .get(id)
+            .map(|slot| slot.block().content.image_markers())
+            .unwrap_or_default()
+    }
+
     /// Fold or unfold what a click landed on.
     ///
     /// A run of calls is drawn as one lid, so a click on it opens the whole run:

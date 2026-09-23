@@ -926,6 +926,16 @@ pub enum Msg<'a> {
         error: &'a str,
     },
     ClipboardHasNoImage,
+    /// Opening an attached image in the desktop viewer did not work.
+    ImagePreviewFailed {
+        reason: &'a str,
+    },
+    /// This front end cannot show a file — no desktop opener is wired.
+    NoOpener,
+    /// The clicked image marker no longer resolves to any bytes.
+    ImageGone,
+    /// The attached image's stored bytes could not be decoded.
+    ImageCorrupt,
     MouseTaken,
     MouseHandedBack,
     NoProviderPanel,

@@ -198,6 +198,15 @@ pub trait Content: Send + Sync + std::fmt::Debug {
         false
     }
 
+    /// The `[Image #N]` attachment numbers this block shows, in order — empty
+    /// for almost everything. A front end turns a click on a block that carries
+    /// a picture into "open image N", the same gesture the composer supports for
+    /// a marker still being typed. Only a block that renders user-typed text
+    /// (where a `[Image #N]` marker can appear) overrides this.
+    fn image_markers(&self) -> Vec<usize> {
+        Vec::new()
+    }
+
     /// One line standing in for the whole block when it is folded.
     fn summary(&self, ctx: &RenderCtx) -> Line {
         self.lines(ctx).into_iter().next().unwrap_or_default()

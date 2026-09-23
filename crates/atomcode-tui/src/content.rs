@@ -535,6 +535,11 @@ impl Content for UserSaid {
     fn content_hash(&self) -> ContentHash {
         hash_of(&["user", &self.0])
     }
+    /// The pictures this message carries, so a click on it can reopen one. A
+    /// user line is the only block a `[Image #N]` marker ever lands in.
+    fn image_markers(&self) -> Vec<usize> {
+        crate::attach::markers_in(&self.0)
+    }
     /// A full-width bar, the way `atomcode-tuix` echoes what you typed.
     ///
     /// The background is the point: in a screen of assistant prose and tool

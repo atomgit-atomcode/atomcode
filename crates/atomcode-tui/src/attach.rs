@@ -34,7 +34,7 @@ fn marker(n: usize) -> String {
 ///
 /// Used to label what was sent, where the log carries the images but the
 /// numbers only survive inside the text the person typed.
-fn markers_in(text: &str) -> Vec<usize> {
+pub(crate) fn markers_in(text: &str) -> Vec<usize> {
     const OPEN: &str = "[Image #";
     let mut out = Vec::new();
     let mut rest = text;
@@ -65,10 +65,50 @@ fn markers_in(text: &str) -> Vec<usize> {
     out
 }
 
+/// The image number whose `[Image #N]` marker covers byte offset `off`, if any.
+///
+/// This is what turns a click into "open image N": a caret offset in the
+/// composer, or a byte offset into a logged line, lands somewhere in the text,
+/// and a click that lands inside a marker's span is a request to open that
+/// picture rather than to move the caret. `None` for a click anywhere else, so
+/// ordinary text is untouched.
+pub fn marker_at_offset(text: &str, off: usize) -> Option<usize> {
+    const OPEN: &str = "[Image #";
+    let mut from = 0;
+    // Same boundary reasoning as `markers_in`: `find` answers on a boundary,
+    // `OPEN` is ASCII, and the digits were taken from the front as ASCII.
+    #[allow(
+        clippy::string_slice,
+        reason = "`find` returns a boundary, `OPEN` is ASCII, digits are ASCII"
+    )]
+    while let Some(rel) = text[from..].find(OPEN) {
+        let at = from + rel;
+        let after = &text[at + OPEN.len()..];
+        let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+        let after_digits = &after[digits.len()..];
+        if !digits.is_empty() && after_digits.starts_with(']') {
+            // The half-open span from `[` through the closing `]`.
+            let end = at + OPEN.len() + digits.len() + 1;
+            if (at..end).contains(&off) {
+                return digits.parse().ok();
+            }
+        }
+        from = at + OPEN.len();
+    }
+    None
+}
+
 /// What the composer is holding between submits.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Attachments {
     images: Vec<Pending>,
+    /// Every image added this session, by marker number — **kept after send**,
+    /// where [`images`](Self::images) is drained. This is what lets a person open
+    /// a picture again from the history: the marker `[Image #N]` in a sent line
+    /// still resolves to its bytes here. Append-only for the session (numbers are
+    /// never reused), and untouched by [`clear`](Self::clear) — a previously sent
+    /// image's bytes must survive the composer being emptied.
+    gallery: Vec<Pending>,
     next: usize,
 }
 
@@ -87,6 +127,7 @@ impl Attachments {
     pub fn new() -> Self {
         Self {
             images: Vec::new(),
+            gallery: Vec::new(),
             next: 1,
         }
     }
@@ -98,8 +139,18 @@ impl Attachments {
     pub fn add(&mut self, image: ImageContent) -> String {
         let n = self.next;
         self.next += 1;
-        self.images.push(Pending { marker: n, image });
+        let pending = Pending { marker: n, image };
+        // The send queue is drained at submit; the gallery keeps a copy so the
+        // picture can be reopened from the history long after it was sent.
+        self.gallery.push(pending.clone());
+        self.images.push(pending);
         marker(n)
+    }
+
+    /// The bytes of image `n`, for reopening it — from the composer or from a
+    /// sent line in the history. `None` if no such number was ever added.
+    pub fn image_at(&self, n: usize) -> Option<&ImageContent> {
+        self.gallery.iter().find(|p| p.marker == n).map(|p| &p.image)
     }
 
     /// Hand over what this text still refers to, and forget all of it.
@@ -130,6 +181,88 @@ impl Attachments {
     pub fn clear(&mut self) {
         self.images.clear();
     }
+}
+
+/// A pasted image file bigger than this is refused rather than attached: the
+/// bytes are re-sent on every turn, so a runaway file would blow the per-request
+/// body. Matches the classic front end's ceiling.
+const MAX_PATH_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+
+/// Interpret a paste payload as a filesystem path to an image file and load it
+/// as an [`ImageContent`] — or `None` when it is not unambiguously an image
+/// path, so prose that merely names a file is never grabbed.
+///
+/// This is the flow a screenshot from WeChat, iTerm2's ⌘V, or a Finder
+/// drag-and-drop takes: copying an image *file* (not bitmap bytes) puts a path
+/// on the clipboard, and the terminal bracketed-pastes that path as plain text.
+/// Without this the composer shows the raw path instead of the picture — the
+/// reported "全部展示成路径". The bytes are read **here, at paste time**, so the
+/// attachment is self-contained and cannot later disagree with the filesystem.
+///
+/// All of these must hold: single line; an absolute path after trimming, one
+/// layer of matched outer quotes, and `\<space>` unescaping (drag-and-drop emits
+/// both); a png/jpg/jpeg/gif/webp extension; an existing regular file no larger
+/// than [`MAX_PATH_IMAGE_BYTES`]. A bare relative `snap.png` is deliberately
+/// rejected — typed at the prompt it is ambiguous between text and attachment.
+pub fn image_from_path(text: &str) -> Option<ImageContent> {
+    use base64::Engine as _;
+
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.contains('\n') {
+        return None;
+    }
+    // One layer of matched outer quotes: Finder drag of a path with spaces wraps
+    // in `'...'`; some shells produce `"..."`. The quote chars are single-byte
+    // ASCII, so the slice stays on a char boundary.
+    #[allow(
+        clippy::string_slice,
+        reason = "the stripped bytes are the ASCII quote chars just matched"
+    )]
+    let unquoted: &str = if trimmed.len() >= 2
+        && ((trimmed.starts_with('\'') && trimmed.ends_with('\''))
+            || (trimmed.starts_with('"') && trimmed.ends_with('"')))
+    {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    };
+    // iTerm2 / drag-and-drop shell-escape spaces (`/path/with\ space.png`).
+    // Backslash before any other char is left alone — no other escape form
+    // occurs in real-world drag pastes.
+    let unescaped = unquoted.replace("\\ ", " ");
+    let path = std::path::Path::new(unescaped.trim());
+    if !path.is_absolute() {
+        return None;
+    }
+    let ext_media_type = match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        _ => return None,
+    };
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_PATH_IMAGE_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    // Downscale/re-encode an oversized image exactly as a clipboard paste is
+    // (image_normalize), so a big attachment can't blow the per-request body.
+    // Falls back to the original bytes/type on any decode failure.
+    let (media_type, data) =
+        match atomcode_capabilities::image_normalize::normalize_image_raw(&bytes) {
+            Some((mt, out)) => (mt, base64::engine::general_purpose::STANDARD.encode(out)),
+            None => (
+                ext_media_type.to_string(),
+                base64::engine::general_purpose::STANDARD.encode(&bytes),
+            ),
+        };
+    Some(ImageContent { media_type, data })
 }
 
 #[cfg(test)]
@@ -204,5 +337,98 @@ mod tests {
         assert_eq!(markers_in("no markers here"), Vec::<usize>::new());
         // A Chinese sentence around one, because that is what this UI is typed in.
         assert_eq!(markers_in("看这个 [Image #3] 对吗"), vec![3]);
+    }
+
+    // The gallery outlives the send: after `take_shown` has drained the queue,
+    // the bytes are still reachable by number so the picture can be reopened
+    // from the history. `clear` (Ctrl+U) must not drop them either.
+    #[test]
+    fn the_gallery_keeps_bytes_reachable_after_send_and_clear() {
+        let mut a = Attachments::new();
+        let m = a.add(img("one"));
+        assert_eq!(a.image_at(1), Some(&img("one")), "reachable while composing");
+        let _ = a.take_shown(&format!("sent {m}"));
+        assert_eq!(a.image_at(1), Some(&img("one")), "still reachable after send");
+        a.clear();
+        assert_eq!(a.image_at(1), Some(&img("one")), "clearing the composer keeps it");
+        assert_eq!(a.image_at(9), None, "a number never added has no image");
+    }
+
+    // A click position (a byte offset) inside an `[Image #N]` span opens that
+    // image; anywhere else is ordinary text and opens nothing.
+    #[test]
+    fn a_click_inside_a_marker_span_names_its_image() {
+        let text = "看 [Image #2] 和 [Image #10] 对吗";
+        let open2 = text.find("[Image #2]").unwrap();
+        let open10 = text.find("[Image #10]").unwrap();
+        assert_eq!(marker_at_offset(text, open2), Some(2), "on the `[`");
+        assert_eq!(marker_at_offset(text, open2 + 5), Some(2), "inside the span");
+        assert_eq!(
+            marker_at_offset(text, open2 + "[Image #2]".len() - 1),
+            Some(2),
+            "on the closing `]`"
+        );
+        assert_eq!(
+            marker_at_offset(text, open2 + "[Image #2]".len()),
+            None,
+            "just past the span is text again"
+        );
+        assert_eq!(marker_at_offset(text, open10 + 6), Some(10), "two-digit number");
+        assert_eq!(marker_at_offset(text, 0), None, "on the leading 看");
+        assert_eq!(marker_at_offset("no markers", 3), None);
+    }
+
+    // A pasted absolute path to a real image file becomes an attachment — the
+    // WeChat/iTerm2/Finder flow. The bytes need not decode: an unrecognised
+    // payload with an image extension still attaches (raw fallback), matching
+    // the clipboard-paste path, so the test does not depend on a real PNG.
+    #[test]
+    fn an_absolute_image_path_loads_as_an_attachment() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("shot.png");
+        std::fs::write(&file, b"\x89PNG not-really-but-has-the-extension").unwrap();
+
+        let img = image_from_path(file.to_str().unwrap()).expect("an image path attaches");
+        assert!(!img.data.is_empty(), "the bytes were read and encoded");
+
+        // Quoted and shell-escaped forms (drag-and-drop) resolve to the same file.
+        let spaced = dir.path().join("my shot.png");
+        std::fs::write(&spaced, b"bytes").unwrap();
+        assert!(
+            image_from_path(&format!("'{}'", spaced.display())).is_some(),
+            "matched outer quotes are stripped"
+        );
+        assert!(
+            image_from_path(&spaced.display().to_string().replace(' ', "\\ ")).is_some(),
+            "shell-escaped spaces are unescaped"
+        );
+    }
+
+    // Everything that is NOT an unambiguous image-attachment intent is left as
+    // text, so ordinary prose and paths are never silently eaten.
+    #[test]
+    fn non_image_paste_payloads_are_left_as_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("real.png");
+        std::fs::write(&png, b"bytes").unwrap();
+
+        assert!(image_from_path("just some prose").is_none(), "prose");
+        assert!(image_from_path("snap.png").is_none(), "relative path is ambiguous");
+        assert!(
+            image_from_path(dir.path().join("notes.txt").to_str().unwrap()).is_none(),
+            "non-image extension"
+        );
+        assert!(
+            image_from_path(dir.path().join("gone.png").to_str().unwrap()).is_none(),
+            "missing file"
+        );
+        assert!(
+            image_from_path(&format!("look at {}", png.display())).is_none(),
+            "a path embedded in a sentence is prose, not an attachment"
+        );
+        assert!(
+            image_from_path(&format!("{}\n{}", png.display(), png.display())).is_none(),
+            "multi-line is a text paste, never a single attachment"
+        );
     }
 }

@@ -863,6 +863,33 @@ impl Moment {
         }
     }
 
+    /// Attach `image` and drop its `[Image #N]` marker in at the caret. The
+    /// marker is part of the sentence, so it lands where the caret is rather than
+    /// appended, and a space is added before it when the caret sits on a word.
+    ///
+    /// The one place a picture joins the composer — a clipboard chord and a
+    /// pasted image-file path both come through here, so numbering and caret
+    /// handling can never drift between them.
+    pub fn insert_image(&mut self, image: atomcode_kernel::message::ImageContent) {
+        let label = self.attachments.add(image);
+        let at = self.caret.min(self.input.len());
+        // Safe on the caret's invariant, the same one `DeleteWord` relies on:
+        // every writer of `self.caret` leaves it on a character boundary.
+        #[allow(
+            clippy::string_slice,
+            reason = "the caret is kept on a character boundary by every writer of it"
+        )]
+        let head = &self.input[..at];
+        let gap = if !head.is_empty() && !head.ends_with(char::is_whitespace) {
+            " "
+        } else {
+            ""
+        };
+        let inserted = format!("{gap}{label}");
+        self.input.insert_str(at, &inserted);
+        self.caret = at + inserted.len();
+    }
+
     /// The "paste again to expand it" gesture: a second paste of the block that
     /// was just folded, its marker still whole at the caret and within the
     /// window, swaps the marker back for the body. `true` when it did.

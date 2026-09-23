@@ -862,6 +862,11 @@ pub struct Tui {
     /// What this screen last told the terminal the window is called, so a
     /// frame that changes nothing writes nothing.
     named: Mutex<Option<String>>,
+    /// Where an attached image's bytes were written on disk, by marker number, so
+    /// a person clicking `[Image #N]` opens it in their desktop viewer. Written
+    /// on first open and reused after — the picture is decoded once, not on every
+    /// click. Session-scoped, like the gallery it mirrors.
+    image_files: Mutex<std::collections::HashMap<usize, std::path::PathBuf>>,
 }
 
 #[async_trait]
@@ -3474,6 +3479,82 @@ impl Tui {
         );
     }
 
+    /// Open attached image `n` in the person's desktop viewer, the way clicking a
+    /// file does. `image` is its bytes when the caller still had them in hand
+    /// (a composer click); `None` means look them up in the session gallery (a
+    /// click on a sent line in the history). Either way the bytes are written to a
+    /// temp file once — reused on later clicks — and handed to the [`OpenerSvc`]
+    /// the tui bundle already provides for `open_file`.
+    ///
+    /// Best-effort by design: the failures a person can do anything about (no
+    /// bytes, cannot write the file, no opener) are said out loud; the open
+    /// itself runs off-thread, since `act` is not async and a desktop launcher
+    /// must not block the render loop.
+    fn preview_image(&self, n: usize, image: Option<atomcode_kernel::message::ImageContent>) {
+        let path = match self.image_temp_file(n, image) {
+            Ok(path) => path,
+            Err(reason) => {
+                self.say_refused(&t(Msg::ImagePreviewFailed { reason: &reason }));
+                return;
+            }
+        };
+        let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
+            return;
+        };
+        let opener = match ctx.require::<atomcode_harness::seams::OpenerSvc>() {
+            Ok(opener) => opener,
+            Err(_) => {
+                let reason = t(Msg::NoOpener);
+                self.say_refused(&t(Msg::ImagePreviewFailed { reason: &reason }));
+                return;
+            }
+        };
+        // Off the render loop: launching Preview.app (`open`, `xdg-open`, …) is a
+        // process spawn, and `act` returns to paint. A failure here is rare and
+        // not actionable, so it is left to the opener's own logging.
+        tokio::spawn(async move {
+            let _ = opener
+                .open(&atomcode_capabilities::tools::OpenTarget::Path(path))
+                .await;
+        });
+    }
+
+    /// The on-disk path of attached image `n`, written once and cached. `image`
+    /// is the bytes if the caller had them; otherwise they come from the gallery.
+    /// The extension follows the media type so the desktop viewer opens it right.
+    fn image_temp_file(
+        &self,
+        n: usize,
+        image: Option<atomcode_kernel::message::ImageContent>,
+    ) -> Result<std::path::PathBuf, String> {
+        use base64::Engine as _;
+
+        let mut cache = self.image_files.lock().expect("image files poisoned");
+        if let Some(path) = cache.get(&n) {
+            if path.exists() {
+                return Ok(path.clone());
+            }
+        }
+        let image = image.ok_or_else(|| t(Msg::ImageGone).into_owned())?;
+        let ext = match image.media_type.as_str() {
+            "image/jpeg" => "jpg",
+            "image/gif" => "gif",
+            "image/webp" => "webp",
+            _ => "png",
+        };
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(image.data.as_bytes())
+            .map_err(|_| t(Msg::ImageCorrupt).into_owned())?;
+        let dir = std::env::temp_dir().join("atomcode-images");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        // `std::process::id` scopes the file to this run so two sessions do not
+        // clobber each other's `[Image #1]`; `n` is monotonic within the run.
+        let path = dir.join(format!("img-{}-{n}.{ext}", std::process::id()));
+        std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+        cache.insert(n, path.clone());
+        Ok(path)
+    }
+
     /// Whether this press steps the execution mode on.
     ///
     /// The rule, ported from the reference front end so neither loses the
@@ -3724,12 +3805,32 @@ impl Tui {
                 return false;
             }
             Action::Paste(text) => {
-                // A big block folds into a `[Pasted #N …]` marker rather than
-                // filling the composer; the body is put back at submit
-                // (`expand_pastes`). Paste the same block again to expand it.
-                let text = sanitize_paste(&text);
-                let now = m.now;
-                m.insert_paste(&text, now);
+                // A pasted image-*file* path is an attachment intent, not prose:
+                // WeChat/iTerm2 save the clipboard image to a temp file and paste
+                // its path, and Finder drag types the path. Load the bytes now and
+                // drop in an `[Image #N]` marker instead of leaving the raw path in
+                // the composer (the reported "全部展示成路径"). Reading at paste time
+                // keeps the attachment self-contained. Anything that is not
+                // unambiguously an image path falls through to the text path.
+                if let Some(image) = crate::attach::image_from_path(&text) {
+                    // Decide the destination before attaching: a model that would
+                    // drop the bytes says so now, while the person still has the
+                    // file, rather than after they have typed about a picture that
+                    // never left.
+                    if let Err(reason) = images_reach_the_model(client) {
+                        drop(m);
+                        self.say_refused(&reason);
+                        return false;
+                    }
+                    m.insert_image(image);
+                } else {
+                    // A big block folds into a `[Pasted #N …]` marker rather than
+                    // filling the composer; the body is put back at submit
+                    // (`expand_pastes`). Paste the same block again to expand it.
+                    let text = sanitize_paste(&text);
+                    let now = m.now;
+                    m.insert_paste(&text, now);
+                }
             }
             Action::AttachImage => {
                 // The destination is decided before the clipboard is even read.
@@ -3749,26 +3850,7 @@ impl Tui {
                     self.say_refused(&t(Msg::ClipboardHasNoImage));
                     return false;
                 };
-                let label = m.attachments.add(image);
-                // At the caret, not appended: the marker is part of the
-                // sentence, and where it lands is where the person put it.
-                let at = m.caret.min(m.input.len());
-                // Safe on the caret's invariant, the same one `DeleteWord`
-                // relies on: every writer of `m.caret` leaves it on a character
-                // boundary.
-                #[allow(
-                    clippy::string_slice,
-                    reason = "the caret is kept on a character boundary by every writer of it"
-                )]
-                let head = &m.input[..at];
-                let gap = if !head.is_empty() && !head.ends_with(char::is_whitespace) {
-                    " "
-                } else {
-                    ""
-                };
-                let inserted = format!("{gap}{label}");
-                m.input.insert_str(at, &inserted);
-                m.caret = at + inserted.len();
+                m.insert_image(image);
             }
             Action::Cancel => {
                 // A turn in flight: Ctrl+C stops it and clears any pending quit —
@@ -3812,6 +3894,15 @@ impl Tui {
                 // the cheaper answer.
                 if let Some(rect) = self.host.field_rect() {
                     if let Some(at) = crate::modules::input::offset_at_cell(&m, rect, x, y) {
+                        // A click inside an `[Image #N]` marker opens the picture
+                        // in the desktop viewer rather than moving the caret — the
+                        // marker is the picture, so clicking it is asking to see it.
+                        if let Some(n) = crate::attach::marker_at_offset(&m.input, at) {
+                            let image = m.attachments.image_at(n).cloned();
+                            drop(m);
+                            self.preview_image(n, image);
+                            return false;
+                        }
                         m.caret = at;
                         return false;
                     }
@@ -3820,6 +3911,25 @@ impl Tui {
                 let Some((id, kind)) = self.host.block_at(x, y) else {
                     return false;
                 };
+                // A click on a sent message that carries a picture opens the
+                // picture, the same as clicking its marker in the composer. The
+                // hit map is per-row, not per-cell, so the block-level answer —
+                // open the image the message holds — is the one available here;
+                // a message is one screenshot in the overwhelmingly common case.
+                // Its bytes are in the session gallery (kept after send), so this
+                // works for a message sent earlier this run.
+                if let Some(n) = self.host.image_markers_at(id).first().copied() {
+                    let image = self
+                        .host
+                        .moment
+                        .read()
+                        .expect("moment poisoned")
+                        .attachments
+                        .image_at(n)
+                        .cloned();
+                    self.preview_image(n, image);
+                    return false;
+                }
                 // Anchor the block that was clicked, not the bottom of the
                 // conversation. A block that grows pushes its own header off
                 // the top — click a tool call and the line you clicked is the
@@ -4954,6 +5064,7 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
             click_streak: Mutex::new(None),
             members: Arc::new(Roster::default()),
             named: Mutex::new(None),
+            image_files: Mutex::new(std::collections::HashMap::new()),
         },
     )
 }
