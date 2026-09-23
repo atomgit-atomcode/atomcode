@@ -10,6 +10,8 @@
 
 **前置：** 本计划在 worktree `/Users/lichao/project/gitcode/ai/atomcode/.worktrees/mcp-panel`、分支 `feat/mcp-panel` 上执行。开工前确认 `git branch --show-current` 是 `feat/mcp-panel`。
 
+**测试命令必须带 `--features mcp`（本计划初稿漏了，是实测抓出来的）。** `mcp` 在这个 crate 里是 opt-in feature：`lib.rs:193` 是 `#[cfg(feature = "mcp")] pub mod mcp;`，而 `default = ["provider", "tools"]`。不带它跑，**整个 `mcp` 模块根本不参与编译**——测试报告会"全绿"，但一个相关用例都没执行。实测数字：默认组合 947 个用例，带 `mcp` 是 **1066** 个，差的 119 个就是 mcp 模块的。这个坑值得记住，因为它**只会在你信任那份绿色报告时咬人**。
+
 **设计依据：** `docs/mcp-panel-design.md` §3（边界）、§4.4（停用项今天读不到）、§6（失败语义）、§7（测试判据）。
 
 ---
@@ -76,7 +78,7 @@
 
 ```bash
 cd /Users/lichao/project/gitcode/ai/atomcode/.worktrees/mcp-panel
-cargo nextest run -p atomcode-capabilities listing_shows_disabled_servers_that_loading_still_hides
+cargo nextest run -p atomcode-capabilities --features mcp listing_shows_disabled_servers_that_loading_still_hides
 ```
 
 Expected: 编译失败，`cannot find function 'load_mcp_config_including_disabled' in this scope`。
@@ -140,7 +142,7 @@ pub fn load_mcp_config_including_disabled(project_dir: &Path) -> Result<Vec<McpS
 - [ ] **Step 4: 跑测试，确认通过**
 
 ```bash
-cargo nextest run -p atomcode-capabilities
+cargo nextest run -p atomcode-capabilities --features mcp
 ```
 
 Expected: 全绿（含既有的 `shipped_mcp_json_example_parses_as_is` 与 `load_mcp_config_reports_malformed_project_file`）。
@@ -199,7 +201,7 @@ EOF
 - [ ] **Step 2: 跑它，确认失败**
 
 ```bash
-cargo nextest run -p atomcode-capabilities a_driver_server_has_no_config_file_to_write
+cargo nextest run -p atomcode-capabilities --features mcp a_driver_server_has_no_config_file_to_write
 ```
 
 Expected: 编译失败，`cannot find function 'config_path_for_source' in this scope`。
@@ -229,7 +231,7 @@ pub fn config_path_for_source(
 - [ ] **Step 4: 跑测试，确认通过**
 
 ```bash
-cargo nextest run -p atomcode-capabilities a_driver_server_has_no_config_file_to_write
+cargo nextest run -p atomcode-capabilities --features mcp a_driver_server_has_no_config_file_to_write
 ```
 
 Expected: PASS。
@@ -329,7 +331,7 @@ EOF
 - [ ] **Step 2: 跑它们，确认失败**
 
 ```bash
-cargo nextest run -p atomcode-capabilities a_disabled_server_is_written_and_read_back
+cargo nextest run -p atomcode-capabilities --features mcp a_disabled_server_is_written_and_read_back
 ```
 
 Expected: 编译失败，`cannot find function 'set_mcp_server_disabled_in_json_file' in this scope`。
@@ -396,7 +398,7 @@ pub fn set_mcp_server_disabled_in_json_file(
 - [ ] **Step 4: 跑测试，确认通过**
 
 ```bash
-cargo nextest run -p atomcode-capabilities
+cargo nextest run -p atomcode-capabilities --features mcp
 ```
 
 Expected: 全绿。
@@ -452,7 +454,7 @@ EOF
 - [ ] **Step 2: 跑它**
 
 ```bash
-cargo nextest run -p atomcode-capabilities a_config_with_comments_refuses_the_disable_rewrite
+cargo nextest run -p atomcode-capabilities --features mcp a_config_with_comments_refuses_the_disable_rewrite
 ```
 
 Expected: **PASS，且不需要写任何新代码。**
@@ -482,7 +484,7 @@ EOF
 - [ ] **Step 1: 整个 crate 跑一遍**
 
 ```bash
-cargo nextest run -p atomcode-capabilities
+cargo nextest run -p atomcode-capabilities --features mcp
 ```
 
 Expected: 全绿。**不要用 `--workspace`**——9 个 consumer 各开不同的 feature 子集，全量构建会编 19 份 capabilities。
