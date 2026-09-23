@@ -910,6 +910,12 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::AppPairTitle => "Pair the phone".into(),
         Msg::AppPairScan => "In the GitCode app: home → AtomCode → scan this code.".into(),
         Msg::AppPairType => "Or paste this pairing password into the app:".into(),
+        Msg::AppPaired => {
+            "The pairing code is out — once the app scans it, this session is on the phone; \
+             `/app stop` ends it."
+                .into()
+        }
+        Msg::CmdAboutAppPaired => "The pairing screen was closed.".into(),
         Msg::RelayNeedsLogin => {
             "the relay client is fetched from a signed-in release — run /login first".into()
         }

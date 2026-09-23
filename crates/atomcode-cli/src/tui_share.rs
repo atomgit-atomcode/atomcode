@@ -313,6 +313,15 @@ pub fn stop_all_sharing() -> bool {
 /// 行的名字。
 pub const ROW: &str = "tui-share";
 
+/// 配对屏关掉时派发的那行命令。
+///
+/// **没人手打它**,它是向导的落点:向导关的时候交回来的是一行命令
+/// (`tui_onboarding::FINISHED` 是同一回事),派发按命令名找它归哪一行——没登记,
+/// 人看到的就是「没有 /app-paired 这条命令」。所以它必须同时出现在
+/// [`ShareCommands::hidden`] 和 `run` 的分支里,而 [`pairing_overlay`] 用这个名字
+/// 收尾。
+const PAIRED: &str = "app-paired";
+
 pub fn row_layer() -> String {
     format!("[[insert]]\nname = \"{ROW}\"\n")
 }
@@ -366,6 +375,12 @@ impl atomcode_tui::command::CommandSet for ShareCommands {
             Command::said_taking("app", tr(SMsg::AppTakes), tr(SMsg::CmdAboutApp)),
             Command::said("desktop", tr(SMsg::CmdAboutDesktop)),
         ]
+    }
+
+    /// 配对屏关掉时交回来的那一行;见 [`PAIRED`]。
+    fn hidden(&self) -> Vec<atomcode_tui::command::Command> {
+        use atomcode_tui::command::Command;
+        vec![Command::said(PAIRED, tr(SMsg::CmdAboutAppPaired))]
     }
 
     async fn run(
@@ -423,6 +438,9 @@ impl atomcode_tui::command::CommandSet for ShareCommands {
                     .await,
                 )
             }
+            // 配对屏自己关掉时交回来的那一行——不是人打的命令,所以只说一句
+            // 「码给出去了」,别的什么都不做:中继还在跑,配对照旧。
+            PAIRED => Outcome::Said(tr(SMsg::AppPaired).into_owned()),
             _ => Outcome::Quiet,
         }
     }
@@ -485,6 +503,9 @@ fn open_desktop() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atomcode_tui::command::CommandSet;
+    use atomcode_tui::overlay::{Overlay, Step};
+    use atomcode_tui::surface::{Key, KeyPress};
 
     /// 中继给的是一个地址,拨号要 ws、手机要 https ——从同一个地址推出来,而不是
     /// 让人配两遍。
@@ -570,6 +591,33 @@ mod tests {
         assert_eq!(bind_host("--host"), "127.0.0.1");
         assert_eq!(bind_host("--host="), "127.0.0.1");
     }
+
+    /// **配对屏关掉时交回来的那行,派发那边必须认得**。向导的落点是命令名,不是
+    /// 「关掉了」这件事本身:名字两头没对上(或只改了一头),人按回车看到的就是
+    /// 「没有 /app-paired 这条命令」——码扫得成、配对也照旧,屏幕上却先冒一条报错。
+    #[test]
+    fn the_pairing_screen_closes_with_a_command_this_row_answers() {
+        let overlay = pairing_overlay(pair_uri("https://relay.example", "tok-1", None));
+        assert_eq!(
+            overlay.key(KeyPress::plain(Key::Enter)),
+            Step::Chose(PAIRED.into()),
+            "向导的落点就是它交出来的那行命令"
+        );
+
+        let commands = ShareCommands {
+            config_path: std::path::PathBuf::new(),
+        };
+        let known: Vec<String> = commands
+            .commands()
+            .into_iter()
+            .chain(commands.hidden())
+            .map(|c| c.name.to_string())
+            .collect();
+        assert!(
+            known.contains(&PAIRED.to_string()),
+            "这一行得认得 `/{PAIRED}`,否则派发报「没有这条命令」:{known:?}"
+        );
+    }
 }
 
 /// 手输配对用的那串「口令」:配对链接的 base64。与经典界面同一个形状——App 认的
@@ -603,6 +651,6 @@ fn pairing_overlay(uri: String) -> Arc<atomcode_tui::wizard::Wizard> {
         tr(SMsg::AppPairTitle),
         vec![step],
         Box::new(|_| {}),
-        "app-paired",
+        PAIRED,
     )
 }

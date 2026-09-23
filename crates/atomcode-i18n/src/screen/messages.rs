@@ -1482,6 +1482,10 @@ pub enum Msg<'a> {
     AppPairTitle,
     AppPairScan,
     AppPairType,
+    /// 配对屏关掉了:码已经给出去,手机扫到就进这个会话。
+    AppPaired,
+    /// 配对屏关掉时派发的那行命令——隐藏,没人手打。
+    CmdAboutAppPaired,
     /// 取中继客户端要先登录(它在受保护的 release 里)。
     RelayNeedsLogin,
     RelayUnsupportedPlatform {
