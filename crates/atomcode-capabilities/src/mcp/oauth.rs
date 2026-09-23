@@ -15,7 +15,9 @@ use sha2::{Digest, Sha256};
 use url::Url;
 use uuid::Uuid;
 
-use super::config::{McpHttpAuthConfig, McpOAuthConfig, McpServerConfig, McpTransportConfig};
+use super::config::{
+    McpConfigSource, McpHttpAuthConfig, McpOAuthConfig, McpServerConfig, McpTransportConfig,
+};
 
 const GITHUB_AUTHORIZE_URL: &str = "https://github.com/login/oauth/authorize";
 const GITHUB_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
@@ -367,7 +369,9 @@ fn login_mcp_oauth_with(
         .and_then(|name| std::env::var(name).ok());
     let client_id = match opts.client_id.or(auth.client_id.clone()) {
         Some(id) => id,
-        None => register_oauth_client(&client, &discovered.metadata, &redirect_uri)?.client_id,
+        None => {
+            register_oauth_client(&client, &discovered.metadata, &redirect_uri, server)?.client_id
+        }
     };
     let scopes = if !opts.scopes.is_empty() {
         opts.scopes
@@ -737,16 +741,47 @@ fn fetch_metadata_url(
         .with_context(|| format!("Failed to parse OAuth authorization server metadata from {url}"))
 }
 
+/// What to do when a server needs a client registered by hand: where *this*
+/// server is configured, and the lines to put there.
+///
+/// Said where it is needed, not as "your .mcp.json": a server in the user file
+/// has no `.mcp.json` at all, and one a client injected has no file. The
+/// secret is named by the variable that holds it, never written into the file.
+fn client_id_advice(server: &McpServerConfig) -> String {
+    let name = &server.name;
+    let entry = format!(
+        "\"auth\": {{ \"type\": \"oauth\", \"client_id\": \"<client id>\", \
+         \"client_secret_env\": \"<variable holding the client secret, if one was issued>\" }}"
+    );
+    let register = "Register an OAuth app with the provider first, with the callback URL \
+                    http://127.0.0.1/callback (any port is used on the loopback address).";
+    match server.source {
+        McpConfigSource::User => format!(
+            "{register}\nThen add its client id to \"{name}\" in {}:\n{entry}",
+            crate::mcp::util::config_dir().join("mcp.json").display()
+        ),
+        McpConfigSource::Project => format!(
+            "{register}\nThen add its client id to \"{name}\" in .mcp.json at the project root:\n{entry}"
+        ),
+        McpConfigSource::Driver => format!(
+            "\"{name}\" was supplied by the client that started this session, not read from \
+             a file: that client has to include a pre-registered auth.client_id for it."
+        ),
+    }
+}
+
 fn register_oauth_client(
     client: &reqwest::blocking::Client,
     metadata: &AuthorizationServerMetadata,
     redirect_uri: &str,
+    server: &McpServerConfig,
 ) -> Result<ClientRegistrationResponse> {
     let Some(registration_endpoint) = metadata.registration_endpoint.as_deref() else {
         bail!(
-            "MCP OAuth requires a pre-registered client_id because the authorization server \
-             does not support dynamic client registration (RFC 7591). \
-             Add a pre-registered client_id to auth.client_id in your .mcp.json and try again."
+            "MCP OAuth for \"{}\" needs a pre-registered client_id: its authorization server \
+             does not support dynamic client registration (RFC 7591).\n{}",
+            server.name,
+            client_id_advice(server)
         );
     };
     let resp = client
@@ -766,11 +801,10 @@ fn register_oauth_client(
         let body = resp.text().unwrap_or_default();
         if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::UNAUTHORIZED {
             bail!(
-                "MCP OAuth dynamic client registration failed: HTTP {status} — \
-                 the authorization server rejected the request. \
-                 Add a pre-registered client_id to auth.client_id \
-                 in your .mcp.json and try again.\n\
-                 Response: {body}"
+                "MCP OAuth dynamic client registration for \"{}\" failed: HTTP {status} — \
+                 the authorization server rejected the request.\n{}\nResponse: {body}",
+                server.name,
+                client_id_advice(server)
             );
         }
         bail!("MCP OAuth dynamic client registration failed: HTTP {status}\nResponse: {body}");
@@ -1270,5 +1304,77 @@ mod tests {
                 "oauth.rs writes to the terminal itself (`{forbidden}`); hand the text to `announce`"
             );
         }
+    }
+
+    /// A server with no dynamic registration is told where *it* is configured.
+    ///
+    /// The message used to say "your .mcp.json" for every server — including one
+    /// in the user file, which has no `.mcp.json`, and one a client injected,
+    /// which has no file at all. A person followed it to the wrong place.
+    #[test]
+    fn a_server_without_dynamic_registration_is_told_where_it_is_configured() {
+        use super::{register_oauth_client, AuthorizationServerMetadata};
+        use crate::mcp::config::{
+            McpConfigSource, McpHttpAuthConfig, McpOAuthConfig, McpServerConfig, McpTransportConfig,
+        };
+
+        let server = |source| McpServerConfig {
+            name: "github".into(),
+            config: McpTransportConfig::Http {
+                url: "https://api.githubcopilot.com/mcp/".into(),
+                headers: Default::default(),
+                auth: Some(McpHttpAuthConfig::OAuth(McpOAuthConfig::default())),
+                timeout_ms: None,
+            },
+            disabled: false,
+            trust: false,
+            auto_approve: Vec::new(),
+            source,
+        };
+        let metadata: AuthorizationServerMetadata = serde_json::from_value(serde_json::json!({
+            "authorization_endpoint": "https://github.com/login/oauth/authorize",
+            "token_endpoint": "https://github.com/login/oauth/access_token"
+        }))
+        .unwrap();
+        let client = reqwest::blocking::Client::new();
+        let said = |source| {
+            register_oauth_client(
+                &client,
+                &metadata,
+                "http://127.0.0.1:1/callback",
+                &server(source),
+            )
+            .map(|_| ())
+            .expect_err("no registration endpoint")
+            .to_string()
+        };
+
+        let user = said(McpConfigSource::User);
+        let user_file = crate::mcp::util::config_dir().join("mcp.json");
+        assert!(
+            user.contains(&user_file.display().to_string()),
+            "a user-level server is pointed at the user file: {user}"
+        );
+        assert!(
+            user.contains("\"client_id\"") && user.contains("\"client_secret_env\""),
+            "with the lines to add: {user}"
+        );
+        assert!(user.contains("\"github\""), "for this server: {user}");
+
+        let project = said(McpConfigSource::Project);
+        assert!(
+            project.contains(".mcp.json at the project root"),
+            "a project server is pointed at the project file: {project}"
+        );
+        assert!(
+            !project.contains(&user_file.display().to_string()),
+            "and not at the user one: {project}"
+        );
+
+        let driver = said(McpConfigSource::Driver);
+        assert!(
+            !driver.contains("mcp.json"),
+            "a server a client supplied has no file to point at: {driver}"
+        );
     }
 }
