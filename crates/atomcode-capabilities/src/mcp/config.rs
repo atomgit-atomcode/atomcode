@@ -1281,6 +1281,25 @@ mod tests {
             "the legacy key is folded into mcpServers, same as the other writers: {text}"
         );
     }
+
+    #[test]
+    fn a_config_with_comments_refuses_the_disable_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(".mcp.json");
+        let original = "{\n  // 别删我\n  \"mcpServers\": {\"srv\": {\"command\": \"npx\"}}\n}";
+        std::fs::write(&target, original).unwrap();
+
+        let error = set_mcp_server_disabled_in_json_file(&target, "srv", true).unwrap_err();
+        assert!(
+            error.to_string().contains("contains comments"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            original,
+            "a refused rewrite must leave the file byte-identical"
+        );
+    }
 }
 
 #[cfg(test)]
