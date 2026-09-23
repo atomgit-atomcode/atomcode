@@ -3482,14 +3482,19 @@ impl Tui {
     /// Open attached image `n` in the person's desktop viewer, the way clicking a
     /// file does. `image` is its bytes when the caller still had them in hand
     /// (a composer click); `None` means look them up in the session gallery (a
-    /// click on a sent line in the history). Either way the bytes are written to a
-    /// temp file once — reused on later clicks — and handed to the [`OpenerSvc`]
-    /// the tui bundle already provides for `open_file`.
+    /// click on a sent line in the history). The bytes are written to a temp file
+    /// once — reused on later clicks — and opened on this machine's desktop.
+    ///
+    /// The opener is [`LocalOpener`] directly, **not** the `OpenerSvc` seam: that
+    /// service is mounted in the agent runtime's plexus context, and this front
+    /// end has its own — requiring it here fails ("no opener"). Direct is also the
+    /// honest answer, because a person clicking in a full-screen terminal *is*
+    /// sitting at the machine the picture should open on.
     ///
     /// Best-effort by design: the failures a person can do anything about (no
-    /// bytes, cannot write the file, no opener) are said out loud; the open
-    /// itself runs off-thread, since `act` is not async and a desktop launcher
-    /// must not block the render loop.
+    /// bytes, cannot write the file) are said out loud; the open itself runs
+    /// off-thread, since `act` is not async and a desktop launcher must not block
+    /// the render loop.
     fn preview_image(&self, n: usize, image: Option<atomcode_kernel::message::ImageContent>) {
         let path = match self.image_temp_file(n, image) {
             Ok(path) => path,
@@ -3498,22 +3503,12 @@ impl Tui {
                 return;
             }
         };
-        let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
-            return;
-        };
-        let opener = match ctx.require::<atomcode_harness::seams::OpenerSvc>() {
-            Ok(opener) => opener,
-            Err(_) => {
-                let reason = t(Msg::NoOpener);
-                self.say_refused(&t(Msg::ImagePreviewFailed { reason: &reason }));
-                return;
-            }
-        };
         // Off the render loop: launching Preview.app (`open`, `xdg-open`, …) is a
         // process spawn, and `act` returns to paint. A failure here is rare and
         // not actionable, so it is left to the opener's own logging.
         tokio::spawn(async move {
-            let _ = opener
+            use atomcode_capabilities::tools::Opener as _;
+            let _ = atomcode_capabilities::tools::LocalOpener
                 .open(&atomcode_capabilities::tools::OpenTarget::Path(path))
                 .await;
         });
