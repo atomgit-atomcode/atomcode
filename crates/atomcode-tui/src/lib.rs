@@ -55,6 +55,7 @@ pub mod diff;
 pub mod el;
 pub mod frame;
 pub mod host;
+pub mod image_cache;
 
 pub mod i18n;
 pub mod keymap;

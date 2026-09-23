@@ -174,6 +174,31 @@ impl Attachments {
             .map(|p| &p.image)
     }
 
+    /// Re-attach the images an arrow-up'd history line refers to, under FRESH
+    /// marker numbers, and rewrite the line to use them — so a recalled image is
+    /// actually sent (and, for a text-only model, re-recognised) again rather than
+    /// reaching the model as a bare `[Image #N]` placeholder.
+    ///
+    /// Each still-known `[Image #old]` becomes `[Image #new]` (the renumber the
+    /// classic front end does, which is why the marker "becomes some other
+    /// number"), with its bytes pushed back onto the send queue. Returns the
+    /// numbers whose bytes are gone (a resumed session's in-memory gallery is
+    /// empty, or the marker was typed as literal text) — their markers are left
+    /// as-is for the caller to note.
+    pub fn rehydrate_recalled(&mut self, line: &mut String) -> Vec<usize> {
+        let mut missing = Vec::new();
+        for old in markers_in(line) {
+            match self.image_at(old).cloned() {
+                Some(image) => {
+                    let fresh = self.add(image);
+                    *line = line.replace(&marker(old), &fresh);
+                }
+                None => missing.push(old),
+            }
+        }
+        missing
+    }
+
     /// Hand over what this text still refers to, and forget all of it.
     ///
     /// The filter is the whole point: an attachment whose marker is no longer
@@ -494,6 +519,31 @@ mod tests {
         );
         assert_eq!(marker_at_offset(text, 0), None, "on the leading 看");
         assert_eq!(marker_at_offset("no markers", 3), None);
+    }
+
+    // Arrow-up recall re-attaches a still-known image under a fresh number and
+    // renumbers the line; a gone image is reported and left as a bare marker.
+    #[test]
+    fn recall_reattaches_known_images_and_renumbers() {
+        let mut a = Attachments::new();
+        let m1 = a.add(img("one")); // [Image #1]
+        let m2 = a.add(img("two")); // [Image #2]
+        // Both were "sent"; the send queue drains but the gallery keeps them.
+        let _ = a.take_shown(&format!("{m1} {m2}"));
+
+        // Recall a line that referenced #1 — it re-attaches under a fresh number.
+        let mut line = format!("look {m1} ok");
+        let missing = a.rehydrate_recalled(&mut line);
+        assert!(missing.is_empty(), "the image is still known");
+        assert_eq!(line, "look [Image #3] ok", "renumbered to a fresh marker");
+        // The fresh marker resolves to the same bytes and is queued to send.
+        assert_eq!(a.image_at(3), Some(&img("one")));
+        assert_eq!(a.take_shown(&line), vec![img("one")], "it goes on submit");
+
+        // A number never added (or a resumed empty gallery) is reported, not faked.
+        let mut gone = "stale [Image #99] here".to_string();
+        assert_eq!(a.rehydrate_recalled(&mut gone), vec![99]);
+        assert_eq!(gone, "stale [Image #99] here", "left as-is for the caller");
     }
 
     // Spans cover each marker whole, so editing can treat it as one chip.
