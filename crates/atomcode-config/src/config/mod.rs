@@ -514,11 +514,15 @@ pub struct UiConfig {
     #[serde(default)]
     pub screen: Screen,
     /// Report the pointer for in-app mouse — click-to-fold a tool call, the copy
-    /// menu, drag-select. `false` hands the pointer to the terminal, so click-drag
-    /// does the terminal's OWN selection (spans the scrollback, copies clean) at
-    /// the cost of those in-app clicks; wheel-scroll still works. Read once at
-    /// startup (like `theme`); `--no-mouse` overrides it off for one launch, and
-    /// Ctrl+O toggles it live. Default on.
+    /// menu, drag-select, and wheel-scroll. `false` hands the pointer to the
+    /// terminal so PLAIN click-drag does the terminal's OWN selection (spans the
+    /// scrollback, copies clean) — at the cost of ALL in-app mouse: no
+    /// click-to-fold, no copy menu, and the wheel becomes the terminal's (native
+    /// scrollback where the emulator keeps it, otherwise scroll with
+    /// PageUp/PageDown). Most people are better off leaving this ON and holding
+    /// Shift to drag-select natively when they want to. Read once at startup (like
+    /// `theme`); `--no-mouse` overrides it off for one launch, Ctrl+O toggles it
+    /// live. Default on.
     #[serde(default = "default_true")]
     pub mouse: bool,
     /// Auto-copy a rendered code block's raw source to the clipboard when the

@@ -36,15 +36,19 @@ pub const ERASE_LINE: &str = "\x1b[K";
 /// rather than argued about: with wrap off, an over-wide row is truncated by
 /// the terminal and the screen stays put.
 ///
-/// Alternate scroll (DECSET 1007) is the other half of owning the screen. In
-/// the alternate screen the terminal's own scrollback is the *shell's* history,
-/// not the conversation, so a wheel the terminal keeps for itself scrolls the
-/// wrong thing entirely — and the conversation above the fold becomes
-/// unreachable with the mouse. With 1007 the terminal translates the wheel into
-/// arrow keys, which this UI already binds to scrolling the stream. It is worth
-/// preferring over mouse reporting (DECSET 1000/1006) precisely because it does
-/// *not* take the mouse: click-drag still selects and copies text the way it
-/// does in any other program.
+/// Alternate scroll (DECSET 1007) is deliberately NOT set. It was, once, on the
+/// theory that having the terminal translate the wheel into arrow keys let the
+/// wheel scroll the stream while the pointer was the terminal's. But the arrows
+/// this UI binds are [`CaretUp`]/[`CaretDown`] — caret motion, and then
+/// input-history recall at the top of the composer — not scroll (that is
+/// PageUp/PageDown). So with the mouse handed back, 1007 turned every wheel notch
+/// into a history recall; staying off is how that bug is avoided. With mouse
+/// reporting on (the default) the wheel arrives as a button event and scrolls
+/// normally; with it off, the wheel is the terminal's own (native scrollback on
+/// emulators that keep it for the alternate screen, otherwise PageUp/PageDown).
+///
+/// [`CaretUp`]: crate::keymap::Action::CaretUp
+/// [`CaretDown`]: crate::keymap::Action::CaretDown
 ///
 /// Bracketed paste (DECSET 2004) is the third. Without it a paste arrives as
 /// keystrokes, which means the newlines in it arrive as *Enter* — a pasted
@@ -59,11 +63,11 @@ pub const ERASE_LINE: &str = "\x1b[K";
 /// arrives. With it the key comes as `CSI 13;2u` and the difference is real.
 /// Terminals that do not know the sequence ignore it, and `ctrl-j` is bound to
 /// the same action for them.
-pub const ENTER: &str = "\x1b[?1049h\x1b[?7l\x1b[?1007h\x1b[?2004h\x1b[>1u\x1b[?25l";
+pub const ENTER: &str = "\x1b[?1049h\x1b[?7l\x1b[?2004h\x1b[>1u\x1b[?25l";
 /// The exact inverse of [`ENTER`]. Popping the keyboard flags matters as much
 /// as leaving the alternate screen: a shell that inherits them sees every key
 /// in a form it does not expect.
-pub const LEAVE: &str = "\x1b[?25h\x1b[<u\x1b[?2004l\x1b[?1007l\x1b[?7h\x1b[?1049l";
+pub const LEAVE: &str = "\x1b[?25h\x1b[<u\x1b[?2004l\x1b[?7h\x1b[?1049l";
 /// Ask the terminal to report the pointer: button presses (1000) with SGR
 /// coordinates (1006), so columns past 223 are reportable at all.
 ///
@@ -843,9 +847,10 @@ mod tests {
         // back. Leaving a shell with wrap off is as rude as leaving it in raw
         // mode — every long command line would overwrite its own last column.
         assert!(ENTER.contains("?7l") && LEAVE.contains("?7h"));
-        // Alternate scroll, likewise: the wheel is ours while we hold the
-        // screen and the terminal's again the moment we let go.
-        assert!(ENTER.contains("?1007h") && LEAVE.contains("?1007l"));
+        // Alternate scroll (1007) is deliberately NOT set — with the mouse handed
+        // back it turned the wheel into arrow keys, which recall input history
+        // rather than scroll. Neither side touches it, so there is nothing to undo.
+        assert!(!ENTER.contains("1007") && !LEAVE.contains("1007"));
         // Bracketed paste, likewise — and leaving it on would make every
         // subsequent shell paste arrive wrapped in markers it does not expect.
         assert!(ENTER.contains("?2004h") && LEAVE.contains("?2004l"));
