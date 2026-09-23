@@ -3963,7 +3963,13 @@ impl Host {
             // already-folded block refuse a click that had just folded it: the
             // click worked once and then the row stopped answering.
             let foldable = !block.content.always_open();
-            let mut own = (foldable && CLICKABLE.contains(&kind)).then_some((block.id, kind));
+            // A block that carries a picture is clickable too — clicking its
+            // `[Image #N]` opens the picture — even though a user message does not
+            // fold and so is not in `CLICKABLE`. Without this the row never enters
+            // the hit map and `block_at` could never answer a click on it.
+            let carries_image = !block.content.image_markers().is_empty();
+            let mut own = ((foldable && CLICKABLE.contains(&kind)) || carries_image)
+                .then_some((block.id, kind));
             // The column this block leaves on the left, and the width that is
             // actually left to draw in. Every render below is asked for `room`,
             // never `rect.w` — content wrapped to the full width and then set in

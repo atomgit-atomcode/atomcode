@@ -253,16 +253,37 @@ pub fn image_from_path(text: &str) -> Option<ImageContent> {
     let bytes = std::fs::read(path).ok()?;
     // Downscale/re-encode an oversized image exactly as a clipboard paste is
     // (image_normalize), so a big attachment can't blow the per-request body.
-    // Falls back to the original bytes/type on any decode failure.
+    // Falls back to the original bytes on any decode failure — but with the media
+    // type sniffed from the bytes, not the file extension: a `.png` that is really
+    // JPEG must not be sent as `image/png`, which strict vision providers reject.
     let (media_type, data) =
         match atomcode_capabilities::image_normalize::normalize_image_raw(&bytes) {
             Some((mt, out)) => (mt, base64::engine::general_purpose::STANDARD.encode(out)),
             None => (
-                ext_media_type.to_string(),
+                sniff_media_type(&bytes).unwrap_or(ext_media_type).to_string(),
                 base64::engine::general_purpose::STANDARD.encode(&bytes),
             ),
         };
     Some(ImageContent { media_type, data })
+}
+
+/// The media type named by an image's magic bytes, or `None` when the bytes do
+/// not begin with one this UI carries. Trusted over the file extension so a
+/// mislabeled file — a `.png` holding JPEG bytes — is sent with the type its
+/// bytes actually are. Only the four the composer accepts are recognised; the
+/// caller falls back to the extension for anything else.
+fn sniff_media_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -376,6 +397,18 @@ mod tests {
         assert_eq!(marker_at_offset(text, open10 + 6), Some(10), "two-digit number");
         assert_eq!(marker_at_offset(text, 0), None, "on the leading 看");
         assert_eq!(marker_at_offset("no markers", 3), None);
+    }
+
+    // The media type follows the bytes, not the extension: a mislabeled file is
+    // not sent with a Content-Type that contradicts its magic bytes.
+    #[test]
+    fn media_type_is_sniffed_from_the_bytes() {
+        assert_eq!(sniff_media_type(b"\x89PNG\r\n\x1a\n..."), Some("image/png"));
+        assert_eq!(sniff_media_type(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("image/jpeg"));
+        assert_eq!(sniff_media_type(b"GIF89a..."), Some("image/gif"));
+        assert_eq!(sniff_media_type(b"RIFF\0\0\0\0WEBPVP8 "), Some("image/webp"));
+        assert_eq!(sniff_media_type(b"not an image"), None, "unknown → fall back to ext");
+        assert_eq!(sniff_media_type(b""), None, "empty never panics");
     }
 
     // A pasted absolute path to a real image file becomes an attachment — the

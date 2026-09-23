@@ -3545,11 +3545,24 @@ impl Tui {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(image.data.as_bytes())
             .map_err(|_| t(Msg::ImageCorrupt).into_owned())?;
-        let dir = std::env::temp_dir().join("atomcode-images");
+        // A per-run subdirectory: `std::process::id` scopes it so two sessions do
+        // not clobber each other's `[Image #1]`, and on unix it is created private
+        // (0700) so another local user on a shared machine cannot read a person's
+        // screenshots or pre-create a file for the viewer to open — the temp dir
+        // is world-traversable and the path would otherwise be predictable.
+        let dir = std::env::temp_dir().join(format!("atomcode-images-{}", std::process::id()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&dir)
+                .map_err(|e| e.to_string())?;
+        }
+        #[cfg(not(unix))]
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        // `std::process::id` scopes the file to this run so two sessions do not
-        // clobber each other's `[Image #1]`; `n` is monotonic within the run.
-        let path = dir.join(format!("img-{}-{n}.{ext}", std::process::id()));
+        let path = dir.join(format!("img-{n}.{ext}"));
         std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
         cache.insert(n, path.clone());
         Ok(path)
@@ -3805,6 +3818,11 @@ impl Tui {
                 return false;
             }
             Action::Paste(text) => {
+                // Release the moment lock before probing the paste as a file path:
+                // `image_from_path` may read and decode a file up to
+                // `MAX_PATH_IMAGE_BYTES`, and holding the write lock across that
+                // would freeze every reader of the moment for the whole read.
+                drop(m);
                 // A pasted image-*file* path is an attachment intent, not prose:
                 // WeChat/iTerm2 save the clipboard image to a temp file and paste
                 // its path, and Finder drag types the path. Load the bytes now and
@@ -3818,19 +3836,27 @@ impl Tui {
                     // file, rather than after they have typed about a picture that
                     // never left.
                     if let Err(reason) = images_reach_the_model(client) {
-                        drop(m);
                         self.say_refused(&reason);
                         return false;
                     }
-                    m.insert_image(image);
+                    self.host
+                        .moment
+                        .write()
+                        .expect("moment poisoned")
+                        .insert_image(image);
                 } else {
                     // A big block folds into a `[Pasted #N …]` marker rather than
                     // filling the composer; the body is put back at submit
                     // (`expand_pastes`). Paste the same block again to expand it.
-                    let text = sanitize_paste(&text);
+                    let clean = sanitize_paste(&text);
+                    let mut m = self.host.moment.write().expect("moment poisoned");
                     let now = m.now;
-                    m.insert_paste(&text, now);
+                    m.insert_paste(&clean, now);
                 }
+                // The line changed, so the slash menu may need to change with it —
+                // the same refresh the fall-through path gives every line edit.
+                self.refresh_menu();
+                return false;
             }
             Action::AttachImage => {
                 // The destination is decided before the clipboard is even read.
@@ -3897,11 +3923,14 @@ impl Tui {
                         // A click inside an `[Image #N]` marker opens the picture
                         // in the desktop viewer rather than moving the caret — the
                         // marker is the picture, so clicking it is asking to see it.
+                        // Only when the bytes are in hand; otherwise it is ordinary
+                        // text and the click is a caret like any other.
                         if let Some(n) = crate::attach::marker_at_offset(&m.input, at) {
-                            let image = m.attachments.image_at(n).cloned();
-                            drop(m);
-                            self.preview_image(n, image);
-                            return false;
+                            if let Some(image) = m.attachments.image_at(n).cloned() {
+                                drop(m);
+                                self.preview_image(n, Some(image));
+                                return false;
+                            }
                         }
                         m.caret = at;
                         return false;
@@ -3916,9 +3945,11 @@ impl Tui {
                 // hit map is per-row, not per-cell, so the block-level answer —
                 // open the image the message holds — is the one available here;
                 // a message is one screenshot in the overwhelmingly common case.
-                // Its bytes are in the session gallery (kept after send), so this
-                // works for a message sent earlier this run.
-                if let Some(n) = self.host.image_markers_at(id).first().copied() {
+                // Only intercept when the bytes are actually in hand: a marker
+                // whose image is gone (a `resume`d session's gallery is empty, or
+                // the text merely contains the `[Image #N]` characters) falls
+                // through rather than popping a refusal on every click.
+                for n in self.host.image_markers_at(id) {
                     let image = self
                         .host
                         .moment
@@ -3927,8 +3958,10 @@ impl Tui {
                         .attachments
                         .image_at(n)
                         .cloned();
-                    self.preview_image(n, image);
-                    return false;
+                    if let Some(image) = image {
+                        self.preview_image(n, Some(image));
+                        return false;
+                    }
                 }
                 // Anchor the block that was clicked, not the bottom of the
                 // conversation. A block that grows pushes its own header off
