@@ -624,6 +624,45 @@ pub enum Msg<'a> {
     SignedOut,
     SignedIn,
 
+    // ── the MCP panel (`mcp.rs`, `modules/mcp.rs`) ──
+    McpPanelTitle,
+    McpPanelServers {
+        n: usize,
+    },
+    McpPanelEmpty,
+    /// The detail page, drawn the moment `Enter` is pressed and filled when the
+    /// round trip comes back.
+    McpDetailPending,
+    /// The three values the host uses for where a server came from: `"global"`,
+    /// `"project"`, `"driver"`. A value it does not know is drawn as it is.
+    McpGroupGlobal,
+    McpGroupProject,
+    McpGroupDriver,
+    /// The detail page's table: four labels, and how many tools are mounted.
+    McpLabelState,
+    McpLabelAuth,
+    McpLabelEndpoint,
+    McpLabelSource,
+    McpLabelTools {
+        n: usize,
+    },
+    /// What the detail page says about credentials.
+    McpAuthNone,
+    McpAuthAuthenticated,
+    McpAuthNotAuthenticated,
+    /// The six things an action can be.
+    McpActionTrust,
+    McpActionUntrust,
+    McpActionLogin,
+    McpActionLogout,
+    McpActionEnable,
+    McpActionDisable,
+    /// The key legend: on the list, on the detail page, and while a round trip
+    /// is out.
+    McpLegendList,
+    McpLegendDetail,
+    McpLegendBusy,
+
     // ── the toolbox and the plugins (`commands.rs`) ──
     CmdTakesToolbox,
     CmdAboutToolbox,

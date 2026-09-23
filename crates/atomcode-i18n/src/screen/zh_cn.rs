@@ -387,6 +387,38 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SignedOut => "已登出;/login 重新登录".into(),
         Msg::SignedIn => "已登录".into(),
 
+        // ── MCP 面板 (`mcp.rs`、`modules/mcp.rs`) ──
+        Msg::McpPanelTitle => "管理 MCP 服务器".into(),
+        Msg::McpPanelServers { n } => format!("{n} 个服务器").into(),
+        Msg::McpPanelEmpty => "没有配置任何 MCP 服务器".into(),
+        Msg::McpDetailPending => "正在取详情…".into(),
+        // 服务器从哪儿来:产品表的 `/help` 来源列说的是同样两个地方,所以这两句读
+        // 它的措辞,不在这儿再写一遍(`tests/tables.rs`)。
+        Msg::McpGroupGlobal => {
+            crate::product::t_with(crate::Locale::ZhCn, crate::product::Msg::HelpSourceGlobal)
+        }
+        Msg::McpGroupProject => {
+            crate::product::t_with(crate::Locale::ZhCn, crate::product::Msg::HelpSourceProject)
+        }
+        Msg::McpGroupDriver => "外部传入".into(),
+        Msg::McpLabelState => "状态".into(),
+        Msg::McpLabelAuth => "认证".into(),
+        Msg::McpLabelEndpoint => "地址".into(),
+        Msg::McpLabelSource => "来源".into(),
+        Msg::McpLabelTools { n } => format!("工具 {n} 个").into(),
+        Msg::McpAuthNone => "不需要".into(),
+        Msg::McpAuthAuthenticated => "已认证".into(),
+        Msg::McpAuthNotAuthenticated => "未认证".into(),
+        Msg::McpActionTrust => "信任这个项目".into(),
+        Msg::McpActionUntrust => "取消信任".into(),
+        Msg::McpActionLogin => "认证".into(),
+        Msg::McpActionLogout => "登出".into(),
+        Msg::McpActionEnable => "启用".into(),
+        Msg::McpActionDisable => "停用".into(),
+        Msg::McpLegendList => "↑/↓ 移动 · Enter 详情 · Esc 关闭".into(),
+        Msg::McpLegendDetail => "↑/↓ 移动 · Enter 执行 · Esc 返回".into(),
+        Msg::McpLegendBusy => "Esc 取消".into(),
+
         // ── the toolbox and the plugins (`commands.rs`) ──
         Msg::CmdTakesToolbox => "[off <名字或 mcp__server__*> | on <同上>]".into(),
         Msg::CmdAboutToolbox => "工具箱:不带参数拉出面板(看有哪些、开关它);带参数直接关掉或放回".into(),
