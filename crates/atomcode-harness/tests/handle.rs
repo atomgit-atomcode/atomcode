@@ -706,6 +706,105 @@ async fn a_stop_right_behind_a_message_stops_that_message_s_turn() {
     }
 }
 
+/// A tool that does not observe its cancel — the kind that keeps a turn alive
+/// after everyone has agreed it should end (an MCP server that will answer in
+/// its own time, a walk over a network mount).
+struct NeverReturns;
+
+#[async_trait::async_trait]
+impl atomcode_kernel::tool::Tool for NeverReturns {
+    fn name(&self) -> &str {
+        "never_returns"
+    }
+    fn description(&self) -> &str {
+        "Never comes back."
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+    fn read_only_hint(&self) -> bool {
+        true
+    }
+    async fn execute(
+        &self,
+        _args: &str,
+        _ctx: &atomcode_kernel::tool::ToolContext,
+    ) -> atomcode_kernel::tool::ToolResult {
+        std::future::pending().await
+    }
+}
+
+struct NeverReturnsRow;
+
+#[async_trait::async_trait]
+impl atomcode_plexus::Plugin for NeverReturnsRow {
+    fn name(&self) -> &'static str {
+        "test-never-returns"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["tools"]
+    }
+    async fn apply(
+        &self,
+        ctx: &atomcode_plexus::Context,
+        _config: &serde_json::Value,
+    ) -> Result<(), String> {
+        let tools = ctx
+            .require::<atomcode_harness::seams::ToolsSvc>()
+            .map_err(|e| e.to_string())?;
+        tools.register(std::sync::Arc::new(NeverReturns))?;
+        Ok(())
+    }
+}
+
+/// A turn that will not end does not outlive the pump that drove it.
+///
+/// Stopping is cooperative, and a tool may simply not take part. The pump used
+/// to wait for such a turn without limit — so the runtime owner above it gave up
+/// after five seconds and aborted *the pump*, which left the turn itself running:
+/// a task with no driver, still able to call tools and write to a session that
+/// may since have been undone or replaced.
+#[tokio::test]
+async fn a_turn_that_will_not_end_does_not_outlive_its_pump() {
+    let dir = scratch("orphan-turn");
+    let mut registry = plugins::catalog();
+    registry.register(std::sync::Arc::new(NeverReturnsRow));
+    let tree = tree(
+        &dir,
+        &replay(
+            r#"{ text = "Going.", calls = [ { name = "never_returns", args = { } } ] },
+               { text = "unreachable" }"#,
+        ),
+        &[r#"[[insert]]
+name = "test-never-returns"
+"#],
+    );
+    let mut app = App::new(registry, tree);
+    app.start().await.expect("must mount");
+    let mut handle = handle_of(&app);
+
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "go".into(),
+            images: Vec::new(),
+        })
+        .unwrap();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), handle.events.recv()).await {
+            Ok(Some(AgentEvent::ToolStarted { .. })) => break,
+            Ok(Some(_)) => continue,
+            other => panic!("the tool never started: {other:?}"),
+        }
+    }
+
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    tokio::time::timeout(Duration::from_secs(8), handle.task)
+        .await
+        .expect("the pump waited on a turn that was never going to end")
+        .expect("the pump panicked");
+}
+
 /// A compaction whose summary never comes back, mounted as a row so the pump
 /// can be watched with one in flight.
 struct NeverSummarises;

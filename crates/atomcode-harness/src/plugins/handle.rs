@@ -1632,10 +1632,28 @@ async fn pump(
     wake.dispose();
     claimed.dispose();
     claimed_elsewhere.dispose();
-    if let Some(handle) = turn.take() {
-        let _ = handle.await;
+    if let Some(mut handle) = turn.take() {
+        // Bounded, then taken. Stopping is cooperative, and a tool that does not
+        // observe its cancel would otherwise hold this task open for as long as
+        // it likes — while whoever is stopping *us* gives up and aborts this
+        // task, leaving the turn itself running: still calling tools, still
+        // writing to a session nobody owns any more, possibly over an undo or a
+        // restore that has already happened. The grace is for the cooperative
+        // ending, which is the ordinary one.
+        if tokio::time::timeout(TURN_STOP_GRACE, &mut handle)
+            .await
+            .is_err()
+        {
+            handle.abort();
+        }
     }
 }
+
+/// How long a turn gets to end itself once its agent has been told to stop.
+///
+/// Shorter than the five seconds a runtime owner waits for this pump, so the
+/// pump is the one that decides what happens to the turn.
+const TURN_STOP_GRACE: Duration = Duration::from_secs(2);
 
 async fn compact(
     ctx: &Context,
