@@ -4589,7 +4589,9 @@ fn spawn_runtime_owner_with_optional_agent(
                             .send(CodingRuntimeEvent::GoalChanged(state.progress()));
                         pending_wakeup = None;
 
-                        if let Some((turn_id, _, snapshot, stats)) = held_turn.take() {
+                        if let Some((turn_id, _, snapshot, stats)) =
+                            held_turn.take_if(|_| !kernel_turn_open)
+                        {
                             active_turn = None;
                             cancel_pending = false;
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(
@@ -4604,6 +4606,14 @@ fn spawn_runtime_owner_with_optional_agent(
                                 runtime_phase_state(generation, RuntimePhase::Ready),
                                 Ordering::Release,
                             );
+                            let _ = done.send(Ok(()));
+                        } else if held_turn.is_some() {
+                        // A turn the agent opened under the hold is not what
+                        // this stops: the person asked for the controller to
+                        // stop, not for their own message to. The hold goes, so
+                        // the turn now running is the one this owner accounts
+                        // for, and its own end reports it.
+                            held_turn = None;
                             let _ = done.send(Ok(()));
                         } else if active_turn.is_none() {
                             cancel_pending = false;
@@ -6618,13 +6628,22 @@ fn spawn_runtime_owner_with_optional_agent(
                             current.finish(GoalTerminal::Cancelled, "cleared by user");
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(current.progress()));
                         }
-                        if let Some((turn_id, _, snapshot, stats)) = held_turn.take() {
+                        if let Some((turn_id, _, snapshot, stats)) =
+                            held_turn.take_if(|_| !kernel_turn_open)
+                        {
                             active_turn = None;
                             cancel_pending = false;
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
                                 turn_id, reason: StopReason::Cancelled, snapshot, stats,
                             }));
                             controls.state.store(runtime_phase_state(generation, RuntimePhase::Ready), Ordering::Release);
+                        } else if held_turn.is_some() {
+                        // A turn the agent opened under the hold is not what
+                        // this stops: the person asked for the controller to
+                        // stop, not for their own message to. The hold goes, so
+                        // the turn now running is the one this owner accounts
+                        // for, and its own end reports it.
+                            held_turn = None;
                         } else if active_turn.is_some() {
                             if request_cancel_snapshot(&agent) {
                                 cancel_pending = true;
@@ -6689,13 +6708,22 @@ fn spawn_runtime_owner_with_optional_agent(
                         }
                         if let Some(runtime) = resources.as_ref() { runtime.loop_active.store(false, Ordering::Release); }
                         pending_wakeup = None;
-                        if let Some((turn_id, _, snapshot, stats)) = held_turn.take() {
+                        if let Some((turn_id, _, snapshot, stats)) =
+                            held_turn.take_if(|_| !kernel_turn_open)
+                        {
                             active_turn = None;
                             cancel_pending = false;
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
                                 turn_id, reason: StopReason::Cancelled, snapshot, stats,
                             }));
                             controls.state.store(runtime_phase_state(generation, RuntimePhase::Ready), Ordering::Release);
+                        } else if held_turn.is_some() {
+                        // A turn the agent opened under the hold is not what
+                        // this stops: the person asked for the controller to
+                        // stop, not for their own message to. The hold goes, so
+                        // the turn now running is the one this owner accounts
+                        // for, and its own end reports it.
+                            held_turn = None;
                         } else if active_turn.is_some() {
                             if request_cancel_snapshot(&agent) {
                                 cancel_pending = true;
@@ -14085,6 +14113,141 @@ mod tests {
             "{terminal:?}"
         );
         runtime.handle.shutdown().await.unwrap();
+    }
+
+    /// Stopping the loop does not stop the turn the person opened under it.
+    ///
+    /// The hold is this owner's bookkeeping, not work: with a turn the agent
+    /// opened under it, closing the hold reported a terminal for a turn that had
+    /// already finished and left `active_turn` empty — so the running one was
+    /// accounted for by nobody, and the second terminal it produced named turn 0.
+    /// `/loop` stopping is not a reason to stop what the person typed, so the
+    /// hold goes and the running turn keeps the id it had.
+    #[tokio::test]
+    async fn stopping_the_loop_leaves_the_turn_opened_under_it_running() {
+        let (
+            handle,
+            mut kernel_commands,
+            kernel_events,
+            mut runtime_events,
+            wakeup_tx,
+            _loop_active,
+            _adapter,
+        ) = controller_test_runtime(Arc::new(TestProviderFactory { fail: false })).await;
+
+        handle.start_loop("watch CI").await.unwrap();
+        handle.submit(UserInput::from("first round")).await.unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { .. })
+        ));
+        kernel_events
+            .send(AgentEvent::TurnStarted { turn: None })
+            .unwrap();
+        wakeup_tx
+            .send(WakeupRequest {
+                delay_seconds: 3600,
+                reason: "later".into(),
+                prompt: "check CI".into(),
+            })
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    runtime_events.recv().await,
+                    Some(CodingRuntimeEvent::LoopChanged(LoopProgress {
+                        last_reason: Some(reason),
+                        ..
+                    })) if reason.starts_with("scheduled in")
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the wakeup was not registered");
+        kernel_events
+            .send(AgentEvent::TurnComplete {
+                turn: None,
+                reason: StopReason::Stopped,
+            })
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        kernel_events
+            .send(AgentEvent::Snapshot {
+                snapshot: SessionSnapshot::new(vec![Message::assistant("round one", vec![])]),
+            })
+            .unwrap();
+
+        // Held, and the person types; the agent opens a turn for it.
+        handle
+            .submit(UserInput::from("while it waits"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { .. })
+        ));
+        kernel_events
+            .send(AgentEvent::TurnStarted { turn: None })
+            .unwrap();
+
+        handle.stop_loop().await.unwrap();
+        // Nothing was asked of the agent: what is running is the person's own.
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                kernel_commands.recv()
+            )
+            .await
+            .is_err(),
+            "stopping the loop stopped the turn the person had opened"
+        );
+
+        kernel_events
+            .send(AgentEvent::TurnComplete {
+                turn: None,
+                reason: StopReason::Stopped,
+            })
+            .unwrap();
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::Snapshot)
+        ));
+        kernel_events
+            .send(AgentEvent::Snapshot {
+                snapshot: SessionSnapshot::new(vec![Message::assistant("answered", vec![])]),
+            })
+            .unwrap();
+
+        let mut terminals = Vec::new();
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(300), runtime_events.recv()).await
+        {
+            if let CodingRuntimeEvent::TurnFinished(completion) = event {
+                terminals.push(completion);
+            }
+        }
+        assert_eq!(
+            terminals.len(),
+            1,
+            "one turn ran under the hold, so one terminal: {terminals:?}"
+        );
+        assert!(
+            matches!(
+                terminals[0],
+                TurnCompletion::Completed {
+                    turn_id: 1,
+                    reason: StopReason::Stopped,
+                    ..
+                }
+            ),
+            "{terminals:?}"
+        );
+        handle.shutdown().await.unwrap();
     }
 
     /// A picture being read is not a reason esc cannot be heard.
