@@ -227,12 +227,16 @@ pub struct Panel {
     pub detail_for: Option<String>,
     /// 进详情之前光标停在列表的哪一行,退回来时站回原处。
     pub list_at: usize,
-    /// 上一次点击落在**哪一级的哪一行**。
+    /// 上一次点击落在**哪一级、哪一台的哪一行**。
     ///
-    /// 鼠标按两次才算动手(见 `Host::mcp_click`),而「同一个格」不能只比行号:
-    /// 进出详情会让同一格底下换一套东西——列表第 8 行是第 3 台服务器,详情第 8 行
-    /// 是第 1 个动作。只比行号的话,双击里落空的那一下就会变成一次危险动作。
-    pub clicked: Option<(Level, usize)>,
+    /// 鼠标按两次才算动手(见 `Host::mcp_click`),而「同一个格」要认三样东西:
+    /// 层级(列表第 8 行是第 3 台服务器,详情第 8 行是第 1 个动作)、**哪一台**
+    /// (A 的详情第 0 行与 B 的详情第 0 行不是同一个动作)、行号。少认一样,单击
+    /// 就能执行:在 A 上点过一下、键盘换到 B,那一下会落到 B 的第 0 个动作上。
+    ///
+    /// 它只说明「指针**此刻**指着它」——所以执行之后、换页之后都清掉(见
+    /// [`back_to_list`] 与 `key` 的 Enter 一臂)。
+    pub clicked: Option<(Level, Option<String>, usize)>,
 }
 
 impl Panel {
@@ -350,6 +354,8 @@ pub fn key(view: &McpView, panel: &mut Panel, press: KeyPress) -> Step {
             panel.detail_for = Some(server.clone());
             panel.list_at = panel.cursor;
             panel.cursor = 0;
+            // 换页了:上一页指着的那一行不再指着任何东西。
+            panel.clicked = None;
             Step::OpenDetail { server }
         }
         (Key::Backspace, _) => {
@@ -383,6 +389,8 @@ fn back_to_list(panel: &mut Panel) {
     panel.level = Level::List;
     panel.detail_for = None;
     panel.cursor = panel.list_at;
+    // 换页了:上一页指着的那一行不再指着任何东西。
+    panel.clicked = None;
 }
 
 fn detail_key(view: &McpView, panel: &mut Panel, press: KeyPress) -> Step {

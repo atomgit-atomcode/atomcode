@@ -3056,7 +3056,7 @@ impl Host {
     /// 的动作行上——那就是一条单击执行危险动作的路。
     pub fn mcp_click(&self, row: usize) -> bool {
         let mut m = self.moment.write().expect("moment poisoned");
-        let (level, cap) = {
+        let (level, server, cap) = {
             let Some(panel) = m.mcp_panel.as_ref() else {
                 return false;
             };
@@ -3064,24 +3064,26 @@ impl Host {
             if panel.busy.is_some() {
                 return false;
             }
-            let cap = match panel.level {
-                crate::mcp::Level::List => m.mcp.listed(panel).len(),
+            match panel.level {
+                crate::mcp::Level::List => (panel.level, None, m.mcp.listed(panel).len()),
                 crate::mcp::Level::Detail => {
                     let Some(detail) = m.mcp.detail_for(panel.detail_for.as_deref()) else {
                         return false;
                     };
-                    panel.actions(detail).len()
+                    // 哪一台是身份的一部分:A 的第 0 行和 B 的第 0 行不是同一个动作。
+                    let server = Some(detail.name.clone());
+                    (panel.level, server, panel.actions(detail).len())
                 }
-            };
-            (panel.level, cap)
+            }
         };
         let Some(panel) = m.mcp_panel.as_mut() else {
             return false;
         };
-        let here = (level, row);
-        let again = panel.clicked == Some(here);
+        let here = (level, server, row);
+        let again = panel.clicked.as_ref() == Some(&here);
         panel.point_at(row, cap);
-        panel.clicked = Some(here);
+        // 要动手了:记下的那一下就算用掉了,不能给下一次单击当背书。
+        panel.clicked = if again { None } else { Some(here) };
         again
     }
 
@@ -8201,6 +8203,88 @@ mod tests {
             2,
             "光标留在原处"
         );
+    }
+
+    /// 换了一台服务器之后,单击不许执行。
+    ///
+    /// 这是「只写不清」那个洞:`clicked` 若只记级别和行号,在 A 的详情页点过第 0 行
+    /// (只指着),再用键盘换到 B,A 记下的那一下会替 B 的第 0 个动作背书——单击就执行。
+    #[test]
+    fn a_click_after_another_server_took_the_page_does_not_act() {
+        let h = host_with_mcp();
+        assert!(h.show_mcp(crate::mcp::McpView::new(vec![
+            server_row("alpha"),
+            server_row("beta"),
+        ])));
+        assert!(h.toggle_mcp());
+
+        // 进 alpha 的详情:两下,第一下指着、第二下才是 Enter。
+        assert!(!h.mcp_click(0), "第一下只指着");
+        assert!(h.mcp_click(0), "同一格再点一下,才按 Enter");
+        let (_, step) = h.mcp_key(crate::surface::KeyPress::plain(crate::surface::Key::Enter));
+        assert!(matches!(step, Some(crate::mcp::Step::OpenDetail { .. })));
+        assert!(h.mcp_detail(server_page("alpha")), "alpha 的详情到了");
+
+        // 在 alpha 的详情页点一下第 0 个动作:只指着,执行不到。
+        assert!(!h.mcp_click(0), "第一下只指着");
+        assert_eq!(
+            h.moment
+                .read()
+                .expect("moment poisoned")
+                .mcp_panel
+                .as_ref()
+                .and_then(|p| p.clicked.clone()),
+            Some((crate::mcp::Level::Detail, Some("alpha".to_string()), 0)),
+            "指针此刻指着 alpha 的第 0 个动作"
+        );
+
+        // 退回列表,用**键盘**换到 beta,再进它的详情——键盘这一路不替指针背书。
+        let _ = h.mcp_key(crate::surface::KeyPress::plain(crate::surface::Key::Esc));
+        let _ = h.mcp_key(crate::surface::KeyPress::plain(crate::surface::Key::Down));
+        let (_, step) = h.mcp_key(crate::surface::KeyPress::plain(crate::surface::Key::Enter));
+        assert!(
+            matches!(step, Some(crate::mcp::Step::OpenDetail { ref server }) if server == "beta"),
+            "已经进了 beta 的详情"
+        );
+        assert!(h.mcp_detail(server_page("beta")), "beta 的详情到了");
+
+        // 关键的一下:只许指着。它要是返回 true,B 的动作就被单击执行了。
+        assert!(
+            !h.mcp_click(0),
+            "换了服务器,同一个行号底下是别人的动作——单击不许执行"
+        );
+        // 盯着 beta 的第 0 个动作再点一次,这才动手。
+        assert!(h.mcp_click(0), "盯着同一个动作再点一次,才算动手");
+    }
+
+    /// 刚执行完的那一下不算「还指着」:要再点一次才算。
+    ///
+    /// 同一个洞的另一半:`clicked` 若在执行后留着,动作执行完、动作表跟着刷新
+    /// (取消信任 → 信任),同一个行号底下已经是另一个动作了,而单击仍然会执行它。
+    #[test]
+    fn an_action_that_just_ran_has_to_be_pointed_at_again() {
+        let h = host_with_mcp();
+        assert!(h.show_mcp(crate::mcp::McpView::new(vec![
+            server_row("alpha"),
+            server_row("beta"),
+        ])));
+        assert!(h.toggle_mcp());
+
+        // 进 alpha 的详情。
+        assert!(!h.mcp_click(0), "第一下只指着");
+        assert!(h.mcp_click(0), "第二下才按 Enter");
+        let _ = h.mcp_key(crate::surface::KeyPress::plain(crate::surface::Key::Enter));
+        assert!(h.mcp_detail(server_page("alpha")), "alpha 的详情到了");
+
+        // 第 0 个动作:两下才动。
+        assert!(!h.mcp_click(0), "第一下只指着");
+        assert!(h.mcp_click(0), "第二下才动手");
+        // 那一下用掉了。动作表跟着刷新之后,同一个行号底下已经是别的动作了。
+        assert!(
+            !h.mcp_click(0),
+            "刚执行完,这一下只算指着——不然刷出来的新动作会被单击执行"
+        );
+        assert!(h.mcp_click(0), "再点一次才算动手");
     }
 
     fn lines_of(frame: &Frame, part: &str) -> Vec<String> {
