@@ -10,7 +10,19 @@
 
 **前置：** worktree `/Users/lichao/project/gitcode/ai/atomcode/.worktrees/mcp-panel`、分支 `feat/mcp-panel`。
 
-**测试命令必须带 `--features mcp`**（`mcp` 是 `atomcode-capabilities` 的 opt-in feature，`lib.rs:193`）。不加 feature 跑，整个 mcp 模块不参与编译，报告会"全绿"却一个相关用例都没执行。
+**测试命令的 `--features mcp` 只对 `atomcode-capabilities` 有效。** `mcp` 是它的 opt-in feature（`lib.rs:193` 的 `#[cfg(feature = "mcp")] pub mod mcp;`，`default = ["provider", "tools"]`）；`atomcode-coding` 与 `atomcode-cli` 都**没有**这个 feature，带了会在编译前就报 `does not contain this feature`。实测：capabilities 默认 947 个用例、带 `mcp` 是 **1066** 个——**不加 feature 跑，整个 mcp 模块不参与编译，报告"全绿"却一个相关用例都没执行。**
+
+**第二个坑：`crates/atomcode-cli/` 的包名是 `atomcode`，不是 `atomcode-cli`。** 目录名与包名不一致（`crates/atomcode-cli/Cargo.toml` 的 `[package] name = "atomcode"`），`-p atomcode-cli` 会报 `did not match any packages`。正确写法是 **`-p atomcode`**。
+
+**三个 crate 的基线健康状况不同，验收前先知道**（均在**未改动的主检出**上实测）：
+
+| crate | 命令 | 基线 |
+| --- | --- | --- |
+| `atomcode-host-api` | `-p atomcode-host-api` | **测试构建编译不过**——三个既有变体没登记进覆盖 match。已由本分支 `fix(host-api): 补上三个漏登记的变体` 修掉 |
+| `atomcode-coding` | `-p atomcode-coding` | 860 跑，**2 个既有失败**（`an_oversized_tool_result_is_shown_head_and_tail_and_saved_whole`、`criteria::a_stopped_reply_is_kept_as_far_as_it_got`），与本次改动无关 |
+| `atomcode`（cli） | `-p atomcode` | 404 passed，健康 |
+
+先量基线再判断红的是谁——这条分支上前两个 crate 都给过意外。
 
 **设计依据：** `docs/mcp-panel-design.md` §3（边界）、§4.1（命令形状）、§4.2（字段映射）、§4.3（加变体）、§7（判据）。
 
@@ -723,7 +735,7 @@ EOF
 - [ ] **Step 2: 跑它，确认失败**
 
 ```bash
-cargo nextest run -p atomcode-cli --features mcp mcp_manage_lists_servers_with_source_and_tool_count mcp_detail_reports_transport_and_auth
+cargo nextest run -p atomcode mcp_manage_lists_servers_with_source_and_tool_count mcp_detail_reports_transport_and_auth
 ```
 
 Expected: 失败——`McpManage` 未被实现（`host.rs` 的 match 不穷尽或落到兜底）。
@@ -813,7 +825,7 @@ fn to_mcp_auth(facts: &atomcode_coding::McpRowFacts) -> McpAuth {
 - [ ] **Step 4: 跑测试，确认通过**
 
 ```bash
-cargo nextest run -p atomcode-cli --features mcp mcp_manage_lists_servers_with_source_and_tool_count mcp_detail_reports_transport_and_auth
+cargo nextest run -p atomcode mcp_manage_lists_servers_with_source_and_tool_count mcp_detail_reports_transport_and_auth
 ```
 
 Expected: PASS。
@@ -846,7 +858,7 @@ EOF
 ```bash
 cargo nextest run -p atomcode-host-api
 cargo nextest run -p atomcode-coding
-cargo nextest run -p atomcode-cli --features mcp
+cargo nextest run -p atomcode
 ```
 
 Expected: 全绿。**不要 `--workspace`**——9 个 consumer 各开不同的 feature 子集，会把这个 95k 行的库编 19 次。
