@@ -446,7 +446,10 @@ mod tests {
         let m: MarketplaceManifest = serde_json::from_str(raw).unwrap();
         match &m.plugins[0].source {
             PluginSource::External(ExternalSource::GitSubdir { pin, .. }) => {
-                assert_eq!(pin.commit.as_deref(), Some("9ae606b331085597f05b67cfa165f2dcd3369a2e"));
+                assert_eq!(
+                    pin.commit.as_deref(),
+                    Some("9ae606b331085597f05b67cfa165f2dcd3369a2e")
+                );
                 assert!(pin.git_ref.is_none());
             }
             other => panic!("expected External::GitSubdir, got {other:?}"),

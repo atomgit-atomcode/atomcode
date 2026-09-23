@@ -90,7 +90,10 @@ pub fn marker_at_offset(text: &str, off: usize) -> Option<usize> {
 /// arrows step over it, and the caret never lands inside it — the "an image is a
 /// chip, not ten characters" behaviour.
 pub fn marker_spans(text: &str) -> Vec<std::ops::Range<usize>> {
-    marker_hits(text).into_iter().map(|(span, _)| span).collect()
+    marker_hits(text)
+        .into_iter()
+        .map(|(span, _)| span)
+        .collect()
 }
 
 /// Move a caret that landed **strictly inside** an `[Image #N]` out to the nearer

@@ -2270,8 +2270,7 @@ mod tests {
         })
         .into_owned();
         let msg = format!("[Image #1] 这个是啥？\n\n{said}");
-        let (before, model, caption) =
-            split_vl_caption(&msg).expect("the caption is split out");
+        let (before, model, caption) = split_vl_caption(&msg).expect("the caption is split out");
         assert_eq!(before, "[Image #1] 这个是啥？");
         assert_eq!(model, "qwen-vl");
         assert_eq!(caption, "a long recognised description");
@@ -2294,7 +2293,10 @@ mod tests {
         .into_owned();
         let msg = format!("quoting {decoy}\n\n{real}");
         let (_, model, caption) = split_vl_caption(&msg).expect("splits at the last marker");
-        assert_eq!(model, "real-vl", "the appended marker wins, not the typed one");
+        assert_eq!(
+            model, "real-vl",
+            "the appended marker wins, not the typed one"
+        );
         assert_eq!(caption, "the actual recognition");
     }
 
@@ -2310,7 +2312,10 @@ mod tests {
         assert_eq!(folded.len(), 1, "folds to a single row: {folded:?}");
         let head = folded[0].plain();
         assert!(head.contains("qwen-vl"), "names the model: {head}");
-        assert!(!head.contains("line two"), "the body is hidden when folded: {head}");
+        assert!(
+            !head.contains("line two"),
+            "the body is hidden when folded: {head}"
+        );
         // Open: the head plus the recognised text.
         let open = block.lines(&ctx);
         assert!(open.len() > 1, "opens to more than the head: {open:?}");
