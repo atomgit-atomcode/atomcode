@@ -3617,6 +3617,17 @@ impl Host {
         };
         let before = panel.clone();
         let step = crate::mcp::key(&view, panel, press);
+        // 指针指过的那一格,到这儿就作废,只要这一下做了两件事之一:
+        //
+        // - 把光标挪了地方:两只手共用一个光标,键盘动过它,鼠标上一次指着的那一格
+        //   就不该再算「同一格」;
+        // - 发出了一次动作(`busy` 从无到有):那一下就用掉了,不能给下一次单击当背书。
+        //
+        // 收在这一处,不写在 `detail_key` 的执行分支里:键盘的**每一次按键**都从这里
+        // 过(鼠标点下去之后那一趟也走它,`run_mcp_key`),所以以后再加执行入口也不会漏。
+        if panel.cursor != before.cursor || (before.busy.is_none() && panel.busy.is_some()) {
+            panel.clicked = None;
+        }
         let changed = *panel != before;
         match step {
             crate::mcp::Step::Stay => (changed, None),
@@ -8284,6 +8295,44 @@ mod tests {
             !h.mcp_click(0),
             "刚执行完,这一下只算指着——不然刷出来的新动作会被单击执行"
         );
+        assert!(h.mcp_click(0), "再点一次才算动手");
+    }
+
+    /// 用键盘执行过动作之后,指针那一次也算用掉了。
+    ///
+    /// 上一条只走了鼠标执行那一趟;而「先用鼠标选中、再用键盘确认」是很自然的操作:
+    /// 单击第 0 行(只选中)→ 按 Enter 执行 → 详情刷新成新的动作表 → 此时单击第 0 行
+    /// 若还算「同一格」,单击一次就执行了刷出来的新动作。
+    #[test]
+    fn an_action_run_from_the_keyboard_also_spends_the_click() {
+        let h = host_with_mcp();
+        assert!(h.show_mcp(crate::mcp::McpView::new(vec![
+            server_row("alpha"),
+            server_row("beta"),
+        ])));
+        assert!(h.toggle_mcp());
+
+        // 进 alpha 的详情:两下,第一下指着、第二下才是 Enter。
+        assert!(!h.mcp_click(0), "第一下只指着");
+        assert!(h.mcp_click(0), "同一格再点一下,才按 Enter");
+        let _ = h.mcp_key(crate::surface::KeyPress::plain(crate::surface::Key::Enter));
+        assert!(h.mcp_detail(server_page("alpha")), "alpha 的详情到了");
+
+        // 鼠标只选中第 0 个动作。
+        assert!(!h.mcp_click(0), "第一下只指着");
+        // 键盘确认——「鼠标选、键盘确认」是很自然的操作。
+        let (_, step) = h.mcp_key(crate::surface::KeyPress::plain(crate::surface::Key::Enter));
+        assert!(
+            matches!(step, Some(crate::mcp::Step::Act { .. })),
+            "键盘把动作发出去了"
+        );
+
+        // 动作落地,详情刷新:同一台服务器、同一个行号,底下已经是别的动作了。
+        assert!(h.mcp_busy(None));
+        assert!(h.mcp_detail(server_page("alpha")));
+
+        // 此刻单击第 0 行:只许指着——不然刷出来的新动作会被单击执行。
+        assert!(!h.mcp_click(0), "键盘执行过那一次,指针的记录已经用掉了");
         assert!(h.mcp_click(0), "再点一次才算动手");
     }
 
