@@ -36,6 +36,12 @@ pub struct CodingAgentConfig {
     pub preferred_language: Option<Locale>,
     /// Resolved `[tools.todo]` policy for this runtime generation.
     pub todo: atomcode_config::config::TodoToolConfig,
+    /// Resolved `[tools.atomgit]` switch for this runtime generation.
+    /// `true` ⇒ the 4 typed AtomGit tools are registered and the persona guidance
+    /// block is included; `false` ⇒ both are omitted (no phantom tool calls).
+    /// See `atomcode_config::config::AtomGitToolConfig` for the excluded paths
+    /// (`GitPushLabelMiddleware`, raw REST via `bash`).
+    pub atomgit_enabled: bool,
     /// Stable config/provider registry key exposed to drivers. This is distinct
     /// from `provider_type`, which selects the adapter implementation.
     pub provider_name: String,
@@ -205,6 +211,8 @@ pub struct CodingRuntimeConfig {
     pub model: String,
     pub preferred_language: Option<Locale>,
     pub todo: atomcode_config::config::TodoToolConfig,
+    /// Resolved `[tools.atomgit]` switch — see `CodingAgentConfig::atomgit_enabled`.
+    pub atomgit_enabled: bool,
     pub provider_name: String,
     pub working_dir: PathBuf,
     pub context_window: u32,
@@ -425,6 +433,10 @@ impl CodingRuntimeConfig {
                 config.language,
             )),
             todo: config.tools.todo.clone(),
+            atomgit_enabled: atomcode_config::config::atomgit_enabled_from_env(
+                std::env::var("ATOMCODE_ATOMGIT").ok().as_deref(),
+                config.tools.atomgit.enabled,
+            ),
             provider_name: r.map(|r| r.selection_id.clone()).unwrap_or_default(),
             working_dir: working_dir.to_path_buf(),
             context_window: r.map(|r| r.context_window as u32).unwrap_or(128_000),
@@ -493,6 +505,7 @@ impl CodingRuntimeConfig {
         );
         config.preferred_language = self.preferred_language;
         config.todo = self.todo.clone();
+        config.atomgit_enabled = self.atomgit_enabled;
         config.provider_name = self.provider_name.clone();
         config.chat_options.max_tokens = self.max_tokens;
         config.telemetry = self.telemetry.clone();
@@ -963,6 +976,7 @@ impl CodingAgentConfig {
             model,
             preferred_language: None,
             todo: Default::default(),
+            atomgit_enabled: true,
             working_dir: working_dir.into(),
             context_window: 128_000,
             stream_timeout: default_stream_timeout(),

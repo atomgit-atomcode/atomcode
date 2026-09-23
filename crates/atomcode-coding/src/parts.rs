@@ -597,8 +597,18 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         any
     };
 
+    // `[tools.atomgit]` switch (`ATOMCODE_ATOMGIT` env wins over the config value):
+    // off ⇒ the four typed REST tools stay out of the catalog AND the persona guidance
+    // block (delivered by `host_tool_guidance`, below, so it travels with whatever is
+    // mounted) — instructing the model to call unmounted tools provokes phantom calls.
     #[cfg(feature = "atomgit")]
-    if opts.tools {
+    let atomgit_enabled = opts.tools
+        && atomcode_config::config::atomgit_enabled_from_env(
+            std::env::var("ATOMCODE_ATOMGIT").ok().as_deref(),
+            cfg.atomgit_enabled,
+        );
+    #[cfg(feature = "atomgit")]
+    if atomgit_enabled {
         let before = names.len();
         register_atomgit_capabilities(&mut registry, &mut names)
             .map_err(|error| io::Error::other(format!("AtomGit tool setup failed: {error}")))?;
@@ -2022,7 +2032,12 @@ mod tests {
 
     #[cfg(feature = "atomgit")]
     #[tokio::test]
+    #[serial_test::serial(atomgit_env)]
     async fn production_prepare_exposes_atomgit_tools() {
+        // Serialized with the test that mutates `ATOMCODE_ATOMGIT`: that one sets the
+        // process-global var to disable the tools, and this one asserts they ARE present,
+        // so they must not overlap — a leaked env var is a false negative here, not a flake
+        // the harness will retry away.
         let project = tempfile::tempdir().unwrap();
         let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
         let parts = prepare(&cfg, io_free_opts()).await.unwrap();
@@ -2036,6 +2051,79 @@ mod tests {
             assert!(
                 names.iter().any(|name| name == expected),
                 "production tool catalog must expose {expected}: {names:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "atomgit")]
+    #[tokio::test]
+    async fn atomgit_tools_absent_when_switch_disabled() {
+        let project = tempfile::tempdir().unwrap();
+        let mut cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
+        cfg.atomgit_enabled = false;
+        let parts = prepare(&cfg, io_free_opts()).await.unwrap();
+        let names = parts.tool_names.clone();
+
+        for expected in ["atomgit_repo", "atomgit_pr", "atomgit_issue", "atomgit_api"] {
+            assert!(
+                !names.iter().any(|name| name == expected),
+                "atomgit tools must be absent when switch is off: {expected} in {names:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "atomgit")]
+    #[tokio::test]
+    async fn other_tools_present_when_atomgit_disabled() {
+        // The switch is scoped: turning it off must not take the rest of the
+        // catalog with it.
+        let project = tempfile::tempdir().unwrap();
+        let mut cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
+        cfg.atomgit_enabled = false;
+        let parts = prepare(&cfg, io_free_opts()).await.unwrap();
+        let names = parts.tool_names.clone();
+
+        for expected in [
+            "read_file",
+            "write_file",
+            "edit_file",
+            "list_directory",
+            "open_file",
+            "bash",
+            "grep",
+            "glob",
+            "search_replace",
+            "todowrite",
+        ] {
+            assert!(
+                names.iter().any(|name| name == expected),
+                "non-atomgit tool must be present when atomgit is disabled: {expected} in {names:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "atomgit")]
+    #[tokio::test]
+    #[serial_test::serial(atomgit_env)]
+    async fn atomgit_env_overrides_config_when_disabled() {
+        // `ATOMCODE_ATOMGIT=0` disables the tools even when the config says on,
+        // which is the escape hatch for a shared config file. The serial guard
+        // keeps the process-global env from leaking into another test.
+        std::env::set_var("ATOMCODE_ATOMGIT", "0");
+        let project = tempfile::tempdir().unwrap();
+        let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
+        assert!(
+            cfg.atomgit_enabled,
+            "default must be true before the env override"
+        );
+        let parts = prepare(&cfg, io_free_opts()).await.unwrap();
+        let names = parts.tool_names.clone();
+        std::env::remove_var("ATOMCODE_ATOMGIT");
+
+        for expected in ["atomgit_repo", "atomgit_pr", "atomgit_issue", "atomgit_api"] {
+            assert!(
+                !names.iter().any(|name| name == expected),
+                "ATOMCODE_ATOMGIT=0 must disable atomgit tools: {expected} in {names:?}"
             );
         }
     }

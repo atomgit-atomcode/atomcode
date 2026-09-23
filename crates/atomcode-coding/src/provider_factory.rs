@@ -265,6 +265,8 @@ pub fn derive_tier_config(
     provider_name: &str,
     provider: &atomcode_config::config::provider::ProviderConfig,
 ) -> CodingAgentConfig {
+    // `base.clone()` carries `atomgit_enabled` from the host agent — subagents
+    // share the switch with their parent (no main-off / sub-on split).
     let mut tier = base.clone();
     tier.model = provider.model.clone();
     tier.supports_vision = provider.accepts_images();
@@ -324,6 +326,8 @@ pub fn derive_tier_config_from_resolved(
     base: &CodingAgentConfig,
     resolved: &atomcode_config::config::provider::ResolvedModelConfig,
 ) -> CodingAgentConfig {
+    // `base.clone()` carries `atomgit_enabled` from the host agent — subagents
+    // share the switch with their parent (no main-off / sub-on split).
     let mut tier = base.clone();
     tier.model = resolved.model.clone();
     tier.supports_vision = resolved.supports_vision;

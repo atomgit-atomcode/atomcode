@@ -349,8 +349,6 @@ Skip the trailer for `git commit --amend` and `git revert`. Only commit when the
     if request_user_input_enabled {
         p.push_str(REQUEST_USER_INPUT_USAGE);
     }
-    #[cfg(feature = "atomgit")]
-    p.push_str(ATOMGIT_TOOL_USAGE);
     if memory_enabled {
         p.push_str(MEMORY_USAGE);
     }
@@ -691,6 +689,13 @@ when its distinct capability is the point.";
 pub(crate) fn host_tool_guidance(tool: &str) -> Option<(&'static str, &'static str)> {
     let (key, section) = match tool {
         "request_user_input" => ("ask", REQUEST_USER_INPUT_USAGE),
+        // Any of the four AtomGit typed tools: the row list carries the guidance via the
+        // mounting row, so the persona body drops it (`coding_persona_rows`) — the block
+        // leaves with the tool instead of outliving it.
+        #[cfg(feature = "atomgit")]
+        "atomgit_repo" | "atomgit_pr" | "atomgit_issue" | "atomgit_api" => {
+            ("atomgit", ATOMGIT_TOOL_USAGE)
+        }
         "code_review" => ("code-review", CODE_REVIEW_USAGE),
         name if name.starts_with("subagent_") => {
             ("external-subagents", EXTERNAL_SUBAGENT_DELEGATION)
@@ -1693,15 +1698,33 @@ mod tests {
 
     #[cfg(feature = "atomgit")]
     #[test]
-    fn persona_prefers_atomgit_tools_without_exposing_credentials() {
+    fn atomgit_guidance_travels_with_the_mounting_row() {
+        // The persona body no longer teaches `## ATOMGIT TOOLS:`: the section is brought by
+        // whichever host mounts the tools (`host_tool_guidance`), so the `[tools.atomgit]`
+        // switch drops the tools and the guidance in one move. Instructing the model to call an
+        // unmounted tool provokes a phantom call. Same shape as `## ASKING THE USER`, asserted
+        // below.
         let p = coding_persona("m", true, false);
+        assert!(
+            !p.contains("## ATOMGIT TOOLS:"),
+            "the body must not teach unmounted tools: {p}"
+        );
 
-        for tool in ["`atomgit_repo`", "`atomgit_pr`", "`atomgit_issue`"] {
-            assert!(p.contains(tool), "persona must direct the model to {tool}");
+        for name in ["atomgit_repo", "atomgit_pr", "atomgit_issue", "atomgit_api"] {
+            let Some((key, text)) = super::host_tool_guidance(name) else {
+                panic!("the host keeps no guidance for {name}")
+            };
+            assert_eq!(key, "atomgit", "all four tools share one guidance block");
+            assert!(
+                text.contains("## ATOMGIT TOOLS:"),
+                "host keeps the block for {name}"
+            );
         }
-        assert!(p.contains("Never read AtomGit auth files"));
-        assert!(p.contains("never pass a credential through `bash`/`curl`"));
-        assert!(p.contains("obtain the current OAuth credential internally"));
+        // The credential guardrail survives the move.
+        let (_, text) = super::host_tool_guidance("atomgit_repo").expect("atomgit_repo guidance");
+        assert!(text.contains("Never read AtomGit auth files"));
+        assert!(text.contains("never pass a credential through `bash`/`curl`"));
+        assert!(text.contains("obtain the current OAuth credential internally"));
     }
 
     #[test]
