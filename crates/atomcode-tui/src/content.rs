@@ -719,6 +719,13 @@ impl ToolCallBlock {
         matches!(self.outcome, Outcome::Pending)
     }
 
+    /// A todo update, batch or incremental. Its "command" is a state marker, not
+    /// something to read, so when the model gave it an intent the row is just
+    /// that phrase — see [`lines`](Self::lines).
+    fn is_todo(&self) -> bool {
+        matches!(self.name.as_str(), "todo" | "todowrite")
+    }
+
     pub fn pending(
         call_id: impl Into<String>,
         name: impl Into<String>,
@@ -1255,6 +1262,15 @@ impl Content for ToolCallBlock {
         }
         let caps = Caps::default();
         let lead = format!("{} ", caps.g(Glyph::ToolMark));
+        // A todo update is a state marker, not a command worth reading: when the
+        // model gave it an intent, that phrase is the whole row — the
+        // `● 待办("action":…)` line and its 运行中/完成 note are dropped, so a run
+        // of todos reads as its own summaries instead of a wall of JSON. An update
+        // with no intent keeps the ordinary shape: the args are then all it has to
+        // say, and the caller was fine either way.
+        if self.is_todo() && self.reason().is_some() {
+            return self.head(w, &lead, self.mark().1, self.name_style());
+        }
         let mut out = self.opening_rows(w, &lead, self.mark().1, self.name_style());
 
         let body = match &self.outcome {
@@ -1345,6 +1361,14 @@ impl Content for ToolCallBlock {
         }
         let caps = Caps::default();
         let lead = format!("{} ", caps.g(Glyph::ToolMark));
+        // A todo update folds to the same single intent row it opens as — there
+        // is no `待办(args)` line or result to leave out (see `lines`), so its
+        // folded and open shapes are one and the same, recessed to the fold grey.
+        // (Reaching here means it has an intent; without one it took the branch
+        // above and shows its args like any other unexplained call.)
+        if self.is_todo() {
+            return self.head(w, &lead, self.mark().1, fold());
+        }
         // The `●` head carries the call's outcome even folded (green done / red
         // failed / muted running), the same as the unexplained `summary`; the
         // reason text stays muted so the dot is the only lit thing on the row.
@@ -3088,6 +3112,49 @@ mod tests {
                 "a finished call is not running"
             );
         }
+    }
+
+    /// A todo update the model explained is its intent phrase and nothing else:
+    /// one `● …` row, no `待办("action":…)` line and no result. A run of them
+    /// then reads as its own summaries rather than a wall of state JSON.
+    #[test]
+    fn a_todo_update_is_just_its_intent_line_not_the_raw_args() {
+        let call = ToolCallBlock::pending(
+            "c",
+            "todo",
+            r#"{"intent":"转向 sha pin 兼容","action":"update","id":5,"status":"in_progress"}"#,
+        )
+        .with(Outcome::Ok("ok".into()));
+        let lines = call.lines(&crate::block::RenderCtx::bare(80));
+        assert_eq!(lines.len(), 1, "a todo update is one row: {lines:?}");
+        let row = lines[0].plain();
+        assert!(row.contains("转向 sha pin 兼容"), "the intent is the row: {row:?}");
+        assert!(!row.contains("action"), "the raw args are gone: {row:?}");
+        assert!(!row.contains("in_progress"), "the status json is gone: {row:?}");
+        // Folded is that same single row — nothing to leave out.
+        let folded = call.summary_lines(&crate::block::RenderCtx::bare(80));
+        assert_eq!(folded.len(), 1, "folds to the one row: {folded:?}");
+        assert!(folded[0].plain().contains("转向 sha pin 兼容"));
+    }
+
+    /// A todo update with no intent keeps the ordinary call shape: its args are
+    /// then the only thing it has to say, so they are shown like any other
+    /// unexplained call.
+    #[test]
+    fn a_todo_update_without_an_intent_keeps_its_args() {
+        let call =
+            ToolCallBlock::pending("c", "todo", r#"{"action":"update","id":5,"status":"completed"}"#);
+        let text: String = call
+            .lines(&crate::block::RenderCtx::bare(80))
+            .iter()
+            .map(|l| l.plain())
+            .collect();
+        // The ordinary call shape — the tool names itself and shows its
+        // argument subject (`Todo(5)`), rather than my intent-only single row.
+        assert!(
+            text.contains("Todo"),
+            "an unexplained todo keeps the ordinary call shape: {text:?}"
+        );
     }
 
     /// A folded call recedes: it is scaffolding over the answer rather than one
