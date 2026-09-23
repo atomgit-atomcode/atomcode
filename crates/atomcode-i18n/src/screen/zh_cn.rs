@@ -782,6 +782,20 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("/{command} 归命令行：退出后运行 `{run}`。").into()
         }
         Msg::CmdAboutInTheCli => "归命令行".into(),
+        Msg::CmdAboutSchedule => "排了哪些定时任务，各自下次什么时候跑".into(),
+        Msg::ScheduleNone => "还没有定时任务。用 `atomcode schedule add` 排一个。".into(),
+        Msg::ScheduleTaskLine {
+            id,
+            title,
+            next,
+            last,
+            state,
+        } => format!("{id} · {title} · 下次 {next} · 上次 {last} · {state}").into(),
+        Msg::ScheduleOn => "开".into(),
+        Msg::ScheduleOff => "关".into(),
+        Msg::ScheduleEditInTheCli => {
+            "增删用 `atomcode schedule add` / `remove`；到点执行的是操作系统的调度器。".into()
+        }
         Msg::CmdAboutProxy => "出站代理：跟随系统、固定当前代理，或不走代理".into(),
         Msg::ProxyTakes => "[follow_system | default_proxy | no_proxy]".into(),
         Msg::ProxyPickerTitle { current } => format!("出站代理（现在：{current}）").into(),

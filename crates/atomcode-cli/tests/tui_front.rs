@@ -584,3 +584,66 @@ async fn the_proxy_mode_is_chosen_here_and_kept_in_the_file() {
     term.press(atomcode_tui::surface::KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), running).await;
 }
+
+/// `/schedule` lists what is scheduled on this machine — read-only, and it says
+/// where adding and removing live (the OS scheduler runs them, screen or no
+/// screen).
+#[tokio::test]
+async fn scheduled_tasks_are_listed_here() {
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("ATOMCODE_HOME", home.path());
+    let project = tempfile::tempdir().unwrap();
+    let count = Arc::new(Count::default());
+    let config_path = home.path().join("config.toml");
+    let _locale = atomcode_config::i18n::test_lock();
+    atomcode_config::i18n::set_locale(atomcode_config::locale::Locale::ZhCn);
+
+    let front_end = FrontEnd::new();
+    let (start, config) = start(
+        project.path(),
+        &count,
+        SessionMode::Fresh,
+        Some(front_end.clone()),
+    );
+    let runtime = CodingRuntime::start(start).await.expect("starts");
+    let screen = Screen {
+        headless: Some((140, 40)),
+        ..Screen::default()
+    };
+    let mounted = tui_front::mount(runtime, front_end, config, None, &screen, config_path, None)
+        .await
+        .expect("the screen mounts");
+    let term = mounted
+        .app
+        .context()
+        .service::<atomcode_tui::plugin::SurfaceSvc>()
+        .and_then(|surface| surface.as_any_headless())
+        .expect("a headless surface");
+    let ui = mounted.ui.clone();
+    let ctx = mounted.app.context();
+    let running = tokio::spawn(async move {
+        let _ = ui.run(&ctx, None).await;
+    });
+
+    term.type_line("/schedule");
+    let mut screen_text = String::new();
+    for _ in 0..200 {
+        screen_text = term.text();
+        if screen_text.contains("atomcode schedule add") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        screen_text.contains("atomcode schedule add"),
+        "an empty list still says how one is made:\n{screen_text}"
+    );
+    assert_eq!(
+        count.0.load(Ordering::SeqCst),
+        0,
+        "nothing was sent as a prompt"
+    );
+
+    term.press(atomcode_tui::surface::KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), running).await;
+}

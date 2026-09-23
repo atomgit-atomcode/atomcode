@@ -36,6 +36,7 @@ pub mod tui_providers;
 pub mod tui_proxy;
 pub mod tui_resume;
 pub mod tui_rewind;
+pub mod tui_schedule;
 pub mod tui_settings;
 pub mod tui_setup;
 pub mod tui_tools;
@@ -114,6 +115,7 @@ pub mod tui_front {
             crate::tui_welcome_words::row_layer(),
             crate::tui_elsewhere::row_layer(),
             crate::tui_proxy::row_layer(),
+            crate::tui_schedule::row_layer(),
         ];
         let mut rows: Vec<Arc<dyn atomcode_plexus::Plugin>> = vec![
             Arc::new(crate::tui_settings::SettingsRow),
@@ -137,6 +139,7 @@ pub mod tui_front {
             Arc::new(crate::tui_proxy::ProxyRow {
                 config_path: config_path.clone(),
             }),
+            Arc::new(crate::tui_schedule::ScheduleRow),
         ];
         // The eighth row, and only when there is something to count into:
         // a launch with telemetry off has no such row at all, which is what

@@ -804,6 +804,23 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("/{command} belongs to the command line: quit and run `{run}`.").into()
         }
         Msg::CmdAboutInTheCli => "belongs to the command line".into(),
+        Msg::CmdAboutSchedule => "the scheduled tasks, and when each runs next".into(),
+        Msg::ScheduleNone => {
+            "Nothing is scheduled. `atomcode schedule add` sets one up.".into()
+        }
+        Msg::ScheduleTaskLine {
+            id,
+            title,
+            next,
+            last,
+            state,
+        } => format!("{id} · {title} · next {next} · last {last} · {state}").into(),
+        Msg::ScheduleOn => "on".into(),
+        Msg::ScheduleOff => "off".into(),
+        Msg::ScheduleEditInTheCli => {
+            "Adding and removing is `atomcode schedule add` / `remove`; the OS scheduler runs them."
+                .into()
+        }
         Msg::CmdAboutProxy => "outbound proxy: follow the system, pin the current one, or none".into(),
         Msg::ProxyTakes => "[follow_system | default_proxy | no_proxy]".into(),
         Msg::ProxyPickerTitle { current } => format!("Outbound proxy (now: {current})").into(),

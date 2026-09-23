@@ -1304,6 +1304,18 @@ pub enum Msg<'a> {
         run: &'a str,
     },
     CmdAboutInTheCli,
+    CmdAboutSchedule,
+    ScheduleNone,
+    ScheduleTaskLine {
+        id: &'a str,
+        title: &'a str,
+        next: &'a str,
+        last: &'a str,
+        state: &'a str,
+    },
+    ScheduleOn,
+    ScheduleOff,
+    ScheduleEditInTheCli,
     CmdAboutProxy,
     ProxyTakes,
     ProxyPickerTitle {
