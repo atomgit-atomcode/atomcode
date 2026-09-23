@@ -185,11 +185,12 @@ struct ParsedHttpAuth {
     headers: BTreeMap<String, String>,
 }
 
-/// Load and merge MCP configurations from project and user levels.
+/// Merge the user-level and project-level configs, disabled entries included.
 ///
-/// Project config (`.mcp.json` in project root) overrides user config
-/// (`ATOMCODE_HOME/mcp.json`) for servers with the same name.
-pub fn load_mcp_config(project_dir: &Path) -> Result<Vec<McpServerConfig>> {
+/// Project overrides user for a server of the same name. This is the whole read; whether
+/// disabled servers are withheld is the caller's decision — see [`load_mcp_config`] and
+/// [`load_mcp_config_including_disabled`].
+fn merge_configs(project_dir: &Path) -> Result<Vec<McpServerConfig>> {
     let user_config = load_config_file(
         &crate::mcp::util::config_dir().join("mcp.json"),
         McpConfigSource::User,
@@ -209,7 +210,29 @@ pub fn load_mcp_config(project_dir: &Path) -> Result<Vec<McpServerConfig>> {
         merged.insert(config.name.clone(), config);
     }
 
-    Ok(merged.into_values().filter(|c| !c.disabled).collect())
+    Ok(merged.into_values().collect())
+}
+
+/// Load and merge MCP configurations from project and user levels.
+///
+/// Project config (`.mcp.json` in project root) overrides user config
+/// (`ATOMCODE_HOME/mcp.json`) for servers with the same name.
+///
+/// Servers configured with `disabled: true` are withheld: they are not a tool source for a
+/// running session. A surface that manages them wants the other entry point, below.
+pub fn load_mcp_config(project_dir: &Path) -> Result<Vec<McpServerConfig>> {
+    Ok(merge_configs(project_dir)?
+        .into_iter()
+        .filter(|c| !c.disabled)
+        .collect())
+}
+
+/// The same merge as [`load_mcp_config`], but keeping `disabled` servers.
+///
+/// A management surface has to show a server it is offering to re-enable; hiding it would
+/// make the switch one-way. Nothing that builds a tool catalog may use this.
+pub fn load_mcp_config_including_disabled(project_dir: &Path) -> Result<Vec<McpServerConfig>> {
+    merge_configs(project_dir)
 }
 
 /// Blank out `//` and `/* … */` comments so a JSONC-flavoured config parses.
@@ -1072,6 +1095,39 @@ mod tests {
         );
         assert_eq!(p["auth"]["type"].as_str(), Some("oauth"));
         assert_eq!(p["auth"]["provider"].as_str(), Some("github"));
+    }
+
+    #[test]
+    fn listing_shows_disabled_servers_that_loading_still_hides() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".mcp.json"),
+            r#"{"mcpServers":{
+                "panel-test-on":  {"command":"npx","args":["-y","a"]},
+                "panel-test-off": {"command":"npx","args":["-y","b"],"disabled":true}
+            }}"#,
+        )
+        .unwrap();
+
+        let listed = load_mcp_config_including_disabled(dir.path()).unwrap();
+        let names: Vec<&str> = listed.iter().map(|c| c.name.as_str()).collect();
+        assert!(
+            names.contains(&"panel-test-off"),
+            "the management list shows disabled servers: {names:?}"
+        );
+        assert!(listed
+            .iter()
+            .find(|c| c.name == "panel-test-off")
+            .unwrap()
+            .disabled);
+
+        let loaded = load_mcp_config(dir.path()).unwrap();
+        let names: Vec<&str> = loaded.iter().map(|c| c.name.as_str()).collect();
+        assert!(
+            !names.contains(&"panel-test-off"),
+            "the runtime load still withholds it: {names:?}"
+        );
+        assert!(names.contains(&"panel-test-on"));
     }
 }
 
