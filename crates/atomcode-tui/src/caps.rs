@@ -323,7 +323,7 @@ fn ascii_for(ch: char) -> Option<&'static str> {
 
         // box drawing
         '\u{2500}' | '\u{2550}' | '\u{2501}' => "-",
-        '\u{2502}' | '\u{2551}' | '\u{2503}' | '\u{258E}' => "|",
+        '\u{2502}' | '\u{2551}' | '\u{2503}' | '\u{258E}' | '\u{258F}' => "|",
         '\u{23BD}' | '\u{23BC}' => "_",
         // `⎿` is a tree-line tail, not a corner; box corners all become `+`
         // so a frame does not get one corner from each source. The glyph set

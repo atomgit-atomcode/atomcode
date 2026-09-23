@@ -27,6 +27,12 @@ mod table;
 /// argument — one site, one decision.)
 pub(super) const RULE: &str = "─";
 
+/// The left gutter bar of a fenced code block. A thin block, not a box vertical:
+/// it reads as a coloured margin beside the code rather than another drawn line,
+/// which is the whole point of dropping the rules. `caps::ascii_for` downgrades it
+/// to `|` where Unicode is unavailable.
+pub(super) const CODE_BAR: &str = "▏";
+
 fn code() -> Style {
     // Inline code is a COOL accent, not a warning colour. Highlighting every
     // identifier / path / command in `Role::Warning` (orange) made a normal
@@ -689,23 +695,27 @@ pub(crate) fn wrap_spans(spans: &[Span], w: u16, prefix: &str, prefix_style: Sty
     out.into_iter().map(|l| l.truncate(w as usize)).collect()
 }
 
-/// A fenced block: dimmed rule, the source with keywords lit, another rule.
+/// A fenced block: a dim left gutter bar down the side, the language named in the
+/// accent colour, the source with keywords lit. No horizontal rules — the bar IS
+/// the frame, which is far less chrome than a top-and-bottom rule when an answer
+/// stacks several blocks (the "横线太多" complaint). The peers that keep command
+/// output light do the same: a single left bar, never a box.
 fn code_block(lines: &[String], lang: &str, w: u16) -> Vec<Line> {
+    // `▏ ` — a bar and a space, in the muted fence colour. Downgrades to `| ` on a
+    // terminal without Unicode (see `caps::ascii_for`), exactly as `RULE` does.
+    let bar = || Span::styled(format!("{CODE_BAR} "), fence());
     let mut out = Vec::new();
-    let label = if lang.is_empty() {
-        RULE.repeat(w as usize)
-    } else {
-        let head = format!("{RULE} {lang} ");
-        format!(
-            "{head}{}",
-            RULE.repeat((w as usize).saturating_sub(width::str_width(&head)))
-        )
-    };
-    out.push(Line::styled(width::take_width(&label, w as usize), fence()));
-    for line in lines {
-        out.push(Line::from_spans(highlight(line, lang)).truncate(w as usize));
+    if !lang.is_empty() {
+        out.push(
+            Line::from_spans(vec![bar(), Span::styled(lang.to_string(), code())])
+                .truncate(w as usize),
+        );
     }
-    out.push(Line::styled(RULE.repeat(w as usize), fence()));
+    for line in lines {
+        let mut spans = vec![bar()];
+        spans.extend(highlight(line, lang));
+        out.push(Line::from_spans(spans).truncate(w as usize));
+    }
     out
 }
 
@@ -1290,11 +1300,47 @@ mod tests {
     }
 
     #[test]
-    fn a_fenced_block_is_framed_and_labelled() {
+    fn a_fenced_block_uses_a_gutter_bar_not_rules() {
         let out = plain("```rust\nfn main() {}\n```", 30);
-        assert!(out[0].starts_with("─ rust "), "{out:?}");
-        assert_eq!(out[1], "fn main() {}");
-        assert!(out[2].chars().all(|c| c == '─'));
+        // A label line and the code, each down a left bar — and NO horizontal
+        // rules: the bar is the whole frame.
+        assert_eq!(out.len(), 2, "no top/bottom rules: {out:?}");
+        assert_eq!(out[0], "▏ rust");
+        assert_eq!(out[1], "▏ fn main() {}");
+        assert!(
+            !out.iter().any(|l| l.chars().all(|c| c == '─')),
+            "no line is a horizontal rule: {out:?}"
+        );
+    }
+
+    #[test]
+    fn the_fence_language_is_coloured_and_the_bar_is_dim() {
+        let out = render("```bash\nls\n```", 30, Style::new());
+        let head = &out[0];
+        // The bar is drawn in the muted fence colour…
+        assert_eq!(
+            head.spans[0].style.fg,
+            Some(Color::role(Role::Muted)),
+            "dim bar: {head:?}"
+        );
+        // …and the language is named in the accent colour so it reads at a glance.
+        assert!(
+            head.spans
+                .iter()
+                .any(|s| s.text.trim() == "bash" && s.style.fg == Some(Color::role(Role::Accent))),
+            "accent language label: {head:?}"
+        );
+        // Every code row also starts with the dim gutter bar.
+        let code = &out[1];
+        assert!(code.spans[0].text.starts_with('▏'), "{code:?}");
+        assert_eq!(code.spans[0].style.fg, Some(Color::role(Role::Muted)));
+    }
+
+    #[test]
+    fn a_fence_without_a_language_has_a_bar_but_no_label() {
+        let out = plain("```\nraw line\n```", 30);
+        // No language ⇒ no label line, just the barred code.
+        assert_eq!(out, vec!["▏ raw line".to_string()]);
     }
 
     #[test]
@@ -1344,7 +1390,8 @@ mod tests {
     fn keywords_and_strings_are_lit_but_the_text_is_untouched() {
         let lines = render("```rust\nlet s = \"hi\";\n```", 40, Style::new());
         let code = &lines[1];
-        assert_eq!(code.plain(), "let s = \"hi\";");
+        // The code sits after the gutter bar, unchanged.
+        assert_eq!(code.plain(), "▏ let s = \"hi\";");
         assert!(
             code.spans.len() > 1,
             "it should be several styled runs, not one"
