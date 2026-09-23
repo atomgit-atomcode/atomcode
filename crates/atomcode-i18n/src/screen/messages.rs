@@ -696,6 +696,12 @@ pub enum Msg<'a> {
     McpLegendList,
     McpLegendDetail,
     McpLegendBusy,
+    /// Something is running that cannot be stopped midway; Esc only hides it.
+    McpLegendBusyHide,
+    /// A cancel was asked for; waiting for it to stop.
+    McpLegendCancelling,
+    /// A panel sign-in was cancelled before the browser came back.
+    McpSignInCancelled,
 
     // ── the toolbox and the plugins (`commands.rs`) ──
     CmdTakesToolbox,
@@ -944,6 +950,21 @@ pub enum Msg<'a> {
     },
     TurnNotStored {
         message: &'a str,
+    },
+    /// A panel login's authorization URL, for when the browser did not open.
+    McpLoginUrl {
+        server: &'a str,
+        url: &'a str,
+    },
+    /// Signing in to a server the config does not define.
+    McpServerNotConfigured {
+        server: &'a str,
+    },
+    /// The sign-in's thread ended without answering.
+    McpSignInLost,
+    /// Signed in, but a turn is running, so the reconnect has to wait.
+    McpSignedInReloadLater {
+        server: &'a str,
     },
     MouseTakenBackAuto,
     ScreenNotConnectedProviders,

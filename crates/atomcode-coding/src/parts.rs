@@ -1427,26 +1427,28 @@ pub struct McpRowFacts {
 ///
 /// The registry and the tool counts are arguments rather than ambient reads, so
 /// the join can be tested against a registry that never connected to anything.
+///
+/// A config file that does not parse is an error, not an empty list: a
+/// management screen that answered "no servers" would be telling the person
+/// their file is empty when it is broken.
 pub async fn mcp_row_facts(
     working_dir: &std::path::Path,
     registry: &atomcode_capabilities::mcp::McpRegistry,
     tool_counts: &[(String, usize)],
-) -> Vec<McpRowFacts> {
+) -> Result<Vec<McpRowFacts>, String> {
     use atomcode_capabilities::mcp::{
         config_path_for_source, load_mcp_config_including_disabled, token_is_expired,
         McpHttpAuthConfig, McpTokenStore, McpTransportConfig, ServerStatus,
     };
     use std::collections::HashMap;
 
-    // A malformed file is the connection path's to report; a management list
-    // must not turn it into "no servers configured".
-    let configs = load_mcp_config_including_disabled(working_dir).unwrap_or_default();
+    let configs = load_mcp_config_including_disabled(working_dir).map_err(|e| format!("{e:#}"))?;
     let live: HashMap<String, ServerStatus> =
         registry.server_statuses().await.into_iter().collect();
     let counts: HashMap<&str, usize> = tool_counts.iter().map(|(n, c)| (n.as_str(), *c)).collect();
     let tokens = McpTokenStore::default();
 
-    configs
+    Ok(configs
         .into_iter()
         .map(|config| {
             let (command, url) = match &config.config {
@@ -1491,22 +1493,70 @@ pub async fn mcp_row_facts(
                 source: config.source,
             }
         })
-        .collect()
+        .collect())
 }
 
 /// What a person can do to one MCP server. This crate's own copy, not
 /// `atomcode_host_api::McpAction`: the wire type lives above this layer
 /// (`cli/host.rs` maps between them, the way it maps `McpRowFacts` → `McpRow`).
+///
+/// Signing in is not one of them: it runs on the front end's side, because it
+/// waits on a browser and writes only a token (`cli/tui_mcp.rs`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum McpAction {
     Trust,
     Untrust,
-    Login,
     Logout,
     /// Remove `disabled` from the file that defines it.
     Enable,
     /// Write `disabled: true` into that file.
     Disable,
+}
+
+impl McpAction {
+    /// Whether the change only reaches the session through a rebuild.
+    ///
+    /// Trust and a config entry are both read when the graph is
+    /// prepared, so writing them changes nothing until it is prepared again —
+    /// and withdrawing (untrust, sign out) takes every MCP tool off, which only
+    /// a rebuild puts back for the servers that are still allowed. `Disable` is
+    /// the one that acts in place: it holds this server's tools back through the
+    /// person's switches, so it needs neither an idle session nor a rebuild.
+    pub fn rebuilds(self) -> bool {
+        !matches!(self, Self::Disable)
+    }
+}
+
+/// Hold back the tools a `Disable` takes off, and say which ones it held.
+///
+/// Only the names this call newly turns off are returned — a tool the person
+/// had already switched off themselves is theirs, and a later `Enable` must not
+/// hand it back.
+pub(crate) fn hold_for_disable(
+    catalog: &atomcode_harness::seams::ToolBox,
+    names: &[String],
+) -> Vec<String> {
+    let already: std::collections::HashSet<String> = catalog.switches().off().into_iter().collect();
+    let mut held = Vec::new();
+    for name in names {
+        if already.contains(name) {
+            continue;
+        }
+        catalog.turn_off(name);
+        held.push(name.clone());
+    }
+    held
+}
+
+/// Undo [`hold_for_disable`]: release exactly the names it held.
+///
+/// Through the catalog, so a tool that is mounted now comes straight back; a
+/// switch for one that is not mounted (the server has not reconnected yet) is
+/// dropped all the same, so it is not born hidden when it does.
+pub(crate) fn release_after_enable(catalog: &atomcode_harness::seams::ToolBox, names: &[String]) {
+    for name in names {
+        catalog.turn_on(name);
+    }
 }
 
 /// Write one server's on/off flag into the file that defines it.
@@ -2171,12 +2221,133 @@ mod tests {
         .unwrap();
 
         let registry = std::sync::Arc::new(McpRegistry::new());
-        let facts = futures::executor::block_on(mcp_row_facts(dir.path(), &registry, &[]));
+        let facts = futures::executor::block_on(mcp_row_facts(dir.path(), &registry, &[])).unwrap();
         let row = facts.iter().find(|f| f.name == "off").expect("listed");
         assert!(row.disabled, "the flag reaches the row");
         assert_eq!(
             row.tool_count, 0,
             "a disabled server put nothing on the model"
+        );
+    }
+
+    /// A config file that does not parse is said, not listed as nothing.
+    ///
+    /// The management list answers "which servers are configured"; answering
+    /// "none" for a file with a stray comma tells the person their config is
+    /// empty when it is broken, and hides the reason from the one screen that
+    /// is about it.
+    #[test]
+    fn a_broken_config_is_an_error_not_an_empty_list() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".mcp.json"),
+            r#"{"mcpServers":{"a":{"command":"npx"},}}"#,
+        )
+        .unwrap();
+
+        let registry = std::sync::Arc::new(McpRegistry::new());
+        let facts = futures::executor::block_on(mcp_row_facts(dir.path(), &registry, &[]));
+        assert!(
+            facts.is_err(),
+            "a file that does not parse must not read as no servers: {facts:?}"
+        );
+    }
+
+    /// A tool of the given name, for a catalog to hold and release.
+    struct Named(&'static str);
+
+    #[async_trait::async_trait]
+    impl atomcode_kernel::tool::Tool for Named {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn description(&self) -> &str {
+            "test tool"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            _args: &str,
+            _ctx: &atomcode_kernel::tool::ToolContext,
+        ) -> atomcode_kernel::tool::ToolResult {
+            atomcode_kernel::tool::ToolResult {
+                call_id: String::new(),
+                content: "ok".into(),
+                is_error: false,
+                images: Vec::new(),
+            }
+        }
+    }
+
+    /// Enabling a server gives back what disabling it took, and nothing else.
+    ///
+    /// `Disable` holds the server's tools through the person's switches, so an
+    /// `Enable` that only edits the file leaves them held: the server is back,
+    /// the list says so, and the model still cannot call any of it. But the
+    /// release must be exactly what the disable held — a tool the person had
+    /// switched off on their own before is theirs, not the server's.
+    #[test]
+    fn enabling_releases_what_disabling_held_and_leaves_the_persons_own_switch() {
+        let catalog = atomcode_harness::seams::ToolBox::new();
+        catalog
+            .register_from("mcp-host", Arc::new(Named("mcp__srv__read")))
+            .unwrap();
+        catalog
+            .register_from("mcp-host", Arc::new(Named("mcp__srv__write")))
+            .unwrap();
+        // The person switched `write` off themselves, before any of this.
+        catalog.turn_off("mcp__srv__write");
+
+        let names = vec!["mcp__srv__read".to_string(), "mcp__srv__write".to_string()];
+        let held = hold_for_disable(&catalog, &names);
+        assert_eq!(
+            held,
+            vec!["mcp__srv__read".to_string()],
+            "only what the disable itself turned off is its to give back"
+        );
+        assert!(
+            catalog.names().is_empty(),
+            "disabled: none of the server's tools is on offer: {:?}",
+            catalog.names()
+        );
+
+        release_after_enable(&catalog, &held);
+        assert_eq!(
+            catalog.names(),
+            vec!["mcp__srv__read".to_string()],
+            "enabled: what the disable held is back, the person's own switch is not"
+        );
+    }
+
+    /// A release that runs before the server's tools are back still counts.
+    ///
+    /// After an `Enable` the server usually reconnects in the rebuilt graph, so
+    /// its tools register *after* the release. The switch has to be gone by then,
+    /// or they are born hidden.
+    #[test]
+    fn a_release_before_the_tools_return_does_not_leave_them_hidden() {
+        let catalog = atomcode_harness::seams::ToolBox::new();
+        catalog
+            .register_from("mcp-host", Arc::new(Named("mcp__srv__read")))
+            .unwrap();
+        let held = hold_for_disable(&catalog, &["mcp__srv__read".to_string()]);
+        // The server goes away (the rebuild after the disable did not connect it).
+        catalog.unregister("mcp__srv__read");
+
+        release_after_enable(&catalog, &held);
+        // ... and comes back in the rebuild after the enable.
+        catalog
+            .register_from("mcp-host", Arc::new(Named("mcp__srv__read")))
+            .unwrap();
+        assert_eq!(
+            catalog.names(),
+            vec!["mcp__srv__read".to_string()],
+            "the tool that came back after the release is on offer"
         );
     }
 

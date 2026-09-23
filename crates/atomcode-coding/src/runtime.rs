@@ -953,8 +953,9 @@ struct RuntimeResources {
 /// counts.
 ///
 /// One helper for the list and the detail arm, so the two cannot disagree about
-/// the same server. `None` registry — no tree, MCP off — is no rows, not an error.
-async fn mcp_rows_of(runtime: &RuntimeResources) -> Vec<crate::parts::McpRowFacts> {
+/// the same server. `None` registry — no tree, MCP off — is no rows, not an error;
+/// a config file that does not parse is one, carried verbatim.
+async fn mcp_rows_of(runtime: &RuntimeResources) -> Result<Vec<crate::parts::McpRowFacts>, String> {
     let counts: Vec<(String, usize)> = runtime
         .parts
         .mcp_statuses()
@@ -969,28 +970,40 @@ async fn mcp_rows_of(runtime: &RuntimeResources) -> Vec<crate::parts::McpRowFact
         Some(registry) => {
             crate::parts::mcp_row_facts(&runtime.config.working_dir, registry, &counts).await
         }
-        None => Vec::new(),
+        None => Ok(Vec::new()),
     }
 }
 
 /// Run one panel action against the live tree: the six things a person can do to
-/// a configured MCP server (`docs/mcp-panel-design.md` §5.2).
+/// a configured MCP server (`docs/mcp-panel-design.md` §5.2), bar signing in.
+///
+/// Signing in is not here: it opens a browser and writes a token, and touches
+/// nothing the runtime owns, so it is the front end's to run beside the screen
+/// (`cli/tui_mcp.rs`) — the way `/openrouter` authorises — followed by the same
+/// `/mcp reload` any config change takes.
 ///
 /// The failure is a `String` because it is carried to the front end verbatim: a
 /// refused config write must arrive with the guard's own words rather than a
 /// generic failure (§6). The caller wraps it in `RuntimeError::ReconfigureFailed`.
 ///
+/// This writes the state; it does not reconnect. Every action but `Disable` is
+/// followed by a capability reload from [`CodingRuntimeHandle::mcp_act`], which is
+/// what makes a trust or an enabled entry reach the session.
+///
 /// Order is the point where trust or auth change: the tools come off the session
-/// BEFORE the state they were authorised under is changed, and nothing is rebuilt
-/// afterwards — the fail-closed order `CodingParts::withdraw_mcp_tools` documents
-/// for `/mcp reload`, `/mcp untrust` and `/mcp logout`.
+/// BEFORE the state they were authorised under is changed — the fail-closed order
+/// `CodingParts::withdraw_mcp_tools` documents for `/mcp reload`, `/mcp untrust`
+/// and `/mcp logout`.
+///
+/// `holds` is what each `Disable` in this session held back, by server, so the
+/// matching `Enable` gives back exactly that (`parts::hold_for_disable`).
 async fn apply_mcp_action(
     runtime: &mut RuntimeResources,
     server: String,
     action: crate::parts::McpAction,
+    holds: &mut BTreeMap<String, Vec<String>>,
 ) -> Result<(), String> {
     use crate::parts::McpAction;
-    use atomcode_capabilities::mcp::load_mcp_config_including_disabled;
 
     match action {
         McpAction::Trust => {
@@ -1013,37 +1026,31 @@ async fn apply_mcp_action(
                 .map(|_| ())
                 .map_err(|e| format!("{e:#}"))
         }
-        McpAction::Login => {
-            // Blocking: it waits on a browser. The token is
-            // saved by `login_mcp_oauth` itself.
-            let config = load_mcp_config_including_disabled(&runtime.config.working_dir)
-                .map_err(|e| format!("{e:#}"))?
-                .into_iter()
-                .find(|c| c.name == server)
-                .ok_or_else(|| format!("MCP server '{server}' is not configured"))?;
-            tokio::task::block_in_place(|| {
-                atomcode_capabilities::mcp::login_mcp_oauth(
-                    &config,
-                    atomcode_capabilities::mcp::McpOAuthLoginOptions {
-                        client_id: None,
-                        client_secret_env: None,
-                        scopes: Vec::new(),
-                    },
-                )
-            })
-            .map(|_| ())
-            .map_err(|e| format!("{e:#}"))
+        McpAction::Disable => {
+            crate::parts::mcp_set_enabled(&runtime.config.working_dir, &server, false).await?;
+            // Take THIS server's tools off the session — by their published
+            // names, not by a glob (sanitised names can carry a hash suffix) —
+            // and remember which ones, so enabling it again can give them back.
+            if let Some(catalog) = runtime.parts.tool_catalog() {
+                let names = runtime.parts.mcp_tools_for_server(&server);
+                let held = crate::parts::hold_for_disable(&catalog, &names);
+                holds.entry(server).or_default().extend(held);
+            }
+            Ok(())
         }
-        McpAction::Disable | McpAction::Enable => {
-            let enabled = action == McpAction::Enable;
-            crate::parts::mcp_set_enabled(&runtime.config.working_dir, &server, enabled).await?;
-            if !enabled {
-                // Take THIS server's tools off the session —
-                // by their published names, not by a glob
-                // (sanitised names can carry a hash suffix).
-                if let Some(catalog) = runtime.parts.tool_catalog() {
-                    for name in runtime.parts.mcp_tools_for_server(&server) {
-                        catalog.turn_off(&name);
+        McpAction::Enable => {
+            crate::parts::mcp_set_enabled(&runtime.config.working_dir, &server, true).await?;
+            if let Some(held) = holds.remove(&server) {
+                match runtime.parts.tool_catalog() {
+                    Some(catalog) => crate::parts::release_after_enable(&catalog, &held),
+                    // No mounted catalog to go through: drop the switches
+                    // directly, so the tools are not born hidden when the
+                    // rebuild brings them back.
+                    None => {
+                        let switches = runtime.parts.tool_switches();
+                        for name in &held {
+                            switches.turn_on(name, &[]);
+                        }
                     }
                 }
             }
@@ -1795,12 +1802,18 @@ impl CodingRuntimeHandle {
         result.await.map_err(|_| RuntimeError::Unavailable)?
     }
 
-    /// Do one thing to one configured MCP server. Answers when it is done — call
-    /// [`mcp_rows`](Self::mcp_rows) for the state it left behind.
+    /// Do one thing to one configured MCP server, and make it reach the session.
+    /// Answers when it is done — call [`mcp_rows`](Self::mcp_rows) for the state it
+    /// left behind.
     ///
-    /// `Untrust` and `Logout` answer [`RuntimeError::Busy`] while a turn is
-    /// running: they withdraw the tools first, which waits for an idle session.
-    /// The other four run mid-turn.
+    /// Trust and an enabled entry are read when the graph is prepared, and
+    /// untrust and sign-out take every MCP tool off; so every action but `Disable`
+    /// is followed by the same capability reload `/mcp reload` runs. Without it the
+    /// panel would show the server exactly as it was — untrusted after 信任,
+    /// disconnected after 启用 — and the person would take the action for a no-op.
+    ///
+    /// Those four answer [`RuntimeError::Busy`] while a turn is running (both the
+    /// withdrawal and the rebuild wait for an idle session); `Disable` runs mid-turn.
     pub async fn mcp_act(
         &self,
         server: String,
@@ -1811,12 +1824,23 @@ impl CodingRuntimeHandle {
         self.tx
             .send(CodingRuntimeControl::McpAct {
                 generation: runtime_state_generation(state),
-                server,
+                server: server.clone(),
                 action,
                 done,
             })
             .map_err(|_| RuntimeError::Unavailable)?;
-        result.await.map_err(|_| RuntimeError::Unavailable)?
+        result.await.map_err(|_| RuntimeError::Unavailable)??;
+        if !action.rebuilds() {
+            return Ok(());
+        }
+        match self.reload_capabilities().await {
+            Ok(_) => Ok(()),
+            Err(RuntimeError::Busy) => Err(RuntimeError::ReconfigureFailed(format!(
+                "the change to MCP server '{server}' is saved, but a turn started before it \
+                 could be applied; run /mcp reload when the turn ends"
+            ))),
+            Err(error) => Err(error),
+        }
     }
 
     /// What the model can call right now, what the person turned off, and what
@@ -3356,6 +3380,10 @@ fn spawn_runtime_owner_with_optional_agent(
         let mut kernel_turn_open = false;
         let mut ai_name_attempted = false;
         let mut persistence_failure = None;
+        // What each panel `Disable` held back, by server, for the matching
+        // `Enable` to give back. Owned here rather than by the parts because a
+        // rebuild replaces the parts and the person's switches outlive it.
+        let mut mcp_disable_holds: BTreeMap<String, Vec<String>> = BTreeMap::new();
         if agent_available {
             replay_pending_resume_prompt(
                 &agent,
@@ -5085,11 +5113,13 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;
                         };
-                        let rows = mcp_rows_of(runtime).await;
-                        let _ = done.send(Ok(McpRowsSnapshot {
-                            generation: RuntimeGeneration(generation),
-                            rows,
-                        }));
+                        let _ = done.send(match mcp_rows_of(runtime).await {
+                            Ok(rows) => Ok(McpRowsSnapshot {
+                                generation: RuntimeGeneration(generation),
+                                rows,
+                            }),
+                            Err(message) => Err(RuntimeError::ReconfigureFailed(message)),
+                        });
                     }
                     Some(CodingRuntimeControl::McpDetail {
                         generation: request_generation,
@@ -5104,14 +5134,13 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;
                         };
-                        let detail = mcp_rows_of(runtime)
-                            .await
-                            .into_iter()
-                            .find(|row| row.name == server);
-                        let _ = done.send(Ok(McpDetailSnapshot {
-                            generation: RuntimeGeneration(generation),
-                            detail,
-                        }));
+                        let _ = done.send(match mcp_rows_of(runtime).await {
+                            Ok(rows) => Ok(McpDetailSnapshot {
+                                generation: RuntimeGeneration(generation),
+                                detail: rows.into_iter().find(|row| row.name == server),
+                            }),
+                            Err(message) => Err(RuntimeError::ReconfigureFailed(message)),
+                        });
                     }
                     Some(CodingRuntimeControl::McpAct {
                         generation: request_generation,
@@ -5119,18 +5148,17 @@ fn spawn_runtime_owner_with_optional_agent(
                         action,
                         done,
                     }) => {
-                        // Withdrawing the tools is the security-reducing mutation
-                        // `withdraw_mcp_tools` awaits an idle terminal for, so the
-                        // two actions that withdraw take the same refusal as the
-                        // dedicated control. The other four do not withdraw —
-                        // `Disable` only takes tools away, and switching a tool
-                        // mid-session is the point (design §5.4) — so they run.
-                        let withdraws = matches!(
-                            action,
-                            crate::parts::McpAction::Untrust | crate::parts::McpAction::Logout
-                        );
+                        // Every action but `Disable` either withdraws the tools
+                        // (untrust, sign out) — the security-reducing mutation
+                        // `withdraw_mcp_tools` awaits an idle terminal for — or only
+                        // reaches the session through the rebuild that follows it
+                        // (trust, enable), which a running turn refuses. So
+                        // they take the same refusal up front, rather than writing
+                        // the change and then failing to apply it. `Disable` holds
+                        // tools back in place and runs mid-turn (design §5.4).
                         if request_generation != generation
-                            || (withdraws && (compaction_suspended || active_turn.is_some()))
+                            || (action.rebuilds()
+                                && (compaction_suspended || active_turn.is_some()))
                         {
                             let _ = done.send(Err(RuntimeError::Busy));
                             continue;
@@ -5139,7 +5167,8 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;
                         };
-                        let outcome = apply_mcp_action(runtime, server, action).await;
+                        let outcome =
+                            apply_mcp_action(runtime, server, action, &mut mcp_disable_holds).await;
                         let _ = done.send(match outcome {
                             Ok(()) => Ok(()),
                             Err(message) => Err(RuntimeError::ReconfigureFailed(message)),
@@ -15971,13 +16000,16 @@ mod tests {
         handle.shutdown().await.unwrap();
     }
 
-    /// The other half of that rule: only the actions that WITHDRAW wait for an
-    /// idle session. `Disable` takes tools away rather than widening anything, and
-    /// a mid-session switch is the point (design §5.4), so it runs mid-turn the
-    /// way `SwitchTool` already does.
+    /// The other half of that rule: the actions that withdraw the tools, and the
+    /// ones that only reach the session through a rebuild, wait for an idle
+    /// session — up front, before anything is written, so a refusal never leaves
+    /// a change on disk that the session does not have. `Disable` takes tools
+    /// away in place rather than widening anything, and a mid-session switch is
+    /// the point (design §5.4), so it runs mid-turn the way `SwitchTool` does.
     #[tokio::test]
     #[serial_test::serial(atomcode_home)]
-    async fn mcp_act_withdraws_reject_an_active_turn_but_a_disable_goes_through() {
+    async fn mcp_act_that_needs_an_idle_session_rejects_an_active_turn_but_a_disable_goes_through()
+    {
         use crate::parts::McpAction;
 
         let home = tempfile::tempdir().unwrap();
@@ -16043,6 +16075,20 @@ mod tests {
         assert_eq!(untrust, Err(RuntimeError::Busy));
         let logout = handle.mcp_act("srv".into(), McpAction::Logout).await;
         assert_eq!(logout, Err(RuntimeError::Busy));
+        // And the two that only a rebuild can apply.
+        for action in [McpAction::Trust, McpAction::Enable] {
+            assert_eq!(
+                handle.mcp_act("srv".into(), action).await,
+                Err(RuntimeError::Busy),
+                "{action:?} is applied by a rebuild, which a running turn refuses"
+            );
+        }
+        assert!(
+            !std::fs::read_to_string(project.path().join(".mcp.json"))
+                .unwrap()
+                .contains("disabled"),
+            "a refused action wrote nothing"
+        );
 
         // The non-withdrawing one goes through: the flag reached the file.
         handle
@@ -16055,6 +16101,58 @@ mod tests {
             "a mid-turn disable still writes the flag: {text}"
         );
 
+        handle.shutdown().await.unwrap();
+    }
+
+    /// Trusting a project from the panel connects its servers.
+    ///
+    /// Trust is read when the graph is prepared, so writing it and stopping
+    /// there left the server listed as untrusted with 信任 still on offer — the
+    /// action looked like it had not happened. After it, the server has to be
+    /// something other than blocked: connecting, connected, or failed on its own
+    /// terms.
+    #[tokio::test]
+    #[serial_test::serial(atomcode_home)]
+    async fn trusting_a_project_from_the_panel_reaches_the_session() {
+        use crate::parts::McpAction;
+        use atomcode_capabilities::mcp::ServerStatus;
+
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join(".mcp.json"),
+            r#"{"mcpServers":{"local":{"command":"/nonexistent/atomcode-test-mcp"}}}"#,
+        )
+        .unwrap();
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().to_path_buf();
+        start.prepare.mcp = true;
+        let runtime = CodingRuntime::start(start).await.unwrap();
+        let handle = runtime.handle.clone();
+
+        let status = |rows: &McpRowsSnapshot| {
+            rows.rows
+                .iter()
+                .find(|row| row.name == "local")
+                .map(|row| row.status.clone())
+                .expect("the project server is listed")
+        };
+        assert_eq!(
+            status(&handle.mcp_rows().await.unwrap()),
+            ServerStatus::BlockedUntrusted,
+            "an untrusted project's server starts blocked"
+        );
+
+        handle
+            .mcp_act("local".into(), McpAction::Trust)
+            .await
+            .unwrap();
+        assert_ne!(
+            status(&handle.mcp_rows().await.unwrap()),
+            ServerStatus::BlockedUntrusted,
+            "after 信任 the server is no longer held back"
+        );
         handle.shutdown().await.unwrap();
     }
 

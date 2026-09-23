@@ -734,7 +734,6 @@ fn to_mcp_action(
     match action {
         McpAction::Trust => Some(Runtime::Trust),
         McpAction::Untrust => Some(Runtime::Untrust),
-        McpAction::Login => Some(Runtime::Login),
         McpAction::Logout => Some(Runtime::Logout),
         McpAction::Enable => Some(Runtime::Enable),
         McpAction::Disable => Some(Runtime::Disable),

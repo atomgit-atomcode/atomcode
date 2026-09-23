@@ -1833,6 +1833,49 @@ pub struct CommandSaid {
     pub refused: bool,
 }
 
+/// Cut a line into runs, with every `http://` / `https://` address in it a
+/// terminal hyperlink (OSC 8).
+///
+/// A command says an address when a person has to go there — an authorization
+/// page a browser did not open, most of all. Such an address is long, and wrapped
+/// to the width it becomes several rows that a selection copies with the breaks
+/// in them; as a link it opens with a click whatever the wrapping, because every
+/// piece of it carries the whole URL. An address runs to the next whitespace.
+fn with_links(line: &str, style: Style) -> Vec<Span> {
+    let mut runs = Vec::new();
+    let mut rest = line;
+    while let Some(start) = ["https://", "http://"]
+        .iter()
+        .filter_map(|scheme| rest.find(scheme))
+        .min()
+    {
+        #[allow(
+            clippy::string_slice,
+            reason = "`start` is where an ASCII scheme begins, so it is a boundary"
+        )]
+        let (before, from) = (&rest[..start], &rest[start..]);
+        let end = from.find(char::is_whitespace).unwrap_or(from.len());
+        #[allow(
+            clippy::string_slice,
+            reason = "`end` is where a whitespace char begins, or the end"
+        )]
+        let (url, after) = (&from[..end], &from[end..]);
+        if !before.is_empty() {
+            runs.push(Span::styled(before.to_string(), style));
+        }
+        runs.push(Span::linked(
+            url.to_string(),
+            style.underline(),
+            url.to_string(),
+        ));
+        rest = after;
+    }
+    if !rest.is_empty() {
+        runs.push(Span::styled(rest.to_string(), style));
+    }
+    runs
+}
+
 impl Content for CommandSaid {
     fn kind(&self) -> &'static str {
         "command"
@@ -1849,7 +1892,12 @@ impl Content for CommandSaid {
         let style = if self.refused { bad() } else { muted() };
         let mut out = Vec::new();
         for line in self.text.split('\n') {
-            out.extend(wrapped(line, w, style, "  "));
+            let runs = with_links(line, style);
+            if runs.iter().any(|run| run.link.is_some()) && w > 0 {
+                out.extend(crate::markdown::wrap_spans(&runs, w, "  ", muted()));
+            } else {
+                out.extend(wrapped(line, w, style, "  "));
+            }
         }
         out
     }
@@ -2323,6 +2371,52 @@ mod tests {
             open.iter().any(|l| l.plain().contains("line two")),
             "the recognition is there when opened"
         );
+    }
+
+    /// An address a command says is a link on every row it wraps onto.
+    ///
+    /// Found at a real terminal: an MCP sign-in's authorization URL, wider than
+    /// the screen, was cut into rows a selection copies with the breaks in them
+    /// — a link that no longer opens. As a hyperlink each piece carries the
+    /// whole address, so a click opens it however it wrapped.
+    #[test]
+    fn an_address_a_command_says_is_a_link_on_every_row_it_wraps_onto() {
+        let url = "https://mcp.linear.app/authorize?response_type=code&client_id=2aRtnaX2z9oqKLsZ&state=fdd43d4a-a686-4a8e-a010-2daa9a3cce54";
+        let said = CommandSaid {
+            text: format!("浏览器没有打开的话,复制这个链接去打开:{url}"),
+            refused: false,
+        };
+        let lines = said.lines(&wctx(40, false));
+        let linked: Vec<&Span> = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .filter(|span| span.link.is_some())
+            .collect();
+        assert!(lines.len() > 2, "the address wrapped: {lines:?}");
+        assert!(
+            linked.iter().all(|span| span.link.as_deref() == Some(url)),
+            "every piece links to the whole address"
+        );
+        let pieces: String = linked.iter().map(|span| span.text.as_str()).collect();
+        assert_eq!(
+            pieces, url,
+            "the linked pieces are the address, and all of it"
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|line| width::str_width(&line.plain()) <= 40),
+            "no row runs past the width"
+        );
+        // And a line with no address is left as it was.
+        let plain = CommandSaid {
+            text: "没有地址的一句话".into(),
+            refused: false,
+        };
+        assert!(plain
+            .lines(&wctx(40, false))
+            .iter()
+            .all(|line| line.spans.iter().all(|span| span.link.is_none())));
     }
 
     fn welcome() -> WelcomeBlock {

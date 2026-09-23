@@ -3131,6 +3131,14 @@ fn execute_slash_command_impl(
                                 client_secret_env: None,
                                 scopes: Vec::new(),
                             },
+                            // What the library used to print itself; kept as it
+                            // was for this screen, which is on its way out.
+                            &|url| {
+                                println!(
+                                    "  Browser didn't open? Open the URL below to authorize MCP server '{server}':"
+                                );
+                                println!("  {url}");
+                            },
                         )
                     });
                     match result {

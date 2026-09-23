@@ -3751,12 +3751,20 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
                     None
                 }
             });
+            // A terminal command: the URL goes to the terminal, as the fallback
+            // for a browser that did not open.
             let token = login_mcp_oauth(
                 &server,
                 McpOAuthLoginOptions {
                     client_id,
                     client_secret_env,
                     scopes,
+                },
+                &|url| {
+                    println!(
+                        "  Browser didn't open? Open the URL below to authorize MCP server {name:?}:"
+                    );
+                    println!("  {url}");
                 },
             )?;
             println!(
