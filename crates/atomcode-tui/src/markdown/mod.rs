@@ -302,7 +302,10 @@ const OPENABLE_EXTENSIONS: &[&str] = &[
 /// name — the only local paths this tree turns into `file://` links, so a bare
 /// `/etc/hosts` or `/usr/bin` never becomes one.
 fn path_openable(path: &str) -> bool {
-    if !path.starts_with('/') {
+    // Absolute, and NOT protocol-relative (`//cdn/x.png`): a leading `//` is a
+    // network address, not a local file, and `file://`-prefixing it would make a
+    // malformed `file:////…` authority.
+    if !path.starts_with('/') || path.starts_with("//") {
         return false;
     }
     let name = path.rsplit('/').next().unwrap_or("");
@@ -1247,6 +1250,14 @@ mod tests {
                 "no link for {text:?}: {spans:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_protocol_relative_double_slash_is_not_a_file_path() {
+        // `//cdn/logo.png` is a network address, not a local file — it must not
+        // become a malformed `file:////…` link.
+        let spans = spans_of("logo at //cdn.example.com/logo.png here", 200);
+        assert!(spans.iter().all(|s| s.link.is_none()), "{spans:?}");
     }
 
     #[test]
