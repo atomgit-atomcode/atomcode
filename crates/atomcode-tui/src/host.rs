@@ -1109,6 +1109,8 @@ pub struct Hits {
     plugins: Option<Rect>,
     /// And the tools panel's.
     tools: Option<Rect>,
+    /// And the MCP panel's.
+    mcp: Option<Rect>,
     /// And the rewind panel's.
     rewind: Option<Rect>,
     /// And the resume panel's.
@@ -2117,6 +2119,7 @@ impl Host {
                 }
                 m.plugins_panel = None;
                 m.rewind_panel = None;
+                m.mcp_panel = None;
                 m.settings_panel = Some(crate::settings::Panel::new());
                 true
             }
@@ -2392,6 +2395,7 @@ impl Host {
                 m.plugins_panel = None;
                 m.tools_panel = None;
                 m.rewind_panel = None;
+                m.mcp_panel = None;
                 m.providers_panel = Some(crate::providers::Panel::new());
                 true
             }
@@ -2666,6 +2670,7 @@ impl Host {
                 }
                 m.tools_panel = None;
                 m.rewind_panel = None;
+                m.mcp_panel = None;
                 m.plugins_panel = Some(crate::plugins::Panel::new());
                 true
             }
@@ -2859,6 +2864,7 @@ impl Host {
                         .clear();
                 }
                 m.rewind_panel = None;
+                m.mcp_panel = None;
                 m.tools_panel = Some(crate::tools::Panel::new());
                 true
             }
@@ -2996,6 +3002,46 @@ impl Host {
         }
     }
 
+    /// Which row of the MCP panel is under the pointer.
+    ///
+    /// 列表层是**服务器**的第几行,详情层是**动作**的第几行——正是 `Panel::cursor`
+    /// 在两级上各自的含义,所以 `point_mcp_at` 能把它直接交给 `point_at`。
+    pub fn mcp_row_at(&self, x: u16, y: u16) -> Option<usize> {
+        let rect = *self.hits.lock().expect("hits poisoned").mcp.as_ref()?;
+        if !rect.contains(x, y) {
+            return None;
+        }
+        let m = self.moment.read().expect("moment poisoned");
+        let vp = crate::moment::Viewport::new(rect, &m);
+        crate::modules::mcp::geometry(&m, &vp).row_at((y - rect.y) as usize)
+    }
+
+    /// Point the MCP panel at a row. True when it moved.
+    ///
+    /// 两级不是同一个索引空间:光标在列表层走服务器、在详情层走动作,所以夹的
+    /// 上界要照当前这一级算。
+    pub fn point_mcp_at(&self, row: usize) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let rows = {
+            let Some(panel) = m.mcp_panel.as_ref() else {
+                return false;
+            };
+            match panel.level {
+                crate::mcp::Level::List => m.mcp.listed(panel).len(),
+                crate::mcp::Level::Detail => {
+                    let Some(detail) = m.mcp.detail_for(panel.detail_for.as_deref()) else {
+                        return false;
+                    };
+                    panel.actions(detail).len()
+                }
+            }
+        };
+        match m.mcp_panel.as_mut() {
+            Some(panel) => panel.point_at(row, rows),
+            None => false,
+        }
+    }
+
     // ---- the rewind panel ---------------------------------------------------
     //
     // The fifth panel, and deliberately the same dozen methods as the other
@@ -3031,6 +3077,7 @@ impl Host {
                         .expect("provider secret poisoned")
                         .clear();
                 }
+                m.mcp_panel = None;
                 m.rewind_panel = Some(crate::rewind::Panel::new());
                 true
             }
@@ -3207,6 +3254,7 @@ impl Host {
         m.plugins_panel = None;
         m.tools_panel = None;
         m.rewind_panel = None;
+        m.mcp_panel = None;
         m.resume_panel = Some(crate::resume::Panel::new());
         true
     }
@@ -3457,8 +3505,30 @@ impl Host {
     /// there without asking the host for the list again.
     pub fn mcp_detail(&self, detail: crate::mcp::McpDetail) -> bool {
         let mut m = self.moment.write().expect("moment poisoned");
+        // 只收**面板正在等的那一台**。一次慢往返回来时,人可能已经退到列表、把面板
+        // 关了,或者早就换了别的一台;照单挂上去就是把别人的页面盖到当前这一页上,
+        // 而这一页上的动作会打到那一台——停用、登出、取消信任都是破坏性的。
+        let Some(panel) = m.mcp_panel.as_ref() else {
+            return false;
+        };
+        if panel.level != crate::mcp::Level::Detail
+            || panel.detail_for.as_deref() != Some(detail.name.as_str())
+        {
+            return false;
+        }
         m.mcp = std::mem::take(&mut m.mcp).with_detail(detail);
         true
+    }
+
+    /// 面板是不是还停在**这一台**的详情页上。
+    ///
+    /// 动作回来的那一趟用它决定要不要再取一次详情:面板已经退到列表或关掉了,
+    /// 这一趟就不该发——发了也没人看,还白搭一次往返。
+    pub fn mcp_awaiting_detail(&self, server: &str) -> bool {
+        let m = self.moment.read().expect("moment poisoned");
+        m.mcp_panel.as_ref().is_some_and(|p| {
+            p.level == crate::mcp::Level::Detail && p.detail_for.as_deref() == Some(server)
+        })
     }
 
     /// Say that an action is on its way there and back, or that it landed.
@@ -4367,6 +4437,7 @@ impl Host {
                         providers: None,
                         plugins: None,
                         tools: None,
+                        mcp: None,
                         rewind: None,
                         resume: None,
                         menu: None,
@@ -4425,6 +4496,11 @@ impl Host {
                         // And the tools panel.
                         if id == crate::modules::tools::ID {
                             self.hits.lock().expect("hits poisoned").tools = Some(*tail_rect);
+                        }
+                        // And the MCP panel, which rides the same tail and is
+                        // worked with the same pointer.
+                        if id == crate::modules::mcp::ID {
+                            self.hits.lock().expect("hits poisoned").mcp = Some(*tail_rect);
                         }
                         // And the rewind panel.
                         if id == crate::modules::rewind::ID {
@@ -7927,6 +8003,61 @@ mod tests {
             lines_of(&grown, "stream"),
             rows_at_rest,
             "and the rows under the eyes are the ones that were there"
+        );
+    }
+
+    fn server_row(name: &str) -> crate::mcp::McpRow {
+        crate::mcp::McpRow {
+            name: name.to_string(),
+            state: crate::mcp::McpState::Connected,
+            source: "project".to_string(),
+            tool_count: 1,
+            config_path: None,
+        }
+    }
+
+    /// 指针落在一台服务器上时,面板要指到那一台。
+    ///
+    /// 坐标不能算:面板骑在对话流尾部,画在第几行由它下面那些模块多高决定,所以
+    /// 坐标只能从**这一帧**里问——和设置面板那条是同一个道理。
+    #[test]
+    fn a_click_on_a_server_reads_the_row_the_frame_drew() {
+        let h = host_with_mcp();
+        assert!(h.show_mcp(crate::mcp::McpView::new(vec![
+            server_row("alpha"),
+            server_row("beta"),
+        ])));
+        assert!(h.toggle_mcp());
+
+        let frame = h.compose((80, 24));
+        let part = frame
+            .part(crate::modules::mcp::ID)
+            .expect("the panel is drawn");
+        let rect = part.rect;
+        let drawn: Vec<String> = part.lines.iter().map(|l| l.plain()).collect();
+
+        // 画出来的每一行服务器都答它自己的序号,而且两台都点得到。
+        let mut seen: Vec<usize> = Vec::new();
+        for (at, text) in drawn.iter().enumerate() {
+            if let Some(i) = h.mcp_row_at(rect.x + 1, rect.y + at as u16) {
+                assert!(!seen.contains(&i), "row {at} answers {i}, already seen");
+                seen.push(i);
+                let wanted = if i == 0 { "alpha" } else { "beta" };
+                assert!(
+                    text.contains(wanted),
+                    "row {at} answers {i} but draws {text:?}"
+                );
+            }
+        }
+        assert_eq!(seen.len(), 2, "两台都点得到:\n{}", drawn.join("\n"));
+
+        // 点第二台,光标就走过去。
+        assert!(h.point_mcp_at(1));
+        let m = h.moment.read().expect("moment poisoned");
+        assert_eq!(
+            m.mcp_panel.as_ref().expect("it is up").cursor,
+            1,
+            "指针把光标挪到点中的那一行"
         );
     }
 

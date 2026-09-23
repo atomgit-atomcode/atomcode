@@ -146,7 +146,7 @@ fn layout<'a>(view: &'a McpView, panel: &'a Panel, h: usize) -> Vec<Row<'a>> {
                 push_servers(&mut rows, &listed, from, to);
             }
         }
-        Level::Detail => match view.detail() {
+        Level::Detail => match view.detail_for(panel.detail_for.as_deref()) {
             Some(detail) => {
                 let state = detail.state.about();
                 let auth = auth_about(&detail.auth);
@@ -290,7 +290,7 @@ fn header_labels(view: &McpView, panel: &Panel) -> Vec<String> {
             })
             .into_owned(),
         ],
-        Level::Detail => vec![match view.detail() {
+        Level::Detail => vec![match view.detail_for(panel.detail_for.as_deref()) {
             Some(detail) => format!("{} MCP Server", detail.name),
             // 详情还没到,连这一台叫什么都不知道:说的是这是哪块面板。
             None => t(Msg::McpPanelTitle).into_owned(),
@@ -459,6 +459,9 @@ pub fn geometry(moment: &Moment, vp: &Viewport<'_>) -> Geometry {
             .into_iter()
             .map(|row| match row {
                 Row::Server(at, _) => Some(at),
+                // 详情层的动作行也映射:键盘能做的事指针也该能做,否则这一层点不动。
+                // 两级指向的都是 `Panel::cursor` 在这级上的含义,不冲突。
+                Row::Action(at, _) => Some(at),
                 _ => None,
             })
             .collect(),
@@ -551,8 +554,11 @@ mod tests {
                 authenticated: false,
             },
         );
+        // 详情页只画**这一台**的,所以面板得说明它在看谁(`Panel::detail_for`)——
+        // 这正是「等 B 的时候视图里还压着 A」那条路要核的东西。
         let panel = Panel {
             level: Level::Detail,
+            detail_for: Some("figma".to_string()),
             ..Panel::new()
         };
         let lines = render_detail(&view.with_detail(detail), &panel, 60);
@@ -562,6 +568,49 @@ mod tests {
             "动作带编号: {text:?}"
         );
         assert!(text.iter().any(|l| l.contains("认证")), "动作名: {text:?}");
+    }
+
+    /// 等 beta 的详情时,屏幕上不许是 alpha 的那一页。
+    ///
+    /// 上一个 bug 的另一半:动作那条盯「按下去打到谁」,这条盯「眼睛看到谁」。
+    /// 视图里那份详情属于上一台,而面板在等的是这一台——两份都叫「详情」,只有名字
+    /// 分得开,所以照名字核,核不上就画待取的空白页。
+    #[test]
+    fn a_detail_for_another_server_is_not_drawn() {
+        let view = McpView::new(vec![
+            row("alpha", "project", McpState::Connected, 1),
+            row("beta", "project", McpState::NeedsAuthentication, 2),
+        ]);
+        let panel = Panel {
+            level: Level::Detail,
+            detail_for: Some("beta".to_string()),
+            ..Panel::new()
+        };
+
+        // 视图里压着 alpha 的那一份,而面板在等 beta。
+        let alpha_page = detail_of("alpha", McpState::Connected, Auth::None);
+        let text = text_of(&render_detail(
+            &view.clone().with_detail(alpha_page),
+            &panel,
+            60,
+        ));
+        let pending = t(Msg::McpDetailPending).into_owned();
+        assert!(
+            text.iter().any(|l| l.contains(&pending)),
+            "等 beta 的时候就画待取页: {text:?}"
+        );
+        assert!(
+            !text.iter().any(|l| l.contains("alpha")),
+            "别人的页面一个像素都不许露: {text:?}"
+        );
+
+        // 名字对上了就画得出来——这条判据不是「详情页永远画不出来」。
+        let beta_page = detail_of("beta", McpState::NeedsAuthentication, Auth::None);
+        let text = text_of(&render_detail(&view.with_detail(beta_page), &panel, 60));
+        assert!(
+            text.iter().any(|l| l.contains("beta")),
+            "这一台的页面画得出来: {text:?}"
+        );
     }
 
     /// 空有两种,说的不是一件事:一台都没配置,还是过滤之后一台都不剩。对着一个

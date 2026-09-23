@@ -1581,6 +1581,22 @@ impl UserInterface for Tui {
                                     continue;
                                 }
                             }
+                            // And the MCP panel: a click points at the row and
+                            // presses Enter on it — the two presses a keyboard
+                            // makes, so a click can never reach further than a
+                            // key can. On the list that opens a server; on a
+                            // server's page it runs the action under the
+                            // pointer.
+                            if self.host.mcp_open() {
+                                if let Some(row) = self.host.mcp_row_at(x, y) {
+                                    let _ = self.host.point_mcp_at(row);
+                                    self.run_mcp_key(crate::surface::KeyPress::plain(
+                                        crate::surface::Key::Enter,
+                                    ));
+                                    stale = true;
+                                    continue;
+                                }
+                            }
                             // And the rewind panel: a click on a turn points at
                             // it and walks on to the second step — the same two
                             // presses the keyboard makes, so a click can never
@@ -1739,6 +1755,15 @@ impl UserInterface for Tui {
                             if self.host.tools_open() {
                                 if let Some(row) = self.host.tools_row_at(x, y) {
                                     stale |= self.host.point_tools_at(row);
+                                }
+                            }
+                            // And the MCP panel, for the same reason: the row under
+                            // the pointer is the row a press would take, and a
+                            // highlight somewhere else while the pointer is somewhere
+                            // is the panel lying about its own state.
+                            if self.host.mcp_open() {
+                                if let Some(row) = self.host.mcp_row_at(x, y) {
+                                    stale |= self.host.point_mcp_at(row);
                                 }
                             }
                             // And the rewind panel.
@@ -2611,6 +2636,20 @@ impl Tui {
                     match done {
                         Ok(view) => {
                             host.show_mcp(view);
+                            // 动作已经落在这一台上了,所以页面上那份详情是旧状态;
+                            // 而 `act` 答的是**目录**(不带详情),整个视图换掉之后
+                            // 这一页会变成空白的「正在取详情…」。面板要是还停在这一
+                            // 台,就再取一次,让人看见动作之后的样子。
+                            if host.mcp_awaiting_detail(&server) {
+                                match port.detail(&server).await {
+                                    Ok(detail) => {
+                                        host.mcp_detail(detail);
+                                    }
+                                    Err(why) => {
+                                        host.mcp_note(Some(why));
+                                    }
+                                }
+                            }
                         }
                         Err(why) => {
                             host.mcp_note(Some(why));
@@ -5938,6 +5977,80 @@ mod mcp_panel_tests {
         }
     }
 
+    /// 两台服务器,而且**记下**每一次动作是冲着谁发的——判据要看的正是这个:
+    /// 「动作发对了」不能只看屏幕上画的是谁,要看真发出去的那一份。
+    struct TwoServers {
+        asked: Arc<std::sync::Mutex<Vec<(String, crate::mcp::Action)>>>,
+    }
+
+    fn named(name: &str, state: crate::mcp::McpState) -> crate::mcp::McpRow {
+        crate::mcp::McpRow {
+            name: name.to_string(),
+            state,
+            source: "project".to_string(),
+            tool_count: 1,
+            config_path: None,
+        }
+    }
+
+    fn page_of(name: &str) -> crate::mcp::McpDetail {
+        crate::mcp::McpDetail {
+            name: name.to_string(),
+            state: crate::mcp::McpState::NeedsAuthentication,
+            source: "project".to_string(),
+            transport: crate::mcp::Transport::Http {
+                url: "https://example.invalid/mcp".to_string(),
+            },
+            auth: crate::mcp::Auth::OAuth {
+                authenticated: false,
+            },
+            tool_count: 1,
+            config_path: None,
+        }
+    }
+
+    #[async_trait]
+    impl crate::mcp::Mcp for TwoServers {
+        async fn list(&self) -> Result<crate::mcp::McpView, String> {
+            Ok(crate::mcp::McpView::new(vec![
+                named("alpha", crate::mcp::McpState::NeedsAuthentication),
+                named("beta", crate::mcp::McpState::NeedsAuthentication),
+            ]))
+        }
+
+        async fn detail(&self, server: &str) -> Result<crate::mcp::McpDetail, String> {
+            Ok(page_of(server))
+        }
+
+        async fn act(
+            &self,
+            server: &str,
+            action: crate::mcp::Action,
+        ) -> Result<crate::mcp::McpView, String> {
+            self.asked
+                .lock()
+                .expect("asked poisoned")
+                .push((server.to_string(), action));
+            Ok(crate::mcp::McpView::new(vec![named(
+                server,
+                crate::mcp::McpState::Connected,
+            )]))
+        }
+    }
+
+    /// 一个上下文,端口就是给的那一个。
+    fn with_port_of(tui: &Tui, port: Arc<dyn crate::mcp::Mcp>) {
+        let app = App::new(PluginRegistry::new(), ConfigTree::default());
+        let _ = app.context().provide::<McpSvc>(port);
+        *tui.ctx.lock().expect("ctx poisoned") = Some(app.context());
+    }
+
+    /// 面板此刻在看**哪一台**。
+    fn looked_at(host: &Arc<Host>) -> Option<String> {
+        let m = host.moment.read().expect("moment poisoned");
+        m.mcp_panel.as_ref().and_then(|p| p.detail_for.clone())
+    }
+
     /// A screen with the MCP panel's module mounted and a wake channel on it:
     /// what a bare `/mcp` needs, plus the door the answer comes back through.
     fn screen() -> (Arc<Host>, Tui, mpsc::UnboundedReceiver<Wake>) {
@@ -6027,6 +6140,63 @@ mod mcp_panel_tests {
             m.mcp.detail().map(|detail| detail.tool_count),
             Some(3),
             "and it is the page the port sent, not a stub built here"
+        );
+    }
+
+    /// 从 A 的详情退回来、立刻进 B,再按下的动作必须是发给 **B** 的。
+    ///
+    /// 这条盯的是最贵的那种错:B 的回包还没到时,视图里压着的是 A 的那一份详情,
+    /// 而屏幕上的动作表正是照它算出来的——照单执行就是拿 A 去停用/登出/取消信任。
+    /// 判据不能只看屏幕上画着谁,要看真发出去的那一份,所以端口在这里记名。
+    ///
+    /// `current_thread` 是判据的一部分:只有单线程运行时,两次按键之间那个「回包
+    /// 还没到」的窗口才是确定的,每一步都走同一条路。少了它,这条会时红时绿。
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_action_from_the_page_never_reaches_the_server_it_was_not_asked_for() {
+        let (host, tui, mut woken) = screen();
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        with_port_of(
+            &tui,
+            Arc::new(TwoServers {
+                asked: asked.clone(),
+            }),
+        );
+
+        tui.act(Action::ToggleMcp, &tui.client);
+        landed(&mut woken).await;
+
+        // 钻进 alpha,回包到了。
+        tui.run_mcp_key(KeyPress::plain(Key::Enter));
+        landed(&mut woken).await;
+        assert_eq!(looked_at(&host), Some("alpha".to_string()), "看的是 alpha");
+
+        // 退回列表,走到 beta 上,再钻进去——**beta 的回包还没到**,视图里仍是
+        // alpha 的那一页。
+        tui.run_mcp_key(KeyPress::plain(Key::Esc));
+        tui.run_mcp_key(KeyPress::plain(Key::Down));
+        tui.run_mcp_key(KeyPress::plain(Key::Enter));
+        assert_eq!(looked_at(&host), Some("beta".to_string()), "看的是 beta");
+
+        // 就在这一页上按 Enter:动作一次都不许落到 alpha 身上。
+        tui.run_mcp_key(KeyPress::plain(Key::Enter));
+
+        // beta 的回包到了,这时才谈得上执行。
+        landed(&mut woken).await;
+        tui.run_mcp_key(KeyPress::plain(Key::Enter));
+        landed(&mut woken).await;
+
+        let asked = asked.lock().expect("asked poisoned").clone();
+        assert!(
+            !asked.iter().any(|(server, _)| server == "alpha"),
+            "一次都不许打到 alpha 身上: {asked:?}"
+        );
+        assert_eq!(
+            asked
+                .iter()
+                .map(|(server, _)| server.as_str())
+                .collect::<Vec<_>>(),
+            vec!["beta"],
+            "而发出去的那一次是 beta 的"
         );
     }
 

@@ -165,6 +165,18 @@ impl McpView {
         self.detail.as_ref()
     }
 
+    /// 这一台的那份详情,不是这一台就当没有。
+    ///
+    /// `for_` 是面板正在看的那一台([`Panel::detail_for`])。过滤而不是断言,
+    /// 因为「回包还没到」本来就是常态:调用方拿到的 `None` 有两重意思——正在等,
+    /// 或者手里那份属于别人——而两者该有同一种表现:画「正在取详情…」,不画
+    /// 别人的页面,也不拿别人的动作去打。
+    pub fn detail_for(&self, for_: Option<&str>) -> Option<&McpDetail> {
+        self.detail
+            .as_ref()
+            .filter(|d| for_ == Some(d.name.as_str()))
+    }
+
     /// 按来源分组,来源之间按名字排。空目录给空表。
     pub fn grouped(&self) -> Vec<(&str, Vec<&McpRow>)> {
         let mut out: Vec<(&str, Vec<&McpRow>)> = Vec::new();
@@ -207,6 +219,14 @@ pub struct Panel {
     /// 上一次操作之后要说的一句话,比如「配置里有注释,写不进去」。
     pub note: Option<String>,
     pub busy: Option<Busy>,
+    /// 详情页在看**哪一台**——正在等的那一台也算。
+    ///
+    /// 详情有名字,而视图里压着的那一份不一定属于当前这一台:人从 A 退回来、
+    /// 立刻对 B 按下 Enter 时,B 的回包还没到,视图里仍是 A 的那一份。照名字核
+    /// 一遍,那一份就既画不出来也按不动——否则 B 的页面上按下的动作会打到 A。
+    pub detail_for: Option<String>,
+    /// 进详情之前光标停在列表的哪一行,退回来时站回原处。
+    pub list_at: usize,
 }
 
 impl Panel {
@@ -321,6 +341,8 @@ pub fn key(view: &McpView, panel: &mut Panel, press: KeyPress) -> Step {
             };
             let server = row.name.clone();
             panel.level = Level::Detail;
+            panel.detail_for = Some(server.clone());
+            panel.list_at = panel.cursor;
             panel.cursor = 0;
             Step::OpenDetail { server }
         }
@@ -347,13 +369,26 @@ pub fn key(view: &McpView, panel: &mut Panel, press: KeyPress) -> Step {
 }
 
 /// 详情层:光标在**动作**之间走,`Esc` 回列表。
+/// 退回列表:光标站回进详情前那一行,并忘掉刚才在看哪一台。
+///
+/// 忘掉是必须的:留着它,下一台的回包到达之前,上一台的详情会被当成「这一台的」
+/// 挂上去——名字核对正是照它做的。
+fn back_to_list(panel: &mut Panel) {
+    panel.level = Level::List;
+    panel.detail_for = None;
+    panel.cursor = panel.list_at;
+}
+
 fn detail_key(view: &McpView, panel: &mut Panel, press: KeyPress) -> Step {
-    let Some(detail) = view.detail() else {
-        // 详情还没到(刚按下 Enter,往返还没回来)。这时 Esc 仍要能退回去,
-        // 否则一次慢往返会把面板卡在空白的详情页上。
+    // 只认**这一台**的详情。`None` 有两重意思——回包还没到,或者手里那份属于
+    // 上一台——而两者该有同一种表现:画「正在取详情…」,不画别人的页面,更不拿
+    // 别人的动作去打(停用、登出、取消信任都是破坏性的)。
+    let Some(detail) = view.detail_for(panel.detail_for.as_deref()) else {
+        // 这时 Esc 仍要能退回去,否则一次慢往返(或一次错配)会把面板卡在空白的
+        // 详情页上。
         return match press.key {
             Key::Esc => {
-                panel.level = Level::List;
+                back_to_list(panel);
                 Step::Stay
             }
             _ => Step::Stay,
@@ -363,7 +398,7 @@ fn detail_key(view: &McpView, panel: &mut Panel, press: KeyPress) -> Step {
     match (press.key, press.mods) {
         (Key::Esc, _) => {
             panel.note = None;
-            panel.level = Level::List;
+            back_to_list(panel);
             Step::Stay
         }
         (Key::Up, _) | (Key::Char('p'), Mods::CTRL) => {
