@@ -194,6 +194,12 @@ echo ""
 echo "=== Generating latest.json ==="
 MANIFEST="$ROOT/latest.json"
 RELEASED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+# The commit these binaries were built from, so a consumer that pins by reading
+# latest.json at a git tag can self-check: the "chore: sync latest.json" commit
+# lands AFTER the tag, so a tag's checked-out latest.json describes the PREVIOUS
+# release. Comparing this `commit` against the tag's own commit makes that lag
+# detectable rather than a silent wrong-sha256. (See feedback E1 / B6.)
+COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
 
 emit_entry() {
     # $1 = target tag (darwin-arm64 / linux-x64 / windows-x64.exe etc.)
@@ -224,6 +230,7 @@ emit_entry() {
 {
     printf '{\n'
     printf '  "version": "%s",\n' "$VERSION"
+    printf '  "commit": "%s",\n' "$COMMIT"
     printf '  "released_at": "%s",\n' "$RELEASED_AT"
     printf '  "binaries": {\n'
     first=1
