@@ -709,6 +709,12 @@ pub struct Moment {
     /// 放在这儿而不是面板里:面板是纯数据、每一键重算一次,而这个是异步回来的,
     /// 且要能认出「答案回来时人已经走到别的行上了」——那时它作废。
     pub resume_preview: Option<(String, Option<Vec<String>>)>,
+    /// The sessions kept running in the background, as the host last pushed
+    /// them (`HostEvent::BackgroundChanged`). A fact of the host's, not of the
+    /// log, so it travels this road — see `crate::bg`.
+    pub bg: crate::bg::BgView,
+    /// The background panel, while it is up.
+    pub bg_panel: Option<crate::bg::Panel>,
     /// What the Usage page draws, as the host last answered it.
     ///
     /// Asked for rather than pushed: an allowance window changes on the

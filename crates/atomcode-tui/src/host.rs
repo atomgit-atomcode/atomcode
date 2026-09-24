@@ -2368,6 +2368,7 @@ impl Host {
                 m.plugins_panel = None;
                 m.rewind_panel = None;
                 m.mcp_panel = None;
+                m.bg_panel = None;
                 m.settings_panel = Some(crate::settings::Panel::new());
                 true
             }
@@ -2644,6 +2645,7 @@ impl Host {
                 m.tools_panel = None;
                 m.rewind_panel = None;
                 m.mcp_panel = None;
+                m.bg_panel = None;
                 m.providers_panel = Some(crate::providers::Panel::new());
                 true
             }
@@ -2919,6 +2921,7 @@ impl Host {
                 m.tools_panel = None;
                 m.rewind_panel = None;
                 m.mcp_panel = None;
+                m.bg_panel = None;
                 m.plugins_panel = Some(crate::plugins::Panel::new());
                 true
             }
@@ -3113,6 +3116,7 @@ impl Host {
                 }
                 m.rewind_panel = None;
                 m.mcp_panel = None;
+                m.bg_panel = None;
                 m.tools_panel = Some(crate::tools::Panel::new());
                 true
             }
@@ -3371,6 +3375,7 @@ impl Host {
                         .clear();
                 }
                 m.mcp_panel = None;
+                m.bg_panel = None;
                 m.rewind_panel = Some(crate::rewind::Panel::new());
                 true
             }
@@ -3548,6 +3553,7 @@ impl Host {
         m.tools_panel = None;
         m.rewind_panel = None;
         m.mcp_panel = None;
+        m.bg_panel = None;
         m.resume_panel = Some(crate::resume::Panel::new());
         true
     }
@@ -3725,6 +3731,89 @@ impl Host {
         }
     }
 
+    // ---- the background panel ---------------------------------------------------
+
+    /// Whether the background panel is up.
+    pub fn bg_open(&self) -> bool {
+        self.moment
+            .read()
+            .expect("moment poisoned")
+            .bg_panel
+            .is_some()
+    }
+
+    /// Bring the background panel up, putting away any other panel a hand works
+    /// in. Opened again while up, it takes the new `moved` — a second `/bg`
+    /// moved another conversation, and Esc should go back to that one. False
+    /// only when there is nothing to draw it with.
+    pub fn open_bg(&self, moved: Option<String>) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        if !self.modules.has_view(crate::modules::bg::ID) {
+            return false;
+        }
+        m.settings_panel = None;
+        if m.providers_panel.take().is_some() {
+            self.providers_secret
+                .lock()
+                .expect("provider secret poisoned")
+                .clear();
+        }
+        m.plugins_panel = None;
+        m.tools_panel = None;
+        m.rewind_panel = None;
+        m.mcp_panel = None;
+        m.resume_panel = None;
+        let mut panel = crate::bg::Panel::new(moved);
+        let view = m.bg.clone();
+        panel.settle(&view);
+        m.bg_panel = Some(panel);
+        true
+    }
+
+    /// Put the background panel away. True when it was up.
+    pub fn close_bg(&self) -> bool {
+        self.moment
+            .write()
+            .expect("moment poisoned")
+            .bg_panel
+            .take()
+            .is_some()
+    }
+
+    /// Put the list the host pushed into the moment. True when it changed.
+    pub fn show_bg(&self, view: crate::bg::BgView) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        if m.bg == view {
+            return false;
+        }
+        m.bg = view.clone();
+        if let Some(panel) = m.bg_panel.as_mut() {
+            panel.settle(&view);
+        }
+        true
+    }
+
+    /// Run one key against the background panel: whether it changed, and what
+    /// the key asked the screen to do.
+    pub fn bg_key(&self, press: crate::surface::KeyPress) -> (bool, Option<crate::bg::Step>) {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let view = m.bg.clone();
+        let Some(panel) = m.bg_panel.as_mut() else {
+            return (false, None);
+        };
+        let before = panel.clone();
+        let step = crate::bg::key(&view, panel, press);
+        let changed = *panel != before;
+        match step {
+            crate::bg::Step::Stay => (changed, None),
+            crate::bg::Step::Close => {
+                m.bg_panel = None;
+                (true, None)
+            }
+            step => (true, Some(step)),
+        }
+    }
+
     // ---- the MCP panel ------------------------------------------------------
     //
     // The same methods the panels above have — open, close, put an answer in,
@@ -3765,6 +3854,7 @@ impl Host {
                 m.rewind_panel = None;
                 m.tools_panel = None;
                 m.resume_panel = None;
+                m.bg_panel = None;
                 m.mcp_panel = Some(crate::mcp::Panel::new());
                 true
             }
@@ -5536,6 +5626,7 @@ pub const TAIL: &[&str] = &[
     crate::modules::mcp::ID,
     crate::modules::rewind::ID,
     crate::modules::resume::ID,
+    crate::modules::bg::ID,
     crate::modules::ask::ID,
     crate::modules::steering::ID,
 ];

@@ -534,6 +534,50 @@ pub enum Msg<'a> {
     ResumeNoOthers,
     ResumePickerHint,
 
+    // ── background sessions (`bg.rs`, `modules/bg.rs`, the host's `background`) ──
+    CmdAboutBg,
+    CmdTakesBg,
+    CmdAboutBackground,
+    CmdTakesTask,
+    BgUsage,
+    BgNeedsTask,
+    BgNoSuchSlot {
+        slot: usize,
+        count: usize,
+    },
+    BgMoved {
+        slot: u32,
+    },
+    BgStarted {
+        slot: u32,
+    },
+    BgDropped {
+        slot: usize,
+    },
+    BgTold {
+        title: &'a str,
+    },
+    BgNoPanel,
+    BgPanelMoved,
+    BgPanelLooking,
+    BgGroupNeedsInput,
+    BgGroupWorking,
+    BgGroupCompleted,
+    BgPanelEmpty,
+    BgPlaceholder,
+    BgReplyTo {
+        title: &'a str,
+    },
+    BgLegend,
+    BgKeys,
+    BgNothingSaid,
+    BgRefusedWhileSharing,
+    BgRefusedWhileAsking,
+    BgRefusedWhileReconfiguring,
+    BgSlotsFull {
+        most: usize,
+    },
+
     // ── reasoning effort, undo and rewind (`commands.rs`) ──
     EffortAbout,
     EffortDefaultAbout,

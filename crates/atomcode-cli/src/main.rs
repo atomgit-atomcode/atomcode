@@ -2598,6 +2598,60 @@ async fn run() -> Result<i32> {
                         skip_permissions: cli.dangerously_skip_permissions,
                         provider_override: cli.provider.clone(),
                     });
+                // `/bg` 要再起 runtime:和启动时同一条装配路径,配置按**那一刻**的
+                // 文件读(期间 `/model`、`/config` 改过的都算),工作目录是前台那时
+                // 所在的目录(`docs/plans/2026-09-25-bg-design.md` §二)。
+                let spawn: atomcode::background::Spawn = {
+                    let config_path = config_path.clone();
+                    let telemetry = telemetry.clone();
+                    let provider = cli.provider.clone();
+                    let skip_permissions = cli.dangerously_skip_permissions;
+                    let no_tools = cli.no_tools;
+                    std::sync::Arc::new(move |working_dir: std::path::PathBuf| {
+                        let config_path = config_path.clone();
+                        let telemetry = telemetry.clone();
+                        let provider = provider.clone();
+                        Box::pin(async move {
+                            let config = if config_path.exists() {
+                                atomcode_config::config::Config::load(&config_path)
+                                    .map_err(|e| e.to_string())?
+                            } else {
+                                atomcode_config::config::Config::default()
+                            };
+                            let mut runtime_cfg = runtime_config_from(
+                                &config,
+                                &working_dir,
+                                provider.as_deref(),
+                                Some(telemetry),
+                                skip_permissions,
+                                true,
+                            );
+                            runtime_cfg.next_prompt_suggestions = true;
+                            let front_end = atomcode_coding::front_end::FrontEnd::new();
+                            let (runtime, config, _) = spawn_native_cli_runtime(
+                                &runtime_cfg,
+                                None,
+                                interactive_provider_bootstrap(&runtime_cfg),
+                                false,
+                                no_tools,
+                                true,
+                                true,
+                                Some(front_end.clone()),
+                            )
+                            .await
+                            .map_err(|e| e.to_string())?;
+                            Ok(atomcode::background::Spawned {
+                                runtime,
+                                front_end,
+                                config,
+                            })
+                        })
+                            as futures::future::BoxFuture<
+                                'static,
+                                Result<atomcode::background::Spawned, String>,
+                            >
+                    })
+                };
                 let result = atomcode::tui_front::run(
                     runtime,
                     front_end,
@@ -2610,6 +2664,7 @@ async fn run() -> Result<i32> {
                     // takes it by value, and which arm runs is decided at
                     // `screen_for`, not here.
                     startup_notice.clone(),
+                    Some(spawn),
                 )
                 .await
                 .map(|()| 0)

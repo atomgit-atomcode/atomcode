@@ -45,6 +45,7 @@
 pub mod ansi;
 pub mod ask;
 pub mod attach;
+pub mod bg;
 pub mod block;
 pub mod caps;
 pub mod clip_hint;

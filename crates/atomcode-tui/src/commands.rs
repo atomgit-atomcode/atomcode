@@ -556,6 +556,141 @@ fn effort_options() -> Vec<CommandOption> {
     out
 }
 
+/// The background sessions, in slot order, as the host answers them now.
+async fn background_list(
+    control: &Arc<dyn atomcode_host_api::HostControl>,
+) -> Result<Vec<atomcode_host_api::BackgroundSession>, String> {
+    match control.call(HostCommand::BackgroundSessions).await {
+        Ok(HostReply::BackgroundSessions { sessions }) => Ok(sessions),
+        Ok(other) => Err(format!("{other:?}")),
+        Err(error) => Err(refusal(error)),
+    }
+}
+
+/// `/bg`, `/bg list`, `/bg <N>`, `/bg drop <N|id>` — and `/bg tell <id> <text>`,
+/// which is what the panel's reply sends (not listed: a person replies from the
+/// panel, where the id is the row they are on).
+async fn background_command(
+    control: &Arc<dyn atomcode_host_api::HostControl>,
+    root: &str,
+    args: &str,
+) -> Outcome {
+    let mut words = args.splitn(2, char::is_whitespace);
+    let first = words.next().unwrap_or("").trim();
+    let rest = words.next().unwrap_or("").trim();
+    // A slot number as `/bg list` numbers it, or a session id as the panel
+    // names it — both land on the same id.
+    let resolve = |sessions: &[atomcode_host_api::BackgroundSession], which: &str| match which
+        .parse::<usize>()
+    {
+        Ok(slot) => sessions
+            .get(slot.wrapping_sub(1))
+            .map(|s| (slot, s.clone()))
+            .ok_or_else(|| {
+                t(Msg::BgNoSuchSlot {
+                    slot,
+                    count: sessions.len(),
+                })
+                .into_owned()
+            }),
+        Err(_) => sessions
+            .iter()
+            .position(|s| s.session == which)
+            .map(|at| (at + 1, sessions[at].clone()))
+            .ok_or_else(|| t(Msg::BgUsage).into_owned()),
+    };
+    match first {
+        "" => match control
+            .call(HostCommand::Background {
+                session: root.to_string(),
+            })
+            .await
+        {
+            Ok(HostReply::Backgrounded { session, .. }) => {
+                let view = background_list(control).await.unwrap_or_default();
+                Outcome::Do(Action::OpenBg {
+                    moved: Some(session),
+                    view: crate::bg::BgView::from_host(view),
+                })
+            }
+            Ok(other) => Outcome::Refused(format!("{other:?}")),
+            Err(error) => Outcome::Refused(refusal(error)),
+        },
+        "list" | "ls" => match background_list(control).await {
+            Ok(sessions) => Outcome::Do(Action::OpenBg {
+                moved: None,
+                view: crate::bg::BgView::from_host(sessions),
+            }),
+            Err(why) => Outcome::Refused(why),
+        },
+        "help" => Outcome::Said(t(Msg::BgUsage).into_owned()),
+        "drop" | "tell" => {
+            let sessions = match background_list(control).await {
+                Ok(sessions) => sessions,
+                Err(why) => return Outcome::Refused(why),
+            };
+            let (which, text) = match first {
+                "tell" => {
+                    let mut parts = rest.splitn(2, char::is_whitespace);
+                    (
+                        parts.next().unwrap_or("").trim(),
+                        parts.next().unwrap_or("").trim(),
+                    )
+                }
+                _ => (rest, ""),
+            };
+            if which.is_empty() || (first == "tell" && text.is_empty()) {
+                return Outcome::Refused(t(Msg::BgUsage).into_owned());
+            }
+            let (slot, session) = match resolve(&sessions, which) {
+                Ok(found) => found,
+                Err(why) => return Outcome::Refused(why),
+            };
+            let command = if first == "tell" {
+                HostCommand::TellBackground {
+                    target: session.session.clone(),
+                    text: text.to_string(),
+                }
+            } else {
+                HostCommand::DropBackground {
+                    target: session.session.clone(),
+                }
+            };
+            match control.call(command).await {
+                Ok(_) if first == "tell" => {
+                    let title = session.title.unwrap_or(session.session);
+                    Outcome::Said(t(Msg::BgTold { title: &title }).into_owned())
+                }
+                Ok(_) => Outcome::Said(t(Msg::BgDropped { slot }).into_owned()),
+                Err(error) => Outcome::Refused(refusal(error)),
+            }
+        }
+        which => {
+            if which.parse::<usize>().is_err() || !rest.is_empty() {
+                return Outcome::Refused(t(Msg::BgUsage).into_owned());
+            }
+            let sessions = match background_list(control).await {
+                Ok(sessions) => sessions,
+                Err(why) => return Outcome::Refused(why),
+            };
+            let (_, session) = match resolve(&sessions, which) {
+                Ok(found) => found,
+                Err(why) => return Outcome::Refused(why),
+            };
+            match control
+                .call(HostCommand::Foreground {
+                    session: root.to_string(),
+                    target: session.session,
+                })
+                .await
+            {
+                Ok(_) => Outcome::Quiet,
+                Err(error) => Outcome::Refused(refusal(error)),
+            }
+        }
+    }
+}
+
 fn session_catalogue() -> Vec<Command> {
     vec![
         Command::said("compact", t(Msg::CmdAboutCompact)),
@@ -568,6 +703,13 @@ fn session_catalogue() -> Vec<Command> {
         // with `/new` as its memorable alias — one row, not two.
         Command::said("session", t(Msg::CmdAboutSession)).with_aliases(&["new"]),
         Command::said_taking("resume", t(Msg::CmdTakesSessionId), t(Msg::CmdAboutResume)),
+        Command::said_taking("bg", t(Msg::CmdTakesBg), t(Msg::CmdAboutBg)),
+        Command::said_taking(
+            "background",
+            t(Msg::CmdTakesTask),
+            t(Msg::CmdAboutBackground),
+        )
+        .requiring(),
         // A closed set of levels, so the menu offers them inline (one row each,
         // marked with the one in force) rather than a modal — the same way `/`
         // shows the commands themselves.
@@ -884,6 +1026,36 @@ impl CommandSet for SessionCommands {
                     .await
                 {
                     Ok(_) => Outcome::Quiet,
+                    Err(error) => Outcome::Refused(refusal(error)),
+                }
+            }
+            // The sessions kept running out of view
+            // (`docs/plans/2026-09-25-bg-design.md`). Everything here is a host
+            // command; the panel is only how the answer is drawn.
+            "bg" => {
+                let Some(control) = control else {
+                    return Outcome::Refused(t(Msg::NoHost).into_owned());
+                };
+                background_command(&control, &root, args.trim()).await
+            }
+            "background" => {
+                let Some(control) = control else {
+                    return Outcome::Refused(t(Msg::NoHost).into_owned());
+                };
+                let task = args.trim();
+                if task.is_empty() {
+                    return Outcome::Refused(t(Msg::BgNeedsTask).into_owned());
+                }
+                match control
+                    .call(HostCommand::StartBackground {
+                        text: task.to_string(),
+                    })
+                    .await
+                {
+                    Ok(HostReply::Backgrounded { slot, .. }) => {
+                        Outcome::Said(t(Msg::BgStarted { slot }).into_owned())
+                    }
+                    Ok(other) => Outcome::Refused(format!("{other:?}")),
                     Err(error) => Outcome::Refused(refusal(error)),
                 }
             }

@@ -154,6 +154,25 @@ pub fn connect(
     config: CodingAgentConfig,
     host_config: Option<Arc<dyn HostConfig>>,
 ) -> Result<HostConnection, String> {
+    let (connection, control) = attach(runtime, front_end, config, host_config, None)?;
+    // 共享(`/webui` / `/sync` / `/app`)要的是这个 runtime 的句柄,而句柄不在
+    // 宿主契约里——它是产品的东西。接上时交给那一层,它自己判断现在共享没有。
+    crate::tui_share::remember(control);
+    Ok(connection)
+}
+
+/// [`connect`], for a host that holds more than one runtime
+/// (`crate::background`): the control comes back as itself, and `shown` says
+/// whether this runtime is the one on screen now — only that one's events are
+/// published to a share. `None` is "always", which is what a host with one
+/// runtime means.
+pub(crate) fn attach(
+    runtime: CodingRuntime,
+    front_end: Arc<FrontEnd>,
+    config: CodingAgentConfig,
+    host_config: Option<Arc<dyn HostConfig>>,
+    shown: Option<Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<(HostConnection, Arc<RuntimeControl>), String> {
     let events = front_end
         .take_receiver()
         .ok_or("this front end is already connected")?;
@@ -181,10 +200,18 @@ pub fn connect(
         while let Some(sequenced) = runtime_events.recv().await {
             // 共享着的话,网页端照这条事件画。挂没挂在那一侧判断,这里不设第二个
             // 开关——两个「现在共享着吗」的答案迟早会不一致。
-            crate::tui_share::publish(&sequenced);
-            // 模式换了也要单独说一声,理由同 attach:远端的徽标读的是那个全局值。
-            if let CodingRuntimeEvent::ModeChanged { mode } = &sequenced.event {
-                crate::tui_share::mode_changed(*mode);
+            //
+            // 只有屏幕上的那个 runtime 的事件才算:后台会话(`crate::background`)
+            // 的回合不是共享出去的那段对话。
+            let on_screen = shown.as_ref().map_or(true, |shown| {
+                shown.load(std::sync::atomic::Ordering::SeqCst)
+            });
+            if on_screen {
+                crate::tui_share::publish(&sequenced);
+                // 模式换了也要单独说一声,理由同 attach:远端的徽标读的是那个全局值。
+                if let CodingRuntimeEvent::ModeChanged { mode } = &sequenced.event {
+                    crate::tui_share::mode_changed(*mode);
+                }
             }
             match sequenced.event {
                 // 运行时没了。走之前说一声 —— 此前这里直接 `break`,于是一个
@@ -391,16 +418,15 @@ pub fn connect(
     });
 
     let session = control.session.lock().expect("session poisoned").clone();
-    // 共享(`/webui` / `/sync` / `/app`)要的是这个 runtime 的句柄,而句柄不在
-    // 宿主契约里——它是产品的东西。接上时交给那一层,它自己判断现在共享没有。
-    crate::tui_share::remember(control.clone());
-
-    Ok(HostConnection {
-        session,
-        commands,
-        events,
+    Ok((
+        HostConnection {
+            session,
+            commands,
+            events,
+            control: control.clone(),
+        },
         control,
-    })
+    ))
 }
 
 impl crate::tui_share::Live for RuntimeControl {
@@ -1175,7 +1201,7 @@ fn command_error(error: RuntimeError) -> CommandError {
 }
 
 /// Host control over a runtime.
-struct RuntimeControl {
+pub(crate) struct RuntimeControl {
     handle: CodingRuntimeHandle,
     /// The live session, as the runtime last said. Empty for a runtime with none.
     session: Mutex<String>,
@@ -1197,6 +1223,36 @@ struct RuntimeControl {
 }
 
 impl RuntimeControl {
+    /// The runtime this controls — for a host holding several
+    /// (`crate::background`), which cancels and stops them itself.
+    pub(crate) fn runtime(&self) -> &CodingRuntimeHandle {
+        &self.handle
+    }
+
+    /// The live session, as the runtime last said.
+    pub(crate) fn session_id(&self) -> String {
+        self.session.lock().expect("session poisoned").clone()
+    }
+
+    /// Where the runtime works now: `/cd` moves it, the configuration it was
+    /// started with does not follow.
+    pub(crate) async fn working_dir_now(&self) -> std::path::PathBuf {
+        match self.handle.context_stats().await {
+            Ok(stats) => stats.working_dir,
+            Err(_) => self
+                .config
+                .lock()
+                .expect("config poisoned")
+                .working_dir
+                .clone(),
+        }
+    }
+
+    /// The front end this runtime's App feeds.
+    pub(crate) fn front_end(&self) -> &Arc<FrontEnd> {
+        &self.front_end
+    }
+
     fn addressed(&self, session: &str) -> Result<(), HostError> {
         if *self.session.lock().expect("session poisoned") == session {
             Ok(())

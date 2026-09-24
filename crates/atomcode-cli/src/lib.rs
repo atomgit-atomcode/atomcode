@@ -29,6 +29,7 @@ fn _tests_assert_in_chinese() {
 pub mod askpass;
 pub mod desktop;
 pub mod relay;
+pub mod tui_bg;
 pub mod tui_command_meter;
 pub mod tui_elsewhere;
 pub mod tui_login;
@@ -61,6 +62,9 @@ pub mod acp;
 /// Lives here because this binary is the host (`docs/architecture-target.md`
 /// §2.4), and a Product crate must not carry a front-end contract.
 pub mod host;
+
+/// 后台会话:一个屏幕背后的多个 runtime(`docs/plans/2026-09-25-bg-design.md`)。
+pub mod background;
 
 /// `atomcode --tui`: the full-screen UI of `atomcode-tui`, in an App of its own,
 /// driving the product runtime through the handle protocol and host control.
@@ -95,6 +99,39 @@ pub mod tui_front {
         // (`crate::tui_opening`).
         opening_notice: Option<String>,
     ) -> Result<launch::Mounted, String> {
+        mount_with_background(
+            runtime,
+            front_end,
+            config,
+            host_config,
+            screen,
+            config_path,
+            telemetry,
+            opening_notice,
+            None,
+        )
+        .await
+        .map(|(mounted, _)| mounted)
+    }
+
+    /// [`mount`], with a way to start more runtimes: `/bg` keeps the session it
+    /// was typed in running out of view (`crate::background`). `None` is a
+    /// screen with one runtime, which refuses `/bg` rather than pretending.
+    ///
+    /// Hands back what holds the runtimes, so the launcher can stop the
+    /// background ones when the screen is gone.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn mount_with_background(
+        runtime: CodingRuntime,
+        front_end: Arc<FrontEnd>,
+        config: CodingAgentConfig,
+        host_config: Option<Arc<dyn crate::host::HostConfig>>,
+        screen: &Screen,
+        config_path: std::path::PathBuf,
+        telemetry: Option<Arc<atomcode_telemetry::Telemetry>>,
+        opening_notice: Option<String>,
+        spawn: Option<crate::background::Spawn>,
+    ) -> Result<(launch::Mounted, Option<Arc<crate::background::Background>>), String> {
         // Both additions belong: the host configuration is what makes
         // `HostCommand::Settings`/`SwitchModel` answerable, and the settings row
         // is the panel `/config` pulls up. They are not alternatives — one is
@@ -113,7 +150,14 @@ pub mod tui_front {
         // here that is about *where this session is* rather than about the
         // configuration file.
         let working_dir = config.working_dir.clone();
-        let connection = connect(runtime, front_end, config, host_config)?;
+        let (connection, background) = match spawn {
+            Some(spawn) => {
+                let (connection, background) =
+                    crate::background::connect(runtime, front_end, config, host_config, spawn)?;
+                (connection, Some(background))
+            }
+            None => (connect(runtime, front_end, config, host_config)?, None),
+        };
         let mut layers = vec![
             crate::tui_settings::row_layer(),
             crate::tui_providers::row_layer(),
@@ -122,6 +166,7 @@ pub mod tui_front {
             crate::tui_mcp::row_layer(),
             crate::tui_rewind::row_layer(),
             crate::tui_resume::row_layer(),
+            crate::tui_bg::row_layer(),
             crate::tui_onboarding::row_layer(),
             crate::tui_login::row_layer(),
             crate::tui_welcome_words::row_layer(),
@@ -144,6 +189,7 @@ pub mod tui_front {
             Arc::new(crate::tui_mcp::McpRow),
             Arc::new(crate::tui_rewind::RewindRow),
             Arc::new(crate::tui_resume::ResumeRow),
+            Arc::new(crate::tui_bg::BgRow),
             Arc::new(crate::tui_onboarding::OnboardingRow {
                 config_path: config_path.clone(),
                 telemetry: telemetry.clone(),
@@ -199,6 +245,7 @@ pub mod tui_front {
             connection,
         )
         .await
+        .map(|mounted| (mounted, background))
     }
 
     /// What host control resolves configuration with for `atomcode --tui`: the
@@ -763,8 +810,9 @@ model = "vendor-b"
         config_path: std::path::PathBuf,
         telemetry: Option<Arc<atomcode_telemetry::Telemetry>>,
         opening_notice: Option<String>,
+        spawn: Option<crate::background::Spawn>,
     ) -> Result<(), String> {
-        let mounted = mount(
+        let (mounted, background) = mount_with_background(
             runtime,
             front_end,
             config,
@@ -773,9 +821,16 @@ model = "vendor-b"
             config_path,
             telemetry,
             opening_notice,
+            spawn,
         )
         .await?;
         let ctx = mounted.app.context();
-        mounted.ui.run(&ctx, None).await
+        let result = mounted.ui.run(&ctx, None).await;
+        // 屏幕没了,后台的会话也停下:取消跑着的回合(半截回复落进日志),放掉租约
+        // (`docs/plans/2026-09-25-bg-design.md` §五)。
+        if let Some(background) = background {
+            background.shutdown_all().await;
+        }
+        result
     }
 }

@@ -1472,6 +1472,12 @@ impl UserInterface for Tui {
                 // at once: the log is the session's only authority
                 // (`docs/adr/0024`), so a person who is not told now will find
                 // out by resuming tomorrow into a conversation missing a turn.
+                // The sessions out of view changed. Kept, not said: the panel
+                // draws them, and a line per state change would bury the
+                // conversation on screen under news about the ones that are not.
+                Wake::Host(HostEvent::BackgroundChanged { sessions }) => {
+                    stale |= self.host.show_bg(crate::bg::BgView::from_host(sessions));
+                }
                 Wake::Host(HostEvent::PersistenceFailed { message, .. }) => {
                     self.host.say(
                         t(Msg::TurnNotStored { message: &message }).into_owned(),
@@ -2066,6 +2072,18 @@ impl UserInterface for Tui {
                 Wake::Input(Input::Key(press)) if self.host.resume_open() => {
                     stale |= self.run_resume_key(press);
                 }
+                // And the background panel — except ctrl+c and ctrl+d, which
+                // keep their meaning everywhere: the screen quits on them, which
+                // is what the panel's own top line promises.
+                Wake::Input(Input::Key(press))
+                    if self.host.bg_open()
+                        && !(matches!(
+                            press.key,
+                            crate::surface::Key::Char('c') | crate::surface::Key::Char('d')
+                        ) && press.mods == crate::surface::Mods::CTRL) =>
+                {
+                    stale |= self.run_bg_key(press);
+                }
                 // A question on screen gets first refusal on every key. It is a
                 // panel riding the tail now, not a modal, so this is the only
                 // place its keys are routed — and focus is still arbitration,
@@ -2630,6 +2648,35 @@ impl Tui {
             return changed;
         };
         self.apply_rewind_step(step);
+        true
+    }
+
+    /// One key against the background panel.
+    ///
+    /// Everything it asks for is said as the command a person could type
+    /// (`/resume <id>`, `/background <task>`, `/bg tell`, `/bg drop`), so the
+    /// panel and a typed command cannot come to mean different things. Opening
+    /// a session is the end of the panel's job; the rest keep it up.
+    fn run_bg_key(&self, press: crate::surface::KeyPress) -> bool {
+        use crate::bg::Step;
+        let (changed, asked) = self.host.bg_key(press);
+        let Some(step) = asked else {
+            return changed;
+        };
+        let line = match step {
+            Step::Open { id } => {
+                self.host.close_bg();
+                format!("/resume {id}")
+            }
+            Step::Start { task } => format!("/background {task}"),
+            Step::Tell { id, text } => format!("/bg tell {id} {text}"),
+            Step::Drop { id } => format!("/bg drop {id}"),
+            Step::Stay | Step::Close => return true,
+        };
+        let keys = self.wake.lock().expect("wake poisoned").clone();
+        if let Some(keys) = keys {
+            let _ = keys.send(Wake::Chose(Some(line)));
+        }
         true
     }
 
@@ -5219,6 +5266,17 @@ impl Tui {
             Action::LookAt(session) => {
                 drop(m);
                 self.switch_to(&session);
+                return false;
+            }
+            // `/bg` brings the panel up on the list it just fetched: the list
+            // first, then the panel over it, so the cursor can land on the
+            // conversation that was just moved.
+            Action::OpenBg { moved, view } => {
+                drop(m);
+                self.host.show_bg(view);
+                if !self.host.open_bg(moved) {
+                    self.say(&t(Msg::BgNoPanel));
+                }
                 return false;
             }
             // The cycle key's action, so a modal or a command that asks for the

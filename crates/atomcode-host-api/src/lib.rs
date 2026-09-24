@@ -291,6 +291,30 @@ pub enum HostCommand {
     /// `provider_unavailable_reason`, `accepts`), the contract does with one
     /// question — and unlike those, the answer carries what to do about it.
     Readiness { session: String },
+    /// Keep `session` running out of view — its turn is not stopped — and put
+    /// an empty session in its place (`docs/plans/2026-09-25-bg-design.md`).
+    ///
+    /// **The one that goes to the background is not replaced, it is kept**:
+    /// same agent, same turn, same lease. What changes is which session the
+    /// front end is following. A host that can hold only one session refuses.
+    Background { session: String },
+    /// The sessions kept running out of view, in the order they were put there.
+    /// A front end numbers them in this order.
+    BackgroundSessions,
+    /// Bring `target`, a background session, to where `session` is now.
+    ///
+    /// `session` goes to the background in its place when it has a
+    /// conversation to keep; an empty one is simply closed — a slot holding
+    /// nothing is a row a person has to read past.
+    Foreground { session: String, target: String },
+    /// Start a new session out of view on `text`; the live one stays live.
+    StartBackground { text: String },
+    /// Say `text` to `target`, a background session, without bringing it
+    /// forward.
+    TellBackground { target: String, text: String },
+    /// Throw `target`, a background session, away: a turn it is running is
+    /// cancelled first, and what it wrote stays in its log.
+    DropBackground { target: String },
 }
 
 impl HostCommand {
@@ -334,12 +358,21 @@ impl HostCommand {
             | Self::Usage { session, .. }
             | Self::Thinking { session }
             | Self::SetThinking { session, .. }
+            | Self::Background { session }
+            | Self::Foreground { session, .. }
             | Self::Readiness { session } => Some(session),
             // Addressed at a stored session, not the live one — see the
             // variant's own note.
             Self::ListSessions { .. }
             | Self::DeleteSession { .. }
             | Self::PreviewSession { .. } => None,
+            // Addressed at a session out of view, or at none: the live one is
+            // not what they act on, so a front end behind on which session is
+            // live is not acting on the wrong one.
+            Self::BackgroundSessions
+            | Self::StartBackground { .. }
+            | Self::TellBackground { .. }
+            | Self::DropBackground { .. } => None,
         }
     }
 }
@@ -536,6 +569,18 @@ pub enum HostReply {
         /// in some other way leaves it out rather than inventing one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stored_at: Option<String>,
+    },
+    /// A session went to the background, and the number it goes by there.
+    ///
+    /// `session` is the one that went: for [`HostCommand::Background`] the
+    /// one that was live, for [`HostCommand::StartBackground`] the new one.
+    Backgrounded {
+        session: String,
+        slot: u32,
+    },
+    /// The sessions kept running out of view, in slot order.
+    BackgroundSessions {
+        sessions: Vec<BackgroundSession>,
     },
     /// The answer to [`HostCommand::Readiness`].
     Readiness {
@@ -1176,6 +1221,46 @@ pub enum HostEvent {
     /// must not be offered in another, which is the whole reason it is here
     /// rather than implied by the connection.
     Suggested { session: String, text: String },
+    /// The sessions out of view changed: one was put there or taken away, a
+    /// turn ended, or one is now waiting for a person. The whole list, in slot
+    /// order — the same one [`HostReply::BackgroundSessions`] answers with, so
+    /// a panel that follows this and one that asks cannot disagree.
+    BackgroundChanged { sessions: Vec<BackgroundSession> },
+}
+
+/// A session kept running out of view.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundSession {
+    pub session: String,
+    /// What the session is called, when it has been named yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub state: BackgroundState,
+    /// When it went to the background. Unix milliseconds.
+    pub created_at: u64,
+    /// One thing worth reading about it now: the question it is waiting on,
+    /// what went wrong, or the last thing it said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last: Option<String>,
+}
+
+/// Where a background session stands.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundState {
+    /// A turn is running.
+    Running,
+    /// A turn is waiting for a person to answer something.
+    Waiting,
+    /// Nothing has run in it.
+    Idle,
+    /// Its last turn finished.
+    Done,
+    /// Its last turn was stopped.
+    Cancelled,
+    /// Its last turn failed, or the session itself stopped working.
+    Failed,
 }
 
 /// Why a host refused or failed a command (`docs/adr/0021` §8).
@@ -1410,6 +1495,22 @@ mod tests {
                 pattern: "mcp__github__*".into(),
                 on: false,
             },
+            HostCommand::Background {
+                session: "a".into(),
+            },
+            HostCommand::BackgroundSessions,
+            HostCommand::Foreground {
+                session: "a".into(),
+                target: "b".into(),
+            },
+            HostCommand::StartBackground {
+                text: "把测试跑一遍".into(),
+            },
+            HostCommand::TellBackground {
+                target: "b".into(),
+                text: "接着来".into(),
+            },
+            HostCommand::DropBackground { target: "b".into() },
         ];
         for c in &all {
             match c {
@@ -1453,6 +1554,12 @@ mod tests {
                 | HostCommand::Thinking { .. }
                 | HostCommand::SetThinking { .. }
                 | HostCommand::Readiness { .. }
+                | HostCommand::Background { .. }
+                | HostCommand::BackgroundSessions
+                | HostCommand::Foreground { .. }
+                | HostCommand::StartBackground { .. }
+                | HostCommand::TellBackground { .. }
+                | HostCommand::DropBackground { .. }
                 | HostCommand::ResetSetting { .. } => {}
             }
         }
@@ -1698,6 +1805,15 @@ mod tests {
             .chain(std::iter::once(HostReply::DoneWithNote {
                 note: "switched, but not written".into(),
             }))
+            .chain([
+                HostReply::Backgrounded {
+                    session: "a".into(),
+                    slot: 1,
+                },
+                HostReply::BackgroundSessions {
+                    sessions: vec![background_session()],
+                },
+            ])
             .collect();
         for r in &all {
             match r {
@@ -1725,6 +1841,8 @@ mod tests {
                 | HostReply::Identity { .. }
                 | HostReply::Sources { .. }
                 | HostReply::ToolCatalog { .. }
+                | HostReply::Backgrounded { .. }
+                | HostReply::BackgroundSessions { .. }
                 | HostReply::Readiness { .. } => {}
             }
         }
@@ -1760,6 +1878,9 @@ mod tests {
                 session: "b".into(),
                 text: "接着把登录那条补上".into(),
             },
+            HostEvent::BackgroundChanged {
+                sessions: vec![background_session()],
+            },
         ];
         for e in &all {
             match e {
@@ -1767,10 +1888,21 @@ mod tests {
                 | HostEvent::Autonomy { .. }
                 | HostEvent::ModeChanged { .. }
                 | HostEvent::Suggested { .. }
+                | HostEvent::BackgroundChanged { .. }
                 | HostEvent::PersistenceFailed { .. } => {}
             }
         }
         all
+    }
+
+    fn background_session() -> BackgroundSession {
+        BackgroundSession {
+            session: "b".into(),
+            title: Some("Rewind 计算问题".into()),
+            state: BackgroundState::Waiting,
+            created_at: 1_758_000_000_000,
+            last: Some("可以改 src/lib.rs 吗?".into()),
+        }
     }
 
     fn errors() -> Vec<HostError> {
@@ -1847,7 +1979,11 @@ mod tests {
     fn a_command_on_the_live_session_names_it() {
         for command in commands() {
             let expected = match &command {
-                HostCommand::ListSessions { .. } => None,
+                HostCommand::ListSessions { .. }
+                | HostCommand::BackgroundSessions
+                | HostCommand::StartBackground { .. }
+                | HostCommand::TellBackground { .. }
+                | HostCommand::DropBackground { .. } => None,
                 _ => Some("a"),
             };
             assert_eq!(command.addressed(), expected, "{command:?}");

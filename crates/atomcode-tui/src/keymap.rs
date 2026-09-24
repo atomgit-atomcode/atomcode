@@ -198,6 +198,14 @@ pub enum Action {
     /// and hands the answer in, rather than the screen holding a seam it would
     /// have to pump. One gesture asks for it — `/resume` with nothing after it.
     OpenResume(crate::resume::ResumeView),
+    /// Bring the background panel up (`crate::bg`).
+    ///
+    /// `moved` is the session `/bg` just put in the background — Esc goes back
+    /// to it — and `None` when the panel was only asked to show the list.
+    OpenBg {
+        moved: Option<String>,
+        view: crate::bg::BgView,
+    },
     /// Put this session — the lead, or a member of its team — on screen.
     ///
     /// An action, and the only one carrying a value, for the reason
