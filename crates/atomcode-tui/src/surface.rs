@@ -1237,6 +1237,24 @@ pub fn probe_report() -> String {
     out
 }
 
+/// Whether this terminal can be asked about its colours at all.
+///
+/// The exchange below ends on a DA1 fence, which every terminal answers and
+/// answers **last**. Orca (observed at 1.4.180) delivers its OSC 11 reply
+/// *after* that DA1 — so the drain stops, the screen starts reading keys, and
+/// the colour reply arrives as a burst of what looks like typing. A wrong
+/// palette costs contrast; this costs a line of `rgb:1c1c/…` in the composer
+/// and a person wondering what they pressed.
+///
+/// So this one is not asked, and the assumed dark palette stands. An explicit
+/// `[ui] theme` is unaffected — it never reaches here.
+///
+/// A pure function of the variable, not a read of it, so the list of terminals
+/// can be judged without owning this machine's environment.
+fn answers_in_order(term_program: Option<&str>) -> bool {
+    !term_program.is_some_and(|program| program.eq_ignore_ascii_case("orca"))
+}
+
 /// Ask the terminal what colours it actually renders.
 ///
 /// Two questions in one exchange: OSC 11 for the background, OSC 4 for each of
@@ -1299,6 +1317,11 @@ fn theme_from_colorfgbg(raw: &str) -> Option<Theme> {
 #[cfg(unix)]
 fn query_terminal() -> (Option<Rgb>, Option<Rgb>, Vec<(u8, Rgb)>) {
     use std::os::fd::AsRawFd;
+
+    // One terminal is not asked at all. See [`answers_in_order`].
+    if !answers_in_order(std::env::var("TERM_PROGRAM").ok().as_deref()) {
+        return (None, None, Vec::new());
+    }
 
     let mut query: Vec<u8> = Vec::with_capacity(256);
     query.extend_from_slice(b"\x1b]11;?\x1b\\");
@@ -2152,5 +2175,53 @@ mod tests {
         // descriptor.
         emergency_restore();
         assert!(!SCREEN_HELD.load(Ordering::SeqCst));
+    }
+
+    /// One terminal is not asked about its colours.
+    ///
+    /// The colour exchange ends on a DA1 fence because every terminal answers
+    /// it last. Orca (1.4.180) answers OSC 11 **after** it — so the drain
+    /// stops, the screen starts reading keys, and the colour reply arrives as
+    /// a burst of what looks like typing. A wrong palette costs contrast; that
+    /// costs a line of `rgb:…` in the composer and a person wondering what
+    /// they pressed.
+    ///
+    /// The list is written out here rather than read from the function, for
+    /// the reason the signal gate's is: reading it back would make removing a
+    /// name from the list a shorter loop and still green.
+    #[test]
+    fn the_terminal_that_answers_out_of_order_is_not_asked() {
+        assert!(!answers_in_order(Some("orca")));
+        assert!(!answers_in_order(Some("Orca")), "however it is cased");
+        // And everything else is, including a terminal that says nothing about
+        // itself — assuming the worst of every terminal would turn one
+        // observed bug into a palette nobody gets.
+        for program in ["iTerm.app", "Apple_Terminal", "WezTerm", "ghostty", ""] {
+            assert!(answers_in_order(Some(program)), "{program}");
+        }
+        assert!(answers_in_order(None));
+    }
+
+    /// And the probe actually asks it.
+    ///
+    /// Judged by reading this file, because the thing that would prove it at
+    /// run time needs a terminal: `query_terminal` writes to a real tty and
+    /// waits on a real reply, so there is no version of it a test can drive.
+    /// The rule above is a pure function and stays green whether or not
+    /// anything calls it — which is exactly the shape of bug that keeps
+    /// turning up here: the judgement pinned, the wiring not.
+    #[cfg(unix)]
+    #[test]
+    fn the_colour_probe_asks_before_it_writes_anything() {
+        let source = include_str!("surface.rs");
+        let body = source
+            .split("fn query_terminal(")
+            .nth(1)
+            .expect("this file defines it");
+        let body = body.split("\n}\n").next().expect("and it ends");
+        assert!(
+            body.contains("answers_in_order("),
+            "the probe writes to the terminal without asking whether this one              can be asked"
+        );
     }
 }
