@@ -34,11 +34,18 @@ pub const DEFAULT_MAX_TOOL_RESULT_BYTES: usize = 64 * 1024;
 
 /// Opt-in policy for exact, no-progress tool-loop detection.
 ///
-/// The default policy warns after three consecutive executions of the same call
+/// The default policy nudges after three consecutive executions of the same call
 /// (or all-read-only batch) return the same model-visible result(s) and success
-/// state, then stops after the fourth. Products may choose higher thresholds for
-/// intentional polling/repetition, or leave the policy disabled. The kernel default
-/// is OFF — a runtime opts in explicitly through [`AgentBuilder::tool_loop_policy`].
+/// state, then stops after the fifth. The nudge is SILENT — a course-correction
+/// message to the MODEL only, never a user-facing warning: a person cannot act on
+/// a mid-turn "it is repeating itself" note (the guard is already correcting it),
+/// so surfacing one is only noise. The gap between the nudge and the stop is
+/// deliberate: it gives a weak model that reacts slowly a couple of rounds to act
+/// on the correction before the turn is cut, rather than only one. Only the STOP
+/// is surfaced to the person, because the turn actually ended. Products may choose
+/// higher thresholds for intentional polling/repetition, or leave the policy
+/// disabled. The kernel default is OFF — a runtime opts in explicitly through
+/// [`AgentBuilder::tool_loop_policy`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ToolLoopPolicy {
     warning_threshold: u32,
@@ -75,7 +82,7 @@ impl Default for ToolLoopPolicy {
     fn default() -> Self {
         Self {
             warning_threshold: 3,
-            stop_threshold: 4,
+            stop_threshold: 5,
         }
     }
 }
@@ -90,18 +97,11 @@ fn tool_loop_course_correction(policy: ToolLoopPolicy) -> String {
     )
 }
 
-fn tool_loop_warning(policy: ToolLoopPolicy) -> String {
-    format!(
-        "possible tool loop: the same call or read-only batch returned the same result(s) {} \
-         times; asking the model to change course",
-        policy.warning_threshold()
-    )
-}
-
 fn tool_loop_terminal_warning(policy: ToolLoopPolicy) -> String {
     format!(
-        "tool loop detected: the same call or read-only batch returned the same result(s) {} \
-         times; stopping before another model request",
+        "Stopped: the model repeated the same action {} times with no new result and did not \
+         change course — it looks stuck (for example an edit that keeps failing the same way). \
+         Send a new message to continue: rephrase the request, or give a concrete hint.",
         policy.stop_threshold()
     )
 }
@@ -4138,7 +4138,12 @@ impl RunningAgent {
                 match exact_loop_decision {
                     ToolLoopDecision::Continue => {}
                     ToolLoopDecision::Warn => {
-                        self.rt.emit(AgentEvent::Warning(tool_loop_warning(policy)));
+                        // SILENT: nudge the model only. No user-facing warning —
+                        // the person cannot act on a mid-turn "the model is
+                        // repeating itself" note (the guard is already correcting
+                        // it), so emitting one only clutters the transcript. The
+                        // user hears about it only if the nudge fails and the turn
+                        // is stopped (the Stop arm below).
                         convo.push(Message::synthetic_user(tool_loop_course_correction(policy)));
                     }
                     ToolLoopDecision::Stop => {

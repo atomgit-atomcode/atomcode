@@ -94,7 +94,7 @@ pub struct CodingAgentConfig {
     /// implement the corresponding UI. The interactive TUI opts in explicitly.
     pub next_prompt_suggestions: bool,
     /// Exact no-progress loop policy. `None` disables it for explicitly intentional
-    /// identical repetition. Defaults to 3/4 and is configurable through
+    /// identical repetition. Defaults to 3/5 and is configurable through
     /// `ATOMCODE_TOOL_LOOP_WARNING_THRESHOLD` / `ATOMCODE_TOOL_LOOP_STOP_THRESHOLD`;
     /// a stop threshold of `0` disables the policy.
     pub tool_loop_policy: Option<ToolLoopPolicy>,
@@ -903,8 +903,8 @@ fn resolve_tool_loop_policy(
     }
     // Values below 3 cannot satisfy the public policy invariant (warning >= 2
     // and warning < stop), so malformed/unsafe external input retains the shipped
-    // 3/4 policy instead of panicking or silently disabling protection.
-    let stop = requested_stop.filter(|value| *value >= 3).unwrap_or(4);
+    // 3/5 policy instead of panicking or silently disabling protection.
+    let stop = requested_stop.filter(|value| *value >= 3).unwrap_or(5);
     let fallback_warning = 3.min(stop - 1).max(2);
     let warning = warning_env
         .and_then(|value| value.trim().parse::<u32>().ok())
@@ -1364,6 +1364,12 @@ mod tests {
         let fallback = resolve_tool_loop_policy(Some("99"), Some("4")).unwrap();
         assert_eq!(fallback.warning_threshold(), 3);
         assert_eq!(fallback.stop_threshold(), 4);
+
+        // The shipped default when nothing is configured: warn at 3, stop at 5 —
+        // two rounds for the course-correction to land before the turn is cut.
+        let default = resolve_tool_loop_policy(None, None).unwrap();
+        assert_eq!(default.warning_threshold(), 3);
+        assert_eq!(default.stop_threshold(), 5);
     }
 
     #[test]

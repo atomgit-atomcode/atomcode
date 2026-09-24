@@ -681,7 +681,9 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StopMaxRounds => "已中断 · 轮数用完了".into(),
         Msg::StopByPolicy => "已中断 · 一条停止策略叫停(时限或预算)".into(),
         Msg::StopRunawayFuse => "已中断 · 兜底熔断,这棵树没挂停止策略".into(),
-        Msg::StopToolLoop => "已中断 · 检测到重复循环".into(),
+        Msg::StopToolLoop => {
+            "已中断 · 模型反复同一步、没有进展 —— 换个说法或给点提示,再发一条消息继续".into()
+        }
         Msg::StopPromptRejected => "已中断 · 输入被拒绝".into(),
         Msg::StopPolicyDenied => "已中断 · 安全策略拦下了这一步".into(),
         Msg::StopRateLimited => "已暂停 · 触发限流".into(),
