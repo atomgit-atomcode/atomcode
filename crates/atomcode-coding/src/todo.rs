@@ -309,15 +309,48 @@ fn current_real_user_start(convo: &Conversation) -> usize {
         .unwrap_or(0)
 }
 
-/// True iff the completion nudge was already injected in the CURRENT real-user turn — so we
-/// nudge at most once; if the model stops again with open items, we let it end.
-fn completion_nudge_already_present(convo: &Conversation) -> bool {
-    let start = current_real_user_start(convo);
-    convo.messages[start..].iter().any(|m| {
-        m.role == Role::User
-            && m.synthetic
-            && m.text.trim_start().starts_with(TODO_COMPLETION_NUDGE)
-    })
+/// How many times one real-user turn is asked to close out its list before a stop is let be.
+const MAX_COMPLETION_NUDGES: usize = 3;
+
+/// Whether this turn may be nudged again: under [`MAX_COMPLETION_NUDGES`], and — when it
+/// was nudged already — only if the model called a tool since. A nudge answered with more
+/// talk is a model that means to stop, and asking again would only spin.
+///
+/// It used to be once per turn. A long turn spent that early, and when the model later
+/// ended a reply on the step it was about to take ("运行测试：") without taking it, the turn
+/// closed as a clean finish with the list still open (a 45-minute, 50-round turn, reported
+/// against 5.1.0).
+fn completion_nudge_allowed(convo: &Conversation) -> bool {
+    let turn = &convo.messages[current_real_user_start(convo)..];
+    let nudges: Vec<usize> = turn
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| {
+            m.role == Role::User
+                && m.synthetic
+                && m.text.trim_start().starts_with(TODO_COMPLETION_NUDGE)
+        })
+        .map(|(i, _)| i)
+        .collect();
+    match nudges.last() {
+        None => true,
+        Some(_) if nudges.len() >= MAX_COMPLETION_NUDGES => false,
+        Some(&last) => turn[last + 1..]
+            .iter()
+            .any(|m| m.role == Role::Assistant && !m.tool_calls.is_empty()),
+    }
+}
+
+/// True iff the reply the model stopped on ends by asking the person something — its last
+/// line ends in a question mark. That stop is waiting for an answer, not stalling.
+fn stops_on_a_question(convo: &Conversation) -> bool {
+    convo
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::Assistant)
+        .and_then(|m| m.text.lines().rev().find(|line| !line.trim().is_empty()))
+        .is_some_and(|line| line.trim_end().ends_with(['?', '？']))
 }
 
 /// True iff the model actively MANAGED the task list this turn (a `todo`/`todowrite` call after
@@ -509,9 +542,11 @@ impl LifecycleHooks for TodoHook {
     }
 
     /// The model wants to stop. If the task list still has OPEN items (pending or in_progress),
-    /// inject a one-shot nudge to close them out (or keep working) and continue the turn — the
-    /// residual gap where a weak model finishes the last item's work but forgets the final
-    /// `todo update`. Fires at most once per real-user turn; `None` otherwise lets it stop.
+    /// inject a nudge to close them out (or keep working) and continue the turn — the gap where
+    /// a weak model finishes the last item's work but forgets the final `todo update`, or ends
+    /// a reply on the step it was about to take. At most [`MAX_COMPLETION_NUDGES`] per
+    /// real-user turn, a further one only after the model did work since the last, and never
+    /// on a reply that asks the person something; `None` otherwise lets it stop.
     ///
     /// The list is the one this round's request showed (see `shown`); a driver
     /// that stops without a request having been made folds the conversation.
@@ -519,7 +554,11 @@ impl LifecycleHooks for TodoHook {
         let shown = self.shown.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let todos = shown.unwrap_or_else(|| derive_current_todos(&convo.messages));
         let has_open = todos.iter().any(|t| t.status != TodoStatus::Completed);
-        if !has_open || !managed_todos_this_turn(convo) || completion_nudge_already_present(convo) {
+        if !has_open
+            || !managed_todos_this_turn(convo)
+            || stops_on_a_question(convo)
+            || !completion_nudge_allowed(convo)
+        {
             return None;
         }
         Some(TODO_COMPLETION_NUDGE.to_string())
@@ -1276,7 +1315,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nudges_at_most_once_per_turn() {
+    async fn a_second_stop_with_no_work_since_the_nudge_is_let_go() {
         let mut convo = convo_of(vec![
             Message::user("do it"),
             todowrite_msg(r#"{"todos":[{"content":"a","status":"in_progress"}]}"#),
@@ -1301,8 +1340,80 @@ mod tests {
                 .offer_continuation(&convo)
                 .await
                 .is_none(),
-            "already nudged this turn → let it stop (no spin)"
+            "nudged, and nothing was done since → let it stop (no spin)"
         );
+    }
+
+    /// A tool call made between two stops: the work the model did after a nudge.
+    fn worked() -> Message {
+        Message::assistant(
+            "running the tests",
+            vec![ToolCall {
+                id: "w".into(),
+                name: "bash".into(),
+                arguments: r#"{"command":"cargo test"}"#.into(),
+            }],
+        )
+    }
+
+    /// A long turn that already spent its nudge, went back to work and then stopped again
+    /// on an announced step ("运行测试：") with items still open, is asked again.
+    ///
+    /// Reported on a 45-minute, 50-round turn: the one nudge a turn used to get was long
+    /// spent, the model ended a reply on the step it was about to take without taking it,
+    /// and the turn closed as a clean finish with the list still open.
+    #[tokio::test]
+    async fn a_stop_after_work_that_followed_a_nudge_is_nudged_again() {
+        let convo = convo_of(vec![
+            Message::user("do it"),
+            todowrite_msg(r#"{"todos":[{"content":"a","status":"in_progress"}]}"#),
+            Message::assistant("summary", vec![]),
+            Message::synthetic_user(TODO_COMPLETION_NUDGE),
+            worked(),
+            Message::assistant("接下来运行测试：", vec![]),
+        ]);
+        assert!(TodoHook::default()
+            .offer_continuation(&convo)
+            .await
+            .is_some());
+    }
+
+    /// Three nudges is the most one turn gets, however much work came between them.
+    #[tokio::test]
+    async fn a_turn_is_nudged_at_most_three_times() {
+        let mut messages = vec![
+            Message::user("do it"),
+            todowrite_msg(r#"{"todos":[{"content":"a","status":"in_progress"}]}"#),
+            Message::assistant("summary", vec![]),
+        ];
+        for _ in 0..3 {
+            messages.push(Message::synthetic_user(TODO_COMPLETION_NUDGE));
+            messages.push(worked());
+            messages.push(Message::assistant("stopping again", vec![]));
+        }
+        assert!(TodoHook::default()
+            .offer_continuation(&convo_of(messages))
+            .await
+            .is_none());
+    }
+
+    /// A reply that ends on a question is waiting for the person, not stalling.
+    #[tokio::test]
+    async fn a_stop_that_asks_the_person_something_is_not_nudged() {
+        for question in ["Which database should I target?", "要我接着改 CI 配置吗？"] {
+            let convo = convo_of(vec![
+                Message::user("do it"),
+                todowrite_msg(r#"{"todos":[{"content":"a","status":"in_progress"}]}"#),
+                Message::assistant(format!("The migration is ready.\n{question}"), vec![]),
+            ]);
+            assert!(
+                TodoHook::default()
+                    .offer_continuation(&convo)
+                    .await
+                    .is_none(),
+                "{question}"
+            );
+        }
     }
 
     // ---- the list after a compaction: the sidecar plus what the transcript still carries --

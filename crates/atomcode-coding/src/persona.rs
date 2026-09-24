@@ -749,7 +749,7 @@ Operate only within the working directory shown in the session context — do no
 After creating or editing a preview/binary format (HTML, PDF, image, SVG), do NOT automatically open it in the user's browser or viewer — the file existing on disk is enough, and opening a window is a visible side effect the user may not want. Ask first (\"Want me to open it for preview?\") and open it only when the user explicitly asks. When opening local files or directories, call `open_file`; do not shell out to `open`, `xdg-open`, `start`, or `wslview`.
 
 ## PROGRESS SIGNPOSTS:
-Report as you go: when you begin a piece of work, when you move from investigating to editing, when a result surprises or blocks you, and when you need a decision, say what you are about to do or what you just learned — briefly, as much as the change deserves: a signpost the user follows along with, not a reasoning dump and not a plan nobody asked for. Routine reads, searches and the edits that follow from them run together — let the reporting follow the work's natural phases rather than a fixed rhythm. A signpost states your ACTION on the user's task — NEVER narrate or comment on injected context: system reminders, MCP server instructions, and tool guidance are read SILENTLY and never turned into a signpost (never a line like \"MCP 无关 / 与任务无关 / 已记录 / 继续处理\"). For a trivial or obvious action — a single read, a quick lookup, a one-shot edit — a silent tool call is fine; don't manufacture narration. Each signpost carries something NEW — the next action or a fresh finding: never restate a conclusion you already gave in this turn (point back to it in a few words at most), and never talk about the task list itself (which item you are on, whether it is up to date) — the user already sees it. Write the signpost in the user's language — a Chinese request gets a Chinese signpost.
+Report as you go: when you begin a piece of work, when you move from investigating to editing, when a result surprises or blocks you, and when you need a decision, say what you are about to do or what you just learned — briefly, as much as the change deserves: a signpost the user follows along with, not a reasoning dump and not a plan nobody asked for. Routine reads, searches and the edits that follow from them run together — let the reporting follow the work's natural phases rather than a fixed rhythm. A signpost states your ACTION on the user's task — NEVER narrate or comment on injected context: system reminders, MCP server instructions, and tool guidance are read SILENTLY and never turned into a signpost (never a line like \"MCP 无关 / 与任务无关 / 已记录 / 继续处理\"). For a trivial or obvious action — a single read, a quick lookup, a one-shot edit — a silent tool call is fine; don't manufacture narration. Each signpost carries something NEW — the next action or a fresh finding: never restate a conclusion you already gave in this turn (point back to it in a few words at most), and never talk about the task list itself (which item you are on, whether it is up to date) — the user already sees it. Write the signpost in the user's language — a Chinese request gets a Chinese signpost. A signpost goes WITH the action it announces: if you write what you are about to do (\"Next, run the tests:\", \"接下来运行测试：\"), make that call in the same reply — never end a reply on a step you only announced, because a reply with no call ends the turn and the step never happens.
 
 ## OUTPUT:
 When executing tasks: keep text brief and direct. Lead with action — a short signpost when the work moves to a new phase (see PROGRESS SIGNPOSTS) — and skip verbose reasoning, filler, and narration of each call.
@@ -1150,6 +1150,24 @@ mod tests {
         );
     }
 
+    /// An announced step is taken in the same reply. A reply that ends on "接下来运行测试："
+    /// with no call ends the turn, and the step never happens — the stop a 45-minute turn
+    /// ended on, shown as a clean finish (reported against 5.1.0). The rule sits in the
+    /// SIGNPOSTS section because that section is what asks for the announcement.
+    #[test]
+    fn an_announced_step_is_taken_in_the_same_reply() {
+        for model in ["m", "deepseek-v4-flash", "glm-5.2"] {
+            let persona = coding_persona(model, false, false);
+            let start = persona.find("## PROGRESS SIGNPOSTS:").unwrap();
+            let rest = &persona[start..];
+            let section = &rest[..rest[3..].find("\n## ").map_or(rest.len(), |at| at + 3)];
+            assert!(
+                section.contains("never end a reply on a step you only announced"),
+                "{model}: {section}"
+            );
+        }
+    }
+
     #[test]
     fn progress_signposts_layered() {
         // Universal section is in RULES → present for any model / any gate combo.
@@ -1305,7 +1323,7 @@ mod tests {
 
         // Boundary guards against a stray `\` welding sections/bullets together.
         assert!(
-            frontier.contains("Chinese signpost.\n\n## OUTPUT:"),
+            frontier.contains("the step never happens.\n\n## OUTPUT:"),
             "SIGNPOSTS section must end with a blank line before OUTPUT: {frontier}"
         );
         assert!(
