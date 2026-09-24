@@ -270,6 +270,11 @@ cargo run -p atomcode-daemon -- --no-auth
 
 发送聊天消息，以 SSE（Server-Sent Events）流式返回响应。
 
+每个 `/chat` 请求都在**自己的 runtime** 里跑一轮，回合结束即关闭；会话内容按 `session_id`
+从磁盘接续。因此配置了 MCP 时，每个请求都会启动并连接 MCP server，并**等它们就位（最多
+30 秒）后才开始回合**，模型本轮即可调用 `mcp__*` 工具；超时的 server 本轮缺席。MCP 启动
+较慢、又需要多轮对话的场景，每轮都要付这笔启动时间。
+
 **请求体：**
 
 ```json
@@ -593,38 +598,43 @@ curl -N -X POST http://127.0.0.1:13456/chat \
 
 #### `GET /mcp/status`
 
-获取所有 MCP 服务器的连接状态。
+获取 MCP 服务器的连接状态。
+
+- 当前项目有 live 会话时（`"source": "live"`），报告**该会话 runtime 实际使用的连接**；
+  `tool_count` 是此刻**已挂载到模型面前**的工具数——`connected` 而 `tool_count` 为 0，
+  表示连上了、工具还没挂上（切会话 / reload 期间会短暂出现）。
+- 没有 live 会话时（`"source": "daemon"`），daemon 不持有任何 MCP 连接：配置里的 server
+  逐个列为 `disconnected`，不带 `tool_count`。`/chat` 请求的连接只存在于该请求的回合内，
+  不反映在这里。
+- 被项目信任门拦下的 server 只出现在 `blocked`，不出现在 `servers`。
 
 **响应示例：**
 
 ```json
 {
+  "source": "live",
   "servers": [
-    {
-      "name": "filesystem",
-      "status": "connected",
-      "tool_count": 5,
-      "error": null
-    },
-    {
-      "name": "github",
-      "status": "error",
-      "tool_count": null,
-      "error": "Connection refused"
-    }
-  ]
+    { "name": "filesystem", "status": "connected", "tool_count": 5 },
+    { "name": "github", "status": "error", "error": "Connection refused" }
+  ],
+  "trusted": true,
+  "blocked": []
 }
 ```
 
 #### `POST /mcp/reload`
 
-重新加载 MCP 配置（从 `~/.atomcode/mcp.json`）。
+重新读取 MCP 配置（用户级 `~/.atomcode/mcp.json` 与项目 `.mcp.json`），让当前 live 会话
+重连全部 server，**等工具重新就位（最多 30 秒）后返回**。没有 live 会话时无事可做（下一个
+runtime 启动时会重新读取配置）。
 
 **响应示例：**
 
 ```json
 {
-  "status": "reloading"
+  "ok": true,
+  "status": "reloading",
+  "runtime_reloaded": true
 }
 ```
 

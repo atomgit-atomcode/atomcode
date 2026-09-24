@@ -478,6 +478,17 @@ pub(crate) async fn run_chat_turn_v2(
         send_chat_runtime_error(&runtime_event_tx, format!("切换模式失败：{error}"));
         return;
     }
+    // A headless surface waits for MCP before its first submit (`docs/adr/0002`),
+    // as `atomcode -p` and the daemon's headless live runtime do. Every `/chat`
+    // request is its own runtime, so every turn is that runtime's first: without
+    // this wait a server slower than the first model request was never offered on
+    // `/chat` at all, turn after turn. Bounded, and a timeout only lets the turn
+    // start without the slow server. A stop while waiting goes to the turn's own
+    // cancel path below rather than a second one here.
+    tokio::select! {
+        _ = handle.wait_mcp_ready(atomcode_capabilities::mcp::CONNECT_TIMEOUT) => {}
+        _ = cancel.cancelled() => {}
+    }
     let input = atomcode_coding::UserInput {
         text: user_text,
         images: user_images,

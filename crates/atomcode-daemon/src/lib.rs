@@ -8832,6 +8832,99 @@ mod tests {
         vl_task.await.expect("VL provider task");
     }
 
+    /// `/chat` offers the MCP tools on its first — which is every — turn.
+    ///
+    /// Reported against v5.1.0: `/mcp/status` said connected, `/live` and
+    /// `atomcode -p` offered `mcp__*`, and `/chat` never did, turn after turn.
+    /// Each `/chat` request starts its own runtime and submitted at once, before
+    /// its servers had connected. The fixture server takes a second to start, so
+    /// without the wait the request below goes out with no MCP tool.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn chat_offers_the_mcp_tools_on_its_first_turn() {
+        let home = ScopedChatHome::new();
+        let dir = home._dir.path().to_path_buf();
+        let script = dir.join("mcp-server.sh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+sleep 1
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"t","version":"0"}}}\n' "$id" ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"echo back","inputSchema":{"type":"object","properties":{}}}]}}\n' "$id" ;;
+    *'"id":'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+  esac
+done
+"#,
+        )
+        .unwrap();
+        // User-level config: no project trust gate.
+        std::fs::write(
+            dir.join("mcp.json"),
+            serde_json::json!({
+                "mcpServers": { "t": { "command": "sh", "args": [script.to_string_lossy()] } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let (main_url, main_request, main_task) = spawn_openai_sse("done").await;
+        let mut config = Config::with_default_provider("main");
+        config
+            .providers
+            .insert("main".into(), test_provider("deepseek-v4-flash", main_url));
+        config
+            .save(&Config::default_path())
+            .expect("save chat test config");
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let active_chats = ActiveChatRegistry::default();
+        let admission = active_chats
+            .admit(None, Some("chat-mcp-first-turn"))
+            .await
+            .unwrap();
+        let operation_id = admission.operation_id.clone();
+        process_chat_request(
+            ChatRequest {
+                message: "which tools do you have".into(),
+                working_dir: Some(dir.clone()),
+                provider: Some("main".into()),
+                session_id: None,
+                request_id: Some("chat-mcp-first-turn".into()),
+                images: Vec::new(),
+                approval_mode: Some(crate::approval_mode::ApprovalMode::Auto),
+            },
+            event_tx,
+            admission.cancellation,
+            admission.operation_id,
+            active_chats.clone(),
+            chat_test_telemetry(&home),
+            permission_bridge::PermissionResponders::new(),
+            permission_bridge::UserInputResponders::new(),
+            false,
+            false,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .await
+        .expect("chat request succeeds");
+        active_chats.complete(&operation_id).await;
+
+        let request = tokio::time::timeout(std::time::Duration::from_secs(10), main_request)
+            .await
+            .expect("the provider must be called")
+            .expect("request captured");
+        assert!(
+            request.contains("mcp__t__echo"),
+            "the first /chat turn went out without the MCP tool"
+        );
+        main_task.await.expect("provider task");
+    }
+
     // 回归：限流事件必须作为独立的 `rate_limited` ChatEvent 下发（非 error/warning），
     // 携带 reset_at_display/reset_label/secs_until_reset，供 webui 渲染倒计时提示。
     #[test]
