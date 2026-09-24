@@ -2003,6 +2003,10 @@ impl Host {
         if text.is_empty() {
             return;
         }
+        // Sweep any echo still up: a second image submitted before the first
+        // finished recognising would otherwise leave the first one live forever,
+        // a stale bar nothing takes down. One echo at a time.
+        self.clear_echo();
         let id = {
             let mut stream = self.stream.write().expect("stream poisoned");
             stream.writer(ECHO).open(
@@ -5604,13 +5608,6 @@ mod tests {
             .emit(crate::block::Coord::default(), Arc::new(call));
     }
 
-    /// A running tool call pulses its `●` mark white↔grey, so a live call reads
-    /// apart from a finished one at a glance.
-    ///
-    /// The block itself draws a still mark — its render is phase-free by design
-    /// (`RenderCtx` carries no tick) — and the host lays the pulse on from the
-    /// injected tick. So the mark's colour differs between the bright and dim
-    /// halves of the cycle, and the dim half is the muted grey.
     /// The recognising echo shows the just-sent message in the conversation flow
     /// while a picture is read, and leaves no trace once it hands over.
     ///
@@ -5661,8 +5658,31 @@ mod tests {
 
         // A second clear is a no-op, never a panic or a double-settle.
         h.clear_echo();
+
+        // A second image submitted before the first finished recognising sweeps
+        // the first echo — one bar, not a stale one left live under the new one.
+        h.open_echo("第一张 [Image #1]".into());
+        h.open_echo("第二张 [Image #2]".into());
+        let two = lines_of(&h);
+        assert!(
+            two.iter().any(|l| l.contains("第二张")),
+            "the newest submit is what shows: {two:?}"
+        );
+        assert!(
+            !two.iter().any(|l| l.contains("第一张")),
+            "the superseded echo is swept, not left live: {two:?}"
+        );
+        h.clear_echo();
+        assert_eq!(lines_of(&h), before, "and both leave no trace");
     }
 
+    /// A running tool call pulses its `●` mark white↔grey, so a live call reads
+    /// apart from a finished one at a glance.
+    ///
+    /// The block itself draws a still mark — its render is phase-free by design
+    /// (`RenderCtx` carries no tick) — and the host lays the pulse on from the
+    /// injected tick. So the mark's colour differs between the bright and dim
+    /// halves of the cycle, and the dim half is the muted grey.
     #[test]
     fn a_running_tool_call_pulses_its_mark_between_ticks() {
         let h = host();
