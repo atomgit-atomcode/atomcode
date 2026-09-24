@@ -8,7 +8,6 @@
 //! act, and every one of them has to be settable by a test.
 
 use crate::i18n::{t, Msg};
-use atomcode_harness::seams::Question;
 
 use crate::frame::Rect;
 
@@ -723,52 +722,16 @@ pub struct Moment {
     pub status: Option<crate::settings::StatusPage>,
 }
 
-/// A question on screen, with the row that is pointed at.
+/// A question on screen: which page and row are lit, and what has been ticked
+/// and typed so far.
 ///
 /// The cursor lives here rather than in the module's folded state because the
 /// highlight has exactly one owner: the row the up/down arrows are on and the
 /// row the pointer is over are the same row. Kept in two places, a panel ends
 /// up pointing at two rows at once — and the row a click would take has to be
-/// the row that is lit, or the light is a lie.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Ask {
-    pub question: Question,
-    /// Which answer is pointed at, as an index into `question.options`.
-    pub cursor: usize,
-}
-
-impl Ask {
-    /// A question with its first answer pointed at.
-    pub fn new(question: Question) -> Self {
-        Self {
-            question,
-            cursor: 0,
-        }
-    }
-
-    /// Point at `row`, clamped to the answers there are.
-    ///
-    /// Clamped rather than rejected: a pointer on the panel's last row of
-    /// padding, or an arrow pressed past the end of a two-answer question, means
-    /// the nearest answer, not nothing.
-    pub fn point_at(&mut self, row: usize) -> bool {
-        let last = self.question.options.len().saturating_sub(1);
-        let row = row.min(last);
-        if row == self.cursor {
-            return false;
-        }
-        self.cursor = row;
-        true
-    }
-
-    /// The value a confirm would return, if there is one to return.
-    pub fn picked(&self) -> Option<String> {
-        self.question
-            .options
-            .get(self.cursor)
-            .map(|a| a.value.clone())
-    }
-}
+/// the row that is lit, or the light is a lie. What the keys do to it is
+/// [`crate::ask`]'s, where the answers are made.
+pub use crate::ask::Sheet as Ask;
 
 impl Moment {
     pub fn working(mut self) -> Self {
@@ -1390,7 +1353,10 @@ mod tests {
     fn a_question_outranks_a_turn_in_flight() {
         use crate::text::Light;
         let mut asking = Moment::default().working();
-        asking.asking = Some(Ask::new(Question::plain("which one", &["a", "b"])));
+        asking.asking = Some(Ask::one(atomcode_harness::seams::Question::plain(
+            "which one",
+            &["a", "b"],
+        )));
         assert_eq!(asking.light(), Light::Waiting);
         assert_eq!(
             Moment::default()

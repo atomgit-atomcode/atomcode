@@ -94,6 +94,17 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::AskFromMember { who } => format!("来自成员 {who}").into(),
         Msg::AskGrantWholeTool => "这个工具的全部调用".into(),
         Msg::AskGrantOnly { what } => format!("仅限 {what}").into(),
+        Msg::AskTypeSomething => "自己输入…".into(),
+        Msg::AskChatInstead => "改为直接对话".into(),
+        Msg::AskSubmit => "提交".into(),
+        Msg::AskNext => "下一题".into(),
+        Msg::AskReviewTitle => "核对你的回答".into(),
+        Msg::AskReviewReady => "确认提交这些回答吗？".into(),
+        Msg::AskReviewSend => "提交回答".into(),
+        Msg::AskReviewCancel => "取消".into(),
+        Msg::AskUnanswered => "（未回答）".into(),
+        Msg::AskLegendToggle => "勾选".into(),
+        Msg::AskLegendSwitch => "切换题目".into(),
 
         // ── 输入行 ──
         Msg::InputAnswerKeys => "enter 送出 · esc 不给".into(),

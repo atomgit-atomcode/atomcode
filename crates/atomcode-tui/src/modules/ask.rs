@@ -17,14 +17,23 @@
 //!   which is what the modal already did; what changes is where the answer is
 //!   drawn, not who is listening.
 //!
+//! What a page offers follows what was asked ([`crate::ask::Form`]): a choice is
+//! its answers; a model's own question adds a row to type an answer of one's own
+//! and a row to talk it over instead; a multiple choice ticks boxes and has a row
+//! that sends them; a question that wants words is a line to type on. Several
+//! questions asked together are pages behind tabs, with a last page to check the
+//! answers on before they go.
+//!
 //! **Nothing about policy lives here.** Whether a call is asked about is the
-//! approval row's business; what an answer *means* is [`crate::ask`]'s. This
-//! draws a question and says which row is pointed at.
+//! approval row's business; what an answer *means*, and what each key does, are
+//! [`crate::ask`]'s. This draws the sheet and says which row is which.
 
+use crate::ask::{Asked, Form, Sheet, Slot};
 use crate::i18n::product::{t as pt, Msg as PMsg};
 use crate::i18n::{t, Msg};
-use atomcode_harness::seams::{Question, ANSWER_ALWAYS};
+use atomcode_harness::seams::ANSWER_ALWAYS;
 
+use crate::caps::{Caps, Glyph};
 use crate::frame::{Line, Span, Style};
 use crate::module::{Height, View};
 use crate::moment::{Moment, Viewport};
@@ -32,12 +41,13 @@ use crate::theme::{self, Role};
 
 pub const ID: &str = "ask";
 
-/// Cells an answer's own furniture takes: the pointer and the number.
-///
-/// Constant across rows on purpose — an answer that starts in one column when it
-/// is pointed at and another when it is not is a stack that twitches as the
-/// cursor moves down it.
+/// Cells a row's own furniture takes before its words: the pointer and the
+/// number. Prose is wrapped to what is left, so it lines up with the answers.
 const LEAD: usize = 4;
+
+/// The most a page tab's name may take. Past that the tabs of a four-question
+/// batch stop fitting a terminal, and the tab that is lit is the one that goes.
+const TAB_MOST: usize = 12;
 
 /// Nothing folds.
 ///
@@ -59,7 +69,7 @@ impl View for Ask {
     fn absorb(_state: &mut State, _fact: &atomcode_harness::session::SessionEvent) {}
 
     fn render(_state: &State, vp: &Viewport<'_>) -> Vec<Line> {
-        let Some(ask) = vp.moment.asking.as_ref() else {
+        let Some(sheet) = vp.moment.asking.as_ref() else {
             return Vec::new();
         };
         let w = vp.rect.w as usize;
@@ -67,25 +77,13 @@ impl View for Ask {
             return Vec::new();
         }
         let caps = vp.moment.caps;
-        let pointer = caps.g(crate::caps::Glyph::Pointer);
-        layout(&ask.question, w, vp.rect.h as usize)
+        layout(sheet, w, vp.rect.h as usize)
             .into_iter()
-            .map(|row| match row {
-                Row::Blank => Line::empty(),
-                Row::Legend => Line::styled(
-                    format!("  {}", crate::widget::keys(&legend(), caps)),
-                    theme::fg(Role::Muted),
-                )
-                .truncate(w),
-                Row::Text { text, role } => {
-                    Line::styled(format!("  {text}"), theme::fg(role)).truncate(w)
-                }
-                Row::Answer(i) => answer_line(&ask.question, i, ask.cursor == i, pointer, w),
-            })
+            .map(|row| draw(sheet, row, caps, w))
             .collect()
     }
 
-    /// What the panel needs, at this width and with this question in it.
+    /// What the panel needs, at this width and with this page up.
     ///
     /// Counted by *laying it out* rather than by a formula, because the question
     /// wraps: how many rows one takes is a fact about the width it is asked at,
@@ -94,29 +92,31 @@ impl View for Ask {
     /// A box that reports a height it does not then draw is how the modal cut the
     /// end off a long question — see `the_panel_is_as_tall_as_what_it_draws`.
     fn height(_state: &State, moment: &Moment, width: u16) -> Height {
-        let Some(ask) = moment.asking.as_ref() else {
+        let Some(sheet) = moment.asking.as_ref() else {
             return Height::Hug(0);
         };
         if width == 0 {
             return Height::Hug(0);
         }
-        let rows = layout(&ask.question, width as usize, usize::MAX).len();
+        let rows = layout(sheet, width as usize, usize::MAX).len();
         Height::Hug(rows.min(u16::MAX as usize) as u16)
     }
 }
 
-/// What the legend says.
-///
-/// One line, and the same one whether the question is an approval or not: the
-/// keys are the screen's business and they do not change with the question. What
-/// an answer *means* is not in here — that is the harness's, and the wording of
-/// each answer comes from the answerer.
-fn legend() -> [(&'static str, String); 3] {
-    [
-        ("↑↓", t(Msg::AskLegendChoose).into_owned()),
-        ("⏎", t(Msg::AskLegendConfirm).into_owned()),
-        ("esc", pt(PMsg::ApprovalDeny).into_owned()),
-    ]
+/// What the legend says: the keys this page answers to, and nothing about what
+/// an answer *means* — that is the harness's, and the wording of each answer
+/// comes from the answerer.
+fn legend(sheet: &Sheet) -> Vec<(&'static str, String)> {
+    let mut keys = vec![("↑↓", t(Msg::AskLegendChoose).into_owned())];
+    if sheet.page().map(Asked::form) == Some(Form::Multiple) {
+        keys.push(("space", t(Msg::AskLegendToggle).into_owned()));
+    }
+    keys.push(("⏎", t(Msg::AskLegendConfirm).into_owned()));
+    if sheet.is_batch() {
+        keys.push(("←→", t(Msg::AskLegendSwitch).into_owned()));
+    }
+    keys.push(("esc", pt(PMsg::ApprovalDeny).into_owned()));
+    keys
 }
 
 /// One row of the panel, before it is drawn.
@@ -128,25 +128,38 @@ fn legend() -> [(&'static str, String); 3] {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Row {
     Blank,
-    /// The key legend. Its words are not in the row because they are not a
-    /// property of the question — see [`legend`].
+    /// The key legend. Its words are not in the row because they are a property
+    /// of the page, not of the row — see [`legend`].
     Legend,
-    /// A line of prose: who is asking, the tool, the call's arguments, the
-    /// question itself.
+    /// A batch's page tabs.
+    Tabs,
+    /// The line between the answers and the way out of answering.
+    Rule,
+    /// A line of prose: who is asking, the tool, the call's arguments.
     Text {
         text: String,
         role: Role,
     },
-    /// An answer, by index into `question.options`.
-    Answer(usize),
+    /// A line of the question itself.
+    Prompt(String),
+    /// A heading of the panel's own: the review page's.
+    Title(String),
+    /// A row that can be lit and taken, by index into [`Sheet::slots`].
+    Slot(usize),
+    /// A line of what an offered answer means, under it.
+    Detail(String),
+    /// A question, on the review page.
+    Asked(String),
+    /// Question `i`'s answer, on the review page.
+    Recap(usize),
 }
 
-/// The rows this question makes at this width, cut down to `h`.
+/// The rows this sheet makes at this width, cut down to `h`.
 ///
 /// `h` of `usize::MAX` is "how many would it take", which is what `height` asks;
 /// the cut only matters once the tail has been rationed and the panel has less
 /// room than it asked for.
-fn layout(question: &Question, w: usize, h: usize) -> Vec<Row> {
+fn layout(sheet: &Sheet, w: usize, h: usize) -> Vec<Row> {
     if w == 0 || h == 0 {
         return Vec::new();
     }
@@ -154,8 +167,29 @@ fn layout(question: &Question, w: usize, h: usize) -> Vec<Row> {
     if body == 0 {
         return Vec::new();
     }
-    let mut rows = vec![Row::Blank];
+    let mut rows = Vec::new();
+    if sheet.is_batch() {
+        rows.push(Row::Tabs);
+    }
+    rows.push(Row::Blank);
+    match sheet.page() {
+        Some(asked) => question_rows(sheet, asked, w, body, h, &mut rows),
+        None => review_rows(sheet, &mut rows),
+    }
+    rows.extend([Row::Blank, Row::Legend]);
+    fit(rows, h)
+}
 
+/// A question's page: who asks, what, and the rows that answer it.
+fn question_rows(
+    sheet: &Sheet,
+    asked: &Asked,
+    w: usize,
+    body: usize,
+    h: usize,
+    rows: &mut Vec<Row>,
+) {
+    let question = &asked.question;
     // Who is asking. A delegated member's question is not this conversation's,
     // and the person answering is owed the difference — a member's name is the
     // one thing that decides whether an answer is honest.
@@ -165,6 +199,7 @@ fn layout(question: &Question, w: usize, h: usize) -> Vec<Row> {
             role: Role::Warning,
         });
     }
+    let slots = sheet.slots();
 
     match &question.about {
         // An approval is about a *call*, and what a call does is pulled out of
@@ -182,7 +217,7 @@ fn layout(question: &Question, w: usize, h: usize) -> Vec<Row> {
             // options off the panel. Whatever fits is the full command; past the
             // budget a single `…` says the rest is there — the exact bytes still
             // execute, this is what the reader is shown of them.
-            let keep = question.options.len() + 3;
+            let keep = slots.len() + 3;
             let budget = h.saturating_sub(rows.len().saturating_add(keep)).max(1);
             let mut used = 0usize;
             let mut clipped = false;
@@ -213,10 +248,7 @@ fn layout(question: &Question, w: usize, h: usize) -> Vec<Row> {
         // Not an approval: the sentence is all there is, and it is the question.
         None => {
             for line in crate::ask::textwrap(&question.prompt, body) {
-                rows.push(Row::Text {
-                    text: line,
-                    role: Role::Secondary,
-                });
+                rows.push(Row::Prompt(line));
             }
         }
     }
@@ -225,46 +257,82 @@ fn layout(question: &Question, w: usize, h: usize) -> Vec<Row> {
     // runs the first answer into the sentence it answers — so it is pushed with
     // the answers rather than into the salvageable margins below.
     rows.push(Row::Blank);
-    for i in 0..question.options.len() {
-        rows.push(Row::Answer(i));
+    let under = w.saturating_sub(detail_indent(sheet)).max(1);
+    for (k, slot) in slots.iter().enumerate() {
+        if *slot == Slot::Chat {
+            rows.push(Row::Rule);
+        }
+        rows.push(Row::Slot(k));
+        if let Slot::Pick(i) = slot {
+            if let Some(means) = asked.description(*i) {
+                for line in crate::ask::textwrap(means, under) {
+                    rows.push(Row::Detail(line));
+                }
+            }
+        }
     }
-    rows.extend([Row::Blank, Row::Legend]);
-    fit(rows, h)
+}
+
+/// A batch's last page: every question with the answer it was given, and the
+/// two ways out.
+fn review_rows(sheet: &Sheet, rows: &mut Vec<Row>) {
+    rows.push(Row::Title(t(Msg::AskReviewTitle).into_owned()));
+    rows.push(Row::Blank);
+    for (i, asked) in sheet.asked.iter().enumerate() {
+        rows.push(Row::Asked(crate::ask::one_line(&asked.question.prompt)));
+        rows.push(Row::Recap(i));
+    }
+    rows.push(Row::Blank);
+    rows.push(Row::Text {
+        text: t(Msg::AskReviewReady).into_owned(),
+        role: Role::Secondary,
+    });
+    for k in 0..sheet.slots().len() {
+        rows.push(Row::Slot(k));
+    }
 }
 
 /// Cut the layout down to the height it was given, least important row first.
 ///
 /// The order is deliberate: the margin above the question goes, then the legend
-/// and its blank, then the command's OWN lines (the text between the header and
-/// the answers) from the bottom up — and only as a last resort the answers. The
-/// answers are the one thing the panel is for; a short terminal that cannot hold
-/// a long command AND its options drops command lines, never an option a person
-/// still has to pick from. `geometry` fits the same way, so a click still lands
-/// on the row it lit.
+/// and its blank, then what the answers mean, then the question's OWN lines (the
+/// text between the header and the answers) from the bottom up — and only as a
+/// last resort the answers. The answers are the one thing the panel is for; a
+/// short terminal that cannot hold a long command AND its options drops command
+/// lines, never an option a person still has to pick from. `geometry` fits the
+/// same way, so a click still lands on the row it lit.
 fn fit(mut rows: Vec<Row>, h: usize) -> Vec<Row> {
     if rows.len() <= h {
         return rows;
     }
-    if rows.first() == Some(&Row::Blank) {
-        rows.remove(0);
+    // The margin: first under the tabs, or first of all.
+    if let Some(i) = rows.iter().take(2).position(|r| *r == Row::Blank) {
+        rows.remove(i);
     }
-    if rows.last() == Some(&Row::Legend) {
+    if rows.len() > h && rows.last() == Some(&Row::Legend) {
         rows.pop();
         if rows.last() == Some(&Row::Blank) {
             rows.pop();
         }
     }
-    // Still too tall: shed the command's own lines before the answers. Each pass
-    // drops the LAST text row that sits before the first answer — the tail of the
-    // command (its `…` marker first, then its bottom lines), keeping the header
-    // and the answers. Only when no such line is left does the final truncate
-    // reach the answers, which no panel this short could have shown in full.
     while rows.len() > h {
-        let first_answer = rows.iter().position(|r| matches!(r, Row::Answer(_)));
+        let Some(cut) = rows.iter().rposition(|r| matches!(r, Row::Detail(_))) else {
+            break;
+        };
+        rows.remove(cut);
+    }
+    // Still too tall: shed the question's own lines before the answers. Each pass
+    // drops the LAST prose row that sits before the first answer — the tail of
+    // the command (its `…` marker first, then its bottom lines), keeping the
+    // header and the answers. Only when no such line is left does the final
+    // truncate reach the answers, which no panel this short could have shown in
+    // full.
+    while rows.len() > h {
+        let first_answer = rows.iter().position(|r| matches!(r, Row::Slot(_)));
         let Some(cut) = first_answer.and_then(|a| {
             rows[..a]
                 .iter()
-                .rposition(|r| matches!(r, Row::Text { .. }))
+                .rposition(|r| matches!(r, Row::Text { .. } | Row::Prompt(_)))
         }) else {
             break;
         };
@@ -274,53 +342,241 @@ fn fit(mut rows: Vec<Row>, h: usize) -> Vec<Row> {
     rows
 }
 
-/// One answer's row, lit up when it is the one pointed at.
-fn answer_line(question: &Question, i: usize, here: bool, pointer: &str, w: usize) -> Line {
-    let Some(answer) = question.options.get(i) else {
+fn draw(sheet: &Sheet, row: Row, caps: Caps, w: usize) -> Line {
+    match row {
+        Row::Blank => Line::empty(),
+        Row::Legend => Line::styled(
+            format!("  {}", crate::widget::keys(&legend(sheet), caps)),
+            theme::fg(Role::Muted),
+        )
+        .truncate(w),
+        Row::Tabs => tabs_line(sheet, caps, w),
+        Row::Rule => Line::styled(
+            format!(
+                "  {}",
+                caps.g(Glyph::Horizontal).repeat(w.saturating_sub(LEAD))
+            ),
+            theme::fg(Role::Muted),
+        )
+        .truncate(w),
+        Row::Text { text, role } => Line::styled(format!("  {text}"), theme::fg(role)).truncate(w),
+        // The question stands out from what surrounds it: a bar down its left and
+        // its words in bold — it is the one sentence on the panel that has to be
+        // read before anything else is.
+        Row::Prompt(text) => Line::from_spans(vec![
+            Span::styled(
+                format!("{} ", caps.g(Glyph::Vertical)),
+                theme::fg(Role::Accent),
+            ),
+            Span::styled(text, theme::fg(Role::PanelFg).bold()),
+        ])
+        .truncate(w),
+        Row::Title(text) => {
+            Line::styled(format!("  {text}"), theme::fg(Role::PanelFg).bold()).truncate(w)
+        }
+        Row::Slot(k) => slot_line(sheet, k, caps, w),
+        Row::Detail(text) => Line::styled(
+            format!("{}{text}", " ".repeat(detail_indent(sheet))),
+            theme::fg(Role::Muted),
+        )
+        .truncate(w),
+        Row::Asked(text) => Line::from_spans(vec![
+            Span::styled(
+                format!("  {} ", caps.g(Glyph::Bullet)),
+                theme::fg(Role::Muted),
+            ),
+            Span::styled(text, theme::fg(Role::Secondary)),
+        ])
+        .truncate(w),
+        Row::Recap(i) => {
+            let arrow = caps.g(Glyph::Right);
+            match sheet.recap(i) {
+                Some(said) => Line::styled(format!("    {arrow} {said}"), theme::fg(Role::Success)),
+                None => Line::styled(
+                    format!("    {arrow} {}", t(Msg::AskUnanswered)),
+                    theme::fg(Role::Muted),
+                ),
+            }
+            .truncate(w)
+        }
+    }
+}
+
+/// A batch's tabs: one per question, marked for whether it has its answer, and
+/// the review page's last. The page that is up is drawn reversed.
+fn tabs_line(sheet: &Sheet, caps: Caps, w: usize) -> Line {
+    let lit = |on: bool| match on {
+        true => theme::fg(Role::Accent).reverse(),
+        false => theme::fg(Role::Secondary),
+    };
+    let mut spans = vec![Span::styled(
+        format!("{} ", caps.g(Glyph::Left)),
+        theme::fg(Role::Muted),
+    )];
+    for (i, asked) in sheet.asked.iter().enumerate() {
+        let answered = sheet.drafts.get(i).is_some_and(|d| d.answer.is_some());
+        let mark = caps.g(match answered {
+            true => Glyph::Checked,
+            false => Glyph::Unchecked,
+        });
+        let name = crate::width::take_width(&asked.title(), TAB_MOST);
+        spans.push(Span::styled(
+            format!(" {mark} {name} "),
+            lit(i == sheet.tab),
+        ));
+        spans.push(Span::raw(" "));
+    }
+    spans.push(Span::styled(
+        format!(" {} {} ", caps.g(Glyph::Ok), t(Msg::AskSubmit)),
+        lit(sheet.reviewing()),
+    ));
+    spans.push(Span::styled(
+        format!(" {}", caps.g(Glyph::Right)),
+        theme::fg(Role::Muted),
+    ));
+    Line::from_spans(spans).truncate(w)
+}
+
+/// How wide the number column is on this page: the widest number and its
+/// stop, and a space. One width for every row, so the words line up.
+fn number_width(sheet: &Sheet) -> usize {
+    let most = (0..sheet.slots().len())
+        .filter_map(|k| sheet.number(k))
+        .max()
+        .unwrap_or(1);
+    most.to_string().len() + 2
+}
+
+/// Where the lines under an answer start: under the answer's own words.
+fn detail_indent(sheet: &Sheet) -> usize {
+    let boxes = match sheet.page().map(Asked::form) {
+        Some(Form::Multiple) => 2,
+        _ => 0,
+    };
+    2 + number_width(sheet) + boxes
+}
+
+/// One row that can be taken, lit when it is the one pointed at.
+fn slot_line(sheet: &Sheet, k: usize, caps: Caps, w: usize) -> Line {
+    let slots = sheet.slots();
+    let Some(&slot) = slots.get(k) else {
         return Line::empty();
     };
+    let here = sheet.cursor() == k;
     // The pointed-at row is the same panel one step brighter, not a reversed
     // video bar — see `theme::Role::PanelSelBg` for why, and `menu::Menu::render`
     // for the same choice made for the same reason.
-    let base = if here {
-        theme::bg(Role::PanelSelBg).under(theme::fg(Role::PanelFg))
-    } else {
-        Style::new()
+    let style = match here {
+        true => theme::bg(Role::PanelSelBg).under(theme::fg(Role::PanelFg)),
+        false => Style::new(),
     };
-    let mut spans = vec![
-        Span::styled(
-            if here {
-                format!("{pointer} ")
-            } else {
-                "  ".to_string()
-            },
-            if here { base } else { theme::fg(Role::Accent) },
-        ),
-        Span::styled(format!("{}  ", i + 1), base),
-        Span::styled(crate::ask::answer_label(&answer.value, &answer.label), base),
-    ];
-    // What "always" would actually cover. A person saying it is owed the scope
-    // they are saying it to — and "every call of this tool" is a very different
-    // promise from "this one command".
-    if answer.value == ANSWER_ALWAYS {
-        if let Some(grant) = question.about.as_ref().and_then(|a| a.grant.as_deref()) {
-            let covers = match grant.trim().is_empty() {
-                true => t(Msg::AskGrantWholeTool).into_owned(),
-                false => t(Msg::AskGrantOnly {
-                    what: &crate::ask::one_line(grant),
-                })
-                .into_owned(),
+    let quiet = theme::fg(Role::Muted).under(style);
+    let mut spans = vec![Span::styled(
+        match here {
+            true => format!("{} ", caps.g(Glyph::Prompt)),
+            false => "  ".to_string(),
+        },
+        theme::fg(Role::Accent).under(style),
+    )];
+    let number = sheet.number(k).map(|n| format!("{n}.")).unwrap_or_default();
+    spans.push(Span::styled(
+        format!("{number:<width$}", width = number_width(sheet)),
+        style,
+    ));
+
+    let asked = sheet.page();
+    let draft = sheet.draft();
+    if asked.map(Asked::form) == Some(Form::Multiple) {
+        let ticked = match slot {
+            Slot::Pick(i) => {
+                Some(draft.is_some_and(|d| d.checked.get(i).copied().unwrap_or(false)))
+            }
+            Slot::Other => Some(draft.is_some_and(|d| !d.typed.trim().is_empty())),
+            _ => None,
+        };
+        if let Some(ticked) = ticked {
+            let mark = match ticked {
+                true => Glyph::Checked,
+                false => Glyph::Unchecked,
+            };
+            spans.push(Span::styled(format!("{} ", caps.g(mark)), style));
+        }
+    }
+
+    match slot {
+        Slot::Pick(i) => {
+            let Some(answer) = asked.and_then(|a| a.question.options.get(i)) else {
+                return Line::from_spans(spans).truncate(w);
             };
             spans.push(Span::styled(
-                format!("  {covers}"),
-                if here { base } else { theme::fg(Role::Muted) },
+                crate::ask::answer_label(&answer.value, &answer.label),
+                style,
             ));
+            // What "always" would actually cover. A person saying it is owed the
+            // scope they are saying it to — and "every call of this tool" is a
+            // very different promise from "this one command".
+            if answer.value == ANSWER_ALWAYS {
+                let grant = asked
+                    .and_then(|a| a.question.about.as_ref())
+                    .and_then(|a| a.grant.as_deref());
+                if let Some(grant) = grant {
+                    let covers = match grant.trim().is_empty() {
+                        true => t(Msg::AskGrantWholeTool).into_owned(),
+                        false => t(Msg::AskGrantOnly {
+                            what: &crate::ask::one_line(grant),
+                        })
+                        .into_owned(),
+                    };
+                    spans.push(Span::styled(
+                        format!("  {covers}"),
+                        match here {
+                            true => style,
+                            false => theme::fg(Role::Muted),
+                        },
+                    ));
+                }
+            }
         }
+        Slot::Other | Slot::Input => {
+            let typed = draft.map(|d| d.typed.as_str()).unwrap_or("");
+            // The caret is a reversed cell at the end of what was typed, drawn
+            // only on the row that is taking the keys.
+            let caret = || Span::styled(" ", Style::new().reverse());
+            if typed.is_empty() {
+                if here {
+                    spans.push(caret());
+                }
+                spans.push(Span::styled(t(Msg::AskTypeSomething).into_owned(), quiet));
+            } else {
+                // The end of what was typed is the part being worked on, so a
+                // line too long for the row shows its tail, not its head.
+                let used: usize = spans.iter().map(Span::width).sum();
+                let room = w.saturating_sub(used + usize::from(here));
+                spans.push(Span::styled(
+                    crate::width::take_width_from_end(typed, room),
+                    style,
+                ));
+                if here {
+                    spans.push(caret());
+                }
+            }
+        }
+        Slot::Submit => spans.push(Span::styled(
+            match sheet.is_batch() {
+                true => t(Msg::AskNext),
+                false => t(Msg::AskSubmit),
+            }
+            .into_owned(),
+            style,
+        )),
+        Slot::Chat => spans.push(Span::styled(t(Msg::AskChatInstead).into_owned(), style)),
+        Slot::Send => spans.push(Span::styled(t(Msg::AskReviewSend).into_owned(), style)),
+        Slot::Cancel => spans.push(Span::styled(t(Msg::AskReviewCancel).into_owned(), style)),
     }
     // Filled to the rect, so the highlight is a band across the row rather than a
     // patch behind the words: the pointed-at row is a surface, and a surface that
     // stops at its last letter is a smudge.
-    pad(Line::from_spans(spans), w, base)
+    pad(Line::from_spans(spans), w, style)
 }
 
 fn pad(line: Line, w: usize, style: Style) -> Line {
@@ -338,9 +594,9 @@ fn pad(line: Line, w: usize, style: Style) -> Line {
 /// Built by the same [`layout`] the frame used, so a click and the row it lights
 /// up cannot come from two different arrangements of one panel.
 pub struct Geometry {
-    /// One entry per drawn row, top to bottom: the answer on it, when it holds
-    /// one. `None` for a row that is prose, blank, the legend — or an answer the
-    /// rect was too short to reach.
+    /// One entry per drawn row, top to bottom: the row of [`Sheet::slots`] on
+    /// it, when it holds one. `None` for a row that is prose, blank, the legend —
+    /// or an answer the rect was too short to reach.
     rows: Vec<Option<usize>>,
 }
 
@@ -355,17 +611,17 @@ impl Geometry {
 }
 
 /// The layout the panel drew, for the host to read a click against.
-pub fn geometry(question: &Question, vp: &Viewport<'_>) -> Geometry {
+pub fn geometry(sheet: &Sheet, vp: &Viewport<'_>) -> Geometry {
     let rows = if vp.rect.w == 0 || vp.rect.h == 0 {
         Vec::new()
     } else {
-        layout(question, vp.rect.w as usize, vp.rect.h as usize)
+        layout(sheet, vp.rect.w as usize, vp.rect.h as usize)
     };
     Geometry {
         rows: rows
             .iter()
             .map(|r| match r {
-                Row::Answer(i) => Some(*i),
+                Row::Slot(k) => Some(*k),
                 _ => None,
             })
             .collect(),
@@ -378,6 +634,7 @@ mod tests {
     use crate::frame::Rect;
     use crate::module::{Mounted, ViewObject};
     use crate::moment::Ask as MomentAsk;
+    use atomcode_capabilities::tools::request_user_input::UserInputRequest;
     use atomcode_harness::seams::{
         AboutCall, Answer, Question as Q, ANSWER_ALLOW, ANSWER_ALWAYS, ANSWER_DENY,
     };
@@ -401,10 +658,51 @@ mod tests {
         }
     }
 
+    /// A model's own question, as the wire brings it.
+    fn model(payload: serde_json::Value) -> Asked {
+        let request: UserInputRequest = serde_json::from_value(payload).expect("a request");
+        crate::ask::question_for(
+            atomcode_capabilities::tools::request_user_input::REQUEST_USER_INPUT_KIND,
+            &serde_json::to_value(request).unwrap(),
+            &[],
+        )
+        .expect("drawn")
+    }
+
+    fn multiple() -> Asked {
+        model(serde_json::json!({
+            "header": "语言",
+            "question": "要支持哪些语言?",
+            "mode": "multiple",
+            "options": [
+                { "label": "Python", "description": "脚本和胶水代码都用它" },
+                { "label": "Rust" },
+                { "label": "Go" },
+            ],
+        }))
+    }
+
+    fn text() -> Asked {
+        model(serde_json::json!({
+            "header": "名字",
+            "question": "新仓库叫什么?",
+            "mode": "text",
+        }))
+    }
+
     /// A moment with this question up and `cursor` pointed at it.
     fn asking(question: Q, cursor: usize) -> Moment {
+        let mut sheet = MomentAsk::one(question);
+        sheet.point_at(cursor);
         Moment {
-            asking: Some(MomentAsk { question, cursor }),
+            asking: Some(sheet),
+            ..Moment::default()
+        }
+    }
+
+    fn with(sheet: Sheet) -> Moment {
+        Moment {
+            asking: Some(sheet),
             ..Moment::default()
         }
     }
@@ -425,6 +723,10 @@ mod tests {
             Height::Fill => unreachable!("the panel never fills"),
         };
         drawn(moment, w, h)
+    }
+
+    fn press(sheet: &mut Sheet, key: crate::surface::Key) {
+        let _ = sheet.key(crate::surface::KeyPress::plain(key));
     }
 
     #[test]
@@ -467,6 +769,55 @@ mod tests {
         }
     }
 
+    /// Every page of every kind of question, at every width a terminal might
+    /// have: as tall as it says and never wider than its rect. The pages a model's
+    /// question adds — the typing row, the boxes, the tabs, the review page — are
+    /// the ones with new furniture on them, and furniture is what overruns.
+    #[test]
+    fn every_page_is_as_tall_as_it_says_and_no_wider_than_its_rect() {
+        let mut typed = Sheet::one(text());
+        typed.type_text(&"很长的名字".repeat(20));
+        let mut ticked = Sheet::one(multiple());
+        press(&mut ticked, crate::surface::Key::Char(' '));
+        let mut batch = Sheet::new(1, vec![multiple(), text(), multiple(), text()]);
+        let first = batch.clone();
+        batch.tab = batch.asked.len();
+        let sheets = [
+            Sheet::one(approval(
+                Some("scribe"),
+                "bash",
+                r#"{"command":"ls"}"#,
+                Some(""),
+            )),
+            Sheet::one(multiple()),
+            ticked,
+            Sheet::one(text()),
+            typed,
+            first,
+            batch,
+        ];
+        for sheet in sheets {
+            let moment = with(sheet.clone());
+            for w in [8u16, 12, 20, 33, 60, 120] {
+                let claimed = match Ask::height(&State, &moment, w) {
+                    Height::Hug(n) => n,
+                    other => panic!("unexpected {other:?}"),
+                };
+                let vp = Viewport::new(Rect::sized(w, claimed), &moment);
+                let lines = Ask::render(&State, &vp);
+                assert_eq!(lines.len(), claimed as usize, "at width {w}: {sheet:?}");
+                for line in &lines {
+                    assert!(
+                        line.width() <= w as usize,
+                        "{} cells at width {w}: {:?}",
+                        line.width(),
+                        line.plain()
+                    );
+                }
+            }
+        }
+    }
+
     /// A height the tail rationed away takes the legend and the margin, never the
     /// answers: a panel that says nothing and explains how to work it is worse
     /// than a short one.
@@ -490,11 +841,11 @@ mod tests {
         }
         // And the gap between the question and its answers survives: running the
         // first answer into the sentence it answers is what that row is for.
-        let rows = layout(&question, 60, 5);
+        let rows = layout(&Sheet::one(question), 60, 5);
         assert_eq!(
-            rows.iter().position(|r| matches!(r, Row::Answer(0))),
+            rows.iter().position(|r| matches!(r, Row::Slot(0))),
             rows.iter()
-                .position(|r| matches!(r, Row::Text { .. }))
+                .position(|r| matches!(r, Row::Prompt(_)))
                 .map(|p| p + 2),
             "{rows:?}"
         );
@@ -512,10 +863,10 @@ mod tests {
             .join("\n");
         let args = serde_json::json!({ "command": cmd }).to_string();
         let question = approval(None, "bash (writes outside the workspace)", &args, Some(""));
-        let rows = layout(&question, 40, 5);
+        let rows = layout(&Sheet::one(question.clone()), 40, 5);
         assert!(rows.len() <= 5, "fits the height: {rows:?}");
         assert_eq!(
-            rows.iter().filter(|r| matches!(r, Row::Answer(_))).count(),
+            rows.iter().filter(|r| matches!(r, Row::Slot(_))).count(),
             question.options.len(),
             "every option survives the squeeze: {rows:?}"
         );
@@ -533,18 +884,19 @@ mod tests {
     fn a_click_reads_the_row_the_frame_drew() {
         let question = approval(None, "write_file", r#"{"file_path":"notes.md"}"#, None);
         let moment = asking(question.clone(), 0);
+        let sheet = moment.asking.clone().unwrap();
         let w = 60u16;
         let h = match Ask::height(&State, &moment, w) {
             Height::Hug(n) => n,
             other => panic!("unexpected {other:?}"),
         };
         let vp = Viewport::new(Rect::sized(w, h), &moment);
-        let geom = geometry(&question, &vp);
+        let geom = geometry(&sheet, &vp);
         let lines = Ask::render(&State, &vp)
             .iter()
             .map(|l| l.plain().trim_end().to_string())
             .collect::<Vec<_>>();
-        let rows = layout(&question, w as usize, h as usize);
+        let rows = layout(&sheet, w as usize, h as usize);
 
         assert_eq!(
             rows.len(),
@@ -554,7 +906,7 @@ mod tests {
         );
         for (row, (laid, line)) in rows.iter().zip(&lines).enumerate() {
             match laid {
-                Row::Answer(i) => {
+                Row::Slot(i) => {
                     assert_eq!(geom.answer_at(row), Some(*i), "row {row}: {line:?}");
                     assert!(
                         line.contains(&crate::ask::answer_label(
@@ -580,30 +932,31 @@ mod tests {
         }
     }
 
-    /// Only one row is pointed at, and it is the one a confirm would take.
+    /// Only one row is pointed at, and it is the one a confirm takes.
     #[test]
     fn exactly_one_answer_is_lit_and_it_is_the_one_a_confirm_takes() {
         let question = approval(None, "write_file", "{}", None);
+        let pointer = Caps::default().g(Glyph::Prompt);
         for cursor in 0..question.options.len() {
             let moment = asking(question.clone(), cursor);
             let lines = framed(&moment, 60);
-            let lit = lines
-                .iter()
-                .filter(|l| {
-                    question
-                        .options
-                        .iter()
-                        .any(|a| l.contains(&crate::ask::answer_label(&a.value, &a.label)))
-                        && l.starts_with(
-                            crate::caps::Caps::default().g(crate::caps::Glyph::Pointer),
-                        )
-                })
-                .count();
+            let lit: Vec<&String> = lines.iter().filter(|l| l.starts_with(pointer)).collect();
             assert_eq!(
-                lit,
+                lit.len(),
                 1,
                 "one lit row for cursor {cursor}:\n{}",
                 lines.join("\n")
+            );
+            let a = &question.options[cursor];
+            assert!(
+                lit[0].contains(&crate::ask::answer_label(&a.value, &a.label)),
+                "the lit row is the pointed-at answer: {lit:?}"
+            );
+            let mut sheet = moment.asking.clone().unwrap();
+            assert_eq!(
+                sheet.enter(),
+                crate::ask::Step::Deliver(vec![Some(crate::ask::Reply::from(a.value.as_str()))]),
+                "and a confirm takes it"
             );
         }
     }
@@ -667,17 +1020,152 @@ mod tests {
             out.contains("3 行"),
             "a bulk payload is measured, not shown:\n{out}"
         );
+        // An approval is a choice between its answers: nothing to type, nothing
+        // to talk over — those are a model's question's, not a gate's.
+        assert!(!out.contains("自己输入"), "{out}");
+        assert!(!out.contains("改为直接对话"), "{out}");
     }
 
-    /// The legend is the panel's keys, and it does not change with the question:
-    /// what an answer *means* is the harness's business, the keys are the
-    /// screen's.
+    /// The legend is the panel's keys: the same three on every choice, and the
+    /// ones a page adds where it adds them.
     #[test]
     fn the_legend_is_one_line_and_says_the_keys() {
         let out = framed(&asking(approval(None, "write_file", "{}", None), 0), 60).join("\n");
         assert!(out.contains("↑↓ 选择"), "{out}");
         assert!(out.contains("⏎ 确认"), "{out}");
         assert!(out.contains("esc 拒绝"), "{out}");
+        assert!(
+            !out.contains("space"),
+            "nothing to tick on a choice:\n{out}"
+        );
+
+        let boxes = framed(&with(Sheet::one(multiple())), 60).join("\n");
+        assert!(boxes.contains("space 勾选"), "{boxes}");
+        let pages = framed(&with(Sheet::new(1, vec![text(), multiple()])), 80).join("\n");
+        assert!(pages.contains("←→ 切换题目"), "{pages}");
+    }
+
+    /// A model's multiple choice is a box per answer, what each answer means
+    /// under it, a row of one's own words, a row that sends them, and a way out
+    /// of answering below a line — and a ticked box looks ticked.
+    #[test]
+    fn a_multiple_choice_draws_a_box_per_answer_and_a_row_that_sends_them() {
+        let mut sheet = Sheet::one(multiple());
+        let on = Caps::default().g(Glyph::Checked);
+        let off = Caps::default().g(Glyph::Unchecked);
+        let before = framed(&with(sheet.clone()), 60);
+        let row = |lines: &[String], word: &str| {
+            lines
+                .iter()
+                .find(|l| l.contains(word))
+                .cloned()
+                .unwrap_or_else(|| panic!("no `{word}` row:\n{}", lines.join("\n")))
+        };
+        assert!(
+            row(&before, "Python").contains(&format!("1. {off} Python")),
+            "{before:?}"
+        );
+        let means = before
+            .iter()
+            .position(|l| l.contains("脚本和胶水代码都用它"))
+            .expect("what an answer means is drawn");
+        assert!(
+            before[means - 1].contains("Python"),
+            "under the answer it explains"
+        );
+        assert!(
+            !before[means].contains("Python"),
+            "on a line of its own: {before:?}"
+        );
+        assert!(
+            row(&before, "自己输入").contains(&format!("4. {off}")),
+            "{before:?}"
+        );
+        assert!(before.iter().any(|l| l.trim() == "提交"), "{before:?}");
+        let chat = before
+            .iter()
+            .position(|l| l.contains("改为直接对话"))
+            .unwrap();
+        assert!(
+            before[chat - 1].contains(Caps::default().g(Glyph::Horizontal)),
+            "the way out sits below a line: {before:?}"
+        );
+        assert!(row(&before, "改为直接对话").contains("5."), "{before:?}");
+
+        press(&mut sheet, crate::surface::Key::Char(' '));
+        let after = framed(&with(sheet), 60);
+        assert!(
+            row(&after, "Python").contains(&format!("1. {on} Python")),
+            "{after:?}"
+        );
+        assert!(
+            row(&after, "Rust").contains(&format!("2. {off} Rust")),
+            "{after:?}"
+        );
+    }
+
+    /// A question that wants words is a line to type on — not a yes and a no.
+    #[test]
+    fn a_text_question_is_a_line_to_type_on() {
+        let mut sheet = Sheet::one(text());
+        let empty = framed(&with(sheet.clone()), 60).join("\n");
+        assert!(empty.contains("新仓库叫什么"), "{empty}");
+        assert!(empty.contains("1. "), "{empty}");
+        assert!(
+            empty.contains("自己输入"),
+            "an empty line says what it is for:\n{empty}"
+        );
+        for no in ["好", "不了", "yes"] {
+            assert!(!empty.contains(no), "no `{no}` to pick:\n{empty}");
+        }
+        sheet.type_text("atomcode-lab");
+        let typed = framed(&with(sheet), 60).join("\n");
+        assert!(typed.contains("atomcode-lab"), "{typed}");
+        assert!(!typed.contains("自己输入"), "{typed}");
+    }
+
+    /// Several questions put together are pages behind tabs, marked as they are
+    /// answered, with a review page at the end that lists every answer.
+    #[test]
+    fn a_batch_draws_tabs_and_a_page_to_review_the_answers_on() {
+        use crate::surface::Key;
+        let mut sheet = Sheet::new(7, vec![multiple(), text()]);
+        let on = Caps::default().g(Glyph::Checked);
+        let off = Caps::default().g(Glyph::Unchecked);
+        let tabs = framed(&with(sheet.clone()), 80)[0].clone();
+        assert!(tabs.contains(&format!("{off} 语言")), "{tabs}");
+        assert!(tabs.contains(&format!("{off} 名字")), "{tabs}");
+        assert!(
+            tabs.contains("提交"),
+            "the review page is the last tab: {tabs}"
+        );
+
+        // Tick Rust, send it, and the page turns to the next question.
+        press(&mut sheet, Key::Down);
+        press(&mut sheet, Key::Char(' '));
+        press(&mut sheet, Key::Down);
+        press(&mut sheet, Key::Down);
+        press(&mut sheet, Key::Down);
+        assert_eq!(sheet.pointed(), Some(Slot::Submit));
+        let next = framed(&with(sheet.clone()), 80);
+        assert!(next.iter().any(|l| l.contains("下一题")), "{next:?}");
+        press(&mut sheet, Key::Enter);
+        assert_eq!(sheet.tab, 1, "on to the next question");
+        let turned = framed(&with(sheet.clone()), 80);
+        assert!(turned[0].contains(&format!("{on} 语言")), "{turned:?}");
+        assert!(turned.join("\n").contains("新仓库叫什么"), "{turned:?}");
+
+        // Skip the second to the review page: the answer given, and the one not.
+        press(&mut sheet, Key::Right);
+        assert!(sheet.reviewing());
+        let review = framed(&with(sheet), 80).join("\n");
+        assert!(review.contains("核对你的回答"), "{review}");
+        assert!(review.contains("要支持哪些语言"), "{review}");
+        assert!(review.contains("Rust"), "{review}");
+        assert!(review.contains("（未回答）"), "{review}");
+        assert!(review.contains("确认提交这些回答吗"), "{review}");
+        assert!(review.contains("1. 提交回答"), "{review}");
+        assert!(review.contains("2. 取消"), "{review}");
     }
 
     /// `point_at` clamps rather than rejecting: a pointer on the padding, or an
@@ -686,10 +1174,10 @@ mod tests {
     fn pointing_clamps_to_the_answers_there_are() {
         let question = approval(None, "write_file", "{}", None);
         let last = question.options.len() - 1;
-        let mut ask = MomentAsk::new(question);
-        assert_eq!(ask.cursor, 0, "the first answer starts lit");
+        let mut ask = MomentAsk::one(question);
+        assert_eq!(ask.cursor(), 0, "the first answer starts lit");
         assert!(ask.point_at(2));
-        assert_eq!(ask.cursor, 2);
+        assert_eq!(ask.cursor(), 2);
         assert!(!ask.point_at(2), "pointing where it already is is not news");
 
         // Past the end is the last answer — and is news only if that moves it.
@@ -698,7 +1186,7 @@ mod tests {
             ask.point_at(99),
             "past the end is a move to the last answer"
         );
-        assert_eq!(ask.cursor, last);
+        assert_eq!(ask.cursor(), last);
         assert!(!ask.point_at(99), "and it stays there");
     }
 

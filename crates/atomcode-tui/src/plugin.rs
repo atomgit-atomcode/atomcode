@@ -1958,6 +1958,15 @@ impl UserInterface for Tui {
                     self.host.secret_paste(&text);
                     stale = true;
                 }
+                // A paste while a question is up is the question's, like every
+                // key: words for its typing row when one is lit, and nothing
+                // otherwise — the composer is off screen, so falling through
+                // would be typing into something nobody can see.
+                Wake::Input(Input::Paste(text))
+                    if self.host.asks.is_waiting() && self.panel_mounted() =>
+                {
+                    stale |= self.host.ask_paste(&text);
+                }
                 // A paste while the providers panel is up belongs to the field
                 // it is working in: the composer is off screen, so falling
                 // through would be typing into something nobody can see.
@@ -3798,34 +3807,33 @@ impl Tui {
         // in this environment**. A screen that is sitting right there, with a
         // question panel, saying it cannot ask.
         if let Some(questions) = crate::ask::batch_for(kind, &payload, &self.client.events()) {
-            let asks = self.host.asks.clone();
+            // Put together, answered together: one panel with a page per
+            // question and a page to check them on, sent back as one reply.
+            // A question left unanswered — declined, or skipped on the way
+            // to the review page — is that question declined, not the batch.
+            let n = questions.len();
+            let answer = self.host.asks.push_batch(questions);
             let client = self.client.clone();
             tokio::spawn(async move {
-                let mut answers = Vec::with_capacity(questions.len());
-                for question in questions {
-                    // One at a time, in the order they were asked. A refusal
-                    // answers *that* question and goes on to the next: the
-                    // batch is several decisions, and declining one is not
-                    // declining the rest.
-                    let answered = asks.push(question.clone()).await.ok().flatten();
-                    answers.push(crate::ask::declinable(&question, answered));
-                }
+                let mut replies = answer.await.unwrap_or_default();
+                replies.resize(n, None);
+                let answers: Vec<Value> = replies.into_iter().map(crate::ask::declinable).collect();
                 client.respond(id, serde_json::json!({ "responses": answers }));
             });
             return;
         }
-        let Some(question) = crate::ask::question_for(kind, &payload, &self.client.events()) else {
+        let Some(asked) = crate::ask::question_for(kind, &payload, &self.client.events()) else {
             // Nothing this screen knows how to put to a person: refused, never
             // left hanging.
             self.client.respond(id, Value::Null);
             return;
         };
-        let answer = self.host.asks.push(question.clone());
+        let answer = self.host.asks.push(asked);
         let client = self.client.clone();
         let kind = kind.to_string();
         tokio::spawn(async move {
             let chosen = answer.await.ok().flatten();
-            client.respond(id, crate::ask::response_for(&kind, &question, chosen));
+            client.respond(id, crate::ask::response_for(&kind, chosen));
         });
     }
 
@@ -3857,7 +3865,12 @@ impl Tui {
             // A refusal — esc — leaves the intervention waiting rather than
             // picking something on the person's behalf. `/policy` is still
             // there when they decide.
-            if let Some(chosen) = answer.await.ok().flatten() {
+            if let Some(chosen) = answer
+                .await
+                .ok()
+                .flatten()
+                .and_then(crate::ask::Reply::into_value)
+            {
                 client.invoke("policy", &chosen);
             }
         });
@@ -5433,55 +5446,57 @@ impl Tui {
     /// **Every answer is reachable by one key.** Up/down walk the list, which is what
     /// a highlighted row is for; enter takes the row that is lit; a digit or a first
     /// letter goes straight to an answer, which is faster once the list is known; esc
-    /// declines. The moves and the picks both live in [`crate::ask::Pending`], so the
-    /// keys the panel shows and the keys the fallback answers are one implementation
-    /// rather than two that agree until one changes.
+    /// declines. With the panel up, what each key does is the panel's own
+    /// ([`crate::ask::Sheet::key`]) — the rows it draws and the keys that take them are
+    /// one implementation rather than two that agree until one changes.
     fn answer_question(&self, press: crate::surface::KeyPress) -> bool {
         use crate::surface::{Key, Mods};
-        let Some((_, question)) = self.host.asks.peek() else {
+        if (press.key, press.mods) == (Key::Char('d'), Mods::CTRL) {
+            return true;
+        }
+        if self.panel_mounted() {
+            if let Some((id, step)) = self.host.ask_key(press) {
+                self.deliver_answer(id, step);
+            }
+            return false;
+        }
+        // No panel: the question at the foot of the stream, one at a time. It
+        // marks no row, so there is no highlight to trust — enter takes an
+        // answer only when there is exactly one to take.
+        let Some(asked) = self.host.asks.current() else {
             return false;
         };
+        let question = asked.question;
         let chosen = match (press.key, press.mods) {
-            (Key::Up, _) | (Key::Char('k'), Mods::CTRL) => {
-                let _ = self.host.move_ask_by(-1);
-                None
-            }
-            (Key::Down, _) | (Key::Char('j'), Mods::CTRL) => {
-                let _ = self.host.move_ask_by(1);
-                None
-            }
             // Esc and ctrl-c decline. Declining is an answer; it is never consent,
             // and it must always be one keystroke away.
             (Key::Esc, _) | (Key::Char('c'), Mods::CTRL) => Some(None),
-            (Key::Char('d'), Mods::CTRL) => return true,
             (Key::Char(c), _) if c.is_ascii_digit() => {
                 crate::ask::nth(&question, c.to_digit(10).unwrap_or(0) as usize).map(Some)
             }
-            // A letter picks the answer that starts with it. It does *not* fall back
-            // to typing: a question's answers are what there is to choose between, and
-            // a stray character is not one of them.
             (Key::Char(c), Mods::NONE) | (Key::Char(c), Mods::SHIFT) => {
                 crate::ask::by_prefix(&question, c).map(Some)
             }
-            // Enter takes the row that is pointed at. With several answers that is
-            // the highlighted one — which is what the highlight is *for*, and why it
-            // starts on the first: a stray return takes what the screen shows it
-            // would take, never a hidden default.
-            //
-            // Unmounted, there is no highlight to trust: the fallback at the foot of
-            // the stream marks nothing, so enter keeps the rule it had there and
-            // takes an answer only when there is exactly one to take.
-            (Key::Enter, _) if self.panel_mounted() => Some(self.pointed_at()),
-            (Key::Enter, _) if question.options.len() == 1 => Some(self.pointed_at()),
+            (Key::Enter, _) if question.options.len() == 1 => {
+                Some(question.options.first().map(|a| a.value.clone()))
+            }
             _ => None,
         };
-        let Some(answer) = chosen else {
-            return false; // a move, or an unrecognised key: nothing to deliver
-        };
-        if let Some(p) = self.host.asks.take() {
-            p.answer(answer);
+        if let Some(answer) = chosen {
+            self.host
+                .asks
+                .answer_current(answer.map(crate::ask::Reply::from));
         }
         false
+    }
+
+    /// Send what the panel came to, to the request it was drawing.
+    fn deliver_answer(&self, id: u64, step: crate::ask::Step) {
+        if let crate::ask::Step::Deliver(replies) = step {
+            if let Some(p) = self.host.asks.take_id(id) {
+                p.finish(replies);
+            }
+        }
     }
 
     /// Whether a question is being drawn as a panel rather than at the foot of the
@@ -5499,29 +5514,15 @@ impl Tui {
             .is_some()
     }
 
-    /// The answer the panel has lit, as it would be delivered.
+    /// Take the row the panel has lit, as a return would. `true` to quit, for the
+    /// key path.
     ///
-    /// One reader for both the return key and a click on a row, so a confirm and a
-    /// pick cannot disagree about what is pointed at. Nothing lit — the question
-    /// arrived this frame and has not been synced — is the first answer, because that
-    /// is the one the panel would have lit.
-    fn pointed_at(&self) -> Option<String> {
-        let m = self.host.moment.read().expect("moment poisoned");
-        match m.asking.as_ref() {
-            Some(ask) => ask.picked(),
-            None => self
-                .host
-                .asks
-                .peek()
-                .and_then(|(_, q)| q.options.first().map(|a| a.value.clone())),
-        }
-    }
-
-    /// Deliver whatever the panel is pointed at. `true` to quit, for the key path.
+    /// One path for both the return key and a click on a row, so a confirm and a
+    /// pick cannot disagree about what is pointed at.
     fn confirm_question(&self) -> bool {
-        let answer = self.pointed_at();
-        if let Some(p) = self.host.asks.take() {
-            p.answer(answer);
+        let press = crate::surface::KeyPress::plain(crate::surface::Key::Enter);
+        if let Some((id, step)) = self.host.ask_key(press) {
+            self.deliver_answer(id, step);
         }
         false
     }

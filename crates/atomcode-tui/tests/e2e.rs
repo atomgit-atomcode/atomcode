@@ -77,6 +77,7 @@ fn agent_catalog() -> PluginRegistry {
     c.register(Arc::new(EchoCommandRow));
     c.register(Arc::new(StallingUtilityRow));
     c.register(Arc::new(StallingModelRow));
+    c.register(Arc::new(RequestUserInputRow));
     c
 }
 
@@ -2293,6 +2294,180 @@ async fn esc_declines_and_the_model_is_told_rather_than_the_turn_dying() {
     assert!(
         screen.contains("Understood."),
         "the turn carried on:\n{screen}"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+/// The model's own `request_user_input`, mounted the way the coding runtime
+/// mounts it: the capabilities tool as it ships, asking through the driver's
+/// request channel — which is the screen.
+struct RequestUserInputRow;
+
+#[async_trait]
+impl Plugin for RequestUserInputRow {
+    fn name(&self) -> &'static str {
+        "test-request-user-input"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["tools"]
+    }
+    async fn apply(&self, ctx: &Context, _config: &serde_json::Value) -> Result<(), String> {
+        atomcode_harness::plugins::tools::mount(
+            ctx,
+            vec![
+                Arc::new(atomcode_capabilities::tools::request_user_input::RequestUserInputTool)
+                    as Arc<dyn atomcode_kernel::tool::Tool>,
+            ],
+        )
+    }
+}
+
+const REQUEST_USER_INPUT_LAYER: &str = "[[insert]]\nname = \"test-request-user-input\"\n";
+
+/// What the model was told by every tool that answered, in order: the tool
+/// results as the log holds them, which is what the next request is built from.
+fn tool_results(s: &Session) -> Vec<String> {
+    s.client()
+        .events()
+        .into_iter()
+        .filter_map(|logged| match logged.event {
+            SessionEvent::ToolResultLogged { content, .. } => Some(content),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A model asks which of several things the person wants, and the person
+/// ticks two: both reach the model.
+///
+/// The screen used to draw every question as a single choice and send back one
+/// pick — the tool promised "multiple", and the person could only ever give one.
+#[tokio::test]
+async fn a_multiple_choice_question_sends_back_every_answer_ticked() {
+    let dir = scratch("ask-multiple");
+    let script = replay(
+        r#"{ text = "Asking.", calls = [ { name = "request_user_input", args = { header = "语言", question = "要支持哪些语言?", mode = "multiple", options = [ { label = "Python" }, { label = "Rust", description = "系统层" }, { label = "Go" } ] } } ] },
+           { text = "Noted." }"#,
+    );
+    let s = start(tree(&dir, &script, &[REQUEST_USER_INPUT_LAYER])).await;
+    let task = s.open().await;
+
+    s.term.type_line("pick languages");
+    until(&s, "space 勾选").await;
+    // Read off the panel itself: the call's arguments are on screen too, in
+    // the transcript, and would say the same words whether the panel did or not.
+    let panel: String = s
+        .term
+        .last()
+        .and_then(|f| f.part("ask").map(|p| p.lines.clone()))
+        .expect("the question panel is up")
+        .iter()
+        .map(|l| l.plain() + "\n")
+        .collect();
+    assert!(panel.contains("要支持哪些语言"), "{panel}");
+    assert!(
+        panel.contains("系统层"),
+        "what an answer means is shown:\n{panel}"
+    );
+
+    // Tick Python and Go with space, then walk to the row that sends them.
+    s.term.press(KeyPress::ch(' '));
+    s.term.press(KeyPress::plain(Key::Down));
+    s.term.press(KeyPress::plain(Key::Down));
+    s.term.press(KeyPress::ch(' '));
+    s.term.press(KeyPress::plain(Key::Down));
+    s.term.press(KeyPress::plain(Key::Down));
+    s.term.press(KeyPress::plain(Key::Enter));
+    s.quiet().await;
+
+    let told = tool_results(&s).join("\n");
+    assert!(
+        told.contains("\"Python\"") && told.contains("\"Go\""),
+        "both ticked answers reach the model: {told}"
+    );
+    assert!(
+        !told.contains("Rust"),
+        "and the unticked one does not: {told}"
+    );
+    assert!(s.screen().contains("Noted."), "the turn carried on");
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+/// A model asks for words, and the person types them: the words reach the
+/// model — not a "yes" or a "no" the screen made up because it had nothing
+/// else to offer.
+#[tokio::test]
+async fn a_text_question_sends_back_what_the_person_typed() {
+    let dir = scratch("ask-text");
+    let script = replay(
+        r#"{ text = "Asking.", calls = [ { name = "request_user_input", args = { header = "名字", question = "新仓库叫什么?", mode = "text" } } ] },
+           { text = "Noted." }"#,
+    );
+    let s = start(tree(&dir, &script, &[REQUEST_USER_INPUT_LAYER])).await;
+    let task = s.open().await;
+
+    s.term.type_line("name it");
+    until(&s, "新仓库叫什么").await;
+    until(&s, "esc 拒绝").await;
+    let panel = s.screen();
+    assert!(
+        !panel.contains("不了"),
+        "no yes/no put in front of it:\n{panel}"
+    );
+
+    // Typed, and pasted: a paste while the question is up is the question's —
+    // the composer is off screen, and words pasted into it would be lost.
+    s.term.type_text("atomcode ");
+    s.term.paste("lab 2");
+    s.term.press(KeyPress::plain(Key::Enter));
+    s.quiet().await;
+
+    let told = tool_results(&s).join("\n");
+    assert!(
+        told.contains("User answered: \"atomcode lab 2\""),
+        "the model gets the words: {told}"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+/// Two questions put together are answered on one panel — a page each and a
+/// page to check them on — and go back as one reply, in order.
+#[tokio::test]
+async fn a_batch_of_questions_is_answered_on_one_panel_and_sent_together() {
+    let dir = scratch("ask-batch");
+    let script = replay(
+        r#"{ text = "Asking.", calls = [ { name = "request_user_input", args = { questions = [ { header = "口味", question = "要哪个口味?", mode = "single", options = [ { label = "vanilla" }, { label = "pistachio" } ] }, { header = "名字", question = "新仓库叫什么?", mode = "text" } ] } } ] },
+           { text = "Noted." }"#,
+    );
+    let s = start(tree(&dir, &script, &[REQUEST_USER_INPUT_LAYER])).await;
+    let task = s.open().await;
+
+    s.term.type_line("two things");
+    until(&s, "切换题目").await;
+    // Page one: the second answer, by its number. Page two: words.
+    s.term.press(KeyPress::ch('2'));
+    until(&s, "新仓库叫什么").await;
+    s.term.type_line("lab");
+    until(&s, "核对你的回答").await;
+    let review = s.screen();
+    assert!(
+        review.contains("pistachio") && review.contains("lab"),
+        "{review}"
+    );
+    s.term.press(KeyPress::ch('1'));
+    s.quiet().await;
+
+    let told = tool_results(&s).join("\n");
+    assert!(
+        told.contains("Q1 (口味): User selected: \"pistachio\"")
+            && told.contains("Q2 (名字): User answered: \"lab\""),
+        "both answers, in order: {told}"
     );
 
     s.term.press(KeyPress::ctrl('d'));

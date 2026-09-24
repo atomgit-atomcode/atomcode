@@ -330,7 +330,10 @@ fn ascii_for(ch: char) -> Option<&'static str> {
         // bullets / circles / diamonds
         '\u{25CF}' | '\u{25C6}' | '\u{25CE}' => "*", // ● ◆ ◎
         '\u{25CB}' | '\u{25E6}' | '\u{25C7}' | '\u{25A2}' => "o", // ○ ◦ ◇ ▢
-        '\u{2022}' | '\u{2219}' => "*",              // • ∙
+        // check boxes
+        '\u{2610}' => "o",              // ☐
+        '\u{2612}' => "x",              // ☒
+        '\u{2022}' | '\u{2219}' => "*", // • ∙
         // pointers
         '\u{25B8}' | '\u{25B6}' | '\u{25BA}' | '\u{276F}' => ">", // ▸ ▶ ► ❯
         '\u{25C2}' | '\u{25C0}' => "<",                           // ◂ ◀
@@ -436,6 +439,14 @@ pub enum Glyph {
     /// This session goes ahead: `accept edits` and `auto`. Drawn twice for the
     /// one mode that asks nothing at all.
     Play,
+    /// A ticked box: an answer picked in a multiple choice, a question of a
+    /// batch that has its answer.
+    Checked,
+    /// Its empty twin.
+    Unchecked,
+    /// Points back and forward — a question panel's page tabs.
+    Left,
+    Right,
 }
 
 /// The frames a spinner cycles through, one per redraw.
@@ -521,6 +532,10 @@ pub fn glyph(unicode: bool, glyph: Glyph) -> &'static str {
             Down => "↓",
             Pause => "\u{23F8}",
             Play => "\u{23F5}",
+            Checked => "\u{2612}",
+            Unchecked => "\u{2610}",
+            Left => "\u{2190}",
+            Right => "\u{2192}",
         }
     } else {
         match glyph {
@@ -544,6 +559,10 @@ pub fn glyph(unicode: bool, glyph: Glyph) -> &'static str {
             Down => "v",
             Pause => "=",
             Play => ">",
+            Checked => "x",
+            Unchecked => "o",
+            Left => "<",
+            Right => ">",
         }
     }
 }
@@ -642,6 +661,10 @@ mod tests {
             Glyph::Down,
             Glyph::Pause,
             Glyph::Play,
+            Glyph::Checked,
+            Glyph::Unchecked,
+            Glyph::Left,
+            Glyph::Right,
         ] {
             let rich = Caps::default().g(glyph);
             let plain = Caps::plain().g(glyph);
@@ -717,6 +740,10 @@ mod tests {
             Glyph::Thumb,
             Glyph::Track,
             Glyph::Down,
+            Glyph::Checked,
+            Glyph::Unchecked,
+            Glyph::Left,
+            Glyph::Right,
         ] {
             let rich = Caps::default().g(glyph);
             assert_eq!(

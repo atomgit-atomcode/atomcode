@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 
 use atomcode_capabilities::tools::approval::{ApprovalRequest, APPROVAL_KIND};
 use atomcode_capabilities::tools::request_user_input::{
-    UserInputRequest, UserInputResponse, REQUEST_USER_INPUT_KIND,
+    UserInputMode, UserInputRequest, UserInputResponse, REQUEST_USER_INPUT_KIND,
 };
 use atomcode_kernel::session::LoggedEvent;
 use atomcode_kernel::session::{
@@ -33,26 +33,174 @@ use atomcode_kernel::session::{
 use serde_json::Value;
 use tokio::sync::oneshot;
 
-/// A question waiting for an answer.
+/// One question as this screen puts it.
+///
+/// The kernel's [`Question`] is what the log can hold, and it holds no more
+/// than a choice between named answers — which is all an approval, a
+/// checkpoint or the `user-questions` seam ever asks. A model's own
+/// `request_user_input` asks more: several answers at once, or words of the
+/// person's own, and each offered answer may carry a sentence saying what it
+/// means. That is kept here, beside the question, rather than added to
+/// `Question`: the log's schema is not the place for how one tool likes its
+/// questions drawn, and the product path does not write `Asked` for this tool
+/// anyway.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Asked {
+    pub question: Question,
+    /// The request as the model sent it, when the question is a model's own
+    /// `request_user_input` read off the wire. `None` for everything else —
+    /// including a `request_user_input` the log already recorded, which is the
+    /// seam's (every seam question is a choice between the answers it named).
+    pub input: Option<UserInputRequest>,
+}
+
+impl From<Question> for Asked {
+    fn from(question: Question) -> Self {
+        Self {
+            question,
+            input: None,
+        }
+    }
+}
+
+/// What kind of answer a question wants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Form {
+    /// One of the offered answers and nothing else: approvals, checkpoints,
+    /// the seam's questions.
+    Choice,
+    /// One of the offered answers, or words of the person's own.
+    Single,
+    /// Any number of the offered answers, plus words of the person's own.
+    Multiple,
+    /// Words of the person's own, and no offered answers at all.
+    Text,
+}
+
+impl Asked {
+    pub fn form(&self) -> Form {
+        match self.input.as_ref().map(|r| &r.mode) {
+            None => Form::Choice,
+            Some(UserInputMode::Single) => Form::Single,
+            Some(UserInputMode::Multiple) => Form::Multiple,
+            Some(UserInputMode::Text) => Form::Text,
+        }
+    }
+
+    /// The sentence the model gave an offered answer, when it gave one that
+    /// says more than the answer's own name.
+    pub fn description(&self, i: usize) -> Option<&str> {
+        let option = self.input.as_ref()?.options.get(i)?;
+        option
+            .description
+            .as_deref()
+            .map(str::trim)
+            .filter(|d| !d.is_empty() && *d != option.label.trim())
+    }
+
+    /// The short name a batch's page tab carries: the model's own `header`,
+    /// or the question's first line when there is none worth reading.
+    pub fn title(&self) -> String {
+        // `Question · x` is how the seam's own questions name who asks; the
+        // name is still the best short handle there is.
+        let header = self
+            .input
+            .as_ref()
+            .map(|r| r.header.trim())
+            .map(|h| h.strip_prefix("Question · ").unwrap_or(h).trim())
+            .filter(|h| !h.is_empty() && *h != "Question");
+        match header {
+            Some(h) => one_line(h),
+            None => one_line(&self.question.prompt),
+        }
+    }
+}
+
+/// What the person answered one question with.
+///
+/// The offered answers they picked, by value, and the words they typed, if
+/// they typed any. A choice question only ever fills the first; the
+/// `request_user_input` wire carries both, and a person may do both at once —
+/// tick two options and add a note.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Reply {
+    pub selected: Vec<String>,
+    pub text: Option<String>,
+}
+
+impl Reply {
+    /// Words of the person's own, and nothing picked.
+    pub fn typed(text: impl Into<String>) -> Self {
+        Self {
+            selected: Vec::new(),
+            text: Some(text.into()),
+        }
+    }
+    /// The one answer a choice question was given, for a caller that only
+    /// ever offered choices: the first picked, else what was typed.
+    pub fn value(&self) -> Option<&str> {
+        self.selected
+            .first()
+            .map(String::as_str)
+            .or(self.text.as_deref())
+    }
+    pub fn into_value(self) -> Option<String> {
+        self.selected.into_iter().next().or(self.text)
+    }
+}
+
+impl From<String> for Reply {
+    fn from(value: String) -> Self {
+        Self {
+            selected: vec![value],
+            text: None,
+        }
+    }
+}
+
+impl From<&str> for Reply {
+    fn from(value: &str) -> Self {
+        Self::from(value.to_string())
+    }
+}
+
+/// Who is waiting on the answer: one caller for one question, or a batch's
+/// caller for all of them at once.
+enum Replier {
+    One(oneshot::Sender<Option<Reply>>),
+    Many(oneshot::Sender<Vec<Option<Reply>>>),
+}
+
+/// A request waiting for an answer: one question, or a batch of them put to
+/// the person together.
 pub struct Pending {
     pub id: u64,
-    pub question: Question,
-    reply: oneshot::Sender<Option<String>>,
+    pub asked: Vec<Asked>,
+    /// Answers given one at a time, by the fallback that draws a question at
+    /// the foot of the stream when no panel is mounted. The panel answers a
+    /// batch whole and never touches this.
+    got: Vec<Option<Reply>>,
+    reply: Replier,
 }
 
 impl Pending {
-    /// Deliver the answer. `None` is a refusal — every caller must read it that
-    /// way, never as consent.
-    pub fn answer(self, choice: Option<String>) {
-        let _ = self.reply.send(choice);
+    /// Deliver every answer at once, one per question, in order. `None` is that
+    /// question declined — every caller must read it that way, never as
+    /// consent — and a question left off the end is declined too.
+    pub fn finish(self, mut replies: Vec<Option<Reply>>) {
+        match self.reply {
+            Replier::One(tx) => {
+                let _ = tx.send(replies.into_iter().next().flatten());
+            }
+            Replier::Many(tx) => {
+                replies.resize(self.asked.len(), None);
+                let _ = tx.send(replies);
+            }
+        }
     }
-    /// What a number key picks, 1-based as the screen shows it.
-    pub fn nth(&self, n: usize) -> Option<String> {
-        nth(&self.question, n)
-    }
-    /// What a letter picks, when an answer's value or label starts with it.
-    pub fn by_prefix(&self, c: char) -> Option<String> {
-        by_prefix(&self.question, c)
+    /// Deliver the answer to the first question. `None` is a refusal.
+    pub fn answer(self, choice: Option<Reply>) {
+        self.finish(vec![choice]);
     }
 }
 
@@ -102,26 +250,66 @@ impl Asks {
         *self.wake.lock().expect("asks poisoned") = Some(tx);
     }
 
-    /// The one currently on screen, if any.
-    pub fn peek(&self) -> Option<(u64, Question)> {
+    /// The request currently on screen, whole, if any.
+    pub fn peek(&self) -> Option<(u64, Vec<Asked>)> {
         self.queue
             .lock()
             .expect("asks poisoned")
             .first()
-            .map(|p| (p.id, p.question.clone()))
+            .map(|p| (p.id, p.asked.clone()))
+    }
+
+    /// The question the fallback at the foot of the stream is showing: the
+    /// first of the front request's that it has not answered yet.
+    pub fn current(&self) -> Option<Asked> {
+        let q = self.queue.lock().expect("asks poisoned");
+        let front = q.first()?;
+        front.asked.get(front.got.len()).cloned()
+    }
+
+    /// Answer the question [`Asks::current`] names, and deliver the request
+    /// once every one of its questions has an answer. The fallback's way of
+    /// answering a batch: one question at a time, in the order they were asked.
+    pub fn answer_current(&self, choice: Option<Reply>) {
+        let done = {
+            let mut q = self.queue.lock().expect("asks poisoned");
+            let Some(front) = q.first_mut() else {
+                return;
+            };
+            front.got.push(choice);
+            match front.got.len() >= front.asked.len() {
+                true => Some(q.remove(0)),
+                false => None,
+            }
+        };
+        if let Some(mut p) = done {
+            let got = std::mem::take(&mut p.got);
+            p.finish(got);
+        }
     }
 
     pub fn is_waiting(&self) -> bool {
         !self.queue.lock().expect("asks poisoned").is_empty()
     }
 
-    /// Take the front question so it can be answered.
+    /// Take the front request so it can be answered.
     pub fn take(&self) -> Option<Pending> {
         let mut q = self.queue.lock().expect("asks poisoned");
         if q.is_empty() {
             None
         } else {
             Some(q.remove(0))
+        }
+    }
+
+    /// Take the front request only if it is the one with this id — the one the
+    /// panel was drawing when the person answered it. Anything else at the front
+    /// is a request they have not seen yet, and an answer is not transferable.
+    pub fn take_id(&self, id: u64) -> Option<Pending> {
+        let mut q = self.queue.lock().expect("asks poisoned");
+        match q.first() {
+            Some(p) if p.id == id => Some(q.remove(0)),
+            _ => None,
         }
     }
 
@@ -135,28 +323,44 @@ impl Asks {
             .drain(..)
             .collect();
         for p in waiting {
-            p.answer(None);
+            p.finish(Vec::new());
         }
     }
 
-    /// Post a question and get the channel its answer will arrive on. A
-    /// question with no answers offered is still a question: it gets the two
-    /// every front end can draw, rather than a prompt nobody can answer.
-    pub(crate) fn push(&self, mut question: Question) -> oneshot::Receiver<Option<String>> {
-        if question.options.is_empty() {
-            question.options = vec![Answer::new("yes"), Answer::new("no")];
-        }
+    /// Post a question and get the channel its answer will arrive on. A choice
+    /// with no answers offered is still a question: it gets the two every front
+    /// end can draw, rather than a prompt nobody can answer. A question that
+    /// wants words is left without — the words are the answer.
+    pub(crate) fn push(&self, asked: impl Into<Asked>) -> oneshot::Receiver<Option<Reply>> {
         let (reply, rx) = oneshot::channel();
+        self.enqueue(vec![asked.into()], Replier::One(reply));
+        rx
+    }
+
+    /// Post several questions to be answered together, and get the channel
+    /// their answers arrive on — one per question, in order.
+    pub(crate) fn push_batch(&self, asked: Vec<Asked>) -> oneshot::Receiver<Vec<Option<Reply>>> {
+        let (reply, rx) = oneshot::channel();
+        self.enqueue(asked, Replier::Many(reply));
+        rx
+    }
+
+    fn enqueue(&self, mut asked: Vec<Asked>, reply: Replier) {
+        for one in &mut asked {
+            if one.form() == Form::Choice && one.question.options.is_empty() {
+                one.question.options = vec![Answer::new("yes"), Answer::new("no")];
+            }
+        }
         let id = self.next.fetch_add(1, Ordering::SeqCst) + 1;
         self.queue.lock().expect("asks poisoned").push(Pending {
             id,
-            question,
+            asked,
+            got: Vec::new(),
             reply,
         });
         if let Some(tx) = self.wake.lock().expect("asks poisoned").as_ref() {
             let _ = tx.send(());
         }
-        rx
     }
 }
 
@@ -167,8 +371,47 @@ impl Asks {
 /// is on screen by the time the request is: that one is drawn when it is there
 /// — options, asker and call exactly as recorded, which the request's wire
 /// shape does not carry. The newest match, because a call can be asked about
-/// twice. Otherwise the question is read off the request.
-pub fn question_for(kind: &str, payload: &Value, events: &[LoggedEvent]) -> Option<Question> {
+/// twice. Otherwise the question is read off the request — and a model's own
+/// `request_user_input` read off the request keeps the request beside it, so
+/// the panel can ask for what the model asked for: several answers, or words.
+pub fn question_for(kind: &str, payload: &Value, events: &[LoggedEvent]) -> Option<Asked> {
+    if kind == REQUEST_USER_INPUT_KIND {
+        let request: UserInputRequest = serde_json::from_value(payload.clone()).ok()?;
+        let recorded = events.iter().rev().find_map(|logged| match &logged.event {
+            SessionEvent::Asked { question, .. } if question.prompt == request.question => {
+                Some(question.clone())
+            }
+            _ => None,
+        });
+        return Some(match recorded {
+            // The seam's own question, asked over this wire: drawn as recorded,
+            // and answered as the choice it is.
+            Some(question) => Asked::from(question),
+            None => Asked {
+                question: Question {
+                    prompt: request.question.clone(),
+                    // The answer's own name is what is drawn; what it means is
+                    // the description, drawn under it (`Asked::description`).
+                    options: request
+                        .options
+                        .iter()
+                        .map(|o| Answer::labelled(o.label.clone(), o.label.clone()))
+                        .collect(),
+                    asker: request
+                        .header
+                        .strip_prefix("Question · ")
+                        .map(str::to_string),
+                    about: None,
+                },
+                input: Some(request),
+            },
+        });
+    }
+    choice_for(kind, payload, events).map(Asked::from)
+}
+
+/// Every kind but `request_user_input`: a choice between named answers.
+fn choice_for(kind: &str, payload: &Value, events: &[LoggedEvent]) -> Option<Question> {
     let asked = |matches: &dyn Fn(&Question) -> bool| {
         events.iter().rev().find_map(|logged| match &logged.event {
             SessionEvent::Asked { question, .. } if matches(question) => Some(question.clone()),
@@ -198,29 +441,6 @@ pub fn question_for(kind: &str, payload: &Value, events: &[LoggedEvent]) -> Opti
                     Question::approval(&request.tool, &request.args, Some(""), None, None)
                 }),
             )
-        }
-        REQUEST_USER_INPUT_KIND => {
-            let request: UserInputRequest = serde_json::from_value(payload.clone()).ok()?;
-            Some(asked(&|q| q.prompt == request.question).unwrap_or_else(|| {
-                Question {
-                    prompt: request.question.clone(),
-                    options: request
-                        .options
-                        .iter()
-                        .map(|o| {
-                            Answer::labelled(
-                                o.label.clone(),
-                                o.description.clone().unwrap_or_else(|| o.label.clone()),
-                            )
-                        })
-                        .collect(),
-                    asker: request
-                        .header
-                        .strip_prefix("Question · ")
-                        .map(str::to_string),
-                    about: None,
-                }
-            }))
         }
         // The kernel's own two checkpoints: a turn that hit the round fuse, and
         // one whose output kept being cut off after the automatic recovery gave
@@ -322,7 +542,7 @@ fn offered_answer(value: &Value) -> Option<Answer> {
 pub const YES: &str = "yes";
 pub const NO: &str = "no";
 
-pub fn batch_for(kind: &str, payload: &Value, events: &[LoggedEvent]) -> Option<Vec<Question>> {
+pub fn batch_for(kind: &str, payload: &Value, events: &[LoggedEvent]) -> Option<Vec<Asked>> {
     if kind != REQUEST_USER_INPUT_KIND {
         return None;
     }
@@ -345,9 +565,16 @@ pub fn batch_for(kind: &str, payload: &Value, events: &[LoggedEvent]) -> Option<
 /// `None` — esc — is that question **declined**, which the tool turns into
 /// "no answer was provided, use your own judgement". Not a refusal of the
 /// batch: a person who skips one question has not skipped the others.
-pub fn declinable(question: &Question, answer: Option<String>) -> Value {
-    response_for(REQUEST_USER_INPUT_KIND, question, answer)
+pub fn declinable(answer: Option<Reply>) -> Value {
+    response_for(REQUEST_USER_INPUT_KIND, answer)
 }
+
+/// What a question is answered with when the person would rather talk it over
+/// than pick: words for the model, not for the screen, so they are not in a
+/// locale table. The model is told to stop and listen — a question answered
+/// with "let's discuss" and then decided anyway is the model guessing again.
+pub const CHAT_INSTEAD: &str = "The user chose to discuss this in the chat instead of \
+     answering here. Do not assume an answer: stop and wait for their next message.";
 
 /// What the two kernel checkpoints are answered with. Their own words rather
 /// than `allow` / `deny`: this is not an approval, and reusing those would put
@@ -357,7 +584,22 @@ pub const STOP: &str = "stop";
 
 /// The answer to send back for a request, in the request's own terms. `None` —
 /// declined, or nobody answered — is a refusal, never consent.
-pub fn response_for(kind: &str, _question: &Question, answer: Option<String>) -> Value {
+pub fn response_for(kind: &str, reply: Option<Reply>) -> Value {
+    if kind == REQUEST_USER_INPUT_KIND {
+        // The wire carries both halves, and both go back: what was ticked and
+        // what was typed. Words that are only whitespace are not an answer.
+        let response = match reply {
+            Some(reply) => UserInputResponse {
+                declined: false,
+                selected: reply.selected,
+                text: reply.text.filter(|t| !t.trim().is_empty()),
+                ..Default::default()
+            },
+            None => UserInputResponse::declined(),
+        };
+        return serde_json::to_value(response).unwrap_or(Value::Null);
+    }
+    let answer = reply.and_then(Reply::into_value);
     match kind {
         APPROVAL_KIND => match answer.as_deref() {
             Some(ANSWER_ALLOW) => serde_json::json!({ "decision": "allow" }),
@@ -369,17 +611,6 @@ pub fn response_for(kind: &str, _question: &Question, answer: Option<String>) ->
             }
             _ => serde_json::json!({ "decision": "deny" }),
         },
-        REQUEST_USER_INPUT_KIND => {
-            let response = match answer {
-                Some(chosen) => UserInputResponse {
-                    declined: false,
-                    selected: vec![chosen],
-                    ..Default::default()
-                },
-                None => UserInputResponse::declined(),
-            };
-            serde_json::to_value(response).unwrap_or(Value::Null)
-        }
         // `{"continue": bool}`, and anything that is not an explicit "keep
         // going" is a stop — the kernel degrades a missing or malformed answer
         // to `false`, and this agrees with it rather than hoping.
@@ -395,6 +626,435 @@ pub fn response_for(kind: &str, _question: &Question, answer: Option<String>) ->
             Some(chosen) => Value::String(chosen),
             None => Value::Null,
         },
+    }
+}
+
+// ---- the panel: which page is up, which row is lit, what has been given ----
+
+/// One row a page of the panel offers, in the order it is drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Slot {
+    /// An offered answer, by index into `question.options`.
+    Pick(usize),
+    /// Words of the person's own, beside the offered answers.
+    Other,
+    /// Words of the person's own as the whole answer — a question that
+    /// offered none.
+    Input,
+    /// A multiple choice's "that is all of them".
+    Submit,
+    /// Talk it over instead of answering here.
+    Chat,
+    /// The review page's two ways out.
+    Send,
+    Cancel,
+}
+
+impl Slot {
+    /// Whether keys pressed on this row are words rather than commands.
+    pub fn types(self) -> bool {
+        matches!(self, Slot::Other | Slot::Input)
+    }
+    /// Whether the row carries a number a digit key can reach. Every row does
+    /// but the one that sends a multiple choice: it is not an answer, and
+    /// numbering it would put a number between the answers and the way out.
+    pub fn numbered(self) -> bool {
+        !matches!(self, Slot::Submit)
+    }
+}
+
+/// What one question has been given so far.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Draft {
+    /// The lit row on this question's page. Per question, so turning back to
+    /// a page finds the row where it was left.
+    pub cursor: usize,
+    /// Which offered answers are ticked, for a multiple choice.
+    pub checked: Vec<bool>,
+    /// What has been typed on the page's typing row.
+    pub typed: String,
+    /// The answer this page was given, in a batch — what its tab is marked
+    /// for and what the review page lists. A lone question is delivered the
+    /// moment it is answered and never keeps one.
+    pub answer: Option<Reply>,
+}
+
+/// The panel's state while a request is on screen.
+///
+/// Here rather than in the module's folded state because a question is not a
+/// fact until it is answered; here rather than in [`crate::moment`] because
+/// the keys that change it and the answers it produces are this file's
+/// business, and a drawing module should only have to read it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Sheet {
+    /// The request this is — an answer goes back only to it.
+    pub id: u64,
+    pub asked: Vec<Asked>,
+    /// Which page is up: a question's index, or `asked.len()` for a batch's
+    /// review page.
+    pub tab: usize,
+    pub drafts: Vec<Draft>,
+    /// The review page's lit row.
+    pub review: usize,
+}
+
+/// What a key did to the panel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Step {
+    /// Nothing to deliver yet. The panel may have changed.
+    Stay,
+    /// The request is answered: one reply per question, `None` declined.
+    Deliver(Vec<Option<Reply>>),
+}
+
+impl Sheet {
+    pub fn new(id: u64, asked: Vec<Asked>) -> Self {
+        let drafts = asked
+            .iter()
+            .map(|a| Draft {
+                checked: vec![false; a.question.options.len()],
+                ..Draft::default()
+            })
+            .collect();
+        Self {
+            id,
+            asked,
+            tab: 0,
+            drafts,
+            review: 0,
+        }
+    }
+
+    /// One question, for a caller with no queue behind it.
+    pub fn one(asked: impl Into<Asked>) -> Self {
+        Self::new(0, vec![asked.into()])
+    }
+
+    /// Several questions put together get a page each, tabs to move between
+    /// them, and a page to check the answers on before they go. One question
+    /// is answered where it stands.
+    pub fn is_batch(&self) -> bool {
+        self.asked.len() > 1
+    }
+
+    pub fn reviewing(&self) -> bool {
+        self.is_batch() && self.tab >= self.asked.len()
+    }
+
+    /// The question whose page is up; `None` on the review page.
+    pub fn page(&self) -> Option<&Asked> {
+        match self.reviewing() {
+            true => None,
+            false => self.asked.get(self.tab),
+        }
+    }
+
+    /// What the page that is up has been given; `None` on the review page.
+    pub fn draft(&self) -> Option<&Draft> {
+        match self.reviewing() {
+            true => None,
+            false => self.drafts.get(self.tab),
+        }
+    }
+
+    /// The rows the page that is up offers, top to bottom.
+    pub fn slots(&self) -> Vec<Slot> {
+        let Some(asked) = self.page() else {
+            return vec![Slot::Send, Slot::Cancel];
+        };
+        let picks = (0..asked.question.options.len()).map(Slot::Pick);
+        match asked.form() {
+            Form::Choice => picks.collect(),
+            Form::Single => picks.chain([Slot::Other, Slot::Chat]).collect(),
+            Form::Multiple => picks
+                .chain([Slot::Other, Slot::Submit, Slot::Chat])
+                .collect(),
+            Form::Text => vec![Slot::Input, Slot::Chat],
+        }
+    }
+
+    /// Which row is lit, as an index into [`Sheet::slots`].
+    pub fn cursor(&self) -> usize {
+        match self.reviewing() {
+            true => self.review,
+            false => self.drafts.get(self.tab).map_or(0, |d| d.cursor),
+        }
+    }
+
+    pub fn pointed(&self) -> Option<Slot> {
+        self.slots().get(self.cursor()).copied()
+    }
+
+    /// The number row `k` is drawn with, 1-based, when it has one.
+    pub fn number(&self, k: usize) -> Option<usize> {
+        let slots = self.slots();
+        slots.get(k).filter(|s| s.numbered())?;
+        Some(slots[..=k].iter().filter(|s| s.numbered()).count())
+    }
+
+    /// Light `row`, clamped to the rows there are. True when it moved.
+    ///
+    /// Clamped rather than rejected: a pointer on the panel's last row of
+    /// padding, or an arrow pressed past the end, means the nearest row.
+    pub fn point_at(&mut self, row: usize) -> bool {
+        let row = row.min(self.slots().len().saturating_sub(1));
+        let reviewing = self.reviewing();
+        let cursor = match reviewing {
+            true => &mut self.review,
+            false => match self.drafts.get_mut(self.tab) {
+                Some(d) => &mut d.cursor,
+                None => return false,
+            },
+        };
+        if *cursor == row {
+            return false;
+        }
+        *cursor = row;
+        true
+    }
+
+    /// Move the light by `delta` rows. Clamped, not wrapped: a light that jumps
+    /// from the last row to the first reads as a slip.
+    pub fn move_by(&mut self, delta: i32) -> bool {
+        let last = self.slots().len().saturating_sub(1) as i32;
+        let row = (self.cursor() as i32 + delta).clamp(0, last) as usize;
+        self.point_at(row)
+    }
+
+    /// Turn to another page of a batch, clamped at both ends.
+    pub fn turn(&mut self, delta: i32) -> bool {
+        if !self.is_batch() {
+            return false;
+        }
+        let tab = (self.tab as i32 + delta).clamp(0, self.asked.len() as i32) as usize;
+        if tab == self.tab {
+            return false;
+        }
+        self.tab = tab;
+        true
+    }
+
+    /// Whether the lit row takes typing.
+    pub fn typing(&self) -> bool {
+        self.pointed().is_some_and(Slot::types)
+    }
+
+    /// Type into the lit row, when it takes words. One line: a pasted line
+    /// break becomes a space.
+    pub fn type_text(&mut self, text: &str) -> bool {
+        if !self.typing() {
+            return false;
+        }
+        let Some(draft) = self.drafts.get_mut(self.tab) else {
+            return false;
+        };
+        draft
+            .typed
+            .extend(text.chars().map(|c| if c.is_control() { ' ' } else { c }));
+        true
+    }
+
+    /// Answer a key. Every key is the panel's while it is up.
+    ///
+    /// **Every answer is reachable by one key.** Up/down walk the rows; enter
+    /// takes the lit one; a digit goes straight to a numbered row; a letter picks
+    /// the answer it starts; left/right (or tab) turn a batch's pages; esc
+    /// declines. On a row that takes words the letters, digits and space are
+    /// words — a person typing an answer is not choosing between rows.
+    pub fn key(&mut self, press: crate::surface::KeyPress) -> Step {
+        use crate::surface::{Key, Mods};
+        let form = self.page().map(Asked::form);
+        match (press.key, press.mods) {
+            // Esc and ctrl-c decline — the whole request. Declining is an
+            // answer; it is never consent, and it is always one keystroke away.
+            (Key::Esc, _) | (Key::Char('c'), Mods::CTRL) => return self.decline(),
+            (Key::Up, _) | (Key::Char('k'), Mods::CTRL) => {
+                self.move_by(-1);
+            }
+            (Key::Down, _) | (Key::Char('j'), Mods::CTRL) => {
+                self.move_by(1);
+            }
+            (Key::Left, _) | (Key::BackTab, _) => {
+                self.turn(-1);
+            }
+            (Key::Right, _) | (Key::Tab, _) => {
+                self.turn(1);
+            }
+            (Key::Enter, _) => return self.enter(),
+            (Key::Backspace, _) if self.typing() => {
+                if let Some(draft) = self.drafts.get_mut(self.tab) {
+                    draft.typed.pop();
+                }
+            }
+            (Key::Char(c), Mods::NONE) | (Key::Char(c), Mods::SHIFT) if self.typing() => {
+                self.type_text(&c.to_string());
+            }
+            (Key::Char(' '), Mods::NONE) => {
+                if let (Some(Slot::Pick(i)), Some(Form::Multiple)) = (self.pointed(), form) {
+                    self.toggle(i);
+                }
+            }
+            (Key::Char(c), Mods::NONE) | (Key::Char(c), Mods::SHIFT) if c.is_ascii_digit() => {
+                let n = c.to_digit(10).unwrap_or(0) as usize;
+                let Some(k) = (0..self.slots().len()).find(|k| self.number(*k) == Some(n)) else {
+                    return Step::Stay;
+                };
+                self.point_at(k);
+                return match self.slots()[k] {
+                    // A number on a multiple choice ticks, like space: sending is
+                    // its own row.
+                    Slot::Pick(i) if form == Some(Form::Multiple) => {
+                        self.toggle(i);
+                        Step::Stay
+                    }
+                    // A number on the typing row goes there to be typed into.
+                    Slot::Other | Slot::Input => Step::Stay,
+                    _ => self.enter(),
+                };
+            }
+            // A letter picks the answer that starts with it, where an answer is
+            // one pick. It does *not* fall back to typing: off the typing row the
+            // answers are what there is to choose between.
+            (Key::Char(c), Mods::NONE) | (Key::Char(c), Mods::SHIFT)
+                if matches!(form, Some(Form::Choice | Form::Single)) =>
+            {
+                let at = self.page().and_then(|asked| {
+                    let value = by_prefix(&asked.question, c)?;
+                    asked.question.options.iter().position(|a| a.value == value)
+                });
+                if let Some(i) = at {
+                    self.point_at(i);
+                    return self.enter();
+                }
+            }
+            _ => {}
+        }
+        Step::Stay
+    }
+
+    /// Take the lit row.
+    pub fn enter(&mut self) -> Step {
+        let Some(slot) = self.pointed() else {
+            return Step::Stay;
+        };
+        let form = self.page().map(Asked::form);
+        match slot {
+            Slot::Pick(i) if form == Some(Form::Multiple) => {
+                self.toggle(i);
+                Step::Stay
+            }
+            Slot::Pick(i) => {
+                let value = self
+                    .page()
+                    .and_then(|a| a.question.options.get(i))
+                    .map(|a| a.value.clone());
+                match value {
+                    Some(value) => self.commit(Reply::from(value)),
+                    None => Step::Stay,
+                }
+            }
+            // On a multiple choice the words are part of the answer by being
+            // there, so enter moves on to the row that sends it.
+            Slot::Other if form == Some(Form::Multiple) => {
+                if let Some(k) = self.slots().iter().position(|s| *s == Slot::Submit) {
+                    self.point_at(k);
+                }
+                Step::Stay
+            }
+            // Nothing typed is nothing to send: the row stays, waiting.
+            Slot::Other | Slot::Input => {
+                let typed = self
+                    .draft()
+                    .map(|d| d.typed.trim().to_string())
+                    .unwrap_or_default();
+                match typed.is_empty() {
+                    true => Step::Stay,
+                    false => self.commit(Reply::typed(typed)),
+                }
+            }
+            Slot::Submit => match self.ticked() {
+                Some(reply) => self.commit(reply),
+                None => Step::Stay,
+            },
+            Slot::Chat => Step::Deliver(vec![Some(Reply::typed(CHAT_INSTEAD)); self.asked.len()]),
+            Slot::Send => Step::Deliver(self.drafts.iter().map(|d| d.answer.clone()).collect()),
+            Slot::Cancel => self.decline(),
+        }
+    }
+
+    /// Everything declined.
+    fn decline(&self) -> Step {
+        Step::Deliver(vec![None; self.asked.len()])
+    }
+
+    fn toggle(&mut self, i: usize) {
+        if let Some(checked) = self
+            .drafts
+            .get_mut(self.tab)
+            .and_then(|d| d.checked.get_mut(i))
+        {
+            *checked = !*checked;
+        }
+    }
+
+    /// What a multiple choice sends: everything ticked, in the order offered,
+    /// and the words, if there are any. `None` when there is neither — a send
+    /// with nothing in it is not an answer, and esc is there for "none".
+    pub fn ticked(&self) -> Option<Reply> {
+        let asked = self.page()?;
+        let draft = self.draft()?;
+        let selected: Vec<String> = asked
+            .question
+            .options
+            .iter()
+            .zip(&draft.checked)
+            .filter(|(_, ticked)| **ticked)
+            .map(|(a, _)| a.value.clone())
+            .collect();
+        let typed = draft.typed.trim();
+        let text = (!typed.is_empty()).then(|| typed.to_string());
+        if selected.is_empty() && text.is_none() {
+            return None;
+        }
+        Some(Reply { selected, text })
+    }
+
+    /// A question answered: sent at once when it is the only one, and in a
+    /// batch kept on its page while the next unanswered one after it comes up —
+    /// the review page when there is none.
+    fn commit(&mut self, reply: Reply) -> Step {
+        if !self.is_batch() {
+            return Step::Deliver(vec![Some(reply)]);
+        }
+        if let Some(draft) = self.drafts.get_mut(self.tab) {
+            draft.answer = Some(reply);
+        }
+        self.tab = (self.tab + 1..self.asked.len())
+            .find(|i| self.drafts.get(*i).is_some_and(|d| d.answer.is_none()))
+            .unwrap_or(self.asked.len());
+        Step::Stay
+    }
+
+    /// How question `i`'s answer reads on the review page: the offered
+    /// answers' own words, then what was typed. `None` when it has none.
+    pub fn recap(&self, i: usize) -> Option<String> {
+        let reply = self.drafts.get(i)?.answer.as_ref()?;
+        let asked = self.asked.get(i)?;
+        let mut said: Vec<String> = reply
+            .selected
+            .iter()
+            .map(|value| {
+                let label = asked
+                    .question
+                    .options
+                    .iter()
+                    .find(|a| &a.value == value)
+                    .map_or(value.as_str(), |a| a.label.as_str());
+                answer_label(value, label)
+            })
+            .collect();
+        said.extend(reply.text.clone());
+        Some(said.join(", "))
     }
 }
 
@@ -532,7 +1192,13 @@ pub fn textwrap(text: &str, width: usize) -> Vec<String> {
     for paragraph in text.lines() {
         let mut rest = paragraph.to_string();
         while crate::width::str_width(&rest) > width {
-            let head = crate::width::take_width(&rest, width);
+            let mut head = crate::width::take_width(&rest, width);
+            // A character wider than the whole row still has to go somewhere, or
+            // this never gets shorter: it goes on a row of its own, and the
+            // drawing cuts what does not fit.
+            if head.is_empty() {
+                head = rest.chars().next().map(String::from).unwrap_or_default();
+            }
             let taken = head.chars().count();
             rest = rest.chars().skip(taken).collect();
             out.push(head);
@@ -588,9 +1254,15 @@ mod tests {
                 },
             ]
         });
-        let questions = batch_for(REQUEST_USER_INPUT_KIND, &two, &[])
+        let asked = batch_for(REQUEST_USER_INPUT_KIND, &two, &[])
             .expect("a batch is a batch, not an unreadable payload");
+        let questions: Vec<Question> = asked.iter().map(|a| a.question.clone()).collect();
         assert_eq!(questions.len(), 2, "both are put to the person");
+        assert_eq!(
+            asked[0].title(),
+            "建仓方案",
+            "each page's tab is its header"
+        );
         assert!(questions[0].prompt.contains("git 仓"), "{:?}", questions[0]);
         assert_eq!(
             questions[0].options.len(),
@@ -603,10 +1275,10 @@ mod tests {
 
         // Answering one and declining the other: the first choice reaches the
         // tool, and the second is a decline rather than a made-up answer.
-        let answered = declinable(&questions[0], Some("独立本体仓".into()));
+        let answered = declinable(Some(Reply::from("独立本体仓")));
         assert_eq!(answered["selected"][0], "独立本体仓");
         assert_eq!(answered["declined"], false);
-        let declined = declinable(&questions[1], None);
+        let declined = declinable(None);
         assert_eq!(
             declined["declined"], true,
             "skipping one question is not answering it: {declined}"
@@ -634,7 +1306,7 @@ mod tests {
             atomcode_kernel::event::ROUND_CAP_CHECKPOINT_KIND,
             atomcode_kernel::event::OUTPUT_TRUNCATION_CHECKPOINT_KIND,
         ] {
-            let question = question_for(kind, &serde_json::json!({}), &[])
+            let question = q(kind, &serde_json::json!({}), &[])
                 .unwrap_or_else(|| panic!("{kind} is a question a person can answer"));
             assert_eq!(
                 question.options.len(),
@@ -645,13 +1317,13 @@ mod tests {
             assert_eq!(nth(&question, 2).as_deref(), Some(STOP));
 
             assert_eq!(
-                response_for(kind, &question, Some(CONTINUE.into())),
+                response_for(kind, Some(Reply::from(CONTINUE))),
                 serde_json::json!({ "continue": true }),
                 "{kind}: continuing says so"
             );
             for answer in [Some(STOP.to_string()), None] {
                 assert_eq!(
-                    response_for(kind, &question, answer.clone()),
+                    response_for(kind, answer.clone().map(Reply::from)),
                     serde_json::json!({ "continue": false }),
                     "{kind}: {answer:?} stops — nothing but an explicit yes goes on"
                 );
@@ -681,8 +1353,7 @@ mod tests {
             None,
         );
         let payload = serde_json::json!({ "call_id": "c", "tool": "write_file", "args": r#"{"file_path":"a"}"# });
-        let question =
-            question_for(APPROVAL_KIND, &payload, &[asked(recorded.clone())]).expect("drawn");
+        let question = q(APPROVAL_KIND, &payload, &[asked(recorded.clone())]).expect("drawn");
         assert_eq!(question, recorded);
         assert!(!question.has(ANSWER_ALWAYS), "never offered what was not");
 
@@ -692,7 +1363,7 @@ mod tests {
             (Some(ANSWER_DENY), "deny"),
             (None, "deny"),
         ] {
-            let value = response_for(APPROVAL_KIND, &question, answer.map(str::to_string));
+            let value = response_for(APPROVAL_KIND, answer.map(Reply::from));
             assert_eq!(value["decision"], decision, "{answer:?}");
         }
     }
@@ -722,8 +1393,7 @@ mod tests {
             "tool": "bash",
             "args": r#"{"command":"rm -rf build"}"#,
         });
-        let drawn =
-            question_for(APPROVAL_KIND, &payload, &[asked(recorded.clone())]).expect("drawn");
+        let drawn = q(APPROVAL_KIND, &payload, &[asked(recorded.clone())]).expect("drawn");
         assert_eq!(
             drawn, recorded,
             "the recorded question, not a synthesized 3-option one"
@@ -758,7 +1428,7 @@ mod tests {
         );
 
         // The blanket answer carries `remember + grant_scope:"all"` (the AllowAlwaysAll wire).
-        let value = response_for(APPROVAL_KIND, &offered, Some(ANSWER_ALWAYS_ALL.to_string()));
+        let value = response_for(APPROVAL_KIND, Some(Reply::from(ANSWER_ALWAYS_ALL)));
         assert_eq!(value["decision"], "allow");
         assert_eq!(value["remember"], true);
         assert_eq!(value["grant_scope"], "all");
@@ -772,17 +1442,17 @@ mod tests {
             "mode": "single",
             "options": [{ "label": "vanilla" }, { "label": "pistachio", "description": "green" }],
         });
-        let question = question_for(REQUEST_USER_INPUT_KIND, &payload, &[]).expect("drawn");
+        let question = q(REQUEST_USER_INPUT_KIND, &payload, &[]).expect("drawn");
         assert_eq!(question.prompt, "Which one?");
         assert_eq!(question.values(), vec!["vanilla", "pistachio"]);
         assert_eq!(question.asker.as_deref(), Some("scout"));
 
-        let picked = response_for(REQUEST_USER_INPUT_KIND, &question, Some("pistachio".into()));
+        let picked = response_for(REQUEST_USER_INPUT_KIND, Some(Reply::from("pistachio")));
         let picked: UserInputResponse = serde_json::from_value(picked).unwrap();
         assert!(!picked.declined);
         assert_eq!(picked.selected, vec!["pistachio"]);
         let declined: UserInputResponse =
-            serde_json::from_value(response_for(REQUEST_USER_INPUT_KIND, &question, None)).unwrap();
+            serde_json::from_value(response_for(REQUEST_USER_INPUT_KIND, None)).unwrap();
         assert!(declined.declined);
     }
 
@@ -800,26 +1470,334 @@ mod tests {
             "prompt": "要不要把这条也带上?",
             "options": ["带上", { "value": "skip", "label": "跳过" }],
         });
-        let question = question_for("some-future-capability", &payload, &[]).expect("drawn");
+        let question = q("some-future-capability", &payload, &[]).expect("drawn");
         assert_eq!(question.prompt, "要不要把这条也带上?");
         assert_eq!(question.values(), vec!["带上", "skip"]);
         assert_eq!(question.asker.as_deref(), Some("some-future-capability"));
         assert_eq!(
-            response_for("some-future-capability", &question, Some("skip".into())),
+            response_for("some-future-capability", Some(Reply::from("skip"))),
             serde_json::json!("skip")
         );
         // Declined stays distinguishable from "nobody could ask".
-        assert_eq!(
-            response_for("some-future-capability", &question, None),
-            Value::Null
-        );
+        assert_eq!(response_for("some-future-capability", None), Value::Null);
 
         // No answers named: yes or no, so there is something to press.
-        let bare = question_for("another", &serde_json::json!({ "message": "继续?" }), &[])
-            .expect("drawn");
+        let bare = q("another", &serde_json::json!({ "message": "继续?" }), &[]).expect("drawn");
         assert_eq!(bare.values(), vec![YES, NO]);
 
         // And a payload with no words in it is genuinely not a question.
-        assert!(question_for("another", &serde_json::json!({ "n": 1 }), &[]).is_none());
+        assert!(q("another", &serde_json::json!({ "n": 1 }), &[]).is_none());
+    }
+
+    /// The question a request draws, for a test that only reads the words.
+    fn q(kind: &str, payload: &Value, events: &[LoggedEvent]) -> Option<Question> {
+        question_for(kind, payload, events).map(|a| a.question)
+    }
+
+    /// A model's own question, as the wire brings it.
+    fn model(payload: Value) -> Asked {
+        question_for(REQUEST_USER_INPUT_KIND, &payload, &[]).expect("drawn")
+    }
+
+    fn keys(sheet: &mut Sheet, keys: &[crate::surface::Key]) -> Step {
+        let mut last = Step::Stay;
+        for key in keys {
+            last = sheet.key(crate::surface::KeyPress::plain(*key));
+        }
+        last
+    }
+
+    /// What reaches the model: the response the tool reads, parsed back.
+    fn wire(step: Step) -> Vec<UserInputResponse> {
+        let Step::Deliver(replies) = step else {
+            panic!("nothing was delivered: {step:?}");
+        };
+        replies
+            .into_iter()
+            .map(|r| serde_json::from_value(declinable(r)).expect("the tool's own shape"))
+            .collect()
+    }
+
+    fn single() -> Asked {
+        model(serde_json::json!({
+            "header": "口味",
+            "question": "要哪个?",
+            "mode": "single",
+            "options": [{ "label": "vanilla" }, { "label": "pistachio", "description": "green" }],
+        }))
+    }
+
+    fn multiple() -> Asked {
+        model(serde_json::json!({
+            "header": "语言",
+            "question": "要支持哪些语言?",
+            "mode": "multiple",
+            "options": [{ "label": "Python" }, { "label": "Rust" }, { "label": "Go" }],
+        }))
+    }
+
+    fn text() -> Asked {
+        model(serde_json::json!({
+            "header": "名字",
+            "question": "新仓库叫什么?",
+            "mode": "text",
+        }))
+    }
+
+    /// The mode the model asked in survives the trip to the screen, and each
+    /// answer keeps its own name — what it means is drawn under it, not in its
+    /// place.
+    #[test]
+    fn a_models_question_keeps_the_mode_it_was_asked_in() {
+        assert_eq!(single().form(), Form::Single);
+        assert_eq!(multiple().form(), Form::Multiple);
+        assert_eq!(text().form(), Form::Text);
+        let one = single();
+        assert_eq!(one.question.options[1].label, "pistachio");
+        assert_eq!(one.description(1), Some("green"));
+        assert_eq!(one.description(0), None);
+        // The seam's own question, recorded in the log, is a choice as it was.
+        let recorded = Question::plain("要哪个?", &["vanilla", "pistachio"]);
+        let payload = serde_json::json!({
+            "header": "Question", "question": "要哪个?", "mode": "single",
+            "options": [{ "label": "vanilla" }, { "label": "pistachio" }],
+        });
+        let seam = question_for(REQUEST_USER_INPUT_KIND, &payload, &[asked(recorded)]).unwrap();
+        assert_eq!(seam.form(), Form::Choice);
+    }
+
+    /// A single choice: an offered answer is sent as picked; the row of one's
+    /// own sends the words, typed, as the tool's `text` — not as a pick of an
+    /// answer that was never offered.
+    #[test]
+    fn a_single_choice_takes_a_pick_or_words_of_ones_own() {
+        use crate::surface::Key;
+        let mut sheet = Sheet::one(single());
+        assert_eq!(
+            sheet.slots(),
+            vec![Slot::Pick(0), Slot::Pick(1), Slot::Other, Slot::Chat]
+        );
+        let picked = wire(keys(&mut sheet.clone(), &[Key::Down, Key::Enter]));
+        assert_eq!(picked[0].selected, vec!["pistachio"]);
+        assert_eq!(picked[0].text, None);
+
+        // To the typing row by its number; enter on nothing typed is nothing.
+        assert_eq!(keys(&mut sheet, &[Key::Char('3'), Key::Enter]), Step::Stay);
+        assert!(sheet.typing());
+        // Letters, digits and spaces are words there, not picks.
+        let typed = keys(
+            &mut sheet,
+            &[
+                Key::Char('m'),
+                Key::Char('i'),
+                Key::Char('n'),
+                Key::Char('t'),
+                Key::Char(' '),
+                Key::Char('2'),
+                Key::Char('x'),
+                Key::Backspace,
+                Key::Enter,
+            ],
+        );
+        let answered = wire(typed);
+        assert!(!answered[0].declined);
+        assert!(answered[0].selected.is_empty(), "{answered:?}");
+        assert_eq!(answered[0].text.as_deref(), Some("mint 2"));
+    }
+
+    /// A multiple choice sends everything ticked, and the words beside them —
+    /// both, because the tool reads both.
+    #[test]
+    fn a_multiple_choice_sends_everything_ticked_and_the_words_beside_them() {
+        use crate::surface::Key;
+        let mut sheet = Sheet::one(multiple());
+        assert_eq!(
+            sheet.slots(),
+            vec![
+                Slot::Pick(0),
+                Slot::Pick(1),
+                Slot::Pick(2),
+                Slot::Other,
+                Slot::Submit,
+                Slot::Chat
+            ]
+        );
+        // Space ticks, and so does enter on an answer: sending is its own row.
+        assert_eq!(
+            keys(
+                &mut sheet,
+                &[Key::Char(' '), Key::Down, Key::Down, Key::Enter]
+            ),
+            Step::Stay
+        );
+        // Untick and tick again: a box is a toggle.
+        keys(&mut sheet, &[Key::Char(' '), Key::Char(' ')]);
+        let mut words = sheet.clone();
+        let sent = wire(keys(&mut sheet, &[Key::Down, Key::Down, Key::Enter]));
+        assert_eq!(sent[0].selected, vec!["Python", "Go"]);
+        assert_eq!(sent[0].text, None);
+
+        // With words on the row of one's own: enter there moves on to the row
+        // that sends, and both halves go.
+        keys(&mut words, &[Key::Down, Key::Char('C'), Key::Enter]);
+        assert_eq!(words.pointed(), Some(Slot::Submit));
+        let both = wire(words.enter());
+        assert_eq!(both[0].selected, vec!["Python", "Go"]);
+        assert_eq!(both[0].text.as_deref(), Some("C"));
+
+        // Nothing ticked and nothing typed is not an answer — esc is for "none".
+        let empty = Sheet::one(multiple());
+        assert_eq!(
+            empty.number(4),
+            None,
+            "the row that sends carries no number"
+        );
+        assert_eq!(
+            empty.number(5),
+            Some(5),
+            "and the way out counts on past it"
+        );
+        let mut empty = Sheet::one(multiple());
+        empty.point_at(4);
+        assert_eq!(empty.enter(), Step::Stay);
+    }
+
+    /// A text question is words: no yes and no no, and nothing sent until
+    /// something is typed.
+    #[test]
+    fn a_text_question_is_answered_with_words() {
+        use crate::surface::Key;
+        let asks = Asks::new();
+        drop(asks.push(text()));
+        let (_, waiting) = asks.peek().unwrap();
+        assert!(
+            waiting[0].question.options.is_empty(),
+            "no yes/no put in front of a question that wants words"
+        );
+        let mut sheet = Sheet::one(waiting[0].clone());
+        assert_eq!(sheet.slots(), vec![Slot::Input, Slot::Chat]);
+        assert!(sheet.typing(), "the line to type on is lit from the start");
+        assert_eq!(keys(&mut sheet, &[Key::Char(' '), Key::Enter]), Step::Stay);
+        sheet.type_text("lab\nrepo");
+        let sent = wire(sheet.enter());
+        assert_eq!(sent[0].text.as_deref(), Some("lab repo"), "one line");
+        assert!(sent[0].selected.is_empty());
+    }
+
+    /// Talking it over instead is an answer the model can act on: stop and
+    /// listen — not "no answer, use your judgement", which is the guess the
+    /// person just declined to let it make.
+    #[test]
+    fn chat_instead_tells_the_model_to_wait_for_the_person() {
+        let mut sheet = Sheet::one(single());
+        sheet.point_at(3);
+        assert_eq!(sheet.pointed(), Some(Slot::Chat));
+        let sent = wire(sheet.enter());
+        assert!(!sent[0].declined);
+        assert_eq!(sent[0].text.as_deref(), Some(CHAT_INSTEAD));
+
+        let mut batch = Sheet::new(1, vec![single(), text()]);
+        let sent = wire(keys(&mut batch, &[crate::surface::Key::Char('4')]));
+        assert_eq!(sent.len(), 2, "the whole batch, not one page of it");
+        assert!(sent.iter().all(|r| r.text.as_deref() == Some(CHAT_INSTEAD)));
+    }
+
+    /// A batch is answered page by page and sent from its review page, every
+    /// answer in the order asked; a page skipped is that question declined, and
+    /// cancelling or esc declines them all.
+    #[test]
+    fn a_batch_is_answered_page_by_page_and_sent_from_the_review_page() {
+        use crate::surface::Key;
+        let mut sheet = Sheet::new(9, vec![single(), multiple(), text()]);
+        // Page one: pick pistachio — the page turns by itself.
+        assert_eq!(keys(&mut sheet, &[Key::Char('2')]), Step::Stay);
+        assert_eq!(sheet.tab, 1);
+        // Page two: skip it. Page three: type.
+        keys(&mut sheet, &[Key::Tab]);
+        assert_eq!(sheet.tab, 2);
+        sheet.type_text("lab");
+        assert_eq!(keys(&mut sheet, &[Key::Enter]), Step::Stay);
+        assert!(
+            sheet.reviewing(),
+            "the last answer leads to the review page"
+        );
+        assert_eq!(sheet.recap(0).as_deref(), Some("pistachio"));
+        assert_eq!(sheet.recap(1), None);
+        assert_eq!(sheet.recap(2).as_deref(), Some("lab"));
+
+        // Back to page two and answer it after all; the pages keep what they had.
+        keys(
+            &mut sheet,
+            &[Key::Left, Key::Left, Key::Char(' '), Key::Char('1')],
+        );
+        assert_eq!(sheet.tab, 1);
+        assert_eq!(
+            sheet.drafts[1].checked,
+            vec![false, false, false],
+            "ticked, unticked"
+        );
+        keys(&mut sheet, &[Key::Char('2'), Key::Char('3')]);
+        sheet.point_at(4);
+        keys(&mut sheet, &[Key::Enter]);
+        assert!(sheet.reviewing());
+
+        let mut cancel = sheet.clone();
+        let sent = wire(keys(&mut sheet, &[Key::Char('1')]));
+        assert_eq!(sent.len(), 3);
+        assert_eq!(sent[0].selected, vec!["pistachio"]);
+        assert_eq!(sent[1].selected, vec!["Rust", "Go"]);
+        assert_eq!(sent[2].text.as_deref(), Some("lab"));
+
+        assert!(wire(keys(&mut cancel, &[Key::Down, Key::Enter]))
+            .iter()
+            .all(|r| r.declined));
+        let mut skipped = Sheet::new(9, vec![single(), text()]);
+        let sent = wire(keys(&mut skipped, &[Key::Right, Key::Right, Key::Enter]));
+        assert!(
+            sent.iter().all(|r| r.declined),
+            "nothing answered, nothing made up"
+        );
+        let mut esc = Sheet::new(9, vec![single(), text()]);
+        keys(&mut esc, &[Key::Char('1')]);
+        let sent = wire(keys(&mut esc, &[Key::Esc]));
+        assert!(sent.iter().all(|r| r.declined), "esc is the whole request");
+    }
+
+    /// A batch pushed through the queue comes back as one answer per question,
+    /// in order — and shutdown refuses every one of them.
+    #[tokio::test]
+    async fn a_batch_comes_back_whole_through_the_queue() {
+        let asks = Asks::new();
+        let answer = asks.push_batch(vec![single(), text()]);
+        let (id, asked) = asks.peek().unwrap();
+        assert_eq!(asked.len(), 2);
+        assert!(
+            asks.take_id(id + 1).is_none(),
+            "an answer is not transferable"
+        );
+        asks.take_id(id)
+            .unwrap()
+            .finish(vec![Some(Reply::from("vanilla"))]);
+        assert_eq!(
+            answer.await.unwrap(),
+            vec![Some(Reply::from("vanilla")), None],
+            "a question left off the end is declined"
+        );
+
+        let refused = asks.push_batch(vec![single(), text()]);
+        asks.refuse_all();
+        assert_eq!(refused.await.unwrap(), vec![None, None]);
+
+        // Without a panel, the fallback answers a batch one question at a time.
+        let answer = asks.push_batch(vec![single(), text()]);
+        assert_eq!(asks.current().unwrap(), single());
+        asks.answer_current(Some(Reply::from("pistachio")));
+        assert_eq!(asks.current().unwrap(), text());
+        asks.answer_current(None);
+        assert!(!asks.is_waiting());
+        assert_eq!(
+            answer.await.unwrap(),
+            vec![Some(Reply::from("pistachio")), None]
+        );
     }
 }

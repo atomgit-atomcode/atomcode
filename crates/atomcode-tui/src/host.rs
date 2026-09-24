@@ -2246,50 +2246,38 @@ impl Host {
         // a panel, and the composer stays exactly where it was. Gating here rather
         // than in each of the four places that read `asking` is what keeps them
         // from disagreeing about whether a question is on screen.
-        let waiting = self
-            .ask_panel_mounted()
-            .then(|| self.asks.peek().map(|(_, q)| q))
-            .flatten();
+        let waiting = self.ask_panel_mounted().then(|| self.asks.peek()).flatten();
         let mut m = self.moment.write().expect("moment poisoned");
         match waiting {
             None => m.asking.take().is_some(),
-            Some(question) => {
-                let cursor = match &m.asking {
-                    Some(had) if had.question == question => had.cursor,
-                    _ => 0,
-                };
-                let same = m
-                    .asking
-                    .as_ref()
-                    .is_some_and(|had| had.question == question && had.cursor == cursor);
-                if same {
-                    return false;
-                }
-                m.asking = Some(crate::moment::Ask { question, cursor });
+            // The same request keeps its sheet — the lit row, the page, what
+            // has been ticked and typed. Keyed on the request's id rather than
+            // on its words: two questions worded alike are still two questions.
+            Some((id, _)) if m.asking.as_ref().is_some_and(|had| had.id == id) => false,
+            Some((id, asked)) => {
+                m.asking = Some(crate::moment::Ask::new(id, asked));
                 true
             }
         }
     }
 
-    /// Move the highlight to an answer, by index. True when it moved.
+    /// Move the highlight to a row, by index. True when it moved.
     pub fn point_ask_at(&self, row: usize) -> bool {
         let mut m = self.moment.write().expect("moment poisoned");
         m.asking.as_mut().is_some_and(|a| a.point_at(row))
     }
 
-    /// Move the highlight by `delta` answers, clamped to the ones there are.
-    ///
-    /// Clamped, not wrapped: a highlight that jumps from the last answer to the
-    /// first reads as a slip, and there is nowhere to fall off to at either end.
-    pub fn move_ask_by(&self, delta: i32) -> bool {
+    /// Give a key to the question panel, and say what it came to.
+    pub fn ask_key(&self, press: crate::surface::KeyPress) -> Option<(u64, crate::ask::Step)> {
         let mut m = self.moment.write().expect("moment poisoned");
-        let Some(ask) = m.asking.as_ref() else {
-            return false;
-        };
-        let last = ask.question.options.len().saturating_sub(1);
-        let cur = ask.cursor as i32;
-        let row = (cur + delta).clamp(0, last as i32) as usize;
-        m.asking.as_mut().is_some_and(|a| a.point_at(row))
+        let sheet = m.asking.as_mut()?;
+        Some((sheet.id, sheet.key(press)))
+    }
+
+    /// Paste into the question panel's typing row. True when it took it.
+    pub fn ask_paste(&self, text: &str) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        m.asking.as_mut().is_some_and(|a| a.type_text(text))
     }
 
     /// Ask for a password on the composer's line (`crate::secret`).
@@ -2453,7 +2441,7 @@ impl Host {
         let m = self.moment.read().expect("moment poisoned");
         let ask = m.asking.as_ref()?;
         let vp = crate::moment::Viewport::new(rect, &m);
-        let geom = crate::modules::ask::geometry(&ask.question, &vp);
+        let geom = crate::modules::ask::geometry(ask, &vp);
         geom.answer_at((y - rect.y) as usize)
     }
 
@@ -4451,7 +4439,7 @@ impl Host {
         // is what makes the row a product's decision instead of a dependency of
         // the front end.
         if !self.ask_panel_mounted() {
-            if let Some((_, question)) = self.asks.peek() {
+            if let Some(question) = self.asks.current().map(|a| a.question) {
                 let pending = crate::content::ChoiceBlock {
                     question: crate::ask::recorded(&question),
                     options: question
@@ -5278,7 +5266,7 @@ impl Host {
         // frame drew and this did not would be out of reach at the bottom of the
         // scroll, which is the whole failure `row_index` exists to prevent.
         let pending = match self.ask_panel_mounted() {
-            false => self.asks.peek().map(|(_, q)| q),
+            false => self.asks.current().map(|a| a.question),
             true => None,
         };
         let question = pending.map_or(0, |q| {

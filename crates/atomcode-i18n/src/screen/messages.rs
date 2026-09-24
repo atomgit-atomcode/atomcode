@@ -142,6 +142,23 @@ pub enum Msg<'a> {
     AskGrantOnly {
         what: &'a str,
     },
+    /// The row a person types an answer of their own on, while it is empty.
+    AskTypeSomething,
+    /// The row that gives up answering here and talks it over instead.
+    AskChatInstead,
+    /// The row that sends a multiple choice, and a batch's last page tab.
+    AskSubmit,
+    /// The row that keeps a multiple choice's answer and turns to the next
+    /// question of a batch.
+    AskNext,
+    AskReviewTitle,
+    AskReviewReady,
+    AskReviewSend,
+    AskReviewCancel,
+    /// A batch question with no answer yet, on the review page.
+    AskUnanswered,
+    AskLegendToggle,
+    AskLegendSwitch,
 
     // ── the input line (`modules/input.rs`) ──
     InputAnswerKeys,
