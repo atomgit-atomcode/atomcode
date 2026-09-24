@@ -912,6 +912,11 @@ impl CCExternalHooks {
     /// (neither engine threads a tool name into the post-tool seam), but ONLY
     /// for a call that will actually run — a `Deny` means the tool is blocked,
     /// so its post-tool hook must not fire. [`Self::post_tool`] removes it.
+    ///
+    /// The kernel chain of 5.1.0 still sent a denied call's `blocked: …` result
+    /// through every `after`, so PostToolUseFailure fired for it with
+    /// `tool_name: null`. The harness path returns the refusal without running
+    /// `post_tool`, which is the line this method always drew.
     pub fn note_call_for_post(&self, call: &ToolCall, gate: &BeforeOutcome) {
         if self.has_post_tool_hooks && !gate.is_deny() {
             if let Ok(mut m) = self.call_tools.lock() {
@@ -942,11 +947,11 @@ impl CCExternalHooks {
         let payload = serde_json::json!({
             "session_id": self.session_id,
             "hook_event_name": event.cc_name(),
-            // The same call id the PreToolUse frame carried. For a call denied at
-            // PreToolUse, `tool_name` is absent here (its name was never stashed),
-            // so this id is what lets an audit join the failure frame back to the
-            // Pre frame that DID carry the name — the "which tool got blocked"
-            // question that was otherwise unanswerable.
+            // The same call id the PreToolUse frame carried, so a hook can pair a
+            // call's arguments, duration and result. A call a PreToolUse hook
+            // denied never reaches here — the failure stream is for calls that
+            // ran — so "which tool got blocked" is recorded on the PreToolUse
+            // side, whose frame names the tool and carries this id.
             "call_id": result.call_id,
             "tool_name": tool_name,
             "tool_response": result.content,

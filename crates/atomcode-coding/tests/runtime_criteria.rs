@@ -1280,6 +1280,87 @@ async fn a_persons_hooks_and_a_plugins_hooks_both_run() {
     runtime.handle.shutdown().await.unwrap();
 }
 
+/// The failure hook hears of calls that ran and failed — not of calls a
+/// PreToolUse hook refused — and each failure carries the tool's name and the
+/// `call_id` its PreToolUse frame had.
+///
+/// Reported from an audited deployment on 5.1.0: a refused call reached
+/// PostToolUseFailure with `tool_name: null`, because the old chain sent the
+/// refusal through every `after` while the name was only kept for calls that
+/// would run. A refusal is the PreToolUse hook's own decision, and that frame
+/// already names the tool and the call; the failure stream is for what ran.
+/// That is also where every other agent draws the line — none fires its
+/// post/failure hook for a call its pre hook blocked.
+///
+/// Negative control: send a refused call through `post_tool` in `CcHooks` and
+/// the failure log gains a `grep` entry.
+async fn the_failure_hook_hears_what_ran_by_name_and_not_what_was_refused() {
+    let env = env();
+    let project = env.project.path();
+    let pre = project.join("pre.jsonl");
+    let failed = project.join("failed.jsonl");
+    std::fs::write(
+        project.join(".hooks.json"),
+        serde_json::json!({
+            "hooks": {
+                "guard": {
+                    "event": "PreToolUse",
+                    "command": format!(
+                        "input=$(cat); printf '%s\\n' \"$input\" >> {}; \
+                         case \"$input\" in *'\"tool_name\":\"grep\"'*) \
+                         echo 'no searching today' >&2; exit 2;; esac",
+                        pre.display()
+                    ),
+                },
+                "audit": {
+                    "event": "PostToolUseFailure",
+                    "command": format!("cat >> {}; echo >> {}", failed.display(), failed.display()),
+                },
+            },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime = CodingRuntime::start(start(project, &recorder, SessionMode::Fresh))
+        .await
+        .unwrap();
+
+    turn(&mut runtime, "search needle").await;
+    turn(&mut runtime, "read no-such-file.txt").await;
+    runtime.handle.shutdown().await.unwrap();
+
+    let frames = |path: &std::path::Path| -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    };
+    let pre = frames(&pre);
+    let call_of = |tool: &str| {
+        pre.iter()
+            .find(|frame| frame["tool_name"] == tool)
+            .unwrap_or_else(|| panic!("no PreToolUse frame for {tool}: {pre:?}"))["call_id"]
+            .clone()
+    };
+    let (refused, ran) = (call_of("grep"), call_of("read_file"));
+    assert!(refused.is_string() && ran.is_string(), "{pre:?}");
+
+    let failed = frames(&failed);
+    assert!(
+        !failed.iter().any(|frame| frame["call_id"] == refused),
+        "a call the PreToolUse hook refused reached the failure hook: {failed:?}"
+    );
+    let failure = failed
+        .iter()
+        .find(|frame| frame["call_id"] == ran)
+        .unwrap_or_else(|| panic!("the call that ran and failed never reached it: {failed:?}"));
+    assert_eq!(failure["hook_event_name"], "PostToolUseFailure");
+    assert_eq!(failure["tool_name"], "read_file", "{failure}");
+}
+
 /// A Claude Code hook told where the session's transcript is gets the session's
 /// log, which replaced the transcript (`docs/adr/0024` §14) — and by the time
 /// the hook runs, the turn it is told about is in that file.
@@ -4761,6 +4842,7 @@ mod criteria {
         the_session_context_is_shown_and_its_git_snapshot_survives_a_resume,
         a_turn_is_transcribed_and_metered,
         a_persons_hooks_and_a_plugins_hooks_both_run,
+        the_failure_hook_hears_what_ran_by_name_and_not_what_was_refused,
         a_stop_hook_is_pointed_at_the_sessions_log,
         the_datalog_is_written_when_it_is_on,
         an_eager_todo_reminder_rides_the_first_request,
