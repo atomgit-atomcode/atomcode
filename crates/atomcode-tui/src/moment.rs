@@ -1143,7 +1143,10 @@ mod tests {
         };
         // A folded paste from before browsing must not survive an empty field.
         m.insert_paste(&big(200), Timestamp::millis(0));
-        assert!(!m.pastes.is_empty(), "the big paste folded into a side-table");
+        assert!(
+            !m.pastes.is_empty(),
+            "the big paste folded into a side-table"
+        );
         // Then arrow-up into the history (set the browsing position last so the
         // paste above cannot be what clears it).
         m.history_at = Some(1);
@@ -1152,7 +1155,10 @@ mod tests {
         assert_eq!(m.history_at, None, "history browsing is left");
         assert!(m.search.is_none());
         assert_eq!(m.draft, "", "the set-aside draft is dropped, not restored");
-        assert!(m.pastes.is_empty(), "folded-paste bookkeeping is dropped too");
+        assert!(
+            m.pastes.is_empty(),
+            "folded-paste bookkeeping is dropped too"
+        );
         assert!(m.recent_folded_paste.is_none());
     }
 
