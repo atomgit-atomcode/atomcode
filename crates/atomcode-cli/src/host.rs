@@ -417,6 +417,43 @@ fn refused_words(error: &CommandError) -> String {
 }
 
 #[cfg(test)]
+mod scope_tests {
+    use super::scope_sessions;
+    use atomcode_host_api::StoredSession;
+
+    fn at(dir: &str) -> StoredSession {
+        StoredSession {
+            id: dir.into(),
+            working_dir: Some(dir.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_folder_with_its_own_sessions_sees_only_those() {
+        let all = vec![at("/a"), at("/b"), at("/a")];
+        let scoped = scope_sessions(all, Some("/a"));
+        assert_eq!(scoped.len(), 2, "only /a's own: {scoped:?}");
+        assert!(scoped.iter().all(|s| s.working_dir.as_deref() == Some("/a")));
+    }
+
+    #[test]
+    fn a_renamed_folder_with_none_of_its_own_falls_back_to_all() {
+        // The reported bug: after a rename the new path has no sessions, so a
+        // filter would show an empty picker. Fall back to every folder's.
+        let all = vec![at("/old-name"), at("/other")];
+        let scoped = scope_sessions(all, Some("/new-name"));
+        assert_eq!(scoped.len(), 2, "renamed folder sees all, not nothing: {scoped:?}");
+    }
+
+    #[test]
+    fn no_cwd_means_everything() {
+        let all = vec![at("/a"), at("/b")];
+        assert_eq!(scope_sessions(all, None).len(), 2);
+    }
+}
+
+#[cfg(test)]
 mod refusal_tests {
     use super::{refused_words, reply};
     use atomcode_kernel::event::{AgentEvent, CommandError};
@@ -989,7 +1026,7 @@ impl RuntimeControl {
     fn list(&self, working_dir: Option<String>) -> Vec<StoredSession> {
         use atomcode_capabilities::session::SessionManager;
         let scan = SessionManager::scan_all();
-        let mut sessions: Vec<StoredSession> = scan
+        let all: Vec<StoredSession> = scan
             .entries
             .into_iter()
             .filter(|entry| entry.message_count > 0)
@@ -1002,10 +1039,31 @@ impl RuntimeControl {
                 turns: u32::try_from(entry.turn_count).unwrap_or(u32::MAX),
                 needs_newer_version: entry.needs_newer_version,
             })
-            .filter(|stored| working_dir.is_none() || stored.working_dir == working_dir)
             .collect();
+        let mut sessions = scope_sessions(all, working_dir.as_deref());
         sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         sessions
+    }
+}
+
+/// Which sessions a `/resume` in `working_dir` should offer: this folder's own
+/// when it has any, otherwise EVERY folder's (each labelled with its own dir in
+/// the picker). The fallback is the whole point — a RENAMED folder's sessions
+/// still live under the OLD path's bucket, so filtering to the new path shows an
+/// empty picker (the "sessions lost after rename" report). Falling back to all,
+/// newest-first, puts the just-used renamed session at the top for the person to
+/// pick by its dir. `None` (no cwd given) already means "everything".
+fn scope_sessions(all: Vec<StoredSession>, working_dir: Option<&str>) -> Vec<StoredSession> {
+    let Some(dir) = working_dir else {
+        return all;
+    };
+    let has_local = all.iter().any(|s| s.working_dir.as_deref() == Some(dir));
+    if has_local {
+        all.into_iter()
+            .filter(|s| s.working_dir.as_deref() == Some(dir))
+            .collect()
+    } else {
+        all
     }
 }
 
