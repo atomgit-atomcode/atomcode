@@ -823,6 +823,12 @@ impl CCExternalHooks {
         let payload = serde_json::json!({
             "session_id": self.session_id,
             "hook_event_name": HookEvent::PreToolUse.cc_name(),
+            // The call's id, so a hook can correlate this PreToolUse with the
+            // PostToolUse/PostToolUseFailure of the SAME call — the only way to
+            // pair "arguments / duration / result", and the only way to tell two
+            // concurrent calls of the same tool apart (a PostToolUse-side file
+            // written by a PreToolUse-side file otherwise has no unique key).
+            "call_id": call.id,
             "tool_name": call.name,
             "tool_input": tool_input,
             "cwd": self.cwd,
@@ -936,6 +942,12 @@ impl CCExternalHooks {
         let payload = serde_json::json!({
             "session_id": self.session_id,
             "hook_event_name": event.cc_name(),
+            // The same call id the PreToolUse frame carried. For a call denied at
+            // PreToolUse, `tool_name` is absent here (its name was never stashed),
+            // so this id is what lets an audit join the failure frame back to the
+            // Pre frame that DID carry the name — the "which tool got blocked"
+            // question that was otherwise unanswerable.
+            "call_id": result.call_id,
             "tool_name": tool_name,
             "tool_response": result.content,
             "cwd": self.cwd,
@@ -1819,6 +1831,32 @@ mod tests {
         assert!(
             text.contains("MATCHED"),
             "session_id must reach the payload: {text}"
+        );
+    }
+
+    /// E4: the call id is threaded into the tool payload, so a hook can correlate
+    /// a PreToolUse with the matching Post frame (and tell concurrent same-name
+    /// calls apart). The hook greps its own stdin for the id and blocks on a hit.
+    #[tokio::test]
+    async fn call_id_is_threaded_into_the_tool_payload() {
+        let hook = HookConfig {
+            event: HookEvent::PreToolUse,
+            matcher: None,
+            command: r#"grep -q '"call_id":"tc-42"' && echo '{"decision":"block","reason":"saw call_id"}'"#
+                .into(),
+            timeout_ms: 5_000,
+            plugin_root: None,
+        };
+        let cc = CCExternalHooks::new(vec![hook], "/tmp");
+        let mut call = ToolCall {
+            id: "tc-42".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        };
+        let gate = cc.pre_tool_gate(&mut call).await;
+        assert!(
+            gate.is_deny(),
+            "the hook saw call_id in its stdin and blocked: {gate:?}"
         );
     }
 
