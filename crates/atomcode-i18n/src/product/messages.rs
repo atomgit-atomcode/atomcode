@@ -30,6 +30,25 @@ pub enum Msg<'a> {
     /// verbatim server error so user-supplied API keys (sk-...) get
     /// the diagnostic detail.
     ChatAuthExpired,
+    /// An OpenAI-compatible request reached a path the server does not have
+    /// (404 / 405): almost always a base_url missing its version path. Names
+    /// the address that was asked, the version path to try when the base_url
+    /// has none, and what the server said.
+    ChatEndpointNotFound {
+        code: u16,
+        url: &'a str,
+        suggestion: Option<&'a str>,
+        detail: &'a str,
+    },
+    /// A streaming request came back with a body that holds no event stream at
+    /// all — a gateway's web page, a JSON error — which used to decode as an
+    /// empty reply and be retried as an upstream flake.
+    ChatNotAnEventStream {
+        url: &'a str,
+        content_type: &'a str,
+        head: &'a str,
+        suggestion: Option<&'a str>,
+    },
     /// Hint appended to a login connection failure (connect/timeout): the
     /// endpoint is reachable from a browser but the client was reset — likely a
     /// proxy/firewall path difference. Points at the actionable knobs.

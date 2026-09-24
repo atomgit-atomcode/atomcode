@@ -21,6 +21,25 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "  ⚠ 登录凭证已失效 — 正在重新登录...\n".into(),
         Msg::ChatAuthExpired =>
             "认证已过期，请执行 /login 重新登录".into(),
+        Msg::ChatEndpointNotFound { code, url, suggestion, detail } => {
+            let try_it = suggestion.map(|s| format!("，可以试试 {s}")).unwrap_or_default();
+            let said = if detail.trim().is_empty() {
+                String::new()
+            } else {
+                format!("服务端返回：{}", detail.trim())
+            };
+            format!(
+                "请求地址不存在（HTTP {code}）：POST {url}。多半是 base_url 不对，常见是少了版本路径（如 /v1、/v4）{try_it}；请检查这个 provider 的 base_url。{said}"
+            )
+            .into()
+        }
+        Msg::ChatNotAnEventStream { url, content_type, head, suggestion } => {
+            let try_it = suggestion.map(|s| format!("，可以试试 {s}")).unwrap_or_default();
+            format!(
+                "上游返回的不是流式响应：POST {url} 没有返回任何流式数据（content-type：{content_type}），开头是：{head}。若 base_url 少了版本路径（如 /v1、/v4），请求会落到网关的网页或别的接口上{try_it}；请检查这个 provider 的 base_url。"
+            )
+            .into()
+        }
         Msg::NetworkConnectHint =>
             "网络连接失败。若浏览器能打开，可能是代理/防火墙差异：用 /proxy 配置代理或设置 HTTPS_PROXY，或在浏览器打开上面的登录链接完成扫码。可按 Esc 跳过，稍后 /login 重试。".into(),
         Msg::CpSetupHeader =>

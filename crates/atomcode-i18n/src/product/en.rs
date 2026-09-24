@@ -19,6 +19,25 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("/login setup failed: {error}").into(),
         Msg::CpReauthAfter401 =>
             "  ⚠ Stored login expired — re-authenticating...\n".into(),
+        Msg::ChatEndpointNotFound { code, url, suggestion, detail } => {
+            let try_it = suggestion.map(|s| format!(" — try {s}")).unwrap_or_default();
+            let said = if detail.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" The server said: {}", detail.trim())
+            };
+            format!(
+                "The request address does not exist (HTTP {code}): POST {url}. The base_url is most likely wrong, usually missing its version path (such as /v1 or /v4){try_it}; check this provider's base_url.{said}"
+            )
+            .into()
+        }
+        Msg::ChatNotAnEventStream { url, content_type, head, suggestion } => {
+            let try_it = suggestion.map(|s| format!(" — try {s}")).unwrap_or_default();
+            format!(
+                "The upstream did not answer with a stream: POST {url} returned no streamed data (content-type: {content_type}); it began with: {head}. A base_url missing its version path (such as /v1 or /v4) lands the request on a gateway's web page or another endpoint{try_it}; check this provider's base_url."
+            )
+            .into()
+        }
         Msg::ChatAuthExpired =>
             "Authentication expired — please run /login to sign in again".into(),
         Msg::NetworkConnectHint =>

@@ -659,7 +659,15 @@ impl LlmProvider for OpenAiCompatProvider {
             let mut reconnect_attempts = 0u32;
             let mut resp = resp;
             'reopen: loop {
-                let mut dec = SseDecoder::new();
+                // What this body claims to be, for the one error that needs it: a
+                // body with no event stream in it at all (see `SseDecoder::finish`).
+                let content_type = resp
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let mut dec = SseDecoder::new().reading(&url, &content_type);
                 let mut emitted_replay_sensitive = false;
                 let mut pending_metadata = Vec::new();
                 let byte_stream = resp.bytes_stream();
@@ -815,6 +823,67 @@ impl LlmProvider for OpenAiCompatProvider {
 
         Ok(s.boxed())
     }
+}
+
+/// `url` as it is safe to show: no user, no password, no query, no fragment. A
+/// base_url may carry a key in either place, and this string reaches the screen.
+pub(crate) fn display_endpoint(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(mut parsed) => {
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.set_query(None);
+            parsed.set_fragment(None);
+            parsed.to_string()
+        }
+        Err(_) => url.split(['?', '#']).next().unwrap_or(url).to_string(),
+    }
+}
+
+/// The base_url with `/v1` added, when the request address carries no version
+/// segment (`v1`, `v4`, `v1beta` …) at all — the usual way a base_url is wrong.
+/// `None` when one is already there: guessing a second would only mislead.
+fn version_suggestion(url: &str) -> Option<String> {
+    let shown = display_endpoint(url);
+    let base = ["/chat/completions", "/responses"]
+        .iter()
+        .find_map(|suffix| shown.strip_suffix(suffix))
+        .unwrap_or(&shown)
+        .trim_end_matches('/');
+    let path = reqwest::Url::parse(base)
+        .map(|u| u.path().to_string())
+        .ok()?;
+    let versioned = path.split('/').any(|seg| {
+        seg.strip_prefix('v')
+            .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+    });
+    (!versioned).then(|| format!("{base}/v1"))
+}
+
+/// Whether a 404 is about the model rather than the address — OpenAI answers an
+/// unknown model name with 404 `model_not_found`, and the base_url is right then.
+fn names_a_missing_model(detail: &str, provider_code: Option<&str>) -> bool {
+    if provider_code.is_some_and(|c| c.contains("model_not_found")) {
+        return true;
+    }
+    let d = detail.to_ascii_lowercase();
+    d.contains("model")
+        && ["not exist", "not found", "does not exist", "no such"]
+            .iter()
+            .any(|p| d.contains(p))
+}
+
+/// The error for a request that reached a path the server does not have.
+fn endpoint_not_found_message(code: u16, url: &str, detail: &str) -> String {
+    let shown = display_endpoint(url);
+    let suggestion = version_suggestion(url);
+    atomcode_config::i18n::t(atomcode_config::i18n::Msg::ChatEndpointNotFound {
+        code,
+        url: &shown,
+        suggestion: suggestion.as_deref(),
+        detail,
+    })
+    .into_owned()
 }
 
 /// The uniform "your session expired, re-run `/login`" terminal error surfaced
@@ -979,9 +1048,16 @@ pub(crate) async fn open_stream(
                     let detail = extract_error_detail(&text);
                     let envelope = serde_json::from_str::<serde_json::Value>(&text).ok();
                     let provider_code = envelope.as_ref().and_then(provider_error_code);
+                    let message = if matches!(code, 404 | 405)
+                        && !names_a_missing_model(&detail, provider_code.as_deref())
+                    {
+                        endpoint_not_found_message(code, url, &detail)
+                    } else {
+                        super::friendly_http_error(code, &detail)
+                    };
                     return Err(ProviderError {
                         retryable: retry::is_retryable_status(code),
-                        message: super::friendly_http_error(code, &detail),
+                        message,
                         http_status: Some(code),
                         code: provider_code,
                         retry_after_secs,
@@ -1586,6 +1662,16 @@ const MAX_TOOL_CALLS: usize = 256;
 /// inline in the network loop) makes the wire→event mapping deterministic and
 /// testable from recorded bytes.
 struct SseDecoder {
+    /// The address this body answered and the content type it claimed, for the
+    /// error a body with no event stream in it gets. `None` in tests that feed
+    /// bytes directly.
+    reading: Option<(String, String)>,
+    /// Whether any `data:` line arrived. A streaming reply without one is not a
+    /// stream at all — see [`Self::finish`].
+    saw_data: bool,
+    /// The start of whatever arrived that is not SSE (a web page, a JSON error),
+    /// kept short, to show in that error.
+    stray: String,
     buf: Vec<u8>,
     /// Per-index `(id, name, accumulated_args)` for in-flight tool calls.
     tool_calls: Vec<(String, String, String)>,
@@ -1611,6 +1697,9 @@ struct SseDecoder {
 impl SseDecoder {
     fn new() -> Self {
         Self {
+            reading: None,
+            saw_data: false,
+            stray: String::new(),
             buf: Vec::new(),
             tool_calls: Vec::new(),
             last_usage: None,
@@ -1623,6 +1712,33 @@ impl SseDecoder {
             last_tool_idx: 0,
             think: super::reasoning::InlineThink::new(),
         }
+    }
+
+    /// Decode the body `url` answered, which claimed to be `content_type`.
+    fn reading(mut self, url: &str, content_type: &str) -> Self {
+        self.reading = Some((url.to_string(), content_type.to_string()));
+        self
+    }
+
+    /// Keep the start of a line that is not SSE, for the error a body with no
+    /// event stream in it gets. Comments, blank lines and the other SSE fields
+    /// are part of a stream and are not kept.
+    fn note_stray(&mut self, line: &str) {
+        const KEEP: usize = 200;
+        let line = line.trim();
+        if line.is_empty()
+            || line.starts_with(':')
+            || ["event:", "id:", "retry:"]
+                .iter()
+                .any(|f| line.starts_with(f))
+            || self.stray.chars().count() >= KEEP
+        {
+            return;
+        }
+        if !self.stray.is_empty() {
+            self.stray.push(' ');
+        }
+        self.stray.extend(line.chars().take(KEEP));
     }
 
     /// Feed a chunk of raw bytes; return any complete `StreamEvent`s produced. Safe
@@ -1657,6 +1773,42 @@ impl SseDecoder {
         let mut out = Vec::new();
         if self.done {
             return out;
+        }
+        // A body that ended without a single `data:` line but was not empty is
+        // not a stream: a gateway's web page for a path it does not serve (200,
+        // text/html — One API / New API answer an unknown path this way), a JSON
+        // error sent with a 200. Decoded as a stream it was an empty reply, and
+        // an empty reply is retried as an upstream flake — five times, and then
+        // the person was told to retry. No retry fixes an address, so it is an
+        // error that says what came back. An empty body stays an empty reply.
+        if !self.saw_data {
+            let rest = String::from_utf8_lossy(&std::mem::take(&mut self.buf)).into_owned();
+            self.note_stray(&rest);
+            if !self.stray.is_empty() {
+                let (url, content_type) = self.reading.clone().unwrap_or_default();
+                let shown = display_endpoint(&url);
+                let suggestion = version_suggestion(&url);
+                self.done = true;
+                out.push(StreamEvent::Error(ProviderError {
+                    retryable: false,
+                    message: atomcode_config::i18n::t(
+                        atomcode_config::i18n::Msg::ChatNotAnEventStream {
+                            url: &shown,
+                            content_type: if content_type.is_empty() {
+                                "?"
+                            } else {
+                                &content_type
+                            },
+                            head: &self.stray,
+                            suggestion: suggestion.as_deref(),
+                        },
+                    )
+                    .into_owned(),
+                    code: Some("not_an_event_stream".to_string()),
+                    ..Default::default()
+                }));
+                return out;
+            }
         }
         // Whatever the stripper was still holding: an unclosed `<think>` means
         // the block never ended, and showing nothing would be worse than
@@ -1700,8 +1852,14 @@ impl SseDecoder {
 
     fn process_line(&mut self, line: &str, out: &mut Vec<StreamEvent>) {
         let Some(data) = line.strip_prefix("data:") else {
-            return; // ignore `event:`/`:comment`/blank lines
+            // `event:`/`:comment`/blank lines are ignored; anything else is kept
+            // (briefly) in case the whole body turns out not to be a stream.
+            if !self.saw_data {
+                self.note_stray(line);
+            }
+            return;
         };
+        self.saw_data = true;
         let data = data.trim();
         if data == "[DONE]" {
             // Same finalization as a stream EOF: flush any accumulated tool
@@ -2067,6 +2225,152 @@ mod tests {
             self.generation.store(1, Ordering::SeqCst);
             Ok(true)
         }
+    }
+
+    // ---- a base_url that misses its version path ------------------------------------------
+
+    async fn open_err(base: &str) -> ProviderError {
+        let provider = OpenAiCompatProvider::new(OpenAiCompatConfig::new("k", base, "m")).unwrap();
+        match provider
+            .chat_stream(&[Message::user("hi")], &[], &ChatOptions::default())
+            .await
+        {
+            Err(e) => e,
+            Ok(stream) => {
+                let events: Vec<_> = stream.collect().await;
+                events
+                    .into_iter()
+                    .find_map(|e| match e {
+                        StreamEvent::Error(e) => Some(e),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("the request was expected to fail"))
+            }
+        }
+    }
+
+    /// A base_url without its version path (`https://api.x.com` for
+    /// `https://api.x.com/v1`) reaches a path the server does not have. The error
+    /// used to be the server's own words — `HTTP 404: Invalid URL (POST
+    /// /chat/completions)` — with nothing saying which address was asked or that
+    /// the base_url is the thing to fix. It now names both, and the version path
+    /// to try.
+    #[tokio::test]
+    async fn a_missing_endpoint_names_the_address_and_the_base_url() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(404).set_body_string(
+                r#"{"error":{"message":"Invalid URL (POST /chat/completions)","type":"invalid_request_error"}}"#,
+            ))
+            .mount(&server)
+            .await;
+        let err = open_err(&server.uri()).await;
+        assert_eq!(err.http_status, Some(404));
+        assert!(!err.retryable);
+        let m = &err.message;
+        assert!(
+            m.contains(&format!("{}/chat/completions", server.uri())),
+            "{m}"
+        );
+        assert!(m.contains("base_url"), "{m}");
+        assert!(
+            m.contains(&format!("{}/v1", server.uri())),
+            "suggests the version path: {m}"
+        );
+        assert!(m.contains("Invalid URL"), "keeps what the server said: {m}");
+    }
+
+    /// A base_url that already has a version path is not told to add one.
+    #[tokio::test]
+    async fn a_versioned_base_url_is_not_told_to_add_v1() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("404 page not found"))
+            .mount(&server)
+            .await;
+        let base = format!("{}/api/paas/v4", server.uri());
+        let err = open_err(&base).await;
+        let m = &err.message;
+        assert!(m.contains("base_url"), "{m}");
+        assert!(!m.contains(&format!("{base}/v1")), "{m}");
+    }
+
+    /// A 404 that says the MODEL does not exist is about the model name, not the
+    /// address — the base_url is right, and saying otherwise sends the person to
+    /// fix the wrong thing.
+    #[tokio::test]
+    async fn a_missing_model_is_not_blamed_on_the_base_url() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(404).set_body_string(
+                r#"{"error":{"message":"The model `m` does not exist or you do not have access to it.","code":"model_not_found"}}"#,
+            ))
+            .mount(&server)
+            .await;
+        let err = open_err(&format!("{}/v1", server.uri())).await;
+        assert!(!err.message.contains("base_url"), "{}", err.message);
+    }
+
+    /// A gateway that answers an unknown path with its web page (200, text/html —
+    /// One API / New API do this) used to decode as an empty reply: the turn was
+    /// retried as an upstream flake five times and then told the person to retry.
+    /// It is an error now, not retried, that says what came back and why.
+    #[tokio::test]
+    async fn a_web_page_where_a_stream_should_be_is_an_error_not_an_empty_reply() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(
+                    "<!doctype html><html><head><title>New API</title></head><body><div id=root></div></body></html>",
+                    "text/html; charset=utf-8",
+                ),
+            )
+            .mount(&server)
+            .await;
+        let err = open_err(&server.uri()).await;
+        assert!(!err.retryable, "no retry can fix an address");
+        let m = &err.message;
+        assert!(m.contains("text/html"), "{m}");
+        assert!(m.contains("base_url"), "{m}");
+        assert!(
+            m.contains(&format!("{}/chat/completions", server.uri())),
+            "{m}"
+        );
+        assert!(m.contains(&format!("{}/v1", server.uri())), "{m}");
+    }
+
+    /// A reply with nothing in it at all is still the upstream flake it always was
+    /// (retried by the loop), not an address problem.
+    #[tokio::test]
+    async fn an_empty_reply_is_still_just_empty() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).insert_header("content-type", "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+        let provider =
+            OpenAiCompatProvider::new(OpenAiCompatConfig::new("k", server.uri(), "m")).unwrap();
+        let events: Vec<_> = provider
+            .chat_stream(&[Message::user("hi")], &[], &ChatOptions::default())
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert!(
+            !events.iter().any(|e| matches!(e, StreamEvent::Error(_))),
+            "{events:?}"
+        );
+    }
+
+    /// The address a message names never carries a credential or a query string.
+    #[test]
+    fn the_address_shown_leaves_credentials_and_queries_out() {
+        let shown =
+            super::display_endpoint("https://me:secret@gw.example.com/chat/completions?key=abc");
+        assert_eq!(shown, "https://gw.example.com/chat/completions");
     }
 
     #[tokio::test]
