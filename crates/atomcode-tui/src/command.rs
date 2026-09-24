@@ -23,7 +23,10 @@ use crate::keymap::Action;
 pub struct Command {
     pub name: Cow<'static, str>,
     pub about: Cow<'static, str>,
-    /// Shown after the name when it takes something, e.g. `<id>`.
+    /// What it takes, e.g. `<id>`. Drawn at the **end** of its row, after the
+    /// gloss (`crate::menu::Item::hint`), rather than after the name: an argument
+    /// list has no length anyone controls, and in the name column a long one
+    /// moved every gloss in the table out of column.
     pub takes: Option<Cow<'static, str>>,
     /// Other names that reach this same command — muscle memory that must keep
     /// working (`/exit` for `/quit`, `/new` for `/session`). An alias is not a
@@ -66,6 +69,23 @@ impl CommandOption {
             value: value.into(),
             about: about.into(),
         }
+    }
+
+    /// The row this value takes once its command has been named out — one row per
+    /// value, which is how the menu offers a closed set instead of a modal.
+    ///
+    /// `active` is the value in force, marked with `mark`: a person reading the
+    /// menu is asking which one is on, and the answer belongs on the row rather
+    /// than in a sentence after it. The value is `{command} {value}` because that
+    /// is what a pick dispatches.
+    pub fn menu_row(&self, command: &str, active: bool, mark: &str) -> crate::menu::Item {
+        let shown = format!("{command} {}", self.value);
+        let label = if active {
+            format!("{shown} {mark}")
+        } else {
+            shown.clone()
+        };
+        crate::menu::Item::new(shown, label).about(self.about.clone())
     }
 }
 
@@ -169,6 +189,20 @@ impl Command {
         } else {
             format!("{} ({})", self.name, self.aliases.join(", "))
         }
+    }
+
+    /// The row this command takes in the menu: `/name (alias)`, what it does, and
+    /// what it takes at the tail.
+    ///
+    /// The shape in one function rather than written where the menu is filled,
+    /// because more than one caller has to agree about it: the screen draws the
+    /// rows, and a judgement that the menu reads as a table asks this same
+    /// function for the rows a person would be looking at. A second copy of the
+    /// shape in a test would answer for a menu nobody sees.
+    pub fn menu_row(&self) -> crate::menu::Item {
+        crate::menu::Item::new(self.name.clone(), self.display_name())
+            .about(self.about.clone())
+            .hint(self.takes.clone().unwrap_or_default())
     }
 }
 

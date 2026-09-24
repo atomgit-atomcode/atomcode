@@ -31,6 +31,19 @@ pub struct Item {
     /// Shown dimmed after the label, in the column every other gloss is in.
     /// Empty for an item that needs no gloss.
     pub about: String,
+    /// Shown dimmed at the **end** of the row, after the gloss: what the thing
+    /// takes, as a command spells it (`[file]`, `[turn]`). Empty for an item that
+    /// takes nothing.
+    ///
+    /// At the tail rather than in the column with the label, and that is the
+    /// whole reason the field exists: an argument list is the one part of a row
+    /// with no length anyone controls — `/plugin`'s is a whole usage sentence —
+    /// while [`name_column`] is one cell for the whole list. In the name column
+    /// a long one pushed its own gloss off to the right and, being the widest row
+    /// in the table, the glosses of the rows that fit with it. From the tail it
+    /// can run long, or be cut by the panel's right edge, without moving
+    /// anything: the two columns people read down are the name and the gloss.
+    pub hint: String,
 }
 
 impl Item {
@@ -39,10 +52,15 @@ impl Item {
             value: value.into(),
             label: label.into(),
             about: String::new(),
+            hint: String::new(),
         }
     }
     pub fn about(mut self, about: impl Into<String>) -> Self {
         self.about = about.into();
+        self
+    }
+    pub fn hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = hint.into();
         self
     }
 }
@@ -77,20 +95,21 @@ pub struct Menu {
 /// pinched against its own text.
 const TRAILING: usize = 2;
 
-/// The tab stop the glosses line up on, in cells.
+/// The furthest the glosses' column may sit, in cells, for a panel `w` wide:
+/// half of it, less the `  /` in front of the name.
 ///
-/// A stop and not "as wide as the widest name in the table": the widest label
-/// the command surface ships is `effort <low|medium|high|xhigh|max|default>` at
-/// 42 cells, and one command's argument list must not push every gloss in the
-/// table to the right of the panel. A name that runs past the stop is simply not
-/// padded, so it keeps the plain gap and its gloss starts late — on the handful
-/// of rows whose argument list is a sentence that reads as intended, and
-/// everywhere else the second column *is* a column.
-///
-/// Sixteen because that is where the names people actually type end: every
-/// `name + argument` in the table is inside it but for `effort`, `mode`, `mcp`
-/// and `rewind`, whose argument lists are a sentence.
-const NAME_STOP: usize = 16;
+/// The column is as wide as the widest name in the table, up to here. What a
+/// command *takes* is not a name and is not measured — it rides at the tail
+/// ([`Item::hint`]), where its length moves nothing — so what sets the column
+/// is names alone, and a skill's name is routinely thirty cells
+/// (`ai-for-science-ai4s-perf-tuning`). A fixed stop short of that left every
+/// such row ragged, which on a list of skills was nearly every row. Half the
+/// panel still leaves the gloss the other half, and a name wider than that
+/// keeps the plain gap on its own row rather than pushing every gloss off the
+/// panel.
+fn name_stop(w: usize) -> usize {
+    (w / 2).saturating_sub(3)
+}
 
 impl Menu {
     pub fn new(at: (u16, u16), items: Vec<Item>) -> Option<Self> {
@@ -138,13 +157,16 @@ impl Menu {
 
     /// How wide one item's row is, in cells.
     fn line_width(&self, item: &Item) -> usize {
-        let about = if item.about.is_empty() {
-            0
-        } else {
-            // The gap and the gloss after the label.
-            2 + width::str_width(&item.about)
+        // The gap and the words after the label — the gloss, then the hint at
+        // the tail, each with its own two cells of separation.
+        let after = |s: &str| {
+            if s.is_empty() {
+                0
+            } else {
+                2 + width::str_width(s)
+            }
         };
-        2 + width::str_width(&item.label) + about + TRAILING
+        2 + width::str_width(&item.label) + after(&item.about) + after(&item.hint) + TRAILING
     }
 
     /// Take a key. Up/down move, enter picks, esc closes — the same vocabulary
@@ -250,16 +272,7 @@ impl Menu {
             };
             let mut spans = vec![Span::styled("  ", base)];
             spans.push(Span::styled(item.label.clone(), base));
-            if !item.about.is_empty() {
-                spans.push(Span::styled(
-                    format!("  {}", item.about),
-                    if here {
-                        base
-                    } else {
-                        theme::fg(Role::Muted).under(panel)
-                    },
-                ));
-            }
+            spans.extend(after_the_name(item, base, here, panel));
             out.push(pad(Line::from_spans(spans), w, base));
         }
         out
@@ -440,7 +453,7 @@ impl Slash {
         }
         let panel = theme::bg(Role::PanelBg).under(theme::fg(Role::PanelFg));
         let start = self.window(rows);
-        let column = name_column(&self.items);
+        let column = name_column(&self.items, name_stop(w));
         let mut out: Vec<Line> = Vec::with_capacity(rows);
         for i in 0..rows {
             let index = start + i;
@@ -463,16 +476,7 @@ impl Slash {
                             },
                         ),
                     ];
-                    if !item.about.is_empty() {
-                        spans.push(Span::styled(
-                            format!("  {}", item.about),
-                            if here {
-                                base
-                            } else {
-                                theme::fg(Role::Muted).under(panel)
-                            },
-                        ));
-                    }
+                    spans.extend(after_the_name(item, base, here, panel));
                     (Line::from_spans(spans), base)
                 }
                 // Never reached in practice: the rect is sized to the window,
@@ -484,6 +488,34 @@ impl Slash {
         }
         out
     }
+}
+
+/// What a row says once its name is drawn: what the thing does, then what it
+/// takes.
+///
+/// One function for both lists, because "what comes after the name" is one rule
+/// and two copies of it are two places for the two panels to drift apart: the
+/// gloss first — the column every row's eye reads down — and the hint at the
+/// tail, after it, for the reason [`Item::hint`] gives. The hint is placed
+/// rather than dropped on a narrow panel: what the panel cuts off is the end of
+/// a row, and a row whose end is cut keeps both of its columns.
+///
+/// Dim on an ordinary row and the row's own panel on the row being pointed at,
+/// the same as the gloss: a lit row is one patch of a brighter panel, and a
+/// differently coloured word inside it would be a second highlight to read.
+fn after_the_name(item: &Item, base: Style, here: bool, panel: Style) -> Vec<Span> {
+    let dim = if here {
+        base
+    } else {
+        theme::fg(Role::Muted).under(panel)
+    };
+    let mut spans: Vec<Span> = Vec::new();
+    for words in [&item.about, &item.hint] {
+        if !words.is_empty() {
+            spans.push(Span::styled(format!("  {words}"), dim));
+        }
+    }
+    spans
 }
 
 /// A line widened to the rect with the panel's own style.
@@ -502,29 +534,32 @@ fn pad(line: Line, w: usize, style: Style) -> Line {
     Line::from_spans(spans).truncate(w)
 }
 
-/// The cell the glosses start at: one past the widest name, up to the stop.
+/// The cell the glosses start at: one past the widest name, up to `stop`
+/// ([`name_stop`]).
 ///
 /// A list of names and what they do reads as a table only if the second column
 /// is a column. Ragged glosses — the difference between `/copy` and `/resume` is
 /// four cells — make the eye jump to the start of every line to find the left
 /// edge again, which is the work a discovery surface exists to save.
 ///
-/// Measured over the items that **have** a gloss, so a list with none comes out
-/// exactly as it was drawn before, and over the whole list rather than the rows
-/// on screen: the column holds still while the window scrolls under the cursor,
-/// and a column that moved with the highlight would be worse than a ragged one.
+/// Measured over the items that **show something after the name** — a gloss or a
+/// hint, since the hint starts where the gloss does on a row that has none — so
+/// a list with neither comes out exactly as it was drawn before, and over the
+/// whole list rather than the rows on screen: the column holds still while the
+/// window scrolls under the cursor, and a column that moved with the highlight
+/// would be worse than a ragged one.
 ///
 /// Cells, not bytes, and through the same authority the rest of the layout
 /// measures with — a name with a CJK argument spec (`cd <目录>`) is wider than it
 /// looks, and this is the one place where getting that wrong shifts a column.
-fn name_column(items: &[Item]) -> usize {
+fn name_column(items: &[Item], stop: usize) -> usize {
     items
         .iter()
-        .filter(|i| !i.about.is_empty())
+        .filter(|i| !i.about.is_empty() || !i.hint.is_empty())
         .map(|i| width::str_width(&i.label))
         .max()
         .unwrap_or(0)
-        .min(NAME_STOP)
+        .min(stop)
 }
 
 /// A name widened to the column with blanks, so the gloss after it starts at the
@@ -867,12 +902,45 @@ mod tests {
         assert_eq!(drawn, ["  /a     短的", "  /bbbb  短的", "  /cc    短的"]);
     }
 
+    /// A list of skills: thirty-cell names, every one past the old fixed stop of
+    /// sixteen, so every gloss started where its own name ended. On a panel
+    /// with room for them they are one column.
+    #[test]
+    fn long_skill_names_still_line_their_glosses_up() {
+        let names = [
+            "adapter-check-principle",
+            "agent-engineering",
+            "agents",
+            "ai-for-science-ai4s-perf-tuning",
+            "ai4s-main",
+            "app",
+        ];
+        let list = Slash::new(
+            names
+                .iter()
+                .map(|n| Item::new(*n, *n).about("做点什么").hint("[给它的话]"))
+                .collect(),
+        );
+        let drawn = slash_rows(&list, 120, names.len());
+        let cells: Vec<usize> = drawn
+            .iter()
+            .map(|row| width::str_width(&row[..row.find("做点什么").expect(row)]))
+            .collect();
+        assert!(
+            cells.iter().all(|c| *c == cells[0]),
+            "{cells:?}\n{drawn:#?}"
+        );
+        assert_eq!(cells[0], "  /ai-for-science-ai4s-perf-tuning  ".len());
+    }
+
     #[test]
     fn a_name_past_the_stop_keeps_the_plain_gap() {
-        // One command's argument list must not move every other gloss: the stop
-        // is where the column is, and a name that runs past it starts its gloss
-        // where its own width puts it. The names that fit are still aligned.
-        let long = "x".repeat(NAME_STOP + 4);
+        // A name nobody here controls — the agent's own command — must not move
+        // every other gloss: the stop is where the column is, and a name that
+        // runs past it starts its gloss where its own width puts it. The names
+        // that fit are still aligned.
+        let stop = name_stop(40);
+        let long = "x".repeat(stop + 4);
         let list = Slash::new(vec![
             Item::new("a", long.clone()).about("长的"),
             Item::new("b", "bb").about("短的"),
@@ -882,9 +950,34 @@ mod tests {
             .map(|r| r.trim_end().to_string())
             .collect();
         assert_eq!(drawn[0], format!("  /{long}  长的"));
+        assert_eq!(drawn[1], format!("  /bb{}  短的", " ".repeat(stop - 2)));
+    }
+
+    #[test]
+    fn what_a_command_takes_rides_at_the_tail_and_moves_no_column() {
+        // The bug this field was added for: `/plugin`'s argument list is a whole
+        // usage sentence, and in the name column it pushed that row's gloss — and
+        // through the column, every other row's gloss — far off to the right.
+        // From the tail it lengthens one row and nothing else.
+        let long = "[list | install <name> | uninstall <name> | update <name> | marketplace …]";
+        let list = Slash::new(vec![
+            Item::new("plugin", "plugin").about("插件").hint(long),
+            Item::new("undo", "undo").about("撤销").hint("[turn]"),
+            Item::new("quit", "quit").about("退出"),
+        ]);
+        let drawn: Vec<String> = slash_rows(&list, 200, 3)
+            .into_iter()
+            .map(|r| r.trim_end().to_string())
+            .collect();
+        // Every gloss in the column, the shortest name padded into it, and the
+        // long hint after its row's gloss rather than before it.
         assert_eq!(
-            drawn[1],
-            format!("  /bb{}  短的", " ".repeat(NAME_STOP - 2))
+            drawn,
+            [
+                format!("  /plugin  插件  {long}"),
+                "  /undo    撤销  [turn]".to_string(),
+                "  /quit    退出".to_string(),
+            ]
         );
     }
 

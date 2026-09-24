@@ -5603,32 +5603,19 @@ impl Tui {
                                 Some(level) => level == opt.value.as_ref(),
                                 None => opt.value == "default",
                             };
-                            let shown = format!("{} {}", c.name, opt.value);
                             // The mark goes through the capability table: on a
                             // terminal that draws `✓` as a box, this menu is
                             // where a person reads which level is in force
                             // (`gates/tui-layers.sh`, literal_glyphs).
-                            let label = if active {
-                                format!("{shown} {}", self.surface.caps().g(crate::caps::Glyph::Ok))
-                            } else {
-                                shown.clone()
-                            };
-                            items.push(
-                                crate::menu::Item::new(shown, label).about(opt.about.to_string()),
-                            );
+                            let mark = self.surface.caps().g(crate::caps::Glyph::Ok);
+                            items.push(opt.menu_row(&c.name, active, mark));
                         }
                         continue;
                     }
-                    // The label shows the aliases (`session (new)`); the value
-                    // inserted / dispatched stays the canonical name.
-                    let label = match &c.takes {
-                        Some(t) => format!("{} {t}", c.display_name()),
-                        None => c.display_name(),
-                    };
-                    items.push(
-                        crate::menu::Item::new(c.name.to_string(), label)
-                            .about(c.about.to_string()),
-                    );
+                    // The row's own shape — aliases shown (`session (new)`), what
+                    // it takes at the tail — belongs to the command, so `/help`
+                    // and the menu cannot disagree about it.
+                    items.push(c.menu_row());
                 }
                 items
             }

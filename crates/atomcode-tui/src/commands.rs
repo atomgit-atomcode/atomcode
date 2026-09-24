@@ -4190,6 +4190,9 @@ mod tests {
         let c = Arc::new(Commands::new());
         let _ = c.add(Arc::new(ScreenCommands));
         let _ = c.add(Arc::new(SessionCommands));
+        let _ = c.add(Arc::new(PluginCommands));
+        let _ = c.add(Arc::new(ToolCommands));
+        let _ = c.add(Arc::new(SetupCommands));
         let _ = c.add(Arc::new(TakeAwayCommands));
         let _ = c.add(Arc::new(HelpCommands { all: c.clone() }));
         c
@@ -4230,6 +4233,105 @@ mod tests {
             Some(&"default"),
             "`default` is the last row: {values:?}"
         );
+    }
+
+    /// 菜单是一张表:每一行的描述都在同一格开始。
+    ///
+    /// 判据压在整张已发行命令表上,而不是一个自己造的小列表:会不会破列取决于
+    /// 表里有哪些行、它们的参数说明有多长,而这两件事只有表自己知道 —— `/plugin`
+    /// 的取值清单是一整句用法,`/cd` 的也一样。读的是面板真正画出来的那几行,
+    /// 所以被验证的是看见的东西,不是某个自己算的列宽。
+    #[test]
+    fn every_gloss_in_the_shipped_menu_starts_in_one_cell() {
+        let c = builtin_for_test();
+        let items: Vec<crate::menu::Item> = c
+            .matching("")
+            .iter()
+            .map(|command| command.menu_row())
+            .collect();
+        assert!(items.len() > 30, "命令表太薄了: {}", items.len());
+
+        let cells = gloss_cells(&items);
+        assert_eq!(
+            cells.iter().filter(|c| c.is_some()).count(),
+            items.iter().filter(|i| !i.about.is_empty()).count(),
+            "有描述的行没被读全"
+        );
+        let column = cells[0].expect("第一行有描述");
+        assert!(
+            cells.iter().all(|c| *c == Some(column)),
+            "描述没齐在同一格: {cells:?}"
+        );
+        // 而且这一格就在整表最宽的名字后面两个空格:表里没有任何一行把列顶开。
+        // 顶开的那一行,正是这条判据要挡住的东西 —— `/plugin` 的参数说明曾经
+        // 长的就是它。
+        let widest = items
+            .iter()
+            .map(|i| crate::width::str_width(&i.label))
+            .max()
+            .expect("表不是空的");
+        assert_eq!(
+            column,
+            widest + 5,
+            "最宽的名字是 {widest} 格,描述却从 {column} 格开始:有行把这一列顶开了"
+        );
+
+        // 窗口在光标下滚动时这一列不动:列宽是照着整张表量的,不是照着屏幕上那十行。
+        for cursor in [0, 12, items.len() - 1] {
+            let mut list = crate::menu::Slash::new(items.clone());
+            list.move_by(cursor as i32);
+            let start = list.window(10);
+            for (i, row) in list
+                .render(crate::frame::Rect::new(0, 0, 400, 10), 10)
+                .iter()
+                .enumerate()
+            {
+                let item = &items[start + i];
+                if item.about.is_empty() {
+                    continue;
+                }
+                let row = row.plain();
+                let at = row
+                    .find(item.about.as_str())
+                    .unwrap_or_else(|| panic!("/{} 的描述没画在行里: {row}", item.label));
+                assert_eq!(
+                    crate::width::str_width(&row[..at]),
+                    column,
+                    "光标在第 {cursor} 行时 /{} 的描述不在列上: {row}",
+                    item.label
+                );
+            }
+        }
+    }
+
+    /// 每一行的描述从第几格开始(`None` = 这行没有描述),读的是面板画出来的那几行。
+    ///
+    /// 行宽给足,免得面板把行尾切掉:这里问的是列,不是截断。顺带钉住行尾那条规矩 ——
+    /// 参数说明在描述**之后**,两者之间不隔着命令名。
+    fn gloss_cells(items: &[crate::menu::Item]) -> Vec<Option<usize>> {
+        let list = crate::menu::Slash::new(items.to_vec());
+        let rows = list.render(
+            crate::frame::Rect::new(0, 0, 400, items.len() as u16),
+            items.len(),
+        );
+        items
+            .iter()
+            .zip(&rows)
+            .map(|(item, line)| {
+                if item.about.is_empty() {
+                    return None;
+                }
+                let row = line.plain();
+                let at = row
+                    .find(item.about.as_str())
+                    .unwrap_or_else(|| panic!("/{} 的描述没画在行里: {row}", item.label));
+                if !item.hint.is_empty() {
+                    let hint = row.find(&item.hint).expect("行尾说明也画在行里");
+                    assert!(hint > at, "/{} 的参数说明跑到了描述前面: {row}", item.label);
+                }
+                Some(crate::width::str_width(&row[..at]))
+            })
+            .collect()
     }
 
     #[tokio::test]
