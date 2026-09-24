@@ -433,6 +433,14 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "it cannot be taken now — no usable provider, or one is being swapped".into()
         }
         Msg::RefusedUnsupported => "this host has no answer for that command".into(),
+        Msg::CostNothingYet => "this conversation has not spent any tokens yet".into(),
+        Msg::CostTokens { prompt, completion, cached, rate, total } => format!(
+            "  sent {prompt} · back {completion} · {total} in all\n  of the sent, {cached} hit the cache ({rate}%)"
+        )
+        .into(),
+        Msg::CostUnattributed { tokens } => {
+            format!("not attributable to any one model: {tokens}").into()
+        }
         Msg::CompactionInterrupted => {
             "the compaction was interrupted — the context is as long as it was".into()
         }

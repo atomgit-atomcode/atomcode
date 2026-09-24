@@ -454,6 +454,19 @@ pub mod tui_front {
                 .unwrap_or_default()
         }
 
+        /// 同一个账号下的好几个选择折成一个名字。
+        fn accounts(&self) -> std::collections::HashMap<String, String> {
+            atomcode_config::config::Config::load(&self.path)
+                .map(|config| {
+                    config
+                        .logical_models()
+                        .into_iter()
+                        .map(|(id, model)| (id, model.account))
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+
         fn identity(&self) -> Option<crate::host::Identity> {
             let auth = atomcode_auth::get_stored_auth()?;
             Some(crate::host::Identity {

@@ -394,6 +394,14 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::RefusedNotRunning => "没有正在跑的回合可停".into(),
         Msg::RefusedUnavailable => "现在接不了 —— 没有可用的 provider,或者正在换".into(),
         Msg::RefusedUnsupported => "这个宿主答不了这条命令".into(),
+        Msg::CostNothingYet => "这段对话还没花过 token".into(),
+        Msg::CostTokens { prompt, completion, cached, rate, total } => format!(
+            "  发出 {prompt} · 收回 {completion} · 共 {total}\n  其中命中缓存 {cached}（{rate}%）"
+        )
+        .into(),
+        Msg::CostUnattributed { tokens } => {
+            format!("归不到哪个模型名下的：{tokens}").into()
+        }
         Msg::CompactionInterrupted => "压缩被打断了 —— 上下文还是原来那么长".into(),
         Msg::RuntimeStopped { how } => format!("运行时停了:{how}。这个会话不会再有新的东西。").into(),
         Msg::GoalMet { condition } => format!("目标达成:{condition}").into(),

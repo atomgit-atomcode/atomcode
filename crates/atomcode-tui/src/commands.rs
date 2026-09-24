@@ -638,6 +638,52 @@ fn change_word(change: atomcode_host_api::FileChange, staged: bool) -> Msg<'stat
 ///
 /// 宿主自己的话(比如「登录过期了」)另走一条事件 —— 它比这里的
 /// 分类更具体,因为 `Unavailable` 把好几种原因攒成了一种。
+/// 一份按模型分开的 token 账单。
+///
+/// 每个模型一段,归不了属的单列在最后 —— 推给任一个模型都是编的。
+/// 命中缓存那一项是 `prompt` 的子集而不是另一笔,所以它后面跟一个比例
+/// —— 一个裸数字读起来像“又花了这么多”。
+fn cost_report(models: &[atomcode_host_api::ModelCost], unattributed: u64) -> String {
+    if models.is_empty() && unattributed == 0 {
+        return t(Msg::CostNothingYet).into_owned();
+    }
+    let mut out: Vec<String> = models
+        .iter()
+        .map(|m| {
+            let rate = match m.prompt {
+                0 => 0,
+                prompt => m.cached.saturating_mul(100) / prompt,
+            };
+            format!(
+                "{} · {}
+{}",
+                m.account,
+                m.model,
+                t(Msg::CostTokens {
+                    prompt: m.prompt,
+                    completion: m.completion,
+                    cached: m.cached,
+                    rate,
+                    total: m.prompt.saturating_add(m.completion),
+                })
+            )
+        })
+        .collect();
+    if unattributed > 0 {
+        out.push(
+            t(Msg::CostUnattributed {
+                tokens: unattributed,
+            })
+            .into_owned(),
+        );
+    }
+    out.join(
+        "
+
+",
+    )
+}
+
 pub(crate) fn refusal_words(error: &atomcode_kernel::event::CommandError) -> String {
     use atomcode_kernel::event::CommandError as E;
     match error {
@@ -1645,7 +1691,30 @@ impl CommandSet for SessionCommands {
                 return Box::pin(self.run("mode", wanted, ctx)).await;
             }
             // `/cost` is `/context` under the name tuix taught. Same reason.
-            "cost" => return Box::pin(self.run("context", "", ctx)).await,
+            // 此前这是 `/context` 的一行别名 —— 而那两条答的不是同一个问题。
+            // `/context` 是「现在窗口里装了多少」,这一条是「这段对话一共花了
+            // 多少」—— **而且按模型分开**:中途换过模型时,合起来的总数什么也
+            // 回答不了。归因那一套有两份设计文档建过
+            // (`2026-07-26-model-cost-attribution.md`),数据一直在会话里。
+            "cost" => {
+                let control = match host(control) {
+                    Ok(control) => control,
+                    Err(refusal) => return refusal,
+                };
+                match control.call(HostCommand::Cost { session: root }).await {
+                    Ok(HostReply::Cost {
+                        models,
+                        unattributed,
+                    }) => Outcome::Said(cost_report(&models, unattributed)),
+                    Ok(other) => Outcome::Refused(
+                        t(Msg::HostSaidSomethingElse {
+                            reply: &format!("{other:?}"),
+                        })
+                        .into_owned(),
+                    ),
+                    Err(error) => Outcome::Refused(refusal(error)),
+                }
+            }
             // What a person asks when they come back to a window and cannot
             // remember which one it is. Everything here is already on screen
             // somewhere — this is the one place that says it all at once.
@@ -2378,6 +2447,61 @@ mod tests {
                 scope: atomcode_kernel::session::RewindScope::Code,
                 based_on: 7,
             })
+        );
+    }
+
+    /// `/cost` 按模型分开算,而不是 `/context` 的别名。
+    ///
+    /// 此前它就是一行 `return self.run("context", ...)` —— 而那两条答的不是同
+    /// 一个问题:`/context` 是「现在窗口里装了多少」,这一条是「这段对话
+    /// 一共花了多少」。归因那一套有两份设计文档建过,数据一直在会话里。
+    ///
+    /// **按模型分开是重点**:中途换过模型时,合起来的总数什么也回答不了。
+    /// 命中缓存那一项是 `prompt` 的子集,不是另一笔 —— 加进总数里就是把同
+    /// 一批 token 算两遍。
+    #[tokio::test]
+    async fn cost_is_counted_per_model_rather_than_aliased_to_context() {
+        let host = Arc::new(Recording::default());
+        host.replies.lock().unwrap().extend([Ok(HostReply::Cost {
+            models: vec![
+                atomcode_host_api::ModelCost {
+                    account: "AtomGit".into(),
+                    model: "glm-5".into(),
+                    prompt: 1000,
+                    completion: 200,
+                    cached: 400,
+                },
+                atomcode_host_api::ModelCost {
+                    account: "自建".into(),
+                    model: "qwen3".into(),
+                    prompt: 50,
+                    completion: 10,
+                    cached: 0,
+                },
+            ],
+            unattributed: 7,
+        })]);
+        let (app, _client, all) = following(&host);
+
+        let said = match all.dispatch("/cost", &app.context()).await {
+            Outcome::Said(said) => said,
+            other => panic!("{other:?}"),
+        };
+        // 两个模型各自一段,不是合起来的一个总数。
+        assert!(said.contains("glm-5") && said.contains("qwen3"), "{said}");
+        assert!(
+            said.contains("AtomGit") && said.contains("自建"),
+            "账号名:{said}"
+        );
+        assert!(said.contains("1200"), "第一个的总数:{said}");
+        assert!(said.contains("40%"), "缓存命中率:{said}");
+        assert!(said.contains('7'), "归不了属的那一块单列:{said}");
+        // 而它问的是 `Cost`,不是 `Context` —— 别名那一版在这里会露馅。
+        assert_eq!(
+            *host.asked.lock().unwrap(),
+            vec![HostCommand::Cost {
+                session: "lead".into()
+            }]
         );
     }
 

@@ -124,6 +124,13 @@ pub enum HostCommand {
     /// typing it out (`docs/plans/2026-09-18-tui-panels-and-commands-inventory.md`
     /// A12).
     Models { session: String },
+    /// 这一会话花了多少 token,**按哪个模型花的分开**。
+    ///
+    /// 和 `Usage` 不同:那一条问的是账号还剩多少额度,这一条问的是
+    /// **这一段对话自己**花了多少 —— 跨账号、离线也答得出来,因为它就在
+    /// 会话自己的记录里。按模型分开是重点:一段对话中途换过模型时,
+    /// 合起来的总数什么也回答不了。
+    Cost { session: String },
     /// Name `session`. What a person calls a conversation when the title it
     /// took from its first message is not what it turned out to be about (A4).
     Rename { session: String, title: String },
@@ -293,6 +300,7 @@ impl HostCommand {
             | Self::Mode { session }
             | Self::ChangeDirectory { session, .. }
             | Self::Models { session }
+            | Self::Cost { session }
             | Self::Rename { session, .. }
             | Self::McpStatus { session }
             | Self::McpTools { session, .. }
@@ -394,6 +402,14 @@ pub enum HostReply {
     /// The settings a person may change, each with what it is set to now.
     Settings {
         settings: Vec<Setting>,
+    },
+    /// 每个模型一行,加上归不了属的那一块。
+    Cost {
+        models: Vec<ModelCost>,
+        /// 没能归到哪个模型名下的 token。单列而不是摄进某一行:推给
+        /// 任一个模型都是编的。
+        #[serde(default)]
+        unattributed: u64,
     },
     /// What a person may switch to — the host's own catalog. `current` is the
     /// one this conversation runs on, when the host knows it.
@@ -831,6 +847,22 @@ pub struct Setting {
     /// When a change takes effect, in a person's terms — "now", "next start".
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub applies: String,
+}
+
+/// 一个模型在这一会话里花掉的 token。
+///
+/// `account` 而不是原始的选择 id:同一个账号下的好几个选择折成一个名字,
+/// 而那是人认得出来的那个。宿主解析,屏幕原样画。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCost {
+    pub account: String,
+    pub model: String,
+    /// 发出去的,含命中缓存的那部分。
+    pub prompt: u64,
+    /// 收回来的。
+    pub completion: u64,
+    /// 上面那个 `prompt` 里命中缓存的那部分 —— 不是另一笔。
+    pub cached: u64,
 }
 
 /// One model a person can pick, as the host lists it.
@@ -1355,6 +1387,7 @@ mod tests {
                 | HostCommand::Mode { .. }
                 | HostCommand::ChangeDirectory { .. }
                 | HostCommand::Models { .. }
+                | HostCommand::Cost { .. }
                 | HostCommand::Sources { .. }
                 | HostCommand::Usage { .. }
                 | HostCommand::Context { .. }
@@ -1641,6 +1674,7 @@ mod tests {
                 | HostReply::McpDetail { .. }
                 | HostReply::Settings { .. }
                 | HostReply::Models { .. }
+                | HostReply::Cost { .. }
                 | HostReply::Changes { .. }
                 | HostReply::Providers { .. }
                 | HostReply::Autonomy { .. }

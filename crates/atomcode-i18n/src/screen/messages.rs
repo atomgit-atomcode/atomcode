@@ -656,6 +656,17 @@ pub enum Msg<'a> {
         reason: &'a str,
     },
     CompactionInterrupted,
+    CostNothingYet,
+    CostTokens {
+        prompt: u64,
+        completion: u64,
+        cached: u64,
+        rate: u64,
+        total: u64,
+    },
+    CostUnattributed {
+        tokens: u64,
+    },
     RefusedStaleQuestion,
     RefusedNotRunning,
     RefusedUnavailable,

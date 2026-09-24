@@ -125,6 +125,11 @@ pub trait HostConfig: Send + Sync {
     fn notifications(&self) -> atomcode_config::config::NotificationConfig {
         atomcode_config::config::NotificationConfig::default()
     }
+
+    /// 选择 id → 账号名。空表 = 这个宿主说不上来,调用方退回用 id。
+    fn accounts(&self) -> std::collections::HashMap<String, String> {
+        Default::default()
+    }
 }
 
 /// Who is signed in, for [`HostConfig::identity`].
@@ -2092,6 +2097,53 @@ impl HostControl for RuntimeControl {
             // The catalog is the tree's — the `models` seam the `/model` switch
             // already resolves through — read here rather than by the screen,
             // which may not reach into the agent's App (`docs/adr/0022` §3).
+            // 这一会话自己花了多少,按模型分开。
+            //
+            // 读的是会话自己的记录(`aggregate_session_cost`),不是账号那一侧的
+            // 额度 —— 所以跨账号、离线都答得出来。归因是 `SnapshotHook` 当时
+            // 写下的:换过模型之后不会把旧的那些重新贴成新模型的。
+            HostCommand::Cost { session } => {
+                self.addressed(&session)?;
+                use atomcode_capabilities::session::{aggregate_session_cost, SessionManager};
+                let working_dir = self
+                    .config
+                    .lock()
+                    .expect("config poisoned")
+                    .working_dir
+                    .clone();
+                let manager = SessionManager::for_project(&working_dir);
+                let report = manager
+                    .read_meta(&session)
+                    .map(|meta| aggregate_session_cost(&meta))
+                    .map_err(|error| HostError::Failed {
+                        message: error.to_string(),
+                    })?;
+                // 账号名而不是选择 id:同一个账号下的好几个选择折成一个名字,
+                // 而那是人认得出来的那个。目录里没有的(比如已经删掉的 provider)
+                // 就原样用 id —— 编一个好听的名字比一串 id 更坏。
+                let catalog = self
+                    .host_config
+                    .as_ref()
+                    .map(|source| source.accounts())
+                    .unwrap_or_default();
+                Ok(HostReply::Cost {
+                    models: report
+                        .models
+                        .into_iter()
+                        .map(|item| atomcode_host_api::ModelCost {
+                            account: catalog
+                                .get(&item.provider_id)
+                                .cloned()
+                                .unwrap_or(item.provider_id),
+                            model: item.model_id,
+                            prompt: item.tokens.input + item.tokens.cached_input,
+                            completion: item.tokens.output,
+                            cached: item.tokens.cached_input,
+                        })
+                        .collect(),
+                    unattributed: report.unattributed_tokens,
+                })
+            }
             HostCommand::Models { session } => {
                 self.addressed(&session)?;
                 use atomcode_host_api::ModelChoice;
