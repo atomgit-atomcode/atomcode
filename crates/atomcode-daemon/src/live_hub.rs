@@ -42,6 +42,15 @@ pub struct LiveBinding {
     pub provider_fingerprint: String,
 }
 
+/// One MCP server of the live runtime, as [`LiveViewHub::mcp_servers`] reports it.
+#[derive(Clone, Debug)]
+pub struct LiveMcpServer {
+    pub name: String,
+    pub status: atomcode_capabilities::mcp::ServerStatus,
+    /// How many of its tools the model is offered right now.
+    pub published_tools: usize,
+}
+
 #[derive(Clone, Debug)]
 pub enum LiveViewEvent {
     InputAccepted {
@@ -735,9 +744,42 @@ impl LiveViewHub {
             )))
             .await
             .map_err(|error| HubError::RuntimeRejected(error.to_string()))?;
+        // A reload reconnects every server: returning before their tools are
+        // published hands the next prompt a model with no MCP tools, which is what
+        // `/mcp/reload` followed by an immediate question used to get.
+        wait_mcp_ready_after_transition(&handle).await;
         self.commit_changed_snapshot(&binding, &handle, &changed)
             .await?;
         Ok(changed)
+    }
+
+    /// The live runtime's MCP servers — the registry the model's tools come from,
+    /// not the daemon's own — each with how many of its tools the model is offered
+    /// right now, and the directory the runtime runs in.
+    ///
+    /// "Connected" alone cannot tell a server whose tools are in front of the model
+    /// from one whose tools are not published yet (a session switch or reload
+    /// rebuilds the tree and reconnects); the published count can.
+    pub async fn mcp_servers(&self) -> Result<(PathBuf, Vec<LiveMcpServer>), HubError> {
+        let (binding, handle) = self.bound_handle()?;
+        let rejected =
+            |error: atomcode_coding::RuntimeError| HubError::RuntimeRejected(error.to_string());
+        let snapshot = handle.mcp_status().await.map_err(rejected)?;
+        let mut servers = Vec::with_capacity(snapshot.servers.len());
+        for (name, status) in snapshot.servers {
+            let published_tools = handle
+                .mcp_tools(name.clone())
+                .await
+                .map_err(rejected)?
+                .tools
+                .len();
+            servers.push(LiveMcpServer {
+                name,
+                status,
+                published_tools,
+            });
+        }
+        Ok((binding.working_dir, servers))
     }
 
     pub fn publish_command_output(&self, text: String) -> Result<(), HubError> {

@@ -5265,6 +5265,11 @@ struct McpServerStatus {
 
 #[derive(Serialize)]
 struct McpStatusResponse {
+    /// Which registry answered: `"live"` — the live session's runtime in this
+    /// project, whose `tool_count` is the tools its model is offered right now (a
+    /// connected server showing 0 has not had its tools published yet) — or
+    /// `"daemon"`, the daemon's own registry, when no live session runs here.
+    source: &'static str,
     servers: Vec<McpServerStatus>,
     /// Whether the current project's `.mcp.json` has been explicitly trusted by
     /// the user.  False means project-source servers are withheld.
@@ -5296,23 +5301,51 @@ fn merge_configured_mcp_statuses(
 }
 
 async fn mcp_status(State(state): State<AppState>) -> Json<McpStatusResponse> {
-    // Prefer the per-project `/chat` registry when it exists; otherwise report
-    // the daemon registry. Live runtime capability changes use the awaitable
-    // CodingRuntime boundary and are reported on the live event stream.
     let working_dir = state.project.read().await.working_dir.clone();
-    let registry = if let Some(reg) = state
-        .mcp_cache
-        .read()
-        .await
-        .get(&working_dir)
-        .map(|c| c.registry.clone())
-    {
-        reg
-    } else {
-        state.mcp_registry.read().await.clone()
+    // A live session in this project answers from its own registry — the one its
+    // model's tools come from. The daemon's registry (`/chat`) connects the same
+    // servers separately and stays up across a session switch, so reporting it
+    // said "connected" while the live model had no MCP tool at all. The count is
+    // then the tools the model is offered, which is what tells the two apart.
+    let live = match crate::native_live::mcp_servers().await {
+        Ok((live_dir, servers)) if live_dir == working_dir => Some(servers),
+        _ => None,
     };
-
-    let statuses = registry.server_statuses().await;
+    let (source, statuses, counts) = match live {
+        Some(servers) => {
+            let counts: HashMap<String, usize> = servers
+                .iter()
+                .map(|server| (server.name.clone(), server.published_tools))
+                .collect();
+            let statuses = servers
+                .into_iter()
+                .map(|server| (server.name, server.status))
+                .collect();
+            ("live", statuses, counts)
+        }
+        None => {
+            // Prefer the per-project `/chat` registry when it exists; otherwise
+            // report the daemon registry.
+            let registry = if let Some(reg) = state
+                .mcp_cache
+                .read()
+                .await
+                .get(&working_dir)
+                .map(|c| c.registry.clone())
+            {
+                reg
+            } else {
+                state.mcp_registry.read().await.clone()
+            };
+            let statuses = registry.server_statuses().await;
+            // Fetch the tool list once (was previously re-fetched per connected server).
+            let mut counts: HashMap<String, usize> = HashMap::new();
+            for tool in registry.list_all_tools().await {
+                *counts.entry(tool.server_name).or_default() += 1;
+            }
+            ("daemon", statuses, counts)
+        }
+    };
 
     let all_cfgs = atomcode_capabilities::mcp::load_mcp_config(&working_dir).unwrap_or_default();
 
@@ -5340,10 +5373,9 @@ async fn mcp_status(State(state): State<AppState>) -> Json<McpStatusResponse> {
         .collect();
     let statuses = merge_configured_mcp_statuses(statuses, &configured_names);
 
-    // Fetch the tool list once (was previously re-fetched per connected server).
-    let tools = registry.list_all_tools().await;
-    let servers = build_mcp_server_rows(statuses, &tools);
+    let servers = build_mcp_server_rows(statuses, |name| counts.get(name).copied().unwrap_or(0));
     Json(McpStatusResponse {
+        source,
         servers,
         trusted,
         blocked,
@@ -5359,7 +5391,7 @@ async fn mcp_status(State(state): State<AppState>) -> Json<McpStatusResponse> {
 /// "blocked" status row here and once in the blocked banner.
 fn build_mcp_server_rows(
     statuses: Vec<(String, atomcode_capabilities::mcp::ServerStatus)>,
-    tools: &[atomcode_capabilities::mcp::McpToolInfo],
+    tool_count: impl Fn(&str) -> usize,
 ) -> Vec<McpServerStatus> {
     use atomcode_capabilities::mcp::ServerStatus;
     let mut servers = Vec::new();
@@ -5373,7 +5405,7 @@ fn build_mcp_server_rows(
             ServerStatus::BlockedUntrusted => continue,
         };
         let tool_count = if matches!(status, ServerStatus::Connected) {
-            Some(tools.iter().filter(|t| t.server_name == name).count())
+            Some(tool_count(&name))
         } else {
             None
         };
@@ -8252,7 +8284,7 @@ mod tests {
                 ("ok".to_string(), ServerStatus::Connected),
                 ("evil".to_string(), ServerStatus::BlockedUntrusted),
             ],
-            &[],
+            |_| 0,
         );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "ok");

@@ -325,6 +325,10 @@ pub async fn reload_capabilities() -> Result<atomcode_coding::SessionChanged, Hu
     hub().reload_capabilities().await
 }
 
+pub async fn mcp_servers() -> Result<(PathBuf, Vec<crate::live_hub::LiveMcpServer>), HubError> {
+    hub().mcp_servers().await
+}
+
 pub fn publish_command_output(text: String) -> Result<(), HubError> {
     hub().publish_command_output(text)
 }

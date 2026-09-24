@@ -2524,6 +2524,97 @@ async fn withdrawing_mcp_takes_the_tools_off_the_model() {
     runtime.handle.shutdown().await.unwrap();
 }
 
+/// Switching sessions keeps the MCP tools in front of the model.
+///
+/// Reported against v5.1.0: after `POST /sessions` + `/live/switch_session` the
+/// model said no `mcp__*` tool was mounted while `/mcp/status` showed every
+/// server connected, and it spent a million tokens in bash instead. A session
+/// switch rebuilds the capability tree; the servers are the same, so the new
+/// tree must offer their tools — here after a fresh session and after resuming
+/// the first one, the two transitions a switch is made of.
+#[cfg(unix)]
+async fn a_switched_session_keeps_the_mcp_tools() {
+    let env = env();
+    let scratch = tempfile::tempdir().unwrap();
+    let spawns = scratch.path().join("spawns.log");
+    let script = write_mcp_server(scratch.path(), &spawns);
+    let recorder = Arc::new(Recorder::default());
+    let mut start = start(env.project.path(), &recorder, SessionMode::Fresh);
+    start.prepare.mcp = true;
+    start.prepare.extra_mcp_servers = vec![atomcode_capabilities::mcp::McpServerConfig {
+        name: "t".into(),
+        disabled: false,
+        config: atomcode_capabilities::mcp::McpTransportConfig::Stdio {
+            command: "sh".into(),
+            args: vec![script.to_string_lossy().into_owned()],
+            env: Default::default(),
+            timeout_ms: Some(10_000),
+        },
+        source: atomcode_capabilities::mcp::config::McpConfigSource::Driver,
+        trust: true,
+        auto_approve: Vec::new(),
+    }];
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+    let first = runtime.session.clone().unwrap().id;
+    let offered = |recorder: &Recorder| {
+        recorder
+            .tools
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .unwrap_or_default()
+    };
+    // Readiness, and what the daemon's `/mcp/status` reads back once it is there:
+    // the server connected AND its tool published to the model. The published
+    // list is what tells "connected" apart from "in front of the model".
+    let ready = |runtime: &CodingRuntime| {
+        let handle = runtime.handle.clone();
+        async move {
+            handle
+                .wait_mcp_ready(std::time::Duration::from_secs(10))
+                .await
+                .unwrap();
+            let status = handle.mcp_status().await.unwrap();
+            assert!(
+                status.servers.iter().any(|(name, status)| name == "t"
+                    && matches!(status, atomcode_capabilities::mcp::ServerStatus::Connected)),
+                "{:?}",
+                status.servers
+            );
+            let tools = handle.mcp_tools("t".into()).await.unwrap().tools;
+            assert_eq!(tools, vec!["mcp__t__echo".to_string()]);
+        }
+    };
+
+    ready(&runtime).await;
+    turn(&mut runtime, "before").await;
+    assert!(
+        offered(&recorder).iter().any(|name| name == "mcp__t__echo"),
+        "the fixture never offered the tool: {:?}",
+        offered(&recorder)
+    );
+
+    runtime.handle.fresh_session().await.unwrap();
+    ready(&runtime).await;
+    turn(&mut runtime, "in a fresh session").await;
+    assert!(
+        offered(&recorder).iter().any(|name| name == "mcp__t__echo"),
+        "a fresh session lost the MCP tools: {:?}",
+        offered(&recorder)
+    );
+
+    runtime.handle.resume_session(first).await.unwrap();
+    ready(&runtime).await;
+    turn(&mut runtime, "back in the first").await;
+    assert!(
+        offered(&recorder).iter().any(|name| name == "mcp__t__echo"),
+        "a resumed session lost the MCP tools: {:?}",
+        offered(&recorder)
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
 /// Cancel a turn that is waiting on the model, and wait for it to end.
 async fn cancel_hanging_turn(runtime: &mut CodingRuntime, recorder: &Recorder) {
     let before = recorder.requests.lock().unwrap().len();
@@ -4864,6 +4955,7 @@ mod criteria {
         a_round_budget_ends_the_turn,
         an_mcp_servers_tools_are_offered_and_run,
         withdrawing_mcp_takes_the_tools_off_the_model,
+        a_switched_session_keeps_the_mcp_tools,
         a_failed_mcp_connection_is_metered,
         a_model_round_reports_how_long_it_took,
         every_metered_event_says_which_turn_and_round_it_was,
