@@ -341,7 +341,7 @@ async fn start_with_connection(
     setup: Setup,
     wrap: impl FnOnce(atomcode_host_api::HostConnection) -> atomcode_host_api::HostConnection,
 ) -> Session {
-    start_full(setup, wrap, None, None, None, None, None).await
+    start_full(setup, wrap, Ports::default()).await
 }
 
 /// A settings port that answers one row with `value` and knows nothing else.
@@ -374,7 +374,15 @@ async fn start_with_connection_and_settings(
     setup: Setup,
     settings: Option<Arc<dyn atomcode_tui::settings::Settings>>,
 ) -> Session {
-    start_full(setup, |control| control, settings, None, None, None, None).await
+    start_full(
+        setup,
+        |control| control,
+        Ports {
+            settings,
+            ..Default::default()
+        },
+    )
+    .await
 }
 
 /// The layer that puts the test's plugins panel on screen.
@@ -411,24 +419,42 @@ async fn start_with_plugins(
     start_full(
         setup,
         |control| control,
-        None,
-        Some(plugins),
-        None,
-        None,
-        None,
+        Ports {
+            plugins: Some(plugins),
+            ..Default::default()
+        },
     )
     .await
 }
 
-async fn start_full(
-    setup: Setup,
-    wrap: impl FnOnce(atomcode_host_api::HostConnection) -> atomcode_host_api::HostConnection,
+/// 一次开屏要填的那几条缝。
+///
+/// 收成一个结构体而不是排成一长串参数:它们全是 `Option`、全是
+/// `Arc<dyn _>`,排成参数的话相邻两个写反了编译器一句话不说。
+/// 和 `launch::Ports` 同一个形状,也是同一个理由。
+#[derive(Default)]
+struct Ports {
     settings: Option<Arc<dyn atomcode_tui::settings::Settings>>,
     plugins: Option<Arc<dyn atomcode_tui::plugins::Plugins>>,
     tools: Option<Arc<dyn atomcode_tui::tools::Tools>>,
     rewind: Option<Arc<dyn atomcode_tui::rewind::Rewind>>,
     resume: Option<Arc<dyn atomcode_tui::resume::Resume>>,
+    shell: Option<Arc<dyn atomcode_tui::shell::Shell>>,
+}
+
+async fn start_full(
+    setup: Setup,
+    wrap: impl FnOnce(atomcode_host_api::HostConnection) -> atomcode_host_api::HostConnection,
+    ports: Ports,
 ) -> Session {
+    let Ports {
+        settings,
+        plugins,
+        tools,
+        rewind,
+        resume,
+        shell,
+    } = ports;
     let agent_layers = setup.agent.clone();
     let registry: Registry = Arc::new(agent_catalog);
     let trees: Trees = Arc::new(move |opening: &Opening| {
@@ -481,6 +507,11 @@ async fn start_full(
     if let Some(resume) = resume {
         extra.push(RESUME_PANEL_LAYER);
         panel_row.push(Arc::new(ResumePanelRow(resume)));
+    }
+    // 本机 shell 同理(`atomcode::tui_shell`):填了这条缝,`!` 才算数。
+    if let Some(shell) = shell {
+        extra.push(SHELL_ROW_LAYER);
+        panel_row.push(Arc::new(ShellPanelRow(shell)));
     }
     let mounted = launch::mount_with(
         &screen,
@@ -5284,6 +5315,171 @@ async fn a_refused_submit_hands_the_words_back_and_says_why_in_words() {
     task.abort();
 }
 
+const SHELL_ROW_LAYER: &str = "[[insert]]\nname = \"tui-shell\"\n";
+
+/// 把假 shell 挂上去的那一行 —— 和启动器那一行同形(`atomcode::tui_shell`)。
+struct ShellPanelRow(Arc<dyn atomcode_tui::shell::Shell>);
+
+#[async_trait]
+impl Plugin for ShellPanelRow {
+    fn name(&self) -> &'static str {
+        "tui-shell"
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["tui-shell"]
+    }
+    async fn apply(&self, ctx: &Context, _config: &serde_json::Value) -> Result<(), String> {
+        let _ = ctx
+            .provide::<atomcode_tui::plugin::ShellSvc>(self.0.clone())
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+/// 开一块接了本机 shell 的屏幕,并把它发出去的命令都拄下来。
+async fn start_with_shell(
+    setup: Setup,
+    shell: Arc<dyn atomcode_tui::shell::Shell>,
+) -> (Session, Arc<std::sync::Mutex<Vec<String>>>) {
+    let sent: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let slot = sent.clone();
+    let session = start_full(
+        setup,
+        move |connection| {
+            let atomcode_host_api::HostConnection {
+                session,
+                commands,
+                events,
+                control,
+            } = connection;
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                while let Some(command) = rx.recv().await {
+                    slot.lock()
+                        .expect("sent poisoned")
+                        .push(format!("{command:?}"));
+                    if commands.send(command).is_err() {
+                        break;
+                    }
+                }
+            });
+            atomcode_host_api::HostConnection {
+                session,
+                commands: tx,
+                events,
+                control,
+            }
+        },
+        Ports {
+            shell: Some(shell),
+            ..Default::default()
+        },
+    )
+    .await;
+    (session, sent)
+}
+
+/// 一个假的本机 shell:不开进程,但记得被叫去跑什么。
+#[derive(Default)]
+struct Ran(std::sync::Mutex<Vec<String>>);
+
+#[async_trait]
+impl atomcode_tui::shell::Shell for Ran {
+    async fn run(&self, command: &str, _within: Duration) -> atomcode_tui::shell::Ran {
+        self.0
+            .lock()
+            .expect("ran poisoned")
+            .push(command.to_string());
+        atomcode_tui::shell::Ran {
+            code: Some(0),
+            output: format!("OUT-OF[{command}]"),
+            timed_out: false,
+        }
+    }
+}
+
+/// `!cmd` 在本机跑,结果留在屏上,并跟**下一条**消息一起给模型。
+///
+/// 三半都要钉,而第三半是最容易漏的:
+/// - `!` 不是发给模型的话 —— 不接这一手的话,`!git status` 会被当成
+///   提示词发出去,而这正是上一代前端有、这一代没有的那件事;
+/// - 结果要**留在对话区**,不是一条几秒就没的提示条 —— 一条命令的输出
+///   可能是几十行,而人要回头看;
+/// - 输出要**跟着下一条消息给模型**。没这一半的话,接下来那句「按上面
+///   那个报错改一下」指的是模型没见过的东西 —— 而屏幕上一切看起来都正常。
+#[tokio::test]
+async fn a_bang_runs_here_and_what_it_printed_goes_with_the_next_message() {
+    let dir = scratch("bang");
+    let shell = Arc::new(Ran::default());
+    let (s, sent) = start_with_shell(
+        tree(&dir, &replay(r#"{ text = "ok" }"#), &[]),
+        shell.clone(),
+    )
+    .await;
+    let task = s.open().await;
+
+    s.term.type_line("!git status");
+    for _ in 0..200 {
+        if !shell.0.lock().expect("ran poisoned").is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        *shell.0.lock().expect("ran poisoned"),
+        vec!["git status".to_string()],
+        "跑的是 `!` 后面那一整行,而不是连 `!` 一起"
+    );
+    // 脚本只有一条回答。`!` 要是被当成提示词发出去了,它就会被花掉,
+    // 屏上会出现 `ok` —— 这是「没有因此开一个回合」最直接的证据。
+    assert!(
+        !transcript(&s).contains("ok"),
+        "这不是在对模型说话,不该开一个回合:\n{}",
+        s.screen()
+    );
+
+    let mut seen = String::new();
+    for _ in 0..200 {
+        seen = transcript(&s);
+        if seen.contains("OUT-OF[git status]") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        seen.contains("OUT-OF[git status]"),
+        "输出留在对话区里:\n{}",
+        s.screen()
+    );
+
+    // 下一条消息带着它走。钉的是**发出去的那条命令**,不是屏上画了
+    // 什么 —— 这一半的整个意义就在于模型收到了什么。
+    s.term.type_line("按上面那个改");
+    for _ in 0..200 {
+        if sent
+            .lock()
+            .expect("sent poisoned")
+            .iter()
+            .any(|c| c.contains("bash-output"))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let wire = sent.lock().expect("sent poisoned").join("\n");
+    assert!(
+        wire.contains("bash-output") && wire.contains("OUT-OF[git status]"),
+        "输出跟着下一条消息给了模型:\n{wire}"
+    );
+    assert!(
+        wire.contains("按上面那个改"),
+        "而话本身也在同一条里:\n{wire}"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
 /// 对话区里现在写着什么 —— 不含输入框与各种面板。
 fn transcript(s: &Session) -> String {
     s.term
@@ -5848,11 +6044,10 @@ async fn start_with_rewind(setup: Setup, rewind: Arc<dyn atomcode_tui::rewind::R
     start_full(
         setup,
         |control| control,
-        None,
-        None,
-        None,
-        Some(rewind),
-        None,
+        Ports {
+            rewind: Some(rewind),
+            ..Default::default()
+        },
     )
     .await
 }
@@ -5863,11 +6058,10 @@ async fn start_with_tools(setup: Setup, tools: Arc<dyn atomcode_tui::tools::Tool
     start_full(
         setup,
         |control| control,
-        None,
-        None,
-        Some(tools),
-        None,
-        None,
+        Ports {
+            tools: Some(tools),
+            ..Default::default()
+        },
     )
     .await
 }
@@ -5908,11 +6102,10 @@ async fn start_with_resume(setup: Setup, resume: Arc<dyn atomcode_tui::resume::R
     start_full(
         setup,
         |control| control,
-        None,
-        None,
-        None,
-        None,
-        Some(resume),
+        Ports {
+            resume: Some(resume),
+            ..Default::default()
+        },
     )
     .await
 }
@@ -6869,11 +7062,10 @@ async fn start_with_mode_host(
                 }
             }
         },
-        settings,
-        None,
-        None,
-        None,
-        None,
+        Ports {
+            settings,
+            ..Default::default()
+        },
     )
     .await;
     let host = made

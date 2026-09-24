@@ -82,6 +82,8 @@ pub mod search;
 pub mod secret;
 pub mod settings;
 pub mod setup;
+/// `!cmd`：人自己在这台机器上跑一条命令。
+pub mod shell;
 pub mod surface;
 pub mod text;
 pub mod theme;

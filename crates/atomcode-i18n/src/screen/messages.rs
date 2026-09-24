@@ -656,6 +656,13 @@ pub enum Msg<'a> {
         reason: &'a str,
     },
     CompactionInterrupted,
+    ShellTimedOut {
+        secs: u64,
+    },
+    ShellFailed {
+        code: &'a str,
+    },
+    ShellSaidNothing,
     CostNothingYet,
     CostTokens {
         prompt: u64,

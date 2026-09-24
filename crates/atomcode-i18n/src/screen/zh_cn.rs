@@ -402,6 +402,9 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CostUnattributed { tokens } => {
             format!("归不到哪个模型名下的：{tokens}").into()
         }
+        Msg::ShellTimedOut { secs } => format!("[跑了 {secs} 秒还没完,停了]").into(),
+        Msg::ShellFailed { code } => format!("[退出码 {code}]").into(),
+        Msg::ShellSaidNothing => "[没有输出]".into(),
         Msg::CompactionInterrupted => "压缩被打断了 —— 上下文还是原来那么长".into(),
         Msg::RuntimeStopped { how } => format!("运行时停了:{how}。这个会话不会再有新的东西。").into(),
         Msg::GoalMet { condition } => format!("目标达成:{condition}").into(),

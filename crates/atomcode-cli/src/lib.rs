@@ -46,6 +46,7 @@ pub mod tui_schedule;
 pub mod tui_settings;
 pub mod tui_setup;
 pub mod tui_share;
+pub mod tui_shell;
 pub mod tui_tools;
 pub mod tui_welcome_words;
 pub mod uninstall;
@@ -125,6 +126,7 @@ pub mod tui_front {
             crate::tui_login::row_layer(),
             crate::tui_welcome_words::row_layer(),
             crate::tui_opening::row_layer(),
+            crate::tui_shell::row_layer(),
             crate::tui_elsewhere::row_layer(),
             crate::tui_proxy::row_layer(),
             crate::tui_schedule::row_layer(),
@@ -153,6 +155,9 @@ pub mod tui_front {
             Arc::new(crate::tui_welcome_words::WelcomeWordsRow),
             Arc::new(crate::tui_opening::OpeningRow {
                 notice: opening_notice,
+            }),
+            Arc::new(crate::tui_shell::ShellRow {
+                working_dir: working_dir.clone(),
             }),
             Arc::new(crate::tui_elsewhere::ElsewhereRow),
             Arc::new(crate::tui_proxy::ProxyRow {

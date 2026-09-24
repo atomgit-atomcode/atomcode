@@ -58,6 +58,9 @@ plexus_service!(WelcomeWordsSvc => dyn crate::content::WelcomeWords, "tui-welcom
 // `content::OpeningNotices`. Unfilled means a launch with nothing to report,
 // which is the ordinary case.
 plexus_service!(OpeningNoticesSvc => crate::content::OpeningNotices, "tui-opening-notices", Seam, "What the launcher has to say about this launch, the moment the screen opens");
+// 跑一条本机命令。手势(`!`)归屏幕,开一个进程归启动器 —— 这块屏幕
+// 碰不到操作系统。没填就没有这个功能,`!git status` 还是一句发给模型的话。
+plexus_service!(ShellSvc => dyn crate::shell::Shell, "tui-shell", Seam, "Running a command on this machine, for the `!` gesture");
 plexus_service!(AgentClientSvc => AgentClient, "tui-agent-client", Core, "The screen's end of its connection to the agent");
 // Declared here, by the one that consumes it (`docs/adr/0021` §6): whoever
 // launches the screen fills it with what its host handed over.
@@ -317,7 +320,29 @@ impl AgentClient {
 
     /// Say something to the agent on screen.
     pub fn send(&self, text: String, images: Vec<atomcode_kernel::message::ImageContent>) {
+        self.send_with(text, images, Vec::new());
+    }
+
+    /// 同上,另带上人在本地做过的事。
+    ///
+    /// `context` 不是人说的话,是人**做的事**(跑过的 `!` 命令与它们的
+    /// 输出)。跟着消息一起过去而不是单独开一个回合:跑一条命令不是在对
+    /// 模型说话,但接下来那句话往往指的就是它。
+    pub fn send_with(
+        &self,
+        text: String,
+        images: Vec<atomcode_kernel::message::ImageContent>,
+        context: Vec<String>,
+    ) {
         let id = format!("tui-{}", self.receipts.fetch_add(1, Ordering::SeqCst));
+        let inner = match context.is_empty() {
+            true => AgentCommand::SendMessage { text, images },
+            false => AgentCommand::SendMessageWithContext {
+                text,
+                images,
+                context: context.join("\n\n"),
+            },
+        };
         let command = {
             let mut views = self.view.lock().expect("client poisoned");
             let on_screen = views.on_screen.clone();
@@ -326,7 +351,7 @@ impl AgentClient {
             }
             views.addressed(AgentCommand::Tagged {
                 id,
-                command: Box::new(AgentCommand::SendMessage { text, images }),
+                command: Box::new(inner),
             })
         };
         self.command(command);
@@ -2555,6 +2580,63 @@ impl Tui {
         self.client.send(text, Vec::new());
     }
 
+    /// 一段留在对话区里的话。
+    ///
+    /// 不走 `Host::say`:那是一条几秒后就没的提示条,而一条命令的输出
+    /// 可能是几十行,而且人要回头看。
+    fn put(host: &std::sync::Arc<crate::host::Host>, text: String) {
+        let mut stream = host.stream.write().expect("stream poisoned");
+        let mut writer = stream.writer("commands");
+        writer.emit(
+            crate::block::Coord::default(),
+            std::sync::Arc::new(crate::content::NoticeBlock { detail: text }),
+        );
+    }
+
+    /// 跑一条本机命令,把结果画出来,并把它攒给模型。
+    ///
+    /// **攒着,不当场发。** 人跑一条 `!` 不是在对模型说话,不该因此开一个
+    /// 回合;但接下来那句「按上面那个报错改一下」指的就是它 —— 模型没见过
+    /// 的话,那句话就是空的。所以结果跟着**下一条消息**一起过去。
+    fn run_locally(&self, command: String, shell: std::sync::Arc<dyn crate::shell::Shell>) {
+        let host = self.host.clone();
+        let keys = self.wake.lock().expect("wake poisoned").clone();
+        // 先把人打的那一行画出来:一条跑了几秒的命令,期间屏上不该没有任何
+        // 关于它的痕迹。
+        Self::put(&host, format!("$ {command}"));
+        tokio::spawn(async move {
+            let ran = shell.run(&command, crate::shell::WITHIN).await;
+            let said = match (ran.timed_out, ran.code) {
+                (true, _) => t(Msg::ShellTimedOut {
+                    secs: crate::shell::WITHIN.as_secs(),
+                })
+                .into_owned(),
+                (false, Some(0)) => String::new(),
+                (false, code) => t(Msg::ShellFailed {
+                    code: &code.map(|c| c.to_string()).unwrap_or_else(|| "—".into()),
+                })
+                .into_owned(),
+            };
+            let body = match (ran.output.trim().is_empty(), said.is_empty()) {
+                (true, true) => t(Msg::ShellSaidNothing).into_owned(),
+                (true, false) => said,
+                (false, true) => ran.output.trim_end().to_string(),
+                (false, false) => format!("{}\n{said}", ran.output.trim_end()),
+            };
+            Self::put(&host, body);
+            // 模型那一份用原始输出,不带屏幕上那句评语。攒着,跟下一条
+            // 消息一起过去。
+            host.moment
+                .write()
+                .expect("moment poisoned")
+                .pending_context
+                .push(crate::shell::as_context(&command, &ran.output));
+            if let Some(keys) = keys {
+                let _ = keys.send(Wake::Fact);
+            }
+        });
+    }
+
     fn delete_session(&self, id: String) {
         let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
             self.host
@@ -4164,6 +4246,21 @@ impl Tui {
                 if text.is_empty() {
                     return false;
                 }
+                // `!cmd` 先看 —— 它既不是命令,也不是发给模型的话。只有启动器
+                // 填了那条缝时才算数;没填的前端(daemon / ACP)里 `!git status`
+                // 照旧是一句话,而不是一条“本该能跑却默默没跑”的命令。
+                if let Some(command) = crate::shell::asks_for_shell(&text) {
+                    if let Some(shell) = self
+                        .ctx
+                        .lock()
+                        .expect("ctx poisoned")
+                        .as_ref()
+                        .and_then(|ctx| ctx.service::<ShellSvc>())
+                    {
+                        self.run_locally(command.to_string(), shell);
+                        return false;
+                    }
+                }
                 // A slash *command* goes to the command surface, everything else
                 // to the model. The one place the two are told apart — and a
                 // filesystem path that merely begins with `/` (`/Users/me/x.png`)
@@ -4214,7 +4311,16 @@ impl Tui {
                 for image in &images {
                     crate::image_cache::write(image);
                 }
-                client.send(text.clone(), images);
+                // 人在本地跑过的那几条,跟这一句一起过去 —— 取走,不重发。
+                let context = std::mem::take(
+                    &mut self
+                        .host
+                        .moment
+                        .write()
+                        .expect("moment poisoned")
+                        .pending_context,
+                );
+                client.send_with(text.clone(), images, context);
                 if recognizing {
                     self.host.start_recognizing();
                     // Put the message in the conversation now, in flow, rather

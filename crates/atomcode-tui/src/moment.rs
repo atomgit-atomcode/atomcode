@@ -502,6 +502,12 @@ pub struct Moment {
     /// 丢掉的另一种写法。所以它们先在这里放一下;而放在 `Moment` 而不是
     /// 一个局部变量里,是因为收走的那一刻和重发的那一刻隔着一次事件往返。
     pub staged_steers: Option<String>,
+    /// 人自己跑过的 `!` 命令与它们的输出,等着跟下一条消息一起给模型。
+    ///
+    /// 攒着而不是当场发:跑一条 `!git status` 不是在对模型说话,不该因此开
+    /// 一个回合。但接下来那句「按上面那个报错改一下」指的就是它 —— 模型没
+    /// 见过的话,那句话就是空的。
+    pub pending_context: Vec<String>,
     /// The question on screen, if one is waiting, and which of its answers is
     /// pointed at.
     ///
