@@ -2228,6 +2228,47 @@ impl CodingRuntimeHandle {
         .await
     }
 
+    /// Undo back to before the log's `turn` — a rewind point's turn — rather
+    /// than to a prompt ordinal in the conversation as it now stands.
+    ///
+    /// What a point names is a turn, and the turn is still in the log however
+    /// much of the conversation a compaction has folded since; an ordinal is
+    /// not (see [`undo_to_turn_in_log`]).
+    pub async fn undo_to_turn(&self, turn: u64) -> Result<UndoResult, RuntimeError> {
+        let generation = self.status().generation;
+        let original = self.snapshot_with_revision().await?;
+        let undo = self
+            .undo_target(generation, original.revision, turn)
+            .await?;
+        self.apply_undo(
+            generation,
+            original.revision,
+            original.undo_snapshot,
+            undo,
+            None,
+        )
+        .await
+    }
+
+    /// The conversation before `turn`, as the control loop reads it off the log.
+    async fn undo_target(
+        &self,
+        generation: u64,
+        expected_revision: u64,
+        turn: u64,
+    ) -> Result<SnapshotUndoResult, RuntimeError> {
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::UndoTarget {
+                generation,
+                expected_revision,
+                turn,
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
     async fn apply_undo(
         &self,
         generation: u64,
@@ -2362,10 +2403,10 @@ impl CodingRuntimeHandle {
             return Err(RuntimeError::Busy);
         }
         let undo = if scope.restores_conversation() {
-            Some(undo_snapshot_to_prompt(
-                &original.undo_snapshot,
-                Some(point.prompt_number),
-            )?)
+            Some(
+                self.undo_target(catalog.generation.0, catalog.revision, point.turn_id)
+                    .await?,
+            )
         } else {
             None
         };
@@ -3055,6 +3096,14 @@ pub enum CodingRuntimeControl {
     RewindCatalog {
         generation: u64,
         done: oneshot::Sender<Result<RewindCatalog, RuntimeError>>,
+    },
+    /// The conversation as it stood before `turn`, read off the session log
+    /// (see [`undo_to_turn_in_log`]).
+    UndoTarget {
+        generation: u64,
+        expected_revision: u64,
+        turn: u64,
+        done: oneshot::Sender<Result<SnapshotUndoResult, RuntimeError>>,
     },
     /// Whether a goal or a loop is running, and how far it has got.
     Autonomy {
@@ -4567,6 +4616,42 @@ fn spawn_runtime_owner_with_optional_agent(
                             points: hook.rewind_points(),
                             code_unavailable: hook.code_rewind_unavailable().map(Into::into),
                         }));
+                    }
+                    Some(CodingRuntimeControl::UndoTarget {
+                        generation: request_generation,
+                        expected_revision,
+                        turn,
+                        done,
+                    }) => {
+                        if request_generation != generation
+                            || expected_revision != conversation_revision
+                            || active_turn.is_some()
+                            || compaction_suspended
+                            || compactions.is_active()
+                        {
+                            let _ = done.send(Err(RuntimeError::Busy));
+                            continue;
+                        }
+                        let Some(runtime) = resources.as_ref() else {
+                            let _ = done.send(Err(RuntimeError::Unavailable));
+                            continue;
+                        };
+                        // The same log the undo snapshot is projected from
+                        // (`current_runtime_snapshot`), so the target and the
+                        // conversation it replaces are read off one history.
+                        let events = match runtime.parts.session.as_ref() {
+                            Some(binding) if binding.manager.is_event_session(&binding.id) => {
+                                binding.manager.load_events(&binding.id).map_err(|error| {
+                                    RuntimeError::ReconfigureFailed(format!(
+                                        "could not read the session log: {error}"
+                                    ))
+                                })
+                            }
+                            _ => live_root_agent(runtime)
+                                .map(|live| live.session().events())
+                                .ok_or(RuntimeError::Unavailable),
+                        };
+                        let _ = done.send(events.and_then(|events| undo_to_turn_in_log(&events, turn)));
                     }
                     // The two controllers live as locals of this loop, which is
                     // why this is a message rather than a field somebody reads:
@@ -8395,6 +8480,9 @@ fn reject_runtime_control(
         CodingRuntimeControl::RewindCatalog { done, .. } => {
             let _ = done.send(Err(RuntimeError::Unavailable));
         }
+        CodingRuntimeControl::UndoTarget { done, .. } => {
+            let _ = done.send(Err(RuntimeError::Unavailable));
+        }
         CodingRuntimeControl::WorkspaceChanges { done, .. } => {
             let _ = done.send(Err(RuntimeError::Unavailable));
         }
@@ -9928,6 +10016,75 @@ pub fn undo_snapshot_to_prompt(
     })
 }
 
+/// Going back to before `turn`, worked out on the session LOG.
+///
+/// A rewind point names a turn, and the log's `TurnStart { turn }` is where it
+/// began. The conversation before it is what the log projects to once a
+/// `Rewound { to: <that seq> }` is appended — the very fact the change is then
+/// committed as (`events_to_become` finds it), so what is planned here and what
+/// lands are one computation.
+///
+/// Nothing here counts prompts in the conversation as it now stands. That was
+/// the bug: a point was looked up by its prompt ordinal in the current
+/// projection, and a compaction folds turns out of the projection — not out of
+/// the log (`SessionEvent::Compacted`) — so every point before a fold asked for
+/// an ordinal the folded conversation no longer had (`UndoOutOfRange`). A
+/// `Rewound` to before a fold takes the fold back with it, and a fold before the
+/// point stays, so the target is the conversation as it really stood then.
+///
+/// A turn a rewind already took back is not a place to go back to: a `Rewound`
+/// to it would also leave out whatever the earlier rewind covered before it.
+pub fn undo_to_turn_in_log(
+    events: &[atomcode_harness::session::LoggedEvent],
+    turn: u64,
+) -> Result<SnapshotUndoResult, RuntimeError> {
+    use atomcode_harness::session::{LoggedEvent, RewindScope as LogScope, SessionEvent};
+    let unavailable = || RuntimeError::RewindPointUnavailable { turn_id: turn };
+    if atomcode_harness::session::rewound_turns(events).contains(&turn) {
+        return Err(unavailable());
+    }
+    let to = events
+        .iter()
+        .find_map(|logged| {
+            matches!(logged.event, SessionEvent::TurnStart { turn: t } if t == turn)
+                .then_some(logged.seq)
+        })
+        .ok_or_else(unavailable)?;
+    let restored_prompt = events
+        .iter()
+        .find_map(|logged| match &logged.event {
+            SessionEvent::UserMessage { turn: t, text, .. } if *t == turn => Some(text.clone()),
+            _ => None,
+        })
+        .ok_or_else(unavailable)?;
+    let mut rewound = events.to_vec();
+    rewound.push(LoggedEvent {
+        seq: events.iter().map(|e| e.seq).max().unwrap_or(0) + 1,
+        at: 0,
+        event: SessionEvent::Rewound {
+            turn: events.iter().map(|e| e.event.turn()).max().unwrap_or(0),
+            to,
+            scope: LogScope::Conversation,
+        },
+    });
+    let prompts = |snapshot: &SessionSnapshot| {
+        snapshot
+            .messages
+            .iter()
+            .filter(|message| {
+                message.role == atomcode_kernel::message::Role::User && !message.synthetic
+            })
+            .count()
+    };
+    let snapshot = atomcode_capabilities::session::events::snapshot_of(&rewound);
+    Ok(SnapshotUndoResult {
+        target_n: prompts(&snapshot) + 1,
+        prompts_before: prompts(&atomcode_capabilities::session::events::snapshot_of(events)),
+        restored_prompt,
+        snapshot,
+    })
+}
+
 fn compute_runtime_undo(
     messages: &[Message],
     nth: Option<usize>,
@@ -10623,6 +10780,114 @@ mod tests {
 
         assert_eq!(acknowledged, vec![original]);
         assert!(pending.is_empty());
+    }
+
+    /// A rewind point is a turn, and the turn is found in the LOG: a point
+    /// before a compaction lands before it with the folded turns back, two
+    /// prompts that read the same are two turns, and what is planned is exactly
+    /// the one `Rewound` the change is committed as.
+    #[test]
+    fn a_rewind_to_a_turn_is_planned_on_the_log() {
+        use atomcode_harness::session::{LoggedEvent, RewindScope as LogScope, SessionEvent};
+
+        let fact = |seq: u64, event: SessionEvent| LoggedEvent { seq, at: 0, event };
+        let said = |turn: u64, text: &str| SessionEvent::UserMessage {
+            turn,
+            text: text.into(),
+            images: Vec::new(),
+        };
+        let reply = |turn: u64, text: &str| SessionEvent::AssistantMessage {
+            turn,
+            round: 1,
+            text: text.into(),
+            reasoning: String::new(),
+            tool_calls: Vec::new(),
+            reasoning_blocks: Vec::new(),
+            meta: None,
+        };
+        let mut events = vec![
+            fact(1, SessionEvent::TurnStart { turn: 1 }),
+            fact(2, said(1, "first")),
+            fact(3, reply(1, "ok")),
+            fact(4, SessionEvent::TurnStart { turn: 2 }),
+            fact(5, said(2, "继续")),
+            fact(6, reply(2, "again")),
+            fact(
+                7,
+                SessionEvent::Compacted {
+                    turn: 2,
+                    through: 6,
+                    summary: "SUMMARY".into(),
+                    from: 0,
+                },
+            ),
+            fact(8, SessionEvent::TurnStart { turn: 3 }),
+            fact(9, said(3, "继续")),
+            fact(10, reply(3, "once more")),
+        ];
+        let texts = |undo: &SnapshotUndoResult| -> Vec<String> {
+            undo.snapshot
+                .messages
+                .iter()
+                .map(|m| m.text.clone())
+                .collect()
+        };
+        let lands_as = |events: &[LoggedEvent], undo: &SnapshotUndoResult| {
+            atomcode_capabilities::session::events::events_to_become(
+                events,
+                &undo.snapshot.messages,
+            )
+        };
+
+        // Before the fold: the folded turn is back in the clear, no summary.
+        let before_the_fold = undo_to_turn_in_log(&events, 2).unwrap();
+        assert_eq!(texts(&before_the_fold), vec!["first", "ok"]);
+        assert_eq!(before_the_fold.restored_prompt, "继续");
+        assert_eq!(
+            lands_as(&events, &before_the_fold),
+            vec![SessionEvent::Rewound {
+                turn: 3,
+                to: 4,
+                scope: LogScope::Conversation,
+            }],
+            "one fact, to that turn's start"
+        );
+
+        // After the fold: the conversation then was the summary.
+        let after_the_fold = undo_to_turn_in_log(&events, 3).unwrap();
+        assert_eq!(texts(&after_the_fold), vec!["SUMMARY"]);
+        assert_eq!(after_the_fold.restored_prompt, "继续");
+        assert_eq!(
+            lands_as(&events, &after_the_fold),
+            vec![SessionEvent::Rewound {
+                turn: 3,
+                to: 8,
+                scope: LogScope::Conversation,
+            }]
+        );
+
+        // A turn the log never held, and one a rewind already took back.
+        assert!(matches!(
+            undo_to_turn_in_log(&events, 9),
+            Err(RuntimeError::RewindPointUnavailable { turn_id: 9 })
+        ));
+        events.push(fact(
+            11,
+            SessionEvent::Rewound {
+                turn: 3,
+                to: 8,
+                scope: LogScope::Conversation,
+            },
+        ));
+        assert!(matches!(
+            undo_to_turn_in_log(&events, 3),
+            Err(RuntimeError::RewindPointUnavailable { turn_id: 3 })
+        ));
+        // …while the turns before it still are.
+        assert_eq!(
+            texts(&undo_to_turn_in_log(&events, 2).unwrap()),
+            vec!["first", "ok"]
+        );
     }
 
     #[test]

@@ -996,6 +996,60 @@ async fn a_rewound_conversation_is_gone_from_what_the_model_sees() {
     runtime.handle.shutdown().await.unwrap();
 }
 
+/// A point recorded before a compaction is still a place to go back to, and
+/// going back there brings the folded turns back in the clear.
+///
+/// The log keeps every fact (`SessionEvent::Compacted`: "compaction changes the
+/// projection, not the history"), and a `Rewound` to a turn before a fold takes
+/// the fold back with it. What used to break was the step in between: the point
+/// was looked up by its prompt ordinal in the *folded* conversation, which had
+/// fewer prompts than the ordinal named — `UndoOutOfRange`.
+async fn a_rewind_point_before_a_compaction_is_still_reachable() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+            .await
+            .unwrap();
+
+    turn(&mut runtime, "early").await;
+    let long = |n: usize| format!("prompt {n} {}", "context ".repeat(500));
+    for n in 0..6 {
+        turn(&mut runtime, &long(n)).await;
+    }
+    compact_and_wait(&mut runtime).await;
+    turn(&mut runtime, "after the fold").await;
+    assert!(
+        !user_texts(&recorder.last_turn_request()).contains(&long(1)),
+        "the fold must have taken the target turn, or this proves nothing"
+    );
+
+    let catalog = runtime.handle.rewind_points().await.unwrap();
+    let point = catalog
+        .points
+        .iter()
+        .find(|point| point.prompt_preview.starts_with("prompt 1 "))
+        .expect("the pre-fold turn is still a rewind point");
+    runtime
+        .handle
+        .rewind(point.turn_id, RewindScope::Conversation)
+        .await
+        .expect("a point before the fold is reachable");
+    turn(&mut runtime, "again").await;
+
+    let seen = recorder.last_turn_request();
+    assert_eq!(
+        user_texts(&seen),
+        vec!["early".to_string(), long(0), "again".to_string()],
+        "the turns the fold had taken are back, the ones after the point are gone"
+    );
+    assert!(
+        !seen.iter().any(|m| m.role == Role::System && m.synthetic),
+        "the point is before the fold, so no summary stands"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
 /// A restored snapshot is the conversation the next turn continues.
 async fn a_restored_snapshot_is_what_the_model_sees() {
     let env = env();
@@ -2505,6 +2559,11 @@ async fn plan_then_compact(runtime: &mut CodingRuntime) {
     for n in 0..6 {
         turn(runtime, &format!("prompt {n} {}", "context ".repeat(500))).await;
     }
+    compact_and_wait(runtime).await;
+}
+
+/// Ask for a compaction and wait until it is committed.
+async fn compact_and_wait(runtime: &mut CodingRuntime) {
     runtime.handle.compact(None).unwrap();
     loop {
         let event = tokio::time::timeout(std::time::Duration::from_secs(10), runtime.events.recv())
@@ -5272,6 +5331,7 @@ mod criteria {
         switching_sessions_switches_what_the_model_sees,
         a_changed_directory_is_where_tools_run,
         a_rewound_conversation_is_gone_from_what_the_model_sees,
+        a_rewind_point_before_a_compaction_is_still_reachable,
         a_restored_snapshot_is_what_the_model_sees,
         plan_mode_refuses_a_write_and_says_so,
         accept_edits_applies_a_write_without_asking,

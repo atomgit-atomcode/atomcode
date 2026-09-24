@@ -259,6 +259,8 @@ mod tests {
             | C::ToolCatalog { .. }
             | C::PendingPolicyIntervention { .. }
             | C::RewindCatalog { .. }
+            // A read of the log; the `ApplyUndo` that uses it is what is told.
+            | C::UndoTarget { .. }
             | C::Autonomy { .. }
             | C::Usage { .. }
             | C::WorkspaceChanges { .. } => Heard::Nothing,

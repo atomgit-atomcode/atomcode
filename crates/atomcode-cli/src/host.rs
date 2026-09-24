@@ -1788,21 +1788,27 @@ impl HostControl for RuntimeControl {
             } => {
                 self.addressed(&session)?;
                 self.fresh(&session, based_on)?;
-                let nth = match turn {
-                    None => None,
-                    Some(turn) => Some(
-                        self.handle
+                let undone = match turn {
+                    None => self.handle.undo_to_prompt(None).await,
+                    // A point names a turn of the log, and is undone as one: not
+                    // as its prompt ordinal, which a compaction since has made
+                    // point past the end of the folded conversation.
+                    Some(turn) => {
+                        if !self
+                            .handle
                             .rewind_points()
                             .await
                             .map_err(refused)?
                             .points
-                            .into_iter()
-                            .find(|point| point.turn_id == turn)
-                            .map(|point| point.prompt_number)
-                            .ok_or(HostError::RewindPointNotFound { turn })?,
-                    ),
-                };
-                let undone = self.handle.undo_to_prompt(nth).await.map_err(refused)?;
+                            .iter()
+                            .any(|point| point.turn_id == turn)
+                        {
+                            return Err(HostError::RewindPointNotFound { turn });
+                        }
+                        self.handle.undo_to_turn(turn).await
+                    }
+                }
+                .map_err(refused)?;
                 Ok(HostReply::Undone {
                     prompt: Some(undone.restored_prompt),
                     restored_files: Vec::new(),

@@ -1185,6 +1185,72 @@ async fn an_undo_through_host_control_hands_the_prompt_back_and_the_model_no_lon
     );
 }
 
+/// An undo that names a rewind point goes back to before THAT turn and hands
+/// its prompt back — the turn is found in the log, not by counting prompts in
+/// the conversation as it now stands. A turn that is no point is refused.
+#[tokio::test]
+async fn an_undo_to_a_named_point_goes_back_to_before_that_turn() {
+    let env = env();
+    let mut connection = connected(&env).await;
+    let session = connection.session.clone();
+    connection.commands.send(subscribe(&session)).unwrap();
+    let mut latest = 0;
+    for text in ["first thing", "second thing"] {
+        connection.commands.send(message(text)).unwrap();
+        let seen = [
+            through_turn(&mut connection).await,
+            quiet(&mut connection).await,
+        ]
+        .concat();
+        latest = last_seen(&seen, &session);
+    }
+    let Ok(HostReply::RewindPoints { points, .. }) = connection
+        .control
+        .call(HostCommand::RewindPoints {
+            session: session.clone(),
+        })
+        .await
+    else {
+        panic!("no rewind points");
+    };
+    let first = points
+        .iter()
+        .find(|point| point.prompt == "first thing")
+        .expect("the first turn is a point")
+        .turn;
+
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::Undo {
+                session: session.clone(),
+                turn: Some(first + 100),
+                based_on: latest,
+            })
+            .await,
+        Err(HostError::RewindPointNotFound { turn: first + 100 })
+    );
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::Undo {
+                session: session.clone(),
+                turn: Some(first),
+                based_on: latest,
+            })
+            .await,
+        Ok(HostReply::Undone {
+            prompt: Some("first thing".into()),
+            restored_files: Vec::new(),
+        })
+    );
+    let _ = quiet(&mut connection).await;
+    connection.commands.send(message("third thing")).unwrap();
+    through_turn(&mut connection).await;
+    let (_, last) = env.script.requests.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(user_texts_in(&last), vec!["third thing".to_string()]);
+}
+
 /// An undo on the session that is live is a *fact in its log*, not a new App:
 /// the subscriber that is reading the session sees `Rewound` arrive on the
 /// stream it already has, and nothing was rebuilt under it (`docs/adr/0022`
