@@ -459,6 +459,10 @@ mod pin_tests {
     use atomcode_capabilities::session::{CatalogEntry, CatalogPresence};
 
     fn entry(id: &str, bucket: &str) -> CatalogEntry {
+        entry_with(id, bucket, 1)
+    }
+
+    fn entry_with(id: &str, bucket: &str, message_count: usize) -> CatalogEntry {
         CatalogEntry {
             id: id.into(),
             name: String::new(),
@@ -467,7 +471,7 @@ mod pin_tests {
             working_dir: "/w".into(),
             created_at_ms: 0,
             updated_at_ms: 0,
-            message_count: 1,
+            message_count,
             turn_count: 1,
             presence: CatalogPresence::NativeOnly,
             needs_newer_version: false,
@@ -504,6 +508,24 @@ mod pin_tests {
     fn an_unknown_session_pins_nothing() {
         let entries = vec![entry("s1", "old")];
         assert_eq!(bucket_to_pin_on_resume(&entries, "missing", "new"), None);
+    }
+
+    #[test]
+    fn a_zero_message_phantom_in_the_folder_does_not_block_the_repair() {
+        // The renamed folder's bucket ("new") holds only a fresh-but-unused
+        // session. The picker treats the folder as owning nothing, so the pin
+        // must still fire — a phantom is not a real session.
+        let entries = vec![entry("s1", "old"), entry_with("phantom", "new", 0)];
+        assert_eq!(
+            bucket_to_pin_on_resume(&entries, "s1", "new"),
+            Some("old".to_string()),
+        );
+    }
+
+    #[test]
+    fn a_zero_message_target_is_not_resumable() {
+        let entries = vec![entry_with("s1", "old", 0)];
+        assert_eq!(bucket_to_pin_on_resume(&entries, "s1", "new"), None);
     }
 }
 
@@ -1132,12 +1154,18 @@ fn scope_sessions(all: Vec<StoredSession>, working_dir: Option<&str>) -> Vec<Sto
 ///   - the target session is on disk (its bucket is knowable);
 ///   - that bucket differs from the folder's current one (the cross-bucket
 ///     signal — a same-bucket resume needs nothing);
-///   - the folder's current bucket holds NO sessions of its own.
+///   - the folder's current bucket holds NO real sessions of its own.
 /// The last guard is the anti-hijack: a marker's mere absence is not enough,
 /// because a folder can own unmarked path-hash sessions (created before markers,
 /// with no fresh session started since). A manual `/resume <foreign-id>` from
 /// such a folder must not freeze it onto the foreign bucket and orphan its own —
 /// so a folder that still owns sessions is never repinned.
+///
+/// "Real" everywhere means `message_count > 0`, matching what `list`/the picker
+/// (`scope_sessions`) count as a session: a 0-message phantom (a fresh session
+/// created but never used) neither identifies its target nor makes a folder
+/// "own" sessions, so a stray one in the renamed folder's bucket cannot block
+/// the repair.
 fn bucket_to_pin_on_resume(
     entries: &[atomcode_capabilities::session::CatalogEntry],
     target: &str,
@@ -1145,14 +1173,14 @@ fn bucket_to_pin_on_resume(
 ) -> Option<String> {
     let session_bucket = entries
         .iter()
-        .find(|entry| entry.id == target)
+        .find(|entry| entry.id == target && entry.message_count > 0)
         .map(|entry| entry.project_bucket.clone())?;
     if session_bucket == current_bucket {
         return None;
     }
     let folder_owns_sessions = entries
         .iter()
-        .any(|entry| entry.project_bucket == current_bucket);
+        .any(|entry| entry.project_bucket == current_bucket && entry.message_count > 0);
     (!folder_owns_sessions).then_some(session_bucket)
 }
 
@@ -1390,14 +1418,19 @@ impl HostControl for RuntimeControl {
                 if target == session {
                     return Err(HostError::SessionInUse { id: target });
                 }
-                let Some(stored) = self
-                    .list(None)
-                    .into_iter()
-                    .find(|stored| stored.id == target)
+                // ONE catalog scan serves both the existence/version check and the
+                // cross-bucket pin decision below — a resume walks every project's
+                // sessions once, not twice. `message_count > 0` matches what the
+                // picker offers (a 0-message phantom is not resumable).
+                let scan = SessionManager::scan_all();
+                let Some(entry) = scan
+                    .entries
+                    .iter()
+                    .find(|entry| entry.id == target && entry.message_count > 0)
                 else {
                     return Err(HostError::NotFound);
                 };
-                if stored.needs_newer_version {
+                if entry.needs_newer_version {
                     return Err(HostError::Failed {
                         message: format!(
                             "session {target} was written by a newer AtomCode; update to resume it"
@@ -1415,7 +1448,6 @@ impl HostControl for RuntimeControl {
                 // resolve, and the resume follows it.
                 if let Ok(stats) = self.handle.context_stats().await {
                     let here = stats.working_dir;
-                    let scan = SessionManager::scan_all();
                     if let Some(bucket) = bucket_to_pin_on_resume(
                         &scan.entries,
                         &target,
