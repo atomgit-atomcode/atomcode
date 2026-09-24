@@ -360,9 +360,18 @@ fn doing(state: &State, moment: &Moment) -> Option<String> {
     // that finishes). Once the turn DOES exist, its own status wins — a lingering
     // flag must never keep saying 正在识别图片 over the model's writing output.
     if state.turn.is_none() {
-        return moment
-            .recognizing_image
-            .then(|| t(Msg::LiveRecognizingImage).into_owned());
+        return moment.recognizing_image.then(|| {
+            let base = t(Msg::LiveRecognizingImage).into_owned();
+            // How long recognition has been running, so a slow one and a stalled
+            // one are told apart — the turn's own clock does not exist yet.
+            match moment.recognizing_since {
+                Some(since) => {
+                    let ms = moment.now.as_millis().saturating_sub(since.as_millis());
+                    format!("{base} · {}", short(ms))
+                }
+                None => base,
+            }
+        });
     }
     match moment.activity {
         Activity::Idle => None,
@@ -818,6 +827,30 @@ mod tests {
         assert!(
             !blank.iter().any(|l| l.contains("正在识别图片")),
             "gone once recognition ends: {blank:?}"
+        );
+    }
+
+    #[test]
+    fn the_recognizing_line_shows_elapsed_time() {
+        // A slow recognition and a stalled one look identical without a clock, so
+        // the line carries how long it has been running (feedback: 一直识别中).
+        let state = State::default();
+        let mut moment = Moment::default().at_tick(0);
+        moment.recognizing_image = true;
+        moment.recognizing_since = Some(Timestamp::millis(0));
+        moment.now = Timestamp::millis(12_000);
+        let line = draw(&state, &moment, 80, 1);
+        assert!(
+            line.iter()
+                .any(|l| l.contains("正在识别图片") && l.contains("12s")),
+            "the recognizing line shows elapsed time: {line:?}"
+        );
+        // No start stamp → just the words, never a panic or a bogus duration.
+        moment.recognizing_since = None;
+        let plain = draw(&state, &moment, 80, 1);
+        assert!(
+            plain.iter().any(|l| l.contains("正在识别图片")),
+            "still speaks without a stamp: {plain:?}"
         );
     }
 

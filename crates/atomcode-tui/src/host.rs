@@ -1917,10 +1917,10 @@ impl Host {
     /// fact) or [`Self::set_activity`] (the turn ending first).
     pub fn start_recognizing(&self) -> bool {
         self.pinned(true, || {
-            self.moment
-                .write()
-                .expect("moment poisoned")
-                .recognizing_image = true;
+            let mut m = self.moment.write().expect("moment poisoned");
+            m.recognizing_image = true;
+            // Stamp the start so the live line can show elapsed recognition time.
+            m.recognizing_since = Some(m.now);
         });
         true
     }

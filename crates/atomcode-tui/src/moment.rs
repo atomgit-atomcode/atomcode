@@ -466,6 +466,13 @@ pub struct Moment {
     /// blank for the seconds it takes. Screen state, cleared the moment the turn
     /// materialises or ends.
     pub recognizing_image: bool,
+    /// When [`recognizing_image`](Self::recognizing_image) was raised, on the
+    /// same injected clock as [`now`](Self::now) — so the live line can show how
+    /// long recognition has been running (a picture-recognition can be slow, and
+    /// a stalled one and a working one look identical without a clock). Set at
+    /// start; read only while `recognizing_image` is true, so a stale value after
+    /// it clears is harmless (the next start overwrites it).
+    pub recognizing_since: Option<Timestamp>,
     /// The mounted cell-grid bitmaps, **as of the frame this moment was taken
     /// for**.
     ///
