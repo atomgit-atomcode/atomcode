@@ -171,8 +171,22 @@ fn load_hooks_file(path: &Path) -> Vec<HookConfig> {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return Vec::new(); // missing file → no hooks (not an error).
     };
-    let Ok(parsed) = serde_json::from_str::<HooksFile>(&raw) else {
-        return Vec::new(); // malformed → skip the file rather than wedge startup.
+    let parsed: HooksFile = match serde_json::from_str(&raw) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            // Malformed → skip the file rather than wedge startup, but SAY so: a
+            // silently-dropped hooks file (one stray comma) means every hook
+            // quietly stops firing with nothing on screen or in the log to
+            // explain it. One warn with the path and the parse error is the
+            // difference between a five-minute fix and a day of bisecting.
+            tracing::warn!(
+                target: "atomcode::hooks",
+                path = %path.display(),
+                %error,
+                "ignoring malformed hooks file — no hooks from it will run"
+            );
+            return Vec::new();
+        }
     };
     parsed
         .hooks
@@ -1255,6 +1269,23 @@ mod tests {
         assert_eq!(hooks[0].event, HookEvent::PreToolUse);
         assert_eq!(hooks[0].matcher.as_deref(), Some("bash"));
         assert_eq!(hooks[0].timeout_ms, 10_000);
+    }
+
+    /// A malformed hooks file is skipped gracefully (never wedges startup) — the
+    /// A8 contract — and a valid one right beside it in a different scope still
+    /// loads. The warn is a side effect; what a test can pin is that a stray comma
+    /// costs only that file, and does not throw or take the others down.
+    #[test]
+    fn a_malformed_hooks_file_is_skipped_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        // A trailing comma — the exact "one stray comma" the report describes.
+        std::fs::write(
+            dir.path().join(".hooks.json"),
+            r#"{"hooks":{"a":{"event":"PreToolUse","command":"echo a"},}}"#,
+        )
+        .unwrap();
+        let hooks = load_hooks_config(dir.path());
+        assert!(hooks.is_empty(), "malformed file yields no hooks, no panic");
     }
 
     #[test]
