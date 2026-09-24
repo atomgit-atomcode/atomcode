@@ -327,11 +327,27 @@ pub fn iter_installed_plugin_assets_for(working_dir: &Path) -> Vec<InstalledPlug
 
 /// Plugin skill directories visible from `working_dir`, paired with the
 /// namespace used by [`crate::skills::SkillRegistry::load_dir`].
+///
+/// **`commands/` as well as `skills/`.** A plugin's `commands/*.md` are the
+/// same thing under another name — that is already how this build reads
+/// `~/.claude/commands` and `<project>/.atomcode/commands`
+/// ([`crate::skills::SkillRegistry`]'s standard directories), and how the
+/// plugins were written for the front end that came before. Reading only
+/// `skills/` meant a plugin whose whole contribution was a `commands/` folder
+/// installed cleanly, reported its files, and contributed nothing that could
+/// be run.
 pub fn installed_plugin_skill_dirs(working_dir: &Path) -> Vec<(PathBuf, String)> {
     let mut out = Vec::new();
     for assets in iter_installed_plugin_assets_for(working_dir) {
-        for dir in assets.skills_dirs() {
-            if dir.exists() {
+        for dir in assets
+            .skills_dirs()
+            .into_iter()
+            .chain(std::iter::once(assets.commands_dir()))
+        {
+            // A plugin may name the same folder twice (`skills = "commands"`),
+            // and loading it twice would make every skill in it ambiguous
+            // against itself.
+            if dir.exists() && !out.iter().any(|(had, _): &(PathBuf, String)| had == &dir) {
                 out.push((dir, assets.plugin.clone()));
             }
         }
@@ -831,5 +847,80 @@ mod tests {
         let assets2 = iter_installed_plugin_assets_for(&other);
         assert_eq!(assets2.len(), 1);
         assert_eq!(assets2[0].plugin, "probe");
+    }
+
+    /// A plugin's `commands/` counts, the same as its `skills/`.
+    ///
+    /// The two words are one thing in this build: `~/.claude/commands` and
+    /// `<project>/.atomcode/commands` are already standard skill directories,
+    /// and plugins were written for a front end that read theirs. Only the
+    /// plugin path was left out — so a plugin whose whole contribution is a
+    /// `commands/` folder installed cleanly, listed its files, and contributed
+    /// nothing anyone could run.
+    #[test]
+    #[serial_test::serial]
+    fn a_plugin_that_ships_commands_contributes_them_like_skills() {
+        let _home = isolated_home();
+        let plugins_root = paths::plugins_root().unwrap();
+        let plugin_dir = plugins_root.join("installed/mp/pair");
+        for (folder, name) in [("skills", "check"), ("commands", "tidy")] {
+            std::fs::create_dir_all(plugin_dir.join(folder)).unwrap();
+            std::fs::write(
+                plugin_dir.join(folder).join(format!("{name}.md")),
+                format!("---\nname: {name}\ndescription: the {name} one\n---\nbody\n"),
+            )
+            .unwrap();
+        }
+        // A second plugin that points `skills` **at** its commands folder — a
+        // legal manifest, and the one shape where the two lists overlap.
+        let twice_dir = plugins_root.join("installed/mp/twice");
+        std::fs::create_dir_all(twice_dir.join("commands")).unwrap();
+        std::fs::write(
+            twice_dir.join("commands/only.md"),
+            "---\nname: only\ndescription: the only one\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(
+            twice_dir.join("plugin.json"),
+            r#"{"name":"twice","skills":"commands"}"#,
+        )
+        .unwrap();
+
+        let mut state = super::super::state::InstalledPluginsFile::default();
+        for name in ["pair", "twice"] {
+            state.plugins.insert(
+                super::super::state::plugin_id(name, "mp"),
+                super::super::state::InstalledPluginEntry {
+                    marketplace: "mp".into(),
+                    plugin: name.into(),
+                    plugin_dir: format!("installed/mp/{name}"),
+                    installed_at: "now".into(),
+                    scope: InstallScope::User,
+                },
+            );
+        }
+        let state_path = paths::installed_plugins_file().unwrap();
+        super::super::state::save_installed_plugins_file(&state_path, &state).unwrap();
+
+        let dirs = installed_plugin_skill_dirs(&_home.path().join("projects/any"));
+        let of = |plugin: &str| -> Vec<String> {
+            dirs.iter()
+                .filter(|(_, ns)| ns == plugin)
+                .map(|(dir, _)| dir.file_name().unwrap().to_string_lossy().into_owned())
+                .collect()
+        };
+        let pair = of("pair");
+        assert!(pair.contains(&"skills".to_string()), "{pair:?}");
+        assert!(
+            pair.contains(&"commands".to_string()),
+            "the commands folder is contributed too: {pair:?}"
+        );
+        // A folder named twice is listed once: loading it twice would make
+        // every skill in it ambiguous against itself.
+        assert_eq!(
+            of("twice"),
+            vec!["commands".to_string()],
+            "a manifest pointing `skills` at `commands` still contributes it once"
+        );
     }
 }
