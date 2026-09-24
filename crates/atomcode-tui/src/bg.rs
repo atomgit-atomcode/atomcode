@@ -43,6 +43,8 @@ pub struct Session {
     pub group: Group,
     /// 那一行右边的摘要。
     pub last: Option<String>,
+    /// 在等人回答(审批或提问)——前台那条提示只为这个出现,出错不算。
+    pub waiting: bool,
 }
 
 impl Session {
@@ -56,6 +58,7 @@ impl Session {
             title,
             group: Group::of(session.state),
             last: session.last,
+            waiting: session.state == atomcode_host_api::BackgroundState::Waiting,
         }
     }
 }
@@ -96,6 +99,28 @@ impl BgView {
     /// 某个会话在 `/bg list` 里的号(从 1 数)。
     pub fn slot_of(&self, id: &str) -> Option<usize> {
         self.slots.iter().position(|s| s == id).map(|at| at + 1)
+    }
+
+    /// 还在跑的(进行中,或在等人)有几个——退出前要问的就是它们。
+    pub fn running(&self) -> usize {
+        self.sessions
+            .iter()
+            .filter(|s| s.group != Group::Completed)
+            .count()
+    }
+
+    /// 前台那一行提示:第一个在等人回答的后台会话,和怎么打开它。
+    pub fn waiting_caption(&self) -> Option<String> {
+        let session = self.sessions.iter().find(|s| s.waiting)?;
+        let slot = self.slot_of(&session.id)?;
+        let title: String = session.title.chars().take(40).collect();
+        Some(
+            crate::i18n::t(crate::i18n::Msg::BgWaitingTip {
+                slot,
+                title: &title,
+            })
+            .into_owned(),
+        )
     }
 
     /// 画的顺序里第几个是哪个会话的 id。
@@ -263,6 +288,7 @@ mod tests {
             title: format!("title {id}"),
             group,
             last: None,
+            waiting: false,
         }
     }
 

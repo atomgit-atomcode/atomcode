@@ -370,6 +370,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::BgRefusedWhileSharing => "这段对话正在共享,先停掉共享再换会话".into(),
         Msg::BgRefusedWhileAsking => "它在等你回答,先答了再换".into(),
         Msg::BgRefusedWhileReconfiguring => "正在换模型,稍等再换".into(),
+        Msg::BgQuitQuestion { count } => format!("{count} 个后台会话还在跑,退出会停掉它们(会话已保存,之后可以 /resume)").into(),
+        Msg::BgQuitConfirm => "退出,停掉它们".into(),
+        Msg::BgQuitStay => "留下".into(),
+        Msg::BgWaitingTip { slot, title } => format!("后台 [{slot}] {title} 在等你回答 · /bg {slot} 打开").into(),
         Msg::BgSlotsFull { most } => format!("后台已经放了 {most} 个会话,先丢掉一个(/bg drop <N>)").into(),
 
         // ── reasoning effort, undo and rewind (`commands.rs`) ──

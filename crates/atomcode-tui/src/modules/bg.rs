@@ -289,6 +289,7 @@ mod tests {
             title: title.into(),
             group,
             last: Some(last.into()),
+            waiting: false,
         }
     }
 

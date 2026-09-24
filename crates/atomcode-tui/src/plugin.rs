@@ -1410,6 +1410,7 @@ impl UserInterface for Tui {
                 Wake::Input(Input::Key(_)) => self.look_at_clipboard(false),
                 _ => {}
             }
+            let closed = matches!(woke, Wake::Closed);
             match woke {
                 Wake::Closed => quit = true,
                 // The fact was folded into the stream by the listener that sent
@@ -2077,6 +2078,7 @@ impl UserInterface for Tui {
                 // is what the panel's own top line promises.
                 Wake::Input(Input::Key(press))
                     if self.host.bg_open()
+                        && !self.host.asks.is_waiting()
                         && !(matches!(
                             press.key,
                             crate::surface::Key::Char('c') | crate::surface::Key::Char('d')
@@ -2153,6 +2155,14 @@ impl UserInterface for Tui {
                     }
                     stale = true;
                 }
+            }
+            // Every way out — ctrl+c twice, ctrl+d, `/quit` — lands here as
+            // `quit`. With background sessions still running it is asked about
+            // once first: leaving stops them. A closed connection is not asked
+            // about; there is nobody left to answer to.
+            if quit && !closed && self.ask_before_quitting() {
+                quit = false;
+                stale = true;
             }
         }
 
@@ -2648,6 +2658,67 @@ impl Tui {
             return changed;
         };
         self.apply_rewind_step(step);
+        true
+    }
+
+    /// Whether quitting has to wait for the person: background sessions are
+    /// still running and they have not said yes yet. Puts the question up
+    /// (once) when it does, through the same question panel an agent's
+    /// questions use.
+    fn ask_before_quitting(&self) -> bool {
+        let running = {
+            let m = self.host.moment.read().expect("moment poisoned");
+            if m.bg_quit_confirmed {
+                return false;
+            }
+            if m.bg_quit_asking {
+                return true;
+            }
+            m.bg.running()
+        };
+        if running == 0 {
+            return false;
+        }
+        self.host
+            .moment
+            .write()
+            .expect("moment poisoned")
+            .bg_quit_asking = true;
+        let question = atomcode_harness::seams::Question {
+            prompt: t(Msg::BgQuitQuestion { count: running }).into_owned(),
+            options: vec![
+                atomcode_harness::seams::Answer::labelled("quit", t(Msg::BgQuitConfirm)),
+                atomcode_harness::seams::Answer::labelled("stay", t(Msg::BgQuitStay)),
+            ],
+            asker: None,
+            about: None,
+        };
+        let answer = self.host.asks.push(question);
+        let host = self.host.clone();
+        let keys = self.wake.lock().expect("wake poisoned").clone();
+        tokio::spawn(async move {
+            let chosen = answer
+                .await
+                .ok()
+                .flatten()
+                .and_then(crate::ask::Reply::into_value);
+            let quit = chosen.as_deref() == Some("quit");
+            {
+                let mut m = host.moment.write().expect("moment poisoned");
+                m.bg_quit_asking = false;
+                m.bg_quit_confirmed = quit;
+            }
+            // Yes goes out the way it came in; the loop stops the rest on its
+            // way out (`client.shutdown()`, which the host takes as "stop them
+            // all"). No — or Esc — leaves everything running.
+            if let Some(keys) = keys {
+                let _ = keys.send(if quit {
+                    Wake::Act(Action::Quit)
+                } else {
+                    Wake::Fact
+                });
+            }
+        });
         true
     }
 

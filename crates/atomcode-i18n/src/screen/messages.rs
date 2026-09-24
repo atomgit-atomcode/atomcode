@@ -577,6 +577,15 @@ pub enum Msg<'a> {
     BgSlotsFull {
         most: usize,
     },
+    BgQuitQuestion {
+        count: usize,
+    },
+    BgQuitConfirm,
+    BgQuitStay,
+    BgWaitingTip {
+        slot: usize,
+        title: &'a str,
+    },
 
     // ── reasoning effort, undo and rewind (`commands.rs`) ──
     EffortAbout,

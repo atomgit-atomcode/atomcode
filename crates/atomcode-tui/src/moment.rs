@@ -715,6 +715,11 @@ pub struct Moment {
     pub bg: crate::bg::BgView,
     /// The background panel, while it is up.
     pub bg_panel: Option<crate::bg::Panel>,
+    /// Quitting was asked about and the person said yes: background sessions
+    /// still running are to be stopped, and the next quit goes through.
+    pub bg_quit_confirmed: bool,
+    /// The "N background sessions are still running" question is up.
+    pub bg_quit_asking: bool,
     /// What the Usage page draws, as the host last answered it.
     ///
     /// Asked for rather than pushed: an allowance window changes on the

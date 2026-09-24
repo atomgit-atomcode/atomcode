@@ -554,3 +554,106 @@ async fn bg_is_refused_while_a_question_waits() {
     assert!(rig.background().await.is_empty());
     rig.quit().await;
 }
+
+/// **Quitting with background sessions still running asks first.** ctrl+d
+/// puts the question up instead of leaving; "stay" (Esc) leaves everything
+/// running and the screen up; saying yes quits, and the background runtime is
+/// stopped — its held turn never finishes even once the model lets go.
+#[tokio::test(flavor = "multi_thread")]
+async fn quitting_with_background_sessions_running_asks_first() {
+    let rig = Rig::new().await;
+    rig.term.type_line("slow task");
+    rig.until("the slow turn reached the model", |rig| {
+        rig.script.started.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    rig.term.type_line("/bg");
+    rig.until_screen(&t(Msg::BgPanelMoved)).await;
+    rig.until_screen(&t(Msg::BgGroupWorking)).await;
+
+    let question = t(Msg::BgQuitQuestion { count: 1 }).into_owned();
+    rig.term.press(KeyPress::ctrl('d'));
+    rig.until_screen(&question).await;
+    assert!(!rig.running.is_finished(), "asked, not gone");
+
+    // Stay.
+    rig.term.press(KeyPress::plain(Key::Esc));
+    rig.until("the question went away", |rig| {
+        !rig.term.text().contains(&question)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!rig.running.is_finished(), "staying keeps the screen up");
+    let list = rig.background().await;
+    assert_eq!(list.len(), 1, "and the background session: {list:#?}");
+    assert_eq!(list[0].state, BackgroundState::Running);
+
+    // Asked again, and this time yes.
+    rig.term.press(KeyPress::ctrl('d'));
+    rig.until_screen(&question).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    rig.term.press(KeyPress::plain(Key::Enter));
+    rig.until("the screen quit", |rig| rig.running.is_finished())
+        .await;
+    rig.until_background("the background runtime was stopped", |list| list.is_empty())
+        .await;
+    rig.release();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        rig.script.finished.load(Ordering::SeqCst),
+        0,
+        "its turn was cancelled, not left running after the screen went"
+    );
+}
+
+/// **With nothing running in the background, quitting is not asked about.**
+#[tokio::test(flavor = "multi_thread")]
+async fn quitting_with_nothing_running_does_not_ask() {
+    let rig = Rig::new().await;
+    rig.term.type_line("/background hello");
+    rig.until_background("the task is done", |list| {
+        list.first()
+            .is_some_and(|s| s.state == BackgroundState::Done)
+    })
+    .await;
+    rig.until_screen(&t(Msg::BgStarted { slot: 1 })).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    rig.term.press(KeyPress::ctrl('d'));
+    rig.until("the screen quit", |rig| rig.running.is_finished())
+        .await;
+}
+
+/// **A background session waiting for an answer says so on the foreground**,
+/// on the row above the composer, with the way to open it; once it is
+/// answered the line is gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_background_session_waiting_for_an_answer_is_told_on_the_foreground() {
+    let rig = Rig::new().await;
+    rig.term.type_line("/background ask me");
+    rig.until_background("the background session is waiting", |list| {
+        list.first()
+            .is_some_and(|s| s.state == BackgroundState::Waiting)
+    })
+    .await;
+    let list = rig.background().await;
+    let title = list[0].title.clone().unwrap_or_default();
+    let tip = t(Msg::BgWaitingTip {
+        slot: 1,
+        title: &title,
+    })
+    .into_owned();
+    rig.until_screen(&tip).await;
+
+    let before = rig.script.count.load(Ordering::SeqCst);
+    rig.term.type_line("/bg 1");
+    rig.until_screen("Which one?").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    rig.term.press(KeyPress::plain(Key::Enter));
+    rig.until("answered", |rig| {
+        rig.script.count.load(Ordering::SeqCst) > before
+    })
+    .await;
+    rig.until("the line went away", |rig| !rig.term.text().contains(&tip))
+        .await;
+    rig.quit().await;
+}

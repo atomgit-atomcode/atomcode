@@ -100,10 +100,16 @@ impl View for Tip {
             //
             // ponytail: it shows over a panel too, where the key it names does
             // nothing. Gate on the composer being the screen if that bites.
-            None => (
-                vp.moment.clipboard_caption().unwrap_or_default(),
-                Role::Muted,
-            ),
+            // A background session waiting for an answer comes before the
+            // clipboard: it is work that has stopped until the person looks,
+            // and the only way they learn of it from here.
+            None => match vp.moment.bg.waiting_caption() {
+                Some(caption) => (caption, Role::Warning),
+                None => (
+                    vp.moment.clipboard_caption().unwrap_or_default(),
+                    Role::Muted,
+                ),
+            },
         };
         El::row(vec![El::Spacer, El::styled(text, theme::fg(role))]).lay(w)
     }
