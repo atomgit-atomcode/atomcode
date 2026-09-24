@@ -1064,6 +1064,14 @@ impl Moment {
         }
         self.input.clear();
         self.caret = 0;
+        // Emptying the field also leaves history browsing: the shoulder badge
+        // (`历史 N/M`, and the `Ctrl+R` search caption) is drawn from these, so a
+        // cleared field left with a stale browsing position keeps a count for
+        // words that are no longer there. Drop the set-aside draft too — the
+        // field is going to nothing, not back to what was being edited.
+        self.history_at = None;
+        self.search = None;
+        self.draft.clear();
         self.quit_armed = true;
         self.notice =
             Some(Notice::for_ms(t(Msg::MomentQuitAgain), false, self.now, QUIT_HINT_MS).below());
@@ -1117,6 +1125,26 @@ mod tests {
         assert!(m.turn_in_flight());
         m.activity = Activity::Stopping;
         assert!(m.turn_in_flight());
+    }
+
+    #[test]
+    fn ctrl_c_while_browsing_history_clears_the_badge_state() {
+        // Arrow-up put a recalled line in the field and a `历史 N/M` badge on the
+        // shoulder; a first Ctrl+C empties the field and must leave browsing too,
+        // or the badge lingers over an empty composer (the reported bug).
+        let mut m = Moment {
+            history: vec!["one".into(), "two".into(), "three".into()],
+            history_at: Some(1),
+            input: "two".into(),
+            caret: 3,
+            draft: "half-typed".into(),
+            ..Default::default()
+        };
+        assert!(!m.cancel_idle(), "first press arms, does not quit");
+        assert_eq!(m.input, "");
+        assert_eq!(m.history_at, None, "history browsing is left");
+        assert!(m.search.is_none());
+        assert_eq!(m.draft, "", "the set-aside draft is dropped, not restored");
     }
 
     fn big(lines: usize) -> String {
