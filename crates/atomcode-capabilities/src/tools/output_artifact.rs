@@ -142,6 +142,25 @@ fn tail_start(s: &str, n: usize) -> usize {
     i
 }
 
+/// The opening of a truncation marker: what is shown, what is NOT, and that
+/// nothing in the missing range may be used.
+///
+/// Said as a byte range rather than left for the model to work out from "first
+/// N + last M bytes". A preview of structured output (JSON, a table) cut in two
+/// reads as one broken document, and a model that does not see it is missing a
+/// stretch fills the stretch in: in a financial deployment on 5.1.0 an answer
+/// quoted three figures, credited to the tool, that appeared in none of its
+/// results. The marker ends at the first `]` after its prefix (see
+/// `next_prompt_suggestion`), so none may appear before the end.
+fn missing_range(total: usize, head_end: usize, tail_begin: usize) -> String {
+    format!(
+        "{ARTIFACT_TRUNCATION_MARKER_PREFIX} — {total} bytes total. Shown: bytes 0–{head_end} and \
+{tail_begin}–{total}. NOT shown: bytes {head_end}–{tail_begin} ({} bytes) — do not quote, total or infer \
+any value from that range until you have read it.",
+        tail_begin - head_end
+    )
+}
+
 pub struct ArtifactMiddleware {
     store: Arc<ArtifactStore>,
 }
@@ -180,19 +199,13 @@ impl ArtifactMiddleware {
         let tail_begin = tail_start(&result.content, PREVIEW_TAIL);
         let head = &result.content[..head_end];
         let tail = &result.content[tail_begin..];
-        // How many `fetch_output` reads the full output takes, so the model sees
-        // the SCALE ("part 1 of N") rather than a bare "there's more" — the
-        // structural hint from feedback B11. Head+tail count as part 1.
-        let parts = total.div_ceil(FETCH_MAX_LIMIT).max(1);
+        let missing = missing_range(total, head_end, tail_begin);
 
         if total > MAX_ARTIFACT_BYTES {
             // Too large to store; inline-truncate only.
             let marker = format!(
-                "\n\n[atomcode: output truncated — {total} bytes total (~{parts} parts of {FETCH_MAX_LIMIT}), \
-showing first {} + last {} bytes (part 1). \
-Full output unavailable (exceeds {MAX_ARTIFACT_BYTES}-byte artifact ceiling).]\n\n",
-                head.len(),
-                tail.len()
+                "\n\n{missing} Full output unavailable (exceeds {MAX_ARTIFACT_BYTES}-byte artifact ceiling); \
+re-run the command with narrower output to see that range.]\n\n"
             );
             result.content = format!("{head}{marker}{tail}");
             return;
@@ -200,19 +213,13 @@ Full output unavailable (exceeds {MAX_ARTIFACT_BYTES}-byte artifact ceiling).]\n
 
         let marker = match self.store.put(result.content.as_bytes()) {
             Ok(id) => format!(
-                "\n\n[atomcode: output truncated — {total} bytes total (~{parts} parts of {FETCH_MAX_LIMIT}), \
-showing first {} + last {} bytes (part 1). \
-Full output saved as artifact {id}. To read the next part: fetch_output(artifact_id=\"{id}\", offset={}, limit={FETCH_MAX_LIMIT}).]\n\n",
-                head.len(),
-                tail.len(),
-                head.len(),
+                "\n\n{missing} Full output saved as artifact {id}; the missing range is {} part(s) of up to \
+{FETCH_MAX_LIMIT} bytes. Read part 1: fetch_output(artifact_id=\"{id}\", offset={head_end}, limit={FETCH_MAX_LIMIT}).]\n\n",
+                (tail_begin - head_end).div_ceil(FETCH_MAX_LIMIT).max(1),
             ),
             Err(_) => format!(
-                "\n\n[atomcode: output truncated — {total} bytes total (~{parts} parts of {FETCH_MAX_LIMIT}), \
-showing first {} + last {} bytes (part 1). \
-Full output unavailable (could not be saved).]\n\n",
-                head.len(),
-                tail.len()
+                "\n\n{missing} Full output unavailable (could not be saved); re-run the command with narrower \
+output to see that range.]\n\n"
             ),
         };
         result.content = format!("{head}{marker}{tail}");
@@ -348,15 +355,19 @@ mod tests {
         // rewritten: smaller, has head+tail+marker, names fetch_output + the id
         assert!(r1.content.len() < big.len());
         assert!(r1.content.contains("fetch_output"));
-        // B11: the marker carries the structural scale ("part 1" + "~N parts").
+        // The marker names what is missing — the byte range that is NOT shown and
+        // that it is not to be used — and how many reads cover it, from where.
+        let (head_end, tail_begin) = (super::PREVIEW_HEAD, big.len() - super::PREVIEW_TAIL);
         assert!(
-            r1.content.contains("part 1"),
-            "marker names the part: {}",
+            r1.content
+                .contains(&format!("NOT shown: bytes {head_end}–{tail_begin}")),
+            "marker names the missing range: {}",
             r1.content
         );
+        assert!(r1.content.contains("do not quote"), "{}", r1.content);
         assert!(
-            r1.content.contains("parts of"),
-            "marker names the total parts: {}",
+            r1.content.contains("1 part(s)") && r1.content.contains(&format!("offset={head_end}")),
+            "marker says how many reads cover it, and where the first starts: {}",
             r1.content
         );
         let id = super::artifact_id(big.as_bytes());
@@ -473,6 +484,13 @@ artifact is unavailable, re-run the original command instead."
         true
     }
 
+    /// A page is at most `FETCH_MAX_LIMIT` bytes and says where the next one
+    /// starts. Spilled again, a default-sized page lost its middle to a fresh
+    /// artifact, and no page size the marker asked for could be read whole.
+    fn self_bounds_output(&self) -> bool {
+        true
+    }
+
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
@@ -545,6 +563,45 @@ mod fetch_output_tests {
             progress: atomcode_kernel::tool::ProgressSink::noop(),
             requester: None,
         }
+    }
+
+    /// A page `fetch_output` returns reaches the model whole.
+    ///
+    /// The page is already bounded (at most `FETCH_MAX_LIMIT` bytes plus a hint
+    /// naming the next offset), but it came back through the same spill as any
+    /// other result, and a default-sized page is over the spill threshold: it
+    /// was cut to head + tail again, into a fresh artifact, and the middle of
+    /// every page was out of reach at the size the marker told the model to ask
+    /// for. On 5.1.0 (threshold 16 KiB, 4 KiB each side) a 64 KiB page kept 8.
+    ///
+    /// Negative control: drop `self_bounds_output` from `FetchOutputTool` and
+    /// the page carries a truncation marker.
+    #[tokio::test]
+    async fn a_fetched_page_reaches_the_model_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(ArtifactStore::new(dir.path()));
+        let full: String = (0..200_000u32)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
+        let id = store.put(full.as_bytes()).unwrap();
+        let tool = FetchOutputTool::new(store.clone());
+
+        let mut page = tool
+            .execute(
+                &format!(r#"{{"artifact_id":"{id}","offset":0}}"#),
+                &ctx(dir.path()),
+            )
+            .await;
+        assert!(!page.is_error, "{}", page.content);
+        ArtifactMiddleware::new(store.clone())
+            .spill(&mut page, tool.self_bounds_output())
+            .await;
+
+        assert!(
+            !page.content.contains(ARTIFACT_TRUNCATION_MARKER_PREFIX),
+            "the page was truncated again on its way to the model"
+        );
+        assert!(page.content.starts_with(&full[..FETCH_MAX_LIMIT]));
     }
 
     #[tokio::test]

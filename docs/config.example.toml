@@ -253,6 +253,10 @@ mode = "follow_system"
 # 内嵌 code_review 在父回合等待期间有自己的默认保险（200 轮/900 秒），均可覆盖，0 为关闭：
 #   ATOMCODE_REVIEW_MAX_ROUNDS=200
 #   ATOMCODE_REVIEW_MAX_DURATION_SECS=900
+# 工具返回超过阈值时，上下文里只留头 32KB + 尾 12KB，并注明中间哪段字节没有显示；
+# 完整内容存为 artifact，模型用 fetch_output 分页读取（每页最多 64KB）。数据密集的
+# 场景（财报、全市场筛选）可调高阈值，单位字节，默认 51200，取值限制在 46080–4194304：
+#   ATOMCODE_TOOL_OUTPUT_THRESHOLD_BYTES=204800
 [coding]
 max_rounds = 0
 
