@@ -267,6 +267,17 @@ impl View for Todo {
             .lay(w),
         );
 
+        // One number column for the rows on screen: `#9` and `#10` side by side
+        // would start their text a column apart. Right-aligned, so the text
+        // column is the same on every row.
+        let digits = rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Item { index, .. } => Some((index + 1).to_string().len()),
+                Row::More { .. } => None,
+            })
+            .max()
+            .unwrap_or(1);
         for row in rows {
             match row {
                 Row::Item {
@@ -286,7 +297,7 @@ impl View for Todo {
                     out.extend(
                         El::row(vec![
                             El::styled(format!("{}  ", todo_glyph(status, unicode)), style),
-                            El::styled(format!("#{}  {content}", index + 1), body),
+                            El::styled(format!("#{:>digits$}  {content}", index + 1), body),
                         ])
                         .lay(w),
                     );
@@ -295,8 +306,10 @@ impl View for Todo {
                 // mistaken for an item, but it does say that items are missing.
                 Row::More { hidden } => out.extend(
                     El::row(vec![El::styled(
+                        // Under the `#`, where every item's number starts: the
+                        // glyph's three columns and the two after it.
                         format!(
-                            "   {}",
+                            "     {}",
                             crate::i18n::product::t(crate::i18n::product::Msg::TodoPanelMore {
                                 n: hidden
                             })
@@ -721,6 +734,46 @@ mod tests {
             r#"{"todos":[{"content":"a","status":"pending"}]}"#,
         )]);
         assert_eq!(drew(&state, 60, 10), drew(&legacy, 60, 10));
+    }
+
+    /// Every item's text starts in the same column, however many digits its
+    /// number has, and the `+N` line sits under the numbers.
+    #[test]
+    fn the_text_column_lines_up_across_one_and_two_digit_numbers() {
+        let body = serde_json::json!({
+            "todos": (0..12)
+                .map(|i| serde_json::json!({
+                    "content": format!("task {i}"),
+                    "status": if i == 0 { "in_progress" } else { "pending" },
+                }))
+                .collect::<Vec<_>>()
+        })
+        .to_string();
+        let state = fold(&[plan(&body)]);
+        let column = |line: &str, needle: &str| {
+            crate::width::str_width(&line[..line.find(needle).expect(needle)])
+        };
+
+        let all = drew(&state, 60, 40);
+        let starts: Vec<usize> = (0..12)
+            .map(|i| {
+                let line = all
+                    .iter()
+                    .find(|l| l.ends_with(&format!("task {i}")))
+                    .unwrap_or_else(|| panic!("task {i}: {all:#?}"));
+                column(line, &format!("task {i}"))
+            })
+            .collect();
+        assert!(
+            starts.iter().all(|c| *c == starts[0]),
+            "{starts:?}\n{all:#?}"
+        );
+
+        // Pulled to the front, the window hides the tail and says so.
+        let cut = drew(&state, 60, 8);
+        let more = cut.iter().find(|l| l.contains("更多")).expect("a +N line");
+        let first = cut.iter().find(|l| l.ends_with("task 0")).expect("task 0");
+        assert_eq!(column(more, "+"), column(first, "#"), "{cut:#?}");
     }
 
     #[test]
