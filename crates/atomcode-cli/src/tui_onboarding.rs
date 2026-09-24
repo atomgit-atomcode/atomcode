@@ -78,8 +78,10 @@ impl Plugin for OnboardingRow {
         // through: opening the session the login made possible is the screen's
         // own dispatch, the same road a person's `/clear` takes.
         let ui = ctx.require::<UiSvc>().map_err(|e| e.to_string())?;
+        let screen = ui.clone();
         let set = Arc::new(Onboarding {
             config_path: self.config_path.clone(),
+            screen: Some(screen),
             start_sign_in: Arc::new(move |wizard, repaint| {
                 sign_in(
                     wizard,
@@ -109,14 +111,51 @@ type StartSignIn = Arc<dyn Fn(Arc<Wizard>, Option<Arc<dyn Repaint>>) + Send + Sy
 struct Onboarding {
     config_path: PathBuf,
     start_sign_in: StartSignIn,
+    /// The screen, for the one answer that is not a sentence: "configure one
+    /// myself" ends by opening the provider panel, which is the screen's own
+    /// `/provider` and not a second road to it.
+    screen: Option<Arc<dyn atomcode_harness::seams::UserInterface>>,
     /// Kept so the answers can be read when it closes: a modal closes with one
     /// value and these are several.
     live: Mutex<Option<Arc<Wizard>>>,
 }
 
-/// What each step asks. Four, as decided (决策 4).
-fn steps() -> Vec<StepDef> {
-    vec![
+/// The three answers to "where does the provider come from".
+///
+/// Named rather than spelled at each use: the same word is a choice's value, a
+/// branch in the callback that decides whether to sign in, and a branch in
+/// `finish` — three places, and a typo in any one of them is a silent fallback
+/// to the CodingPlan path.
+const CODINGPLAN: &str = "codingplan";
+const BY_HAND: &str = "manual";
+const NOT_NOW: &str = "skip";
+
+/// What each step asks.
+///
+/// `warn_it_clears` prepends the one step that is not about setting anything
+/// up: `/welcome` run in the middle of a conversation ends, if the sign-in
+/// works, by opening a fresh session — and the conversation on screen is not in
+/// it. Asked before the walkthrough rather than at the moment it happens,
+/// because by then the person has signed in and the answer can only be "too
+/// late". A first launch has nothing to lose and is not asked.
+fn steps(warn_it_clears: bool) -> Vec<StepDef> {
+    let mut steps = Vec::new();
+    if warn_it_clears {
+        // `Note`, so leaving is `esc` — the same key the intro already tells
+        // people about, rather than a second idiom for the same "no".
+        steps.push(
+            StepDef::new(
+                "would-clear",
+                tr(SMsg::OnboardWouldClearTitle),
+                StepKind::Note,
+            )
+            .saying(vec![
+                tr(SMsg::OnboardWouldClearLine1).into_owned(),
+                tr(SMsg::OnboardWouldClearLine2).into_owned(),
+            ]),
+        );
+    }
+    steps.extend([
         StepDef::new("intro", tr(SMsg::OnboardIntroTitle), StepKind::Note).saying(vec![
             tr(SMsg::OnboardIntroLine1).into_owned(),
             tr(SMsg::OnboardIntroLine2).into_owned(),
@@ -135,6 +174,22 @@ fn steps() -> Vec<StepDef> {
                     .about(tr(SMsg::OnboardLanguageFollowSystemAbout)),
             ]),
         ),
+        // Three answers, not two. Skipping used to be the only alternative to
+        // signing in, which left everyone with an API key of their own — or a
+        // model they host — finishing the walkthrough on a machine that still
+        // had no provider, with nothing said about where to put one.
+        StepDef::new(
+            "setup",
+            tr(SMsg::OnboardSetupTitle),
+            StepKind::Choose(vec![
+                Choice::new(CODINGPLAN, tr(SMsg::OnboardSetupCodingPlan))
+                    .about(tr(SMsg::OnboardSetupCodingPlanAbout)),
+                Choice::new(BY_HAND, tr(SMsg::OnboardSetupManual))
+                    .about(tr(SMsg::OnboardSetupManualAbout)),
+                Choice::new(NOT_NOW, tr(SMsg::OnboardSetupSkip))
+                    .about(tr(SMsg::OnboardSetupSkipAbout)),
+            ]),
+        ),
         StepDef::new(
             "login",
             tr(SMsg::OnboardLoginTitle),
@@ -142,12 +197,13 @@ fn steps() -> Vec<StepDef> {
         )
         .saying(vec![tr(SMsg::OnboardFetchingLoginUrl).into_owned()]),
         StepDef::new("confirm", tr(SMsg::OnboardConfirmTitle), StepKind::Note),
-    ]
+    ]);
+    steps
 }
 
 impl Onboarding {
     /// Build the modal and start whatever each step needs as it opens.
-    fn open(&self, repaint: Option<Arc<dyn Repaint>>) -> Arc<Wizard> {
+    fn open(&self, repaint: Option<Arc<dyn Repaint>>, warn_it_clears: bool) -> Arc<Wizard> {
         // The callback needs the wizard the callback is being built for, so it
         // takes a weak handle filled in immediately after. The first step opens
         // inside `Wizard::new`, before this is set — which is why the first step
@@ -158,7 +214,7 @@ impl Onboarding {
         let wizard = Wizard::new(
             MODAL,
             tr(SMsg::OnboardModalTitle),
-            steps(),
+            steps(warn_it_clears),
             Box::new(move |id| {
                 if id != "login" {
                     return;
@@ -166,7 +222,15 @@ impl Onboarding {
                 let Some(wizard) = here.get().and_then(Weak::upgrade) else {
                     return;
                 };
-                start(wizard, repaint.clone());
+                // Only the CodingPlan answer has anything to wait for. The
+                // other two answer this step where it stands — inside the
+                // `advance` that opened it, so the step never reaches a frame
+                // and nobody watches a "sign in" they said no to.
+                if answered(&wizard, "setup").as_deref() == Some(CODINGPLAN) {
+                    start(wizard, repaint.clone());
+                } else {
+                    wizard.resolve(String::new());
+                }
             }),
             FINISHED,
         );
@@ -202,14 +266,53 @@ impl Onboarding {
                 }
             }
         }
-        match answer("login") {
-            Some(detail) => said.push(detail),
-            // A skip is the absence of an answer, which is why it is worth
-            // saying out loud: the machine is still not ready.
-            None => said.push(tr(SMsg::OnboardLoginSkipped).into_owned()),
+        // Which of the three was chosen decides what "done" means. Read here
+        // and not from the login step's answer: the two that do not sign in
+        // answer it where it stands, and an empty answer would read as a
+        // sign-in that returned nothing.
+        match answer("setup").as_deref() {
+            Some(BY_HAND) => {
+                said.push(tr(SMsg::OnboardSetupByHand).into_owned());
+                // The panel the person needs, opened for them — through the
+                // screen's own `/provider`, the same road a person's hand
+                // takes. A second way in is a second thing to keep in step.
+                if let Some(screen) = self.screen.as_ref() {
+                    screen.run_slash("provider");
+                }
+            }
+            Some(NOT_NOW) => said.push(tr(SMsg::OnboardLoginSkipped).into_owned()),
+            _ => match answer("login") {
+                Some(detail) => said.push(detail),
+                // A skip is the absence of an answer, which is why it is worth
+                // saying out loud: the machine is still not ready.
+                None => said.push(tr(SMsg::OnboardLoginSkipped).into_owned()),
+            },
         }
         said.join("\n")
     }
+}
+
+/// One step's answer, by id.
+fn answered(wizard: &Arc<Wizard>, step: &str) -> Option<String> {
+    wizard
+        .answers()
+        .into_iter()
+        .find(|(had, _)| had == step)
+        .and_then(|(_, answer)| answer)
+}
+
+/// Whether this screen already has a conversation on it.
+///
+/// A user message is the marker rather than "the log is not empty": a session
+/// carries facts of its own from the moment it opens, and clearing a screen
+/// nobody has said anything on costs nothing.
+fn conversation_has_begun(events: &[atomcode_kernel::session::LoggedEvent]) -> bool {
+    events.iter().any(|logged| {
+        matches!(
+            logged.event,
+            atomcode_kernel::session::SessionEvent::UserMessage { .. }
+        )
+    })
 }
 
 /// Write one setting, the way the settings panel writes one.
@@ -407,7 +510,15 @@ impl CommandSet for Onboarding {
 
     async fn run(&self, name: &str, _args: &str, ctx: &Context) -> Outcome {
         match name {
-            COMMAND => Outcome::Open(self.open(ctx.service::<RepaintSvc>())),
+            COMMAND => {
+                // Asked of the screen's own client, which is where a
+                // conversation is: the walkthrough itself has no idea whether
+                // anybody has said anything yet.
+                let warn_it_clears = ctx
+                    .service::<AgentClientSvc>()
+                    .is_some_and(|client| conversation_has_begun(&client.events()));
+                Outcome::Open(self.open(ctx.service::<RepaintSvc>(), warn_it_clears))
+            }
             FINISHED => Outcome::Said(self.finish()),
             _ => Outcome::Quiet,
         }
@@ -433,6 +544,9 @@ mod tests {
         Onboarding {
             config_path: path,
             start_sign_in: start,
+            // No screen: a criterion that opened the provider panel would be
+            // asserting about a screen it does not have.
+            screen: None,
             live: Mutex::new(None),
         }
     }
@@ -457,12 +571,18 @@ mod tests {
                 count.fetch_add(1, Ordering::SeqCst);
             }),
         );
-        let w = flow.open(None);
+        let w = flow.open(None, false);
         assert_eq!(started.load(Ordering::SeqCst), 0, "not while it is built");
 
         enter(&w); // intro
         assert_eq!(started.load(Ordering::SeqCst), 0, "not on the way past");
         enter(&w); // language: the first choice
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            0,
+            "and not before the person has said where the provider comes from"
+        );
+        enter(&w); // setup: CodingPlan, the first choice
         assert_eq!(
             started.load(Ordering::SeqCst),
             1,
@@ -481,10 +601,11 @@ mod tests {
                 wizard.resolve("登录成了：someone");
             }),
         );
-        let w = flow.open(None);
+        let w = flow.open(None, false);
         enter(&w); // intro
         w.key(KeyPress::plain(Key::Down)); // English
-        enter(&w); // language → the waiting step, which resolves itself
+        enter(&w); // language
+        enter(&w); // setup: CodingPlan → the waiting step, which resolves itself
         assert_eq!(
             enter(&w),
             Step::Chose(FINISHED.into()),
@@ -511,15 +632,145 @@ mod tests {
             // Never resolves: the person presses enter to pass it by.
             Arc::new(|_, _| {}),
         );
-        let w = flow.open(None);
+        let w = flow.open(None, false);
         enter(&w); // intro
         enter(&w); // language
+        enter(&w); // setup: CodingPlan, so the wait really opens
         enter(&w); // skip the wait
         assert_eq!(enter(&w), Step::Chose(FINISHED.into()));
 
         let said = flow.finish();
         assert!(said.contains("跳过"), "{said}");
         assert!(said.contains(COMMAND), "it says how to come back: {said}");
+    }
+
+    /// "Configure one myself" does not sign in, and does not call it skipped.
+    ///
+    /// The gap this closes: the walkthrough had two answers, sign in or skip,
+    /// so everyone with an API key of their own — or a model they host — came
+    /// out of it on a machine with no provider and nothing said about where to
+    /// put one. The branch has to do two things and both are easy to lose: not
+    /// start a sign-in nobody asked for, and say where the settings are.
+    #[test]
+    fn configuring_by_hand_starts_no_login_and_says_where_to_go() {
+        let started = Arc::new(AtomicUsize::new(0));
+        let count = started.clone();
+        let flow = flow(
+            scratch("by-hand"),
+            Arc::new(move |_, _| {
+                count.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let w = flow.open(None, false);
+        enter(&w); // intro
+        enter(&w); // language
+        w.key(KeyPress::plain(Key::Down)); // past CodingPlan
+                                           // The waiting step is answered inside this same press, so the one
+                                           // after it is the last one.
+        enter(&w); // setup: configure one myself
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            0,
+            "no browser was opened at someone who said they would do it themselves"
+        );
+        assert_eq!(
+            enter(&w),
+            Step::Chose(FINISHED.into()),
+            "and the wait did not stand between them and the end"
+        );
+
+        let said = flow.finish();
+        assert!(
+            said.contains("provider"),
+            "it says where the key goes: {said}"
+        );
+        assert!(
+            !said.contains(tr(SMsg::OnboardLoginSkipped).as_ref()),
+            "and does not report it as a skip — nothing was skipped: {said}"
+        );
+    }
+
+    /// Saying "not now" is still a skip, with the step in between.
+    #[test]
+    fn saying_not_now_is_reported_as_a_skip() {
+        let started = Arc::new(AtomicUsize::new(0));
+        let count = started.clone();
+        let flow = flow(
+            scratch("not-now"),
+            Arc::new(move |_, _| {
+                count.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let w = flow.open(None, false);
+        enter(&w); // intro
+        enter(&w); // language
+        w.key(KeyPress::plain(Key::Down));
+        w.key(KeyPress::plain(Key::Down)); // past both
+        enter(&w); // setup: not now
+        assert_eq!(started.load(Ordering::SeqCst), 0, "nothing was set going");
+        assert_eq!(enter(&w), Step::Chose(FINISHED.into()));
+        assert!(flow.finish().contains("跳过"));
+    }
+
+    /// `/welcome` in the middle of a conversation says so before it starts.
+    ///
+    /// A successful sign-in ends by opening a fresh session, which is right on
+    /// a machine that could not work a minute ago and wrong on one that has
+    /// been working all morning — the conversation on screen is not in the new
+    /// session. Asked first, because asked afterwards the only honest answer
+    /// is "too late". A first launch has nothing to lose and is not asked: a
+    /// question with one sensible answer teaches people to stop reading them.
+    #[test]
+    fn a_walkthrough_that_would_clear_the_screen_says_so_first() {
+        let flow = flow(scratch("warns"), Arc::new(|_, _| {}));
+
+        let fresh = flow.open(None, false);
+        assert_eq!(
+            fresh.total(),
+            5,
+            "a first launch is not asked about a conversation it does not have"
+        );
+
+        let mid = flow.open(None, true);
+        assert_eq!(mid.total(), 6, "and one that would lose something is");
+        // Leaving is `esc`, the same key every other step takes — and it
+        // answers nothing, so nothing was set up by asking.
+        assert_eq!(
+            mid.key(KeyPress::plain(Key::Esc)),
+            Step::Cancelled,
+            "saying no leaves, rather than going on to the next step"
+        );
+        assert!(
+            mid.answers().is_empty(),
+            "and nothing was answered on the way out: {:?}",
+            mid.answers()
+        );
+    }
+
+    /// What counts as "there is a conversation here".
+    ///
+    /// A user message, not a non-empty log: a session carries facts of its own
+    /// from the moment it opens, and clearing a screen nobody has said anything
+    /// on costs nothing. Asking anyway is the question people learn to skip.
+    #[test]
+    fn only_something_a_person_said_counts_as_a_conversation() {
+        use atomcode_kernel::session::{LoggedEvent, SessionEvent};
+        let logged = |event| LoggedEvent {
+            seq: 1,
+            at: 0,
+            event,
+        };
+        assert!(!conversation_has_begun(&[]));
+        assert!(!conversation_has_begun(&[logged(
+            SessionEvent::TurnStart { turn: 1 }
+        )]));
+        assert!(conversation_has_begun(&[logged(
+            SessionEvent::UserMessage {
+                turn: 1,
+                text: "hello".into(),
+                images: Vec::new(),
+            }
+        )]));
     }
 
     /// The command readiness names is one this row actually contributes.

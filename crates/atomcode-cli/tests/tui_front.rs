@@ -616,6 +616,47 @@ async fn the_classic_name_for_the_walkthrough_still_opens_it() {
         "`/welcome` opened the walkthrough:\n{screen_text}"
     );
     assert_eq!(count.0.load(Ordering::SeqCst), 0, "not sent as a prompt");
+    // On a screen nobody has said anything on, the walkthrough opens straight
+    // into the intro: a question whose only sensible answer is yes is one
+    // people learn to press through without reading.
+    assert!(
+        !screen_text.contains("这会清屏"),
+        "nothing to lose, so nothing to ask:\n{screen_text}"
+    );
+
+    // Now say something, so there is a conversation to lose, and ask again.
+    //
+    // **The wiring is the half worth pinning.** Whether the warning step is
+    // built is a flag, and the flag is worked out in `run()` from the session
+    // on screen — a build that always passed `false` would keep every unit
+    // criterion about the step green and still never show it to anybody.
+    term.press(atomcode_tui::surface::KeyPress::plain(
+        atomcode_tui::surface::Key::Esc,
+    ));
+    term.type_line("hello");
+    for _ in 0..200 {
+        if count.0.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        count.0.load(Ordering::SeqCst) > 0,
+        "the turn was taken, so the log has something a person said"
+    );
+
+    term.type_line("/welcome");
+    for _ in 0..200 {
+        screen_text = term.text();
+        if screen_text.contains("这会清屏") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        screen_text.contains("这会清屏"),
+        "asked before the walkthrough, not after the sign-in that clears:\n{screen_text}"
+    );
 
     term.press(atomcode_tui::surface::KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), running).await;
