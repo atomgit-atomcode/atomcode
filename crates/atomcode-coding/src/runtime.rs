@@ -730,7 +730,12 @@ pub enum DriverCommand {
         snapshot: SessionSnapshot,
         correlation_id: u64,
     },
-    StartGoal(String),
+    /// Work towards this on its own until it holds.
+    ///
+    /// The text is the condition **and** the first round's prompt — the
+    /// runtime opens that round itself. Images ride along because a goal is
+    /// often given as "make it look like this".
+    StartGoal(UserInput),
     StopGoal,
     StartLoop(String),
     StopLoop,
@@ -1647,11 +1652,12 @@ impl CodingRuntimeHandle {
                     done,
                 }
             }
-            DriverCommand::StartGoal(condition) => {
+            DriverCommand::StartGoal(input) => {
                 let (done, _result) = oneshot::channel();
                 CodingRuntimeControl::StartGoal {
                     generation,
-                    condition,
+                    condition: input.text,
+                    images: input.images,
                     done,
                     recovery_tx: self.tx.clone(),
                 }
@@ -1670,6 +1676,7 @@ impl CodingRuntimeHandle {
                     // through `RuntimeCommands`, where the cadence lives.
                     every: None,
                     done,
+                    recovery_tx: self.tx.clone(),
                 }
             }
             DriverCommand::StopLoop => {
@@ -2418,13 +2425,15 @@ impl CodingRuntimeHandle {
         result.await.map_err(|_| RuntimeError::Unavailable)?
     }
 
-    pub async fn start_goal(&self, condition: impl Into<String>) -> Result<(), RuntimeError> {
+    pub async fn start_goal(&self, condition: impl Into<UserInput>) -> Result<(), RuntimeError> {
         let state = self.state.load(Ordering::Acquire);
         let (done, result) = oneshot::channel();
+        let condition = condition.into();
         self.tx
             .send(CodingRuntimeControl::StartGoal {
                 generation: runtime_state_generation(state),
-                condition: condition.into(),
+                condition: condition.text,
+                images: condition.images,
                 done,
                 recovery_tx: self.tx.clone(),
             })
@@ -2457,6 +2466,7 @@ impl CodingRuntimeHandle {
                 prompt: prompt.into(),
                 every,
                 done,
+                recovery_tx: self.tx.clone(),
             })
             .map_err(|_| RuntimeError::Unavailable)?;
         result.await.map_err(|_| RuntimeError::Unavailable)?
@@ -3048,9 +3058,14 @@ pub enum CodingRuntimeControl {
     StartGoal {
         generation: u64,
         condition: String,
+        /// What the person attached to the condition. The first round carries
+        /// them; later rounds are the evaluator's own words and carry none.
+        images: Vec<ImageContent>,
         done: oneshot::Sender<Result<(), RuntimeError>>,
-        /// Self-send channel so the owner loop can post an [`AdjustGoalRounds`] once
-        /// the live per-plan round budget has been resolved off the loop.
+        /// Self-send channel. The owner loop posts the goal's own first round
+        /// on it as a [`Submit`](CodingRuntimeControl::Submit), and an
+        /// [`AdjustGoalRounds`] once the live per-plan round budget has been
+        /// resolved off the loop.
         recovery_tx: mpsc::UnboundedSender<CodingRuntimeControl>,
     },
     /// Self-sent from a background task after goal start: applies the live per-plan
@@ -3072,6 +3087,8 @@ pub enum CodingRuntimeControl {
         generation: u64,
         prompt: String,
         done: oneshot::Sender<Result<(), RuntimeError>>,
+        /// Self-send channel, for the loop's own first round.
+        recovery_tx: mpsc::UnboundedSender<CodingRuntimeControl>,
     },
     StopLoop {
         generation: u64,
@@ -7096,13 +7113,23 @@ fn spawn_runtime_owner_with_optional_agent(
                             }
                         }
                     }
-                    Some(CodingRuntimeControl::StartGoal { generation: request_generation, condition, done, recovery_tx }) => {
+                    Some(CodingRuntimeControl::StartGoal { generation: request_generation, condition, images, done, recovery_tx }) => {
                         if !native_protocol || request_generation != generation || compaction_suspended {
                             let _ = done.send(Err(RuntimeError::Busy));
                             continue;
                         }
                         if resources.is_none() {
                             let _ = done.send(Err(RuntimeError::Unavailable));
+                            continue;
+                        }
+                        // Starting a goal now means opening its first round, so
+                        // an agent that cannot take one means the goal cannot
+                        // start. Registering it anyway would put the badge on
+                        // screen over a session that is never going to move.
+                        if !agent_available {
+                            let _ = done.send(Err(provider_unavailable_reason
+                                .map(RuntimeError::ProviderUnavailable)
+                                .unwrap_or(RuntimeError::Unavailable)));
                             continue;
                         }
                         if active_turn.is_some() && held_turn.is_none() {
@@ -7133,13 +7160,33 @@ fn spawn_runtime_owner_with_optional_agent(
                             // AdjustGoalRounds; env override wins and any miss keeps the default.
                             let next = GoalState::new(
                                 controller_id,
-                                condition,
+                                condition.clone(),
                                 runtime.config.goal_max_rounds,
                                 runtime.config.goal_max_duration_secs,
                             );
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(next.progress()));
                             goal = Some(next);
                             let _ = done.send(Ok(()));
+                            // The first round is this one. Every later round
+                            // comes from a turn's END — the evaluator reads the
+                            // round that just finished and writes the next
+                            // prompt — so a goal that only registered itself
+                            // would sit there with nothing to end, until the
+                            // person typed something of their own, and THAT
+                            // would become round one's prompt. Which is not
+                            // what they asked for.
+                            //
+                            // Self-sent rather than opened here: `Submit` is
+                            // where a turn begins, with the execution policy,
+                            // the receipt and the turn accounting that belong
+                            // to it. A second way in would be a second answer
+                            // to "what is a turn".
+                            let (started, _) = oneshot::channel();
+                            let _ = recovery_tx.send(CodingRuntimeControl::Submit {
+                                generation: request_generation,
+                                input: UserInput { text: condition, images },
+                                done: started,
+                            });
                             // Only spawn the quota fetch when it could actually change the cap:
                             // an env override short-circuits to the default, and with no live
                             // rate-limit source there is nothing to derive from.
@@ -7214,13 +7261,21 @@ fn spawn_runtime_owner_with_optional_agent(
                         }
                         let _ = done.send(Ok(()));
                     }
-                    Some(CodingRuntimeControl::StartLoop { generation: request_generation, prompt, every, done }) => {
+                    Some(CodingRuntimeControl::StartLoop { generation: request_generation, prompt, every, done, recovery_tx }) => {
                         if !native_protocol || request_generation != generation || compaction_suspended {
                             let _ = done.send(Err(RuntimeError::Busy));
                             continue;
                         }
                         if resources.is_none() {
                             let _ = done.send(Err(RuntimeError::Unavailable));
+                            continue;
+                        }
+                        // Same as `/goal`: the first round is opened here, so
+                        // no agent to open it means no loop.
+                        if !agent_available {
+                            let _ = done.send(Err(provider_unavailable_reason
+                                .map(RuntimeError::ProviderUnavailable)
+                                .unwrap_or(RuntimeError::Unavailable)));
                             continue;
                         }
                         if active_turn.is_some() && held_turn.is_none() {
@@ -7245,11 +7300,24 @@ fn spawn_runtime_owner_with_optional_agent(
                         while wakeup_rx.try_recv().is_ok() {}
                         if let Some(runtime) = resources.as_ref() {
                             next_controller_id = next_controller_id.wrapping_add(1);
-                            let next = LoopState::new(next_controller_id, prompt, runtime.config.loop_max_rounds).every(every);
+                            let next = LoopState::new(next_controller_id, prompt.clone(), runtime.config.loop_max_rounds).every(every);
                             runtime.loop_active.store(true, Ordering::Release);
                             let _ = runtime_event_tx.send(CodingRuntimeEvent::LoopChanged(next.progress()));
                             loop_state = Some(next);
                             let _ = done.send(Ok(()));
+                            // The first pass, for the same reason as `/goal`'s:
+                            // the next one is scheduled by the END of this one,
+                            // whether the model asks (`schedule_wakeup`) or the
+                            // person set a cadence. With no first pass there is
+                            // nothing to schedule from — "every five minutes"
+                            // would start five minutes late at best, and never
+                            // at all in the model-paced form.
+                            let (started, _) = oneshot::channel();
+                            let _ = recovery_tx.send(CodingRuntimeControl::Submit {
+                                generation: request_generation,
+                                input: UserInput::from(prompt),
+                                done: started,
+                            });
                         }
                     }
                     Some(CodingRuntimeControl::StopLoop { generation: request_generation, done }) => {
@@ -11508,22 +11576,42 @@ mod tests {
                 if condition == "tests pass"
         ));
 
-        runtime.handle.start_loop("watch CI", None).await.unwrap();
-        assert!(matches!(
-            next_native_event(&mut runtime).await,
-            CodingRuntimeEvent::GoalChanged(GoalProgress { active: false, .. })
-        ));
-        assert!(matches!(
-            next_native_event(&mut runtime).await,
-            CodingRuntimeEvent::LoopChanged(LoopProgress { active: true, label, .. })
-                if label == "watch CI"
-        ));
+        // Starting either one now also opens its first round, so the slot is
+        // not free until that round is over — the same rule as any other turn,
+        // and the reason this ends the round rather than asking twice in a row.
+        runtime.handle.cancel().await.ok();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match runtime.handle.start_loop("watch CI", None).await {
+                    Ok(()) => break,
+                    Err(_) => tokio::task::yield_now().await,
+                }
+            }
+        })
+        .await
+        .expect("the loop never took the slot from the goal");
+
+        let (mut goal_gone, mut loop_running) = (false, false);
+        while !(goal_gone && loop_running) {
+            match next_native_event(&mut runtime).await {
+                CodingRuntimeEvent::GoalChanged(progress) if !progress.active => goal_gone = true,
+                CodingRuntimeEvent::LoopChanged(progress) if progress.active => {
+                    assert_eq!(progress.label, "watch CI");
+                    loop_running = true;
+                }
+                _ => {}
+            }
+        }
 
         runtime.handle.stop_loop().await.unwrap();
-        assert!(matches!(
-            next_native_event(&mut runtime).await,
-            CodingRuntimeEvent::LoopChanged(LoopProgress { active: false, .. })
-        ));
+        loop {
+            if let CodingRuntimeEvent::LoopChanged(progress) = next_native_event(&mut runtime).await
+            {
+                if !progress.active {
+                    break;
+                }
+            }
+        }
         runtime.handle.shutdown().await.unwrap();
     }
 
@@ -12014,10 +12102,6 @@ mod tests {
 
         handle.start_goal("tests pass").await.unwrap();
         let _ = runtime_events.recv().await;
-        handle
-            .submit(UserInput::from("initial turn"))
-            .await
-            .unwrap();
         assert!(matches!(
             kernel_commands.recv().await,
             Some(AgentCommand::SendMessage { .. })
@@ -12080,10 +12164,6 @@ mod tests {
                 ..
             }))
         ));
-        handle
-            .submit(UserInput::from("long running goal"))
-            .await
-            .unwrap();
         assert!(matches!(
             kernel_commands.recv().await,
             Some(AgentCommand::SendMessage { .. })
@@ -12161,7 +12241,6 @@ mod tests {
 
         handle.start_goal("finish the task").await.unwrap();
         let _ = runtime_events.recv().await;
-        handle.submit(UserInput::from("start work")).await.unwrap();
         assert!(matches!(
             kernel_commands.recv().await,
             Some(AgentCommand::SendMessage { .. })
@@ -12269,10 +12348,6 @@ mod tests {
 
         handle.start_goal("tests pass").await.unwrap();
         let _ = runtime_events.recv().await;
-        handle
-            .submit(UserInput::from("initial turn"))
-            .await
-            .unwrap();
         assert!(matches!(
             kernel_commands.recv().await,
             Some(AgentCommand::SendMessage { .. })
@@ -12347,10 +12422,6 @@ mod tests {
 
         handle.start_goal("tests pass").await.unwrap();
         let _ = runtime_events.recv().await;
-        handle
-            .submit(UserInput::from("initial turn"))
-            .await
-            .unwrap();
         assert!(matches!(
             kernel_commands.recv().await,
             Some(AgentCommand::SendMessage { .. })
@@ -12443,10 +12514,6 @@ mod tests {
                 ..
             }))
         ));
-        handle
-            .submit(UserInput::from("initial turn"))
-            .await
-            .unwrap();
         assert!(matches!(
             kernel_commands.recv().await,
             Some(AgentCommand::SendMessage { .. })
@@ -12624,10 +12691,6 @@ mod tests {
 
         handle.start_goal("tests pass").await.unwrap();
         let _ = runtime_events.recv().await;
-        handle
-            .submit(UserInput::from("initial turn"))
-            .await
-            .unwrap();
         let _ = kernel_commands.recv().await;
 
         for attempt in 0..2 {
@@ -12698,10 +12761,6 @@ mod tests {
 
         handle.start_loop("watch CI", None).await.unwrap();
         let _ = runtime_events.recv().await;
-        handle
-            .submit(UserInput::from("initial turn"))
-            .await
-            .unwrap();
         let _ = kernel_commands.recv().await;
 
         for attempt in 0..2 {
@@ -12798,7 +12857,6 @@ mod tests {
         ) = controller_test_runtime(Arc::new(TestProviderFactory { fail: false })).await;
 
         handle.start_loop("watch CI", None).await.unwrap();
-        handle.submit(UserInput::from("first round")).await.unwrap();
         assert!(matches!(
             kernel_commands.recv().await,
             Some(AgentCommand::SendMessage { .. })
@@ -12929,10 +12987,6 @@ mod tests {
 
         handle.start_loop("watch CI", None).await.unwrap();
         let _ = runtime_events.recv().await;
-        handle
-            .submit(UserInput::from("initial turn"))
-            .await
-            .unwrap();
         let _ = kernel_commands.recv().await;
         wakeup_tx
             .send(WakeupRequest {
@@ -12995,10 +13049,6 @@ mod tests {
 
         handle.start_goal("tests pass").await.unwrap();
         let _ = runtime_events.recv().await;
-        handle
-            .submit(UserInput::from("initial turn"))
-            .await
-            .unwrap();
         let _ = kernel_commands.recv().await;
         drop(kernel_commands);
         kernel_events
@@ -13048,10 +13098,6 @@ mod tests {
 
         handle.start_loop("watch CI", None).await.unwrap();
         let _ = runtime_events.recv().await;
-        handle
-            .submit(UserInput::from("initial turn"))
-            .await
-            .unwrap();
         let _ = kernel_commands.recv().await;
         wakeup_tx
             .send(WakeupRequest {
@@ -13117,13 +13163,9 @@ mod tests {
                 ..
             }))
         ));
-        handle
-            .submit(UserInput::from("initial turn"))
-            .await
-            .unwrap();
         assert!(matches!(
             kernel_commands.recv().await,
-            Some(AgentCommand::SendMessage { text, .. }) if text == "initial turn"
+            Some(AgentCommand::SendMessage { text, .. }) if text == "tests pass"
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
@@ -13176,13 +13218,9 @@ mod tests {
                 ..
             }))
         ));
-        handle
-            .submit(UserInput::from("initial turn"))
-            .await
-            .unwrap();
         assert!(matches!(
             kernel_commands.recv().await,
-            Some(AgentCommand::SendMessage { text, .. }) if text == "initial turn"
+            Some(AgentCommand::SendMessage { text, .. }) if text == "tests pass"
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
@@ -13239,13 +13277,9 @@ mod tests {
                 ..
             }))
         ));
-        handle
-            .submit(UserInput::from("initial turn"))
-            .await
-            .unwrap();
         assert!(matches!(
             kernel_commands.recv().await,
-            Some(AgentCommand::SendMessage { text, .. }) if text == "initial turn"
+            Some(AgentCommand::SendMessage { text, .. }) if text == "tests pass"
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
@@ -13342,10 +13376,6 @@ mod tests {
         ) = controller_test_runtime(Arc::new(PanicProviderFactory)).await;
 
         handle.start_goal("tests pass").await.unwrap();
-        handle
-            .submit(UserInput::from("initial turn"))
-            .await
-            .unwrap();
         assert!(matches!(
             kernel_commands.recv().await,
             Some(AgentCommand::SendMessage { .. })
@@ -13418,13 +13448,9 @@ mod tests {
             }))
         ));
         assert!(loop_active.load(Ordering::Acquire));
-        handle
-            .submit(UserInput::from("initial turn"))
-            .await
-            .unwrap();
         assert!(matches!(
             kernel_commands.recv().await,
-            Some(AgentCommand::SendMessage { text, .. }) if text == "initial turn"
+            Some(AgentCommand::SendMessage { text, .. }) if text == "watch CI"
         ));
         wakeup_tx
             .send(WakeupRequest {
@@ -14759,7 +14785,6 @@ mod tests {
         ) = controller_test_runtime(Arc::new(TestProviderFactory { fail: false })).await;
 
         handle.start_loop("watch CI", None).await.unwrap();
-        handle.submit(UserInput::from("first round")).await.unwrap();
         assert!(matches!(
             kernel_commands.recv().await,
             Some(AgentCommand::SendMessage { .. })
@@ -15125,10 +15150,6 @@ mod tests {
                 ..
             }))
         ));
-        handle
-            .submit(UserInput::from("initial turn"))
-            .await
-            .unwrap();
         assert!(matches!(
             kernel_commands.recv().await,
             Some(AgentCommand::SendMessage { .. })
@@ -15714,10 +15735,6 @@ mod tests {
 
         handle.start_goal("tests pass").await.unwrap();
         let _ = runtime_events.recv().await;
-        handle
-            .submit(UserInput::from("initial turn"))
-            .await
-            .unwrap();
         let _ = kernel_commands.recv().await;
         kernel_events
             .send(AgentEvent::TurnComplete {
@@ -15884,10 +15901,6 @@ mod tests {
                 ..
             }))
         ));
-        handle
-            .submit(UserInput::from("initial turn"))
-            .await
-            .unwrap();
         assert!(matches!(
             kernel_commands.recv().await,
             Some(AgentCommand::SendMessage { .. })
@@ -15957,7 +15970,14 @@ mod tests {
                 ..
             }))
         ));
-        assert_eq!(handle.status().phase, RuntimePhase::Ready);
+        // The goal that took the slot opens its own first round, so what the
+        // held turn's terminal left behind is a session back at work — not an
+        // idle one.
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { text, .. }) if text == "tests pass"
+        ));
+        assert_eq!(handle.status().phase, RuntimePhase::InTurn);
 
         handle.shutdown().await.unwrap();
     }
@@ -16009,10 +16029,6 @@ mod tests {
                 ..
             }))
         ));
-        handle
-            .submit(UserInput::from("initial turn"))
-            .await
-            .unwrap();
         assert!(matches!(
             kernel_commands.recv().await,
             Some(AgentCommand::SendMessage { .. })
@@ -16068,7 +16084,13 @@ mod tests {
                 ..
             }))
         ));
-        assert_eq!(handle.status().phase, RuntimePhase::Ready);
+        // Same as the other way round: the loop that took the slot runs its
+        // own first pass.
+        assert!(matches!(
+            kernel_commands.recv().await,
+            Some(AgentCommand::SendMessage { text, .. }) if text == "watch CI"
+        ));
+        assert_eq!(handle.status().phase, RuntimePhase::InTurn);
 
         handle.shutdown().await.unwrap();
     }
@@ -16185,10 +16207,6 @@ mod tests {
 
         handle.start_loop("watch CI", None).await.unwrap();
         let _ = runtime_events.recv().await;
-        handle
-            .submit(UserInput::from("initial turn"))
-            .await
-            .unwrap();
         let _ = kernel_commands.recv().await;
         wakeup_tx
             .send(WakeupRequest {
@@ -18569,10 +18587,6 @@ mod tests {
 
         handle.start_goal("tests pass").await.unwrap();
         let _ = runtime_events.recv().await; // GoalChanged(active=true)
-        handle
-            .submit(UserInput::from("initial turn"))
-            .await
-            .unwrap();
         assert!(matches!(
             kernel_commands.recv().await,
             Some(AgentCommand::SendMessage { .. })
@@ -18648,10 +18662,6 @@ mod tests {
 
         handle.start_goal("tests pass").await.unwrap();
         let _ = runtime_events.recv().await; // GoalChanged(active=true)
-        handle
-            .submit(UserInput::from("initial turn"))
-            .await
-            .unwrap();
         let _ = kernel_commands.recv().await;
 
         for attempt in 0..2 {
@@ -18746,10 +18756,6 @@ mod tests {
         // --- Drive the goal to PausedAtCap ---
         handle.start_goal("tests pass").await.unwrap();
         let _ = runtime_events.recv().await; // GoalChanged(active=true)
-        handle
-            .submit(UserInput::from("initial turn"))
-            .await
-            .unwrap();
         let _ = kernel_commands.recv().await; // SendMessage
 
         for attempt in 0..2 {
@@ -18954,10 +18960,6 @@ mod tests {
 
         handle.start_goal("tests pass").await.unwrap();
         let _ = runtime_events.recv().await; // GoalChanged(active=true)
-        handle
-            .submit(UserInput::from("initial turn"))
-            .await
-            .unwrap();
         assert!(matches!(
             kernel_commands.recv().await,
             Some(AgentCommand::SendMessage { .. })
@@ -19047,10 +19049,6 @@ mod tests {
         // --- Drive the goal to Met ---
         handle.start_goal("tests pass").await.unwrap();
         let _ = runtime_events.recv().await; // GoalChanged(active=true)
-        handle
-            .submit(UserInput::from("initial turn"))
-            .await
-            .unwrap();
         assert!(matches!(
             kernel_commands.recv().await,
             Some(AgentCommand::SendMessage { .. })

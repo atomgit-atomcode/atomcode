@@ -1539,8 +1539,66 @@ async fn a_quiet_task_list_is_named_once_by_one_voice() {
     runtime.handle.shutdown().await.unwrap();
 }
 
+/// A goal works towards the condition; it does not merely register it.
+///
+/// Every round after the first comes from a turn's END — the evaluator reads
+/// the round that just finished and writes the next prompt. So a goal that only
+/// put itself on the badge has nothing to end: it would sit there until the
+/// person typed something of their own, and THAT would quietly become round
+/// one's prompt. Taking the first round back out of the `StartGoal` handler is
+/// the falsification, and nothing is ever asked of the model.
+async fn a_goal_works_towards_the_condition_without_being_pushed() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let runtime = CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+        .await
+        .unwrap();
+
+    // The only thing that happens. Nothing is submitted.
+    runtime
+        .handle
+        .start_goal("make the tests pass")
+        .await
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let first = loop {
+        let request = recorder
+            .requests
+            .lock()
+            .unwrap()
+            .first()
+            .cloned()
+            .unwrap_or_default();
+        if !request.is_empty() {
+            break request;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the goal never asked the model anything"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    let said: Vec<&str> = first
+        .iter()
+        .filter(|m| m.role == Role::User && !m.synthetic)
+        .map(|m| m.text.as_str())
+        .collect();
+    assert_eq!(
+        said,
+        vec!["make the tests pass"],
+        "the first round IS the condition, once: {said:?}"
+    );
+
+    let _ = runtime.handle.stop_goal().await;
+    runtime.handle.shutdown().await.unwrap();
+}
+
 /// Inside a `/loop`, the model can schedule its next pass — the loop stays
 /// alive instead of finishing after the first turn.
+///
+/// The first pass is the loop's own, too: nothing is submitted here, and a
+/// wakeup can only be scheduled by a round that ran.
 async fn a_loop_turn_can_schedule_its_next_pass() {
     let env = env();
     let recorder = Arc::new(Recorder::default());
@@ -1549,12 +1607,8 @@ async fn a_loop_turn_can_schedule_its_next_pass() {
             .await
             .unwrap();
 
-    runtime.handle.start_loop("watch", None).await.unwrap();
-    runtime
-        .handle
-        .submit(UserInput::from("tick"))
-        .await
-        .unwrap();
+    // "tick" is what the fake model answers with a `schedule_wakeup`.
+    runtime.handle.start_loop("tick", None).await.unwrap();
     // The loop turn is held open while a wakeup is pending, so there is no
     // `TurnFinished` to wait for: the scheduled pass is the observable fact.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -5101,6 +5155,7 @@ mod criteria {
         the_datalog_is_written_when_it_is_on,
         an_eager_todo_reminder_rides_the_first_request,
         a_quiet_task_list_is_named_once_by_one_voice,
+        a_goal_works_towards_the_condition_without_being_pushed,
         a_loop_turn_can_schedule_its_next_pass,
         a_strict_credential_refusal_ends_the_turn_with_a_choice,
         a_permission_allow_rule_cannot_unlock_the_credential_boundary,

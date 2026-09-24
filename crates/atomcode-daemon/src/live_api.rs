@@ -2513,7 +2513,8 @@ pub(crate) async fn live_goal_start(
         return Json(serde_json::json!({"accepted": false, "error": error}));
     }
     let accepted =
-        crate::native_live::dispatch(atomcode_coding::DriverCommand::StartGoal(condition)).is_ok();
+        crate::native_live::dispatch(atomcode_coding::DriverCommand::StartGoal(condition.into()))
+            .is_ok();
     Json(serde_json::json!({"accepted": accepted}))
 }
 

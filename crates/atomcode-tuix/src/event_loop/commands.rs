@@ -3719,7 +3719,12 @@ fn execute_slash_command_impl(
                     let images = take_marker_matched_images(state, arg);
                     if ctx
                         .runtime
-                        .dispatch(atomcode_coding::DriverCommand::StartGoal(condition.clone()))
+                        .dispatch(atomcode_coding::DriverCommand::StartGoal(
+                            atomcode_coding::UserInput {
+                                text: condition.clone(),
+                                images,
+                            },
+                        ))
                         .is_err()
                     {
                         renderer.render(UiLine::Error(t(Msg::CmdProviderUnavailable).into_owned()));
@@ -3749,20 +3754,11 @@ fn execute_slash_command_impl(
                             renderer.flush();
                         }
                     }
-                    let submitted = if images.is_empty() {
-                        submit_agent_text(ctx, condition)
-                    } else {
-                        submit_agent_input(
-                            ctx,
-                            atomcode_coding::UserInput {
-                                text: condition,
-                                images,
-                            },
-                        )
-                    };
-                    if submitted {
-                        state.on_submit();
-                    }
+                    // The runtime opens the goal's first round itself, out of
+                    // the same `StartGoal` above. Submitting the condition from
+                    // here as well — which is what this used to do — is now two
+                    // turns for one `/goal`.
+                    state.on_submit();
                 }
             }
         }
@@ -3816,9 +3812,8 @@ fn execute_slash_command_impl(
                     state.loop_label = Some(prompt.clone());
                     state.loop_round = 0;
                     state.loop_started_at = Some(std::time::Instant::now());
-                    if submit_agent_text(ctx, prompt) {
-                        state.on_submit();
-                    }
+                    // The runtime runs the first pass itself (see `/goal`).
+                    state.on_submit();
                     // Non-silent: /loop is live-only (persistence deferred) — tell the
                     // user it won't come back after a restart/resume.
                     renderer.render(UiLine::CommandOutput(
