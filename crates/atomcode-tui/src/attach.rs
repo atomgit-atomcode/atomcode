@@ -407,21 +407,51 @@ pub fn from_clipboard(surface: &dyn crate::surface::Surface) -> Option<Pasted> {
     }
 }
 
+/// 一份粘进编辑区的文本文件,最大到这里。
+///
+/// **理由和图片那条一样,只是更钝:编辑区里的东西每一轮都要重发。** 把一份
+/// 日志粘进来,是把它按轮计费,而且多半一轮都撑不过——一兆文本已经比大多数
+/// 模型的上下文窗口还长了。真要让模型看一个大文件,它自己有读文件的工具,
+/// 那条路只读它要的那几行。
+///
+/// 而在此之前,这里是 `read_to_string`,没有上限:一个几百兆的文件会被整个
+/// 拉进内存、整个塞进编辑区,然后这块屏幕就没了。
+pub const MAX_PASTED_TEXT_BYTES: u64 = 1024 * 1024;
+
+/// `/paste <path>` 拿到了什么。
+#[derive(Debug)]
+pub enum FromFile {
+    /// 拿到了。
+    Got(Pasted),
+    /// 空文件 —— 一种状态,不是失败。
+    Empty,
+    /// 太大了,不粘。`bytes` 是它有多大。
+    TooBig { bytes: u64 },
+}
+
 /// What `/paste <path>` gets: the picture at that path, or its text.
 ///
-/// `Ok(None)` is an empty file — a state, not a failure. `Err` is the file not
-/// being readable at all, which is the only thing worth an error.
+/// `Err` is the file not being readable at all, which is the only thing worth
+/// an error — empty and too big are both answers (see [`FromFile`]).
 ///
 /// **A relative path counts here**, unlike in a paste ([`load_image_file`] says
 /// why): `/paste shot.png` in the working directory is unambiguous, and it is
 /// the other half of the Windows fallback — the half for a screenshot that was
 /// saved to a file rather than left on the clipboard.
-pub fn from_file(path: &std::path::Path) -> Result<Option<Pasted>, std::io::Error> {
+pub fn from_file(path: &std::path::Path) -> Result<FromFile, std::io::Error> {
     if let Some(image) = load_image_file(path) {
-        return Ok(Some(Pasted::Picture(image)));
+        return Ok(FromFile::Got(Pasted::Picture(image)));
+    }
+    // 先问多大,再读 —— 反过来的话,问的时候文件已经在内存里了。
+    let bytes = std::fs::metadata(path)?.len();
+    if bytes > MAX_PASTED_TEXT_BYTES {
+        return Ok(FromFile::TooBig { bytes });
     }
     let text = std::fs::read_to_string(path)?;
-    Ok((!text.is_empty()).then_some(Pasted::Text(text)))
+    Ok(match text.is_empty() {
+        true => FromFile::Empty,
+        false => FromFile::Got(Pasted::Text(text)),
+    })
 }
 
 /// A `file://` URL as a local path: scheme (and optional `localhost` host)
@@ -804,7 +834,7 @@ mod tests {
         let png = dir.path().join("shot.png");
         std::fs::write(&png, b"\x89PNG not-really-but-has-the-extension").unwrap();
         assert!(
-            matches!(from_file(&png), Ok(Some(Pasted::Picture(_)))),
+            matches!(from_file(&png), Ok(FromFile::Got(Pasted::Picture(_)))),
             "a named picture file attaches"
         );
         // The same path as a *paste payload* is still not an attachment — the
@@ -816,18 +846,53 @@ mod tests {
 
         let notes = dir.path().join("notes.txt");
         std::fs::write(&notes, "two lines\nof prose").unwrap();
-        assert_eq!(
-            from_file(&notes).unwrap(),
-            Some(Pasted::Text("two lines\nof prose".into()))
+        assert!(
+            matches!(
+                from_file(&notes),
+                Ok(FromFile::Got(Pasted::Text(ref text))) if text == "two lines\nof prose"
+            ),
+            "anything else is read as its text"
         );
 
         let blank = dir.path().join("blank.txt");
         std::fs::write(&blank, "").unwrap();
-        assert_eq!(from_file(&blank).unwrap(), None, "empty is a state");
+        assert!(
+            matches!(from_file(&blank), Ok(FromFile::Empty)),
+            "empty is a state"
+        );
         assert!(
             from_file(&dir.path().join("nope.txt")).is_err(),
             "unreadable is the only error"
         );
+    }
+
+    /// 一份太大的文件粘不进编辑区,而且**不是**说成「读不了」。
+    ///
+    /// 在此之前这里是 `read_to_string`,没有上限:`/paste` 一个几百兆的日志
+    /// 会把它整个拉进内存、整个塞进编辑区,而编辑区里的东西**每一轮都要重发**
+    /// —— 是把那份日志按轮计费,而且多半一轮都撑不过。
+    ///
+    /// 「不是读不了」这一半要单独钉:把它并进那个 `Err` 分支,人看到的是
+    /// 「这个文件读不了」,于是去查权限、查编码,而文件好好的。
+    #[test]
+    fn a_file_too_big_for_the_composer_is_refused_and_not_called_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("huge.log");
+        std::fs::write(&big, vec![b'x'; MAX_PASTED_TEXT_BYTES as usize + 1]).unwrap();
+        match from_file(&big) {
+            Ok(FromFile::TooBig { bytes }) => {
+                assert_eq!(bytes, MAX_PASTED_TEXT_BYTES + 1, "说得出它有多大")
+            }
+            other => panic!("{other:?}"),
+        }
+        // 而刚好到上限的那一份进得来 —— 否则这条判据只是在说「大的别要」,
+        // 把上限设成 0 也照样绿。
+        let fits = dir.path().join("fits.log");
+        std::fs::write(&fits, vec![b'x'; MAX_PASTED_TEXT_BYTES as usize]).unwrap();
+        assert!(matches!(
+            from_file(&fits),
+            Ok(FromFile::Got(Pasted::Text(_)))
+        ));
     }
 
     // Everything that is NOT an unambiguous image-attachment intent is left as

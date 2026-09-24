@@ -2172,6 +2172,29 @@ pub fn token_count_u64(n: u64) -> String {
     format!("{trimmed}{suffix}")
 }
 
+/// 一个字节数,写给人看。
+///
+/// 和 [`token_count`] 同一条规矩:能读得懂就写准数,读不懂了才四舍五入。
+/// 单位是 1024 那一套,因为这是文件大小,而文件系统就是这么算的。
+pub fn byte_size(n: u64) -> String {
+    const K: f64 = 1024.0;
+    const M: f64 = K * 1024.0;
+    const G: f64 = M * 1024.0;
+    let f = n as f64;
+    let (scaled, suffix) = if f < K {
+        return format!("{n} B");
+    } else if f < M {
+        (f / K, "KB")
+    } else if f < G {
+        (f / M, "MB")
+    } else {
+        (f / G, "GB")
+    };
+    let text = format!("{scaled:.1}");
+    let trimmed = text.strip_suffix(".0").unwrap_or(&text);
+    format!("{trimmed} {suffix}")
+}
+
 /// The mark and the words for one stop reason.
 ///
 /// `完成` / `已中断` are `atomcode-tuix`'s two words for these two outcomes, and

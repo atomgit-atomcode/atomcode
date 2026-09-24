@@ -4631,8 +4631,22 @@ impl Tui {
                     Some(path) => {
                         let full = std::path::Path::new(path);
                         match crate::attach::from_file(full) {
-                            Ok(Some(found)) => Ok(found),
-                            Ok(None) => Err(t(Msg::FileIsEmpty { path }).into_owned()),
+                            Ok(crate::attach::FromFile::Got(found)) => Ok(found),
+                            Ok(crate::attach::FromFile::Empty) => {
+                                Err(t(Msg::FileIsEmpty { path }).into_owned())
+                            }
+                            // 不是「读不了」:它读得了,只是粘进来对谁都没有
+                            // 好处。所以这句话要说出有多大,以及该走哪条路。
+                            Ok(crate::attach::FromFile::TooBig { bytes }) => {
+                                Err(t(Msg::FileTooBigToPaste {
+                                    path,
+                                    size: &crate::content::byte_size(bytes),
+                                    cap: &crate::content::byte_size(
+                                        crate::attach::MAX_PASTED_TEXT_BYTES,
+                                    ),
+                                })
+                                .into_owned())
+                            }
                             Err(error) => Err(t(Msg::FileUnreadable {
                                 path,
                                 error: &error.to_string(),

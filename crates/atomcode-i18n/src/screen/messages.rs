@@ -1681,4 +1681,11 @@ pub enum Msg<'a> {
     /// Tacked onto a "copied" line when nothing could confirm it: the text
     /// went out as OSC 52 and the terminal does not answer.
     CopyHandedOver,
+    /// `/paste <file>` on something too big to put in the composer. **Not**
+    /// [`Msg::FileUnreadable`]: it reads fine, it just must not go there.
+    FileTooBigToPaste {
+        path: &'a str,
+        size: &'a str,
+        cap: &'a str,
+    },
 }

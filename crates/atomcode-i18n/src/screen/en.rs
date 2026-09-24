@@ -1089,5 +1089,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CopyHandedOver => {
             " (handed to the terminal; if it does not allow copying, nothing happened)".into()
         }
+        Msg::FileTooBigToPaste { path, size, cap } => format!(
+            "{path} is {size}, too big to paste (the limit is {cap}). What is in the              composer is re-sent every turn; ask the model to read the file itself and              it will read only the lines it needs."
+        )
+        .into(),
     }
 }
