@@ -173,8 +173,10 @@ mod tests {
     /// name and competing with it for the one shoulder.
     #[test]
     fn a_picture_on_the_clipboard_is_offered_here_with_the_key_that_takes_it() {
-        let mut moment = Moment::default();
-        moment.now = Timestamp::millis(0);
+        let mut moment = Moment {
+            now: Timestamp::millis(0),
+            ..Moment::default()
+        };
         assert!(
             draw_at(&moment, 60, 1)[0].plain().trim().is_empty(),
             "nothing offered, nothing said"

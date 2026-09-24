@@ -658,8 +658,10 @@ mod tests {
     /// (`modules::tip` judges the offer itself).
     #[test]
     fn the_upper_rule_never_carries_the_clipboard_offer() {
-        let mut m = Moment::default();
-        m.clipboard_hint = true;
+        let mut m = Moment {
+            clipboard_hint: true,
+            ..Moment::default()
+        };
         let out = draw(&State::default(), &m, 60, 3);
         assert!(!out[0].contains("剪贴板"), "{out:?}");
 
