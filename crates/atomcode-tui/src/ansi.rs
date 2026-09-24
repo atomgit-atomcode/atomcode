@@ -63,11 +63,18 @@ pub const ERASE_LINE: &str = "\x1b[K";
 /// arrives. With it the key comes as `CSI 13;2u` and the difference is real.
 /// Terminals that do not know the sequence ignore it, and `ctrl-j` is bound to
 /// the same action for them.
-pub const ENTER: &str = "\x1b[?1049h\x1b[?7l\x1b[?2004h\x1b[>1u\x1b[?25l";
+pub const ENTER: &str = "\x1b[?1049h\x1b[?7l\x1b[?2004h\x1b[?1004h\x1b[>1u\x1b[?25l";
+/// `?1004` is focus reporting: the terminal says when the window gains or loses
+/// focus. It is asked for so a finished turn can tell whether anybody was
+/// looking — a notification for work a person watched happen is noise, and the
+/// one they needed is the one that arrived while they were elsewhere. A
+/// terminal that does not know the mode ignores it and the answer stays
+/// "unknown", which the notifier treats as "say it anyway".
+///
 /// The exact inverse of [`ENTER`]. Popping the keyboard flags matters as much
 /// as leaving the alternate screen: a shell that inherits them sees every key
 /// in a form it does not expect.
-pub const LEAVE: &str = "\x1b[?25h\x1b[<u\x1b[?2004l\x1b[?7h\x1b[?1049l";
+pub const LEAVE: &str = "\x1b[?25h\x1b[<u\x1b[?1004l\x1b[?2004l\x1b[?7h\x1b[?1049l";
 /// Ask the terminal to report the pointer: button presses (1000) with SGR
 /// coordinates (1006), so columns past 223 are reportable at all.
 ///
@@ -601,6 +608,20 @@ pub fn encode(frame: &Frame) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// 进屏时要了焦点报告,出去时原样退回去。
+    ///
+    /// “刚才有没有人在看”是回合结束通知唯一的依据:人看着它做完的那一次
+    /// 弹通知是噪音,而真正需要通知的那一次正是人不在的时候。不要的话,
+    /// 终端一句不说,通知就只能按“不知道”处理。
+    ///
+    /// 退出那一半同样要钉:一个继承了焦点报告的 shell 会在每次切窗口时
+    /// 收到一串它不认识的字节。
+    #[test]
+    fn entering_asks_for_focus_reporting_and_leaving_puts_it_back() {
+        assert!(super::ENTER.contains("\x1b[?1004h"), "{:?}", super::ENTER);
+        assert!(super::LEAVE.contains("\x1b[?1004l"), "{:?}", super::LEAVE);
+    }
+
     /// A title is somebody's words — a model's summary, or what they typed —
     /// so an escape character in it must not end the escape early and paint
     /// the rest onto the screen as commands.

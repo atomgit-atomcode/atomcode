@@ -81,20 +81,9 @@ static SYNC_UPGRADE_CHECKED: AtomicBool = AtomicBool::new(false);
 /// post-crash keypress as a literal `[27u` / `[99;5u` CSI-u report. We
 /// therefore emit the full panic-safe restore sequence (idempotent on
 /// the graceful path) before dropping raw mode.
-fn notify_stop_reason(
-    reason: atomcode_kernel::event::StopReason,
-) -> atomcode_capabilities::notify::NotifyStopReason {
-    use atomcode_capabilities::notify::NotifyStopReason as N;
-    use atomcode_kernel::event::StopReason as T;
-    match reason {
-        T::Stopped => N::Natural,
-        T::Cancelled => N::Cancelled,
-        T::MaxRounds | T::MaxContinuations => N::TurnLimit,
-        T::RepeatLoop | T::ToolLoopDetected => N::StepLimit,
-        T::ProviderError | T::Timeout | T::PromptRejected | T::RateLimited => N::Error,
-        _ => N::Error,
-    }
-}
+// 停下的理由怎么映成通知里的那一档,现在住在 `host.rs`:交互那一侧
+// 发通知的是它,而 headless 和它必须对同一批理由说同一句话。
+use atomcode::host::notify_stop_reason;
 
 fn headless_completion_exit_code(
     completion: &atomcode_coding::TurnCompletion,

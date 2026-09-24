@@ -27,6 +27,9 @@ atomcode-host-api = { path = "../atomcode-host-api" }
 # stack) is deliberately left off.
 atomcode-capabilities = { path = "../atomcode-capabilities", default-features = false, features = [
     "tools",
+    # 焦点事件往哪儿存。发通知是宿主那一侧的事(屏幕碰不到操作系统),
+    # 但「刚才有没有人在看」只有终端知道,而读终端的是这边。
+    "notify",
 ] }
 # Wiping a typed password when the prompt closes (`secret.rs`). The same crate
 # the askpass server holds its cache in, so the secret is zeroized on both ends

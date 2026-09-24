@@ -116,6 +116,15 @@ pub trait HostConfig: Send + Sync {
     fn identity(&self) -> Option<Identity> {
         None
     }
+
+    /// 完成通知和铃声的开关,按现在的配置。
+    ///
+    /// 每次问,不是启动时抓一份:两个开关的应用时机是 `NextTurn`,
+    /// 而“下一回合”正是发通知的那一刻。默认是关着的 —— 一个说不出
+    /// 自己配置的宿主不该替人决定要不要弹窗。
+    fn notifications(&self) -> atomcode_config::config::NotificationConfig {
+        atomcode_config::config::NotificationConfig::default()
+    }
 }
 
 /// Who is signed in, for [`HostConfig::identity`].
@@ -232,6 +241,10 @@ pub fn connect(
                 // Before this, only ACP heard about it (as an internal error)
                 // and the screen heard nothing at all.
                 CodingRuntimeEvent::TurnFinished(completion) => {
+                    // 完了告诉一声。发在这儿而不是屏幕上:弹窗和铃声是操作系统
+                    // 的事,而屏幕碰不到操作系统(`gates/tui-layers.sh`)。「刚才有没有
+                    // 人在看」由屏幕那边的焦点事件存进同一个全局,这里只读。
+                    notify_turn(&watched, &completion);
                     if let Some(message) = persistence_failure(&completion) {
                         let session = watched.session.lock().expect("session poisoned").clone();
                         watched.announce(HostEvent::PersistenceFailed { session, message });
@@ -264,6 +277,11 @@ pub fn connect(
                     });
                 }
                 other => {
+                    // 在等人拿主意。这是另一种“活停在这儿了”,而人很可能已经去
+                    // 干别的了 —— 正是通知存在的理由。
+                    if let CodingRuntimeEvent::Request(request) = &other {
+                        notify_waiting(&watched, request);
+                    }
                     if let Some(event) = translate(other) {
                         if out.send(event).is_err() {
                             break;
@@ -983,6 +1001,106 @@ fn translate(event: CodingRuntimeEvent) -> Option<AgentEvent> {
         }
         _ => None,
     }
+}
+
+/// 这次值不值得往下走到通知那一步。
+///
+/// 一处,两个发送点共用:两个开关各管一半(一个弹窗、一个响铃),而"两个都关着"
+/// 是唯一一种连算都不用算的情形。分开写两遍,迟早有一个漏掉其中一个开关。
+fn would_notify(cfg: &atomcode_config::config::NotificationConfig) -> bool {
+    cfg.enabled || cfg.bell
+}
+
+/// 停下的理由,映成通知里的那一档。
+///
+/// 共用一份:headless 和交互那一侧对同一批理由必须说同一句话,否则
+/// 同一次停下在两个入口会是两种说法。
+pub fn notify_stop_reason(
+    reason: atomcode_kernel::event::StopReason,
+) -> atomcode_capabilities::notify::NotifyStopReason {
+    use atomcode_capabilities::notify::NotifyStopReason as N;
+    use atomcode_kernel::event::StopReason as T;
+    match reason {
+        T::Stopped => N::Natural,
+        T::Cancelled => N::Cancelled,
+        T::MaxRounds | T::MaxContinuations => N::TurnLimit,
+        T::RepeatLoop | T::ToolLoopDetected => N::StepLimit,
+        T::ProviderError | T::Timeout | T::PromptRejected | T::RateLimited => N::Error,
+        _ => N::Error,
+    }
+}
+
+/// 一回合完了,告诉人一声 —— 如果他说要的话。
+///
+/// `notifications.enabled` / `notifications.bell` 两个开关一直在设置面板里
+/// 列着,**而新屏幕一处都没接** —— 拨了没有任何反应。底层那份实现是
+/// 好的(`capabilities::notify`),只是除了 headless 没人调。
+///
+/// 发在宿主而不是屏幕上:弹窗和铃声是操作系统的事,而屏幕碰不到操作
+/// 系统。这也顺手给 daemon / ACP 那几个走同一个宿主的入口带上了。
+fn notify_turn(control: &RuntimeControl, completion: &atomcode_coding::TurnCompletion) {
+    use atomcode_capabilities::notify;
+    let Some(source) = control.host_config.as_ref() else {
+        return;
+    };
+    let cfg = source.notifications();
+    if !would_notify(&cfg) {
+        return;
+    }
+    let (reason, stats) = match completion {
+        atomcode_coding::TurnCompletion::Completed { reason, stats, .. } => {
+            (notify_stop_reason(*reason), stats)
+        }
+        atomcode_coding::TurnCompletion::SnapshotUnavailable { stats, .. } => {
+            (notify::NotifyStopReason::Error, stats)
+        }
+    };
+    let working_dir = control
+        .config
+        .lock()
+        .expect("config poisoned")
+        .working_dir
+        .clone();
+    notify::notify_turn_finished(
+        &cfg,
+        notify::TurnNotification {
+            duration: stats.duration,
+            turn_count: stats.turn_count,
+            tool_call_count: stats.tool_call_count,
+            total_tokens: Some(stats.prompt_tokens + stats.completion_tokens),
+            stop_reason: reason,
+            working_dir: Some(&working_dir),
+        },
+    );
+}
+
+/// 有一件事在等人拿主意。
+///
+/// 和回合结束同一条路,同一批开关:这也是“活停在这儿了”,而且更坏 ——
+/// 回合结束至少是结束了,这一件是在等,没人回来就一直等。
+fn notify_waiting(control: &RuntimeControl, request: &atomcode_coding::RuntimeRequest) {
+    use atomcode_capabilities::notify;
+    let Some(source) = control.host_config.as_ref() else {
+        return;
+    };
+    let cfg = source.notifications();
+    if !would_notify(&cfg) {
+        return;
+    }
+    let working_dir = control
+        .config
+        .lock()
+        .expect("config poisoned")
+        .working_dir
+        .clone();
+    notify::notify(
+        &cfg,
+        notify::NotificationEvent::ApprovalNeeded(notify::ApprovalNotification {
+            tool_name: &request.kind,
+            detail: None,
+            working_dir: Some(&working_dir),
+        }),
+    );
 }
 
 /// 一个目标结束时该说的话,`None` 表示不用这里说。
@@ -2652,6 +2770,66 @@ mod tests {
             },
         });
         assert!(!said.trim().is_empty(), "打断了也要说:{said}");
+    }
+
+    /// 两个开关真的管用 —— 拨了不响,和拨了没反应,是两件事。
+    ///
+    /// `notifications.enabled` / `notifications.bell` 一直在设置面板里列着,
+    /// **而新屏幕一处都没接**:拨了没有任何反应。底层那份实现是好的
+    /// (`capabilities::notify`),只是除了 headless 没人调。
+    ///
+    /// 判的是**这条路上有没有那个开关的分支**:两个都关时一个字节都不该往外发。
+    /// 真弹不弹窗是操作系统的事,不在这儿判。
+    #[test]
+    fn the_two_notification_switches_are_actually_read() {
+        use atomcode_config::config::NotificationConfig;
+        let off = NotificationConfig {
+            enabled: false,
+            bell: false,
+            ..Default::default()
+        };
+        assert!(
+            !would_notify(&off),
+            "两个都关着的时候,这条路必须在发出去之前就停住"
+        );
+        for on in [
+            NotificationConfig {
+                enabled: true,
+                bell: false,
+                ..Default::default()
+            },
+            NotificationConfig {
+                enabled: false,
+                bell: true,
+                ..Default::default()
+            },
+        ] {
+            assert!(would_notify(&on), "任一个开着就要往下走:{on:?}");
+        }
+    }
+
+    /// 而且这条路真的被走到了 —— 开关管用,没人调它照样没用。
+    ///
+    /// 读这个文件判,因为真的走一遍要一个操作系统通知中心:`notify_turn` 要
+    /// 回合终态,`notify_waiting` 要一次真的审批请求,两者都在事件循环里,而
+    /// 那个循环要一个活的运行时。上面那条只钉了"开关读没读",它在没人调用
+    /// 的时候照样全绿 —— 这正是这一轮反复撞的形状。
+    #[test]
+    fn the_event_loop_actually_asks_for_a_notification() {
+        // 测试模块之前的那半。**这一刀是必须的**:不切的话,下面那两个
+        // 字符串字面量自己就是两次命中 —— 删掉真正的调用点它照样全绿。
+        // 第一版就是这么写的,做阴性对照时当场抳出来了。
+        let source = include_str!("host.rs");
+        let production = source.split("\n#[cfg(test)]").next().expect("the file");
+        for (hook, at) in [
+            ("notify_turn(&", "TurnFinished"),
+            ("notify_waiting(&", "Request"),
+        ] {
+            assert!(
+                production.contains(hook),
+                "`{hook}` 只有定义没有调用点 —— {at} 那一臂没接上通知"
+            );
+        }
     }
 
     /// 目标结束时,「达成」和「判不了算不算达成」不能长得一样。

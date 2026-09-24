@@ -1735,6 +1735,18 @@ pub fn from_crossterm(event: crossterm::event::Event) -> Option<Input> {
     match event {
         Event::Resize(w, h) => Some(Input::Resize(w, h)),
         Event::Paste(text) => Some(Input::Paste(text)),
+        // 窗口进出焦点。屏幕自己不画它,但「刚才有没有人在看」是一条回合
+        // 结束时要用的事实:人看着它做完的那一次不该弹通知,而真正需要
+        // 通知的那一次正是人不在的时候。存成一个全局,因为发通知的是宿主
+        // 那一侧(屏幕碰不到操作系统),两边隔着一条事件通道。
+        Event::FocusGained => {
+            atomcode_capabilities::notify::set_terminal_focus_state(Some(true));
+            None
+        }
+        Event::FocusLost => {
+            atomcode_capabilities::notify::set_terminal_focus_state(Some(false));
+            None
+        }
         // Press, not release: a fold should happen under the finger. A move is
         // reported rather than dropped — the menu is the one thing here that
         // follows a pointer and it needs to know which row it is over. The

@@ -444,6 +444,16 @@ pub mod tui_front {
         ///
         /// The name and the email, never the token — this answer is printed on
         /// a screen and kept in a log.
+        /// 两个开关按现在的文件读,不是启动时抓一份。
+        ///
+        /// 它们的应用时机是 `NextTurn`(`config/settings.rs`),而“下一回合”正是
+        /// 发通知的那一刻 —— 拨了开关就该下一次生效,而不是重启之后。
+        fn notifications(&self) -> atomcode_config::config::NotificationConfig {
+            atomcode_config::config::Config::load(&self.path)
+                .map(|config| config.notifications)
+                .unwrap_or_default()
+        }
+
         fn identity(&self) -> Option<crate::host::Identity> {
             let auth = atomcode_auth::get_stored_auth()?;
             Some(crate::host::Identity {
