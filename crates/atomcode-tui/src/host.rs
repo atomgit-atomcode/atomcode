@@ -1590,6 +1590,9 @@ impl Host {
         m.turn_started = None;
         m.quiet_since = None;
         m.steering.clear();
+        m.queued.clear();
+        m.withdrawn.clear();
+        m.resend_withdrawn = false;
         // The `正在识别图片` line belongs to a picture sent into the view being
         // left; carried across it would claim the arriving conversation is
         // recognising one it never saw. (Its own message fact clears it in the
@@ -2092,7 +2095,7 @@ impl Host {
     /// through [`Host::set_steering`], so the row this adds is pinned against
     /// the reader's scroll like any other tail row — it takes a line off the
     /// conversation, and a reader studying history must not watch it slide.
-    pub fn add_steering(&self, text: &str) {
+    pub fn add_steering(&self, id: &str, text: &str) {
         let text = text.trim();
         if text.is_empty() {
             return;
@@ -2107,6 +2110,11 @@ impl Host {
             next.push('\n');
         }
         next.push_str(text);
+        self.moment
+            .write()
+            .expect("moment poisoned")
+            .queued
+            .push((id.to_string(), text.to_string()));
         self.set_steering(next);
     }
 
@@ -2118,7 +2126,29 @@ impl Host {
     /// which is when the transcript starts drawing them too. Clearing at the end
     /// of the turn instead would show every steering line twice.
     pub fn clear_steering(&self) {
+        self.moment.write().expect("moment poisoned").queued.clear();
         self.set_steering(String::new());
+    }
+
+    /// A queued line the runtime has withdrawn (`id` is the receipt it was sent
+    /// under): off the panel, and kept to be handed back. `false` when `id` is
+    /// not a queued line — then it is some other send, and its refusal is news.
+    pub fn withdraw_queued(&self, id: &str) -> bool {
+        let rest = {
+            let mut m = self.moment.write().expect("moment poisoned");
+            let Some(at) = m.queued.iter().position(|(queued, _)| queued == id) else {
+                return false;
+            };
+            let (_, text) = m.queued.remove(at);
+            m.withdrawn.push(text);
+            m.queued
+                .iter()
+                .map(|(_, text)| text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        self.set_steering(rest);
+        true
     }
 
     /// Replace what is waiting, pinned. `false` when it did not change.

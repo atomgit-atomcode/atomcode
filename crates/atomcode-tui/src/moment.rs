@@ -496,12 +496,28 @@ pub struct Moment {
     /// appends on submit and clears on `AgentEvent::Steered`; see
     /// `modules::steering`.
     pub steering: String,
-    /// 排队的话被 `Ctrl+B` 收走了,等取消落地后重发。
+    /// The same words as [`steering`](Self::steering), **one entry per
+    /// message** — the receipt id it was sent under, and the text as sent
+    /// (`[Image #N]` markers included).
     ///
-    /// 取消是一次往返,没等到终态就提交会被答 `Busy` —— 那正好是把话
-    /// 丢掉的另一种写法。所以它们先在这里放一下;而放在 `Moment` 而不是
-    /// 一个局部变量里,是因为收走的那一刻和重发的那一刻隔着一次事件往返。
-    pub staged_steers: Option<String>,
+    /// `steering` is what the panel draws, joined by newlines, where a message
+    /// with a newline of its own cannot be told from two. The id is what ties a
+    /// line to the runtime's answer about it: a stop withdraws what is still
+    /// waiting and answers each withdrawn send `Rejected { NotRunning }`, and
+    /// only a line named by such an answer is one the model will never get.
+    /// Kept and cleared with `steering`.
+    pub queued: Vec<(String, String)>,
+    /// Lines the runtime withdrew, oldest first, waiting for the turn to be
+    /// over so they can be handed back — or, after `Ctrl+B`, sent again.
+    ///
+    /// Only what was withdrawn: a stop that lost the race to the turn's own
+    /// end withdrew nothing, the lines went on to the model, and giving them
+    /// back as well would say them twice.
+    pub withdrawn: Vec<String>,
+    /// The last stop was `Ctrl+B`: what it withdraws goes out again, each as
+    /// its own message, rather than back to the composer. `esc` and `ctrl-c`
+    /// set it false, so it always says what the latest stop asked for.
+    pub resend_withdrawn: bool,
     /// 人自己跑过的 `!` 命令与它们的输出,等着跟下一条消息一起给模型。
     ///
     /// 攒着而不是当场发:跑一条 `!git status` 不是在对模型说话,不该因此开

@@ -280,7 +280,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::FileIsEmpty { path } => format!("{path} 是空的").into(),
         Msg::FileUnreadable { path, error } => format!("读不了 {path}:{error}").into(),
         Msg::KeysHelp => "enter 发送 · shift+enter 换行(或 ctrl-j) · ctrl-d 退出 · ctrl-w 删词\n\
-             esc 依次:取消选中 -> 清空输入 -> 停止当轮 · ctrl-c 直接停止当轮\n\
+             当轮进行中:esc 或 ctrl-c 停止当轮,排队的话退回输入框 · ctrl-b 停止当轮,排队的话立刻发出\n\
+             空闲时:esc 连按两下清空输入,输入已空再连按两下打开回退 · ctrl-c 清空输入,再按一次退出\n\
              上/下 在输入里移动游标,到头则翻历史 · 点击输入框定位游标\n\
              pgup/pgdn 与滚轮滚动对话\n\
              alt-r 思考(一行/全文/收起,循环) · ctrl-t 工具输出(全部/单个摘要/成组摘要,循环) · ctrl-l 重画屏幕\n\

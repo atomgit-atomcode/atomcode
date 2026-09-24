@@ -309,7 +309,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::FileIsEmpty { path } => format!("{path} is empty").into(),
         Msg::FileUnreadable { path, error } => format!("cannot read {path}: {error}").into(),
         Msg::KeysHelp => "enter sends · shift+enter a new line (or ctrl-j) · ctrl-d quits · ctrl-w deletes a word\n\
-             esc in order: drop the selection -> clear the composer -> stop the turn · ctrl-c stops the turn outright\n\
+             during a turn: esc or ctrl-c stops it and hands what was queued back to the composer · ctrl-b stops it and sends what was queued right away\n\
+             idle: esc twice clears the composer, twice more on an empty one opens rewind · ctrl-c clears the composer, again to quit\n\
              up/down move the caret, and page through history once at the end · click to put the caret where you clicked\n\
              pgup/pgdn and the wheel scroll the conversation\n\
              alt-r reasoning (one line / in full / folded, cycles) · ctrl-t tool output (all / one summary each / summarised in groups, cycles) · ctrl-l redraws\n\

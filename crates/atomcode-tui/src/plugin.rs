@@ -322,8 +322,12 @@ impl AgentClient {
     }
 
     /// Say something to the agent on screen.
-    pub fn send(&self, text: String, images: Vec<atomcode_kernel::message::ImageContent>) {
-        self.send_with(text, images, Vec::new());
+    pub fn send(
+        &self,
+        text: String,
+        images: Vec<atomcode_kernel::message::ImageContent>,
+    ) -> CommandId {
+        self.send_with(text, images, Vec::new())
     }
 
     /// 同上,另带上人在本地做过的事。
@@ -336,7 +340,7 @@ impl AgentClient {
         text: String,
         images: Vec<atomcode_kernel::message::ImageContent>,
         context: Vec<String>,
-    ) {
+    ) -> CommandId {
         let id = format!("tui-{}", self.receipts.fetch_add(1, Ordering::SeqCst));
         let inner = match context.is_empty() {
             true => AgentCommand::SendMessage { text, images },
@@ -353,11 +357,12 @@ impl AgentClient {
                 view.outstanding.insert(id.clone());
             }
             views.addressed(AgentCommand::Tagged {
-                id,
+                id: id.clone(),
                 command: Box::new(inner),
             })
         };
         self.command(command);
+        id
     }
     /// Stop the turn of the agent on screen.
     pub fn cancel(&self) {
@@ -1231,7 +1236,7 @@ impl UserInterface for Tui {
             // `last_sent` all the same, so an Escape that stops this first turn
             // hands it back the way it would any other (see `Action::Escape`).
             self.host.moment.write().expect("moment poisoned").last_sent = Some(text.clone());
-            client.send(text, Vec::new());
+            let _ = client.send(text, Vec::new());
         }
 
         let mut quit = false;
@@ -2592,18 +2597,82 @@ impl Tui {
     ///
     /// 给 `Ctrl+B` 用:收走的那几句本来就是提交过一次的文本 —— 粘贴已经还原
     /// 过、图已经跟着那一次走了,所以这里不再碰附件队列。
-    fn submit_text(&self, text: String) {
+    fn submit_text(&self, text: String) -> Option<CommandId> {
         if text.trim().is_empty() {
-            return;
+            return None;
         }
-        {
+        let images = {
             let mut m = self.host.moment.write().expect("moment poisoned");
             // 和一次普通提交一样:这是「最后发出去的那句」,下一次 Escape
             // 要把它退回来。
             m.last_sent = Some(text.clone());
             m.interrupted = false;
+            // 图要再带一次:运行时撤回排队的那一条时,图是跟着一起撤的。
+            // 按标记从本会话的图库里取,不经附件队列 —— 那里放的是输入框
+            // 里正在写的那句的图,不是这句的。
+            let mut seen = std::collections::HashSet::new();
+            crate::attach::markers_in(&text)
+                .into_iter()
+                .filter(|n| seen.insert(*n))
+                .filter_map(|n| m.attachments.image_at(n).cloned())
+                .collect::<Vec<_>>()
+        };
+        Some(self.client.send(text, images))
+    }
+
+    /// Settle the lines the runtime withdrew: sent again, each on its own, after
+    /// `Ctrl+B`; otherwise back into the composer.
+    ///
+    /// Only the first resend opens the turn — the runtime takes one message a
+    /// step — so the rest wait in its inbox the way a line typed mid-turn does,
+    /// and are listed the same way: a stop before they are folded in withdraws
+    /// them too, and they come back like any other.
+    fn settle_withdrawn(&self) {
+        let (withdrawn, resend) = {
+            let mut m = self.host.moment.write().expect("moment poisoned");
+            if m.withdrawn.is_empty() {
+                return;
+            }
+            let resend = std::mem::take(&mut m.resend_withdrawn);
+            (std::mem::take(&mut m.withdrawn), resend)
+        };
+        if !resend {
+            self.hand_back(withdrawn);
+            return;
         }
-        self.client.send(text, Vec::new());
+        for (at, text) in withdrawn.into_iter().enumerate() {
+            let Some(id) = self.submit_text(text.clone()) else {
+                continue;
+            };
+            if at > 0 {
+                self.host.add_steering(&id, &text);
+            }
+        }
+    }
+
+    /// Put words a stop withdrew back into the composer: oldest first, ahead
+    /// of anything being typed, which is where they stood in time.
+    ///
+    /// As they were sent, `[Image #N]` markers included — the next submit
+    /// re-attaches those from the session's gallery, the way a line recalled
+    /// with the up arrow does.
+    fn hand_back(&self, queued: Vec<String>) {
+        if queued.is_empty() {
+            return;
+        }
+        {
+            let mut m = self.host.moment.write().expect("moment poisoned");
+            let mut restored = queued.join("\n");
+            if !m.input.is_empty() {
+                restored.push('\n');
+                restored.push_str(&m.input);
+            }
+            m.input = restored;
+            m.caret = m.input.len();
+            m.history_at = None;
+            m.draft.clear();
+        }
+        self.refresh_menu();
     }
 
     /// 一段留在对话区里的话。
@@ -3788,6 +3857,27 @@ impl Tui {
             }
             AgentEvent::Rejected { command, error } => {
                 self.client.answered(&command);
+                // A queued line the person's stop withdrew. It is on its way
+                // back to the composer (or out again, for `Ctrl+B`), so it is
+                // neither a failure to report nor a reason to put the last
+                // prompt back.
+                if matches!(error, atomcode_kernel::event::CommandError::NotRunning)
+                    && self.host.withdraw_queued(&command)
+                {
+                    // The turn may already be over — the stop lost the race to
+                    // its own end, and there is no turn end still to come to
+                    // settle this. Otherwise the turn end does it.
+                    let over = !self
+                        .host
+                        .moment
+                        .read()
+                        .expect("moment poisoned")
+                        .turn_in_flight();
+                    if over {
+                        self.settle_withdrawn();
+                    }
+                    return true;
+                }
                 // A send that never became a turn produces no message fact to
                 // take the `正在识别图片` line down; do it here.
                 self.host.stop_recognizing();
@@ -3920,20 +4010,20 @@ impl Tui {
             // with the turn rather than lying about work that will not happen. The
             // `已中断` note is not raised here: a self-cancel already marked it on
             // the key (`Action::Escape`), and an internal cancel must not.
-            AgentEvent::TurnComplete { .. } | AgentEvent::Cancelled => {
-                // `Ctrl+B` 收走的话,等的就是这一刻。取消已经落地,重新提交
-                // 不会再碰上 `Busy`。
-                let staged = self
-                    .host
-                    .moment
-                    .write()
-                    .expect("moment poisoned")
-                    .staged_steers
-                    .take();
-                if let Some(text) = staged {
-                    self.submit_text(text);
-                }
+            event @ (AgentEvent::TurnComplete { .. } | AgentEvent::Cancelled) => {
+                // Lines a stop withdrew are settled once the turn is over:
+                // resubmitting now no longer meets `Busy`. The withdrawal
+                // receipts precede the turn's end on this connection, so every
+                // line they named is in `withdrawn` by now. The panel is
+                // cleared first, so a line `Ctrl+B` sends back into the inbox
+                // is listed afresh rather than wiped.
                 self.host.clear_steering();
+                // At `TurnComplete` only: a cancelled turn ends `Cancelled` and
+                // then `TurnComplete`, and a line resent at the first would be
+                // wiped off the panel by the second.
+                if matches!(event, AgentEvent::TurnComplete { .. }) {
+                    self.settle_withdrawn();
+                }
                 // A turn just spent some of the allowance, so this is the
                 // moment the figure changed. Rate-limited inside.
                 self.check_allowance();
@@ -4352,7 +4442,7 @@ impl Tui {
                         .expect("moment poisoned")
                         .pending_context,
                 );
-                client.send_with(text.clone(), images, context);
+                let id = client.send_with(text.clone(), images, context);
                 if recognizing {
                     self.host.start_recognizing();
                     // Put the message in the conversation now, in flow, rather
@@ -4362,7 +4452,7 @@ impl Tui {
                     self.host.open_echo(text.clone());
                 }
                 if steering {
-                    self.host.add_steering(&text);
+                    self.host.add_steering(&id, &text);
                 }
                 return false;
             }
@@ -4689,6 +4779,9 @@ impl Tui {
                 // by the agent's account too, as for `Action::Escape`.
                 if m.turn_in_flight() || !client.settled() {
                     m.disarm_quit();
+                    // The same stop as `esc`, and the queue comes back the same
+                    // way: stopped is not thrown away.
+                    m.resend_withdrawn = false;
                     drop(m);
                     self.stop_turn(client);
                     return false;
@@ -5011,10 +5104,10 @@ impl Tui {
             Action::InterruptAndSend => {
                 // `m` 是外层已经拿着的写锁。在这儿再 `moment.write()` 一次是
                 // 同一个线程上的第二把写锁 —— 当场死锁。
-                let waiting = std::mem::take(&mut m.steering);
-                let staged = !waiting.trim().is_empty();
-                if staged {
-                    m.staged_steers = Some(waiting);
+                // 收走的不是面板上那一串,是逐条的原话:重发要一条是一条,和
+                // 回合里插进去时一个样子,而不是拼成一条人没写过的话。
+                if !m.queued.is_empty() {
+                    m.resend_withdrawn = true;
                 } else {
                     // 没有排队的话,那这一下就是一次普通的停。
                     m.interrupted = true;
@@ -5047,7 +5140,14 @@ impl Tui {
                     // for the turn to be idle before it draws (see `modules::input`),
                     // so it never overlaps the turn it closes.
                     m.interrupted = true;
-                    if m.input.is_empty() {
+                    // What was queued behind the turn stops with it (the
+                    // runtime withdraws it) and comes back to the composer once
+                    // the cancel lands — see `Moment::withdrawn`. It then takes the
+                    // place of the running prompt handed back below: that one is
+                    // in the transcript already, the queued lines are nowhere.
+                    let queued = !m.queued.is_empty();
+                    m.resend_withdrawn = false;
+                    if m.input.is_empty() && !queued {
                         if let Some(sent) = m.last_sent.clone() {
                             m.input = sent;
                             m.caret = m.input.len();

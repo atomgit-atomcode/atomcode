@@ -1124,6 +1124,232 @@ async fn ctrl_b_interrupts_and_sends_what_was_queued() {
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
 
+/// Queue two lines behind a running turn and wait until the panel shows both.
+///
+/// The turn is a five-second `sleep`, so it is still running when the key under
+/// test is pressed: what these judge is what happens to words the model has
+/// not been handed yet.
+async fn queue_two_behind_a_turn(s: &Session, first: &str, second: &str) {
+    s.term.type_line("first");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    s.term.type_line(first);
+    s.term.type_line(second);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let screen = s.screen();
+    assert!(
+        screen.contains(first) && screen.contains(second),
+        "both are in the queue panel:\n{screen}"
+    );
+}
+
+/// What the person said, message by message, as the log has it.
+fn user_messages(s: &Session) -> Vec<String> {
+    s.client()
+        .events()
+        .into_iter()
+        .filter_map(|logged| match logged.event {
+            SessionEvent::UserMessage { text, .. } => Some(text),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `esc` stops the turn **and everything queued behind it** — the runtime's
+/// `stand_down` is deliberate about that (a stop that let the queue open the
+/// next turn is a person watching the agent carry on). But stopping them is
+/// not throwing them away: they come back to the composer, in the order they
+/// were typed, for the person to send, edit or drop. They used to vanish, with
+/// a `没有送达` per line as the only trace.
+#[tokio::test]
+async fn esc_puts_what_was_queued_back_in_the_composer() {
+    let dir = scratch("esc-queued-back");
+    let script = replay(
+        r#"{ text = "one", calls = [ { name = "bash", args = { command = "sleep 5" } } ] },
+           { text = "two" }"#,
+    );
+    let s = start(tree(&dir, &script, &[])).await;
+    let task = s.open().await;
+    queue_two_behind_a_turn(&s, "QUEUED-a1", "QUEUED-b2").await;
+
+    s.term.press(KeyPress::plain(Key::Esc));
+    for _ in 0..300 {
+        if composer_text(&s).contains("QUEUED-b2") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    s.quiet().await;
+    let field = composer_text(&s);
+    let (a, b) = (field.find("QUEUED-a1"), field.find("QUEUED-b2"));
+    assert!(
+        matches!((a, b), (Some(a), Some(b)) if a < b),
+        "both are back in the composer, oldest first:\n{field}"
+    );
+    assert!(
+        !user_messages(&s).iter().any(|m| m.contains("QUEUED")),
+        "stopped means not sent: {:?}",
+        user_messages(&s)
+    );
+    assert!(
+        !s.screen().contains("没有送达"),
+        "a line handed back is not a line that failed:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+/// `ctrl-c` is the same stop, and hands the queue back the same way — ahead of
+/// whatever is being typed, which is where it stood in time.
+#[tokio::test]
+async fn ctrl_c_puts_what_was_queued_back_ahead_of_the_draft() {
+    let dir = scratch("ctrl-c-queued-back");
+    let script = replay(
+        r#"{ text = "one", calls = [ { name = "bash", args = { command = "sleep 5" } } ] },
+           { text = "two" }"#,
+    );
+    let s = start(tree(&dir, &script, &[])).await;
+    let task = s.open().await;
+    queue_two_behind_a_turn(&s, "QUEUED-c3", "QUEUED-d4").await;
+    s.term.type_text("DRAFT-e5");
+
+    s.term.press(KeyPress::ctrl('c'));
+    for _ in 0..300 {
+        if composer_text(&s).contains("QUEUED-d4") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    s.quiet().await;
+    let field = composer_text(&s);
+    let at = |needle: &str| field.find(needle);
+    assert!(
+        matches!(
+            (at("QUEUED-c3"), at("QUEUED-d4"), at("DRAFT-e5")),
+            (Some(c), Some(d), Some(e)) if c < d && d < e
+        ),
+        "the queue comes back ahead of the draft, which is kept:\n{field}"
+    );
+    assert!(
+        !user_messages(&s).iter().any(|m| m.contains("QUEUED")),
+        "{:?}",
+        user_messages(&s)
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+/// What `Ctrl+B` sent after the first line is queued again, and a stop hands
+/// it back like any other.
+///
+/// Only the first resent line opens the turn; the runtime takes one message a
+/// step, so the rest wait in its inbox exactly as lines typed mid-turn do. They
+/// were sent untracked, so an `esc` before they were folded in withdrew them
+/// with nothing to give them back to — `没有送达`, and gone.
+#[tokio::test]
+async fn what_ctrl_b_resent_and_was_still_waiting_comes_back_on_esc() {
+    let dir = scratch("ctrl-b-then-esc");
+    let script = replay(
+        r#"{ text = "one", calls = [ { name = "bash", args = { command = "sleep 5" } } ] },
+           { text = "two", calls = [ { name = "bash", args = { command = "sleep 5" } } ] },
+           { text = "three" }"#,
+    );
+    let s = start(tree(&dir, &script, &[])).await;
+    let task = s.open().await;
+    queue_two_behind_a_turn(&s, "QUEUED-h8", "QUEUED-i9").await;
+
+    s.term.press(KeyPress::ctrl('b'));
+    for _ in 0..300 {
+        if user_messages(&s).iter().any(|m| m.contains("QUEUED-h8")) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        s.screen().contains("QUEUED-i9"),
+        "the second line is shown waiting again:\n{}",
+        s.screen()
+    );
+    s.term.press(KeyPress::plain(Key::Esc));
+    for _ in 0..300 {
+        if composer_text(&s).contains("QUEUED-i9") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    s.quiet().await;
+    assert!(
+        composer_text(&s).contains("QUEUED-i9"),
+        "it comes back to the composer:\n{}",
+        s.screen()
+    );
+    assert!(
+        !user_messages(&s).iter().any(|m| m.contains("QUEUED-i9")),
+        "{:?}",
+        user_messages(&s)
+    );
+    assert!(!s.screen().contains("没有送达"), "{}", s.screen());
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+/// `Ctrl+B` sends what was queued **as it was queued**: one message each, in
+/// order — the same shape they would have had folding into the turn — not
+/// glued into one message the person never wrote. And a queued line that
+/// carried a picture still carries it: the runtime dropped the queued send,
+/// picture and all, so the resend has to bring it again.
+#[tokio::test]
+async fn ctrl_b_sends_each_queued_message_on_its_own_with_its_picture() {
+    let dir = scratch("ctrl-b-each");
+    let script = replay_vision(
+        r#"{ text = "one", calls = [ { name = "bash", args = { command = "sleep 5" } } ] },
+           { text = "two" }, { text = "three" }, { text = "four" }"#,
+        true,
+    );
+    let s = start(tree(&dir, &script, &[])).await;
+    let task = s.open().await;
+    s.term.type_line("first");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    s.term.set_clipboard_image(screenshot("queued"));
+    s.term.press(KeyPress::ctrl('v'));
+    s.term.type_line("QUEUED-f6 看图");
+    s.term.type_line("QUEUED-g7");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    s.term.press(KeyPress::ctrl('b'));
+    for _ in 0..300 {
+        if user_messages(&s).iter().any(|m| m.contains("QUEUED-g7")) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    s.quiet().await;
+    let said = user_messages(&s);
+    let f6 = said.iter().position(|m| m.contains("QUEUED-f6"));
+    let g7 = said.iter().position(|m| m.contains("QUEUED-g7"));
+    assert!(
+        matches!((f6, g7), (Some(f), Some(g)) if f < g),
+        "two messages, in the order they were queued — not one glued together: {said:?}"
+    );
+    let with_picture = s
+        .client()
+        .events()
+        .into_iter()
+        .find_map(|logged| match logged.event {
+            SessionEvent::UserMessage { text, images, .. } if text.contains("QUEUED-f6") => {
+                Some(images.len())
+            }
+            _ => None,
+        });
+    assert_eq!(with_picture, Some(1), "the queued picture went with it");
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
 #[tokio::test]
 async fn a_line_typed_mid_turn_is_shown_until_the_model_is_handed_it() {
     // The gap this panel exists for, and it is only visible from the outside:
