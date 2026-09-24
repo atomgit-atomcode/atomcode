@@ -36,6 +36,15 @@ pub struct ClipHint {
     /// carries the count it started at, so one that raced a paste — the key
     /// that pastes starts a look of its own — can tell.
     takes: u64,
+    /// The picture last taken onto the line, fingerprinted as the clipboard held
+    /// it at that moment.
+    ///
+    /// The look after a paste is reading that same picture: a paste is not a
+    /// keystroke (`Cmd+V` arrives as a bracketed paste) so nothing looked while
+    /// it came in, and without this the next keystroke's look offered the person
+    /// the picture already on their line. Compared by mark rather than by a
+    /// flag, so a *different* picture copied in the meantime is still news.
+    taken_mark: Option<u64>,
 }
 
 impl ClipHint {
@@ -56,23 +65,35 @@ impl ClipHint {
     /// opens the offer; the one already seen changes nothing, so it is never
     /// offered twice; nothing there takes the offer down.
     ///
-    /// Except when a picture was taken while the look was out: then what it
-    /// read is the picture just taken, which is recorded as seen and not
-    /// offered — it is already on the line.
+    /// Except a picture that has just been taken onto the line: that one is
+    /// recorded as seen and not offered — it is already on the line. A paste can
+    /// beat a look two ways and both are read here: one that landed while the
+    /// look was out (the ticket says so, and has to, because the mark below may
+    /// be recorded after the look started), and one that landed before it
+    /// started, which the mark recognizes.
     pub fn found(&mut self, picture: Option<u64>, now: Instant, ticket: u64) {
+        let taken = ticket != self.takes || (picture.is_some() && picture == self.taken_mark);
+        // Spent on the first look after the paste, whatever that look read: a
+        // picture copied since is judged on its own mark, not on this one.
+        self.taken_mark = None;
         if picture == self.seen {
             return;
         }
         self.seen = picture;
-        let raced = ticket != self.takes;
-        self.until = picture.filter(|_| !raced).map(|_| now + SHOWN_FOR);
+        self.until = picture.filter(|_| !taken).map(|_| now + SHOWN_FOR);
     }
 
     /// The picture was taken onto the line: the offer has been answered. It is
     /// still the one seen, so it is not offered again while it stays there.
-    pub fn taken(&mut self) {
+    ///
+    /// `mark` is what the clipboard was holding when it was taken, so the next
+    /// look recognizes the picture instead of reading it as a new one. `None`
+    /// when that could not be read — nothing is suppressed then, and the worst
+    /// that costs is one offer of the picture just pasted.
+    pub fn taken(&mut self, mark: Option<u64>) {
         self.until = None;
         self.takes += 1;
+        self.taken_mark = mark;
     }
 
     /// Whether the offer is up at `now`.
@@ -120,7 +141,7 @@ mod tests {
         // Taken, and still there: not offered again either.
         let mut taken = ClipHint::default();
         see(&mut taken, Some(1), t0);
-        taken.taken();
+        taken.taken(Some(1));
         assert!(!taken.showing(t0));
         see(&mut taken, Some(1), t0 + Duration::from_secs(1));
         assert!(!taken.showing(t0 + Duration::from_secs(1)));
@@ -131,7 +152,7 @@ mod tests {
         let t0 = Instant::now();
         let mut hint = ClipHint::default();
         see(&mut hint, Some(1), t0);
-        hint.taken();
+        hint.taken(Some(1));
 
         let t1 = t0 + Duration::from_secs(20);
         see(&mut hint, Some(2), t1);
@@ -158,7 +179,7 @@ mod tests {
         let t0 = Instant::now();
         let mut hint = ClipHint::default();
         let ticket = hint.looking(t0);
-        hint.taken();
+        hint.taken(Some(1));
         hint.found(Some(1), t0 + Duration::from_millis(200), ticket);
         assert!(
             !hint.showing(t0 + Duration::from_millis(200)),
@@ -166,13 +187,48 @@ mod tests {
         );
         // And it is now the one seen: a later look does not offer it either.
         let later = t0 + Duration::from_secs(3);
-        let ticket = hint.looking(later);
-        hint.found(Some(1), later, ticket);
+        see(&mut hint, Some(1), later);
         assert!(!hint.showing(later));
         // A new picture after that is offered as usual.
-        let ticket = hint.looking(later);
-        hint.found(Some(2), later, ticket);
+        see(&mut hint, Some(2), later);
         assert!(hint.showing(later));
+    }
+
+    /// The reported one: paste a screenshot with `Cmd+V` and the hint appeared
+    /// *after* the paste. `Cmd+V` is a bracketed paste rather than a keystroke,
+    /// so no look ran while it arrived and nothing had recorded the picture as
+    /// seen — the next keystroke's look read it as a new picture and offered the
+    /// person what was already on their line.
+    #[test]
+    fn a_picture_taken_before_any_look_is_not_offered_back_by_the_next_one() {
+        let t0 = Instant::now();
+        let mut hint = ClipHint::default();
+
+        // Taken with nothing looked at yet, which is the `Cmd+V` case: no look
+        // has run, so `seen` is `None` and the picture reads as brand new.
+        hint.taken(Some(7));
+        see(&mut hint, Some(7), t0);
+        assert!(
+            !hint.showing(t0),
+            "the picture just pasted is not news about the clipboard"
+        );
+
+        // Taken again, and the look reads the same picture: still nothing to say.
+        hint.taken(Some(7));
+        see(&mut hint, Some(7), t0 + Duration::from_secs(1));
+        assert!(!hint.showing(t0 + Duration::from_secs(1)));
+
+        // A different picture is news even right after a paste, so the mark is
+        // spent on the first look rather than being a standing gag order.
+        see(&mut hint, Some(8), t0 + Duration::from_secs(2));
+        assert!(hint.showing(t0 + Duration::from_secs(2)));
+
+        // And a paste whose picture could not be fingerprinted suppresses
+        // nothing — the worst case is one offer of what was just pasted.
+        let mut blind = ClipHint::default();
+        blind.taken(None);
+        see(&mut blind, Some(7), t0);
+        assert!(blind.showing(t0));
     }
 
     #[test]

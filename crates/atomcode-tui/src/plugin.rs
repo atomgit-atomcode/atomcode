@@ -4816,11 +4816,28 @@ impl Tui {
                         self.say_refused(&reason);
                         return false;
                     }
-                    self.host
-                        .moment
-                        .write()
-                        .expect("moment poisoned")
-                        .insert_image(image);
+                    // The clipboard road is the empty-text case; a pasted *path*
+                    // leaves the clipboard's own picture where it was, the same
+                    // split `/paste <file>` makes. This is the door most people
+                    // use (`Cmd+V` is swallowed by the terminal and never reaches
+                    // the `AttachImage` key), and it is not a keystroke, so no look
+                    // runs while it arrives: without these lines the next
+                    // keystroke's look read the picture just pasted as a new one
+                    // and offered it back. The fingerprint is what lets that look
+                    // recognize it — taken before the moment is locked, because it
+                    // copies the picture's pixels out.
+                    let off_the_clipboard = text.trim().is_empty();
+                    let mark = if off_the_clipboard {
+                        self.surface.clipboard_image_mark()
+                    } else {
+                        None
+                    };
+                    let mut m = self.host.moment.write().expect("moment poisoned");
+                    m.insert_image(image);
+                    if off_the_clipboard {
+                        m.clip.taken(mark);
+                        m.clipboard_hint = false;
+                    }
                 } else {
                     // A big block folds into a `[Pasted #N …]` marker rather than
                     // filling the composer; the body is put back at submit
@@ -4852,9 +4869,13 @@ impl Tui {
                     self.say_refused(&t(Msg::ClipboardHasNoImage));
                     return false;
                 };
+                // Read with the picture, which is where it is still the same
+                // picture: the look on the next keystroke has to recognize what
+                // was just taken instead of reading it as a new one.
+                let mark = self.surface.clipboard_image_mark();
                 m.insert_image(image);
                 // The offer is answered.
-                m.clip.taken();
+                m.clip.taken(mark);
                 m.clipboard_hint = false;
             }
             // `/paste`, from the clipboard or from a named file. A picture
@@ -4908,12 +4929,22 @@ impl Tui {
                             self.say_refused(&reason);
                             return false;
                         }
+                        // The fingerprint is taken before the moment is locked —
+                        // it copies the picture's pixels out — and only for the
+                        // clipboard road: a `/paste <file>` leaves the clipboard's
+                        // own picture where it was, and still news.
+                        let from_clipboard = from.is_none();
+                        let mark = if from_clipboard {
+                            self.surface.clipboard_image_mark()
+                        } else {
+                            None
+                        };
                         let mut m = self.host.moment.write().expect("moment poisoned");
                         m.insert_image(image);
                         // From the clipboard, the offer is answered; from a
                         // file, the picture on the clipboard is still there.
-                        if from.is_none() {
-                            m.clip.taken();
+                        if from_clipboard {
+                            m.clip.taken(mark);
                             m.clipboard_hint = false;
                         }
                     }

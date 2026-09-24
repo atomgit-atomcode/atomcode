@@ -1777,7 +1777,7 @@ async fn esc_out_of_a_search_gives_the_draft_back() {
     task.abort();
 }
 
-/// A picture on the clipboard is offered on the composer's upper rule — the
+/// A picture on the clipboard is offered in the tip row above the composer — the
 /// moment it is worth saying is when the person comes back to the terminal with
 /// one — and the offer goes once the picture is taken. The same picture still
 /// on the clipboard is not offered again: it is the one already on the line.
@@ -1819,6 +1819,48 @@ async fn a_picture_on_the_clipboard_is_offered_until_it_is_taken() {
     assert!(
         !s.screen().contains("剪贴板有图片"),
         "the same picture is not offered twice:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+/// The door most people use: `Cmd+V`, which the terminal swallows and delivers
+/// as a bracketed paste rather than as the `Ctrl+V` key. Nothing looks at the
+/// clipboard while it arrives — a paste is not a keystroke — so the look the
+/// *next* keystroke starts is the first to see that picture, and it has to
+/// recognize it as the one already on the line. The reported screen was the
+/// offer appearing after the paste, naming a picture already in the composer.
+///
+/// No focus event anywhere: the picture was copied with the terminal already in
+/// front, which is the case where no look has run at all before the paste.
+#[tokio::test]
+async fn a_picture_pasted_with_cmd_v_is_not_offered_back_afterwards() {
+    let dir = scratch("cmd-v-offer");
+    let s = start(tree(&dir, &replay_vision(r#"{ text = "ok" }"#, true), &[])).await;
+    let task = s.open().await;
+    s.quiet().await;
+    s.term.set_clipboard_image(screenshot("cmd-v"));
+
+    // An empty bracketed paste is what a screenshot arrives as: the terminal
+    // has no text to hand over, and the picture is recovered from the clipboard.
+    s.term.paste("");
+    s.quiet().await;
+    assert!(s.screen().contains("[Image #1]"), "{}", s.screen());
+
+    // The look the next keystroke starts reads that same picture — but looks are
+    // spaced (`LOOK_EVERY`), so the keystroke has to come after that spacing or
+    // no look happens and this judgement would pass on a screen nothing looked
+    // at. The spacing is why the reported bug showed up on typing rather than at
+    // the paste: the paste itself looks at nothing.
+    tokio::time::sleep(Duration::from_millis(1_600)).await;
+    s.term.type_text("x");
+    s.quiet().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !s.screen().contains("剪贴板有图片"),
+        "the picture already on the line is not offered back:\n{}",
         s.screen()
     );
 

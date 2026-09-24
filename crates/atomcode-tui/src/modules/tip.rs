@@ -28,8 +28,11 @@
 //! Nothing folds into a tip, and nothing ever will: a tip is not a fact. What
 //! this row draws is [`Moment::notice`](crate::moment::Moment::notice) — a line
 //! the host was asked to say for a moment, with the reading it expires at
-//! travelling alongside it. So the state below stays empty and every tip is read
-//! off the moment, the way the live line reads its clock.
+//! travelling alongside it — and, when nothing is being said, the offer of a
+//! picture on the clipboard ([`Moment::clipboard_caption`](crate::moment::Moment::clipboard_caption)),
+//! which is the same kind of thing: something the person could do next. So the
+//! state below stays empty and every tip is read off the moment, the way the
+//! live line reads its clock.
 
 use atomcode_harness::session::SessionEvent;
 
@@ -88,7 +91,19 @@ impl View for Tip {
         let (text, role) = match live {
             Some(n) if n.refused => (n.text.clone(), Role::Error),
             Some(n) => (n.text.clone(), Role::Muted),
-            None => (String::new(), Role::Muted),
+            // Nothing said for a moment: the clipboard's own offer, when a
+            // picture has just arrived there. The same row because it is the same
+            // kind of thing — something the person could do next, right now — and
+            // the right edge because that is out of the way of the words being
+            // typed. It is not a notice and does not become one: a paste takes it
+            // down, not a clock (`crate::clip_hint`).
+            //
+            // ponytail: it shows over a panel too, where the key it names does
+            // nothing. Gate on the composer being the screen if that bites.
+            None => (
+                vp.moment.clipboard_caption().unwrap_or_default(),
+                Role::Muted,
+            ),
         };
         El::row(vec![El::Spacer, El::styled(text, theme::fg(role))]).lay(w)
     }
@@ -146,6 +161,56 @@ mod tests {
             Tip::height(&State, &Moment::default().working(), 80),
             Height::Hug(1),
             "and a turn in flight changes nothing here"
+        );
+    }
+
+    /// The offer of a picture on the clipboard lands here, against the right
+    /// edge, one row above the field — it names the key that takes a picture on
+    /// *this* terminal (`ctrl+v`, or `ctrl+alt+v` and `/paste` where the terminal
+    /// keeps `ctrl+v` for its own text paste), and nothing on the row below says
+    /// which key that is. Moved here from the composer's upper rule: beside the
+    /// field it read as chrome about the box, in the same band as the session's
+    /// name and competing with it for the one shoulder.
+    #[test]
+    fn a_picture_on_the_clipboard_is_offered_here_with_the_key_that_takes_it() {
+        let mut moment = Moment::default();
+        moment.now = Timestamp::millis(0);
+        assert!(
+            draw_at(&moment, 60, 1)[0].plain().trim().is_empty(),
+            "nothing offered, nothing said"
+        );
+
+        moment.clipboard_hint = true;
+        let here = draw_at(&moment, 60, 1);
+        assert!(
+            here[0].plain().contains("剪贴板有图片") && here[0].plain().contains("ctrl+v"),
+            "{:?}",
+            here[0].plain()
+        );
+        assert!(
+            here[0].plain().ends_with("粘贴"),
+            "against the right edge, above the box: {:?}",
+            here[0].plain()
+        );
+
+        // Where the terminal keeps `ctrl+v` for itself, the row names the key
+        // that does work here and the command for the rest.
+        moment.caps.paste_image = crate::caps::PasteImage::CtrlAltVOrCommand;
+        let elsewhere = draw_at(&moment, 80, 1);
+        assert!(
+            elsewhere[0].plain().contains("ctrl+alt+v") && elsewhere[0].plain().contains("/paste"),
+            "{:?}",
+            elsewhere[0].plain()
+        );
+
+        // Something said for a moment outranks it: a notice answers what the
+        // person just did, the offer is ambient, and the row holds one line.
+        let said = moment.with_notice("已复制到剪贴板", false, Timestamp::millis(0));
+        let out = draw_at(&said, 80, 1);
+        assert!(
+            out[0].plain().contains("已复制到剪贴板") && !out[0].plain().contains("剪贴板有图片"),
+            "{:?}",
+            out[0].plain()
         );
     }
 

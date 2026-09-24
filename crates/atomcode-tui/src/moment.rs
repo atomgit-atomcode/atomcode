@@ -1084,6 +1084,26 @@ impl Moment {
         true
     }
 
+    /// The offer of a picture on the clipboard, naming the key that takes it
+    /// *here* — which the shield knows and this does not (`Caps::paste_image`).
+    /// `None` while there is no offer.
+    ///
+    /// The words live with the flag that raises them, so the row that draws the
+    /// offer does not have to know what raises it: it is the tip row's line, the
+    /// same one a notice rides, one row above the composer.
+    pub fn clipboard_caption(&self) -> Option<String> {
+        if !self.clipboard_hint {
+            return None;
+        }
+        Some(
+            t(match self.caps.paste_image {
+                crate::caps::PasteImage::CtrlV => Msg::InputClipboardImage,
+                crate::caps::PasteImage::CtrlAltVOrCommand => Msg::InputClipboardImageAltOrCommand,
+            })
+            .into_owned(),
+        )
+    }
+
     /// Drop the folded-paste bookkeeping — after the draft is sent, or dropped.
     pub fn clear_pastes(&mut self) {
         self.pastes.clear();
