@@ -1312,6 +1312,77 @@ fn real_main() {
     rt.block_on(async_main());
 }
 
+/// 启动时该说的那几句「你现在的处境和默认不一样」。
+///
+/// 四件事,都是**人以为的默认不成立**的时候才说:审批被整个绕过、进程带着
+/// 管理员权限跑、离线档开着(所以联网的工具、遥测、自更新都不动)、装着的
+/// 插件带了钩子但还没被信任(所以那些钩子不跑)。每一条的共同点是:不说的话,
+/// 人会以为是别的东西坏了。
+///
+/// 纯函数,拿的是已经问过环境的结果 —— 于是「有没有说」本身能被判据摆布。
+/// 上一代默认屏正是在这里丢的:三条启动提示一条都没画,而没有任何一处会红。
+fn launch_warnings(
+    bypassing_approval: bool,
+    is_admin: bool,
+    offline: bool,
+    untrusted_plugins: &[String],
+) -> Vec<String> {
+    use atomcode_i18n::product::{t, Msg};
+    let mut out = Vec::new();
+    if bypassing_approval {
+        out.push(t(Msg::BypassWarningBanner).into_owned());
+    }
+    if is_admin {
+        out.push(t(Msg::AdminWarningBanner).into_owned());
+    }
+    if offline {
+        out.push(t(Msg::OfflineModeActive).into_owned());
+    }
+    if !untrusted_plugins.is_empty() {
+        out.push(
+            t(Msg::PluginHooksUntrusted {
+                count: untrusted_plugins.len(),
+                names: &untrusted_plugins.join(", "),
+            })
+            .into_owned(),
+        );
+    }
+    out
+}
+
+/// 现在有哪些装着的插件带着还没被信任的钩子。
+///
+/// 先跑一次迁移:装在这条规矩之前的插件是被顺延信任的,不先迁移就会把它们
+/// 全列出来 —— 一句关于并不存在的问题的提醒。
+fn untrusted_plugin_hooks() -> Vec<String> {
+    atomcode_capabilities::plugin::hook_trust::ensure_migrated();
+    atomcode_capabilities::plugin::installed_plugin_hook_trust_status()
+        .into_iter()
+        .filter(|status| !status.trusted)
+        .map(|status| status.plugin)
+        .collect()
+}
+
+/// 这一趟启动,开场要说的全部。
+///
+/// **一个函数而不是调用点上一串嵌套的合并**,理由就是 `warnings` 这个参数:
+/// 它是必填的,所以把它漏掉是编译不过,而不是少画几行字。上一代默认屏正是
+/// 在那条缝上丢掉三条启动提示的——没有任何一处会红。
+///
+/// 顺序:先「刚才发生了什么」(换了目录、配置没读全、会话被占用分叉了),
+/// 再「这一趟的处境」([`launch_warnings`])。人先要知道前者。
+fn startup_notices(
+    resume_switch: Option<String>,
+    config: Option<String>,
+    session: Option<String>,
+    warnings: Vec<String>,
+) -> Option<String> {
+    merge_startup_notices(
+        merge_startup_notices(resume_switch, merge_startup_notices(config, session)),
+        (!warnings.is_empty()).then(|| warnings.join("\n")),
+    )
+}
+
 fn merge_startup_notices(
     config_notice: Option<String>,
     session_notice: Option<String>,
@@ -2298,9 +2369,19 @@ async fn run() -> Result<i32> {
         });
     // Cross-project resume notice rides on top so the switched working directory
     // is the first thing the user sees in the TUI.
-    let startup_notice = merge_startup_notices(
+    //
+    // 这几句排在最后,因为它们说的是「这一趟启动的处境」,而上面那几句说的是
+    // 「刚才发生了什么」—— 人先要知道后者。
+    let startup_notice = startup_notices(
         resume_switch_notice,
-        merge_startup_notices(config_startup_notice, session_startup_notice),
+        config_startup_notice,
+        session_startup_notice,
+        launch_warnings(
+            cli.dangerously_skip_permissions,
+            is_admin,
+            atomcode_config::config::offline::is_offline_active(),
+            &untrusted_plugin_hooks(),
+        ),
     );
     let (mut native_headless_runtime, mut native_tui_runtime) = if is_headless {
         (Some(native_runtime), None)
@@ -4697,10 +4778,10 @@ mod tests {
         apply_cli_runtime_overrides, atomcode_log_path, close_thinking_chunk,
         format_thinking_chunk, format_verbose_tool_chunk, headless_completion_exit_code,
         headless_completion_notify_reason, headless_denial_exit_code,
-        interactive_provider_bootstrap, is_completion_invocation, merge_startup_notices,
-        print_shell_completion, resolve_in_catalog, resolve_working_dir, resume_hint_line,
-        runtime_config_from, should_fork_busy_continue, truncate_log_line, Cli, Commands,
-        HeadlessOutputFormat, DEFAULT_LOG_DIRECTIVES,
+        interactive_provider_bootstrap, is_completion_invocation, launch_warnings,
+        merge_startup_notices, print_shell_completion, resolve_in_catalog, resolve_working_dir,
+        resume_hint_line, runtime_config_from, should_fork_busy_continue, startup_notices,
+        truncate_log_line, Cli, Commands, HeadlessOutputFormat, DEFAULT_LOG_DIRECTIVES,
     };
     use clap::Parser;
     use clap_complete::Shell;
@@ -4972,6 +5053,66 @@ mod tests {
             .as_deref(),
             Some("bad provider ignored\nbusy session forked")
         );
+    }
+
+    /// 开场那一段里,四类话一句都不会掉,而这一趟的处境排在最后。
+    ///
+    /// 钉的是**合起来那一步**:上面那条判据只证明每一句自己写得对,而三条
+    /// 启动提示上一次是在「写对了但没人合进去」这一步丢的。
+    #[test]
+    fn everything_a_launch_has_to_say_is_in_the_opening_and_the_warnings_come_last() {
+        let said = startup_notices(
+            Some("switched to /elsewhere".into()),
+            Some("bad provider ignored".into()),
+            Some("busy session forked".into()),
+            vec!["running as root".into()],
+        )
+        .expect("something to say");
+        for line in [
+            "switched to /elsewhere",
+            "bad provider ignored",
+            "busy session forked",
+            "running as root",
+        ] {
+            assert!(said.contains(line), "`{line}` 掉了:\n{said}");
+        }
+        assert!(
+            said.lines().last() == Some("running as root"),
+            "这一趟的处境排在最后:\n{said}"
+        );
+        // 平常的那一次没有开场白 —— 不是一个空行。
+        assert_eq!(startup_notices(None, None, None, Vec::new()), None);
+    }
+
+    /// 启动时那几句「你现在的处境和默认不一样」,该说的时候说,不该说的时候
+    /// 一句都不说。
+    ///
+    /// **两半都要钉,而后一半才是这条判据的意义。** 只钉「开了就说」的话,
+    /// 把这个函数写成「永远都说」照样全绿 —— 而那样每一次普通启动都会顶着
+    /// 四条警告开场,人两天之后就不再看它们,于是真的那一次也漏掉。
+    #[test]
+    fn a_launch_says_how_it_differs_from_the_ordinary_one_and_otherwise_says_nothing() {
+        assert!(
+            launch_warnings(false, false, false, &[]).is_empty(),
+            "平常的那一次,一句都不说"
+        );
+
+        let all = launch_warnings(true, true, true, &["a".into(), "b".into()]);
+        assert_eq!(all.len(), 4, "四件事各一句:{all:?}");
+        // 插件那句要说出是哪几个 —— 「有插件没被信任」而不说哪个,人无从下手。
+        let plugins = all.last().expect("four lines");
+        assert!(plugins.contains('a') && plugins.contains('b'), "{plugins}");
+
+        // 各说各的:只有一件成立时,另外三句不许跟着出来。
+        assert_eq!(launch_warnings(true, false, false, &[]).len(), 1);
+        assert_eq!(launch_warnings(false, true, false, &[]).len(), 1);
+        assert_eq!(launch_warnings(false, false, true, &[]).len(), 1);
+        assert_eq!(launch_warnings(false, false, false, &["a".into()]).len(), 1);
+        // 而四句彼此不同 —— 都指向同一句话的话,人分不出发生了什么。
+        let mut distinct = all.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), 4, "{all:?}");
     }
 
     #[test]
