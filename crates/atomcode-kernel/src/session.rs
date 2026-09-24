@@ -17,7 +17,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::event::{PolicyIntervention, StopReason};
-use crate::message::{ImageContent, Message, MessageMeta, ReasoningBlock};
+use crate::message::{ImageContent, Message, MessageMeta, ReasoningBlock, Role};
 use crate::stream::TokenUsage;
 use crate::tool::ToolCall;
 
@@ -865,6 +865,75 @@ fn taken_back(events: &[LoggedEvent]) -> impl Fn(SeqNo) -> bool {
     move |seq: SeqNo| rewound.iter().any(|(to, at)| seq >= *to && seq < *at)
 }
 
+/// 投影的落笔处：把一条条事实落成模型可见的消息。
+///
+/// 它存在的唯一理由是图片。provider 只在 user 消息上序列化图片（tool 消息上带图直接
+/// 400），所以工具带回来的图必须另起一条 user 消息承载；而那条消息**不能**插在同一批
+/// tool 结果中间——assistant 的 `tool_calls` 后面必须紧跟这批结果的全部 tool 消息，
+/// 中间夹一条 user 会让整个请求被拒（`insufficient tool messages following tool_calls
+/// message`）。一批里每来一条带图的结果就落一条承载消息正是这个错误：两次 `read_file`
+/// 读图就够把会话锁死，而每轮请求都由这份投影重建，于是每个「继续」都原样再失败一次。
+///
+/// 所以图片先攒着（[`take_images`](Self::take_images)），等这条流水线上落下第一条
+/// **不是** tool 结果的消息时（或日志走完时）才作为一条 user 承载消息落下，紧跟这一批
+/// 结果之后。这与回合引擎 live 路径的时机一致：`agent/engine.rs` 把一批图片攒进
+/// `turn_images`，批结束后才落一条。
+struct Projection {
+    messages: Vec<TracedMessage>,
+    /// 已收下、还没落成承载消息的图片。
+    pending: Vec<ImageContent>,
+    /// 第一条带图结果的序号，给承载消息做 provenance。
+    pending_from: SeqNo,
+}
+
+impl Projection {
+    fn new() -> Self {
+        Self {
+            messages: Vec::new(),
+            pending: Vec::new(),
+            pending_from: 0,
+        }
+    }
+
+    /// 落一条消息。落下之前，若这一条不是 tool 结果而手里还攒着图片，说明上一批结果
+    /// 已经走完：先把承载消息落了，图片才不会挤进这批结果中间。
+    fn push(&mut self, message: Message, source: Provenance) {
+        if message.role != Role::Tool {
+            self.flush_images();
+        }
+        self.messages.push(TracedMessage { message, source });
+    }
+
+    /// 收下一条工具结果带的图片，**不**当场落消息（理由见 struct 的说明）。
+    fn take_images(&mut self, from: SeqNo, images: &[ImageContent]) {
+        if images.is_empty() {
+            return;
+        }
+        if self.pending.is_empty() {
+            self.pending_from = from;
+        }
+        self.pending.extend(images.iter().cloned());
+    }
+
+    /// 日志走完：攒着的图片也要落下。
+    fn finish(mut self) -> Vec<TracedMessage> {
+        self.flush_images();
+        self.messages
+    }
+
+    fn flush_images(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let mut carrier = Message::user_with_images("", std::mem::take(&mut self.pending));
+        carrier.synthetic = true;
+        self.messages.push(TracedMessage {
+            message: carrier,
+            source: Provenance::Derived(self.pending_from),
+        });
+    }
+}
+
 fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<TracedMessage> {
     let taken_back = taken_back(events);
 
@@ -920,14 +989,11 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<TracedMessage> {
         })
         .collect();
 
-    let mut messages = Vec::new();
-    let mut push = |message: Message, source: Provenance| {
-        messages.push(TracedMessage { message, source });
-    };
+    let mut projection = Projection::new();
     if let Some((seq, summary)) = summary {
         let mut message = Message::system(summary);
         message.synthetic = true;
-        push(message, Provenance::Summary(seq));
+        projection.push(message, Provenance::Summary(seq));
     }
 
     for logged in events.iter().filter(|e| {
@@ -982,7 +1048,7 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<TracedMessage> {
                         if let SessionEvent::AssistantMessage { tool_calls, .. } = &e.event {
                             for call in tool_calls {
                                 if !answered.contains(call.id.as_str()) {
-                                    push(
+                                    projection.push(
                                         Message::tool_result(&call.id, "(cancelled)", true),
                                         Provenance::Derived(seq),
                                     );
@@ -991,7 +1057,7 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<TracedMessage> {
                         }
                     }
                 }
-                push(Message::user_interruption(), Provenance::Derived(seq));
+                projection.push(Message::user_interruption(), Provenance::Derived(seq));
             }
             SessionEvent::UserMessage { text, images, .. } => {
                 let text = text_of(text);
@@ -1000,7 +1066,7 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<TracedMessage> {
                 } else {
                     Message::user_with_images(text, images.clone())
                 };
-                push(message, Provenance::Event(seq));
+                projection.push(message, Provenance::Event(seq));
             }
             // A summary a resumed session was seeded with stands for what came
             // before it — until a later compaction's summary stands for that too.
@@ -1061,7 +1127,7 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<TracedMessage> {
                     InjectionOrigin::CompactionSummary => Provenance::Summary(seq),
                     _ => Provenance::Derived(seq),
                 };
-                push(message, source);
+                projection.push(message, source);
             }
             SessionEvent::AssistantMessage {
                 text,
@@ -1079,10 +1145,10 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<TracedMessage> {
                 if with_meta {
                     message.meta = meta.clone();
                 }
-                push(message, Provenance::Event(seq));
+                projection.push(message, Provenance::Event(seq));
             }
             SessionEvent::PartialReply { text, .. } if !text.is_empty() => {
-                push(
+                projection.push(
                     Message::assistant(text_of(text), Vec::new()),
                     Provenance::Event(seq),
                 );
@@ -1105,25 +1171,28 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<TracedMessage> {
                 } else {
                     content.clone()
                 };
-                push(
+                projection.push(
                     Message::tool_result(call_id, &shown, *is_error),
                     Provenance::Event(seq),
                 );
                 // A provider serializes images on a user message and rejects
-                // them on a tool one, so the picture rides in immediately
-                // after the result it belongs to.
-                if !images.is_empty() {
-                    let mut carrier = Message::user_with_images("", images.clone());
-                    carrier.synthetic = true;
-                    push(carrier, Provenance::Derived(seq));
-                }
+                // them on a tool one, so the picture rides in a carrier user
+                // message of its own — but only once this batch's results have
+                // ALL landed: a user message between two tool results of one
+                // assistant `tool_calls` is exactly the payload a provider
+                // rejects as "insufficient tool messages following tool_calls
+                // message". Two image results in one batch used to break the
+                // session permanently, since every request is rebuilt from this
+                // projection. `Projection` holds them until the run of tool
+                // messages ends (or the log does).
+                projection.take_images(seq, images);
             }
             // Chunks, headers, usage and turn boundaries are facts about the
             // session, not content the model receives.
             _ => {}
         }
     }
-    messages
+    projection.finish()
 }
 
 // ---- questions put to a person ------------------------------------------
