@@ -325,6 +325,14 @@ pub async fn reload_capabilities() -> Result<atomcode_coding::SessionChanged, Hu
     hub().reload_capabilities().await
 }
 
+/// "Always allow" an MCP tool through the live runtime — see
+/// [`atomcode_coding::CodingRuntimeHandle::approve_mcp_tool`].
+pub async fn approve_mcp_tool(
+    alias: String,
+) -> Result<Option<atomcode_coding::McpToolApproval>, HubError> {
+    hub().approve_mcp_tool(alias).await
+}
+
 pub async fn mcp_servers() -> Result<(PathBuf, Vec<crate::live_hub::LiveMcpServer>), HubError> {
     hub().mcp_servers().await
 }

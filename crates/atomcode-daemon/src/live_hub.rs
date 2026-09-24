@@ -753,6 +753,19 @@ impl LiveViewHub {
         Ok(changed)
     }
 
+    /// "Always allow" an MCP tool through the bound runtime, whose registry is the
+    /// one the model's MCP calls go through.
+    pub async fn approve_mcp_tool(
+        &self,
+        alias: String,
+    ) -> Result<Option<atomcode_coding::McpToolApproval>, HubError> {
+        let (_, handle) = self.bound_handle()?;
+        handle
+            .approve_mcp_tool(alias)
+            .await
+            .map_err(|error| HubError::RuntimeRejected(error.to_string()))
+    }
+
     /// The live runtime's MCP servers — the registry the model's tools come from,
     /// not the daemon's own — each with how many of its tools the model is offered
     /// right now, and the directory the runtime runs in.

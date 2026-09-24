@@ -11,7 +11,6 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
 
-use atomcode_capabilities::mcp::McpRegistry;
 use atomcode_capabilities::tools::PermissionDecision;
 use atomcode_coding::runtime::{CodingRuntimeEvent, CompactionCompletion};
 use atomcode_config::config::Config;
@@ -414,7 +413,7 @@ pub(crate) async fn run_chat_turn_v2(
     runtime_event_tx: mpsc::UnboundedSender<CodingRuntimeEvent>,
     cancel: CancellationToken,
     runtime_cfg: atomcode_coding::CodingRuntimeConfig,
-    mut perm_rx: Option<mpsc::UnboundedReceiver<PermissionDecision>>,
+    mut perm_rx: Option<mpsc::UnboundedReceiver<crate::permission_bridge::ChatPermission>>,
     user_input_responders: Option<crate::permission_bridge::UserInputResponders>,
     approval_mode: ApprovalMode,
 ) {
@@ -511,21 +510,29 @@ pub(crate) async fn run_chat_turn_v2(
             }
             CodingRuntimeEvent::Request(request) if request.kind == APPROVAL_KIND => {
                 let _ = runtime_event_tx.send(CodingRuntimeEvent::Request(request.clone()));
-                if serde_json::from_value::<ApprovalRequest>(request.payload).is_err() {
+                let Ok(approval) = serde_json::from_value::<ApprovalRequest>(request.payload)
+                else {
                     let _ = handle.respond(request.id, serde_json::Value::Null).await;
                     continue;
-                }
-                let decision = match &mut perm_rx {
-                    None => fallback_approval_decision(approval_mode),
+                };
+                let answer = match &mut perm_rx {
+                    None => fallback_approval_decision(approval_mode).into(),
                     Some(rx) => tokio::select! {
                         _ = cancel.cancelled(), if !cancelled => {
                             cancelled = true;
                             let _ = handle.cancel().await;
-                            PermissionDecision::Deny
+                            PermissionDecision::Deny.into()
                         }
-                        decision = rx.recv() => decision.unwrap_or(PermissionDecision::Deny),
+                        answer = rx.recv() => answer.unwrap_or(PermissionDecision::Deny.into()),
                     },
                 };
+                // "Always allow this MCP tool" is carried out by this runtime — the
+                // one the call belongs to — and names the tool the request is for,
+                // not whatever the client sent alongside its answer.
+                if answer.persist_mcp_tool && approval.tool.starts_with("mcp__") {
+                    persist_mcp_tool_approval(&handle, approval.tool.clone()).await;
+                }
+                let decision = answer.decision;
                 let response = match decision {
                     PermissionDecision::AllowOnce => ApprovalResponse::allow(),
                     PermissionDecision::AllowAlways => ApprovalResponse::allow_always(),
@@ -2286,6 +2293,45 @@ pub(crate) struct LivePermissionReq {
     pub tool_name: Option<String>,
 }
 
+/// Carry out "always allow this MCP tool" through `handle` — the runtime the
+/// call belongs to — and say what happened.
+pub(crate) async fn persist_mcp_tool_approval(
+    handle: &atomcode_coding::CodingRuntimeHandle,
+    alias: String,
+) {
+    match handle.approve_mcp_tool(alias.clone()).await {
+        Ok(approval) => report_mcp_tool_approval(&alias, approval),
+        Err(error) => tracing::warn!(
+            target: "atomcode::mcp",
+            tool = %alias,
+            %error,
+            "\"always allow\" not applied"
+        ),
+    }
+}
+
+fn report_mcp_tool_approval(alias: &str, approval: Option<atomcode_coding::McpToolApproval>) {
+    match approval {
+        None => tracing::warn!(
+            target: "atomcode::mcp",
+            tool = %alias,
+            "\"always allow\" not applied: no connected server offers this tool"
+        ),
+        Some(atomcode_coding::McpToolApproval {
+            server,
+            tool,
+            persist_error: Some(error),
+        }) => tracing::warn!(
+            target: "atomcode::mcp",
+            %server,
+            %tool,
+            %error,
+            "allowed for this session, but not written to autoApprove"
+        ),
+        Some(_) => {}
+    }
+}
+
 /// POST /live/permission — Deliver a permission decision for a pending live-session tool-approval
 /// request. The hub correlates the response with the pending native request.
 ///
@@ -2293,24 +2339,18 @@ pub(crate) struct LivePermissionReq {
 ///   "allow"        → PermissionDecision::AllowOnce
 ///   "always_allow" → PermissionDecision::AllowAlways (persisted for the session)
 ///   anything else  → PermissionDecision::Deny
-pub(crate) async fn live_permission(
-    State(state): State<AppState>,
-    Json(req): Json<LivePermissionReq>,
-) -> impl IntoResponse {
+pub(crate) async fn live_permission(Json(req): Json<LivePermissionReq>) -> impl IntoResponse {
     use atomcode_capabilities::tools::{parse_permission_decision, PermissionDecision};
     let decision = if req.decision == "allow_persist" {
-        if let Some(full) = req.tool_name.as_deref() {
-            let reg = state.mcp_registry.read().await.clone();
-            if let Some((server, tool)) = reg.split_tool_name(full).await {
-                let project_dir = state.project.read().await.working_dir.clone();
-                if let Err(e) = atomcode_capabilities::mcp::config::add_auto_approved_tool(
-                    &project_dir,
-                    &server,
-                    &tool,
-                ) {
-                    tracing::warn!("[permission] persist autoApprove failed: {e}");
-                }
-                reg.mark_tool_auto_approved(full);
+        if let Some(full) = req.tool_name.as_deref().filter(|t| t.starts_with("mcp__")) {
+            match crate::native_live::approve_mcp_tool(full.to_string()).await {
+                Ok(approval) => report_mcp_tool_approval(full, approval),
+                Err(error) => tracing::warn!(
+                    target: "atomcode::mcp",
+                    tool = %full,
+                    error = ?error,
+                    "\"always allow\" not applied: no live runtime to apply it"
+                ),
             }
         }
         PermissionDecision::AllowOnce
@@ -2518,8 +2558,6 @@ pub(crate) async fn live_mcp_trust(State(state): State<AppState>) -> impl IntoRe
     let working_dir = live_current_working_dir(&fallback);
     match atomcode_capabilities::mcp::trust::trust_project(&working_dir) {
         Ok(()) => {
-            let new_registry = Arc::new(McpRegistry::from_config_background(&working_dir));
-            crate::replace_project_mcp_registry(&state, &working_dir, new_registry).await;
             // Re-prepare the persistent native runtime so it mounts the newly
             // trusted project servers immediately. Best-effort: before the first
             // turn there is no runtime yet, and its first prepare reads trust

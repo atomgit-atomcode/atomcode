@@ -181,6 +181,17 @@ pub struct McpStatusSnapshot {
     pub servers: Vec<(String, atomcode_capabilities::mcp::ServerStatus)>,
 }
 
+/// An MCP tool made "always allowed" by [`CodingRuntimeHandle::approve_mcp_tool`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpToolApproval {
+    pub server: String,
+    /// The tool's own name on its server — what `autoApprove` lists.
+    pub tool: String,
+    /// Why the project file was not written, when it was not. The session
+    /// grant holds either way; only the next session would ask again.
+    pub persist_error: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct McpToolsSnapshot {
     pub generation: RuntimeGeneration,
@@ -1855,6 +1866,27 @@ impl CodingRuntimeHandle {
         result.await.map_err(|_| RuntimeError::Unavailable)?
     }
 
+    /// "Always allow" the MCP tool the model calls `alias` (`mcp__<server>__<tool>`):
+    /// auto-approve it for the rest of this session and add it to the project's
+    /// `autoApprove`, both through THIS runtime's registry — the one whose tools the
+    /// model calls, and the only one that can map a sanitised alias back to the
+    /// server's own tool name. `None` when no connected server offers `alias`.
+    pub async fn approve_mcp_tool(
+        &self,
+        alias: String,
+    ) -> Result<Option<McpToolApproval>, RuntimeError> {
+        let state = self.state.load(Ordering::Acquire);
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::ApproveMcpTool {
+                generation: runtime_state_generation(state),
+                alias,
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
     /// The management list: every configured server — disabled ones included —
     /// with the live status, source, config path, transport, auth and tool count.
     pub async fn mcp_rows(&self) -> Result<McpRowsSnapshot, RuntimeError> {
@@ -2869,6 +2901,14 @@ pub enum CodingRuntimeControl {
         generation: u64,
         server: String,
         done: oneshot::Sender<Result<McpToolsSnapshot, RuntimeError>>,
+    },
+    /// "Always allow" one MCP tool: auto-approve it in this session and write it
+    /// into the project's `autoApprove`. Runs mid-turn — it is answered while an
+    /// approval for that very tool is pending — and needs no rebuild.
+    ApproveMcpTool {
+        generation: u64,
+        alias: String,
+        done: oneshot::Sender<Result<Option<McpToolApproval>, RuntimeError>>,
     },
     /// The panel's list: every configured server — disabled ones included — with
     /// the live status, source, config path, transport, auth and tool count.
@@ -5215,6 +5255,46 @@ fn spawn_runtime_owner_with_optional_agent(
                             tools,
                             available,
                         }));
+                    }
+                    Some(CodingRuntimeControl::ApproveMcpTool {
+                        generation: request_generation,
+                        alias,
+                        done,
+                    }) => {
+                        // Generation only: this answers an approval the running
+                        // turn is waiting on, so an active turn is the normal case.
+                        if request_generation != generation {
+                            let _ = done.send(Err(RuntimeError::Busy));
+                            continue;
+                        }
+                        let Some(runtime) = resources.as_ref() else {
+                            let _ = done.send(Err(RuntimeError::Unavailable));
+                            continue;
+                        };
+                        let Some(registry) = runtime.parts.mcp_registry.as_ref() else {
+                            let _ = done.send(Ok(None));
+                            continue;
+                        };
+                        let Some((server, tool)) = registry.split_tool_name(&alias).await else {
+                            let _ = done.send(Ok(None));
+                            continue;
+                        };
+                        // The session grant first: a project file that cannot be
+                        // rewritten (a commented `.mcp.json` is refused) must not
+                        // cost the person the answer they just gave.
+                        registry.mark_tool_auto_approved(&alias);
+                        let persist_error = atomcode_capabilities::mcp::config::add_auto_approved_tool(
+                            &runtime.config.working_dir,
+                            &server,
+                            &tool,
+                        )
+                        .err()
+                        .map(|error| format!("{error:#}"));
+                        let _ = done.send(Ok(Some(McpToolApproval {
+                            server,
+                            tool,
+                            persist_error,
+                        })));
                     }
                     Some(CodingRuntimeControl::McpRows {
                         generation: request_generation,
@@ -8219,6 +8299,9 @@ fn reject_runtime_control(
             let _ = done.send(Err(RuntimeError::Unavailable));
         }
         CodingRuntimeControl::McpTools { done, .. } => {
+            let _ = done.send(Err(RuntimeError::Unavailable));
+        }
+        CodingRuntimeControl::ApproveMcpTool { done, .. } => {
             let _ = done.send(Err(RuntimeError::Unavailable));
         }
         CodingRuntimeControl::McpRows { done, .. } => {

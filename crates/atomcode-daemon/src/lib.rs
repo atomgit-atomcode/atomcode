@@ -139,7 +139,6 @@ use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use atomcode_auth as auth;
-use atomcode_capabilities::mcp::McpRegistry;
 use atomcode_capabilities::session::{SessionManager as NativeSessionManager, SessionStoreError};
 use atomcode_coding::CodingRuntimeEvent;
 use atomcode_config::config::Config;
@@ -658,10 +657,6 @@ pub struct AppState {
     pub project: ProjectStateStore,
     /// Admitted background chat operations and their session/request aliases.
     active_chats: ActiveChatRegistry,
-    /// MCP server registry (global, used for /mcp/status backward compat)
-    pub mcp_registry: Arc<RwLock<Arc<McpRegistry>>>,
-    /// Per-project MCP registry cache (keyed by working_dir)
-    pub mcp_cache: Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>>,
     /// In-flight OAuth login sessions (login_id -> entry)
     pub(crate) login_sessions: LoginSessionsStore,
     /// Serializes external OAuth attempt creation with capacity accounting.
@@ -702,15 +697,6 @@ pub struct AppState {
     /// [`auth_token::webui_cookie_name`].
     pub webui_cookie_name: String,
 }
-
-/// Cached MCP registry for a specific project directory.
-pub struct CachedMcpRegistry {
-    pub registry: Arc<McpRegistry>,
-    pub last_used: std::time::Instant,
-}
-
-/// Maximum number of per-project MCP registries to cache.
-const MCP_CACHE_MAX: usize = 5;
 
 /// Get default working directory
 fn default_working_dir() -> PathBuf {
@@ -4621,7 +4607,6 @@ async fn chat_stream(
 
     // Clone state for the spawned task
     let active_chats = state.active_chats.clone();
-    let mcp_cache = state.mcp_cache.clone();
     let telemetry = state.telemetry.clone();
     let pending_permissions = state.pending_permissions.clone();
     let pending_user_inputs = state.pending_user_inputs.clone();
@@ -4661,7 +4646,6 @@ async fn chat_stream(
                     cancel_token,
                     operation_id,
                     active_chats,
-                    mcp_cache,
                     telemetry,
                     pending_permissions,
                     pending_user_inputs,
@@ -4844,9 +4828,6 @@ async fn process_chat_request(
     cancel_token: CancellationToken,
     operation_id: String,
     active_chats: ActiveChatRegistry,
-    // CodingRuntime builds its own MCP; this per-project cache is warmed by
-    // the /context, /compact and /live paths, not the chat turn.
-    _mcp_cache: Arc<RwLock<HashMap<PathBuf, CachedMcpRegistry>>>,
     telemetry: Arc<Telemetry>,
     pending_permissions: permission_bridge::PermissionResponders,
     pending_user_inputs: permission_bridge::UserInputResponders,
@@ -5009,8 +4990,7 @@ async fn process_chat_request(
         // Interactive approval: route /chat/permission decisions to the native runtime
         // request waiting for this turn.
         let perm_rx = if registered_permission_responder {
-            let (tx, rx) =
-                mpsc::unbounded_channel::<atomcode_capabilities::tools::PermissionDecision>();
+            let (tx, rx) = mpsc::unbounded_channel::<permission_bridge::ChatPermission>();
             pending_permissions.register(perm_session_key.clone(), tx);
             Some(rx)
         } else {
@@ -5193,7 +5173,9 @@ pub struct PermissionDecisionRequest {
     pub session_id: String,
     /// "allow" | "deny" | "always_allow" | "allow_persist"
     pub decision: String,
-    /// Full MCP tool name (`mcp__{server}__{tool}`); required for `allow_persist`.
+    /// Full MCP tool name (`mcp__{server}__{tool}`). Accepted for compatibility and
+    /// ignored here: `allow_persist` applies to the tool the pending request names,
+    /// which the runtime that asked already knows.
     #[serde(default)]
     pub tool_name: Option<String>,
 }
@@ -5204,23 +5186,15 @@ async fn chat_permission(
 ) -> impl IntoResponse {
     use atomcode_capabilities::tools::{parse_permission_decision, PermissionDecision};
     if req.decision == "allow_persist" {
-        if let Some(full) = req.tool_name.as_deref() {
-            let reg = state.mcp_registry.read().await.clone();
-            if let Some((server, tool)) = reg.split_tool_name(full).await {
-                let project_dir = state.project.read().await.working_dir.clone();
-                if let Err(e) = atomcode_capabilities::mcp::config::add_auto_approved_tool(
-                    &project_dir,
-                    &server,
-                    &tool,
-                ) {
-                    tracing::warn!("[permission] persist autoApprove failed: {e}");
-                }
-                reg.mark_tool_auto_approved(full);
-            }
-        }
-        let ok = state
-            .pending_permissions
-            .deliver(&req.session_id, PermissionDecision::AllowOnce);
+        // The runtime waiting on this answer carries it out, through its own
+        // registry and for the tool its request names (`run_chat_turn_v2`).
+        let ok = state.pending_permissions.deliver(
+            &req.session_id,
+            permission_bridge::ChatPermission {
+                decision: PermissionDecision::AllowOnce,
+                persist_mcp_tool: true,
+            },
+        );
         return Json(serde_json::json!({ "success": ok }));
     }
     let decision = parse_permission_decision(&req.decision);
@@ -5265,10 +5239,11 @@ struct McpServerStatus {
 
 #[derive(Serialize)]
 struct McpStatusResponse {
-    /// Which registry answered: `"live"` — the live session's runtime in this
-    /// project, whose `tool_count` is the tools its model is offered right now (a
-    /// connected server showing 0 has not had its tools published yet) — or
-    /// `"daemon"`, the daemon's own registry, when no live session runs here.
+    /// Who answered: `"live"` — the live session's runtime in this project, whose
+    /// `tool_count` is the tools its model is offered right now (a connected
+    /// server showing 0 has not had its tools published yet) — or `"daemon"`
+    /// when no live session runs here, and every configured server is listed
+    /// `disconnected` because nothing is connected.
     source: &'static str,
     servers: Vec<McpServerStatus>,
     /// Whether the current project's `.mcp.json` has been explicitly trusted by
@@ -5302,11 +5277,31 @@ fn merge_configured_mcp_statuses(
 
 async fn mcp_status(State(state): State<AppState>) -> Json<McpStatusResponse> {
     let working_dir = state.project.read().await.working_dir.clone();
-    // A live session in this project answers from its own registry — the one its
-    // model's tools come from. The daemon's registry (`/chat`) connects the same
-    // servers separately and stays up across a session switch, so reporting it
-    // said "connected" while the live model had no MCP tool at all. The count is
-    // then the tools the model is offered, which is what tells the two apart.
+    let all_cfgs = atomcode_capabilities::mcp::load_mcp_config(&working_dir).unwrap_or_default();
+
+    // Trust / blocked enrichment: compute blocked FIRST so we can exclude them from the
+    // server rows. Blocked (untrusted-project) servers are withheld — they never
+    // connect — so they appear in `blocked[]` only, never also as a row (a
+    // contradiction the webui rendered).
+    let trusted = atomcode_capabilities::mcp::trust::is_project_trusted(&working_dir);
+    let blocked: Vec<String> =
+        atomcode_capabilities::mcp::trust::partition_by_trust(all_cfgs.clone(), &working_dir)
+            .blocked
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+    let configured_names: Vec<String> = all_cfgs
+        .iter()
+        .map(|c| c.name.clone())
+        .filter(|n| !blocked.contains(n))
+        .collect();
+
+    // The only MCP connections are a runtime's own. A live session in this
+    // project answers from its registry — the one its model's tools come from —
+    // and each server's count is the tools the model is offered right now, so a
+    // connected server showing 0 is one whose tools are not in front of the model
+    // yet (a switch or reload reconnects). A configured server the registry has
+    // not reported yet shows as `connecting`, so a slow handshake reads as one.
     let live = match crate::native_live::mcp_servers().await {
         Ok((live_dir, servers)) if live_dir == working_dir => Some(servers),
         _ => None,
@@ -5321,57 +5316,22 @@ async fn mcp_status(State(state): State<AppState>) -> Json<McpStatusResponse> {
                 .into_iter()
                 .map(|server| (server.name, server.status))
                 .collect();
+            let statuses = merge_configured_mcp_statuses(statuses, &configured_names);
             ("live", statuses, counts)
         }
+        // No live session here: nothing is connected — a `/chat` turn starts its
+        // own runtime and connects for the length of the turn. The configured
+        // servers are listed as such, rather than connecting every one of them a
+        // second time only to report on them (and not as `connecting`, which a
+        // front end polls on).
         None => {
-            // Prefer the per-project `/chat` registry when it exists; otherwise
-            // report the daemon registry.
-            let registry = if let Some(reg) = state
-                .mcp_cache
-                .read()
-                .await
-                .get(&working_dir)
-                .map(|c| c.registry.clone())
-            {
-                reg
-            } else {
-                state.mcp_registry.read().await.clone()
-            };
-            let statuses = registry.server_statuses().await;
-            // Fetch the tool list once (was previously re-fetched per connected server).
-            let mut counts: HashMap<String, usize> = HashMap::new();
-            for tool in registry.list_all_tools().await {
-                *counts.entry(tool.server_name).or_default() += 1;
-            }
-            ("daemon", statuses, counts)
+            let statuses = configured_names
+                .into_iter()
+                .map(|name| (name, atomcode_capabilities::mcp::ServerStatus::Disconnected))
+                .collect();
+            ("daemon", statuses, HashMap::new())
         }
     };
-
-    let all_cfgs = atomcode_capabilities::mcp::load_mcp_config(&working_dir).unwrap_or_default();
-
-    // Trust / blocked enrichment: compute blocked FIRST so we can exclude them from the
-    // "connecting" synthetic entries below. Blocked (untrusted-project) servers are withheld
-    // — they never connect — so they must NOT appear as "connecting" in the status list while
-    // simultaneously appearing in `blocked[]` (a contradiction the webui rendered).
-    let trusted = atomcode_capabilities::mcp::trust::is_project_trusted(&working_dir);
-    let blocked: Vec<String> =
-        atomcode_capabilities::mcp::trust::partition_by_trust(all_cfgs.clone(), &working_dir)
-            .blocked
-            .into_iter()
-            .map(|c| c.name)
-            .collect();
-
-    // Surface configured-but-not-yet-connected servers as `connecting` so a slow
-    // handshake (especially remote HTTP) renders as "connecting", not an empty
-    // panel. Names come from the same user + project mcp.json the registry loads.
-    // Blocked servers are excluded: they aren't "connecting", they're withheld, and they
-    // already appear in the `blocked[]` list above.
-    let configured_names: Vec<String> = all_cfgs
-        .iter()
-        .map(|c| c.name.clone())
-        .filter(|n| !blocked.contains(n))
-        .collect();
-    let statuses = merge_configured_mcp_statuses(statuses, &configured_names);
 
     let servers = build_mcp_server_rows(statuses, |name| counts.get(name).copied().unwrap_or(0));
     Json(McpStatusResponse {
@@ -5419,41 +5379,10 @@ fn build_mcp_server_rows(
     servers
 }
 
-/// Replace the daemon fallback registry and invalidate the per-project cache
-/// under one cache write barrier. The replacement also occupies the cache key
-/// so a concurrent cache-miss build cannot resurrect its stale registry after
-/// this cutover.
-pub(crate) async fn replace_project_mcp_registry(
-    state: &AppState,
-    project_dir: &std::path::Path,
-    replacement: Arc<McpRegistry>,
-) {
-    let mut cache = state.mcp_cache.write().await;
-    if !cache.contains_key(project_dir) && cache.len() >= MCP_CACHE_MAX {
-        if let Some(oldest_key) = cache
-            .iter()
-            .min_by_key(|(_, value)| value.last_used)
-            .map(|(key, _)| key.clone())
-        {
-            cache.remove(&oldest_key);
-        }
-    }
-    cache.insert(
-        project_dir.to_path_buf(),
-        CachedMcpRegistry {
-            registry: replacement.clone(),
-            last_used: std::time::Instant::now(),
-        },
-    );
-    *state.mcp_registry.write().await = replacement;
-}
-
-async fn mcp_reload(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let project = state.project.read().await;
-    let project_dir = project.working_dir.clone();
-    drop(project);
-    let new_registry = Arc::new(McpRegistry::from_config_background(&project_dir));
-    replace_project_mcp_registry(&state, &project_dir, new_registry).await;
+/// Reconnect the live session's MCP servers and wait for their tools. With no
+/// live session nothing is connected, so there is nothing to reload: the next
+/// runtime reads the config fresh when it starts.
+async fn mcp_reload() -> Json<serde_json::Value> {
     let runtime_reloaded = match crate::native_live::binding() {
         Ok(_) => crate::native_live::reload_capabilities().await.is_ok(),
         Err(_) => true,
@@ -6591,10 +6520,6 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     // Step 6: Seed account_id from stored auth (R4.3)
     telemetry.set_account_id(auth::get_stored_auth().map(|a| a.user.id));
 
-    // Initialize MCP registry from project working directory config
-    // This reads both $ATOMCODE_HOME/mcp.json (user-level) and <project>/.mcp.json (project-level)
-    let mcp_registry = McpRegistry::from_config_background(&project_state.working_dir);
-
     // Step 7: Build AppState (R1.4)
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let last_activity = Arc::new(std::sync::atomic::AtomicI64::new(now_unix_ms()));
@@ -6605,8 +6530,6 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     let state = AppState {
         project: project_store,
         active_chats: ActiveChatRegistry::default(),
-        mcp_registry: Arc::new(RwLock::new(Arc::new(mcp_registry))),
-        mcp_cache: Arc::new(RwLock::new(HashMap::new())),
         login_sessions: Arc::new(RwLock::new(HashMap::new())),
         login_start_lock: Arc::new(Mutex::new(())),
         daemon_instance_id: Arc::from(uuid::Uuid::new_v4().to_string()),
@@ -7676,8 +7599,6 @@ mod tests {
                 name: "chat-test".into(),
             })),
             active_chats: ActiveChatRegistry::default(),
-            mcp_registry: Arc::new(RwLock::new(Arc::new(McpRegistry::new()))),
-            mcp_cache: Arc::new(RwLock::new(HashMap::new())),
             login_sessions: Arc::new(RwLock::new(HashMap::new())),
             login_start_lock: Arc::new(Mutex::new(())),
             daemon_instance_id: Arc::from("chat-test-instance"),
@@ -7736,34 +7657,38 @@ mod tests {
         assert!(event_rx.try_recv().is_err());
     }
 
+    /// With no live session nothing is connected, and `/mcp/status` says so: the
+    /// configured servers are listed `disconnected` (not `connecting`, which a front
+    /// end polls on), and a server withheld by project trust stays out of the rows.
+    /// It used to connect every server a second time, on a registry of its own,
+    /// only to report on them.
     #[tokio::test(flavor = "current_thread")]
-    async fn replacing_project_mcp_registry_invalidates_the_cached_registry() {
+    async fn mcp_status_without_a_live_session_connects_nothing() {
         let home = ScopedChatHome::new();
         let state = chat_test_state(&home);
-        let working_dir = state.project.read().await.working_dir.clone();
-        let stale = Arc::new(McpRegistry::new());
-        state.mcp_cache.write().await.insert(
-            working_dir.clone(),
-            CachedMcpRegistry {
-                registry: stale,
-                last_used: std::time::Instant::now(),
-            },
-        );
-        let replacement = Arc::new(McpRegistry::new());
+        let dir = state.project.read().await.working_dir.clone();
+        std::fs::write(
+            dir.join("mcp.json"),
+            r#"{"mcpServers":{"user-srv":{"command":"/bin/true"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(".mcp.json"),
+            r#"{"mcpServers":{"project-srv":{"command":"/bin/true"}}}"#,
+        )
+        .unwrap();
 
-        replace_project_mcp_registry(&state, &working_dir, replacement.clone()).await;
+        let Json(status) = mcp_status(State(state)).await;
 
-        let cached = state
-            .mcp_cache
-            .read()
-            .await
-            .get(&working_dir)
-            .expect("replacement must occupy the cache key")
-            .registry
-            .clone();
-        assert!(Arc::ptr_eq(&cached, &replacement));
-        let current = state.mcp_registry.read().await;
-        assert!(Arc::ptr_eq(&*current, &replacement));
+        assert_eq!(status.source, "daemon");
+        let rows: Vec<(&str, &str)> = status
+            .servers
+            .iter()
+            .map(|row| (row.name.as_str(), row.status.as_str()))
+            .collect();
+        assert_eq!(rows, vec![("user-srv", "disconnected")]);
+        assert!(status.servers.iter().all(|row| row.tool_count.is_none()));
+        assert_eq!(status.blocked, vec!["project-srv".to_string()]);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -8084,7 +8009,6 @@ mod tests {
             admission.cancellation,
             admission.operation_id,
             active_chats.clone(),
-            Arc::new(RwLock::new(HashMap::new())),
             chat_test_telemetry(&home),
             permission_bridge::PermissionResponders::new(),
             permission_bridge::UserInputResponders::new(),
@@ -8876,7 +8800,6 @@ mod tests {
             admission.cancellation,
             admission.operation_id,
             active_chats.clone(),
-            Arc::new(RwLock::new(HashMap::new())),
             telemetry,
             permission_bridge::PermissionResponders::new(),
             permission_bridge::UserInputResponders::new(),

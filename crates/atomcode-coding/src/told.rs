@@ -229,6 +229,9 @@ mod tests {
             C::Compact { .. }
             | C::Submit { .. }
             | C::Respond { .. }
+            // "Always allow" one MCP tool: part of the answer to an approval, which
+            // the `Respond` that follows carries; the model's tools do not change.
+            | C::ApproveMcpTool { .. }
             | C::ResolvePolicyIntervention { .. }
             | C::Cancel { .. }
             | C::QueueLocalContext { .. }

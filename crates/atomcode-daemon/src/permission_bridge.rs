@@ -10,10 +10,29 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 
+/// A person's answer to a `/chat` approval: the decision, and whether it was
+/// "always allow this MCP tool". The runtime waiting on the answer is the one
+/// that carries the tool out — through its own registry — so the flag travels
+/// with the decision instead of being acted on here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChatPermission {
+    pub decision: PermissionDecision,
+    pub persist_mcp_tool: bool,
+}
+
+impl From<PermissionDecision> for ChatPermission {
+    fn from(decision: PermissionDecision) -> Self {
+        Self {
+            decision,
+            persist_mcp_tool: false,
+        }
+    }
+}
+
 /// session_id -> decider 的 response 发送端。
 #[derive(Clone, Default)]
 pub struct PermissionResponders {
-    inner: Arc<RwLock<HashMap<String, UnboundedSender<PermissionDecision>>>>,
+    inner: Arc<RwLock<HashMap<String, UnboundedSender<ChatPermission>>>>,
 }
 
 /// A pending `/chat` structured-input request, keyed by the native runtime request id.
@@ -70,7 +89,7 @@ impl PermissionResponders {
     }
 
     /// 登记某 session 的决定发送端（`/chat` 启动时调用）。
-    pub fn register(&self, session_id: String, tx: UnboundedSender<PermissionDecision>) {
+    pub fn register(&self, session_id: String, tx: UnboundedSender<ChatPermission>) {
         self.inner.write().unwrap().insert(session_id, tx);
     }
 
@@ -80,9 +99,9 @@ impl PermissionResponders {
     }
 
     /// 把决定送给对应 session 的 decider。返回是否成功（session 是否在等待）。
-    pub fn deliver(&self, session_id: &str, decision: PermissionDecision) -> bool {
+    pub fn deliver(&self, session_id: &str, answer: impl Into<ChatPermission>) -> bool {
         if let Some(tx) = self.inner.read().unwrap().get(session_id) {
-            tx.send(decision).is_ok()
+            tx.send(answer.into()).is_ok()
         } else {
             false
         }
@@ -101,10 +120,26 @@ mod tests {
         reg.register("sess-1".into(), tx);
 
         assert!(reg.deliver("sess-1", PermissionDecision::AllowOnce));
-        assert!(matches!(
+        assert_eq!(
             rx.recv().await,
-            Some(PermissionDecision::AllowOnce)
-        ));
+            Some(ChatPermission::from(PermissionDecision::AllowOnce))
+        );
+    }
+
+    /// "Always allow this MCP tool" travels with the decision to the runtime that
+    /// asked, which carries it out through its own registry.
+    #[tokio::test]
+    async fn an_always_allow_reaches_the_runtime_with_its_decision() {
+        let reg = PermissionResponders::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        reg.register("sess-1".into(), tx);
+        let answer = ChatPermission {
+            decision: PermissionDecision::AllowOnce,
+            persist_mcp_tool: true,
+        };
+
+        assert!(reg.deliver("sess-1", answer));
+        assert_eq!(rx.recv().await, Some(answer));
     }
 
     #[test]

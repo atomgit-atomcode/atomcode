@@ -150,7 +150,8 @@ MCP 总开关：`CodingRuntimeConfig.mcp` 默认 `true`。**没有命令行全�
 
 **daemon HTTP 端点**：`GET /mcp/status`、`POST /mcp/reload`、`POST /live/mcp/trust`。
 
-- `GET /mcp/status`：当前项目有 live 会话时，报告**该会话 runtime 自己的**注册表（`"source": "live"`），每个 server 的 `tool_count` 是此刻**已发布给模型**的工具数——`connected` 而 `tool_count` 为 0 表示连上了、工具还没挂到模型面前（切会话 / reload 会重建能力树并重连）。没有 live 会话时报告 daemon 自己的注册表（`"source": "daemon"`，`tool_count` 为该注册表列出的工具数）。
+- `GET /mcp/status`：当前项目有 live 会话时，报告**该会话 runtime 自己的**注册表（`"source": "live"`），每个 server 的 `tool_count` 是此刻**已发布给模型**的工具数——`connected` 而 `tool_count` 为 0 表示连上了、工具还没挂到模型面前（切会话 / reload 会重建能力树并重连）。没有 live 会话时什么都没有连接（`"source": "daemon"`）：配置里的 server 逐个列为 `disconnected`、不带 `tool_count`；daemon 不再为了报状态另起一套连接（`/chat` 的回合各自在自己的 runtime 里连接）。
+- 审批里选「始终允许」（`allow_persist`）：由发起审批的那个 runtime 用它自己的注册表执行——本会话立即不再询问该工具，并写入定义该 server 的配置文件（项目 `.mcp.json`，否则用户级 `mcp.json`）的 `autoApprove`；配置文件带注释时拒绝改写，本会话的放行照样生效。
 - `POST /mcp/reload`、`POST /live/mcp/trust`，以及 `/live/switch_session`、切目录、新会话：都等 live 会话的 MCP 工具就位后再返回（最多 `CONNECT_TIMEOUT` 30 秒；超时照常返回，慢 server 的工具随后出现）。
 
 ---

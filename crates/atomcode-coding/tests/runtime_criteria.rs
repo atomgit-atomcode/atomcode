@@ -2615,6 +2615,92 @@ async fn a_switched_session_keeps_the_mcp_tools() {
     runtime.handle.shutdown().await.unwrap();
 }
 
+/// "Always allow" an MCP tool holds for the rest of the session and is written
+/// into `autoApprove` — through the runtime's own registry.
+///
+/// The daemon used to do this against a registry of its own: it wrote the file,
+/// then marked the tool auto-approved on a registry the model's calls never go
+/// through, so the very next call to the tool asked again until a reload.
+///
+/// Negative control: skip `approve_mcp_tool` and the second call asks again.
+#[cfg(unix)]
+async fn always_allowing_an_mcp_tool_holds_for_the_session_and_is_written() {
+    let env = env();
+    let scratch = tempfile::tempdir().unwrap();
+    let spawns = scratch.path().join("spawns.log");
+    let script = write_mcp_server(scratch.path(), &spawns);
+    let recorder = Arc::new(Recorder::default());
+    let mut start = start(env.project.path(), &recorder, SessionMode::Fresh);
+    start.prepare.mcp = true;
+    start.prepare.extra_mcp_servers = vec![atomcode_capabilities::mcp::McpServerConfig {
+        name: "t".into(),
+        disabled: false,
+        config: atomcode_capabilities::mcp::McpTransportConfig::Stdio {
+            command: "sh".into(),
+            args: vec![script.to_string_lossy().into_owned()],
+            env: Default::default(),
+            timeout_ms: Some(10_000),
+        },
+        source: atomcode_capabilities::mcp::config::McpConfigSource::Driver,
+        // Not trusted: each call is asked about until something says otherwise.
+        trust: false,
+        auto_approve: Vec::new(),
+    }];
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+    runtime
+        .handle
+        .wait_mcp_ready(std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
+
+    let allow = serde_json::json!({ "decision": "allow" });
+    let asked = turn_answering(&mut runtime, "mcp echo", Some(allow)).await;
+    assert_eq!(asked, 1, "an untrusted MCP tool is asked about");
+
+    let approval = runtime
+        .handle
+        .approve_mcp_tool("mcp__t__echo".into())
+        .await
+        .unwrap()
+        .expect("a connected server offers the tool");
+    assert_eq!(
+        (approval.server.as_str(), approval.tool.as_str()),
+        ("t", "echo")
+    );
+    assert_eq!(approval.persist_error, None);
+
+    let asked = turn_answering(&mut runtime, "mcp echo", None).await;
+    assert_eq!(asked, 0, "an always-allowed tool is not asked about again");
+    let result = recorder
+        .last_request()
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::Tool)
+        .map(|m| m.text.clone())
+        .unwrap_or_default();
+    assert!(result.contains("echo:from-server"), "it ran: {result}");
+
+    // Not defined in the project's `.mcp.json`, so it goes to the user file.
+    let user = std::fs::read_to_string(env._home.path().join("mcp.json")).unwrap();
+    let user: serde_json::Value = serde_json::from_str(&user).unwrap();
+    assert_eq!(
+        user["mcpServers"]["t"]["autoApprove"],
+        serde_json::json!(["echo"]),
+        "{user}"
+    );
+
+    assert_eq!(
+        runtime
+            .handle
+            .approve_mcp_tool("mcp__nobody__nothing".into())
+            .await
+            .unwrap(),
+        None,
+        "a tool no connected server offers is not approved"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
 /// Cancel a turn that is waiting on the model, and wait for it to end.
 async fn cancel_hanging_turn(runtime: &mut CodingRuntime, recorder: &Recorder) {
     let before = recorder.requests.lock().unwrap().len();
@@ -4956,6 +5042,7 @@ mod criteria {
         an_mcp_servers_tools_are_offered_and_run,
         withdrawing_mcp_takes_the_tools_off_the_model,
         a_switched_session_keeps_the_mcp_tools,
+        always_allowing_an_mcp_tool_holds_for_the_session_and_is_written,
         a_failed_mcp_connection_is_metered,
         a_model_round_reports_how_long_it_took,
         every_metered_event_says_which_turn_and_round_it_was,
