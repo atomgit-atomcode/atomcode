@@ -323,6 +323,13 @@ pub struct Moment {
     /// title still carries any name; the name PILL on the input rule shows only a
     /// user-chosen one, so an auto-guess does not pin a chip to the composer.
     pub title_user_set: bool,
+    /// 也许接下来会说的一句话,宿主在一个回合**自己结束**之后给的
+    /// (`HostEvent::Suggested`)。
+    ///
+    /// **不是会话里的一条事实**:没人说过它,它是一个猜测。所以它只在编辑区
+    /// 空着、而且没有回合在跑的时候画出来,提交之后就作废 —— 一句针对已经
+    /// 过去的那个回合的建议,比没有建议更坏。
+    pub suggestion: Option<String>,
     pub scroll: ScrollPos,
     /// What the pointer has selected, if anything. Screen state, not a fact —
     /// which is exactly what this struct is for.

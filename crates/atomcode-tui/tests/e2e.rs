@@ -7371,13 +7371,19 @@ struct ModeHost {
 impl ModeHost {
     fn announce(&self, session: &str, mode: atomcode_host_api::Mode) {
         *self.current.lock().expect("current poisoned") = Some(mode);
+        self.push(atomcode_host_api::HostEvent::ModeChanged {
+            session: session.to_string(),
+            mode,
+        });
+    }
+
+    /// 这块 e2e 里唯一一个**能往屏幕推事件**的宿主,所以别的宿主事件也从这儿
+    /// 推 —— 再写一个只为了推另一种事件的假宿主,是同一件事的第二份。
+    fn push(&self, event: atomcode_host_api::HostEvent) {
         let said = self.said.lock().expect("said poisoned");
         said.as_ref()
             .expect("the screen subscribed before it could be told")
-            .send(atomcode_host_api::HostEvent::ModeChanged {
-                session: session.to_string(),
-                mode,
-            })
+            .send(event)
             .expect("the screen is still there to hear it");
     }
 }
@@ -7621,6 +7627,83 @@ async fn a_mode_set_before_the_screen_connected_still_reaches_the_row() {
     assert!(
         row.contains("auto"),
         "a session running without asking drew as an ordinary one: {row:?}"
+    );
+    task.abort();
+}
+
+/// 宿主猜的「接下来也许可以说」,一路走到编辑区里。
+///
+/// 这一条钉的是**整条线**:事件到了屏幕、画在了field 下面、→ 把它收下、收下
+/// 之后它成为一条真的用户消息。三段接线里少任何一段,屏幕上都只是「什么都没
+/// 发生」—— 而运行时那一侧一直在为每个自己结束的回合采一次样,采完丢掉。
+///
+/// **还钉了「收下之后它就没了」**:留着的话,人把它删掉之后它会再冒出来,
+/// 而那正是「删掉」要表达的意思的反面。
+#[tokio::test]
+async fn a_guess_at_what_to_say_next_reaches_the_field_and_right_takes_it() {
+    let dir = scratch("suggested");
+    let (s, host) = start_with_mode_host(
+        tree(&dir, &replay(r#"{ text = "ok" }"#), &[]),
+        None,
+        Some(atomcode_host_api::Mode::Ask),
+    )
+    .await;
+    let task = s.open().await;
+    s.quiet().await;
+    let session = s.client().root();
+
+    host.push(atomcode_host_api::HostEvent::Suggested {
+        session: session.clone(),
+        text: "接着把登录那条补上".into(),
+    });
+    let mut shown = String::new();
+    for _ in 0..200 {
+        shown = composer_text(&s);
+        if shown.contains("接着把登录那条补上") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        shown.contains("接着把登录那条补上"),
+        "猜的那句话画在编辑区那一块里:\n{}",
+        s.screen()
+    );
+    // 带着键名。一行没有键名的灰字读起来是一个标签,不是一个可以按的东西。
+    assert!(shown.contains('→'), "并且说得出怎么收下它:\n{shown}");
+
+    s.term.press(KeyPress::plain(Key::Right));
+    for _ in 0..200 {
+        if composer_text(&s).contains("❯ 接着把登录那条补上") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let shown = composer_text(&s);
+    assert!(
+        shown.contains("❯ 接着把登录那条补上"),
+        "→ 把它收进了输入行:\n{}",
+        s.screen()
+    );
+    assert!(
+        !shown.contains('→'),
+        "收下之后那一行就该没了,否则它会再被收一次:\n{shown}"
+    );
+
+    // 而它现在是一句真的话:回车发出去,对话区里就有它。
+    s.term.press(KeyPress::plain(Key::Enter));
+    let mut seen = String::new();
+    for _ in 0..200 {
+        seen = transcript(&s);
+        if seen.contains("接着把登录那条补上") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        seen.contains("接着把登录那条补上"),
+        "收下的那句话要能像自己打的一样发出去:\n{}",
+        s.screen()
     );
     task.abort();
 }

@@ -164,6 +164,20 @@ pub fn being_pathed(typed: &str) -> Option<&str> {
     (!rest.contains(char::is_whitespace)).then_some(rest)
 }
 
+/// 一段任意来源的文字,压成一行、去掉控制字符。
+///
+/// 给的是模型写的东西:换行会把编辑区下面那一行撑成好几行,而 ESC / BEL 之类
+/// 能把自己的转义序列夹带到屏幕上。两件都在这里挡掉,所以下游画它的地方不必
+/// 各自再想一遍。
+pub fn one_line(raw: &str) -> String {
+    raw.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The rest of the newest earlier line that starts with what is typed.
 ///
 /// What a shell does (fish, zsh's autosuggest) and for the same reason: the

@@ -232,6 +232,20 @@ pub fn connect(
                         running: (!ended).then(|| running_of_goal(progress)),
                     });
                 }
+                // 一句「接下来也许可以说」。回合自己结束之后采一次,由运行时
+                // 按代/修订号过滤过 —— 这里只补上「是哪个会话的」,因为在一个
+                // 会话里采到的建议不该出现在另一个会话的编辑区里。
+                //
+                // 走 `HostEvent` 而不是那条转成对话内容的路:没人说过这句话,
+                // 它不是会话里的一条事实,不该进日志也不该进对话区。
+                CodingRuntimeEvent::NextPromptSuggested {
+                    session_id, text, ..
+                } => {
+                    let session = session_id.unwrap_or_else(|| {
+                        watched.session.lock().expect("session poisoned").clone()
+                    });
+                    watched.announce(HostEvent::Suggested { session, text });
+                }
                 CodingRuntimeEvent::LoopChanged(progress) => {
                     let session = watched.session.lock().expect("session poisoned").clone();
                     let stopped = !progress.active;

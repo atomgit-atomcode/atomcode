@@ -1462,6 +1462,12 @@ impl UserInterface for Tui {
                 Wake::Host(HostEvent::ModeChanged { session, mode }) => {
                     stale |= took_mode(&self.host.moment, &session, Some(mode));
                 }
+                // A guess at what might be said next. Kept, not said: nobody
+                // said it, so it is not a line of the conversation — it sits
+                // under the field until it is taken or stops applying.
+                Wake::Host(HostEvent::Suggested { session, text }) => {
+                    stale |= took_suggestion(&self.host.moment, &session, &text);
+                }
                 // The turn finished; the log did not get it. Said loudly and
                 // at once: the log is the session's only authority
                 // (`docs/adr/0024`), so a person who is not told now will find
@@ -4494,6 +4500,10 @@ impl Tui {
                 m.input.clear();
                 m.clear_pastes();
                 m.caret = 0;
+                // 这句猜的是「刚才那个回合之后也许会说什么」。话已经说出去了,
+                // 那个回合过去了 —— 留着的话,下一个回合结束、而新的建议没来
+                // (模型没答上来)时,人会看到一句针对更早以前的建议。
+                m.suggestion = None;
                 m.history_at = None;
                 m.draft.clear();
                 m.scroll = crate::moment::ScrollPos::BOTTOM;
@@ -6146,11 +6156,55 @@ pub fn took_mode(
     true
 }
 
+/// Take the host's guess at what might be said next. Returns whether anything
+/// moved.
+///
+/// A separate function for the reason [`took_autonomy`] is one: the loop it is
+/// called from cannot be reached from a criterion, and every rule about when a
+/// guess may be kept is worth stating on its own.
+///
+/// **Refused while somebody is typing**, and not merely undrawn: kept, it would
+/// surface the moment they cleared the line — a sentence appearing in front of
+/// a person who just decided not to say anything reads as the screen having
+/// thought of it for them.
+pub fn took_suggestion(
+    moment: &std::sync::RwLock<crate::moment::Moment>,
+    session: &str,
+    text: &str,
+) -> bool {
+    let mut m = moment.write().expect("moment poisoned");
+    // A guess sampled in one session must not be offered in another.
+    if m.viewing != session && m.lead != session {
+        return false;
+    }
+    if !m.input.is_empty() || m.turn_started.is_some() {
+        return false;
+    }
+    let text = crate::text::one_line(text);
+    if text.is_empty() || m.suggestion.as_deref() == Some(text.as_str()) {
+        return false;
+    }
+    m.suggestion = Some(text);
+    true
+}
+
 /// Take the ghost into the field, if the caret is at the end and there is one.
 ///
 /// `true` when it took something, which is the caller's cue that right meant
 /// "accept" rather than "move".
 fn accept_ghost(m: &mut crate::moment::Moment) -> bool {
+    // An empty field with a guess on it: right takes the guess. The history
+    // ghost below never fires here — it answers with the rest of a line that
+    // starts with what is typed, and nothing is typed — so the two cannot both
+    // claim the key.
+    if m.input.is_empty() {
+        if let Some(words) = m.suggestion.take() {
+            m.input = words;
+            m.caret = m.input.len();
+            return true;
+        }
+        return false;
+    }
     if m.caret != m.input.len() {
         return false;
     }
@@ -6723,6 +6777,84 @@ mod history_tests {
         recall_back(&mut m);
         recall_forward(&mut m);
         assert_eq!(m.input, "mine");
+    }
+}
+
+#[cfg(test)]
+mod suggestion_tests {
+    use super::{accept_ghost, took_suggestion};
+    use crate::moment::Moment;
+    use std::sync::RwLock;
+
+    fn idle(session: &str) -> RwLock<Moment> {
+        RwLock::new(Moment {
+            lead: session.into(),
+            viewing: session.into(),
+            ..Moment::default()
+        })
+    }
+
+    /// 一句猜出来的话,只在它还适用的时候留着。
+    ///
+    /// **拒的那几种才是这条判据的内容**。尤其「有人正在打字就不接」:只是
+    /// 不画的话,那句话还在手里,人删光自己写了一半的东西之后它会冒出来 ——
+    /// 一个刚决定什么都不说的人,面前出现了一句替他想好的话。
+    #[test]
+    fn a_guess_is_kept_only_while_it_still_applies() {
+        let moment = idle("lead");
+        assert!(took_suggestion(&moment, "lead", "接着把登录那条补上"));
+        assert_eq!(
+            moment.read().unwrap().suggestion.as_deref(),
+            Some("接着把登录那条补上")
+        );
+        // 同一句话再来一次不是新消息。
+        assert!(!took_suggestion(&moment, "lead", "接着把登录那条补上"));
+
+        // 别人的会话里采到的,不许画在这块屏幕上。
+        let moment = idle("lead");
+        assert!(!took_suggestion(&moment, "member-2", "换个方向试试"));
+        assert!(moment.read().unwrap().suggestion.is_none());
+
+        // 有人正在打字。
+        let moment = idle("lead");
+        moment.write().unwrap().input = "我自己".into();
+        assert!(!took_suggestion(&moment, "lead", "换个方向试试"));
+        assert!(moment.read().unwrap().suggestion.is_none());
+
+        // 回合还在跑:这句猜的是「一个回合结束之后」,而这里还没结束。
+        let moment = idle("lead");
+        moment.write().unwrap().turn_started = Some(Default::default());
+        assert!(!took_suggestion(&moment, "lead", "换个方向试试"));
+
+        // 空话不是话;模型给的换行与控制字符压成一行,否则编辑区下面那一行
+        // 会被撑开,而 ESC 能把自己的转义序列夹带上屏。
+        let moment = idle("lead");
+        assert!(!took_suggestion(&moment, "lead", "   "));
+        assert!(took_suggestion(&moment, "lead", "两行\n并成\u{1b}一行"));
+        assert_eq!(
+            moment.read().unwrap().suggestion.as_deref(),
+            Some("两行 并成 一行")
+        );
+    }
+
+    /// 编辑区空着的时候,→ 收下那句话 —— 和它收下历史 ghost 是同一个手势。
+    ///
+    /// 收下之后**这句猜的话就没了**:留着的话,人把它删掉之后它会再冒出来,
+    /// 而那正是「删掉」要表达的意思的反面。
+    #[test]
+    fn right_takes_the_guess_into_an_empty_field_and_it_is_then_gone() {
+        let moment = idle("lead");
+        assert!(took_suggestion(&moment, "lead", "接着把登录那条补上"));
+        let mut m = moment.write().unwrap();
+        assert!(accept_ghost(&mut m));
+        assert_eq!(m.input, "接着把登录那条补上");
+        assert_eq!(m.caret, m.input.len());
+        assert!(m.suggestion.is_none(), "收下之后就不该再有了");
+        drop(m);
+
+        // 没有猜的话,空编辑区上的 → 什么也不做 —— 这个键不许让人意外。
+        let empty = idle("lead");
+        assert!(!accept_ghost(&mut empty.write().unwrap()));
     }
 }
 

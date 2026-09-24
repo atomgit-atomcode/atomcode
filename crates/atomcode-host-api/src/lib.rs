@@ -1162,6 +1162,20 @@ pub enum HostEvent {
     /// not draw it, and this is the road it travels instead — the same bargain
     /// [`HostEvent::Autonomy`] strikes, and for the same reason.
     ModeChanged { session: String, mode: Mode },
+    /// Something the person might say next, offered after a turn ended by
+    /// itself.
+    ///
+    /// **Not a fact in the log and not part of the conversation.** Nobody said
+    /// it; it is a guess the host made, and a guess belongs on the screen for
+    /// as long as it is useful and nowhere after that. A front end shows it
+    /// only while the composer is empty and the session idle, and drops it the
+    /// moment either stops being true — a suggestion for a conversation that
+    /// has moved on is worse than none.
+    ///
+    /// `session` is whose turn it followed: an answer sampled from one session
+    /// must not be offered in another, which is the whole reason it is here
+    /// rather than implied by the connection.
+    Suggested { session: String, text: String },
 }
 
 /// Why a host refused or failed a command (`docs/adr/0021` §8).
@@ -1742,12 +1756,17 @@ mod tests {
                 session: "b".into(),
                 mode: Mode::Plan,
             },
+            HostEvent::Suggested {
+                session: "b".into(),
+                text: "接着把登录那条补上".into(),
+            },
         ];
         for e in &all {
             match e {
                 HostEvent::SessionChanged { .. }
                 | HostEvent::Autonomy { .. }
                 | HostEvent::ModeChanged { .. }
+                | HostEvent::Suggested { .. }
                 | HostEvent::PersistenceFailed { .. } => {}
             }
         }

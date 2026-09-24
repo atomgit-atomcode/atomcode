@@ -71,6 +71,32 @@ fn clipboard_caption(moment: &crate::moment::Moment) -> Option<String> {
     )
 }
 
+/// 建议那一行现在写什么。`None` = 不画。
+///
+/// **它不走内联的 ghost 那个位置**,尽管那里也是一句灰字、也是按 → 收下。
+/// 那一条的来源是这个会话自己说过的话(`text::ghost` 的注释写着这件事:
+/// 「不问模型,什么都不编」),而这一句是模型写的。画在同一个位置、同一个
+/// 样子的话,人分不出哪句是自己说过的、哪句是被猜出来的 —— 所以这一句单独
+/// 一行,并且**带着那个键的名字**,像上一代前端那样。
+///
+/// 只在编辑区空着、没有回合在跑、也不是在问密码的时候画:它是一个猜测,
+/// 猜测不该盖住人正在写的东西,也不该在人等着回答的时候冒出来。
+fn suggested(moment: &crate::moment::Moment) -> Option<String> {
+    let text = moment.suggestion.as_deref()?.trim();
+    if text.is_empty()
+        || !moment.input.is_empty()
+        || moment.secret.is_some()
+        || moment.activity != Activity::Idle
+    {
+        return None;
+    }
+    Some(format!(
+        "{} {}",
+        moment.caps.g(crate::caps::Glyph::Gutter),
+        t(Msg::ComposerSuggested { text })
+    ))
+}
+
 fn history_caption(moment: &crate::moment::Moment) -> Option<String> {
     let total = moment.history.len();
     // A search says where it is in the same place, and instead: two counters on
@@ -483,6 +509,11 @@ impl View for Input {
         // idle: the flag is raised the instant Escape is pressed, but the turn is
         // still landing then, so drawing it before the turn is idle would put a
         // "已中断" line over a turn that is visibly still stopping.
+        // 也许接下来可以说的一句话。和上面那条 `已中断` 同一种形状:只在有话
+        // 说的时候才有这一行,所以它不是一行常驻的装饰。
+        if let Some(words) = suggested(vp.moment) {
+            rows.push(El::styled(words, theme::fg(Role::Muted)));
+        }
         if note_shown(vp.moment) {
             let note = format!(
                 "{} {}",
@@ -511,9 +542,13 @@ impl View for Input {
         let body = body_width(width);
         let (text, at) = shown(moment);
         let typed = lay(&text, at, body).0.len().min(MAX_ROWS);
-        // The `已中断` note under the box is one more row while it is up.
+        // The `已中断` note under the box is one more row while it is up, and
+        // so is the guess at what to say next. Counted here or the row is drawn
+        // into space the layout did not give this part — which is a row that
+        // exists in `render` and nowhere on screen.
         let note = usize::from(note_shown(moment));
-        Height::Hug((RULES + typed.max(1) + note) as u16)
+        let guess = usize::from(suggested(moment).is_some());
+        Height::Hug((RULES + typed.max(1) + note + guess) as u16)
     }
 }
 

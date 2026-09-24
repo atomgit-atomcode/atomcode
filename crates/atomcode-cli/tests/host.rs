@@ -107,6 +107,11 @@ impl LlmProvider for Scripted {
             Some(m) if m.role == Role::User && m.text == "hang" => {
                 return Ok(Box::pin(futures::stream::pending()));
             }
+            // 运行时在一个回合自己结束之后采的那一次:它是一条独立的请求,
+            // 不是对话里的一轮,认得出来是因为它带着自己的那段说明。
+            Some(m) if m.text.starts_with("Predict the short message") => {
+                StreamEvent::TextDelta("接着把登录那条补上".into())
+            }
             Some(m) if m.role == Role::Tool => StreamEvent::TextDelta(format!("saw: {}", m.text)),
             _ => StreamEvent::TextDelta(format!("answer {n}")),
         };
@@ -505,6 +510,77 @@ async fn a_front_end_hears_the_turn_and_the_facts_of_the_session_the_runtime_run
             AgentEvent::Fact(c) if matches!(&c.event, SessionEvent::AssistantMessage { text, .. } if text == "answer 1")
         )),
         "{events:#?}"
+    );
+}
+
+/// 一个回合自己结束之后,宿主把「接下来也许会说什么」告诉屏幕。
+///
+/// 钉的是**宿主那一段**:运行时一直在采这一次样(交互式启动就开着),而此前
+/// 它掉在 `translate` 的 `_ => None` 里 —— 每个回合白采一次,没有任何一处
+/// 说它没生效。屏幕那一侧怎么画、按哪个键收下,由 `tui` 的 e2e 钉;两边都要
+/// 有,因为屏幕那条用的是假宿主,它看不见这一段在不在。
+#[tokio::test]
+async fn a_finished_turn_offers_what_might_be_said_next() {
+    let env = env();
+    let mut agent = CodingAgentConfig::new(
+        "key",
+        "https://example.test/v1",
+        "scripted",
+        env.project.path(),
+    );
+    agent.interactive = true;
+    // 交互式启动时 `main.rs` 打开的就是这个;headless 关着,因为没人在看。
+    agent.next_prompt_suggestions = true;
+    let front_end = FrontEnd::new();
+    let start = CodingRuntimeStart {
+        agent: agent.clone(),
+        prepare: PrepareOptions {
+            request_user_input: true,
+            session: SessionMode::Fresh,
+            tools: true,
+            skill_dirs: Some(Vec::new()),
+            plugin_skill_dirs: Vec::new(),
+            mcp: false,
+            extra_mcp_servers: Vec::new(),
+            external_subagents: Vec::new(),
+            memory: false,
+            web: false,
+            review: false,
+            subagents: SubagentPolicy::Disabled,
+            rate_limit_source: None,
+            front_end: Some(front_end.clone()),
+        },
+        provider_factory: Arc::new(Factory(env.script.clone())),
+        plugin_hooks: Arc::new(StaticPluginHookSource::default()),
+        image_preprocessor: None,
+    };
+    let runtime = CodingRuntime::start(start)
+        .await
+        .expect("the runtime starts");
+    let mut connection = connect(runtime, front_end, agent, None).expect("connects once");
+    let session = connection.session.clone();
+    let mut watching = connection.control.subscribe();
+    connection.commands.send(subscribe(&session)).unwrap();
+    let _ = quiet(&mut connection).await;
+    connection.commands.send(message("修一下登录")).unwrap();
+    through_turn(&mut connection).await;
+
+    let offered = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match watching.recv().await {
+                Some(HostEvent::Suggested { session, text }) => return (session, text),
+                Some(_) => continue,
+                None => panic!("the host stopped talking"),
+            }
+        }
+    })
+    .await
+    .expect("a finished turn never offered anything");
+
+    assert_eq!(offered.1, "接着把登录那条补上");
+    assert_eq!(
+        offered.0, session,
+        "一个会话里采到的建议不许挂在另一个会话上"
     );
 }
 
