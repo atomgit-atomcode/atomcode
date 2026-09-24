@@ -119,6 +119,10 @@ pub enum Action {
     /// paste text: on a terminal with no bracketed paste that chord arrives as
     /// a literal `\x16`, and the terminal's own paste is already the way text
     /// gets in.
+    ///
+    /// A file is named by the path the command already placed (`~` expanded,
+    /// a relative one under the session's working directory) — the handler
+    /// holds only the session id, which is not a directory.
     PasteFrom(Option<String>),
     /// Pull the settings panel up over the composer, or put it away if it is
     /// already up.

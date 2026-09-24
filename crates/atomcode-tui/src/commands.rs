@@ -56,7 +56,7 @@ impl CommandSet for ScreenCommands {
     fn commands(&self) -> Vec<Command> {
         screen_catalogue()
     }
-    async fn run(&self, name: &str, args: &str, _ctx: &Context) -> Outcome {
+    async fn run(&self, name: &str, args: &str, ctx: &Context) -> Outcome {
         match name {
             "quit" | "exit" => Outcome::Do(Action::Quit),
             "reasoning" => Outcome::Do(Action::ToggleFold("reasoning")),
@@ -88,10 +88,22 @@ impl CommandSet for ScreenCommands {
             // read once: `clipboard_image` decodes bytes, and asking it "is
             // there one?" here and "give it to me" there would decode twice —
             // and could get two different answers if the clipboard changed in
-            // between.
+            // between. A path, though, is placed here: which directory a
+            // relative one is in is the host's answer, and the handler cannot
+            // wait for it.
             "paste" => match args.trim() {
                 "" => Outcome::Do(Action::PasteFrom(None)),
-                path => Outcome::Do(Action::PasteFrom(Some(path.to_string()))),
+                path => {
+                    let Some(client) = ctx.service::<crate::plugin::AgentClientSvc>() else {
+                        return Outcome::Refused(t(Msg::NoAgent).into_owned());
+                    };
+                    match session_path(&client, path).await {
+                        Ok(full) => {
+                            Outcome::Do(Action::PasteFrom(Some(full.display().to_string())))
+                        }
+                        Err(refused) => refused,
+                    }
+                }
             },
             "config" => Outcome::Do(Action::ToggleSettings),
             "provider" => Outcome::Do(Action::ToggleProviders),
@@ -424,11 +436,9 @@ impl CommandSet for TakeAwayCommands {
                 // Relative to where the session is working, not to wherever the
                 // process happened to be started: a person saying `/save` means
                 // "beside the code I am looking at".
-                let path = std::path::Path::new(&name);
-                let path = if path.is_absolute() {
-                    path.to_path_buf()
-                } else {
-                    std::path::Path::new(&client.root()).join(path)
+                let path = match session_path(&client, &name).await {
+                    Ok(path) => path,
+                    Err(refused) => return refused,
                 };
                 // **An existing file that this command did not write is not
                 // overwritten.** `/save` produces markdown; a `.md` target is
@@ -472,7 +482,10 @@ impl CommandSet for TakeAwayCommands {
                 if path.is_empty() {
                     return Outcome::Refused(t(Msg::ViewWhichFile).into_owned());
                 }
-                let full = view_path(path, &client.root(), crate::text::home_dir().as_deref());
+                let full = match session_path(&client, path).await {
+                    Ok(full) => full,
+                    Err(refused) => return refused,
+                };
                 let shown = crate::text::collapse_home(&full.display().to_string());
                 match view_file(&full) {
                     // Read here rather than in the overlay: an overlay draws
@@ -828,7 +841,7 @@ impl CommandSet for SessionCommands {
                     // types `/cd` — after which this listed another project's
                     // sessions and called them this one's. Asked of the host,
                     // the way `/cd` asks.
-                    let here = working_dir(Some(control.clone()), client.root()).await;
+                    let here = working_dir(Some(control.clone()), client.root()).await.ok();
                     return match control
                         .call(HostCommand::ListSessions { working_dir: here })
                         .await
@@ -1078,9 +1091,18 @@ impl CommandSet for SessionCommands {
                     .or_else(|| directory.strip_prefix("unpin"))
                 {
                     let pinning = directory.starts_with("pin");
+                    // Placed the way `/view` places a file: a mark stored as
+                    // typed only means something from wherever the process was
+                    // started, and `unpin` has to name what `pin` stored.
                     let where_ = match rest.trim() {
-                        "" => client.root(),
-                        named => named.to_string(),
+                        "" => match working_dir(control.clone(), client.root()).await {
+                            Ok(here) => here,
+                            Err(why) => return Outcome::Refused(why),
+                        },
+                        named => match session_path(&client, named).await {
+                            Ok(place) => place.display().to_string(),
+                            Err(refused) => return refused,
+                        },
                     };
                     let Some(places) = ctx.service::<crate::plugin::PlacesSvc>() else {
                         return Outcome::Refused(t(Msg::NoPlaces).into_owned());
@@ -1112,8 +1134,9 @@ impl CommandSet for SessionCommands {
                     let from = if std::path::Path::new(directory).is_absolute() {
                         directory.to_string()
                     } else {
-                        let Some(here) = working_dir(control.clone(), client.root()).await else {
-                            return Outcome::Refused(t(Msg::NoHost).into_owned());
+                        let here = match working_dir(control.clone(), client.root()).await {
+                            Ok(here) => here,
+                            Err(why) => return Outcome::Refused(why),
                         };
                         if directory.is_empty() {
                             here
@@ -1607,11 +1630,17 @@ impl CommandSet for SessionCommands {
                         effort: &effort,
                     })
                     .into_owned(),
-                    t(Msg::StatusWhereLine {
-                        where_: &crate::text::collapse_home(&client.root()),
-                    })
-                    .into_owned(),
                 ];
+                // Where the session works is the host's to say; with no answer
+                // the line is left out rather than filled with the session id.
+                if let Ok(here) = working_dir(control.clone(), root.clone()).await {
+                    lines.push(
+                        t(Msg::StatusWhereLine {
+                            where_: &crate::text::collapse_home(&here),
+                        })
+                        .into_owned(),
+                    );
+                }
                 if let Some(control) = control {
                     if let Ok(HostReply::Autonomy {
                         running: Some(running),
@@ -1813,14 +1842,46 @@ impl CommandSet for SessionCommands {
 ///
 /// 问宿主,不看屏幕自己记的东西:目录是运行中那棵树的事实,`/cd` 改的也是它
 /// (`docs/adr/0022` §3)。
+///
+/// 答不上来时带着理由:没接宿主是一回事,宿主在但这一刻答不了(比如正在重建)
+/// 是另一回事,两者说成同一句会让人去查错地方。
 async fn working_dir(
     control: Option<std::sync::Arc<dyn atomcode_host_api::HostControl>>,
     session: String,
-) -> Option<String> {
-    let control = control?;
+) -> Result<String, String> {
+    let Some(control) = control else {
+        return Err(t(Msg::NoHost).into_owned());
+    };
     match control.call(HostCommand::Context { session }).await {
-        Ok(HostReply::Context { working_dir, .. }) => Some(working_dir),
-        _ => None,
+        Ok(HostReply::Context { working_dir, .. }) => Ok(working_dir),
+        Ok(other) => Err(t(Msg::HostSaidSomethingElse {
+            reply: &format!("{other:?}"),
+        })
+        .into_owned()),
+        Err(error) => Err(refusal(error)),
+    }
+}
+
+/// A path a person typed, placed where they meant it: `~` is the home directory,
+/// an absolute path is itself, and a relative one is beside the code the
+/// session works on — which only the host can say. `client.root()` is the
+/// session this screen follows, **not a directory**; `/view`, `/save` and
+/// `/paste` all once joined onto it and so only ever worked with an absolute
+/// path, and `/cd pin` stored the text as typed. With no answer from the host,
+/// a relative path is refused — with the host's reason — rather than read or
+/// written somewhere guessed.
+async fn session_path(
+    client: &crate::plugin::AgentClient,
+    typed: &str,
+) -> Result<std::path::PathBuf, Outcome> {
+    let home = crate::text::home_dir();
+    let expanded = crate::text::expand_home_with(typed, home.as_deref());
+    if std::path::Path::new(&expanded).is_absolute() {
+        return Ok(expanded.into());
+    }
+    match working_dir(client.control(), client.root()).await {
+        Ok(here) => Ok(view_path(typed, &here, home.as_deref())),
+        Err(why) => Err(Outcome::Refused(why)),
     }
 }
 
@@ -3057,10 +3118,34 @@ mod tests {
     /// A screen following a session the model has answered in, with `answer` as
     /// its last reply.
     fn answered(answer: &str) -> (App, Arc<Commands>, Arc<crate::surface::Headless>) {
+        answered_on(answer, Arc::new(Recording::default()))
+    }
+
+    /// A host that says the session `lead` is working in `dir`. The id and the
+    /// directory differ on purpose: a path joined onto the id is then a path
+    /// that does not exist, which is what these commands once did.
+    fn working_in(dir: &std::path::Path) -> Arc<Recording> {
+        let host = Arc::new(Recording::default());
+        host.replies
+            .lock()
+            .unwrap()
+            .push_back(Ok(HostReply::Context {
+                window: 1,
+                used: 0,
+                model: "m".into(),
+                working_dir: dir.display().to_string(),
+            }));
+        host
+    }
+
+    fn answered_on(
+        answer: &str,
+        host: Arc<Recording>,
+    ) -> (App, Arc<Commands>, Arc<crate::surface::Headless>) {
         let app = bare();
         let client = Arc::new(crate::plugin::AgentClient::default());
         let (commands, _agent) = tokio::sync::mpsc::unbounded_channel();
-        client.connect(commands, Arc::new(Recording::default()));
+        client.connect(commands, host);
         client.follow("lead");
         for (seq, event) in [
             SessionEvent::UserMessage {
@@ -3153,6 +3238,164 @@ mod tests {
             all.dispatch("/view /nowhere/at/all", &app.context()).await,
             Outcome::Refused(_)
         ));
+    }
+
+    /// A relative path is beside the code the session works on — the directory
+    /// the host names, not the session id this screen follows. The two were
+    /// once confused: `/view src/main.rs` read `<id>/src/main.rs`, and only an
+    /// absolute path ever worked.
+    #[tokio::test]
+    async fn view_reads_a_relative_path_in_the_working_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("note.txt"), "IN-THE-WORKING-DIR\n").expect("write");
+        let (app, all, _surface) = answered_on("好了", working_in(dir.path()));
+        match all.dispatch("/view note.txt", &app.context()).await {
+            Outcome::Open(overlay) => assert_eq!(overlay.id(), "view"),
+            other => panic!("the file beside the code opens: {other:?}"),
+        }
+    }
+
+    /// `/save` with a relative name — or none — writes into the working
+    /// directory, which is what "beside the code" means.
+    #[tokio::test]
+    async fn save_writes_a_relative_name_into_the_working_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (app, all, _surface) = answered_on("写好了", working_in(dir.path()));
+        match all.dispatch("/save 聊天.md", &app.context()).await {
+            Outcome::Said(_) => {}
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            dir.path().join("聊天.md").is_file(),
+            "saved beside the code"
+        );
+
+        let (app, all, _surface) = answered_on("写好了", working_in(dir.path()));
+        match all.dispatch("/save", &app.context()).await {
+            Outcome::Said(_) => {}
+            other => panic!("a bare /save has somewhere to go: {other:?}"),
+        }
+        assert!(
+            dir.path().join("atomcode-lead.md").is_file(),
+            "the default name lands in the working directory too"
+        );
+    }
+
+    /// A path only the host can place is not guessed at: when the host does not
+    /// say where the session works (this one answers `Context` with `Done`), a
+    /// relative name is refused rather than written under whatever the screen
+    /// happens to hold.
+    #[tokio::test]
+    async fn a_relative_path_with_no_one_to_place_it_is_refused() {
+        let (app, all, _surface) = answered("写好了");
+        // The reason, not just a refusal: joined onto the session id the write
+        // fails too, and would be refused for the wrong reason.
+        match all.dispatch("/save 聊天.md", &app.context()).await {
+            Outcome::Refused(why) => assert_eq!(
+                why,
+                t(Msg::HostSaidSomethingElse {
+                    reply: &format!("{:?}", HostReply::Done),
+                }),
+                "{why}"
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A host that is there but cannot answer says why — it is not reported as
+    /// no host at all, which would send a person looking for the wrong fault.
+    #[tokio::test]
+    async fn a_host_that_cannot_place_a_path_says_why() {
+        let host = Arc::new(Recording::default());
+        host.replies.lock().unwrap().push_back(Err(HostError::Busy {
+            reason: "rebuilding".into(),
+        }));
+        let (app, all, _surface) = answered_on("好了", host);
+        match all.dispatch("/view note.txt", &app.context()).await {
+            Outcome::Refused(why) => assert_eq!(
+                why,
+                refusal(HostError::Busy {
+                    reason: "rebuilding".into()
+                }),
+                "the host's own reason, not NoHost"
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// `/status` says where the session works, not which session it is twice.
+    #[tokio::test]
+    async fn status_says_the_working_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (app, _client, all) = following(&working_in(dir.path()));
+        match all.dispatch("/status", &app.context()).await {
+            Outcome::Said(text) => assert!(
+                text.contains(&dir.path().display().to_string()),
+                "the where-line names the working directory:\n{text}"
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// `/cd pin` with no directory marks the one the session is working in.
+    #[tokio::test]
+    async fn cd_pin_marks_the_working_directory() {
+        #[derive(Default)]
+        struct Kept {
+            pinned: std::sync::Mutex<Vec<String>>,
+            unpinned: std::sync::Mutex<Vec<String>>,
+        }
+        #[async_trait]
+        impl crate::places::Places for Kept {
+            async fn bookmarks(&self) -> Vec<String> {
+                Vec::new()
+            }
+            async fn pin(&self, dir: &str) -> Result<(), String> {
+                self.pinned.lock().unwrap().push(dir.to_string());
+                Ok(())
+            }
+            async fn unpin(&self, dir: &str) -> Result<(), String> {
+                self.unpinned.lock().unwrap().push(dir.to_string());
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        // One answer per relative place asked about: bare, `src`, `src` again.
+        let host = working_in(dir.path());
+        for _ in 0..2 {
+            host.replies
+                .lock()
+                .unwrap()
+                .push_back(Ok(HostReply::Context {
+                    window: 1,
+                    used: 0,
+                    model: "m".into(),
+                    working_dir: dir.path().display().to_string(),
+                }));
+        }
+        let (app, _client, all) = following(&host);
+        let kept = Arc::new(Kept::default());
+        let _ = app
+            .context()
+            .provide::<crate::plugin::PlacesSvc>(kept.clone());
+        let _ = all.dispatch("/cd pin", &app.context()).await;
+        // A named directory is placed the way `/view` places a file: a mark
+        // that only means something from wherever the process was started is
+        // not a mark, and `unpin` must name the same string `pin` stored.
+        let _ = all.dispatch("/cd pin src", &app.context()).await;
+        let _ = all.dispatch("/cd unpin src", &app.context()).await;
+        let src = dir.path().join("src").display().to_string();
+        let mut pinned = vec![dir.path().display().to_string(), src.clone()];
+        if let Some(home) = crate::text::home_dir() {
+            let _ = all.dispatch("/cd pin ~/proj", &app.context()).await;
+            pinned.push(home.join("proj").display().to_string());
+        }
+        assert_eq!(
+            *kept.pinned.lock().unwrap(),
+            pinned,
+            "the marks are places, not the session id or the text as typed"
+        );
+        assert_eq!(*kept.unpinned.lock().unwrap(), vec![src]);
     }
 
     /// A file too long to show is shown as far as it goes — **and the title
@@ -3433,12 +3676,14 @@ mod tests {
     /// text-only, and why a clipboard picture had no road on a terminal that
     /// eats ctrl-v. Resolving the source moved to the handler, where the
     /// clipboard is read once and a picture can attach — so what is left to
-    /// judge here is the routing, and the substance is judged in
+    /// judge here is the routing and where a named path is, and the substance
+    /// is judged in
     /// `attach::{from_clipboard, from_file}` and by the two `e2e` judgements
     /// that press the keys.
     #[tokio::test]
     async fn paste_names_its_source_and_leaves_the_reading_to_the_handler() {
-        let app = bare();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (app, _client, _) = following(&working_in(dir.path()));
         let all = Arc::new(Commands::new());
         let _ = all.add(Arc::new(ScreenCommands));
 
@@ -3447,11 +3692,24 @@ mod tests {
             Outcome::Do(Action::PasteFrom(None)),
             "no argument is the clipboard"
         );
+        // A path is placed here, where the host can be asked: the handler is
+        // synchronous and holds only the session id, which is not a directory.
+        if let Some(home) = crate::text::home_dir() {
+            assert_eq!(
+                all.dispatch("/paste ~/shot.png", &app.context()).await,
+                Outcome::Do(Action::PasteFrom(Some(
+                    home.join("shot.png").display().to_string()
+                ))),
+                "`~` is the home directory, and needs no host"
+            );
+        }
+        // The host's one answer is still unspent: `~` did not ask for it.
         assert_eq!(
-            all.dispatch("/paste ~/shot.png", &app.context()).await,
-            Outcome::Do(Action::PasteFrom(Some("~/shot.png".into()))),
-            "a path is passed through as typed: expanding it needs a home \
-             directory, and that is the handler's to know"
+            all.dispatch("/paste shot.png", &app.context()).await,
+            Outcome::Do(Action::PasteFrom(Some(
+                dir.path().join("shot.png").display().to_string()
+            ))),
+            "a relative path is in the working directory, not under the session id"
         );
     }
 

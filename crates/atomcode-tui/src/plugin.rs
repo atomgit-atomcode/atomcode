@@ -4445,13 +4445,11 @@ impl Tui {
                 let found = match from.as_deref() {
                     None => crate::attach::from_clipboard(self.surface.as_ref())
                         .ok_or_else(|| t(Msg::ClipboardHasNothing).into_owned()),
+                    // Already placed by the command: `client.root()` here is
+                    // the session id, not a directory to resolve against.
                     Some(path) => {
-                        let full = crate::commands::view_path(
-                            path,
-                            &client.root(),
-                            crate::text::home_dir().as_deref(),
-                        );
-                        match crate::attach::from_file(&full) {
+                        let full = std::path::Path::new(path);
+                        match crate::attach::from_file(full) {
                             Ok(Some(found)) => Ok(found),
                             Ok(None) => Err(t(Msg::FileIsEmpty { path }).into_owned()),
                             Err(error) => Err(t(Msg::FileUnreadable {
