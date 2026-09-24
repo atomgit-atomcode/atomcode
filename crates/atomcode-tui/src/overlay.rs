@@ -151,9 +151,54 @@ impl Picker {
             .collect()
     }
 
+    /// What has been typed into this list, for a criterion.
+    pub fn filter(&self) -> String {
+        self.filter.read().expect("picker poisoned").clone()
+    }
+
     pub fn selected(&self) -> Option<Choice> {
         let at = *self.cursor.read().expect("picker poisoned");
         self.visible().into_iter().nth(at)
+    }
+
+    /// What `Tab` would grow the filter to: the longest opening the rows still
+    /// matching all share.
+    ///
+    /// Shell completion, and the same rule: only rows the filter is a *prefix*
+    /// of take part. The filter itself matches anywhere in a row (typing
+    /// "config" finds "edit the config file"), which is right for finding a row
+    /// and wrong for completing one — a match in the middle has no "rest" to
+    /// offer.
+    ///
+    /// `None` when there is nothing to add, which is a `Tab` that does nothing
+    /// rather than one that shortens what was typed.
+    fn completion(&self) -> Option<String> {
+        let typed = self.filter.read().expect("picker poisoned").clone();
+        if typed.is_empty() {
+            return None;
+        }
+        let lower = typed.to_lowercase();
+        let starting: Vec<String> = self
+            .visible()
+            .into_iter()
+            .map(|choice| choice.label)
+            .filter(|label| label.to_lowercase().starts_with(&lower))
+            .collect();
+        let (first, rest) = starting.split_first()?;
+        // By character, not by byte: a common opening cut mid-character is not
+        // a string, and these are file names.
+        let head: Vec<char> = first.chars().collect();
+        let mut upto = head.len();
+        for other in rest {
+            let shared = head
+                .iter()
+                .zip(other.chars())
+                .take_while(|(a, b)| a.to_lowercase().eq(b.to_lowercase()))
+                .count();
+            upto = upto.min(shared);
+        }
+        let grown: String = head[..upto].iter().collect();
+        (grown.chars().count() > typed.chars().count()).then_some(grown)
     }
 
     fn move_by(&self, by: i32) {
@@ -459,6 +504,18 @@ impl Overlay for Picker {
                     }
                 }
             },
+            // Type a bit, `Tab`, type a bit — the gesture people already have
+            // for paths. It grows the filter as far as the rows agree and then
+            // stops, so the next keystroke is the one that decides between
+            // them; a `Tab` that jumped to the first match would be choosing
+            // for them.
+            (Key::Tab, _) => {
+                if let Some(grown) = self.completion() {
+                    *self.filter.write().expect("picker poisoned") = grown;
+                    *self.cursor.write().expect("picker poisoned") = 0;
+                }
+                Step::Stay
+            }
             (Key::Backspace, _) => {
                 self.filter.write().expect("picker poisoned").pop();
                 *self.cursor.write().expect("picker poisoned") = 0;
@@ -662,6 +719,59 @@ mod tests {
                 Choice::new("c", "gamma").about("third"),
             ],
         )
+    }
+
+    /// `Tab` grows what was typed as far as the rows agree, and no further.
+    ///
+    /// The gesture people already have for paths, and `/cd` is where it is
+    /// missed: the browser lists one level, and typing the next name in full
+    /// to descend is what a shell stopped asking for decades ago.
+    ///
+    /// Two halves, and the second is the one worth stating. It stops at the
+    /// last character the candidates share — a `Tab` that jumped to the first
+    /// match would be choosing between them, which is the person's next
+    /// keystroke to make. And only rows the typed text *starts* are candidates:
+    /// the filter matches anywhere in a row, which is right for finding one and
+    /// meaningless for completing one.
+    #[test]
+    fn tab_grows_the_filter_as_far_as_the_rows_agree() {
+        let p = Picker::new(
+            "test",
+            "挑一个",
+            vec![
+                Choice::new("1", "atomcode-tui"),
+                Choice::new("2", "atomcode-cli"),
+                Choice::new("3", "harness"),
+            ],
+        );
+        for ch in "atom".chars() {
+            p.key(KeyPress::ch(ch));
+        }
+        assert_eq!(p.key(KeyPress::plain(Key::Tab)), Step::Stay);
+        assert_eq!(
+            p.filter(),
+            "atomcode-",
+            "as far as both agree, and not one character into the choice"
+        );
+        // Again with nothing left to agree on: the key does nothing rather
+        // than picking one.
+        assert_eq!(p.key(KeyPress::plain(Key::Tab)), Step::Stay);
+        assert_eq!(p.filter(), "atomcode-");
+        // One candidate left: completed in full, and Enter then has a row.
+        p.key(KeyPress::ch('t'));
+        p.key(KeyPress::plain(Key::Tab));
+        assert_eq!(p.filter(), "atomcode-tui");
+        assert_eq!(p.key(KeyPress::plain(Key::Enter)), Step::Chose("1".into()));
+
+        // A filter that matches in the middle of a row has no completion to
+        // offer, and must not shorten what was typed.
+        let p = picker();
+        for ch in "et".chars() {
+            p.key(KeyPress::ch(ch));
+        }
+        assert_eq!(p.visible().len(), 1, "\"beta\" matches in the middle");
+        p.key(KeyPress::plain(Key::Tab));
+        assert_eq!(p.filter(), "et", "left exactly as typed");
     }
 
     /// A list that says what typing means is not a dead end when nothing
