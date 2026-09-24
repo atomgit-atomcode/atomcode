@@ -173,7 +173,14 @@ pub fn connect(
                 crate::tui_share::mode_changed(*mode);
             }
             match sequenced.event {
-                CodingRuntimeEvent::RuntimeStopped(_) => break,
+                // 运行时没了。走之前说一声 —— 此前这里直接 `break`,于是一个
+                // 正在进行的回合永远停在「工作中」,而什么都不会再来。
+                CodingRuntimeEvent::RuntimeStopped(exit) => {
+                    let _ = out.send(said(tr(SMsg::RuntimeStopped {
+                        how: &format!("{exit:?}"),
+                    })));
+                    break;
+                }
                 CodingRuntimeEvent::SessionChanged(changed) => {
                     let Some(session) = changed.session_id else {
                         continue;
@@ -196,6 +203,15 @@ pub fn connect(
                 // the line and the command cannot disagree.
                 CodingRuntimeEvent::GoalChanged(progress) => {
                     let session = watched.session.lock().expect("session poisoned").clone();
+                    // 结束的时候说一句。徒有徽标消失的话,「达成了」和「判不了
+                    // 算不算达成,停了」在屏上一模一样 —— 而第二种会被当成第一种。
+                    // 另外两种终态(停死、评估失败)运行时自己会发
+                    // `ControllerWarning`,不在这儿再说一遍。
+                    if let Some(words) = goal_ending(&progress) {
+                        if out.send(said(words.into())).is_err() {
+                            break;
+                        }
+                    }
                     let ended = progress.terminal.is_some();
                     watched.announce(HostEvent::Autonomy {
                         session,
@@ -935,7 +951,9 @@ fn translate(event: CodingRuntimeEvent) -> Option<AgentEvent> {
             CompactionCompletion::Failed { trigger, error } => {
                 Some(AgentEvent::CompactionFailed { trigger, error })
             }
-            CompactionCompletion::Interrupted { .. } => None,
+            // 打断了也要说。不说的话屏上只是「开始压缩」后面什么都没有,
+            // 而上下文还是原来那么长 —— 下一句话照样会撞上它。
+            CompactionCompletion::Interrupted { .. } => Some(said(tr(SMsg::CompactionInterrupted))),
         },
         CodingRuntimeEvent::ControllerWarning(message)
         | CodingRuntimeEvent::PersistenceWarning(message) => Some(AgentEvent::Error {
@@ -944,7 +962,61 @@ fn translate(event: CodingRuntimeEvent) -> Option<AgentEvent> {
             code: None,
             retryable: None,
         }),
+        // 识图失败。此前屏上只剩一个 `[图片识别失败]` 标记,原因和怎么
+        // 办都在这条事件里,而这条事件掉进了 `_ => None`。
+        CodingRuntimeEvent::VisionPreprocessFailed { reason } => {
+            Some(said(tr(SMsg::VisionFailedBecause { reason: &reason })))
+        }
+        // 没有可用的 provider。话与「改去哪里」都已经有现成的 ——
+        // `readiness_for` 就是干这个的,只是只在开屏那一次被问过。
+        CodingRuntimeEvent::ProviderUnavailable { reason, .. } => {
+            match readiness_for(Some(reason)) {
+                HostReply::Readiness { why: Some(why), .. } => Some(said(why.into())),
+                _ => None,
+            }
+        }
         _ => None,
+    }
+}
+
+/// 一个目标结束时该说的话,`None` 表示不用这里说。
+///
+/// 只管两种终态:**达成**和**停了但判不了算不算达成**。徒有徽标消失
+/// 的话,这两种在屏上一模一样 —— 而第二种会被当成第一种,人以为目标
+/// 完成了。另外两种(停死、评估失败、发不出下一轮)运行时自己会发
+/// `ControllerWarning` 带着原因,在这儿再说一遍就是说两遍。
+///
+/// `Cancelled` 也不说:那是人自己停的,命令已经答过一句了。
+fn goal_ending(progress: &atomcode_coding::GoalProgress) -> Option<String> {
+    use atomcode_coding::GoalTerminal;
+    match progress.terminal? {
+        GoalTerminal::Met => Some(
+            tr(SMsg::GoalMet {
+                condition: &progress.condition,
+            })
+            .into_owned(),
+        ),
+        // 停下来了、运行时又没给出原因 —— 这正是「评估没有结论」那一种。
+        GoalTerminal::Stopped if progress.last_reason.is_none() => Some(
+            tr(SMsg::GoalGaveUp {
+                condition: &progress.condition,
+            })
+            .into_owned(),
+        ),
+        _ => None,
+    }
+}
+
+/// 一句给人看的话,走屏幕画警告的那条路。
+///
+/// `AgentEvent::Error` 是这块屏幕唯一会把它画出来的形状
+/// (`tui/src/plugin.rs` 的 `say_refused`),和 `ControllerWarning` 走的是同一条。
+fn said(message: std::borrow::Cow<'_, str>) -> AgentEvent {
+    AgentEvent::Error {
+        message: message.into_owned(),
+        http_status: None,
+        code: None,
+        retryable: None,
     }
 }
 
@@ -2523,5 +2595,79 @@ fn catalog_tool(listing: atomcode_harness::seams::ToolListing) -> atomcode_host_
             Live::OffInSession => Wire::OffInSession,
             Live::ExcludedByConfig => Wire::ExcludedByConfig,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 运行时说了话的事件,不能在转给屏幕的路上被 `_ => None` 吃掉。
+    ///
+    /// `translate` 的兜底那一臂把**每一种没列出来的事件**扔掉,而其中几种是这块
+    /// 屏幕唯一能听到它们的地方:识图为什么失败、为什么没有可用的 provider、
+    /// 压缩被打断了。三条的共同形状是**没有任何一处说它没生效** —— 图只剩一个
+    /// `[图片识别失败]` 标记,provider 那条连标记都没有。
+    ///
+    /// 判的是「有没有话出来」,不是那句话长什么样:措辞归语言表,这里要钉的是
+    /// 那一臂还在。
+    #[test]
+    fn what_the_runtime_said_is_not_dropped_on_the_way_to_the_screen() {
+        let words = |event| match translate(event) {
+            Some(AgentEvent::Error { message, .. }) => message,
+            other => panic!("没有话出来:{other:?}"),
+        };
+
+        let said = words(CodingRuntimeEvent::VisionPreprocessFailed {
+            reason: "VL-NOT-CONFIGURED".into(),
+        });
+        assert!(said.contains("VL-NOT-CONFIGURED"), "原因带上了:{said}");
+
+        let said = words(CodingRuntimeEvent::ProviderUnavailable {
+            reason: atomcode_coding::ProviderUnavailableReason::AuthenticationRequired,
+            forced: false,
+        });
+        assert!(!said.trim().is_empty(), "说了为什么用不了:{said}");
+
+        let said = words(CodingRuntimeEvent::CompactionFinished {
+            completion: CompactionCompletion::Interrupted {
+                trigger: atomcode_kernel::message::CompactTrigger::Manual { focus: None },
+                reason: atomcode_coding::CompactionInterruption::RuntimeReconfigured,
+            },
+        });
+        assert!(!said.trim().is_empty(), "打断了也要说:{said}");
+    }
+
+    /// 目标结束时,「达成」和「判不了算不算达成」不能长得一样。
+    ///
+    /// 徽标消失是两者共有的,所以只看屏幕的话第二种会被当成第一种 —— 人以为
+    /// 目标完成了。另外两种终态(停死、评估失败)运行时自己会发
+    /// `ControllerWarning` 带着原因,在这儿再说一遍就是说两遍;人自己停的
+    /// (`Cancelled`)命令已经答过一句了。
+    #[test]
+    fn a_goal_that_ended_says_which_of_the_two_silent_endings_it_was() {
+        use atomcode_coding::{GoalPhase, GoalProgress, GoalTerminal};
+        let ended = |terminal, last_reason| {
+            goal_ending(&GoalProgress {
+                active: false,
+                terminal: Some(terminal),
+                phase: GoalPhase::Pursuing,
+                round: 3,
+                max_rounds: None,
+                elapsed_secs: 0,
+                condition: "测试全绿 z8k".into(),
+                last_reason,
+            })
+        };
+        let met = ended(GoalTerminal::Met, None).expect("达成要说");
+        let gave_up = ended(GoalTerminal::Stopped, None).expect("判不了也要说");
+        assert!(met.contains("测试全绿 z8k") && gave_up.contains("测试全绿 z8k"));
+        assert_ne!(met, gave_up, "两种结局不能是同一句话");
+
+        // 运行时已经给了原因的那一种,这里不再说 —— 否则同一件事说两遍。
+        assert_eq!(ended(GoalTerminal::Stopped, Some("卡住了".into())), None);
+        assert_eq!(ended(GoalTerminal::Failed, None), None);
+        // 人自己停的,命令已经答过「目标停了。」
+        assert_eq!(ended(GoalTerminal::Cancelled, None), None);
     }
 }

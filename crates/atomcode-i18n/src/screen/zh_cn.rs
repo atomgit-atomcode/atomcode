@@ -388,6 +388,13 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StatusModelLine { model, effort } => format!("模型 {model} · 思考强度 {effort}").into(),
         Msg::StatusWhereLine { where_ } => format!("在 {where_}").into(),
         Msg::StatusAutonomyLine { what, round, took } => format!("在自己干:{what} · 第 {round} 轮 · 已跑 {took}").into(),
+        Msg::VisionFailedBecause { reason } => format!("图片没认出来:{reason}").into(),
+        Msg::CompactionInterrupted => "压缩被打断了 —— 上下文还是原来那么长".into(),
+        Msg::RuntimeStopped { how } => format!("运行时停了:{how}。这个会话不会再有新的东西。").into(),
+        Msg::GoalMet { condition } => format!("目标达成:{condition}").into(),
+        Msg::GoalGaveUp { condition } => {
+            format!("目标停了,但没能判定它是否达成:{condition}").into()
+        }
         Msg::WhoAmIUnnamed => "登录着,但宿主没说是谁".into(),
         Msg::WhoAmIStoredAt { path } => format!("凭据存在 {path}").into(),
         Msg::WhoAmINobody => "没有人登录;这份配置用的是自带的凭据".into(),

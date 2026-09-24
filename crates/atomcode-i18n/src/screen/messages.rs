@@ -652,6 +652,19 @@ pub enum Msg<'a> {
         round: u32,
         took: &'a str,
     },
+    VisionFailedBecause {
+        reason: &'a str,
+    },
+    CompactionInterrupted,
+    RuntimeStopped {
+        how: &'a str,
+    },
+    GoalMet {
+        condition: &'a str,
+    },
+    GoalGaveUp {
+        condition: &'a str,
+    },
     WhoAmIUnnamed,
     WhoAmIStoredAt {
         path: &'a str,

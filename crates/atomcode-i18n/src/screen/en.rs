@@ -418,6 +418,20 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StatusModelLine { model, effort } => format!("model {model} · reasoning effort {effort}").into(),
         Msg::StatusWhereLine { where_ } => format!("in {where_}").into(),
         Msg::StatusAutonomyLine { what, round, took } => format!("running on its own: {what} · round {round} · {took} so far").into(),
+        Msg::VisionFailedBecause { reason } => {
+            format!("the picture was not recognised: {reason}").into()
+        }
+        Msg::RuntimeStopped { how } => {
+            format!("the runtime stopped: {how}. nothing more will arrive in this session.").into()
+        }
+        Msg::CompactionInterrupted => {
+            "the compaction was interrupted — the context is as long as it was".into()
+        }
+        Msg::GoalMet { condition } => format!("goal met: {condition}").into(),
+        Msg::GoalGaveUp { condition } => {
+            format!("the goal stopped without being able to tell whether it was met: {condition}")
+                .into()
+        }
         Msg::WhoAmIUnnamed => "signed in, but the host did not say as whom".into(),
         Msg::WhoAmIStoredAt { path } => format!("kept in {path}").into(),
         Msg::WhoAmINobody => "nobody is signed in; this configuration uses its own credentials".into(),
