@@ -184,14 +184,49 @@ pub(crate) fn path_in_temp_dir(raw: &str, cwd: &Path) -> bool {
 /// files under `~/Downloads/…`), without opening any other location.
 pub(crate) fn canonical_dir_key(raw: &str, cwd: &Path) -> String {
     let resolved = resolve_path(raw, cwd);
-    // Scope to the parent directory, which usually EXISTS even when the file being
-    // created does not — so canonicalizing it gives a stable key across the
-    // create-then-edit sequence. Fall back to the resolved path if there is no parent.
+    // Scope to the parent directory. It USUALLY exists even when the file being
+    // created does not — but not always: the model may create a brand-new folder
+    // and write into it. A plain `canonicalize().unwrap_or(dir)` would then key
+    // the FIRST write (folder absent) on the lexical path and every LATER write
+    // (folder now created) on the canonical one, so "always allow this folder"
+    // was granted under one key and checked under another — and kept asking
+    // (reported bug). Canonicalize the deepest ANCESTOR that exists and append
+    // the not-yet-created tail lexically, which is stable across the folder's
+    // creation (mkdir adds real dirs, never symlinks, so the canonical form of
+    // the created dir equals canonical-ancestor + that same tail).
     let dir = resolved.parent().map(Path::to_path_buf).unwrap_or(resolved);
-    std::fs::canonicalize(&dir)
-        .unwrap_or(dir)
+    canonicalize_existing_prefix(&dir)
         .to_string_lossy()
         .into_owned()
+}
+
+/// `path` canonicalized as far as it exists: the canonical form of its deepest
+/// EXISTING ancestor, with the remaining (not-yet-created) components appended
+/// lexically. Unlike `canonicalize().unwrap_or(path)`, the result does not flip
+/// between the lexical and the canonical spelling the moment the directory is
+/// created — which is what makes it usable as a stable session-grant key across
+/// a create-then-write sequence. The ancestor walk mirrors [`path_under_any`].
+fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = path;
+    loop {
+        if let Ok(canon) = std::fs::canonicalize(cur) {
+            let mut result = canon;
+            // `tail` was pushed deepest-first while walking up; replay it
+            // shallowest-first to rebuild the original order under the ancestor.
+            result.extend(tail.iter().rev());
+            return result;
+        }
+        match (cur.file_name(), cur.parent()) {
+            (Some(name), Some(parent)) => {
+                tail.push(name.to_os_string());
+                cur = parent;
+            }
+            // No ancestor canonicalizes (e.g. a relative path with no existing
+            // prefix): fall back to the lexical path, as before.
+            _ => return path.to_path_buf(),
+        }
+    }
 }
 
 /// Grant key for an out-of-workspace write. Free fn (no `self`) so it can run inside
@@ -626,6 +661,51 @@ mod tests {
             gate.before(&mut o, &edit, &silent_rt()).await.is_deny(),
             "a file in a different folder must still prompt"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grant_key_is_stable_when_the_target_folder_gets_created() {
+        // The reported bug: "本会话总是允许写入此目录" kept asking. The model
+        // creates a NEW folder outside the workspace and writes several files
+        // into it; the first write keyed the grant on the folder BEFORE it
+        // existed, later writes keyed it AFTER — and a plain
+        // `canonicalize().unwrap_or` flips between the lexical and the canonical
+        // spelling once the folder exists, so the grant never matched again.
+        //
+        // A symlinked ancestor makes lexical ≠ canonical, so this test genuinely
+        // exercises the flip (without one, a temp root already canonicalizes to
+        // itself and the bug is invisible).
+        let tmp = tempfile::tempdir().unwrap();
+        let real = std::fs::canonicalize(tmp.path()).unwrap().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = std::fs::canonicalize(tmp.path()).unwrap().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // Targets addressed THROUGH the symlink, in a folder that does not exist yet.
+        let newdir_via_link = link.join("report");
+        let first = newdir_via_link.join("a.md");
+        let second = newdir_via_link.join("b.md");
+        let canonical_newdir = real.join("report");
+
+        // Before the folder exists.
+        let key_absent = canonical_dir_key(first.to_str().unwrap(), tmp.path());
+        // The write tool creates the folder; a later write sees it existing.
+        std::fs::create_dir_all(&newdir_via_link).unwrap();
+        let key_present_same = canonical_dir_key(first.to_str().unwrap(), tmp.path());
+        let key_present_sibling = canonical_dir_key(second.to_str().unwrap(), tmp.path());
+
+        assert_eq!(
+            key_absent, key_present_same,
+            "the folder key must not change once the folder is created"
+        );
+        assert_eq!(
+            key_absent, key_present_sibling,
+            "a sibling in the same folder shares the key across creation"
+        );
+        // Always the symlink-resolved folder — the same string a pre-existing
+        // folder addressed either way would produce.
+        assert_eq!(key_present_sibling, canonical_newdir.to_string_lossy());
     }
 
     #[tokio::test]
