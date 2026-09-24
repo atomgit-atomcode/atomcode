@@ -98,6 +98,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         // ── 输入行 ──
         Msg::InputAnswerKeys => "enter 送出 · esc 不给".into(),
         Msg::InputHistoryNth { nth, total } => format!("历史 {nth}/{total}").into(),
+        Msg::InputClipboardImage => "剪贴板有图片 · ctrl+v 粘贴".into(),
+        Msg::InputClipboardImageAltOrCommand => "剪贴板有图片 · ctrl+alt+v 或 /paste 粘贴".into(),
         Msg::InputSearchNth { query, nth, total } =>
             format!("搜索 '{query}' {nth}/{total}").into(),
         Msg::InputSearchNone { query } => format!("搜索 '{query}' 无匹配").into(),

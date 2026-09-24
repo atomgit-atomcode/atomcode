@@ -1987,6 +1987,27 @@ pub struct TurnEndBlock {
     /// the task was done when it was not (reported against 5.1.0). Ignored for
     /// every other stop, which already says it was cut short.
     pub open_items: usize,
+    /// When the turn ended, as the person's own clock reads it (`21:42`) — see
+    /// [`clock_of`]. `None` when the log recorded no time for it.
+    pub ended_at: Option<String>,
+}
+
+/// A log timestamp (ms since the epoch) as the local wall clock's `HH:MM`, for
+/// the line that closes a turn: "when did that finish" is the question a person
+/// scrolling back asks, and the duration beside it does not answer it. `None`
+/// for a zero stamp, which is a record that carried no time.
+///
+/// Read from the fact's own stamp, not a clock, so a replayed or resumed session
+/// shows when its turns really ended.
+pub fn clock_of(at_ms: u64) -> Option<String> {
+    use chrono::TimeZone;
+    if at_ms == 0 {
+        return None;
+    }
+    chrono::Local
+        .timestamp_millis_opt(i64::try_from(at_ms).ok()?)
+        .single()
+        .map(|t| t.format("%H:%M").to_string())
 }
 
 /// What one turn cost, as its own facts recorded it.
@@ -2040,10 +2061,12 @@ impl TurnStats {
         // prompt+completion.
         let billable =
             self.completion as usize + (self.prompt as usize).saturating_sub(self.cached as usize);
+        // How long first, beside the time it ended: the two answer "when" and
+        // "how long", and the counts after them answer "how much".
         let mut parts = vec![
+            fmt_dur(self.elapsed_ms),
             t(Msg::TurnRounds { steps: self.steps }).into_owned(),
             t(Msg::TurnTools { tools: self.tools }).into_owned(),
-            fmt_dur(self.elapsed_ms),
             format!("{} tokens", fmt_tokens(billable)),
         ];
         if with_cached {
@@ -2325,6 +2348,7 @@ impl Content for TurnEndBlock {
                 self.done_index,
             ),
             &self.open_items.to_string(),
+            self.ended_at.as_deref().unwrap_or(""),
         ])
     }
     /// The turn's outcome and its cost on one light line at the left margin:
@@ -2349,15 +2373,29 @@ impl Content for TurnEndBlock {
         let w = ctx.width;
         let caps = Caps::default();
         let (mark, said, style) = turn_end_note(self.stop, self.done_index, self.open_items);
-        let short = format!("{} {said}", caps.g(mark));
+        let clean = matches!(self.stop, StopReason::Stopped) && self.open_items == 0;
+        // When it ended rides beside the word for a clean finish
+        // (`✻ Nailed it 21:42 · 12.5s · …`). Every other outcome's words are a
+        // sentence — a cause, what to do next — and a time glued to its end reads
+        // as part of it, so there the time leads the figures instead.
+        let short = match (&self.ended_at, clean) {
+            (Some(at), true) => format!("{} {said} {at}", caps.g(mark)),
+            _ => format!("{} {said}", caps.g(mark)),
+        };
+        let lead = self.ended_at.as_ref().filter(|_| !clean);
 
         // Under the rule, in the order they are worth reading: the cost first
         // (it is about this turn), then the cause of a failure. The cache ratio
         // rides only a clean stop, the way tuix drops it from a failed turn.
         let mut under: Vec<String> = Vec::new();
         let mut caption = short;
-        let with_cached = matches!(self.stop, StopReason::Stopped) && self.open_items == 0;
-        if let Some(stats) = self.stats.caption(with_cached) {
+        let with_cached = clean;
+        let stats = match (lead, self.stats.caption(with_cached)) {
+            (Some(at), Some(stats)) => Some(format!("{at} · {stats}")),
+            (Some(at), None) => Some(at.clone()),
+            (None, stats) => stats,
+        };
+        if let Some(stats) = stats {
             let wider = format!("{caption} · {stats}");
             if crate::el::caption_fits(&wider, w as usize) {
                 caption = wider;
@@ -2394,6 +2432,50 @@ impl Content for TurnEndBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ended(stop: StopReason, open_items: usize) -> String {
+        TurnEndBlock {
+            stop,
+            error: None,
+            stats: TurnStats {
+                steps: 1,
+                prompt: 2_700,
+                completion: 50,
+                cached: 2_646,
+                tools: 0,
+                elapsed_ms: 12_500,
+            },
+            done_index: 1,
+            open_items,
+            ended_at: Some("21:42".into()),
+        }
+        .lines(&RenderCtx::bare(200))[0]
+            .plain()
+    }
+
+    /// A clean finish says when it ended, beside its word, and then how long it
+    /// took — `✻ Nailed it 21:42 · 12.5s · 1 轮 · 0 工具 · … tokens · …% cached`.
+    #[test]
+    fn a_clean_finish_says_when_it_ended_then_how_long() {
+        let line = ended(StopReason::Stopped, 0);
+        let rounds = t(Msg::TurnRounds { steps: 1 }).into_owned();
+        let tools = t(Msg::TurnTools { tools: 0 }).into_owned();
+        assert!(
+            line.contains(&format!("Nailed it 21:42 · 12.5s · {rounds} · {tools} · ")),
+            "{line}"
+        );
+        assert!(line.ends_with("% cached"), "{line}");
+    }
+
+    /// Any other outcome's words are a sentence — a cause, what to do next — so
+    /// the time does not trail them: it leads the figures.
+    #[test]
+    fn a_stop_that_is_not_a_finish_leads_its_figures_with_the_time() {
+        for (stop, open) in [(StopReason::MaxRounds, 0), (StopReason::Stopped, 2)] {
+            let line = ended(stop, open);
+            assert!(line.contains(" · 21:42 · 12.5s · "), "{line}");
+        }
+    }
 
     #[test]
     fn split_vl_caption_pulls_the_recognition_out_of_a_user_message() {
@@ -2920,6 +3002,7 @@ mod tests {
             stats: TurnStats::default(),
             done_index: 0,
             open_items: 0,
+            ended_at: None,
         };
         let lines = block.lines(&crate::block::RenderCtx::bare(100));
         let text: String = lines
@@ -2947,6 +3030,7 @@ mod tests {
             stats: TurnStats::default(),
             done_index: 0,
             open_items: 0,
+            ended_at: None,
         };
         let lines = short.lines(&crate::block::RenderCtx::bare(100));
         assert_eq!(lines.len(), 1);
@@ -2966,6 +3050,7 @@ mod tests {
                 stats: TurnStats::default(),
                 done_index: 0,
                 open_items: 0,
+                ended_at: None,
             }
             .lines(&crate::block::RenderCtx::bare(80))
             .iter()
@@ -3084,6 +3169,7 @@ mod tests {
             },
             done_index: 0,
             open_items: 0,
+            ended_at: None,
         };
         let text = drawn(&block, 100);
         for want in [
@@ -3121,6 +3207,7 @@ mod tests {
             },
             done_index: 0,
             open_items: 0,
+            ended_at: None,
         };
         let text = drawn(&block, 80);
         assert!(!text.contains("cached"), "{text:?}");
@@ -3145,6 +3232,7 @@ mod tests {
             stats: TurnStats::default(),
             done_index: 0,
             open_items: 0,
+            ended_at: None,
         };
         let lines = block.lines(&crate::block::RenderCtx::bare(80));
         assert_eq!(lines.len(), 1, "nothing to say means no extra row");
@@ -3173,6 +3261,7 @@ mod tests {
             },
             done_index: 0,
             open_items: 0,
+            ended_at: None,
         };
         let outcome = format!("{} Done", Caps::default().g(Glyph::Ok));
         let first = (0..200u16)
@@ -3211,6 +3300,7 @@ mod tests {
             },
             done_index: 0,
             open_items: 0,
+            ended_at: None,
         };
         for w in 0..160u16 {
             for line in block.lines(&crate::block::RenderCtx::bare(w)) {
@@ -3278,6 +3368,7 @@ mod tests {
                 stats: TurnStats::default(),
                 done_index: 0,
                 open_items: 0,
+                ended_at: None,
             }),
             Box::new(TurnEndBlock {
                 stop: StopReason::Cancelled,
@@ -3285,6 +3376,7 @@ mod tests {
                 stats: TurnStats::default(),
                 done_index: 0,
                 open_items: 0,
+                ended_at: None,
             }),
             // With figures, and with figures plus a cause: the caption is
             // longest here, so this is the case that would run off the edge.
@@ -3301,6 +3393,7 @@ mod tests {
                 },
                 done_index: 1,
                 open_items: 0,
+                ended_at: None,
             }),
             Box::new(TurnEndBlock {
                 stop: StopReason::ProviderError,
@@ -3315,6 +3408,7 @@ mod tests {
                 },
                 done_index: 0,
                 open_items: 0,
+                ended_at: None,
             }),
         ];
         for item in &items {

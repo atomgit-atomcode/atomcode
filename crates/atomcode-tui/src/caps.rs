@@ -155,6 +155,25 @@ pub struct Caps {
     /// component that wants a picture will ask this rather than the
     /// environment.
     pub graphics: Graphics,
+    /// Which key takes a picture off the clipboard in this terminal — what a
+    /// hint about one has to name.
+    pub paste_image: PasteImage,
+}
+
+/// How a picture on the clipboard gets onto the line.
+///
+/// Its own answer, and the shield's, because it is about the platform: Windows
+/// Terminal and conhost bind `ctrl+v` to their own paste, which forwards the
+/// clipboard's *text* only — an image-only clipboard sends nothing, so the key
+/// never reaches this screen. `ctrl+alt+v` gets through there, and `/paste`
+/// gets through everywhere. Elsewhere `ctrl+v` arrives.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PasteImage {
+    /// `ctrl+v`.
+    #[default]
+    CtrlV,
+    /// `ctrl+alt+v`, or `/paste`.
+    CtrlAltVOrCommand,
 }
 
 impl Default for Caps {
@@ -169,6 +188,7 @@ impl Default for Caps {
             // default. `detect` is where a real answer comes from.
             cell_background: true,
             graphics: Graphics::None,
+            paste_image: PasteImage::CtrlV,
         }
     }
 }
@@ -182,6 +202,7 @@ impl Caps {
             palette: crate::theme::Palette::assumed(crate::theme::Theme::Dark),
             cell_background: false,
             graphics: Graphics::None,
+            paste_image: PasteImage::CtrlV,
         }
     }
 
@@ -256,6 +277,11 @@ impl Caps {
                 || env("TERM_PROGRAM").is_some()
                 || env("TERM").is_some_and(|t| t.contains("jediterm")),
             graphics,
+            paste_image: if cfg!(windows) {
+                PasteImage::CtrlAltVOrCommand
+            } else {
+                PasteImage::CtrlV
+            },
         }
     }
 

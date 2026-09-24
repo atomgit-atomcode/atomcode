@@ -55,6 +55,22 @@ fn note_shown(moment: &crate::moment::Moment) -> bool {
     moment.interrupted && moment.activity == Activity::Idle && moment.secret.is_none()
 }
 
+/// The offer of a picture on the clipboard, for the right shoulder of the rule,
+/// naming the key that takes it *here* — which the shield knows and this does
+/// not (`Caps::paste_image`). `None` while there is no offer.
+fn clipboard_caption(moment: &crate::moment::Moment) -> Option<String> {
+    if !moment.clipboard_hint {
+        return None;
+    }
+    Some(
+        t(match moment.caps.paste_image {
+            crate::caps::PasteImage::CtrlV => Msg::InputClipboardImage,
+            crate::caps::PasteImage::CtrlAltVOrCommand => Msg::InputClipboardImageAltOrCommand,
+        })
+        .into_owned(),
+    )
+}
+
 fn history_caption(moment: &crate::moment::Moment) -> Option<String> {
     let total = moment.history.len();
     // A search says where it is in the same place, and instead: two counters on
@@ -387,7 +403,21 @@ impl View for Input {
                 .title
                 .as_deref()
                 .filter(|s| !s.is_empty() && vp.moment.title_user_set);
-            if history.is_none() && name.is_none() {
+            // A picture on the clipboard takes the right shoulder for the few
+            // seconds it is offered: it is the thing to act on *now*, and the
+            // name is back as soon as the offer is gone. Plain rather than on
+            // the name's pill, so the two are not read as the same kind of thing.
+            let offer = clipboard_caption(vp.moment);
+            if let Some(offer) = offer.as_deref() {
+                El::text(crate::el::flanked_rule(
+                    history.as_deref(),
+                    Some(offer),
+                    w as usize,
+                    muted,
+                    muted,
+                    muted,
+                ))
+            } else if history.is_none() && name.is_none() {
                 rule()
             } else {
                 El::text(crate::el::flanked_rule(
@@ -612,6 +642,41 @@ mod tests {
             12,
             "still a full-width rule: {narrow:?}"
         );
+    }
+
+    /// The offer rides the upper rule's right shoulder, and names the key that
+    /// takes a picture on *this* terminal — `ctrl+v`, or, where the terminal
+    /// keeps `ctrl+v` for its own text paste, `ctrl+alt+v` and `/paste`.
+    #[test]
+    fn a_picture_on_the_clipboard_is_offered_with_the_key_that_takes_it_here() {
+        let mut m = Moment::default();
+        let bare = draw(&State::default(), &m, 60, 3);
+        assert!(!bare[0].contains("剪贴板"), "{bare:?}");
+
+        m.clipboard_hint = true;
+        let here = draw(&State::default(), &m, 60, 3);
+        assert!(
+            here[0].contains("剪贴板有图片") && here[0].contains("ctrl+v"),
+            "{here:?}"
+        );
+        assert!(!here[0].contains("/paste"), "{here:?}");
+
+        m.caps.paste_image = crate::caps::PasteImage::CtrlAltVOrCommand;
+        let windows = draw(&State::default(), &m, 60, 3);
+        assert!(
+            windows[0].contains("ctrl+alt+v") && windows[0].contains("/paste"),
+            "{windows:?}"
+        );
+
+        // It takes the name's place while it is up, and the name comes back.
+        m.caps.paste_image = crate::caps::PasteImage::CtrlV;
+        m.title = Some("修解析器".into());
+        m.title_user_set = true;
+        let offered = draw(&State::default(), &m, 60, 3);
+        assert!(offered[0].contains("剪贴板有图片") && !offered[0].contains("修解析器"));
+        m.clipboard_hint = false;
+        let after = draw(&State::default(), &m, 60, 3);
+        assert!(after[0].contains("修解析器") && !after[0].contains("剪贴板"));
     }
 
     #[test]

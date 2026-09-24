@@ -568,6 +568,7 @@ impl Producer for Transcript {
                         stats,
                         done_index,
                         open_items,
+                        ended_at: crate::content::clock_of(logged.at),
                     }),
                 );
             }
@@ -1169,6 +1170,37 @@ mod tests {
         for end in &ends {
             assert!(!end.contains("没完成"), "{end:?}");
         }
+    }
+
+    /// The line that closes a turn says when it ended, read off the `TurnEnd`
+    /// fact's own stamp — so a resumed or replayed session shows when its turns
+    /// really ended, not when they were drawn again.
+    #[test]
+    fn a_turns_closing_line_says_when_it_ended() {
+        let at = 1_790_000_000_000_u64;
+        let stamped = |seq: u64, event: SessionEvent| atomcode_harness::session::LoggedEvent {
+            seq,
+            at,
+            event,
+        };
+        let mut s = Stream::new();
+        let t = Transcript::default();
+        for (i, fact) in [
+            SessionEvent::TurnStart { turn: 1 },
+            SessionEvent::TurnEnd {
+                turn: 1,
+                stop: atomcode_harness::seams::StopReason::Stopped,
+                error: None,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut w = s.writer(ID);
+            t.absorb(&stamped(i as u64 + 1, fact), &mut w);
+        }
+        let clock = crate::content::clock_of(at).expect("a real stamp reads as a time");
+        assert!(said(&s).contains(&clock), "{} lacks {clock}", said(&s));
     }
 
     #[test]

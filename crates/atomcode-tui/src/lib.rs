@@ -47,6 +47,7 @@ pub mod ask;
 pub mod attach;
 pub mod block;
 pub mod caps;
+pub mod clip_hint;
 pub mod command;
 pub mod commands;
 pub mod conformance;

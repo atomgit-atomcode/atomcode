@@ -159,6 +159,205 @@ fn encode_jpeg(img: &image::DynamicImage, quality: u8) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Decode a packed Windows `CF_DIB` clipboard payload into `(width, height,
+/// RGBA8)`.
+///
+/// A `CF_DIB` is a `BITMAPINFOHEADER`-family header, optional bitfield masks
+/// and palette, then the pixels — a BMP file without its 14-byte file header.
+/// It is wrapped in a synthesized one here and decoded through the BMP *file*
+/// path, so the explicit pixel offset (`bfOffBits`) is computed from the header
+/// rather than guessed. Guessing is the bug this exists for: `arboard`'s
+/// header-less decode places the pixels wrongly for V4/V5 headers with
+/// `BI_BITFIELDS` compression and rejects the image — and that is exactly what
+/// the Windows Snipping Tool (`Win+Shift+S`) and Qt-based screenshot tools put
+/// on the clipboard, so a screenshot read as "no image".
+///
+/// Target-independent on purpose: the decoder is judged on every host, and only
+/// the reading of the clipboard is Windows-only (it lives with the screen).
+pub fn dib_to_rgba(dib: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    const FILE_HEADER_SIZE: u64 = 14;
+    const INFO_HEADER_SIZE: u64 = 40;
+    const BI_BITFIELDS: u32 = 3;
+
+    if dib.len() < INFO_HEADER_SIZE as usize {
+        return None;
+    }
+    let u32_at = |at: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(dib.get(at..at + 4)?.try_into().ok()?))
+    };
+    let header_size = u64::from(u32_at(0)?);
+    if header_size < INFO_HEADER_SIZE || header_size > dib.len() as u64 {
+        return None;
+    }
+    let bit_count = u16::from_le_bytes([*dib.get(14)?, *dib.get(15)?]);
+    let compression = u32_at(16)?;
+    let colors_used = u64::from(u32_at(32)?);
+
+    // A plain BITMAPINFOHEADER with BI_BITFIELDS is followed by three DWORD
+    // masks; the larger (V2..V5) headers carry the masks inside themselves.
+    let mask_bytes: u64 = if header_size == INFO_HEADER_SIZE && compression == BI_BITFIELDS {
+        12
+    } else {
+        0
+    };
+    let palette_entries: u64 = if colors_used != 0 {
+        colors_used
+    } else if bit_count <= 8 {
+        1u64 << bit_count
+    } else {
+        0
+    };
+    let pixel_offset =
+        u32::try_from(FILE_HEADER_SIZE + header_size + mask_bytes + palette_entries * 4).ok()?;
+    let file_size = u32::try_from(FILE_HEADER_SIZE + dib.len() as u64).ok()?;
+
+    let mut bmp = Vec::with_capacity(FILE_HEADER_SIZE as usize + dib.len());
+    bmp.extend_from_slice(b"BM");
+    bmp.extend_from_slice(&file_size.to_le_bytes());
+    bmp.extend_from_slice(&0u32.to_le_bytes());
+    bmp.extend_from_slice(&pixel_offset.to_le_bytes());
+    bmp.extend_from_slice(dib);
+
+    let decoded = image::load_from_memory_with_format(&bmp, image::ImageFormat::Bmp).ok()?;
+    let rgba = decoded.into_rgba8();
+    let (w, h) = rgba.dimensions();
+    Some((w, h, rgba.into_raw()))
+}
+
+#[cfg(test)]
+mod dib_tests {
+    //! The exact DIB shapes screenshot tools put on the Windows clipboard — the
+    //! ones `arboard`'s header-less decode rejects.
+
+    use super::dib_to_rgba;
+
+    fn push32(v: u32, out: &mut Vec<u8>) {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    fn push16(v: u16, out: &mut Vec<u8>) {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+
+    /// 2x2 bottom-up BGRA: memory rows are [red, green] (bottom) then
+    /// [blue, white] (top), all opaque.
+    const PIXELS_2X2: [u8; 16] = [
+        0x00, 0x00, 0xff, 0xff, // red
+        0x00, 0xff, 0x00, 0xff, // green
+        0xff, 0x00, 0x00, 0xff, // blue
+        0xff, 0xff, 0xff, 0xff, // white
+    ];
+
+    /// What Qt writes for 32-bit content: a plain `BITMAPINFOHEADER` with
+    /// `BI_BITFIELDS` and three trailing DWORD masks.
+    fn qt_cf_dib(width: u32, height: u32, pixels_bgra: &[u8], compression: u32) -> Vec<u8> {
+        let mut d = Vec::with_capacity(52 + pixels_bgra.len());
+        push32(40, &mut d);
+        push32(width, &mut d);
+        push32(height, &mut d);
+        push16(1, &mut d);
+        push16(32, &mut d);
+        push32(compression, &mut d);
+        push32(pixels_bgra.len() as u32, &mut d);
+        push32(0, &mut d);
+        push32(0, &mut d);
+        push32(0, &mut d);
+        push32(0, &mut d);
+        if compression == 3 {
+            push32(0x00ff_0000, &mut d);
+            push32(0x0000_ff00, &mut d);
+            push32(0x0000_00ff, &mut d);
+        }
+        d.extend_from_slice(pixels_bgra);
+        d
+    }
+
+    /// A `CF_DIBV5` as the Snipping Tool and Qt tools leave it: a 124-byte
+    /// `BITMAPV5HEADER`, `BI_BITFIELDS`, masks inside the header.
+    fn dibv5(width: u32, height: u32, pixels_bgra: &[u8]) -> Vec<u8> {
+        let mut d = Vec::with_capacity(124 + pixels_bgra.len());
+        push32(124, &mut d);
+        push32(width, &mut d);
+        push32(height, &mut d);
+        push16(1, &mut d);
+        push16(32, &mut d);
+        push32(3, &mut d);
+        push32(0, &mut d);
+        push32(0, &mut d);
+        push32(0, &mut d);
+        push32(0, &mut d);
+        push32(0, &mut d);
+        push32(0x00ff_0000, &mut d);
+        push32(0x0000_ff00, &mut d);
+        push32(0x0000_00ff, &mut d);
+        push32(0xff00_0000, &mut d);
+        push32(0x7352_4742, &mut d); // LCS_sRGB
+        d.extend_from_slice(&[0u8; 36]);
+        push32(0, &mut d);
+        push32(0, &mut d);
+        push32(0, &mut d);
+        push32(4, &mut d);
+        push32(0, &mut d);
+        push32(0, &mut d);
+        push32(0, &mut d);
+        assert_eq!(d.len(), 124);
+        d.extend_from_slice(pixels_bgra);
+        d
+    }
+
+    const RED: [u8; 4] = [255, 0, 0, 255];
+    const GREEN: [u8; 4] = [0, 255, 0, 255];
+    const BLUE: [u8; 4] = [0, 0, 255, 255];
+    const WHITE: [u8; 4] = [255, 255, 255, 255];
+
+    fn pixels(dib: &[u8]) -> (u32, u32, Vec<[u8; 4]>) {
+        let (w, h, rgba) = dib_to_rgba(dib).expect("the DIB decodes");
+        let px = rgba
+            .chunks_exact(4)
+            .map(|c| [c[0], c[1], c[2], c[3]])
+            .collect();
+        (w, h, px)
+    }
+
+    #[test]
+    fn a_dibv5_from_a_screenshot_tool_decodes() {
+        let (w, h, px) = pixels(&dibv5(2, 2, &PIXELS_2X2));
+        assert_eq!((w, h), (2, 2));
+        // Top row first (the array is bottom-up), BGRA → RGBA.
+        assert_eq!(px, vec![BLUE, WHITE, RED, GREEN]);
+    }
+
+    #[test]
+    fn a_qt_dib_with_trailing_masks_decodes() {
+        let (w, h, px) = pixels(&qt_cf_dib(2, 2, &PIXELS_2X2, 3));
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(px, vec![BLUE, WHITE, RED, GREEN]);
+    }
+
+    #[test]
+    fn a_plain_bi_rgb_dib_decodes_opaque() {
+        // The fourth byte is unused in BI_RGB; zero it to show it is not read
+        // as transparency.
+        let mut pixels_bgra = PIXELS_2X2;
+        for alpha in pixels_bgra.iter_mut().skip(3).step_by(4) {
+            *alpha = 0;
+        }
+        let (w, h, px) = pixels(&qt_cf_dib(2, 2, &pixels_bgra, 0));
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(px, vec![BLUE, WHITE, RED, GREEN]);
+    }
+
+    #[test]
+    fn a_malformed_dib_is_refused_not_panicked_on() {
+        assert!(dib_to_rgba(&[0u8; 12]).is_none(), "too short");
+        let mut oversized = qt_cf_dib(2, 2, &PIXELS_2X2, 3);
+        oversized[0..4].copy_from_slice(&0xffff_ffffu32.to_le_bytes());
+        assert!(
+            dib_to_rgba(&oversized).is_none(),
+            "header beyond the buffer"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

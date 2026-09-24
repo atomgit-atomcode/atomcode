@@ -137,6 +137,10 @@ pub enum Input {
     /// A pointer event at a cell, in the frame's own coordinates.
     Mouse(Click, u16, u16),
     Resize(u16, u16),
+    /// The terminal window gained (`true`) or lost focus. Coming back to the
+    /// terminal is when a person has just been somewhere else — taking a
+    /// screenshot, most often.
+    Focus(bool),
 }
 
 /// The terminal, as a seam.
@@ -297,6 +301,18 @@ pub trait Surface: Send + Sync {
         None
     }
 
+    /// A fingerprint of the picture on the clipboard, or `None` when there is
+    /// none — enough to tell "a new picture arrived" from "the same one is
+    /// still there", without encoding it the way [`clipboard_image`] does.
+    ///
+    /// Still a read of the pixels, so the caller spaces its looks
+    /// (`crate::clip_hint::LOOK_EVERY`) rather than asking every frame.
+    ///
+    /// [`clipboard_image`]: Surface::clipboard_image
+    fn clipboard_image_mark(&self) -> Option<u64> {
+        None
+    }
+
     /// The recorder behind this surface, when it is one. How a test reaches the
     /// frames without the tree having to know it is being tested.
     fn as_any_headless(&self) -> Option<Arc<Headless>> {
@@ -434,6 +450,11 @@ impl Headless {
     /// right-button path is otherwise only ever exercised by a hand.
     pub fn pointer(&self, click: Click, x: u16, y: u16) {
         let _ = self.keys.send(Input::Mouse(click, x, y));
+    }
+
+    /// The window gains or loses focus, the way the terminal would say so.
+    pub fn focus(&self, gained: bool) {
+        let _ = self.keys.send(Input::Focus(gained));
     }
 
     /// Press a key.
@@ -599,6 +620,13 @@ impl Surface for Headless {
     }
     fn clipboard_image(&self) -> Option<atomcode_kernel::message::ImageContent> {
         self.clipboard.lock().expect("headless poisoned").clone()
+    }
+    fn clipboard_image_mark(&self) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        let image = self.clipboard.lock().expect("headless poisoned").clone()?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        image.data.hash(&mut hasher);
+        Some(hasher.finish())
     }
     /// Recorded rather than written anywhere, which is the point: a scripted
     /// pointer already delivers the events a menu reads, so without recording
@@ -1044,6 +1072,65 @@ fn give_back_stderr(held: &StderrHeld) {
 #[cfg(not(unix))]
 fn give_back_stderr(_held: &StderrHeld) {}
 
+/// A cheap fingerprint of a clipboard picture's pixels: its size, and sixteen
+/// evenly spread 128-byte windows of it. Sampling throughout tells apart two
+/// same-sized screenshots whose top and bottom chrome match, and keeps a look
+/// at a 4K picture to a couple of KB of hashing. `atomcode-tuix`'s, kept.
+fn pixel_fingerprint(width: usize, height: usize, bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    const SAMPLES: usize = 16;
+    const WINDOW: usize = 128;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (width, height, bytes.len()).hash(&mut hasher);
+    if bytes.len() <= SAMPLES * WINDOW {
+        bytes.hash(&mut hasher);
+    } else {
+        let step = (bytes.len() - WINDOW) / (SAMPLES - 1);
+        for i in 0..SAMPLES {
+            let at = i * step;
+            bytes.get(at..at + WINDOW).hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+/// The picture on the clipboard as `(width, height, RGBA8)`, or `None`.
+///
+/// Through `arboard` first; on Windows, when it cannot decode what is there,
+/// through the raw `CF_DIB` — which Windows synthesises from any bitmap on the
+/// clipboard. That second road is not an edge case: the Snipping Tool
+/// (`Win+Shift+S`) and Qt screenshot tools leave a V5 header with bitfield
+/// masks that `arboard` rejects, so without it a screenshot read as "no image"
+/// — to the paste and to the hint that offers one alike.
+fn clipboard_rgba() -> Option<(usize, usize, Vec<u8>)> {
+    let from_arboard = arboard::Clipboard::new()
+        .ok()
+        .and_then(|mut clipboard| clipboard.get_image().ok())
+        .map(|img| (img.width, img.height, img.bytes.into_owned()));
+    #[cfg(windows)]
+    {
+        from_arboard.or_else(|| {
+            let dib = read_raw_cf_dib()?;
+            let (w, h, rgba) = atomcode_capabilities::image_normalize::dib_to_rgba(&dib)?;
+            Some((w as usize, h as usize, rgba))
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        from_arboard
+    }
+}
+
+/// The raw `CF_DIB` bytes on the Windows clipboard, when there is any bitmap.
+#[cfg(windows)]
+fn read_raw_cf_dib() -> Option<Vec<u8>> {
+    let clip = clipboard_win::Clipboard::new_attempts(10).ok()?;
+    let mut dib = Vec::new();
+    clipboard_win::raw::get_vec(clipboard_win::formats::CF_DIB, &mut dib).ok()?;
+    drop(clip);
+    (!dib.is_empty()).then_some(dib)
+}
+
 /// Read an image off the system clipboard, encoded the way providers want it.
 ///
 /// `arboard::get_image` hands back raw RGBA and no format; every provider
@@ -1059,9 +1146,8 @@ fn give_back_stderr(_held: &StderrHeld) {}
 fn read_clipboard_image() -> Option<atomcode_kernel::message::ImageContent> {
     use base64::Engine as _;
 
-    let mut clipboard = arboard::Clipboard::new().ok()?;
-    let img = clipboard.get_image().ok()?;
-    let png = encode_rgba_png(img.width, img.height, &img.bytes)?;
+    let (width, height, rgba) = clipboard_rgba()?;
+    let png = encode_rgba_png(width, height, &rgba)?;
     // Downscale/re-encode an oversized paste (longest edge > 1568px or > ~1.5 MB) so a
     // big screenshot can't blow the per-request body — the image is re-sent every turn.
     // Falls back to the original PNG on any decode failure. See image_normalize.
@@ -1638,6 +1724,10 @@ impl Surface for Terminal {
     fn clipboard_image(&self) -> Option<atomcode_kernel::message::ImageContent> {
         read_clipboard_image()
     }
+    fn clipboard_image_mark(&self) -> Option<u64> {
+        let (width, height, rgba) = clipboard_rgba()?;
+        Some(pixel_fingerprint(width, height, &rgba))
+    }
     fn clipboard_text(&self) -> Option<String> {
         read_clipboard_text()
     }
@@ -1787,11 +1877,11 @@ pub fn from_crossterm(event: crossterm::event::Event) -> Option<Input> {
         // 那一侧(屏幕碰不到操作系统),两边隔着一条事件通道。
         Event::FocusGained => {
             atomcode_capabilities::notify::set_terminal_focus_state(Some(true));
-            None
+            Some(Input::Focus(true))
         }
         Event::FocusLost => {
             atomcode_capabilities::notify::set_terminal_focus_state(Some(false));
-            None
+            Some(Input::Focus(false))
         }
         // Press, not release: a fold should happen under the finger. A move is
         // reported rather than dropped — the menu is the one thing here that

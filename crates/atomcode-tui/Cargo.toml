@@ -35,6 +35,9 @@ atomcode-capabilities = { path = "../atomcode-capabilities", default-features = 
 # the askpass server holds its cache in, so the secret is zeroized on both ends
 # of the one hop it makes.
 zeroize = "1"
+# The wall-clock time a turn ended (`HH:MM`) on its closing line, in the
+# person's own time zone. `clock` only: nothing here formats dates or parses.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
 # Reading the clipboard. The surface is the only row allowed to talk to the
 # terminal, and the clipboard is the terminal's — so the platform lives here,
@@ -63,6 +66,12 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", 
 # Reading the terminal's answer to an OSC 11 query needs the tty as a file
 # descriptor with a timeout — `poll` and `read`, which crossterm does not
 # expose. Unix only; elsewhere the theme comes from config or `COLORFGBG`.
+# The raw `CF_DIB` behind a Windows clipboard picture, for the screenshots
+# `arboard` cannot decode (the Snipping Tool's and Qt tools' V5 headers). The
+# same crate `arboard` already uses there, so nothing new is built.
+[target.'cfg(windows)'.dependencies]
+clipboard-win = "5.4"
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

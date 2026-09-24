@@ -1777,6 +1777,55 @@ async fn esc_out_of_a_search_gives_the_draft_back() {
     task.abort();
 }
 
+/// A picture on the clipboard is offered on the composer's upper rule — the
+/// moment it is worth saying is when the person comes back to the terminal with
+/// one — and the offer goes once the picture is taken. The same picture still
+/// on the clipboard is not offered again: it is the one already on the line.
+#[tokio::test]
+async fn a_picture_on_the_clipboard_is_offered_until_it_is_taken() {
+    let dir = scratch("clipboard-hint");
+    let s = start(tree(&dir, &replay_vision(r#"{ text = "ok" }"#, true), &[])).await;
+    let task = s.open().await;
+    s.quiet().await;
+    s.term.focus(true);
+    s.quiet().await;
+    assert!(
+        !s.screen().contains("剪贴板有图片"),
+        "nothing on the clipboard, nothing offered:\n{}",
+        s.screen()
+    );
+
+    s.term.set_clipboard_image(screenshot("offered"));
+    s.term.focus(true);
+    until(&s, "剪贴板有图片").await;
+    assert!(
+        s.screen().contains("ctrl+v"),
+        "it says which key takes it here:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::ctrl('v'));
+    s.quiet().await;
+    assert!(s.screen().contains("[Image #1]"), "{}", s.screen());
+    assert!(
+        !s.screen().contains("剪贴板有图片"),
+        "taken, so no longer offered:\n{}",
+        s.screen()
+    );
+
+    s.term.focus(true);
+    s.quiet().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !s.screen().contains("剪贴板有图片"),
+        "the same picture is not offered twice:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
 /// `/paste` is the way in for a clipboard picture on a terminal that eats
 /// `Ctrl+V` — Windows Terminal, PuTTY. Typed as a command, so nothing in the
 /// key layer can swallow it.

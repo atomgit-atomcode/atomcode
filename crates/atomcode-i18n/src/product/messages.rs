@@ -249,9 +249,10 @@ pub enum Msg<'a> {
     /// reaching atomcode, so Windows builds emit
     /// `StatusClipboardImageHintSlash` instead.
     StatusClipboardImageHint,
-    /// Windows variant: "Image in clipboard · /paste". Tells the
-    /// user to fall back on the `/paste` slash command, which works
-    /// in every terminal regardless of host keybinds.
+    /// Windows variant: "Image in clipboard · ctrl+alt+v or /paste".
+    /// Windows Terminal keeps `ctrl+v` for its own text paste, but lets
+    /// `ctrl+alt+v` through; `/paste` works in every terminal regardless of
+    /// host keybinds.
     StatusClipboardImageHintSlash,
     /// Lowest-priority status-row fallback: nudge the user toward the
     /// `/webui` command (browser UI) when no higher-priority hint

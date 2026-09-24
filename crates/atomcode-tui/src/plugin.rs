@@ -1247,6 +1247,9 @@ impl UserInterface for Tui {
             let _ = client.send(text, Vec::new());
         }
 
+        // A picture already on the clipboard when the screen comes up is as
+        // much news as one that arrives later.
+        self.look_at_clipboard(true);
         let mut quit = false;
         // Whether what is on screen is out of date. `compose` walks the stream
         // and encodes a whole screen, so a frame is composed when the loop is
@@ -1397,6 +1400,16 @@ impl UserInterface for Tui {
             if matches!(&woke, Wake::Tick | Wake::Input(Input::Key(_))) {
                 self.surface.heal_mouse();
             }
+            // A look at the clipboard, at the two moments a picture is worth
+            // offering: coming back to the terminal (from taking a screenshot,
+            // most often) — at once — and typing, spaced. Not on a timer: a look
+            // copies the picture's pixels, and a screen left open overnight has
+            // no one to offer anything to.
+            match &woke {
+                Wake::Input(Input::Focus(true)) => self.look_at_clipboard(true),
+                Wake::Input(Input::Key(_)) => self.look_at_clipboard(false),
+                _ => {}
+            }
             match woke {
                 Wake::Closed => quit = true,
                 // The fact was folded into the stream by the listener that sent
@@ -1519,6 +1532,8 @@ impl UserInterface for Tui {
                         .say(t(Msg::MouseTakenBackAuto).into_owned(), false);
                     stale = true;
                 }
+                // Acted on above; a change of focus draws nothing by itself.
+                Wake::Input(Input::Focus(_)) => {}
                 Wake::Input(Input::Resize(..)) => {
                     // A resize is the terminal reflowing its own screen under
                     // us, and the repaint diff skips a row whose bytes did not
@@ -2657,6 +2672,61 @@ impl Tui {
     /// are still reading, unlike resuming, which is the end of the list's job.
     /// The row goes when the host says it is gone — not before, or a failed
     /// delete would leave the screen showing a session that is still there.
+    /// Look at the clipboard, off the loop, and offer a picture that has just
+    /// arrived there (`crate::clip_hint` has the rules).
+    ///
+    /// `now` skips the spacing: coming back to the terminal is the moment, and
+    /// waiting out the rest of a spacing would miss it. The read happens on a
+    /// blocking thread — it copies the picture's pixels out — and the loop is
+    /// woken only when the offer actually appears or goes.
+    fn look_at_clipboard(&self, now: bool) {
+        let ticket = {
+            let mut m = self.host.moment.write().expect("moment poisoned");
+            let at = std::time::Instant::now();
+            if !now && !m.clip.due(at) {
+                return;
+            }
+            m.clip.looking(at)
+        };
+        let surface = self.surface.clone();
+        let host = self.host.clone();
+        let wake = self.wake.lock().expect("wake poisoned").clone();
+        tokio::spawn(async move {
+            let mark = tokio::task::spawn_blocking(move || surface.clipboard_image_mark())
+                .await
+                .ok()
+                .flatten();
+            let showing = {
+                let mut m = host.moment.write().expect("moment poisoned");
+                let at = std::time::Instant::now();
+                m.clip.found(mark, at, ticket);
+                let showing = m.clip.showing(at);
+                let changed = m.clipboard_hint != showing;
+                m.clipboard_hint = showing;
+                if changed {
+                    if let Some(wake) = &wake {
+                        let _ = wake.send(Wake::Fact);
+                    }
+                }
+                showing
+            };
+            if !showing {
+                return;
+            }
+            // And down again once its time is up — unless it was answered, or a
+            // newer picture's offer has taken over, in which case that one's
+            // own look put its own timer in.
+            tokio::time::sleep(crate::clip_hint::SHOWN_FOR).await;
+            let mut m = host.moment.write().expect("moment poisoned");
+            if m.clipboard_hint && !m.clip.showing(std::time::Instant::now()) {
+                m.clipboard_hint = false;
+                if let Some(wake) = &wake {
+                    let _ = wake.send(Wake::Fact);
+                }
+            }
+        });
+    }
+
     /// 把一段已经展开好的话作为人自己的消息发出去。
     ///
     /// 给 `Ctrl+B` 用:收走的那几句本来就是提交过一次的文本 —— 粘贴已经还原
@@ -4773,6 +4843,9 @@ impl Tui {
                     return false;
                 };
                 m.insert_image(image);
+                // The offer is answered.
+                m.clip.taken();
+                m.clipboard_hint = false;
             }
             // `/paste`, from the clipboard or from a named file. A picture
             // attaches; anything else goes in as text — and which it is is
@@ -4825,11 +4898,14 @@ impl Tui {
                             self.say_refused(&reason);
                             return false;
                         }
-                        self.host
-                            .moment
-                            .write()
-                            .expect("moment poisoned")
-                            .insert_image(image);
+                        let mut m = self.host.moment.write().expect("moment poisoned");
+                        m.insert_image(image);
+                        // From the clipboard, the offer is answered; from a
+                        // file, the picture on the clipboard is still there.
+                        if from.is_none() {
+                            m.clip.taken();
+                            m.clipboard_hint = false;
+                        }
                     }
                 }
                 return false;

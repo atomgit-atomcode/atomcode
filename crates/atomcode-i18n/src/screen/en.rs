@@ -119,6 +119,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         // ── the input line ──
         Msg::InputAnswerKeys => "enter to send · esc to withhold".into(),
         Msg::InputHistoryNth { nth, total } => format!("history {nth}/{total}").into(),
+        Msg::InputClipboardImage => "Image in clipboard · ctrl+v to paste".into(),
+        Msg::InputClipboardImageAltOrCommand => {
+            "Image in clipboard · ctrl+alt+v or /paste".into()
+        }
         Msg::InputSearchNth { query, nth, total } =>
             format!("search '{query}' {nth}/{total}").into(),
         Msg::InputSearchNone { query } => format!("search '{query}' no match").into(),

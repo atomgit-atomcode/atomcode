@@ -692,6 +692,8 @@ dependencies = [
  "atomcode-plexus",
  "atomcode-tree-host",
  "base64",
+ "clipboard-win",
+ "chrono",
  "crossterm",
  "ctor",
  "futures",

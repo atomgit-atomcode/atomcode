@@ -410,7 +410,7 @@ atomcode --prompt-file task.md
 | `Ctrl+U` | 清空当前行 |
 | `Ctrl+W` | 删除一个单词 |
 | `Ctrl+K` | 删除到行尾 |
-| `Ctrl+V / Ctrl+Alt+V` | 从剪贴板粘贴文本或图片（Windows 也可用 `/paste`） |
+| `Ctrl+V / Ctrl+Alt+V` | 把剪贴板里的图片以 `[Image #N]` 附加到输入框（文本用终端自己的粘贴）；Windows Terminal 下用 `Ctrl+Alt+V` 或 `/paste` |
 
 > **换行快捷键的终端兼容性：**
 >
@@ -420,12 +420,15 @@ atomcode --prompt-file task.md
 > - Xshell 不支持 Kitty 协议；可在键盘映射设置中把某个空闲组合映射为发送 `ESC, Enter`（`\x1b\r`）达到同样效果，或直接从剪贴板粘贴多行文本（已启用 bracketed paste）。
 
 > **Windows 下粘贴图片：**
-> Windows Terminal 和 conhost 默认把 `Ctrl+V` 绑给它们自己的 `paste` action — 这个 action 只会从剪贴板读 `CF_UNICODETEXT`，剪贴板上只有图片时它什么都不会发，应用里的 `Ctrl+V` 处理器根本收不到事件。两种解法：
+> Windows Terminal 和 conhost 默认把 `Ctrl+V` 绑给它们自己的 `paste` action — 这个 action 只会从剪贴板读 `CF_UNICODETEXT`，剪贴板上只有图片时它什么都不会发，应用里的 `Ctrl+V` 处理器根本收不到事件。三种解法：
 >
-> 1. 使用 **`/paste`** —— 这个斜杠命令直接读取剪贴板图片并以 `[Image #N]` 的形式附加到输入框，在 Windows Terminal、PowerShell 7、conhost、git bash 等所有终端里都能正常工作。Windows 版的 TUI 右下角会自动显示 `剪贴板有图片 · /paste 粘贴` 作为提示。
-> 2. 若想保留 `Ctrl+V` 的肌肉记忆：打开 Windows Terminal 的 `settings.json`（`Ctrl+,` → 右下角"打开 JSON 文件"），在 `"actions"` 数组里删掉 `{ "command": "paste", "keys": "ctrl+v" }`，或把它改绑到 `ctrl+shift+v`。重启 Windows Terminal 后，`Ctrl+V` 就能透传给 atomcode 了。
+> 1. 按 **`Ctrl+Alt+V`** —— Windows Terminal 不拦截它，会把剪贴板图片以 `[Image #N]` 的形式附加到输入框。
+> 2. 使用 **`/paste`** —— 这个斜杠命令直接读取剪贴板图片并同样附加到输入框，在 Windows Terminal、PowerShell 7、conhost、git bash 等所有终端里都能正常工作。
+> 3. 若想保留 `Ctrl+V` 的肌肉记忆：打开 Windows Terminal 的 `settings.json`（`Ctrl+,` → 右下角"打开 JSON 文件"），在 `"actions"` 数组里删掉 `{ "command": "paste", "keys": "ctrl+v" }`，或把它改绑到 `ctrl+shift+v`。重启 Windows Terminal 后，`Ctrl+V` 就能透传给 atomcode 了。
 >
 > Git Bash（MinTTY）不拦截 `Ctrl+V`，开箱即用。
+>
+> 剪贴板里出现新图片时（比如用 `Win+Shift+S` 截图），输入框右上角会显示几秒 `剪贴板有图片 · ctrl+alt+v 或 /paste 粘贴`（macOS 和 Linux 上是 `剪贴板有图片 · ctrl+v 粘贴`）。系统截图工具和 Qt 类截图工具（PixPin、Snipaste）放进剪贴板的图也能读，包括它们使用的 `CF_DIBV5` 格式。
 
 ### 导航
 

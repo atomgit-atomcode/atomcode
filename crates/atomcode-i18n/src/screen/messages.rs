@@ -149,6 +149,11 @@ pub enum Msg<'a> {
         nth: usize,
         total: usize,
     },
+    /// A picture is on the clipboard, and `ctrl+v` takes it.
+    InputClipboardImage,
+    /// A picture is on the clipboard, on a terminal that keeps `ctrl+v` for its
+    /// own text paste: `ctrl+alt+v` or `/paste` take it.
+    InputClipboardImageAltOrCommand,
     /// The `Ctrl+R` search, with a hit: which of the history it landed on.
     InputSearchNth {
         query: &'a str,

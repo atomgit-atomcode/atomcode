@@ -28986,6 +28986,18 @@ fn clipboard_image_hint_state(
                     img.bytes.as_ref(),
                 ))),
                 Err(arboard::Error::ContentNotAvailable) => Ok(None),
+                // The Snipping Tool's and Qt tools' CF_DIBV5 makes arboard fail
+                // rather than say "no image" — the paste path already falls back
+                // to the raw CF_DIB for it (see `try_paste_clipboard_image`), and the
+                // hint has to see the same picture or it never offers one. The
+                // fingerprint is the paste path's, so a picture already on the
+                // line is recognised as the one on the clipboard.
+                #[cfg(windows)]
+                Err(_) => read_raw_cf_dib()
+                    .and_then(|dib| decode_cf_dib_to_rgba(&dib))
+                    .map(|(w, h, rgba)| Some(rgba_fingerprint(w as usize, h as usize, &rgba)))
+                    .ok_or(()),
+                #[cfg(not(windows))]
                 Err(_) => Err(()),
             },
             Err(_) => Err(()),
