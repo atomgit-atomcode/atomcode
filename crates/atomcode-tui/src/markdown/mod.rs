@@ -807,7 +807,16 @@ fn highlight(line: &str, _lang: &str) -> Vec<Span> {
     // the job here. `Muted` keeps the recede but holds its own floor.
     let comment = Style::new().fg(Color::role(Role::Muted)).italic();
     let number = Style::new().fg(Color::role(Role::Warning));
-    let plain = code();
+    // Everything a fenced block's body is NOT: the terminal's own foreground.
+    // `code()` is the INLINE style — accent, so a command inside a sentence
+    // stands out from the prose around it. A fenced block has no prose around
+    // it; there the accent lands on every identifier, path and bare command,
+    // so a block whose tokens happen to miss the lists above (a shell block
+    // has no keyword, no quoted string) comes out tinted end to end and reads
+    // as highlighted rather than as code. Colour here has to mean something,
+    // and "unclassified" is not a meaning. `Secondary` resolves to no SGR at
+    // all, so the body follows whatever the terminal's foreground is.
+    let plain = Style::new().fg(Color::role(Role::Secondary));
 
     let t = line.trim_start();
     if t.starts_with("//") || t.starts_with('#') || t.starts_with("--") {
@@ -1335,6 +1344,38 @@ mod tests {
         let code = &out[1];
         assert!(code.spans[0].text.starts_with('▏'), "{code:?}");
         assert_eq!(code.spans[0].style.fg, Some(Color::role(Role::Muted)));
+    }
+
+    #[test]
+    fn a_fenced_block_body_takes_the_terminal_foreground_not_the_inline_accent() {
+        // A shell block has no keyword and no quoted string, so every token in
+        // it falls through to `plain`. While `plain` was the inline-code style
+        // the whole block came out accent-tinted and read as highlighted text
+        // rather than as code.
+        let out = render(
+            "```bash\ncd homework2\npython3 run.py\n```",
+            40,
+            Style::new(),
+        );
+        for row in &out[1..] {
+            for span in &row.spans[1..] {
+                assert_eq!(
+                    span.style.fg,
+                    Some(Color::role(Role::Secondary)),
+                    "body follows the terminal foreground: {span:?}"
+                );
+            }
+        }
+        // Inline code keeps the accent: there it is what separates a command
+        // from the prose it sits in.
+        let prose = render("run `cd homework2` first", 40, Style::new());
+        assert!(
+            prose[0]
+                .spans
+                .iter()
+                .any(|s| s.text == "homework2" && s.style.fg == Some(Color::role(Role::Accent))),
+            "inline code stays accent: {prose:?}"
+        );
     }
 
     #[test]
