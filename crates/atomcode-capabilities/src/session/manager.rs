@@ -1104,11 +1104,37 @@ impl SessionManager {
     /// write failure leaves the plain path-hash behaviour unchanged rather than
     /// erroring a session start.
     pub fn ensure_project_marker(working_dir: &Path) {
+        Self::write_project_marker(working_dir, &atomcode_config::util::stable_project_hash(working_dir));
+    }
+
+    /// Pin this project to an EXISTING session bucket — the one a session it is
+    /// resuming actually lives in — rather than to its own path hash.
+    ///
+    /// This is the folder-RENAME repair on the resume side: a renamed folder's
+    /// sessions still live under the OLD path's bucket, so a resume here would
+    /// look in this folder's (empty) bucket and miss them. Pinning the folder to
+    /// the resumed session's bucket makes that resume load AND makes later
+    /// resumes and fresh sessions here land in the same place. Unlike
+    /// [`Self::ensure_project_marker`], which freezes the current path hash, this
+    /// freezes a GIVEN bucket. No-op if a marker is already there (a folder with
+    /// its own identity is never hijacked) or if `bucket` is not a valid bucket
+    /// id. Best-effort, like `ensure_project_marker`.
+    pub fn pin_project_bucket(working_dir: &Path, bucket: &str) {
+        if !valid_project_bucket(bucket) {
+            return;
+        }
+        Self::write_project_marker(working_dir, bucket);
+    }
+
+    /// Write the pin marker `<working_dir>/.atomcode/local/id` = `bucket`,
+    /// no-op if one is already there. Also drops a `.gitignore` sentinel so the
+    /// marker never reaches version control. Best-effort: a write failure leaves
+    /// the plain path-hash behaviour unchanged rather than erroring the caller.
+    fn write_project_marker(working_dir: &Path, bucket: &str) {
         let marker = Self::project_marker_path(working_dir);
         if marker.exists() {
             return;
         }
-        let bucket = atomcode_config::util::stable_project_hash(working_dir);
         let Some(dir) = marker.parent() else {
             return;
         };
@@ -7783,6 +7809,43 @@ mod tests {
         assert_eq!(
             SessionManager::project_hash(&junk),
             atomcode_config::util::stable_project_hash(&junk),
+        );
+    }
+
+    #[test]
+    fn pinning_to_a_bucket_survives_the_rename_that_lost_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The renamed folder: unmarked, so its bucket is its own (empty) path
+        // hash — this is exactly why a resume here misses the old sessions.
+        let renamed = tmp.path().join("proj-renamed");
+        std::fs::create_dir_all(&renamed).unwrap();
+        assert_eq!(
+            SessionManager::project_hash(&renamed),
+            atomcode_config::util::stable_project_hash(&renamed),
+        );
+
+        // Resuming a session whose files live under some other bucket pins the
+        // folder to THAT bucket, so this and future resumes resolve to it.
+        let session_bucket = "00112233445566ff".to_string();
+        SessionManager::pin_project_bucket(&renamed, &session_bucket);
+        assert_eq!(SessionManager::project_hash(&renamed), session_bucket);
+
+        // Pinning never hijacks a folder that already has a marker.
+        SessionManager::pin_project_bucket(&renamed, "ffffffffffffffff");
+        assert_eq!(
+            SessionManager::project_hash(&renamed),
+            session_bucket,
+            "a second pin does not overwrite the first"
+        );
+
+        // A junk bucket is refused outright, leaving the path-hash default.
+        let fresh = tmp.path().join("fresh");
+        std::fs::create_dir_all(&fresh).unwrap();
+        SessionManager::pin_project_bucket(&fresh, "not-a-bucket");
+        assert_eq!(
+            SessionManager::project_hash(&fresh),
+            atomcode_config::util::stable_project_hash(&fresh),
+            "an invalid bucket writes no marker"
         );
     }
 

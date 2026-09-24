@@ -454,6 +454,60 @@ mod scope_tests {
 }
 
 #[cfg(test)]
+mod pin_tests {
+    use super::bucket_to_pin_on_resume;
+    use atomcode_capabilities::session::{CatalogEntry, CatalogPresence};
+
+    fn entry(id: &str, bucket: &str) -> CatalogEntry {
+        CatalogEntry {
+            id: id.into(),
+            name: String::new(),
+            fork_root_id: None,
+            project_bucket: bucket.into(),
+            working_dir: "/w".into(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            message_count: 1,
+            turn_count: 1,
+            presence: CatalogPresence::NativeOnly,
+            needs_newer_version: false,
+        }
+    }
+
+    #[test]
+    fn renamed_folder_pins_to_the_sessions_bucket() {
+        // The folder resolves to an empty bucket ("new") — nothing of its own on
+        // disk — and the resumed session lives under "old". Pin to "old".
+        let entries = vec![entry("s1", "old")];
+        assert_eq!(
+            bucket_to_pin_on_resume(&entries, "s1", "new"),
+            Some("old".to_string()),
+        );
+    }
+
+    #[test]
+    fn same_bucket_resume_pins_nothing() {
+        let entries = vec![entry("s1", "here")];
+        assert_eq!(bucket_to_pin_on_resume(&entries, "s1", "here"), None);
+    }
+
+    #[test]
+    fn a_folder_that_owns_sessions_is_never_repinned() {
+        // The anti-hijack: the current bucket already holds a session, so even a
+        // manual `/resume` of a foreign session must not freeze this folder onto
+        // the foreign bucket and orphan its own.
+        let entries = vec![entry("mine", "here"), entry("foreign", "elsewhere")];
+        assert_eq!(bucket_to_pin_on_resume(&entries, "foreign", "here"), None);
+    }
+
+    #[test]
+    fn an_unknown_session_pins_nothing() {
+        let entries = vec![entry("s1", "old")];
+        assert_eq!(bucket_to_pin_on_resume(&entries, "missing", "new"), None);
+    }
+}
+
+#[cfg(test)]
 mod refusal_tests {
     use super::{refused_words, reply};
     use atomcode_kernel::event::{AgentEvent, CommandError};
@@ -1067,6 +1121,41 @@ fn scope_sessions(all: Vec<StoredSession>, working_dir: Option<&str>) -> Vec<Sto
     }
 }
 
+/// Whether resuming `target` from a folder resolving to `current_bucket` should
+/// pin the folder to the session's own bucket — and to which. `None` leaves the
+/// folder as it is.
+///
+/// The folder-rename repair: a renamed folder resolves to an empty bucket, so a
+/// resume would look there and miss the session, which still lives under the old
+/// path's bucket. Pinning first makes the load succeed and future resumes here
+/// find it. Pins only when ALL hold:
+///   - the target session is on disk (its bucket is knowable);
+///   - that bucket differs from the folder's current one (the cross-bucket
+///     signal — a same-bucket resume needs nothing);
+///   - the folder's current bucket holds NO sessions of its own.
+/// The last guard is the anti-hijack: a marker's mere absence is not enough,
+/// because a folder can own unmarked path-hash sessions (created before markers,
+/// with no fresh session started since). A manual `/resume <foreign-id>` from
+/// such a folder must not freeze it onto the foreign bucket and orphan its own —
+/// so a folder that still owns sessions is never repinned.
+fn bucket_to_pin_on_resume(
+    entries: &[atomcode_capabilities::session::CatalogEntry],
+    target: &str,
+    current_bucket: &str,
+) -> Option<String> {
+    let session_bucket = entries
+        .iter()
+        .find(|entry| entry.id == target)
+        .map(|entry| entry.project_bucket.clone())?;
+    if session_bucket == current_bucket {
+        return None;
+    }
+    let folder_owns_sessions = entries
+        .iter()
+        .any(|entry| entry.project_bucket == current_bucket);
+    (!folder_owns_sessions).then_some(session_bucket)
+}
+
 /// What this person has typed into this project before, newest first.
 ///
 /// **Folded from the logs, never a second store.** What was typed is part of a
@@ -1296,6 +1385,7 @@ impl HostControl for RuntimeControl {
                 self.changed(changed.session_id)
             }
             HostCommand::Resume { session, target } => {
+                use atomcode_capabilities::session::SessionManager;
                 self.addressed(&session)?;
                 if target == session {
                     return Err(HostError::SessionInUse { id: target });
@@ -1313,6 +1403,26 @@ impl HostControl for RuntimeControl {
                             "session {target} was written by a newer AtomCode; update to resume it"
                         ),
                     });
+                }
+                // A resume that crosses buckets is the folder-RENAME signal: the
+                // renamed folder resolves to an empty bucket, so without a pin the
+                // load below would look there and fail. Pin the folder to the
+                // session's actual bucket first — see `bucket_to_pin_on_resume`
+                // for the exact (anti-hijack) conditions. Best-effort throughout:
+                // a runtime hiccup reading the working dir must NOT fail an
+                // otherwise-fine resume, so this never uses `?`. The runtime's own
+                // working dir, not the process's: `/cd` moves where sessions
+                // resolve, and the resume follows it.
+                if let Ok(stats) = self.handle.context_stats().await {
+                    let here = stats.working_dir;
+                    let scan = SessionManager::scan_all();
+                    if let Some(bucket) = bucket_to_pin_on_resume(
+                        &scan.entries,
+                        &target,
+                        &SessionManager::project_hash(&here),
+                    ) {
+                        SessionManager::pin_project_bucket(&here, &bucket);
+                    }
                 }
                 let changed = self.handle.resume_session(target).await.map_err(refused)?;
                 self.changed(changed.session_id)
