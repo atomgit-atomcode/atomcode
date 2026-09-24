@@ -185,6 +185,27 @@ fn git(at: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     Ok(out.stdout)
 }
 
+/// Same, except that an exit of **1** is an answer rather than a failure.
+///
+/// `git diff --no-index` follows `diff(1)`: `0` = the two are the same, `1` =
+/// they differ, `>=2` = something actually went wrong. Reading `1` as a failure
+/// reads "here is the diff" as "git could not do it" — and with the caller
+/// swallowing that into an empty string, an untracked file's whole content came
+/// out on screen as **没有改动**.
+fn git_comparing(at: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(at)
+        .env("GIT_PAGER", "cat")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .map_err(|why| format!("git: {why}"))?;
+    match out.status.code() {
+        Some(0) | Some(1) => Ok(out.stdout),
+        _ => Err(String::from_utf8_lossy(&out.stderr).trim().to_string()),
+    }
+}
+
 /// Every file the checkout at `at` has something to say about, with how much
 /// each changed.
 ///
@@ -221,9 +242,18 @@ pub fn file_diff(at: &Path, path: &str) -> Result<String, String> {
     if !text.is_empty() {
         return Ok(text);
     }
-    // Empty against HEAD means untracked: git has nothing to compare. Ask it to
-    // diff the file against nothing, which is how `git diff` shows a new file.
-    let out = git(at, &["diff", "--no-index", "--", "/dev/null", path]).unwrap_or_default();
+    // Empty against HEAD has **two** meanings: the file is untouched, or git
+    // has never heard of it. Only the second has anything to show, and asking
+    // which it is costs one call — while guessing costs a tracked, untouched
+    // file being drawn as though every line of it had just been written.
+    if !git(at, &["ls-files", "--", path])?.is_empty() {
+        return Ok(text);
+    }
+    // Untracked, so: diff it against nothing, which is how `git diff` shows a
+    // new file. `git_comparing` and not `git`, because this one answers by its
+    // exit code.
+    let out =
+        git_comparing(at, &["diff", "--no-index", "--", "/dev/null", path]).unwrap_or_default();
     Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
@@ -328,6 +358,55 @@ mod tests {
             got[1],
             (1, 0, false, "plain.rs".to_string()),
             "and the record after a rename is read as its own file"
+        );
+    }
+
+    /// 一个还没被 git 记过的文件,`/diff` 要能看见它整个内容。
+    ///
+    /// **`git diff --no-index` 用退出码回答问题**:0 = 一样,1 = 不一样,
+    /// ≥2 = 真出错了。把 1 当成出错,再把出错吞成空字符串,屏幕上写的就是
+    /// 「没有改动」—— 而那个文件通篇都是改动。刚建的文件正是人最想看一眼的
+    /// 那一种。
+    ///
+    /// 用真 git 跑,因为被测的恰恰是**真 git 的退出码**:一个假的 git 会按
+    /// 写这条判据的人以为的样子退出,而那个以为正是这条 bug 本身。
+    #[test]
+    fn a_file_git_has_never_heard_of_still_shows_its_diff() {
+        let work = tempfile::tempdir().unwrap();
+        let at = work.path();
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.email", "t@t"],
+            &["config", "user.name", "t"],
+        ] {
+            Command::new("git")
+                .args(args)
+                .current_dir(at)
+                .status()
+                .unwrap();
+        }
+        std::fs::write(at.join("README"), "x\n").unwrap();
+        for args in [&["add", "-A"][..], &["commit", "-q", "-m", "init"]] {
+            Command::new("git")
+                .args(args)
+                .current_dir(at)
+                .status()
+                .unwrap();
+        }
+
+        // 新文件,git 没听说过。
+        std::fs::write(at.join("fresh.rs"), "fn main() {}\n").unwrap();
+        let shown = file_diff(at, "fresh.rs").expect("git ran");
+        assert!(
+            shown.contains("fn main() {}"),
+            "新文件的内容就是它的 diff:{shown:?}"
+        );
+
+        // 而一个真的没动过的文件仍然是空的 —— 否则这条判据只是在说
+        // 「随便什么都别返回空」。
+        assert!(
+            file_diff(at, "README").expect("git ran").is_empty(),
+            "没动过的就是没动过"
         );
     }
 }
