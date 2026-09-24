@@ -1065,9 +1065,63 @@ impl SessionManager {
         &self.root
     }
 
-    /// Stable per-project bucket id shared with project-scoped trust storage.
+    /// The bucket a project's sessions live in.
+    ///
+    /// Prefers the persistent marker written by [`Self::ensure_project_marker`]
+    /// (`<working_dir>/.atomcode/local/id`), falling back to the path hash for a
+    /// project that has no marker yet — the pre-marker default. The marker is
+    /// what survives a folder RENAME: it travels with the folder and holds the
+    /// bucket the sessions are actually in, whereas the path hash changes with
+    /// the path and would orphan them. A marker whose content is not a valid
+    /// bucket id is ignored. (Project-scoped MCP trust keys on the path via its
+    /// own `mcp::registry::project_trust_key`, deliberately NOT this — a renamed
+    /// folder re-confirming trust is the safer boundary.)
     pub fn project_hash(working_dir: &Path) -> String {
+        if let Ok(content) = fs::read_to_string(Self::project_marker_path(working_dir)) {
+            let id = content.trim();
+            if valid_project_bucket(id) {
+                return id.to_string();
+            }
+        }
         atomcode_config::util::stable_project_hash(working_dir)
+    }
+
+    /// The pin file: `<working_dir>/.atomcode/local/id`. In the already
+    /// git-ignored machine-local dir (see `config::memory`), so it never reaches
+    /// version control and moves with the folder on a rename.
+    fn project_marker_path(working_dir: &Path) -> PathBuf {
+        working_dir.join(".atomcode").join("local").join("id")
+    }
+
+    /// Pin this project to a stable session bucket, so a later folder rename
+    /// still finds its sessions. Called when a session STARTS in `working_dir`.
+    ///
+    /// No-op if a marker is already there. Otherwise freezes the CURRENT path
+    /// hash into the marker: for a project that already has a path-hash bucket
+    /// this simply records where its sessions already are (adoption, zero data
+    /// movement); for a brand-new project it is the same bucket a session would
+    /// use anyway — only now frozen, so a rename cannot move it. Best-effort: a
+    /// write failure leaves the plain path-hash behaviour unchanged rather than
+    /// erroring a session start.
+    pub fn ensure_project_marker(working_dir: &Path) {
+        let marker = Self::project_marker_path(working_dir);
+        if marker.exists() {
+            return;
+        }
+        let bucket = atomcode_config::util::stable_project_hash(working_dir);
+        let Some(dir) = marker.parent() else {
+            return;
+        };
+        if fs::create_dir_all(dir).is_err() {
+            return;
+        }
+        // Keep the marker out of version control, like the local memory store —
+        // never clobbering a `.gitignore` already there.
+        let gitignore = dir.join(".gitignore");
+        if !gitignore.exists() {
+            let _ = fs::write(&gitignore, "*\n");
+        }
+        let _ = fs::write(&marker, format!("{bucket}\n"));
     }
 
     pub fn snapshot_path(&self, id: &str) -> SessionResult<PathBuf> {
@@ -7685,6 +7739,51 @@ mod tests {
 
         assert_eq!(loaded.snapshot, inflight);
         assert_eq!(pending, None);
+    }
+
+    #[test]
+    fn a_project_marker_keeps_the_bucket_stable_across_a_folder_rename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = tmp.path().join("proj");
+        std::fs::create_dir_all(&old).unwrap();
+
+        // No marker yet: the bucket is the plain path hash (unchanged behaviour).
+        assert_eq!(
+            SessionManager::project_hash(&old),
+            atomcode_config::util::stable_project_hash(&old),
+        );
+
+        // Starting a session pins the project — the marker freezes the CURRENT
+        // path hash, so the resolved bucket does not change.
+        SessionManager::ensure_project_marker(&old);
+        let frozen = SessionManager::project_hash(&old);
+        assert_eq!(frozen, atomcode_config::util::stable_project_hash(&old));
+
+        // Rename the folder (the marker travels inside it).
+        let renamed = tmp.path().join("proj-renamed");
+        std::fs::rename(&old, &renamed).unwrap();
+
+        // The bucket is STILL the old hash — the sessions are found — even though
+        // the new path hashes to something else.
+        assert_eq!(
+            SessionManager::project_hash(&renamed),
+            frozen,
+            "rename keeps the frozen bucket"
+        );
+        assert_ne!(
+            frozen,
+            atomcode_config::util::stable_project_hash(&renamed),
+            "and it differs from the renamed path's own hash"
+        );
+
+        // A junk marker is ignored (falls back to the path hash).
+        let junk = tmp.path().join("junk");
+        std::fs::create_dir_all(junk.join(".atomcode").join("local")).unwrap();
+        std::fs::write(junk.join(".atomcode").join("local").join("id"), "not-a-bucket").unwrap();
+        assert_eq!(
+            SessionManager::project_hash(&junk),
+            atomcode_config::util::stable_project_hash(&junk),
+        );
     }
 
     #[test]

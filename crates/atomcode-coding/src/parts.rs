@@ -804,6 +804,12 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         SessionMode::Disabled => None,
         SessionMode::Fresh => {
             let id = uuid::Uuid::new_v4().to_string();
+            // Pin the project to its bucket before resolving it, so a later
+            // folder rename still finds these sessions (the marker travels with
+            // the folder; the path hash does not). Freezes the current bucket —
+            // adoption for a project that already has one, a no-op change for a
+            // brand-new one — see `SessionManager::ensure_project_marker`.
+            SessionManager::ensure_project_marker(&cfg.working_dir);
             let manager = Arc::new(SessionManager::for_project(&cfg.working_dir));
             let lease = session_lease(&manager, &id, reuse_lease.as_ref())?;
             let now = atomcode_capabilities::session::now_ms();
