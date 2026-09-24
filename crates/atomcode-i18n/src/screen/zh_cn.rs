@@ -1010,5 +1010,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         }
         Msg::ProxySaveFailed { error } => format!("代理设置没写进配置文件：{error}").into(),
         Msg::SteeringQueued => "将在下一次工具调用后提交的消息（按 Ctrl+B 中断并立即发送）".into(),
+        Msg::RemoteRan { command } => format!("（另一端执行了 {command}）").into(),
+        Msg::RemoteDesktopOnly => "这条得在这台机器上敲。另一端能用的是：".into(),
     }
 }

@@ -1081,5 +1081,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "Queued — sent after the next tool call (press Ctrl+B to interrupt and send now)"
                 .into()
         }
+        Msg::RemoteRan { command } => format!("(the other end ran {command})").into(),
+        Msg::RemoteDesktopOnly => {
+            "That one has to be typed on this machine. From there you can use:".into()
+        }
     }
 }

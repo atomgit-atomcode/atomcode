@@ -7,11 +7,14 @@
 //! **为什么在 cli**:hub 是 daemon 的东西,屏幕不认识 daemon(`docs/adr/0022` §3)。
 //! 屏幕只说「挂上 / 摘下 / 开浏览器」。
 //!
-//! **三个接点**,少一个网页那边就看不全:
+//! **四个接点**,少一个网页那边就看不全:
 //! 1. **挂上**:把 runtime 的句柄交给 hub,它由此能把网页发来的话派进来;
 //! 2. **事件**:runtime 每条事件都推给 hub,网页照它画(`crate::host` 的那趟循环);
 //! 3. **本地输入回显**:终端里打的字,网页端是从 hub 的「输入被接受」那条事实看到的
-//!    ——不告诉它,网页上就只见回答不见问题。
+//!    ——不告诉它,网页上就只见回答不见问题;
+//! 4. **那一端请这块屏幕跑一条命令**:`/status`、`/cost` 这些答案只有屏幕这一侧有,
+//!    而手机上起一个 `/goal` 然后把手机放下,是那一端真正要的唯一一件有状态的事。
+//!    准不准跑归屏幕(`atomcode_tui::remote`),这里只是线。
 //!
 //! **挂着的东西是一个,不是每块屏幕一个**:hub 一次只绑一个 runtime,所以绑定放在
 //! 这里的静态槽里,`/webui`、`/app`、`/sync` 共用它(经典界面同样如此)。
@@ -95,6 +98,20 @@ pub async fn attach(config_path: &std::path::Path) -> Result<(), String> {
     if let Ok(mode) = handle.mode().await {
         atomcode_daemon::live_set_mode(mode);
     }
+    // 第四个接点:那一端从现在起可以请这块屏幕跑一条命令。注册要在挂上之后
+    // ——`unregister_embedded_runtime` 会把这个槽清掉,先注册就白注册了。
+    let mut asked = atomcode_daemon::native_live::register_remote_command_sink();
+    let relay = relayed().0.clone();
+    let pump = tokio::spawn(async move {
+        while let Some(line) = asked.recv().await {
+            if relay.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    if let Some(old) = relay_pump().lock().expect("pump poisoned").replace(pump) {
+        old.abort();
+    }
     Ok(())
 }
 
@@ -104,9 +121,60 @@ pub fn detach() -> Result<bool, String> {
     let Some(binding) = taken else {
         return Ok(false);
     };
+    if let Some(pump) = relay_pump().lock().expect("pump poisoned").take() {
+        pump.abort();
+    }
     atomcode_daemon::native_live::unregister_embedded_runtime(&binding)
         .map_err(|error| format!("{error:?}"))?;
     Ok(true)
+}
+
+/// 那一端问过来的命令,转成屏幕认得的形状。
+///
+/// **为什么中间要隔一层自己的通道**:daemon 那个槽是「谁最后注册谁收」,而它在
+/// `attach` 的时候才有;屏幕的缝却是启动时就要填好的——那时还没人共享。所以这里
+/// 常驻一条通道交给屏幕,`attach` 再把 daemon 那一侧的收件口泵进来,`detach` 收掉。
+fn relayed() -> &'static (
+    tokio::sync::mpsc::UnboundedSender<String>,
+    Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<String>>>,
+) {
+    static RELAYED: OnceLock<(
+        tokio::sync::mpsc::UnboundedSender<String>,
+        Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<String>>>,
+    )> = OnceLock::new();
+    RELAYED.get_or_init(|| {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (tx, Mutex::new(Some(rx)))
+    })
+}
+
+/// 把 daemon 那一侧的收件口泵进上面那条通道的任务。`detach` 收掉它。
+fn relay_pump() -> &'static Mutex<Option<tokio::task::JoinHandle<()>>> {
+    static PUMP: OnceLock<Mutex<Option<tokio::task::JoinHandle<()>>>> = OnceLock::new();
+    PUMP.get_or_init(|| Mutex::new(None))
+}
+
+/// 屏幕那一侧的缝:等下一条,以及把跑完的话回给问的那一端。
+struct FarEnd {
+    asked: tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<String>>>,
+}
+
+#[async_trait::async_trait]
+impl atomcode_tui::remote::Remote for FarEnd {
+    async fn next(&self) -> Option<String> {
+        let mut guard = self.asked.lock().await;
+        // 收件口只有一个,而这条缝只会被那一趟泵调用——拿不到就说明没有第二个
+        // 问题会来了,而不是「这次没有」。
+        let receiver = guard.as_mut()?;
+        let line = receiver.recv().await;
+        if line.is_none() {
+            *guard = None;
+        }
+        line
+    }
+    fn said(&self, text: String) {
+        let _ = atomcode_daemon::native_live::publish_command_output(text);
+    }
 }
 
 /// runtime 的一条事件,推给网页端。没挂着就什么也不做。
@@ -339,8 +407,11 @@ impl atomcode_plexus::Plugin for ShareRow {
     fn inject(&self) -> &'static [&'static str] {
         &["tui-commands"]
     }
+    fn provides(&self) -> &'static [&'static str] {
+        &["tui-remote"]
+    }
     fn description(&self) -> &'static str {
-        "sharing this terminal session: the browser, and the desktop app"
+        "sharing this terminal session: the browser, the desktop app, and the commands they ask it to run"
     }
     async fn apply(
         &self,
@@ -353,6 +424,13 @@ impl atomcode_plexus::Plugin for ShareRow {
         commands.add(Arc::new(ShareCommands {
             config_path: self.config_path.clone(),
         }))?;
+        // 填在这里而不是 `attach` 里:屏幕的循环启动时就要取这条缝,而那时
+        // 还没人共享。挂上之前它只是等着,等不到任何东西——正确的答案。
+        let _ = ctx
+            .provide::<atomcode_tui::plugin::RemoteSvc>(Arc::new(FarEnd {
+                asked: tokio::sync::Mutex::new(relayed().1.lock().expect("relay poisoned").take()),
+            }))
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 }

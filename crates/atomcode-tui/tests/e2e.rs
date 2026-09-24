@@ -440,6 +440,7 @@ struct Ports {
     rewind: Option<Arc<dyn atomcode_tui::rewind::Rewind>>,
     resume: Option<Arc<dyn atomcode_tui::resume::Resume>>,
     shell: Option<Arc<dyn atomcode_tui::shell::Shell>>,
+    remote: Option<Arc<dyn atomcode_tui::remote::Remote>>,
 }
 
 async fn start_full(
@@ -454,6 +455,7 @@ async fn start_full(
         rewind,
         resume,
         shell,
+        remote,
     } = ports;
     let agent_layers = setup.agent.clone();
     let registry: Registry = Arc::new(agent_catalog);
@@ -512,6 +514,11 @@ async fn start_full(
     if let Some(shell) = shell {
         extra.push(SHELL_ROW_LAYER);
         panel_row.push(Arc::new(ShellPanelRow(shell)));
+    }
+    // 远端那条路同理(`atomcode::tui_share`):没填就没有远端。
+    if let Some(remote) = remote {
+        extra.push(REMOTE_ROW_LAYER);
+        panel_row.push(Arc::new(RemotePanelRow(remote)));
     }
     let mounted = launch::mount_with(
         &screen,
@@ -5474,6 +5481,117 @@ async fn a_bang_runs_here_and_what_it_printed_goes_with_the_next_message() {
     assert!(
         wire.contains("按上面那个改"),
         "而话本身也在同一条里:\n{wire}"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+const REMOTE_ROW_LAYER: &str = "[[insert]]\nname = \"tui-remote\"\n";
+
+/// 把假远端挂上去的那一行 —— 和启动器那一行同形(`atomcode::tui_share`)。
+struct RemotePanelRow(Arc<dyn atomcode_tui::remote::Remote>);
+
+#[async_trait]
+impl Plugin for RemotePanelRow {
+    fn name(&self) -> &'static str {
+        "tui-remote"
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["tui-remote"]
+    }
+    async fn apply(&self, ctx: &Context, _config: &serde_json::Value) -> Result<(), String> {
+        let _ = ctx
+            .provide::<atomcode_tui::plugin::RemoteSvc>(self.0.clone())
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+/// 一个假的另一端:问什么由测试推进去,答什么留在手里。
+struct FarEnd {
+    asks: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<String>>,
+    said: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl atomcode_tui::remote::Remote for FarEnd {
+    async fn next(&self) -> Option<String> {
+        self.asks.lock().await.recv().await
+    }
+    fn said(&self, text: String) {
+        self.said.lock().expect("said poisoned").push(text);
+    }
+}
+
+/// 另一端请这块屏幕跑的命令,跑在这儿,答案回到那儿 —— 而会把这一侧地面
+/// 换掉的那几条,拒。
+///
+/// 两半都要钉,而**拒的那一半才是理由**:
+/// - 放行的那一半没有的话,手机上的 `/status` 与 `/goal` 按下去什么都不会
+///   发生,而那一端只会看到一个不回话的按钮(上一代前端有这条路,这一代
+///   直到现在没人接);
+/// - 而要是把它做成「远端等同于本人」,手机上一个误触就能 `/cd` 掉这一侧
+///   的工作目录 —— 那一端看不见这块屏幕上正开着什么。
+#[tokio::test]
+async fn the_far_end_runs_what_it_may_here_and_hears_back_and_is_refused_the_rest() {
+    let dir = scratch("remote");
+    let (ask, asks) = tokio::sync::mpsc::unbounded_channel();
+    let far = Arc::new(FarEnd {
+        asks: tokio::sync::Mutex::new(asks),
+        said: std::sync::Mutex::new(Vec::new()),
+    });
+    let s = start_full(
+        tree(&dir, &replay(r#"{ text = "ok" }"#), &[]),
+        |connection| connection,
+        Ports {
+            remote: Some(far.clone()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let task = s.open().await;
+
+    // 放行的那一半。
+    ask.send("/status".into()).expect("the screen is listening");
+    let mut heard = Vec::new();
+    for _ in 0..200 {
+        heard = far.said.lock().expect("said poisoned").clone();
+        if !heard.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        heard.iter().any(|said| said.starts_with("/status\n")),
+        "跑完的话回到了问的那一端:{heard:?}"
+    );
+    // 而键盘这一侧也知道那一端干了什么 —— 否则答案是凭空冒出来的。
+    let seen = transcript(&s);
+    assert!(
+        seen.contains("/status"),
+        "另一端做过什么,这块屏幕上也写着:\n{}",
+        s.screen()
+    );
+
+    // 拒的那一半。
+    ask.send("/cd /tmp".into())
+        .expect("the screen is listening");
+    for _ in 0..200 {
+        if far.said.lock().expect("said poisoned").len() > heard.len() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let heard = far.said.lock().expect("said poisoned").clone();
+    assert!(
+        heard.iter().any(|said| said.starts_with("/cd /tmp\n")),
+        "拒也要回话,否则那一端只是没反应:{heard:?}"
+    );
+    assert!(
+        !transcript(&s).contains("/cd /tmp"),
+        "而这一侧什么也没发生:\n{}",
+        s.screen()
     );
 
     s.term.press(KeyPress::ctrl('d'));

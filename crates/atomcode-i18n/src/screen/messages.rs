@@ -1664,4 +1664,13 @@ pub enum Msg<'a> {
     /// Header above the type-ahead queue: lines typed while a turn runs, folded
     /// in at the next tool-call boundary (or flushed immediately with Esc).
     SteeringQueued,
+
+    // ── a command the phone or the browser asked this screen to run (`remote.rs`) ──
+    /// Said on the terminal too, so the person at the keyboard knows the far
+    /// end did something.
+    RemoteRan {
+        command: &'a str,
+    },
+    /// Sent back to the far end when it asked for something it may not have.
+    RemoteDesktopOnly,
 }

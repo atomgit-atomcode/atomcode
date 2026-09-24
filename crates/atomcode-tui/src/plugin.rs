@@ -61,6 +61,9 @@ plexus_service!(OpeningNoticesSvc => crate::content::OpeningNotices, "tui-openin
 // 跑一条本机命令。手势(`!`)归屏幕,开一个进程归启动器 —— 这块屏幕
 // 碰不到操作系统。没填就没有这个功能,`!git status` 还是一句发给模型的话。
 plexus_service!(ShellSvc => dyn crate::shell::Shell, "tui-shell", Seam, "Running a command on this machine, for the `!` gesture");
+// 共享出去之后,手机或浏览器请这块屏幕跑一条命令。跑什么、准不准跑归屏幕
+// (`crate::remote`),线路归启动器——这块屏幕不认识 daemon。没填就没有这条路。
+plexus_service!(RemoteSvc => dyn crate::remote::Remote, "tui-remote", Seam, "Commands the phone or the browser asks this screen to run, and where their answers go");
 plexus_service!(AgentClientSvc => AgentClient, "tui-agent-client", Core, "The screen's end of its connection to the agent");
 // Declared here, by the one that consumes it (`docs/adr/0021` §6): whoever
 // launches the screen fills it with what its host handed over.
@@ -748,6 +751,8 @@ enum Wake {
     Input(Input),
     /// An action from somewhere other than a key — a command, for now.
     Act(Action),
+    /// A command the far end (phone, browser) asked this screen to run.
+    Remote(String),
     /// A modal closed with this.
     Chose(Option<String>),
     Tick,
@@ -1036,6 +1041,20 @@ impl UserInterface for Tui {
                     break;
                 }
             }
+        });
+
+        // What the far end asks of this screen while the session is shared.
+        // Only started when the launcher filled the seam: without it there is
+        // no far end, which is the ordinary case (headless, ACP).
+        let remote_pump = ctx.service::<RemoteSvc>().map(|remote| {
+            let asked = wake_tx.clone();
+            tokio::spawn(async move {
+                while let Some(line) = remote.next().await {
+                    if asked.send(Wake::Remote(line)).is_err() {
+                        break;
+                    }
+                }
+            })
         });
 
         // Everything the connection says. Content arrives as the session's facts
@@ -1431,6 +1450,10 @@ impl UserInterface for Tui {
                 Wake::Host(_) => {}
                 Wake::Act(action) => {
                     quit = self.act(action, &client);
+                    stale = true;
+                }
+                Wake::Remote(line) => {
+                    self.run_remotely(&line);
                     stale = true;
                 }
                 Wake::Chose(chosen) => {
@@ -2075,6 +2098,9 @@ impl UserInterface for Tui {
         reader.abort();
         asks_pump.abort();
         host_pump.abort();
+        if let Some(pump) = remote_pump {
+            pump.abort();
+        }
         // Refuse what is waiting and stop what is running, then wait for the
         // turn to say it has ended — but not forever: a tool that ignores its
         // cancel is not a reason to leave the terminal in the alternate screen.
@@ -5634,6 +5660,58 @@ impl Tui {
         let line = line.to_string();
         tokio::spawn(async move {
             let outcome = commands.dispatch(&line, &ctx).await;
+            deliver(&host, &keys, outcome);
+        });
+    }
+
+    /// Run what the far end asked for, and tell it what happened.
+    ///
+    /// Through the same dispatcher a typed line goes through: a command that
+    /// behaved differently depending on who asked would be a second
+    /// implementation of every command on the list.
+    fn run_remotely(&self, line: &str) {
+        let (Some(ctx), Some(keys)) = (
+            self.ctx.lock().expect("ctx poisoned").clone(),
+            self.wake.lock().expect("wake poisoned").clone(),
+        ) else {
+            return;
+        };
+        // Whoever asked is also where the answer goes: no seam, no far end,
+        // and nothing to answer.
+        let Some(remote) = ctx.service::<RemoteSvc>() else {
+            return;
+        };
+        let display = format!("/{}", line.trim().trim_start_matches('/'));
+        let command = match crate::remote::asked(line) {
+            crate::remote::Asked::Nothing => return,
+            crate::remote::Asked::Refused => {
+                // Only to the end that asked. Nothing happened here, and a
+                // line on this screen about it would be noise about somebody
+                // else's mistake.
+                remote.said(format!("{display}\n{}", crate::remote::refusal()));
+                return;
+            }
+            crate::remote::Asked::Run(command) => command,
+        };
+        // Said on this screen too: the person at the keyboard should know the
+        // far end did something, rather than watch an answer appear under a
+        // question they never asked. In the conversation and not on the tip
+        // row — the tip row fades, and somebody who looked away has to be able
+        // to look back and see what the other end did.
+        self.host
+            .said(t(Msg::RemoteRan { command: &display }).into_owned(), false);
+        let commands = self.host.commands.clone();
+        let host = self.host.clone();
+        tokio::spawn(async move {
+            let outcome = commands.dispatch(&command, &ctx).await;
+            // Back to whoever asked, before `deliver` consumes it. A modal or
+            // an action has nothing to send: what they do shows up in the
+            // session's own facts, which the far end is already watching.
+            if let crate::command::Outcome::Said(text) | crate::command::Outcome::Refused(text) =
+                &outcome
+            {
+                remote.said(format!("{display}\n{text}"));
+            }
             deliver(&host, &keys, outcome);
         });
     }
