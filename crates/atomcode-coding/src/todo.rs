@@ -5,10 +5,12 @@
 
 use async_trait::async_trait;
 use atomcode_capabilities::reminder::synthetic_system_reminder;
-use atomcode_capabilities::session::manager::{SessionManager, TodoSidecar, TodoSidecarItem};
+use atomcode_capabilities::session::manager::{
+    SessionManager, TodoCallPosition, TodoSidecar, TodoSidecarItem,
+};
 use atomcode_capabilities::tools::todo::{
     active_todo_calls, apply_todo_action, derive_current_todos, is_todo_call, is_todo_plan,
-    reduce_todos, render_todos_numbered, TodoItem, TodoStatus,
+    reduce_todos, render_todos_numbered, ActiveTodoCall, TodoItem, TodoStatus,
 };
 use atomcode_kernel::event::StopReason;
 use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
@@ -515,12 +517,8 @@ impl LifecycleHooks for TodoHook {
             })
             .collect();
         let manager = SessionManager::for_project(working_dir);
-        let _ = manager.write_todo_sidecar(
-            session_id,
-            &items,
-            convo.messages.len(),
-            current.last_call.as_deref(),
-        );
+        let _ =
+            manager.write_todo_sidecar(session_id, &items, convo.messages.len(), current.through);
     }
 }
 
@@ -535,10 +533,21 @@ impl TodoHook {
     }
 }
 
-/// The task list as it stands, and the last todo call it reflects.
+/// The task list as it stands, and where the last todo call it reflects was made.
 struct CurrentTodos {
     items: Vec<TodoItem>,
-    last_call: Option<String>,
+    through: Option<TodoCallPosition>,
+}
+
+/// Where `call` was made, when its message carries the kernel's turn stats. A message
+/// without them (`turn_id` 0 is a record from before they existed) has no position.
+fn position(call: &ActiveTodoCall<'_>) -> Option<TodoCallPosition> {
+    let meta = call.meta.filter(|meta| meta.turn_id > 0)?;
+    Some(TodoCallPosition {
+        turn: meta.turn_id,
+        round: meta.round,
+        index: u32::try_from(call.index).unwrap_or(u32::MAX),
+    })
 }
 
 /// The current task list: the transcript's todo calls, over the session's sidecar when
@@ -553,22 +562,36 @@ struct CurrentTodos {
 /// again, and was stopped by the tool-loop guard for repeating itself. A cleared list fell
 /// back to the same stale sidecar and was cleared again for the same reason.
 ///
+/// Only the calls made after the sidecar's `through` are laid over it — by position, not
+/// by call id (see [`TodoCallPosition`]). Calls at or before it are already in the list: a
+/// compaction kept them, or an undo left them behind while taking later ones away, and
+/// applying them again would append each `add` a second time. A call with no position is
+/// from a record older than positions and is treated the same way. A sidecar with no
+/// `through` (written before it existed) takes every call.
+///
+/// Known limit: an undo that takes back a turn whose calls the sidecar already reflects
+/// leaves those calls' effect in the list — nothing in the transcript tells an undone turn
+/// from a compacted one.
+///
 /// `sidecar` is read only when the transcript holds no plan.
 fn current_todos(
     messages: &[Message],
     sidecar: impl FnOnce() -> Option<TodoSidecar>,
 ) -> Option<CurrentTodos> {
     let calls = active_todo_calls(messages);
-    let last_call = calls.last().map(|call| call.id.clone());
-    if calls.iter().any(|call| is_todo_plan(&call.arguments)) {
+    let last = calls.iter().filter_map(position).max();
+    if calls.iter().any(|c| is_todo_plan(&c.call.arguments)) {
         let items = reduce_todos(
             calls
                 .iter()
-                .map(|call| (call.name.as_str(), call.arguments.as_str())),
+                .map(|c| (c.call.name.as_str(), c.call.arguments.as_str())),
         );
-        return Some(CurrentTodos { items, last_call });
+        return Some(CurrentTodos {
+            items,
+            through: last,
+        });
     }
-    let (mut items, applied) = match sidecar() {
+    let (mut items, through) = match sidecar() {
         Some(sidecar) => {
             let items = sidecar
                 .todos
@@ -578,23 +601,23 @@ fn current_todos(
                     status: parse_todo_status(&item.status),
                 })
                 .collect();
-            (items, sidecar.last_call)
+            (items, sidecar.through)
         }
         None if calls.is_empty() => return None,
         None => (Vec::new(), None),
     };
-    // The calls the sidecar already reflects are the ones up to its last call. When that
-    // call is not in the transcript, compaction took it, and every call left is newer.
-    let start = applied
-        .as_deref()
-        .and_then(|seen| calls.iter().position(|call| call.id == seen))
-        .map_or(0, |at| at + 1);
-    for call in &calls[start..] {
-        apply_todo_action(&mut items, &call.arguments);
+    for call in &calls {
+        let newer = match through {
+            None => true,
+            Some(through) => position(call).is_some_and(|at| at > through),
+        };
+        if newer {
+            apply_todo_action(&mut items, &call.call.arguments);
+        }
     }
     Some(CurrentTodos {
         items,
-        last_call: last_call.or(applied),
+        through: last.max(through),
     })
 }
 
@@ -1243,18 +1266,33 @@ mod tests {
 
     // ---- the list after a compaction: the sidecar plus what the transcript still carries --
 
-    fn todo_call(id: &str, args: &str) -> Message {
-        Message::assistant(
+    /// A todo call made in `turn`/`round`, as the kernel records it.
+    fn todo_call(id: &str, turn: u64, round: u32, args: &str) -> Message {
+        let mut message = Message::assistant(
             "",
             vec![ToolCall {
                 id: id.into(),
                 name: "todowrite".into(),
                 arguments: args.into(),
             }],
-        )
+        );
+        message.meta = Some(atomcode_kernel::message::MessageMeta {
+            turn_id: turn,
+            round,
+            ..Default::default()
+        });
+        message
     }
 
-    fn sidecar_of(items: &[(&str, &str)], last_call: Option<&str>) -> TodoSidecar {
+    fn at(turn: u64, round: u32) -> TodoCallPosition {
+        TodoCallPosition {
+            turn,
+            round,
+            index: 0,
+        }
+    }
+
+    fn sidecar_of(items: &[(&str, &str)], through: Option<TodoCallPosition>) -> TodoSidecar {
         TodoSidecar {
             todos: items
                 .iter()
@@ -1264,16 +1302,12 @@ mod tests {
                 })
                 .collect(),
             message_count: 40,
-            last_call: last_call.map(str::to_string),
+            through,
         }
     }
 
-    fn statuses(current: &CurrentTodos) -> Vec<(String, TodoStatus)> {
-        current
-            .items
-            .iter()
-            .map(|t| (t.content.clone(), t.status))
-            .collect()
+    fn titles(current: &CurrentTodos) -> Vec<String> {
+        current.items.iter().map(|t| t.content.clone()).collect()
     }
 
     const THREE_STARTED: [(&str, &str); 3] = [
@@ -1281,6 +1315,8 @@ mod tests {
         ("wire the loader into main", "completed"),
         ("verify resume after restart", "in_progress"),
     ];
+
+    const ADD_DOCS: &str = r#"{"action":"add","content":"document the loader flags"}"#;
 
     /// The reported loop: compaction took the plan, the model marked #3 completed, and the
     /// list it was shown still had #3 in progress — so it sent the same update again until
@@ -1292,57 +1328,132 @@ mod tests {
     fn an_update_after_compaction_lands_on_the_sidecar_list() {
         let messages = vec![
             Message::user("carry on"),
-            todo_call("c9", r#"{"action":"update","id":3,"status":"completed"}"#),
+            todo_call(
+                "c9",
+                6,
+                1,
+                r#"{"action":"update","id":3,"status":"completed"}"#,
+            ),
             Message::tool_result("c9", "#3 → completed", false),
         ];
-        let current = current_todos(&messages, || Some(sidecar_of(&THREE_STARTED, Some("c7"))))
-            .expect("a sidecar is a list");
-        assert_eq!(
-            current.items[2].status,
-            TodoStatus::Completed,
-            "{:?}",
-            statuses(&current)
-        );
-        assert_eq!(current.last_call.as_deref(), Some("c9"));
+        let current = current_todos(&messages, || {
+            Some(sidecar_of(&THREE_STARTED, Some(at(5, 4))))
+        })
+        .expect("a sidecar is a list");
+        assert_eq!(current.items[2].status, TodoStatus::Completed);
+        assert_eq!(current.through, Some(at(6, 1)));
         assert!(
             derive_current_todos(&messages).is_empty(),
             "the old path folded to nothing"
         );
     }
 
-    /// The sidecar already reflects every call up to its `last_call`; a compaction that
-    /// kept some of those calls must not apply them again — an `add` would append twice.
+    /// The sidecar already reflects every call up to `through`; a compaction that kept
+    /// some of those calls must not apply them again — an `add` would append twice.
     #[test]
     fn calls_the_sidecar_already_reflects_are_not_applied_twice() {
         let messages = vec![
-            todo_call(
-                "a1",
-                r#"{"action":"add","content":"document the loader flags"}"#,
-            ),
-            Message::tool_result("a1", "Added task: document the loader flags", false),
+            todo_call("a1", 5, 2, ADD_DOCS),
             Message::user("next"),
-            todo_call("u2", r#"{"action":"update","id":4,"status":"in_progress"}"#),
-            Message::tool_result("u2", "#4 → in_progress", false),
+            todo_call(
+                "u2",
+                6,
+                1,
+                r#"{"action":"update","id":4,"status":"in_progress"}"#,
+            ),
         ];
         let mut after_add = THREE_STARTED.to_vec();
         after_add[2].1 = "completed";
         after_add.push(("document the loader flags", "pending"));
-        let current = current_todos(&messages, || Some(sidecar_of(&after_add, Some("a1"))))
+        let current = current_todos(&messages, || Some(sidecar_of(&after_add, Some(at(5, 2)))))
             .expect("a sidecar is a list");
-        assert_eq!(current.items.len(), 4, "{:?}", statuses(&current));
+        assert_eq!(current.items.len(), 4, "{:?}", titles(&current));
         assert_eq!(current.items[3].status, TodoStatus::InProgress);
     }
 
-    /// A sidecar written before `last_call` existed says nothing about which calls it has
+    /// Call ids are not positions: Ollama numbers every reply's calls from
+    /// `ollama_call_0`, so a whole session's todo calls can share one id. The sidecar is
+    /// matched by where a call was made, so only the one made after it lands.
+    #[test]
+    fn calls_that_share_an_id_are_told_apart_by_where_they_were_made() {
+        let messages = vec![
+            todo_call("ollama_call_0", 5, 1, ADD_DOCS),
+            todo_call(
+                "ollama_call_0",
+                6,
+                1,
+                r#"{"action":"add","content":"benchmark the loader"}"#,
+            ),
+            todo_call(
+                "ollama_call_0",
+                7,
+                1,
+                r#"{"action":"add","content":"announce the loader flags"}"#,
+            ),
+        ];
+        let mut reflected = THREE_STARTED.to_vec();
+        reflected.push(("document the loader flags", "pending"));
+        reflected.push(("benchmark the loader", "pending"));
+        let current =
+            current_todos(&messages, || Some(sidecar_of(&reflected, Some(at(6, 1))))).unwrap();
+        assert_eq!(
+            titles(&current)[3..],
+            [
+                "document the loader flags",
+                "benchmark the loader",
+                "announce the loader flags"
+            ],
+        );
+        assert_eq!(current.through, Some(at(7, 1)));
+    }
+
+    /// An undo takes the latest turn's calls out of the transcript. What is left is at or
+    /// before the sidecar's `through`, so it is not laid over the list a second time.
+    #[test]
+    fn an_undo_does_not_apply_what_the_sidecar_already_has() {
+        // Turn 6 added the docs task; turn 7 (the sidecar's last) was taken back.
+        let messages = vec![todo_call("a1", 6, 1, ADD_DOCS)];
+        let mut reflected = THREE_STARTED.to_vec();
+        reflected.push(("document the loader flags", "pending"));
+        reflected.push(("benchmark the loader", "pending"));
+        let current =
+            current_todos(&messages, || Some(sidecar_of(&reflected, Some(at(7, 1))))).unwrap();
+        assert_eq!(current.items.len(), 5, "{:?}", titles(&current));
+        assert_eq!(current.through, Some(at(7, 1)));
+    }
+
+    /// A call recorded without the kernel's turn stats is older than any sidecar that has
+    /// a `through`: it is not laid over one.
+    #[test]
+    fn a_call_without_a_position_is_older_than_the_sidecar() {
+        let messages = vec![Message::assistant(
+            "",
+            vec![ToolCall {
+                id: "old".into(),
+                name: "todowrite".into(),
+                arguments: ADD_DOCS.into(),
+            }],
+        )];
+        let current = current_todos(&messages, || {
+            Some(sidecar_of(&THREE_STARTED, Some(at(2, 1))))
+        })
+        .unwrap();
+        assert_eq!(current.items.len(), 3);
+    }
+
+    /// A sidecar written before `through` existed says nothing about which calls it has
     /// seen; every call the transcript carries is laid over it.
     #[test]
-    fn a_sidecar_without_a_last_call_takes_every_update() {
+    fn a_sidecar_without_a_position_takes_every_update() {
         let messages = vec![todo_call(
             "c1",
+            3,
+            1,
             r#"{"action":"update","id":3,"status":"completed"}"#,
         )];
         let current = current_todos(&messages, || Some(sidecar_of(&THREE_STARTED, None))).unwrap();
         assert_eq!(current.items[2].status, TodoStatus::Completed);
+        assert_eq!(current.through, Some(at(3, 1)));
     }
 
     /// Clearing the list is a plan with nothing in it, not the absence of a plan: it must
@@ -1351,7 +1462,7 @@ mod tests {
     fn a_cleared_list_stays_cleared() {
         let messages = vec![
             Message::user("clear your todos"),
-            todo_call("c1", r#"{"todos":[]}"#),
+            todo_call("c1", 8, 1, r#"{"todos":[]}"#),
             Message::tool_result("c1", "(no tasks)", false),
         ];
         let current = current_todos(&messages, || {
@@ -1359,7 +1470,7 @@ mod tests {
         })
         .expect("an emptied list is still a list");
         assert!(current.items.is_empty());
-        assert_eq!(current.last_call.as_deref(), Some("c1"));
+        assert_eq!(current.through, Some(at(8, 1)));
     }
 
     /// A plan still in the transcript wins over the sidecar, as before.
@@ -1367,24 +1478,32 @@ mod tests {
     fn a_plan_in_the_transcript_is_the_list() {
         let messages = vec![todo_call(
             "p1",
+            1,
+            1,
             r#"{"todos":[{"content":"rename the session flag","status":"in_progress"}]}"#,
         )];
         let current = current_todos(&messages, || panic!("sidecar must not be read")).unwrap();
-        assert_eq!(current.items.len(), 1);
-        assert_eq!(current.items[0].content, "rename the session flag");
+        assert_eq!(titles(&current), ["rename the session flag"]);
     }
 
     /// A rejected call is not part of the list, over the sidecar as in the transcript.
     #[test]
     fn a_failed_update_does_not_land_on_the_sidecar() {
         let messages = vec![
-            todo_call("c1", r#"{"action":"update","id":3,"status":"completed"}"#),
+            todo_call(
+                "c1",
+                6,
+                1,
+                r#"{"action":"update","id":3,"status":"completed"}"#,
+            ),
             Message::tool_result("c1", "todowrite: bad", true),
         ];
-        let current =
-            current_todos(&messages, || Some(sidecar_of(&THREE_STARTED, Some("c0")))).unwrap();
+        let current = current_todos(&messages, || {
+            Some(sidecar_of(&THREE_STARTED, Some(at(5, 1))))
+        })
+        .unwrap();
         assert_eq!(current.items[2].status, TodoStatus::InProgress);
-        assert_eq!(current.last_call.as_deref(), Some("c0"));
+        assert_eq!(current.through, Some(at(5, 1)));
     }
 
     /// No plan, no sidecar, no todo calls: there is no list.

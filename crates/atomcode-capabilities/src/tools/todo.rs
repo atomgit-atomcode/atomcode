@@ -6,7 +6,7 @@
 
 use super::{err, ok};
 use async_trait::async_trait;
-use atomcode_kernel::message::Message;
+use atomcode_kernel::message::{Message, MessageMeta};
 use atomcode_kernel::tool::{Tool, ToolCall, ToolContext, ToolResult};
 use serde::Deserialize;
 use serde_json::json;
@@ -325,15 +325,25 @@ pub fn derive_current_todos(messages: &[Message]) -> Vec<TodoItem> {
     reduce_todos(
         active_todo_calls(messages)
             .into_iter()
-            .map(|c| (c.name.as_str(), c.arguments.as_str())),
+            .map(|c| (c.call.name.as_str(), c.call.arguments.as_str())),
     )
+}
+
+/// A todo call that still shapes the list, with where it was made.
+pub struct ActiveTodoCall<'a> {
+    pub call: &'a ToolCall,
+    /// The kernel stats of the assistant message that made it — its `turn_id` and
+    /// `round` place it in the session. `None` for a message recorded without them.
+    pub meta: Option<&'a MessageMeta>,
+    /// Its position among that message's tool calls.
+    pub index: usize,
 }
 
 /// The todo calls that still shape the list, in order: after the most recent user
 /// interruption and without the ones that came back an error. The input
 /// [`derive_current_todos`] folds, exposed so a caller that folds over a baseline of
 /// its own (the session's todo sidecar) reads the same calls.
-pub fn active_todo_calls(messages: &[Message]) -> Vec<&ToolCall> {
+pub fn active_todo_calls(messages: &[Message]) -> Vec<ActiveTodoCall<'_>> {
     // A user cancel retires the active plan without deleting its history. Fold
     // only calls after the most recent authoritative interruption boundary; an
     // explicit later "continue" can create a fresh full-list plan from history.
@@ -348,8 +358,17 @@ pub fn active_todo_calls(messages: &[Message]) -> Vec<&ToolCall> {
         .collect::<std::collections::HashSet<_>>();
     active_messages
         .iter()
-        .flat_map(|m| m.tool_calls.iter())
-        .filter(|call| is_todo_call(&call.name) && !failed_call_ids.contains(call.id.as_str()))
+        .flat_map(|m| {
+            m.tool_calls
+                .iter()
+                .enumerate()
+                .map(move |(index, call)| ActiveTodoCall {
+                    call,
+                    meta: m.meta.as_ref(),
+                    index,
+                })
+        })
+        .filter(|c| is_todo_call(&c.call.name) && !failed_call_ids.contains(c.call.id.as_str()))
         .collect()
 }
 

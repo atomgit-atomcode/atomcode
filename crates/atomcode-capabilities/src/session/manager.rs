@@ -54,13 +54,29 @@ pub struct TodoSidecar {
     /// Conversation message count at write time (stale-detection marker).
     #[serde(default)]
     pub message_count: usize,
-    /// Id of the last todo call `todos` already reflects. A transcript that lost
-    /// its plan to compaction still carries the calls made since; a reader lays
-    /// only the ones after this id over `todos`, so none is applied twice (a
+    /// Where the last todo call `todos` already reflects was made. A transcript
+    /// that lost its plan to compaction still carries calls; a reader lays only
+    /// the ones made after this point over `todos`, so none is applied twice (a
     /// replayed `add` would append its task again). `None` in a sidecar written
     /// before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_call: Option<String>,
+    pub through: Option<TodoCallPosition>,
+}
+
+/// Where in a session a todo call was made: the kernel turn, the round within it,
+/// and the call's index in that round's reply.
+///
+/// A position, not the call's id: ids are provider-minted and need not be unique
+/// (Ollama numbers every reply's calls from `ollama_call_0`). Turn ids never go
+/// back — a resumed session seeds its counter from every turn its log holds, the
+/// taken-back ones included — so a call made later always sorts after.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub struct TodoCallPosition {
+    pub turn: u64,
+    pub round: u32,
+    pub index: u32,
 }
 
 /// One todo row in the sidecar. `status` uses the canonical strings
@@ -1194,12 +1210,12 @@ impl SessionManager {
         id: &str,
         todos: &[TodoSidecarItem],
         message_count: usize,
-        last_call: Option<&str>,
+        through: Option<TodoCallPosition>,
     ) -> SessionResult<()> {
         let sidecar = TodoSidecar {
             todos: todos.to_vec(),
             message_count,
-            last_call: last_call.map(str::to_string),
+            through,
         };
         let bytes = serialize_bounded(&sidecar, "todo sidecar", MAX_TODO_SIDECAR_BYTES)?;
         atomic_write(&self.todo_sidecar_path(id)?, &bytes)
