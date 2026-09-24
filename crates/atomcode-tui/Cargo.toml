@@ -66,14 +66,14 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", 
 # Reading the terminal's answer to an OSC 11 query needs the tty as a file
 # descriptor with a timeout — `poll` and `read`, which crossterm does not
 # expose. Unix only; elsewhere the theme comes from config or `COLORFGBG`.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # The raw `CF_DIB` behind a Windows clipboard picture, for the screenshots
 # `arboard` cannot decode (the Snipping Tool's and Qt tools' V5 headers). The
 # same crate `arboard` already uses there, so nothing new is built.
 [target.'cfg(windows)'.dependencies]
 clipboard-win = "5.4"
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
