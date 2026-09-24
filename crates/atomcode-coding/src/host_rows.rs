@@ -1590,6 +1590,13 @@ impl Plugin for McpHostPlugin {
             publication_enabled,
         };
 
+        // A tree mounted over servers that are already up — a remount on the same
+        // parts, which an undo or a restored snapshot is — offers their tools
+        // before the row returns, from what the registry last listed. Left to the
+        // task below, the first request after the remount could go out before it
+        // ran, with no MCP tools at all. The task's live listing then reconciles.
+        publish_mcp(&toolbox, &registry, registry.listed_tools(), &shared, true).await;
+
         let task = {
             let toolbox = toolbox.clone();
             let registry = Arc::clone(&registry);
@@ -1647,9 +1654,22 @@ impl Plugin for McpHostPlugin {
                 }
             })
         };
-        // The task and the tools leave with the row.
+        // The task and the tools leave with the row — unless another row has taken
+        // over the same parts' publication since (a remount mounts the new tree
+        // before it drops this one). The name list is shared and by then holds the
+        // new tree's tools: draining it here would leave them registered there but
+        // unlisted, and `withdraw_mcp_tools`, which unregisters by this list, would
+        // then leave revoked tools in front of the model.
         let _ = ctx.effect(move || {
             task.abort();
+            let still_mounted = toolbox_slot
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &toolbox));
+            if !still_mounted {
+                return;
+            }
             let mut names = shared.tool_names.write().unwrap_or_else(|e| e.into_inner());
             for name in names.drain(..) {
                 toolbox.unregister(&name);
