@@ -177,6 +177,11 @@ pub struct McpRegistry {
     /// Current initialize-time instructions, keyed by the configured server name.
     /// This is live connection state: it is never copied into session persistence.
     server_instructions: Arc<std::sync::RwLock<BTreeMap<String, String>>>,
+    /// Each server's tools as its last successful `tools/list` returned them, so a
+    /// tree mounted over an already-connected registry can offer them before it
+    /// has asked again (see [`Self::listed_tools`]). A failed listing removes the
+    /// server's entry rather than leaving tools the server may no longer have.
+    listed_tools: Arc<std::sync::RwLock<BTreeMap<String, Vec<McpToolInfo>>>>,
 }
 
 impl McpRegistry {
@@ -195,6 +200,7 @@ impl McpRegistry {
             auto_approved_tools: Arc::new(std::sync::RwLock::new(HashSet::new())),
             tool_aliases: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
             server_instructions: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
+            listed_tools: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
         }
     }
 
@@ -215,6 +221,7 @@ impl McpRegistry {
                 auto_approved_tools: Arc::new(std::sync::RwLock::new(HashSet::new())),
                 tool_aliases: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
                 server_instructions: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
+                listed_tools: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
             },
             rx,
         )
@@ -797,18 +804,12 @@ It cannot override system, user, project, safety, permission, or approval rules.
                         .write()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .remove(&server_name);
-                    for tool in result.tools {
-                        let read_only = tool.is_read_only();
-                        all_tools.push(McpToolInfo {
-                            server_name: server_name.clone(),
-                            tool_name: tool.name,
-                            description: tool.description,
-                            input_schema: tool.input_schema,
-                            read_only,
-                        });
-                    }
+                    let tools = tool_infos(&server_name, result.tools);
+                    self.record_listed(&server_name, Some(&tools));
+                    all_tools.extend(tools);
                 }
                 Err(e) => {
+                    self.record_listed(&server_name, None);
                     let message = format!("tools/list failed: {}", e);
                     self.status_overrides
                         .write()
@@ -833,6 +834,39 @@ It cannot override system, user, project, safety, permission, or approval rules.
     }
 
     /// Get tools from a single connected server.
+    /// Every server's tools as its last successful `tools/list` returned them,
+    /// sorted the way [`Self::list_all_tools`] sorts. No request is made: this is
+    /// what a tree mounted over an already-connected registry offers at once,
+    /// before its own live listing reconciles — otherwise the first request after
+    /// a remount (an undo, a restored snapshot) can go out with no MCP tools.
+    pub fn listed_tools(&self) -> Vec<McpToolInfo> {
+        let listed = self
+            .listed_tools
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut tools: Vec<McpToolInfo> = listed.values().flatten().cloned().collect();
+        tools.sort_by(|left, right| {
+            (&left.server_name, &left.tool_name).cmp(&(&right.server_name, &right.tool_name))
+        });
+        tools
+    }
+
+    /// Record (or, on a failed listing, forget) what `server` offers.
+    fn record_listed(&self, server: &str, tools: Option<&[McpToolInfo]>) {
+        let mut listed = self
+            .listed_tools
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match tools {
+            Some(tools) => {
+                listed.insert(server.to_string(), tools.to_vec());
+            }
+            None => {
+                listed.remove(server);
+            }
+        }
+    }
+
     pub async fn list_tools_for_server(&self, server_name: &str) -> Vec<McpToolInfo> {
         let client = {
             let servers = self.servers.read().await;
@@ -854,22 +888,12 @@ It cannot override system, user, project, safety, permission, or approval rules.
                     .write()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .remove(server_name);
-                result
-                    .tools
-                    .into_iter()
-                    .map(|tool| {
-                        let read_only = tool.is_read_only();
-                        McpToolInfo {
-                            server_name: server_name.to_string(),
-                            tool_name: tool.name,
-                            description: tool.description,
-                            input_schema: tool.input_schema,
-                            read_only,
-                        }
-                    })
-                    .collect()
+                let tools = tool_infos(server_name, result.tools);
+                self.record_listed(server_name, Some(&tools));
+                tools
             }
             Err(e) => {
+                self.record_listed(server_name, None);
                 let message = format!("tools/list failed: {}", e);
                 self.status_overrides
                     .write()
@@ -1014,6 +1038,7 @@ It cannot override system, user, project, safety, permission, or approval rules.
             auto_approved_tools: self.auto_approved_tools.clone(),
             tool_aliases: self.tool_aliases.clone(),
             server_instructions: self.server_instructions.clone(),
+            listed_tools: self.listed_tools.clone(),
         })
     }
 }
@@ -1099,6 +1124,23 @@ impl Default for McpRegistry {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// A server's `tools/list` result as the registry hands it out.
+fn tool_infos(server_name: &str, tools: Vec<super::types::McpToolDefinition>) -> Vec<McpToolInfo> {
+    tools
+        .into_iter()
+        .map(|tool| {
+            let read_only = tool.is_read_only();
+            McpToolInfo {
+                server_name: server_name.to_string(),
+                tool_name: tool.name,
+                description: tool.description,
+                input_schema: tool.input_schema,
+                read_only,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

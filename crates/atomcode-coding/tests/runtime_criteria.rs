@@ -2151,6 +2151,43 @@ done
     script
 }
 
+/// A runtime start with the fixture server `t` (`write_mcp_server`) mounted,
+/// trusted or not.
+fn start_with_mcp_server(
+    project: &std::path::Path,
+    recorder: &Arc<Recorder>,
+    script: &std::path::Path,
+    trust: bool,
+) -> CodingRuntimeStart {
+    let mut start = start(project, recorder, SessionMode::Fresh);
+    start.prepare.mcp = true;
+    start.prepare.extra_mcp_servers = vec![atomcode_capabilities::mcp::McpServerConfig {
+        name: "t".into(),
+        disabled: false,
+        config: atomcode_capabilities::mcp::McpTransportConfig::Stdio {
+            command: "sh".into(),
+            args: vec![script.to_string_lossy().into_owned()],
+            env: Default::default(),
+            timeout_ms: Some(10_000),
+        },
+        source: atomcode_capabilities::mcp::config::McpConfigSource::Driver,
+        trust,
+        auto_approve: Vec::new(),
+    }];
+    start
+}
+
+/// The tools the model was offered in its most recent request.
+fn last_offered(recorder: &Recorder) -> Vec<String> {
+    recorder
+        .tools
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .unwrap_or_default()
+}
+
 /// An MCP server's tools are offered to the model and run — connected once,
 /// by the runtime, whichever engine drives the turns.
 #[cfg(unix)]
@@ -2539,32 +2576,9 @@ async fn a_switched_session_keeps_the_mcp_tools() {
     let spawns = scratch.path().join("spawns.log");
     let script = write_mcp_server(scratch.path(), &spawns);
     let recorder = Arc::new(Recorder::default());
-    let mut start = start(env.project.path(), &recorder, SessionMode::Fresh);
-    start.prepare.mcp = true;
-    start.prepare.extra_mcp_servers = vec![atomcode_capabilities::mcp::McpServerConfig {
-        name: "t".into(),
-        disabled: false,
-        config: atomcode_capabilities::mcp::McpTransportConfig::Stdio {
-            command: "sh".into(),
-            args: vec![script.to_string_lossy().into_owned()],
-            env: Default::default(),
-            timeout_ms: Some(10_000),
-        },
-        source: atomcode_capabilities::mcp::config::McpConfigSource::Driver,
-        trust: true,
-        auto_approve: Vec::new(),
-    }];
+    let start = start_with_mcp_server(env.project.path(), &recorder, &script, true);
     let mut runtime = CodingRuntime::start(start).await.unwrap();
     let first = runtime.session.clone().unwrap().id;
-    let offered = |recorder: &Recorder| {
-        recorder
-            .tools
-            .lock()
-            .unwrap()
-            .last()
-            .cloned()
-            .unwrap_or_default()
-    };
     // Readiness, and what the daemon's `/mcp/status` reads back once it is there:
     // the server connected AND its tool published to the model. The published
     // list is what tells "connected" apart from "in front of the model".
@@ -2590,27 +2604,33 @@ async fn a_switched_session_keeps_the_mcp_tools() {
     ready(&runtime).await;
     turn(&mut runtime, "before").await;
     assert!(
-        offered(&recorder).iter().any(|name| name == "mcp__t__echo"),
+        last_offered(&recorder)
+            .iter()
+            .any(|name| name == "mcp__t__echo"),
         "the fixture never offered the tool: {:?}",
-        offered(&recorder)
+        last_offered(&recorder)
     );
 
     runtime.handle.fresh_session().await.unwrap();
     ready(&runtime).await;
     turn(&mut runtime, "in a fresh session").await;
     assert!(
-        offered(&recorder).iter().any(|name| name == "mcp__t__echo"),
+        last_offered(&recorder)
+            .iter()
+            .any(|name| name == "mcp__t__echo"),
         "a fresh session lost the MCP tools: {:?}",
-        offered(&recorder)
+        last_offered(&recorder)
     );
 
     runtime.handle.resume_session(first).await.unwrap();
     ready(&runtime).await;
     turn(&mut runtime, "back in the first").await;
     assert!(
-        offered(&recorder).iter().any(|name| name == "mcp__t__echo"),
+        last_offered(&recorder)
+            .iter()
+            .any(|name| name == "mcp__t__echo"),
         "a resumed session lost the MCP tools: {:?}",
-        offered(&recorder)
+        last_offered(&recorder)
     );
     runtime.handle.shutdown().await.unwrap();
 }
@@ -2630,22 +2650,8 @@ async fn always_allowing_an_mcp_tool_holds_for_the_session_and_is_written() {
     let spawns = scratch.path().join("spawns.log");
     let script = write_mcp_server(scratch.path(), &spawns);
     let recorder = Arc::new(Recorder::default());
-    let mut start = start(env.project.path(), &recorder, SessionMode::Fresh);
-    start.prepare.mcp = true;
-    start.prepare.extra_mcp_servers = vec![atomcode_capabilities::mcp::McpServerConfig {
-        name: "t".into(),
-        disabled: false,
-        config: atomcode_capabilities::mcp::McpTransportConfig::Stdio {
-            command: "sh".into(),
-            args: vec![script.to_string_lossy().into_owned()],
-            env: Default::default(),
-            timeout_ms: Some(10_000),
-        },
-        source: atomcode_capabilities::mcp::config::McpConfigSource::Driver,
-        // Not trusted: each call is asked about until something says otherwise.
-        trust: false,
-        auto_approve: Vec::new(),
-    }];
+    // Not trusted: each call is asked about until something says otherwise.
+    let start = start_with_mcp_server(env.project.path(), &recorder, &script, false);
     let mut runtime = CodingRuntime::start(start).await.unwrap();
     runtime
         .handle
@@ -2697,6 +2703,77 @@ async fn always_allowing_an_mcp_tool_holds_for_the_session_and_is_written() {
             .unwrap(),
         None,
         "a tool no connected server offers is not approved"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// An undo or a restored snapshot keeps the MCP tools in front of the model.
+///
+/// Both remount the tree on the SAME parts (no new prepare): the new tree's
+/// `mcp-host` row publishes into a tool-name list it shares with the old row,
+/// and the old row's unload drains that list. Whether that costs the new tree
+/// its MCP tools is what this pins — the connection pool design (docs/plans/
+/// 2026-09-24-mcp-connection-pool-across-sessions-design.md §5) builds on it.
+#[cfg(unix)]
+async fn an_undo_or_a_restore_keeps_the_mcp_tools() {
+    let env = env();
+    let scratch = tempfile::tempdir().unwrap();
+    let spawns = scratch.path().join("spawns.log");
+    let script = write_mcp_server(scratch.path(), &spawns);
+    let recorder = Arc::new(Recorder::default());
+    let start = start_with_mcp_server(env.project.path(), &recorder, &script, true);
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+    runtime
+        .handle
+        .wait_mcp_ready(std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
+    let has_echo = |recorder: &Recorder| last_offered(recorder).iter().any(|n| n == "mcp__t__echo");
+
+    turn(&mut runtime, "first").await;
+    turn(&mut runtime, "second").await;
+    assert!(has_echo(&recorder), "{:?}", last_offered(&recorder));
+
+    runtime.handle.undo_to_prompt(None).await.unwrap();
+    turn(&mut runtime, "after the undo").await;
+    assert!(
+        has_echo(&recorder),
+        "an undo lost the MCP tools: {:?}",
+        last_offered(&recorder)
+    );
+    turn(&mut runtime, "one more after the undo").await;
+    assert!(has_echo(&recorder), "{:?}", last_offered(&recorder));
+
+    runtime
+        .handle
+        .restore_snapshot(SessionSnapshot::new(vec![
+            Message::user("restored"),
+            Message::assistant("noted", vec![]),
+        ]))
+        .await
+        .unwrap();
+    turn(&mut runtime, "after the restore").await;
+    assert!(
+        has_echo(&recorder),
+        "a restored snapshot lost the MCP tools: {:?}",
+        last_offered(&recorder)
+    );
+    // The name list the runtime reports from must still hold the tool too:
+    // `mcp_tools` filters the registry's aliases by it.
+    let listed = runtime.handle.mcp_tools("t".into()).await.unwrap().tools;
+    assert_eq!(listed, vec!["mcp__t__echo".to_string()]);
+
+    // And withdrawing (what `/mcp untrust` and `/mcp logout` open with) still
+    // takes the tools off: it unregisters by that same list, so a remount that
+    // emptied it would leave revoked tools in front of the model.
+    runtime.handle.withdraw_mcp_tools().await.unwrap();
+    turn(&mut runtime, "after the withdrawal").await;
+    assert!(
+        !last_offered(&recorder)
+            .iter()
+            .any(|n| n.starts_with("mcp__")),
+        "withdrawn MCP tools were still offered after a remount: {:?}",
+        last_offered(&recorder)
     );
     runtime.handle.shutdown().await.unwrap();
 }
@@ -5043,6 +5120,7 @@ mod criteria {
         withdrawing_mcp_takes_the_tools_off_the_model,
         a_switched_session_keeps_the_mcp_tools,
         always_allowing_an_mcp_tool_holds_for_the_session_and_is_written,
+        an_undo_or_a_restore_keeps_the_mcp_tools,
         a_failed_mcp_connection_is_metered,
         a_model_round_reports_how_long_it_took,
         every_metered_event_says_which_turn_and_round_it_was,
