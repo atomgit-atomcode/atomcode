@@ -191,9 +191,14 @@ pub(crate) fn canonical_dir_key(raw: &str, cwd: &Path) -> String {
     // (folder now created) on the canonical one, so "always allow this folder"
     // was granted under one key and checked under another — and kept asking
     // (reported bug). Canonicalize the deepest ANCESTOR that exists and append
-    // the not-yet-created tail lexically, which is stable across the folder's
-    // creation (mkdir adds real dirs, never symlinks, so the canonical form of
-    // the created dir equals canonical-ancestor + that same tail).
+    // the not-yet-created tail lexically — stable across the folder's creation
+    // AS LONG AS the folder is created as a real directory (which the write
+    // tools do: `create_dir_all`), so the created dir's canonical form is the
+    // canonical-ancestor plus that same tail. A `..`/`.` in the not-yet-created
+    // tail, or a component later replaced by a SYMLINK (e.g. a `bash` gate reuse
+    // where the model `ln -s`es the dir before writing), genuinely changes the
+    // directory's identity and may still re-prompt — those are not the common
+    // create-then-write case this targets.
     let dir = resolved.parent().map(Path::to_path_buf).unwrap_or(resolved);
     canonicalize_existing_prefix(&dir)
         .to_string_lossy()
@@ -205,26 +210,26 @@ pub(crate) fn canonical_dir_key(raw: &str, cwd: &Path) -> String {
 /// lexically. Unlike `canonicalize().unwrap_or(path)`, the result does not flip
 /// between the lexical and the canonical spelling the moment the directory is
 /// created — which is what makes it usable as a stable session-grant key across
-/// a create-then-write sequence. The ancestor walk mirrors [`path_under_any`].
+/// a create-then-write sequence. The ancestor walk climbs by `parent()`, the
+/// same way [`path_under_any`] does.
 fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
-    let mut tail: Vec<std::ffi::OsString> = Vec::new();
-    let mut cur = path;
+    let mut ancestor = path;
     loop {
-        if let Ok(canon) = std::fs::canonicalize(cur) {
-            let mut result = canon;
-            // `tail` was pushed deepest-first while walking up; replay it
-            // shallowest-first to rebuild the original order under the ancestor.
-            result.extend(tail.iter().rev());
-            return result;
+        if let Ok(canon) = std::fs::canonicalize(ancestor) {
+            // The part of `path` below the deepest existing ancestor. `ancestor`
+            // came from `path`'s own `parent()` chain, so it is always a prefix.
+            // An empty tail (the whole path exists) must leave `canon` untouched
+            // — `join("")` would append a trailing separator and desync the key.
+            return match path.strip_prefix(ancestor) {
+                Ok(tail) if !tail.as_os_str().is_empty() => canon.join(tail),
+                _ => canon,
+            };
         }
-        match (cur.file_name(), cur.parent()) {
-            (Some(name), Some(parent)) => {
-                tail.push(name.to_os_string());
-                cur = parent;
-            }
+        match ancestor.parent() {
+            Some(parent) => ancestor = parent,
             // No ancestor canonicalizes (e.g. a relative path with no existing
             // prefix): fall back to the lexical path, as before.
-            _ => return path.to_path_buf(),
+            None => return path.to_path_buf(),
         }
     }
 }
