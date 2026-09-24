@@ -238,6 +238,18 @@ impl LlmProvider for RecordingProvider {
                     .to_string(),
                 })
             }
+            Some(m) if m.role == Role::User && m.text == "finish the first thing" => {
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: "todowrite".into(),
+                    arguments: serde_json::json!({
+                        "action": "update",
+                        "id": 1,
+                        "status": "completed",
+                    })
+                    .to_string(),
+                })
+            }
             Some(m) if m.role == Role::User && m.text == "leak the token" => {
                 StreamEvent::ToolCall(ToolCall {
                     id: format!("call-{n}"),
@@ -2202,6 +2214,91 @@ async fn a_written_task_list_outlives_the_messages_it_came_from() {
     assert!(
         titles.iter().any(|t| t.contains("first")),
         "sidecar: {titles:?}"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// After a compaction took the plan out of the conversation, a status update
+/// the model makes is in the list it is shown on the very next round.
+///
+/// The reported loop: the list lived on only in the sidecar, the update was laid
+/// over it by where each call was made — and the request a hook is handed is
+/// projected without the stats that say where. No call had a place, none was
+/// laid over, and the model marked #1 completed, saw `[~] 1.` again, sent the
+/// same update, and was stopped by the tool-loop guard for repeating itself.
+///
+/// Negative control: hand `pre_request` the request's messages as they are
+/// (without the log's stats) and the round after the update still shows `[~] 1.`.
+async fn an_update_after_a_compaction_is_what_the_next_round_sees() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+            .await
+            .unwrap();
+
+    turn(&mut runtime, "plan two things").await;
+    // Enough after the plan that a summary is a net win and the plan is folded.
+    for n in 0..6 {
+        turn(
+            &mut runtime,
+            &format!("prompt {n} {}", "context ".repeat(500)),
+        )
+        .await;
+    }
+    runtime.handle.compact(None).unwrap();
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), runtime.events.recv())
+            .await
+            .expect("compaction did not finish")
+            .expect("runtime event stream closed");
+        if let CodingRuntimeEvent::CompactionFinished { completion } = event.event {
+            let atomcode_coding::runtime::CompactionCompletion::Completed(outcome) = completion
+            else {
+                panic!("{completion:?}");
+            };
+            assert!(outcome.committed, "the compaction was refused");
+            break;
+        }
+    }
+
+    turn(&mut runtime, "finish the first thing").await;
+
+    let requests = recorder.requests.lock().unwrap().clone();
+    let at = requests
+        .iter()
+        .position(|request| {
+            request
+                .iter()
+                .any(|m| m.role == Role::User && m.text == "finish the first thing")
+        })
+        .expect("the turn was asked");
+    let asked = &requests[at];
+    assert!(
+        !asked
+            .iter()
+            .flat_map(|m| m.tool_calls.iter())
+            .any(|c| c.name == "todowrite" && c.arguments.contains("\"todos\"")),
+        "the plan is still in the conversation, so this proves nothing about the sidecar"
+    );
+    let list = |request: &[Message]| {
+        request
+            .iter()
+            .rev()
+            .find(|m| m.synthetic && m.text.contains("1. the first thing"))
+            .map(|m| m.text.clone())
+            .unwrap_or_default()
+    };
+    assert!(
+        list(asked).contains("[~] 1. the first thing"),
+        "before the update the sidecar's list rides: {}",
+        list(asked)
+    );
+    let after = &requests[at + 1];
+    assert!(
+        list(after).contains("[x] 1. the first thing"),
+        "the round after the update still shows the old status: {}",
+        list(after)
     );
     runtime.handle.shutdown().await.unwrap();
 }
@@ -4622,6 +4719,7 @@ mod criteria {
         every_metered_event_says_which_turn_and_round_it_was,
         telemetry_and_the_session_log_agree_on_where_they_are,
         a_written_task_list_outlives_the_messages_it_came_from,
+        an_update_after_a_compaction_is_what_the_next_round_sees,
         the_retry_budget_follows_a_model_switch,
         a_meaningless_temperature_is_ignored_rather_than_breaking_a_model_switch,
         a_cancelled_turn_is_undone_by_default,

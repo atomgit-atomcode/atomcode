@@ -64,10 +64,12 @@ use atomcode_harness::events::{
 use atomcode_harness::seams::{
     AgentsSvc, SessionDefaults, SessionDefaultsSvc, SessionSvc, SystemPromptSvc, TurnOutcome,
 };
-use atomcode_harness::session::{InjectionOrigin, SessionEvent};
+use atomcode_harness::session::{
+    derive_messages_with_meta, InjectionOrigin, LoggedEvent, SessionEvent,
+};
 use atomcode_kernel::agent::CommandDescription;
 use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
-use atomcode_kernel::message::{Conversation, Message, MessageMeta, SessionSnapshot};
+use atomcode_kernel::message::{Conversation, Message, MessageMeta, Role, SessionSnapshot};
 use atomcode_plexus::{Context, Listener, Next, Plugin, Waterfall};
 use serde_json::Value;
 
@@ -418,6 +420,43 @@ impl Waterfall<PreStep> for Bridge {
     }
 }
 
+/// `messages` with the stats the log recorded for each assistant message.
+///
+/// A request is projected from the log without them (`derive_messages`), so
+/// that nothing about what the model is sent changes. The hooks it is handed to
+/// were written against a kernel conversation whose assistant messages carry
+/// them, and one reads them: the todo hook places each call by its turn and
+/// round to know which ones its sidecar already reflects. Handed the bare
+/// projection, no call had a place, none was laid over the sidecar, and after a
+/// compaction the model marked a task completed and was shown it in progress
+/// again — until the tool-loop guard stopped it for repeating the update.
+///
+/// The request is the system prompt, then the log's projection, then whatever
+/// tails rode along; the stats go on the projection's span only when it lines
+/// up message for message. When it does not, the messages go as they are.
+fn with_logged_meta(messages: &[Message], events: &[LoggedEvent]) -> Vec<Message> {
+    let mut out = messages.to_vec();
+    let logged = derive_messages_with_meta(events);
+    let start = usize::from(
+        out.first()
+            .is_some_and(|m| m.role == Role::System && !m.synthetic),
+    );
+    let Some(span) = out.get_mut(start..start + logged.len()) else {
+        return out;
+    };
+    let lines_up = span.iter().zip(&logged).all(|(sent, kept)| {
+        sent.role == kept.role && sent.text == kept.text && sent.tool_calls == kept.tool_calls
+    });
+    if lines_up {
+        for (sent, kept) in span.iter_mut().zip(logged) {
+            if sent.meta.is_none() {
+                sent.meta = kept.meta;
+            }
+        }
+    }
+    out
+}
+
 #[async_trait]
 impl Waterfall<AgentRequest> for Bridge {
     async fn handle(
@@ -453,10 +492,11 @@ impl Waterfall<AgentRequest> for Bridge {
         // same way the harness's own tails do: past the log check, never logged.
         // A hook that rewrote the history instead would be putting words in
         // front of the model that no log can explain, so its edits are dropped.
-        let mut proposed = req.messages.clone();
+        let mut proposed = with_logged_meta(&req.messages, &agent.session().events());
+        let handed = proposed.clone();
         let before = proposed.len();
         self.hook.pre_request(&mut proposed, &ctx).await;
-        if proposed.len() > before && proposed[..before] == req.messages[..] {
+        if proposed.len() > before && proposed[..before] == handed[..] {
             req.messages.extend(proposed.drain(before..));
         }
         self.hook
