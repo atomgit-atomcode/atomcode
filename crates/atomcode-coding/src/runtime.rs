@@ -2590,6 +2590,9 @@ impl CodingRuntime {
         )
         .await
         .map_err(runtime_start_prepare_error)?;
+        // The first tree owns the pool from the start, so the servers it is still
+        // connecting are offered to it as they come up.
+        parts.settle_mcp_pool().await;
         parts.register_extra_tool(Arc::new(ScheduleWakeupTool::new(
             wakeup_tx.clone(),
             Arc::clone(&loop_active),
@@ -6349,10 +6352,10 @@ fn spawn_runtime_owner_with_optional_agent(
                                     runtime_phase_state(generation, previous_phase),
                                     Ordering::Release,
                                 );
-                                // A failed candidate may have offered the pool connections
-                                // the old tree does not use; they close here rather than
-                                // at the next commit. (It only removes: a pool a reload
-                                // cleared stays empty.)
+                                // Back to the old tree: it stays the pool's owner, so the
+                                // failed candidate's connections — made or still being
+                                // made — are turned away and close with it. (A pool a
+                                // reload cleared stays empty.)
                                 runtime.parts.settle_mcp_pool().await;
                                 resources = Some(runtime);
                                 let _ = done.send(Err(error));
@@ -6508,9 +6511,10 @@ fn spawn_runtime_owner_with_optional_agent(
                         }
                         preserve_sessionless_snapshot(&mut runtime, &stop_report);
                         runtime = candidate;
-                        // The old tree is gone: keep only the connections the new
-                        // one holds. The rest close once nothing holds them — a
-                        // server dropped from the config, the old directory's.
+                        // The old tree is gone: the new one owns the pool, holding
+                        // only its own connections. The rest close once nothing
+                        // holds them — a server dropped from the config, the old
+                        // directory's, a late one of the old registry's.
                         runtime.parts.settle_mcp_pool().await;
                         agent = Some(replacement);
                         generation = generation.wrapping_add(1);

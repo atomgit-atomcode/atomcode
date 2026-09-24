@@ -2125,12 +2125,22 @@ async fn a_round_budget_ends_the_turn() {
 /// A minimal MCP server over stdio: one `echo` tool. A shell script rather than
 /// capabilities' test binary, which cargo only builds for that crate's tests.
 fn write_mcp_server(dir: &std::path::Path, calls: &std::path::Path) -> std::path::PathBuf {
+    write_mcp_server_after(dir, calls, 0)
+}
+
+/// [`write_mcp_server`], taking `delay_secs` to start answering — a slow `npx`.
+fn write_mcp_server_after(
+    dir: &std::path::Path,
+    calls: &std::path::Path,
+    delay_secs: u32,
+) -> std::path::PathBuf {
     let script = dir.join("server.sh");
     std::fs::write(
         &script,
         format!(
             r#"#!/bin/sh
 echo "started $$" >> "{spawns}"
+sleep {delay_secs}
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   case "$line" in
@@ -2882,6 +2892,49 @@ async fn an_undo_or_a_restore_keeps_the_mcp_tools() {
         "withdrawn MCP tools were still offered after a remount: {:?}",
         last_offered(&recorder)
     );
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// A server still starting when the person switches leaves nothing behind.
+///
+/// The old tree's registry is cancelled when the new one takes over, and only
+/// the registry in use may add to the pool: the old registry's slow server does
+/// not linger as a pooled process, and cannot take the place of the connection
+/// the new tree made. The next switch hands over the live one.
+#[cfg(unix)]
+async fn a_server_still_starting_at_a_switch_leaves_nothing_behind() {
+    let env = env();
+    let scratch = tempfile::tempdir().unwrap();
+    let spawns = scratch.path().join("spawns.log");
+    let script = write_mcp_server_after(scratch.path(), &spawns, 1);
+    let recorder = Arc::new(Recorder::default());
+    let start = start_with_mcp_server(env.project.path(), &recorder, &script, true);
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+    let wait = std::time::Duration::from_secs(10);
+
+    // Switch while the first server is still starting.
+    runtime.handle.fresh_session().await.unwrap();
+    runtime.handle.wait_mcp_ready(wait).await.unwrap();
+    turn(&mut runtime, "after the switch").await;
+    assert!(last_offered(&recorder).iter().any(|n| n == "mcp__t__echo"));
+
+    let pids = started_pids(&spawns);
+    assert_eq!(pids.len(), 2, "{pids:?}");
+    assert!(
+        exited(pids[0]).await,
+        "the superseded server is still running"
+    );
+
+    // The live connection is the one handed over next.
+    runtime.handle.fresh_session().await.unwrap();
+    turn(&mut runtime, "and again").await;
+    assert!(last_offered(&recorder).iter().any(|n| n == "mcp__t__echo"));
+    assert_eq!(
+        started_pids(&spawns).len(),
+        2,
+        "the live connection was not reused"
+    );
+    assert!(process_alive(pids[1]));
     runtime.handle.shutdown().await.unwrap();
 }
 
@@ -5443,6 +5496,7 @@ mod criteria {
         a_switched_session_keeps_the_mcp_tools,
         always_allowing_an_mcp_tool_holds_for_the_session_and_is_written,
         an_undo_or_a_restore_keeps_the_mcp_tools,
+        a_server_still_starting_at_a_switch_leaves_nothing_behind,
         a_reload_reconnects_the_mcp_servers,
         a_changed_directory_does_not_reuse_the_connections,
         a_dead_connection_is_not_reused,

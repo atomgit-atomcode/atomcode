@@ -61,8 +61,8 @@ server 进程启动 3 次。
 CodingRuntime(owner 循环里的状态,跨 generation 存活)
   └─ McpConnectionPool
        key:   server name
-       value: { identity: McpConnectionIdentity, client: Arc<dyn McpClient>(已完成 initialize), tools, 入池时的池代数 }
-       gen:   池代数(整池清空时 +1)
+       value: { identity: McpConnectionIdentity, client: Arc<dyn McpClient>(已完成 initialize), instructions, timeout, tools }
+       owner: 在用 registry 的 id(清空后为空)
 ```
 
 - **类型放 capabilities**(`mcp::pool`),只是机制;**实例由 CodingRuntime 持有**,
@@ -74,14 +74,18 @@ CodingRuntime(owner 循环里的状态,跨 generation 存活)
   不进标识(它们是 registry 的审批状态,每代按配置重新种)。OAuth token 每次请求现读、
   不固化在连接里,所以不进标识;logout 走整池清空。
 - **借用条件,四个同时成立**:标识相等;该 client 的 `initialize` 已完成;连接未关闭
-  (stdio 子进程未退出、状态 `Connected`);池的代数与借用方所见一致(见下)。
+  (stdio 子进程未退出、状态 `Connected`)。
   否则照常新连,连上后放进池。
 - **借用连同工具列表**:池条目存连接时拉到的工具列表,借用方直接用它,不再 `tools/list`。
   工具定义因此逐字节不变,请求缓存前缀不被打破(见缓存红线)。借用不产生
   `McpConnectEvent::Connected`(不计一次连接尝试,遥测不虚增);mcp-host 行挂载时本就先发布
   `list_all_tools()`,初次连接完成时再全量对账,借来的工具在两处都会出现。
-- **池的代数**:池带一个单调递增的代数,整池清空时加一。连接任务开始时记下代数,
-  完成时代数已变就不放回池、直接关闭——清空之后仍在路上的旧连接不能混进 reload 后的池。
+- **池只收在用 registry 的连接(owner)**:每个 registry 有唯一 id;启动、提交、候选失败
+  回退时,在用的 registry settle 成为 owner,池只持有它自己的连接。`put` 在池锁内核对 owner,
+  于是候选、被替换的、prepare 半途失败留下的孤儿 registry,无论何时连上都进不了池、不会挤掉
+  在用连接,随各自 registry 关闭。清空(撤回)后 owner 为空;被撤回的 registry 不再成为 owner。
+  (初稿用「池代数」只挡住了清空后的迟到连接,评审指出挡不住候选与被替换的 registry,
+  改为 owner。)
 - **归还 / 淘汰**:提交新 generation 后,池只保留新 registry 实际在用的键,其余逐个关闭
   (stdio kill、HTTP DELETE)。**候选失败丢弃时不淘汰任何东西**——旧 generation 还在用。
 - **失败的 server 不进池**:下一代照常重连,保留「重建即自愈」。
@@ -160,7 +164,7 @@ CodingRuntime(owner 循环里的状态,跨 generation 存活)
 | 改目录不复用 | 切到另一目录后是新连接,旧目录的进程已退出 |
 | 配置改了的 server 重连,其余复用 | 两次切换之间改一个 server 的 args:它重启,另一个不重启 |
 | 工具定义不变 | 切会话前后发给 provider 的 MCP 工具定义逐字节相同(请求缓存前缀不破) |
-| 清空后迟到的连接不入池 | 让一个 server 连接变慢,期间 `/mcp reload`:它连上后被关闭,池里只有 reload 之后的连接 |
+| 非在用 registry 的连接不入池 | 慢 server 启动途中切会话:被替换的进程退出,下次切换接手的是在用连接;pool 单元测试覆盖候选 / 清空后 / 另一 owner 的 put 被拒 |
 | 坏连接不复用 | 杀掉子进程后切会话:该 server 重连,工具可用 |
 | 授权不外泄 | 会话 A 仅内存授权(持久化失败)的工具,在新会话 B 中仍需审批 |
 | 撤回先于改状态 | untrust / logout 后旧 catalog 无 MCP 工具,池已清空,进程已退出 |
@@ -171,7 +175,7 @@ CodingRuntime(owner 循环里的状态,跨 generation 存活)
 
 1. 判据先行(上表),其中第 1、2 行在当前代码上应为红。
 2. capabilities:`McpClient` 改为可共享(`Arc`);新增 `mcp::pool::McpConnectionPool`
-   (连接标识、借用条件、池代数、按在用集合淘汰、整池清空);`McpRegistry` 新增「带池构造」入口,
+   (连接标识、借用条件、owner、settle、整池清空);`McpRegistry` 新增「带池构造」入口,
    借到的 server 直接登记、未借到的照常后台连接并回填池。
 3. coding:`PrepareOptions` 增加池句柄;owner 循环持有池;Reprepare 提交后按新 registry
    在用集合淘汰;Reload / ReloadConfig / 撤回路径在 `withdraw_mcp_tools` 之后清空池。

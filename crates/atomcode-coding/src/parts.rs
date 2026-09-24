@@ -1370,13 +1370,23 @@ impl CodingParts {
         }
     }
 
-    /// Keep in the connection pool only what this parts' registry holds — called
-    /// once this parts is the one in use.
+    /// Make this parts' registry the connection pool's owner, holding exactly its
+    /// connections — called whenever this parts becomes, or stays, the one in use:
+    /// at start, at a commit, and when a failed rebuild falls back to it. From then
+    /// on only this registry adds to the pool; a candidate's, a superseded one's or
+    /// an orphan's late connection is turned away and closes with its registry.
+    ///
+    /// A withdrawn registry (reload, untrust, sign-out) is not made the owner: the
+    /// withdrawal cleared the pool so the next tree connects afresh, and a rebuild
+    /// that failed after it must not hand the revoked connections back.
     pub(crate) async fn settle_mcp_pool(&self) {
         let (Some(pool), Some(registry)) = (&self.mcp_pool, &self.mcp_registry) else {
             return;
         };
-        pool.retain(&registry.connected_clients().await);
+        if registry.is_withdrawn() {
+            return;
+        }
+        pool.settle(registry.id(), registry.pooled_connections().await);
     }
 
     /// The connection pool, for tests and diagnostics.

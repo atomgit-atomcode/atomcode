@@ -86,12 +86,15 @@ pub struct PooledConnection {
     pub tools: Vec<McpToolInfo>,
 }
 
-/// The pool: at most one connection per server name.
+/// The pool: at most one connection per server name, all of them the connections
+/// of one registry — the one the runtime is using, its *owner*.
 ///
-/// `generation` goes up every time the pool is cleared. A connection being
-/// made when the pool was cleared (a reload came in while a server was still
-/// starting) is not let in afterwards: [`Self::put`] refuses a connection
-/// started under an older generation.
+/// Only the owner adds to it ([`Self::put`], checked under the pool's lock).
+/// Every other registry that is still finishing connections — a candidate that
+/// is being built or failed, one superseded by a switch, one orphaned by a
+/// prepare that failed half way — is turned away whenever it finishes: its
+/// connections close with it instead of outliving it here, and none of them
+/// can push the owner's connection for the same server out.
 #[derive(Default)]
 pub struct McpConnectionPool {
     inner: Mutex<PoolInner>,
@@ -101,7 +104,7 @@ impl std::fmt::Debug for McpConnectionPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let inner = self.lock();
         f.debug_struct("McpConnectionPool")
-            .field("generation", &inner.generation)
+            .field("owner", &inner.owner)
             .field("servers", &inner.entries.keys().collect::<Vec<_>>())
             .finish()
     }
@@ -109,7 +112,9 @@ impl std::fmt::Debug for McpConnectionPool {
 
 #[derive(Default)]
 struct PoolInner {
-    generation: u64,
+    /// The registry whose connections these are (`McpRegistry::id`). `None`
+    /// after [`McpConnectionPool::clear`], until a registry settles.
+    owner: Option<u64>,
     entries: BTreeMap<String, PooledConnection>,
 }
 
@@ -122,11 +127,6 @@ impl McpConnectionPool {
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// The current generation, to pass back to [`Self::put`].
-    pub fn generation(&self) -> u64 {
-        self.lock().generation
     }
 
     /// The connection for `identity`, if the pool holds one made the same way
@@ -154,17 +154,37 @@ impl McpConnectionPool {
         Some(entry.clone())
     }
 
-    /// Offer a connection made under `generation`. Refused — and `false`
-    /// returned — when the pool has been cleared since.
-    pub fn put(&self, generation: u64, connection: PooledConnection) -> bool {
+    /// Offer a connection `registry` just made. Taken only when `registry` is the
+    /// owner; `false` otherwise.
+    pub fn put(&self, registry: u64, connection: PooledConnection) -> bool {
         let mut inner = self.lock();
-        if inner.generation != generation {
+        if inner.owner != Some(registry) {
             return false;
         }
         inner
             .entries
             .insert(connection.identity.name.clone(), connection);
         true
+    }
+
+    /// Make `registry` the owner, holding exactly `connections` — its own, as it
+    /// reports them. What the pool held for another registry is let go and
+    /// closes once nothing else holds it. When `registry` already was the owner,
+    /// what it put since it was read is kept too.
+    pub fn settle(&self, registry: u64, connections: Vec<PooledConnection>) {
+        let mut inner = self.lock();
+        let kept = if inner.owner == Some(registry) {
+            std::mem::take(&mut inner.entries)
+        } else {
+            BTreeMap::new()
+        };
+        inner.owner = Some(registry);
+        inner.entries = kept;
+        for connection in connections {
+            inner
+                .entries
+                .insert(connection.identity.name.clone(), connection);
+        }
     }
 
     /// Update what a pooled server offers, when it is still the same connection.
@@ -177,22 +197,11 @@ impl McpConnectionPool {
         }
     }
 
-    /// Keep only the connections `in_use` still holds (by name and the very same
-    /// client). What is dropped closes once no registry holds it either.
-    pub fn retain(&self, in_use: &BTreeMap<String, Arc<dyn McpClient>>) {
-        let mut inner = self.lock();
-        inner.entries.retain(|name, entry| {
-            in_use
-                .get(name)
-                .is_some_and(|client| Arc::ptr_eq(client, &entry.client))
-        });
-    }
-
-    /// Forget every connection and refuse any made before now. Used when the
-    /// connections must be made again: a reload, a trust or sign-in change.
+    /// Forget every connection, with no owner until a registry settles. Used when
+    /// the connections must be made again: a reload, a trust or sign-in change.
     pub fn clear(&self) {
         let mut inner = self.lock();
-        inner.generation += 1;
+        inner.owner = None;
         inner.entries.clear();
     }
 
@@ -266,11 +275,14 @@ mod tests {
         (pooled, fake)
     }
 
+    const OWNER: u64 = 1;
+    const OTHER: u64 = 2;
+
     #[test]
     fn a_connection_made_the_same_way_is_handed_over() {
         let pool = McpConnectionPool::new();
         let (pooled, _) = connection(identity("/p", "srv"));
-        assert!(pool.put(pool.generation(), pooled.clone()));
+        pool.settle(OWNER, vec![pooled.clone()]);
         let taken = pool
             .take_over(&identity("/p", "srv"))
             .expect("same identity");
@@ -281,7 +293,7 @@ mod tests {
     fn any_difference_in_how_it_was_made_is_a_new_connection() {
         let pool = McpConnectionPool::new();
         let (pooled, _) = connection(identity("/p", "srv"));
-        pool.put(pool.generation(), pooled);
+        pool.settle(OWNER, vec![pooled]);
         assert!(pool.take_over(&identity("/other", "srv")).is_none());
         assert!(pool.take_over(&identity("/p", "srv-v2")).is_none());
         let mut untrusted = identity("/p", "srv");
@@ -297,38 +309,58 @@ mod tests {
     fn a_connection_that_is_no_longer_up_is_not_handed_over() {
         let pool = McpConnectionPool::new();
         let (pooled, fake) = connection(identity("/p", "srv"));
-        pool.put(pool.generation(), pooled);
+        pool.settle(OWNER, vec![pooled]);
         fake.0.store(false, Ordering::Release);
         assert!(pool.take_over(&identity("/p", "srv")).is_none());
     }
 
-    /// A server still starting when the pool was cleared (a reload came in) must
-    /// not get into the cleared pool when it finishes.
+    /// Only the registry in use adds to the pool. A candidate, a superseded one,
+    /// one orphaned by a failed prepare — whichever finishes a connection late —
+    /// is turned away, and cannot push the owner's connection for the same
+    /// server out.
     #[test]
-    fn a_connection_started_before_a_clear_is_turned_away() {
+    fn only_the_registry_in_use_adds_to_the_pool() {
         let pool = McpConnectionPool::new();
-        let started_under = pool.generation();
-        pool.clear();
+        let (own, _) = connection(identity("/p", "srv"));
+        pool.settle(OWNER, Vec::new());
+        assert!(pool.put(OWNER, own.clone()));
+
         let (late, _) = connection(identity("/p", "srv"));
-        assert!(!pool.put(started_under, late));
-        assert!(pool.names().is_empty());
+        assert!(!pool.put(OTHER, late));
+        let held = pool.take_over(&identity("/p", "srv")).unwrap();
+        assert!(Arc::ptr_eq(&held.client, &own.client));
     }
 
+    /// A new owner holds exactly its own connections; what the old one held is
+    /// let go.
     #[test]
-    fn only_the_connections_in_use_are_kept() {
+    fn a_new_owner_holds_only_its_own_connections() {
         let pool = McpConnectionPool::new();
-        let (pooled, _) = connection(identity("/p", "srv"));
-        pool.put(pool.generation(), pooled.clone());
+        let (old, _) = connection(identity("/a", "srv"));
+        pool.settle(OWNER, vec![old]);
+        pool.settle(OTHER, Vec::new());
+        assert!(pool.names().is_empty());
+        assert!(!pool.put(OWNER, connection(identity("/a", "srv")).0));
+    }
 
-        let mut in_use = BTreeMap::new();
-        in_use.insert("srv".to_string(), Arc::clone(&pooled.client));
-        pool.retain(&in_use);
+    /// Settling the owner again keeps what it put since it was last read.
+    #[test]
+    fn settling_the_same_owner_keeps_what_it_put() {
+        let pool = McpConnectionPool::new();
+        pool.settle(OWNER, Vec::new());
+        assert!(pool.put(OWNER, connection(identity("/p", "srv")).0));
+        pool.settle(OWNER, Vec::new());
         assert_eq!(pool.names(), vec!["srv".to_string()]);
+    }
 
-        // The same name held by a different connection is not this one.
-        let (other, _) = connection(identity("/p", "srv"));
-        in_use.insert("srv".to_string(), other.client);
-        pool.retain(&in_use);
+    /// After a clear nobody adds until a registry settles: a server that was
+    /// still starting when a reload cleared the pool does not get in.
+    #[test]
+    fn after_a_clear_nothing_gets_in_until_a_registry_settles() {
+        let pool = McpConnectionPool::new();
+        pool.settle(OWNER, Vec::new());
+        pool.clear();
+        assert!(!pool.put(OWNER, connection(identity("/p", "srv")).0));
         assert!(pool.names().is_empty());
     }
 }

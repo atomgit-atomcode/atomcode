@@ -185,6 +185,18 @@ pub struct McpRegistry {
     /// The runtime's connection pool this registry takes connections from and
     /// offers its own to, when it was built with one.
     pool: Option<Arc<super::pool::McpConnectionPool>>,
+    /// Who this registry is to the pool: only the registry in use may add to it.
+    /// Shared by `share()` clones, which are the same registry.
+    id: u64,
+    /// How each server's connection was made, for handing it to the pool.
+    identities: Arc<std::sync::RwLock<BTreeMap<String, super::pool::McpConnectionIdentity>>>,
+}
+
+/// Registry ids, unique for the life of the process.
+static NEXT_REGISTRY_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_registry_id() -> u64 {
+    NEXT_REGISTRY_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl McpRegistry {
@@ -205,6 +217,8 @@ impl McpRegistry {
             server_instructions: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
             listed_tools: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
             pool: None,
+            id: next_registry_id(),
+            identities: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
         }
     }
 
@@ -227,6 +241,8 @@ impl McpRegistry {
                 server_instructions: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
                 listed_tools: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
                 pool: None,
+                id: next_registry_id(),
+                identities: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
             },
             rx,
         )
@@ -551,12 +567,17 @@ It cannot override system, user, project, safety, permission, or approval rules.
         // Take over what the pool already holds. The registry is new and nobody
         // else can see it yet, so its locks are free.
         let project_trusted = is_project_trusted_local(project_dir);
-        let pool_generation = pool.as_ref().map(|pool| pool.generation());
+        let registry_id = registry.id;
         let configs: Vec<(McpServerConfig, super::pool::McpConnectionIdentity)> = configs
             .into_iter()
             .filter_map(|config| {
                 let identity =
                     super::pool::McpConnectionIdentity::new(project_dir, project_trusted, &config);
+                registry
+                    .identities
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(config.name.clone(), identity.clone());
                 let Some(taken) = pool.as_ref().and_then(|pool| pool.take_over(&identity)) else {
                     return Some((config, identity));
                 };
@@ -652,14 +673,12 @@ It cannot override system, user, project, safety, permission, or approval rules.
                                     let mut servers = servers.write().await;
                                     servers.insert(name.clone(), Arc::clone(&client));
                                     drop(servers);
-                                    // Offered under the generation the pool had when
-                                    // this registry was built: a pool cleared since
-                                    // (a reload while this server was starting) turns
-                                    // it away, and it closes with this registry.
-                                    if let (Some(pool), Some(generation)) = (&pool, pool_generation)
-                                    {
+                                    // Taken only if this registry is the one in use by
+                                    // then: a candidate's, a superseded one's or an
+                                    // orphan's connection closes with its registry.
+                                    if let Some(pool) = &pool {
                                         pool.put(
-                                            generation,
+                                            registry_id,
                                             super::pool::PooledConnection {
                                                 identity,
                                                 client,
@@ -894,10 +913,50 @@ It cannot override system, user, project, safety, permission, or approval rules.
     }
 
     /// Get tools from a single connected server.
-    /// The connected clients by server name — what a connection pool keeps when
-    /// this registry is the one in use.
-    pub async fn connected_clients(&self) -> BTreeMap<String, Arc<dyn McpClient>> {
-        self.servers.read().await.clone()
+    /// Who this registry is to a connection pool (see [`super::pool`]).
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Whether this registry's work was cancelled — withdrawn, or dropped as a
+    /// candidate. A withdrawn registry's connections are not handed on.
+    pub fn is_withdrawn(&self) -> bool {
+        *self.cancelled.borrow()
+    }
+
+    /// This registry's connections as a pool holds them: every connected server
+    /// it knows how it made, with its instructions, timeout and last-listed tools.
+    pub async fn pooled_connections(&self) -> Vec<super::pool::PooledConnection> {
+        let servers = self.servers.read().await.clone();
+        let timeouts = self.server_timeouts_ms.read().await.clone();
+        let identities = self
+            .identities
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let instructions = self
+            .server_instructions
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let listed = self
+            .listed_tools
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        servers
+            .into_iter()
+            .filter_map(|(name, client)| {
+                let identity = identities.get(&name)?.clone();
+                Some(super::pool::PooledConnection {
+                    identity,
+                    timeout_ms: timeouts.get(&name).copied().unwrap_or_default(),
+                    instructions: instructions.get(&name).cloned(),
+                    tools: listed.get(&name).cloned().unwrap_or_default(),
+                    client,
+                })
+            })
+            .collect()
     }
 
     /// Every server's tools as its last successful `tools/list` returned them,
@@ -1145,6 +1204,8 @@ It cannot override system, user, project, safety, permission, or approval rules.
             server_instructions: self.server_instructions.clone(),
             listed_tools: self.listed_tools.clone(),
             pool: self.pool.clone(),
+            id: self.id,
+            identities: self.identities.clone(),
         })
     }
 }
