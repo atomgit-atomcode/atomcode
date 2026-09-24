@@ -1547,6 +1547,13 @@ impl HostState {
     }
 }
 
+/// Where a session in `working_dir` keeps the tool outputs it spilled — the
+/// `tool-output-artifact` row's `dir`, named once for the template and for the
+/// runtime's patch of that row.
+pub(crate) fn artifacts_dir(working_dir: &Path) -> std::path::PathBuf {
+    working_dir.join(".atomcode").join("artifacts")
+}
+
 /// As [`mount_swappable`], carrying the runtime's own state into the tree.
 pub async fn mount_hosted(
     working_dir: &Path,
@@ -1561,7 +1568,7 @@ pub async fn mount_hosted(
         .clone()
         .unwrap_or_else(|| provider.model_name().to_string());
     let (providers, provider_id) = ProviderSlots::new(provider);
-    let artifacts = working_dir.join(".atomcode").join("artifacts");
+    let artifacts = artifacts_dir(working_dir);
     // The two halves of one rule. Attended: no `root`, so the fs world is not
     // fenced and a target next door reaches `tool-write-approval`, which asks.
     // Headless: fenced, and the `approval` row stays the `deny-risky` one that

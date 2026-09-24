@@ -640,6 +640,9 @@ struct OutputArtifactRow {
     /// no `dir`, no row, because an artifact nobody can fetch later is worse
     /// than not truncating at all.
     dir: Option<String>,
+    /// Spill above this many bytes instead of the default. Clamped where it is
+    /// applied; `ATOMCODE_TOOL_OUTPUT_THRESHOLD_BYTES` wins over it.
+    threshold_bytes: Option<usize>,
 }
 
 pub struct OutputArtifactPlugin;
@@ -678,7 +681,10 @@ impl Plugin for OutputArtifactPlugin {
                 atomcode_capabilities::tools::FetchOutputTool::new(store.clone()),
             )],
         )?;
-        let spill = Arc::new(atomcode_capabilities::tools::ArtifactMiddleware::new(store));
+        let spill = Arc::new(
+            atomcode_capabilities::tools::ArtifactMiddleware::new(store)
+                .with_threshold(row.threshold_bytes),
+        );
         // Appended: it rewrites the RESULT, so it must see what every earlier
         // listener produced.
         let _ = ctx.on_waterfall::<ToolsExecute>(

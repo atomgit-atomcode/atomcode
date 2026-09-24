@@ -9073,6 +9073,12 @@ struct MemoryPatch<'a> {
 }
 
 #[derive(serde::Serialize)]
+struct OutputArtifactPatch {
+    dir: std::path::PathBuf,
+    threshold_bytes: usize,
+}
+
+#[derive(serde::Serialize)]
 struct SubagentRowPatch {
     max_rounds: u32,
 }
@@ -9137,6 +9143,19 @@ fn harness_option_rows(
                 MemoryPatch {
                     project_root: wd,
                     inject: prepare.memory,
+                },
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    // `[tools.output] threshold_bytes`: where an oversized tool result is cut.
+    // Patched only when set, so an unconfigured tree mounts the row as written.
+    if let Some(threshold_bytes) = config.tool_output_threshold_bytes {
+        rows = rows
+            .patch(
+                "tool-output-artifact",
+                OutputArtifactPatch {
+                    dir: crate::on_harness::artifacts_dir(wd),
+                    threshold_bytes,
                 },
             )
             .map_err(|e| e.to_string())?;

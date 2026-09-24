@@ -379,3 +379,51 @@ async fn a_checkout_bounds_the_write_and_leaves_the_read_alone() {
     mounted.shutdown().await;
     let _ = std::fs::remove_dir_all(&sibling);
 }
+
+/// `[tools.output] threshold_bytes` reaches the row that cuts oversized tool
+/// results, beside the directory it already had; unset, the row is as written.
+///
+/// A deployment an editor extension starts cannot always be given an
+/// environment, so the file has to reach the row on its own. A wholesale
+/// `[[patch]]` that dropped `dir` would stop the row mounting at all, so both
+/// fields are checked.
+#[tokio::test]
+async fn a_configured_output_threshold_reaches_the_row_that_cuts() {
+    let project = tempfile::tempdir().unwrap();
+    let row_of = |mounted: &support::Mounted| {
+        mounted
+            .row_configs()
+            .into_iter()
+            .find(|(id, _)| id == "tool-output-artifact")
+            .expect("the row that spills tool output is mounted")
+            .1
+    };
+    let dir = project.path().join(".atomcode").join("artifacts");
+    let cfg_from = |file: &atomcode_config::config::Config| {
+        atomcode_coding::CodingRuntimeConfig::from_config(
+            file,
+            project.path(),
+            None,
+            None,
+            false,
+            false,
+        )
+        .agent_config()
+    };
+
+    let mut file = atomcode_config::config::Config::default();
+    file.tools.output.threshold_bytes = Some(204_800);
+    let mounted = support::mount(&cfg_from(&file), quiet_options(), Arc::new(CannedProvider)).await;
+    let row = row_of(&mounted);
+    assert_eq!(row["threshold_bytes"], 204_800, "{row}");
+    assert_eq!(row["dir"], dir.to_string_lossy().as_ref(), "{row}");
+    mounted.stop();
+
+    let unset = atomcode_config::config::Config::default();
+    let mounted =
+        support::mount(&cfg_from(&unset), quiet_options(), Arc::new(CannedProvider)).await;
+    let row = row_of(&mounted);
+    assert!(row.get("threshold_bytes").is_none(), "{row}");
+    assert_eq!(row["dir"], dir.to_string_lossy().as_ref(), "{row}");
+    mounted.stop();
+}

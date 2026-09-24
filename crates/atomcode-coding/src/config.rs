@@ -42,6 +42,9 @@ pub struct CodingAgentConfig {
     /// See `atomcode_config::config::AtomGitToolConfig` for the excluded paths
     /// (`GitPushLabelMiddleware`, raw REST via `bash`).
     pub atomgit_enabled: bool,
+    /// `[tools.output] threshold_bytes`: spill a tool result above this many
+    /// bytes instead of the default. `None` leaves the row as the tree mounts it.
+    pub tool_output_threshold_bytes: Option<usize>,
     /// Stable config/provider registry key exposed to drivers. This is distinct
     /// from `provider_type`, which selects the adapter implementation.
     pub provider_name: String,
@@ -213,6 +216,8 @@ pub struct CodingRuntimeConfig {
     pub todo: atomcode_config::config::TodoToolConfig,
     /// Resolved `[tools.atomgit]` switch — see `CodingAgentConfig::atomgit_enabled`.
     pub atomgit_enabled: bool,
+    /// See `CodingAgentConfig::tool_output_threshold_bytes`.
+    pub tool_output_threshold_bytes: Option<usize>,
     pub provider_name: String,
     pub working_dir: PathBuf,
     pub context_window: u32,
@@ -344,6 +349,10 @@ pub fn describe_config_file(config_file: &std::path::Path) -> String {
          `claude-code`, `model`, `permission`, `timeout_secs`, `enabled`), add the Codex \
          or Claude Code CLI as a delegate where the front end allows it.\n\
          - `[tools.todo]` `enabled`, and `eager` = `auto` | `preferred` | `always`.\n\
+         - `[tools.output]` `threshold_bytes`: a tool result larger than this (default \
+         51200, clamped to 46080..=4194304) is saved whole and shown as a head + tail \
+         preview that `fetch_output` reads past; `ATOMCODE_TOOL_OUTPUT_THRESHOLD_BYTES` \
+         wins.\n\
          - `[lsp]` `enabled`, `auto_detect`, and `[lsp.servers.<extension>]` = \
          `{{ command, args, root_markers }}`.\n\
          - `[web_search]` `provider` = `exa` | `duckduckgo`, and `api_key` for Exa; the \
@@ -437,6 +446,7 @@ impl CodingRuntimeConfig {
                 std::env::var("ATOMCODE_ATOMGIT").ok().as_deref(),
                 config.tools.atomgit.enabled,
             ),
+            tool_output_threshold_bytes: config.tools.output.threshold_bytes,
             provider_name: r.map(|r| r.selection_id.clone()).unwrap_or_default(),
             working_dir: working_dir.to_path_buf(),
             context_window: r.map(|r| r.context_window as u32).unwrap_or(128_000),
@@ -506,6 +516,7 @@ impl CodingRuntimeConfig {
         config.preferred_language = self.preferred_language;
         config.todo = self.todo.clone();
         config.atomgit_enabled = self.atomgit_enabled;
+        config.tool_output_threshold_bytes = self.tool_output_threshold_bytes;
         config.provider_name = self.provider_name.clone();
         config.chat_options.max_tokens = self.max_tokens;
         config.telemetry = self.telemetry.clone();
@@ -983,6 +994,7 @@ impl CodingAgentConfig {
             preferred_language: None,
             todo: Default::default(),
             atomgit_enabled: true,
+            tool_output_threshold_bytes: None,
             working_dir: working_dir.into(),
             context_window: 128_000,
             stream_timeout: default_stream_timeout(),

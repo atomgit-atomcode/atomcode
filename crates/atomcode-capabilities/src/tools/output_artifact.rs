@@ -98,8 +98,12 @@ const MAX_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
 /// byte. (Feedback B11.)
 const THRESHOLD_ENV: &str = "ATOMCODE_TOOL_OUTPUT_THRESHOLD_BYTES";
 
-/// The spill threshold to use, from `ATOMCODE_TOOL_OUTPUT_THRESHOLD_BYTES` or the
-/// default. Pure over its input so it is testable without touching process env.
+/// The spill threshold to use: `ATOMCODE_TOOL_OUTPUT_THRESHOLD_BYTES`, else the
+/// configured value (`[tools.output] threshold_bytes`), else the default. The
+/// environment wins so an operator can override a file without editing it; the
+/// file exists for a process that cannot be given an environment, such as a
+/// daemon an editor extension starts. Pure over its inputs so it is testable
+/// without touching process env.
 ///
 /// Clamped to `[HEAD + TAIL + marker, MAX_ARTIFACT_BYTES]`:
 /// - **Floor** — the preview is head + tail + a ~few-hundred-byte marker, so a
@@ -112,16 +116,13 @@ const THRESHOLD_ENV: &str = "ATOMCODE_TOOL_OUTPUT_THRESHOLD_BYTES";
 ///
 /// A bad/empty value falls back to the default rather than erroring — a typo in
 /// an env var must not make every tool output either truncate at 0 or never.
-fn resolve_threshold(env_val: Option<&str>) -> usize {
+fn resolve_threshold(env_val: Option<&str>, configured: Option<usize>) -> usize {
     const FLOOR: usize = PREVIEW_HEAD + PREVIEW_TAIL + 1024;
     env_val
         .and_then(|v| v.trim().parse::<usize>().ok())
+        .or(configured)
         .map(|v| v.clamp(FLOOR, MAX_ARTIFACT_BYTES))
         .unwrap_or(THRESHOLD_BYTES)
-}
-
-fn threshold_bytes() -> usize {
-    resolve_threshold(std::env::var(THRESHOLD_ENV).ok().as_deref())
 }
 
 /// Largest char-boundary index ≤ n.
@@ -163,11 +164,27 @@ any value from that range until you have read it.",
 
 pub struct ArtifactMiddleware {
     store: Arc<ArtifactStore>,
+    /// `[tools.output] threshold_bytes`, when the deployment set one.
+    threshold: Option<usize>,
 }
 
 impl ArtifactMiddleware {
     pub fn new(store: Arc<ArtifactStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            threshold: None,
+        }
+    }
+
+    /// Spill above `threshold` bytes rather than the default; see
+    /// [`resolve_threshold`] for how it ranks against the environment.
+    pub fn with_threshold(mut self, threshold: Option<usize>) -> Self {
+        self.threshold = threshold;
+        self
+    }
+
+    fn threshold_bytes(&self) -> usize {
+        resolve_threshold(std::env::var(THRESHOLD_ENV).ok().as_deref(), self.threshold)
     }
 }
 
@@ -192,7 +209,7 @@ impl ArtifactMiddleware {
             return;
         }
         let total = result.content.len();
-        if total <= threshold_bytes() {
+        if total <= self.threshold_bytes() {
             return;
         }
         let head_end = head_boundary(&result.content, PREVIEW_HEAD);
@@ -250,19 +267,80 @@ mod tests {
         };
         let floor = PREVIEW_HEAD + PREVIEW_TAIL + 1024;
         // Unset / empty / garbage → the default, to the byte.
-        assert_eq!(resolve_threshold(None), THRESHOLD_BYTES);
-        assert_eq!(resolve_threshold(Some("  ")), THRESHOLD_BYTES);
-        assert_eq!(resolve_threshold(Some("not-a-number")), THRESHOLD_BYTES);
+        assert_eq!(resolve_threshold(None, None), THRESHOLD_BYTES);
+        assert_eq!(resolve_threshold(Some("  "), None), THRESHOLD_BYTES);
+        assert_eq!(
+            resolve_threshold(Some("not-a-number"), None),
+            THRESHOLD_BYTES
+        );
         // A larger value (the data-dense case) is honored verbatim.
-        assert_eq!(resolve_threshold(Some("200000")), 200_000);
-        assert_eq!(resolve_threshold(Some(" 200000 ")), 200_000);
+        assert_eq!(resolve_threshold(Some("200000"), None), 200_000);
+        assert_eq!(resolve_threshold(Some(" 200000 "), None), 200_000);
         // Below head+tail+marker → floored, so a spill still SHRINKS the result.
-        assert_eq!(resolve_threshold(Some("1000")), floor);
+        assert_eq!(resolve_threshold(Some("1000"), None), floor);
         // Above the artifact ceiling → clamped, so the hard context cap holds.
         assert_eq!(
-            resolve_threshold(Some("8388608")),
+            resolve_threshold(Some("8388608"), None),
             MAX_ARTIFACT_BYTES,
             "an over-large threshold must not defeat the {MAX_ARTIFACT_BYTES}-byte ceiling"
+        );
+    }
+
+    /// `[tools.output] threshold_bytes` is used when the environment says
+    /// nothing usable, is clamped the same way, and gives way to the
+    /// environment when both are set.
+    #[test]
+    fn a_configured_threshold_is_used_clamped_and_yields_to_the_environment() {
+        use super::{
+            resolve_threshold, MAX_ARTIFACT_BYTES, PREVIEW_HEAD, PREVIEW_TAIL, THRESHOLD_BYTES,
+        };
+        let floor = PREVIEW_HEAD + PREVIEW_TAIL + 1024;
+        assert_eq!(resolve_threshold(None, Some(204_800)), 204_800);
+        assert_eq!(resolve_threshold(Some("junk"), Some(204_800)), 204_800);
+        assert_eq!(resolve_threshold(None, Some(1)), floor);
+        assert_eq!(
+            resolve_threshold(None, Some(usize::MAX)),
+            MAX_ARTIFACT_BYTES
+        );
+        assert_eq!(resolve_threshold(Some("100000"), Some(204_800)), 100_000);
+        assert_eq!(resolve_threshold(None, None), THRESHOLD_BYTES);
+    }
+
+    /// A middleware given a threshold spills by it: a result between the default
+    /// and the configured value reaches the model whole.
+    #[tokio::test]
+    async fn a_configured_threshold_decides_what_is_spilled() {
+        use atomcode_kernel::tool::ToolResult;
+        // Only when the environment is silent; the ranking itself is pinned above.
+        if std::env::var_os(super::THRESHOLD_ENV).is_some() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(super::ArtifactStore::new(dir.path()));
+        let big = "x".repeat(super::THRESHOLD_BYTES + 10_000);
+        let mut result = ToolResult {
+            call_id: "c".into(),
+            content: big.clone(),
+            is_error: false,
+            images: vec![],
+        };
+        super::ArtifactMiddleware::new(store.clone())
+            .with_threshold(Some(super::THRESHOLD_BYTES + 20_000))
+            .spill(&mut result, false)
+            .await;
+        assert_eq!(
+            result.content, big,
+            "under the configured threshold: untouched"
+        );
+
+        super::ArtifactMiddleware::new(store)
+            .spill(&mut result, false)
+            .await;
+        assert!(
+            result
+                .content
+                .contains(super::ARTIFACT_TRUNCATION_MARKER_PREFIX),
+            "and the default still spills it"
         );
     }
 

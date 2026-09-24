@@ -165,6 +165,34 @@ pub enum Screen {
 pub struct ToolsConfig {
     pub todo: TodoToolConfig,
     pub atomgit: AtomGitToolConfig,
+    #[serde(skip_serializing_if = "OutputToolConfig::is_default")]
+    pub output: OutputToolConfig,
+}
+
+/// `[tools.output]` — how an oversized tool result reaches the model.
+///
+/// A result over `threshold_bytes` is kept whole as an artifact and shown as a
+/// head + tail preview that names the range it leaves out; `fetch_output` reads
+/// the rest. Unset is the built-in default (50 KiB). Out-of-range values are
+/// clamped where they are applied, and `ATOMCODE_TOOL_OUTPUT_THRESHOLD_BYTES`
+/// wins — the file is for a deployment that cannot set the process's
+/// environment, such as a daemon an editor extension starts.
+///
+/// ```toml
+/// [tools.output]
+/// threshold_bytes = 204800
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OutputToolConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threshold_bytes: Option<usize>,
+}
+
+impl OutputToolConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 /// `[permissions]` — user-declared pre-authorization for tool calls, so the common
@@ -3425,6 +3453,9 @@ model = "missing-type"
                     eager: TodoEagerness::Always,
                 },
                 atomgit: Default::default(),
+                output: OutputToolConfig {
+                    threshold_bytes: Some(204_800),
+                },
             },
             vision_preprocessor_provider: None,
             language: None,
@@ -3473,6 +3504,7 @@ model = "missing-type"
         assert_eq!(reloaded.datalog.dir.as_deref(), Some("/var/log/ac"));
         assert!(!reloaded.tools.todo.enabled);
         assert_eq!(reloaded.tools.todo.eager, TodoEagerness::Always);
+        assert_eq!(reloaded.tools.output.threshold_bytes, Some(204_800));
         assert!(reloaded.notifications.enabled);
         assert_eq!(
             reloaded.network.proxy.mode,
@@ -4743,6 +4775,22 @@ base_url = "https://b.invalid/v1"
                 .unwrap();
         assert!(!both.tools.todo.enabled);
         assert!(!both.tools.atomgit.enabled);
+    }
+
+    /// `[tools.output] threshold_bytes` is read when present, absent when not —
+    /// and a file that never set it is not written back with an empty table.
+    #[test]
+    fn output_tool_threshold_parses_and_stays_out_of_an_unset_file() {
+        let defaulted: Config = toml::from_str("").unwrap();
+        assert_eq!(defaulted.tools.output.threshold_bytes, None);
+        let written = toml::to_string(&defaulted).unwrap();
+        assert!(!written.contains("[tools.output]"), "{written}");
+
+        let configured: Config =
+            toml::from_str("[tools.output]\nthreshold_bytes = 204800\n").unwrap();
+        assert_eq!(configured.tools.output.threshold_bytes, Some(204_800));
+        let written = toml::to_string(&configured).unwrap();
+        assert!(written.contains("threshold_bytes = 204800"), "{written}");
     }
 
     #[test]

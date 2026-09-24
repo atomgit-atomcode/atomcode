@@ -307,6 +307,7 @@ pub(crate) fn chat_runtime_config(
             std::env::var("ATOMCODE_ATOMGIT").ok().as_deref(),
             config.tools.atomgit.enabled,
         ),
+        tool_output_threshold_bytes: config.tools.output.threshold_bytes,
         provider_name: provider_name.to_string(),
         working_dir: working_dir.to_path_buf(),
         context_window: p.map(|p| p.context_window as u32).unwrap_or(128_000),
