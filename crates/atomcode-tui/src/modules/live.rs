@@ -45,7 +45,9 @@
 use crate::i18n::{t, Msg};
 use atomcode_harness::session::SessionEvent;
 
+use crate::block::{Content, RenderCtx};
 use crate::caps::Glyph;
+use crate::content::UserSaid;
 use crate::el::El;
 use crate::frame::{Line, Style};
 use crate::module::{Height, View};
@@ -232,6 +234,22 @@ impl View for Live {
         for _ in 0..margin {
             out.push(Line::empty());
         }
+        // Recognising a picture for a text-only model: echo what the person just
+        // sent, as the user bar, above the 正在识别图片 line — so their words are
+        // on screen the instant they submit, not only once recognition finishes
+        // and the turn's message is finally logged (feedback: 先把输入框的内容展示到
+        // 对话区). Transient by design: the permanent user line still arrives from
+        // the log, drawn by the transcript exactly as on replay, and this strip is
+        // gone by then (its flag clears with the turn), so the two never both show.
+        if state.turn.is_none() && vp.moment.recognizing_image {
+            let bar = pending_user_bar(vp.moment, w);
+            if !bar.is_empty() {
+                out.extend(bar);
+                // The seam a user bar keeps under it between blocks, so the
+                // recognising line below is not welded to the bar's background.
+                out.push(Line::empty());
+            }
+        }
         out.extend(El::row(row).lay(w));
         out
     }
@@ -250,7 +268,7 @@ impl View for Live {
     /// itself into the stream's scroll would be drawing outside it — the stream's
     /// rows are the host's to count against the offset. So the line steps aside
     /// and comes back, instead of following content it does not own.
-    fn height(state: &State, moment: &Moment, _width: u16) -> Height {
+    fn height(state: &State, moment: &Moment, width: u16) -> Height {
         // A question on screen is what the person is dealing with, and this line
         // is a claim about what the agent is doing — context for an answer, not
         // an answer. It steps aside rather than sharing the foot of the screen
@@ -265,7 +283,22 @@ impl View for Live {
             return Height::Hug(0);
         }
         match showing(state, moment) {
-            Some(_) => Height::Hug(ROWS),
+            // The echoed user bar (and the blank row under it) adds its own rows
+            // to the strip while a picture is being recognised — asked for here so
+            // `render` fills exactly the rect it claimed, the same as the margin.
+            Some(_) => {
+                let extra = if state.turn.is_none() && moment.recognizing_image {
+                    let bar = pending_user_bar(moment, width);
+                    if bar.is_empty() {
+                        0
+                    } else {
+                        bar.len() as u16 + 1
+                    }
+                } else {
+                    0
+                };
+                Height::Hug(ROWS + extra)
+            }
             None => Height::Hug(0),
         }
     }
@@ -353,6 +386,21 @@ fn quiet_for(state: &State, moment: &Moment) -> Option<u64> {
 /// ends it, long enough that an ordinary prefill or a long reasoning burst
 /// never trips it.
 const QUIET_AFTER_MS: u64 = 30_000;
+
+/// The message the person just sent, rendered as the user bar, to echo above the
+/// 正在识别图片 line while a picture is being recognised for a text-only model —
+/// empty when there is nothing to echo.
+///
+/// The text is [`Moment::last_sent`], which at this point is exactly the words the
+/// submit sent (markers and all), so this bar is identical to the permanent user
+/// line the transcript later folds out of the logged message: the transient echo
+/// and the real one show the same thing, and the handoff is seamless.
+fn pending_user_bar(moment: &Moment, width: u16) -> Vec<Line> {
+    match &moment.last_sent {
+        Some(text) if !text.is_empty() => UserSaid(text.clone()).lines(&RenderCtx::bare(width)),
+        _ => Vec::new(),
+    }
+}
 
 fn doing(state: &State, moment: &Moment) -> Option<String> {
     // No turn yet: the only thing to say is that a picture is being recognised
@@ -851,6 +899,66 @@ mod tests {
         assert!(
             plain.iter().any(|l| l.contains("正在识别图片")),
             "still speaks without a stamp: {plain:?}"
+        );
+    }
+
+    #[test]
+    fn the_recognizing_strip_echoes_the_message_the_person_just_sent() {
+        // 先把输入框的内容展示到对话区，然后再展示 正在识别图片: while the picture is
+        // being recognised the message is on screen straight away, above the
+        // 正在识别图片 line, not held back until recognition finishes.
+        let state = State::default();
+        let mut moment = Moment::default().at_tick(0);
+        moment.recognizing_image = true;
+        moment.recognizing_since = Some(Timestamp::millis(0));
+        moment.now = Timestamp::millis(3_000);
+        moment.last_sent = Some("看看这张图 [Image #1]".into());
+
+        let h = Live::height(&state, &moment, 80);
+        let rows = match h {
+            Height::Hug(n) => draw(&state, &moment, 80, n),
+            other => panic!("expected a hugged height, got {other:?}"),
+        };
+        assert!(
+            rows.iter().any(|l| l.contains("看看这张图")),
+            "the sent message is echoed while recognising: {rows:?}"
+        );
+        let said = rows
+            .iter()
+            .position(|l| l.contains("看看这张图"))
+            .expect("message row");
+        let recognising = rows
+            .iter()
+            .position(|l| l.contains("正在识别图片"))
+            .expect("recognising row");
+        assert!(
+            said < recognising,
+            "the message comes first, the 正在识别图片 line below it: {rows:?}"
+        );
+        // The height asked for is the rect it then fills: no clipped or blank
+        // rows left over, the same contract the margin keeps.
+        assert_eq!(
+            rows.len(),
+            match h {
+                Height::Hug(n) => n as usize,
+                _ => unreachable!(),
+            },
+            "render fills exactly the rows height claimed: {rows:?}"
+        );
+
+        // Nothing sent (an empty last_sent): just the recognising line, as before.
+        moment.last_sent = None;
+        let plain = match Live::height(&state, &moment, 80) {
+            Height::Hug(n) => draw(&state, &moment, 80, n),
+            other => panic!("{other:?}"),
+        };
+        assert!(
+            plain.iter().any(|l| l.contains("正在识别图片")),
+            "still speaks with nothing to echo: {plain:?}"
+        );
+        assert!(
+            !plain.iter().any(|l| l.contains("看看这张图")),
+            "and echoes nothing when there is nothing sent: {plain:?}"
         );
     }
 
