@@ -815,10 +815,37 @@ struct WebProviderPatch<'a> {
 ///
 /// Empty for a default config, so the tree reads the same as if this were not
 /// here at all.
+/// 这套配置要不要让模型给会话起名字。
+///
+/// 读的是运行时手里的那份配置;没有(装配时没人给)就回到磁盘上那份,和别的
+/// 「人写在 config.toml 里」的问题同一条路。
+pub fn names_sessions_with_a_model(cfg: &crate::CodingAgentConfig) -> bool {
+    match cfg.subagent_config.as_deref() {
+        Some(config) => atomcode_config::config::ai_session_naming_enabled(config),
+        None => {
+            atomcode_config::config::Config::load(&atomcode_config::config::Config::default_path())
+                .map(|config| atomcode_config::config::ai_session_naming_enabled(&config))
+                .unwrap_or(false)
+        }
+    }
+}
+
 pub fn config_rows(cfg: &crate::CodingAgentConfig) -> Result<Layer, String> {
     use atomcode_capabilities::tools::CredentialShellPolicy;
 
     let mut out = model_rows(cfg)?;
+    // `[ui] ai_session_naming`(或 `ATOMCODE_AI_SESSION_NAMING`)选的是**哪一个
+    // 命名器**填 `session-title` 这条缝:默认那个读第一句话、不问模型;开了之后
+    // 换成问工具模型的那个。两者都把答案作为一条 `Titled` 事实提交,所以会话
+    // 目录、`/resume` 列表和屏上的窗口标题读到的是同一个名字。
+    //
+    // **在这里而不是在运行时自己再起一个命名器。** 那正是此前的做法:回合末另
+    // 起一次模型请求,答案走 `SessionNameSuggested` 事件——而默认屏幕根本没接
+    // 那条事件。于是这个开关的全部效果就是每个会话白烧一次模型请求,屏幕上一
+    // 个字都不会变。一件事一个 owner,这里是那个 owner。
+    if names_sessions_with_a_model(cfg) {
+        out = out.swap("session-title-first-prompt", "session-title-model");
+    }
     // With the checkpoint, a front end that draws the question is asked before a
     // turn is cut off by its budget or ends with its answer cut off.
     if cfg.round_cap_checkpoint {

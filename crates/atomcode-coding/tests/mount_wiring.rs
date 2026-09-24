@@ -196,6 +196,70 @@ async fn a_sessions_cost_is_recorded_per_model_across_a_switch() {
 /// verbatim — so a key carried as row config is a key on somebody's screen. The
 /// judge is the printed tree and every `describe_self` aspect, with a sentinel
 /// standing in for the key (never a real one).
+/// `[ui] ai_session_naming` 换的是**哪一个命名器挂上**,不是另起一个。
+///
+/// 这个开关此前的全部效果是:运行时在回合末**自己再问一次模型**要名字,答案
+/// 走 `SessionNameSuggested` 事件 —— 而默认屏幕根本没接那条事件。于是它默认
+/// 打开的情况下,每个会话白烧一次模型请求,屏幕上一个字都不会变。
+///
+/// 现在它换的是填 `session-title` 那条缝的行。答案照旧作为一条 `Titled` 事实
+/// 提交,所以会话目录、`/resume` 列表和窗口标题读到的是同一个名字 —— 一件事
+/// 一个 owner。
+///
+/// **两半都要钉**:只钉「开了就挂模型命名器」的话,把这次 swap 写成无条件
+/// 照样全绿 —— 而那样连关掉这个开关的人也要为每个会话多付一次模型请求。
+#[tokio::test]
+#[serial_test::serial(atomcode_home)]
+async fn ai_session_naming_picks_the_namer_rather_than_starting_a_second_one() {
+    // 这个开关也认环境变量,而它会盖掉配置里的值。
+    std::env::remove_var("ATOMCODE_AI_SESSION_NAMING");
+    let project = tempfile::tempdir().unwrap();
+
+    let named_by = |on: bool| {
+        let mut file = atomcode_config::config::Config::default();
+        file.ui.ai_session_naming = on;
+        let mut cfg = atomcode_coding::CodingRuntimeConfig::from_config(
+            &file,
+            project.path(),
+            None,
+            None,
+            false,
+            false,
+        )
+        .agent_config();
+        // 运行时是由 `install_subagent_tiers` 挂上这一份的;这里直接给,因为
+        // 被测的是「读到的那份配置怎么改这棵树」,不是谁把它放上去的。
+        cfg.subagent_config = Some(std::sync::Arc::new(file));
+        cfg
+    };
+
+    let off = support::mount(&named_by(false), quiet_options(), Arc::new(CannedProvider))
+        .await
+        .dump();
+    // 缝的 id 两边都叫 `session-title-first-prompt`;真正换掉的是填它的那个行
+    // 的名字,dump 里写成 `id <- name`。
+    assert!(
+        off.contains("session-title-first-prompt <- session-title-first-prompt"),
+        "关掉的时候读第一句话就够了,不问模型:\n{off}"
+    );
+    assert!(
+        !off.contains("session-title-model"),
+        "而且不许悄悄挂上问模型的那个:\n{off}"
+    );
+
+    let on = support::mount(&named_by(true), quiet_options(), Arc::new(CannedProvider))
+        .await
+        .dump();
+    assert!(
+        on.contains("session-title-first-prompt <- session-title-model"),
+        "开着的时候是模型来起名字:\n{on}"
+    );
+    assert!(
+        !on.contains("session-title-first-prompt <- session-title-first-prompt"),
+        "一条缝一个命名器,不是两个都挂上:\n{on}"
+    );
+}
+
 #[tokio::test]
 #[serial_test::serial(atomcode_home)]
 async fn a_configured_credential_never_enters_the_config_tree() {

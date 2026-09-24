@@ -3506,7 +3506,6 @@ fn spawn_runtime_owner_with_optional_agent(
     let mut wakeup_rx = wakeup_rx.unwrap_or(closed_wakeup_rx);
     let (goal_eval_tx, mut goal_eval_rx) = mpsc::unbounded_channel::<EvalOutcome>();
     let (loop_fire_tx, mut loop_fire_rx) = mpsc::unbounded_channel::<(u64, u64, WakeupRequest)>();
-    let (session_name_tx, mut session_name_rx) = mpsc::unbounded_channel::<(u64, String)>();
     let (next_prompt_tx, mut next_prompt_rx) =
         mpsc::unbounded_channel::<NextPromptSuggestionOutcome>();
     let (team_event_tx, mut team_event_rx) = mpsc::unbounded_channel();
@@ -3580,7 +3579,6 @@ fn spawn_runtime_owner_with_optional_agent(
         // turn is one this owner keeps open after the agent finished it, and the
         // agent can open another under it (a message typed while `/loop` waits).
         let mut kernel_turn_open = false;
-        let mut ai_name_attempted = false;
         let mut persistence_failure = None;
         // What each panel `Disable` held back, by server, for the matching
         // `Enable` to give back. Owned here rather than by the parts because a
@@ -3886,14 +3884,6 @@ fn spawn_runtime_owner_with_optional_agent(
                             }
                             pending_wakeup = Some(wakeup);
                         }
-                    }
-                }
-                suggestion = session_name_rx.recv(), if native_protocol => {
-                    let Some((name_generation, name)) = suggestion else { continue };
-                    if name_generation == generation {
-                        let _ = runtime_event_tx.send(
-                            CodingRuntimeEvent::SessionNameSuggested { name },
-                        );
                     }
                 }
                 suggestion = next_prompt_rx.recv(), if native_protocol => {
@@ -6594,12 +6584,6 @@ fn spawn_runtime_owner_with_optional_agent(
                         observed_tokens = None;
                         snapshot_in_flight = false;
                         compaction_suspended = false;
-                        if matches!(
-                            operation,
-                            ReconfigureKind::FreshSession | ReconfigureKind::ChangeDirectory
-                        ) {
-                            ai_name_attempted = false;
-                        }
                         match reloaded_from {
                             Some(None) => tell(&runtime, Some(crate::told::reloaded())),
                             Some(Some(before)) => {
@@ -7860,56 +7844,6 @@ fn spawn_runtime_owner_with_optional_agent(
                                     let stats = std::mem::take(&mut turn_stats);
                                     let turn_id = active_turn.unwrap_or_default();
                                     let mut completion_reason = reason;
-                                    if reason != StopReason::Cancelled && !ai_name_attempted {
-                                        if let Some(conversation) =
-                                            crate::session_title::first_exchange_text(&snapshot.messages)
-                                        {
-                                            let enabled = resources
-                                                .as_ref()
-                                                .and_then(|runtime| {
-                                                    runtime.config.subagent_config.as_deref()
-                                                })
-                                                .map(
-                                                    atomcode_config::config::ai_session_naming_enabled,
-                                                )
-                                                .unwrap_or_else(|| {
-                                                    atomcode_config::config::Config::load(
-                                                        &atomcode_config::config::Config::default_path(),
-                                                    )
-                                                    .map(|config| {
-                                                        atomcode_config::config::ai_session_naming_enabled(
-                                                            &config,
-                                                        )
-                                                    })
-                                                    .unwrap_or(false)
-                                                });
-                                            if enabled {
-                                                ai_name_attempted = true;
-                                                let provider = resources.as_ref().and_then(|runtime| {
-                                                    let session_id = runtime.parts.session.as_ref()
-                                                        .map(|binding| binding.id.as_str());
-                                                    runtime.provider_factory
-                                                        .build(&runtime.config, session_id)
-                                                        .ok()
-                                                });
-                                                if let Some(provider) = provider {
-                                                    let tx = session_name_tx.clone();
-                                                    let name_generation = generation;
-                                                    tokio::spawn(async move {
-                                                        if let Some(name) =
-                                                            crate::session_title::generate_session_title(
-                                                                provider,
-                                                                conversation,
-                                                            )
-                                                            .await
-                                                        {
-                                                            let _ = tx.send((name_generation, name));
-                                                        }
-                                                    });
-                                                }
-                                            }
-                                        }
-                                    }
                                     if let Some(state) = goal.as_mut().filter(|state| state.active) {
                                         if let Some(meta) = stats.last_usage.as_ref() {
                                             state.tokens_used = state.tokens_used.saturating_add(
