@@ -1210,6 +1210,21 @@ fn bucket_to_pin_on_resume(
 /// something this conversation said, and the arrow keys are how a person
 /// re-sends something — re-sending a retracted instruction is the one outcome
 /// worth ruling out.
+/// What the person actually typed in a stored turn — the words, not a picture
+/// the runtime recognised for a text-only model.
+///
+/// The message a text-only model reads has the VL caption folded into it
+/// (`content::split_vl_caption`), so a reader that wants the person's half has to
+/// split it back out — the same thing the live recall does in `Host::absorb`.
+/// Skipped here once, a resumed session seeded the up-arrow history with the
+/// whole `[图片内容（由 …）]` wall, and an up-arrow dropped a 997-char image
+/// description into the composer.
+fn typed_words(user: &str) -> String {
+    atomcode_tui::content::split_vl_caption(user)
+        .map(|(said, ..)| said)
+        .unwrap_or_else(|| user.to_string())
+}
+
 fn typed_before(here: &std::path::Path, skip: &str, limit: usize) -> Vec<String> {
     use atomcode_capabilities::session::{events, SessionManager};
     let manager = SessionManager::for_project(here);
@@ -1236,7 +1251,8 @@ fn typed_before(here: &std::path::Path, skip: &str, limit: usize) -> Vec<String>
             if record.undone {
                 continue;
             }
-            let said = record.user.trim();
+            let typed = typed_words(&record.user);
+            let said = typed.trim();
             if said.is_empty() {
                 continue;
             }
@@ -1246,6 +1262,43 @@ fn typed_before(here: &std::path::Path, skip: &str, limit: usize) -> Vec<String>
         }
     }
     out
+}
+
+#[cfg(test)]
+mod recall_tests {
+    use super::typed_words;
+    use atomcode_i18n::product::{t, Msg};
+
+    /// An up-arrow through history recalls what the person typed, never the
+    /// picture the runtime recognised for a text-only model.
+    ///
+    /// The bug this pins: a resumed session seeded recall from the stored
+    /// message, which folds the VL caption in — so up-arrow dropped the whole
+    /// `[图片内容（由 …）]` wall into the composer instead of `[Image #2] 这个呢?`.
+    #[test]
+    fn recall_keeps_the_words_not_the_folded_vl_caption() {
+        let folded = t(Msg::VisionRecognised {
+            model: "qwen-vl",
+            text: "这是一张很长的图片描述，里面有大量逐字转录……",
+        })
+        .into_owned();
+
+        // Words plus a picture: only the words come back.
+        let msg = format!("[Image #2] 这个呢?\n\n{folded}");
+        assert_eq!(typed_words(&msg), "[Image #2] 这个呢?");
+
+        // An ordinary message is untouched.
+        assert_eq!(typed_words("就是普通一句话"), "就是普通一句话");
+
+        // A picture with no words: nothing to re-type, so recall skips it
+        // (`typed_before` drops an empty line) rather than recalling the caption.
+        let only = format!("\n\n{folded}");
+        assert!(
+            typed_words(&only).trim().is_empty(),
+            "an image-only turn recalls no words, not the recognition: {:?}",
+            typed_words(&only)
+        );
+    }
 }
 
 /// The last few exchanges of a stored session, for someone deciding whether to
