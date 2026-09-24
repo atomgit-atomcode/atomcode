@@ -963,6 +963,48 @@ mod tests {
     }
 
     #[test]
+    fn the_recognizing_strip_fills_exactly_what_it_asks_for_at_any_width() {
+        // The echoed bar is the module's first width-dependent height: the bar
+        // wraps to more rows as the screen narrows, so `height` and `render` must
+        // agree at every width or the host clips the 正在识别图片 line off (too
+        // many rows) or leaves a blank one (too few). Held here across a sweep,
+        // the same discipline `it_is_never_wider_than_its_rect` keeps for the
+        // turn line.
+        let state = State::default();
+        let mut moment = Moment::default().at_tick(0);
+        moment.recognizing_image = true;
+        moment.recognizing_since = Some(Timestamp::millis(0));
+        moment.now = Timestamp::millis(3_000);
+        moment.last_sent = Some("看看这张图，帮我看看里面写了什么内容 [Image #1]".into());
+
+        // From 1: a zero-width rect draws nothing (`render` bails), while the
+        // strip still claims its rows — a looseness the whole module has at
+        // width 0, where nothing is on screen anyway. The agreement that matters
+        // is at the widths a person reads it at.
+        for w in [1u16, 2, 3, 7, 14, 21, 40, 80, 200] {
+            let claimed = match Live::height(&state, &moment, w) {
+                Height::Hug(n) | Height::Fixed(n) => n,
+                Height::Fill => panic!("the live strip never fills"),
+            };
+            let vp = Viewport::new(Rect::sized(w, claimed), &moment);
+            let rows = Live::render(&state, &vp);
+            assert_eq!(
+                rows.len(),
+                claimed as usize,
+                "width {w}: render filled {} of the {claimed} rows it claimed",
+                rows.len()
+            );
+            for line in &rows {
+                assert!(
+                    line.width() <= w as usize,
+                    "width {w}: a row ran {} cells past the rect",
+                    line.width()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn the_line_says_what_the_turn_is_doing_now() {
         // Each fact moves it, in the order a turn produces them. The line is
         // read at a glance, so the words are the assertion — a phase that does
