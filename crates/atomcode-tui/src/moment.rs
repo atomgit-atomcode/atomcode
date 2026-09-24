@@ -1065,13 +1065,17 @@ impl Moment {
         self.input.clear();
         self.caret = 0;
         // Emptying the field also leaves history browsing: the shoulder badge
-        // (`历史 N/M`, and the `Ctrl+R` search caption) is drawn from these, so a
-        // cleared field left with a stale browsing position keeps a count for
-        // words that are no longer there. Drop the set-aside draft too — the
-        // field is going to nothing, not back to what was being edited.
+        // (`历史 N/M`) is drawn from `history_at`, so a cleared field left with a
+        // stale browsing position keeps a count for words that are no longer
+        // there. Drop the set-aside draft and the folded-paste side-tables too —
+        // the field is going to nothing, not back to what was being edited, and
+        // orphaned paste bodies would otherwise linger. `search` is torn down
+        // upstream before Ctrl+C reaches here (an unhandled key ends the search
+        // in `crate::search::key`), so nulling it is belt-and-suspenders.
         self.history_at = None;
         self.search = None;
         self.draft.clear();
+        self.clear_pastes();
         self.quit_armed = true;
         self.notice =
             Some(Notice::for_ms(t(Msg::MomentQuitAgain), false, self.now, QUIT_HINT_MS).below());
@@ -1134,17 +1138,22 @@ mod tests {
         // or the badge lingers over an empty composer (the reported bug).
         let mut m = Moment {
             history: vec!["one".into(), "two".into(), "three".into()],
-            history_at: Some(1),
-            input: "two".into(),
-            caret: 3,
             draft: "half-typed".into(),
             ..Default::default()
         };
+        // A folded paste from before browsing must not survive an empty field.
+        m.insert_paste(&big(200), Timestamp::millis(0));
+        assert!(!m.pastes.is_empty(), "the big paste folded into a side-table");
+        // Then arrow-up into the history (set the browsing position last so the
+        // paste above cannot be what clears it).
+        m.history_at = Some(1);
         assert!(!m.cancel_idle(), "first press arms, does not quit");
         assert_eq!(m.input, "");
         assert_eq!(m.history_at, None, "history browsing is left");
         assert!(m.search.is_none());
         assert_eq!(m.draft, "", "the set-aside draft is dropped, not restored");
+        assert!(m.pastes.is_empty(), "folded-paste bookkeeping is dropped too");
+        assert!(m.recent_folded_paste.is_none());
     }
 
     fn big(lines: usize) -> String {
