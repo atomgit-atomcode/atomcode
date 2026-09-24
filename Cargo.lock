@@ -336,6 +336,7 @@ dependencies = [
  "atomcode-tui",
  "atomcode-tuix",
  "atomcode-updater",
+ "base64",
  "clap",
  "clap_complete",
  "crossterm",
