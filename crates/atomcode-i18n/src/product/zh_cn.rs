@@ -1135,7 +1135,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             "/welcome 会清屏。是否继续？[y/N]".into(),
         Msg::CmdWelcomeDescription => "重新运行 onboarding 向导".into(),
         Msg::VisionPreprocessSuccess { char_count } =>
-            format!("✓ VL 识别图片成功，返回 {char_count} chars").into(),
+            format!("VL 识别图片成功，返回 {char_count} chars").into(),
         Msg::VlCaptionExpandHint => "点击展开".into(),
         Msg::VisionPreprocessFailed { reason } =>
             format!("VL 预处理失败：{reason} · 本轮以纯文字继续，图片已恢复可重试").into(),

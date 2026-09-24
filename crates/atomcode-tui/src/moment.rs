@@ -1137,9 +1137,12 @@ mod tests {
 
     #[test]
     fn older_history_goes_in_front_and_takes_every_index_with_it() {
-        let mut m = Moment::default();
-        m.history = vec!["mine one".into(), "mine two".into()];
-        m.history_at = Some(1); // browsing the newest of this session's two
+        let mut m = Moment {
+            history: vec!["mine one".into(), "mine two".into()],
+            // browsing the newest of this session's two
+            history_at: Some(1),
+            ..Default::default()
+        };
         assert!(m.history_grew_older(vec!["older one".into(), "older two".into()]));
         assert_eq!(
             m.history,
@@ -1155,8 +1158,10 @@ mod tests {
 
     #[test]
     fn a_line_this_session_already_said_is_not_listed_twice() {
-        let mut m = Moment::default();
-        m.history = vec!["cargo fmt".into()];
+        let mut m = Moment {
+            history: vec!["cargo fmt".into()],
+            ..Default::default()
+        };
         assert!(m.history_grew_older(vec!["git log".into(), "cargo fmt".into()]));
         assert_eq!(m.history, vec!["git log", "cargo fmt"]);
         // And an answer that adds nothing says so, so the caller can skip the

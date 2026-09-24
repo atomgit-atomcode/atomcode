@@ -1164,8 +1164,11 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::OnboardingConfirmClear =>
             "/welcome will clear the screen. Continue? [y/N]".into(),
         Msg::CmdWelcomeDescription => "Re-run the onboarding wizard".into(),
+        // No mark of its own: whoever draws this decides what "it worked"
+        // looks like (tuix writes a check, the new screen a green dot). A mark
+        // baked in here is one the drawer then has to strip back off.
         Msg::VisionPreprocessSuccess { char_count } =>
-            format!("✓ VL recognised image, returned {char_count} chars").into(),
+            format!("VL recognised image, returned {char_count} chars").into(),
         Msg::VlCaptionExpandHint => "click to expand".into(),
         Msg::VisionPreprocessFailed { reason } =>
             format!("VL preprocessing failed: {reason} · continuing text-only this turn; images restored, retry to re-run recognition").into(),

@@ -203,9 +203,10 @@ mod tests {
     use super::*;
 
     fn moment(history: &[&str]) -> Moment {
-        let mut m = Moment::default();
-        m.history = history.iter().map(|s| (*s).to_string()).collect();
-        m
+        Moment {
+            history: history.iter().map(|s| (*s).to_string()).collect(),
+            ..Default::default()
+        }
     }
 
     const H: [&str; 5] = [

@@ -596,14 +596,14 @@ pub struct VlCaptionBlock {
 }
 
 impl VlCaptionBlock {
-    /// The one-line stand-in: the localized "recognised, N chars" line with its
-    /// `✓` swapped for the fold dot and the model named. The dot carries the
-    /// outcome — green for a good recognition, the way a finished tool call's `●`
-    /// does — while the detail stays muted.
+    /// The one-line stand-in: the fold dot, the localized "recognised, N chars"
+    /// line, and the model named. The dot carries the outcome — green for a
+    /// good recognition, the way a finished tool call's `●` does — while the
+    /// detail stays muted. The message itself carries no mark of its own, which
+    /// is why there is none to take off here.
     fn head_line(&self, ctx: &RenderCtx) -> Line {
         let n = self.text.chars().count();
-        let base = pt(PMsg::VisionPreprocessSuccess { char_count: n });
-        let body = base.trim_start_matches('✓').trim_start();
+        let body = pt(PMsg::VisionPreprocessSuccess { char_count: n });
         let mark = ctx.caps.g(Glyph::ToolMark);
         let rest = format!(" {body}  {}", self.model);
         let room = (ctx.width as usize).saturating_sub(width::str_width(mark));

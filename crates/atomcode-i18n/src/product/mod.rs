@@ -803,4 +803,28 @@ mod tests {
         // Restore upstream default.
         set_brand("AtomCode", "AtomGit OAuth");
     }
+
+    /// A message says what happened; the screen says what it looks like.
+    ///
+    /// `VisionPreprocessSuccess` used to arrive with a `\u{2713}` in both tables, and
+    /// the new screen then took it back off so it could put its own green dot
+    /// there \u2014 two places deciding what "it worked" looks like, and a literal
+    /// glyph in a crate whose layering gate exists to keep decoration going
+    /// through `Caps::g`, so an ASCII terminal gets something it can draw.
+    ///
+    /// Both locales, because a table is only as clean as its worst one and the
+    /// process locale decides which of them a criterion would otherwise see.
+    #[test]
+    fn a_status_message_carries_no_mark_of_its_own() {
+        for locale in [Locale::En, Locale::ZhCn] {
+            let s = t_with(locale, Msg::VisionPreprocessSuccess { char_count: 7 });
+            assert!(
+                !s.contains(['\u{2713}', '\u{2717}', '\u{25cf}', '\u{2022}']),
+                "{locale:?} bakes a mark into the message: {s}"
+            );
+            // And it is still the message, so the line above is not passing on
+            // an empty string.
+            assert!(s.contains('7'), "{locale:?} still says how many: {s}");
+        }
+    }
 }
