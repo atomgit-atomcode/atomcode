@@ -560,7 +560,7 @@ fn session_catalogue() -> Vec<Command> {
     vec![
         Command::said("compact", t(Msg::CmdAboutCompact)),
         Command::said("cancel-all", t(Msg::CmdAboutCancelAll)),
-        Command::said("context", t(Msg::CmdAboutContext)),
+        Command::said_taking("context", "[prompt]".into(), t(Msg::CmdAboutContext)),
         Command::said("agents", t(Msg::CmdAboutAgents)),
         Command::said("transcript", t(Msg::CmdAboutTranscript)),
         Command::said("clear", t(Msg::CmdAboutClear)),
@@ -774,6 +774,39 @@ impl CommandSet for SessionCommands {
                 Outcome::Quiet
             }
             "context" => {
+                // `/context prompt`:这个会话到底跑在哪份系统提示词上。人想看
+                // 它的那一刻很具体 —— agent 表现得像是被告知了一件谁也不记得
+                // 告诉过它的事,而那份提示词是挂着的各行各写一段拼出来的,
+                // 没有任何一处能读到全文。
+                if args.trim() == "prompt" {
+                    let control = match host(control) {
+                        Ok(control) => control,
+                        Err(refusal) => return refusal,
+                    };
+                    return match control
+                        .call(HostCommand::Context {
+                            session: root,
+                            prompt: true,
+                        })
+                        .await
+                    {
+                        Ok(HostReply::Context {
+                            system_prompt: Some(prompt),
+                            ..
+                        }) if !prompt.trim().is_empty() => Outcome::Said(prompt),
+                        // 宿主答了,只是没有提示词可说 —— 不是错误。
+                        Ok(HostReply::Context { .. }) => {
+                            Outcome::Said(t(Msg::ContextNoPrompt).into_owned())
+                        }
+                        Ok(other) => Outcome::Refused(
+                            t(Msg::HostSaidSomethingElse {
+                                reply: &format!("{other:?}"),
+                            })
+                            .into_owned(),
+                        ),
+                        Err(error) => Outcome::Refused(refusal(error)),
+                    };
+                }
                 let events = client.events();
                 let turn = events
                     .iter()
@@ -800,7 +833,12 @@ impl CommandSet for SessionCommands {
                         used,
                         model,
                         ..
-                    }) = control.call(HostCommand::Context { session: root }).await
+                    }) = control
+                        .call(HostCommand::Context {
+                            session: root,
+                            prompt: false,
+                        })
+                        .await
                     {
                         if window > 0 {
                             said.push_str(&format!(
@@ -1968,7 +2006,13 @@ async fn working_dir(
     let Some(control) = control else {
         return Err(t(Msg::NoHost).into_owned());
     };
-    match control.call(HostCommand::Context { session }).await {
+    match control
+        .call(HostCommand::Context {
+            session,
+            prompt: false,
+        })
+        .await
+    {
         Ok(HostReply::Context { working_dir, .. }) => Ok(working_dir),
         Ok(other) => Err(t(Msg::HostSaidSomethingElse {
             reply: &format!("{other:?}"),
@@ -2672,6 +2716,7 @@ mod tests {
                 used: 50_000,
                 model: "glm-5".into(),
                 working_dir: "/w".into(),
+                system_prompt: None,
             }));
         let (app, _client, all) = following(&host);
 
@@ -2690,8 +2735,61 @@ mod tests {
         assert_eq!(
             *host.asked.lock().unwrap(),
             vec![HostCommand::Context {
-                session: "lead".into()
+                session: "lead".into(),
+                prompt: false,
             }]
+        );
+    }
+
+    /// `/context prompt` 拿的是这个会话真正跑着的那份系统提示词。
+    ///
+    /// 人问它的那一刻很具体:agent 表现得像是被告知了一件谁也不记得告诉过它的
+    /// 事。而那份提示词是挂着的各行各写一段拼出来的 —— 没有任何一处能读到
+    /// 全文,连写它的人也不能。
+    ///
+    /// **另一半同样要钉:不带参数的 `/context` 不许把它要过来。** 那是一份几千
+    /// 字的东西,而状态面板每隔一会儿就问一次这条命令;只钉前一半的话,把
+    /// `prompt` 恒设成 `true` 照样全绿,而每一次刷新都在搬一份提示词。
+    #[tokio::test]
+    async fn context_prompt_shows_the_system_prompt_and_plain_context_does_not_fetch_it() {
+        let host = Arc::new(Recording::default());
+        host.replies.lock().unwrap().extend([
+            Ok(HostReply::Context {
+                window: 1,
+                used: 0,
+                model: "m".into(),
+                working_dir: "/w".into(),
+                system_prompt: Some("You are a coding agent.\nTools: …".into()),
+            }),
+            Ok(HostReply::Context {
+                window: 1,
+                used: 0,
+                model: "m".into(),
+                working_dir: "/w".into(),
+                system_prompt: None,
+            }),
+        ]);
+        let (app, _client, all) = following(&host);
+
+        match all.dispatch("/context prompt", &app.context()).await {
+            Outcome::Said(text) => {
+                assert!(text.contains("You are a coding agent."), "{text}");
+                // 原样,不是摘要:人要读的就是这份东西本身。
+                assert!(text.contains("Tools: …"), "{text}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // 没有提示词可说不是错误。
+        match all.dispatch("/context prompt", &app.context()).await {
+            Outcome::Said(text) => assert!(!text.is_empty(), "{text}"),
+            other => panic!("{other:?}"),
+        }
+        let asked = host.asked.lock().unwrap().clone();
+        assert!(
+            asked
+                .iter()
+                .all(|c| matches!(c, HostCommand::Context { prompt: true, .. })),
+            "问的时候要说明是要提示词的:{asked:?}"
         );
     }
 
@@ -2708,6 +2806,7 @@ mod tests {
                 used: 0,
                 model: String::new(),
                 working_dir: "/w".into(),
+                system_prompt: None,
             }));
         let (app, _client, all) = following(&host);
         match all.dispatch("/context", &app.context()).await {
@@ -3421,6 +3520,7 @@ mod tests {
                 used: 0,
                 model: "m".into(),
                 working_dir: dir.display().to_string(),
+                system_prompt: None,
             }));
         host
     }
@@ -3658,6 +3758,7 @@ mod tests {
                     used: 0,
                     model: "m".into(),
                     working_dir: dir.path().display().to_string(),
+                    system_prompt: None,
                 }));
         }
         let (app, _client, all) = following(&host);
@@ -4177,6 +4278,7 @@ mod tests {
                 used: 0,
                 model: "m".into(),
                 working_dir: here.path().display().to_string(),
+                system_prompt: None,
             }));
         host.replies
             .lock()

@@ -232,7 +232,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdAboutView => "open a file in a read-only overlay; costs no turn and does not enter the conversation".into(),
         Msg::CmdAboutCompact => "fold the history to make room in the context".into(),
         Msg::CmdAboutCancelAll => "stop the turn running here and in every team member; the members stay on the team".into(),
-        Msg::CmdAboutContext => "how much this session has used".into(),
+        Msg::CmdAboutContext => {
+            "how much this session has used; prompt shows the system prompt it runs on".into()
+        }
         Msg::CmdAboutAgents => "every agent under this session: the lead and each member, stopped ones included; pick one to read its conversation".into(),
         Msg::CmdAboutTranscript => "list the conversation the way the model sees it".into(),
         Msg::CmdAboutClear => "start a new session: this conversation is put down and a clean one begins".into(),
@@ -1093,6 +1095,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CopyHandedOver => {
             " (handed to the terminal; if it does not allow copying, nothing happened)".into()
         }
+        Msg::ContextNoPrompt => "This host assembles no system prompt.".into(),
         Msg::FileTooBigToPaste { path, size, cap } => format!(
             "{path} is {size}, too big to paste (the limit is {cap}). What is in the              composer is re-sent every turn; ask the model to read the file itself and              it will read only the lines it needs."
         )

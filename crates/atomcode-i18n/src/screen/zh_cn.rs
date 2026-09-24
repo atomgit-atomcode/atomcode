@@ -205,7 +205,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdAboutView => "开一个只读浮层看文件;不花一个回合,也不进对话".into(),
         Msg::CmdAboutCompact => "压缩历史,给上下文腾地方".into(),
         Msg::CmdAboutCancelAll => "停下这个会话与每个团队成员正在跑的回合;成员留在团队里".into(),
-        Msg::CmdAboutContext => "这次会话用掉了多少".into(),
+        Msg::CmdAboutContext => "这次会话用掉了多少；prompt 看它跑在哪份系统提示词上".into(),
         Msg::CmdAboutAgents => "这个会话底下有过的 agent:主与每个成员,含已停的;选一个切过去看它的对话".into(),
         Msg::CmdAboutTranscript => "把对话按模型看到的样子列出来".into(),
         Msg::CmdAboutClear => "开一个新会话:这段对话放下,换一条干净的".into(),
@@ -1017,6 +1017,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::RemoteDesktopOnly => "这条得在这台机器上敲。另一端能用的是：".into(),
         Msg::UsageUnknown { why } => format!("问不到还剩多少：{why}").into(),
         Msg::CopyHandedOver => "（交给了终端；它要是不让复制，这次就没有）".into(),
+        Msg::ContextNoPrompt => "这个宿主没有系统提示词可说。".into(),
         Msg::FileTooBigToPaste { path, size, cap } => format!(
             "{path} 有 {size}，粘不进来（上限 {cap}）。编辑区里的东西每一轮都要重发；             让模型自己去读这个文件，它只会读要用的那几行。"
         )

@@ -322,7 +322,13 @@ async fn context_text(sessions: &Sessions, sid: &SessionId) -> Option<String> {
         used,
         model,
         ..
-    } = control.call(HostCommand::Context { session }).await.ok()?
+    } = control
+        .call(HostCommand::Context {
+            session,
+            prompt: false,
+        })
+        .await
+        .ok()?
     else {
         return None;
     };
@@ -357,7 +363,13 @@ async fn status_text(sessions: &Sessions, sid: &SessionId) -> Option<String> {
             state.native_id.clone(),
         )
     };
-    let ctx_note = match control.call(HostCommand::Context { session }).await {
+    let ctx_note = match control
+        .call(HostCommand::Context {
+            session,
+            prompt: false,
+        })
+        .await
+    {
         Ok(HostReply::Context { window, used, .. }) => format!(
             "\ncontext: {used}/{window} tokens ({:.1}%)",
             percent(used, window)

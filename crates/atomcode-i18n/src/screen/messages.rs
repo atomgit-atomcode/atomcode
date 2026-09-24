@@ -1693,4 +1693,6 @@ pub enum Msg<'a> {
         size: &'a str,
         cap: &'a str,
     },
+    /// `/context prompt` against a host that assembles no system prompt.
+    ContextNoPrompt,
 }

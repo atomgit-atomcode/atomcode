@@ -3077,7 +3077,8 @@ impl Tui {
             };
             let (context, who, mcp, usage, sources) = tokio::join!(
                 ask(HostCommand::Context {
-                    session: session.clone()
+                    session: session.clone(),
+                    prompt: false,
                 }),
                 ask(HostCommand::WhoAmI {
                     session: session.clone()
@@ -3296,6 +3297,7 @@ impl Tui {
             let context = match control
                 .call(HostCommand::Context {
                     session: session.clone(),
+                    prompt: false,
                 })
                 .await
             {

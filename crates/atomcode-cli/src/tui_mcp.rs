@@ -261,6 +261,7 @@ async fn sign_in(
     let working_dir = match control
         .call(HostCommand::Context {
             session: session.clone(),
+            prompt: false,
         })
         .await
     {
@@ -749,6 +750,7 @@ mod tests {
                         used: 0,
                         model: "m".into(),
                         working_dir: self.working_dir.to_string_lossy().into_owned(),
+                        system_prompt: None,
                     }),
                 ),
                 HostCommand::Reload { .. } => ("Reload", self.reload.clone()),

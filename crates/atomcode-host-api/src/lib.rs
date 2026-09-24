@@ -227,7 +227,18 @@ pub enum HostCommand {
     /// has to fit in. A front end that could not ask this could only count what
     /// it had seen, which is not the same number — the host packs a system
     /// prompt, instructions and tool definitions the screen never sees.
-    Context { session: String },
+    Context {
+        session: String,
+        /// Also send back the system prompt this session runs on.
+        ///
+        /// Asked for rather than always sent, because it is the one part of
+        /// this answer that is *long* — a few thousand words on a session with
+        /// skills and instructions — and every other caller wants a number.
+        /// It is what a person reads when the agent behaves as though it were
+        /// told something nobody remembers telling it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        prompt: bool,
+    },
     /// What this person has typed into this project before, newest first.
     ///
     /// **Folded from the sessions' own logs, not a second store.** A session's
@@ -318,7 +329,7 @@ impl HostCommand {
             | Self::Changes { session, .. }
             | Self::Providers { session }
             | Self::Autonomy { session }
-            | Self::Context { session }
+            | Self::Context { session, .. }
             | Self::History { session, .. }
             | Self::Usage { session, .. }
             | Self::Thinking { session }
@@ -446,6 +457,9 @@ pub enum HostReply {
         /// Where the session works. Part of the same answer because "what am I
         /// carrying" and "what am I carrying it over" are asked together.
         working_dir: String,
+        /// The system prompt, when it was asked for and the host has one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        system_prompt: Option<String>,
     },
     /// What was typed into this project before, newest first and de-duplicated.
     History {
@@ -1306,6 +1320,7 @@ mod tests {
             },
             HostCommand::Context {
                 session: "a".into(),
+                prompt: false,
             },
             HostCommand::Rename {
                 session: "a".into(),
@@ -1603,6 +1618,7 @@ mod tests {
                 used: 48_000,
                 model: "glm-5".into(),
                 working_dir: "/w".into(),
+                system_prompt: None,
             },
             HostReply::Usage {
                 unavailable: None,

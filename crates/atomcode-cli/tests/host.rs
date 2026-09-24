@@ -508,6 +508,46 @@ async fn a_front_end_hears_the_turn_and_the_facts_of_the_session_the_runtime_run
     );
 }
 
+/// 问系统提示词,答的是这个会话真正跑着的那一份。
+///
+/// 屏幕那一侧只知道「我问了、宿主答了」—— 一个假宿主照样能让那条判据全绿。
+/// 真正会断的是这一段:运行时得去它自己那棵树上把各行写的那几段渲染出来。
+/// 而这条反过来也钉住了默认不带:一份几千字的东西不该跟着每一次状态刷新走。
+#[tokio::test]
+async fn the_system_prompt_comes_back_only_when_it_was_asked_for() {
+    let env = env();
+    let connection = connected(&env).await;
+    let session = connection.session.clone();
+
+    let asked = connection
+        .control
+        .call(HostCommand::Context {
+            session: session.clone(),
+            prompt: true,
+        })
+        .await;
+    let Ok(HostReply::Context { system_prompt, .. }) = asked else {
+        panic!("{asked:?}");
+    };
+    let prompt = system_prompt.expect("asked for the prompt and got none");
+    assert!(
+        !prompt.trim().is_empty(),
+        "空的提示词说明渲染的是别的东西:{prompt:?}"
+    );
+
+    let plain = connection
+        .control
+        .call(HostCommand::Context {
+            session,
+            prompt: false,
+        })
+        .await;
+    let Ok(HostReply::Context { system_prompt, .. }) = plain else {
+        panic!("{plain:?}");
+    };
+    assert_eq!(system_prompt, None, "没问就不该带上");
+}
+
 #[tokio::test]
 async fn a_new_session_is_a_session_change_and_the_rebuilt_app_feeds_the_same_channel() {
     let env = env();

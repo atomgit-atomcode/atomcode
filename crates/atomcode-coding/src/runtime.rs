@@ -569,6 +569,12 @@ pub struct RuntimeContextStats {
     pub utilization: f32,
     pub model: String,
     pub working_dir: std::path::PathBuf,
+    /// 这个会话跑在哪份系统提示词上 —— 只有问了才带。
+    ///
+    /// **只有问了才带**,因为它长:装了技能与项目说明的会话上是几千字,而
+    /// 每个别的调用方要的都是一个数。人想看它的那一刻很具体:agent 表现得
+    /// 像是被告知了一件谁也不记得告诉过它的事。
+    pub system_prompt: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1850,11 +1856,20 @@ impl CodingRuntimeHandle {
     }
 
     pub async fn context_stats(&self) -> Result<RuntimeContextStats, RuntimeError> {
+        self.context_stats_with(false).await
+    }
+
+    /// The same, and with `prompt` the system prompt this session runs on.
+    pub async fn context_stats_with(
+        &self,
+        prompt: bool,
+    ) -> Result<RuntimeContextStats, RuntimeError> {
         let state = self.state.load(Ordering::Acquire);
         let (done, result) = oneshot::channel();
         self.tx
             .send(CodingRuntimeControl::ContextStats {
                 generation: runtime_state_generation(state),
+                prompt,
                 done,
             })
             .map_err(|_| RuntimeError::Unavailable)?;
@@ -2920,6 +2935,8 @@ pub enum CodingRuntimeControl {
     },
     ContextStats {
         generation: u64,
+        /// 连系统提示词一起答。见 [`RuntimeContextStats::system_prompt`]。
+        prompt: bool,
         done: oneshot::Sender<Result<RuntimeContextStats, RuntimeError>>,
     },
     /// The execution mode in force, decoded from the same three flags the
@@ -5156,6 +5173,7 @@ fn spawn_runtime_owner_with_optional_agent(
                     }
                     Some(CodingRuntimeControl::ContextStats {
                         generation: request_generation,
+                        prompt,
                         done,
                     }) => {
                         let Some(runtime) = resources.as_ref() else {
@@ -5175,12 +5193,24 @@ fn spawn_runtime_owner_with_optional_agent(
                         } else {
                             used_tokens as f32 / context_window as f32
                         };
+                        // 每一段都是挂着的某一行写的,所以这里渲染的就是模型
+                        // 真正收到的那一份 —— 不是这一层照着记忆重拼一份。
+                        let system_prompt = prompt
+                            .then(|| {
+                                let app = runtime.harness_app.as_ref()?;
+                                let prompts = app
+                                    .context()
+                                    .service::<atomcode_harness::seams::SystemPromptSvc>()?;
+                                Some(prompts.render())
+                            })
+                            .flatten();
                         let _ = done.send(Ok(RuntimeContextStats {
                             context_window,
                             used_tokens,
                             utilization,
                             model: runtime.config.model.clone(),
                             working_dir: runtime.config.working_dir.clone(),
+                            system_prompt,
                         }));
                     }
                     Some(CodingRuntimeControl::WaitMcpReady {

@@ -2286,14 +2286,19 @@ impl HostControl for RuntimeControl {
                     .or_else(|| now.looping.map(running_of_loop));
                 Ok(HostReply::Autonomy { running })
             }
-            HostCommand::Context { session } => {
+            HostCommand::Context { session, prompt } => {
                 self.addressed(&session)?;
-                let now = self.handle.context_stats().await.map_err(refused)?;
+                let now = self
+                    .handle
+                    .context_stats_with(prompt)
+                    .await
+                    .map_err(refused)?;
                 Ok(HostReply::Context {
                     window: now.context_window,
                     used: now.used_tokens,
                     model: now.model,
                     working_dir: now.working_dir.display().to_string(),
+                    system_prompt: now.system_prompt,
                 })
             }
             // Best-effort by contract: a meter that is slow or down does not
