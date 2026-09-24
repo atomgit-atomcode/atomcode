@@ -182,12 +182,25 @@ impl ProvidersView {
     /// most of the time, so the screen marks the row from what it already knows
     /// about its own session rather than asking the file to know something it
     /// cannot.
-    pub fn with_current(&self, id: Option<&str>) -> Self {
+    ///
+    /// `live` is that name, and it is **not always a selection id**: the
+    /// description reports the model sent on the wire ([`ModelRow::model`]),
+    /// which an aliased row differs from — `AtomGit-deepseek-flash` sends
+    /// `deepseek-flash`. Both names are answered, the id first. And a name no row
+    /// answers to (the first frames of a session, a session on a model the file
+    /// no longer lists) leaves the list exactly as the file had it: marking
+    /// nothing is not a neutral act here, because `model_after` steps *from* the
+    /// marked row and an unmarked list steps off the first one every time.
+    pub fn with_current(&self, live: Option<&str>) -> Self {
+        let Some(at) = live.and_then(|live| self.marked_row(live)) else {
+            return self.clone();
+        };
         let models: Vec<ModelRow> = self
             .models
             .iter()
-            .map(|row| ModelRow {
-                current: id == Some(row.id.as_str()),
+            .enumerate()
+            .map(|(i, row)| ModelRow {
+                current: i == at,
                 ..row.clone()
             })
             .collect();
@@ -196,6 +209,30 @@ impl ProvidersView {
             models: Arc::new(models),
             protocols: self.protocols.clone(),
             efforts: self.efforts.clone(),
+        }
+    }
+
+    /// Which row `live` names: by selection id when that is what it is, else the
+    /// one row that sends it on the wire.
+    ///
+    /// Two accounts running the same model is answered `None` — the file's own
+    /// row stays marked rather than one of them being picked at random. Telling
+    /// those apart needs the description to report the *selection* rather than
+    /// the wire name, which is a change to what an agent says about itself, not
+    /// to this list.
+    fn marked_row(&self, live: &str) -> Option<usize> {
+        if let Some(at) = self.models.iter().position(|row| row.id == live) {
+            return Some(at);
+        }
+        let mut named = self
+            .models
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.model == live)
+            .map(|(at, _)| at);
+        match (named.next(), named.next()) {
+            (Some(at), None) => Some(at),
+            _ => None,
         }
     }
 
@@ -1588,6 +1625,96 @@ mod tests {
             Vec::new(),
         );
         assert_eq!(ids(&v, true), Some("a/1".into()));
+    }
+
+    /// The reported `F2`: it named the model it started on, every press, and
+    /// switched nothing.
+    ///
+    /// The screen knows what the session is on by the name the description
+    /// reports — the model **sent on the wire** — while a row is keyed by its
+    /// selection id. Those differ for every aliased model (`AtomGit-deepseek-flash`
+    /// sends `deepseek-flash`, which is the name on the status line), so nothing
+    /// matched, no row was marked, and `model_after` fell back to the first row
+    /// every time.
+    #[test]
+    fn the_row_in_use_is_found_by_the_name_the_description_reports() {
+        let wire = |id: &str, sent: &str, account: &str| ModelRow {
+            model: sent.into(),
+            ..model(id, account)
+        };
+        let view = ProvidersView::new(
+            vec![account("AtomGit", 2), account("grok", 1)],
+            vec![
+                wire("AtomGit-deepseek-flash", "deepseek-flash", "AtomGit"),
+                wire("AtomGit-glm5.3-flash", "glm5.3-flash", "AtomGit"),
+                wire("grok/grok-4.6", "grok-4.6", "grok"),
+            ],
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let live = view.with_current(Some("deepseek-flash"));
+        let marked: Vec<&str> = live
+            .models()
+            .iter()
+            .filter(|m| m.current)
+            .map(|m| m.id.as_str())
+            .collect();
+        assert_eq!(
+            marked,
+            ["AtomGit-deepseek-flash"],
+            "one row, the one in use"
+        );
+        assert_eq!(
+            live.model_after(true).map(|m| m.id.clone()),
+            Some("AtomGit-glm5.3-flash".into()),
+            "F2 steps off it rather than naming it again"
+        );
+        assert_eq!(
+            live.model_after(false).map(|m| m.id.clone()),
+            Some("grok/grok-4.6".into()),
+            "and back wraps round the list"
+        );
+
+        // The selection id is the other name the screen could hand over, and it
+        // is answered first: a row knows both.
+        let by_id = view.with_current(Some("AtomGit-glm5.3-flash"));
+        assert_eq!(
+            by_id.model_after(true).map(|m| m.id.clone()),
+            Some("grok/grok-4.6".into())
+        );
+    }
+
+    /// No description yet — the first frames of a session — is not a reason to
+    /// forget the row the *file* starts on. Marking nothing is what left `F2`
+    /// stepping from nowhere and landing on the first row: the same reported
+    /// symptom, reached another way.
+    #[test]
+    fn nothing_to_mark_leaves_the_row_the_file_starts_on_marked() {
+        let mut rows = vec![model("a/1", "a"), model("b/1", "b")];
+        rows[0].current = true;
+        let view = ProvidersView::new(
+            vec![account("a", 1), account("b", 1)],
+            rows,
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(
+            view.with_current(None)
+                .model_after(true)
+                .map(|m| m.id.clone()),
+            Some("b/1".into()),
+            "it still steps from the row the file named"
+        );
+
+        // And a name no row answers to is the same case: a session on a model
+        // that is no longer in the list steps from where the list says it is.
+        assert_eq!(
+            view.with_current(Some("gone/away"))
+                .model_after(true)
+                .map(|m| m.id.clone()),
+            Some("b/1".into())
+        );
     }
 
     fn view() -> ProvidersView {
