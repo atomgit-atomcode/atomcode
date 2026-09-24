@@ -6656,6 +6656,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/live", get(live_api::live_stream))
         .route("/live/message", post(live_api::live_message))
         .route("/live/stop", post(live_api::live_stop))
+        .route("/live/release", post(live_api::live_release))
         .route("/live/permission", post(live_api::live_permission))
         .route("/live/user-input", post(live_api::live_user_input))
         .route(

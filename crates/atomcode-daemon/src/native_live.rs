@@ -206,6 +206,35 @@ pub async fn cancel_confirmed() -> Result<(), HubError> {
     hub().cancel_confirmed().await
 }
 
+/// Force-tear-down the daemon's headless live runtime regardless of its phase or
+/// turn state, and unbind — so a wedged/orphaned runtime can be replaced.
+///
+/// The explicit recovery for feedback B12. `ensure_headless_runtime` refuses to
+/// replace a runtime whose phase is `InTurn`/`WaitingApproval`/`Reconfiguring`,
+/// while `cancel_confirmed` refuses when the hub's `turn_active` is false — so if
+/// those two ever disagree (a stalled reconfigure, an orphaned approval whose
+/// consumer disconnected), NEITHER the rebind nor the cancel converges it and
+/// every `GET /live?session_id=` 404s forever. This is the escape hatch a client
+/// calls after that refusal: kill the current turn and unbind, unconditionally.
+///
+/// `Ok(true)` when something was released, `Ok(false)` when nothing was bound.
+/// Scoped to the daemon-owned (headless) runtime; an **embedded** runtime (the
+/// in-process TUI's) is refused — it is the TUI's to own, not the daemon's to kill.
+pub async fn force_release() -> Result<bool, String> {
+    if embedded_binding().is_some() {
+        return Err("live runtime is owned by the in-process TUI; not force-releasing it".into());
+    }
+    let mut owner = headless().lock().await;
+    let Some(old) = owner.take() else {
+        return Ok(false);
+    };
+    // Best-effort: a handle whose task already died still needs the unbind, so a
+    // shutdown error must not leave the binding dangling.
+    let _ = old.handle.shutdown().await;
+    let _ = hub().unbind(&old.binding);
+    Ok(true)
+}
+
 pub fn dispatch(command: DriverCommand) -> Result<(), HubError> {
     hub().dispatch(command)
 }
@@ -395,7 +424,12 @@ pub async fn ensure_headless_runtime(
             RuntimePhase::InTurn | RuntimePhase::WaitingApproval | RuntimePhase::Reconfiguring
         ) {
             *owner = Some(old);
-            return Err("cannot replace an active live runtime".into());
+            return Err(
+                "cannot replace an active live runtime — if it is wedged/orphaned \
+                 (its consumer disconnected mid-turn), POST /live/release to force-release it, \
+                 then retry"
+                    .into(),
+            );
         }
         old.handle
             .shutdown()

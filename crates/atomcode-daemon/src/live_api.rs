@@ -1905,6 +1905,18 @@ pub(crate) async fn live_stop() -> impl IntoResponse {
     Json(serde_json::json!({ "accepted": accepted }))
 }
 
+/// POST /live/release — force-tear-down a wedged/orphaned headless runtime so a
+/// subsequent `GET /live?session_id=` can bind again. Unlike `/live/stop`
+/// (`cancel_confirmed`, which is gated on `turn_active` and refuses a runtime the
+/// hub no longer counts as mid-turn), this is unconditional. See
+/// `native_live::force_release`. (Feedback B12.)
+pub(crate) async fn live_release() -> impl IntoResponse {
+    match crate::native_live::force_release().await {
+        Ok(released) => Json(serde_json::json!({ "released": released })),
+        Err(reason) => Json(serde_json::json!({ "released": false, "error": reason })),
+    }
+}
+
 #[derive(serde::Deserialize)]
 pub(crate) struct LiveSwitchSessionReq {
     pub session_id: String,
