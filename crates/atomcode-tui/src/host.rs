@@ -2130,6 +2130,40 @@ impl Host {
         self.set_steering(String::new());
     }
 
+    /// The model has been handed `inputs` — these lines, and only these, stop
+    /// waiting.
+    ///
+    /// The runtime folds one message per step (`inbox().claim()`), so one
+    /// `Steered` names one of the lines queued, not all of them. Clearing the
+    /// whole list here is what lost words: with A, B and C queued, A folded and
+    /// took B and C off the list while they still sat in the inbox, so a stop
+    /// that withdrew them found no queued line to claim, and only the last one
+    /// came back. Each input takes off the first queued line with its text; an
+    /// input that matches none (the text was rewritten on the way — an expanded
+    /// paste) takes off the oldest, which is the one the inbox hands out first.
+    pub fn steered(&self, inputs: &[&str]) {
+        let rest = {
+            let mut m = self.moment.write().expect("moment poisoned");
+            for input in inputs {
+                let input = input.trim();
+                let at = m
+                    .queued
+                    .iter()
+                    .position(|(_, text)| text == input)
+                    .or_else(|| (!m.queued.is_empty()).then_some(0));
+                if let Some(at) = at {
+                    m.queued.remove(at);
+                }
+            }
+            m.queued
+                .iter()
+                .map(|(_, text)| text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        self.set_steering(rest);
+    }
+
     /// A queued line the runtime has withdrawn (`id` is the receipt it was sent
     /// under): off the panel, and kept to be handed back. `false` when `id` is
     /// not a queued line — then it is some other send, and its refusal is news.
@@ -5611,6 +5645,35 @@ mod tests {
         mods.add_view(Arc::new(Mounted::<input::Input>::new()))
             .unwrap();
         Host::new(mods, default_layout())
+    }
+
+    /// One fold takes only the line it folded off the queue, so the lines still
+    /// in the inbox are still there for a stop to claim — the way queued words
+    /// were lost behind `ctrl-b` / `esc`.
+    #[test]
+    fn a_fold_takes_only_its_own_line_off_the_queue() {
+        let h = host();
+        h.add_steering("tui-1", "a");
+        h.add_steering("tui-2", "b");
+        h.add_steering("tui-3", "c");
+
+        h.steered(&["a"]);
+        let queued = |h: &Host| -> Vec<String> {
+            let m = h.moment.read().unwrap();
+            m.queued.iter().map(|(_, t)| t.clone()).collect()
+        };
+        assert_eq!(queued(&h), vec!["b", "c"], "one fold, one line off");
+        assert_eq!(h.moment.read().unwrap().steering, "b\nc");
+
+        // The stop withdraws the two still waiting: both are claimed, the
+        // folded one is not.
+        assert!(h.withdraw_queued("tui-2"));
+        assert!(h.withdraw_queued("tui-3"));
+        assert!(
+            !h.withdraw_queued("tui-1"),
+            "a folded line is not withdrawn"
+        );
+        assert_eq!(h.moment.read().unwrap().withdrawn, vec!["b", "c"]);
     }
 
     fn mark_fg_of(h: &Host, tick: u64) -> Option<crate::frame::Color> {

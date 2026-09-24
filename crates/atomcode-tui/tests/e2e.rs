@@ -1124,6 +1124,67 @@ async fn ctrl_b_interrupts_and_sends_what_was_queued() {
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
 
+/// The runtime folds ONE queued line per step, so after the first of three is
+/// folded the other two are still waiting — on the panel and in the inbox —
+/// and `ctrl-b` sends both. The panel used to empty on the first fold, the
+/// stop's withdrawal receipts then matched nothing queued, and the middle line
+/// was lost with only the last handed back.
+#[tokio::test]
+async fn ctrl_b_after_one_queued_line_was_folded_sends_the_rest() {
+    let dir = scratch("interrupt-after-fold");
+    let script = replay(
+        r#"{ text = "one", calls = [ { name = "bash", args = { command = "sleep 1" } } ] },
+           { text = "two", calls = [ { name = "bash", args = { command = "sleep 5" } } ] },
+           { text = "three" },
+           { text = "four" },
+           { text = "five" }"#,
+    );
+    let s = start(tree(&dir, &script, &[])).await;
+    let task = s.open().await;
+
+    s.term.type_line("first");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    s.term.type_line("QUEUED-a1");
+    s.term.type_line("QUEUED-b2");
+    s.term.type_line("QUEUED-c3");
+
+    // The next step folds the first of them into the turn.
+    let mut folded = false;
+    for _ in 0..100 {
+        if user_messages(&s).iter().any(|m| m == "QUEUED-a1") {
+            folded = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(folded, "the first queued line was folded:\n{}", s.screen());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let screen = s.screen();
+    assert!(
+        screen.contains("QUEUED-b2") && screen.contains("QUEUED-c3"),
+        "the two not yet folded are still shown as waiting:\n{screen}"
+    );
+
+    s.term.press(KeyPress::ctrl('b'));
+
+    let mut said = Vec::new();
+    for _ in 0..300 {
+        said = user_messages(&s);
+        if said.iter().any(|m| m == "QUEUED-b2") && said.iter().any(|m| m == "QUEUED-c3") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        said.iter().any(|m| m == "QUEUED-b2") && said.iter().any(|m| m == "QUEUED-c3"),
+        "both lines still waiting were sent, not dropped: {said:?}\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
 /// Queue two lines behind a running turn and wait until the panel shows both.
 ///
 /// The turn is a five-second `sleep`, so it is still running when the key under

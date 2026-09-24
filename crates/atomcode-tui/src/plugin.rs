@@ -4169,14 +4169,21 @@ impl Tui {
                 self.check_allowance();
                 self.set_activity(Activity::Idle)
             }
-            AgentEvent::Steered { .. } => {
-                // The model has been handed what was waiting. This is the moment
-                // the transcript starts drawing it too, so the panel leaves as it
-                // arrives rather than showing the same sentence twice. The `true`
-                // is the panel leaving — the transcript's half of the exchange
-                // comes to the screen as the fact itself, which needs no frame
-                // from here.
-                self.host.clear_steering();
+            AgentEvent::Steered { inputs, count, .. } => {
+                // The model has been handed what it names. This is the moment
+                // the transcript starts drawing it too, so those lines leave the
+                // panel as they arrive rather than showing the same sentence
+                // twice — and only those: the lines still in the inbox are still
+                // waiting, and a stop must still find them to hand back. The
+                // `true` is the panel changing — the transcript's half of the
+                // exchange comes to the screen as the fact itself.
+                let texts: Vec<&str> = if inputs.is_empty() {
+                    // An older runtime says how many, not which.
+                    vec![""; count]
+                } else {
+                    inputs.iter().map(|input| input.text.as_str()).collect()
+                };
+                self.host.steered(&texts);
                 true
             }
             AgentEvent::Compacted { committed, .. } => {
