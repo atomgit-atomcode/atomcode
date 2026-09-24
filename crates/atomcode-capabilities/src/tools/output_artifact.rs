@@ -205,7 +205,7 @@ impl ArtifactMiddleware {
             // Too large to store; inline-truncate only.
             let marker = format!(
                 "\n\n{missing} Full output unavailable (exceeds {MAX_ARTIFACT_BYTES}-byte artifact ceiling); \
-re-run the command with narrower output to see that range.]\n\n"
+re-run the tool call with narrower output to see that range.]\n\n"
             );
             result.content = format!("{head}{marker}{tail}");
             return;
@@ -218,7 +218,7 @@ re-run the command with narrower output to see that range.]\n\n"
                 (tail_begin - head_end).div_ceil(FETCH_MAX_LIMIT).max(1),
             ),
             Err(_) => format!(
-                "\n\n{missing} Full output unavailable (could not be saved); re-run the command with narrower \
+                "\n\n{missing} Full output unavailable (could not be saved); re-run the tool call with narrower \
 output to see that range.]\n\n"
             ),
         };
