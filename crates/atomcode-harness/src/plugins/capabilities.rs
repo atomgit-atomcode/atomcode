@@ -638,11 +638,62 @@ impl crate::commands::CatalogCommand for RunSkill {
     }
 }
 
-/// `skills`: what is installed, for a person rather than for the model.
+/// The leading run of skill names in `args`, and the rest as one task.
 ///
-/// The catalog the row already holds, listed by name and by what each is for.
-/// Not the tool: `list_skills` answers the *model*, and a person asking "what
-/// do I have" should not have to spend a turn to find out.
+/// `known` answers "is this token the name of a skill", canonically — the
+/// registry's own resolution, so `review` and `plugin:review` are one skill and
+/// naming it twice loads it once.
+///
+/// The rule is a **prefix scan**: take tokens while each one names a skill, and
+/// the first token that does not is where the task begins. So
+/// `/skills plan review fix the auth bug` loads `plan` and `review` and gives
+/// both "fix the auth bug".
+///
+/// The failure this shape has, and the reason the caller echoes what it loaded:
+/// a misspelled second name is not an error, it silently becomes the first word
+/// of the task. Nothing here can tell that apart from a task that happens to
+/// start with a word — but a person reading "loaded: plan" when they asked for
+/// two can.
+///
+/// The task keeps its original spacing: it is prose being handed to a model,
+/// and re-joining on single spaces would rewrite anything with alignment in it.
+fn skills_and_task<'a>(
+    args: &'a str,
+    known: impl Fn(&str) -> Option<String>,
+) -> (Vec<String>, &'a str) {
+    let mut taken: Vec<String> = Vec::new();
+    let mut canonical: Vec<String> = Vec::new();
+    let mut rest = args.trim_start();
+    loop {
+        let token = match rest.split_whitespace().next() {
+            Some(token) => token,
+            None => break,
+        };
+        let Some(name) = known(token) else { break };
+        if !canonical.contains(&name) {
+            canonical.push(name);
+            taken.push(token.to_string());
+        }
+        rest = rest[token.len()..].trim_start();
+    }
+    (canonical, rest)
+}
+
+/// `skills`: what is installed, and — given names — running them.
+///
+/// Bare, it is the catalog the row already holds, listed by name and by what
+/// each is for. Not the tool: `list_skills` answers the *model*, and a person
+/// asking "what do I have" should not have to spend a turn to find out.
+///
+/// With names, it loads them all into **one** turn. That is the only thing this
+/// offers over `/&lt;name&gt;`, which is registered per skill and is the ordinary
+/// way to run one: two skills that are meant to apply to the same task have to
+/// arrive together, because sent as two turns the first has already been
+/// answered before the second is read.
+///
+/// **It used to throw the argument away.** `/skills review my patch` listed
+/// every skill and did nothing else — which reads, to the person who typed
+/// it, exactly like having run something.
 struct ListSkills(Arc<SkillRegistry>);
 
 #[async_trait]
@@ -650,13 +701,17 @@ impl crate::commands::CatalogCommand for ListSkills {
     fn describe(&self) -> atomcode_kernel::agent::CommandDescription {
         atomcode_kernel::agent::CommandDescription {
             name: "skills".into(),
-            usage: None,
-            summary: "装了哪些 skill,各是干什么的".into(),
+            usage: Some("[名字… [给它们的话]]".into()),
+            summary: "装了哪些 skill;给名字就把它们一起用上".into(),
             target: atomcode_kernel::agent::CommandTarget::Session,
         }
     }
 
-    async fn run(&self, _agent: Arc<crate::agent::Agent>, _args: &str) -> Result<String, String> {
+    async fn run(&self, agent: Arc<crate::agent::Agent>, args: &str) -> Result<String, String> {
+        let args = args.trim();
+        if !args.is_empty() {
+            return self.run_them(agent, args);
+        }
         let listed = self.0.list();
         if listed.is_empty() {
             return Ok("一个 skill 都没装".into());
@@ -666,6 +721,48 @@ impl crate::commands::CatalogCommand for ListSkills {
             .map(|(name, about)| format!("{name} · {about}"))
             .collect::<Vec<_>>()
             .join("\n"))
+    }
+}
+
+impl ListSkills {
+    fn run_them(&self, agent: Arc<crate::agent::Agent>, args: &str) -> Result<String, String> {
+        let (names, task) = skills_and_task(args, |token| {
+            self.0
+                .get(token)
+                .filter(|skill| skill.user_invocable)
+                .map(|skill| skill.name.clone())
+        });
+        let Some(first) = args.split_whitespace().next() else {
+            return Err("没说要用哪个 skill".into());
+        };
+        if names.is_empty() {
+            return Err(format!("没有叫 `{first}` 的 skill"));
+        }
+        // Each gets the same task: they are several ways of looking at one
+        // thing, not a pipeline.
+        let blocks: Vec<String> = names
+            .iter()
+            .filter_map(|name| self.0.get(name))
+            .map(|skill| skill.expand(task, agent.session_id()))
+            .filter(|text| !text.trim().is_empty())
+            .collect();
+        if blocks.is_empty() {
+            return Err("展开之后是空的".into());
+        }
+        // One turn, with a rule between them: sent as several the first would
+        // be answered before the second was read.
+        agent.send(blocks.join("\n\n---\n\n"));
+        // Named back, because a misspelled second name is not an error — it
+        // quietly became the first word of the task, and this line is where
+        // that becomes visible.
+        Ok(format!(
+            "按 {} 开始",
+            names
+                .iter()
+                .map(|name| bare_name(name))
+                .collect::<Vec<_>>()
+                .join(" · ")
+        ))
     }
 }
 
@@ -974,5 +1071,58 @@ impl Plugin for McpPlugin {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::skills_and_task;
+
+    /// Where the names stop and the task starts.
+    ///
+    /// The prefix scan, judged without a registry: what counts as a skill is
+    /// the closure's answer, so the rule itself is the whole subject. Three
+    /// things it has to get right, and each one has a way of being wrong that
+    /// nobody would see:
+    ///
+    /// - the task keeps its own spacing. It is prose on its way to a model,
+    ///   and re-joining tokens on single spaces rewrites anything aligned;
+    /// - naming a skill twice loads it once. Two copies of the same prompt in
+    ///   one turn is not twice the instruction, it is a confusing one;
+    /// - a word that is not a skill ends the run, **including the first**. A
+    ///   scan that kept looking would find a skill name in the middle of a
+    ///   sentence and load it.
+    #[test]
+    fn the_names_stop_at_the_first_word_that_is_not_one() {
+        // What the registry does: a bare name and its qualified form are the
+        // same skill, and `get` answers with the canonical one either way.
+        let known = |token: &str| match token {
+            "plan" | "review" => Some(format!("plugin:{token}")),
+            "plugin:plan" | "plugin:review" => Some(token.to_string()),
+            _ => None,
+        };
+        let (names, task) = skills_and_task("plan review fix the auth bug", known);
+        assert_eq!(names, vec!["plugin:plan", "plugin:review"]);
+        assert_eq!(task, "fix the auth bug");
+
+        // Spacing is the person's.
+        let (_, task) = skills_and_task("plan   look   at   this", known);
+        assert_eq!(task, "look   at   this");
+
+        // Canonically the same skill, named twice.
+        let (names, task) = skills_and_task("plan plugin:plan go", known);
+        assert_eq!(names, vec!["plugin:plan"], "loaded once");
+        assert_eq!(task, "go");
+
+        // The first word already ends it.
+        let (names, task) = skills_and_task("fix the plan", known);
+        assert!(names.is_empty());
+        assert_eq!(task, "fix the plan", "and nothing was eaten off the front");
+
+        // Names and nothing else is a run with an empty task, not an error:
+        // a skill that needs no argument is the ordinary case.
+        let (names, task) = skills_and_task("  plan  ", known);
+        assert_eq!(names, vec!["plugin:plan"]);
+        assert_eq!(task, "");
     }
 }

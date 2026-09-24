@@ -194,6 +194,92 @@ async fn skills_are_discovered_and_the_prompt_mentions_them_only_when_they_exist
     }
 }
 
+/// `/skills` with names on it runs them — all into one turn.
+///
+/// **It used to throw the argument away.** `run` took `_args` and listed the
+/// catalog, so `/skills review my patch` printed every installed skill and did
+/// nothing else — which reads, to the person who typed it, exactly like having
+/// run something. That is the half worth a criterion: the listing was always
+/// fine, and a build that regressed to it would look busy and be idle.
+///
+/// One turn for several skills is the only thing this offers over `/&lt;name&gt;`,
+/// which is registered per skill and is the ordinary way to run one. Two skills
+/// meant for the same task have to arrive together: sent as two turns, the
+/// first is answered before the second is read.
+#[tokio::test]
+async fn skills_with_names_on_it_runs_them_together_rather_than_listing() {
+    let dir = scratch("skills-chained");
+    for (name, body) in [
+        ("plan", "Lay it out first."),
+        ("review", "Then read it back."),
+    ] {
+        let at = dir.join(format!(".claude/skills/{name}"));
+        std::fs::create_dir_all(&at).unwrap();
+        std::fs::write(
+            at.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: the {name} one\n---\n\n{body}\n"),
+        )
+        .unwrap();
+    }
+
+    let app = start(tree(&dir, STOP, &[])).await;
+    let catalog = app
+        .context()
+        .service::<atomcode_harness::seams::CommandsSvc>()
+        .expect("the catalog is a core row");
+    let agent = atomcode_harness::create_agent(&app)
+        .await
+        .expect("an agent to run commands against");
+    let skills = || {
+        catalog
+            .find("skills", &agent)
+            .expect("offered, so findable")
+    };
+
+    let said = skills()
+        .run(agent.clone(), "plan review fix the auth bug")
+        .await
+        .expect("running two skills");
+    assert!(
+        said.contains("plan") && said.contains("review"),
+        "it names what it loaded, which is where a misspelled second name          becomes visible: {said}"
+    );
+    assert!(
+        agent
+            .inbox()
+            .waiting_from(atomcode_harness::agent::MessageOrigin::User),
+        "and it is waiting as the person's own message, not a listing"
+    );
+    let queued = agent.inbox().claim().message.expect("a message was queued");
+    assert!(
+        queued.contains("Lay it out first.") && queued.contains("Then read it back."),
+        "both skills are in it: {queued}"
+    );
+    assert!(
+        queued.contains("fix the auth bug"),
+        "and so is the task they were both given: {queued}"
+    );
+    assert_eq!(
+        queued.matches("---").count(),
+        1,
+        "one turn with a rule between them, not two turns: {queued}"
+    );
+
+    // A name nothing answers to is refused, rather than silently becoming a
+    // task nobody asked to run.
+    assert!(skills()
+        .run(agent.clone(), "nosuchskill do the thing")
+        .await
+        .is_err());
+
+    // And bare, it still lists.
+    let listed = skills().run(agent.clone(), "").await.expect("listing");
+    assert!(
+        listed.contains("plan") && listed.contains("the review one"),
+        "{listed}"
+    );
+}
+
 /// A capability row puts its own commands in the catalog, so a front end offers
 /// them without knowing they exist
 /// (`docs/adr/0021` §10, `docs/plans/2026-09-18-tui-panels-and-commands-inventory.md`
