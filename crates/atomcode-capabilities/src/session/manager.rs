@@ -54,6 +54,13 @@ pub struct TodoSidecar {
     /// Conversation message count at write time (stale-detection marker).
     #[serde(default)]
     pub message_count: usize,
+    /// Id of the last todo call `todos` already reflects. A transcript that lost
+    /// its plan to compaction still carries the calls made since; a reader lays
+    /// only the ones after this id over `todos`, so none is applied twice (a
+    /// replayed `add` would append its task again). `None` in a sidecar written
+    /// before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_call: Option<String>,
 }
 
 /// One todo row in the sidecar. `status` uses the canonical strings
@@ -1187,10 +1194,12 @@ impl SessionManager {
         id: &str,
         todos: &[TodoSidecarItem],
         message_count: usize,
+        last_call: Option<&str>,
     ) -> SessionResult<()> {
         let sidecar = TodoSidecar {
             todos: todos.to_vec(),
             message_count,
+            last_call: last_call.map(str::to_string),
         };
         let bytes = serialize_bounded(&sidecar, "todo sidecar", MAX_TODO_SIDECAR_BYTES)?;
         atomic_write(&self.todo_sidecar_path(id)?, &bytes)

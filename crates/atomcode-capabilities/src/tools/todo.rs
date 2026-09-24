@@ -7,7 +7,7 @@
 use super::{err, ok};
 use async_trait::async_trait;
 use atomcode_kernel::message::Message;
-use atomcode_kernel::tool::{Tool, ToolContext, ToolResult};
+use atomcode_kernel::tool::{Tool, ToolCall, ToolContext, ToolResult};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -322,6 +322,18 @@ pub fn reduce_todos<'a>(calls: impl IntoIterator<Item = (&'a str, &'a str)>) -> 
 /// The current todo list, folded over the transcript (see [`reduce_todos`]). Returns `vec![]`
 /// if there is no valid `todowrite` and no `todo` events.
 pub fn derive_current_todos(messages: &[Message]) -> Vec<TodoItem> {
+    reduce_todos(
+        active_todo_calls(messages)
+            .into_iter()
+            .map(|c| (c.name.as_str(), c.arguments.as_str())),
+    )
+}
+
+/// The todo calls that still shape the list, in order: after the most recent user
+/// interruption and without the ones that came back an error. The input
+/// [`derive_current_todos`] folds, exposed so a caller that folds over a baseline of
+/// its own (the session's todo sidecar) reads the same calls.
+pub fn active_todo_calls(messages: &[Message]) -> Vec<&ToolCall> {
     // A user cancel retires the active plan without deleting its history. Fold
     // only calls after the most recent authoritative interruption boundary; an
     // explicit later "continue" can create a fresh full-list plan from history.
@@ -334,13 +346,11 @@ pub fn derive_current_todos(messages: &[Message]) -> Vec<TodoItem> {
         .filter(|message| message.is_error)
         .filter_map(|message| message.tool_call_id.as_deref())
         .collect::<std::collections::HashSet<_>>();
-    reduce_todos(
-        active_messages
-            .iter()
-            .flat_map(|m| m.tool_calls.iter())
-            .filter(|call| !failed_call_ids.contains(call.id.as_str()))
-            .map(|c| (c.name.as_str(), c.arguments.as_str())),
-    )
+    active_messages
+        .iter()
+        .flat_map(|m| m.tool_calls.iter())
+        .filter(|call| is_todo_call(&call.name) && !failed_call_ids.contains(call.id.as_str()))
+        .collect()
 }
 
 /// Stateless full-list-replace todo tool. No interior state — current list is derived

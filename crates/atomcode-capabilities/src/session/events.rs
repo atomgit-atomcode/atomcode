@@ -1232,7 +1232,7 @@ mod tests {
         let lease = created(&manager, "s1");
         manager.append_events(&lease, &a_turn()).unwrap();
         manager.rename("s1", "renamed").unwrap();
-        manager.write_todo_sidecar("s1", &[], 2).unwrap();
+        manager.write_todo_sidecar("s1", &[], 2, None).unwrap();
         manager
             .commit_native_runtime_mutation(
                 &lease,
@@ -1612,7 +1612,7 @@ mod tests {
         let (_dir, manager) = store();
         let lease = created(&manager, "s1");
         manager.append_events(&lease, &a_turn()).unwrap();
-        manager.write_todo_sidecar("s1", &[], 2).unwrap();
+        manager.write_todo_sidecar("s1", &[], 2, None).unwrap();
         manager.delete(&lease).unwrap();
         let left: Vec<String> = fs::read_dir(manager.root())
             .unwrap()

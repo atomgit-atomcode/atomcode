@@ -5,9 +5,10 @@
 
 use async_trait::async_trait;
 use atomcode_capabilities::reminder::synthetic_system_reminder;
-use atomcode_capabilities::session::manager::{SessionManager, TodoSidecarItem};
+use atomcode_capabilities::session::manager::{SessionManager, TodoSidecar, TodoSidecarItem};
 use atomcode_capabilities::tools::todo::{
-    derive_current_todos, is_todo_call, is_todo_plan, render_todos_numbered, TodoItem, TodoStatus,
+    active_todo_calls, apply_todo_action, derive_current_todos, is_todo_call, is_todo_plan,
+    reduce_todos, render_todos_numbered, TodoItem, TodoStatus,
 };
 use atomcode_kernel::event::StopReason;
 use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
@@ -442,23 +443,9 @@ fn just_wrote_full_list(messages: &[Message]) -> bool {
 #[async_trait]
 impl LifecycleHooks for TodoHook {
     async fn pre_request(&self, messages: &mut Vec<Message>, ctx: &TurnCtx) {
-        let todos = derive_current_todos(messages);
-        // Transcript-derived list may be EMPTY after a compaction drained the old
-        // turns (incl. the early todowrite plan call) — recover from the persisted
-        // sidecar so the model keeps seeing its plan (issue #1503). Fall back to
-        // the sidecar ONLY when the transcript has nothing; otherwise the live
-        // transcript is the authoritative source.
-        let todos = if todos.is_empty() {
-            // Only reach for the sidecar when a session context exists.
-            let Some(working_dir) = self.working_dir.as_deref() else {
-                return;
-            };
-            let Some(session_id) = ctx.session_id.as_deref() else {
-                return;
-            };
-            sidecar_todos_for(working_dir, session_id).unwrap_or_default()
-        } else {
-            todos
+        let Some(CurrentTodos { items: todos, .. }) = current_todos(messages, || self.sidecar(ctx))
+        else {
+            return;
         };
         if todos.is_empty() {
             return;
@@ -501,10 +488,11 @@ impl LifecycleHooks for TodoHook {
 
     /// Turn ended: persist the CURRENT todo list to the session sidecar so a later
     /// compaction (which drains the transcript's todowrite calls) can't erase the
-    /// list the model / vscode panel rely on (issue #1503). Best-effort and only
-    /// when the transcript still yields todos (a turn that never planned has
-    /// nothing to persist; a rollback/undo that truncated the transcript past the
-    /// plan will simply not reach a `turn_complete` write with that stale state).
+    /// list the model / vscode panel rely on (issue #1503). Best-effort, and only
+    /// when there is a list (see [`current_todos`]; a session that never planned
+    /// has nothing to persist). What is written is the list as the model saw it —
+    /// after a compaction, the previous sidecar with this turn's updates on top —
+    /// so a second compaction does not roll those updates back.
     /// `ctx.session_id` is `None` for headless drivers — nothing to key the file on.
     async fn turn_complete(&self, convo: &Conversation, _reason: &StopReason, ctx: &TurnCtx) {
         let Some(working_dir) = self.working_dir.as_deref() else {
@@ -513,11 +501,13 @@ impl LifecycleHooks for TodoHook {
         let Some(session_id) = ctx.session_id.as_deref() else {
             return;
         };
-        let todos = derive_current_todos(&convo.messages);
-        if todos.is_empty() {
+        // An explicitly emptied list is written too: left unwritten, the sidecar would
+        // keep the list from before the clear and hand it back after a compaction.
+        let Some(current) = current_todos(&convo.messages, || self.sidecar(ctx)) else {
             return;
-        }
-        let items: Vec<TodoSidecarItem> = todos
+        };
+        let items: Vec<TodoSidecarItem> = current
+            .items
             .iter()
             .map(|t| TodoSidecarItem {
                 content: t.content.clone(),
@@ -525,28 +515,87 @@ impl LifecycleHooks for TodoHook {
             })
             .collect();
         let manager = SessionManager::for_project(working_dir);
-        let _ = manager.write_todo_sidecar(session_id, &items, convo.messages.len());
+        let _ = manager.write_todo_sidecar(
+            session_id,
+            &items,
+            convo.messages.len(),
+            current.last_call.as_deref(),
+        );
     }
 }
 
-/// Recover the todo list from the persisted sidecar when the transcript-derived
-/// list is empty (post-compaction). Stale sidecars (written against MORE messages
-/// than the current transcript — a rollback/undo truncated history) are discarded
-/// by `read_todo_sidecar`'s marker check, so a rolled-back session never shows an
-/// outdated list.
-fn sidecar_todos_for(working_dir: &std::path::Path, session_id: &str) -> Option<Vec<TodoItem>> {
-    let manager = SessionManager::for_project(working_dir);
-    let sidecar = manager.read_todo_sidecar(session_id).ok()??;
-    Some(
-        sidecar
-            .todos
-            .into_iter()
-            .map(|item| TodoItem {
-                content: item.content,
-                status: parse_todo_status(&item.status),
-            })
-            .collect(),
-    )
+impl TodoHook {
+    /// The session's persisted todo sidecar, when there is a session to key it on.
+    fn sidecar(&self, ctx: &TurnCtx) -> Option<TodoSidecar> {
+        let working_dir = self.working_dir.as_deref()?;
+        let session_id = ctx.session_id.as_deref()?;
+        SessionManager::for_project(working_dir)
+            .read_todo_sidecar(session_id)
+            .ok()?
+    }
+}
+
+/// The task list as it stands, and the last todo call it reflects.
+struct CurrentTodos {
+    items: Vec<TodoItem>,
+    last_call: Option<String>,
+}
+
+/// The current task list: the transcript's todo calls, over the session's sidecar when
+/// the transcript no longer holds a plan. `None` when there is no list at all.
+///
+/// A plan in the transcript is authoritative — including an empty one, which is the list
+/// being cleared, not the list being absent. Only when compaction has drained the plan
+/// (issue #1503) is the sidecar the baseline, and the updates the transcript still carries
+/// are laid over it rather than dropped. Folded on their own they name ids an empty list
+/// does not have and come to nothing, so the model was shown the sidecar's list from the
+/// last completed turn: it marked #3 completed, still saw `[~]`, sent the same update
+/// again, and was stopped by the tool-loop guard for repeating itself. A cleared list fell
+/// back to the same stale sidecar and was cleared again for the same reason.
+///
+/// `sidecar` is read only when the transcript holds no plan.
+fn current_todos(
+    messages: &[Message],
+    sidecar: impl FnOnce() -> Option<TodoSidecar>,
+) -> Option<CurrentTodos> {
+    let calls = active_todo_calls(messages);
+    let last_call = calls.last().map(|call| call.id.clone());
+    if calls.iter().any(|call| is_todo_plan(&call.arguments)) {
+        let items = reduce_todos(
+            calls
+                .iter()
+                .map(|call| (call.name.as_str(), call.arguments.as_str())),
+        );
+        return Some(CurrentTodos { items, last_call });
+    }
+    let (mut items, applied) = match sidecar() {
+        Some(sidecar) => {
+            let items = sidecar
+                .todos
+                .into_iter()
+                .map(|item| TodoItem {
+                    content: item.content,
+                    status: parse_todo_status(&item.status),
+                })
+                .collect();
+            (items, sidecar.last_call)
+        }
+        None if calls.is_empty() => return None,
+        None => (Vec::new(), None),
+    };
+    // The calls the sidecar already reflects are the ones up to its last call. When that
+    // call is not in the transcript, compaction took it, and every call left is newer.
+    let start = applied
+        .as_deref()
+        .and_then(|seen| calls.iter().position(|call| call.id == seen))
+        .map_or(0, |at| at + 1);
+    for call in &calls[start..] {
+        apply_todo_action(&mut items, &call.arguments);
+    }
+    Some(CurrentTodos {
+        items,
+        last_call: last_call.or(applied),
+    })
 }
 
 /// Map the canonical sidecar status strings back to [`TodoStatus`].
@@ -1190,5 +1239,157 @@ mod tests {
                 .is_none(),
             "already nudged this turn → let it stop (no spin)"
         );
+    }
+
+    // ---- the list after a compaction: the sidecar plus what the transcript still carries --
+
+    fn todo_call(id: &str, args: &str) -> Message {
+        Message::assistant(
+            "",
+            vec![ToolCall {
+                id: id.into(),
+                name: "todowrite".into(),
+                arguments: args.into(),
+            }],
+        )
+    }
+
+    fn sidecar_of(items: &[(&str, &str)], last_call: Option<&str>) -> TodoSidecar {
+        TodoSidecar {
+            todos: items
+                .iter()
+                .map(|(content, status)| TodoSidecarItem {
+                    content: (*content).into(),
+                    status: (*status).into(),
+                })
+                .collect(),
+            message_count: 40,
+            last_call: last_call.map(str::to_string),
+        }
+    }
+
+    fn statuses(current: &CurrentTodos) -> Vec<(String, TodoStatus)> {
+        current
+            .items
+            .iter()
+            .map(|t| (t.content.clone(), t.status))
+            .collect()
+    }
+
+    const THREE_STARTED: [(&str, &str); 3] = [
+        ("parse the config file", "completed"),
+        ("wire the loader into main", "completed"),
+        ("verify resume after restart", "in_progress"),
+    ];
+
+    /// The reported loop: compaction took the plan, the model marked #3 completed, and the
+    /// list it was shown still had #3 in progress — so it sent the same update again until
+    /// the tool-loop guard stopped it. The update lands on the sidecar's list.
+    ///
+    /// Negative control: fold the transcript alone (the old path) and the update names an
+    /// id an empty list does not have, which left the sidecar's `in_progress` standing.
+    #[test]
+    fn an_update_after_compaction_lands_on_the_sidecar_list() {
+        let messages = vec![
+            Message::user("carry on"),
+            todo_call("c9", r#"{"action":"update","id":3,"status":"completed"}"#),
+            Message::tool_result("c9", "#3 → completed", false),
+        ];
+        let current = current_todos(&messages, || Some(sidecar_of(&THREE_STARTED, Some("c7"))))
+            .expect("a sidecar is a list");
+        assert_eq!(
+            current.items[2].status,
+            TodoStatus::Completed,
+            "{:?}",
+            statuses(&current)
+        );
+        assert_eq!(current.last_call.as_deref(), Some("c9"));
+        assert!(
+            derive_current_todos(&messages).is_empty(),
+            "the old path folded to nothing"
+        );
+    }
+
+    /// The sidecar already reflects every call up to its `last_call`; a compaction that
+    /// kept some of those calls must not apply them again — an `add` would append twice.
+    #[test]
+    fn calls_the_sidecar_already_reflects_are_not_applied_twice() {
+        let messages = vec![
+            todo_call(
+                "a1",
+                r#"{"action":"add","content":"document the loader flags"}"#,
+            ),
+            Message::tool_result("a1", "Added task: document the loader flags", false),
+            Message::user("next"),
+            todo_call("u2", r#"{"action":"update","id":4,"status":"in_progress"}"#),
+            Message::tool_result("u2", "#4 → in_progress", false),
+        ];
+        let mut after_add = THREE_STARTED.to_vec();
+        after_add[2].1 = "completed";
+        after_add.push(("document the loader flags", "pending"));
+        let current = current_todos(&messages, || Some(sidecar_of(&after_add, Some("a1"))))
+            .expect("a sidecar is a list");
+        assert_eq!(current.items.len(), 4, "{:?}", statuses(&current));
+        assert_eq!(current.items[3].status, TodoStatus::InProgress);
+    }
+
+    /// A sidecar written before `last_call` existed says nothing about which calls it has
+    /// seen; every call the transcript carries is laid over it.
+    #[test]
+    fn a_sidecar_without_a_last_call_takes_every_update() {
+        let messages = vec![todo_call(
+            "c1",
+            r#"{"action":"update","id":3,"status":"completed"}"#,
+        )];
+        let current = current_todos(&messages, || Some(sidecar_of(&THREE_STARTED, None))).unwrap();
+        assert_eq!(current.items[2].status, TodoStatus::Completed);
+    }
+
+    /// Clearing the list is a plan with nothing in it, not the absence of a plan: it must
+    /// not fall back to the sidecar, which still holds the list from before the clear.
+    #[test]
+    fn a_cleared_list_stays_cleared() {
+        let messages = vec![
+            Message::user("clear your todos"),
+            todo_call("c1", r#"{"todos":[]}"#),
+            Message::tool_result("c1", "(no tasks)", false),
+        ];
+        let current = current_todos(&messages, || {
+            panic!("a plan in the transcript is authoritative; the sidecar is not read")
+        })
+        .expect("an emptied list is still a list");
+        assert!(current.items.is_empty());
+        assert_eq!(current.last_call.as_deref(), Some("c1"));
+    }
+
+    /// A plan still in the transcript wins over the sidecar, as before.
+    #[test]
+    fn a_plan_in_the_transcript_is_the_list() {
+        let messages = vec![todo_call(
+            "p1",
+            r#"{"todos":[{"content":"rename the session flag","status":"in_progress"}]}"#,
+        )];
+        let current = current_todos(&messages, || panic!("sidecar must not be read")).unwrap();
+        assert_eq!(current.items.len(), 1);
+        assert_eq!(current.items[0].content, "rename the session flag");
+    }
+
+    /// A rejected call is not part of the list, over the sidecar as in the transcript.
+    #[test]
+    fn a_failed_update_does_not_land_on_the_sidecar() {
+        let messages = vec![
+            todo_call("c1", r#"{"action":"update","id":3,"status":"completed"}"#),
+            Message::tool_result("c1", "todowrite: bad", true),
+        ];
+        let current =
+            current_todos(&messages, || Some(sidecar_of(&THREE_STARTED, Some("c0")))).unwrap();
+        assert_eq!(current.items[2].status, TodoStatus::InProgress);
+        assert_eq!(current.last_call.as_deref(), Some("c0"));
+    }
+
+    /// No plan, no sidecar, no todo calls: there is no list.
+    #[test]
+    fn no_list_anywhere_is_none() {
+        assert!(current_todos(&[Message::user("hi")], || None).is_none());
     }
 }
