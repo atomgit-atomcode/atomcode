@@ -1128,9 +1128,12 @@ fn print_shell_completion(shell: Shell, out: &mut dyn Write) {
 enum HookCommands {
     /// List all loaded hooks with their status
     List,
-    /// Test a specific hook by name
+    /// Test a loaded hook, matched by event name or a command substring
     Test {
-        /// Hook name to test
+        /// Which hook to test: an event name (e.g. `PreToolUse`) or a substring of
+        /// the hook's `command`. NOT the `.hooks.json` key — keys are not retained
+        /// when hooks are loaded, so `hooks list` (by event) and this matcher are
+        /// how you name one.
         name: String,
     },
     /// Show hook configuration paths
