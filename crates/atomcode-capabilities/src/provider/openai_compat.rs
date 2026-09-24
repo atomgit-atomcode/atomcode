@@ -3487,22 +3487,26 @@ mod tests {
     fn sse_parallel_tool_calls_without_index_split_by_id() {
         let mut d = SseDecoder::new();
         let mut ev = Vec::new();
-        ev.extend(d.feed(
-            line(json!({"choices":[{"delta":{"tool_calls":[
-                {"id":"c0","function":{"name":"a","arguments":"{\"x\":1"}},
-                {"id":"c1","function":{"name":"b","arguments":"{\"y\":2"}}
-            ]}}]}))
-            .as_bytes(),
-        ));
+        ev.extend(
+            d.feed(
+                line(json!({"choices":[{"delta":{"tool_calls":[
+                    {"id":"c0","function":{"name":"a","arguments":"{\"x\":1"}},
+                    {"id":"c1","function":{"name":"b","arguments":"{\"y\":2"}}
+                ]}}]}))
+                .as_bytes(),
+            ),
+        );
         // Continuation deltas, still without index, carry the id so each lands on
         // its own call rather than both appending to slot 0.
-        ev.extend(d.feed(
-            line(json!({"choices":[{"delta":{"tool_calls":[
-                {"id":"c0","function":{"arguments":"}"}},
-                {"id":"c1","function":{"arguments":"}"}}
-            ]}}]}))
-            .as_bytes(),
-        ));
+        ev.extend(
+            d.feed(
+                line(json!({"choices":[{"delta":{"tool_calls":[
+                    {"id":"c0","function":{"arguments":"}"}},
+                    {"id":"c1","function":{"arguments":"}"}}
+                ]}}]}))
+                .as_bytes(),
+            ),
+        );
         ev.extend(
             d.feed(line(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})).as_bytes()),
         );

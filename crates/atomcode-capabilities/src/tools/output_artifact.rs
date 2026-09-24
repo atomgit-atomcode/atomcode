@@ -238,7 +238,9 @@ impl atomcode_kernel::middleware::ToolMiddleware for ArtifactMiddleware {
 mod tests {
     #[test]
     fn threshold_env_override_defaults_byte_identical_and_clamps() {
-        use super::{resolve_threshold, MAX_ARTIFACT_BYTES, PREVIEW_HEAD, PREVIEW_TAIL, THRESHOLD_BYTES};
+        use super::{
+            resolve_threshold, MAX_ARTIFACT_BYTES, PREVIEW_HEAD, PREVIEW_TAIL, THRESHOLD_BYTES,
+        };
         let floor = PREVIEW_HEAD + PREVIEW_TAIL + 1024;
         // Unset / empty / garbage → the default, to the byte.
         assert_eq!(resolve_threshold(None), THRESHOLD_BYTES);
@@ -347,8 +349,16 @@ mod tests {
         assert!(r1.content.len() < big.len());
         assert!(r1.content.contains("fetch_output"));
         // B11: the marker carries the structural scale ("part 1" + "~N parts").
-        assert!(r1.content.contains("part 1"), "marker names the part: {}", r1.content);
-        assert!(r1.content.contains("parts of"), "marker names the total parts: {}", r1.content);
+        assert!(
+            r1.content.contains("part 1"),
+            "marker names the part: {}",
+            r1.content
+        );
+        assert!(
+            r1.content.contains("parts of"),
+            "marker names the total parts: {}",
+            r1.content
+        );
         let id = super::artifact_id(big.as_bytes());
         assert!(r1.content.contains(&id));
         // artifact holds the FULL original
