@@ -66,6 +66,12 @@ pub enum Action {
     /// pressing ctrl-c to stop a model that is running must not turn into
     /// "cleared your draft" just because there was one.
     Escape,
+    /// 停掉这一轮,然后把排在它后面的话立刻发出去。
+    ///
+    /// 两步,而且顺序是必须的:取消是一次往返,没等到终态就提交的话
+    /// 运行时会答 `Busy` —— 那正好是把话丢掉的另一种写法。所以这一键
+    /// 先把排队的话收走存好,再发取消;取消落地那一刻才重新提交。
+    InterruptAndSend,
     /// Start a selection at this cell.
     SelectFrom(u16, u16),
     /// Drag it out to here.
@@ -316,6 +322,10 @@ impl Keymap for Default_ {
             (KeyPress::plain(Key::Backspace), Action::Backspace),
             (KeyPress::plain(Key::Esc), Action::Escape),
             (KeyPress::ctrl('c'), Action::Cancel),
+            // 中断并把排队的话立刻发出去。这一下曾经是 `esc` 的承诺
+            // (面板上就这么写着),而 `esc` 实际上取消之后把它们丢了 ——
+            // 现在它自己一个键，`esc` 仍然是干净的「停下」。
+            (KeyPress::ctrl('b'), Action::InterruptAndSend),
             // Three keys for one action, because only one of them can be
             // relied on. Shift-enter is what people reach for and needs the
             // keyboard protocol to arrive at all; alt-enter is what several
@@ -514,6 +524,29 @@ mod tests {
             keys.resolve(KeyPress::new(Key::F(2), Mods::SHIFT)),
             Some(Action::CycleModel { forward: false })
         );
+    }
+
+    /// 「中断并立即发送」是自己一个键,不是 `esc`。
+    ///
+    /// 面板一直写着有这么一下,只是写的是 `esc` —— 而 `esc` 取消之后把
+    /// 排队的话丢了。两个动作分开:`esc` 仍然是干净的「停下」,
+    /// `Ctrl+B` 是那句承诺。
+    ///
+    /// 并列钉住 `esc` 没被改掉:把两个意思压回一个键上,正是这条要修的
+    /// 毛病。
+    #[test]
+    fn interrupt_and_send_is_its_own_key() {
+        let keys = Keys::new();
+        keys.add(&Default_).unwrap();
+        assert_eq!(
+            keys.resolve(KeyPress::ctrl('b')),
+            Some(Action::InterruptAndSend)
+        );
+        assert_eq!(
+            keys.resolve(KeyPress::plain(Key::Esc)),
+            Some(Action::Escape)
+        );
+        assert_eq!(keys.resolve(KeyPress::ctrl('c')), Some(Action::Cancel));
     }
 
     /// What SSH and PuTTY send instead. Unbound, backspace stops working over

@@ -2537,6 +2537,24 @@ impl Tui {
     /// are still reading, unlike resuming, which is the end of the list's job.
     /// The row goes when the host says it is gone — not before, or a failed
     /// delete would leave the screen showing a session that is still there.
+    /// 把一段已经展开好的话作为人自己的消息发出去。
+    ///
+    /// 给 `Ctrl+B` 用:收走的那几句本来就是提交过一次的文本 —— 粘贴已经还原
+    /// 过、图已经跟着那一次走了,所以这里不再碰附件队列。
+    fn submit_text(&self, text: String) {
+        if text.trim().is_empty() {
+            return;
+        }
+        {
+            let mut m = self.host.moment.write().expect("moment poisoned");
+            // 和一次普通提交一样:这是「最后发出去的那句」,下一次 Escape
+            // 要把它退回来。
+            m.last_sent = Some(text.clone());
+            m.interrupted = false;
+        }
+        self.client.send(text, Vec::new());
+    }
+
     fn delete_session(&self, id: String) {
         let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
             self.host
@@ -3789,6 +3807,18 @@ impl Tui {
             // `已中断` note is not raised here: a self-cancel already marked it on
             // the key (`Action::Escape`), and an internal cancel must not.
             AgentEvent::TurnComplete { .. } | AgentEvent::Cancelled => {
+                // `Ctrl+B` 收走的话,等的就是这一刻。取消已经落地,重新提交
+                // 不会再碰上 `Busy`。
+                let staged = self
+                    .host
+                    .moment
+                    .write()
+                    .expect("moment poisoned")
+                    .staged_steers
+                    .take();
+                if let Some(text) = staged {
+                    self.submit_text(text);
+                }
                 self.host.clear_steering();
                 // A turn just spent some of the allowance, so this is the
                 // moment the figure changed. Rate-limited inside.
@@ -4817,6 +4847,30 @@ impl Tui {
             // then the turn. Clearing a draft you were still writing is
             // annoying; losing it because you wanted to stop the model is
             // worse, which is why ctrl-c stays `Cancel` and only stops.
+            // 中断,然后把排队的话立刻发出去。
+            //
+            // 面板一直写着有这么一下,只是之前写的是 `esc` —— 而 `esc`
+            // 取消之后把它们丢了(底座的 `stand_down` 就是这么定的)。
+            //
+            // 先收走再取消,顺序是必须的:没等到取消终态就提交,运行时
+            // 会答 `Busy`,那正好是把话丢掉的另一种写法。重发在
+            // `AgentEvent::Cancelled` 那一臂。
+            Action::InterruptAndSend => {
+                // `m` 是外层已经拿着的写锁。在这儿再 `moment.write()` 一次是
+                // 同一个线程上的第二把写锁 —— 当场死锁。
+                let waiting = std::mem::take(&mut m.steering);
+                let staged = !waiting.trim().is_empty();
+                if staged {
+                    m.staged_steers = Some(waiting);
+                } else {
+                    // 没有排队的话,那这一下就是一次普通的停。
+                    m.interrupted = true;
+                }
+                drop(m);
+                self.stop_turn(client);
+                // `false` 是「不退出」—— `act` 的返回值是 `quit`,不是「管了」。
+                return false;
+            }
             Action::Escape => {
                 // While a turn is in flight, one Escape stops it — no double-tap
                 // when there is something running to stop. If the composer is

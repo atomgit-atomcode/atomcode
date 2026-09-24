@@ -1067,7 +1067,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("The proxy setting was not written to the config file: {error}").into()
         }
         Msg::SteeringQueued => {
-            "Queued — sent after the next tool call (press Esc to interrupt and send now)".into()
+            "Queued — sent after the next tool call (press Ctrl+B to interrupt and send now)"
+                .into()
         }
     }
 }

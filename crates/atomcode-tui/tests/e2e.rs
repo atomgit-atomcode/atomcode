@@ -1027,6 +1027,65 @@ async fn typing_during_a_turn_is_folded_into_it_rather_than_queued() {
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
 
+/// `Ctrl+B` 真的做到了面板上写的那句话:中断,并把排队的话立刻发出去。
+///
+/// 面板一直写着有这么一下,只是写的是 `esc` —— 而 `esc` 取消之后把排队
+/// 的话**丢了**(底座的 `stand_down` 就是这么定的,而屏幕一声不响)。
+///
+/// 只能端到端钉:键位表只知道这一下解成哪个动作,而这条要钉的是
+/// **话真的又发出去了** —— 中间隔着一次取消往返 - 没等到取消终态就
+/// 提交会被答 `Busy`,而那正好是把话丢掉的另一种写法。
+#[tokio::test]
+async fn ctrl_b_interrupts_and_sends_what_was_queued() {
+    let dir = scratch("interrupt-and-send");
+    let script = replay(
+        r#"{ text = "one", calls = [ { name = "bash", args = { command = "sleep 5" } } ] },
+           { text = "answered the queued one" }"#,
+    );
+    let s = start(tree(&dir, &script, &[])).await;
+    let task = s.open().await;
+
+    s.term.type_line("first");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    s.term.type_line("QUEUED-x7k");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        s.screen().contains("QUEUED-x7k"),
+        "排在面板里了:\n{}",
+        s.screen()
+    );
+
+    // 面板是「模型的收件箱里还有这么一句」,不是对话。重发之前,这句话
+    // 不在 transcript 里。
+    assert!(
+        !transcript(&s).contains("QUEUED-x7k"),
+        "重发之前它只在面板里:\n{}",
+        transcript(&s)
+    );
+
+    s.term.press(KeyPress::ctrl('b'));
+
+    // 取消落地后重新提交 —— 这一句变成一条真正的用户消息(一条
+    // `UserMessage` 事实),这是「话真的又发出去了」唯一不依赖脚本剩几条的
+    // 硬证据。
+    let mut seen = String::new();
+    for _ in 0..300 {
+        seen = transcript(&s);
+        if seen.contains("QUEUED-x7k") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        seen.contains("QUEUED-x7k"),
+        "排队的话被重新发出去了,而不是跟着取消一起消失:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
 #[tokio::test]
 async fn a_line_typed_mid_turn_is_shown_until_the_model_is_handed_it() {
     // The gap this panel exists for, and it is only visible from the outside:
@@ -5223,6 +5282,22 @@ async fn a_refused_submit_hands_the_words_back_and_says_why_in_words() {
         "而不是一个枚举的名字:\n{screen}"
     );
     task.abort();
+}
+
+/// 对话区里现在写着什么 —— 不含输入框与各种面板。
+fn transcript(s: &Session) -> String {
+    s.term
+        .last()
+        .expect("a frame")
+        .part("stream")
+        .map(|part| {
+            part.lines
+                .iter()
+                .map(|l| l.plain())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
 }
 
 /// 输入框里现在写着什么。

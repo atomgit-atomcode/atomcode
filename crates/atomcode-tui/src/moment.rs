@@ -496,6 +496,12 @@ pub struct Moment {
     /// appends on submit and clears on `AgentEvent::Steered`; see
     /// `modules::steering`.
     pub steering: String,
+    /// 排队的话被 `Ctrl+B` 收走了,等取消落地后重发。
+    ///
+    /// 取消是一次往返,没等到终态就提交会被答 `Busy` —— 那正好是把话
+    /// 丢掉的另一种写法。所以它们先在这里放一下;而放在 `Moment` 而不是
+    /// 一个局部变量里,是因为收走的那一刻和重发的那一刻隔着一次事件往返。
+    pub staged_steers: Option<String>,
     /// The question on screen, if one is waiting, and which of its answers is
     /// pointed at.
     ///

@@ -998,6 +998,6 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("没有叫「{wanted}」的代理模式：可选 follow_system、default_proxy、no_proxy。").into()
         }
         Msg::ProxySaveFailed { error } => format!("代理设置没写进配置文件：{error}").into(),
-        Msg::SteeringQueued => "将在下一次工具调用后提交的消息（按 Esc 中断并立即发送）".into(),
+        Msg::SteeringQueued => "将在下一次工具调用后提交的消息（按 Ctrl+B 中断并立即发送）".into(),
     }
 }
