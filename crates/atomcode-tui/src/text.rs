@@ -353,6 +353,59 @@ pub fn collapse_home_with(path: &str, home: Option<&std::path::Path>) -> String 
     }
 }
 
+/// Every path inside a *command line* folded to `~`, for the row that shows a
+/// shell call.
+///
+/// A command is not a path, so [`collapse_home`] cannot be pointed at it: the
+/// home directory turns up in the middle, several times, next to quotes and
+/// `=`. The rule is the shell's own — a `~` only expands at the start of a
+/// word — so only a run that begins at a word boundary and ends at one is
+/// folded.
+///
+/// `:` and `,` are deliberately **not** boundaries. A path inside a
+/// `PATH`-style colon list, or the remote half of `host:/path`, is not
+/// shell-expanded there, so writing `~` would be a line that no longer means
+/// what it says.
+///
+/// Cosmetic only: what ran, and what a copy of the transcript carries, keep the
+/// real path.
+pub fn collapse_home_in_command(command: &str) -> String {
+    collapse_home_in_command_with(command, home_dir().as_deref())
+}
+
+/// The implementation, with home explicit. See [`collapse_home_in_command`].
+pub fn collapse_home_in_command_with(command: &str, home: Option<&std::path::Path>) -> String {
+    let Some(home) = home else {
+        return command.to_string();
+    };
+    let home = home.to_string_lossy();
+    let home = home.trim_end_matches(std::path::MAIN_SEPARATOR);
+    if home.is_empty() || !command.contains(home) {
+        return command.to_string();
+    }
+    let boundary = |c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '=' | '(');
+    let mut out = String::with_capacity(command.len());
+    let mut i = 0;
+    while i < command.len() {
+        let rest = &command[i..];
+        if let Some(after) = rest.strip_prefix(home) {
+            let opens = i == 0 || command[..i].chars().next_back().is_none_or(boundary);
+            let closes = after.is_empty()
+                || after.starts_with(std::path::MAIN_SEPARATOR)
+                || after.chars().next().is_none_or(boundary);
+            if opens && closes {
+                out.push('~');
+                i += home.len();
+                continue;
+            }
+        }
+        let ch = rest.chars().next().expect("not at the end");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 /// `~` and `~/…` written back out as the home directory — the inverse of
 /// [`collapse_home`], for a path a person **typed**.
 ///
@@ -671,6 +724,40 @@ mod tests {
         assert_eq!(collapse_home_with("/home/me", Some(home)), "~");
         // A home we could not determine is not a home we guess at.
         assert_eq!(collapse_home_with("/home/me/a", None), "/home/me/a");
+    }
+
+    /// A command line folds every path in it, and only where a `~` would have
+    /// meant the same thing.
+    ///
+    /// A shell row is one line wide, and on a real machine the absolute home
+    /// path eats most of it before the command has said anything. But a `~` is
+    /// only the home directory **at the start of a word** — written anywhere
+    /// else it is a literal tilde, so folding there would print a line that no
+    /// longer means what it says. `:` and `,` are the two that look like
+    /// boundaries and are not: neither a `PATH` list nor `host:/path` expands
+    /// a `~` after them.
+    #[test]
+    fn a_command_folds_the_home_paths_a_shell_would_have_expanded() {
+        let home = std::path::Path::new("/home/me");
+        let fold = |cmd: &str| collapse_home_in_command_with(cmd, Some(home));
+        assert_eq!(fold("ls /home/me/proj"), "ls ~/proj");
+        assert_eq!(fold("cd /home/me"), "cd ~");
+        // Several, and inside quotes, which is a word boundary.
+        assert_eq!(fold("diff \"/home/me/a\" /home/me/b"), "diff \"~/a\" ~/b");
+        assert_eq!(fold("X=/home/me/bin cmd"), "X=~/bin cmd");
+        // Not a boundary: the shell would not have expanded these either.
+        assert_eq!(
+            fold("PATH=/usr/bin:/home/me/bin"),
+            "PATH=/usr/bin:/home/me/bin"
+        );
+        assert_eq!(fold("scp host:/home/me/a ."), "scp host:/home/me/a .");
+        // A longer directory that merely starts the same is a different one.
+        assert_eq!(fold("ls /home/melon"), "ls /home/melon");
+        // Nothing to fold against leaves the line exactly as it is.
+        assert_eq!(
+            collapse_home_in_command_with("ls /home/me", None),
+            "ls /home/me"
+        );
     }
 
     #[test]

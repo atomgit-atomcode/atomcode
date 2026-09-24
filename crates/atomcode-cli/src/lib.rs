@@ -449,6 +449,9 @@ pub mod tui_front {
             Some(crate::host::Identity {
                 who: auth.user.name.unwrap_or(auth.user.username),
                 detail: auth.user.email,
+                // Which file to delete when the answer above is the wrong
+                // account, and which one was copied to the other machine.
+                stored_at: Some(atomcode_auth::auth_file_path().display().to_string()),
             })
         }
 

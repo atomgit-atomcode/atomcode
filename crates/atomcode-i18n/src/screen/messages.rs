@@ -653,6 +653,9 @@ pub enum Msg<'a> {
         took: &'a str,
     },
     WhoAmIUnnamed,
+    WhoAmIStoredAt {
+        path: &'a str,
+    },
     WhoAmINobody,
     ThinkingNow {
         value: &'a str,

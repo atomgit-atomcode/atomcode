@@ -2976,6 +2976,7 @@ impl Tui {
                     signed_in: true,
                     who: Some(who),
                     detail,
+                    ..
                 }) => Some((who, detail)),
                 _ => None,
             };

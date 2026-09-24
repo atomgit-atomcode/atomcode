@@ -389,6 +389,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StatusWhereLine { where_ } => format!("在 {where_}").into(),
         Msg::StatusAutonomyLine { what, round, took } => format!("在自己干:{what} · 第 {round} 轮 · 已跑 {took}").into(),
         Msg::WhoAmIUnnamed => "登录着,但宿主没说是谁".into(),
+        Msg::WhoAmIStoredAt { path } => format!("凭据存在 {path}").into(),
         Msg::WhoAmINobody => "没有人登录;这份配置用的是自带的凭据".into(),
         Msg::ThinkingNow { value } => format!("思考:{value};改用 /think on 或 /think off").into(),
         Msg::NoThinkingSwitch => "这个宿主没有思考开关".into(),

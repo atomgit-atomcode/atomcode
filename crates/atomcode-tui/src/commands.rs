@@ -1648,13 +1648,12 @@ impl CommandSet for SessionCommands {
                         signed_in: true,
                         who,
                         detail,
-                    }) => {
-                        let who = who.unwrap_or_else(|| t(Msg::WhoAmIUnnamed).into_owned());
-                        Outcome::Said(match detail {
-                            Some(detail) => format!("{who} · {detail}"),
-                            None => who,
-                        })
-                    }
+                        stored_at,
+                    }) => Outcome::Said(whoami_lines(
+                        who.unwrap_or_else(|| t(Msg::WhoAmIUnnamed).into_owned()),
+                        detail,
+                        stored_at,
+                    )),
                     Ok(HostReply::Identity { .. }) => {
                         Outcome::Said(t(Msg::WhoAmINobody).into_owned())
                     }
@@ -2102,6 +2101,28 @@ fn code_blocks(text: &str) -> Vec<String> {
 /// The conversation as markdown: who said what, in order, with tool traffic
 /// left out. What is saved is read somewhere else — an editor, a review, an
 /// issue — so it is the conversation, not this screen's rendering of it.
+/// What `/whoami` says: the name, then what is worth showing beside it, then
+/// where the thing that says so is kept.
+///
+/// The path is its own line and the last one. The question it answers comes
+/// **after** the answer above reads wrong — which file do I delete, which one
+/// did I copy to the other machine — so it must not push the name off the
+/// first line. A host that signs in some other way sends nothing and this says
+/// nothing; the path is folded to `~` like every other path on this screen.
+fn whoami_lines(who: String, detail: Option<String>, stored_at: Option<String>) -> String {
+    let mut said = match detail {
+        Some(detail) => format!("{who} · {detail}"),
+        None => who,
+    };
+    if let Some(path) = stored_at.filter(|path| !path.trim().is_empty()) {
+        said.push('\n');
+        said.push_str(&t(Msg::WhoAmIStoredAt {
+            path: &crate::text::collapse_home(&path),
+        }));
+    }
+    said
+}
+
 fn as_markdown(events: &[atomcode_kernel::session::LoggedEvent]) -> String {
     let mut out = String::new();
     for message in derive_messages(events) {
@@ -2977,11 +2998,13 @@ mod tests {
                 signed_in: true,
                 who: Some("lichao".into()),
                 detail: Some("li@example.com".into()),
+                stored_at: None,
             }),
             Ok(HostReply::Identity {
                 signed_in: false,
                 who: None,
                 detail: None,
+                stored_at: None,
             }),
             Ok(HostReply::Settings {
                 settings: vec![atomcode_host_api::Setting {
@@ -3321,6 +3344,59 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(fresh.exists());
+    }
+
+    /// `/whoami` also says where the credential that says so is kept.
+    ///
+    /// The question this answers is the one asked *after* the name comes back
+    /// wrong — which file do I delete, which one did I copy to the other
+    /// machine. So it is its own line and the last one: pushed onto the first,
+    /// it would cost the name its place for a path nobody reads until
+    /// something is broken.
+    ///
+    /// A host that signs in some other way sends nothing, and then this says
+    /// nothing rather than a line with an empty path in it. The end-to-end
+    /// half is the `stored_at` in the reply reaching the words at all — the
+    /// contract grew a field and a screen that ignored it would look exactly
+    /// like one that did not.
+    #[tokio::test]
+    async fn whoami_says_where_the_credential_is_kept() {
+        let host = Arc::new(Recording::default());
+        host.replies.lock().unwrap().extend([
+            Ok(HostReply::Identity {
+                signed_in: true,
+                who: Some("李超".into()),
+                detail: Some("me@example.com".into()),
+                stored_at: Some("/tmp/nowhere/auth.json".into()),
+            }),
+            Ok(HostReply::Identity {
+                signed_in: true,
+                who: Some("李超".into()),
+                detail: None,
+                stored_at: None,
+            }),
+        ]);
+        let (app, _client, all) = following(&host);
+
+        match all.dispatch("/whoami", &app.context()).await {
+            Outcome::Said(said) => {
+                let (first, rest) = said.split_once('\n').expect("two lines: {said}");
+                assert!(
+                    first.contains("李超") && first.contains("me@example.com"),
+                    "who they are comes first: {said}"
+                );
+                assert!(
+                    rest.contains("/tmp/nowhere/auth.json"),
+                    "and where it is kept is its own line: {said}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        // A host with nothing to say about a file says nothing.
+        match all.dispatch("/whoami", &app.context()).await {
+            Outcome::Said(said) => assert_eq!(said, "李超"),
+            other => panic!("{other:?}"),
+        }
     }
 
     /// `/copy msg` takes the whole reply, not just the code in it.

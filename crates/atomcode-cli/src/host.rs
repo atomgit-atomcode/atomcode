@@ -125,6 +125,8 @@ pub struct Identity {
     pub who: String,
     /// Anything worth showing beside it — an email, an organisation.
     pub detail: Option<String>,
+    /// Where the credential that says so is kept. A path, never its contents.
+    pub stored_at: Option<String>,
 }
 
 /// Connect a front end to a runtime started with `front_end` in its prepare
@@ -2110,15 +2112,21 @@ impl HostControl for RuntimeControl {
                     .clone()
                     .and_then(|source| source.identity());
                 Ok(match identity {
-                    Some(Identity { who, detail }) => HostReply::Identity {
+                    Some(Identity {
+                        who,
+                        detail,
+                        stored_at,
+                    }) => HostReply::Identity {
                         signed_in: true,
                         who: Some(who),
                         detail,
+                        stored_at,
                     },
                     None => HostReply::Identity {
                         signed_in: false,
                         who: None,
                         detail: None,
+                        stored_at: None,
                     },
                 })
             }

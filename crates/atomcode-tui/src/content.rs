@@ -1263,6 +1263,16 @@ pub fn display_tool_name(name: &str) -> String {
 }
 
 pub fn subject_of(tool: &str, args: &str) -> String {
+    subject_of_within(tool, args, crate::text::home_dir().as_deref())
+}
+
+/// The implementation, with the home directory passed in. See [`subject_of`].
+///
+/// Split so a criterion can judge *which tools get their paths folded* without
+/// owning this machine's `HOME` — and, more to the point, so that branch is
+/// judged at all: pinning the folder alone leaves "a shell row asks for it and
+/// a file row does not" resting on nothing.
+pub fn subject_of_within(tool: &str, args: &str, home: Option<&std::path::Path>) -> String {
     let look = look(tool);
     let parsed: Option<serde_json::Value> = serde_json::from_str(args).ok();
     if let Some(obj) = parsed.as_ref().and_then(|v| v.as_object()) {
@@ -1274,6 +1284,13 @@ pub fn subject_of(tool: &str, args: &str) -> String {
                 };
                 let text = text.trim();
                 if !text.is_empty() {
+                    // A shell call is shown with its home paths folded to `~`.
+                    // The row is one line wide and an absolute home path eats
+                    // most of it — on this machine, `/Users/someone/` before
+                    // the command has said anything. What ran is untouched.
+                    if look.verb == Some(Verb::Shell) {
+                        return crate::text::collapse_home_in_command_with(text, home);
+                    }
                     return text.to_string();
                 }
             }
@@ -3607,6 +3624,28 @@ mod tests {
             !subject_of(&unknown.name, &unknown.args).is_empty(),
             "an unknown tool still gets a subject, or the table would have to \
              track the catalog"
+        );
+    }
+
+    /// The shell row folds its home paths; the file row leaves its path alone.
+    ///
+    /// The row is one line, and on a real machine the absolute home path eats
+    /// most of it before the command has said anything — `$ /Users/someone/…`
+    /// with the verb still to come. But it is the *shell* row: a `~` means the
+    /// home directory because a shell expands it there, and a file path shown
+    /// in a tool card is not a shell word. So the branch is part of the claim,
+    /// and it is the half that rests on nothing when only the folder is pinned.
+    #[test]
+    fn a_shell_row_folds_its_home_paths_and_a_file_row_does_not() {
+        let home = std::path::Path::new("/home/me");
+        assert_eq!(
+            subject_of_within("bash", r#"{"command":"ls /home/me/proj"}"#, Some(home)),
+            "ls ~/proj"
+        );
+        assert_eq!(
+            subject_of_within("read_file", r#"{"file_path":"/home/me/a.rs"}"#, Some(home)),
+            "/home/me/a.rs",
+            "a path in a file card is not a shell word"
         );
     }
 

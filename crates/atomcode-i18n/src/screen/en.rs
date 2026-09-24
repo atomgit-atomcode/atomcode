@@ -419,6 +419,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StatusWhereLine { where_ } => format!("in {where_}").into(),
         Msg::StatusAutonomyLine { what, round, took } => format!("running on its own: {what} · round {round} · {took} so far").into(),
         Msg::WhoAmIUnnamed => "signed in, but the host did not say as whom".into(),
+        Msg::WhoAmIStoredAt { path } => format!("kept in {path}").into(),
         Msg::WhoAmINobody => "nobody is signed in; this configuration uses its own credentials".into(),
         Msg::ThinkingNow { value } => format!("thinking: {value}; /think on or /think off changes it").into(),
         Msg::NoThinkingSwitch => "this host has no thinking switch".into(),

@@ -470,6 +470,15 @@ pub enum HostReply {
         /// Anything worth showing beside the name — an email, an organisation.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
+        /// Where the host keeps the thing that says so, if it keeps it
+        /// anywhere.
+        ///
+        /// A path, never its contents. The question it answers is the one
+        /// asked after "who am I" comes back wrong — which file do I delete,
+        /// which one did I copy to the other machine — and a host that signs
+        /// in some other way leaves it out rather than inventing one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stored_at: Option<String>,
     },
     /// The answer to [`HostCommand::Readiness`].
     Readiness {
@@ -1518,6 +1527,7 @@ mod tests {
             },
             HostReply::Identity {
                 signed_in: true,
+                stored_at: Some("~/.atomcode/auth.json".into()),
                 who: Some("lichao".into()),
                 detail: Some("atomgit".into()),
             },
