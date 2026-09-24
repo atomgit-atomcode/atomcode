@@ -65,7 +65,7 @@ use atomcode_harness::seams::{
     AgentsSvc, SessionDefaults, SessionDefaultsSvc, SessionSvc, SystemPromptSvc, TurnOutcome,
 };
 use atomcode_harness::session::{
-    derive_messages_with_meta, InjectionOrigin, LoggedEvent, SessionEvent,
+    derive_messages_with_meta, InjectionOrigin, SessionEvent, SessionLog,
 };
 use atomcode_kernel::agent::CommandDescription;
 use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
@@ -239,7 +239,14 @@ impl Plugin for SessionNativePlugin {
 #[derive(Default)]
 pub struct HostHooks {
     hooks: RwLock<BTreeMap<String, Arc<dyn LifecycleHooks>>>,
+    /// The log's projection with its stats, for the request being made — see
+    /// [`HostHooks::logged_view`].
+    logged_view: Mutex<Option<(LoggedViewKey, Arc<Vec<Message>>)>>,
 }
+
+/// Which request a [`HostHooks::logged_view`] was made for: the session, how
+/// far its log had got, and the turn and round asking.
+type LoggedViewKey = (String, usize, u64, u32);
 
 impl HostHooks {
     pub fn new() -> Arc<Self> {
@@ -261,6 +268,27 @@ impl HostHooks {
             .keys()
             .cloned()
             .collect()
+    }
+
+    /// The log's projection with each assistant message's stats, made once per
+    /// request and shared by every hook's bridge.
+    ///
+    /// Each hook has a bridge of its own, and each would otherwise copy the
+    /// whole log and project it again on every request — a cost that grows with
+    /// the session and is paid once per mounted hook. A view that is stale by
+    /// some path the key does not see costs nothing worse than the stats:
+    /// [`with_logged_meta`] only lends them to messages that line up.
+    fn logged_view(&self, log: &SessionLog, turn: u64, round: u32) -> Arc<Vec<Message>> {
+        let key = (log.id().to_string(), log.len(), turn, round);
+        let mut cached = self.logged_view.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, view)) = cached.as_ref() {
+            if *at == key {
+                return view.clone();
+            }
+        }
+        let view = Arc::new(derive_messages_with_meta(&log.events()));
+        *cached = Some((key, view.clone()));
+        view
     }
 
     fn get(&self, name: &str) -> Option<Arc<dyn LifecycleHooks>> {
@@ -324,6 +352,7 @@ impl Plugin for KernelHooksPlugin {
         let bridge = Arc::new(Bridge {
             ctx: ctx.clone(),
             hook,
+            host: self.0.clone(),
             session_started: AtomicBool::new(false),
             turn_started: Mutex::new(None),
         });
@@ -337,6 +366,8 @@ impl Plugin for KernelHooksPlugin {
 struct Bridge {
     ctx: Context,
     hook: Arc<dyn LifecycleHooks>,
+    /// The table the hook came from, which keeps the request's log view.
+    host: Arc<HostHooks>,
     session_started: AtomicBool,
     /// The turn `turn_start` already ran for. A retry re-runs the request chain
     /// below it; the turn still started once.
@@ -434,9 +465,8 @@ impl Waterfall<PreStep> for Bridge {
 /// The request is the system prompt, then the log's projection, then whatever
 /// tails rode along; the stats go on the projection's span only when it lines
 /// up message for message. When it does not, the messages go as they are.
-fn with_logged_meta(messages: &[Message], events: &[LoggedEvent]) -> Vec<Message> {
+fn with_logged_meta(messages: &[Message], logged: &[Message]) -> Vec<Message> {
     let mut out = messages.to_vec();
-    let logged = derive_messages_with_meta(events);
     let start = usize::from(
         out.first()
             .is_some_and(|m| m.role == Role::System && !m.synthetic),
@@ -444,13 +474,13 @@ fn with_logged_meta(messages: &[Message], events: &[LoggedEvent]) -> Vec<Message
     let Some(span) = out.get_mut(start..start + logged.len()) else {
         return out;
     };
-    let lines_up = span.iter().zip(&logged).all(|(sent, kept)| {
+    let lines_up = span.iter().zip(logged).all(|(sent, kept)| {
         sent.role == kept.role && sent.text == kept.text && sent.tool_calls == kept.tool_calls
     });
     if lines_up {
         for (sent, kept) in span.iter_mut().zip(logged) {
             if sent.meta.is_none() {
-                sent.meta = kept.meta;
+                sent.meta = kept.meta.clone();
             }
         }
     }
@@ -492,7 +522,8 @@ impl Waterfall<AgentRequest> for Bridge {
         // same way the harness's own tails do: past the log check, never logged.
         // A hook that rewrote the history instead would be putting words in
         // front of the model that no log can explain, so its edits are dropped.
-        let mut proposed = with_logged_meta(&req.messages, &agent.session().events());
+        let logged = self.host.logged_view(&agent.session(), req.turn, req.round);
+        let mut proposed = with_logged_meta(&req.messages, &logged);
         let handed = proposed.clone();
         let before = proposed.len();
         self.hook.pre_request(&mut proposed, &ctx).await;
