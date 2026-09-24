@@ -613,6 +613,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ScreenNotConnectedProviders => "屏幕还没接上,改不了 provider".into(),
         Msg::NoProviderPort => "这个屏幕没有接 provider:启动器没有提供 `tui-providers`".into(),
         Msg::ProviderEdited { id } => format!("改好了 {id}").into(),
+        Msg::ProviderProbePassed => "✓ 连通检测通过".into(),
+        Msg::ProviderProbeFailed => "✗ 连通检测没通过 —— 原因和改法在对话里".into(),
         Msg::ProviderAddedAddModel { id } => format!("加好了 {id},给它添一个模型").into(),
         Msg::ProviderAdded { id } => format!("加好了 {id}").into(),
         Msg::ProviderDeletedWithModels { id } => format!("删了 {id},连同它下面的模型").into(),

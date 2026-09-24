@@ -1487,7 +1487,25 @@ pub trait Providers: Send + Sync {
     fn edit_model(&self, id: &str, draft: &ModelDraft) -> Result<(), String>;
 
     fn delete_model(&self, id: &str) -> Result<(), String>;
+
+    /// Check that an account just saved answers — and, when a model was the
+    /// thing saved, that the model exists — so a wrong base_url is caught where
+    /// it was typed rather than as a failed turn later. `selection` is the
+    /// model's selection id when a model was saved.
+    ///
+    /// The answer is what to tell the person, and whether it is fine. It is a
+    /// future because it is a network round trip; the screen runs it off the
+    /// frame and says the answer when it lands. `None` when there is nothing
+    /// this port checks (a protocol it does not probe, no endpoint yet) — the
+    /// default, so a port need not know probing exists.
+    fn probe(&self, _account: &str, _selection: Option<&str>) -> Option<ProbeFuture> {
+        None
+    }
 }
+
+/// See [`Providers::probe`]: what to say, and whether all is well.
+pub type ProbeFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = (String, bool)> + Send + 'static>>;
 
 #[cfg(test)]
 mod tests {

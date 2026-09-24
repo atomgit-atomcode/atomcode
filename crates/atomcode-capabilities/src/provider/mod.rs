@@ -19,6 +19,7 @@ mod anthropic;
 mod atomgit_sign;
 mod ollama;
 mod openai_compat;
+pub mod probe;
 mod reasoning;
 mod responses;
 mod retry;

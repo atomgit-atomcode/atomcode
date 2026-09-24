@@ -27,13 +27,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use atomcode_capabilities::provider::probe::{probe_chat_endpoint, ProbeTarget};
 use atomcode_config::config::{provider_preset, Config};
 use atomcode_config::provider_edit::{self, AccountPatch, KeyWrite, ModelPatch};
 use atomcode_plexus::{Context, Plugin};
 use atomcode_tui::module::{Modules, Mounted};
 use atomcode_tui::plugin::ModulesSvc;
 use atomcode_tui::providers::{
-    AccountDraft, AccountRow, ModelDraft, ModelRow, Protocol, Providers, ProvidersView,
+    AccountDraft, AccountRow, ModelDraft, ModelRow, ProbeFuture, Protocol, Providers, ProvidersView,
 };
 use serde_json::Value;
 
@@ -648,6 +649,54 @@ impl Providers for ConfigProviders {
         })?;
         self.clear_dangling_default()
     }
+
+    /// One request to the endpoint just saved (`atomcode_capabilities::provider::probe`),
+    /// resolved from the file the way a turn would resolve it: the model's own
+    /// settings when a model was saved (so its name is checked too), the
+    /// account's otherwise. Only the chat/completions wire is probed — the others
+    /// answer other paths — and never a CodingPlan account, which `/login` set up
+    /// and nobody typed.
+    fn probe(&self, account: &str, selection: Option<&str>) -> Option<ProbeFuture> {
+        let config = self.load();
+        if config.account_is_codingplan_managed(account) {
+            return None;
+        }
+        let (wire, target) = match selection {
+            Some(selection) => {
+                let resolved = config.resolve_model(Some(selection)).ok()?;
+                (
+                    resolved.provider_type.clone(),
+                    ProbeTarget {
+                        base_url: resolved.base_url.clone()?,
+                        api_key: resolved.api_key.clone(),
+                        model: Some(resolved.model.clone()),
+                        user_agent: resolved.user_agent.clone(),
+                        skip_tls_verify: resolved.skip_tls_verify,
+                    },
+                )
+            }
+            None => {
+                let endpoint = config.account_endpoint(account)?;
+                (
+                    endpoint.provider_type.clone(),
+                    ProbeTarget {
+                        base_url: endpoint.base_url.clone()?,
+                        api_key: endpoint.api_key.clone(),
+                        model: None,
+                        user_agent: endpoint.user_agent.clone(),
+                        skip_tls_verify: endpoint.skip_tls_verify,
+                    },
+                )
+            }
+        };
+        if !matches!(wire.as_str(), "openai" | "openai-compat" | "openai_compat") {
+            return None;
+        }
+        Some(Box::pin(async move {
+            let verdict = probe_chat_endpoint(&target).await;
+            (verdict.describe(), verdict.is_ok())
+        }))
+    }
 }
 
 impl ConfigProviders {
@@ -773,6 +822,85 @@ context_window = 64000
         // And the legacy flat entry is still reachable — as what it is, one
         // selectable model rather than an account with models under it.
         assert!(models.contains(&"deepseek"), "{models:?}");
+    }
+
+    /// A gateway that serves its API under `/v1` and its web page everywhere
+    /// else, the way One API / New API do.
+    async fn gateway_under_v1() -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16 * 1024];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buf[..n]);
+                    let (status, kind, body) = if head.starts_with("POST /v1/chat/completions") {
+                        (
+                            "400 Bad Request",
+                            "application/json",
+                            r#"{"error":{"message":"messages is empty"}}"#,
+                        )
+                    } else {
+                        ("200 OK", "text/html", "<!doctype html><html></html>")
+                    };
+                    let reply = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// The reported mistake, caught where it is made: an account saved with a
+    /// base_url missing its `/v1`. The check says it does not answer, and names
+    /// the base_url that does.
+    #[tokio::test]
+    async fn an_account_saved_without_its_v1_is_told_so_and_which_url_answers() {
+        let addr = gateway_under_v1().await;
+        let (port, path) = port("probe-v1");
+        std::fs::write(
+            &path,
+            format!(
+                "[provider_accounts.gw]\nprovider = \"openai-compatible\"\nbase_url = \"http://{addr}\"\napi_key = \"sk-gw\"\n"
+            ),
+        )
+        .unwrap();
+        let (said, fine) = port
+            .probe("gw", None)
+            .expect("an OpenAI-compatible account is checked")
+            .await;
+        assert!(!fine, "{said}");
+        assert!(said.contains(&format!("http://{addr}/v1")), "{said}");
+
+        // Fixed, the same check says it answers.
+        std::fs::write(
+            &path,
+            format!(
+                "[provider_accounts.gw]\nprovider = \"openai-compatible\"\nbase_url = \"http://{addr}/v1\"\napi_key = \"sk-gw\"\n"
+            ),
+        )
+        .unwrap();
+        let (said, fine) = port.probe("gw", None).unwrap().await;
+        assert!(fine, "{said}");
+    }
+
+    /// Only the chat/completions wire is checked: an Anthropic account answers
+    /// another path, and a probe of it would report a working account as broken.
+    #[test]
+    fn an_account_on_another_wire_is_not_probed() {
+        let (port, path) = port("probe-anthropic");
+        std::fs::write(
+            &path,
+            "[provider_accounts.cl]\nprovider = \"anthropic-compatible\"\nbase_url = \"https://example.com\"\napi_key = \"sk\"\n",
+        )
+        .unwrap();
+        assert!(port.probe("cl", None).is_none());
+        assert!(port.probe("nobody", None).is_none());
     }
 
     /// Nothing that crosses the seam carries a key, however the row is printed.

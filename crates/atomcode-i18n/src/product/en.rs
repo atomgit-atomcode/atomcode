@@ -31,6 +31,35 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             )
             .into()
         }
+        Msg::ProbeReachable { url } => {
+            format!("✓ Connection check: {url} answers as an OpenAI-compatible endpoint.").into()
+        }
+        Msg::ProbeKeyRejected { url, status } => format!(
+            "⚠ Connection check: the address {url} is right, but the API key was refused (HTTP {status}) — check the key."
+        )
+        .into(),
+        Msg::ProbeModelMissing { url, model } => format!(
+            "⚠ Connection check: the address {url} and the key are fine, but the server says the model \"{model}\" does not exist — check the model name."
+        )
+        .into(),
+        Msg::ProbeWrongPath { url, found, fix } => match fix {
+            Some(fix) => format!(
+                "✗ Connection check: {url} is not an OpenAI-compatible endpoint (it returned {found}). Change the base_url to {fix} — that one answered."
+            )
+            .into(),
+            None => format!(
+                "✗ Connection check: {url} is not an OpenAI-compatible endpoint (it returned {found}). The base_url may be missing or have the wrong version path (such as /v1 or /v4); check the provider's documentation."
+            )
+            .into(),
+        },
+        Msg::ProbeUnreachable { url, reason } => format!(
+            "✗ Connection check: could not reach {url} ({reason}) — check the address, the network or the proxy (/proxy)."
+        )
+        .into(),
+        Msg::ProbeUnexpected { url, status, detail } => format!(
+            "⚠ Connection check: {url} returned HTTP {status}: {detail}. Cannot tell yet whether the setup is right; try sending a message."
+        )
+        .into(),
         Msg::ChatNotAnEventStream { url, content_type, head, suggestion } => {
             let try_it = suggestion.map(|s| format!(" — try {s}")).unwrap_or_default();
             format!(

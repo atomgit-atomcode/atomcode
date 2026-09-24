@@ -745,6 +745,11 @@ pub const HISTORY_MOST: u32 = 200;
 /// a reason never to redraw.
 const COALESCE_LIMIT: usize = 256;
 
+/// How long the tip row holds "the connection check failed". Longer than an
+/// ordinary notice: it arrives seconds after the save, on its own, and is the one
+/// line that says a just-saved account will not work.
+const PROBE_NOTICE_MS: u64 = 10_000;
+
 /// What woke the loop up.
 enum Wake {
     Fact,
@@ -2317,6 +2322,9 @@ impl Tui {
         let Some(port) = ctx.service::<crate::plugin::ProvidersSvc>() else {
             return Err(t(Msg::NoProviderPort).into_owned());
         };
+        // What to check once the write has landed: the account, and the model
+        // when a model was saved (see `Providers::probe`).
+        let mut check: Option<(String, Option<String>)> = None;
         let said = match step {
             Step::Use { .. } | Step::Stay | Step::Close => None,
             Step::SaveAccount {
@@ -2324,10 +2332,12 @@ impl Tui {
                 draft,
             } => {
                 port.edit_account(&id, &draft)?;
+                check = Some((id.clone(), None));
                 Some(t(Msg::ProviderEdited { id: &id }).into_owned())
             }
             Step::SaveAccount { id: None, draft } => {
                 let id = port.add_account(&draft)?;
+                check = Some((id.clone(), None));
                 // Straight into its model list: an account with no model under
                 // it cannot be talked to, so "what now" is answered by showing
                 // the one thing left to do.
@@ -2340,10 +2350,12 @@ impl Tui {
                 draft,
             } => {
                 port.edit_model(&id, &draft)?;
+                check = Some((draft.account.clone(), Some(id.clone())));
                 Some(t(Msg::ProviderEdited { id: &id }).into_owned())
             }
             Step::SaveModel { id: None, draft } => {
                 let id = port.add_model(&draft)?;
+                check = Some((draft.account.clone(), Some(id.clone())));
                 Some(t(Msg::ProviderAdded { id: &id }).into_owned())
             }
             Step::DeleteAccount { id } => {
@@ -2356,7 +2368,44 @@ impl Tui {
             }
         };
         self.reload_after_provider_change();
+        if let Some((account, selection)) = check {
+            if let Some(probe) = port.probe(&account, selection.as_deref()) {
+                self.say_when_probed(probe);
+            }
+        }
         Ok(said)
+    }
+
+    /// Run a saved account's check off the frame, and say what it found.
+    ///
+    /// Said in two places, because the providers panel is up when it lands and
+    /// covers the conversation. The tip row — above the panel, where the person
+    /// is looking — says at once whether the account answered. When it did not,
+    /// the reason and the base_url that does answer go into the conversation
+    /// (`Host::said`), where they stay: the tip row holds one line and fades, and
+    /// a person who saved a base_url missing its `/v1` has to be able to read
+    /// which one to use whenever they look, rather than meet it later as a
+    /// failed turn that never mentions the base_url. A pass adds nothing to the
+    /// conversation — every save would otherwise leave a line behind.
+    fn say_when_probed(&self, probe: crate::providers::ProbeFuture) {
+        let host = self.host.clone();
+        let keys = self.wake.lock().expect("wake poisoned").clone();
+        tokio::spawn(async move {
+            let (said, fine) = probe.await;
+            if fine {
+                host.say(t(Msg::ProviderProbePassed).into_owned(), false);
+            } else {
+                host.said(said, true);
+                host.say_for(
+                    t(Msg::ProviderProbeFailed).into_owned(),
+                    true,
+                    PROBE_NOTICE_MS,
+                );
+            }
+            if let Some(keys) = keys {
+                let _ = keys.send(Wake::Fact);
+            }
+        });
     }
 
     /// Hand the runtime a reload after a provider changed.
@@ -7494,6 +7543,202 @@ mod paste_burst_tests {
                 Input::Paste("a\nb".into()),
                 Input::Key(KeyPress::plain(Key::Esc)),
             ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod provider_probe_tests {
+    use super::*;
+    use crate::providers::{AccountDraft, ModelDraft, ProbeFuture, Providers, ProvidersView, Step};
+    use atomcode_plexus::{App, ConfigTree, PluginRegistry};
+
+    /// A port that takes every write and answers every check with what it was
+    /// asked about — so the test can see which account, and which model, the
+    /// screen asked the port to check.
+    struct Checked;
+
+    impl Providers for Checked {
+        fn rows(&self) -> ProvidersView {
+            ProvidersView::default()
+        }
+        fn add_account(&self, _draft: &AccountDraft) -> Result<String, String> {
+            Ok("gw".into())
+        }
+        fn edit_account(&self, _id: &str, _draft: &AccountDraft) -> Result<(), String> {
+            Ok(())
+        }
+        fn delete_account(&self, _id: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn add_model(&self, _draft: &ModelDraft) -> Result<String, String> {
+            Ok("gw/m".into())
+        }
+        fn edit_model(&self, _id: &str, _draft: &ModelDraft) -> Result<(), String> {
+            Ok(())
+        }
+        fn delete_model(&self, _id: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn probe(&self, account: &str, selection: Option<&str>) -> Option<ProbeFuture> {
+            let said = format!("checked {account} {}", selection.unwrap_or("-"));
+            Some(Box::pin(async move { (said, false) }))
+        }
+    }
+
+    /// Like `Checked`, but every check passes.
+    struct Passes;
+
+    impl Providers for Passes {
+        fn rows(&self) -> ProvidersView {
+            Checked.rows()
+        }
+        fn add_account(&self, draft: &AccountDraft) -> Result<String, String> {
+            Checked.add_account(draft)
+        }
+        fn edit_account(&self, id: &str, draft: &AccountDraft) -> Result<(), String> {
+            Checked.edit_account(id, draft)
+        }
+        fn delete_account(&self, id: &str) -> Result<(), String> {
+            Checked.delete_account(id)
+        }
+        fn add_model(&self, draft: &ModelDraft) -> Result<String, String> {
+            Checked.add_model(draft)
+        }
+        fn edit_model(&self, id: &str, draft: &ModelDraft) -> Result<(), String> {
+            Checked.edit_model(id, draft)
+        }
+        fn delete_model(&self, id: &str) -> Result<(), String> {
+            Checked.delete_model(id)
+        }
+        fn probe(&self, _account: &str, _selection: Option<&str>) -> Option<ProbeFuture> {
+            Some(Box::pin(async { ("answered".to_string(), true) }))
+        }
+    }
+
+    fn screen() -> (Arc<Host>, Tui, mpsc::UnboundedReceiver<Wake>) {
+        screen_with(Arc::new(Checked))
+    }
+
+    fn screen_with(port: Arc<dyn Providers>) -> (Arc<Host>, Tui, mpsc::UnboundedReceiver<Wake>) {
+        let (host, tui) = assemble(Headless::new(100, 24));
+        let (wake, woken) = mpsc::unbounded_channel();
+        *tui.wake.lock().expect("wake poisoned") = Some(wake);
+        let app = App::new(PluginRegistry::new(), ConfigTree::default());
+        let _ = app.context().provide::<ProvidersSvc>(port);
+        *tui.ctx.lock().expect("ctx poisoned") = Some(app.context());
+        (host, tui, woken)
+    }
+
+    /// Everything the conversation holds, as text.
+    fn conversation(host: &Arc<Host>) -> String {
+        let stream = host.stream.read().expect("stream poisoned");
+        stream
+            .slots()
+            .iter()
+            .flat_map(|slot| {
+                slot.block()
+                    .content
+                    .lines(&crate::block::RenderCtx::bare(200))
+            })
+            .map(|line| line.plain())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    async fn checked(woken: &mut mpsc::UnboundedReceiver<Wake>) {
+        let woke = tokio::time::timeout(std::time::Duration::from_secs(5), woken.recv()).await;
+        assert!(
+            matches!(woke, Ok(Some(Wake::Fact))),
+            "the check landed and said so"
+        );
+    }
+
+    fn account() -> AccountDraft {
+        AccountDraft {
+            name: "gw".into(),
+            protocol: "openai-compatible".into(),
+            endpoint: "https://gw.example.com".into(),
+            key: Some("sk".into()),
+        }
+    }
+
+    /// The tip row: what the person sees over the providers panel.
+    fn tip(host: &Arc<Host>) -> Option<(String, bool)> {
+        let m = host.moment.read().expect("moment poisoned");
+        m.notice.as_ref().map(|n| (n.text.clone(), n.refused))
+    }
+
+    /// A failed check is said where the person is looking — the tip row over the
+    /// panel, which covers the conversation — and its reason lands in the
+    /// conversation, where it stays: the tip row holds one line and fades, and
+    /// would have been the only place a wrong base_url was named.
+    #[tokio::test]
+    async fn a_failed_check_is_flagged_over_the_panel_and_explained_in_the_conversation() {
+        let (host, tui, mut woken) = screen();
+        tui.apply_provider_step(Step::SaveAccount {
+            id: None,
+            draft: account(),
+        })
+        .expect("the write lands");
+        checked(&mut woken).await;
+        assert!(
+            conversation(&host).contains("checked gw -"),
+            "{}",
+            conversation(&host)
+        );
+        assert_eq!(
+            tip(&host),
+            Some((t(Msg::ProviderProbeFailed).into_owned(), true))
+        );
+    }
+
+    /// A check that passed says so over the panel and leaves the conversation
+    /// alone: every save would otherwise add a line to it.
+    #[tokio::test]
+    async fn a_passed_check_is_said_over_the_panel_only() {
+        let (host, tui, mut woken) = screen_with(Arc::new(Passes));
+        tui.apply_provider_step(Step::SaveAccount {
+            id: None,
+            draft: account(),
+        })
+        .expect("the write lands");
+        checked(&mut woken).await;
+        assert!(
+            !conversation(&host).contains("answered"),
+            "{}",
+            conversation(&host)
+        );
+        assert_eq!(
+            tip(&host),
+            Some((t(Msg::ProviderProbePassed).into_owned(), false))
+        );
+    }
+
+    /// A saved model is checked with the model named, so a wrong model name is
+    /// caught as well as a wrong address.
+    #[tokio::test]
+    async fn a_saved_model_is_checked_by_its_selection() {
+        let (host, tui, mut woken) = screen();
+        tui.apply_provider_step(Step::SaveModel {
+            id: None,
+            draft: ModelDraft {
+                account: "gw".into(),
+                model: "m".into(),
+                window: None,
+                vision: None,
+                effort: None,
+                levels: None,
+                default: false,
+                key: None,
+            },
+        })
+        .expect("the write lands");
+        checked(&mut woken).await;
+        assert!(
+            conversation(&host).contains("checked gw gw/m"),
+            "{}",
+            conversation(&host)
         );
     }
 }

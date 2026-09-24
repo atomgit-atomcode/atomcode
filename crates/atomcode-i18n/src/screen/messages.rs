@@ -1065,6 +1065,11 @@ pub enum Msg<'a> {
     ProviderEdited {
         id: &'a str,
     },
+    /// The tip row, when a saved account answered as it should.
+    ProviderProbePassed,
+    /// The tip row, when it did not: the reason, with the address to use, is in
+    /// the conversation — the tip row holds one line and fades.
+    ProviderProbeFailed,
     ProviderAddedAddModel {
         id: &'a str,
     },

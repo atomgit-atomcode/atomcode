@@ -843,7 +843,7 @@ pub(crate) fn display_endpoint(url: &str) -> String {
 /// The base_url with `/v1` added, when the request address carries no version
 /// segment (`v1`, `v4`, `v1beta` …) at all — the usual way a base_url is wrong.
 /// `None` when one is already there: guessing a second would only mislead.
-fn version_suggestion(url: &str) -> Option<String> {
+pub(crate) fn version_suggestion(url: &str) -> Option<String> {
     let shown = display_endpoint(url);
     let base = ["/chat/completions", "/responses"]
         .iter()
@@ -862,7 +862,7 @@ fn version_suggestion(url: &str) -> Option<String> {
 
 /// Whether a 404 is about the model rather than the address — OpenAI answers an
 /// unknown model name with 404 `model_not_found`, and the base_url is right then.
-fn names_a_missing_model(detail: &str, provider_code: Option<&str>) -> bool {
+pub(crate) fn names_a_missing_model(detail: &str, provider_code: Option<&str>) -> bool {
     if provider_code.is_some_and(|c| c.contains("model_not_found")) {
         return true;
     }
@@ -1616,7 +1616,7 @@ pub(crate) fn error_code(err: &serde_json::Value) -> Option<String> {
 
 /// Extract a code from either the standard nested `error` envelope or vendor-style
 /// top-level `{code,message}` responses.
-fn provider_error_code(envelope: &serde_json::Value) -> Option<String> {
+pub(crate) fn provider_error_code(envelope: &serde_json::Value) -> Option<String> {
     envelope
         .get("error")
         .and_then(error_code)

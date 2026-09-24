@@ -1109,6 +1109,34 @@ impl Config {
         Ok(())
     }
 
+    /// What it takes to reach an account's endpoint, resolved the way a request
+    /// resolves it: the preset's base URL when none is stored, the key with its
+    /// environment fallbacks. Covers a legacy `[providers.*]` entry by its id too.
+    /// `None` for an id this file does not have.
+    pub fn account_endpoint(&self, id: &str) -> Option<AccountEndpoint> {
+        if let Some(account) = self.provider_accounts.get(id) {
+            let preset = provider_preset::preset_or_compatible(&account.provider);
+            return Some(AccountEndpoint {
+                provider_type: preset.provider_type.wire().to_string(),
+                base_url: account
+                    .base_url
+                    .clone()
+                    .or_else(|| preset.default_base_url.map(str::to_string)),
+                api_key: resolve_account_api_key(account, preset),
+                user_agent: account.user_agent.clone(),
+                skip_tls_verify: account.skip_tls_verify,
+            });
+        }
+        let legacy = self.providers.get(id)?;
+        Some(AccountEndpoint {
+            provider_type: legacy.provider_type.clone(),
+            base_url: legacy.base_url.clone(),
+            api_key: legacy.resolved_api_key(),
+            user_agent: legacy.user_agent.clone(),
+            skip_tls_verify: legacy.skip_tls_verify,
+        })
+    }
+
     /// THE single provider/model resolution boundary (design §3.4, §10). Given a
     /// selection id (or `None` for the active [`Self::effective_model_selection`]),
     /// resolve the model profile, its account, the preset, environment API keys,
@@ -1282,6 +1310,27 @@ pub struct ReasoningFieldsMut<'a> {
     pub thinking_keep: &'a mut Option<String>,
     pub reasoning_history: &'a mut Option<String>,
     pub reasoning_effort: &'a mut Option<String>,
+}
+
+/// See [`Config::account_endpoint`]. `Debug` redacts the key.
+#[derive(Clone)]
+pub struct AccountEndpoint {
+    /// The wire type (`openai`, `responses`, `anthropic`, `ollama`).
+    pub provider_type: String,
+    pub base_url: Option<String>,
+    pub api_key: Option<String>,
+    pub user_agent: Option<String>,
+    pub skip_tls_verify: bool,
+}
+
+impl std::fmt::Debug for AccountEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccountEndpoint")
+            .field("provider_type", &self.provider_type)
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 /// Resolve an account's API key with environment fallbacks, mirroring
@@ -4775,6 +4824,45 @@ base_url = "https://b.invalid/v1"
                 .unwrap();
         assert!(!both.tools.todo.enabled);
         assert!(!both.tools.atomgit.enabled);
+    }
+
+    /// An account's endpoint resolves as a request would: a stored base_url and
+    /// key as given, the preset's base URL when none is stored, and a legacy
+    /// `[providers.*]` entry by its id.
+    #[test]
+    fn an_accounts_endpoint_resolves_like_a_request() {
+        let config: Config = toml::from_str(
+            r#"
+[provider_accounts.gw]
+provider = "openai-compatible"
+base_url = "https://gw.example.com"
+api_key = "sk-literal"
+
+[provider_accounts.ds]
+provider = "deepseek"
+api_key = "sk-ds"
+
+[providers.old]
+type = "openai"
+model = "m"
+base_url = "https://old.example.com/v1"
+api_key = "sk-old"
+"#,
+        )
+        .unwrap();
+        let gw = config.account_endpoint("gw").unwrap();
+        assert_eq!(gw.provider_type, "openai");
+        assert_eq!(gw.base_url.as_deref(), Some("https://gw.example.com"));
+        assert_eq!(gw.api_key.as_deref(), Some("sk-literal"));
+        let ds = config.account_endpoint("ds").unwrap();
+        assert!(
+            ds.base_url.is_some(),
+            "the preset's base URL fills in: {ds:?}"
+        );
+        let old = config.account_endpoint("old").unwrap();
+        assert_eq!(old.base_url.as_deref(), Some("https://old.example.com/v1"));
+        assert_eq!(old.api_key.as_deref(), Some("sk-old"));
+        assert!(config.account_endpoint("nobody").is_none());
     }
 
     /// `[tools.output] threshold_bytes` is read when present, absent when not —

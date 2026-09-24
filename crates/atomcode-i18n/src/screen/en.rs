@@ -658,6 +658,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ScreenNotConnectedProviders => "the screen is not connected; providers cannot be changed".into(),
         Msg::NoProviderPort => "this screen has no providers: the launcher provided no `tui-providers`".into(),
         Msg::ProviderEdited { id } => format!("{id} changed").into(),
+        Msg::ProviderProbePassed => "✓ Connection check passed".into(),
+        Msg::ProviderProbeFailed => {
+            "✗ Connection check failed — the reason and the fix are in the conversation".into()
+        }
         Msg::ProviderAddedAddModel { id } => format!("{id} added — now give it a model").into(),
         Msg::ProviderAdded { id } => format!("{id} added").into(),
         Msg::ProviderDeletedWithModels { id } => format!("{id} removed, and the models under it").into(),

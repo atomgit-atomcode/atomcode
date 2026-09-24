@@ -33,6 +33,33 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             )
             .into()
         }
+        Msg::ProbeReachable { url } => format!("✓ 连通检测：{url} 能按 OpenAI 兼容接口正常应答。").into(),
+        Msg::ProbeKeyRejected { url, status } => format!(
+            "⚠ 连通检测：地址 {url} 是对的，但 API key 被拒绝（HTTP {status}）——请检查 key。"
+        )
+        .into(),
+        Msg::ProbeModelMissing { url, model } => format!(
+            "⚠ 连通检测：地址 {url} 和 key 都没问题，但服务端说模型「{model}」不存在——请检查模型名。"
+        )
+        .into(),
+        Msg::ProbeWrongPath { url, found, fix } => match fix {
+            Some(fix) => format!(
+                "✗ 连通检测：{url} 不是 OpenAI 兼容接口（返回了 {found}）。把 base_url 改成 {fix} 就能连通（已实测）。"
+            )
+            .into(),
+            None => format!(
+                "✗ 连通检测：{url} 不是 OpenAI 兼容接口（返回了 {found}）。base_url 可能少了或写错了版本路径（如 /v1、/v4），请对照服务商文档检查。"
+            )
+            .into(),
+        },
+        Msg::ProbeUnreachable { url, reason } => format!(
+            "✗ 连通检测：连不上 {url}（{reason}）——请检查地址、网络或代理（/proxy）。"
+        )
+        .into(),
+        Msg::ProbeUnexpected { url, status, detail } => format!(
+            "⚠ 连通检测：{url} 返回 HTTP {status}：{detail}。暂时无法判断配置是否正确，可以直接试着发一条消息。"
+        )
+        .into(),
         Msg::ChatNotAnEventStream { url, content_type, head, suggestion } => {
             let try_it = suggestion.map(|s| format!("，可以试试 {s}")).unwrap_or_default();
             format!(

@@ -40,6 +40,32 @@ pub enum Msg<'a> {
         suggestion: Option<&'a str>,
         detail: &'a str,
     },
+    // ── provider probe (a saved account's endpoint, checked once) ──
+    ProbeReachable {
+        url: &'a str,
+    },
+    ProbeKeyRejected {
+        url: &'a str,
+        status: u16,
+    },
+    ProbeModelMissing {
+        url: &'a str,
+        model: &'a str,
+    },
+    ProbeWrongPath {
+        url: &'a str,
+        found: &'a str,
+        fix: Option<&'a str>,
+    },
+    ProbeUnreachable {
+        url: &'a str,
+        reason: &'a str,
+    },
+    ProbeUnexpected {
+        url: &'a str,
+        status: u16,
+        detail: &'a str,
+    },
     /// A streaming request came back with a body that holds no event stream at
     /// all — a gateway's web page, a JSON error — which used to decode as an
     /// empty reply and be retried as an upstream flake.

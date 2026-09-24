@@ -4110,9 +4110,16 @@ impl Host {
     /// `refused` is the same distinction `content::CommandSaid` draws — it could
     /// not be done — so "已复制" and "没有可复制的内容" never look alike.
     pub fn say(&self, text: impl Into<String>, refused: bool) {
+        self.say_for(text, refused, crate::moment::NOTICE_MS);
+    }
+
+    /// [`Host::say`], held for `for_ms` instead of the usual three seconds — for
+    /// a line that arrives on its own, seconds after whatever caused it, and so
+    /// may land while a person is looking elsewhere.
+    pub fn say_for(&self, text: impl Into<String>, refused: bool, for_ms: u64) {
         let mut m = self.moment.write().expect("moment poisoned");
         let now = m.now;
-        m.notice = Some(Notice::for_ms(text, refused, now, crate::moment::NOTICE_MS));
+        m.notice = Some(Notice::for_ms(text, refused, now, for_ms));
     }
 
     /// Put a line in the conversation, the way a command's answer lands there.
