@@ -627,6 +627,7 @@ impl LiveViewHub {
             .resume_session_with_lease(session_id, working_dir, lease)
             .await
             .map_err(map_session_transition_error)?;
+        wait_mcp_ready_after_transition(&handle).await;
         self.commit_changed_snapshot(&binding, &handle, &changed)
             .await?;
         Ok(changed)
@@ -644,6 +645,7 @@ impl LiveViewHub {
             .fresh_session()
             .await
             .map_err(map_session_transition_error)?;
+        wait_mcp_ready_after_transition(&handle).await;
         let projection_error = self
             .commit_changed_snapshot(expected, &handle, &changed)
             .await
@@ -666,6 +668,7 @@ impl LiveViewHub {
         if session_change_is_noop(&binding, &changed) {
             return Ok(changed);
         }
+        wait_mcp_ready_after_transition(&handle).await;
         self.commit_changed_snapshot(&binding, &handle, &changed)
             .await?;
         Ok(changed)
@@ -1214,6 +1217,29 @@ impl LiveViewHub {
         );
         Ok(())
     }
+}
+
+/// After a session transition (resume / cd / fresh) rebuilds the capability
+/// graph at a new generation, wait for that generation's MCP tools to publish
+/// into the kernel catalog before returning — the same wait the initial bind
+/// does (`native_live::bind_after_mcp_ready`).
+///
+/// Without it, a `/live/switch_session` (or `/cd`, or a fresh session) hands the
+/// caller a runtime whose MCP tools the model cannot see yet, while
+/// `/mcp/status` still reports the servers connected — the model then flails in
+/// bash with no tools and no way for a front end to observe why.
+///
+/// Best-effort by design: [`wait_mcp_ready`] caps at `CONNECT_TIMEOUT` and
+/// returns `Ok` on timeout (a stalled server must not fail the switch), and it
+/// returns immediately when the tools are already published (the common
+/// same-directory reuse). A generation/busy race is a non-fatal miss — the tools
+/// still appear when ready; we simply did not get to block for them this once.
+///
+/// [`wait_mcp_ready`]: atomcode_coding::CodingRuntimeHandle::wait_mcp_ready
+async fn wait_mcp_ready_after_transition(handle: &CodingRuntimeHandle) {
+    let _ = handle
+        .wait_mcp_ready(atomcode_capabilities::mcp::CONNECT_TIMEOUT)
+        .await;
 }
 
 fn map_session_transition_error(error: atomcode_coding::RuntimeError) -> HubError {
