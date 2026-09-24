@@ -101,14 +101,22 @@ const THRESHOLD_ENV: &str = "ATOMCODE_TOOL_OUTPUT_THRESHOLD_BYTES";
 /// The spill threshold to use, from `ATOMCODE_TOOL_OUTPUT_THRESHOLD_BYTES` or the
 /// default. Pure over its input so it is testable without touching process env.
 ///
-/// Floored at `HEAD + TAIL`: the head/tail preview is fixed-size, so a threshold
-/// below it could not shrink the result (the whole invariant of spilling). A
-/// bad/empty value falls back to the default rather than erroring — a typo in an
-/// env var must not make every tool output either truncate at 0 or never.
+/// Clamped to `[HEAD + TAIL + marker, MAX_ARTIFACT_BYTES]`:
+/// - **Floor** — the preview is head + tail + a ~few-hundred-byte marker, so a
+///   threshold below that could make a "truncated" result *larger* than the
+///   original (breaking the whole point of spilling); the 1 KiB slack covers the
+///   marker with room to spare.
+/// - **Ceiling** — never above the artifact ceiling, or a result between the
+///   ceiling and an over-large threshold would reach the model *whole* and blow
+///   the context (the exact failure `MAX_ARTIFACT_BYTES` exists to prevent).
+///
+/// A bad/empty value falls back to the default rather than erroring — a typo in
+/// an env var must not make every tool output either truncate at 0 or never.
 fn resolve_threshold(env_val: Option<&str>) -> usize {
+    const FLOOR: usize = PREVIEW_HEAD + PREVIEW_TAIL + 1024;
     env_val
         .and_then(|v| v.trim().parse::<usize>().ok())
-        .map(|v| v.max(PREVIEW_HEAD + PREVIEW_TAIL))
+        .map(|v| v.clamp(FLOOR, MAX_ARTIFACT_BYTES))
         .unwrap_or(THRESHOLD_BYTES)
 }
 
@@ -229,8 +237,9 @@ impl atomcode_kernel::middleware::ToolMiddleware for ArtifactMiddleware {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn threshold_env_override_defaults_byte_identical_and_floors() {
-        use super::{resolve_threshold, PREVIEW_HEAD, PREVIEW_TAIL, THRESHOLD_BYTES};
+    fn threshold_env_override_defaults_byte_identical_and_clamps() {
+        use super::{resolve_threshold, MAX_ARTIFACT_BYTES, PREVIEW_HEAD, PREVIEW_TAIL, THRESHOLD_BYTES};
+        let floor = PREVIEW_HEAD + PREVIEW_TAIL + 1024;
         // Unset / empty / garbage → the default, to the byte.
         assert_eq!(resolve_threshold(None), THRESHOLD_BYTES);
         assert_eq!(resolve_threshold(Some("  ")), THRESHOLD_BYTES);
@@ -238,10 +247,13 @@ mod tests {
         // A larger value (the data-dense case) is honored verbatim.
         assert_eq!(resolve_threshold(Some("200000")), 200_000);
         assert_eq!(resolve_threshold(Some(" 200000 ")), 200_000);
-        // Below the fixed head+tail preview → floored, so a spill still shrinks.
+        // Below head+tail+marker → floored, so a spill still SHRINKS the result.
+        assert_eq!(resolve_threshold(Some("1000")), floor);
+        // Above the artifact ceiling → clamped, so the hard context cap holds.
         assert_eq!(
-            resolve_threshold(Some("1000")),
-            PREVIEW_HEAD + PREVIEW_TAIL
+            resolve_threshold(Some("8388608")),
+            MAX_ARTIFACT_BYTES,
+            "an over-large threshold must not defeat the {MAX_ARTIFACT_BYTES}-byte ceiling"
         );
     }
 

@@ -335,6 +335,28 @@ impl LiveViewHub {
         Ok(())
     }
 
+    /// Clear the binding and ALL per-session state **including `turn_active`**,
+    /// unconditionally — the force-release path (feedback B12).
+    ///
+    /// Ordinary [`unbind`](Self::unbind) refuses while a turn is active, which is
+    /// exactly the wedge this must clear: an orphaned `InTurn`/`WaitingApproval`
+    /// turn whose consumer disconnected leaves `turn_active == true` forever, so
+    /// both `unbind` and the next `bind_with_provider` reject and every
+    /// `/live?session_id=` 404s. The caller has already torn down the runtime
+    /// handle, so there is no live turn to protect — reset the hub to match.
+    pub fn force_unbind(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.binding = None;
+        state.snapshot = None;
+        state.snapshot_error = None;
+        state.replay.clear();
+        state.goal_progress = None;
+        state.pending_requests.clear();
+        state.pending_web_steers.clear();
+        state.last_runtime_sequence = None;
+        state.turn_active = false;
+    }
+
     pub fn replace_snapshot(
         &self,
         binding: &LiveBinding,

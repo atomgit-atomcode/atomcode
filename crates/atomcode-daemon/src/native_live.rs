@@ -228,10 +228,13 @@ pub async fn force_release() -> Result<bool, String> {
     let Some(old) = owner.take() else {
         return Ok(false);
     };
-    // Best-effort: a handle whose task already died still needs the unbind, so a
-    // shutdown error must not leave the binding dangling.
+    // Best-effort shutdown: a handle whose task already died still needs the hub
+    // reset, so a shutdown error must not stop it. Then `force_unbind` (NOT
+    // `unbind`) — the wedge is `turn_active == true`, which ordinary `unbind`
+    // refuses; force_unbind clears it too, so the next bind actually succeeds.
+    // The runtime handle is gone by now, so there is no live turn to protect.
     let _ = old.handle.shutdown().await;
-    let _ = hub().unbind(&old.binding);
+    hub().force_unbind();
     Ok(true)
 }
 
