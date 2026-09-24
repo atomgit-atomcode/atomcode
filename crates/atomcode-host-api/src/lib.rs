@@ -331,6 +331,19 @@ impl HostCommand {
 pub enum HostReply {
     /// Done. The live session is the one it was.
     Done,
+    /// Done — and something about it is worth saying.
+    ///
+    /// For a command whose live half went through while a durable half did
+    /// not: switching the model takes effect at once and is also written to
+    /// the configuration, and the write can fail on its own. Refusing would be
+    /// a lie in one direction (the switch *did* happen) and a bare `Done` is a
+    /// lie in the other (the next start will not remember it) — which is how
+    /// "it reverts to the old model on restart" reached a person as silence.
+    ///
+    /// `note` is the host's own words, shown as they stand.
+    DoneWithNote {
+        note: String,
+    },
     /// The live session is now `session`. A front end drops the stream of the
     /// one it replaced and follows this one (`docs/adr/0022` §6).
     SessionChanged {
@@ -1606,9 +1619,16 @@ mod tests {
                 }],
             },
         ];
+        let all: Vec<HostReply> = all
+            .into_iter()
+            .chain(std::iter::once(HostReply::DoneWithNote {
+                note: "switched, but not written".into(),
+            }))
+            .collect();
         for r in &all {
             match r {
                 HostReply::Done
+                | HostReply::DoneWithNote { .. }
                 | HostReply::SessionChanged { .. }
                 | HostReply::Sessions { .. }
                 | HostReply::SessionPreview { .. }

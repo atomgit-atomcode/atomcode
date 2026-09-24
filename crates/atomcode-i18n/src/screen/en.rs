@@ -424,6 +424,15 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::RuntimeStopped { how } => {
             format!("the runtime stopped: {how}. nothing more will arrive in this session.").into()
         }
+        Msg::ModelNotKept { error } => {
+            format!("but it was not written down; the next start will use the old one: {error}").into()
+        }
+        Msg::RefusedStaleQuestion => "that question is no longer waiting for an answer".into(),
+        Msg::RefusedNotRunning => "there is no turn running to act on".into(),
+        Msg::RefusedUnavailable => {
+            "it cannot be taken now — no usable provider, or one is being swapped".into()
+        }
+        Msg::RefusedUnsupported => "this host has no answer for that command".into(),
         Msg::CompactionInterrupted => {
             "the compaction was interrupted — the context is as long as it was".into()
         }

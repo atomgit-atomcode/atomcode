@@ -630,6 +630,27 @@ fn change_word(change: atomcode_host_api::FileChange, staged: bool) -> Msg<'stat
     }
 }
 
+/// 一次拒绝,用话说。
+///
+/// 此前这儿是 `format!("{error:?}")`,于是屏上写的是「没有送达:Unavailable」
+/// —— 一个枚举的 Debug 形式,中文界面上的一个英文词,而且不告诉任何人
+/// 该怎么办。`Busy` 更难看:它会把整个结构体清单都印出来。
+///
+/// 宿主自己的话(比如「登录过期了」)另走一条事件 —— 它比这里的
+/// 分类更具体,因为 `Unavailable` 把好几种原因攒成了一种。
+pub(crate) fn refusal_words(error: &atomcode_kernel::event::CommandError) -> String {
+    use atomcode_kernel::event::CommandError as E;
+    match error {
+        E::StaleQuestion => t(Msg::RefusedStaleQuestion).into_owned(),
+        E::NotRunning => t(Msg::RefusedNotRunning).into_owned(),
+        E::Unavailable => t(Msg::RefusedUnavailable).into_owned(),
+        E::Busy { reason } => t(Msg::HostBusy { reason }).into_owned(),
+        E::NotFound => t(Msg::HostNotFound).into_owned(),
+        E::Unsupported => t(Msg::RefusedUnsupported).into_owned(),
+        other => format!("{other:?}"),
+    }
+}
+
 pub(crate) fn refusal(error: HostError) -> String {
     match error {
         HostError::Busy { reason } => t(Msg::HostBusy { reason: &reason }).into_owned(),
@@ -1051,6 +1072,11 @@ impl CommandSet for SessionCommands {
                     })
                     .await
                 {
+                    // 宿主说换成了,但有话要说 —— 两句都要说:换确实成了,
+                    // 而没存下来是重启之后才看得到的那一半。
+                    Ok(HostReply::DoneWithNote { note }) => {
+                        Outcome::Said(format!("{}\n{note}", t(Msg::ModelSet { wanted })))
+                    }
                     Ok(_) => Outcome::Said(t(Msg::ModelSet { wanted }).into_owned()),
                     Err(error) => Outcome::Refused(refusal(error)),
                 }
@@ -2353,6 +2379,65 @@ mod tests {
                 based_on: 7,
             })
         );
+    }
+
+    /// 被拒的提交说的是话,不是一个枚举的名字。
+    ///
+    /// 此前这里是 `format!("{error:?}")`,于是中文界面上写着
+    /// 「没有送达:Unavailable」—— 一个英文词,而且不告诉任何人该怎么办。
+    /// `Busy` 更难看:它会把整个结构体清单都印出来。
+    ///
+    /// 带理由的那一种要把理由带上:`Busy { reason }` 里的 reason 是运行时
+    /// 自己写的,丢了就只剩「忙」。
+    #[test]
+    fn a_refusal_is_said_in_words() {
+        use atomcode_kernel::event::CommandError as E;
+        for error in [
+            E::StaleQuestion,
+            E::NotRunning,
+            E::Unavailable,
+            E::NotFound,
+            E::Unsupported,
+        ] {
+            let said = refusal_words(&error);
+            assert!(
+                !said.contains(&format!("{error:?}")),
+                "{error:?} 还是把枚举名印出来了:{said}"
+            );
+            assert!(!said.trim().is_empty(), "{error:?}");
+        }
+        let busy = refusal_words(&E::Busy {
+            reason: "正在压缩 q4z".into(),
+        });
+        assert!(busy.contains("正在压缩 q4z"), "理由带上了:{busy}");
+        assert!(!busy.contains("Busy {"), "而不是整个结构体:{busy}");
+    }
+
+    /// 换模型没存下来时,屏上要说两句。
+    ///
+    /// 换本身确实生效了,而写配置可能单独失败 —— 于是重启之后又
+    /// 回到旧模型,而人当时看到的是一句干干净净的「模型 → X」。此前
+    /// 这一半只进了日志文件,屏幕一个字不提。
+    ///
+    /// 两句都要说:只说第二句会读成「没换成」,只说第一句就是
+    /// 今天这个样子。
+    #[tokio::test]
+    async fn a_model_switch_that_was_not_written_down_says_both_halves() {
+        let host = Arc::new(Recording::default());
+        let (app, _client, all) = following(&host);
+        host.replies
+            .lock()
+            .unwrap()
+            .extend([Ok(HostReply::DoneWithNote {
+                note: "但没存下来 PERM-DENIED".into(),
+            })]);
+        match all.dispatch("/model glm-5", &app.context()).await {
+            Outcome::Said(said) => {
+                assert!(said.contains("glm-5"), "换成了哪个:{said}");
+                assert!(said.contains("PERM-DENIED"), "以及没存下来:{said}");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     /// The rest of host control over a session is a command each, for the

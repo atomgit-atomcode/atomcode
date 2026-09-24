@@ -3659,8 +3659,23 @@ impl Tui {
                 // A send that never became a turn produces no message fact to
                 // take the `正在识别图片` line down; do it here.
                 self.host.stop_recognizing();
+                // **把话退回输入框。** 提交时输入框已经清了,而被拒的提交
+                // 永远不会成为一条事实 —— 于是既不在屏上、也不在上箭头的
+                // 历史里,打了多长都一样没了。只在输入框空着的时候退,
+                // 和 Escape 那一臂同一条规矩:人已经在打别的了就不覆盖。
+                {
+                    let mut m = self.host.moment.write().expect("moment poisoned");
+                    if m.input.is_empty() {
+                        if let Some(sent) = m.last_sent.clone() {
+                            m.input = sent;
+                            m.caret = m.input.len();
+                            m.history_at = None;
+                            m.draft.clear();
+                        }
+                    }
+                }
                 self.say_refused(&t(Msg::NotDelivered {
-                    error: &format!("{error:?}"),
+                    error: &crate::commands::refusal_words(&error),
                 }));
                 true
             }

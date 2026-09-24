@@ -5180,6 +5180,67 @@ fn t_resume_no_others() -> String {
     atomcode_i18n::screen::t(atomcode_i18n::screen::Msg::ResumeNoOthers).into_owned()
 }
 
+/// 一次被拒的提交,话不会就这么没了。
+///
+/// 提交的那一刻输入框就清了,而被拒的提交**永远不会成为一条事实**
+/// —— 于是它既不在屏上,也不在上箭头的历史里(历史是从
+/// `SessionEvent::UserMessage` 折出来的)。打了多长都一样没了,而没登录、
+/// 正在换 provider、刚按完 Esc 就回车 —— 这三种都会被拒。
+///
+/// 另一半是那句话自己:此前写的是 `{error:?}`,中文界面上一个英文枚举名。
+#[tokio::test]
+async fn a_refused_submit_hands_the_words_back_and_says_why_in_words() {
+    let dir = scratch("refused");
+    let (s, agent) = start_with_agent_events(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    let task = s.open().await;
+
+    s.term.type_line("这句话不应该消失 w3q");
+    s.quiet().await;
+    // 提交之后输入框是空的 —— 这正是后面要退回去的前提。
+    assert!(
+        !composer_text(&s).contains("w3q"),
+        "提交清了输入框:{:?}",
+        composer_text(&s)
+    );
+
+    agent
+        .send(atomcode_kernel::event::AgentEvent::Rejected {
+            command: "tui-1".into(),
+            error: atomcode_kernel::event::CommandError::Unavailable,
+        })
+        .expect("the screen is listening");
+    s.quiet().await;
+
+    assert!(
+        composer_text(&s).contains("w3q"),
+        "话退回了输入框:{:?}\n{}",
+        composer_text(&s),
+        s.screen()
+    );
+    let screen = s.screen();
+    assert!(
+        !screen.contains("Unavailable"),
+        "而不是一个枚举的名字:\n{screen}"
+    );
+    task.abort();
+}
+
+/// 输入框里现在写着什么。
+fn composer_text(s: &Session) -> String {
+    s.term
+        .last()
+        .expect("a frame")
+        .part("input")
+        .map(|part| {
+            part.lines
+                .iter()
+                .map(|l| l.plain())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
 /// A recording resume port: it says yes, and keeps what it was asked to throw
 /// away.
 #[derive(Default)]

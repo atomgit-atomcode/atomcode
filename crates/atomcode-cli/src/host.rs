@@ -394,8 +394,14 @@ fn reply(out: &mpsc::UnboundedSender<AgentEvent>, receipt: Option<CommandId>, an
                 steered: false,
             });
         }
-        (Some(command), Err((error, _))) => {
+        (Some(command), Err((error, message))) => {
             let _ = out.send(AgentEvent::Rejected { command, error });
+            // 宿主自己的话,当它有的时候。此前这一半被 `_` 丢掉 ——
+            // 而它比 `Rejected` 带的分类具体得多:`Unavailable` 把「没登录」、
+            // 「正在换 provider」攼成了同一个词,而这两件事该做的是不同的。
+            if let Some(message) = message.filter(|m| !m.trim().is_empty()) {
+                let _ = out.send(said(message.into()));
+            }
         }
         // Nobody asked for a receipt, so a failure a person should see is said
         // the way every other failure is. **Every** failure: a command refused
@@ -1764,6 +1770,16 @@ impl HostControl for RuntimeControl {
                         %error,
                         "model switched for this run but could not be persisted",
                     );
+                    // **不能只进日志。** 日志写的是文件,而人看到的是一句
+                    // 干干净净的「模型 → X」—— 于是重启之后又回到旧模型,
+                    // 而没有任何一处说过它没存下。换本身确实成了,所以不能拒;
+                    // 但也不能答一个干净的 `Done`。
+                    return Ok(HostReply::DoneWithNote {
+                        note: tr(SMsg::ModelNotKept {
+                            error: &error.to_string(),
+                        })
+                        .into_owned(),
+                    });
                 }
                 Ok(reply)
             }

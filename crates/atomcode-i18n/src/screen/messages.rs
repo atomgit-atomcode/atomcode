@@ -656,6 +656,13 @@ pub enum Msg<'a> {
         reason: &'a str,
     },
     CompactionInterrupted,
+    RefusedStaleQuestion,
+    RefusedNotRunning,
+    RefusedUnavailable,
+    RefusedUnsupported,
+    ModelNotKept {
+        error: &'a str,
+    },
     RuntimeStopped {
         how: &'a str,
     },
