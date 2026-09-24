@@ -388,13 +388,84 @@ where
     bind()
 }
 
+/// Why a live runtime could not be joined — and, when another runtime is in
+/// the way, which one and in what phase.
+///
+/// Serialized as the bare message, so `{"error": …}` is the same string on the
+/// wire it always was and a client that matches it keeps working; who is in
+/// the way is carried separately ([`occupant`](Self::occupant)) for the caller
+/// that wants to report it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveJoinError {
+    message: String,
+    occupant: Option<LiveOccupant>,
+}
+
+/// The runtime that holds the live binding a request wanted.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LiveOccupant {
+    pub session_id: String,
+    pub working_dir: String,
+    pub phase: String,
+}
+
+impl LiveJoinError {
+    pub fn occupant(&self) -> Option<&LiveOccupant> {
+        self.occupant.as_ref()
+    }
+}
+
+impl From<String> for LiveJoinError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            occupant: None,
+        }
+    }
+}
+
+impl std::fmt::Display for LiveJoinError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl serde::Serialize for LiveJoinError {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.message)
+    }
+}
+
+/// The refusal for a rebind while `binding`'s runtime is busy (`phase`).
+///
+/// The opening words are the ones this refusal has always had — adapters match
+/// on them — and after them, which session holds the binding and doing what,
+/// since with every health check green that is the one thing an operator
+/// cannot otherwise see.
+fn occupied_by(binding: &LiveBinding, phase: RuntimePhase) -> LiveJoinError {
+    let phase = format!("{phase:?}");
+    LiveJoinError {
+        message: format!(
+            "cannot replace an active live runtime: session {} is {phase} — if it is \
+             wedged/orphaned (its consumer disconnected mid-turn), POST /live/release to \
+             force-release it, then retry",
+            binding.session_id
+        ),
+        occupant: Some(LiveOccupant {
+            session_id: binding.session_id.clone(),
+            working_dir: binding.working_dir.display().to_string(),
+            phase,
+        }),
+    }
+}
+
 pub async fn ensure_headless_runtime(
     working_dir: PathBuf,
     telemetry: Arc<Telemetry>,
     provider_name: String,
     mode: RuntimeMode,
     requested_session_id: Option<String>,
-) -> Result<LiveJoin, String> {
+) -> Result<LiveJoin, LiveJoinError> {
     if let Some(binding) = embedded_binding() {
         if requested_session_id
             .as_deref()
@@ -404,9 +475,10 @@ pub async fn ensure_headless_runtime(
                 "embedded runtime is bound to session {:?}, requested {:?}",
                 binding.session_id,
                 requested_session_id.as_deref().unwrap_or_default()
-            ));
+            )
+            .into());
         }
-        return join().map_err(|error| format!("live hub join failed: {error:?}"));
+        return join().map_err(|error| format!("live hub join failed: {error:?}").into());
     }
 
     let mut owner = headless().lock().await;
@@ -418,34 +490,40 @@ pub async fn ensure_headless_runtime(
                     .is_none_or(|requested| requested == current.binding.session_id)
         });
     if can_reuse {
-        return join().map_err(|error| format!("live hub join failed: {error:?}"));
+        return join().map_err(|error| format!("live hub join failed: {error:?}").into());
     }
 
     if let Some(old) = owner.take() {
+        let phase = old.handle.status().phase;
         if matches!(
-            old.handle.status().phase,
+            phase,
             RuntimePhase::InTurn | RuntimePhase::WaitingApproval | RuntimePhase::Reconfiguring
         ) {
+            let refused = occupied_by(&old.binding, phase);
             *owner = Some(old);
-            return Err(
-                "cannot replace an active live runtime — if it is wedged/orphaned \
-                 (its consumer disconnected mid-turn), POST /live/release to force-release it, \
-                 then retry"
-                    .into(),
-            );
+            return Err(refused);
         }
         old.handle
             .shutdown()
             .await
             .map_err(|_| "failed to stop previous live runtime".to_string())?;
-        let _ = hub().unbind(&old.binding);
+        // Shut down, so there is no turn left to protect: a `turn_active` the
+        // hub still holds only means the terminal event never reached it, and
+        // the plain `unbind` would refuse — leaving this dead runtime bound and
+        // the bind below rejected. Someone else's binding is not ours to clear.
+        match hub().unbind_retired(&old.binding) {
+            Ok(()) | Err(HubError::Unbound) | Err(HubError::StaleBinding) => {}
+            Err(error) => {
+                return Err(format!("failed to unbind previous live runtime: {error:?}").into())
+            }
+        }
     }
 
     let config =
         atomcode_config::config::Config::load(&atomcode_config::config::Config::default_path())
             .map_err(|error| error.to_string())?;
     if !config.selection_exists(&provider_name) {
-        return Err(format!("provider {provider_name:?} not found"));
+        return Err(format!("provider {provider_name:?} not found").into());
     }
     let provider_fingerprint = provider_fingerprint(&config, &provider_name)?;
     let runtime_config: CodingRuntimeConfig =
@@ -551,7 +629,7 @@ pub async fn ensure_headless_runtime(
     });
     *owner = Some(HeadlessRuntime { binding, handle });
     drop(owner);
-    join().map_err(|error| format!("live hub join failed: {error:?}"))
+    join().map_err(|error| format!("live hub join failed: {error:?}").into())
 }
 
 #[cfg(test)]
@@ -559,6 +637,61 @@ mod tests {
     use super::bind_after_mcp_ready;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    /// Refused because another runtime is busy: the refusal says **which one
+    /// and doing what**. "cannot replace an active live runtime" alone left an
+    /// operator with every health check green and no way to see that session X
+    /// was parked on an approval nobody could answer.
+    #[test]
+    fn a_refused_rebind_names_the_runtime_in_the_way() {
+        let binding = crate::live_hub::LiveBinding {
+            id: 3,
+            generation: 1,
+            session_id: "session-held".into(),
+            working_dir: std::path::PathBuf::from("/work/proj"),
+            provider: "p".into(),
+            provider_fingerprint: "f".into(),
+        };
+        let refused = super::occupied_by(&binding, atomcode_coding::RuntimePhase::WaitingApproval);
+
+        let said = refused.to_string();
+        // What clients already match on stays where it was.
+        assert!(
+            said.starts_with("cannot replace an active live runtime"),
+            "{said}"
+        );
+        assert!(
+            said.contains("session-held") && said.contains("WaitingApproval"),
+            "{said}"
+        );
+        assert!(
+            said.contains("POST /live/release"),
+            "the way out is still named: {said}"
+        );
+
+        // `error` stays a string on the wire — an adapter that matches it keeps
+        // working — and who is in the way rides beside it.
+        assert_eq!(
+            serde_json::to_value(&refused).unwrap(),
+            serde_json::Value::String(said)
+        );
+        assert_eq!(
+            serde_json::to_value(refused.occupant()).unwrap(),
+            serde_json::json!({
+                "session_id": "session-held",
+                "working_dir": "/work/proj",
+                "phase": "WaitingApproval",
+            })
+        );
+
+        // Any other failure has nobody in the way.
+        let other = super::LiveJoinError::from("provider \"x\" not found".to_string());
+        assert!(other.occupant().is_none());
+        assert_eq!(
+            serde_json::to_value(&other).unwrap(),
+            serde_json::json!("provider \"x\" not found")
+        );
+    }
 
     #[tokio::test]
     async fn headless_bind_waits_for_mcp_catalog_readiness() {

@@ -1328,11 +1328,13 @@ pub(crate) async fn live_stream(
     {
         Ok(join) => join,
         Err(error) => {
+            // `error` is the same string it always was; `occupant` says which
+            // runtime holds the binding and in what phase, when one does.
             return (
                 StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "error": error })),
+                Json(serde_json::json!({ "error": error, "occupant": error.occupant() })),
             )
-                .into_response()
+                .into_response();
         }
     };
     let snapshot_wd = join.binding.working_dir.clone();

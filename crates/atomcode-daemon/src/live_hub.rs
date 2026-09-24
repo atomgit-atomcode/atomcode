@@ -335,6 +335,37 @@ impl LiveViewHub {
         Ok(())
     }
 
+    /// Unbind a runtime **that has already been shut down**, turn or no turn.
+    ///
+    /// [`unbind`](Self::unbind) refuses while `turn_active`, to protect a turn
+    /// that is running. Once the runtime is shut down there is no turn left to
+    /// protect, and a flag still set then only means the terminal event never
+    /// reached the hub (forwarding stopped first) — refusing would leave the
+    /// dead runtime bound and every later bind rejected. Unlike
+    /// [`force_unbind`](Self::force_unbind) this is scoped to `binding`: a
+    /// successor that is already bound is left alone (`StaleBinding`).
+    pub fn unbind_retired(&self, binding: &LiveBinding) -> Result<(), HubError> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let current_binding_id = state
+            .binding
+            .as_ref()
+            .map(|current| current.identity.id)
+            .ok_or(HubError::Unbound)?;
+        if current_binding_id != binding.id {
+            return Err(HubError::StaleBinding);
+        }
+        state.binding = None;
+        state.snapshot = None;
+        state.snapshot_error = None;
+        state.replay.clear();
+        state.goal_progress = None;
+        state.pending_requests.clear();
+        state.pending_web_steers.clear();
+        state.last_runtime_sequence = None;
+        state.turn_active = false;
+        Ok(())
+    }
+
     /// Clear the binding and ALL per-session state **including `turn_active`**,
     /// unconditionally — the force-release path (feedback B12).
     ///
@@ -1977,6 +2008,61 @@ mod tests {
             )
             .unwrap_err(),
             HubError::StaleEvent
+        );
+    }
+
+    /// A runtime that has been shut down is unbound even when the hub still
+    /// believes its turn is running — the flag outlived the runtime, e.g. the
+    /// event forwarding stopped before the terminal event arrived.
+    ///
+    /// Replacing a runtime used `unbind` and ignored its refusal: the old
+    /// runtime was already dead, the binding stayed, and every later bind hit
+    /// `ActiveTurn` — a `/live?session_id=` that 404s until someone knows to
+    /// call `/live/release`.
+    #[test]
+    fn a_retired_runtime_is_unbound_even_with_a_turn_flag_left_behind() {
+        let hub = LiveViewHub::new();
+        let (first, _) = control();
+        let old = hub
+            .bind("session-1", PathBuf::from("/one"), snapshot("old"), first)
+            .unwrap();
+        hub.submit(UserInput {
+            text: "hello".into(),
+            images: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(hub.unbind(&old).unwrap_err(), HubError::ActiveTurn);
+
+        hub.unbind_retired(&old).unwrap();
+        let (second, _) = control();
+        hub.bind("session-2", PathBuf::from("/two"), snapshot("new"), second)
+            .expect("the replacement binds once the retired runtime is gone");
+    }
+
+    /// Retiring is scoped to the binding named: it never clears a successor.
+    /// That is the difference from `force_unbind`, which clears whatever is
+    /// bound.
+    #[test]
+    fn retiring_a_runtime_does_not_unbind_its_successor() {
+        let hub = LiveViewHub::new();
+        let (first, _) = control();
+        let old = hub
+            .bind("session-1", PathBuf::from("/one"), snapshot("old"), first)
+            .unwrap();
+        hub.unbind_retired(&old).unwrap();
+        let (second, _) = control();
+        let new = hub
+            .bind("session-2", PathBuf::from("/two"), snapshot("new"), second)
+            .unwrap();
+
+        assert_eq!(
+            hub.unbind_retired(&old).unwrap_err(),
+            HubError::StaleBinding
+        );
+        assert_eq!(
+            hub.join().unwrap().binding,
+            new,
+            "the successor stays bound"
         );
     }
 
