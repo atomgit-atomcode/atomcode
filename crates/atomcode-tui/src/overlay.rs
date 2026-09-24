@@ -187,6 +187,13 @@ pub struct Reading {
     /// closing and "picks nothing" are the same for both and would otherwise be
     /// written twice.
     diff: bool,
+    /// What `esc` goes back to, for a reader that was opened out of a list.
+    ///
+    /// `None` — a `/view` of a path somebody typed — closes outright: there is
+    /// no list behind it to return to. Set, it is a command the way a
+    /// [`Picker`]'s pick is one, so going back is the same dispatch that got
+    /// here and not a second way of building the list.
+    back_to: RwLock<Option<String>>,
 }
 
 impl Reading {
@@ -197,6 +204,7 @@ impl Reading {
             lines: text.lines().map(str::to_string).collect(),
             at: RwLock::new(0),
             diff: false,
+            back_to: RwLock::new(None),
         })
     }
 
@@ -210,7 +218,23 @@ impl Reading {
             lines: text.lines().map(str::to_string).collect(),
             at: RwLock::new(0),
             diff: true,
+            back_to: RwLock::new(None),
         })
+    }
+
+    /// Let `esc` and `left` go back to `command` instead of closing.
+    ///
+    /// For a reader reached by picking a row: the reason to open one file's
+    /// diff is almost always to then open the next one's, and without this that
+    /// costs retyping the command that built the list — which is also the
+    /// moment the list is rebuilt, so the cursor is back at the top.
+    ///
+    /// Opt-in for the same reason [`Picker::accepting_typed`] is: most readers
+    /// have nothing behind them, and one that pretended to would dispatch a
+    /// command nobody asked for on the way out.
+    pub fn returning_to(self: Arc<Self>, command: impl Into<String>) -> Arc<Self> {
+        *self.back_to.write().expect("reading poisoned") = Some(command.into());
+        self
     }
 
     /// Where the window starts, for a criterion.
@@ -308,9 +332,18 @@ impl Overlay for Reading {
                 self.scroll(20);
                 Step::Stay
             }
-            // Closed with nothing, always: looking at a file picks nothing and
-            // runs nothing. An overlay that answered with a value here would
-            // dispatch that value as a command.
+            // Back to the list, when there is one behind this.
+            //
+            // `Left` as well as `esc`, because this is one level down from a
+            // list and that is the direction people reach for — and because a
+            // reader has nothing else to do with a sideways key.
+            Key::Esc | Key::Left => match self.back_to.read().expect("reading poisoned").clone() {
+                Some(command) => Step::Chose(command),
+                None => Step::Cancelled,
+            },
+            // Closed with nothing otherwise: looking at a file picks nothing
+            // and runs nothing. An overlay that answered with a value here
+            // would dispatch that value as a command.
             _ => Step::Cancelled,
         }
     }
@@ -767,7 +800,9 @@ mod tests {
         }
         assert_eq!(r.top(), 0, "nor before the first");
 
-        // Anything else closes it, and always with nothing.
+        // Anything else closes it, and always with nothing. `Esc` is in the
+        // list because this reader has nothing behind it; one that does is
+        // `a_reader_reached_from_a_list_goes_back_to_it`.
         for press in [
             KeyPress::plain(Key::Enter),
             KeyPress::plain(Key::Esc),
@@ -783,6 +818,44 @@ mod tests {
         // An empty file says so rather than drawing nothing at all.
         let empty = Reading::new("empty.txt", "");
         assert!(drawn(&empty)[0].contains("空文件"), "{:?}", drawn(&empty));
+    }
+
+    /// A reader opened out of a list goes back to the list, not away.
+    ///
+    /// The reason to open one file's diff is almost always to then open the
+    /// next one's, and `esc` used to close the whole thing — so seeing a
+    /// second file meant retyping the command, which also rebuilt the list
+    /// with the cursor back at the top. `left` as well as `esc`, because this
+    /// is one level down from a list and that is the direction people reach
+    /// for.
+    ///
+    /// The `None` half is the other half of the claim: a `/view` of a path
+    /// somebody typed has no list behind it, and one that dispatched a command
+    /// on the way out would run something nobody asked for.
+    #[test]
+    fn a_reader_reached_from_a_list_goes_back_to_it() {
+        for press in [KeyPress::plain(Key::Esc), KeyPress::plain(Key::Left)] {
+            assert_eq!(
+                Reading::diff("src/a.rs", "@@ -1 +1 @@\n-a\n+b\n")
+                    .returning_to("/diff")
+                    .key(press),
+                Step::Chose("/diff".into()),
+                "{press:?}"
+            );
+            assert_eq!(
+                Reading::new("notes.md", "x").key(press),
+                Step::Cancelled,
+                "nothing behind it: {press:?}"
+            );
+        }
+        // Everything else still closes, list behind it or not: the reader has
+        // one job and leaving is the only thing it answers.
+        assert_eq!(
+            Reading::diff("src/a.rs", "x")
+                .returning_to("/diff")
+                .key(KeyPress::ch('q')),
+            Step::Cancelled
+        );
     }
 
     /// A diff is drawn by its signs rather than by line numbers.

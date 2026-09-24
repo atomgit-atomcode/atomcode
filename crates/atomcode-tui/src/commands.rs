@@ -1299,7 +1299,16 @@ impl CommandSet for SessionCommands {
                                 t(Msg::DiffNoChangeIn { what: &what }).into_owned(),
                             );
                         }
-                        Outcome::Open(crate::overlay::Reading::diff(what, &text))
+                        // `esc` goes back to the list this file came out of,
+                        // in the scope it was listed in: reading one file's
+                        // diff is how you decide to read the next one's.
+                        let listing = match scope {
+                            atomcode_host_api::ChangeScope::Workspace => "/diff git",
+                            _ => "/diff",
+                        };
+                        Outcome::Open(
+                            crate::overlay::Reading::diff(what, &text).returning_to(listing),
+                        )
                     }
                     Ok(HostReply::Changes { files, .. }) if files.is_empty() => {
                         Outcome::Said(t(Msg::DiffNothingChanged).into_owned())
@@ -2791,9 +2800,18 @@ mod tests {
              not the session's — same file, silently a different answer"
         );
 
-        // And that command is the one that asks.
+        // And that command is the one that asks — and the reader it opens
+        // goes back to the listing **in the scope it came from**. A checkout
+        // row that backed out into the session's listing would be the same
+        // silent swap the row's value exists to prevent.
         match all.dispatch("/diff git src/a.rs", &app.context()).await {
-            Outcome::Open(reader) => assert_eq!(reader.id(), "view"),
+            Outcome::Open(reader) => {
+                assert_eq!(reader.id(), "view");
+                assert_eq!(
+                    reader.key(crate::surface::KeyPress::plain(crate::surface::Key::Esc)),
+                    crate::overlay::Step::Chose("/diff git".into()),
+                );
+            }
             other => panic!("{other:?}"),
         }
         assert_eq!(
@@ -2890,7 +2908,17 @@ mod tests {
             other => panic!("{other:?}"),
         }
         match all.dispatch("/diff src/parser.rs", &app.context()).await {
-            Outcome::Open(reader) => assert_eq!(reader.id(), "view"),
+            Outcome::Open(reader) => {
+                assert_eq!(reader.id(), "view");
+                // Back to the list, not away: reading one file's diff is how
+                // a person decides to read the next one's, and closing
+                // outright made that a retype — which also rebuilt the list
+                // with the cursor at the top.
+                assert_eq!(
+                    reader.key(crate::surface::KeyPress::plain(crate::surface::Key::Esc)),
+                    crate::overlay::Step::Chose("/diff".into()),
+                );
+            }
             other => panic!("{other:?}"),
         }
         // Changed nothing: said, not refused.
