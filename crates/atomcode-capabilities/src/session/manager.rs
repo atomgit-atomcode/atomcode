@@ -1104,7 +1104,10 @@ impl SessionManager {
     /// write failure leaves the plain path-hash behaviour unchanged rather than
     /// erroring a session start.
     pub fn ensure_project_marker(working_dir: &Path) {
-        Self::write_project_marker(working_dir, &atomcode_config::util::stable_project_hash(working_dir));
+        Self::write_project_marker(
+            working_dir,
+            &atomcode_config::util::stable_project_hash(working_dir),
+        );
     }
 
     /// Pin this project to an EXISTING session bucket — the one a session it is
@@ -7805,7 +7808,11 @@ mod tests {
         // A junk marker is ignored (falls back to the path hash).
         let junk = tmp.path().join("junk");
         std::fs::create_dir_all(junk.join(".atomcode").join("local")).unwrap();
-        std::fs::write(junk.join(".atomcode").join("local").join("id"), "not-a-bucket").unwrap();
+        std::fs::write(
+            junk.join(".atomcode").join("local").join("id"),
+            "not-a-bucket",
+        )
+        .unwrap();
         assert_eq!(
             SessionManager::project_hash(&junk),
             atomcode_config::util::stable_project_hash(&junk),

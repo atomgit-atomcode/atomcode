@@ -436,7 +436,9 @@ mod scope_tests {
         let all = vec![at("/a"), at("/b"), at("/a")];
         let scoped = scope_sessions(all, Some("/a"));
         assert_eq!(scoped.len(), 2, "only /a's own: {scoped:?}");
-        assert!(scoped.iter().all(|s| s.working_dir.as_deref() == Some("/a")));
+        assert!(scoped
+            .iter()
+            .all(|s| s.working_dir.as_deref() == Some("/a")));
     }
 
     #[test]
@@ -445,7 +447,11 @@ mod scope_tests {
         // filter would show an empty picker. Fall back to every folder's.
         let all = vec![at("/old-name"), at("/other")];
         let scoped = scope_sessions(all, Some("/new-name"));
-        assert_eq!(scoped.len(), 2, "renamed folder sees all, not nothing: {scoped:?}");
+        assert_eq!(
+            scoped.len(),
+            2,
+            "renamed folder sees all, not nothing: {scoped:?}"
+        );
     }
 
     #[test]
