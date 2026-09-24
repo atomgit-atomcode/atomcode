@@ -425,10 +425,26 @@ impl crate::commands::CatalogCommand for ReviewCommand {
 
     async fn run(&self, agent: Arc<crate::agent::Agent>, args: &str) -> Result<String, String> {
         use atomcode_kernel::tool::ToolContext;
+        // **The word, turned into the shape the tool parses.** `scope` is an
+        // internally tagged enum (`#[serde(tag = "kind")]`), so a bare string
+        // under that key cannot deserialize — `/review staged` and
+        // `/review <base>` both failed outright, with only the bare form
+        // working, while this command's own usage line advertised both.
+        //
+        // Written as the tool's `staged` / `base` fields rather than as a
+        // `{"kind": …}` object: they are the documented compatibility form,
+        // they are what older prompts already send, and they take a plain word
+        // — which is what this argument is.
         let scope = args.trim();
         let mut call = serde_json::Map::new();
-        if !scope.is_empty() {
-            call.insert("scope".into(), serde_json::Value::String(scope.to_string()));
+        match scope {
+            "" => {}
+            "staged" => {
+                call.insert("staged".into(), serde_json::Value::Bool(true));
+            }
+            base => {
+                call.insert("base".into(), serde_json::Value::String(base.to_string()));
+            }
         }
         let result = self
             .0
@@ -801,11 +817,32 @@ impl crate::commands::CatalogCommand for MemoryCommand {
 
     async fn run(&self, _agent: Arc<crate::agent::Agent>, args: &str) -> Result<String, String> {
         use atomcode_kernel::tool::ToolContext;
-        let content = args.trim();
+        // 哪一层。写在前面的 `--global` / `--local` 是人会打的写法,而不认
+        // 它的后果是**把那两个字当成要记住的话写进项目那一层** ——
+        // 记下了、记错了地方、而且记进去的是一句没人写的话。
+        let (scope, content) = match args.trim() {
+            rest if rest.starts_with("--") => {
+                let (flag, tail) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+                match flag {
+                    "--global" | "-g" => (Some("global"), tail.trim()),
+                    "--local" => (Some("local"), tail.trim()),
+                    "--project" => (Some("project"), tail.trim()),
+                    other => {
+                        return Err(format!(
+                            "不认识 `{other}`;只有 --global / --local / --project"
+                        ))
+                    }
+                }
+            }
+            rest => (None, rest),
+        };
         if self.action != "list" && content.is_empty() {
             return Err(format!("要有话可{}", self.summary));
         }
         let mut call = serde_json::json!({ "action": self.action });
+        if let Some(scope) = scope {
+            call["scope"] = serde_json::Value::String(scope.into());
+        }
         if !content.is_empty() {
             // Under the name this action reads it by. `forget` takes a
             // `keyword` and `remember` a `content`, and sending one as the

@@ -2060,7 +2060,7 @@ impl atomcode_harness::commands::CatalogCommand for WorktreeCommand {
     fn describe(&self) -> CommandDescription {
         on_the_session(
             "worktree",
-            Some("<名字> [基准] | list | done | cleanup <名字> [--force]"),
+            Some("[create] <名字> [基准] | list | done | cleanup <名字> [--force]"),
             "开一个自己的分支与 checkout 并进去干活;`list` 看有哪些,`done` 回主检出,`cleanup` 清掉",
         )
     }
@@ -2113,15 +2113,35 @@ async fn run_worktree(
                 .is_some_and(|flag| matches!(*flag, "--force" | "-f"));
             cleanup(root, name, force, runtime).await
         }
-        Some(name) => {
-            let at = worktree(root, name, parts.get(1).copied())?;
+        // `create` 是上一代前端的写法,也是人会自己想到的写法。不认它的后果
+        // 不是报错而是**建一个叫 `create` 的分支并切进去**,后面那个名字变成
+        // 基准、再后面的静默丢掉 —— 一条看起来成功了的命令。
+        Some(_) => {
+            let Some((name, base)) = worktree_target(&parts) else {
+                return Err("要一个名字:`/worktree create 试一下`".into());
+            };
+            let at = worktree(root, name, base)?;
             runtime.change_directory(at.clone()).await?;
             Ok(format!("在 worktree `{name}` 里干活:{}", at.display()))
         }
     }
 }
 
-const WORKTREE_USAGE: &str = "用法:`/worktree <名字> [基准]` 开一个自己的 checkout 并进去 · \
+/// 哪个名字、以哪里为基准 —— 带不带 `create` 都一样。
+///
+/// `create` 是上一代前端的写法,也是人会自己想到的写法。不认它的后果
+/// 不是报错,是把它当成名字去建一个叫 `create` 的分支并切进去,后面那个
+/// 名字变成基准、再后面的静默丢掉。
+fn worktree_target<'a>(parts: &[&'a str]) -> Option<(&'a str, Option<&'a str>)> {
+    let rest = match parts.first().copied() {
+        Some("create") => &parts[1..],
+        _ => parts,
+    };
+    Some((*rest.first()?, rest.get(1).copied()))
+}
+
+const WORKTREE_USAGE: &str =
+    "用法:`/worktree [create] <名字> [基准]` 开一个自己的 checkout 并进去 · \
      `/worktree list` 看有哪些 · `/worktree done` 回主检出 · \
      `/worktree cleanup <名字> [--force]` 清掉";
 
@@ -2728,6 +2748,20 @@ fn means_help(arg: &str) -> bool {
     matches!(arg, "help" | "?" | "-h" | "--help")
 }
 
+/// 「它现在怎么样了」的几种说法。
+///
+/// 和 [`means_help`] 同一类事故,只是更难看见:`/goal status` 会
+/// **把「status」当成一个目标条件开始干**,`/loop status` 会每轮都
+/// 做一件叫 status 的事 —— 而且因为两者看起来都像「开始了」,人不会
+/// 立刻发现自己请来的不是一份报告。
+///
+/// 答得出来的东西本来就一直画在状态行上。真要让这条命令自己报一份,
+/// 得给 `RuntimeCommands` 加一个进度读法 —— 那是另一件事;这里先把
+/// 「问一句反而把东西跑起来」堵掉。
+fn means_status(arg: &str) -> bool {
+    matches!(arg, "status" | "state" | "progress" | "状态")
+}
+
 struct GoalCommand(Arc<dyn crate::runtime::RuntimeCommands>);
 
 #[async_trait]
@@ -2772,6 +2806,9 @@ async fn run_goal(
             // 收工的几种说法都认。一个人想停下自主循环的时候,不该还要先想起
             // 这里用的是哪个词 —— 而这几个词没有一个可能是真条件:谁也不会把
             // 「达成 cancel」当成目标。
+            word if means_status(word) => {
+                Ok("干到哪一轮了,状态行一直在说。要收工就 `/goal stop`。".into())
+            }
             word if means_stop(word) => {
                 runtime.stop_goal().await?;
                 Ok("目标停了。".into())
@@ -2858,6 +2895,9 @@ async fn run_loop(
                  /loop stop(或 off/clear/cancel/reset/none)—— 收工。\n\
                  跑到第几轮了,状态行一直在说。重启不恢复。"
                 .into()),
+            word if means_status(word) => {
+                Ok("跑到第几轮了,状态行一直在说。要收工就 `/loop stop`。".into())
+            }
             // 同 `/goal`:收工的几种说法都认,理由也一样。
             word if means_stop(word) => {
                 runtime.stop_loop().await?;
@@ -3394,6 +3434,60 @@ mod tests {
         assert!(
             futures::FutureExt::catch_unwind(panicked).await.is_err(),
             "一条真条件必须走到运行时去"
+        );
+    }
+
+    /// `/worktree create <名字> [基准]` 建的是那个名字,不是一个叫
+    /// `create` 的分支。
+    ///
+    /// 不认这个词的后果不是报错而是**静默走错**:`create` 当成名字、
+    /// `fix-bug` 当成基准、`main` 直接丢掉,然后切进一个叫 `create` 的
+    /// checkout 里 —— 一条看起来成功了的命令。上一代前端认它,人也会
+    /// 自己想到这么写。
+    ///
+    /// 只钉解析:真建一个 worktree 要一个仓库和一次 `git worktree add`。
+    #[test]
+    fn worktree_create_names_the_worktree_not_the_word() {
+        assert_eq!(
+            super::worktree_target(&["create", "fix-bug", "main"]),
+            Some(("fix-bug", Some("main")))
+        );
+        assert_eq!(
+            super::worktree_target(&["create", "fix-bug"]),
+            Some(("fix-bug", None))
+        );
+        // 不写 `create` 的老写法照旧管用。
+        assert_eq!(
+            super::worktree_target(&["fix-bug", "main"]),
+            Some(("fix-bug", Some("main")))
+        );
+        // `create` 后面什么都没有 —— 不是“建一个叫 create 的”。
+        assert_eq!(super::worktree_target(&["create"]), None);
+    }
+
+    /// 问「现在怎么样了」也不能把东西跑起来。
+    ///
+    /// 和 `help` 同一类事故,只是更难看见:`/goal status` 会把「status」
+    /// 当成目标条件开始干,`/loop status` 会每轮做一件叫 status 的事 ——
+    /// 而两者看起来都像「开始了」,人不会立刻发现请来的不是一份报告。
+    ///
+    /// `Pointed` 的 `start_goal`/`start_loop` 是 `unreachable!`,所以「问一句反而
+    /// 跑起来」在这里是当场炸,不是静悄悄发生。
+    #[tokio::test]
+    async fn goal_and_loop_answer_a_status_without_starting_anything() {
+        let runtime: Arc<dyn crate::runtime::RuntimeCommands> = pointed();
+        for word in ["status", "state", "progress", "状态"] {
+            let said = super::run_goal(&runtime, word).await.expect(word);
+            assert!(said.contains("/goal stop"), "它说的是怎么看、怎么停:{said}");
+            let said = super::run_loop(&runtime, word).await.expect(word);
+            assert!(said.contains("/loop stop"), "{said}");
+        }
+        // 而一句真的以 status 开头的条件仍然是条件:名单是整词,
+        // 不是前缀 —— 否则「status 里不再有错」这样的目标就永远开不了。
+        let panicked = std::panic::AssertUnwindSafe(super::run_goal(&runtime, "status 里不再有错"));
+        assert!(
+            futures::FutureExt::catch_unwind(panicked).await.is_err(),
+            "一句真条件必须走到运行时去"
         );
     }
 

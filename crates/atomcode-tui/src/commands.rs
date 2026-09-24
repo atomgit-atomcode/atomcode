@@ -1083,14 +1083,28 @@ impl CommandSet for SessionCommands {
                 }
             }
             "cd" => {
-                let directory = args.trim();
+                // `~/…` 是人打出来的写法,而展开它的是 shell —— 一条命令的
+                // 参数没经过 shell。不展开的话它不是绝对路径,会被拼到当前
+                // 目录后面变成 `<wd>/~/x`,然后报一句「进不去」—— `text.rs` 里
+                // `expand_home_with` 的说明写的就是这个失败形状,之前只接了
+                // `/view` 和 `/paste`。先展开,再看它是不是个子命令。
+                let expanded =
+                    crate::text::expand_home_with(args.trim(), crate::text::home_dir().as_deref());
+                let directory = expanded.trim();
                 // `pin` / `unpin`:标一个目录,或取消。带目录就是它,不带就是
                 // 现在这个——人多半是干着干着决定「这地方以后还要来」。
-                if let Some(rest) = directory
-                    .strip_prefix("pin")
-                    .or_else(|| directory.strip_prefix("unpin"))
-                {
-                    let pinning = directory.starts_with("pin");
+                // **整词,不是前缀。** `strip_prefix("pin")` 让 `/cd pinia-app` 变成
+                // 「把 ia-app 加书签」—— 目录压根没进去,屏上还说标好了;
+                // `/cd unpinned-dir` 更坏,`starts_with("pin")` 是假,于是变成
+                // 「取消标记 ned-dir」。一个真的子命令后面要么什么都没有,
+                // 要么跟一个空格。
+                let word = |head: &str| {
+                    directory
+                        .strip_prefix(head)
+                        .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+                };
+                if let Some(rest) = word("unpin").or_else(|| word("pin")) {
+                    let pinning = word("unpin").is_none();
                     // Placed the way `/view` places a file: a mark stored as
                     // typed only means something from wherever the process was
                     // started, and `unpin` has to name what `pin` stored.
@@ -2564,6 +2578,38 @@ mod tests {
                     windows_only: false,
                 },
             ]
+        );
+    }
+
+    /// `pin` / `unpin` 是整词,不是前缀。
+    ///
+    /// `strip_prefix("pin")` 让 `/cd pinia-app` 变成「把 ia-app 加书签」——
+    /// 目录压根没进去,而屏上说标好了;`/cd unpinned-dir` 更坏,
+    /// `starts_with("pin")` 是假,于是变成「取消标记 ned-dir」。两条都是
+    /// 「看起来成功了、实际做的是另一件事」。
+    #[tokio::test]
+    async fn cd_reads_pin_as_a_word_not_as_a_prefix() {
+        let host = Arc::new(Recording::default());
+        let (app, _client, all) = following(&host);
+        // 没挂书签端口。真是子命令的话会在那里被拒,不是命令的话
+        // 会走到换目录那一路 —— 两者答得不一样,正好用来分辨。
+        let pinned = all.dispatch("/cd pinia-app", &app.context()).await;
+        assert_ne!(
+            pinned,
+            Outcome::Refused(t(Msg::NoPlaces).into_owned()),
+            "`pinia-app` 是个目录名,不是 `pin ia-app`"
+        );
+        let unpinned = all.dispatch("/cd unpinned-dir", &app.context()).await;
+        assert_ne!(
+            unpinned,
+            Outcome::Refused(t(Msg::NoPlaces).into_owned()),
+            "`unpinned-dir` 同理"
+        );
+        // 而真的子命令仍然是子命令。
+        assert_eq!(
+            all.dispatch("/cd pin /srv/x", &app.context()).await,
+            Outcome::Refused(t(Msg::NoPlaces).into_owned()),
+            "后面跟空格的才是子命令"
         );
     }
 

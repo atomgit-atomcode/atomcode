@@ -194,6 +194,73 @@ async fn skills_are_discovered_and_the_prompt_mentions_them_only_when_they_exist
     }
 }
 
+/// `/remember --global <话>` 记在全局那一层,而不是把 `--global` 当成要记住的话。
+///
+/// 底层的 `memory` 工具一直有 `scope`(project / local / global),只是命令从不传 ——
+/// 于是一句 `/remember --global 我偏好中文` **把那两个字一起写进项目那一层**:
+/// 记下了、记错了地方、而且记进去的是一句没人写的话。三件错事里没有
+/// 一件会报错。
+#[tokio::test]
+async fn remember_writes_the_tier_the_flag_names() {
+    use atomcode_capabilities::memory::MemoryStore;
+    let dir = scratch("remember-scope");
+    let global = dir.join("elsewhere/memory.md");
+    std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+
+    let app = start(tree(
+        &dir,
+        STOP,
+        &[&format!(
+            "[[patch]]\nid = \"memory\"\nconfig = {{ project_root = {:?}, global = {:?} }}\n",
+            dir.to_string_lossy(),
+            global.to_string_lossy()
+        )],
+    ))
+    .await;
+    let catalog = app
+        .context()
+        .service::<atomcode_harness::seams::CommandsSvc>()
+        .expect("the catalog is a core row");
+    let agent = atomcode_harness::create_agent(&app)
+        .await
+        .expect("an agent");
+
+    catalog
+        .find("remember", &agent)
+        .expect("offered")
+        .run(agent.clone(), "--global 全局这一句 g7x")
+        .await
+        .expect("remembering globally");
+
+    let kept = MemoryStore::new(global.clone()).load().join("\n");
+    assert!(kept.contains("全局这一句 g7x"), "它落在全局那一层:{kept:?}");
+    assert!(
+        !kept.contains("--global"),
+        "而且标志本身不是要记住的话:{kept:?}"
+    );
+
+    // 不带标志的照旧写项目那一层 —— 默认没有被改掉。
+    catalog
+        .find("remember", &agent)
+        .expect("offered")
+        .run(agent.clone(), "项目这一句 p4k")
+        .await
+        .expect("remembering");
+    let still = MemoryStore::new(global).load().join("\n");
+    assert!(
+        !still.contains("项目这一句 p4k"),
+        "没带标志的不该跑到全局去:{still:?}"
+    );
+
+    // 不认识的标志是拒,不是静默当成正文。
+    assert!(catalog
+        .find("remember", &agent)
+        .expect("offered")
+        .run(agent.clone(), "--worldwide 试一下")
+        .await
+        .is_err());
+}
+
 /// `/skills` with names on it runs them — all into one turn.
 ///
 /// **It used to throw the argument away.** `run` took `_args` and listed the
@@ -416,6 +483,42 @@ async fn a_capability_row_offers_its_own_commands_and_they_do_the_work() {
         offered_now.contains(&"review".to_string()),
         "the review row offers `/review`: {offered_now:?}"
     );
+
+    // **And the argument it advertises actually parses.**
+    //
+    // `/review` takes `[staged | <base>]` in its own usage line, and both
+    // forms used to be rejected outright: the command wrote the word under
+    // `scope`, which is an internally tagged enum (`#[serde(tag = "kind")]`)
+    // and cannot take a bare string. Only the argument-less form worked, so a
+    // command whose help told you to type one of two words answered both with
+    // `invalid arguments`.
+    //
+    // Judged by what the tool says back, not by the JSON this builds: a
+    // criterion on the JSON would be pinning a shape against nothing. The
+    // scratch directory is not a repository, so the run stops at `git diff`
+    // and costs no model round — which is exactly the point past the parse.
+    // The catalog of the tree that mounts the row — not the one above, which
+    // has no review row at all.
+    let reviewing_catalog = reviewing
+        .context()
+        .service::<atomcode_harness::seams::CommandsSvc>()
+        .expect("the catalog");
+    let review = || {
+        reviewing_catalog
+            .find("review", &review_agent)
+            .expect("offered, so findable")
+    };
+    for scope in ["staged", "main"] {
+        let said = review()
+            .run(review_agent.clone(), scope)
+            .await
+            .err()
+            .unwrap_or_default();
+        assert!(
+            !said.contains("invalid arguments") && !said.contains("invalid scope"),
+            "`/review {scope}` got past the argument parser: {said}"
+        );
+    }
     drop(reviewing);
 }
 
