@@ -822,11 +822,15 @@ impl CommandSet for SessionCommands {
                 };
                 let target = args.trim();
                 if target.is_empty() {
-                    let working_dir = std::env::current_dir()
-                        .ok()
-                        .map(|dir| dir.display().to_string());
+                    // **Where the session works, not where the process was
+                    // started.** The list is scoped to a directory, and the
+                    // two part company the moment anyone passes `--dir` or
+                    // types `/cd` — after which this listed another project's
+                    // sessions and called them this one's. Asked of the host,
+                    // the way `/cd` asks.
+                    let here = working_dir(Some(control.clone()), client.root()).await;
                     return match control
-                        .call(HostCommand::ListSessions { working_dir })
+                        .call(HostCommand::ListSessions { working_dir: here })
                         .await
                     {
                         Ok(HostReply::Sessions { sessions }) => {

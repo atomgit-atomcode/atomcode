@@ -341,7 +341,7 @@ async fn start_with_connection(
     setup: Setup,
     wrap: impl FnOnce(atomcode_host_api::HostConnection) -> atomcode_host_api::HostConnection,
 ) -> Session {
-    start_full(setup, wrap, None, None, None, None).await
+    start_full(setup, wrap, None, None, None, None, None).await
 }
 
 /// A settings port that answers one row with `value` and knows nothing else.
@@ -374,7 +374,7 @@ async fn start_with_connection_and_settings(
     setup: Setup,
     settings: Option<Arc<dyn atomcode_tui::settings::Settings>>,
 ) -> Session {
-    start_full(setup, |control| control, settings, None, None, None).await
+    start_full(setup, |control| control, settings, None, None, None, None).await
 }
 
 /// The layer that puts the test's plugins panel on screen.
@@ -408,7 +408,16 @@ async fn start_with_plugins(
     setup: Setup,
     plugins: Arc<dyn atomcode_tui::plugins::Plugins>,
 ) -> Session {
-    start_full(setup, |control| control, None, Some(plugins), None, None).await
+    start_full(
+        setup,
+        |control| control,
+        None,
+        Some(plugins),
+        None,
+        None,
+        None,
+    )
+    .await
 }
 
 async fn start_full(
@@ -418,6 +427,7 @@ async fn start_full(
     plugins: Option<Arc<dyn atomcode_tui::plugins::Plugins>>,
     tools: Option<Arc<dyn atomcode_tui::tools::Tools>>,
     rewind: Option<Arc<dyn atomcode_tui::rewind::Rewind>>,
+    resume: Option<Arc<dyn atomcode_tui::resume::Resume>>,
 ) -> Session {
     let agent_layers = setup.agent.clone();
     let registry: Registry = Arc::new(agent_catalog);
@@ -464,6 +474,13 @@ async fn start_full(
     if let Some(rewind) = rewind {
         extra.push(REWIND_PANEL_LAYER);
         panel_row.push(Arc::new(RewindPanelRow(rewind)));
+    }
+    // And for the resume panel (`atomcode::tui_resume`). Its list arrives with
+    // the `/resume` command's own round trip; the port is only for throwing a
+    // stored session away, which the panel starts by itself.
+    if let Some(resume) = resume {
+        extra.push(RESUME_PANEL_LAYER);
+        panel_row.push(Arc::new(ResumePanelRow(resume)));
     }
     let mounted = launch::mount_with(
         &screen,
@@ -5158,6 +5175,118 @@ async fn moved_from(s: &Session, from: &str) -> String {
     panic!("the screen never left {from}:\n{}", s.screen());
 }
 
+/// What the panel says when there is nothing else to go back to.
+fn t_resume_no_others() -> String {
+    atomcode_i18n::screen::t(atomcode_i18n::screen::Msg::ResumeNoOthers).into_owned()
+}
+
+/// A recording resume port: it says yes, and keeps what it was asked to throw
+/// away.
+#[derive(Default)]
+struct DeletedSessions(std::sync::Mutex<Vec<String>>);
+
+#[async_trait]
+impl atomcode_tui::resume::Resume for DeletedSessions {
+    async fn delete(&self, id: &str) -> Result<(), String> {
+        self.0
+            .lock()
+            .expect("deleted poisoned")
+            .push(id.to_string());
+        Ok(())
+    }
+    async fn preview(&self, _id: &str) -> Result<Vec<String>, String> {
+        Ok(Vec::new())
+    }
+}
+
+/// Deleting a session from the panel takes two presses, and the second one
+/// reaches the store.
+///
+/// **The wiring, which the panel's own criterion cannot see.** `resume::key`
+/// answers the second `Delete` with `Step::Delete { id }`, and that has been
+/// pinned as a pure function since the panel was written — but whether anything
+/// carries that step to the port, and whether the row then leaves the list, is
+/// three files away (`plugin.rs` dispatch → `ResumeSvc` → `forget_resume`). A
+/// build with the dispatch arm missing keeps the unit criterion green and
+/// quietly does nothing at all.
+///
+/// The first press is asserted too, and it is the half that costs something to
+/// get wrong: one press that deleted would make a key people reach for on a
+/// list into a key that throws work away.
+#[tokio::test]
+async fn a_session_is_deleted_from_the_panel_by_two_presses_and_not_by_one() {
+    let home = scratch("resume-delete-home");
+    let root = scratch("resume-delete-work");
+    let store = Arc::new(DeletedSessions::default());
+    let s = start_with_resume(
+        tree_persistent(&root, &home, &replay(r#"{ text = "ANSWERED" }"#)),
+        store.clone(),
+    )
+    .await;
+    let task = s.open().await;
+
+    // One session with something in it, then a second to be looking at —
+    // `/resume` leaves out the one on screen, so the list needs another.
+    s.term.type_line("a question");
+    s.quiet().await;
+    let first = s.client().session();
+    persisted(&home, &first, 4).await;
+    s.term.type_line("/clear");
+    let second = moved_from(&s, &first).await;
+    s.quiet().await;
+    assert_ne!(first, second);
+
+    s.term.type_line("/resume");
+    s.quiet().await;
+    // The row for the session left behind: its first prompt is its name, and
+    // `N 轮 · …` is the metadata only a panel row carries — the conversation
+    // above says the same words without them.
+    assert!(
+        s.screen().contains("1 轮 ·"),
+        "the panel lists the session left behind:\n{}",
+        s.screen()
+    );
+
+    // One press arms it and says so; it does not delete.
+    s.term.press(atomcode_tui::surface::KeyPress::plain(
+        atomcode_tui::surface::Key::Delete,
+    ));
+    s.quiet().await;
+    assert!(
+        store.0.lock().expect("deleted poisoned").is_empty(),
+        "one press is not a delete"
+    );
+
+    // The second one goes through to the store, and the row leaves the list.
+    s.term.press(atomcode_tui::surface::KeyPress::plain(
+        atomcode_tui::surface::Key::Delete,
+    ));
+    for _ in 0..200 {
+        if !store.0.lock().expect("deleted poisoned").is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        *store.0.lock().expect("deleted poisoned"),
+        vec![first.clone()],
+        "the second press reached the store, once"
+    );
+    s.quiet().await;
+    let after = s.screen();
+    assert!(
+        !after.contains("1 轮 ·"),
+        "and the row it deleted is gone from the list:\n{after}"
+    );
+    assert!(
+        after.contains(&t_resume_no_others()),
+        "which leaves the list saying it is empty, not showing a stale row:\n{after}"
+    );
+
+    s.term.press(atomcode_tui::surface::KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
 /// The host replaces the session — a new one, then the first one again — and
 /// the screen draws each in a stream of its own: nothing of the session it left
 /// is drawn over the one it moved to, nothing is drawn twice, and the session
@@ -5580,13 +5709,76 @@ impl Plugin for RewindPanelRow {
 
 /// Start the screen with a rewind port behind it.
 async fn start_with_rewind(setup: Setup, rewind: Arc<dyn atomcode_tui::rewind::Rewind>) -> Session {
-    start_full(setup, |control| control, None, None, None, Some(rewind)).await
+    start_full(
+        setup,
+        |control| control,
+        None,
+        None,
+        None,
+        Some(rewind),
+        None,
+    )
+    .await
 }
 
 /// Start the screen with a tools port behind it — the only way to see the
 /// panel: a screen with no port refuses to open it.
 async fn start_with_tools(setup: Setup, tools: Arc<dyn atomcode_tui::tools::Tools>) -> Session {
-    start_full(setup, |control| control, None, None, Some(tools), None).await
+    start_full(
+        setup,
+        |control| control,
+        None,
+        None,
+        Some(tools),
+        None,
+        None,
+    )
+    .await
+}
+
+const RESUME_PANEL_LAYER: &str = "[[insert]]\nname = \"tui-panel-resume\"\n";
+
+/// The resume panel's view and its port, mounted the way the launcher's row
+/// mounts them (`atomcode::tui_resume`).
+struct ResumePanelRow(Arc<dyn atomcode_tui::resume::Resume>);
+
+#[async_trait]
+impl Plugin for ResumePanelRow {
+    fn name(&self) -> &'static str {
+        "tui-panel-resume"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["tui-modules"]
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["tui-resume", "tui-resume-store"]
+    }
+    async fn apply(&self, ctx: &Context, _config: &serde_json::Value) -> Result<(), String> {
+        let mods = ctx
+            .require::<atomcode_tui::plugin::ModulesSvc>()
+            .map_err(|e| e.to_string())?;
+        mods.add_view(Arc::new(atomcode_tui::module::Mounted::<
+            atomcode_tui::modules::resume::Resume,
+        >::new()))?;
+        let _ = ctx
+            .provide::<atomcode_tui::plugin::ResumeSvc>(self.0.clone())
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+/// Start the screen with a resume port behind it.
+async fn start_with_resume(setup: Setup, resume: Arc<dyn atomcode_tui::resume::Resume>) -> Session {
+    start_full(
+        setup,
+        |control| control,
+        None,
+        None,
+        None,
+        None,
+        Some(resume),
+    )
+    .await
 }
 
 // ---- the plugins panel ---------------------------------------------------
@@ -6542,6 +6734,7 @@ async fn start_with_mode_host(
             }
         },
         settings,
+        None,
         None,
         None,
         None,
