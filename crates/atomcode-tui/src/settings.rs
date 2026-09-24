@@ -510,8 +510,13 @@ pub struct UsagePage {
     /// Tokens of the context window this session is using, and how big it is.
     /// `None` when the host would not say.
     pub context: Option<ContextUse>,
-    /// The account's rolling windows. Empty means the host does not meter.
+    /// The account's rolling windows. Empty with no [`Self::unavailable`]
+    /// means the host does not meter.
     pub windows: Vec<atomcode_host_api::UsageWindow>,
+    /// Why there is no answer, when there is none — see the host contract's
+    /// field of the same name. Drawing this as "not metered" would tell
+    /// somebody held back BY the allowance the opposite of the truth.
+    pub unavailable: Option<String>,
     /// What the account is subscribed to. `None` when the host has no notion of
     /// a plan — not the same as a plan that ran out, which is still reported.
     pub plan: Option<atomcode_host_api::Entitlement>,

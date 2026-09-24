@@ -2296,19 +2296,27 @@ impl HostControl for RuntimeControl {
                     working_dir: now.working_dir.display().to_string(),
                 })
             }
-            // Best-effort by contract: a host that meters nothing, and a source
-            // that is slow or down, both answer with an empty list. "I could not
-            // reach the meter" and "there is no meter" look the same to a person
-            // — neither is a number — and making this fail would make `/usage`
-            // the one command that breaks when the network hiccups.
+            // Best-effort by contract: a meter that is slow or down does not
+            // make this fail, or `/usage` would be the one command that breaks
+            // when the network hiccups. What it does do is SAY so
+            // (`unavailable`): "there is no meter" and "I could not reach the
+            // meter" both arrive as an empty list, and telling a person the
+            // first when it was the second is telling them the opposite of the
+            // truth — someone held back by the allowance would read "this host
+            // does not count one".
             HostCommand::Usage {
                 session,
                 windows_only,
             } => {
                 self.addressed(&session)?;
-                let (windows, plan, spent) =
-                    self.handle.usage(windows_only).await.map_err(refused)?;
+                let atomcode_coding::Allowance {
+                    windows,
+                    plan,
+                    spent,
+                    unavailable,
+                } = self.handle.usage(windows_only).await.map_err(refused)?;
                 Ok(HostReply::Usage {
+                    unavailable,
                     plan: plan.map(|plan| atomcode_host_api::Entitlement {
                         plan: plan.plan,
                         active: plan.active,

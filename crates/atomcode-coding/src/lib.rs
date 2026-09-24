@@ -106,7 +106,7 @@ pub use rate_limit::{
     RateLimitWindowSource,
 };
 pub use runtime::{
-    CodingRuntime, CodingRuntimeEvent, CodingRuntimeEvents, CodingRuntimeHandle,
+    Allowance, CodingRuntime, CodingRuntimeEvent, CodingRuntimeEvents, CodingRuntimeHandle,
     CodingRuntimeStart, CompactionInterruption, DeferredRuntimeState, DriverCommand,
     ImagePreprocessor, LocalContextInput, McpDetailSnapshot, McpRowsSnapshot, McpStatusSnapshot,
     McpToolApproval, McpToolsSnapshot, ProviderBootstrap, ProviderUnavailableReason,

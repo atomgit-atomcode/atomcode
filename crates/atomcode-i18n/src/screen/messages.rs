@@ -1673,4 +1673,12 @@ pub enum Msg<'a> {
     },
     /// Sent back to the far end when it asked for something it may not have.
     RemoteDesktopOnly,
+    /// The meter was asked and did not answer. **Not** the same sentence as
+    /// [`Msg::UsageNotCounted`], which is a host that counts nothing.
+    UsageUnknown {
+        why: &'a str,
+    },
+    /// Tacked onto a "copied" line when nothing could confirm it: the text
+    /// went out as OSC 52 and the terminal does not answer.
+    CopyHandedOver,
 }

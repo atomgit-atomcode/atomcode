@@ -259,7 +259,12 @@ pub trait Surface: Send + Sync {
     /// The surface's job because it is the only layer that may talk to the
     /// terminal, and the terminal is what has a clipboard — see
     /// [`crate::ansi::set_clipboard`] for why not `pbcopy`.
-    fn copy(&self, _text: &str) {}
+    ///
+    /// The answer says **whether it can be confirmed**, which is not the same
+    /// as whether it worked: see [`Copied`].
+    fn copy(&self, _text: &str) -> Copied {
+        Copied::HandedOver
+    }
 
     /// Take what the clipboard holds as text.
     ///
@@ -578,11 +583,13 @@ impl Surface for Headless {
     /// The scripted clipboard is one text buffer: a copy writes it and a paste
     /// reads it, so the round trip a person performs works with no clipboard,
     /// and a test can watch either end.
-    fn copy(&self, text: &str) {
+    fn copy(&self, text: &str) -> Copied {
         if text.is_empty() {
-            return;
+            return Copied::HandedOver;
         }
         *self.clipboard_text.lock().expect("headless poisoned") = Some(text.to_string());
+        // 这块「终端」就是那个剪贴板,所以它确实收下了。
+        Copied::Here
     }
     fn clipboard_text(&self) -> Option<String> {
         self.clipboard_text
@@ -1105,16 +1112,17 @@ fn read_clipboard_text() -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-/// Hand the text to whatever this machine uses for a clipboard.
+/// Hand the text to whatever this machine uses for a clipboard. `true` when one
+/// of them took it — which is the only part of a copy that can be confirmed.
 ///
 /// Skipped over ssh: the helper would put it on the *server's* clipboard, which
 /// is not the one anybody is looking at. There OSC 52 is the only thing that
-/// can work, and it is already on its way.
-fn local_clipboard(text: &str) {
+/// can work, and it is already on its way — and nothing can be confirmed.
+fn local_clipboard(text: &str) -> bool {
     use std::process::{Command, Stdio};
 
     if std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some() {
-        return;
+        return false;
     }
     let helpers: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
         &[("pbcopy", &[])]
@@ -1143,10 +1151,14 @@ fn local_clipboard(text: &str) {
             // over a broken pipe would be worse than a copy that half worked.
             let _ = stdin.write_all(text.as_bytes());
         }
-        // `stdin` is dropped here, so the child sees EOF and can exit.
-        let _ = child.wait();
-        return;
+        // `stdin` is dropped here, so the child sees EOF and can exit. A
+        // helper that ran and exited 0 took it; one that failed is no better
+        // than not being installed, so the next one gets a turn.
+        if child.wait().map(|done| done.success()).unwrap_or(false) {
+            return true;
+        }
     }
+    false
 }
 
 // ---- what colour is the terminal? ---------------------------------------
@@ -1603,9 +1615,9 @@ impl Surface for Terminal {
         let _ = out.write_all(crate::ansi::set_title(title).as_bytes());
         let _ = out.flush();
     }
-    fn copy(&self, text: &str) {
+    fn copy(&self, text: &str) -> Copied {
         if text.is_empty() {
-            return;
+            return Copied::HandedOver;
         }
         // Both paths, because either can be unavailable and they fail
         // differently. OSC 52 crosses ssh and tmux, but the terminal may refuse
@@ -1617,7 +1629,11 @@ impl Surface for Terminal {
         let mut out = std::io::stdout();
         let _ = out.write_all(ansi::set_clipboard(text).as_bytes());
         let _ = out.flush();
-        local_clipboard(text);
+        // 这一句是唯一能确认的那一半 —— OSC 52 写出去了不等于终端收下了。
+        match local_clipboard(text) {
+            true => Copied::Here,
+            false => Copied::HandedOver,
+        }
     }
     fn clipboard_image(&self) -> Option<atomcode_kernel::message::ImageContent> {
         read_clipboard_image()
@@ -1645,6 +1661,36 @@ impl Drop for Terminal {
     fn drop(&mut self) {
         if self.raw {
             self.restore();
+        }
+    }
+}
+
+/// 一次复制,以及能不能确认它成了。
+///
+/// **两件事,不是一件。** 一个本机助手(`pbcopy`、`wl-copy`…)收下了它,就是
+/// 在剪贴板里了,这能确认。而 OSC 52 是把字节写给终端**然后没有下文**——
+/// 终端不回话,它也可能悄悄拒掉:iTerm2 出厂就把剪贴板访问关着,而 ssh 上
+/// OSC 52 是唯一的路。
+///
+/// 两种都写成「已复制」的那一次,人会去别处粘贴,粘出上一次复制的东西,
+/// 然后找半天。所以不能确认的时候就说不能确认。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Copied {
+    /// 本机助手收下了 —— 它在这台机器的剪贴板里。
+    Here,
+    /// 只交给了终端。成没成只有终端知道,而它不说。
+    HandedOver,
+}
+
+impl Copied {
+    /// 把一句「复制好了」补成实话。
+    pub fn words(self, said: impl Into<String>) -> String {
+        let said = said.into();
+        match self {
+            Copied::Here => said,
+            Copied::HandedOver => {
+                format!("{said}{}", crate::i18n::t(crate::i18n::Msg::CopyHandedOver))
+            }
         }
     }
 }
@@ -1811,6 +1857,37 @@ pub fn from_crossterm(event: crossterm::event::Event) -> Option<Input> {
 mod tests {
     use super::*;
     use crate::frame::{Line, Rect};
+
+    /// 一次不能确认的复制,不许说成一次复制好了的。
+    ///
+    /// OSC 52 是写出去就没有下文的:终端不回话,而它可能悄悄拒掉(iTerm2
+    /// 出厂就关着剪贴板访问),ssh 上这还是唯一的路。两种都写成同一句的那
+    /// 一次,人去别处粘贴,粘出的是上一次复制的东西,然后找半天。
+    ///
+    /// 反面才是理由,所以这条钉的是**两句话不一样**:把不能确认的那半也
+    /// 原样返回,这条就红 —— 而屏幕上一切照旧。
+    #[test]
+    fn a_copy_that_cannot_be_confirmed_does_not_say_it_was_copied() {
+        let done = Copied::Here.words("已复制");
+        let maybe = Copied::HandedOver.words("已复制");
+        assert_eq!(done, "已复制", "确认了的那一句原样");
+        assert_ne!(maybe, done, "没确认的不能是同一句话:{maybe}");
+        assert!(maybe.starts_with("已复制"), "但也不是换一句话说:{maybe}");
+
+        // 而一块答不上来的屏幕默认是「不能确认」,不是「成了」—— 这是安全的
+        // 那一侧,也是每个自己不实现 `copy` 的 surface 得到的答案。
+        struct Mute;
+        impl Surface for Mute {
+            fn describe(&self) -> String {
+                "mute".into()
+            }
+            fn size(&self) -> (u16, u16) {
+                (80, 24)
+            }
+            fn present(&self, _frame: &Frame) {}
+        }
+        assert_eq!(Mute.copy("x"), Copied::HandedOver);
+    }
 
     /// Being killed still gives the screen back.
     ///

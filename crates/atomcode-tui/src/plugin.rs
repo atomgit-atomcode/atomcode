@@ -3311,7 +3311,7 @@ impl Tui {
                 }),
                 _ => None,
             };
-            let (windows, plan, stats) = match control
+            let (windows, plan, stats, unavailable) = match control
                 .call(HostCommand::Usage {
                     session,
                     windows_only: false,
@@ -3322,10 +3322,13 @@ impl Tui {
                     windows,
                     plan,
                     stats,
-                }) => (windows, plan, stats),
-                // A host that will not say is a host with nothing to draw; the
-                // page says so rather than showing an error where a chart goes.
-                _ => (Vec::new(), None, None),
+                    unavailable,
+                }) => (windows, plan, stats, unavailable),
+                // The host itself would not answer. That is not "nothing to
+                // count" either — the page says which it was rather than
+                // drawing an empty allowance over a live one.
+                Ok(other) => (Vec::new(), None, None, Some(format!("{other:?}"))),
+                Err(error) => (Vec::new(), None, None, Some(format!("{error:?}"))),
             };
             host.moment.write().expect("moment poisoned").usage =
                 Some(crate::settings::UsagePage {
@@ -3333,6 +3336,7 @@ impl Tui {
                     windows,
                     plan,
                     stats,
+                    unavailable,
                 });
             if let Some(repaint) = repaint {
                 repaint.now();
@@ -4966,12 +4970,13 @@ impl Tui {
                 drop(m);
                 let text = self.host.compose(self.surface.size()).selected_text(&sel);
                 if !text.is_empty() {
-                    self.surface.copy(&text);
                     // Confirm on the tip row, the way the right-click `copy` menu
                     // item does — the auto-copy of a drag-release is still a copy,
                     // and it must say so on the gesture itself rather than leave
-                    // the person to copy a second time to learn it worked.
-                    self.host.say(t(Msg::CopiedSelection).into_owned(), false);
+                    // the person to copy a second time to learn it worked. And it
+                    // says WHICH kind of "copied" it was — see `Copied`.
+                    let how = self.surface.copy(&text);
+                    self.host.say(how.words(t(Msg::CopiedSelection)), false);
                 }
                 return false;
             }
@@ -5588,12 +5593,12 @@ impl Tui {
                 if let Some(sel) = selected {
                     let text = self.host.compose(self.surface.size()).selected_text(&sel);
                     if !text.is_empty() {
-                        self.surface.copy(&text);
+                        let how = self.surface.copy(&text);
                         // The reserved row above the field, not the stream: this
                         // is true of *now*, and a block for it would push the
                         // conversation up a row for a sentence nobody reads
                         // twice.
-                        self.host.say(t(Msg::CopiedSelection).into_owned(), false);
+                        self.host.say(how.words(t(Msg::CopiedSelection)), false);
                         return false;
                     }
                 }
@@ -5620,10 +5625,12 @@ impl Tui {
                     );
                     return false;
                 }
-                self.surface.copy(&text);
+                let how = self.surface.copy(&text);
                 // The other front end's usage panel already says this.
                 self.host.say(
-                    crate::i18n::product::t(crate::i18n::product::Msg::UsageCopied).into_owned(),
+                    how.words(crate::i18n::product::t(
+                        crate::i18n::product::Msg::UsageCopied,
+                    )),
                     false,
                 );
                 false

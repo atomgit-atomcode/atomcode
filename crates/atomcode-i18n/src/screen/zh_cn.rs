@@ -1012,5 +1012,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SteeringQueued => "将在下一次工具调用后提交的消息（按 Ctrl+B 中断并立即发送）".into(),
         Msg::RemoteRan { command } => format!("（另一端执行了 {command}）").into(),
         Msg::RemoteDesktopOnly => "这条得在这台机器上敲。另一端能用的是：".into(),
+        Msg::UsageUnknown { why } => format!("问不到还剩多少：{why}").into(),
+        Msg::CopyHandedOver => "（交给了终端；它要是不让复制，这次就没有）".into(),
     }
 }

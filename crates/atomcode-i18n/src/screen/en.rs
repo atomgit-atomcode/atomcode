@@ -1085,5 +1085,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::RemoteDesktopOnly => {
             "That one has to be typed on this machine. From there you can use:".into()
         }
+        Msg::UsageUnknown { why } => format!("Could not find out what is left: {why}").into(),
+        Msg::CopyHandedOver => {
+            " (handed to the terminal; if it does not allow copying, nothing happened)".into()
+        }
     }
 }

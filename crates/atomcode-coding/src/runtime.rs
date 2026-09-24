@@ -698,6 +698,52 @@ fn forwarded_steer_for_acknowledgement(
     }
 }
 
+/// 账户还剩多少 —— 以及「问不到」这件事本身。
+///
+/// **`windows` 空有两个意思,而它们必须分得开。** 一个是「这个宿主根本不计
+/// 额度」(没有账户服务),另一个是「问了,没答上来」(超时、网络断、服务在
+/// 抽风)。把后者画成前者,屏幕上写的就是事实的反面——一个正被额度挡住的人
+/// 会读到「不计额度」,然后去别处找原因。所以问不到的时候 `unavailable`
+/// 说为什么,而那时 `windows` 的空不代表任何事。
+#[derive(Clone, Debug, Default)]
+pub struct Allowance {
+    /// 一个窗口一行。空且 `unavailable` 也空 = 真的不计额度。
+    pub windows: Vec<crate::rate_limit::RateLimitWindow>,
+    /// 窗口背后的套餐,服务说得出的话。
+    pub plan: Option<crate::rate_limit::Entitlement>,
+    /// 已经花掉的,服务记得的话。
+    pub spent: Option<crate::rate_limit::AccountUsage>,
+    /// 问不到的时候,为什么。
+    pub unavailable: Option<String>,
+}
+
+/// 问到了就是那些窗口;没问到是空的,而空由 [`why_not`] 解释。
+fn windows_or_nothing(
+    asked: &Result<
+        Result<Vec<crate::rate_limit::RateLimitWindow>, String>,
+        tokio::time::error::Elapsed,
+    >,
+) -> Vec<crate::rate_limit::RateLimitWindow> {
+    match asked {
+        Ok(Ok(windows)) => windows.clone(),
+        _ => Vec::new(),
+    }
+}
+
+/// 为什么没有答案。`None` = 有答案(哪怕答案是「一个窗口都没有」)。
+fn why_not(
+    asked: &Result<
+        Result<Vec<crate::rate_limit::RateLimitWindow>, String>,
+        tokio::time::error::Elapsed,
+    >,
+) -> Option<String> {
+    match asked {
+        Ok(Ok(_)) => None,
+        Ok(Err(error)) => Some(error.clone()),
+        Err(elapsed) => Some(elapsed.to_string()),
+    }
+}
+
 /// Ordered, fire-and-forget driver requests. This is the native replacement for
 /// the core AgentCommand channel during asynchronous runtime startup.
 #[derive(Clone, Debug)]
@@ -2229,17 +2275,7 @@ impl CodingRuntimeHandle {
     /// two trips would be two chances for one of them to be a moment stale
     /// against the other.
     #[allow(clippy::type_complexity)]
-    pub async fn usage(
-        &self,
-        windows_only: bool,
-    ) -> Result<
-        (
-            Vec<crate::rate_limit::RateLimitWindow>,
-            Option<crate::rate_limit::Entitlement>,
-            Option<crate::rate_limit::AccountUsage>,
-        ),
-        RuntimeError,
-    > {
+    pub async fn usage(&self, windows_only: bool) -> Result<Allowance, RuntimeError> {
         let state = self.state.load(Ordering::Acquire);
         let (done, result) = oneshot::channel();
         self.tx
@@ -3014,17 +3050,7 @@ pub enum CodingRuntimeControl {
         /// Fetch the windows alone, as the host contract's field of the same
         /// name asks: one call on the account instead of three.
         windows_only: bool,
-        #[allow(clippy::type_complexity)]
-        done: oneshot::Sender<
-            Result<
-                (
-                    Vec<crate::rate_limit::RateLimitWindow>,
-                    Option<crate::rate_limit::Entitlement>,
-                    Option<crate::rate_limit::AccountUsage>,
-                ),
-                RuntimeError,
-            >,
-        >,
+        done: oneshot::Sender<Result<Allowance, RuntimeError>>,
     },
     /// What this session has changed in the workspace. `file` asks for one
     /// file's diff text instead of the summary of all of them.
@@ -4569,8 +4595,10 @@ fn spawn_runtime_owner_with_optional_agent(
                             .as_ref()
                             .and_then(|runtime| runtime.parts.rate_limit_source().cloned());
                         tokio::spawn(async move {
+                            // No source at all: this really is a host that
+                            // counts nothing, and an empty answer says so.
                             let Some(source) = source else {
-                                let _ = done.send(Ok((Vec::new(), None, None)));
+                                let _ = done.send(Ok(Allowance::default()));
                                 return;
                             };
                             // Asked for together, not one after another: these
@@ -4586,12 +4614,13 @@ fn spawn_runtime_owner_with_optional_agent(
                             // asking the other two on a timer would triple the
                             // traffic to say the same thing.
                             if windows_only {
-                                let windows = tokio::time::timeout(budget, source.fetch_windows())
-                                    .await
-                                    .ok()
-                                    .and_then(|fetched| fetched.ok())
-                                    .unwrap_or_default();
-                                let _ = done.send(Ok((windows, None, None)));
+                                let asked =
+                                    tokio::time::timeout(budget, source.fetch_windows()).await;
+                                let _ = done.send(Ok(Allowance {
+                                    windows: windows_or_nothing(&asked),
+                                    unavailable: why_not(&asked),
+                                    ..Allowance::default()
+                                }));
                                 return;
                             }
                             let (windows, plan, spent) = tokio::join!(
@@ -4602,13 +4631,18 @@ fn spawn_runtime_owner_with_optional_agent(
                             // Each answer stands or falls on its own: a plan
                             // the service would not say is not a reason to draw
                             // no windows.
-                            let windows = windows
-                                .ok()
-                                .and_then(|fetched| fetched.ok())
-                                .unwrap_or_default();
                             let plan = plan.ok().and_then(|fetched| fetched.ok()).flatten();
                             let spent = spent.ok().and_then(|fetched| fetched.ok()).flatten();
-                            let _ = done.send(Ok((windows, plan, spent)));
+                            let _ = done.send(Ok(Allowance {
+                                windows: windows_or_nothing(&windows),
+                                plan,
+                                spent,
+                                // The windows are the answer this question is
+                                // about. A plan or a spend that did not come
+                                // back leaves its own field empty and says
+                                // nothing more — those two are extra.
+                                unavailable: why_not(&windows),
+                            }));
                         });
                     }
                     // Reading only: unlike the rewind catalog this does not

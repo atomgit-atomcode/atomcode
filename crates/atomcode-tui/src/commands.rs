@@ -383,8 +383,9 @@ impl CommandSet for TakeAwayCommands {
                         return Outcome::Refused(t(Msg::NoClipboard).into_owned());
                     };
                     let lines = answer.lines().count();
-                    surface.copy(&answer);
-                    return Outcome::Said(t(Msg::CopiedLines { lines }).into_owned());
+                    return Outcome::Said(
+                        surface.copy(&answer).words(t(Msg::CopiedLines { lines })),
+                    );
                 }
                 let blocks = code_blocks(&answer);
                 if blocks.is_empty() {
@@ -418,8 +419,7 @@ impl CommandSet for TakeAwayCommands {
                     return Outcome::Refused(t(Msg::NoClipboard).into_owned());
                 };
                 let lines = text.lines().count();
-                surface.copy(&text);
-                Outcome::Said(t(Msg::CopiedLines { lines }).into_owned())
+                Outcome::Said(surface.copy(&text).words(t(Msg::CopiedLines { lines })))
             }
             // Markdown rather than the screen's own rendering: what is saved is
             // read elsewhere — in an editor, in a review, in an issue — and the
@@ -1570,6 +1570,13 @@ impl CommandSet for SessionCommands {
                     })
                     .await
                 {
+                    // 问不到 ≠ 不计额度。两者的窗口都是空的,而说错的那一次,
+                    // 正在被额度挡住的人会读到「这个宿主不计额度」,然后去
+                    // 别处找原因。
+                    Ok(HostReply::Usage {
+                        unavailable: Some(why),
+                        ..
+                    }) => Outcome::Refused(t(Msg::UsageUnknown { why: &why }).into_owned()),
                     Ok(HostReply::Usage { windows, .. }) if windows.is_empty() => {
                         Outcome::Said(t(Msg::UsageNotCounted).into_owned())
                     }
@@ -2728,6 +2735,7 @@ mod tests {
             Ok(HostReply::Usage {
                 plan: None,
                 stats: None,
+                unavailable: None,
                 windows: vec![
                     atomcode_host_api::UsageWindow {
                         label: "5 小时".into(),
@@ -2754,6 +2762,16 @@ mod tests {
             Ok(HostReply::Usage {
                 plan: None,
                 stats: None,
+                unavailable: None,
+                windows: Vec::new(),
+            }),
+            // Asked, and the meter did not answer. The windows are empty here
+            // too — which is exactly why this third reply has to read
+            // differently from the second.
+            Ok(HostReply::Usage {
+                plan: None,
+                stats: None,
+                unavailable: Some("timed out".into()),
                 windows: Vec::new(),
             }),
         ]);
@@ -2775,9 +2793,23 @@ mod tests {
             Outcome::Said(text) => assert!(text.contains("不计额度"), "{text}"),
             other => panic!("{other:?}"),
         }
+        // 而问不到的那一次,**不能**说成同一句话。两次的窗口都是空的,所以
+        // 只钉上面那一半的话,把两者合并回去照样全绿 —— 而合并之后,一个正
+        // 被额度挡住的人读到的是「这个宿主不计额度」。
+        match all.dispatch("/usage", &app.context()).await {
+            Outcome::Refused(text) => {
+                assert!(!text.contains("不计额度"), "这是问不到,不是不计:{text}");
+                assert!(text.contains("timed out"), "而且说得出为什么:{text}");
+            }
+            other => panic!("{other:?}"),
+        }
         assert_eq!(
             *host.asked.lock().unwrap(),
             vec![
+                HostCommand::Usage {
+                    session: "lead".into(),
+                    windows_only: false,
+                },
                 HostCommand::Usage {
                     session: "lead".into(),
                     windows_only: false,

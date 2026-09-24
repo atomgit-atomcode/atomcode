@@ -730,9 +730,15 @@ fn allowance_lines(page: Option<&crate::settings::UsagePage>) -> Vec<UsageLine> 
 
     // Said, not returned on: an account with no metered windows may still have
     // a plan, and the first version of this bailed out here.
+    //
+    // 「不计额度」和「问不到」是两句话。两种情况下窗口都是空的,而把后者
+    // 画成前者,一个正被额度挡在外面的人会读到「这个宿主不计额度」。
     if page.windows.is_empty() {
         out.push(UsageLine::Head(t(Msg::UsageAllowanceHead).into_owned()));
-        out.push(UsageLine::Note(t(Msg::UsageNotCounted).into_owned()));
+        out.push(UsageLine::Note(match page.unavailable.as_deref() {
+            Some(why) => t(Msg::UsageUnknown { why }).into_owned(),
+            None => t(Msg::UsageNotCounted).into_owned(),
+        }));
         out.push(UsageLine::Gap);
     }
 
@@ -2224,6 +2230,7 @@ mod tests {
     fn the_usage_page_draws_what_was_counted_and_no_bar_for_what_was_not() {
         let counted = usage_page(crate::settings::UsagePage {
             context: None,
+            unavailable: None,
             plan: None,
             windows: vec![window("5 小时", Some(42))],
             stats: None,
@@ -2245,6 +2252,7 @@ mod tests {
         // table; the protection belongs wherever a bar still is.
         let pair = usage_page(crate::settings::UsagePage {
             context: None,
+            unavailable: None,
             plan: None,
             windows: vec![window("5 小时", Some(90)), window("每周", Some(10))],
             stats: None,
@@ -2263,6 +2271,7 @@ mod tests {
 
         let uncounted = usage_page(crate::settings::UsagePage {
             context: None,
+            unavailable: None,
             plan: None,
             windows: vec![window("每周", None)],
             stats: None,
@@ -2272,6 +2281,40 @@ mod tests {
         assert!(
             !shown.contains('█'),
             "and draws no bar, because an empty one would claim zero: {shown}"
+        );
+    }
+
+    /// 「问不到」和「不计额度」在这一页上不是同一句话。
+    ///
+    /// 两种情况下窗口都是空的,所以这一条真正钉的是**两者读起来不一样**:
+    /// 把它们合并回去(问不到时照样写「不计额度」)照样能画出一页来,而那一页
+    /// 对一个正被额度挡在外面的人说的是事实的反面 —— 他会去别处找原因。
+    #[test]
+    fn a_meter_that_did_not_answer_does_not_read_as_a_host_with_no_meter() {
+        let no_meter = usage_page(crate::settings::UsagePage {
+            context: None,
+            unavailable: None,
+            plan: None,
+            windows: Vec::new(),
+            stats: None,
+        });
+        let no_answer = usage_page(crate::settings::UsagePage {
+            context: None,
+            unavailable: Some("timed out".into()),
+            plan: None,
+            windows: Vec::new(),
+            stats: None,
+        });
+        let no_meter = drawn(&no_meter, 80, 20).join("\n");
+        let no_answer = drawn(&no_answer, 80, 20).join("\n");
+        assert!(no_meter.contains("不计额度"), "{no_meter}");
+        assert!(
+            !no_answer.contains("不计额度"),
+            "问不到的时候不能说成不计:{no_answer}"
+        );
+        assert!(
+            no_answer.contains("timed out"),
+            "而且说得出为什么:{no_answer}"
         );
     }
 
@@ -2286,6 +2329,7 @@ mod tests {
         use atomcode_host_api::{DayUse, ModelSeries, ModelUse, UsageStats};
         let page = models_page(crate::settings::UsagePage {
             context: None,
+            unavailable: None,
             plan: None,
             windows: Vec::new(),
             stats: Some(UsageStats {
@@ -2405,6 +2449,7 @@ mod tests {
         use atomcode_host_api::{DayUse, ModelSeries, ModelUse, UsageStats};
         let page = models_page(crate::settings::UsagePage {
             context: None,
+            unavailable: None,
             plan: None,
             windows: Vec::new(),
             stats: Some(UsageStats {
@@ -2512,6 +2557,7 @@ mod tests {
         let last = daily[89].date.clone();
         let page = models_page(crate::settings::UsagePage {
             context: None,
+            unavailable: None,
             plan: None,
             windows: Vec::new(),
             stats: Some(UsageStats {
@@ -2559,6 +2605,7 @@ mod tests {
         let page = |active: bool, left: i32| {
             usage_page(crate::settings::UsagePage {
                 context: None,
+                unavailable: None,
                 plan: Some(Entitlement {
                     plan: "CodingPlan Pro".into(),
                     active,
@@ -2618,6 +2665,7 @@ mod tests {
             .collect();
         let page = stats_page(crate::settings::UsagePage {
             context: None,
+            unavailable: None,
             plan: None,
             windows: Vec::new(),
             stats: Some(UsageStats {
@@ -2707,6 +2755,7 @@ mod tests {
             .collect();
         let page = stats_page(crate::settings::UsagePage {
             context: None,
+            unavailable: None,
             plan: None,
             windows: Vec::new(),
             stats: Some(UsageStats {
@@ -2803,6 +2852,7 @@ mod tests {
         spent.resets_in_seconds = 11;
         let page = usage_page(crate::settings::UsagePage {
             context: None,
+            unavailable: None,
             plan: None,
             windows: vec![spent],
             stats: None,
@@ -2851,6 +2901,7 @@ mod tests {
             .collect();
         let page = crate::settings::UsagePage {
             context: None,
+            unavailable: None,
             plan: None,
             windows: Vec::new(),
             stats: Some(UsageStats {
@@ -2979,6 +3030,7 @@ mod tests {
         use atomcode_host_api::{DayUse, Entitlement, ModelUse, UsageStats};
         let page = crate::settings::UsagePage {
             context: None,
+            unavailable: None,
             plan: Some(Entitlement {
                 plan: "CodingPlan Pro".into(),
                 active: true,
@@ -3081,6 +3133,7 @@ mod tests {
                 settings_panel: Some(scrolled),
                 usage: Some(crate::settings::UsagePage {
                     context: None,
+                    unavailable: None,
                     plan: None,
                     windows: Vec::new(),
                     stats: Some(atomcode_host_api::UsageStats {

@@ -451,10 +451,24 @@ pub enum HostReply {
     History {
         entries: Vec<String>,
     },
-    /// What the account has left, window by window. Empty for a host that
-    /// meters nothing.
+    /// What the account has left, window by window.
+    ///
+    /// Still best effort: a meter that is slow or down does not make this
+    /// fail, because `/usage` would then be the one command that breaks when
+    /// the network hiccups. But the two empty answers are **not** the same
+    /// answer, and `unavailable` is which one it was — see its own note.
     Usage {
+        /// Empty with no `unavailable` means a host that meters nothing.
         windows: Vec<UsageWindow>,
+        /// Why there is no answer, when there is none.
+        ///
+        /// **「不计额度」和「问不到」必须读起来不一样。** Both arrive as an
+        /// empty list, and drawing the second as the first tells a person the
+        /// opposite of the truth: someone who is being held back BY the
+        /// allowance reads "this host does not count one" and goes looking
+        /// somewhere else for the reason. Same shape as `WorkspaceChanges`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unavailable: Option<String>,
         /// What the account is subscribed to, when the host has a notion of it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         plan: Option<Entitlement>,
@@ -1410,11 +1424,7 @@ mod tests {
                 | HostCommand::Thinking { .. }
                 | HostCommand::SetThinking { .. }
                 | HostCommand::Readiness { .. }
-                | HostCommand::ResetSetting { .. }
-                | HostCommand::ToolCatalog { .. }
-                | HostCommand::SwitchTool { .. }
-                | HostCommand::PreviewSession { .. }
-                | HostCommand::DeleteSession { .. } => {}
+                | HostCommand::ResetSetting { .. } => {}
             }
         }
         all
@@ -1595,6 +1605,7 @@ mod tests {
                 working_dir: "/w".into(),
             },
             HostReply::Usage {
+                unavailable: None,
                 plan: Some(Entitlement {
                     plan: "CodingPlan Pro".into(),
                     active: true,
@@ -1684,8 +1695,7 @@ mod tests {
                 | HostReply::Identity { .. }
                 | HostReply::Sources { .. }
                 | HostReply::ToolCatalog { .. }
-                | HostReply::Readiness { .. }
-                | HostReply::SessionPreview { .. } => {}
+                | HostReply::Readiness { .. } => {}
             }
         }
         all
