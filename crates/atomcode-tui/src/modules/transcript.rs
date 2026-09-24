@@ -50,6 +50,13 @@ struct Open {
     /// The task list as the turns so far left it, so a turn that ends on its
     /// own can say whether it left work open. Fed the same facts the panel is.
     plan: crate::modules::todo::Plan,
+    /// Whether the turn in flight made a call to the task list. A turn that
+    /// never touched it — a question about something else, answered — is not
+    /// stopping on the list's open items, which an earlier turn left there.
+    touched_plan: bool,
+    /// The last thing the turn in flight said, for whether it stopped on a
+    /// question to the person.
+    last_reply: String,
 }
 
 /// Turns session facts into what a person reads.
@@ -159,6 +166,8 @@ impl Producer for Transcript {
                 // reports. Read off the fact rather than a clock, so replay is
                 // deterministic.
                 open.started_at = Some(logged.at);
+                open.touched_plan = false;
+                open.last_reply.clear();
             }
             SessionEvent::Rewound { to, scope, .. } => {
                 let to_turn = self
@@ -253,6 +262,15 @@ impl Producer for Transcript {
                 ..
             } => {
                 let at = Coord::new(*turn, *round);
+                if tool_calls
+                    .iter()
+                    .any(|c| atomcode_capabilities::tools::todo::is_todo_call(&c.name))
+                {
+                    open.touched_plan = true;
+                }
+                if !text.trim().is_empty() {
+                    open.last_reply = text.clone();
+                }
                 match open.thought.take() {
                     Some((id, _)) => {
                         out.settle(id);
@@ -510,9 +528,16 @@ impl Producer for Transcript {
                 // standing between one turn's figures and the next turn's line.
                 let mut stats = std::mem::take(&mut open.stats);
                 stats.elapsed_ms = start.map(|s| logged.at.saturating_sub(s)).unwrap_or(0);
-                // Asked only of a turn the model ended on its own: every other
-                // stop already says it was cut short.
-                let open_items = if matches!(stop, atomcode_harness::seams::StopReason::Stopped) {
+                // Asked only of a turn the model ended on its own (every other
+                // stop already says it was cut short), that worked the list this
+                // turn, and that did not end on a question to the person — the
+                // same conditions the runtime nudges under, so the line never
+                // tells someone to send "继续" when they owe an answer, or on a
+                // turn about something else.
+                let open_items = if matches!(stop, atomcode_harness::seams::StopReason::Stopped)
+                    && open.touched_plan
+                    && !atomcode_capabilities::tools::todo::ends_on_a_question(&open.last_reply)
+                {
                     open.plan.open_items()
                 } else {
                     0
@@ -1045,6 +1070,21 @@ mod tests {
                 to: 4,
                 scope: RewindScope::Conversation,
             },
+            // The turn after the undo works the list again (an update, not a
+            // new plan), so it is a turn that stopped on the list.
+            SessionEvent::AssistantMessage {
+                turn: 3,
+                round: 1,
+                text: String::new(),
+                reasoning: String::new(),
+                tool_calls: vec![atomcode_kernel::tool::ToolCall {
+                    id: "c3".into(),
+                    name: "todowrite".into(),
+                    arguments: r#"{"action":"update","id":2,"status":"in_progress"}"#.into(),
+                }],
+                reasoning_blocks: Vec::new(),
+                meta: None,
+            },
             end(3),
         ];
         let s = fold(&facts);
@@ -1070,6 +1110,65 @@ mod tests {
             "undo reopens the list: {:?}",
             ends[2]
         );
+    }
+
+    /// Two stops that leave the list open and are not the model walking away
+    /// from it, so the line does not tell the person to send "继续": a reply
+    /// that ends on a question (the person owes an answer), and a later turn
+    /// that never touched the list (a question about something else, answered).
+    /// The same two conditions keep the runtime from nudging those stops.
+    #[test]
+    fn a_question_or_an_unrelated_turn_is_not_called_stopped_with_work_open() {
+        use atomcode_harness::seams::StopReason;
+        let reply = |turn: u64, text: &str, calls: Vec<atomcode_kernel::tool::ToolCall>| {
+            SessionEvent::AssistantMessage {
+                turn,
+                round: 1,
+                text: text.into(),
+                reasoning: String::new(),
+                tool_calls: calls,
+                reasoning_blocks: Vec::new(),
+                meta: None,
+            }
+        };
+        let plan = atomcode_kernel::tool::ToolCall {
+            id: "c1".into(),
+            name: "todowrite".into(),
+            arguments: r#"{"todos":[{"content":"write the migration","status":"completed"},
+                {"content":"wire it into CI","status":"pending"}]}"#
+                .into(),
+        };
+        let end = |turn: u64| SessionEvent::TurnEnd {
+            turn,
+            stop: StopReason::Stopped,
+            error: None,
+        };
+        let facts = vec![
+            SessionEvent::TurnStart { turn: 1 },
+            reply(1, "", vec![plan]),
+            reply(1, "迁移写好了。\n要我接着改 CI 配置吗？", Vec::new()),
+            end(1),
+            SessionEvent::TurnStart { turn: 2 },
+            reply(2, "foo 把配置读进来,再交给 loader。", Vec::new()),
+            end(2),
+        ];
+        let s = fold(&facts);
+        let ends: Vec<String> = s
+            .slots()
+            .iter()
+            .filter(|x| x.block().kind() == "turn_end")
+            .filter_map(|x| {
+                x.block()
+                    .content
+                    .lines(&crate::block::RenderCtx::bare(120))
+                    .first()
+                    .map(|l| l.plain())
+            })
+            .collect();
+        assert_eq!(ends.len(), 2, "{ends:?}");
+        for end in &ends {
+            assert!(!end.contains("没完成"), "{end:?}");
+        }
     }
 
     #[test]

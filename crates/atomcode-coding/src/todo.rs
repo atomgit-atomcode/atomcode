@@ -9,8 +9,8 @@ use atomcode_capabilities::session::manager::{
     SessionManager, TodoCallPosition, TodoSidecar, TodoSidecarItem,
 };
 use atomcode_capabilities::tools::todo::{
-    active_todo_calls, apply_todo_action, derive_current_todos, is_todo_call, is_todo_plan,
-    reduce_todos, render_todos_numbered, ActiveTodoCall, TodoItem, TodoStatus,
+    active_todo_calls, apply_todo_action, derive_current_todos, ends_on_a_question, is_todo_call,
+    is_todo_plan, reduce_todos, render_todos_numbered, ActiveTodoCall, TodoItem, TodoStatus,
 };
 use atomcode_kernel::event::StopReason;
 use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
@@ -341,16 +341,15 @@ fn completion_nudge_allowed(convo: &Conversation) -> bool {
     }
 }
 
-/// True iff the reply the model stopped on ends by asking the person something — its last
-/// line ends in a question mark. That stop is waiting for an answer, not stalling.
+/// True iff the reply the model stopped on ends by asking the person something (see
+/// [`ends_on_a_question`]). That stop is waiting for an answer, not stalling.
 fn stops_on_a_question(convo: &Conversation) -> bool {
     convo
         .messages
         .iter()
         .rev()
         .find(|m| m.role == Role::Assistant)
-        .and_then(|m| m.text.lines().rev().find(|line| !line.trim().is_empty()))
-        .is_some_and(|line| line.trim_end().ends_with(['?', '？']))
+        .is_some_and(|m| ends_on_a_question(&m.text))
 }
 
 /// True iff the model actively MANAGED the task list this turn (a `todo`/`todowrite` call after

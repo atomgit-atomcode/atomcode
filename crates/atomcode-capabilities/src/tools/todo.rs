@@ -281,6 +281,18 @@ pub fn is_todo_plan(args: &str) -> bool {
     parse_todos(args).is_ok()
 }
 
+/// Whether a reply ends by asking the person something: its last non-blank line
+/// ends in a question mark. A stop like that is waiting for an answer, not
+/// walking away from open work — the one rule both the runtime (whether to
+/// nudge) and a front end (whether to say work was left) read it by.
+pub fn ends_on_a_question(reply: &str) -> bool {
+    reply
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .is_some_and(|line| line.trim_end().ends_with(['?', '？']))
+}
+
 /// The tool the model calls. `todowrite` replaced an older `todo`; both names
 /// still appear in transcripts, so both are folded.
 pub const TOOL_NAME: &str = "todowrite";
