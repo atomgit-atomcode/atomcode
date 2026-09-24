@@ -47,6 +47,9 @@ struct Open {
     /// records no elapsed of its own, so it is folded from the two timestamps
     /// the same way the two front ends do it. `None` between turns.
     started_at: Option<u64>,
+    /// The task list as the turns so far left it, so a turn that ends on its
+    /// own can say whether it left work open. Fed the same facts the panel is.
+    plan: crate::modules::todo::Plan,
 }
 
 /// Turns session facts into what a person reads.
@@ -143,6 +146,7 @@ impl Producer for Transcript {
         let fact = &logged.event;
         let mut open = self.open.lock().expect("transcript poisoned");
         let at = Coord::new(fact.turn(), 0);
+        open.plan.absorb(fact);
         match fact {
             // Where the turns start, so an undo can say which one it went back
             // to; and the undo itself, as a line in the stream that says so.
@@ -164,6 +168,11 @@ impl Producer for Transcript {
                     .iter()
                     .find(|(seq, _)| *seq == *to)
                     .map(|(_, turn)| *turn);
+                // The turns taken back take their part of the plan with them,
+                // as the panel's projection does.
+                if let Some(turn) = to_turn.filter(|_| scope.takes_back_conversation()) {
+                    open.plan.retract_from(turn);
+                }
                 out.emit(
                     at,
                     Arc::new(crate::content::RewoundBlock {
@@ -501,13 +510,23 @@ impl Producer for Transcript {
                 // standing between one turn's figures and the next turn's line.
                 let mut stats = std::mem::take(&mut open.stats);
                 stats.elapsed_ms = start.map(|s| logged.at.saturating_sub(s)).unwrap_or(0);
+                // Asked only of a turn the model ended on its own: every other
+                // stop already says it was cut short.
+                let open_items = if matches!(stop, atomcode_harness::seams::StopReason::Stopped) {
+                    open.plan.open_items()
+                } else {
+                    0
+                };
                 // A clean stop takes the next rotation slot and advances it; every
                 // other outcome leaves the rotation where it is (its label is
-                // ignored) so the celebratory verbs are not burned on failures.
+                // ignored) so the celebratory verbs are not burned on failures —
+                // nor on a stop that left the list open.
                 let done_index = {
                     let mut seq = self.done_seq.lock().expect("transcript poisoned");
                     let idx = *seq;
-                    if matches!(stop, atomcode_harness::seams::StopReason::Stopped) {
+                    if matches!(stop, atomcode_harness::seams::StopReason::Stopped)
+                        && open_items == 0
+                    {
                         *seq += 1;
                     }
                     idx
@@ -523,6 +542,7 @@ impl Producer for Transcript {
                         error: error.clone(),
                         stats,
                         done_index,
+                        open_items,
                     }),
                 );
             }
@@ -968,6 +988,88 @@ mod tests {
         for leaked in ["1200", "880", "tokens", "轮", "cached"] {
             assert!(!last.contains(leaked), "{leaked} leaked into {last:?}");
         }
+    }
+
+    /// A turn the model ended on its own says so, not "done", while the task list
+    /// it kept still has open items — and says how many, so the person knows
+    /// work is left. Reported against 5.1.0: a 45-minute turn ended on "运行测试："
+    /// with no call, and the line read `✓ Served` over a list that was not done.
+    ///
+    /// The count follows the plan through an undo the way the panel does: the
+    /// turn that finished the list is taken back, and the list is open again.
+    #[test]
+    fn a_turn_that_stops_with_the_list_open_says_so_instead_of_done() {
+        use atomcode_harness::seams::StopReason;
+        use atomcode_harness::session::RewindScope;
+        let plan = |turn: u64, id: &str, todos: &str| SessionEvent::AssistantMessage {
+            turn,
+            round: 1,
+            text: String::new(),
+            reasoning: String::new(),
+            tool_calls: vec![atomcode_kernel::tool::ToolCall {
+                id: id.into(),
+                name: "todowrite".into(),
+                arguments: format!(r#"{{"todos":{todos}}}"#),
+            }],
+            reasoning_blocks: Vec::new(),
+            meta: None,
+        };
+        let end = |turn: u64| SessionEvent::TurnEnd {
+            turn,
+            stop: StopReason::Stopped,
+            error: None,
+        };
+        let facts = vec![
+            SessionEvent::TurnStart { turn: 1 },
+            plan(
+                1,
+                "c1",
+                r#"[{"content":"write the migration","status":"completed"},
+                    {"content":"run the tests","status":"in_progress"},
+                    {"content":"wire it into CI","status":"pending"}]"#,
+            ),
+            end(1),
+            // `conformance::logged` numbers from one: this `TurnStart` is seq 4.
+            SessionEvent::TurnStart { turn: 2 },
+            plan(
+                2,
+                "c2",
+                r#"[{"content":"write the migration","status":"completed"},
+                    {"content":"run the tests","status":"completed"},
+                    {"content":"wire it into CI","status":"completed"}]"#,
+            ),
+            end(2),
+            SessionEvent::TurnStart { turn: 3 },
+            SessionEvent::Rewound {
+                turn: 3,
+                to: 4,
+                scope: RewindScope::Conversation,
+            },
+            end(3),
+        ];
+        let s = fold(&facts);
+        let ends: Vec<String> = s
+            .slots()
+            .iter()
+            .filter(|x| x.block().kind() == "turn_end")
+            .filter_map(|x| {
+                x.block()
+                    .content
+                    .lines(&crate::block::RenderCtx::bare(120))
+                    .first()
+                    .map(|l| l.plain())
+            })
+            .collect();
+        assert_eq!(ends.len(), 3, "{ends:?}");
+        assert!(ends[0].contains("还有 2 项没完成"), "{:?}", ends[0]);
+        assert!(!ends[0].contains("Done"), "{:?}", ends[0]);
+        // The open stop did not spend a rotation slot: the first clean finish is `Done`.
+        assert!(ends[1].contains("Done"), "{:?}", ends[1]);
+        assert!(
+            ends[2].contains("还有 2 项没完成"),
+            "undo reopens the list: {:?}",
+            ends[2]
+        );
     }
 
     #[test]

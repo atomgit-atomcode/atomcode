@@ -43,9 +43,97 @@ struct Call {
     failed: bool,
 }
 
+/// The calls that shape the task list, in the order the log recorded them, and
+/// the list they fold to.
+///
+/// Its own type because two readers need the same answer: the panel draws the
+/// list, and the transcript's turn-end line says whether a turn that ended on
+/// its own left work open. Each keeps a `Plan` and feeds it the same facts, so
+/// the line cannot call a turn finished while the panel still shows items.
+#[derive(Default)]
+pub(crate) struct Plan {
+    calls: Vec<Call>,
+}
+
+impl Plan {
+    /// Take in one fact. `true` when the list may have changed.
+    pub(crate) fn absorb(&mut self, fact: &SessionEvent) -> bool {
+        match fact {
+            // The call is recorded when the model makes it, before anyone knows
+            // whether it will be accepted. `todowrite` validates its own
+            // arguments, so a bad plan comes back as an error result below.
+            SessionEvent::AssistantMessage {
+                tool_calls, turn, ..
+            } => {
+                let before = self.calls.len();
+                for call in tool_calls.iter().filter(|c| is_todo_call(&c.name)) {
+                    self.calls.push(Call {
+                        id: call.id.clone(),
+                        name: call.name.clone(),
+                        args: call.arguments.clone(),
+                        turn: *turn,
+                        failed: false,
+                    });
+                }
+                self.calls.len() != before
+            }
+
+            SessionEvent::ToolResultLogged {
+                call_id, is_error, ..
+            } if *is_error => match self.calls.iter_mut().find(|c| c.id == *call_id) {
+                Some(call) => {
+                    call.failed = true;
+                    true
+                }
+                None => false,
+            },
+
+            // A cancel retires the plan: the list was for work that did not
+            // happen, and the person who stopped it did not ask for the rest.
+            // The calls stay in the log — only the *active* list is dropped, so
+            // a resumed session reads this the same way. A later continue is a
+            // fresh plan against the same history, which is exactly what
+            // `derive_current_todos` does with the interruption boundary.
+            SessionEvent::TurnEnd {
+                stop: StopReason::Cancelled,
+                ..
+            } => {
+                self.calls.clear();
+                true
+            }
+
+            _ => false,
+        }
+    }
+
+    /// The list, leaving out the turns in `undone`. Completed items included.
+    pub(crate) fn fold(&self, undone: &std::collections::BTreeSet<u64>) -> Vec<TodoItem> {
+        reduce_todos(
+            self.calls
+                .iter()
+                .filter(|c| !c.failed && !undone.contains(&c.turn))
+                .map(|c| (c.name.as_str(), c.args.as_str())),
+        )
+    }
+
+    /// Forget the calls of `turn` and every turn after it — what an undo that
+    /// takes the conversation back to before `turn` leaves of the plan.
+    pub(crate) fn retract_from(&mut self, turn: u64) {
+        self.calls.retain(|c| c.turn < turn);
+    }
+
+    /// How many items are not completed yet.
+    pub(crate) fn open_items(&self) -> usize {
+        self.fold(&std::collections::BTreeSet::new())
+            .iter()
+            .filter(|t| t.status != TodoStatus::Completed)
+            .count()
+    }
+}
+
 #[derive(Default)]
 pub struct State {
-    calls: Vec<Call>,
+    plan: Plan,
     /// The fold of `calls`, kept rather than recomputed.
     ///
     /// `render` and `height` both have to ask whether there is a panel at all —
@@ -75,13 +163,7 @@ fn refold(state: &mut State) {
 
 /// The calls, folded into a list, leaving out the turns that were taken back.
 fn fold_calls(state: &State, undone: &std::collections::BTreeSet<u64>) -> Vec<TodoItem> {
-    let mut items = reduce_todos(
-        state
-            .calls
-            .iter()
-            .filter(|c| !c.failed && !undone.contains(&c.turn))
-            .map(|c| (c.name.as_str(), c.args.as_str())),
-    );
+    let mut items = state.plan.fold(undone);
     // `all` on an empty list is true, which is the answer we want there too.
     if items.iter().all(|t| t.status == TodoStatus::Completed) {
         items.clear();
@@ -108,59 +190,8 @@ impl View for Todo {
     }
 
     fn absorb(state: &mut State, fact: &SessionEvent) {
-        match fact {
-            // The call is recorded when the model makes it, before anyone knows
-            // whether it will be accepted. `todowrite` validates its own
-            // arguments, so a bad plan comes back as an error result below.
-            SessionEvent::AssistantMessage {
-                tool_calls, turn, ..
-            } => {
-                let before = state.calls.len();
-                for call in tool_calls.iter().filter(|c| is_todo_call(&c.name)) {
-                    state.calls.push(Call {
-                        id: call.id.clone(),
-                        name: call.name.clone(),
-                        args: call.arguments.clone(),
-                        turn: *turn,
-                        failed: false,
-                    });
-                }
-                if state.calls.len() != before {
-                    refold(state);
-                }
-            }
-
-            SessionEvent::ToolResultLogged {
-                call_id, is_error, ..
-            } => {
-                if !*is_error {
-                    return;
-                }
-                let mut hit = false;
-                if let Some(call) = state.calls.iter_mut().find(|c| c.id == *call_id) {
-                    call.failed = true;
-                    hit = true;
-                }
-                if hit {
-                    refold(state);
-                }
-            }
-
-            // A cancel retires the plan: the list was for work that did not
-            // happen, and the person who stopped it did not ask for the rest.
-            // The calls stay in the log — only the *active* list is dropped, so
-            // a resumed session reads this the same way. A later continue is a
-            // fresh plan against the same history, which is exactly what
-            // `derive_current_todos` does with the interruption boundary.
-            SessionEvent::TurnEnd {
-                stop: StopReason::Cancelled,
-                ..
-            } => {
-                state.calls.clear();
-                refold(state);
-            }
-
-            _ => {}
+        if state.plan.absorb(fact) {
+            refold(state);
         }
     }
 

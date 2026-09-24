@@ -1980,6 +1980,13 @@ pub struct TurnEndBlock {
     /// turn by the producer so consecutive turns vary. Ignored for every stop
     /// but [`StopReason::Stopped`].
     pub done_index: usize,
+    /// Items the session's task list still had open when a turn ended on its
+    /// own. Non-zero turns a [`StopReason::Stopped`] into a stop, not a finish:
+    /// a model that ends a reply on the step it was about to take, with work
+    /// left on the list, has not delivered, and a `✓ Served` there told a person
+    /// the task was done when it was not (reported against 5.1.0). Ignored for
+    /// every other stop, which already says it was cut short.
+    pub open_items: usize,
 }
 
 /// What one turn cost, as its own facts recorded it.
@@ -2202,10 +2209,17 @@ pub fn byte_size(n: u64) -> String {
 /// vocabulary is the product's rather than new. What is added is the cause,
 /// where a person can do something about it: a turn that ran out of rounds says
 /// so, in words, instead of showing them a variant name or nothing at all.
-fn turn_end_note(stop: StopReason, done_index: usize) -> (Glyph, String, Style) {
+fn turn_end_note(stop: StopReason, done_index: usize, open_items: usize) -> (Glyph, String, Style) {
     use StopReason::*;
     let warn = Style::new().fg(Color::role(Role::Warning));
     match stop {
+        // The model stopped on its own with the list still open: said as a stop,
+        // with the count and what to do about it — never a celebratory verb.
+        Stopped if open_items > 0 => (
+            Glyph::Interrupted,
+            t(Msg::StopWithOpenItems { count: open_items }).into_owned(),
+            warn,
+        ),
         // The only clean end: the model answered and asked for nothing. The word
         // rotates through `DONE_LABELS` the way tuix's does, so consecutive turns
         // read a little differently instead of the same `完成` every time.
@@ -2310,6 +2324,7 @@ impl Content for TurnEndBlock {
                 self.stats.elapsed_ms,
                 self.done_index,
             ),
+            &self.open_items.to_string(),
         ])
     }
     /// The turn's outcome and its cost on one light line at the left margin:
@@ -2333,7 +2348,7 @@ impl Content for TurnEndBlock {
         }
         let w = ctx.width;
         let caps = Caps::default();
-        let (mark, said, style) = turn_end_note(self.stop, self.done_index);
+        let (mark, said, style) = turn_end_note(self.stop, self.done_index, self.open_items);
         let short = format!("{} {said}", caps.g(mark));
 
         // Under the rule, in the order they are worth reading: the cost first
@@ -2341,7 +2356,7 @@ impl Content for TurnEndBlock {
         // rides only a clean stop, the way tuix drops it from a failed turn.
         let mut under: Vec<String> = Vec::new();
         let mut caption = short;
-        let with_cached = matches!(self.stop, StopReason::Stopped);
+        let with_cached = matches!(self.stop, StopReason::Stopped) && self.open_items == 0;
         if let Some(stats) = self.stats.caption(with_cached) {
             let wider = format!("{caption} · {stats}");
             if crate::el::caption_fits(&wider, w as usize) {
@@ -2904,6 +2919,7 @@ mod tests {
             error: Some(error.into()),
             stats: TurnStats::default(),
             done_index: 0,
+            open_items: 0,
         };
         let lines = block.lines(&crate::block::RenderCtx::bare(100));
         let text: String = lines
@@ -2930,6 +2946,7 @@ mod tests {
             error: Some("quota reached".into()),
             stats: TurnStats::default(),
             done_index: 0,
+            open_items: 0,
         };
         let lines = short.lines(&crate::block::RenderCtx::bare(100));
         assert_eq!(lines.len(), 1);
@@ -2948,6 +2965,7 @@ mod tests {
                 error: None,
                 stats: TurnStats::default(),
                 done_index: 0,
+                open_items: 0,
             }
             .lines(&crate::block::RenderCtx::bare(80))
             .iter()
@@ -3022,8 +3040,14 @@ mod tests {
 
         // Every reason is one of two outcomes, and the mark says which. The clean
         // end wears the `✻` sparkle; nothing cut short does.
-        let mark = |stop| turn_end_note(stop, 0).0;
+        let mark = |stop| turn_end_note(stop, 0, 0).0;
         assert_eq!(mark(StopReason::Stopped), Glyph::Sparkle);
+        // A stop the model chose, with the task list still open, is not a finish.
+        assert_ne!(
+            turn_end_note(StopReason::Stopped, 0, 2).0,
+            Glyph::Sparkle,
+            "an open list does not wear the finish mark"
+        );
         for cut in [
             StopReason::Cancelled,
             StopReason::MaxRounds,
@@ -3059,6 +3083,7 @@ mod tests {
                 elapsed_ms: 32_700,
             },
             done_index: 0,
+            open_items: 0,
         };
         let text = drawn(&block, 100);
         for want in [
@@ -3095,6 +3120,7 @@ mod tests {
                 elapsed_ms: 1_200,
             },
             done_index: 0,
+            open_items: 0,
         };
         let text = drawn(&block, 80);
         assert!(!text.contains("cached"), "{text:?}");
@@ -3118,6 +3144,7 @@ mod tests {
             error: None,
             stats: TurnStats::default(),
             done_index: 0,
+            open_items: 0,
         };
         let lines = block.lines(&crate::block::RenderCtx::bare(80));
         assert_eq!(lines.len(), 1, "nothing to say means no extra row");
@@ -3145,6 +3172,7 @@ mod tests {
                 elapsed_ms: 32_700,
             },
             done_index: 0,
+            open_items: 0,
         };
         let outcome = format!("{} Done", Caps::default().g(Glyph::Ok));
         let first = (0..200u16)
@@ -3182,6 +3210,7 @@ mod tests {
                 elapsed_ms: 3_725_000,
             },
             done_index: 0,
+            open_items: 0,
         };
         for w in 0..160u16 {
             for line in block.lines(&crate::block::RenderCtx::bare(w)) {
@@ -3248,12 +3277,14 @@ mod tests {
                 error: None,
                 stats: TurnStats::default(),
                 done_index: 0,
+                open_items: 0,
             }),
             Box::new(TurnEndBlock {
                 stop: StopReason::Cancelled,
                 error: Some("by the user".into()),
                 stats: TurnStats::default(),
                 done_index: 0,
+                open_items: 0,
             }),
             // With figures, and with figures plus a cause: the caption is
             // longest here, so this is the case that would run off the edge.
@@ -3269,6 +3300,7 @@ mod tests {
                     elapsed_ms: 92_400,
                 },
                 done_index: 1,
+                open_items: 0,
             }),
             Box::new(TurnEndBlock {
                 stop: StopReason::ProviderError,
@@ -3282,6 +3314,7 @@ mod tests {
                     elapsed_ms: 15_000,
                 },
                 done_index: 0,
+                open_items: 0,
             }),
         ];
         for item in &items {

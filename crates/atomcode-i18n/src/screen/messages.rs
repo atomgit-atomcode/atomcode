@@ -1226,6 +1226,11 @@ pub enum Msg<'a> {
     StopTimeout,
     StopInvariantViolated,
     StopMaxContinuations,
+    /// A turn the model ended on its own while the task list it kept still had
+    /// open items: not a failure, and not a finish either.
+    StopWithOpenItems {
+        count: usize,
+    },
 
     // ── the live strip and the folded-lines notes (`modules/live.rs`, `host.rs`) ──
     LiveStopping,

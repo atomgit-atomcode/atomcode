@@ -714,6 +714,9 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StopTimeout => "已中断 · 模型长时间没有回应".into(),
         Msg::StopInvariantViolated => "已中断 · 内部不变量被破坏,这条会话不宜再续".into(),
         Msg::StopMaxContinuations => "已中断 · 自动续跑次数用完了".into(),
+        Msg::StopWithOpenItems { count } => {
+            format!("已停下 · 任务清单还有 {count} 项没完成 —— 发一句「继续」接着做").into()
+        }
 
         // ── the live strip and the folded-lines notes (`modules/live.rs`, `host.rs`) ──
         Msg::LiveStopping => "正在停止".into(),
