@@ -1,6 +1,6 @@
 # 同目录切会话复用 MCP 连接(runtime 内连接池)设计
 
-状态: 提议(2026-09-24),待评审。落在 5.2.0 之后的独立分支。
+状态: 已实现(2026-09-24,分支 `feat/mcp-connection-pool`)。第 5 节三个问题的结论见各条末尾。
 
 ## 1. 问题
 
@@ -139,10 +139,16 @@ CodingRuntime(owner 循环里的状态,跨 generation 存活)
 1. **疑似既有 bug**:`ApplyUndo` / `RestoreSnapshot` 在同一 parts 上重挂树时,新旧两棵树的
    mcp-host 行共享 `tool_names`,旧树卸载会清空这份名单,可能让新树的记录丢失
    (调研阅读推断,未实测)。本设计会碰这块代码,先写判据确认。
+   **结论**:推断的「名单被清空」只是短窗口;实测到的是另一个问题——新树只在后台任务里发布,
+   重挂后第一轮请求常先于发布发出、没有 MCP 工具。已修(`493e5a028`,已合入 5.2.0):registry
+   记下每个 server 上次列出的工具,挂载时先同步发布;旧行卸载只在仍是当前树时清共享名单。
 2. 连接标识是否要纳入父进程环境(stdio 子进程继承 daemon 的环境,不止 `${VAR}` 展开值)。
    倾向不纳入:环境在一个进程生命周期内基本不变;需要时 `/mcp reload` 强制重连。
+   **结论**:不纳入。
 3. `McpClient` 目前是 `Box<dyn McpClient>` 独占于 registry 的 map;池化要改成 `Arc` 共享,
    要确认 stdio `owns_transport_lifetime` 与恢复克隆的所有权在共享下仍然成立。
+   **结论**:registry 里本就存 `Arc<dyn McpClient>`;真正拥有子进程的只有一个 `StdioClient`,
+   在最后一个 `Arc` 释放时才 kill,恢复克隆不拥有。共享成立,不需要退路。
 
 ## 6. 判据(先写判据再实现)
 

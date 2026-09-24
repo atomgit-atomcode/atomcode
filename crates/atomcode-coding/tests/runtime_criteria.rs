@@ -503,6 +503,7 @@ fn start(
             plugin_skill_dirs: Vec::new(),
             mcp: false,
             extra_mcp_servers: Vec::new(),
+            mcp_pool: None,
             external_subagents: Vec::new(),
             memory: false,
             web: false,
@@ -2129,7 +2130,7 @@ fn write_mcp_server(dir: &std::path::Path, calls: &std::path::Path) -> std::path
         &script,
         format!(
             r#"#!/bin/sh
-echo started >> "{spawns}"
+echo "started $$" >> "{spawns}"
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   case "$line" in
@@ -2186,6 +2187,93 @@ fn last_offered(recorder: &Recorder) -> Vec<String> {
         .last()
         .cloned()
         .unwrap_or_default()
+}
+
+/// The MCP tool definitions of the most recent request, as sent.
+fn last_mcp_defs(recorder: &Recorder) -> Vec<ToolDef> {
+    recorder
+        .defs
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|def| def.name.starts_with("mcp__"))
+        .collect()
+}
+
+/// The PIDs of every fixture server started so far (`write_mcp_server` logs one
+/// line per start).
+fn started_pids(spawns: &std::path::Path) -> Vec<u32> {
+    std::fs::read_to_string(spawns)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.strip_prefix("started ")?.trim().parse().ok())
+        .collect()
+}
+
+/// Running, as opposed to gone or a zombie (exited, not yet reaped by its parent
+/// — `kill -0` still succeeds on one).
+fn process_alive(pid: u32) -> bool {
+    std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .map(|out| {
+            let stat = String::from_utf8_lossy(&out.stdout);
+            let stat = stat.trim();
+            !stat.is_empty() && !stat.starts_with('Z')
+        })
+        .unwrap_or(false)
+}
+
+/// Wait (up to 5s) for `pid` to exit.
+async fn exited(pid: u32) -> bool {
+    for _ in 0..50 {
+        if !process_alive(pid) {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    false
+}
+
+/// A user-level `mcp.json` (`$ATOMCODE_HOME/mcp.json`) naming the fixture
+/// servers `(name, script, extra args)`. User-level, so no project trust gate.
+fn write_user_mcp_json(
+    home: &std::path::Path,
+    servers: &[(&str, &std::path::Path, &[&str])],
+    leading_comment: bool,
+) {
+    let entries: serde_json::Map<String, serde_json::Value> = servers
+        .iter()
+        .map(|(name, script, extra)| {
+            let mut args = vec![script.to_string_lossy().into_owned()];
+            args.extend(extra.iter().map(|arg| arg.to_string()));
+            (
+                name.to_string(),
+                serde_json::json!({ "command": "sh", "args": args }),
+            )
+        })
+        .collect();
+    let body = serde_json::to_string_pretty(&serde_json::json!({ "mcpServers": entries })).unwrap();
+    let text = if leading_comment {
+        format!("// servers for the test\n{body}")
+    } else {
+        body
+    };
+    std::fs::write(home.join("mcp.json"), text).unwrap();
+}
+
+/// A runtime start with MCP on and no driver-supplied servers: what it connects
+/// comes from the config files.
+fn start_with_mcp_config(
+    project: &std::path::Path,
+    recorder: &Arc<Recorder>,
+) -> CodingRuntimeStart {
+    let mut start = start(project, recorder, SessionMode::Fresh);
+    start.prepare.mcp = true;
+    start
 }
 
 /// An MCP server's tools are offered to the model and run — connected once,
@@ -2561,14 +2649,24 @@ async fn withdrawing_mcp_takes_the_tools_off_the_model() {
     runtime.handle.shutdown().await.unwrap();
 }
 
-/// Switching sessions keeps the MCP tools in front of the model.
+/// Switching sessions keeps the MCP tools in front of the model — on the very
+/// next request, from the same server process.
 ///
 /// Reported against v5.1.0: after `POST /sessions` + `/live/switch_session` the
 /// model said no `mcp__*` tool was mounted while `/mcp/status` showed every
-/// server connected, and it spent a million tokens in bash instead. A session
-/// switch rebuilds the capability tree; the servers are the same, so the new
-/// tree must offer their tools — here after a fresh session and after resuming
-/// the first one, the two transitions a switch is made of.
+/// server connected. A switch rebuilds the capability tree, and used to restart
+/// every server with it: the new tree had no tools until they reconnected, and a
+/// stateful server (a browser, a database session) lost its state each time.
+/// The runtime's connection pool hands the servers that are already up to the
+/// next tree (`docs/plans/2026-09-24-mcp-connection-pool-across-sessions-design.md`),
+/// with the tools they were last listed with — the same definitions, so the
+/// request cache prefix does not move.
+///
+/// Here: a fresh session, then resuming the first one — the two transitions a
+/// switch is made of — with no waiting after either.
+///
+/// Negative control: build the registry with `from_config_background_with_extra`
+/// (no pool) in `parts::prepare` and the server starts three times.
 #[cfg(unix)]
 async fn a_switched_session_keeps_the_mcp_tools() {
     let env = env();
@@ -2579,29 +2677,12 @@ async fn a_switched_session_keeps_the_mcp_tools() {
     let start = start_with_mcp_server(env.project.path(), &recorder, &script, true);
     let mut runtime = CodingRuntime::start(start).await.unwrap();
     let first = runtime.session.clone().unwrap().id;
-    // Readiness, and what the daemon's `/mcp/status` reads back once it is there:
-    // the server connected AND its tool published to the model. The published
-    // list is what tells "connected" apart from "in front of the model".
-    let ready = |runtime: &CodingRuntime| {
-        let handle = runtime.handle.clone();
-        async move {
-            handle
-                .wait_mcp_ready(std::time::Duration::from_secs(10))
-                .await
-                .unwrap();
-            let status = handle.mcp_status().await.unwrap();
-            assert!(
-                status.servers.iter().any(|(name, status)| name == "t"
-                    && matches!(status, atomcode_capabilities::mcp::ServerStatus::Connected)),
-                "{:?}",
-                status.servers
-            );
-            let tools = handle.mcp_tools("t".into()).await.unwrap().tools;
-            assert_eq!(tools, vec!["mcp__t__echo".to_string()]);
-        }
-    };
+    runtime
+        .handle
+        .wait_mcp_ready(std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
 
-    ready(&runtime).await;
     turn(&mut runtime, "before").await;
     assert!(
         last_offered(&recorder)
@@ -2610,9 +2691,9 @@ async fn a_switched_session_keeps_the_mcp_tools() {
         "the fixture never offered the tool: {:?}",
         last_offered(&recorder)
     );
+    let defs_before = last_mcp_defs(&recorder);
 
     runtime.handle.fresh_session().await.unwrap();
-    ready(&runtime).await;
     turn(&mut runtime, "in a fresh session").await;
     assert!(
         last_offered(&recorder)
@@ -2621,9 +2702,13 @@ async fn a_switched_session_keeps_the_mcp_tools() {
         "a fresh session lost the MCP tools: {:?}",
         last_offered(&recorder)
     );
+    assert_eq!(
+        last_mcp_defs(&recorder),
+        defs_before,
+        "the definitions changed"
+    );
 
     runtime.handle.resume_session(first).await.unwrap();
-    ready(&runtime).await;
     turn(&mut runtime, "back in the first").await;
     assert!(
         last_offered(&recorder)
@@ -2631,6 +2716,28 @@ async fn a_switched_session_keeps_the_mcp_tools() {
             .any(|name| name == "mcp__t__echo"),
         "a resumed session lost the MCP tools: {:?}",
         last_offered(&recorder)
+    );
+    assert_eq!(
+        last_mcp_defs(&recorder),
+        defs_before,
+        "the definitions changed"
+    );
+
+    // What the daemon's `/mcp/status` reads: connected, and published.
+    let status = runtime.handle.mcp_status().await.unwrap();
+    assert!(
+        status.servers.iter().any(|(name, status)| name == "t"
+            && matches!(status, atomcode_capabilities::mcp::ServerStatus::Connected)),
+        "{:?}",
+        status.servers
+    );
+    let tools = runtime.handle.mcp_tools("t".into()).await.unwrap().tools;
+    assert_eq!(tools, vec!["mcp__t__echo".to_string()]);
+
+    assert_eq!(
+        started_pids(&spawns).len(),
+        1,
+        "the server was restarted by a session switch"
     );
     runtime.handle.shutdown().await.unwrap();
 }
@@ -2774,6 +2881,221 @@ async fn an_undo_or_a_restore_keeps_the_mcp_tools() {
             .any(|n| n.starts_with("mcp__")),
         "withdrawn MCP tools were still offered after a remount: {:?}",
         last_offered(&recorder)
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// `/mcp reload` reconnects: the pool is cleared, the server starts again, and
+/// the process it replaced is gone.
+#[cfg(unix)]
+async fn a_reload_reconnects_the_mcp_servers() {
+    let env = env();
+    let scratch = tempfile::tempdir().unwrap();
+    let spawns = scratch.path().join("spawns.log");
+    let script = write_mcp_server(scratch.path(), &spawns);
+    let recorder = Arc::new(Recorder::default());
+    let start = start_with_mcp_server(env.project.path(), &recorder, &script, true);
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+    let wait = std::time::Duration::from_secs(10);
+    runtime.handle.wait_mcp_ready(wait).await.unwrap();
+    turn(&mut runtime, "before").await;
+
+    runtime.handle.reload_capabilities().await.unwrap();
+    runtime.handle.wait_mcp_ready(wait).await.unwrap();
+    turn(&mut runtime, "after the reload").await;
+
+    let pids = started_pids(&spawns);
+    assert_eq!(pids.len(), 2, "a reload reuses nothing: {pids:?}");
+    assert!(last_offered(&recorder).iter().any(|n| n == "mcp__t__echo"));
+    assert!(
+        exited(pids[0]).await,
+        "the replaced server is still running"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// A connection is for one directory: after `/cd` the server starts again there,
+/// and the old directory's process is gone.
+#[cfg(unix)]
+async fn a_changed_directory_does_not_reuse_the_connections() {
+    let env = env();
+    let scratch = tempfile::tempdir().unwrap();
+    let spawns = scratch.path().join("spawns.log");
+    let script = write_mcp_server(scratch.path(), &spawns);
+    let recorder = Arc::new(Recorder::default());
+    let start = start_with_mcp_server(env.project.path(), &recorder, &script, true);
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+    let wait = std::time::Duration::from_secs(10);
+    runtime.handle.wait_mcp_ready(wait).await.unwrap();
+    turn(&mut runtime, "before").await;
+
+    let elsewhere = tempfile::tempdir().unwrap();
+    runtime
+        .handle
+        .change_directory(elsewhere.path().to_path_buf())
+        .await
+        .unwrap();
+    runtime.handle.wait_mcp_ready(wait).await.unwrap();
+    turn(&mut runtime, "elsewhere").await;
+
+    let pids = started_pids(&spawns);
+    assert_eq!(
+        pids.len(),
+        2,
+        "another directory reused a connection: {pids:?}"
+    );
+    assert!(last_offered(&recorder).iter().any(|n| n == "mcp__t__echo"));
+    assert!(
+        exited(pids[0]).await,
+        "the old directory's server is still running"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// A server that died is not handed over: the next session starts it again and
+/// its tool works.
+#[cfg(unix)]
+async fn a_dead_connection_is_not_reused() {
+    let env = env();
+    let scratch = tempfile::tempdir().unwrap();
+    let spawns = scratch.path().join("spawns.log");
+    let script = write_mcp_server(scratch.path(), &spawns);
+    let recorder = Arc::new(Recorder::default());
+    let start = start_with_mcp_server(env.project.path(), &recorder, &script, true);
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+    let wait = std::time::Duration::from_secs(10);
+    runtime.handle.wait_mcp_ready(wait).await.unwrap();
+    turn(&mut runtime, "before").await;
+
+    let first = started_pids(&spawns)[0];
+    std::process::Command::new("kill")
+        .arg(first.to_string())
+        .status()
+        .unwrap();
+    assert!(exited(first).await);
+
+    runtime.handle.fresh_session().await.unwrap();
+    runtime.handle.wait_mcp_ready(wait).await.unwrap();
+    turn(&mut runtime, "mcp echo").await;
+    let result = recorder
+        .last_request()
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::Tool)
+        .map(|m| m.text.clone())
+        .unwrap_or_default();
+    assert!(result.contains("echo:from-server"), "result: {result}");
+    assert_eq!(
+        started_pids(&spawns).len(),
+        2,
+        "the dead server was not restarted"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// A server whose configuration changed between two sessions starts again; the
+/// one that did not change is handed over.
+#[cfg(unix)]
+async fn a_changed_server_reconnects_and_the_rest_are_reused() {
+    let env = env();
+    let scratch = tempfile::tempdir().unwrap();
+    let steady_log = scratch.path().join("steady.log");
+    let changed_log = scratch.path().join("changed.log");
+    let steady_dir = scratch.path().join("steady");
+    let changed_dir = scratch.path().join("changed");
+    std::fs::create_dir_all(&steady_dir).unwrap();
+    std::fs::create_dir_all(&changed_dir).unwrap();
+    let steady = write_mcp_server(&steady_dir, &steady_log);
+    let changed = write_mcp_server(&changed_dir, &changed_log);
+    write_user_mcp_json(
+        env._home.path(),
+        &[("steady", &steady, &[]), ("changed", &changed, &[])],
+        false,
+    );
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime = CodingRuntime::start(start_with_mcp_config(env.project.path(), &recorder))
+        .await
+        .unwrap();
+    let wait = std::time::Duration::from_secs(10);
+    runtime.handle.wait_mcp_ready(wait).await.unwrap();
+    turn(&mut runtime, "before").await;
+
+    write_user_mcp_json(
+        env._home.path(),
+        &[("steady", &steady, &[]), ("changed", &changed, &["--v2"])],
+        false,
+    );
+    runtime.handle.fresh_session().await.unwrap();
+    runtime.handle.wait_mcp_ready(wait).await.unwrap();
+    turn(&mut runtime, "after the edit").await;
+
+    assert_eq!(
+        started_pids(&steady_log).len(),
+        1,
+        "the unchanged server restarted"
+    );
+    assert_eq!(
+        started_pids(&changed_log).len(),
+        2,
+        "the changed server was reused"
+    );
+    let offered = last_offered(&recorder);
+    assert!(
+        offered.iter().any(|n| n == "mcp__steady__echo")
+            && offered.iter().any(|n| n == "mcp__changed__echo"),
+        "{offered:?}"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// A grant that lives only in one session's registry — "always allow" whose
+/// write to the config was refused — does not follow the connection into the
+/// next session: only the connection is shared, not the approvals made over it.
+#[cfg(unix)]
+async fn a_session_only_grant_stays_with_its_session() {
+    let env = env();
+    let scratch = tempfile::tempdir().unwrap();
+    let spawns = scratch.path().join("spawns.log");
+    let script = write_mcp_server(scratch.path(), &spawns);
+    // Commented, so `autoApprove` cannot be written back: the grant stays in memory.
+    write_user_mcp_json(env._home.path(), &[("t", &script, &[])], true);
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime = CodingRuntime::start(start_with_mcp_config(env.project.path(), &recorder))
+        .await
+        .unwrap();
+    runtime
+        .handle
+        .wait_mcp_ready(std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
+
+    let allow = serde_json::json!({ "decision": "allow" });
+    assert_eq!(
+        turn_answering(&mut runtime, "mcp echo", Some(allow.clone())).await,
+        1
+    );
+    let approval = runtime
+        .handle
+        .approve_mcp_tool("mcp__t__echo".into())
+        .await
+        .unwrap()
+        .expect("the server offers the tool");
+    assert!(
+        approval.persist_error.is_some(),
+        "the commented config was rewritten"
+    );
+    assert_eq!(turn_answering(&mut runtime, "mcp echo", None).await, 0);
+
+    runtime.handle.fresh_session().await.unwrap();
+    assert_eq!(
+        turn_answering(&mut runtime, "mcp echo", Some(allow)).await,
+        1,
+        "a session-only grant followed the connection into the next session"
+    );
+    assert_eq!(
+        started_pids(&spawns).len(),
+        1,
+        "the connection itself is reused"
     );
     runtime.handle.shutdown().await.unwrap();
 }
@@ -5121,6 +5443,11 @@ mod criteria {
         a_switched_session_keeps_the_mcp_tools,
         always_allowing_an_mcp_tool_holds_for_the_session_and_is_written,
         an_undo_or_a_restore_keeps_the_mcp_tools,
+        a_reload_reconnects_the_mcp_servers,
+        a_changed_directory_does_not_reuse_the_connections,
+        a_dead_connection_is_not_reused,
+        a_changed_server_reconnects_and_the_rest_are_reused,
+        a_session_only_grant_stays_with_its_session,
         a_failed_mcp_connection_is_metered,
         a_model_round_reports_how_long_it_took,
         every_metered_event_says_which_turn_and_round_it_was,

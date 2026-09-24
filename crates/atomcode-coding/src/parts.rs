@@ -114,6 +114,13 @@ pub struct PrepareOptions {
     /// the injecting driver is the trust boundary. Ignored when `mcp` is
     /// false (no registry is created).
     pub extra_mcp_servers: Vec<McpServerConfig>,
+    /// The connections the runtime keeps across the trees it prepares. A prepare
+    /// takes over every server the pool holds a connection for (same directory,
+    /// same configuration, still connected) instead of restarting it, and offers
+    /// the pool the ones it makes. `None` = every prepare connects afresh. Owned by
+    /// the runtime (`docs/adr/0002`): it is created when the runtime starts and
+    /// carried from one generation's options to the next.
+    pub mcp_pool: Option<Arc<atomcode_capabilities::mcp::pool::McpConnectionPool>>,
     /// External-agent subagent instances (`[[subagent.external]]` profiles) to
     /// mount as named `subagent_<name>` tools. Each drives Claude Code / Codex as
     /// a subagent. A profile whose binary is missing on PATH is skipped. Empty =
@@ -155,6 +162,7 @@ impl Default for PrepareOptions {
             plugin_skill_dirs: Vec::new(),
             mcp: true,
             extra_mcp_servers: Vec::new(),
+            mcp_pool: None,
             external_subagents: Vec::new(),
             memory: true,
             web: true,
@@ -437,6 +445,9 @@ pub struct CodingParts {
     /// Connected MCP servers (None when `opts.tools` or `opts.mcp` was false; an empty
     /// registry, not None, when MCP is on but nothing is configured).
     pub mcp_registry: Option<Arc<McpRegistry>>,
+    /// The runtime's connection pool this parts' registry takes from and offers
+    /// to (`PrepareOptions::mcp_pool`). Withdrawing clears it.
+    mcp_pool: Option<Arc<atomcode_capabilities::mcp::pool::McpConnectionPool>>,
     /// The agent's tool working dir as a LIVE handle (kernel Seam 1b): the driver
     /// mutates it to implement `/cd` — tools resolve against the new dir from the
     /// next call. Session/memory/recall stay anchored to the PREPARE-time project
@@ -786,10 +797,11 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             }
         };
         (
-            Some(Arc::new(McpRegistry::from_config_background_with_extra(
+            Some(Arc::new(McpRegistry::from_config_background_pooled(
                 &cfg.working_dir,
                 Some(event_tx),
                 opts.extra_mcp_servers.clone(),
+                opts.mcp_pool.clone(),
             ))),
             Some(event_rx),
             telemetry_rx,
@@ -1009,6 +1021,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         snapshot_persistence_status,
         session,
         runtime_resume: None,
+        mcp_pool: mcp_registry.as_ref().and(opts.mcp_pool.clone()),
         mcp_registry,
         review_provider,
         subagent_provider,
@@ -1331,6 +1344,12 @@ impl CodingParts {
         if let Some(registry) = &self.mcp_registry {
             registry.cancel_pending_work();
         }
+        // Every withdrawal comes before a change the connections were made under
+        // (a reload, trust, a sign-in or sign-out): the next tree must connect
+        // afresh, not take these over. They close with this tree's registry.
+        if let Some(pool) = &self.mcp_pool {
+            pool.clear();
+        }
         // Held across the unregister so a publish that is already inside the
         // lock finishes first and its names are in the list we drain — rather
         // than being added right after we cleared it.
@@ -1349,6 +1368,20 @@ impl CodingParts {
                 toolbox.unregister(name);
             }
         }
+    }
+
+    /// Keep in the connection pool only what this parts' registry holds — called
+    /// once this parts is the one in use.
+    pub(crate) async fn settle_mcp_pool(&self) {
+        let (Some(pool), Some(registry)) = (&self.mcp_pool, &self.mcp_registry) else {
+            return;
+        };
+        pool.retain(&registry.connected_clients().await);
+    }
+
+    /// The connection pool, for tests and diagnostics.
+    pub fn mcp_pool(&self) -> Option<&Arc<atomcode_capabilities::mcp::pool::McpConnectionPool>> {
+        self.mcp_pool.as_ref()
     }
 
     pub(crate) async fn mcp_statuses(
@@ -2140,6 +2173,7 @@ mod tests {
             plugin_skill_dirs: Vec::new(),
             mcp: true,
             extra_mcp_servers: Vec::new(),
+            mcp_pool: None,
             external_subagents: Vec::new(),
             memory: false,
             web: false,
@@ -2389,6 +2423,7 @@ mod tests {
             plugin_skill_dirs: Vec::new(),
             mcp: false,
             extra_mcp_servers: Vec::new(),
+            mcp_pool: None,
             external_subagents: Vec::new(),
             memory: false,
             web: false,

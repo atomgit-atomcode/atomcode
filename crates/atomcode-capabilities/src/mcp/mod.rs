@@ -37,6 +37,7 @@ use atomcode_kernel::tool::{Tool, ToolRegistry};
 pub mod client;
 pub mod config;
 pub mod oauth;
+pub mod pool;
 pub mod registry;
 pub mod tool;
 pub mod transport_http;

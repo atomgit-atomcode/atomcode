@@ -182,6 +182,9 @@ pub struct McpRegistry {
     /// has asked again (see [`Self::listed_tools`]). A failed listing removes the
     /// server's entry rather than leaving tools the server may no longer have.
     listed_tools: Arc<std::sync::RwLock<BTreeMap<String, Vec<McpToolInfo>>>>,
+    /// The runtime's connection pool this registry takes connections from and
+    /// offers its own to, when it was built with one.
+    pool: Option<Arc<super::pool::McpConnectionPool>>,
 }
 
 impl McpRegistry {
@@ -201,6 +204,7 @@ impl McpRegistry {
             tool_aliases: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
             server_instructions: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
             listed_tools: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
+            pool: None,
         }
     }
 
@@ -222,6 +226,7 @@ impl McpRegistry {
                 tool_aliases: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
                 server_instructions: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
                 listed_tools: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
+                pool: None,
             },
             rx,
         )
@@ -465,7 +470,26 @@ It cannot override system, user, project, safety, permission, or approval rules.
         event_tx: Option<mpsc::UnboundedSender<McpConnectEvent>>,
         extra_servers: Vec<McpServerConfig>,
     ) -> Self {
+        Self::from_config_background_pooled(project_dir, event_tx, extra_servers, None)
+    }
+
+    /// [`Self::from_config_background_with_extra`], taking over from `pool` every
+    /// server it already holds a connection for — made the same way, in the same
+    /// directory, still connected — and offering it every connection it makes.
+    ///
+    /// A taken-over server is in the registry before this returns, with the tools
+    /// it was last listed with; no `Connected` event is sent for it (nothing was
+    /// dialled). The rest connect in the background as usual. The registry's own
+    /// approvals, aliases, cancellation and events are its own either way: only
+    /// the connection is shared (`docs/adr/0002`).
+    pub fn from_config_background_pooled(
+        project_dir: &std::path::Path,
+        event_tx: Option<mpsc::UnboundedSender<McpConnectEvent>>,
+        extra_servers: Vec<McpServerConfig>,
+        pool: Option<Arc<super::pool::McpConnectionPool>>,
+    ) -> Self {
         let mut registry = Self::new();
+        registry.pool = pool.clone();
         // Merge external channel with internal one
         let combined_tx = event_tx.or(registry.connect_events.clone());
         registry.connect_events = combined_tx.clone();
@@ -524,6 +548,23 @@ It cannot override system, user, project, safety, permission, or approval rules.
             names.extend(configs.iter().map(|config| config.name.clone()));
         }
 
+        // Take over what the pool already holds. The registry is new and nobody
+        // else can see it yet, so its locks are free.
+        let project_trusted = is_project_trusted_local(project_dir);
+        let pool_generation = pool.as_ref().map(|pool| pool.generation());
+        let configs: Vec<(McpServerConfig, super::pool::McpConnectionIdentity)> = configs
+            .into_iter()
+            .filter_map(|config| {
+                let identity =
+                    super::pool::McpConnectionIdentity::new(project_dir, project_trusted, &config);
+                let Some(taken) = pool.as_ref().and_then(|pool| pool.take_over(&identity)) else {
+                    return Some((config, identity));
+                };
+                registry.adopt(taken);
+                None
+            })
+            .collect();
+
         if !configs.is_empty() {
             let servers = registry.servers.clone();
             let server_timeouts_ms = registry.server_timeouts_ms.clone();
@@ -536,7 +577,8 @@ It cannot override system, user, project, safety, permission, or approval rules.
                 // Connect servers in parallel
                 let tasks: Vec<_> = configs
                     .into_iter()
-                    .map(|config| {
+                    .map(|(config, identity)| {
+                        let pool = pool.clone();
                         let servers = servers.clone();
                         let server_timeouts_ms = server_timeouts_ms.clone();
                         let failed_servers = failed_servers.clone();
@@ -600,15 +642,33 @@ It cannot override system, user, project, safety, permission, or approval rules.
                                         let mut instructions = server_instructions
                                             .write()
                                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                        if let Some(value) = normalized {
+                                        if let Some(value) = normalized.clone() {
                                             instructions.insert(name.clone(), value);
                                         } else {
                                             instructions.remove(&name);
                                         }
                                     }
+                                    let client: Arc<dyn McpClient> = Arc::from(client);
                                     let mut servers = servers.write().await;
-                                    servers.insert(name.clone(), Arc::from(client));
+                                    servers.insert(name.clone(), Arc::clone(&client));
                                     drop(servers);
+                                    // Offered under the generation the pool had when
+                                    // this registry was built: a pool cleared since
+                                    // (a reload while this server was starting) turns
+                                    // it away, and it closes with this registry.
+                                    if let (Some(pool), Some(generation)) = (&pool, pool_generation)
+                                    {
+                                        pool.put(
+                                            generation,
+                                            super::pool::PooledConnection {
+                                                identity,
+                                                client,
+                                                instructions: normalized,
+                                                timeout_ms,
+                                                tools: Vec::new(),
+                                            },
+                                        );
+                                    }
                                     let mut timeouts = server_timeouts_ms.write().await;
                                     timeouts.insert(name.clone(), timeout_ms);
                                     let mut failed = failed_servers.write().await;
@@ -792,12 +852,12 @@ It cannot override system, user, project, safety, permission, or approval rules.
             .into_iter()
             .map(|(server_name, client)| async move {
                 let result = client.list_tools().await;
-                (server_name, result)
+                (server_name, client, result)
             })
             .collect();
         let mut all_tools = Vec::new();
 
-        while let Some((server_name, result)) = pending.next().await {
+        while let Some((server_name, client, result)) = pending.next().await {
             match result {
                 Ok(result) => {
                     self.status_overrides
@@ -805,11 +865,11 @@ It cannot override system, user, project, safety, permission, or approval rules.
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .remove(&server_name);
                     let tools = tool_infos(&server_name, result.tools);
-                    self.record_listed(&server_name, Some(&tools));
+                    self.record_listed(&server_name, &client, Some(&tools));
                     all_tools.extend(tools);
                 }
                 Err(e) => {
-                    self.record_listed(&server_name, None);
+                    self.record_listed(&server_name, &client, None);
                     let message = format!("tools/list failed: {}", e);
                     self.status_overrides
                         .write()
@@ -834,6 +894,12 @@ It cannot override system, user, project, safety, permission, or approval rules.
     }
 
     /// Get tools from a single connected server.
+    /// The connected clients by server name — what a connection pool keeps when
+    /// this registry is the one in use.
+    pub async fn connected_clients(&self) -> BTreeMap<String, Arc<dyn McpClient>> {
+        self.servers.read().await.clone()
+    }
+
     /// Every server's tools as its last successful `tools/list` returned them,
     /// sorted the way [`Self::list_all_tools`] sorts. No request is made: this is
     /// what a tree mounted over an already-connected registry offers at once,
@@ -851,8 +917,44 @@ It cannot override system, user, project, safety, permission, or approval rules.
         tools
     }
 
+    /// Put a connection taken over from the pool into this (new, unshared)
+    /// registry, as a connected server with the tools it was last listed with.
+    fn adopt(&self, taken: super::pool::PooledConnection) {
+        let name = taken.identity.name.clone();
+        self.servers
+            .try_write()
+            .expect("a registry under construction is not shared")
+            .insert(name.clone(), Arc::clone(&taken.client));
+        self.server_timeouts_ms
+            .try_write()
+            .expect("a registry under construction is not shared")
+            .insert(name.clone(), taken.timeout_ms);
+        {
+            let mut instructions = self
+                .server_instructions
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match taken.instructions {
+                Some(value) => instructions.insert(name.clone(), value),
+                None => instructions.remove(&name),
+            };
+        }
+        if !taken.tools.is_empty() {
+            self.listed_tools
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(name, taken.tools);
+        }
+    }
+
     /// Record (or, on a failed listing, forget) what `server` offers.
-    fn record_listed(&self, server: &str, tools: Option<&[McpToolInfo]>) {
+    /// The pool's copy follows, when `client` is the connection it holds.
+    fn record_listed(
+        &self,
+        server: &str,
+        client: &Arc<dyn McpClient>,
+        tools: Option<&[McpToolInfo]>,
+    ) {
         let mut listed = self
             .listed_tools
             .write()
@@ -860,6 +962,9 @@ It cannot override system, user, project, safety, permission, or approval rules.
         match tools {
             Some(tools) => {
                 listed.insert(server.to_string(), tools.to_vec());
+                if let Some(pool) = &self.pool {
+                    pool.record_tools(server, client, tools.to_vec());
+                }
             }
             None => {
                 listed.remove(server);
@@ -889,11 +994,11 @@ It cannot override system, user, project, safety, permission, or approval rules.
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .remove(server_name);
                 let tools = tool_infos(server_name, result.tools);
-                self.record_listed(server_name, Some(&tools));
+                self.record_listed(server_name, &client, Some(&tools));
                 tools
             }
             Err(e) => {
-                self.record_listed(server_name, None);
+                self.record_listed(server_name, &client, None);
                 let message = format!("tools/list failed: {}", e);
                 self.status_overrides
                     .write()
@@ -1039,6 +1144,7 @@ It cannot override system, user, project, safety, permission, or approval rules.
             tool_aliases: self.tool_aliases.clone(),
             server_instructions: self.server_instructions.clone(),
             listed_tools: self.listed_tools.clone(),
+            pool: self.pool.clone(),
         })
     }
 }

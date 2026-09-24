@@ -2558,11 +2558,20 @@ impl CodingRuntime {
     ) -> Result<Self, RuntimeStartError> {
         let CodingRuntimeStart {
             mut agent,
-            prepare,
+            mut prepare,
             provider_factory,
             plugin_hooks,
             image_preprocessor,
         } = input;
+        // The runtime owns the MCP connections its generations share (`docs/adr/
+        // 0002`): one pool for the life of the runtime, carried in the options each
+        // prepare is given, so a session switch takes over the servers that are
+        // already up instead of restarting them.
+        if prepare.mcp {
+            prepare.mcp_pool.get_or_insert_with(|| {
+                Arc::new(atomcode_capabilities::mcp::pool::McpConnectionPool::new())
+            });
+        }
         if let Some(config) = agent.subagent_config.clone() {
             crate::provider_factory::install_subagent_tiers(
                 provider_factory.clone(),
@@ -6340,6 +6349,11 @@ fn spawn_runtime_owner_with_optional_agent(
                                     runtime_phase_state(generation, previous_phase),
                                     Ordering::Release,
                                 );
+                                // A failed candidate may have offered the pool connections
+                                // the old tree does not use; they close here rather than
+                                // at the next commit. (It only removes: a pool a reload
+                                // cleared stays empty.)
+                                runtime.parts.settle_mcp_pool().await;
                                 resources = Some(runtime);
                                 let _ = done.send(Err(error));
                                 continue;
@@ -6376,6 +6390,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                     runtime_phase_state(generation, previous_phase),
                                     Ordering::Release,
                                 );
+                                runtime.parts.settle_mcp_pool().await;
                                 resources = Some(runtime);
                                 let candidate_error = match cleanup_error {
                                     Some(cleanup_error) => {
@@ -6400,6 +6415,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 runtime_phase_state(generation, previous_phase),
                                 Ordering::Release,
                             );
+                            runtime.parts.settle_mcp_pool().await;
                             resources = Some(runtime);
                             let publish_error = match cleanup_error {
                                 Some(cleanup_error) => {
@@ -6479,6 +6495,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = replacement.commands.send(AgentCommand::Shutdown);
                             let cleanup_error =
                                 discard_uncommitted_session(operation, &candidate).err();
+                            runtime.parts.settle_mcp_pool().await;
                             resources = Some(runtime);
                             let error = match cleanup_error {
                                 Some(cleanup_error) => RuntimeError::ReconfigureFailed(format!(
@@ -6491,6 +6508,10 @@ fn spawn_runtime_owner_with_optional_agent(
                         }
                         preserve_sessionless_snapshot(&mut runtime, &stop_report);
                         runtime = candidate;
+                        // The old tree is gone: keep only the connections the new
+                        // one holds. The rest close once nothing holds them — a
+                        // server dropped from the config, the old directory's.
+                        runtime.parts.settle_mcp_pool().await;
                         agent = Some(replacement);
                         generation = generation.wrapping_add(1);
                         event_generation.store(generation, Ordering::Release);
@@ -11442,6 +11463,7 @@ mod tests {
                 plugin_skill_dirs: Vec::new(),
                 mcp: false,
                 extra_mcp_servers: Vec::new(),
+                mcp_pool: None,
                 external_subagents: Vec::new(),
                 memory: false,
                 web: false,

@@ -37,6 +37,7 @@ async fn sensitive_read_is_gated_and_fails_closed_through_full_assembly() {
         plugin_skill_dirs: Vec::new(),
         mcp: false,
         extra_mcp_servers: Vec::new(),
+        mcp_pool: None,
         external_subagents: Vec::new(),
         memory: false,
         web: false,
