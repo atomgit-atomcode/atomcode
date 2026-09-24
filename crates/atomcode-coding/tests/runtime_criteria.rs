@@ -21,7 +21,7 @@ use atomcode_coding::{
     StaticPluginHookSource, SubagentPolicy, UserInput,
 };
 use atomcode_kernel::message::{Message, Role, SessionSnapshot};
-use atomcode_kernel::provider::{ChatOptions, LlmProvider};
+use atomcode_kernel::provider::{ChatOptions, LlmProvider, ToolChoice};
 use atomcode_kernel::stream::{ProviderError, StreamEvent, TokenUsage};
 use atomcode_kernel::tool::{ToolCall, ToolDef};
 use futures::stream::{BoxStream, StreamExt as _};
@@ -2237,50 +2237,13 @@ async fn an_update_after_a_compaction_is_what_the_next_round_sees() {
             .await
             .unwrap();
 
-    turn(&mut runtime, "plan two things").await;
-    // Enough after the plan that a summary is a net win and the plan is folded.
-    for n in 0..6 {
-        turn(
-            &mut runtime,
-            &format!("prompt {n} {}", "context ".repeat(500)),
-        )
-        .await;
-    }
-    runtime.handle.compact(None).unwrap();
-    loop {
-        let event = tokio::time::timeout(std::time::Duration::from_secs(10), runtime.events.recv())
-            .await
-            .expect("compaction did not finish")
-            .expect("runtime event stream closed");
-        if let CodingRuntimeEvent::CompactionFinished { completion } = event.event {
-            let atomcode_coding::runtime::CompactionCompletion::Completed(outcome) = completion
-            else {
-                panic!("{completion:?}");
-            };
-            assert!(outcome.committed, "the compaction was refused");
-            break;
-        }
-    }
+    plan_then_compact(&mut runtime).await;
 
     turn(&mut runtime, "finish the first thing").await;
 
     let requests = recorder.requests.lock().unwrap().clone();
-    let at = requests
-        .iter()
-        .position(|request| {
-            request
-                .iter()
-                .any(|m| m.role == Role::User && m.text == "finish the first thing")
-        })
-        .expect("the turn was asked");
+    let at = first_asking(&requests, "finish the first thing");
     let asked = &requests[at];
-    assert!(
-        !asked
-            .iter()
-            .flat_map(|m| m.tool_calls.iter())
-            .any(|c| c.name == "todowrite" && c.arguments.contains("\"todos\"")),
-        "the plan is still in the conversation, so this proves nothing about the sidecar"
-    );
     let list = |request: &[Message]| {
         request
             .iter()
@@ -2299,6 +2262,111 @@ async fn an_update_after_a_compaction_is_what_the_next_round_sees() {
         list(after).contains("[x] 1. the first thing"),
         "the round after the update still shows the old status: {}",
         list(after)
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// Plan two things, bury the plan under turns long enough that a summary is a
+/// net win, and compact: what is left of the list is the sidecar.
+async fn plan_then_compact(runtime: &mut CodingRuntime) {
+    turn(runtime, "plan two things").await;
+    for n in 0..6 {
+        turn(runtime, &format!("prompt {n} {}", "context ".repeat(500))).await;
+    }
+    runtime.handle.compact(None).unwrap();
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), runtime.events.recv())
+            .await
+            .expect("compaction did not finish")
+            .expect("runtime event stream closed");
+        if let CodingRuntimeEvent::CompactionFinished { completion } = event.event {
+            let atomcode_coding::runtime::CompactionCompletion::Completed(outcome) = completion
+            else {
+                panic!("{completion:?}");
+            };
+            assert!(outcome.committed, "the compaction was refused");
+            break;
+        }
+    }
+}
+
+/// The first request that carried the person's `text`, checked to be one the
+/// plan is no longer in — otherwise it proves nothing about the sidecar.
+fn first_asking(requests: &[Vec<Message>], text: &str) -> usize {
+    let at = requests
+        .iter()
+        .position(|request| {
+            request
+                .iter()
+                .any(|m| m.role == Role::User && m.text == text)
+        })
+        .expect("the turn was asked");
+    assert!(
+        !requests[at]
+            .iter()
+            .flat_map(|m| m.tool_calls.iter())
+            .any(|c| c.name == "todowrite" && c.arguments.contains("\"todos\"")),
+        "the plan is still in the conversation, so this proves nothing about the sidecar"
+    );
+    at
+}
+
+/// A model that stops with items still open on a compacted plan is asked to
+/// close them out, as it would be on a plan still in the conversation.
+///
+/// The stop check folded the conversation alone. After a compaction that is the
+/// turn's updates over an empty list — no open items — so the nudge never came,
+/// while every request showed the model a list with #2 still pending.
+///
+/// Negative control: fold `convo` alone in `offer_continuation` and no request
+/// after the answer carries the nudge.
+async fn a_compacted_plan_still_asks_to_close_out_what_is_open() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+            .await
+            .unwrap();
+    plan_then_compact(&mut runtime).await;
+
+    turn(&mut runtime, "finish the first thing").await;
+
+    let requests = recorder.requests.lock().unwrap().clone();
+    let at = first_asking(&requests, "finish the first thing");
+    assert!(
+        requests[at..].iter().flatten().any(|m| m
+            .text
+            .contains("Before you finish: the task list still has open items")),
+        "#2 is still pending and the model stopped without being asked about it"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// A compacted plan is still a plan: the eager policy does not force a new one.
+///
+/// It checked for a list in the conversation alone, found none once the plan
+/// was compacted away, and — under `always` — made the provider call
+/// `todowrite` first on the next turn, so the model planned over a list it had.
+///
+/// Negative control: fold `messages` alone in `TodoEagerHook::should_activate`
+/// and the turn after the compaction is forced to `todowrite`.
+async fn a_compacted_plan_is_not_planned_again() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut start = start(env.project.path(), &recorder, SessionMode::Fresh);
+    start.agent.todo.eager = atomcode_config::config::TodoEagerness::Always;
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+    plan_then_compact(&mut runtime).await;
+
+    turn(&mut runtime, "carry on").await;
+
+    let requests = recorder.requests.lock().unwrap().clone();
+    let at = first_asking(&requests, "carry on");
+    let options = recorder.options.lock().unwrap()[at].clone();
+    assert_eq!(
+        options.tool_choice,
+        ToolChoice::Auto,
+        "the sidecar still holds an open plan, and the turn was made to plan again"
     );
     runtime.handle.shutdown().await.unwrap();
 }
@@ -4720,6 +4788,8 @@ mod criteria {
         telemetry_and_the_session_log_agree_on_where_they_are,
         a_written_task_list_outlives_the_messages_it_came_from,
         an_update_after_a_compaction_is_what_the_next_round_sees,
+        a_compacted_plan_still_asks_to_close_out_what_is_open,
+        a_compacted_plan_is_not_planned_again,
         the_retry_budget_follows_a_model_switch,
         a_meaningless_temperature_is_ignored_rather_than_breaking_a_model_switch,
         a_cancelled_turn_is_undone_by_default,

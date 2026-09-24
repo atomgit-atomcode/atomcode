@@ -46,19 +46,29 @@ pub struct TodoHook {
     /// tests / headless drivers: sidecar persistence is skipped and the hook
     /// stays transcript-derived only (matches the pre-sidecar behavior).
     working_dir: Option<std::path::PathBuf>,
+    /// The list this round's request showed the model — `None` until a request
+    /// has been made. The stop check reads it rather than folding the
+    /// conversation again: after a compaction the conversation alone is the
+    /// turn's updates over an empty list, and the model would be let go with
+    /// items open that it had just been shown.
+    shown: std::sync::Mutex<Option<Vec<TodoItem>>>,
 }
 
 impl TodoHook {
     pub fn new(working_dir: impl Into<std::path::PathBuf>) -> Self {
         Self {
             working_dir: Some(working_dir.into()),
+            shown: Default::default(),
         }
     }
 }
 
 impl Default for TodoHook {
     fn default() -> Self {
-        Self { working_dir: None }
+        Self {
+            working_dir: None,
+            shown: Default::default(),
+        }
     }
 }
 
@@ -72,6 +82,10 @@ pub struct TodoEagerHook {
     /// forces the tool choice (that was unsupported by DeepSeek V4 and regressed
     /// efficiency on small tasks; only `always` hard-forces).
     force_complex_for_weak_model: bool,
+    /// Where the session's todo sidecar is found, as for [`TodoHook`]. A plan a
+    /// compaction took out of the conversation is still a plan, and is only in
+    /// the sidecar; without it the policy would ask for a new one over it.
+    working_dir: Option<std::path::PathBuf>,
 }
 
 impl TodoEagerHook {
@@ -101,16 +115,29 @@ impl TodoEagerHook {
         Self {
             eagerness,
             force_complex_for_weak_model,
+            working_dir: None,
         }
     }
 
+    /// Read the list the way [`TodoHook`] does, sidecar included.
+    pub fn with_working_dir(mut self, working_dir: impl Into<std::path::PathBuf>) -> Self {
+        self.working_dir = Some(working_dir.into());
+        self
+    }
+
     fn should_activate(&self, messages: &[Message], ctx: &TurnCtx) -> bool {
-        let todos = derive_current_todos(messages);
-        ctx.round == 1
-            && self.eagerness != TodoEagerness::Auto
-            && todos
-                .iter()
-                .all(|todo| todo.status == TodoStatus::Completed)
+        if ctx.round != 1 || self.eagerness == TodoEagerness::Auto {
+            return false;
+        }
+        current_todos(messages, || read_sidecar(self.working_dir.as_deref(), ctx)).map_or(
+            true,
+            |current| {
+                current
+                    .items
+                    .iter()
+                    .all(|todo| todo.status == TodoStatus::Completed)
+            },
+        )
     }
 
     /// The explicit `always` policy is the ONLY one that hard-forces the tool
@@ -445,8 +472,14 @@ fn just_wrote_full_list(messages: &[Message]) -> bool {
 #[async_trait]
 impl LifecycleHooks for TodoHook {
     async fn pre_request(&self, messages: &mut Vec<Message>, ctx: &TurnCtx) {
-        let Some(CurrentTodos { items: todos, .. }) = current_todos(messages, || self.sidecar(ctx))
-        else {
+        let current = current_todos(messages, || self.sidecar(ctx));
+        *self.shown.lock().unwrap_or_else(|e| e.into_inner()) = Some(
+            current
+                .as_ref()
+                .map(|c| c.items.clone())
+                .unwrap_or_default(),
+        );
+        let Some(CurrentTodos { items: todos, .. }) = current else {
             return;
         };
         if todos.is_empty() {
@@ -479,8 +512,12 @@ impl LifecycleHooks for TodoHook {
     /// inject a one-shot nudge to close them out (or keep working) and continue the turn — the
     /// residual gap where a weak model finishes the last item's work but forgets the final
     /// `todo update`. Fires at most once per real-user turn; `None` otherwise lets it stop.
+    ///
+    /// The list is the one this round's request showed (see `shown`); a driver
+    /// that stops without a request having been made folds the conversation.
     async fn offer_continuation(&self, convo: &Conversation) -> Option<String> {
-        let todos = derive_current_todos(&convo.messages);
+        let shown = self.shown.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let todos = shown.unwrap_or_else(|| derive_current_todos(&convo.messages));
         let has_open = todos.iter().any(|t| t.status != TodoStatus::Completed);
         if !has_open || !managed_todos_this_turn(convo) || completion_nudge_already_present(convo) {
             return None;
@@ -525,12 +562,16 @@ impl LifecycleHooks for TodoHook {
 impl TodoHook {
     /// The session's persisted todo sidecar, when there is a session to key it on.
     fn sidecar(&self, ctx: &TurnCtx) -> Option<TodoSidecar> {
-        let working_dir = self.working_dir.as_deref()?;
-        let session_id = ctx.session_id.as_deref()?;
-        SessionManager::for_project(working_dir)
-            .read_todo_sidecar(session_id)
-            .ok()?
+        read_sidecar(self.working_dir.as_deref(), ctx)
     }
+}
+
+/// The session's persisted todo sidecar, when there is a session to key it on.
+fn read_sidecar(working_dir: Option<&std::path::Path>, ctx: &TurnCtx) -> Option<TodoSidecar> {
+    let session_id = ctx.session_id.as_deref()?;
+    SessionManager::for_project(working_dir?)
+        .read_todo_sidecar(session_id)
+        .ok()?
 }
 
 /// The task list as it stands, and where the last todo call it reflects was made.

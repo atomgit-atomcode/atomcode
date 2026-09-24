@@ -8835,11 +8835,14 @@ fn harness_host_state(
     if parts.todo_enabled() {
         hooks.insert(
             "todo-eager",
-            Arc::new(crate::todo::TodoEagerHook::new(
-                &config.model,
-                &config.provider_type,
-                config.todo.eager,
-            )),
+            Arc::new(
+                crate::todo::TodoEagerHook::new(
+                    &config.model,
+                    &config.provider_type,
+                    config.todo.eager,
+                )
+                .with_working_dir(config.working_dir.clone()),
+            ),
         );
         // Everything the model is told about its list: the list and where it
         // stands on EVERY request, one note when it has gone quiet for a few
