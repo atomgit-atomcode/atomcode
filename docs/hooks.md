@@ -1,366 +1,179 @@
 # AtomCode Hooks
 
-The Hooks system allows you to insert custom logic at key execution points in AtomCode, enabling flexible extensibility.
+Hooks let you run your own shell command at key points in a session — to audit,
+gate, rewrite, or inject context — without changing the core.
 
-## Quick Start
+> **What changed (read this if you used hooks before):** the older TOML system
+> (`hooks.toml` with `[[hooks]]` / `[[webhooks]]` / `[[async_webhooks]]`, and the
+> built-in Rust hooks) **no longer fires at runtime**. The one live hook system is
+> the JSON one described here (`hooks.json` / `.hooks.json`). If you have a
+> `hooks.toml`, migrate it to `.hooks.json` — a TOML hook is silently inert.
 
-### Three-step setup: Directory → Script → TOML
+## Quick start
 
-**Step 1**: Create the hooks directory
-
-```bash
-# Global hooks (apply to all projects)
-mkdir -p ~/.atomcode/hooks
-
-# Project-level hooks (only apply to current project, override same-name global hook)
-mkdir -p .atomcode/hooks
-```
-
-**Step 2**: Write a hook script
-
-Create `~/.atomcode/hooks/my_hook.sh`:
-
-```bash
-#!/bin/bash
-# Receive context JSON via stdin
-INPUT=$(cat)
-
-# Parse key info (install jq recommended: brew install jq / apt-get install jq)
-if command -v jq &> /dev/null; then
-    TOOL=$(echo "$INPUT" | jq -r '.tool_name // empty')
-    echo "Hook saw tool: $TOOL" >&2
-else
-    # Without jq, use python instead:
-    # TOOL=$(echo "$INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('tool_name',''))" 2>/dev/null)
-    echo "Hook: raw input received" >&2
-fi
-
-# Return execution result
-echo "ok"
-```
-
-Make it executable:
-
-```bash
-chmod +x ~/.atomcode/hooks/my_hook.sh
-```
-
-**Step 3**: Configure `hooks.toml`
-
-Create `~/.atomcode/hooks/hooks.toml`:
-
-```toml
-[[hooks]]
-name = "my-hook"
-description = "My custom hook"
-trigger = "post_tool"      # Trigger timing
-script = "my_hook.sh"
-script_type = "shell"       # shell | python
-enabled = true
-timeout_secs = 2
-```
-
-Done! Hooks are automatically loaded when AtomCode starts.
-
----
-
-## Configuration Overview
-
-AtomCode supports **three** hook implementations, managed via two config files:
-
-| Method | Config file | Implementation | Use case |
-|------|---------|------|---------|
-| **TOML ScriptHook** | `hooks.toml` → `[[hooks]]` | Local script (shell/python) | Local customization, rapid prototyping |
-| **TOML Webhook** | `hooks.toml` → `[[webhooks]]` / `[[async_webhooks]]` | HTTP remote call | Cloud services, external integrations |
-| **JSON CC Compatible** | `.hooks.json` / `hooks.json` | Shell command (legacy protocol) | CC plugin compatibility |
-
-> All three methods can coexist. They are loaded uniformly via `HookEngine::load_all()`:
-> 1. JSON hooks（`hooks.json`）
-> 2. TOML hooks (ScriptHook + WebhookHook, from `hooks.toml`)
-> 3. Built-in Hooks (native Rust, auto-registered)
->
-> Global hooks load first, project hooks load after. Same-name project hooks **override** global hooks (last-loaded wins).
-
----
-
-## TOML ScriptHook (Recommended)
-
-### Supported trigger values
-
-| trigger value | Alias | When triggered | Can affect flow |
-|-----------|------|---------|:--:|
-| `pre_tool` | `pre_tool_execution` | Before tool execution | ✅ Can block/modify args |
-| `post_tool` | `post_tool_execution` | After tool execution | ❌ fire-and-forget |
-| `post_turn` | — | After turn completes | ❌ fire-and-forget |
-| `system_prompt` | — | When building system prompt | ✅ Can append instructions |
-
-### Script input (stdin JSON)
-
-```json
-{
-  "tool_name": "edit_file",
-  "tool_args": "{\"file_path\": \"...\", ...}",
-  "working_dir": "/path/to/project",
-  "session_id": "session-123",
-  "turn_number": 5
-}
-```
-
-`post_tool`'s stdin is a nested structure that additionally includes `result_context` (a sibling of `hook_context`):
-
-```json
-{
-  "hook_context": {
-    "tool_name": "edit_file",
-    "tool_args": "{...}",
-    "working_dir": "/path/to/project",
-    "session_id": "session-123",
-    "turn_number": 5
-  },
-  "result_context": {
-    "tool_name": "edit_file",
-    "tool_args": "{...}",
-    "result": "File updated",
-    "success": true,
-    "duration_ms": 150
-  }
-}
-```
-
-`system_prompt` stdin input is the same as `post_turn` (includes base context, no `tool_args`/`result_context`). The script should output appended system prompt content to stdout (plain text or JSON `message` field).
-
-### Script output format
-
-```
-ok                    # Continue (default)
-deny: <reason>        # Block (only effective for pre_tool)
-modify: <new_args>    # Replace args (only effective for pre_tool)
-warning: <message>    # Continue but print warning
-```
-
-JSON output is also supported (recommended):
-
-```json
-{"result": "ok", "message": "checked"}
-{"result": "deny", "message": "unsafe path"}
-{"result": "modify", "modified_content": "{\"file_path\": \"/safe\"}"}
-{"result": "warning", "message": "file is large, review carefully"}
-```
-
-### Full configuration example
-
-```toml
-[[hooks]]
-name = "pre-check"
-description = "Block dangerous write operations"
-trigger = "pre_tool"
-script = "check_write.sh"
-script_type = "shell"
-enabled = true
-timeout_secs = 3
-```
-
----
-
-## TOML Webhook
-
-### Supported trigger values (comma-separated for multiple)
-
-| trigger value (canonical) | Alias | When triggered |
-|-----------|------|---------|
-| `turn_start` | — | Before turn starts |
-| `tool_call_start` | — | When tool call starts |
-| `pre_tool` | `before_tool` | Before tool execution |
-| `post_tool` | `after_tool` | After tool execution |
-| `turn_complete` | `after_turn` | After turn completes (detailed stats) |
-| `post_turn` | — | After turn completes (legacy compat) |
-| `session_start` | — | On session start |
-| `session_end` | — | On session end |
-| `error` | — | On error |
-| `model_response` | — | After model response |
-| `system_prompt` | — | When building system prompt |
-| `message`² | `message_received` | On user message received |
-
-> Uses **contains matching** (comma-separated triggers). E.g. `trigger = "pre_tool,post_tool"` fires on both occasions.
->
-> ² `message`: WebhookHook has implemented the corresponding trait, but the engine has not registered a trigger slot yet; currently not functional.
-
-### Synchronous Webhook
-
-```toml
-[[webhooks]]
-name = "slack-notify"
-description = "Send tool call notifications to Slack"
-trigger = "pre_tool,post_tool"
-url = "https://hooks.slack.com/services/XXX"
-method = "POST"
-timeout_secs = 10
-retries = 2
-enabled = true
-
-[webhooks.headers]
-Authorization = "Bearer YOUR_TOKEN"
-```
-
-### Async Batch Webhook (recommended for high-frequency scenarios)
-
-```toml
-[[async_webhooks]]
-name = "audit-log"
-trigger = "post_tool"
-url = "https://log.example.com/batch"
-timeout_secs = 10
-batch_size = 20            # default 10, send when reached
-flush_interval_ms = 1000   # default 1000ms, periodic flush
-retries = 2
-enabled = true
-
-[async_webhooks.headers]
-Authorization = "Bearer AUDIT_TOKEN"
-```
-
-> Async webhooks do not block the main flow. See [Webhook Guide](./webhook-guide.md) and [Async Webhook Guide](./async-webhook-guide.md).
-
----
-
-## JSON CC Compatible Configuration
-
-Compatible with Claude Code plugin's `.hooks.json`. Load paths:
-
-- `~/.atomcode/hooks.json` — Global
-- `<project>/.hooks.json` — Project (overrides same-name global)
+**1. Write the config** — project-level `<project>/.hooks.json` (or global
+`$ATOMCODE_HOME/hooks.json`, where `$ATOMCODE_HOME` defaults to `~/.atomcode`):
 
 ```json
 {
   "hooks": {
-    "my-hook": {
-      "event": "pre_tool_use",
-      "matcher": "write*",
-      "command": "echo '{\"action\": \"allow\"}'",
-      "timeout_ms": 10000,
-      "disabled": false
+    "audit-bash": {
+      "event": "PreToolUse",
+      "matcher": "bash",
+      "command": "/usr/local/bin/audit-bash.sh",
+      "timeout_ms": 10000
     }
   }
 }
 ```
 
-Supported `event` values: `pre_tool_use`, `post_tool_use`, `post_tool_use_failure`, `session_start`, `session_end`, `user_prompt_submit`.
-
-> **Case/style-insensitive:** the loader accepts both CC PascalCase (`PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `SessionStart`, `UserPromptSubmit`) and snake_case (`pre_tool_use`, `post_tool_use_failure`, `session_start`, …) — the two spellings are equivalent.
-
-Hooks receive context via environment variables (`ATOMCODE_HOOK_EVENT`, `ATOMCODE_HOOK_CONTEXT`, `ATOMCODE_TOOL_NAME`, etc.). The stdout protocol varies by event:
-
-- **`pre_tool_use`** — output `{"action":"allow"}` / `{"action":"block","reason":"..."}` / `{"action":"modify","args":{...}}` (`args` replaces the tool-call arguments)
-- **`user_prompt_submit`** — output `{"decision":"block","reason":"..."}` to block submission, or `{"hookSpecificOutput":{"additionalContext":"..."}}` to inject extra context; plain-text stdout is treated as an additionalContext injection
-- **`post_tool_use`** — fire-and-forget; stdout does not affect the flow
-- **`post_tool_use_failure`** — like `post_tool_use`, but fired only when the tool call FAILED (`tool_response` carries the error output), so a plugin can tell success from failure
-
----
-
-## Built-in Hooks (no configuration needed, auto-enabled)
-
-| Hook | When triggered | Function |
-|------|---------|------|
-| `ToolAuditLogHook` | On tool call | Log calls to audit log (tracing) |
-| `TurnStatsHook` | Turn start + complete | Track turn duration and operations |
-| `AutoCommitHook` | Turn complete | Auto `git commit` every N turns |
-| `SessionSummaryHook` | Session start + end | Print session summary |
-| `ErrorReportHook` | On error | Log error details |
-| `ResponseValidationHook` | After model response | Detect sensitive information |
-
-Built-in hooks auto-register and cannot be disabled via configuration yet (future CLI will provide enable/disable switches). Same-name project-level hooks cannot override built-in hooks (built-in hooks are native Rust, outside the TOML configuration system).
-
----
-
-## CLI Commands
+**2. Write the command** — it receives a JSON payload on **stdin** and (for
+gating events) prints a decision as JSON on stdout:
 
 ```bash
-# List loaded hooks
-atomcode hooks list
-
-# View config paths
-atomcode hooks paths
-
-# Test a single hook
-atomcode hooks test my-hook
+#!/bin/bash
+payload=$(cat)                       # the event payload arrives on stdin
+tool=$(printf '%s' "$payload" | jq -r '.tool_name // empty')
+echo "saw $tool" >&2                 # stderr is for your own logging
+echo '{"action":"allow"}'            # stdout is the decision (gating events)
 ```
----
 
-## 调试技巧
+That's it — the command runs on the matching event.
 
-### 手动测试 hook 脚本
+> **No `hooks.json` is a valid state** (no hooks). A **malformed** `hooks.json`
+> is skipped and a warning is logged (`target=atomcode::hooks`, with the path and
+> the parse error) — one stray comma disables that file's hooks, so check the log
+> if a hook stops firing. JSON does **not** allow comments.
 
-TOML ScriptHook 通过 stdin 接收上下文 JSON（字段对应 `HookCtx`：`tool_name` / `tool_args` / `working_dir` / `session_id` / `turn_number`，无 `event` 字段）：
+## Config file
+
+| Scope | Path |
+|-------|------|
+| Global (user) | `$ATOMCODE_HOME/hooks.json` (default `~/.atomcode/hooks.json`) |
+| Project | `<project>/.hooks.json` |
+
+Both load; project hooks are added to the global ones. Each entry:
+
+| Field | Required | Meaning |
+|-------|:--:|---------|
+| `event` | ✅ | One of the 8 events below (PascalCase or snake_case). |
+| `command` | ✅ | The shell command line to run. **Not** env-var-expanded — use an **absolute path** (`~` and `$VARS` are NOT resolved). |
+| `matcher` | — | Tool-name glob for tool events; `\|`-separated alternatives (e.g. `bash\|edit_file`, `write*`). Omit to match every tool. |
+| `timeout_ms` | — | Per-run timeout (default `10000`). A timeout or crash is **fail-open** (treated as "proceed"). |
+| `disabled` | — | `true` to keep the entry but not run it. |
+
+The map key (`"audit-bash"` above) is for your own organization; it is **not**
+retained after loading, so you cannot address a hook by it (see the CLI section).
+
+## Events
+
+All eight, with the snake_case alias each also accepts:
+
+| Event | Alias | Fires | Can affect the flow? |
+|-------|-------|-------|:--:|
+| `PreToolUse` | `pre_tool_use` | before a tool runs | ✅ allow / deny / ask / modify |
+| `PostToolUse` | `post_tool_use` | after a tool succeeds | ✅ block / rewrite output |
+| `PostToolUseFailure` | `post_tool_use_failure` | after a tool **fails** | ✅ block / rewrite output |
+| `UserPromptSubmit` | `user_prompt_submit` | on a submitted prompt | ✅ block / inject context |
+| `SessionStart` | `session_start` | when a session begins | inject context |
+| `SessionEnd` | `session_end` | when a session ends | fire-and-forget |
+| `Stop` | `stop` | when a turn stops cleanly | fire-and-forget |
+| `StopFailure` | `stop_failure` | when a turn stops on error | fire-and-forget |
+
+Tool matchers (`matcher`) apply only to the three tool events.
+
+## The stdin payload
+
+The command reads a JSON object on stdin. Fields depend on the event:
+
+- **`PreToolUse`** — `session_id`, `hook_event_name`, `call_id`, `tool_name`,
+  `tool_input` (the parsed argument object), `cwd`
+- **`PostToolUse` / `PostToolUseFailure`** — `session_id`, `hook_event_name`,
+  `call_id`, `tool_name`, `tool_response`, `cwd`
+- **`UserPromptSubmit`** — `session_id`, `hook_event_name`, `cwd`, `prompt`
+- **`SessionStart` / `SessionEnd`** — `session_id`, `hook_event_name`, `cwd`
+- **`Stop` / `StopFailure`** — `session_id`, `hook_event_name`, `cwd`,
+  `transcript_path`, `stop_hook_active`, `stop_reason`
+
+> `call_id` correlates a `PreToolUse` with the matching `PostToolUse` /
+> `PostToolUseFailure` of the same call — the only reliable way to pair
+> arguments/result and to tell two concurrent calls of the same tool apart.
+> (A call denied at `PreToolUse` still fires `PostToolUseFailure`, but without a
+> `tool_name`; join it back to the Pre frame by `call_id`.)
+
+## The stdout decision
+
+Two things settle a hook's outcome: its **stdout** (the last JSON line) and its
+**exit code**.
+
+**Exit code (Claude-Code contract):** `0` = ok; **`2` = a deliberate block**
+(give a reason on stdout/stderr); any other non-zero is a *non-blocking* error —
+the tool proceeds (a broken hook must not wedge the turn).
+
+**stdout JSON** — both an atomcode-native and a CC-compatible shape are accepted:
+
+`PreToolUse` (gate + rewrite):
+
+```json
+{"action":"allow"}
+{"action":"block","reason":"writing outside the workspace"}
+{"action":"modify","args":{"path":"/safe/path"}}
+```
+
+or the CC shape:
+
+```json
+{"hookSpecificOutput":{"permissionDecision":"allow|deny|ask",
+  "permissionDecisionReason":"...","updatedInput":{...},
+  "additionalContext":"..."}}
+```
+
+`PostToolUse` / `PostToolUseFailure` (block or rewrite the result the model sees):
+
+```json
+{"decision":"block","reason":"..."}
+{"hookSpecificOutput":{"updatedToolOutput":"redacted result"}}
+```
+
+`UserPromptSubmit` (block the prompt, or inject context):
+
+```json
+{"decision":"block","reason":"..."}
+{"hookSpecificOutput":{"additionalContext":"extra context for the model"}}
+```
+
+When several hooks match one event, the **most-restrictive** decision wins
+(`deny` > `ask` > `allow` > proceed); rewrites apply in registration order.
+
+## CLI
 
 ```bash
-# pre_tool 测试上下文（扁平结构）
-echo '{"tool_name":"read_file","tool_args":"{}","working_dir":"/tmp","session_id":"s1","turn_number":1}' | bash path/to/hook.sh
-
-# post_tool 测试上下文（嵌套结构，含 result_context）
-echo '{"hook_context":{"tool_name":"read_file","tool_args":"{}","working_dir":"/tmp","session_id":"s1","turn_number":1},"result_context":{"tool_name":"read_file","tool_args":"{}","result":"File content here","success":true,"duration_ms":12}}' | bash path/to/hook.sh
+atomcode hooks list           # loaded hooks, grouped by event
+atomcode hooks paths          # the exact files that are read (with ✓/✗)
+atomcode hooks test <NAME>    # dry-run a hook with a synthetic payload
 ```
 
-JSON CC 兼容 Hook 通过环境变量接收（TOML ScriptHook 不适用，TOML 用 stdin）：
+`hooks test <NAME>` matches by **event name** (e.g. `PreToolUse`) or a
+**substring of the command** — not the config key (keys are not retained). Run
+`hooks test` with no match to see every loaded hook by event + command.
 
-```bash
-# 导出环境变量模拟运行环境（仅 JSON CC 格式）
-export ATOMCODE_HOOK_EVENT="post_tool_use"
-export ATOMCODE_TOOL_NAME="read_file"
-export ATOMCODE_HOOK_CONTEXT='{"tool_name":"read_file"}'
-python path/to/hook.py
-```
+## Not firing? Six checks
 
-### 配置文件语法校验
+| # | Check | Common cause |
+|---|-------|--------------|
+| 1 | The file parses | A stray comma disables the whole file — check the `atomcode::hooks` warning in the log; JSON allows no comments. |
+| 2 | `command` is an absolute path | `~` / `$VARS` are not expanded. |
+| 3 | `event` spelled right | See the table (either case). |
+| 4 | `matcher` matches the tool | Tool events only; omit it to match all. |
+| 5 | `disabled` not set | Defaults to enabled. |
+| 6 | Not timing out | Default 10s; a timeout is fail-open (silently proceeds). |
 
-```bash
-# TOML 格式校验（需要 Python ≥ 3.11；旧版请 pip install tomli 并将 tomllib 替换为 tomli）
-python -c "from pathlib import Path; import tomllib; tomllib.load(Path('path/to/hooks.toml').open('rb'))"
+## Security notes
 
-# JSON 格式校验
-python -c "from pathlib import Path; import json; json.load(Path('path/to/hooks.json').open('rb'))"
-```
-
-### CLI 排查命令
-
-```bash
-# 查看当前加载的所有 hook
-atomcode hooks list
-
-# 查看 hook 配置路径
-atomcode hooks paths
-
-# 测试单个 hook 是否正常触发
-atomcode hooks test <hook-name>
-```
-
-### Hook 不触发的 6 步排查清单
-
-| 步骤 | 检查项 | 常见问题 |
-|------|--------|---------|
-| 1 | 文件路径是否存在 | `~` 不会自动展开，需用绝对路径（如 `C:\Users\you\...` 或 `/home/you/...`） |
-| 2 | `enabled = true` | 默认 `true`，检查是否意外设为 `false` |
-| 3 | `trigger` / `event` 拼写正确 | 参考上方事件表，大小写敏感 |
-| 4 | 脚本有执行权限 | Linux/macOS 需 `chmod +x` |
-| 5 | 脚本没有超时 | TOML 默认 2s，JSON 默认 10s |
-| 6 | 项目级 hook 覆盖了全局 hook | 项目 hook 优先级更高 |
-
----
-
-## Security Notes
-
-1. **Project hooks override same-name global hooks** (project hooks load after global hooks)
-2. **Hooks cannot bypass the permission system** — `pre_tool` deny does not override the user's `always_allow` settings
-3. **Script execution has timeouts** — TOML ScriptHook default 2s, JSON default 10s, Webhook default 10s
-4. **Scripts run under user permissions** — be mindful of script security itself
-5. **Timeout/crash is fail-open** — a script timeout or crash is treated as `ok`, not blocking the flow
-6. **Windows compatibility** — `~` is not auto-expanded; use absolute paths (e.g. `C:\Users\you\...` or `/home/you/...`); use `\\` or `/` as the path separator; for Python scripts, specify the interpreter path explicitly
-
----
-
-## Related Docs
-
-- [CLI Guide](./hook-cli-guide.md) — `atomcode hooks` command reference
-- [Complete Timing List](./hook-timing-complete.md) — all hook timings and available configurations
-- [Webhook Guide](./webhook-guide.md) — HTTP remote calls
-- [Async Webhook Guide](./async-webhook-guide.md) — batch async delivery
-- [Architecture](./hook-architecture.md) — developer-oriented architecture reference
+1. Hooks **cannot bypass the permission system** — a `PreToolUse` deny does not
+   override a user's stored allow, and an allow is convenience, never consent for
+   a security boundary.
+2. Commands run with **your** permissions — mind the command's own safety.
+3. **Fail-open:** a timeout or crash is treated as "proceed", not "block".
+4. On Windows, use an absolute path with an explicit interpreter; `~` is not
+   expanded.
