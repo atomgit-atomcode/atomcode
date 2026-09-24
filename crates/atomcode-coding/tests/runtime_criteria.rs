@@ -2245,6 +2245,46 @@ fn last_offered(recorder: &Recorder) -> Vec<String> {
 /// An MCP server's tools are offered to the model and run — connected once,
 /// by the runtime, whichever engine drives the turns.
 #[cfg(unix)]
+/// 告诉模型的 MCP 用法,只能是这套产品真有的用法。
+///
+/// `describe_self` 是**说给模型听**的,而模型会把它转述给人:「运行
+/// `/mcp trust`」。上一代前端有这三条命令(`trust` / `reload` / `login`),
+/// 这一代一条都没有 —— 于是人照着敲,得到「不认识这条命令」,而错的那个
+/// 从头到尾没有露过面:它藏在一句说给模型听的话里,没有任何一处会判红。
+///
+/// 所以这条钉的是**没被提到的那几条**。只钉「提到了 `/mcp` 和 `/reload`」
+/// 的话,把三条已经不存在的命令原样加回去照样全绿。
+async fn what_the_model_is_told_about_mcp_only_names_ways_this_build_has() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut start = start(env.project.path(), &recorder, SessionMode::Fresh);
+    start.prepare.mcp = true;
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+
+    turn(&mut runtime, "describe mcp").await;
+    let said = last_tool_result(&recorder);
+    runtime.handle.shutdown().await.unwrap();
+
+    // 人要做的三件事,各有一个真的落点:信任项目与 OAuth 登录在 `/mcp` 那块
+    // 面板上,改完文件重连是 `/reload`。
+    for real in ["/mcp", "/reload"] {
+        assert!(said.contains(real), "`{real}` 得说出来:\n{said}");
+    }
+    // 而这几条是上一代前端的,这一代没有。
+    for gone in [
+        "/mcp trust",
+        "/mcp untrust",
+        "/mcp reload",
+        "/mcp login",
+        "/mcp logout",
+    ] {
+        assert!(
+            !said.contains(gone),
+            "`{gone}` 这条命令不存在,照着敲只会得到「不认识」:\n{said}"
+        );
+    }
+}
+
 async fn an_mcp_servers_tools_are_offered_and_run() {
     let env = env();
     let scratch = tempfile::tempdir().unwrap();
@@ -4245,7 +4285,11 @@ async fn a_capability_the_runtime_mounts_itself_still_describes_itself() {
     // Enough to add a server for the person, not just to know servers exist.
     assert!(operations.contains("\"mcpServers\""), "{operations}");
     assert!(operations.contains("atomcode mcp add"), "{operations}");
-    assert!(operations.contains("/mcp trust"), "{operations}");
+    // 信任项目这件事说得出来,而且说的是这套产品真有的落点 —— 哪一条命令、
+    // 哪块面板由 `what_the_model_is_told_about_mcp_only_names_ways_this_build_has`
+    // 单独钉;这里钉的是「这件事有没有被提到」。
+    assert!(operations.contains("trusting the project"), "{operations}");
+    assert!(operations.contains("/reload"), "{operations}");
     // And a skill: the file it is and what starts it.
     assert!(operations.contains("SKILL.md"), "{operations}");
     assert!(operations.contains("description:"), "{operations}");
@@ -5171,6 +5215,7 @@ mod criteria {
         the_ui_language_does_not_reach_the_persona,
         a_permission_rule_refuses_what_it_denies,
         a_round_budget_ends_the_turn,
+        what_the_model_is_told_about_mcp_only_names_ways_this_build_has,
         an_mcp_servers_tools_are_offered_and_run,
         withdrawing_mcp_takes_the_tools_off_the_model,
         a_switched_session_keeps_the_mcp_tools,

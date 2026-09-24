@@ -1558,11 +1558,13 @@ impl Plugin for McpHostPlugin {
                  allowed; trailing commas are not.\n\
                  To add a server for the person: write the entry (for a stdio server, \
                  `atomcode mcp add <name> <command> [args…]` writes `.mcp.json`, and \
-                 `--global` the user file). A project's own servers stay unconnected until \
-                 the person trusts the project with `/mcp trust`; after a file changes, \
-                 `/mcp reload` reconnects; an OAuth server needs `/mcp login <name>`. \
-                 Each server's tools join the catalog as `mcp__<server>__<tool>` and go \
-                 through the same approval as everything else.",
+                 `--global` the user file). Two things only the person can do, and both \
+                 are on the MCP screen that `/mcp` opens, one server to a row: trusting \
+                 the project, without which its own `.mcp.json` servers never connect, \
+                 and signing in to an OAuth server. After a file changes, `/reload` reads \
+                 the servers again and reconnects. Each server's tools join the catalog \
+                 as `mcp__<server>__<tool>` and go through the same approval as \
+                 everything else.",
                 user = atomcode_harness::home().join("mcp.json").display(),
             ),
         );
