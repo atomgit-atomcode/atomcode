@@ -1383,6 +1383,9 @@ pub(crate) struct McpPublication {
     /// Where this row hands the mounted catalog back, so `withdraw_mcp_tools`
     /// can take the published tools off it. Nothing else writes it.
     pub(crate) toolbox_slot: Arc<RwLock<Option<Arc<atomcode_harness::seams::ToolBox>>>>,
+    /// Where this row hands the system prompt back, so `withdraw_mcp_tools` can
+    /// take the servers' instructions out with their tools.
+    pub(crate) prompts_slot: Arc<RwLock<Option<Arc<atomcode_harness::seams::PromptRegistry>>>>,
 }
 
 /// What `mcp-telemetry` needs: the second stream of connection events, and the
@@ -1502,6 +1505,10 @@ async fn publish_mcp(
         }
     }
     names.sort_unstable();
+    // The servers' instructions follow the tools now in front of the model.
+    if let Some(prompts) = &publication.prompts {
+        crate::mcp_instructions::project(prompts, registry, &names);
+    }
 }
 
 /// The publication state a publishing task shares with the runtime.
@@ -1510,6 +1517,8 @@ struct McpShared {
     tool_names: Arc<RwLock<Vec<String>>>,
     publish_lock: Arc<tokio::sync::Mutex<()>>,
     publication_enabled: Arc<AtomicBool>,
+    /// The system prompt the servers' instructions go in.
+    prompts: Option<Arc<atomcode_harness::seams::PromptRegistry>>,
 }
 
 #[async_trait]
@@ -1576,6 +1585,7 @@ impl Plugin for McpHostPlugin {
             publication_enabled,
             catalog_ready,
             toolbox_slot,
+            prompts_slot,
         } = publication;
         let _ = ctx
             .provide::<atomcode_harness::seams::McpSvc>(Arc::clone(&registry))
@@ -1586,10 +1596,13 @@ impl Plugin for McpHostPlugin {
         // Withdrawal happens from the runtime, not from here, and it has to
         // reach this catalog or the model keeps being offered what was revoked.
         *toolbox_slot.write().unwrap_or_else(|e| e.into_inner()) = Some(toolbox.clone());
+        let prompts = ctx.service::<atomcode_harness::seams::SystemPromptSvc>();
+        *prompts_slot.write().unwrap_or_else(|e| e.into_inner()) = prompts.clone();
         let shared = McpShared {
             tool_names,
             publish_lock,
             publication_enabled,
+            prompts,
         };
 
         // A tree mounted over servers that are already up — a remount on the same
@@ -1636,6 +1649,9 @@ impl Plugin for McpHostPlugin {
                             for name in names.drain(..) {
                                 toolbox.unregister(&name);
                             }
+                            if let Some(prompts) = &shared.prompts {
+                                prompts.remove(crate::mcp_instructions::FRAGMENT.0);
+                            }
                             break;
                         }
                         _ = &mut initial => {
@@ -1675,6 +1691,9 @@ impl Plugin for McpHostPlugin {
             let mut names = shared.tool_names.write().unwrap_or_else(|e| e.into_inner());
             for name in names.drain(..) {
                 toolbox.unregister(&name);
+            }
+            if let Some(prompts) = &shared.prompts {
+                prompts.remove(crate::mcp_instructions::FRAGMENT.0);
             }
         });
         Ok(())

@@ -9007,17 +9007,6 @@ fn harness_host_state(
         hooks.insert("native-snapshot", snapshot);
     }
     let mcp = parts.mcp_publication();
-    if let Some(publication) = &mcp {
-        // Server-scoped instructions for the MCP tools currently mounted, as an
-        // ephemeral request tail — the chain's projection, the same object.
-        hooks.insert(
-            "mcp-instructions",
-            Arc::new(crate::mcp_instructions::McpInstructionsHook::new(
-                Arc::clone(&publication.registry),
-                Arc::clone(&publication.tool_names),
-            )),
-        );
-    }
     let middleware = crate::host_rows::HostMiddleware::new();
     if let Some(telemetry) = &config.telemetry {
         // One per mounted tree, shared by the two adapters: the hook is the only

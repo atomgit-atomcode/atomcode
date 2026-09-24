@@ -396,6 +396,9 @@ pub struct CodingParts {
     /// whatever was published. Filled by the row; `None` before it mounts or
     /// when no MCP is configured, and that is the "nothing published yet" case.
     mcp_toolbox: Arc<std::sync::RwLock<Option<Arc<atomcode_harness::seams::ToolBox>>>>,
+    /// The system prompt the mounted tree renders, filled by the same row, so
+    /// withdrawing takes the servers' instructions out with their tools.
+    mcp_prompts: Arc<std::sync::RwLock<Option<Arc<atomcode_harness::seams::PromptRegistry>>>>,
     /// True only after the publisher has reconciled every initial connection into
     /// the mounted kernel catalog. This is distinct from transport readiness.
     mcp_catalog_ready: tokio::sync::watch::Sender<bool>,
@@ -999,6 +1002,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         mcp_publish_lock: Arc::new(tokio::sync::Mutex::new(())),
         mcp_publication_enabled,
         mcp_toolbox: Arc::new(std::sync::RwLock::new(None)),
+        mcp_prompts: Arc::new(std::sync::RwLock::new(None)),
         mcp_catalog_ready: tokio::sync::watch::channel(mcp_registry.is_none()).0,
         _mcp_work_guard: mcp_work_guard,
         approval: Arc::new(ApprovalMiddleware::in_memory()),
@@ -1183,6 +1187,7 @@ impl CodingParts {
             publication_enabled: Arc::clone(&self.mcp_publication_enabled),
             catalog_ready: self.mcp_catalog_ready.clone(),
             toolbox_slot: Arc::clone(&self.mcp_toolbox),
+            prompts_slot: Arc::clone(&self.mcp_prompts),
         })
     }
 
@@ -1348,6 +1353,14 @@ impl CodingParts {
             for name in &names {
                 toolbox.unregister(name);
             }
+        }
+        if let Some(prompts) = self
+            .mcp_prompts
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            prompts.remove(crate::mcp_instructions::FRAGMENT.0);
         }
     }
 

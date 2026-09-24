@@ -2178,6 +2178,25 @@ async fn a_round_budget_ends_the_turn() {
 /// A minimal MCP server over stdio: one `echo` tool. A shell script rather than
 /// capabilities' test binary, which cargo only builds for that crate's tests.
 fn write_mcp_server(dir: &std::path::Path, calls: &std::path::Path) -> std::path::PathBuf {
+    write_mcp_server_with(dir, calls, None)
+}
+
+/// [`write_mcp_server`], announcing `instructions` in its `initialize` reply.
+fn write_mcp_server_with(
+    dir: &std::path::Path,
+    calls: &std::path::Path,
+    instructions: Option<&str>,
+) -> std::path::PathBuf {
+    let instructions = instructions
+        .map(|text| {
+            format!(
+                r#","instructions":{}"#,
+                serde_json::to_string(text).unwrap()
+            )
+        })
+        .unwrap_or_default()
+        .replace('{', "{{")
+        .replace('}', "}}");
     let script = dir.join("server.sh");
     std::fs::write(
         &script,
@@ -2188,7 +2207,7 @@ while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   case "$line" in
     *'"method":"initialize"'*)
-      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"protocolVersion":"2025-11-05","capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"t","version":"0"}}}}}}\n' "$id" ;;
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"protocolVersion":"2025-11-05","capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"t","version":"0"}}__INSTRUCTIONS__}}}}\n' "$id" ;;
     *'"method":"tools/list"'*)
       printf '{{"jsonrpc":"2.0","id":%s,"result":{{"tools":[{{"name":"echo","description":"echo back","inputSchema":{{"type":"object","properties":{{"message":{{"type":"string"}}}},"required":["message"]}}}}]}}}}\n' "$id" ;;
     *'"method":"tools/call"'*)
@@ -2199,7 +2218,8 @@ while IFS= read -r line; do
 done
 "#,
             spawns = calls.display()
-        ),
+        )
+        .replace("__INSTRUCTIONS__", &instructions.replace("{{", "{").replace("}}", "}")),
     )
     .unwrap();
     script
@@ -2868,6 +2888,71 @@ async fn an_undo_or_a_restore_keeps_the_mcp_tools() {
             .any(|n| n.starts_with("mcp__")),
         "withdrawn MCP tools were still offered after a remount: {:?}",
         last_offered(&recorder)
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// A server's instructions reach the model in the SYSTEM prompt — never as a
+/// message at the end of the conversation.
+///
+/// They used to ride each request as a trailing user message, and on a round
+/// with nothing after the tool results the model answered it ("MCP 指引与本任务
+/// 无关"). Moved into the system prompt they are part of what the model is told,
+/// not something said to it; unchanged, they are the same bytes every round.
+#[cfg(unix)]
+async fn a_servers_instructions_are_in_the_system_prompt() {
+    let env = env();
+    let scratch = tempfile::tempdir().unwrap();
+    let spawns = scratch.path().join("spawns.log");
+    let script = write_mcp_server_with(scratch.path(), &spawns, Some("Prefer echo for greetings."));
+    let recorder = Arc::new(Recorder::default());
+    let start = start_with_mcp_server(env.project.path(), &recorder, &script, true);
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+    runtime
+        .handle
+        .wait_mcp_ready(std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
+
+    turn(&mut runtime, "first").await;
+    let first = recorder.last_request();
+    turn(&mut runtime, "second").await;
+    let second = recorder.last_request();
+
+    for request in [&first, &second] {
+        let system = request
+            .iter()
+            .find(|m| m.role == Role::System)
+            .map(|m| m.text.clone())
+            .unwrap_or_default();
+        assert!(
+            system.contains("<mcp-server-instructions>\n")
+                && system.contains("Prefer echo for greetings."),
+            "the instructions are not in the system prompt"
+        );
+        assert!(
+            !request
+                .iter()
+                .filter(|m| m.role != Role::System)
+                .any(|m| m.text.contains("Prefer echo for greetings.")),
+            "the instructions were also sent as a message"
+        );
+    }
+    // The same bytes both rounds: the prompt prefix stays cacheable.
+    assert_eq!(
+        first[0], second[0],
+        "the system prompt changed between rounds"
+    );
+
+    // Withdrawn with the tools (`/mcp untrust`, `/mcp logout` open with this).
+    runtime.handle.withdraw_mcp_tools().await.unwrap();
+    turn(&mut runtime, "after the withdrawal").await;
+    assert!(
+        !recorder
+            .last_request()
+            .iter()
+            .any(|m| m.text.contains("Prefer echo for greetings.")),
+        "withdrawn instructions were still sent"
     );
     runtime.handle.shutdown().await.unwrap();
 }
@@ -5218,6 +5303,7 @@ mod criteria {
         what_the_model_is_told_about_mcp_only_names_ways_this_build_has,
         an_mcp_servers_tools_are_offered_and_run,
         withdrawing_mcp_takes_the_tools_off_the_model,
+        a_servers_instructions_are_in_the_system_prompt,
         a_switched_session_keeps_the_mcp_tools,
         always_allowing_an_mcp_tool_holds_for_the_session_and_is_written,
         an_undo_or_a_restore_keeps_the_mcp_tools,
