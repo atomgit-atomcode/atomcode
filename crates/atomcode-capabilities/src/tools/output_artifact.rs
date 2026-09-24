@@ -92,6 +92,30 @@ const PREVIEW_HEAD: usize = 32 * 1024;
 const PREVIEW_TAIL: usize = 12 * 1024;
 const MAX_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
 
+/// Override the spill threshold. Data-dense scenarios (financial reports,
+/// whole-market scans) truncate constantly at the 50 KB default; this lets an
+/// operator raise it without a rebuild. Default is [`THRESHOLD_BYTES`] to the
+/// byte. (Feedback B11.)
+const THRESHOLD_ENV: &str = "ATOMCODE_TOOL_OUTPUT_THRESHOLD_BYTES";
+
+/// The spill threshold to use, from `ATOMCODE_TOOL_OUTPUT_THRESHOLD_BYTES` or the
+/// default. Pure over its input so it is testable without touching process env.
+///
+/// Floored at `HEAD + TAIL`: the head/tail preview is fixed-size, so a threshold
+/// below it could not shrink the result (the whole invariant of spilling). A
+/// bad/empty value falls back to the default rather than erroring — a typo in an
+/// env var must not make every tool output either truncate at 0 or never.
+fn resolve_threshold(env_val: Option<&str>) -> usize {
+    env_val
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|v| v.max(PREVIEW_HEAD + PREVIEW_TAIL))
+        .unwrap_or(THRESHOLD_BYTES)
+}
+
+fn threshold_bytes() -> usize {
+    resolve_threshold(std::env::var(THRESHOLD_ENV).ok().as_deref())
+}
+
 /// Largest char-boundary index ≤ n.
 fn head_boundary(s: &str, n: usize) -> usize {
     let mut i = n.min(s.len());
@@ -141,18 +165,23 @@ impl ArtifactMiddleware {
             return;
         }
         let total = result.content.len();
-        if total <= THRESHOLD_BYTES {
+        if total <= threshold_bytes() {
             return;
         }
         let head_end = head_boundary(&result.content, PREVIEW_HEAD);
         let tail_begin = tail_start(&result.content, PREVIEW_TAIL);
         let head = &result.content[..head_end];
         let tail = &result.content[tail_begin..];
+        // How many `fetch_output` reads the full output takes, so the model sees
+        // the SCALE ("part 1 of N") rather than a bare "there's more" — the
+        // structural hint from feedback B11. Head+tail count as part 1.
+        let parts = total.div_ceil(FETCH_MAX_LIMIT).max(1);
 
         if total > MAX_ARTIFACT_BYTES {
             // Too large to store; inline-truncate only.
             let marker = format!(
-                "\n\n[atomcode: output truncated — {total} bytes total, showing first {} + last {} bytes. \
+                "\n\n[atomcode: output truncated — {total} bytes total (~{parts} parts of {FETCH_MAX_LIMIT}), \
+showing first {} + last {} bytes (part 1). \
 Full output unavailable (exceeds {MAX_ARTIFACT_BYTES}-byte artifact ceiling).]\n\n",
                 head.len(),
                 tail.len()
@@ -163,13 +192,16 @@ Full output unavailable (exceeds {MAX_ARTIFACT_BYTES}-byte artifact ceiling).]\n
 
         let marker = match self.store.put(result.content.as_bytes()) {
             Ok(id) => format!(
-                "\n\n[atomcode: output truncated — {total} bytes total, showing first {} + last {} bytes. \
-Full output saved as artifact {id}. To read more: fetch_output(artifact_id=\"{id}\", offset, limit).]\n\n",
+                "\n\n[atomcode: output truncated — {total} bytes total (~{parts} parts of {FETCH_MAX_LIMIT}), \
+showing first {} + last {} bytes (part 1). \
+Full output saved as artifact {id}. To read the next part: fetch_output(artifact_id=\"{id}\", offset={}, limit={FETCH_MAX_LIMIT}).]\n\n",
                 head.len(),
-                tail.len()
+                tail.len(),
+                head.len(),
             ),
             Err(_) => format!(
-                "\n\n[atomcode: output truncated — {total} bytes total, showing first {} + last {} bytes. \
+                "\n\n[atomcode: output truncated — {total} bytes total (~{parts} parts of {FETCH_MAX_LIMIT}), \
+showing first {} + last {} bytes (part 1). \
 Full output unavailable (could not be saved).]\n\n",
                 head.len(),
                 tail.len()
@@ -196,6 +228,23 @@ impl atomcode_kernel::middleware::ToolMiddleware for ArtifactMiddleware {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn threshold_env_override_defaults_byte_identical_and_floors() {
+        use super::{resolve_threshold, PREVIEW_HEAD, PREVIEW_TAIL, THRESHOLD_BYTES};
+        // Unset / empty / garbage → the default, to the byte.
+        assert_eq!(resolve_threshold(None), THRESHOLD_BYTES);
+        assert_eq!(resolve_threshold(Some("  ")), THRESHOLD_BYTES);
+        assert_eq!(resolve_threshold(Some("not-a-number")), THRESHOLD_BYTES);
+        // A larger value (the data-dense case) is honored verbatim.
+        assert_eq!(resolve_threshold(Some("200000")), 200_000);
+        assert_eq!(resolve_threshold(Some(" 200000 ")), 200_000);
+        // Below the fixed head+tail preview → floored, so a spill still shrinks.
+        assert_eq!(
+            resolve_threshold(Some("1000")),
+            PREVIEW_HEAD + PREVIEW_TAIL
+        );
+    }
+
     #[test]
     fn id_is_16_hex_and_deterministic() {
         let a = super::artifact_id(b"hello world");
@@ -285,6 +334,9 @@ mod tests {
         // rewritten: smaller, has head+tail+marker, names fetch_output + the id
         assert!(r1.content.len() < big.len());
         assert!(r1.content.contains("fetch_output"));
+        // B11: the marker carries the structural scale ("part 1" + "~N parts").
+        assert!(r1.content.contains("part 1"), "marker names the part: {}", r1.content);
+        assert!(r1.content.contains("parts of"), "marker names the total parts: {}", r1.content);
         let id = super::artifact_id(big.as_bytes());
         assert!(r1.content.contains(&id));
         // artifact holds the FULL original
