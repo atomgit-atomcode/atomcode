@@ -167,41 +167,117 @@ struct HookEntry {
     disabled: bool,
 }
 
-fn load_hooks_file(path: &Path) -> Vec<HookConfig> {
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return Vec::new(); // missing file → no hooks (not an error).
-    };
-    let parsed: HooksFile = match serde_json::from_str(&raw) {
-        Ok(parsed) => parsed,
+/// What reading one hooks file came to — the answer `atomcode hooks list/paths` shows
+/// beside the path, so "the file is there" is never mistaken for "its hooks run".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HooksFileStatus {
+    /// No file: no hooks from it, and nothing wrong.
+    Missing,
+    /// The file is there but could not be read (permissions, not UTF-8, a directory).
+    Unreadable { error: String },
+    /// The file does not parse. None of its hooks run.
+    Malformed { error: String },
+    /// The file parsed. `hooks` will run; `disabled` are switched off with
+    /// `"disabled": true`; `unknown_events` names each entry dropped because its
+    /// `event` is not one of the eight (a typo, or an event from the retired engine).
+    Loaded {
+        hooks: usize,
+        disabled: usize,
+        unknown_events: Vec<String>,
+    },
+}
+
+/// Read one hooks file: its hooks, and what reading it came to. Says nothing itself —
+/// [`load_hooks_file`] logs, [`hooks_file_status`] reports — so a caller that asks for
+/// both does not log twice.
+///
+/// Comments are allowed (`//`, `/* */`), as in `.mcp.json`: one stripper for both
+/// hand-edited configs, so a comment that works in one works in the other.
+fn read_hooks_file(path: &Path) -> (Vec<HookConfig>, HooksFileStatus) {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return (Vec::new(), HooksFileStatus::Missing);
+        }
         Err(error) => {
-            // Malformed → skip the file rather than wedge startup, but SAY so: a
-            // silently-dropped hooks file (one stray comma) means every hook
-            // quietly stops firing with nothing on screen or in the log to
-            // explain it. One warn with the path and the parse error is the
-            // difference between a five-minute fix and a day of bisecting.
-            tracing::warn!(
-                target: "atomcode::hooks",
-                path = %path.display(),
-                %error,
-                "ignoring malformed hooks file — no hooks from it will run"
-            );
-            return Vec::new();
+            let error = error.to_string();
+            return (Vec::new(), HooksFileStatus::Unreadable { error });
         }
     };
-    parsed
-        .hooks
-        .into_values()
-        .filter(|e| !e.disabled)
-        .filter_map(|e| {
-            HookEvent::parse(&e.event).map(|event| HookConfig {
-                event,
-                matcher: e.matcher,
-                command: e.command,
-                timeout_ms: e.timeout_ms,
-                plugin_root: None,
-            })
-        })
-        .collect()
+    let parsed: HooksFile = match serde_json::from_str(&crate::jsonc::strip_comments(&raw)) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            let error = error.to_string();
+            return (Vec::new(), HooksFileStatus::Malformed { error });
+        }
+    };
+    let mut disabled = 0;
+    let mut unknown_events = Vec::new();
+    let mut hooks = Vec::new();
+    for entry in parsed.hooks.into_values() {
+        if entry.disabled {
+            disabled += 1;
+            continue;
+        }
+        let Some(event) = HookEvent::parse(&entry.event) else {
+            unknown_events.push(entry.event);
+            continue;
+        };
+        hooks.push(HookConfig {
+            event,
+            matcher: entry.matcher,
+            command: entry.command,
+            timeout_ms: entry.timeout_ms,
+            plugin_root: None,
+        });
+    }
+    let status = HooksFileStatus::Loaded {
+        hooks: hooks.len(),
+        disabled,
+        unknown_events,
+    };
+    (hooks, status)
+}
+
+/// What reading the hooks file at `path` comes to, for diagnostics.
+pub fn hooks_file_status(path: &Path) -> HooksFileStatus {
+    read_hooks_file(path).1
+}
+
+fn load_hooks_file(path: &Path) -> Vec<HookConfig> {
+    let (hooks, status) = read_hooks_file(path);
+    // A file that is dropped (or an entry in it) is skipped rather than wedging
+    // startup, but SAID: a silently-dropped hooks file (one stray comma) means every
+    // hook quietly stops firing with nothing on screen or in the log to explain it —
+    // for an audit or a gate that is worse than failing to start. One warn with the
+    // path and the reason is the difference between a five-minute fix and a day of
+    // bisecting; `atomcode hooks list` shows the same status beside the path.
+    match &status {
+        HooksFileStatus::Missing => {}
+        HooksFileStatus::Unreadable { error } => tracing::warn!(
+            target: "atomcode::hooks",
+            path = %path.display(),
+            %error,
+            "cannot read hooks file — no hooks from it will run"
+        ),
+        HooksFileStatus::Malformed { error } => tracing::warn!(
+            target: "atomcode::hooks",
+            path = %path.display(),
+            %error,
+            "ignoring malformed hooks file — no hooks from it will run"
+        ),
+        HooksFileStatus::Loaded { unknown_events, .. } => {
+            for event in unknown_events {
+                tracing::warn!(
+                    target: "atomcode::hooks",
+                    path = %path.display(),
+                    %event,
+                    "skipping hook with unknown event — it will not run"
+                );
+            }
+        }
+    }
+    hooks
 }
 
 /// Resolve `$ATOMCODE_HOME` (fallback `~/.atomcode`).
@@ -1286,6 +1362,105 @@ mod tests {
         assert_eq!(hooks[0].event, HookEvent::PreToolUse);
         assert_eq!(hooks[0].matcher.as_deref(), Some("bash"));
         assert_eq!(hooks[0].timeout_ms, 10_000);
+    }
+
+    /// A comment in `.hooks.json` is allowed, as in `.mcp.json`. It used to make the
+    /// whole file fail to parse, so every hook in it silently stopped firing while
+    /// `hooks list` showed the file ✓ present — an audit hook that never ran.
+    #[test]
+    fn a_commented_hooks_file_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".hooks.json");
+        std::fs::write(
+            &path,
+            r#"{
+  // audit every bash call
+  "hooks": {
+    "audit": {
+      "event": "PreToolUse", /* gate */
+      "matcher": "bash",
+      "command": "/usr/local/bin/audit.sh --url=https://audit.example.com/in"
+    }
+  }
+}"#,
+        )
+        .unwrap();
+        let (hooks, status) = read_hooks_file(&path);
+        assert_eq!(hooks.len(), 1, "{status:?}");
+        assert_eq!(
+            hooks[0].command, "/usr/local/bin/audit.sh --url=https://audit.example.com/in",
+            "a `//` inside a string is not a comment"
+        );
+        assert_eq!(
+            status,
+            HooksFileStatus::Loaded {
+                hooks: 1,
+                disabled: 0,
+                unknown_events: Vec::new()
+            }
+        );
+    }
+
+    /// What reading the file came to is reported, so "the file is there" is never
+    /// mistaken for "its hooks run": a parse failure carries the serde error, a
+    /// dropped entry names its event, and an absent file is just absent.
+    #[test]
+    fn the_status_tells_a_broken_file_from_an_empty_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".hooks.json");
+        assert_eq!(hooks_file_status(&path), HooksFileStatus::Missing);
+
+        std::fs::write(&path, r#"{"hooks":{"a":{"event":"Stop","command":"x",}}}"#).unwrap();
+        match hooks_file_status(&path) {
+            HooksFileStatus::Malformed { error } => {
+                assert!(
+                    error.contains("line 1"),
+                    "the serde position is kept: {error}"
+                )
+            }
+            other => panic!("a trailing comma is malformed, got {other:?}"),
+        }
+
+        std::fs::write(
+            &path,
+            r#"{"hooks":{
+                "a":{"event":"Stop","command":"x"},
+                "b":{"event":"Stop","command":"y","disabled":true},
+                "c":{"event":"OnUserPromptSubmit","command":"z"}
+            }}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            hooks_file_status(&path),
+            HooksFileStatus::Loaded {
+                hooks: 1,
+                disabled: 1,
+                unknown_events: vec!["OnUserPromptSubmit".into()]
+            }
+        );
+
+        std::fs::write(&path, r#"{"hooks":{}}"#).unwrap();
+        assert_eq!(
+            hooks_file_status(&path),
+            HooksFileStatus::Loaded {
+                hooks: 0,
+                disabled: 0,
+                unknown_events: Vec::new()
+            }
+        );
+    }
+
+    /// A path that exists but cannot be read as a file is not "missing".
+    #[test]
+    fn a_hooks_path_that_cannot_be_read_is_not_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".hooks.json");
+        std::fs::create_dir(&path).unwrap();
+        assert!(
+            matches!(hooks_file_status(&path), HooksFileStatus::Unreadable { .. }),
+            "{:?}",
+            hooks_file_status(&path)
+        );
     }
 
     /// A malformed hooks file is skipped gracefully (never wedges startup) — the

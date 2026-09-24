@@ -44,6 +44,10 @@ pub mod datalog;
 /// Dependency-free, so it is always available regardless of capability features.
 pub mod reminder;
 
+/// JSONC comment stripping shared by the hand-edited JSON configs (`.mcp.json`,
+/// `.hooks.json`). Dependency-free, so it is always available.
+pub mod jsonc;
+
 /// Provider- and UI-neutral contracts shared by Team Agent orchestration and drivers.
 pub mod team;
 

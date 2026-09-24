@@ -3814,6 +3814,44 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
     }
 }
 
+/// One line of `atomcode hooks list/paths`: a hooks file and what reading it came to.
+fn hooks_file_line(
+    label: &str,
+    path: &std::path::Path,
+    status: &atomcode_capabilities::cc_hooks::HooksFileStatus,
+) -> String {
+    use atomcode_capabilities::cc_hooks::HooksFileStatus;
+    let path = path.display();
+    match status {
+        HooksFileStatus::Missing => format!("  ✗ {label} {path}  (not found)"),
+        HooksFileStatus::Unreadable { error } => {
+            format!("  ⚠ {label} {path}  — cannot read: {error} · none of its hooks run")
+        }
+        HooksFileStatus::Malformed { error } => {
+            format!("  ⚠ {label} {path}  — parse error: {error} · none of its hooks run")
+        }
+        HooksFileStatus::Loaded {
+            hooks,
+            disabled,
+            unknown_events,
+        } => {
+            let mut counts = format!("{hooks} hook{}", if *hooks == 1 { "" } else { "s" });
+            if *disabled > 0 {
+                counts.push_str(&format!(", {disabled} disabled"));
+            }
+            if unknown_events.is_empty() {
+                return format!("  ✓ {label} {path}  ({counts})");
+            }
+            let names = unknown_events
+                .iter()
+                .map(|event| format!("\"{event}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("  ⚠ {label} {path}  ({counts}; skipped unknown event {names} — not run)")
+        }
+    }
+}
+
 /// Handle hooks subcommands.
 ///
 /// Reports and tests the CC-compatible external hooks the LIVE runtime actually
@@ -3822,7 +3860,8 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
 /// hooks) no longer fires at runtime, so it is intentionally not surfaced here.
 async fn handle_hooks(cmd: HookCommands) -> Result<()> {
     use atomcode_capabilities::cc_hooks::{
-        global_hooks_path, load_hooks_config, project_hooks_path, run_hook_for_test, HookEvent,
+        global_hooks_path, hooks_file_status, load_hooks_config, project_hooks_path,
+        run_hook_for_test, HookEvent,
     };
     HEADLESS_MODE.store(true, Ordering::Relaxed);
 
@@ -3845,17 +3884,26 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
     // Display the EXACT files cc_hooks loads — via cc_hooks' own resolver, not
     // `Config::config_dir()` (which is sudo-aware and would diverge from what the
     // hook loader actually reads under `sudo`, turning the diagnostic into a lie).
+    // Each file is shown with what reading it came to, not just whether it exists: a
+    // file that is there but does not parse runs none of its hooks, and a bare ✓
+    // beside it read as "loaded".
     let project_hooks = project_hooks_path(&cwd);
     let print_paths = || {
         match global_hooks_path() {
-            Some(g) => {
-                let mark = if g.exists() { "✓" } else { "✗" };
-                println!("  {} Global:   {}", mark, g.display());
-            }
+            Some(g) => println!(
+                "{}",
+                hooks_file_line("Global:  ", &g, &hooks_file_status(&g))
+            ),
             None => println!("  ✗ Global:   (no home directory)"),
         }
-        let p = if project_hooks.exists() { "✓" } else { "✗" };
-        println!("  {} Project:  {}", p, project_hooks.display());
+        println!(
+            "{}",
+            hooks_file_line(
+                "Project: ",
+                &project_hooks,
+                &hooks_file_status(&project_hooks)
+            )
+        );
     };
 
     match cmd {
@@ -4623,6 +4671,39 @@ fn install_panic_hook(telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>) 
 
 #[cfg(test)]
 mod tests {
+
+    /// `hooks list/paths` shows what reading each file came to, not just whether it
+    /// exists: a file that does not parse used to show ✓ beside "(No hooks loaded)".
+    #[test]
+    fn a_hooks_file_line_says_whether_its_hooks_run() {
+        use atomcode_capabilities::cc_hooks::HooksFileStatus;
+        let path = std::path::Path::new("/w/.hooks.json");
+        let line = |status| super::hooks_file_line("Project: ", path, &status);
+        assert_eq!(
+            line(HooksFileStatus::Missing),
+            "  ✗ Project:  /w/.hooks.json  (not found)"
+        );
+        let broken = line(HooksFileStatus::Malformed {
+            error: "expected value at line 2 column 3".into(),
+        });
+        assert!(broken.starts_with("  ⚠ Project:"), "{broken}");
+        assert!(broken.contains("line 2 column 3") && broken.contains("none of its hooks run"));
+        assert_eq!(
+            line(HooksFileStatus::Loaded {
+                hooks: 3,
+                disabled: 1,
+                unknown_events: Vec::new()
+            }),
+            "  ✓ Project:  /w/.hooks.json  (3 hooks, 1 disabled)"
+        );
+        let skipped = line(HooksFileStatus::Loaded {
+            hooks: 1,
+            disabled: 0,
+            unknown_events: vec!["OnUserPromptSubmit".into()],
+        });
+        assert!(skipped.starts_with("  ⚠ Project:"), "{skipped}");
+        assert!(skipped.contains("1 hook;") && skipped.contains("\"OnUserPromptSubmit\""));
+    }
     use super::{
         apply_cli_runtime_overrides, atomcode_log_path, close_thinking_chunk,
         format_thinking_chunk, format_verbose_tool_chunk, headless_completion_exit_code,
