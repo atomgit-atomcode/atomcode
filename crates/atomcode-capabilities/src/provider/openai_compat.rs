@@ -1598,6 +1598,10 @@ struct SseDecoder {
     response_model_seen: bool,
     seen_finish: bool,
     tool_call_delta_count: usize,
+    /// The slot the last tool-call delta landed in, so a delta that carries
+    /// neither `index` nor `id` (a bare argument continuation from a gateway that
+    /// omits both) appends to the call it is continuing rather than to slot 0.
+    last_tool_idx: usize,
     /// Reasoning that arrived in the content channel, for a model whose serving
     /// layer has no reasoning parser configured. Per decoder, so an unclosed
     /// block cannot reach the next response — see [`InlineThink`].
@@ -1616,6 +1620,7 @@ impl SseDecoder {
             response_model_seen: false,
             seen_finish: false,
             tool_call_delta_count: 0,
+            last_tool_idx: 0,
             think: super::reasoning::InlineThink::new(),
         }
     }
@@ -1791,7 +1796,30 @@ impl SseDecoder {
             }
             for tc in tcs {
                 self.tool_call_delta_count += 1;
-                let idx = tc.index.unwrap_or(0);
+                // Which call this delta belongs to. `index` is authoritative when
+                // present. When it is absent — some OpenAI-compatible gateways omit
+                // it — fall back to the call `id`, matching an existing call or
+                // opening a new one, the way ai-sdk does. Keying everything to 0
+                // (the old `unwrap_or(0)`) merged parallel calls into one corrupt
+                // call whose arguments were several calls concatenated. A delta with
+                // neither index nor id is a bare continuation of the most recent.
+                let idx = if let Some(i) = tc.index {
+                    i as usize
+                } else if let Some(id) = tc.id.as_deref().filter(|s| !s.is_empty()) {
+                    match self.tool_calls.iter().position(|e| e.0 == id) {
+                        Some(pos) => pos,
+                        None => {
+                            if self.tool_calls.len() >= MAX_TOOL_CALLS {
+                                continue;
+                            }
+                            self.tool_calls
+                                .push((String::new(), String::new(), String::new()));
+                            self.tool_calls.len() - 1
+                        }
+                    }
+                } else {
+                    self.last_tool_idx
+                };
                 // Bound the index BEFORE it pads the vector: an out-of-range value
                 // (e.g. `index: 999_999_999`) would otherwise push ~a billion slots →
                 // OOM. Real responses index densely from 0; a huge sparse index is
@@ -1803,6 +1831,7 @@ impl SseDecoder {
                     self.tool_calls
                         .push((String::new(), String::new(), String::new()));
                 }
+                self.last_tool_idx = idx;
                 let entry = &mut self.tool_calls[idx];
                 let mut delta_id: Option<String> = None;
                 let mut delta_name: Option<String> = None;
@@ -3449,6 +3478,49 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "a");
         assert_eq!(calls[1].name, "b");
+    }
+
+    /// A gateway that omits `index` but sends `id` on each delta: the calls must
+    /// split by `id`, not collapse into one corrupt call whose arguments are
+    /// several calls concatenated (the old `unwrap_or(0)`).
+    #[test]
+    fn sse_parallel_tool_calls_without_index_split_by_id() {
+        let mut d = SseDecoder::new();
+        let mut ev = Vec::new();
+        ev.extend(d.feed(
+            line(json!({"choices":[{"delta":{"tool_calls":[
+                {"id":"c0","function":{"name":"a","arguments":"{\"x\":1"}},
+                {"id":"c1","function":{"name":"b","arguments":"{\"y\":2"}}
+            ]}}]}))
+            .as_bytes(),
+        ));
+        // Continuation deltas, still without index, carry the id so each lands on
+        // its own call rather than both appending to slot 0.
+        ev.extend(d.feed(
+            line(json!({"choices":[{"delta":{"tool_calls":[
+                {"id":"c0","function":{"arguments":"}"}},
+                {"id":"c1","function":{"arguments":"}"}}
+            ]}}]}))
+            .as_bytes(),
+        ));
+        ev.extend(
+            d.feed(line(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})).as_bytes()),
+        );
+        let calls: Vec<_> = ev
+            .iter()
+            .filter_map(|e| {
+                if let StreamEvent::ToolCall(t) = e {
+                    Some(t.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(calls.len(), 2, "two ids → two calls, not one merged");
+        assert_eq!(calls[0].name, "a");
+        assert_eq!(calls[0].arguments, "{\"x\":1}", "args are this call's only");
+        assert_eq!(calls[1].name, "b");
+        assert_eq!(calls[1].arguments, "{\"y\":2}");
     }
 
     /// A gateway can leave a buffered slot WITHOUT a `function.name`: an `id` on its own,
