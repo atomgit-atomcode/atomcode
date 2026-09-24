@@ -385,14 +385,32 @@ fn shell_command(command: &str) -> tokio::process::Command {
 /// (b) tell a DELIBERATE exit-2 block from a hook that merely failed to launch (see
 /// [`deliberate_block_reason`]). The OUTER `None` (timeout / spawn-failure) → the
 /// caller treats it as a silent continue.
+///
+/// The hook runs **in the project** (`project_dir`) and is told where it is, as
+/// `ATOMCODE_PROJECT_DIR` and Claude Code's `CLAUDE_PROJECT_DIR`. That is what
+/// lets one hooks file serve every place the project is mounted — the command
+/// names its script `./hooks/x.sh` or `"$ATOMCODE_PROJECT_DIR"/hooks/x.sh`.
+/// Variables are the shell's to expand, never substituted into the command
+/// here: a value spliced into a shell line would be parsed as shell.
 async fn run_command_hook(
     hook: &HookConfig,
+    project_dir: &str,
     stdin_json: &str,
 ) -> Option<(Option<i32>, String, String)> {
     use std::process::Stdio;
     use tokio::io::AsyncWriteExt;
 
     let mut cmd = shell_command(&hook.command);
+    if !project_dir.is_empty() {
+        cmd.env("ATOMCODE_PROJECT_DIR", project_dir);
+        cmd.env("CLAUDE_PROJECT_DIR", project_dir);
+        // Only a directory that is there: a working directory the child cannot
+        // enter fails the spawn, and a failed spawn is a silent continue — the
+        // hook would quietly never run.
+        if Path::new(project_dir).is_dir() {
+            cmd.current_dir(project_dir);
+        }
+    }
     #[cfg(unix)]
     crate::process_utils::apply_utf8_locale_env(&mut cmd);
     cmd.stdin(Stdio::piped())
@@ -446,9 +464,14 @@ pub struct HookRunOutput {
 /// Run ONE hook for diagnostics, piping `payload` to its stdin (the CC
 /// `json.load(sys.stdin)` contract) and honoring the hook's timeout. Reuses the
 /// SAME executor the live middleware uses, so `atomcode hooks test` observes exactly
-/// what a real turn would run. Returns `None` if the hook timed out or failed to spawn.
-pub async fn run_hook_for_test(hook: &HookConfig, payload: &Value) -> Option<HookRunOutput> {
-    run_command_hook(hook, &payload.to_string())
+/// what a real turn would run — in `project_dir`, with the same variables. Returns
+/// `None` if the hook timed out or failed to spawn.
+pub async fn run_hook_for_test(
+    hook: &HookConfig,
+    project_dir: &Path,
+    payload: &Value,
+) -> Option<HookRunOutput> {
+    run_command_hook(hook, &project_dir.to_string_lossy(), &payload.to_string())
         .await
         .map(|(exit_code, stdout, stderr)| HookRunOutput {
             exit_code,
@@ -689,8 +712,12 @@ impl LifecycleHooks for CCExternalHooks {
         // injected context stays deterministic. A single slow hook no longer serializes
         // the rest.
         let matched = self.matching(HookEvent::SessionStart, None);
-        let outs =
-            futures::future::join_all(matched.iter().map(|h| run_command_hook(h, &payload))).await;
+        let outs = futures::future::join_all(
+            matched
+                .iter()
+                .map(|h| run_command_hook(h, &self.cwd, &payload)),
+        )
+        .await;
         for (_code, stdout, _stderr) in outs.into_iter().flatten() {
             // SessionStart: stdout (plain or hookSpecificOutput.additionalContext)
             // is injected as context. CC cannot block here.
@@ -723,8 +750,12 @@ impl LifecycleHooks for CCExternalHooks {
         // rest contribute injected context. (CC likewise runs UserPromptSubmit hooks in
         // parallel and aggregates.)
         let matched = self.matching(HookEvent::UserPromptSubmit, None);
-        let outs =
-            futures::future::join_all(matched.iter().map(|h| run_command_hook(h, &payload))).await;
+        let outs = futures::future::join_all(
+            matched
+                .iter()
+                .map(|h| run_command_hook(h, &self.cwd, &payload)),
+        )
+        .await;
         let mut injected: Vec<String> = Vec::new();
         for out in outs {
             let Some((exit_code, stdout, stderr)) = out else {
@@ -784,7 +815,12 @@ impl LifecycleHooks for CCExternalHooks {
         .to_string();
         // Observation only — fire all matching hooks concurrently and ignore output.
         let matched = self.matching(HookEvent::SessionEnd, None);
-        futures::future::join_all(matched.iter().map(|h| run_command_hook(h, &payload))).await;
+        futures::future::join_all(
+            matched
+                .iter()
+                .map(|h| run_command_hook(h, &self.cwd, &payload)),
+        )
+        .await;
     }
 
     /// CC's turn-terminal pair: EVERY turn end fires EXACTLY ONE of `Stop` /
@@ -817,7 +853,12 @@ impl LifecycleHooks for CCExternalHooks {
         })
         .to_string();
         // Observation only — fire all matching hooks concurrently and ignore output.
-        futures::future::join_all(matched.iter().map(|h| run_command_hook(h, &payload))).await;
+        futures::future::join_all(
+            matched
+                .iter()
+                .map(|h| run_command_hook(h, &self.cwd, &payload)),
+        )
+        .await;
     }
 }
 
@@ -918,7 +959,9 @@ impl CCExternalHooks {
         // remaining hooks — and so the rewrite order is deterministic.
         let mut gate = BeforeOutcome::Proceed;
         for hook in self.matching(HookEvent::PreToolUse, Some(&call.name)) {
-            let Some((exit_code, stdout, stderr)) = run_command_hook(hook, &payload).await else {
+            let Some((exit_code, stdout, stderr)) =
+                run_command_hook(hook, &self.cwd, &payload).await
+            else {
                 continue;
             };
             let decided =
@@ -1043,7 +1086,8 @@ impl CCExternalHooks {
             .iter()
             .filter(|h| h.event == event && post_tool_matches(&h.matcher, tool_name.as_deref()))
         {
-            let Some((_code, stdout, _stderr)) = run_command_hook(hook, &payload).await else {
+            let Some((_code, stdout, _stderr)) = run_command_hook(hook, &self.cwd, &payload).await
+            else {
                 continue;
             };
             if let Some(d) =
@@ -1543,9 +1587,13 @@ mod tests {
             timeout_ms: 5_000,
             plugin_root: None,
         };
-        let out = run_hook_for_test(&hook, &serde_json::json!({"hook_event_name": "PreToolUse"}))
-            .await
-            .expect("hook ran");
+        let out = run_hook_for_test(
+            &hook,
+            Path::new("/tmp"),
+            &serde_json::json!({"hook_event_name": "PreToolUse"}),
+        )
+        .await
+        .expect("hook ran");
         assert_eq!(out.exit_code, Some(0));
         assert!(out.stdout.contains("hooktest-ok"), "stdout: {}", out.stdout);
     }
@@ -1616,6 +1664,97 @@ mod tests {
         assert!(cc.user_prompt_submit(&mut text).await.is_ok());
         assert!(text.contains("hi"), "original prompt preserved");
         assert!(text.contains("CTX"), "context appended: {text}");
+    }
+
+    /// A hook runs **in the project**, and is told where that is.
+    ///
+    /// The payload has always said `cwd: <project>`, while the process ran in
+    /// whatever directory the atomcode process happened to be in — a daemon's,
+    /// or the one before a `/cd`. And with no variable naming the project, one
+    /// hooks file could not serve two mount points: `${WORKSPACE}` is only as
+    /// good as an environment the daemon may not have. `CLAUDE_PROJECT_DIR` is
+    /// the name Claude Code gives the same thing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_hook_runs_in_the_project_and_is_told_where_it_is() {
+        let project = tempfile::tempdir().expect("tempdir");
+        let dir = project.path().display().to_string();
+        let hook = HookConfig {
+            event: HookEvent::UserPromptSubmit,
+            matcher: None,
+            command: r#"printf '{"hookSpecificOutput":{"additionalContext":"cwd=%s|a=%s|c=%s"}}' "$(pwd -P)" "$ATOMCODE_PROJECT_DIR" "$CLAUDE_PROJECT_DIR""#.into(),
+            timeout_ms: 5_000,
+            plugin_root: None,
+        };
+        let cc = CCExternalHooks::new(vec![hook], dir.clone());
+        let mut text = "hi".to_string();
+        assert!(cc.user_prompt_submit(&mut text).await.is_ok());
+        let real = project.path().canonicalize().expect("canonical");
+        assert!(
+            text.contains(&format!("cwd={}|", real.display())),
+            "the process runs in the project: {text}"
+        );
+        assert!(
+            text.contains(&format!("|a={dir}|c={dir}")),
+            "both names say where the project is: {text}"
+        );
+    }
+
+    /// The case from the field: one hooks file for many mount points. The
+    /// script sits under the project; the hook names it relatively, or through
+    /// the variable — and both find it wherever the project is mounted.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn one_hooks_file_finds_its_script_wherever_the_project_is() {
+        use std::os::unix::fs::PermissionsExt;
+        let project = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(project.path().join("hooks")).expect("hooks dir");
+        let script = project.path().join("hooks/guard.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '{\"hookSpecificOutput\":{\"additionalContext\":\"%s\"}}' \"$1\"\n",
+        )
+        .expect("script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let hook = |command: &str| HookConfig {
+            event: HookEvent::UserPromptSubmit,
+            matcher: None,
+            command: command.into(),
+            timeout_ms: 5_000,
+            plugin_root: None,
+        };
+        let cc = CCExternalHooks::new(
+            vec![
+                hook("./hooks/guard.sh RELATIVE-RAN"),
+                hook(r#""$ATOMCODE_PROJECT_DIR"/hooks/guard.sh VARIABLE-RAN"#),
+            ],
+            project.path().display().to_string(),
+        );
+        let mut text = "hi".to_string();
+        assert!(cc.user_prompt_submit(&mut text).await.is_ok());
+        assert!(text.contains("RELATIVE-RAN"), "a relative path: {text}");
+        assert!(
+            text.contains("VARIABLE-RAN"),
+            "through the variable: {text}"
+        );
+    }
+
+    /// A project directory that is not there does not stop the hook: a working
+    /// directory the child cannot enter fails the spawn, and a spawn failure is
+    /// a silent continue — the hook would quietly never run.
+    #[tokio::test]
+    async fn a_missing_project_directory_does_not_stop_the_hook() {
+        let hook = HookConfig {
+            event: HookEvent::UserPromptSubmit,
+            matcher: None,
+            command: r#"echo '{"hookSpecificOutput":{"additionalContext":"STILL-RAN"}}'"#.into(),
+            timeout_ms: 5_000,
+            plugin_root: None,
+        };
+        let cc = CCExternalHooks::new(vec![hook], "/nonexistent/atomcode-project-dir");
+        let mut text = "hi".to_string();
+        assert!(cc.user_prompt_submit(&mut text).await.is_ok());
+        assert!(text.contains("STILL-RAN"), "{text}");
     }
 
     #[tokio::test]
@@ -1728,7 +1867,7 @@ mod tests {
         std::env::set_var("LANG", "C");
         std::env::set_var("LC_CTYPE", "C");
 
-        let (_code, stdout, _stderr) = run_command_hook(&hook, "{}").await.unwrap();
+        let (_code, stdout, _stderr) = run_command_hook(&hook, "", "{}").await.unwrap();
 
         assert!(
             stdout.contains("产品需求/流水线/帮助文档/GitCode-Action-官网文档.md"),

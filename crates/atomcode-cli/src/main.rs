@@ -4018,7 +4018,7 @@ async fn handle_hooks(cmd: HookCommands) -> Result<()> {
                         }),
                     };
                     let start = std::time::Instant::now();
-                    match run_hook_for_test(hook, &payload).await {
+                    match run_hook_for_test(hook, &cwd, &payload).await {
                         Some(out) => {
                             println!("📋 Result:");
                             println!("  Duration:  {:?}", start.elapsed());

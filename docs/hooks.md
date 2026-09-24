@@ -43,7 +43,8 @@ That's it — the command runs on the matching event.
 > **No `hooks.json` is a valid state** (no hooks). A **malformed** `hooks.json`
 > is skipped and a warning is logged (`target=atomcode::hooks`, with the path and
 > the parse error) — one stray comma disables that file's hooks, so check the log
-> if a hook stops firing. JSON does **not** allow comments.
+> (or `atomcode hooks list`, which marks such a file ⚠) if a hook stops firing.
+> `//` and `/* */` comments are allowed, as in `.mcp.json`; trailing commas are not.
 
 ## Config file
 
@@ -57,13 +58,50 @@ Both load; project hooks are added to the global ones. Each entry:
 | Field | Required | Meaning |
 |-------|:--:|---------|
 | `event` | ✅ | One of the 8 events below (PascalCase or snake_case). |
-| `command` | ✅ | The shell command line to run. **Not** env-var-expanded — use an **absolute path** (`~` and `$VARS` are NOT resolved). |
+| `command` | ✅ | The shell command line to run, **in the project directory**. The shell expands variables — see [How the command runs](#how-the-command-runs). |
 | `matcher` | — | Tool-name glob for tool events; `\|`-separated alternatives (e.g. `bash\|edit_file`, `write*`). Omit to match every tool. |
 | `timeout_ms` | — | Per-run timeout (default `10000`). A timeout or crash is **fail-open** (treated as "proceed"). |
 | `disabled` | — | `true` to keep the entry but not run it. |
 
 The map key (`"audit-bash"` above) is for your own organization; it is **not**
 retained after loading, so you cannot address a hook by it (see the CLI section).
+
+## How the command runs
+
+`command` is handed to the shell as one line — `sh -c` on Linux/macOS, `cmd /C`
+on Windows — so pipes, `&&` and quoting work as they would in a terminal.
+
+- **Where:** the working directory is the **project directory** (the same path
+  as `cwd` in the payload), so a script beside the project can be named
+  relatively: `./hooks/guard.sh`.
+- **Variables:** atomcode adds these to the hook's environment:
+
+  | Variable | Value |
+  |----------|-------|
+  | `ATOMCODE_PROJECT_DIR` | The project directory. |
+  | `CLAUDE_PROJECT_DIR` | The same, under the name Claude Code uses. |
+  | `ATOMCODE_PLUGIN_ROOT` / `CLAUDE_PLUGIN_ROOT` | Plugin hooks only: the plugin's own directory. |
+
+  Everything else is inherited from the atomcode process — in daemon mode, the
+  **daemon's** environment, not your shell's.
+- **Expansion is the shell's.** atomcode never substitutes variables into the
+  command itself (a value spliced into a shell line would be parsed as shell).
+  So on Linux/macOS `$VAR`, `${VAR}`, `${VAR:-default}` and a leading `~` work;
+  on Windows `cmd` expands `%VAR%` and **not** `${VAR}`. A variable that is not
+  set expands to nothing — `${WORKSPACE}/hooks/guard.sh` becomes
+  `/hooks/guard.sh` — so for a path inside the project, prefer the variable
+  atomcode always sets, quoted:
+
+  ```json
+  "command": "\"$ATOMCODE_PROJECT_DIR\"/hooks/guard.sh"
+  ```
+
+  One hooks file then works wherever the project is mounted.
+
+> **Not the same as `.mcp.json`.** An MCP server's `command`/`args` are an
+> argument list that starts the process without a shell to expand anything, so
+> atomcode expands `${VAR}` there itself — on every platform. A hook's `command`
+> goes through a shell, which does it.
 
 ## Events
 
@@ -161,8 +199,8 @@ atomcode hooks test <NAME>    # dry-run a hook with a synthetic payload
 
 | # | Check | Common cause |
 |---|-------|--------------|
-| 1 | The file parses | A stray comma disables the whole file — check the `atomcode::hooks` warning in the log; JSON allows no comments. |
-| 2 | `command` is an absolute path | `~` / `$VARS` are not expanded. |
+| 1 | The file parses | A stray comma disables the whole file — `atomcode hooks list` marks it ⚠ with the parse error. Comments are fine; trailing commas are not. |
+| 2 | The path resolves | It runs in the project directory, and a variable the atomcode process (in daemon mode, the daemon) does not have expands to nothing. Use `$ATOMCODE_PROJECT_DIR`, or try the line in `sh -c`. |
 | 3 | `event` spelled right | See the table (either case). |
 | 4 | `matcher` matches the tool | Tool events only; omit it to match all. |
 | 5 | `disabled` not set | Defaults to enabled. |
@@ -175,5 +213,5 @@ atomcode hooks test <NAME>    # dry-run a hook with a synthetic payload
    a security boundary.
 2. Commands run with **your** permissions — mind the command's own safety.
 3. **Fail-open:** a timeout or crash is treated as "proceed", not "block".
-4. On Windows, use an absolute path with an explicit interpreter; `~` is not
-   expanded.
+4. On Windows the command runs under `cmd /C`: use an explicit interpreter,
+   and `%VAR%` rather than `${VAR}`; `~` is not expanded.
