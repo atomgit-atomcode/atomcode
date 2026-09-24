@@ -33,6 +33,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             )
             .into()
         }
+        Msg::ChatUpstreamErrorBody { url, detail } => format!(
+            "上游没有返回流式数据，而是回了一条错误：{detail}（POST {url}）。多半是上游临时故障或限流，稍后再试。"
+        )
+        .into(),
         Msg::ProbeReachable { url } => format!("✓ 连通检测：{url} 能按 OpenAI 兼容接口正常应答。").into(),
         Msg::ProbeKeyRejected { url, status } => format!(
             "⚠ 连通检测：地址 {url} 是对的，但 API key 被拒绝（HTTP {status}）——请检查 key。"

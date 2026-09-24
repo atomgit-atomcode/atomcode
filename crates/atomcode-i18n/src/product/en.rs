@@ -31,6 +31,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             )
             .into()
         }
+        Msg::ChatUpstreamErrorBody { url, detail } => format!(
+            "The upstream answered with an error instead of a stream: {detail} (POST {url}). Most likely a temporary outage or rate limit; try again shortly."
+        )
+        .into(),
         Msg::ProbeReachable { url } => {
             format!("✓ Connection check: {url} answers as an OpenAI-compatible endpoint.").into()
         }

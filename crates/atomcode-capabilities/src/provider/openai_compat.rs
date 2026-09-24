@@ -1724,7 +1724,9 @@ impl SseDecoder {
     /// event stream in it gets. Comments, blank lines and the other SSE fields
     /// are part of a stream and are not kept.
     fn note_stray(&mut self, line: &str) {
-        const KEEP: usize = 200;
+        // Enough for a JSON error envelope to be read whole; the head shown for a
+        // web page is cut much shorter where it is said.
+        const KEEP: usize = 2000;
         let line = line.trim();
         if line.is_empty()
             || line.starts_with(':')
@@ -1787,8 +1789,30 @@ impl SseDecoder {
             if !self.stray.is_empty() {
                 let (url, content_type) = self.reading.clone().unwrap_or_default();
                 let shown = display_endpoint(&url);
-                let suggestion = version_suggestion(&url);
                 self.done = true;
+                // A JSON error where the stream should be is the API refusing —
+                // an overload or a rate limit some gateways send as 200. The
+                // address is right: say what the server said, and let the loop
+                // retry it, as it did when this decoded as an empty reply.
+                let body = self.stray.trim_start();
+                if body.starts_with('{') || body.starts_with('[') {
+                    let detail = extract_error_detail(body);
+                    out.push(StreamEvent::Error(ProviderError {
+                        retryable: true,
+                        message: atomcode_config::i18n::t(
+                            atomcode_config::i18n::Msg::ChatUpstreamErrorBody {
+                                url: &shown,
+                                detail: &detail,
+                            },
+                        )
+                        .into_owned(),
+                        code: Some("upstream_error_body".to_string()),
+                        ..Default::default()
+                    }));
+                    return out;
+                }
+                let suggestion = version_suggestion(&url);
+                let head: String = self.stray.chars().take(200).collect();
                 out.push(StreamEvent::Error(ProviderError {
                     retryable: false,
                     message: atomcode_config::i18n::t(
@@ -1799,7 +1823,7 @@ impl SseDecoder {
                             } else {
                                 &content_type
                             },
-                            head: &self.stray,
+                            head: &head,
                             suggestion: suggestion.as_deref(),
                         },
                     )
@@ -2338,6 +2362,31 @@ mod tests {
             "{m}"
         );
         assert!(m.contains(&format!("{}/v1", server.uri())), "{m}");
+    }
+
+    /// A gateway that answers an overload with 200 and a JSON error, instead of a
+    /// stream, has an address that is right: the error is passed on in its own
+    /// words and may be retried — it was retried before, as an empty reply, and a
+    /// brief outage recovered. Blaming the base_url would send the person to
+    /// break a working setup.
+    #[tokio::test]
+    async fn a_json_error_where_a_stream_should_be_is_passed_on_and_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                r#"{"error":{"message":"upstream overloaded, try again later"}}"#,
+                "application/json",
+            ))
+            .mount(&server)
+            .await;
+        let err = open_err(&format!("{}/v1", server.uri())).await;
+        assert!(err.retryable, "a transient refusal may be retried");
+        assert!(
+            err.message.contains("upstream overloaded"),
+            "{}",
+            err.message
+        );
+        assert!(!err.message.contains("base_url"), "{}", err.message);
     }
 
     /// A reply with nothing in it at all is still the upstream flake it always was

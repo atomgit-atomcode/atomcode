@@ -155,6 +155,10 @@ fn classify(status: u16, content_type: &str, body: &str, asked_model: bool) -> S
         }
     };
     match status {
+        // A 403 page is a firewall's challenge in front of the API (Cloudflare
+        // and the like), not the API refusing the key: the same reason a 429 or
+        // 5xx page below is not taken as a wrong address.
+        403 if is_page => Seen::Other(status, kind(), false),
         401 | 403 => Seen::Key(status),
         // The model is the complaint: the path is there.
         _ if missing_model => {
@@ -200,7 +204,9 @@ async fn ask(
     let response = request
         .send()
         .await
-        .map_err(|e| super::retry::err_chain(&e))?;
+        // `without_url`: reqwest names the address in full — query and
+        // `user:password@` included — and this reason is shown and kept.
+        .map_err(|e| super::retry::err_chain(&e.without_url()))?;
     let status = response.status().as_u16();
     let content_type = response
         .headers()
@@ -393,6 +399,48 @@ mod tests {
                 "{status}"
             );
         }
+    }
+
+    /// A 403 web page is a firewall's challenge (Cloudflare and the like) in
+    /// front of the API, not the API refusing the key — sending the person to
+    /// change a key that works would be the wrong fix.
+    #[test]
+    fn a_challenge_page_under_403_is_not_a_refused_key() {
+        assert!(matches!(
+            classify(
+                403,
+                "text/html",
+                "<html><title>Just a moment...</title></html>",
+                false
+            ),
+            Seen::Other(403, _, false)
+        ));
+        // The API's own 403 still names the key.
+        assert_eq!(
+            classify(
+                403,
+                "application/json",
+                r#"{"error":{"message":"forbidden"}}"#,
+                false
+            ),
+            Seen::Key(403)
+        );
+    }
+
+    /// A base_url may carry a credential — a `?key=` or a `user:password@`. When
+    /// nothing answers, the transport's reason names the address in full, and
+    /// that reason stays in the conversation: it must not carry the credential.
+    #[tokio::test]
+    async fn an_unreachable_reason_leaves_the_credential_out() {
+        let verdict =
+            probe_chat_endpoint(&target("http://me:hunter2@127.0.0.1:9/v1?key=topsecret")).await;
+        assert!(
+            matches!(verdict, ProbeVerdict::Unreachable { .. }),
+            "{verdict:?}"
+        );
+        let said = verdict.describe();
+        assert!(!said.contains("topsecret"), "{said}");
+        assert!(!said.contains("hunter2"), "{said}");
     }
 
     /// The reported case behind a gateway that routes by model: the base_url

@@ -955,6 +955,9 @@ pub struct Tui {
     /// on first open and reused after — the picture is decoded once, not on every
     /// click. Session-scoped, like the gallery it mirrors.
     image_files: Mutex<std::collections::HashMap<usize, std::path::PathBuf>>,
+    /// How many provider checks have been started, so one that lands after a
+    /// later save is dropped rather than said (see [`Tui::say_when_probed`]).
+    probes: Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[async_trait]
@@ -2387,11 +2390,23 @@ impl Tui {
     /// which one to use whenever they look, rather than meet it later as a
     /// failed turn that never mentions the base_url. A pass adds nothing to the
     /// conversation — every save would otherwise leave a line behind.
+    ///
+    /// Only the newest check is said. A check can take seconds — longer when the
+    /// first address times out and `/v1` is tried as well — and a person who
+    /// fixes a base_url and saves again must not have the stale "failed" of the
+    /// first save land over the second one's pass, or leave a failure in the
+    /// conversation for a configuration that now works.
     fn say_when_probed(&self, probe: crate::providers::ProbeFuture) {
+        use std::sync::atomic::Ordering;
         let host = self.host.clone();
         let keys = self.wake.lock().expect("wake poisoned").clone();
+        let probes = self.probes.clone();
+        let ticket = probes.fetch_add(1, Ordering::SeqCst) + 1;
         tokio::spawn(async move {
             let (said, fine) = probe.await;
+            if probes.load(Ordering::SeqCst) != ticket {
+                return;
+            }
             if fine {
                 host.say(t(Msg::ProviderProbePassed).into_owned(), false);
             } else {
@@ -6265,6 +6280,7 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
             members: Arc::new(Roster::default()),
             named: Mutex::new(None),
             image_files: Mutex::new(std::collections::HashMap::new()),
+            probes: Arc::default(),
         },
     )
 }
@@ -7706,6 +7722,81 @@ mod provider_probe_tests {
         checked(&mut woken).await;
         assert!(
             !conversation(&host).contains("answered"),
+            "{}",
+            conversation(&host)
+        );
+        assert_eq!(
+            tip(&host),
+            Some((t(Msg::ProviderProbePassed).into_owned(), false))
+        );
+    }
+
+    /// A port whose first check is held until released and then fails, and whose
+    /// every later check passes at once — a base_url that timed out, fixed.
+    struct SlowThenFixed {
+        calls: std::sync::atomic::AtomicUsize,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl Providers for SlowThenFixed {
+        fn rows(&self) -> ProvidersView {
+            Checked.rows()
+        }
+        fn add_account(&self, draft: &AccountDraft) -> Result<String, String> {
+            Checked.add_account(draft)
+        }
+        fn edit_account(&self, id: &str, draft: &AccountDraft) -> Result<(), String> {
+            Checked.edit_account(id, draft)
+        }
+        fn delete_account(&self, id: &str) -> Result<(), String> {
+            Checked.delete_account(id)
+        }
+        fn add_model(&self, draft: &ModelDraft) -> Result<String, String> {
+            Checked.add_model(draft)
+        }
+        fn edit_model(&self, id: &str, draft: &ModelDraft) -> Result<(), String> {
+            Checked.edit_model(id, draft)
+        }
+        fn delete_model(&self, id: &str) -> Result<(), String> {
+            Checked.delete_model(id)
+        }
+        fn probe(&self, _account: &str, _selection: Option<&str>) -> Option<ProbeFuture> {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                let release = self.release.clone();
+                Some(Box::pin(async move {
+                    release.notified().await;
+                    ("stale failure".to_string(), false)
+                }))
+            } else {
+                Some(Box::pin(async { ("fresh pass".to_string(), true) }))
+            }
+        }
+    }
+
+    /// The first save's check lands after the second save's has passed: it is
+    /// dropped. Otherwise a person who fixed the base_url would read "failed" for
+    /// a configuration that works, and keep a stale failure in the conversation.
+    #[tokio::test]
+    async fn a_check_that_lands_after_a_later_save_is_dropped() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (host, tui, mut woken) = screen_with(Arc::new(SlowThenFixed {
+            calls: Default::default(),
+            release: release.clone(),
+        }));
+        for _ in 0..2 {
+            tui.apply_provider_step(Step::SaveAccount {
+                id: Some("gw".into()),
+                draft: account(),
+            })
+            .expect("the write lands");
+        }
+        checked(&mut woken).await;
+        release.notify_one();
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !conversation(&host).contains("stale failure"),
             "{}",
             conversation(&host)
         );

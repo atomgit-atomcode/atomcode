@@ -40,6 +40,13 @@ pub enum Msg<'a> {
         suggestion: Option<&'a str>,
         detail: &'a str,
     },
+    /// A streaming request answered with a JSON error instead of a stream — an
+    /// overload or a rate limit sent as 200. The address is right; the error is
+    /// passed on in the server's words.
+    ChatUpstreamErrorBody {
+        url: &'a str,
+        detail: &'a str,
+    },
     // ── provider probe (a saved account's endpoint, checked once) ──
     ProbeReachable {
         url: &'a str,
