@@ -4172,6 +4172,11 @@ impl Tui {
                 client.send(text.clone(), images);
                 if recognizing {
                     self.host.start_recognizing();
+                    // Put the message in the conversation now, in flow, rather
+                    // than leaving the screen with only the bottom `正在识别图片`
+                    // strip for the seconds recognition takes. Taken down when the
+                    // real, logged user line arrives (`Host::clear_echo`).
+                    self.host.open_echo(text.clone());
                 }
                 if steering {
                     self.host.add_steering(&text);

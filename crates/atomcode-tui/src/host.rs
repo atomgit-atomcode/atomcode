@@ -1287,6 +1287,41 @@ pub struct Host {
     /// of calls at once) and cleared with the stream, because a call id is the
     /// session's own.
     call_blocks: Mutex<std::collections::HashMap<String, BlockId>>,
+    /// The in-flow user bar shown while a picture is being recognised for a
+    /// text-only model, before the message that carries it is logged.
+    ///
+    /// The person's words reach the screen the instant they submit — in the
+    /// conversation flow, not the bottom strip — rather than only once the
+    /// multi-second recognition finishes and the folded message is written. It is
+    /// a live block on its own `echo` producer ([`Host::open_echo`]); when the
+    /// real message lands from the log the transcript draws the permanent user
+    /// line and this one is amended to nothing ([`Host::clear_echo`]), so replay,
+    /// which never opens it, is unchanged and the two never both show.
+    pending_echo: Mutex<Option<BlockId>>,
+}
+
+/// The producer id the pre-turn recognising echo writes under — its own, so
+/// amending it away never touches a transcript block, and so `settle_all` on any
+/// other producer leaves it alone.
+const ECHO: &str = "echo";
+
+/// A block amended to nothing: it draws no rows, and a slot that draws no rows is
+/// not a neighbour, so the seams around where it was stay where they were
+/// (`lid_row`, and the `rows > 0` guard in `row_index`). What the recognising
+/// echo becomes once the real user line has arrived.
+#[derive(Debug)]
+struct Gone;
+
+impl crate::block::Content for Gone {
+    fn kind(&self) -> &'static str {
+        ECHO
+    }
+    fn content_hash(&self) -> crate::block::ContentHash {
+        crate::block::hash_of(&["echo-gone"])
+    }
+    fn lines(&self, _ctx: &crate::block::RenderCtx) -> Vec<crate::frame::Line> {
+        Vec::new()
+    }
 }
 
 /// The cached layout of the stream's rows, top to bottom.
@@ -1486,6 +1521,7 @@ impl Host {
                 total: 0,
             }),
             call_blocks: Mutex::new(std::collections::HashMap::new()),
+            pending_echo: Mutex::new(None),
         }
     }
 
@@ -1908,6 +1944,10 @@ impl Host {
                 visual_changed = true;
             }
         });
+        // A turn that ended before its first fact (an immediate error) takes the
+        // recognising line down here rather than through `settle_working`; the
+        // echo that stood in for the message goes with it.
+        self.clear_echo();
         visual_changed
     }
 
@@ -1944,7 +1984,48 @@ impl Host {
                 .expect("moment poisoned")
                 .recognizing_image = false;
         });
+        self.clear_echo();
         true
+    }
+
+    /// Echo the message the person just submitted into the conversation, now,
+    /// while its picture is being recognised for a text-only model — so their
+    /// words are in the flow the instant they hit Enter, not held back the several
+    /// seconds recognition takes.
+    ///
+    /// A live block on the [`ECHO`] producer: in the stream, so it sits in the
+    /// conversation flow (not the bottom strip the `正在识别图片` line rides), and
+    /// live, so [`Self::clear_echo`] can amend it to nothing once the real,
+    /// logged user line arrives. `text` is exactly what the submit sent — the same
+    /// words the transcript will later fold out of the message — so the echo and
+    /// the permanent line show the same thing.
+    pub fn open_echo(&self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        let id = {
+            let mut stream = self.stream.write().expect("stream poisoned");
+            stream.writer(ECHO).open(
+                crate::block::Coord::default(),
+                Arc::new(crate::content::UserSaid(text)),
+            )
+        };
+        *self.pending_echo.lock().expect("echo poisoned") = Some(id);
+    }
+
+    /// Take the recognising echo down: the real user line is on screen now (or the
+    /// send never became one), so the placeholder amends to nothing and settles.
+    /// A no-op when there is no echo up, and on replay, which never opens one.
+    pub fn clear_echo(&self) {
+        let Some(id) = self.pending_echo.lock().expect("echo poisoned").take() else {
+            return;
+        };
+        let mut stream = self.stream.write().expect("stream poisoned");
+        let mut writer = stream.writer(ECHO);
+        // Amend first (only a live block can be), then settle: the block stays,
+        // drawing no rows, rather than lingering live to be swept at turn's end.
+        writer.amend(id, Arc::new(Gone));
+        writer.settle(id);
     }
 
     /// A turn has started: remember to raise the working line, but not yet —
@@ -1986,6 +2067,9 @@ impl Host {
             m.recognizing_image = false;
             m.activity = crate::moment::Activity::Working;
         });
+        // The turn's first fact — its own message — is on screen; the echo that
+        // stood in for it while the picture was read hands over to it.
+        self.clear_echo();
         true
     }
 
@@ -5527,6 +5611,58 @@ mod tests {
     /// (`RenderCtx` carries no tick) — and the host lays the pulse on from the
     /// injected tick. So the mark's colour differs between the bright and dim
     /// halves of the cycle, and the dim half is the muted grey.
+    /// The recognising echo shows the just-sent message in the conversation flow
+    /// while a picture is read, and leaves no trace once it hands over.
+    ///
+    /// Two halves. It has to appear — the whole point is the words not waiting on
+    /// the several seconds recognition takes — and it has to vanish *cleanly* when
+    /// the real user line arrives: an empty block that still counted as a
+    /// neighbour would leave a blank row where it was.
+    #[test]
+    fn the_recognising_echo_shows_the_message_then_leaves_no_trace() {
+        let lines_of = |h: &Host| -> Vec<String> {
+            let caps = crate::block::ShapeCaps::of(&crate::caps::Caps::default());
+            h.stream_lines(
+                Rect::sized(80, 20),
+                0,
+                caps,
+                crate::moment::Activity::Working,
+                0,
+            )
+            .0
+            .iter()
+            .map(|l| l.plain())
+            .collect()
+        };
+
+        let h = host();
+        let before = lines_of(&h);
+
+        h.open_echo("[Image #1] 看看这个".into());
+        let during = lines_of(&h);
+        assert!(
+            during.iter().any(|l| l.contains("看看这个")),
+            "the message is in the conversation while recognising: {during:?}"
+        );
+
+        // Clearing it — as the real user line arriving does — leaves the stream
+        // exactly as it was: no leftover row, no stray blank from a seam.
+        h.clear_echo();
+        let after = lines_of(&h);
+        assert!(
+            !after.iter().any(|l| l.contains("看看这个")),
+            "the echo is gone once it has handed over: {after:?}"
+        );
+        assert_eq!(
+            after, before,
+            "and it leaves no trace — a slot drawing no rows is not a neighbour, \
+             so the seams stay where they were"
+        );
+
+        // A second clear is a no-op, never a panic or a double-settle.
+        h.clear_echo();
+    }
+
     #[test]
     fn a_running_tool_call_pulses_its_mark_between_ticks() {
         let h = host();
