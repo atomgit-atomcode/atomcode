@@ -142,6 +142,25 @@ pub trait WelcomeWords: Send + Sync + 'static {
     fn about(&self, command: &str) -> Option<String>;
 }
 
+/// What the launcher has to say about *this launch*, the moment the screen opens.
+///
+/// Not a fact in the session log and not an answer the host can be asked: these
+/// are known before either exists. What reaches a person this way today is a
+/// configuration file that did not parse, a `resume` whose session lives in
+/// another project and so quietly moved the working directory (and with it that
+/// project's hooks and MCP servers), and a session that was forked because the
+/// one asked for was busy.
+///
+/// **stderr is not an answer.** Entering the alternate screen wipes whatever was
+/// written before it, so a launcher that prints one of these and then opens a
+/// full-screen UI has said nothing at all.
+///
+/// Said **once per launch**, unlike the welcome block above it, which every
+/// session gets: these are not about the session, they are about how this
+/// process started.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct OpeningNotices(pub Vec<String>);
+
 /// What this build calls itself, as data rather than as constants.
 ///
 /// A fork's whole visible identity is these few fields. The previous shape —

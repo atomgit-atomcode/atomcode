@@ -2536,6 +2536,10 @@ async fn run() -> Result<i32> {
                     &screen,
                     config_path.clone(),
                     Some(telemetry.clone()),
+                    // Cloned rather than moved: the classic arm below still
+                    // takes it by value, and which arm runs is decided at
+                    // `screen_for`, not here.
+                    startup_notice.clone(),
                 )
                 .await
                 .map(|()| 0)

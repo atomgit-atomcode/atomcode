@@ -143,9 +143,18 @@ async fn a_session_the_product_wrote_comes_back_on_the_row_assembled_screen() {
     let config_path = home.path().join("config.toml");
     // `None` for the host configuration: this criterion is about mounting the
     // screen, and a host that resolves nothing is the honest stand-in.
-    let mounted = tui_front::mount(second, front_end, config, None, &screen, config_path, None)
-        .await
-        .expect("the screen mounts");
+    let mounted = tui_front::mount(
+        second,
+        front_end,
+        config,
+        None,
+        &screen,
+        config_path,
+        None,
+        None,
+    )
+    .await
+    .expect("the screen mounts");
 
     // The row that gets an unconfigured machine working is mounted here, and
     // not behind a condition: what it contributes is a command, and whether it
@@ -305,9 +314,18 @@ async fn the_welcome_block_reads_the_language_the_launcher_knows() {
         headless: Some((100, 30)),
         ..Screen::default()
     };
-    let mounted = tui_front::mount(runtime, front_end, config, None, &screen, config_path, None)
-        .await
-        .expect("the screen mounts");
+    let mounted = tui_front::mount(
+        runtime,
+        front_end,
+        config,
+        None,
+        &screen,
+        config_path,
+        None,
+        None,
+    )
+    .await
+    .expect("the screen mounts");
 
     let term = mounted
         .app
@@ -343,6 +361,104 @@ async fn the_welcome_block_reads_the_language_the_launcher_knows() {
     let _ = tokio::time::timeout(Duration::from_secs(5), running).await;
 }
 
+/// What the launcher knows about *this launch* is on screen, and the welcome
+/// block still opens above it.
+///
+/// Three notices reach a person only this way — a configuration file that did
+/// not parse, a `resume` that moved the working directory into another project,
+/// and a session forked because the one asked for was busy. All three were dead
+/// on this screen: the launcher computed them and handed them to
+/// `atomcode_tuix::run`, which this screen is not. stderr is not the fix, since
+/// entering the alternate screen wipes it.
+///
+/// **The second half is the one that needs a criterion.** `open_conversation`
+/// stands down when the stream already holds a block from another producer, and
+/// these are emitted before the welcome. They are `commands` blocks, the same
+/// producer the readiness notice has always used, so the welcome still lands —
+/// but that is an invariant two files apart, and getting it wrong trades a
+/// silent notice for a silent welcome.
+#[tokio::test]
+async fn what_this_launch_has_to_say_is_said_and_the_welcome_still_opens() {
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("ATOMCODE_HOME", home.path());
+    let project = tempfile::tempdir().unwrap();
+    let count = Arc::new(Count::default());
+
+    let config_path = home.path().join("config.toml");
+    std::fs::write(&config_path, "language = \"en\"\n").unwrap();
+    let _locale = atomcode_config::i18n::test_lock();
+    atomcode_config::i18n::set_locale(atomcode_config::i18n::resolve_initial_locale(
+        None,
+        Some(atomcode_config::locale::Locale::En),
+    ));
+
+    let front_end = FrontEnd::new();
+    let (start, config) = start(
+        project.path(),
+        &count,
+        SessionMode::Fresh,
+        Some(front_end.clone()),
+    );
+    let runtime = CodingRuntime::start(start).await.expect("starts");
+    let screen = Screen {
+        headless: Some((100, 30)),
+        ..Screen::default()
+    };
+    // As the launcher builds it: `merge_startup_notices` joins what it has with
+    // a newline, and each piece is about its own thing.
+    let notice = "this config did not parse\nthat resume moved you to another project";
+    let mounted = tui_front::mount(
+        runtime,
+        front_end,
+        config,
+        None,
+        &screen,
+        config_path,
+        None,
+        Some(notice.to_string()),
+    )
+    .await
+    .expect("the screen mounts");
+
+    let term = mounted
+        .app
+        .context()
+        .service::<atomcode_tui::plugin::SurfaceSvc>()
+        .and_then(|surface| surface.as_any_headless())
+        .expect("a headless surface");
+    let ui = mounted.ui.clone();
+    let ctx = mounted.app.context();
+    let running = tokio::spawn(async move {
+        let _ = ui.run(&ctx, None).await;
+    });
+
+    let mut screen_text = String::new();
+    for _ in 0..200 {
+        screen_text = term.text();
+        if screen_text.contains("this config did not parse")
+            && screen_text.contains("Tips for getting started")
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        screen_text.contains("this config did not parse"),
+        "the launcher's news reached the screen:\n{screen_text}"
+    );
+    assert!(
+        screen_text.contains("that resume moved you to another project"),
+        "and so did the second piece, as its own notice:\n{screen_text}"
+    );
+    assert!(
+        screen_text.contains("Tips for getting started"),
+        "and the welcome still opened over them:\n{screen_text}"
+    );
+
+    term.press(atomcode_tui::surface::KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), running).await;
+}
+
 /// The commands only the classic screen has yet (`/webui`, `/sync`, `/app`,
 /// `/desktop`), typed on this one after the default moved: each says where it
 /// still lives instead of "no such command" — and none is recommended, so the
@@ -370,9 +486,18 @@ async fn a_command_only_the_classic_screen_has_says_where_it_lives() {
         headless: Some((120, 40)),
         ..Screen::default()
     };
-    let mounted = tui_front::mount(runtime, front_end, config, None, &screen, config_path, None)
-        .await
-        .expect("the screen mounts");
+    let mounted = tui_front::mount(
+        runtime,
+        front_end,
+        config,
+        None,
+        &screen,
+        config_path,
+        None,
+        None,
+    )
+    .await
+    .expect("the screen mounts");
     let term = mounted
         .app
         .context()
@@ -453,9 +578,18 @@ async fn the_classic_name_for_the_walkthrough_still_opens_it() {
         headless: Some((120, 40)),
         ..Screen::default()
     };
-    let mounted = tui_front::mount(runtime, front_end, config, None, &screen, config_path, None)
-        .await
-        .expect("the screen mounts");
+    let mounted = tui_front::mount(
+        runtime,
+        front_end,
+        config,
+        None,
+        &screen,
+        config_path,
+        None,
+        None,
+    )
+    .await
+    .expect("the screen mounts");
     let term = mounted
         .app
         .context()
@@ -520,6 +654,7 @@ async fn the_proxy_mode_is_chosen_here_and_kept_in_the_file() {
         None,
         &screen,
         config_path.clone(),
+        None,
         None,
     )
     .await
@@ -610,9 +745,18 @@ async fn scheduled_tasks_are_listed_here() {
         headless: Some((140, 40)),
         ..Screen::default()
     };
-    let mounted = tui_front::mount(runtime, front_end, config, None, &screen, config_path, None)
-        .await
-        .expect("the screen mounts");
+    let mounted = tui_front::mount(
+        runtime,
+        front_end,
+        config,
+        None,
+        &screen,
+        config_path,
+        None,
+        None,
+    )
+    .await
+    .expect("the screen mounts");
     let term = mounted
         .app
         .context()
@@ -673,9 +817,18 @@ async fn the_launchers_own_commands_are_in_the_menu() {
         headless: Some((160, 60)),
         ..Screen::default()
     };
-    let mounted = tui_front::mount(runtime, front_end, config, None, &screen, config_path, None)
-        .await
-        .expect("the screen mounts");
+    let mounted = tui_front::mount(
+        runtime,
+        front_end,
+        config,
+        None,
+        &screen,
+        config_path,
+        None,
+        None,
+    )
+    .await
+    .expect("the screen mounts");
     let commands = mounted
         .app
         .context()

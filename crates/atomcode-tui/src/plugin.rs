@@ -54,6 +54,10 @@ plexus_service!(BrandSvc => crate::content::Brand, "tui-brand", Seam, "What this
 // the product. Left unfilled, the row uses the sentences this build ships
 // (`modules::welcome::ShippedWords`), so a screen with no launcher still opens.
 plexus_service!(WelcomeWordsSvc => dyn crate::content::WelcomeWords, "tui-welcome-words", Seam, "The welcome block's heading and tip descriptions, in the language in force");
+// What the launcher knows about this launch and the screen cannot: see
+// `content::OpeningNotices`. Unfilled means a launch with nothing to report,
+// which is the ordinary case.
+plexus_service!(OpeningNoticesSvc => crate::content::OpeningNotices, "tui-opening-notices", Seam, "What the launcher has to say about this launch, the moment the screen opens");
 plexus_service!(AgentClientSvc => AgentClient, "tui-agent-client", Core, "The screen's end of its connection to the agent");
 // Declared here, by the one that consumes it (`docs/adr/0021` §6): whoever
 // launches the screen fills it with what its host handed over.
@@ -1044,6 +1048,38 @@ impl UserInterface for Tui {
             let mut m = self.host.moment.write().expect("moment poisoned");
             m.lead = session.clone();
             m.viewing = session.clone();
+        }
+
+        // What the launcher has to say about this launch
+        // (`content::OpeningNotices`).
+        //
+        // **Here and not beside the welcome below**, for two reasons. It must
+        // not wait on the agent describing itself: a configuration file that
+        // did not parse is exactly the launch where that description may never
+        // arrive, and a notice nobody sees is the failure this closes. And it
+        // must be said once per *launch* — `owes_opening` is raised again on
+        // every session change, which is right for a welcome and wrong for
+        // news about how the process started.
+        //
+        // Leaving these in the stream does not cost the welcome its place:
+        // `open_conversation` stands down only for a block some *other*
+        // producer made, and these are `commands`, like the readiness notice
+        // below that has always been able to arrive first.
+        if let Some(notices) = ctx.service::<OpeningNoticesSvc>() {
+            let mut stream = self.host.stream.write().expect("stream poisoned");
+            let mut writer = stream.writer("commands");
+            for detail in notices.0.iter().filter(|line| !line.trim().is_empty()) {
+                writer.emit(
+                    crate::block::Coord::default(),
+                    Arc::new(crate::content::NoticeBlock {
+                        detail: detail.clone(),
+                    }),
+                );
+            }
+            drop(stream);
+            // Nothing else is owed yet, so without this the first frame waits
+            // on whatever the agent says first.
+            let _ = wake_tx.send(Wake::Fact);
         }
 
         // Whether the conversation still owes its first word. Answered in the

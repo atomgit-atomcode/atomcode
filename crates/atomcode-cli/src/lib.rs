@@ -34,6 +34,7 @@ pub mod tui_elsewhere;
 pub mod tui_login;
 pub mod tui_mcp;
 pub mod tui_onboarding;
+pub mod tui_opening;
 pub mod tui_openrouter;
 pub mod tui_places;
 pub mod tui_plugins;
@@ -89,6 +90,9 @@ pub mod tui_front {
         screen: &Screen,
         config_path: std::path::PathBuf,
         telemetry: Option<Arc<atomcode_telemetry::Telemetry>>,
+        // What this launch has to say for itself, if anything
+        // (`crate::tui_opening`).
+        opening_notice: Option<String>,
     ) -> Result<launch::Mounted, String> {
         // Both additions belong: the host configuration is what makes
         // `HostCommand::Settings`/`SwitchModel` answerable, and the settings row
@@ -120,6 +124,7 @@ pub mod tui_front {
             crate::tui_onboarding::row_layer(),
             crate::tui_login::row_layer(),
             crate::tui_welcome_words::row_layer(),
+            crate::tui_opening::row_layer(),
             crate::tui_elsewhere::row_layer(),
             crate::tui_proxy::row_layer(),
             crate::tui_schedule::row_layer(),
@@ -146,6 +151,9 @@ pub mod tui_front {
                 telemetry: telemetry.clone(),
             }),
             Arc::new(crate::tui_welcome_words::WelcomeWordsRow),
+            Arc::new(crate::tui_opening::OpeningRow {
+                notice: opening_notice,
+            }),
             Arc::new(crate::tui_elsewhere::ElsewhereRow),
             Arc::new(crate::tui_proxy::ProxyRow {
                 config_path: config_path.clone(),
@@ -723,6 +731,7 @@ model = "vendor-b"
         screen: &Screen,
         config_path: std::path::PathBuf,
         telemetry: Option<Arc<atomcode_telemetry::Telemetry>>,
+        opening_notice: Option<String>,
     ) -> Result<(), String> {
         let mounted = mount(
             runtime,
@@ -732,6 +741,7 @@ model = "vendor-b"
             screen,
             config_path,
             telemetry,
+            opening_notice,
         )
         .await?;
         let ctx = mounted.app.context();
