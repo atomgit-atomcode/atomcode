@@ -744,8 +744,13 @@ async fn the_guard_warns_then_ends_a_turn_that_is_not_progressing() {
 async fn the_guard_does_not_fire_when_results_differ() {
     let dir = scratch("guard-progress");
     // Each call appends, so the result differs every time — that is progress,
-    // not a loop, and the guard must not confuse the two.
-    let script = always_calls("bash", r#"{ command = "date +%s%N" }"#);
+    // not a loop, and the guard must not confuse the two. Counted rather than
+    // timed: BSD `date` (macOS) has no `%N`, so two calls in the same second
+    // answered the same and the guard, rightly, stopped the turn.
+    let script = always_calls(
+        "bash",
+        r#"{ command = "echo x >> ticks && wc -l < ticks" }"#,
+    );
     let rows = "[[patch]]\nid = \"round-cap\"\nconfig = { max_rounds = 5 }\n\n\
                 [[remove]]\nid = \"repeat-fuse\"\n\n\
                 [[patch]]\nid = \"tool-loop-guard\"\nconfig = { warn_after = 2, stop_after = 3 }\n\n\
