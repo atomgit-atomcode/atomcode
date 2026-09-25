@@ -177,6 +177,27 @@ impl View for Status {
         if let Some(text) = &autonomy {
             reserved += width::str_width(text) + sep_w;
         }
+        // Sessions still running in the background (`/background`), and how many
+        // of them are waiting on the person. Nothing when none are: the block
+        // is for "there is work going on that you cannot see", and a zero says
+        // nothing of the kind. Waiting turns it the warning colour — that one
+        // is stopped until somebody answers it.
+        let background = {
+            let running = vp.moment.bg.running();
+            (running > 0).then(|| {
+                let waiting = vp.moment.bg.waiting();
+                let text = t(Msg::StatusBackground { running, waiting }).into_owned();
+                let role = if waiting > 0 {
+                    Role::Warning
+                } else {
+                    Role::Accent
+                };
+                (text, theme::fg(role))
+            })
+        };
+        if let Some((text, _)) = &background {
+            reserved += width::str_width(text) + sep_w;
+        }
         // How much allowance is left, but only once it is close enough to
         // change what a person does. Below that it is a number nobody acts on,
         // and a row that always carries one has that much less room for the
@@ -262,6 +283,10 @@ impl View for Status {
         if let Some(text) = autonomy {
             row.push(El::styled(sep_text.clone(), dim));
             row.push(El::styled(text, theme::fg(Role::Accent)));
+        }
+        if let Some((text, style)) = background {
+            row.push(El::styled(sep_text.clone(), dim));
+            row.push(El::styled(text, style));
         }
         if let Some((text, percent)) = allowance {
             row.push(El::styled(sep_text.clone(), dim));
@@ -645,6 +670,66 @@ mod tests {
             .first()
             .map(|l| l.plain())
             .unwrap_or_default()
+    }
+
+    /// Background sessions still running get a block of their own on the row,
+    /// with how many are waiting on the person; with none running there is no
+    /// block at all.
+    #[test]
+    fn the_row_counts_the_sessions_running_in_the_background() {
+        use crate::bg::{BgView, Group, Session};
+        let session = |id: &str, group: Group, waiting: bool| Session {
+            id: id.into(),
+            title: id.into(),
+            group,
+            last: None,
+            waiting,
+        };
+        let with = |sessions: Vec<Session>| Moment {
+            cwd: "~/w".into(),
+            bg: BgView::new(sessions),
+            ..Default::default()
+        };
+        let running = |running, waiting| {
+            crate::i18n::t(Msg::StatusBackground { running, waiting }).into_owned()
+        };
+
+        let none = draw::<Status>(&State::default(), 120, &with(Vec::new()));
+        let finished = draw::<Status>(
+            &State::default(),
+            120,
+            &with(vec![session("a", Group::Completed, false)]),
+        );
+        assert_eq!(none, finished, "a finished one is not work going on");
+
+        let two = draw::<Status>(
+            &State::default(),
+            120,
+            &with(vec![
+                session("a", Group::Working, false),
+                session("b", Group::Working, false),
+                session("c", Group::Completed, false),
+            ]),
+        );
+        assert!(two.contains(&running(2, 0)), "{two:?}");
+
+        let asking = draw::<Status>(
+            &State::default(),
+            120,
+            &with(vec![
+                session("a", Group::Working, false),
+                session("b", Group::NeedsInput, true),
+            ]),
+        );
+        assert!(asking.contains(&running(2, 1)), "{asking:?}");
+
+        // On a narrow row the block keeps its place and the fitted group gives.
+        let narrow = draw::<Status>(
+            &State::default(),
+            40,
+            &with(vec![session("a", Group::Working, false)]),
+        );
+        assert!(narrow.contains(&running(1, 0)), "{narrow:?}");
     }
 
     /// The allowance is only spoken about once it is close to spent.

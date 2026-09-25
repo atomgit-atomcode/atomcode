@@ -567,9 +567,9 @@ async fn background_list(
     }
 }
 
-/// `/bg`, `/bg list`, `/bg <N>`, `/bg drop <N|id>` — and `/bg tell <id> <text>`,
-/// which is what the panel's reply sends (not listed: a person replies from the
-/// panel, where the id is the row they are on).
+/// `/background` (`/bg`): bare, `<task>`, `list`, `<N>`, `drop <N|id>` — and
+/// `tell <id> <text>`, which is what the panel's reply sends (not listed: a
+/// person replies from the panel, where the id is the row they are on).
 async fn background_command(
     control: &Arc<dyn atomcode_host_api::HostControl>,
     root: &str,
@@ -598,6 +598,29 @@ async fn background_command(
             .position(|s| s.session == which)
             .map(|at| (at + 1, sessions[at].clone()))
             .ok_or_else(|| t(Msg::BgUsage).into_owned()),
+    };
+    // A word is a subcommand only where it cannot be a task: `list` alone,
+    // `drop 2`, a bare slot number. Anything else is words for a new background
+    // session to work on — "tell me why the build is slow" is a task, not
+    // `tell` addressed to a session called "me".
+    //
+    // A target is a slot number, or a session id as the panel sends it
+    // (`/bg drop <id>` for ctrl+x) — an id is a UUID, which no task reads as.
+    let is_target = |word: &str| {
+        let word = word.split_whitespace().next().unwrap_or("");
+        word.parse::<usize>().is_ok()
+            || (word.len() == 36
+                && word.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+                && word.matches('-').count() == 4)
+    };
+    let is_slot = |word: &str| word.parse::<usize>().is_ok();
+    let first = match first {
+        "list" | "ls" | "help" if rest.is_empty() => first,
+        "drop" if is_target(rest) && rest.split_whitespace().count() == 1 => first,
+        "tell" if is_target(rest) => first,
+        "" => first,
+        which if is_slot(which) && rest.is_empty() => which,
+        _ => return start_background(control, args).await,
     };
     match first {
         "" => match control
@@ -691,6 +714,25 @@ async fn background_command(
     }
 }
 
+/// Start a new session in the background on `task`; the one on screen stays.
+async fn start_background(
+    control: &Arc<dyn atomcode_host_api::HostControl>,
+    task: &str,
+) -> Outcome {
+    match control
+        .call(HostCommand::StartBackground {
+            text: task.to_string(),
+        })
+        .await
+    {
+        Ok(HostReply::Backgrounded { slot, .. }) => {
+            Outcome::Said(t(Msg::BgStarted { slot }).into_owned())
+        }
+        Ok(other) => Outcome::Refused(format!("{other:?}")),
+        Err(error) => Outcome::Refused(refusal(error)),
+    }
+}
+
 fn session_catalogue() -> Vec<Command> {
     vec![
         Command::said("compact", t(Msg::CmdAboutCompact)),
@@ -703,13 +745,12 @@ fn session_catalogue() -> Vec<Command> {
         // with `/new` as its memorable alias — one row, not two.
         Command::said("session", t(Msg::CmdAboutSession)).with_aliases(&["new"]),
         Command::said_taking("resume", t(Msg::CmdTakesSessionId), t(Msg::CmdAboutResume)),
-        Command::said_taking("bg", t(Msg::CmdTakesBg), t(Msg::CmdAboutBg)),
-        Command::said_taking(
-            "background",
-            t(Msg::CmdTakesTask),
-            t(Msg::CmdAboutBackground),
-        )
-        .requiring(),
+        // One command for everything about background sessions: bare, it moves
+        // this one there; with words, those words are a task for a new one; and
+        // `list` / `<N>` / `drop <N>` look at, switch to and drop them. `/bg` is
+        // the short name people type.
+        Command::said_taking("background", t(Msg::CmdTakesBg), t(Msg::CmdAboutBg))
+            .with_aliases(&["bg"]),
         // A closed set of levels, so the menu offers them inline (one row each,
         // marked with the one in force) rather than a modal — the same way `/`
         // shows the commands themselves.
@@ -1032,32 +1073,11 @@ impl CommandSet for SessionCommands {
             // The sessions kept running out of view
             // (`docs/plans/2026-09-25-bg-design.md`). Everything here is a host
             // command; the panel is only how the answer is drawn.
-            "bg" => {
-                let Some(control) = control else {
-                    return Outcome::Refused(t(Msg::NoHost).into_owned());
-                };
-                background_command(&control, &root, args.trim()).await
-            }
             "background" => {
                 let Some(control) = control else {
                     return Outcome::Refused(t(Msg::NoHost).into_owned());
                 };
-                let task = args.trim();
-                if task.is_empty() {
-                    return Outcome::Refused(t(Msg::BgNeedsTask).into_owned());
-                }
-                match control
-                    .call(HostCommand::StartBackground {
-                        text: task.to_string(),
-                    })
-                    .await
-                {
-                    Ok(HostReply::Backgrounded { slot, .. }) => {
-                        Outcome::Said(t(Msg::BgStarted { slot }).into_owned())
-                    }
-                    Ok(other) => Outcome::Refused(format!("{other:?}")),
-                    Err(error) => Outcome::Refused(refusal(error)),
-                }
+                background_command(&control, &root, args.trim()).await
             }
             // Who has been on this team, and the way to look at any of them.
             //

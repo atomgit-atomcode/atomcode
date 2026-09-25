@@ -190,6 +190,12 @@ pub enum Msg<'a> {
         name: &'a str,
     },
     StatusStopping,
+    /// The status row's background block: how many background sessions are
+    /// still running, and how many of those are waiting for the person.
+    StatusBackground {
+        running: usize,
+        waiting: usize,
+    },
     StatusGoal,
     StatusLoop,
     /// `kind` is already localised — [`Msg::StatusGoal`] or [`Msg::StatusLoop`].
@@ -537,10 +543,7 @@ pub enum Msg<'a> {
     // ── background sessions (`bg.rs`, `modules/bg.rs`, the host's `background`) ──
     CmdAboutBg,
     CmdTakesBg,
-    CmdAboutBackground,
-    CmdTakesTask,
     BgUsage,
-    BgNeedsTask,
     BgNoSuchSlot {
         slot: usize,
         count: usize,

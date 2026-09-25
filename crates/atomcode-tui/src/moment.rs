@@ -521,13 +521,13 @@ pub struct Moment {
     /// Kept and cleared with `steering`.
     pub queued: Vec<(String, String)>,
     /// Lines the runtime withdrew, oldest first, waiting for the turn to be
-    /// over so they can be handed back — or, after `Ctrl+B`, sent again.
+    /// over so they can be handed back — or, after `Ctrl+X`, sent again.
     ///
     /// Only what was withdrawn: a stop that lost the race to the turn's own
     /// end withdrew nothing, the lines went on to the model, and giving them
     /// back as well would say them twice.
     pub withdrawn: Vec<String>,
-    /// The last stop was `Ctrl+B`: what it withdraws goes out again, each as
+    /// The last stop was `Ctrl+X`: what it withdraws goes out again, each as
     /// its own message, rather than back to the composer. `esc` and `ctrl-c`
     /// set it false, so it always says what the latest stop asked for.
     pub resend_withdrawn: bool,

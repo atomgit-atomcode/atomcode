@@ -439,6 +439,51 @@ async fn background_task_runs_without_changing_the_foreground() {
     rig.quit().await;
 }
 
+/// **`/bg` and `/background` are one command, the row counts what runs out of
+/// view, and → on an empty box opens it.** `/bg <task>` starts a background
+/// session like `/background <task>` does; while it runs the status row says so,
+/// and says nothing once it is done; with nothing typed, → opens the panel —
+/// and with nothing in the background it opens nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn bg_takes_a_task_the_row_counts_it_and_right_opens_the_panel() {
+    let rig = Rig::new().await;
+    let first = rig.client.root();
+    let panel = t(Msg::BgPlaceholder).into_owned();
+    let counted = t(Msg::StatusBackground {
+        running: 1,
+        waiting: 0,
+    })
+    .into_owned();
+
+    // Nothing in the background: → is only a caret move.
+    rig.term.press(KeyPress::plain(Key::Right));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!rig.term.text().contains(&panel), "{}", rig.term.text());
+
+    rig.term.type_line("/bg slow job");
+    rig.until_screen(&t(Msg::BgStarted { slot: 1 })).await;
+    assert_eq!(rig.client.root(), first, "the foreground did not move");
+    rig.until_screen(&counted).await;
+
+    rig.term.press(KeyPress::plain(Key::Right));
+    rig.until_screen(&panel).await;
+    rig.term.press(KeyPress::plain(Key::Esc));
+    rig.until("the panel closed", |rig| !rig.term.text().contains(&panel))
+        .await;
+
+    rig.release();
+    rig.until_background("the task finished", |list| {
+        list.first()
+            .is_some_and(|s| s.state == BackgroundState::Done)
+    })
+    .await;
+    rig.until("the row stops counting a finished one", |rig| {
+        !rig.term.text().contains(&counted)
+    })
+    .await;
+    rig.quit().await;
+}
+
 /// **The panel's box starts a task, and the list shows it.** Typed into the
 /// panel rather than as a command — the same host command underneath.
 #[tokio::test(flavor = "multi_thread")]

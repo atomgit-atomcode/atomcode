@@ -130,7 +130,7 @@ fn bars(moment: &Moment, width: u16) -> Vec<Line> {
         return Vec::new();
     }
     // A queue, not a stack of full user bars: a header that says these are waiting
-    // (folded at the next tool call, or flushed now with Ctrl+B), then one compact
+    // (folded at the next tool call, or flushed now with Ctrl+X), then one compact
     // `↳ <text>` per message oldest-first — so several lines typed ahead read as one
     // pending batch instead of N look-alike sent messages.
     let mut out: Vec<Line> = Vec::new();

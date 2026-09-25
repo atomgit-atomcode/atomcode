@@ -142,6 +142,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         // ── the status bar ──
         Msg::StatusMember { name } => format!("member {name}").into(),
         Msg::StatusStopping => "stopping".into(),
+        Msg::StatusBackground { running, waiting } => match waiting {
+            0 => format!("{running} in background").into(),
+            waiting => format!("{running} in background · {waiting} waiting on you").into(),
+        },
         Msg::StatusGoal => "goal".into(),
         Msg::StatusLoop => "loop".into(),
         Msg::StatusRoundsHeld { kind, rounds, why } => {
@@ -324,7 +328,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::FileIsEmpty { path } => format!("{path} is empty").into(),
         Msg::FileUnreadable { path, error } => format!("cannot read {path}: {error}").into(),
         Msg::KeysHelp => "enter sends · shift+enter a new line (or ctrl-j) · ctrl-d quits · ctrl-w deletes a word\n\
-             during a turn: esc or ctrl-c stops it and hands what was queued back to the composer · ctrl-b stops it and sends what was queued right away\n\
+             during a turn: esc or ctrl-c stops it and hands what was queued back to the composer · ctrl-x stops it and sends what was queued right away\n\
              idle: esc twice clears the composer, twice more on an empty one opens rewind · ctrl-c clears the composer, again to quit\n\
              up/down move the caret, and page through history once at the end · click to put the caret where you clicked\n\
              pgup/pgdn and the wheel scroll the conversation\n\
@@ -378,12 +382,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ResumePickerHint => "back to which session · enter opens it · Delete throws it away".into(),
 
         // ── background sessions ──
-        Msg::CmdAboutBg => "keep this session running in the background; or list, switch to or drop background sessions".into(),
-        Msg::CmdTakesBg => "[list | <N> | drop <N>]".into(),
-        Msg::CmdAboutBackground => "start a new session in the background on a task; this one stays".into(),
-        Msg::CmdTakesTask => "<task>".into(),
-        Msg::BgUsage => "usage: /bg · /bg list · /bg <N> · /bg drop <N>".into(),
-        Msg::BgNeedsTask => "what should it do? /background <task>".into(),
+        Msg::CmdAboutBg => "background sessions: bare, keep this one running in the background; with a task, start a new one on it; or list, switch to or drop them".into(),
+        Msg::CmdTakesBg => "[<task> | list | <N> | drop <N>]".into(),
+        Msg::BgUsage => "usage: /bg · /bg <task> · /bg list · /bg <N> · /bg drop <N> (/bg is /background)".into(),
         Msg::BgNoSuchSlot { slot, count } => format!("there is no background session #{slot} ({count} in all)").into(),
         Msg::BgMoved { slot } => format!("the conversation keeps running as background #{slot}; this is a new one").into(),
         Msg::BgStarted { slot } => format!("background #{slot} is on it").into(),
@@ -1137,7 +1138,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("The proxy setting was not written to the config file: {error}").into()
         }
         Msg::SteeringQueued => {
-            "Queued — sent after the next tool call (press Ctrl+B to interrupt and send now)"
+            "Queued — sent after the next tool call (press Ctrl+X to interrupt and send now)"
                 .into()
         }
         Msg::RemoteRan { command } => format!("(the other end ran {command})").into(),

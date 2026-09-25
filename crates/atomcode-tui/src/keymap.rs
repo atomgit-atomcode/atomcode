@@ -333,7 +333,7 @@ impl Keymap for Default_ {
             // 中断并把排队的话立刻发出去。这一下曾经是 `esc` 的承诺
             // (面板上就这么写着),而 `esc` 实际上取消之后把它们丢了 ——
             // 现在它自己一个键，`esc` 仍然是干净的「停下」。
-            (KeyPress::ctrl('b'), Action::InterruptAndSend),
+            (KeyPress::ctrl('x'), Action::InterruptAndSend),
             // Three keys for one action, because only one of them can be
             // relied on. Shift-enter is what people reach for and needs the
             // keyboard protocol to arrive at all; alt-enter is what several
@@ -538,7 +538,7 @@ mod tests {
     ///
     /// 面板一直写着有这么一下,只是写的是 `esc` —— 而 `esc` 取消之后把
     /// 排队的话丢了。两个动作分开:`esc` 仍然是干净的「停下」,
-    /// `Ctrl+B` 是那句承诺。
+    /// `Ctrl+X` 是那句承诺。
     ///
     /// 并列钉住 `esc` 没被改掉:把两个意思压回一个键上,正是这条要修的
     /// 毛病。
@@ -547,7 +547,7 @@ mod tests {
         let keys = Keys::new();
         keys.add(&Default_).unwrap();
         assert_eq!(
-            keys.resolve(KeyPress::ctrl('b')),
+            keys.resolve(KeyPress::ctrl('x')),
             Some(Action::InterruptAndSend)
         );
         assert_eq!(

@@ -109,6 +109,11 @@ impl BgView {
             .count()
     }
 
+    /// 还在跑的里面,有几个在等人回答。
+    pub fn waiting(&self) -> usize {
+        self.sessions.iter().filter(|s| s.waiting).count()
+    }
+
     /// 前台那一行提示:第一个在等人回答的后台会话,和怎么打开它。
     pub fn waiting_caption(&self) -> Option<String> {
         let session = self.sessions.iter().find(|s| s.waiting)?;

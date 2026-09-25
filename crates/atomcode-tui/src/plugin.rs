@@ -2862,7 +2862,7 @@ impl Tui {
 
     /// 把一段已经展开好的话作为人自己的消息发出去。
     ///
-    /// 给 `Ctrl+B` 用:收走的那几句本来就是提交过一次的文本 —— 粘贴已经还原
+    /// 给 `Ctrl+X` 用:收走的那几句本来就是提交过一次的文本 —— 粘贴已经还原
     /// 过、图已经跟着那一次走了,所以这里不再碰附件队列。
     fn submit_text(&self, text: String) -> Option<CommandId> {
         if text.trim().is_empty() {
@@ -2888,7 +2888,7 @@ impl Tui {
     }
 
     /// Settle the lines the runtime withdrew: sent again, each on its own, after
-    /// `Ctrl+B`; otherwise back into the composer.
+    /// `Ctrl+X`; otherwise back into the composer.
     ///
     /// Only the first resend opens the turn — the runtime takes one message a
     /// step — so the rest wait in its inbox the way a line typed mid-turn does,
@@ -4129,7 +4129,7 @@ impl Tui {
             AgentEvent::Rejected { command, error } => {
                 self.client.answered(&command);
                 // A queued line the person's stop withdrew. It is on its way
-                // back to the composer (or out again, for `Ctrl+B`), so it is
+                // back to the composer (or out again, for `Ctrl+X`), so it is
                 // neither a failure to report nor a reason to put the last
                 // prompt back.
                 if matches!(error, atomcode_kernel::event::CommandError::NotRunning)
@@ -4286,7 +4286,7 @@ impl Tui {
                 // resubmitting now no longer meets `Busy`. The withdrawal
                 // receipts precede the turn's end on this connection, so every
                 // line they named is in `withdrawn` by now. The panel is
-                // cleared first, so a line `Ctrl+B` sends back into the inbox
+                // cleared first, so a line `Ctrl+X` sends back into the inbox
                 // is listed afresh rather than wiped.
                 self.host.clear_steering();
                 // At `TurnComplete` only: a cancelled turn ends `Cancelled` and
@@ -4865,6 +4865,20 @@ impl Tui {
                 // gesture. Anywhere else it is still just a caret move, and
                 // with no ghost it does nothing, so the key never surprises.
                 if accept_ghost(&mut m) {
+                    return false;
+                }
+                // Nothing typed and nothing offered: right opens the background
+                // sessions, where there are any — the Claude Code gesture. Before
+                // the ghost it would have taken the one suggestion away, and with
+                // nothing in the background there is nothing to open, so the key
+                // stays what it was.
+                if m.input.is_empty() && !m.bg.is_empty() {
+                    let view = m.bg.clone();
+                    drop(m);
+                    self.host.show_bg(view);
+                    if !self.host.open_bg(None) {
+                        self.say(&t(Msg::BgNoPanel));
+                    }
                     return false;
                 }
                 // Step over an `[Image #N]` as one chip.

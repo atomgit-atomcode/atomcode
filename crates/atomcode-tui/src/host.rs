@@ -5728,7 +5728,7 @@ mod tests {
 
     /// One fold takes only the line it folded off the queue, so the lines still
     /// in the inbox are still there for a stop to claim — the way queued words
-    /// were lost behind `ctrl-b` / `esc`.
+    /// were lost behind `ctrl-x` / `esc`.
     #[test]
     fn a_fold_takes_only_its_own_line_off_the_queue() {
         let h = host();

@@ -119,6 +119,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         // ── 状态栏 ──
         Msg::StatusMember { name } => format!("成员 {name}").into(),
         Msg::StatusStopping => "停止中".into(),
+        Msg::StatusBackground { running, waiting } => match waiting {
+            0 => format!("后台 {running}").into(),
+            waiting => format!("后台 {running} · {waiting} 等你").into(),
+        },
         Msg::StatusGoal => "目标".into(),
         Msg::StatusLoop => "循环".into(),
         Msg::StatusRoundsHeld { kind, rounds, why } => {
@@ -293,7 +297,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::FileIsEmpty { path } => format!("{path} 是空的").into(),
         Msg::FileUnreadable { path, error } => format!("读不了 {path}:{error}").into(),
         Msg::KeysHelp => "enter 发送 · shift+enter 换行(或 ctrl-j) · ctrl-d 退出 · ctrl-w 删词\n\
-             当轮进行中:esc 或 ctrl-c 停止当轮,排队的话退回输入框 · ctrl-b 停止当轮,排队的话立刻发出\n\
+             当轮进行中:esc 或 ctrl-c 停止当轮,排队的话退回输入框 · ctrl-x 停止当轮,排队的话立刻发出\n\
              空闲时:esc 连按两下清空输入,输入已空再连按两下打开回退 · ctrl-c 清空输入,再按一次退出\n\
              上/下 在输入里移动游标,到头则翻历史 · 点击输入框定位游标\n\
              pgup/pgdn 与滚轮滚动对话\n\
@@ -344,12 +348,9 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ResumePickerHint => "回到哪个会话 · enter 打开 · Delete 删掉".into(),
 
         // ── background sessions ──
-        Msg::CmdAboutBg => "把这个会话放到后台接着跑;或看、换、丢后台会话".into(),
-        Msg::CmdTakesBg => "[list | <N> | drop <N>]".into(),
-        Msg::CmdAboutBackground => "新开一个后台会话去做一件事,这里不动".into(),
-        Msg::CmdTakesTask => "<任务>".into(),
-        Msg::BgUsage => "用法:/bg · /bg list · /bg <N> · /bg drop <N>".into(),
-        Msg::BgNeedsTask => "要它做什么?/background <任务>".into(),
+        Msg::CmdAboutBg => "后台会话:不带参数把这个会话放到后台接着跑,带任务就新开一个去做;也能看、换、丢".into(),
+        Msg::CmdTakesBg => "[<任务> | list | <N> | drop <N>]".into(),
+        Msg::BgUsage => "用法:/bg · /bg <任务> · /bg list · /bg <N> · /bg drop <N>(/bg 即 /background)".into(),
         Msg::BgNoSuchSlot { slot, count } => format!("没有第 {slot} 号后台会话(一共 {count} 个)").into(),
         Msg::BgMoved { slot } => format!("刚才的会话在后台 [#{slot}] 接着跑,这里是新的会话").into(),
         Msg::BgStarted { slot } => format!("后台 [#{slot}] 开始做了").into(),
@@ -1061,7 +1062,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("没有叫「{wanted}」的代理模式：可选 follow_system、default_proxy、no_proxy。").into()
         }
         Msg::ProxySaveFailed { error } => format!("代理设置没写进配置文件：{error}").into(),
-        Msg::SteeringQueued => "将在下一次工具调用后提交的消息（按 Ctrl+B 中断并立即发送）".into(),
+        Msg::SteeringQueued => "将在下一次工具调用后提交的消息（按 Ctrl+X 中断并立即发送）".into(),
         Msg::RemoteRan { command } => format!("（另一端执行了 {command}）").into(),
         Msg::RemoteDesktopOnly => "这条得在这台机器上敲。另一端能用的是：".into(),
         Msg::UsageUnknown { why } => format!("问不到还剩多少：{why}").into(),

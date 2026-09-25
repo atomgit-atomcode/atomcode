@@ -1066,7 +1066,7 @@ async fn typing_during_a_turn_is_folded_into_it_rather_than_queued() {
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
 
-/// `Ctrl+B` 真的做到了面板上写的那句话:中断,并把排队的话立刻发出去。
+/// `Ctrl+X` 真的做到了面板上写的那句话:中断,并把排队的话立刻发出去。
 ///
 /// 面板一直写着有这么一下,只是写的是 `esc` —— 而 `esc` 取消之后把排队
 /// 的话**丢了**(底座的 `stand_down` 就是这么定的,而屏幕一声不响)。
@@ -1075,7 +1075,7 @@ async fn typing_during_a_turn_is_folded_into_it_rather_than_queued() {
 /// **话真的又发出去了** —— 中间隔着一次取消往返 - 没等到取消终态就
 /// 提交会被答 `Busy`,而那正好是把话丢掉的另一种写法。
 #[tokio::test]
-async fn ctrl_b_interrupts_and_sends_what_was_queued() {
+async fn ctrl_x_interrupts_and_sends_what_was_queued() {
     let dir = scratch("interrupt-and-send");
     let script = replay(
         r#"{ text = "one", calls = [ { name = "bash", args = { command = "sleep 5" } } ] },
@@ -1102,7 +1102,7 @@ async fn ctrl_b_interrupts_and_sends_what_was_queued() {
         transcript(&s)
     );
 
-    s.term.press(KeyPress::ctrl('b'));
+    s.term.press(KeyPress::ctrl('x'));
 
     // 取消落地后重新提交 —— 这一句变成一条真正的用户消息(一条
     // `UserMessage` 事实),这是「话真的又发出去了」唯一不依赖脚本剩几条的
@@ -1120,6 +1120,11 @@ async fn ctrl_b_interrupts_and_sends_what_was_queued() {
         "排队的话被重新发出去了,而不是跟着取消一起消失:\n{}",
         s.screen()
     );
+    assert!(
+        a_turn_was_interrupted(&s),
+        "ctrl-x 真的中断了这一轮,而不是等它自己跑完:\n{}",
+        s.screen()
+    );
 
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
@@ -1127,11 +1132,11 @@ async fn ctrl_b_interrupts_and_sends_what_was_queued() {
 
 /// The runtime folds ONE queued line per step, so after the first of three is
 /// folded the other two are still waiting — on the panel and in the inbox —
-/// and `ctrl-b` sends both. The panel used to empty on the first fold, the
+/// and `ctrl-x` sends both. The panel used to empty on the first fold, the
 /// stop's withdrawal receipts then matched nothing queued, and the middle line
 /// was lost with only the last handed back.
 #[tokio::test]
-async fn ctrl_b_after_one_queued_line_was_folded_sends_the_rest() {
+async fn ctrl_x_after_one_queued_line_was_folded_sends_the_rest() {
     let dir = scratch("interrupt-after-fold");
     let script = replay(
         r#"{ text = "one", calls = [ { name = "bash", args = { command = "sleep 1" } } ] },
@@ -1166,7 +1171,7 @@ async fn ctrl_b_after_one_queued_line_was_folded_sends_the_rest() {
         "the two not yet folded are still shown as waiting:\n{screen}"
     );
 
-    s.term.press(KeyPress::ctrl('b'));
+    s.term.press(KeyPress::ctrl('x'));
 
     let mut said = Vec::new();
     for _ in 0..300 {
@@ -1179,6 +1184,11 @@ async fn ctrl_b_after_one_queued_line_was_folded_sends_the_rest() {
     assert!(
         said.iter().any(|m| m == "QUEUED-b2") && said.iter().any(|m| m == "QUEUED-c3"),
         "both lines still waiting were sent, not dropped: {said:?}\n{}",
+        s.screen()
+    );
+    assert!(
+        a_turn_was_interrupted(&s),
+        "ctrl-x stopped the turn rather than letting it finish:\n{}",
         s.screen()
     );
 
@@ -1202,6 +1212,17 @@ async fn queue_two_behind_a_turn(s: &Session, first: &str, second: &str) {
         screen.contains(first) && screen.contains(second),
         "both are in the queue panel:\n{screen}"
     );
+}
+
+/// Whether a turn was stopped by a key rather than left to finish: the log
+/// records the stop as its own fact. Without this, a key that did nothing at
+/// all passes the resend checks — the five-second tool finishes on its own and
+/// the queued lines go out as the next turn anyway.
+fn a_turn_was_interrupted(s: &Session) -> bool {
+    s.client()
+        .events()
+        .into_iter()
+        .any(|logged| matches!(logged.event, SessionEvent::Interrupted { .. }))
 }
 
 /// What the person said, message by message, as the log has it.
@@ -1303,7 +1324,7 @@ async fn ctrl_c_puts_what_was_queued_back_ahead_of_the_draft() {
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
 
-/// What `Ctrl+B` sent after the first line is queued again, and a stop hands
+/// What `Ctrl+X` sent after the first line is queued again, and a stop hands
 /// it back like any other.
 ///
 /// Only the first resent line opens the turn; the runtime takes one message a
@@ -1311,8 +1332,8 @@ async fn ctrl_c_puts_what_was_queued_back_ahead_of_the_draft() {
 /// were sent untracked, so an `esc` before they were folded in withdrew them
 /// with nothing to give them back to — `没有送达`, and gone.
 #[tokio::test]
-async fn what_ctrl_b_resent_and_was_still_waiting_comes_back_on_esc() {
-    let dir = scratch("ctrl-b-then-esc");
+async fn what_ctrl_x_resent_and_was_still_waiting_comes_back_on_esc() {
+    let dir = scratch("ctrl-x-then-esc");
     let script = replay(
         r#"{ text = "one", calls = [ { name = "bash", args = { command = "sleep 5" } } ] },
            { text = "two", calls = [ { name = "bash", args = { command = "sleep 5" } } ] },
@@ -1322,7 +1343,7 @@ async fn what_ctrl_b_resent_and_was_still_waiting_comes_back_on_esc() {
     let task = s.open().await;
     queue_two_behind_a_turn(&s, "QUEUED-h8", "QUEUED-i9").await;
 
-    s.term.press(KeyPress::ctrl('b'));
+    s.term.press(KeyPress::ctrl('x'));
     for _ in 0..300 {
         if user_messages(&s).iter().any(|m| m.contains("QUEUED-h8")) {
             break;
@@ -1352,20 +1373,25 @@ async fn what_ctrl_b_resent_and_was_still_waiting_comes_back_on_esc() {
         "{:?}",
         user_messages(&s)
     );
+    assert!(
+        a_turn_was_interrupted(&s),
+        "ctrl-x stopped the turn:\n{}",
+        s.screen()
+    );
     assert!(!s.screen().contains("没有送达"), "{}", s.screen());
 
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
 
-/// `Ctrl+B` sends what was queued **as it was queued**: one message each, in
+/// `Ctrl+X` sends what was queued **as it was queued**: one message each, in
 /// order — the same shape they would have had folding into the turn — not
 /// glued into one message the person never wrote. And a queued line that
 /// carried a picture still carries it: the runtime dropped the queued send,
 /// picture and all, so the resend has to bring it again.
 #[tokio::test]
-async fn ctrl_b_sends_each_queued_message_on_its_own_with_its_picture() {
-    let dir = scratch("ctrl-b-each");
+async fn ctrl_x_sends_each_queued_message_on_its_own_with_its_picture() {
+    let dir = scratch("ctrl-x-each");
     let script = replay_vision(
         r#"{ text = "one", calls = [ { name = "bash", args = { command = "sleep 5" } } ] },
            { text = "two" }, { text = "three" }, { text = "four" }"#,
@@ -1381,7 +1407,7 @@ async fn ctrl_b_sends_each_queued_message_on_its_own_with_its_picture() {
     s.term.type_line("QUEUED-g7");
     tokio::time::sleep(Duration::from_millis(400)).await;
 
-    s.term.press(KeyPress::ctrl('b'));
+    s.term.press(KeyPress::ctrl('x'));
     for _ in 0..300 {
         if user_messages(&s).iter().any(|m| m.contains("QUEUED-g7")) {
             break;
@@ -1406,6 +1432,11 @@ async fn ctrl_b_sends_each_queued_message_on_its_own_with_its_picture() {
             }
             _ => None,
         });
+    assert!(
+        a_turn_was_interrupted(&s),
+        "ctrl-x stopped the turn:\n{}",
+        s.screen()
+    );
     assert_eq!(with_picture, Some(1), "the queued picture went with it");
 
     s.term.press(KeyPress::ctrl('d'));
