@@ -846,7 +846,7 @@ model = "vendor-b"
         telemetry: Option<Arc<atomcode_telemetry::Telemetry>>,
         opening_notice: Option<String>,
         spawn: Option<crate::background::Spawn>,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<Option<Left>, String> {
         let (mounted, background) = mount_with_background(
             runtime,
             front_end,
@@ -868,10 +868,22 @@ model = "vendor-b"
         let left = match background {
             Some(background) => {
                 background.shutdown_all().await;
-                background.left_behind()
+                Some(Left {
+                    foreground: background.front_at_exit(),
+                    background: background.left_behind(),
+                })
             }
-            None => Vec::new(),
+            None => None,
         };
         result.map(|()| left)
+    }
+
+    /// What the screen left behind that a person can come back to: the
+    /// session in front as it went (not the one it started on — `/bg`,
+    /// `/resume` and `/session` move it), and the background sessions it
+    /// stopped. Empty sessions are not in it.
+    pub struct Left {
+        pub foreground: Option<String>,
+        pub background: Vec<String>,
     }
 }

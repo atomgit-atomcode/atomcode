@@ -402,7 +402,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::BgPlaceholder => "describe a task for a new session".into(),
         Msg::BgReplyTo { title } => format!("reply to “{title}”").into(),
         Msg::BgLegend => "enter to return · space to reply · ctrl+x to delete · ? for shortcuts".into(),
-        Msg::BgKeys => "↑↓ select · enter opens · esc goes back · space replies to the selected one · ctrl+x deletes (a running one is cancelled) · type a task and enter to start a new background session".into(),
+        Msg::BgKeys => "↑↓ select · enter opens · esc goes back · ← puts the panel away · space replies to the selected one · ctrl+x deletes (a running one is cancelled) · type a task and enter to start a new background session".into(),
         Msg::BgNothingSaid => "(nothing said yet)".into(),
         Msg::BgRefusedWhileSharing => "this conversation is being shared — stop sharing before switching sessions".into(),
         Msg::BgRefusedWhileAsking => "it is waiting for your answer — answer it first".into(),

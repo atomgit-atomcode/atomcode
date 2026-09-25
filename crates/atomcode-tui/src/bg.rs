@@ -263,6 +263,11 @@ pub fn key(view: &BgView, panel: &mut Panel, press: KeyPress) -> Step {
                 _ => Step::Close,
             }
         }
+        // ← 在空输入框上拉起了这块面板,空着的时候 ← 再把它收起——留在现在这个
+        // 会话。`/bg` 之后要在新的前台说话,走的就是这一下(esc 是回到刚移走的那个)。
+        (Key::Left, Mods::NONE) if panel.input.is_empty() && panel.replying.is_none() => {
+            Step::Close
+        }
         (Key::Char('x'), Mods::CTRL) => match selected {
             Some(id) => Step::Drop { id },
             None => Step::Stay,
@@ -462,6 +467,16 @@ mod tests {
         );
         assert!(panel.wheel(&view, 5));
         assert_eq!(panel.cursor, 2, "滚轮夹在列表里");
+    }
+
+    /// ← on an empty box puts the panel away and stays on this session.
+    #[test]
+    fn left_on_an_empty_box_puts_the_panel_away() {
+        let view = view();
+        let mut panel = Panel::new(Some("done".into()));
+        assert_eq!(key(&view, &mut panel, press(Key::Left)), Step::Close);
+        typed(&mut panel, &view, "a");
+        assert_eq!(key(&view, &mut panel, press(Key::Left)), Step::Stay);
     }
 
     #[test]

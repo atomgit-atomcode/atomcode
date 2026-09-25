@@ -750,19 +750,87 @@ async fn quitting_says_how_to_resume_the_background_sessions_it_stopped() {
     rig.until_background("the background runtime was stopped", |list| list.is_empty())
         .await;
 
-    let lines =
-        atomcode::exit_resume_hints("atomcode", Some(&fresh), &rig.host.left_behind(), false);
+    // The foreground in front at exit is the fresh one `/bg` put there, and
+    // nothing was said in it: no line for it, as for any empty session.
+    assert_eq!(
+        rig.host.front_at_exit(),
+        None,
+        "an empty foreground has no line"
+    );
+    let lines = atomcode::exit_resume_hints(
+        "atomcode",
+        rig.host.front_at_exit().as_deref(),
+        &rig.host.left_behind(),
+        false,
+    );
+    assert_eq!(
+        lines,
+        vec![atomcode::resume_hint_line("atomcode", &first, false, false)],
+        "the stopped background session's line, in the foreground's words"
+    );
+    assert!(
+        lines[0].contains(&format!("atomcode resume {first}")),
+        "{lines:?}"
+    );
+}
+
+/// **The foreground `resume` line is for the session in front at exit**, not
+/// the one the screen started on: after `/bg`, something said in the new
+/// foreground, then quitting — the line names the new session, and the one
+/// it started on is named once, as the background session it now is.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_resume_line_on_exit_names_the_session_in_front_then() {
+    let rig = Rig::new().await;
+    let first = rig.client.root();
+    rig.term.type_line("slow task");
+    rig.until("the slow turn reached the model", |rig| {
+        rig.script.started.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    rig.term.type_line("/bg");
+    rig.until_screen(&t(Msg::BgPanelMoved)).await;
+    let fresh = rig.client.root();
+    assert_ne!(fresh, first);
+    // Say something in the new foreground: ← puts the panel away and stays
+    // here (Esc would go back to the moved session).
+    rig.term.press(KeyPress::plain(Key::Left));
+    rig.until("the panel is put away", |rig| {
+        !rig.term.text().contains(&*t(Msg::BgPanelMoved))
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let before = rig.script.count.load(Ordering::SeqCst);
+    rig.term.type_line("hello there");
+    rig.until("the new foreground's turn was answered", |rig| {
+        rig.script.count.load(Ordering::SeqCst) > before
+    })
+    .await;
+    rig.until_screen("hello there").await;
+    assert_eq!(rig.client.root(), fresh, "still on the new foreground");
+
+    rig.term.press(KeyPress::ctrl('d'));
+    rig.until_screen(&t(Msg::BgQuitQuestion { count: 1 })).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    rig.term.press(KeyPress::plain(Key::Enter));
+    rig.until("the screen quit", |rig| rig.running.is_finished())
+        .await;
+    rig.until_background("the background runtime was stopped", |list| list.is_empty())
+        .await;
+
+    assert_eq!(rig.host.front_at_exit().as_deref(), Some(fresh.as_str()));
+    let lines = atomcode::exit_resume_hints(
+        "atomcode",
+        rig.host.front_at_exit().as_deref(),
+        &rig.host.left_behind(),
+        false,
+    );
     assert_eq!(
         lines,
         vec![
             atomcode::resume_hint_line("atomcode", &fresh, false, false),
             atomcode::resume_hint_line("atomcode", &first, false, false),
         ],
-        "the foreground's line, then the stopped background session's"
-    );
-    assert!(
-        lines[1].contains(&format!("atomcode resume {first}")),
-        "{lines:?}"
+        "the session in front at exit first, then the background one"
     );
 }
 

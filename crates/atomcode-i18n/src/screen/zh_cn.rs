@@ -368,7 +368,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::BgPlaceholder => "描述一个任务,新开一个会话".into(),
         Msg::BgReplyTo { title } => format!("回复「{title}」").into(),
         Msg::BgLegend => "enter 打开 · space 回复 · ctrl+x 删除 · ? 快捷键".into(),
-        Msg::BgKeys => "↑↓ 选 · enter 打开 · esc 回去 · space 就地回复选中的 · ctrl+x 删除(跑着的先取消) · 在框里写任务再回车,新开一个后台会话".into(),
+        Msg::BgKeys => "↑↓ 选 · enter 打开 · esc 回去 · ← 收起面板 · space 就地回复选中的 · ctrl+x 删除(跑着的先取消) · 在框里写任务再回车,新开一个后台会话".into(),
         Msg::BgNothingSaid => "(还没说什么)".into(),
         Msg::BgRefusedWhileSharing => "这段对话正在共享,先停掉共享再换会话".into(),
         Msg::BgRefusedWhileAsking => "它在等你回答,先答了再换".into(),

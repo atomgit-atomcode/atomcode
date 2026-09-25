@@ -125,6 +125,10 @@ pub struct Background {
     /// The sessions stopped because the screen went away, in slot order — what
     /// the launcher prints a `resume` line for after the terminal is back.
     left: Mutex<Vec<String>>,
+    /// The session in front when the screen went away, if it had anything said
+    /// in it — `None` inside until the exit is recorded, `Some(None)` for an
+    /// empty one, which gets no `resume` line.
+    exit_front: Mutex<Option<Option<String>>>,
 }
 
 /// [`crate::host::connect`],外加后台会话。
@@ -161,6 +165,7 @@ pub fn connect(
         op: tokio::sync::Mutex::new(()),
         me: me.clone(),
         left: Mutex::new(Vec::new()),
+        exit_front: Mutex::new(None),
     });
     // 泵在 `Arc` 建好之后才起:起早了,第一条事件升级不了弱引用,泵就停了。
     parts.pump(Arc::downgrade(&background));
@@ -557,6 +562,9 @@ impl Background {
             }
             // 退出:前台照旧,后台的一个个停下来(`tui_front::run` 等它们停完)。
             Kind::Shutdown => {
+                // Which session is in front, read **before** the stop goes out:
+                // after it the App is gone and its log with it.
+                self.record_exit_front();
                 let front = self.front_commands();
                 let _ = front.send(command);
                 if let Some(me) = self.me.upgrade() {
@@ -582,18 +590,47 @@ impl Background {
     /// 停下每一个后台 runtime。退出时用;调多次无害。
     pub async fn shutdown_all(&self) {
         let _op = self.op.lock().await;
+        // A screen that closed without saying so never sent the stop; the
+        // front is still up, so it can still be read here.
+        self.record_exit_front();
         let slots = std::mem::take(&mut self.state.lock().expect("background poisoned").slots);
-        self.left
-            .lock()
-            .expect("left poisoned")
-            .extend(slots.iter().map(|slot| slot.control.session_id()));
+        self.left.lock().expect("left poisoned").extend(
+            slots
+                .iter()
+                .filter(|slot| has_conversation(slot))
+                .map(|slot| slot.control.session_id()),
+        );
         futures::future::join_all(slots.into_iter().map(stop)).await;
+    }
+
+    /// Note which session is in front as the screen goes, once: `/bg`,
+    /// `/bg N`, `/resume` and `/session` have all moved it since start, and
+    /// the line printed after exit is for this one. An empty one is noted as
+    /// nothing to come back to.
+    fn record_exit_front(&self) {
+        let mut noted = self.exit_front.lock().expect("exit poisoned");
+        if noted.is_some() {
+            return;
+        }
+        let state = self.state.lock().expect("background poisoned");
+        let session = state.front.control.session_id();
+        *noted = Some((!session.is_empty() && has_conversation(&state.front)).then_some(session));
     }
 
     /// The background sessions the exit stopped. Each is saved and can be
     /// resumed; the launcher says how, the way it does for the foreground one.
     pub fn left_behind(&self) -> Vec<String> {
         self.left.lock().expect("left poisoned").clone()
+    }
+
+    /// The session that was in front when the screen went away, when anything
+    /// was said in it.
+    pub fn front_at_exit(&self) -> Option<String> {
+        self.exit_front
+            .lock()
+            .expect("exit poisoned")
+            .clone()
+            .flatten()
     }
 
     fn busy(reason: String) -> HostError {

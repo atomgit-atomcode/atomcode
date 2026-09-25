@@ -2660,12 +2660,17 @@ async fn run() -> Result<i32> {
                 )
                 .await
                 .map_err(|why| anyhow::anyhow!(why));
-                // 前台那句,再加上退出时停掉的每个后台会话一句——同一个格式。
-                let left = result.as_ref().map(Vec::clone).unwrap_or_default();
+                // 退出时在前台的那个会话一句(换过前台就不是启动时那个;空会话
+                // 不打),再加上退出时停掉的每个后台会话一句——同一个格式。宿主
+                // 说不出的时候(没起到屏幕)才退回启动时那个。
+                let (foreground, background) = match &result {
+                    Ok(Some(left)) => (left.foreground.clone(), left.background.clone()),
+                    _ => (active_session_id.clone(), Vec::new()),
+                };
                 for line in atomcode::exit_resume_hints(
                     BIN_NAME,
-                    active_session_id.as_deref(),
-                    &left,
+                    foreground.as_deref(),
+                    &background,
                     hint_zh,
                 ) {
                     println!("\n{line}");
