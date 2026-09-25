@@ -733,6 +733,50 @@ async fn start_background(
     }
 }
 
+/// `/review`: what the session it starts is asked to do.
+///
+/// The compact syntax becomes the explicit schema the `code_review` tool takes —
+/// `[deep|deep+verify] [staged|<base>]` — and stays pure so the command's meaning
+/// is judged without a session. `<base>` means the committed `base..HEAD` range,
+/// not the legacy top-level `base` field whose diff quietly included the working
+/// tree as a side effect.
+fn review_prompt(arg: &str) -> String {
+    let arg = arg.trim();
+    // A leading `deep+verify` or `deep` keyword — alone or before a scope — sets
+    // the depth; anything else is the scope.
+    let (depth, scope): (Option<&str>, &str) = if let Some(rest) = arg
+        .strip_prefix("deep+verify")
+        .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+    {
+        (Some("deep+verify"), rest.trim())
+    } else if let Some(rest) = arg
+        .strip_prefix("deep")
+        .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+    {
+        (Some("deep"), rest.trim())
+    } else {
+        (None, arg)
+    };
+    let scope_json = if scope.is_empty() {
+        r#"{"kind":"working_tree"}"#.to_string()
+    } else if scope.eq_ignore_ascii_case("staged") {
+        r#"{"kind":"staged"}"#.to_string()
+    } else {
+        format!(
+            r#"{{"kind":"range","base":{base},"head":"HEAD"}}"#,
+            base = serde_json::to_string(scope).expect("serializing a string cannot fail")
+        )
+    };
+    let args = match depth {
+        Some(depth) => format!(r#"{{"scope":{scope_json},"depth":"{depth}"}}"#),
+        None => format!(r#"{{"scope":{scope_json}}}"#),
+    };
+    format!(
+        "Review the requested changes: call the `code_review` tool with {args}, then give me a \
+         concise summary of its findings."
+    )
+}
+
 fn session_catalogue() -> Vec<Command> {
     vec![
         Command::said("compact", t(Msg::CmdAboutCompact)),
@@ -751,6 +795,11 @@ fn session_catalogue() -> Vec<Command> {
         // the short name people type.
         Command::said_taking("background", t(Msg::CmdTakesBg), t(Msg::CmdAboutBg))
             .with_aliases(&["bg"]),
+        // A review runs in a session of its own by default — the reviewer is a
+        // whole runtime, and a review takes minutes the person's conversation is
+        // not a place to wait them out in. Same road as `/background`, with the
+        // task filled in.
+        Command::said_taking("review", t(Msg::CmdTakesReview), t(Msg::CmdAboutReview)),
         // A closed set of levels, so the menu offers them inline (one row each,
         // marked with the one in force) rather than a modal — the same way `/`
         // shows the commands themselves.
@@ -903,6 +952,15 @@ impl CommandSet for SessionCommands {
     }
     fn commands(&self) -> Vec<Command> {
         session_catalogue()
+    }
+    /// `/review` is claimed from the agent's own catalog, which defines the same
+    /// name for its inline reviewer (`atomcode-harness`'s `ReviewCommand`,
+    /// `CommandTarget::Session`). This screen's `/review` is the one that runs
+    /// the review in a session of its own, and two sets defining one name is an
+    /// error rather than a silent winner — so the claim is written down, the way
+    /// `SetupCommands` claims `/setup`.
+    fn overrides(&self) -> Vec<&'static str> {
+        vec!["review"]
     }
     /// What `/agents` dispatches when a row is picked. Not listed: nobody types
     /// it, and a session id in the menu would be noise (`CommandSet::hidden`).
@@ -1079,6 +1137,17 @@ impl CommandSet for SessionCommands {
                     return Outcome::Refused(t(Msg::NoHost).into_owned());
                 };
                 background_command(&control, &root, args.trim()).await
+            }
+            // A review of the current changes, in a session of its own: the
+            // reviewer works while this conversation keeps going, and its answer
+            // is read in `/bg` (or brought forward with `/bg <N>`). Same call as
+            // `/background`, with the task filled in — including the working
+            // directory, which the host takes from the foreground session.
+            "review" => {
+                let Some(control) = control else {
+                    return Outcome::Refused(t(Msg::NoHost).into_owned());
+                };
+                start_background(&control, &review_prompt(args.trim())).await
             }
             // Who has been on this team, and the way to look at any of them.
             //
@@ -4376,6 +4445,153 @@ mod tests {
     }
 
     use atomcode_plexus::{App, ConfigTree, PluginRegistry};
+
+    /// `/review`'s compact syntax becomes the tool's explicit schema.
+    ///
+    /// Judged on the prompt rather than through a session: what this command
+    /// *means* is the arguments it names, and the session it goes to is the
+    /// host's business (`/background` and `StartBackground` are judged there).
+    #[test]
+    fn a_review_prompt_names_the_scope_and_depth_the_tool_takes() {
+        let bare = review_prompt("");
+        assert!(
+            bare.contains(r#"{"scope":{"kind":"working_tree"}}"#),
+            "{bare}"
+        );
+        assert!(bare.contains("code_review"), "it names the tool: {bare}");
+        assert!(!bare.contains("depth"), "no depth unless asked: {bare}");
+        assert!(
+            !review_prompt("staged").contains("depth"),
+            "a scope alone is not a depth"
+        );
+
+        assert!(
+            review_prompt("staged").contains(r#"{"scope":{"kind":"staged"}}"#),
+            "{}",
+            review_prompt("staged")
+        );
+
+        // A ref is the committed range, not the legacy top-level `base` field,
+        // whose diff quietly included the working tree as a side effect.
+        let range = review_prompt("release/v5.1.0");
+        assert!(
+            range.contains(r#"{"kind":"range","base":"release/v5.1.0","head":"HEAD"}"#),
+            "{range}"
+        );
+
+        // A ref that needs escaping cannot break the arguments it sits in.
+        let odd = review_prompt("odd\"ref");
+        assert!(odd.contains(r#""base":"odd\"ref""#), "{odd}");
+
+        // Depth is a keyword before the scope, alone or with one.
+        let deep = review_prompt("deep");
+        assert!(
+            deep.contains(r#""depth":"deep""#) && deep.contains(r#""kind":"working_tree""#),
+            "{deep}"
+        );
+        let both = review_prompt("deep+verify staged");
+        assert!(
+            both.contains(r#""depth":"deep+verify""#) && both.contains(r#""kind":"staged""#),
+            "{both}"
+        );
+        // A ref that merely starts with those letters is a ref, not a depth.
+        let named = review_prompt("deeper");
+        assert!(named.contains(r#""base":"deeper""#), "{named}");
+        assert!(!named.contains("depth"), "{named}");
+    }
+
+    /// A set that carries `/review` the way the agent's catalog does — and, like
+    /// it, carries nothing at *mount* time: the description arrives after the
+    /// tree is built, which is why the mount itself never clashes.
+    struct AgentReview {
+        told: std::sync::atomic::AtomicBool,
+    }
+
+    impl AgentReview {
+        fn new() -> Self {
+            Self {
+                told: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+        /// The description arrived: now its catalog lists `review`.
+        fn described(&self) {
+            self.told.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl CommandSet for AgentReview {
+        fn id(&self) -> &'static str {
+            "cmd-agent-catalog"
+        }
+        fn commands(&self) -> Vec<Command> {
+            if !self.told.load(std::sync::atomic::Ordering::SeqCst) {
+                return Vec::new();
+            }
+            vec![Command::said(
+                "review",
+                "让评审员看一遍现在的改动;只读,不改".into(),
+            )]
+        }
+        async fn run(&self, _name: &str, _args: &str, _ctx: &Context) -> Outcome {
+            Outcome::Said("inline".into())
+        }
+    }
+
+    /// `/review` is the screen's own, and the screen says so out loud.
+    ///
+    /// The agent's catalog carries a `review` too — `atomcode-harness`'s
+    /// `ReviewCommand`, its reviewer run in this conversation — and it mounts
+    /// after this set. `CommandSet::overrides` is the only way a name may be
+    /// claimed twice, so the claim is written down rather than left to mount
+    /// order; the dispatch below is what says whose command actually runs, since
+    /// the screen's refuses for want of a host and the agent's would have said
+    /// `inline`.
+    #[tokio::test]
+    async fn review_takes_the_name_from_the_agent_catalog() {
+        assert_eq!(
+            SessionCommands.overrides(),
+            vec!["review"],
+            "the claim is what makes the overlap legal"
+        );
+
+        let c = Commands::new();
+        c.add(Arc::new(SessionCommands)).unwrap();
+        let agent = Arc::new(AgentReview::new());
+        c.add(agent.clone())
+            .expect("nothing clashes at mount: no description has arrived yet");
+        agent.described();
+
+        assert_eq!(
+            c.all().iter().filter(|x| x.name == "review").count(),
+            1,
+            "one /review, not two"
+        );
+        let app = bare();
+        assert_eq!(
+            c.dispatch("/review", &app.context()).await,
+            Outcome::Refused(t(Msg::NoAgent).into_owned()),
+            "the screen's own /review ran (it refuses for want of an agent), \
+             not the agent's catalog one (which would have said `inline`)"
+        );
+
+        // Mount order is not what decides it. The other order — the agent's
+        // description already in hand when the screen's set arrives, so *this*
+        // set is the incoming one — ends in the same place, and the claim is
+        // what makes it legal: without it `add` refuses the overlap outright.
+        let reversed = Commands::new();
+        let agent = Arc::new(AgentReview::new());
+        agent.described();
+        reversed.add(agent).unwrap();
+        reversed
+            .add(Arc::new(SessionCommands))
+            .expect("the claim makes the overlap legal, whichever mounts first");
+        assert_eq!(
+            reversed.all().iter().filter(|x| x.name == "review").count(),
+            1,
+            "still one /review"
+        );
+    }
 
     fn bare() -> App {
         App::new(PluginRegistry::new(), ConfigTree::default())

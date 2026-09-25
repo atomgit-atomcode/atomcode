@@ -352,6 +352,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         // ── background sessions ──
         Msg::CmdAboutBg => "后台会话:不带参数把这个会话放到后台接着跑,带任务就新开一个去做;也能看、换、丢".into(),
         Msg::CmdTakesBg => "[<任务> | list | <N> | drop <N>]".into(),
+        Msg::CmdAboutReview => "让另一个会话把这次改动审一遍——默认放后台跑,当前对话不停".into(),
+        Msg::CmdTakesReview => "[deep | deep+verify] [staged | <base>]".into(),
         Msg::BgUsage => "用法:/bg · /bg <任务> · /bg list · /bg <N> · /bg drop <N>(/bg 即 /background)".into(),
         Msg::BgNoSuchSlot { slot, count } => format!("没有第 {slot} 号后台会话(一共 {count} 个)").into(),
         Msg::BgMoved { slot } => format!("刚才的会话在后台 [#{slot}] 接着跑,这里是新的会话").into(),

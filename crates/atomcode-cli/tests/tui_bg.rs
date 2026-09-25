@@ -442,6 +442,43 @@ async fn background_task_runs_without_changing_the_foreground() {
     rig.quit().await;
 }
 
+/// **`/review` runs in the background by default.** The command is
+/// `/background` with the task filled in: the person's conversation keeps its
+/// place, and the review's own session is handed the prompt that names the tool
+/// and the scope — which is what `/review` *is*. `/bg 1` brings it forward to
+/// read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_review_runs_in_a_background_session_by_default() {
+    let rig = Rig::new().await;
+    let first = rig.client.root();
+    rig.term.type_line("/review staged");
+    rig.until_screen(&t(Msg::BgStarted { slot: 1 })).await;
+    assert_eq!(rig.client.root(), first, "the foreground did not move");
+    let list = rig.background().await;
+    assert_eq!(list.len(), 1, "{list:#?}");
+    let review = list[0].session.clone();
+    assert_ne!(review, first);
+
+    rig.until_background("the review finished", |list| {
+        list.first()
+            .is_some_and(|s| s.state == BackgroundState::Done)
+    })
+    .await;
+    // The task that session was given names the tool and the scope the person
+    // asked for. Read after the turn: the log is written as it goes, and before
+    // the turn there is nothing to read yet.
+    let log = rig.stored(&review).await;
+    assert!(log.contains("code_review"), "{log}");
+    assert!(log.contains(r#"{"scope":{"kind":"staged"}}"#), "{log}");
+
+    rig.term.type_line("/bg 1");
+    rig.until("the review comes forward", |rig| {
+        rig.client.root() == review
+    })
+    .await;
+    rig.quit().await;
+}
+
 /// **`/bg` and `/background` are one command, the row counts what runs out of
 /// view, and ← on an empty box opens it.** `/bg <task>` starts a background
 /// session like `/background <task>` does; while it runs the status row says so,

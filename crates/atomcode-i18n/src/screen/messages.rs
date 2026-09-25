@@ -548,6 +548,10 @@ pub enum Msg<'a> {
     // ── background sessions (`bg.rs`, `modules/bg.rs`, the host's `background`) ──
     CmdAboutBg,
     CmdTakesBg,
+
+    // ── `/review`: the current changes reviewed, in a session of their own ──
+    CmdAboutReview,
+    CmdTakesReview,
     BgUsage,
     BgNoSuchSlot {
         slot: usize,

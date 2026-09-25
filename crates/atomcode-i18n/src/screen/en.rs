@@ -386,6 +386,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         // ── background sessions ──
         Msg::CmdAboutBg => "background sessions: bare, keep this one running in the background; with a task, start a new one on it; or list, switch to or drop them".into(),
         Msg::CmdTakesBg => "[<task> | list | <N> | drop <N>]".into(),
+        Msg::CmdAboutReview => "have the current changes reviewed in a session of their own — it runs in the background, so this conversation keeps going".into(),
+        Msg::CmdTakesReview => "[deep | deep+verify] [staged | <base>]".into(),
         Msg::BgUsage => "usage: /bg · /bg <task> · /bg list · /bg <N> · /bg drop <N> (/bg is /background)".into(),
         Msg::BgNoSuchSlot { slot, count } => format!("there is no background session #{slot} ({count} in all)").into(),
         Msg::BgMoved { slot } => format!("the conversation keeps running as background #{slot}; this is a new one").into(),
