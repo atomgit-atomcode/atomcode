@@ -2467,6 +2467,41 @@ async fn a_text_question_sends_back_what_the_person_typed() {
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
 
+/// A typo on the row of one's own words is fixed where it is: the arrows move
+/// the caret back into the word, the missing letter goes in there, and the
+/// model gets the word as corrected — not a line that had to be backspaced away.
+#[tokio::test]
+async fn a_typo_on_the_typing_row_is_fixed_where_it_is() {
+    let dir = scratch("ask-caret");
+    let script = replay(
+        r#"{ text = "Asking.", calls = [ { name = "request_user_input", args = { header = "问候", question = "说什么?", mode = "single", options = [ { label = "hi" }, { label = "hey" } ] } } ] },
+           { text = "Noted." }"#,
+    );
+    let s = start(tree(&dir, &script, &[REQUEST_USER_INPUT_LAYER])).await;
+    let task = s.open().await;
+
+    s.term.type_line("greet");
+    until(&s, "说什么").await;
+    // To the row of one's own words by its number, then the typo.
+    s.term.press(KeyPress::ch('3'));
+    s.term.type_text("helo");
+    until(&s, "helo").await;
+    s.term.press(KeyPress::plain(Key::Left));
+    s.term.press(KeyPress::plain(Key::Left));
+    s.term.press(KeyPress::ch('l'));
+    s.term.press(KeyPress::plain(Key::Enter));
+    s.quiet().await;
+
+    let told = tool_results(&s).join("\n");
+    assert!(
+        told.contains("User answered: \"hello\""),
+        "the model gets the word as corrected: {told}"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
 /// Two questions put together are answered on one panel — a page each and a
 /// page to check them on — and go back as one reply, in order.
 #[tokio::test]

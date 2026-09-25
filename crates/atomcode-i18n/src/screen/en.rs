@@ -124,6 +124,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::AskUnanswered => "(not answered)".into(),
         Msg::AskLegendToggle => "toggle".into(),
         Msg::AskLegendSwitch => "switch question".into(),
+        Msg::AskLegendCaret => "move cursor".into(),
         Msg::AskGrantWholeTool => "every call of this tool".into(),
         Msg::AskGrantOnly { what } => format!("only {what}").into(),
 

@@ -159,6 +159,8 @@ pub enum Msg<'a> {
     AskUnanswered,
     AskLegendToggle,
     AskLegendSwitch,
+    /// Left and right, on a typing row with words in it.
+    AskLegendCaret,
 
     // ── the input line (`modules/input.rs`) ──
     InputAnswerKeys,

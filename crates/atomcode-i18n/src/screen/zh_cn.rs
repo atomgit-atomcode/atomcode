@@ -105,6 +105,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::AskUnanswered => "（未回答）".into(),
         Msg::AskLegendToggle => "勾选".into(),
         Msg::AskLegendSwitch => "切换题目".into(),
+        Msg::AskLegendCaret => "移动光标".into(),
 
         // ── 输入行 ──
         Msg::InputAnswerKeys => "enter 送出 · esc 不给".into(),

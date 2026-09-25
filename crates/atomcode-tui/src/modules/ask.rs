@@ -111,9 +111,18 @@ fn legend(sheet: &Sheet) -> Vec<(&'static str, String)> {
     if sheet.page().map(Asked::form) == Some(Form::Multiple) {
         keys.push(("space", t(Msg::AskLegendToggle).into_owned()));
     }
+    // On a line with words in it the arrows move the caret, and turning the
+    // page is Tab's alone — the legend says whichever is true right now.
+    if sheet.editing() {
+        keys.push(("←→", t(Msg::AskLegendCaret).into_owned()));
+    }
     keys.push(("⏎", t(Msg::AskLegendConfirm).into_owned()));
     if sheet.is_batch() {
-        keys.push(("←→", t(Msg::AskLegendSwitch).into_owned()));
+        let turn = match sheet.editing() {
+            true => "tab",
+            false => "←→",
+        };
+        keys.push((turn, t(Msg::AskLegendSwitch).into_owned()));
     }
     keys.push(("esc", pt(PMsg::ApprovalDeny).into_owned()));
     keys
@@ -547,18 +556,18 @@ fn slot_line(sheet: &Sheet, k: usize, caps: Caps, w: usize) -> Line {
                     spans.push(caret());
                 }
                 spans.push(Span::styled(t(Msg::AskTypeSomething).into_owned(), quiet));
+            } else if here {
+                let used: usize = spans.iter().map(Span::width).sum();
+                let at = draft.map_or(typed.len(), |d| d.caret);
+                spans.extend(caret_in(typed, at, style, w.saturating_sub(used)));
             } else {
                 // The end of what was typed is the part being worked on, so a
                 // line too long for the row shows its tail, not its head.
                 let used: usize = spans.iter().map(Span::width).sum();
-                let room = w.saturating_sub(used + usize::from(here));
                 spans.push(Span::styled(
-                    crate::width::take_width_from_end(typed, room),
+                    crate::width::take_width_from_end(typed, w.saturating_sub(used)),
                     style,
                 ));
-                if here {
-                    spans.push(caret());
-                }
             }
         }
         Slot::Submit => spans.push(Span::styled(
@@ -577,6 +586,27 @@ fn slot_line(sheet: &Sheet, k: usize, caps: Caps, w: usize) -> Line {
     // patch behind the words: the pointed-at row is a surface, and a surface that
     // stops at its last letter is a smudge.
     pad(Line::from_spans(spans), w, style)
+}
+
+/// What was typed, with the caret on the cell it is at, kept in `room` cells.
+///
+/// The caret is drawn the way every other field on this screen draws it
+/// ([`crate::modules::chrome::caret_spans`]). A line longer than the room
+/// scrolls so the caret stays on screen: as much of what comes before it as
+/// fits — counted in cells, so a wide character is two — and what comes after
+/// is cut at the edge.
+fn caret_in(typed: &str, at: usize, style: Style, room: usize) -> Vec<Span> {
+    let at = crate::text::snap(typed, at);
+    let (before, rest) = typed.split_at(at);
+    // The caret's own cell: the character it sits on, or one blank past the end.
+    let on = rest.chars().next().map_or(1, crate::width::char_width);
+    let fits = room.saturating_sub(on);
+    let shown = match crate::width::str_width(before) <= fits {
+        true => before.to_string(),
+        false => crate::width::take_width_from_end(before, fits),
+    };
+    let line = format!("{shown}{rest}");
+    crate::modules::chrome::caret_spans(&line, shown.len(), style, room)
 }
 
 fn pad(line: Line, w: usize, style: Style) -> Line {
@@ -1196,5 +1226,88 @@ mod tests {
     fn the_row_id_and_the_module_id_are_one_string() {
         assert_eq!(Ask::id(), ID);
         assert_eq!(Mounted::<Ask>::new().id(), ID);
+    }
+
+    /// The typing row as drawn: which cell the caret is on (the reversed one),
+    /// counted in cells from the left edge, and what it covers.
+    fn caret_cell(sheet: &Sheet, w: u16) -> (usize, String) {
+        let moment = with(sheet.clone());
+        let h = match Ask::height(&State, &moment, w) {
+            Height::Hug(n) => n,
+            other => panic!("unexpected {other:?}"),
+        };
+        let vp = Viewport::new(Rect::sized(w, h), &moment);
+        let lines = Ask::render(&State, &vp);
+        let row = lines
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.style.reverse))
+            .unwrap_or_else(|| panic!("no caret drawn: {lines:?}"));
+        assert!(
+            row.width() <= w as usize,
+            "{} cells at width {w}",
+            row.width()
+        );
+        let at = row.spans.iter().position(|s| s.style.reverse).unwrap();
+        let column = row.spans[..at].iter().map(Span::width).sum();
+        (column, row.spans[at].text.clone())
+    }
+
+    /// The caret is drawn on the cell it is at — after two wide characters that
+    /// is four cells along, not two — and a line too long for its row scrolls
+    /// so the caret stays on screen at either end.
+    #[test]
+    fn the_caret_is_drawn_on_the_cell_it_is_at() {
+        use crate::surface::Key;
+        let mut sheet = Sheet::one(text());
+        sheet.type_text("中文字");
+        press(&mut sheet, Key::Left);
+        let (column, on) = caret_cell(&sheet, 40);
+        let (end, _) = {
+            let mut at_end = sheet.clone();
+            press(&mut at_end, Key::End);
+            caret_cell(&at_end, 40)
+        };
+        assert_eq!(on, "字", "the caret covers the character it is before");
+        assert_eq!(end - column, 2, "and 字 is two cells wide");
+        press(&mut sheet, Key::Home);
+        let (start, on) = caret_cell(&sheet, 40);
+        assert_eq!(on, "中");
+        assert_eq!(column - start, 4, "two wide characters are four cells");
+
+        let mut long = Sheet::one(text());
+        long.type_text(&format!("{}终点", "起".repeat(60)));
+        for w in [20u16, 33] {
+            let (column, on) = caret_cell(&long, w);
+            assert_eq!(on, " ", "at the end, a block past the last character");
+            assert!(column < w as usize, "and still on screen at width {w}");
+            let mut home = long.clone();
+            press(&mut home, Key::Home);
+            assert_eq!(
+                caret_cell(&home, w).1,
+                "起",
+                "the start scrolls back into view"
+            );
+        }
+    }
+
+    /// The legend follows what the arrows do right now: move the caret on a
+    /// line with words in it, turn the page otherwise — and then Tab is named
+    /// for turning the page.
+    #[test]
+    fn the_legend_says_what_the_arrows_do_now() {
+        let mut one = Sheet::one(text());
+        let empty = framed(&with(one.clone()), 80).join("\n");
+        assert!(!empty.contains("移动光标"), "{empty}");
+        one.type_text("ab");
+        let editing = framed(&with(one), 80).join("\n");
+        assert!(editing.contains("←→ 移动光标"), "{editing}");
+
+        let mut batch = Sheet::new(1, vec![text(), multiple()]);
+        let turning = framed(&with(batch.clone()), 100).join("\n");
+        assert!(turning.contains("←→ 切换题目"), "{turning}");
+        batch.type_text("ab");
+        let typing = framed(&with(batch), 100).join("\n");
+        assert!(typing.contains("←→ 移动光标"), "{typing}");
+        assert!(typing.contains("tab 切换题目"), "{typing}");
     }
 }

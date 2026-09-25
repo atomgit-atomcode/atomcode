@@ -673,6 +673,10 @@ pub struct Draft {
     pub checked: Vec<bool>,
     /// What has been typed on the page's typing row.
     pub typed: String,
+    /// Where in `typed` the next character goes, as a byte offset kept on a
+    /// character boundary — the same caret every single-line field on this
+    /// screen keeps ([`crate::text::step_caret`] and its siblings move it).
+    pub caret: usize,
     /// The answer this page was given, in a batch — what its tab is marked
     /// for and what the review page lists. A lone question is delivered the
     /// moment it is answered and never keeps one.
@@ -839,18 +843,33 @@ impl Sheet {
         self.pointed().is_some_and(Slot::types)
     }
 
-    /// Type into the lit row, when it takes words. One line: a pasted line
-    /// break becomes a space.
-    pub fn type_text(&mut self, text: &str) -> bool {
+    /// Whether the lit row takes typing and already has words in it — the one
+    /// state in which left and right move a caret rather than turn a page. An
+    /// empty line has nowhere for a caret to go, so there the arrows keep their
+    /// page-turning job.
+    pub fn editing(&self) -> bool {
+        self.typing() && self.draft().is_some_and(|d| !d.typed.is_empty())
+    }
+
+    /// The lit row's words and caret, when the lit row takes words.
+    fn field(&mut self) -> Option<(&mut String, &mut usize)> {
         if !self.typing() {
-            return false;
+            return None;
         }
-        let Some(draft) = self.drafts.get_mut(self.tab) else {
+        let draft = self.drafts.get_mut(self.tab)?;
+        Some((&mut draft.typed, &mut draft.caret))
+    }
+
+    /// Type into the lit row at its caret, when it takes words. One line: a
+    /// pasted line break becomes a space.
+    pub fn type_text(&mut self, text: &str) -> bool {
+        let Some((typed, caret)) = self.field() else {
             return false;
         };
-        draft
-            .typed
-            .extend(text.chars().map(|c| if c.is_control() { ' ' } else { c }));
+        for c in text.chars() {
+            let c = if c.is_control() { ' ' } else { c };
+            crate::text::insert_at(typed, caret, c);
+        }
         true
     }
 
@@ -874,6 +893,23 @@ impl Sheet {
             (Key::Down, _) | (Key::Char('j'), Mods::CTRL) => {
                 self.move_by(1);
             }
+            // On a line with words in it the arrows move the caret; Tab still
+            // turns the page, so a batch can be left from anywhere.
+            (Key::Left | Key::Right, _) if self.editing() => {
+                if let Some((typed, caret)) = self.field() {
+                    *caret = crate::text::step_caret(typed, *caret, press.key == Key::Right);
+                }
+            }
+            (Key::Home, _) | (Key::Char('a'), Mods::CTRL) if self.typing() => {
+                if let Some((_, caret)) = self.field() {
+                    *caret = 0;
+                }
+            }
+            (Key::End, _) | (Key::Char('e'), Mods::CTRL) if self.typing() => {
+                if let Some((typed, caret)) = self.field() {
+                    *caret = typed.len();
+                }
+            }
             (Key::Left, _) | (Key::BackTab, _) => {
                 self.turn(-1);
             }
@@ -882,8 +918,13 @@ impl Sheet {
             }
             (Key::Enter, _) => return self.enter(),
             (Key::Backspace, _) if self.typing() => {
-                if let Some(draft) = self.drafts.get_mut(self.tab) {
-                    draft.typed.pop();
+                if let Some((typed, caret)) = self.field() {
+                    crate::text::backspace_at(typed, caret);
+                }
+            }
+            (Key::Delete, _) if self.typing() => {
+                if let Some((typed, caret)) = self.field() {
+                    crate::text::delete_at(typed, caret);
                 }
             }
             (Key::Char(c), Mods::NONE) | (Key::Char(c), Mods::SHIFT) if self.typing() => {
@@ -1725,10 +1766,11 @@ mod tests {
         assert_eq!(sheet.recap(1), None);
         assert_eq!(sheet.recap(2).as_deref(), Some("lab"));
 
-        // Back to page two and answer it after all; the pages keep what they had.
+        // Back to page two (Tab, since page three has words the arrows would move
+        // through) and answer it after all; the pages keep what they had.
         keys(
             &mut sheet,
-            &[Key::Left, Key::Left, Key::Char(' '), Key::Char('1')],
+            &[Key::BackTab, Key::BackTab, Key::Char(' '), Key::Char('1')],
         );
         assert_eq!(sheet.tab, 1);
         assert_eq!(
@@ -1798,6 +1840,96 @@ mod tests {
         assert_eq!(
             answer.await.unwrap(),
             vec![Some(Reply::from("pistachio")), None]
+        );
+    }
+
+    fn typed(sheet: &Sheet) -> (String, usize) {
+        let d = sheet.draft().expect("a question page");
+        (d.typed.clone(), d.caret)
+    }
+
+    /// A typing row is edited where its caret is: arrows move it a character
+    /// at a time, Home/End go to the ends, backspace and Delete take out the
+    /// character before and under it, and typing goes in at it.
+    #[test]
+    fn a_typing_row_is_edited_at_its_caret() {
+        use crate::surface::Key;
+        let mut sheet = Sheet::one(text());
+        sheet.type_text("helo");
+        assert_eq!(typed(&sheet), ("helo".into(), 4));
+        keys(&mut sheet, &[Key::Left, Key::Char('l')]);
+        assert_eq!(typed(&sheet), ("hello".into(), 4), "typed in at the caret");
+        keys(
+            &mut sheet,
+            &[Key::Home, Key::Char('>'), Key::Right, Key::Delete],
+        );
+        assert_eq!(typed(&sheet), (">hllo".into(), 2));
+        keys(&mut sheet, &[Key::Backspace]);
+        assert_eq!(
+            typed(&sheet),
+            (">llo".into(), 1),
+            "backspace takes the one before"
+        );
+        keys(&mut sheet, &[Key::End, Key::Right, Key::Backspace]);
+        assert_eq!(typed(&sheet), (">ll".into(), 3), "past the end is the end");
+        keys(&mut sheet, &[Key::Home, Key::Left, Key::Backspace]);
+        assert_eq!(
+            typed(&sheet),
+            (">ll".into(), 0),
+            "before the start is the start"
+        );
+        // A paste goes in at the caret too, whole.
+        sheet.type_text("a b");
+        assert_eq!(typed(&sheet), ("a b>ll".into(), 3));
+        assert_eq!(wire(sheet.enter())[0].text.as_deref(), Some("a b>ll"));
+    }
+
+    /// Wide characters are one step each, however many bytes and cells they
+    /// take — a caret that stepped a byte would land inside one and panic.
+    #[test]
+    fn the_caret_steps_over_wide_characters_whole() {
+        use crate::surface::Key;
+        let mut sheet = Sheet::one(text());
+        sheet.type_text("中文字");
+        keys(&mut sheet, &[Key::Left]);
+        assert_eq!(typed(&sheet), ("中文字".into(), 6));
+        keys(&mut sheet, &[Key::Char('a')]);
+        assert_eq!(typed(&sheet), ("中文a字".into(), 7));
+        keys(&mut sheet, &[Key::Left, Key::Left, Key::Backspace]);
+        assert_eq!(typed(&sheet), ("文a字".into(), 0));
+        keys(&mut sheet, &[Key::Delete, Key::End, Key::Backspace]);
+        assert_eq!(typed(&sheet), ("a".into(), 1));
+    }
+
+    /// Left and right move the caret only on a line with words in it. Off the
+    /// typing row, or on an empty one, they turn a batch's pages as before —
+    /// and Tab turns them from anywhere.
+    #[test]
+    fn the_arrows_turn_pages_unless_there_are_words_to_move_through() {
+        use crate::surface::Key;
+        let mut batch = Sheet::new(1, vec![text(), single()]);
+        assert!(batch.typing() && !batch.editing());
+        keys(&mut batch, &[Key::Right]);
+        assert_eq!(batch.tab, 1, "an empty line: the arrow turns the page");
+        keys(&mut batch, &[Key::Left]);
+        assert_eq!(batch.tab, 0);
+        batch.type_text("ab");
+        keys(&mut batch, &[Key::Left, Key::Right, Key::Left]);
+        assert_eq!(
+            batch.tab, 0,
+            "words to move through: the arrows stay on the page"
+        );
+        assert_eq!(typed(&batch), ("ab".into(), 1));
+        keys(&mut batch, &[Key::Tab]);
+        assert_eq!(batch.tab, 1, "Tab still turns it");
+        keys(&mut batch, &[Key::Right]);
+        assert_eq!(batch.tab, 2, "off the typing row the arrows turn pages");
+        keys(&mut batch, &[Key::BackTab, Key::BackTab]);
+        assert_eq!(batch.tab, 0);
+        assert_eq!(
+            typed(&batch),
+            ("ab".into(), 1),
+            "and the page kept its caret"
         );
     }
 }
