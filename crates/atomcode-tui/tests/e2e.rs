@@ -8564,6 +8564,89 @@ async fn a_guess_at_what_to_say_next_reaches_the_field_and_right_takes_it() {
     task.abort();
 }
 
+/// Plain `Tab` takes the guess too — the key the reference front end's hint row
+/// named (`Tab: …`), and the one this screen's row now names beside `→`.
+///
+/// Pinned with `ui.mode_switch_key = "tab"` on purpose: that is the one setting
+/// where plain Tab is somebody else's key, and a guess on an empty line still
+/// wins — so Tab always means what the row advertising it says. Without the
+/// guess, the same setting cycles (the test below).
+#[tokio::test]
+async fn a_guess_at_what_to_say_next_is_taken_by_plain_tab() {
+    let dir = scratch("suggested-tab");
+    let (s, host) = start_with_mode_host(
+        tree(&dir, &replay(r#"{ text = "ok" }"#), &[]),
+        Some(Arc::new(TabSwitch("tab"))),
+        Some(atomcode_host_api::Mode::Ask),
+    )
+    .await;
+    let task = s.open().await;
+    s.quiet().await;
+    let session = s.client().root();
+
+    host.push(atomcode_host_api::HostEvent::Suggested {
+        session,
+        text: "接着把登录那条补上".into(),
+    });
+    let mut shown = String::new();
+    for _ in 0..200 {
+        shown = composer_text(&s);
+        if shown.contains("接着把登录那条补上") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        shown.contains("Tab"),
+        "那一行说得出 Tab 能收下它:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::plain(Key::Tab));
+    for _ in 0..200 {
+        if composer_text(&s).contains("❯ 接着把登录那条补上") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let shown = composer_text(&s);
+    assert!(
+        shown.contains("❯ 接着把登录那条补上"),
+        "Tab 把它收进了输入行:\n{}",
+        s.screen()
+    );
+    assert!(
+        host.asked.lock().expect("asked poisoned").is_empty(),
+        "收下那句话和切模式是两件事,那一按只能干前一件"
+    );
+
+    // And it takes it only on an empty line. With words in the field — here the
+    // same sentence, now in the history, typed back as a prefix — plain Tab is
+    // the mode key again, and it does **not** quietly complete from history
+    // instead: that would be a key nobody advertised ahead of one this row does.
+    //
+    // Judged on the mode and not on the text: the completion is drawn as a dim
+    // ghost *inside* the line (`modules::input`), so scraping the composer cannot
+    // tell "offered" from "taken" — while a Tab that took something never
+    // reaches the mode key at all.
+    s.term.press(KeyPress::plain(Key::Enter));
+    s.quiet().await;
+    s.term.type_text("接着");
+    s.term.press(KeyPress::plain(Key::Tab));
+    for _ in 0..200 {
+        if !host.asked.lock().expect("asked poisoned").is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        host.asked.lock().expect("asked poisoned").as_slice(),
+        &[atomcode_host_api::Mode::AcceptEdits],
+        "行里有字的时候,Tab 还是那个模式键"
+    );
+    task.abort();
+}
+
 /// With `ui.mode_switch_key = "tab"` plain Tab cycles — the setting, not a
 /// second key.
 #[tokio::test]

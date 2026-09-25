@@ -1155,7 +1155,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             " (handed to the terminal; if it does not allow copying, nothing happened)".into()
         }
         Msg::ContextNoPrompt => "This host assembles no system prompt.".into(),
-        Msg::ComposerSuggested { text } => format!("press → to go on with: {text}").into(),
+        Msg::ComposerSuggested { text } => {
+            format!("press Tab or → to go on with: {text}").into()
+        }
         Msg::FileTooBigToPaste { path, size, cap } => format!(
             "{path} is {size}, too big to paste (the limit is {cap}). What is in the              composer is re-sent every turn; ask the model to read the file itself and              it will read only the lines it needs."
         )
