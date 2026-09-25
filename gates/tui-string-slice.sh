@@ -15,7 +15,14 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-out=$(cargo clippy --no-deps -p atomcode-tui --all-targets -- \
+# TUI_STRING_SLICE_MANIFEST 只给阴性对照(tui-string-slice.spec.sh)用:
+# 让同一条判据去量一个密封在 mktemp 里的 fixture crate。
+if [ -n "${TUI_STRING_SLICE_MANIFEST:-}" ]; then
+  target=(--manifest-path "$TUI_STRING_SLICE_MANIFEST")
+else
+  target=(-p atomcode-tui)
+fi
+out=$(cargo clippy --no-deps "${target[@]}" --all-targets -- \
         -A warnings -D clippy::string_slice 2>&1)
 if echo "$out" | grep -q "^error\[E\|^error: could not compile.*due to.*previous error" && \
    ! echo "$out" | grep -q "indexing into a string"; then

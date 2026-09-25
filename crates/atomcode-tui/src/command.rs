@@ -475,6 +475,10 @@ impl Commands {
 /// not a command, and must NOT be dispatched (which would answer "没有 /Users/…
 /// 这条命令"). Arguments that are themselves paths (`/cd /Users/me`) are fine —
 /// only the first token is inspected.
+#[allow(
+    clippy::string_slice,
+    reason = "`name_end` is a `find` result on `rest` itself, or `rest.len()`: a char boundary"
+)]
 pub fn looks_like_command(line: &str) -> bool {
     let Some(rest) = line.trim_start().strip_prefix('/') else {
         return false;

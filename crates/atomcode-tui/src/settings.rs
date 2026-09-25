@@ -438,8 +438,7 @@ impl Panel {
     /// the reason `Picker` does it: the list under the cursor just changed, so
     /// staying at the same index would be pointing at a different setting.
     pub fn type_into_search(&mut self, c: char) -> bool {
-        self.query.insert(self.query_caret, c);
-        self.query_caret += c.len_utf8();
+        crate::text::insert_at(&mut self.query, &mut self.query_caret, c);
         self.cursor = 0;
         true
     }
@@ -448,15 +447,13 @@ impl Panel {
     /// by byte — the box holds whatever was typed, including words that are not
     /// one byte per letter.
     pub fn backspace_search(&mut self) -> bool {
-        if self.query_caret == 0 {
+        // The shared caret helper snaps a caret that is not on a character
+        // boundary (both fields are public) instead of panicking on the slice.
+        let before = self.query.len();
+        crate::text::backspace_at(&mut self.query, &mut self.query_caret);
+        if self.query.len() == before {
             return false;
         }
-        let before = &self.query[..self.query_caret];
-        let Some((at, _)) = before.char_indices().next_back() else {
-            return false;
-        };
-        self.query.remove(at);
-        self.query_caret = at;
         self.cursor = 0;
         true
     }
@@ -836,6 +833,30 @@ pub trait Settings: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The search box's caret is a public byte offset. One that lands inside a
+    /// Chinese character (byte 1 of the three in "模") must be snapped, not
+    /// sliced at: the slice would panic in the middle of a key press.
+    #[test]
+    fn backspace_in_the_search_box_never_slices_inside_a_character() {
+        let mut panel = Panel {
+            query: "模型".into(),
+            query_caret: 1,
+            ..Panel::default()
+        };
+        assert!(!panel.backspace_search(), "no whole character before it");
+        assert_eq!(panel.query, "模型");
+
+        panel.query_caret = 4; // inside "型": snaps back to after "模"
+        assert!(panel.backspace_search());
+        assert_eq!(panel.query, "型");
+        assert_eq!(panel.query_caret, 0);
+
+        panel.query_caret = 2; // inside "型" again: typing lands before it
+        panel.type_into_search('新');
+        assert_eq!(panel.query, "新型");
+        assert_eq!(panel.query_caret, "新".len());
+    }
 
     fn row(id: &str, label: &str, value: &str, kind: SettingKind) -> SettingRow {
         SettingRow {

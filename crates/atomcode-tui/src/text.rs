@@ -131,6 +131,10 @@ pub fn collapse_home(path: &str) -> String {
 /// and a title saying `C:\\work\\thing` when it could say `thing` is the same
 /// waste on either OS. Falls back to the whole string when there is no
 /// separator in it, which is what a bare directory name already is.
+#[allow(
+    clippy::string_slice,
+    reason = "`at` is an `rfind` of a one-byte ASCII separator, so `at + 1` is a char boundary"
+)]
 pub fn basename(path: &str) -> &str {
     let trimmed = path.trim_end_matches(['/', '\\']);
     match trimmed.rfind(['/', '\\']) {
@@ -148,6 +152,10 @@ pub fn basename(path: &str) -> &str {
 ///
 /// `Some("")` — a bare `@` at the end — is a real answer: it lists the working
 /// directory, which is how a person finds out what is there.
+#[allow(
+    clippy::string_slice,
+    reason = "`at` is an `rfind('@')` on `typed`; `@` is one byte, so `at + 1` is a char boundary"
+)]
 pub fn being_pathed(typed: &str) -> Option<&str> {
     let at = typed.rfind('@')?;
     let opens = at == 0
@@ -189,6 +197,10 @@ pub fn one_line(raw: &str) -> String {
 /// `None` while browsing the history (the field is already showing an entry),
 /// for an empty field (everything would match), and for an exact repeat (there
 /// is nothing left to accept).
+#[allow(
+    clippy::string_slice,
+    reason = "`entry.starts_with(typed)` holds, so `typed.len()` is a char boundary of `entry`"
+)]
 pub fn ghost<'a>(typed: &str, history: &'a [String], browsing: bool) -> Option<&'a str> {
     if browsing || typed.is_empty() {
         return None;
@@ -388,6 +400,10 @@ pub fn collapse_home_in_command(command: &str) -> String {
 }
 
 /// The implementation, with home explicit. See [`collapse_home_in_command`].
+#[allow(
+    clippy::string_slice,
+    reason = "`i` only advances by a whole char's `len_utf8` or by `home.len()` after `strip_prefix(home)` matched: always a char boundary"
+)]
 pub fn collapse_home_in_command_with(command: &str, home: Option<&std::path::Path>) -> String {
     let Some(home) = home else {
         return command.to_string();
@@ -499,6 +515,10 @@ pub(crate) fn insert_at(text: &mut String, caret: &mut usize, c: char) {
 }
 
 /// Take out the character before the caret.
+#[allow(
+    clippy::string_slice,
+    reason = "`at` comes from `snap`, which walks back to `is_char_boundary`"
+)]
 pub(crate) fn backspace_at(text: &mut String, caret: &mut usize) {
     let at = snap(text, *caret);
     let Some(previous) = text[..at].chars().next_back() else {
@@ -519,6 +539,10 @@ pub(crate) fn delete_at(text: &mut String, caret: &mut usize) {
 }
 
 /// The caret, one character further along — or where it was, at either end.
+#[allow(
+    clippy::string_slice,
+    reason = "`at` comes from `snap`, which walks back to `is_char_boundary`"
+)]
 pub(crate) fn step_caret(text: &str, caret: usize, forward: bool) -> usize {
     let at = snap(text, caret);
     match forward {

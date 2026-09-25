@@ -906,6 +906,10 @@ mod tests {
     /// sixteen, so every gloss started where its own name ended. On a panel
     /// with room for them they are one column.
     #[test]
+    #[allow(
+        clippy::string_slice,
+        reason = "test: offset is a `find` on the same row, a char boundary"
+    )]
     fn long_skill_names_still_line_their_glosses_up() {
         let names = [
             "adapter-check-principle",

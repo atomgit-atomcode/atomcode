@@ -680,6 +680,10 @@ mod tests {
 
     // Spans cover each marker whole, so editing can treat it as one chip.
     #[test]
+    #[allow(
+        clippy::string_slice,
+        reason = "test: spans come from `marker_spans`, whose edges are ASCII `[` / `]`"
+    )]
     fn marker_spans_cover_each_marker_whole() {
         let text = "a [Image #2] b [Image #10] c";
         let spans = marker_spans(text);

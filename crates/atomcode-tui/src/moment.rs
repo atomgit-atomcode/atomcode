@@ -232,6 +232,10 @@ fn normalize_newlines(text: &str) -> String {
 /// (index `N - 1`). A malformed or out-of-range marker is left exactly as
 /// written. Called at submit: the model gets the whole paste, while the composer
 /// and the history keep the terse marker.
+#[allow(
+    clippy::string_slice,
+    reason = "`start` / `end` come from `find` of an ASCII marker and of `]` (one byte) in the same string, so `..=end` and `end + 1` are char boundaries"
+)]
 pub fn expand_pastes(text: &str, pastes: &[String]) -> String {
     if pastes.is_empty() {
         return text.to_string();

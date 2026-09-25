@@ -944,6 +944,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::string_slice,
+        reason = "test: `at` is a `find` on the same header, a char boundary"
+    )]
     fn the_header_is_where_a_click_on_a_tab_lands() {
         // The hit test walks the same header the frame drew, so the second tab's
         // own cells answer with the second tab.

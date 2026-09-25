@@ -2734,6 +2734,10 @@ mod tests {
     /// column, since `请求次数` is four characters and eight cells. Four of the
     /// seven figures were missing here entirely.
     #[test]
+    #[allow(
+        clippy::string_slice,
+        reason = "test: offsets are `find` results (plus the found label's own length) on the same line, and `line.len() - value.len()` is where its suffix `value` starts"
+    )]
     fn the_overview_says_all_seven_figures_in_two_columns_that_line_up() {
         use atomcode_host_api::{DayUse, ModelUse, UsageStats};
         // Two runs of working days: three, then a gap, then two that reach the

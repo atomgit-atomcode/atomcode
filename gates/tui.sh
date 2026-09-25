@@ -84,6 +84,8 @@ step "分层：OS 差异不得漏出屏蔽层" gates/tui-layers.sh
 step "分层闸门自身会判红"          gates/tui-layers.spec.sh
 step "i18n：屏幕不得写死中文"      gates/tui-i18n.sh
 step "i18n 闸门自身会判红"        gates/tui-i18n.spec.sh
+step "字节切片：每处都说明为何安全" gates/tui-string-slice.sh
+step "字节切片闸门自身会判红"      gates/tui-string-slice.spec.sh
 step "阴性对照：坏东西必须判红"    gates/tui-negative.sh
 step "格式"                        cargo fmt -p atomcode-tui -- --check
 # `--no-deps` is load-bearing, not tidiness: without it `-D warnings` promotes

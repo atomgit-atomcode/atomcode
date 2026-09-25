@@ -226,6 +226,10 @@ fn lay(input: &str, caret: usize, body: usize) -> (Vec<String>, (usize, usize), 
 /// Scans the row itself rather than mapping the whole field's spans through the
 /// wrap, so a marker split across a wrap boundary is simply left plain (harmless)
 /// instead of risking an off-by-one into the non-ASCII text a person typed.
+#[allow(
+    clippy::string_slice,
+    reason = "marker spans are ASCII `[` / `]` edges found in `row` itself; every cut is a char boundary"
+)]
 fn image_chip_segments(row: &str) -> Vec<crate::el::El> {
     use crate::el::El;
     let spans = crate::attach::marker_spans(row);
@@ -237,10 +241,6 @@ fn image_chip_segments(row: &str) -> Vec<crate::el::El> {
     let mut cursor = 0;
     // Every cut is a marker edge (ASCII `[` / `]`) or a prior one, so it lands on
     // a char boundary even when the text between markers is Chinese.
-    #[allow(
-        clippy::string_slice,
-        reason = "marker spans are ASCII edges; every cut is a char boundary"
-    )]
     for span in spans {
         if span.start > cursor {
             out.push(El::raw(row[cursor..span.start].to_string()));

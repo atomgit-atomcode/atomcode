@@ -664,6 +664,10 @@ impl Content for VlCaptionBlock {
 /// Locale-robust: the marker's fixed parts are read from the very i18n string
 /// that wrote it ([`PMsg::VisionRecognised`]), so a translated marker still
 /// splits — there is no hardcoded `[图片内容` prefix to drift.
+#[allow(
+    clippy::string_slice,
+    reason = "`start` is an `rfind(pre)` on `text`, and `start + pre.len()` is the end of that same match: both char boundaries"
+)]
 pub fn split_vl_caption(text: &str) -> Option<(String, String, String)> {
     const MODEL: &str = "\u{1}";
     const BODY: &str = "\u{2}";
@@ -2683,6 +2687,10 @@ mod tests {
     /// This is the one a fork needs. Before it, changing the name meant editing
     /// the layout code and the cell count in three places.
     #[test]
+    #[allow(
+        clippy::string_slice,
+        reason = "test: offset is a `find` on the same line, a char boundary"
+    )]
     fn another_build_can_call_itself_something_else() {
         let mine = Brand {
             name: "◆ 龙仔".into(),

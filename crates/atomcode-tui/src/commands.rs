@@ -4444,6 +4444,10 @@ mod tests {
     /// 的取值清单是一整句用法,`/cd` 的也一样。读的是面板真正画出来的那几行,
     /// 所以被验证的是看见的东西,不是某个自己算的列宽。
     #[test]
+    #[allow(
+        clippy::string_slice,
+        reason = "test: `at` is a `find` on the same row, a char boundary"
+    )]
     fn every_gloss_in_the_shipped_menu_starts_in_one_cell() {
         let c = builtin_for_test();
         let items: Vec<crate::menu::Item> = c
@@ -4510,6 +4514,10 @@ mod tests {
     ///
     /// 行宽给足,免得面板把行尾切掉:这里问的是列,不是截断。顺带钉住行尾那条规矩 ——
     /// 参数说明在描述**之后**,两者之间不隔着命令名。
+    #[allow(
+        clippy::string_slice,
+        reason = "test: `at` is a `find` on the same row, a char boundary"
+    )]
     fn gloss_cells(items: &[crate::menu::Item]) -> Vec<Option<usize>> {
         let list = crate::menu::Slash::new(items.to_vec());
         let rows = list.render(

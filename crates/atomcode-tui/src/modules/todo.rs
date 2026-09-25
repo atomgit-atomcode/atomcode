@@ -739,6 +739,10 @@ mod tests {
     /// Every item's text starts in the same column, however many digits its
     /// number has, and the `+N` line sits under the numbers.
     #[test]
+    #[allow(
+        clippy::string_slice,
+        reason = "test: offset is a `find` on the same line, a char boundary"
+    )]
     fn the_text_column_lines_up_across_one_and_two_digit_numbers() {
         let body = serde_json::json!({
             "todos": (0..12)

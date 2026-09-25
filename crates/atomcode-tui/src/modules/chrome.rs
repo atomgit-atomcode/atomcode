@@ -137,6 +137,10 @@ pub fn edit_line(
 /// is what a terminal caret does and what makes the end of a line work: there is
 /// no character to sit on, so a block is appended instead and both cases read
 /// the same.
+#[allow(
+    clippy::string_slice,
+    reason = "`at` is snapped to `is_char_boundary` just above"
+)]
 pub fn caret_spans(text: &str, at: usize, base: Style, room: usize) -> Vec<Span> {
     let at = at.min(text.len());
     // Snap to a character boundary: a byte offset from the middle of a
