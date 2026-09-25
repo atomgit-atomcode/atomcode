@@ -481,6 +481,25 @@ fn data_rows(parsed: &[Vec<String>]) -> Vec<&Vec<String>> {
     parsed.iter().filter(|r| !is_separator(r)).collect()
 }
 
+/// The rows to draw, and whether the first of them is a header.
+///
+/// GFM requires a header row, and a table with nothing to label its columns with
+/// — a `key：value` record list — is written with an empty one. Taken as a header
+/// it is drawn as a blank bold row with a `├┼┤` rule around nothing, which is a
+/// box that says "table" and then says nothing at all.
+///
+/// So an all-blank first row is not a header: it is dropped, and the first row
+/// left is body. Only when a row is left — a table that is nothing but a blank
+/// header keeps the box it had, rather than collapsing to one border.
+fn rows_and_header(parsed: &[Vec<String>]) -> (Vec<&Vec<String>>, bool) {
+    let rows = data_rows(parsed);
+    let blank_head = rows.len() > 1 && rows[0].iter().all(|cell| cell.trim().is_empty());
+    (
+        rows.into_iter().skip(usize::from(blank_head)).collect(),
+        !blank_head,
+    )
+}
+
 /// One content cell inside its borders: left pad, the cell, the fill to the
 /// column width, right pad. The caller draws the `│` between cells; this is just
 /// what sits in one column.
@@ -499,10 +518,10 @@ fn padded_cell(spans: &mut Vec<Span>, content: Vec<Span>, used: usize, cw: usize
 /// header set in bold (the body's colour, not a highlight), and `├┼┤` rules
 /// between every pair of rows.
 fn aligned(parsed: &[Vec<String>], col_widths: &[usize], base: Style) -> Vec<Line> {
-    let rows = data_rows(parsed);
+    let (rows, labeled) = rows_and_header(parsed);
     let mut out = vec![border_line(col_widths, TOP_L, TOP_MID, TOP_R)];
     for (i, row) in rows.iter().enumerate() {
-        let style = if i == 0 { base.bold() } else { base };
+        let style = if labeled && i == 0 { base.bold() } else { base };
         let mut spans = vec![Span::styled(VERT.to_string(), fence())];
         for (j, &cw) in col_widths.iter().enumerate() {
             let cell = cell_line(row.get(j).map(String::as_str).unwrap_or(""), style);
@@ -525,10 +544,10 @@ fn aligned(parsed: &[Vec<String>], col_widths: &[usize], base: Style) -> Vec<Lin
 /// tier promises.
 fn wrapped_grid(parsed: &[Vec<String>], col_widths: &[usize], base: Style) -> Vec<Line> {
     let ncols = col_widths.len();
-    let rows = data_rows(parsed);
+    let (rows, labeled) = rows_and_header(parsed);
     let mut out = vec![border_line(col_widths, TOP_L, TOP_MID, TOP_R)];
     for (i, row) in rows.iter().enumerate() {
-        let style = if i == 0 { base.bold() } else { base };
+        let style = if labeled && i == 0 { base.bold() } else { base };
         let wrapped: Vec<Vec<String>> = (0..ncols)
             .map(|j| {
                 let cell = row.get(j).map(String::as_str).unwrap_or("");
@@ -564,13 +583,14 @@ fn wrapped_grid(parsed: &[Vec<String>], col_widths: &[usize], base: Style) -> Ve
 /// whole justification.
 fn flat(parsed: &[Vec<String>], w: u16, base: Style) -> Vec<Line> {
     let ncols = effective_ncols(parsed);
-    let mut rows = data_rows(parsed);
-    // The first content row is the header when the block has a delimiter row,
-    // which `render` has already established.
-    let headers: Vec<String> = rows.first().map(|h| (*h).clone()).unwrap_or_default();
-    if !headers.is_empty() {
-        rows.remove(0);
-    }
+    let (mut rows, labeled) = rows_and_header(parsed);
+    // The labels are the header's own cells. A table without a header has none to
+    // label with, and a bare `：` in front of every value is a separator between
+    // nothing and something.
+    let headers: Vec<String> = match labeled {
+        true => rows.remove(0).iter().cloned().collect(),
+        false => Vec::new(),
+    };
     let label_w = headers
         .iter()
         .map(|h| visible_width(h, base))
@@ -899,6 +919,56 @@ mod tests {
         );
     }
 
+    /// A blank header row is not a header.
+    ///
+    /// GFM makes the writer put a header row there whatever the table holds, and a
+    /// `key：value` record list has nothing to label its columns with — so it goes
+    /// in empty. Taken as a header it was drawn as a blank row with a `├┼┤` rule
+    /// around nothing: a box that says "table" and then says nothing.
+    #[test]
+    fn a_blank_header_row_is_not_drawn_as_a_header() {
+        let body = ["| 提交 | f505bdb71 |", "| 改动 | host.rs |"];
+
+        let unlabeled = drawn(&["| | |", "|---|---|", body[0], body[1]], 40);
+        assert_eq!(unlabeled.len(), 5, "top, two rows, bottom: {unlabeled:?}");
+        assert_eq!(
+            rows_of(&unlabeled).len(),
+            2,
+            "the blank row is not one of them: {unlabeled:?}"
+        );
+        assert!(
+            unlabeled[1].contains("提交"),
+            "the first row is body: {unlabeled:?}"
+        );
+
+        // And the row that takes its place is body, not a header under a blank
+        // one: nothing was labeled, so nothing is emboldened.
+        let source: Vec<String> = ["| | |", "|---|---|", body[0], body[1]]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let lines = render(&source, 40, Style::new()).unwrap();
+        let cell = lines[1]
+            .spans
+            .iter()
+            .find(|s| s.text == "提交")
+            .expect("the first body cell");
+        assert!(!cell.style.bold, "a table without a header has no bold row");
+
+        // The same body under a real header keeps the header and its rule.
+        let labeled = drawn(&["| 项目 | 值 |", "|---|---|", body[0], body[1]], 40);
+        assert_eq!(
+            labeled.len(),
+            7,
+            "top, header, rule, two rows, bottom: {labeled:?}"
+        );
+        assert!(labeled[1].contains("项目"), "{labeled:?}");
+        assert!(
+            labeled[2].starts_with('├'),
+            "the header keeps its rule: {labeled:?}"
+        );
+    }
+
     /// The flat records tier styles its header labels the same way the grid
     /// does: bold, not highlighted. The grid test above only exercises `aligned`
     /// (the rows fit at width 40); a narrow width drops to `flat`, and without
@@ -1166,6 +1236,33 @@ mod tests {
                 .filter(|l| l.contains(':'))
                 .all(|l| l.contains('：')),
             "the label separator is the full-width colon: {out:?}"
+        );
+    }
+
+    /// A table without a header has nothing to label its values with, so the flat
+    /// tier does not hang a bare `：` in front of each one.
+    #[test]
+    fn flat_records_of_a_table_without_a_header_carry_no_label() {
+        let out = drawn(
+            &[
+                "| | |",
+                "|---|---|",
+                "| a_very_long_identifier | another_long_identifier |",
+            ],
+            30,
+        );
+        // One line per cell, each standing alone: no `：` with nothing on its left.
+        assert_eq!(out.len(), 2, "one line per cell: {out:?}");
+        assert!(
+            !out.iter().any(|l| l.contains('：')),
+            "a separator between nothing and something: {out:?}"
+        );
+        // The values are the cells' own words. Read as *drawn*, not as written:
+        // the inline renderer eats the `_` pairs (`a_very_long_identifier` comes
+        // out `averylong_identifier`), which is that renderer's business.
+        assert!(
+            out.iter().all(|l| l.contains("identifier")),
+            "the values are still there: {out:?}"
         );
     }
 
