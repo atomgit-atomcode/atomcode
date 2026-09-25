@@ -300,6 +300,17 @@ impl Allowance {
     }
 }
 
+/// One line said while a turn was running and not yet handed to the model.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Queued {
+    /// The receipt it was sent under — what ties it to the runtime's answer.
+    pub id: String,
+    /// As sent, `[Image #N]` markers included.
+    pub text: String,
+    /// Its place in the order lines were typed ([`Moment::queued_seq`]).
+    pub seq: u64,
+}
+
 /// The non-derivable half of what a module renders from.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Moment {
@@ -523,18 +534,39 @@ pub struct Moment {
     /// waiting and answers each withdrawn send `Rejected { NotRunning }`, and
     /// only a line named by such an answer is one the model will never get.
     /// Kept and cleared with `steering`.
-    pub queued: Vec<(String, String)>,
+    pub queued: Vec<Queued>,
+    /// The ticket the next queued line takes: its place in the order lines
+    /// were typed, which is the order they are handed back or sent again in.
+    pub queued_seq: u64,
     /// Lines the runtime withdrew, oldest first, waiting for the turn to be
     /// over so they can be handed back — or, after `Ctrl+X`, sent again.
     ///
     /// Only what was withdrawn: a stop that lost the race to the turn's own
     /// end withdrew nothing, the lines went on to the model, and giving them
     /// back as well would say them twice.
-    pub withdrawn: Vec<String>,
-    /// The last stop was `Ctrl+X`: what it withdraws goes out again, each as
-    /// its own message, rather than back to the composer. `esc` and `ctrl-c`
-    /// set it false, so it always says what the latest stop asked for.
+    ///
+    /// Oldest first by ticket, not by arrival: a fold the stop overtook (the
+    /// runtime had already taken it out of the inbox) is refused after the ones
+    /// still in the inbox, though it was typed before them.
+    pub withdrawn: Vec<Queued>,
+    /// The stop in progress was `Ctrl+X`: what it withdraws goes out again,
+    /// each as its own message, rather than back to the composer. `esc` and
+    /// `ctrl-c` set it false, and the stop's settling clears it whether or not
+    /// anything was withdrawn — so it never outlives the stop that set it and
+    /// turns a later, internal cancel into a resend.
     pub resend_withdrawn: bool,
+    /// A stop was asked for and its turn has not settled yet: the lines queued
+    /// behind it are on their way back (withdrawn, then settled), not on their
+    /// way to the model. What a switch of view must not drop.
+    pub stopping: bool,
+    /// Receipts of lines already handed back while the refusal that names them
+    /// was still to come — the view they were queued in was left mid-stop.
+    /// The refusal, when it arrives, is expected rather than news.
+    pub handed_back: std::collections::BTreeSet<String>,
+    /// The lead's turn has started on this screen and not yet ended, by its
+    /// turn events. While it has, its end is still coming and is where a stop
+    /// settles; the agent's status going idle is not.
+    pub turn_open: bool,
     /// 人自己跑过的 `!` 命令与它们的输出,等着跟下一条消息一起给模型。
     ///
     /// 攒着而不是当场发:跑一条 `!git status` 不是在对模型说话,不该因此开

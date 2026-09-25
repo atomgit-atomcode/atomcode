@@ -418,10 +418,26 @@ pub struct ClaimedInput {
 plexus_event!(
     /// A turn took a message a driver wants a receipt for (`docs/adr/0021` §7).
     ///
-    /// Emitted the moment the message is claimed, because that is the first
-    /// moment anyone knows whether it starts a turn or joins the one running.
+    /// Emitted once the turn has kept the message — claimed, past `PreStep`,
+    /// and about to enter the log — because that is the first moment anyone
+    /// knows whether it starts a turn or joins the one running, and whether it
+    /// joins it at all: a fold a stop overtook is [`InputWithdrawn`] instead.
     /// Emitted on the agent's own context, like [`InboxInserted`].
     InputClaimed, "agent/inbox/claimed", Emit, ClaimedInput
+);
+
+plexus_event!(
+    /// A message a turn had claimed to fold in, given up because the person
+    /// stopped the turn before it reached the log.
+    ///
+    /// The same answer [`crate::agent::Agent::stand_down`] gives what is still
+    /// waiting in the inbox, for the one message that was already out of it:
+    /// claimed at a step boundary, then held by `PreStep` (a picture being
+    /// recognised can take seconds) while the stop landed. Committed anyway, it
+    /// went into a turn that was over before it was asked anything — in the
+    /// conversation, never answered, and never handed back. The driver answers
+    /// its receipt `Rejected { NotRunning }`, exactly as for the rest.
+    InputWithdrawn, "agent/inbox/withdrawn", Emit, ClaimedInput
 );
 
 plexus_event!(

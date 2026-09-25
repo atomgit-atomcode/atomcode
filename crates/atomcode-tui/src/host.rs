@@ -1590,9 +1590,13 @@ impl Host {
         m.turn_started = None;
         m.quiet_since = None;
         m.steering.clear();
+        // What a stop withdrew was taken off before this (`Host::take_stopped`);
+        // the rest of the queue belongs to the view being left.
         m.queued.clear();
         m.withdrawn.clear();
         m.resend_withdrawn = false;
+        m.stopping = false;
+        m.turn_open = false;
         // The `正在识别图片` line belongs to a picture sent into the view being
         // left; carried across it would claim the arriving conversation is
         // recognising one it never saw. (Its own message fact clears it in the
@@ -2110,11 +2114,16 @@ impl Host {
             next.push('\n');
         }
         next.push_str(text);
-        self.moment
-            .write()
-            .expect("moment poisoned")
-            .queued
-            .push((id.to_string(), text.to_string()));
+        {
+            let mut m = self.moment.write().expect("moment poisoned");
+            let seq = m.queued_seq;
+            m.queued_seq += 1;
+            m.queued.push(crate::moment::Queued {
+                id: id.to_string(),
+                text: text.to_string(),
+                seq,
+            });
+        }
         self.set_steering(next);
     }
 
@@ -2149,17 +2158,13 @@ impl Host {
                 let at = m
                     .queued
                     .iter()
-                    .position(|(_, text)| text == input)
+                    .position(|queued| queued.text == input)
                     .or_else(|| (!m.queued.is_empty()).then_some(0));
                 if let Some(at) = at {
                     m.queued.remove(at);
                 }
             }
-            m.queued
-                .iter()
-                .map(|(_, text)| text.as_str())
-                .collect::<Vec<_>>()
-                .join("\n")
+            waiting(&m.queued)
         };
         self.set_steering(rest);
     }
@@ -2170,19 +2175,46 @@ impl Host {
     pub fn withdraw_queued(&self, id: &str) -> bool {
         let rest = {
             let mut m = self.moment.write().expect("moment poisoned");
-            let Some(at) = m.queued.iter().position(|(queued, _)| queued == id) else {
+            let Some(at) = m.queued.iter().position(|queued| queued.id == id) else {
                 return false;
             };
-            let (_, text) = m.queued.remove(at);
-            m.withdrawn.push(text);
-            m.queued
-                .iter()
-                .map(|(_, text)| text.as_str())
-                .collect::<Vec<_>>()
-                .join("\n")
+            let line = m.queued.remove(at);
+            // In the order they were typed, whatever order the refusals came
+            // in (see `Moment::withdrawn`).
+            let before = m.withdrawn.partition_point(|w| w.seq < line.seq);
+            m.withdrawn.insert(before, line);
+            waiting(&m.queued)
         };
         self.set_steering(rest);
         true
+    }
+
+    /// Everything a stop in progress is taking back, taken off the screen now:
+    /// the lines already withdrawn, and — while the stop has yet to settle —
+    /// the lines still listed, whose refusals are still to come. Oldest first.
+    ///
+    /// For leaving the view mid-stop. The turn's end, which settles a stop, is
+    /// the view's own, and a screen showing another agent never sees it; so
+    /// what the stop took back is handed over now rather than cleared with the
+    /// view. The refusals still to come are remembered (`Moment::handed_back`)
+    /// so they arrive as expected rather than as `没有送达`.
+    pub fn take_stopped(&self) -> Vec<String> {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let mut lines = std::mem::take(&mut m.withdrawn);
+        if m.stopping {
+            let pending = std::mem::take(&mut m.queued);
+            for line in &pending {
+                m.handed_back.insert(line.id.clone());
+            }
+            lines.extend(pending);
+            lines.sort_by_key(|line| line.seq);
+        }
+        m.stopping = false;
+        m.resend_withdrawn = false;
+        let rest = waiting(&m.queued);
+        drop(m);
+        self.set_steering(rest);
+        lines.into_iter().map(|line| line.text).collect()
     }
 
     /// Replace what is waiting, pinned. `false` when it did not change.
@@ -5714,6 +5746,15 @@ pub fn default_layout() -> Region {
     )
 }
 
+/// What the steering panel draws for `queued`: one line each, oldest first.
+fn waiting(queued: &[crate::moment::Queued]) -> String {
+    queued
+        .iter()
+        .map(|queued| queued.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5745,7 +5786,7 @@ mod tests {
         h.steered(&["a"]);
         let queued = |h: &Host| -> Vec<String> {
             let m = h.moment.read().unwrap();
-            m.queued.iter().map(|(_, t)| t.clone()).collect()
+            m.queued.iter().map(|q| q.text.clone()).collect()
         };
         assert_eq!(queued(&h), vec!["b", "c"], "one fold, one line off");
         assert_eq!(h.moment.read().unwrap().steering, "b\nc");
@@ -5758,7 +5799,15 @@ mod tests {
             !h.withdraw_queued("tui-1"),
             "a folded line is not withdrawn"
         );
-        assert_eq!(h.moment.read().unwrap().withdrawn, vec!["b", "c"]);
+        let withdrawn: Vec<String> = h
+            .moment
+            .read()
+            .unwrap()
+            .withdrawn
+            .iter()
+            .map(|w| w.text.clone())
+            .collect();
+        assert_eq!(withdrawn, vec!["b", "c"]);
     }
 
     fn mark_fg_of(h: &Host, tick: u64) -> Option<crate::frame::Color> {

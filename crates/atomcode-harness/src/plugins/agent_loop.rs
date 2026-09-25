@@ -405,16 +405,21 @@ impl PluginAgentLoop {
             // later passes this is what folds a mid-turn message into the turn
             // already running instead of making it wait for the next one.
             let claimed = agent.inbox().claim();
-            if let (Some(receipt), true) = (claimed.receipt.clone(), claimed.message.is_some()) {
-                agent
-                    .ctx()
-                    .emit::<crate::events::InputClaimed>(&crate::events::ClaimedInput {
-                        agent: agent.id(),
-                        receipt,
-                        turn,
-                        steered: step > 0,
-                    });
-            }
+            // The receipt is answered once the turn has kept the message, not
+            // here: a stop can still overtake it (below).
+            let answering = match (&claimed.receipt, claimed.message.is_some()) {
+                (Some(receipt), true) => Some(crate::events::ClaimedInput {
+                    agent: agent.id(),
+                    receipt: receipt.clone(),
+                    turn,
+                    steered: step > 0,
+                }),
+                _ => None,
+            };
+            let folded = match (&claimed.message, step > 0) {
+                (Some(text), true) => Some((text.clone(), claimed.origin)),
+                _ => None,
+            };
             let mut decision = StepDecision {
                 turn,
                 step: step + 1,
@@ -434,7 +439,39 @@ impl PluginAgentLoop {
                         Box::pin(async move { d })
                     })
                     .await;
+            }
 
+            // A fold the person's stop overtook. `stand_down` withdrew what was
+            // still in the inbox when the stop landed; this one was already out
+            // of it, held by `PreStep` (recognising a picture takes seconds).
+            // Committed anyway it joined a turn that ends before asking anything
+            // — in the conversation, never answered, never handed back. So it is
+            // withdrawn like the rest: not logged, its receipt refused, a peer's
+            // report kept as a note and its context kept for the next turn.
+            if let (Some((text, origin)), true) = (&folded, agent.cancelled()) {
+                if let Some(input) = &answering {
+                    agent.ctx().emit::<crate::events::InputWithdrawn>(input);
+                }
+                for (context, from) in std::mem::take(&mut decision.injections) {
+                    agent.note(context, from);
+                }
+                if let MessageOrigin::Peer(sender) = origin {
+                    let from = self
+                        .ctx
+                        .service::<crate::seams::AgentsSvc>()
+                        .and_then(|a| a.get(*sender))
+                        .map(|a| a.session_id().to_string())
+                        .unwrap_or_else(|| format!("agent-{sender}"));
+                    agent.note(text.clone(), InjectionOrigin::Peer { from });
+                }
+                outcome.stop = StopReason::Cancelled;
+                break;
+            }
+            if let Some(input) = &answering {
+                agent.ctx().emit::<crate::events::InputClaimed>(input);
+            }
+
+            if !decision.is_empty() || step == 0 {
                 if let Some(reason) = decision.rejected.clone() {
                     // The attempt is a fact even though nothing was sent: a
                     // turn that was refused must be visible in the log.

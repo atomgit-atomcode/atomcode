@@ -2894,14 +2894,25 @@ impl Tui {
     /// step — so the rest wait in its inbox the way a line typed mid-turn does,
     /// and are listed the same way: a stop before they are folded in withdraws
     /// them too, and they come back like any other.
+    ///
+    /// Settling is also where the stop ends: whether or not it took anything
+    /// back, what it asked for (`resend_withdrawn`) is spent here. Left set by a
+    /// `Ctrl+X` that found nothing to withdraw, it made a later cancel that no
+    /// one pressed — a model switch reconfiguring the turn — send lines again
+    /// instead of handing them back.
     fn settle_withdrawn(&self) {
         let (withdrawn, resend) = {
             let mut m = self.host.moment.write().expect("moment poisoned");
+            let resend = std::mem::take(&mut m.resend_withdrawn);
+            m.stopping = false;
             if m.withdrawn.is_empty() {
                 return;
             }
-            let resend = std::mem::take(&mut m.resend_withdrawn);
-            (std::mem::take(&mut m.withdrawn), resend)
+            let withdrawn: Vec<String> = std::mem::take(&mut m.withdrawn)
+                .into_iter()
+                .map(|line| line.text)
+                .collect();
+            (withdrawn, resend)
         };
         if !resend {
             self.hand_back(withdrawn);
@@ -3835,7 +3846,12 @@ impl Tui {
         let Some(known) = self.client.look_at(session) else {
             return false;
         };
+        // What a stop in progress is taking back comes back now: the turn end
+        // that would settle it belongs to the view being left, and this screen
+        // will not see it.
+        let stopped = self.host.take_stopped();
         self.host.switch_view();
+        self.hand_back(stopped);
         for logged in &known {
             self.host.absorb_logged(logged);
         }
@@ -3856,6 +3872,9 @@ impl Tui {
         if let Some(activity) = activity {
             m.activity = activity;
         }
+        // Back on a lead that is still working, its turn end is still to come
+        // — the start was dropped while a member was on screen, not undone.
+        m.turn_open = session == self.client.root() && activity.is_some();
         true
     }
 
@@ -4128,6 +4147,20 @@ impl Tui {
             }
             AgentEvent::Rejected { command, error } => {
                 self.client.answered(&command);
+                // A queued line already handed back when its view was left
+                // mid-stop (`Host::take_stopped`): this is the refusal that was
+                // expected, not news.
+                if matches!(error, atomcode_kernel::event::CommandError::NotRunning)
+                    && self
+                        .host
+                        .moment
+                        .write()
+                        .expect("moment poisoned")
+                        .handed_back
+                        .remove(&command)
+                {
+                    return false;
+                }
                 // A queued line the person's stop withdrew. It is on its way
                 // back to the composer (or out again, for `Ctrl+X`), so it is
                 // neither a failure to report nor a reason to put the last
@@ -4205,6 +4238,18 @@ impl Tui {
                         AgentStatus::Working => Activity::Working,
                         AgentStatus::Stopping => Activity::Stopping,
                     });
+                    // And its turn's end, for the same reason: a member's turn
+                    // events are not on this connection, so its going idle is
+                    // the turn ending — what was queued behind it goes with the
+                    // turn, and what a stop withdrew is settled here, as the
+                    // lead's is at `TurnComplete`. Without it a stop pressed on
+                    // a member's screen settled nothing, and the lines it
+                    // withdrew were cleared with the view.
+                    if status == AgentStatus::Idle {
+                        self.host.clear_steering();
+                        self.settle_withdrawn();
+                        changed = true;
+                    }
                 } else if on_screen && status == AgentStatus::Idle && self.client.settled() {
                     // The lead's own line is moved by its turn events, which say
                     // more than a status does — but only while they arrive. When
@@ -4214,6 +4259,14 @@ impl Tui {
                     // still unclaimed, is the backstop: the screen never keeps
                     // insisting on work the agent says is over.
                     changed |= self.set_activity(crate::moment::Activity::Idle);
+                    // A stop settles there too, when no turn end is still to
+                    // come: one that never opened (stopped before it began) has
+                    // none. While one is open its end is still on its way, by
+                    // another road than this status, and settling ahead of it
+                    // would have that end wipe the resent lines off the panel.
+                    if !self.host.moment.read().expect("moment poisoned").turn_open {
+                        self.settle_withdrawn();
+                    }
                 }
                 changed
             }
@@ -4274,7 +4327,10 @@ impl Tui {
             // Arm the working line rather than raise it here: it settles when the
             // turn's first fact is folded (`AgentEvent::Fact`), so "正在等待模型"
             // never paints a frame ahead of the message that started the turn.
-            AgentEvent::TurnStarted { .. } => self.host.arm_working(),
+            AgentEvent::TurnStarted { .. } => {
+                self.host.moment.write().expect("moment poisoned").turn_open = true;
+                self.host.arm_working()
+            }
             // A cancel (whoever asked for it) or a failure can end the turn with
             // words still in the inbox — nothing folded them, and no `Steered` is
             // coming. The panel is a claim about the model's inbox, so it goes
@@ -4293,6 +4349,7 @@ impl Tui {
                 // then `TurnComplete`, and a line resent at the first would be
                 // wiped off the panel by the second.
                 if matches!(event, AgentEvent::TurnComplete { .. }) {
+                    self.host.moment.write().expect("moment poisoned").turn_open = false;
                     self.settle_withdrawn();
                 }
                 // A turn just spent some of the allowance, so this is the
@@ -5115,6 +5172,7 @@ impl Tui {
                     // The same stop as `esc`, and the queue comes back the same
                     // way: stopped is not thrown away.
                     m.resend_withdrawn = false;
+                    m.stopping = true;
                     drop(m);
                     self.stop_turn(client);
                     return false;
@@ -5450,6 +5508,9 @@ impl Tui {
                 // 同一个线程上的第二把写锁 —— 当场死锁。
                 // 收走的不是面板上那一串,是逐条的原话:重发要一条是一条,和
                 // 回合里插进去时一个样子,而不是拼成一条人没写过的话。
+                // A stop with a turn to settle it; on an idle screen there is
+                // nothing to take back.
+                m.stopping = m.turn_in_flight() || !client.settled();
                 if !m.queued.is_empty() {
                     m.resend_withdrawn = true;
                 } else {
@@ -5491,6 +5552,7 @@ impl Tui {
                     // in the transcript already, the queued lines are nowhere.
                     let queued = !m.queued.is_empty();
                     m.resend_withdrawn = false;
+                    m.stopping = true;
                     if m.input.is_empty() && !queued {
                         if let Some(sent) = m.last_sent.clone() {
                             m.input = sent;

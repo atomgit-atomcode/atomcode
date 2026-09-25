@@ -995,27 +995,46 @@ impl Forwarded {
         Arc::default()
     }
 
-    /// Listen on `tree` for the claims, answering on `events`.
+    /// Listen on `tree` for the claims — and for a fold a stop overtook —
+    /// answering on `events`.
     pub fn listen(
         self: &Arc<Self>,
         tree: &Context,
         events: mpsc::UnboundedSender<AgentEvent>,
-    ) -> atomcode_plexus::Disposable {
+    ) -> Vec<atomcode_plexus::Disposable> {
         let forwarded = self.clone();
-        tree.on_emit::<crate::events::InputClaimed>(move |input: &crate::events::ClaimedInput| {
-            if forwarded
-                .waiting
-                .lock()
-                .expect("forwarded poisoned")
-                .remove(&input.receipt)
-            {
-                let _ = events.send(AgentEvent::Accepted {
-                    command: input.receipt.clone(),
-                    turn: Some(input.turn),
-                    steered: input.steered,
-                });
-            }
-        })
+        let accepted = events.clone();
+        let claimed = tree.on_emit::<crate::events::InputClaimed>(
+            move |input: &crate::events::ClaimedInput| {
+                if forwarded.take(&input.receipt) {
+                    let _ = accepted.send(AgentEvent::Accepted {
+                        command: input.receipt.clone(),
+                        turn: Some(input.turn),
+                        steered: input.steered,
+                    });
+                }
+            },
+        );
+        let forwarded = self.clone();
+        let withdrawn = tree.on_emit::<crate::events::InputWithdrawn>(
+            move |input: &crate::events::ClaimedInput| {
+                if forwarded.take(&input.receipt) {
+                    let _ = events.send(AgentEvent::Rejected {
+                        command: input.receipt.clone(),
+                        error: atomcode_kernel::event::CommandError::NotRunning,
+                    });
+                }
+            },
+        );
+        vec![claimed, withdrawn]
+    }
+
+    /// `receipt` was one of this connection's, and is answered now.
+    fn take(&self, receipt: &atomcode_kernel::event::CommandId) -> bool {
+        self.waiting
+            .lock()
+            .expect("forwarded poisoned")
+            .remove(receipt)
     }
 }
 
@@ -1055,7 +1074,18 @@ pub fn command_member(
         // as the lead's (`Agent::stand_down`).
         AgentCommand::Cancel => {
             let running = target.status() != crate::agent::AgentStatus::Idle;
-            let _ = target.stand_down();
+            // Answered the way the lead's are: what this connection sent and
+            // the stop withdrew is refused `NotRunning`, so the sender can hand
+            // it back. Dropped in silence, a person who stopped a member lost
+            // every line queued behind its turn.
+            for command in target.stand_down().receipts {
+                if forwarded.take(&command) {
+                    let _ = events.send(AgentEvent::Rejected {
+                        command,
+                        error: CommandError::NotRunning,
+                    });
+                }
+            }
             target.interrupt();
             if running {
                 Ok(Some(Some(target.session().current_turn())))
@@ -1261,6 +1291,18 @@ async fn pump(
                     command: input.receipt.clone(),
                     turn: Some(input.turn),
                     steered: input.steered,
+                });
+            }
+        });
+    // A fold the stop overtook is answered like what the stop withdrew from
+    // the inbox (`AgentCommand::Cancel` below).
+    let refusals = events.clone();
+    let withdrawn =
+        ctx.on_emit::<crate::events::InputWithdrawn>(move |input: &crate::events::ClaimedInput| {
+            if input.agent == me {
+                let _ = refusals.send(AgentEvent::Rejected {
+                    command: input.receipt.clone(),
+                    error: atomcode_kernel::event::CommandError::NotRunning,
                 });
             }
         });
@@ -1631,7 +1673,10 @@ async fn pump(
     }
     wake.dispose();
     claimed.dispose();
-    claimed_elsewhere.dispose();
+    withdrawn.dispose();
+    for listening in claimed_elsewhere {
+        listening.dispose();
+    }
     if let Some(mut handle) = turn.take() {
         // Bounded, then taken. Stopping is cooperative, and a tool that does not
         // observe its cancel would otherwise hold this task open for as long as

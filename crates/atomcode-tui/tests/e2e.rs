@@ -70,9 +70,67 @@ impl Plugin for HoldTurnEnd {
     }
 }
 
+/// Messages [`SlowPreStep`] has been handed, so a test knows when one is
+/// being held.
+static HELD_AT_PRE_STEP: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Holds a step's input in `PreStep` for two seconds when it says `SLOW-`:
+/// the window between a turn claiming a message and the message entering the
+/// log, which recognising a picture opens for real. A stop that lands in it
+/// finds the message neither in the inbox nor in the conversation.
+struct SlowPreStep;
+
+#[async_trait]
+impl atomcode_plexus::Waterfall<atomcode_harness::events::PreStep> for SlowPreStep {
+    async fn handle(
+        &self,
+        decision: &mut atomcode_harness::events::StepDecision,
+        next: atomcode_plexus::Next<'_, atomcode_harness::events::PreStep>,
+    ) -> atomcode_harness::events::StepDecision {
+        if let Some(message) = decision.message.clone().filter(|m| m.contains("SLOW-")) {
+            HELD_AT_PRE_STEP
+                .lock()
+                .expect("held poisoned")
+                .push(message);
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        next.run(decision).await
+    }
+}
+
+#[async_trait]
+impl Plugin for SlowPreStep {
+    fn name(&self) -> &'static str {
+        "test-slow-pre-step"
+    }
+    async fn apply(&self, ctx: &Context, _config: &serde_json::Value) -> Result<(), String> {
+        let _ = ctx.on_waterfall::<atomcode_harness::events::PreStep>(Arc::new(SlowPreStep), false);
+        Ok(())
+    }
+}
+
+const SLOW_PRE_STEP: &str = "[[insert]]\nname = \"test-slow-pre-step\"\n";
+
+/// Wait until the turn is holding `marker` in `PreStep`.
+async fn held_at_pre_step(marker: &str) {
+    for _ in 0..200 {
+        if HELD_AT_PRE_STEP
+            .lock()
+            .expect("held poisoned")
+            .iter()
+            .any(|m| m.contains(marker))
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("{marker} never reached PreStep");
+}
+
 fn agent_catalog() -> PluginRegistry {
     let mut c = atomcode_harness::plugins::catalog();
     c.register(Arc::new(HoldTurnEnd));
+    c.register(Arc::new(SlowPreStep));
     c.register(Arc::new(EffortSpyRow));
     c.register(Arc::new(EchoCommandRow));
     c.register(Arc::new(StallingUtilityRow));
@@ -1350,6 +1408,14 @@ async fn what_ctrl_x_resent_and_was_still_waiting_comes_back_on_esc() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    // Judged before the esc, which interrupts too: without this, a `ctrl-x`
+    // that did nothing passes — the five-second tool finishes, the next step
+    // folds `h8` in, and the esc below does all the stopping.
+    assert!(
+        a_turn_was_interrupted(&s),
+        "ctrl-x stopped the turn, before any esc:\n{}",
+        s.screen()
+    );
     assert!(
         s.screen().contains("QUEUED-i9"),
         "the second line is shown waiting again:\n{}",
@@ -1373,12 +1439,292 @@ async fn what_ctrl_x_resent_and_was_still_waiting_comes_back_on_esc() {
         "{:?}",
         user_messages(&s)
     );
+    assert!(!s.screen().contains("没有送达"), "{}", s.screen());
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+/// The turns a stop ended, by the log.
+fn interrupted_turns(s: &Session) -> Vec<u64> {
+    s.client()
+        .events()
+        .into_iter()
+        .filter_map(|logged| match logged.event {
+            SessionEvent::Interrupted { turn, .. } => Some(turn),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The turn each user message was said in, as the log has it.
+fn user_turns(s: &Session) -> Vec<(u64, String)> {
+    s.client()
+        .events()
+        .into_iter()
+        .filter_map(|logged| match logged.event {
+            SessionEvent::UserMessage { turn, text, .. } => Some((turn, text)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A queued line the turn had already taken out of the inbox — claimed at a
+/// step boundary and held in `PreStep` (a picture being recognised) — when
+/// `ctrl-x` landed is sent again like the rest, and first, where it was typed.
+///
+/// The stop withdraws only what is still in the inbox, and this one was not:
+/// it was committed into the turn being stopped, which then ended before
+/// asking the model anything. It sat in the conversation unanswered while the
+/// line typed after it went out and was answered — "stopped, not sent" for the
+/// one the person had said first.
+#[tokio::test]
+async fn ctrl_x_sends_again_a_queued_line_the_turn_was_still_taking_in() {
+    let dir = scratch("ctrl-x-claimed");
+    let script = replay(
+        r#"{ text = "one", calls = [ { name = "bash", args = { command = "sleep 1" } } ] },
+           { text = "two" }, { text = "three" }, { text = "four" }, { text = "five" }"#,
+    );
+    let s = start(tree(&dir, &script, &[SLOW_PRE_STEP])).await;
+    let task = s.open().await;
+
+    s.term.type_line("first");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    s.term.type_line("SLOW-k4m");
+    s.term.type_line("QUEUED-k5n");
+    held_at_pre_step("SLOW-k4m").await;
+
+    s.term.press(KeyPress::ctrl('x'));
+    for _ in 0..300 {
+        let said = user_messages(&s);
+        if said.iter().any(|m| m == "QUEUED-k5n") && said.iter().any(|m| m == "SLOW-k4m") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let stopped = interrupted_turns(&s);
     assert!(
-        a_turn_was_interrupted(&s),
+        !stopped.is_empty(),
         "ctrl-x stopped the turn:\n{}",
         s.screen()
     );
+    let said = user_turns(&s);
+    let at = |needle: &str| said.iter().position(|(_, text)| text == needle);
+    assert!(
+        said.iter()
+            .filter(|(_, text)| text == "SLOW-k4m")
+            .all(|(turn, _)| !stopped.contains(turn)),
+        "the line being taken in did not go into the stopped turn: {said:?}"
+    );
+    assert!(
+        matches!((at("SLOW-k4m"), at("QUEUED-k5n")), (Some(a), Some(b)) if a < b),
+        "both went out again, in the order they were typed: {said:?}"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+/// The same line, stopped with `esc`: back to the composer with the rest, ahead
+/// of them — not left in the conversation of a turn that never answered it.
+#[tokio::test]
+async fn esc_hands_back_a_queued_line_the_turn_was_still_taking_in() {
+    let dir = scratch("esc-claimed");
+    let script = replay(
+        r#"{ text = "one", calls = [ { name = "bash", args = { command = "sleep 1" } } ] },
+           { text = "two" }, { text = "three" }"#,
+    );
+    let s = start(tree(&dir, &script, &[SLOW_PRE_STEP])).await;
+    let task = s.open().await;
+
+    s.term.type_line("first");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    s.term.type_line("SLOW-p2q");
+    s.term.type_line("QUEUED-p3r");
+    held_at_pre_step("SLOW-p2q").await;
+
+    s.term.press(KeyPress::plain(Key::Esc));
+    for _ in 0..300 {
+        if composer_text(&s).contains("SLOW-p2q") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    s.quiet().await;
+    let field = composer_text(&s);
+    assert!(
+        matches!(
+            (field.find("SLOW-p2q"), field.find("QUEUED-p3r")),
+            (Some(a), Some(b)) if a < b
+        ),
+        "both are back in the composer, in the order they were typed:\n{field}"
+    );
+    assert!(
+        !user_messages(&s)
+            .iter()
+            .any(|m| m.contains("SLOW-p2q") || m.contains("QUEUED-p3r")),
+        "stopped means not in the conversation: {:?}",
+        user_messages(&s)
+    );
     assert!(!s.screen().contains("没有送达"), "{}", s.screen());
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+/// A `ctrl-x` that found nothing to withdraw does not turn a later cancel —
+/// one no key asked for, like a model switch reconfiguring the turn — into a
+/// resend: what that cancel withdraws comes back to the composer.
+///
+/// "Nothing to withdraw" is the screen not having heard the fold yet: the line
+/// is still on its panel when the key goes down, but the runtime has already
+/// handed it to the model. Here the connection never passes the fold on, which
+/// makes that moment last. The key then asked for a resend nothing consumed,
+/// and the flag stood until the next cancel of any kind.
+#[tokio::test]
+async fn a_ctrl_x_that_withdrew_nothing_does_not_make_a_later_cancel_resend() {
+    let dir = scratch("ctrl-x-stale");
+    let script = replay(
+        r#"{ text = "one", calls = [ { name = "bash", args = { command = "sleep 1" } } ] },
+           { text = "two", calls = [ { name = "bash", args = { command = "sleep 5" } } ] },
+           { text = "three", calls = [ { name = "bash", args = { command = "sleep 5" } } ] },
+           { text = "four" }, { text = "five" }, { text = "six" }"#,
+    );
+    let s = start_with_connection(tree(&dir, &script, &[]), |connection| {
+        let atomcode_host_api::HostConnection {
+            session,
+            commands,
+            mut events,
+            control,
+        } = connection;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                if matches!(event, atomcode_kernel::event::AgentEvent::Steered { .. }) {
+                    continue;
+                }
+                if tx.send(event).is_err() {
+                    break;
+                }
+            }
+        });
+        atomcode_host_api::HostConnection {
+            session,
+            commands,
+            events: rx,
+            control,
+        }
+    })
+    .await;
+    let task = s.open().await;
+
+    s.term.type_line("first");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    s.term.type_line("LATE-s1");
+    for _ in 0..100 {
+        if user_messages(&s).iter().any(|m| m == "LATE-s1") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        s.screen().contains("LATE-s1"),
+        "the fold was not heard, so the line is still listed:\n{}",
+        s.screen()
+    );
+    s.term.press(KeyPress::ctrl('x'));
+    s.quiet().await;
+    assert!(a_turn_was_interrupted(&s), "{}", s.screen());
+
+    s.term.type_line("second");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    s.term.type_line("LATE-s2");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    s.client().cancel();
+    for _ in 0..300 {
+        if composer_text(&s).contains("LATE-s2") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    s.quiet().await;
+    assert!(
+        composer_text(&s).contains("LATE-s2"),
+        "a cancel no key asked for hands the line back:\n{}",
+        s.screen()
+    );
+    assert!(
+        !user_messages(&s).iter().any(|m| m == "LATE-s2"),
+        "and does not send it: {:?}",
+        user_messages(&s)
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+/// When the lead's turn events do not arrive — its status going idle is all
+/// the screen hears — a stop's withdrawn lines are still settled there, not
+/// held for a turn end that is not coming.
+#[tokio::test]
+async fn a_stop_settles_on_idle_when_no_turn_end_arrives() {
+    let dir = scratch("settle-on-idle");
+    let script = replay(
+        r#"{ text = "one", calls = [ { name = "bash", args = { command = "sleep 5" } } ] },
+           { text = "two" }"#,
+    );
+    let s = start_with_connection(tree(&dir, &script, &[]), |connection| {
+        let atomcode_host_api::HostConnection {
+            session,
+            commands,
+            mut events,
+            control,
+        } = connection;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            use atomcode_kernel::event::AgentEvent;
+            while let Some(event) = events.recv().await {
+                if matches!(
+                    event,
+                    AgentEvent::TurnStarted { .. }
+                        | AgentEvent::TurnComplete { .. }
+                        | AgentEvent::Cancelled
+                ) {
+                    continue;
+                }
+                if tx.send(event).is_err() {
+                    break;
+                }
+            }
+        });
+        atomcode_host_api::HostConnection {
+            session,
+            commands,
+            events: rx,
+            control,
+        }
+    })
+    .await;
+    let task = s.open().await;
+    queue_two_behind_a_turn(&s, "QUEUED-t1", "QUEUED-t2").await;
+
+    s.term.press(KeyPress::plain(Key::Esc));
+    for _ in 0..300 {
+        if composer_text(&s).contains("QUEUED-t2") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    s.quiet().await;
+    let field = composer_text(&s);
+    assert!(
+        matches!(
+            (field.find("QUEUED-t1"), field.find("QUEUED-t2")),
+            (Some(a), Some(b)) if a < b
+        ),
+        "both are back in the composer:\n{field}"
+    );
 
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
@@ -5138,6 +5484,171 @@ async fn esc_stops_a_lead_that_is_still_working_after_looking_at_a_member() {
         "the lead ran on past the stop:\n{}",
         s.screen()
     );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+/// A lead that delegates to a member that never answers — busy until stopped —
+/// and then works for a while itself.
+fn team_with_a_busy_member(dir: &Path) -> (String, String) {
+    let script = replay(
+        r#"{ text = "Delegating.", calls = [ { name = "team", args = { action = "delegate", name = "scout", role = "explorer", task = "look around" } } ] },
+           { text = "Delegated." },
+           { text = "one", calls = [ { name = "bash", args = { command = "sleep 1" } } ] },
+           { text = "two" }, { text = "three" }"#,
+    );
+    let member = format!(
+        "[[insert]]\nname = \"team-in-process\"\nconfig = {{ project_root = {dir:?} }}\n\n\
+         [[insert]]\nid = \"llm-utility\"\nname = \"test-stalling-utility\"\n",
+        dir = dir.to_string_lossy(),
+    );
+    (script, member)
+}
+
+/// Put the member `scout` on screen through the team panel.
+async fn look_at_the_member(s: &Session) {
+    s.term.press(KeyPress::plain(Key::Tab));
+    until(s, "Enter 切换").await;
+    s.term.press(KeyPress::plain(Key::Down));
+    s.term.press(KeyPress::plain(Key::Enter));
+    until(s, "正在看 scout").await;
+}
+
+/// Lines queued behind a member's turn, on its own screen, come back to the
+/// composer when `esc` stops it — as the lead's do. The member's stop withdrew
+/// them without a word to the screen, and a member's turn end never reaches
+/// this connection, so nothing settled them either: stopped and gone.
+#[tokio::test]
+async fn esc_on_a_member_s_screen_puts_what_was_queued_back() {
+    let dir = scratch("member-esc-queued");
+    let (script, member) = team_with_a_busy_member(&dir);
+    let s = start(tree(&dir, &script, &[&member])).await;
+    let task = s.open().await;
+    s.term.type_line("have someone look around");
+    until(&s, "Delegated.").await;
+    s.quiet().await;
+    look_at_the_member(&s).await;
+
+    s.term.type_line("MQ-u1");
+    s.term.type_line("MQ-u2");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        s.screen().contains("MQ-u1") && s.screen().contains("MQ-u2"),
+        "both are waiting behind the member's turn:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::plain(Key::Esc));
+    for _ in 0..300 {
+        if composer_text(&s).contains("MQ-u2") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let field = composer_text(&s);
+    assert!(
+        matches!(
+            (field.find("MQ-u1"), field.find("MQ-u2")),
+            (Some(a), Some(b)) if a < b
+        ),
+        "both are back in the composer, oldest first:\n{field}"
+    );
+    assert!(
+        !user_messages(&s).iter().any(|m| m.contains("MQ-u")),
+        "stopped means not sent: {:?}",
+        user_messages(&s)
+    );
+    assert!(!s.screen().contains("没有送达"), "{}", s.screen());
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+/// `ctrl-x` on a member's screen sends what was queued to the member again.
+#[tokio::test]
+async fn ctrl_x_on_a_member_s_screen_sends_what_was_queued() {
+    let dir = scratch("member-ctrl-x-queued");
+    let (script, member) = team_with_a_busy_member(&dir);
+    let s = start(tree(&dir, &script, &[&member])).await;
+    let task = s.open().await;
+    s.term.type_line("have someone look around");
+    until(&s, "Delegated.").await;
+    s.quiet().await;
+    look_at_the_member(&s).await;
+
+    s.term.type_line("MQ-w1");
+    s.term.type_line("MQ-w2");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    s.term.press(KeyPress::ctrl('x'));
+    for _ in 0..300 {
+        if user_messages(&s).iter().any(|m| m == "MQ-w1") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        user_messages(&s).iter().any(|m| m == "MQ-w1"),
+        "the first line went to the member again: {:?}\n{}",
+        user_messages(&s),
+        s.screen()
+    );
+    // The member takes one message a step and never answers, so the second is
+    // waiting in its inbox — listed, where a later stop can find it.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        s.screen().contains("MQ-w2"),
+        "the second is waiting behind it:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+/// Leaving the lead's screen while its stop is still settling does not lose
+/// what the stop took back: it is in the composer on the screen arrived at.
+///
+/// The stop settles at the lead's turn end, and a screen showing a member
+/// never sees that; the view switch cleared the lines instead. Here the turn is
+/// slow to end — it is holding a queued line in `PreStep` — so the switch lands
+/// between the stop and the settling.
+#[tokio::test]
+async fn leaving_the_lead_mid_stop_keeps_what_the_stop_took_back() {
+    let dir = scratch("switch-mid-stop");
+    let (script, member) = team_with_a_busy_member(&dir);
+    let s = start(tree(&dir, &script, &[&member, SLOW_PRE_STEP])).await;
+    let task = s.open().await;
+    s.term.type_line("have someone look around");
+    until(&s, "Delegated.").await;
+    s.quiet().await;
+
+    s.term.type_line("now take your time");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    s.term.type_line("SLOW-v1x");
+    s.term.type_line("QUEUED-v2y");
+    held_at_pre_step("SLOW-v1x").await;
+    s.term.press(KeyPress::plain(Key::Esc));
+    look_at_the_member(&s).await;
+
+    for _ in 0..100 {
+        if composer_text(&s).contains("QUEUED-v2y") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Past the held line's own refusal, which must not read as a failure.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let field = composer_text(&s);
+    assert!(
+        matches!(
+            (field.find("SLOW-v1x"), field.find("QUEUED-v2y")),
+            (Some(a), Some(b)) if a < b
+        ),
+        "what the stop took back is in the composer:\n{field}"
+    );
+    assert!(!s.screen().contains("没有送达"), "{}", s.screen());
 
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
