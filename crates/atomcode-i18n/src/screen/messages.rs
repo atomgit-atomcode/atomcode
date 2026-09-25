@@ -402,6 +402,9 @@ pub enum Msg<'a> {
         id: &'a str,
     },
     HostUnavailable,
+    /// An undo or rewind based on less than the log now holds: a message or a
+    /// turn arrived after what the screen had when it asked (`HostError::Stale`).
+    HostStale,
     HostNoProvider {
         reason: &'a str,
     },

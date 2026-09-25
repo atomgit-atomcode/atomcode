@@ -1322,6 +1322,84 @@ async fn an_undo_reaches_the_subscriber_as_a_fact_and_rebuilds_nothing() {
     );
 }
 
+/// Every fact an undo puts in the log reaches the subscriber — also when the
+/// log could not say the change live and the App was rebuilt around it — so a
+/// screen that has seen everything it was sent can undo again.
+///
+/// An undo right after an undo: the first leaves a reminder that rides with
+/// the next message, so going back to before *that* message keeps the reminder
+/// and is no prefix of the log. The runtime then appends the change to the
+/// store (`Rewound` and the conversation committed again) and rebuilds the App
+/// on it. Those facts were never pushed to the front end: the screen's last
+/// fact stayed before them, and the next undo — based on it — was refused as
+/// `Stale` while the person could see the whole conversation (a real session,
+/// seq 94710–94956, refused with `Stale { current: 94956 }`).
+#[tokio::test]
+async fn an_undo_the_log_could_not_say_live_still_reaches_the_subscriber() {
+    let env = env();
+    let (mut connection, front_end) = connected_as(&env, SubagentPolicy::Disabled, None).await;
+    let session = connection.session.clone();
+    connection.commands.send(subscribe(&session)).unwrap();
+    let mut seen = Vec::new();
+    for text in ["first thing", "second thing"] {
+        connection.commands.send(message(text)).unwrap();
+        seen.extend(through_turn(&mut connection).await);
+    }
+    seen.extend(quiet(&mut connection).await);
+    let undo = |based_on| HostCommand::Undo {
+        session: session.clone(),
+        turn: None,
+        based_on,
+    };
+    assert!(matches!(
+        connection
+            .control
+            .call(undo(last_seen(&seen, &session)))
+            .await,
+        Ok(HostReply::Undone { .. })
+    ));
+    seen.extend(quiet(&mut connection).await);
+    connection.commands.send(message("third thing")).unwrap();
+    seen.extend(through_turn(&mut connection).await);
+    seen.extend(quiet(&mut connection).await);
+    let apps = front_end.apps_fed();
+
+    let undone = connection
+        .control
+        .call(undo(last_seen(&seen, &session)))
+        .await;
+    assert!(
+        matches!(&undone, Ok(HostReply::Undone { prompt: Some(p), .. }) if p == "third thing"),
+        "{undone:?}"
+    );
+    assert!(
+        front_end.apps_fed() > apps,
+        "the setup no longer reaches the rebuilt branch, so this criterion \
+         judges nothing: the second undo was said live"
+    );
+    seen.extend(quiet(&mut connection).await);
+    let sent = last_seen(&seen, &session);
+    let logged = front_end
+        .app()
+        .and_then(|app| atomcode_harness::feed::Feed::find(&app, &session))
+        .expect("the session is live")
+        .session()
+        .events()
+        .last()
+        .map(|logged| logged.seq)
+        .unwrap();
+
+    let again = connection.control.call(undo(sent)).await;
+    assert!(
+        matches!(&again, Ok(HostReply::Undone { prompt: Some(p), .. }) if p == "first thing"),
+        "an undo based on everything the subscriber was sent is not stale: {again:?}"
+    );
+    assert_eq!(
+        sent, logged,
+        "the subscriber was sent every fact the log holds"
+    );
+}
+
 /// The turns a rewind can go back to are listed, and a rewind of the
 /// conversation to one of them takes it and everything after it back; a turn
 /// that is not a point is refused.

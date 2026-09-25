@@ -886,6 +886,7 @@ pub(crate) fn refusal(error: HostError) -> String {
         HostError::NotFound => t(Msg::HostNotFound).into_owned(),
         HostError::SessionInUse { id } => t(Msg::HostSessionInUse { id: &id }).into_owned(),
         HostError::Unavailable => t(Msg::HostUnavailable).into_owned(),
+        HostError::Stale { .. } => t(Msg::HostStale).into_owned(),
         HostError::ProviderUnavailable { reason } => t(Msg::HostNoProvider {
             reason: &format!("{reason:?}"),
         })
@@ -2584,6 +2585,15 @@ mod tests {
         fn subscribe(&self) -> tokio::sync::mpsc::UnboundedReceiver<atomcode_host_api::HostEvent> {
             tokio::sync::mpsc::unbounded_channel().1
         }
+    }
+
+    /// A stale undo is said in words, not as the contract's Debug text: the
+    /// person was shown `Stale { current: 94956 }` and could do nothing with it.
+    #[test]
+    fn a_stale_refusal_is_a_sentence() {
+        let said = refusal(HostError::Stale { current: 94956 });
+        assert_eq!(said, t(Msg::HostStale));
+        assert!(!said.contains("Stale") && !said.contains("94956"), "{said}");
     }
 
     /// A screen following session `lead`, whose last fact it saw is number 7.

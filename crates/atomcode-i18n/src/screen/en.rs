@@ -305,6 +305,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::HostNotFound => "not found: the session has been changed, or there is no such session".into(),
         Msg::HostSessionInUse { id } => format!("session {id} is in use elsewhere").into(),
         Msg::HostUnavailable => "the host is unavailable right now".into(),
+        Msg::HostStale => "the conversation has a newer turn than this screen has drawn; try again once it shows".into(),
         Msg::HostNoProvider { reason } => format!("no model available: {reason}").into(),
         Msg::HostSaidSomethingElse { reply } => format!("the host answered something else: {reply}").into(),
 

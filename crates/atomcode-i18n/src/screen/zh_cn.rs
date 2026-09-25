@@ -274,6 +274,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::HostNotFound => "找不到:会话已经换过,或者没有这个会话".into(),
         Msg::HostSessionInUse { id } => format!("会话 {id} 正在别处用着").into(),
         Msg::HostUnavailable => "宿主现在不可用".into(),
+        Msg::HostStale => "对话在这之后又有了新的一轮,屏幕还没跟上;等它画出来再试一次".into(),
         Msg::HostNoProvider { reason } => format!("没有可用的模型:{reason}").into(),
         Msg::HostSaidSomethingElse { reply } => format!("宿主答了别的:{reply}").into(),
 

@@ -204,18 +204,29 @@ impl Feed {
 
         if let Some(registry) = ctx.service::<AgentsSvc>() {
             let feed = self.clone();
+            let agents = registry.clone();
             listening.push(ctx.on_emit::<AgentCreated>(move |info: &AgentInfo| {
-                let Some(member) = registry.get(info.id) else {
-                    return;
-                };
-                let Some(parent) = member.parent() else {
+                let Some(created) = agents.get(info.id) else {
                     return;
                 };
                 let mut sessions = feed.subscriptions.lock().expect("subscriptions poisoned");
+                if let Some(subscription) = sessions.get_mut(created.session_id()) {
+                    feed.catch_up(subscription, &created);
+                }
+                let Some(parent) = created.parent() else {
+                    return;
+                };
                 if let Some(subscription) = sessions.get_mut(parent) {
-                    feed.announce(subscription, &member);
+                    feed.announce(subscription, &created);
                 }
             }));
+            // An agent this App already had when the feed attached.
+            let mut sessions = self.subscriptions.lock().expect("subscriptions poisoned");
+            for agent in registry.list() {
+                if let Some(subscription) = sessions.get_mut(agent.session_id()) {
+                    self.catch_up(subscription, &agent);
+                }
+            }
         }
 
         let feed = self.clone();
@@ -253,6 +264,28 @@ impl Feed {
         );
 
         listening
+    }
+
+    /// The facts of a subscribed session that an App brought with it and nobody
+    /// committed in front of this feed: a host that rebuilds its App for the
+    /// same session builds it on the log, and whatever the log gained between
+    /// the two Apps — an undo the old one could not say live, appended to the
+    /// store for the new one to replay — arrives here and nowhere else. Without
+    /// it the subscriber's stream has a gap, and what it is based on is behind
+    /// a log it was never shown (a front end's undo refused as stale).
+    fn catch_up(&self, subscription: &mut Subscription, agent: &Agent) {
+        let session = agent.session_id().to_string();
+        for logged in agent.session().events() {
+            if logged.seq > subscription.high {
+                subscription.high = logged.seq;
+                let _ = self.events.send(AgentEvent::Fact(Box::new(Committed {
+                    session: session.clone(),
+                    seq: logged.seq,
+                    at: logged.at,
+                    event: logged.event,
+                })));
+            }
+        }
     }
 
     /// A member, described and then where it stands — once.

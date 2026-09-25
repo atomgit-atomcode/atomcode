@@ -174,6 +174,7 @@ fn said(error: atomcode_host_api::HostError) -> String {
         HostError::Busy { reason } => tr(SMsg::HostBusy { reason: &reason }).into_owned(),
         HostError::Unavailable => tr(SMsg::HostUnavailable).into_owned(),
         HostError::NotFound => tr(SMsg::HostNotFoundShort).into_owned(),
+        HostError::Stale { .. } => tr(SMsg::HostStale).into_owned(),
         HostError::Failed { message } => message,
         other => format!("{other:?}"),
     }
