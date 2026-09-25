@@ -136,7 +136,18 @@ fn legend(sheet: &Sheet) -> Vec<(&'static str, String)> {
 /// shape rules out by construction rather than by keeping two formulas in step.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Row {
+    /// The panel's own edge, and always its first row: the line the composer
+    /// draws between the transcript and the field, which the panel owes because
+    /// the composer is what it takes the rows of. Without it a question reads as
+    /// one more paragraph of the answer that produced it.
+    Edge,
+    /// The gap between two things the reader is meant to take apart — the
+    /// question and its answers, the answers and the legend.
     Blank,
+    /// The margin under a batch's tabs. A blank with nothing to separate, so it
+    /// is the one row the tail takes back first; named apart from [`Row::Blank`]
+    /// because that one may not go until there is nothing else left — see [`fit`].
+    Margin,
     /// The key legend. Its words are not in the row because they are a property
     /// of the page, not of the row — see [`legend`].
     Legend,
@@ -145,10 +156,7 @@ enum Row {
     /// The line between the answers and the way out of answering.
     Rule,
     /// A line of prose: who is asking, the tool, the call's arguments.
-    Text {
-        text: String,
-        role: Role,
-    },
+    Text { text: String, role: Role },
     /// A line of the question itself.
     Prompt(String),
     /// A heading of the panel's own: the review page's.
@@ -176,11 +184,11 @@ fn layout(sheet: &Sheet, w: usize, h: usize) -> Vec<Row> {
     if body == 0 {
         return Vec::new();
     }
-    let mut rows = Vec::new();
+    let mut rows = vec![Row::Edge];
     if sheet.is_batch() {
         rows.push(Row::Tabs);
+        rows.push(Row::Margin);
     }
-    rows.push(Row::Blank);
     match sheet.page() {
         Some(asked) => question_rows(sheet, asked, w, body, h, &mut rows),
         None => review_rows(sheet, &mut rows),
@@ -314,9 +322,18 @@ fn fit(mut rows: Vec<Row>, h: usize) -> Vec<Row> {
     if rows.len() <= h {
         return rows;
     }
-    // The margin: first under the tabs, or first of all.
-    if let Some(i) = rows.iter().take(2).position(|r| *r == Row::Blank) {
-        rows.remove(i);
+    // The room around the question is what the tail takes back first: the margin
+    // a batch keeps under its tabs, and then the panel's own edge. Both are
+    // chrome, and chrome is never paid for with a word of what is being asked —
+    // on a rect this short the panel is the whole of what is on screen, and a
+    // rule between it and a stream nobody can see is one row spent on nothing.
+    for row in [Row::Margin, Row::Edge] {
+        if rows.len() <= h {
+            break;
+        }
+        if let Some(i) = rows.iter().position(|r| *r == row) {
+            rows.remove(i);
+        }
     }
     if rows.len() > h && rows.last() == Some(&Row::Legend) {
         rows.pop();
@@ -353,7 +370,13 @@ fn fit(mut rows: Vec<Row>, h: usize) -> Vec<Row> {
 
 fn draw(sheet: &Sheet, row: Row, caps: Caps, w: usize) -> Line {
     match row {
-        Row::Blank => Line::empty(),
+        // The same run of `─` the composer spans its own rect with: the panel
+        // holds the foot of the screen while a question is up, and the edge is
+        // what says so.
+        Row::Edge => {
+            Line::styled(caps.g(Glyph::Horizontal).repeat(w), theme::fg(Role::Muted)).truncate(w)
+        }
+        Row::Blank | Row::Margin => Line::empty(),
         Row::Legend => Line::styled(
             format!("  {}", crate::widget::keys(&legend(sheet), caps)),
             theme::fg(Role::Muted),
@@ -759,6 +782,54 @@ mod tests {
         let _ = sheet.key(crate::surface::KeyPress::plain(key));
     }
 
+    /// A batch's tabs, wherever the panel drew them.
+    ///
+    /// Found by what is on the row rather than by counting from the top: the
+    /// panel's edge is the row above them, and a test that hard-codes the index
+    /// has to be renumbered every time the panel gains a piece of furniture.
+    fn tabs_row(lines: &[String]) -> String {
+        lines
+            .iter()
+            .find(|l| l.contains("语言") && l.contains("名字"))
+            .cloned()
+            .unwrap_or_else(|| panic!("no tabs row:\n{}", lines.join("\n")))
+    }
+
+    /// The line the composer draws between the transcript and the field is the
+    /// panel's first row while a question is up.
+    ///
+    /// The composer steps aside for the panel — it takes the very rows the field
+    /// would have had (`Host::asked_height`) — and a question that inherits those
+    /// rows without inheriting the line between them and the conversation reads
+    /// as one more paragraph of the answer that produced it.
+    #[test]
+    fn the_question_is_edged_off_from_the_stream() {
+        let w = 60u16;
+        let rule = Caps::default().g(Glyph::Horizontal).repeat(w as usize);
+        let mut review = Sheet::new(1, vec![text(), multiple()]);
+        review.tab = review.asked.len();
+        for moment in [
+            asking(Q::plain("Keep going?", &["yes", "no"]), 0),
+            asking(approval(None, "bash", r#"{"command":"ls"}"#, None), 0),
+            with(Sheet::new(1, vec![text(), multiple()])),
+            with(review),
+        ] {
+            let lines = framed(&moment, w);
+            assert_eq!(lines[0], rule, "{lines:#?}");
+        }
+
+        // And what it costs is what it gives back first: a panel the tail
+        // rationed to five rows spends them on the question and its answers, and
+        // loses the edge rather than a word of what is being asked.
+        let tight = drawn(
+            &asking(Q::plain("Keep going?", &["yes", "no", "maybe"]), 0),
+            w,
+            5,
+        );
+        assert!(tight.join("\n").contains("Keep going?"), "{tight:#?}");
+        assert!(!tight.contains(&rule), "{tight:#?}");
+    }
+
     #[test]
     fn nothing_asked_is_not_a_panel() {
         // The row the composer keeps: a panel that sat there saying "no question"
@@ -1162,7 +1233,7 @@ mod tests {
         let mut sheet = Sheet::new(7, vec![multiple(), text()]);
         let on = Caps::default().g(Glyph::Checked);
         let off = Caps::default().g(Glyph::Unchecked);
-        let tabs = framed(&with(sheet.clone()), 80)[0].clone();
+        let tabs = tabs_row(&framed(&with(sheet.clone()), 80));
         assert!(tabs.contains(&format!("{off} 语言")), "{tabs}");
         assert!(tabs.contains(&format!("{off} 名字")), "{tabs}");
         assert!(
@@ -1182,7 +1253,10 @@ mod tests {
         press(&mut sheet, Key::Enter);
         assert_eq!(sheet.tab, 1, "on to the next question");
         let turned = framed(&with(sheet.clone()), 80);
-        assert!(turned[0].contains(&format!("{on} 语言")), "{turned:?}");
+        assert!(
+            tabs_row(&turned).contains(&format!("{on} 语言")),
+            "{turned:?}"
+        );
         assert!(turned.join("\n").contains("新仓库叫什么"), "{turned:?}");
 
         // Skip the second to the review page: the answer given, and the one not.
