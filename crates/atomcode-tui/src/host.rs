@@ -56,6 +56,20 @@ fn hideable(kind: &str) -> bool {
     kind == "reasoning" || crate::content::ENVIRONMENTAL_INJECTIONS.contains(&kind)
 }
 
+/// Whether a block says what became of a turn rather than being content of one:
+/// the welcome, and the marker a rewind leaves.
+///
+/// Those two are drawn even when the turn they sit in was taken back or
+/// cancelled — they are the whole of what the screen has left to say about it.
+/// Nothing else is, and that includes a call that refuses to fold: `always_open`
+/// answers a question about *folding* (`use_skill`, and a write or an edit that
+/// must show its diff), and a turn the person took back must not leave that
+/// diff on the screen. It used to be read as this predicate too, which is how a
+/// taken-back edit came to draw its whole diff.
+fn tells_of_the_turn(kind: &str) -> bool {
+    matches!(kind, "welcome" | "rewound")
+}
+
 /// How much of a tool call's output the screen draws.
 ///
 /// A third axis, and deliberately not a fourth [`Showing`]: that one says how
@@ -936,14 +950,15 @@ fn lid_row(
     // A turn a rewind took back is not drawn at all: the person said it should
     // not have happened, and a screen still showing it is a conversation whose
     // visible half disagrees with the model's. What *did* happen is the
-    // `Rewound` block, which is `always_open` and so survives this.
-    if pres.is_rewound(b.at.turn) && !b.content.always_open() {
+    // `Rewound` block — a marker rather than a turn's own content — which
+    // survives this through [`tells_of_the_turn`].
+    if pres.is_rewound(b.at.turn) && !tells_of_the_turn(kind) {
         return None;
     }
     // A turn the person cancelled is one dim line, whatever its kind does and
     // whether or not it would have merged into a run: what it said happened, and
     // the model no longer sees it.
-    if pres.is_undone(b.at.turn) && !b.content.always_open() {
+    if pres.is_undone(b.at.turn) && !tells_of_the_turn(kind) {
         return Some(SlotRows {
             // Asked of the content, not assumed: the count and the picture have
             // to be the same answer. It was a constant `1` while every folded
@@ -6459,6 +6474,87 @@ mod tests {
         );
     }
 
+    /// A call that refuses to fold is still a call.
+    ///
+    /// `always_open` answers a question about *folding* — a write or an edit shows
+    /// its diff while open — and it used to stand in for this predicate as well.
+    /// Read that way, a change the person had taken back stayed on the screen as
+    /// a whole diff, in a conversation whose visible half then disagreed with the
+    /// model's.
+    #[test]
+    fn a_call_that_refuses_to_fold_still_goes_when_its_turn_does() {
+        let edited = || {
+            let h = host();
+            h.absorb(&SessionEvent::AssistantMessage {
+                turn: 2,
+                round: 1,
+                text: "改一处".into(),
+                reasoning: String::new(),
+                tool_calls: vec![atomcode_kernel::tool::ToolCall {
+                    id: "e1".into(),
+                    name: "edit_file".into(),
+                    arguments: r#"{"file_path":"a.rs"}"#.into(),
+                }],
+                reasoning_blocks: Vec::new(),
+                meta: None,
+            });
+            h.absorb(&SessionEvent::ToolResultLogged {
+                turn: 2,
+                round: 1,
+                call_id: "e1".into(),
+                content: "--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-old line\n+TAKEN_BACK_EDIT\n"
+                    .into(),
+                is_error: false,
+                images: Vec::new(),
+            });
+            h
+        };
+        let shown = |h: &Host| {
+            h.compose((80, 30))
+                .part("stream")
+                .map(|part| {
+                    part.lines
+                        .iter()
+                        .map(|line| line.plain())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default()
+        };
+
+        // Taken back: nothing of that turn is drawn, its diff least of all.
+        let h = edited();
+        assert!(
+            shown(&h).contains("TAKEN_BACK_EDIT"),
+            "the diff is up first"
+        );
+        assert!(h.mark_undone(
+            std::collections::BTreeSet::from([2]),
+            std::collections::BTreeSet::from([2]),
+        ));
+        let rewound = shown(&h);
+        assert!(
+            !rewound.contains("TAKEN_BACK_EDIT") && !rewound.contains("改一处"),
+            "a turn the person took back leaves no diff, and no call either:\n{rewound}"
+        );
+
+        // Cancelled: the same call is one line, not a diff.
+        let h = edited();
+        assert!(h.mark_undone(
+            std::collections::BTreeSet::from([2]),
+            std::collections::BTreeSet::new(),
+        ));
+        let cancelled = shown(&h);
+        assert!(
+            !cancelled.contains("TAKEN_BACK_EDIT"),
+            "a cancelled turn draws the call, never its change:\n{cancelled}"
+        );
+        assert!(
+            cancelled.contains("EditFile"),
+            "the dim line is still the call:\n{cancelled}"
+        );
+    }
+
     /// A block whose row count follows the terminal's capabilities.
     ///
     /// A real one, not a mock: the judgement below is about whether the row
@@ -11301,6 +11397,86 @@ mod tests {
             h.compose(size).rows().join("\n"),
             folded,
             "clicking it again is the inverse"
+        );
+    }
+
+    /// A write or an edit refuses the fold every other call takes.
+    ///
+    /// A file changed, and while the call is open it draws that change as a diff
+    /// (`ToolCallBlock::diff_view`) — which is what the row is for. Folded it was
+    /// the call and never its result: `● …` over one `⎿ EditFile(path)` line.
+    ///
+    /// Both calls are put in the state a finished call recedes into, the one the
+    /// plugin writes the moment a result lands (`fold_finished`), so what is
+    /// compared is two calls of the same age on the same screen.
+    #[test]
+    fn an_edit_refuses_the_fold_a_read_takes() {
+        let h = host();
+        h.absorb(&SessionEvent::AssistantMessage {
+            turn: 1,
+            round: 1,
+            text: "改一处,再读一个".into(),
+            reasoning: String::new(),
+            tool_calls: vec![
+                atomcode_kernel::tool::ToolCall {
+                    id: "e1".into(),
+                    name: "edit_file".into(),
+                    arguments: r#"{"file_path":"a.rs"}"#.into(),
+                },
+                atomcode_kernel::tool::ToolCall {
+                    id: "r1".into(),
+                    name: "read_file".into(),
+                    arguments: r#"{"file_path":"b.rs"}"#.into(),
+                },
+            ],
+            reasoning_blocks: Vec::new(),
+            meta: None,
+        });
+        h.absorb(&SessionEvent::ToolResultLogged {
+            turn: 1,
+            round: 1,
+            call_id: "e1".into(),
+            content: "--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-fn main() {}\n+fn main() { }\n".into(),
+            is_error: false,
+            images: Vec::new(),
+        });
+        h.absorb(&SessionEvent::ToolResultLogged {
+            turn: 1,
+            round: 1,
+            call_id: "r1".into(),
+            // Two lines, so the folded form can only say how many there are: a
+            // one-line result rides the summary itself (`· …`), which would make
+            // the assertion below prove nothing.
+            content: "first line\nSECOND_LINE_MARKER\n".into(),
+            is_error: false,
+            images: Vec::new(),
+        });
+
+        let ids: Vec<BlockId> = {
+            let stream = h.stream.read().expect("stream poisoned");
+            stream
+                .slots()
+                .iter()
+                .filter(|slot| slot.block().kind() == "tool_call")
+                .map(|slot| slot.block().id)
+                .collect()
+        };
+        assert_eq!(ids.len(), 2, "two calls to judge");
+        for id in &ids {
+            h.presentation
+                .write()
+                .expect("presentation poisoned")
+                .fold_finished(*id);
+        }
+
+        let screen = h.compose((90, 40)).rows().join("\n");
+        assert!(
+            screen.contains("fn main() { }"),
+            "the edit's diff is drawn:\n{screen}"
+        );
+        assert!(
+            !screen.contains("SECOND_LINE_MARKER"),
+            "and the read receded to its summary:\n{screen}"
         );
     }
 

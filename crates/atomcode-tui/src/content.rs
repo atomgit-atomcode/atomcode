@@ -1165,6 +1165,10 @@ pub struct Look {
     /// Loading a skill is not output, it is a change in how the agent will
     /// behave for the rest of the turn. Collapsing it to a summary hides the
     /// most consequential thing that happened.
+    ///
+    /// A write or an edit is the same shape of thing: a file changed, and the
+    /// diff it draws when open is the whole of what a person wants from the row.
+    /// Folded, it was the call and never its result.
     pub always_open: bool,
 }
 
@@ -1203,7 +1207,15 @@ pub fn look(tool: &str) -> Look {
             subject: &["command"],
             always_open: false,
         },
-        "read_file" | "write_file" | "edit_file" | "list_directory" => Look {
+        // A write or an edit changed the workspace, and the change is what the
+        // row is for: open, the call draws its diff in place (`diff_view`).
+        // Folded it was the call and never what it did.
+        "write_file" | "edit_file" => Look {
+            subject: &["file_path", "path"],
+            always_open: true,
+            ..GENERIC
+        },
+        "read_file" | "list_directory" => Look {
             subject: &["file_path", "path"],
             ..GENERIC
         },
