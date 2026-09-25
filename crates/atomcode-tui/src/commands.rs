@@ -799,7 +799,13 @@ fn session_catalogue() -> Vec<Command> {
         // whole runtime, and a review takes minutes the person's conversation is
         // not a place to wait them out in. Same road as `/background`, with the
         // task filled in.
-        Command::said_taking("review", t(Msg::CmdTakesReview), t(Msg::CmdAboutReview)),
+        //
+        // `requiring`: taking the row stops on the line so the scope can be
+        // typed. The bare form is worth having — it means the working tree — but
+        // it is not worth *firing on the pick*: somebody who opened the menu and
+        // took this row is about to say which changes. Enter without an argument
+        // runs the default, which is what the row would have started anyway.
+        Command::said_taking("review", t(Msg::CmdTakesReview), t(Msg::CmdAboutReview)).requiring(),
         // A closed set of levels, so the menu offers them inline (one row each,
         // marked with the one in force) rather than a modal — the same way `/`
         // shows the commands themselves.

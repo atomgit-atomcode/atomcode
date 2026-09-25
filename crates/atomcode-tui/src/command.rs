@@ -39,13 +39,17 @@ pub struct Command {
     /// expands it into one row per option, and picking a row dispatches
     /// `{name} {value}`. Empty for a command that takes free text or nothing.
     pub options: Vec<CommandOption>,
-    /// The free-text argument is required and has no useful bare form, so taking
-    /// the row completes the name onto the line (`/rename `) for the argument to
-    /// be typed rather than dispatching it — which would only answer "needs a
-    /// name". Distinct from [`takes`](Self::takes) being set: `/model` and
-    /// `/resume` take an argument too, but running them bare opens a picker, so
-    /// they still dispatch. Only for commands with no closed [`options`] and no
-    /// bare form worth reaching.
+    /// Taking this row stops on the line instead of dispatching: the name (and a
+    /// space, when it takes an argument) is completed there for the argument to
+    /// be typed.
+    ///
+    /// Two reasons to set it, and the flag is about the *pick* either way: the
+    /// bare form would only answer "needs a name" (`/rename`), or the bare form
+    /// is a default the person taking the row is about to vary (`/review` — bare
+    /// means the working tree, and Enter still runs it). Distinct from
+    /// [`takes`](Self::takes) being set: `/model` and `/resume` take an argument
+    /// too, but running them bare opens a picker, so they still dispatch. Only
+    /// for commands with no closed [`options`], which open their values instead.
     pub require_arg: bool,
 }
 

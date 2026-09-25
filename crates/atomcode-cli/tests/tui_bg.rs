@@ -479,6 +479,35 @@ async fn a_review_runs_in_a_background_session_by_default() {
     rig.quit().await;
 }
 
+/// **Taking `/review`'s menu row stops on the line.** The bare form is worth
+/// having — it means the working tree — but not worth firing on the pick: this
+/// row starts a whole session, and somebody who opened the menu and took it is
+/// about to say *which* changes. Enter without an argument still runs it.
+#[tokio::test(flavor = "multi_thread")]
+async fn taking_the_review_row_leaves_it_on_the_line() {
+    let rig = Rig::new().await;
+    rig.term.type_text("/rev");
+    rig.until_screen("/review").await;
+
+    rig.term.press(KeyPress::plain(Key::Enter));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        rig.background().await.is_empty(),
+        "taking the row started a review anyway"
+    );
+    assert!(
+        rig.term.text().contains("/review"),
+        "选中之后它停在行上,等你说审哪里:\n{}",
+        rig.term.text()
+    );
+
+    // And enter again runs the default — the working tree, which is what the row
+    // would have started on its own.
+    rig.term.press(KeyPress::plain(Key::Enter));
+    rig.until_screen(&t(Msg::BgStarted { slot: 1 })).await;
+    rig.quit().await;
+}
+
 /// **`/bg` and `/background` are one command, the row counts what runs out of
 /// view, and ← on an empty box opens it.** `/bg <task>` starts a background
 /// session like `/background <task>` does; while it runs the status row says so,
