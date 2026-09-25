@@ -552,6 +552,20 @@ pub enum Msg<'a> {
     // ── `/review`: the current changes reviewed, in a session of their own ──
     CmdAboutReview,
     CmdTakesReview,
+    /// What `/review` is about to do, for the line that says its session started
+    /// (`审查未提交的改动`). The scope, in a person's words — the same parse that
+    /// wrote the prompt, said out loud.
+    ReviewWhatUncommitted,
+    ReviewWhatStaged,
+    ReviewWhatRange {
+        base: &'a str,
+    },
+    /// `/review` 起来时的那一句:在做什么、有几个文件在变、以及结果回来之后会怎样。
+    /// `files` 是宿主量出来的;量不出来(不在 git 仓库里之类)就只说范围。
+    ReviewStarted {
+        what: &'a str,
+        files: Option<usize>,
+    },
     BgUsage,
     BgNoSuchSlot {
         slot: usize,
@@ -562,6 +576,12 @@ pub enum Msg<'a> {
     },
     BgStarted {
         slot: u32,
+    },
+    /// The same line, saying what it is about to do — for the callers that know
+    /// (`/review` knows the scope it just turned into a prompt).
+    BgStartedWhat {
+        slot: u32,
+        what: &'a str,
     },
     BgDropped {
         slot: usize,
@@ -598,6 +618,12 @@ pub enum Msg<'a> {
     BgWaitingTip {
         slot: usize,
         title: &'a str,
+    },
+    /// 一个后台会话的成果,投回发起它的那段对话(`background.rs`):内容本身,加上
+    /// 该拿它做什么。不是一句"去 /bg 读" —— 那句把核实这件事留给了一个人。
+    BackgroundResult {
+        title: &'a str,
+        answer: &'a str,
     },
 
     // ── reasoning effort, undo and rewind (`commands.rs`) ──

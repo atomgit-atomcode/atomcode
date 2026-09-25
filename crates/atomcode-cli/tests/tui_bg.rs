@@ -452,7 +452,13 @@ async fn a_review_runs_in_a_background_session_by_default() {
     let rig = Rig::new().await;
     let first = rig.client.root();
     rig.term.type_line("/review staged");
-    rig.until_screen(&t(Msg::BgStarted { slot: 1 })).await;
+    // 开始那行说出它在审哪一段,量得出文件数就说数(这个 rig 的目录不在 git 仓库
+    // 里,量不出来,所以 `files: None`)。
+    rig.until_screen(&t(Msg::ReviewStarted {
+        what: &t(Msg::ReviewWhatStaged),
+        files: None,
+    }))
+    .await;
     assert_eq!(rig.client.root(), first, "the foreground did not move");
     let list = rig.background().await;
     assert_eq!(list.len(), 1, "{list:#?}");
@@ -504,7 +510,37 @@ async fn taking_the_review_row_leaves_it_on_the_line() {
     // And enter again runs the default — the working tree, which is what the row
     // would have started on its own.
     rig.term.press(KeyPress::plain(Key::Enter));
+    rig.until_screen(&t(Msg::ReviewStarted {
+        what: &t(Msg::ReviewWhatUncommitted),
+        files: None,
+    }))
+    .await;
+    rig.quit().await;
+}
+
+/// **A finished background run's content comes home.** The answer lands in the
+/// conversation that started it — not a "go read /bg" pointer — and the model
+/// runs a turn on it, which is what the line promising to verify needs.
+///
+/// The scripted provider answers `answer N` off one counter, so `answer 1` on
+/// this screen can only be the delivered content (the background session's own
+/// transcript is not on screen), and `answer 2` is the turn that followed it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_finished_background_run_delivers_its_answer_home() {
+    let rig = Rig::new().await;
+    rig.term.type_line("/background quiet job");
     rig.until_screen(&t(Msg::BgStarted { slot: 1 })).await;
+    let list = rig.background().await;
+    assert_eq!(list.len(), 1, "{list:#?}");
+
+    rig.until("后台的结果回到这段对话里", |rig| {
+        rig.term.text().contains("answer 1")
+    })
+    .await;
+    rig.until("而且它真的接着干了", |rig| {
+        rig.term.text().contains("answer 2")
+    })
+    .await;
     rig.quit().await;
 }
 

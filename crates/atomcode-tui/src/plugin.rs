@@ -1477,6 +1477,10 @@ impl UserInterface for Tui {
                 // draws them, and a line per state change would bury the
                 // conversation on screen under news about the ones that are not.
                 Wake::Host(HostEvent::BackgroundChanged { sessions }) => {
+                    // 没有"它做完了"这一行:干完的**内容**由宿主投回发起它的那段对话
+                    // (`background.rs` 的 `deliver_home`),那才是这一屏该出现的消息。
+                    // 这里再报一次"做完了、去 /bg 读",同一件事说两遍,而第二遍还把看
+                    // 结果这件事留给人自己去开面板。
                     stale |= self.host.show_bg(crate::bg::BgView::from_host(sessions));
                 }
                 Wake::Host(HostEvent::PersistenceFailed { message, .. }) => {

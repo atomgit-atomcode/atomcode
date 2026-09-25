@@ -684,6 +684,7 @@ mod tests {
             group,
             last: None,
             waiting,
+            stats: None,
         };
         let with = |sessions: Vec<Session>| Moment {
             cwd: "~/w".into(),

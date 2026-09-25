@@ -620,7 +620,7 @@ async fn background_command(
         "tell" if is_target(rest) => first,
         "" => first,
         which if is_slot(which) && rest.is_empty() => which,
-        _ => return start_background(control, args).await,
+        _ => return start_background(control, None, args).await,
     };
     match first {
         "" => match control
@@ -715,19 +715,26 @@ async fn background_command(
 }
 
 /// Start a new session in the background on `task`; the one on screen stays.
+///
+/// `reviewed` is what the session is about and the scope to measure, for the
+/// callers that know it (`/review`): the line that says it started then names the
+/// work and how many files it touches. `None` for a plain `/background <task>`.
 async fn start_background(
     control: &Arc<dyn atomcode_host_api::HostControl>,
+    reviewed: Option<(&str, &str)>,
     task: &str,
 ) -> Outcome {
     match control
         .call(HostCommand::StartBackground {
             text: task.to_string(),
+            scope: reviewed.map(|(_, scope)| scope.to_string()),
         })
         .await
     {
-        Ok(HostReply::Backgrounded { slot, .. }) => {
-            Outcome::Said(t(Msg::BgStarted { slot }).into_owned())
-        }
+        Ok(HostReply::Backgrounded { slot, files, .. }) => Outcome::Said(match reviewed {
+            Some((what, _)) => t(Msg::ReviewStarted { what, files }).into_owned(),
+            None => t(Msg::BgStarted { slot }).into_owned(),
+        }),
         Ok(other) => Outcome::Refused(format!("{other:?}")),
         Err(error) => Outcome::Refused(refusal(error)),
     }
@@ -740,11 +747,15 @@ async fn start_background(
 /// is judged without a session. `<base>` means the committed `base..HEAD` range,
 /// not the legacy top-level `base` field whose diff quietly included the working
 /// tree as a side effect.
-fn review_prompt(arg: &str) -> String {
+/// `/review` 的简写拆成 *(深度, 范围)*:`[deep|deep+verify] [staged|<base>]`。
+///
+/// 一处解析、两处用:[`review_prompt`] 把它翻成工具要的 schema,[`review_what`] 把它
+/// 说成人要读的那句话 —— 两个口径不会各拆一半而对不上。
+fn review_scope(arg: &str) -> (Option<&str>, &str) {
     let arg = arg.trim();
     // A leading `deep+verify` or `deep` keyword — alone or before a scope — sets
     // the depth; anything else is the scope.
-    let (depth, scope): (Option<&str>, &str) = if let Some(rest) = arg
+    if let Some(rest) = arg
         .strip_prefix("deep+verify")
         .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
     {
@@ -756,7 +767,27 @@ fn review_prompt(arg: &str) -> String {
         (Some("deep"), rest.trim())
     } else {
         (None, arg)
+    }
+}
+
+/// `/review` 那一行说它要干什么:范围,说得出深度时连深度一起。
+fn review_what(arg: &str) -> String {
+    let (depth, scope) = review_scope(arg);
+    let what = if scope.is_empty() {
+        t(Msg::ReviewWhatUncommitted).into_owned()
+    } else if scope.eq_ignore_ascii_case("staged") {
+        t(Msg::ReviewWhatStaged).into_owned()
+    } else {
+        t(Msg::ReviewWhatRange { base: scope }).into_owned()
     };
+    match depth {
+        Some(depth) => format!("{what}  {depth}"),
+        None => what,
+    }
+}
+
+fn review_prompt(arg: &str) -> String {
+    let (depth, scope) = review_scope(arg);
     let scope_json = if scope.is_empty() {
         r#"{"kind":"working_tree"}"#.to_string()
     } else if scope.eq_ignore_ascii_case("staged") {
@@ -1153,7 +1184,20 @@ impl CommandSet for SessionCommands {
                 let Some(control) = control else {
                     return Outcome::Refused(t(Msg::NoHost).into_owned());
                 };
-                start_background(&control, &review_prompt(args.trim())).await
+                // 范围按工具自己的词汇交给宿主 —— 量文件数要用它:`working_tree`
+                // 就是"没给参数"的那一个。
+                let (_, scope) = review_scope(args.trim());
+                let scope = if scope.is_empty() {
+                    "working_tree"
+                } else {
+                    scope
+                };
+                start_background(
+                    &control,
+                    Some((&review_what(args.trim()), scope)),
+                    &review_prompt(args.trim()),
+                )
+                .await
             }
             // Who has been on this team, and the way to look at any of them.
             //

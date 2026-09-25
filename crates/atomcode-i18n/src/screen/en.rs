@@ -388,10 +388,24 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdTakesBg => "[<task> | list | <N> | drop <N>]".into(),
         Msg::CmdAboutReview => "have the current changes reviewed in a session of their own — it runs in the background, so this conversation keeps going".into(),
         Msg::CmdTakesReview => "[deep | deep+verify] [staged | <base>]".into(),
+        Msg::ReviewWhatUncommitted => "reviewing the uncommitted changes".into(),
+        Msg::ReviewWhatStaged => "reviewing the staged changes".into(),
+        Msg::ReviewWhatRange { base } => format!("reviewing the commits after {base}").into(),
+        Msg::ReviewStarted { what, files } => match files {
+            Some(files) => format!(
+                "I started {what} in the background — {files} files change in this scope. When the result comes back I will go through it here, item by item."
+            )
+            .into(),
+            None => format!(
+                "I started {what} in the background. When the result comes back I will go through it here, item by item."
+            )
+            .into(),
+        },
         Msg::BgUsage => "usage: /bg · /bg <task> · /bg list · /bg <N> · /bg drop <N> (/bg is /background)".into(),
         Msg::BgNoSuchSlot { slot, count } => format!("there is no background session #{slot} ({count} in all)").into(),
         Msg::BgMoved { slot } => format!("the conversation keeps running as background #{slot}; this is a new one").into(),
         Msg::BgStarted { slot } => format!("background #{slot} is on it").into(),
+        Msg::BgStartedWhat { slot, what } => format!("background [{slot}] is on it: {what}").into(),
         Msg::BgDropped { slot } => format!("background #{slot} is gone").into(),
         Msg::BgTold { title } => format!("sent to “{title}”").into(),
         Msg::BgNoPanel => "this screen has no background panel".into(),
@@ -415,6 +429,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::BgQuitStay => "stay".into(),
         Msg::BgWaitingTip { slot, title } => format!("background [{slot}] {title} is waiting for your answer · /bg {slot} opens it").into(),
         Msg::BgSlotsFull { most } => format!("{most} sessions are already in the background — drop one first (/bg drop <N>)").into(),
+
+        Msg::BackgroundResult { title, answer } => format!(
+            "“{title}” is back from the background. Its result:\n\n{answer}\n\nGo through it item by item, list what needs changing, and flag anything you are unsure about."
+        )
+        .into(),
 
         // ── reasoning effort, undo and rewind (`commands.rs`) ──
         Msg::EffortAbout => "this session's reasoning effort".into(),

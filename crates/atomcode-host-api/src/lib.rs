@@ -308,7 +308,14 @@ pub enum HostCommand {
     /// nothing is a row a person has to read past.
     Foreground { session: String, target: String },
     /// Start a new session out of view on `text`; the live one stays live.
-    StartBackground { text: String },
+    StartBackground {
+        text: String,
+        /// The scope the task is about, in `/review`'s own words
+        /// (`working_tree` / `staged` / `<base>`) when the caller knows it. With
+        /// one, the reply carries how many files it touches.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<String>,
+    },
     /// Say `text` to `target`, a background session, without bringing it
     /// forward.
     TellBackground { target: String, text: String },
@@ -577,6 +584,11 @@ pub enum HostReply {
     Backgrounded {
         session: String,
         slot: u32,
+        /// 那个范围里有多少个文件(给了 `scope` 时才算)。`None` = 这里问不出来:
+        /// 不在 git 仓库里、没有那个 base、或 git 不在 —— 那就不说数,而不是说一个
+        /// 谁都没量过的 0。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        files: Option<usize>,
     },
     /// The sessions kept running out of view, in slot order.
     BackgroundSessions {
@@ -1242,6 +1254,38 @@ pub struct BackgroundSession {
     /// what went wrong, or the last thing it said.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last: Option<String>,
+    /// What its work has cost so far, in the shape the turn summary is drawn in.
+    /// Read by the host off that session's own log — the only place those
+    /// numbers live for a session the screen is not following. `None` before it
+    /// has run a request, and on hosts that do not read that log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats: Option<BackgroundStats>,
+}
+
+/// What a background session's work cost, field for field what the turn summary
+/// beside it needs (`2 轮 · 2 工具 · 32.7s · 2.60K tokens · 97% cached`).
+///
+/// Grouped rather than flattened into [`BackgroundSession`] so the two readings
+/// that belong together stay together: `prompt` is the context the **last**
+/// request sent and `cached` is the part of that same reading served from cache
+/// (a ratio of one reading, not of two), while `completion` is work each round
+/// did once and so adds up.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundStats {
+    /// Model requests it ran.
+    pub steps: u32,
+    /// Tool calls those requests made.
+    pub tools: u32,
+    /// The context its last request sent.
+    pub prompt: u32,
+    /// How much of that came from the cache.
+    pub cached: u32,
+    /// Tokens it generated, summed over its rounds.
+    pub completion: u32,
+    /// Wall-clock the work took, in milliseconds. `0` when the log carried no
+    /// timing — a session cut before it opened, or one replayed from a log old
+    /// enough not to have stamped one.
+    pub elapsed_ms: u64,
 }
 
 /// Where a background session stands.
@@ -1505,6 +1549,7 @@ mod tests {
             },
             HostCommand::StartBackground {
                 text: "把测试跑一遍".into(),
+                scope: None,
             },
             HostCommand::TellBackground {
                 target: "b".into(),
@@ -1809,6 +1854,7 @@ mod tests {
                 HostReply::Backgrounded {
                     session: "a".into(),
                     slot: 1,
+                    files: None,
                 },
                 HostReply::BackgroundSessions {
                     sessions: vec![background_session()],
@@ -1902,6 +1948,7 @@ mod tests {
             state: BackgroundState::Waiting,
             created_at: 1_758_000_000_000,
             last: Some("可以改 src/lib.rs 吗?".into()),
+            stats: None,
         }
     }
 

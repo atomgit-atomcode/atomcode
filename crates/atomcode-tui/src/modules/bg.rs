@@ -224,10 +224,18 @@ fn session_line(view: &BgView, panel: &Panel, at: usize, w: usize) -> Line {
         base.under(theme::fg(Role::PanelFg))
     };
     let replying = panel.replying.as_deref() == Some(session.id.as_str());
-    let last = session
+    let mut last = session
         .last
         .clone()
         .unwrap_or_else(|| t(Msg::BgNothingSaid).into_owned());
+    // 做完了就把这次活花掉的接在后面(`2 轮 · 2 工具 · 32.7s · …`):它已经是历史,
+    // 而这一列本来就是给"这个会话眼下什么状况"看的。
+    if session.group == Group::Completed {
+        let figures = crate::bg::figures(session.stats);
+        if !figures.is_empty() {
+            last = format!("{last}  {figures}");
+        }
+    }
     let spans = vec![
         Span::styled("  ", base),
         Span::styled(mark, base.under(mark_style)),
@@ -323,6 +331,7 @@ mod tests {
             group,
             last: Some(last.into()),
             waiting: false,
+            stats: None,
         }
     }
 

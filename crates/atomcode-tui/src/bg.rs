@@ -45,6 +45,9 @@ pub struct Session {
     pub last: Option<String>,
     /// 在等人回答(审批或提问)——前台那条提示只为这个出现,出错不算。
     pub waiting: bool,
+    /// 这次活花掉的,宿主从它自己的日志折出来。`None` = 还没发过请求,或那个宿主
+    /// 不读后台会话的日志——两种都没有可说的数。
+    pub stats: Option<atomcode_host_api::BackgroundStats>,
 }
 
 impl Session {
@@ -59,8 +62,30 @@ impl Session {
             group: Group::of(session.state),
             last: session.last,
             waiting: session.state == atomcode_host_api::BackgroundState::Waiting,
+            stats: session.stats,
         }
     }
+}
+
+/// 那六个数字,画成本机那条回合汇总的样子
+/// (`2 轮 · 2 工具 · 32.7s · 2.60K tokens · 97% cached`)。
+///
+/// 一条请求都没发过的用不着补零:本机的 `caption` 那时答 `None`,这里也就空着 ——
+/// 「0 轮  0 工具」不是关于这次活的信息。空串 = 没得说。
+pub(crate) fn figures(stats: Option<atomcode_host_api::BackgroundStats>) -> String {
+    let Some(stats) = stats else {
+        return String::new();
+    };
+    crate::content::TurnStats {
+        steps: stats.steps,
+        prompt: stats.prompt,
+        completion: stats.completion,
+        cached: stats.cached,
+        tools: stats.tools,
+        elapsed_ms: stats.elapsed_ms,
+    }
+    .caption(true)
+    .unwrap_or_default()
 }
 
 /// 后台会话们,**按画的顺序**:先按组,组内按宿主给的顺序(放进后台的先后)。
@@ -345,6 +370,7 @@ mod tests {
             group,
             last: None,
             waiting: false,
+            stats: None,
         }
     }
 

@@ -2211,7 +2211,7 @@ impl TurnStats {
     /// `with_cached` is off for an interrupted turn: tuix drops the cache ratio
     /// from anything but a clean stop, and a hit rate beside a failure reads as a
     /// figure about the failure.
-    fn caption(&self, with_cached: bool) -> Option<String> {
+    pub(crate) fn caption(&self, with_cached: bool) -> Option<String> {
         // A turn that never reached its first request has no rounds and no
         // tokens; the rule then carries only the outcome.
         if self.steps == 0 && self.prompt == 0 && self.completion == 0 {

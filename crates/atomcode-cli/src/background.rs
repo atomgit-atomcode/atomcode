@@ -24,11 +24,11 @@ use atomcode_coding::runtime::{RuntimePhase, UserInput};
 use atomcode_coding::{CodingAgentConfig, CodingRuntime};
 use atomcode_harness::feed::Feed;
 use atomcode_host_api::{
-    BackgroundSession, BackgroundState, HostCommand, HostConnection, HostControl, HostError,
-    HostEvent, HostReply,
+    BackgroundSession, BackgroundState, BackgroundStats, HostCommand, HostConnection, HostControl,
+    HostError, HostEvent, HostReply,
 };
 use atomcode_kernel::event::{AgentCommand, AgentEvent, StopReason};
-use atomcode_kernel::session::SessionEvent;
+use atomcode_kernel::session::{LoggedEvent, SessionEvent};
 use futures::future::BoxFuture;
 use tokio::sync::mpsc;
 
@@ -59,6 +59,9 @@ struct Live {
     track: Arc<Mutex<Track>>,
     /// 放到后台的时刻,unix 毫秒。
     since: u64,
+    /// 是替哪个会话干活的(会话 id)。等于它自己 = 不是替谁干活,没有第二个读者 ——
+    /// `/bg` 把当前会话放到后台接着跑就是这种。
+    origin: String,
 }
 
 /// 从一个 runtime 的事件里记下的、面板要说的那几件事。
@@ -72,6 +75,51 @@ struct Track {
     error: Option<String>,
 }
 
+/// 这个范围里有多少个文件在变。
+///
+/// `None` = 这里问不出来(不在 git 仓库里、没有那个 base、或 git 不在):那就不说数,
+/// 而不是说一个谁都没量过的 0。`scope` 就是 `/review` 自己的词汇 —— 一行说"范围是
+/// 未提交的改动",另一行说"X 个文件",两处不能各算一半。
+fn changed_files(dir: &std::path::Path, scope: &str) -> Option<usize> {
+    let mut git = std::process::Command::new("git");
+    git.current_dir(dir);
+    match scope {
+        "staged" => {
+            git.args(["diff", "--cached", "--name-only"]);
+        }
+        "working_tree" => {
+            // `status`,不是 `diff`:这次还没提交的包括还没被 git 看见的那些新文件。
+            git.args(["status", "--porcelain"]);
+        }
+        base => {
+            let range = format!("{base}..HEAD");
+            git.args(["diff", "--name-only", &range]);
+        }
+    }
+    let out = git.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    Some(text.lines().filter(|line| !line.trim().is_empty()).count())
+}
+
+/// 一个回合结束后,这个会话该被算成什么状态。
+///
+/// 一处判断两处用:面板那一行(`Track::saw`)与"要不要把结果投回去"看的是同一件事
+/// —— 被中断和出错都不是一次结果,投回去只会让人读一段没有结论的话。
+fn ended_state(reason: &StopReason) -> BackgroundState {
+    match reason {
+        StopReason::Cancelled => BackgroundState::Cancelled,
+        StopReason::ProviderError
+        | StopReason::Timeout
+        | StopReason::PromptRejected
+        | StopReason::RateLimited
+        | StopReason::InvariantViolated => BackgroundState::Failed,
+        _ => BackgroundState::Done,
+    }
+}
+
 impl Track {
     /// 记下一件事。返回面板要不要重画。
     fn saw(&mut self, event: &AgentEvent) -> bool {
@@ -82,15 +130,7 @@ impl Track {
             }
             AgentEvent::TurnComplete { reason, .. } => {
                 self.pending = None;
-                self.ended = Some(match reason {
-                    StopReason::Cancelled => BackgroundState::Cancelled,
-                    StopReason::ProviderError
-                    | StopReason::Timeout
-                    | StopReason::PromptRejected
-                    | StopReason::RateLimited
-                    | StopReason::InvariantViolated => BackgroundState::Failed,
-                    _ => BackgroundState::Done,
-                });
+                self.ended = Some(ended_state(reason));
                 true
             }
             AgentEvent::Error { message, .. } => {
@@ -249,6 +289,7 @@ fn attach(
     } = connection;
     let track = Arc::new(Mutex::new(Track::default()));
     let said = control.subscribe();
+    let own = control.session_id();
     Ok((
         Live {
             id,
@@ -257,6 +298,7 @@ fn attach(
             shown: flag,
             track: track.clone(),
             since: now_ms(),
+            origin: own,
         },
         Pumps {
             id,
@@ -300,19 +342,33 @@ fn in_turn(live: &Live) -> bool {
 }
 
 /// 这个会话的日志,从它自己的 App 里读。
-fn log_of(live: &Live) -> Vec<SessionEvent> {
+///
+/// 连每条事实的提交时刻一起带回来(`LoggedEvent::at`):面板那一行摘要只看事件本身,
+/// 但「这次活干多久」要看首尾两个时刻 —— 而那是**这次活**的跨度,不是这个槽位开了
+/// 多久(它可能先空着,也可能中途在等一个回答)。
+fn log_of(live: &Live) -> Vec<LoggedEvent> {
     let session = live.control.session_id();
     live.control
         .front_end()
         .app()
         .and_then(|app| Feed::find(&app, &session))
-        .map(|agent| {
-            agent
-                .session()
-                .events()
-                .into_iter()
-                .map(|logged| logged.event)
-                .collect()
+        .map(|agent| agent.session().events())
+        .unwrap_or_default()
+}
+
+/// 这个后台会话叫什么:它自己起的名字,还没起名就用它第一句话。
+fn name_of(log: &[LoggedEvent]) -> String {
+    log.iter()
+        .rev()
+        .find_map(|logged| match &logged.event {
+            SessionEvent::Titled { title, .. } if !title.trim().is_empty() => Some(title.clone()),
+            _ => None,
+        })
+        .or_else(|| {
+            log.iter().find_map(|logged| match &logged.event {
+                SessionEvent::UserMessage { text, .. } => one_line(text),
+                _ => None,
+            })
         })
         .unwrap_or_default()
 }
@@ -325,28 +381,66 @@ fn one_line(text: &str) -> Option<String> {
         .map(|line| line.chars().take(240).collect())
 }
 
+/// 这次活花掉的:从它自己的日志折出来,字段和本机那条回合汇总(`content::TurnStats`)
+/// 一一对应 —— 屏幕上两行用的是同一套口径,「入 / 缓存」指的是**最后一次请求**的上下文
+/// (整段每轮重发,所以最后那次读数就是现在这一次),而「出」是每轮新做的工作,累加。
+///
+/// 一条请求都没发过就 `None`:没有可说的数,画出来只会是「0 轮  0 工具」。
+fn stats_of(log: &[LoggedEvent]) -> Option<BackgroundStats> {
+    let mut steps = 0u32;
+    let mut tools = 0u32;
+    let mut completion = 0u32;
+    let mut last: Option<atomcode_kernel::stream::TokenUsage> = None;
+    for logged in log {
+        match &logged.event {
+            SessionEvent::StepEnd { tool_calls, .. } => {
+                steps += 1;
+                tools = tools.saturating_add(*tool_calls);
+            }
+            SessionEvent::Usage { usage, .. } => {
+                completion = completion.saturating_add(usage.completion);
+                last = Some(*usage);
+            }
+            _ => {}
+        }
+    }
+    let usage = last?;
+    let elapsed_ms = match (log.first(), log.last()) {
+        (Some(first), Some(last)) => last.at.saturating_sub(first.at),
+        _ => 0,
+    };
+    Some(BackgroundStats {
+        steps,
+        tools,
+        prompt: usage.prompt,
+        cached: usage.cached,
+        completion,
+        elapsed_ms,
+    })
+}
+
 fn describe(live: &Live) -> BackgroundSession {
     let state = state_of(live);
     let log = log_of(live);
-    let title = log.iter().rev().find_map(|event| match event {
+    let title = log.iter().rev().find_map(|logged| match &logged.event {
         SessionEvent::Titled { title, .. } if !title.trim().is_empty() => Some(title.clone()),
         _ => None,
     });
     let asked = || {
-        log.iter().rev().find_map(|event| match event {
+        log.iter().rev().find_map(|logged| match &logged.event {
             SessionEvent::Asked { question, .. } => one_line(&question.prompt),
             _ => None,
         })
     };
     let said = || {
-        log.iter().rev().find_map(|event| match event {
+        log.iter().rev().find_map(|logged| match &logged.event {
             SessionEvent::AssistantMessage { text, .. }
             | SessionEvent::PartialReply { text, .. } => one_line(text),
             _ => None,
         })
     };
     let first_words = || {
-        log.iter().find_map(|event| match event {
+        log.iter().find_map(|logged| match &logged.event {
             SessionEvent::UserMessage { text, .. } => one_line(text),
             _ => None,
         })
@@ -384,6 +478,7 @@ fn describe(live: &Live) -> BackgroundSession {
         state,
         created_at: live.since,
         last,
+        stats: stats_of(&log),
     }
 }
 
@@ -391,7 +486,7 @@ fn describe(live: &Live) -> BackgroundSession {
 fn has_conversation(live: &Live) -> bool {
     log_of(live)
         .iter()
-        .any(|event| matches!(event, SessionEvent::UserMessage { .. }))
+        .any(|logged| matches!(logged.event, SessionEvent::UserMessage { .. }))
 }
 
 async fn stop(live: Live) {
@@ -415,6 +510,13 @@ impl Background {
 
     /// 一个 runtime 的事件到了。
     fn arrived(&self, id: u64, event: AgentEvent, changed: bool) {
+        // 替别的会话干活的那个,干完了把结果投回去 —— 内容落在发起它的那段对话里,
+        // 模型接着逐条核实。这是"结果回来了"在那段对话里的形状。
+        if let AgentEvent::TurnComplete { reason, .. } = &event {
+            if ended_state(reason) == BackgroundState::Done {
+                self.deliver_home(id);
+            }
+        }
         let front = {
             let state = self.state.lock().expect("background poisoned");
             if state.front.id == id {
@@ -429,6 +531,59 @@ impl Background {
         if changed && !front {
             self.announce_list();
         }
+    }
+
+    /// 把一个刚干完的后台会话说的话,投回发起它的那个会话。
+    ///
+    /// 只在"它是替别的会话干活"时才投(`origin` 不是它自己):`/bg` 把当前会话放到
+    /// 后台接着跑,它本来就是那个会话,没有第二个读者。
+    ///
+    /// 投的是**内容**而不是一句通知。发起时说的是"结果回来后我会逐条核实",而那次
+    /// 核实要真发生,就得让那段对话拿到结果 —— "去 /bg 读"是把这件事留给了一个人。
+    fn deliver_home(&self, id: u64) {
+        use atomcode_i18n::screen::{t as tr, Msg as SMsg};
+        let (origin, frame) = {
+            let state = self.state.lock().expect("background poisoned");
+            let Some(live) = state.slots.iter().find(|slot| slot.id == id) else {
+                return;
+            };
+            if live.origin.is_empty() || live.origin == live.control.session_id() {
+                return;
+            }
+            let log = log_of(live);
+            let Some(answer) = log.iter().rev().find_map(|logged| match &logged.event {
+                SessionEvent::AssistantMessage { text, .. } if !text.trim().is_empty() => {
+                    Some(text.trim().to_string())
+                }
+                _ => None,
+            }) else {
+                return;
+            };
+            let title = name_of(&log);
+            let frame = tr(SMsg::BackgroundResult {
+                title: &title,
+                answer: &answer,
+            })
+            .into_owned();
+            (live.origin.clone(), frame)
+        };
+        // 发起它的那个会话可能已经被丢了、或被换掉了:那就不投 —— 面板里还有它。
+        let handle = {
+            let state = self.state.lock().expect("background poisoned");
+            let live = if state.front.control.session_id() == origin {
+                Some(&state.front)
+            } else {
+                state
+                    .slots
+                    .iter()
+                    .find(|slot| slot.control.session_id() == origin)
+            };
+            live.map(|live| live.control.runtime().clone())
+        };
+        let Some(handle) = handle else { return };
+        tokio::spawn(async move {
+            let _ = handle.submit(UserInput::from(frame)).await;
+        });
     }
 
     /// 一个 runtime 的宿主事件到了。只有前台那个的才是屏幕上那个会话的事。
@@ -719,7 +874,12 @@ impl Background {
             previous: Some(session.clone()),
         });
         self.announce_list();
-        Ok(HostReply::Backgrounded { session, slot })
+        Ok(HostReply::Backgrounded {
+            session,
+            slot,
+            // 这条路是把**当前**会话放到后台接着跑:没有新范围,也没有要量的东西。
+            files: None,
+        })
     }
 
     async fn foreground(&self, session: String, target: String) -> Result<HostReply, HostError> {
@@ -756,7 +916,7 @@ impl Background {
         Ok(HostReply::SessionChanged { session: target })
     }
 
-    async fn start(&self, text: String) -> Result<HostReply, HostError> {
+    async fn start(&self, text: String, scope: Option<String>) -> Result<HostReply, HostError> {
         let _op = self.op.lock().await;
         let control = {
             let state = self.state.lock().expect("background poisoned");
@@ -766,7 +926,13 @@ impl Background {
             state.front.control.clone()
         };
         let working_dir = control.working_dir_now().await;
-        let live = self.spawn_at(working_dir, false).await?;
+        // 说得出范围的(审查就是),顺手把"这次有几个文件在变"算出来 —— 那行要说它。
+        let files = scope
+            .as_deref()
+            .and_then(|scope| changed_files(&working_dir, scope));
+        let mut live = self.spawn_at(working_dir, false).await?;
+        // 它是替**前台那个**干的:干完把结果投回去,而不是留在这里等人来读。
+        live.origin = control.session_id();
         if let Err(error) = live.control.runtime().submit(UserInput::from(text)).await {
             // 没接下任务的会话不留槽:它只会是一行什么都不做的空会话。
             stop(live).await;
@@ -779,7 +945,11 @@ impl Background {
             state.slots.len() as u32
         };
         self.announce_list();
-        Ok(HostReply::Backgrounded { session, slot })
+        Ok(HostReply::Backgrounded {
+            session,
+            slot,
+            files,
+        })
     }
 
     async fn tell(&self, target: String, text: String) -> Result<HostReply, HostError> {
@@ -836,7 +1006,7 @@ impl HostControl for Background {
                 sessions: self.list(),
             }),
             HostCommand::Foreground { session, target } => self.foreground(session, target).await,
-            HostCommand::StartBackground { text } => self.start(text).await,
+            HostCommand::StartBackground { text, scope } => self.start(text, scope).await,
             HostCommand::TellBackground { target, text } => self.tell(target, text).await,
             HostCommand::DropBackground { target } => self.drop_one(target).await,
             // 恢复一个正在后台跑的会话,就是把它带回来:租约本来就不让同一个会话
@@ -861,6 +1031,59 @@ impl HostControl for Background {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 范围里有几个文件在变,是真的去问 git。
+    ///
+    /// 三种范围各过一遍:这个数是给人读的("这次有 2 个文件在变"),编不出来。
+    #[test]
+    fn a_scope_counts_the_files_it_touches() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return; // 这台机器没有 git:没有可量的东西。
+        }
+        let dir = std::env::temp_dir().join(format!("atomcode-bg-files-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(&dir)
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("a.txt"), "one").expect("write");
+        std::fs::write(dir.join("b.txt"), "two").expect("write");
+        assert_eq!(
+            changed_files(&dir, "working_tree"),
+            Some(2),
+            "两个还没提交的文件,包括 git 还没看见的那个"
+        );
+        git(&["add", "a.txt"]);
+        assert_eq!(changed_files(&dir, "staged"), Some(1));
+        git(&["add", "b.txt"]);
+        git(&["commit", "-qm", "one"]);
+        std::fs::write(dir.join("b.txt"), "two again").expect("write");
+        git(&["add", "b.txt"]);
+        git(&["commit", "-qm", "two"]);
+        assert_eq!(
+            changed_files(&dir, "HEAD~1"),
+            Some(1),
+            "已提交的那一段:HEAD~1..HEAD 只动了 b.txt"
+        );
+        // 问不出来的地方说"问不出来",而不是一个谁都没量过的零。
+        assert_eq!(
+            changed_files(std::path::Path::new("/"), "working_tree"),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// 回合怎么结束的,面板就怎么分组——被取消的不算失败,出错的要人看。
     #[test]

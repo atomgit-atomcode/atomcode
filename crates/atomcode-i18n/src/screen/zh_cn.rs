@@ -354,10 +354,21 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdTakesBg => "[<任务> | list | <N> | drop <N>]".into(),
         Msg::CmdAboutReview => "让另一个会话把这次改动审一遍——默认放后台跑,当前对话不停".into(),
         Msg::CmdTakesReview => "[deep | deep+verify] [staged | <base>]".into(),
+        Msg::ReviewWhatUncommitted => "审查未提交的改动".into(),
+        Msg::ReviewWhatStaged => "审查已暂存的改动".into(),
+        Msg::ReviewWhatRange { base } => format!("审查 {base} 之后的提交").into(),
+        Msg::ReviewStarted { what, files } => match files {
+            Some(files) => format!(
+                "已经在后台启动{what};这次有 {files} 个文件在变。结果回来后,我会在这里逐条核实再告诉你。"
+            )
+            .into(),
+            None => format!("已经在后台启动{what}。结果回来后,我会在这里逐条核实再告诉你。").into(),
+        },
         Msg::BgUsage => "用法:/bg · /bg <任务> · /bg list · /bg <N> · /bg drop <N>(/bg 即 /background)".into(),
         Msg::BgNoSuchSlot { slot, count } => format!("没有第 {slot} 号后台会话(一共 {count} 个)").into(),
         Msg::BgMoved { slot } => format!("刚才的会话在后台 [#{slot}] 接着跑,这里是新的会话").into(),
         Msg::BgStarted { slot } => format!("后台 [#{slot}] 开始做了").into(),
+        Msg::BgStartedWhat { slot, what } => format!("后台 [#{slot}] 开始做了:{what}").into(),
         Msg::BgDropped { slot } => format!("已丢掉后台 [#{slot}]").into(),
         Msg::BgTold { title } => format!("已发给「{title}」").into(),
         Msg::BgNoPanel => "这块屏幕没挂后台面板".into(),
@@ -381,6 +392,11 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::BgQuitStay => "留下".into(),
         Msg::BgWaitingTip { slot, title } => format!("后台 [{slot}] {title} 在等你回答 · /bg {slot} 打开").into(),
         Msg::BgSlotsFull { most } => format!("后台已经放了 {most} 个会话,先丢掉一个(/bg drop <N>)").into(),
+
+        Msg::BackgroundResult { title, answer } => format!(
+            "后台「{title}」的结果回来了:\n\n{answer}\n\n逐条核实一遍,把该改的列出来;拿不准的指出来。"
+        )
+        .into(),
 
         // ── reasoning effort, undo and rewind (`commands.rs`) ──
         Msg::EffortAbout => "这个会话的思考强度".into(),
