@@ -513,13 +513,21 @@ impl Presentation {
 /// someone was reading away is the one gesture that can lose work. A click on
 /// prose stays a no-op.
 ///
-/// A thought and a tool call are in. Both are drawn as a one-line lid over a
-/// detail — `· 思考 3 行`, `● ReadFile(a.rs) · ok` — and a click on a lid has
-/// exactly one meaning. Folding a thought was reachable only by ctrl-r, which
-/// moves *every* thought in the transcript; the row itself answered nothing, so
-/// pointing at a lid opens that lid and costs no other gesture. A press that
-/// moves is still a selection, and ctrl-r still does them all at once.
-const CLICKABLE: [&str; 2] = ["tool_call", "reasoning"];
+/// A thought, a tool call and a VL caption are in. All three are drawn as a
+/// one-line lid over a detail — `· 思考 3 行`, `● ReadFile(a.rs) · ok`,
+/// `● VL 识别图片成功，返回 N chars` — and a click on a lid has exactly one
+/// meaning. Folding a thought was reachable only by ctrl-r, which moves *every*
+/// thought in the transcript; the row itself answered nothing, so pointing at a
+/// lid opens that lid and costs no other gesture. A press that moves is still a
+/// selection, and ctrl-r still does them all at once.
+///
+/// The VL caption was the lid that answered nothing either way. It is folded by
+/// default ([`Presentation::default_folds`]) and its row says `点击展开`, so it
+/// advertises the gesture — but a recognition runs to thousands of characters,
+/// and with nothing to point at it had no way onto the screen at all. The words
+/// behind it are the VL helper's about a picture, not words a person wrote, so
+/// opening it on a click is not the prose case above.
+const CLICKABLE: [&str; 3] = ["tool_call", "reasoning", "vl_caption"];
 
 /// How many rows the slash menu may take, margin aside.
 ///
@@ -11164,11 +11172,12 @@ mod tests {
     }
 
     #[test]
-    fn a_thought_and_a_tool_call_answer_a_click_but_prose_does_not() {
+    fn the_lids_answer_a_click_and_prose_does_not() {
         // Two decisions, deliberately different. Prose is not a click target:
         // it is the largest surface on the screen, and folding away the answer
-        // someone was reading is the one gesture that can lose work. A thought
-        // or a tool call is a one-line lid, and a click on a lid has one meaning.
+        // someone was reading is the one gesture that can lose work. A lid — a
+        // thought, a tool call, a VL caption — is a one-line stand-in for a
+        // detail, and a click on a lid has one meaning.
         //
         // A lid, specifically — not a hidden block. Reasoning opens off the
         // screen now, so this asks for its lid first: a click can only land on
@@ -11184,7 +11193,9 @@ mod tests {
             .collect();
         assert!(!kinds.is_empty(), "nothing is clickable at all");
         assert!(
-            kinds.iter().all(|k| *k == "tool_call" || *k == "reasoning"),
+            kinds
+                .iter()
+                .all(|k| *k == "tool_call" || *k == "reasoning" || *k == "vl_caption"),
             "these answer a click too: {kinds:?}"
         );
         assert!(
@@ -11222,6 +11233,67 @@ mod tests {
         assert!(
             open.contains("hmm"),
             "the click showed the working:\n{open}"
+        );
+
+        h.toggle_block(id, kind);
+        assert_eq!(
+            h.compose(size).rows().join("\n"),
+            folded,
+            "clicking it again is the inverse"
+        );
+    }
+
+    /// The lid that answered nothing either way.
+    ///
+    /// `default_folds` folds a VL caption and its row says `点击展开`, but the
+    /// kind was not in [`CLICKABLE`], so the row never entered the hit map and a
+    /// recognition of a few thousand characters — the reported
+    /// `● VL 识别图片成功，返回 2257 chars  qwen3.8-27b  点击展开` — had no way onto
+    /// the screen at all.
+    #[test]
+    fn clicking_a_vl_caption_opens_the_recognition() {
+        let h = host();
+        let caption = "一层是登录界面\n二层是报错弹窗\n三层是网络面板";
+        let said = crate::i18n::product::t(crate::i18n::product::Msg::VisionRecognised {
+            model: "qwen3.8-27b",
+            text: caption,
+        })
+        .into_owned();
+        h.absorb(&SessionEvent::UserMessage {
+            text: format!("[Image #1] 看看这是啥？\n\n{said}"),
+            turn: 1,
+            images: Vec::new(),
+        });
+
+        let size = (80, 40);
+        let folded = h.compose(size).rows().join("\n");
+        assert!(
+            folded.contains("点击展开"),
+            "folded to a summary:\n{folded}"
+        );
+        assert!(
+            folded.contains("qwen3.8-27b"),
+            "the row names the model that read the picture:\n{folded}"
+        );
+        assert!(
+            !folded.contains("三层是网络面板"),
+            "the recognition is folded away:\n{folded}"
+        );
+
+        let rect = h.compose(size).part("stream").unwrap().rect;
+        let (id, kind) = (rect.y..rect.bottom())
+            .filter_map(|y| h.block_at(2, y))
+            .find(|(_, kind)| *kind == "vl_caption")
+            .expect("the folded caption answers a click");
+        h.toggle_block(id, kind);
+        let open = h.compose(size).rows().join("\n");
+        assert!(
+            open.contains("三层是网络面板"),
+            "the click showed the recognition:\n{open}"
+        );
+        assert!(
+            !open.contains("点击展开"),
+            "and an open block does not advertise the gesture:\n{open}"
         );
 
         h.toggle_block(id, kind);
