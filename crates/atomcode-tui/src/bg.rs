@@ -155,6 +155,9 @@ pub struct Panel {
     pub moved: Option<String>,
     /// 光标要落在的会话——列表可能晚一步到,到了再落。
     pub aim: Option<String>,
+    /// 刚才想就地回复一个在等你回答的会话:话不发,图例那一行换成「按 Enter 打开」。
+    /// 下一次按键就收起。
+    pub waiting_note: bool,
 }
 
 impl Panel {
@@ -164,6 +167,34 @@ impl Panel {
             moved,
             ..Self::default()
         }
+    }
+
+    /// 点了第 `at` 行:没选中就选中它,已经选中的再点一次就打开。
+    pub fn click(&mut self, view: &BgView, at: usize) -> Step {
+        self.waiting_note = false;
+        let Some(session) = view.at(at) else {
+            return Step::Stay;
+        };
+        if self.cursor == at {
+            return Step::Open {
+                id: session.id.clone(),
+            };
+        }
+        self.cursor = at;
+        Step::Stay
+    }
+
+    /// 滚轮:光标往上 / 往下走 `by` 行,夹在列表里。动了返回 `true`。
+    pub fn wheel(&mut self, view: &BgView, by: i32) -> bool {
+        let last = view.sessions().len().saturating_sub(1);
+        let want = if by < 0 {
+            self.cursor.saturating_sub(by.unsigned_abs() as usize)
+        } else {
+            self.cursor.saturating_add(by as usize).min(last)
+        };
+        let moved = want != self.cursor;
+        self.cursor = want;
+        moved
     }
 
     /// 列表换了:光标要是在等一个会话出现,它出现了就落上去;否则夹在列表里。
@@ -208,6 +239,14 @@ pub enum Step {
 /// ctrl+c 不在这里:它照常走两次退出(路由那一侧不把它交给面板)。
 pub fn key(view: &BgView, panel: &mut Panel, press: KeyPress) -> Step {
     let selected = view.at(panel.cursor).map(|s| s.id.clone());
+    panel.waiting_note = false;
+    // 在等审批或提问的会话不收「回复」:它等的是那个问题的答案,一句话塞进去只会
+    // 换回运行时的一个拒绝。要答,得把它打开。
+    let waits = |id: &str| {
+        view.position(id)
+            .and_then(|at| view.at(at))
+            .is_some_and(|s| s.waiting)
+    };
     if !matches!(press.key, Key::Char('?')) || !panel.input.is_empty() {
         panel.keys = false;
     }
@@ -244,6 +283,11 @@ pub fn key(view: &BgView, panel: &mut Panel, press: KeyPress) -> Step {
                 if text.is_empty() {
                     return Step::Stay;
                 }
+                if waits(&id) {
+                    // 回复写到一半,它开始等人了:话留在框里,不发。
+                    panel.waiting_note = true;
+                    return Step::Stay;
+                }
                 panel.input.clear();
                 panel.replying = None;
                 return Step::Tell { id, text };
@@ -264,8 +308,10 @@ pub fn key(view: &BgView, panel: &mut Panel, press: KeyPress) -> Step {
         // 空着的输入框里,space 是「回复选中的那个」,`?` 是按键说明;写了字之后
         // 它们就只是字。
         (Key::Char(' '), Mods::NONE) if panel.input.is_empty() && panel.replying.is_none() => {
-            if let Some(id) = selected {
-                panel.replying = Some(id);
+            match selected {
+                Some(id) if waits(&id) => panel.waiting_note = true,
+                Some(id) => panel.replying = Some(id),
+                None => {}
             }
             Step::Stay
         }
@@ -385,6 +431,37 @@ mod tests {
         key(&view, &mut panel, press(Key::Char(' ')));
         assert_eq!(key(&view, &mut panel, press(Key::Esc)), Step::Stay);
         assert!(panel.replying.is_none());
+    }
+
+    /// 在等你回答的会话不收就地回复:space 不进入回复,只提示去打开它。
+    #[test]
+    fn space_on_a_waiting_session_does_not_reply() {
+        let mut sessions = vec![session("asking", Group::NeedsInput)];
+        sessions[0].waiting = true;
+        let view = BgView::new(sessions);
+        let mut panel = Panel::new(None);
+        assert_eq!(key(&view, &mut panel, press(Key::Char(' '))), Step::Stay);
+        assert!(panel.replying.is_none());
+        assert!(panel.waiting_note);
+        key(&view, &mut panel, press(Key::Down));
+        assert!(!panel.waiting_note, "下一次按键就收起");
+    }
+
+    /// 点一行是选中,再点同一行才打开。
+    #[test]
+    fn a_click_selects_and_a_second_click_opens() {
+        let view = view();
+        let mut panel = Panel::new(None);
+        assert_eq!(panel.click(&view, 1), Step::Stay);
+        assert_eq!(panel.cursor, 1);
+        assert_eq!(
+            panel.click(&view, 1),
+            Step::Open {
+                id: "running".into()
+            }
+        );
+        assert!(panel.wheel(&view, 5));
+        assert_eq!(panel.cursor, 2, "滚轮夹在列表里");
     }
 
     #[test]

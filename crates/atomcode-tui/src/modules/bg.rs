@@ -170,6 +170,11 @@ fn draw(view: &BgView, panel: &Panel, row: Row, w: usize, caps: crate::caps::Cap
         Row::BoxTop => box_edge(w, caps, true),
         Row::BoxBottom => box_edge(w, caps, false),
         Row::Input => input_line(view, panel, w, caps),
+        Row::Legend if panel.waiting_note => Line::styled(
+            format!("  {}", t(Msg::BgReplyWaiting)),
+            theme::fg(Role::Warning),
+        )
+        .truncate(w),
         Row::Legend => Line::styled(
             format!(
                 "  {}",
@@ -276,6 +281,34 @@ fn input_line(view: &BgView, panel: &Panel, w: usize, caps: crate::caps::Caps) -
         ));
     }
     Line::from_spans(spans).truncate(w)
+}
+
+/// 命中测试要的:每一屏行对应画的顺序里的第几个会话。
+pub struct Geometry {
+    rows: Vec<Option<usize>>,
+}
+
+impl Geometry {
+    /// 第 `row` 屏行是哪个会话,不在会话行上就是 `None`。
+    pub fn session_at(&self, row: usize) -> Option<usize> {
+        self.rows.get(row).copied().flatten()
+    }
+}
+
+/// 和 `render` 同一份布局,所以点到的就是画在那儿的。
+pub fn geometry(moment: &Moment) -> Geometry {
+    let Some(panel) = moment.bg_panel.as_ref() else {
+        return Geometry { rows: Vec::new() };
+    };
+    Geometry {
+        rows: layout(&moment.bg, panel)
+            .into_iter()
+            .map(|row| match row {
+                Row::Session(at) => Some(at),
+                _ => None,
+            })
+            .collect(),
+    }
 }
 
 #[cfg(test)]

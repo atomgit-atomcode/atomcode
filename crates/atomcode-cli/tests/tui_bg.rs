@@ -164,6 +164,8 @@ struct Rig {
     client: Arc<atomcode_tui::plugin::AgentClient>,
     running: tokio::task::JoinHandle<()>,
     _mounted: atomcode_tui::launch::Mounted,
+    /// What holds the runtimes, as the launcher gets it back.
+    host: Arc<atomcode::background::Background>,
 }
 
 impl Rig {
@@ -204,7 +206,7 @@ impl Rig {
             headless: Some((120, 48)),
             ..Screen::default()
         };
-        let (mounted, _) = tui_front::mount_with_background(
+        let (mounted, host) = tui_front::mount_with_background(
             runtime,
             front_end,
             config,
@@ -238,6 +240,7 @@ impl Rig {
             client,
             running,
             _mounted: mounted,
+            host: host.expect("a host that can start runtimes"),
         };
         // The first session is on screen before anything is typed.
         rig.until("the first session is followed", |rig| {
@@ -717,5 +720,146 @@ async fn a_background_session_waiting_for_an_answer_is_told_on_the_foreground() 
     .await;
     rig.until("the line went away", |rig| !rig.term.text().contains(&tip))
         .await;
+    rig.quit().await;
+}
+
+/// **Leaving prints how to come back to every background session it stopped**
+/// — the foreground's `resume` line, then one per background session, in the
+/// same words.
+#[tokio::test(flavor = "multi_thread")]
+async fn quitting_says_how_to_resume_the_background_sessions_it_stopped() {
+    let rig = Rig::new().await;
+    let first = rig.client.root();
+    rig.term.type_line("slow task");
+    rig.until("the slow turn reached the model", |rig| {
+        rig.script.started.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    rig.term.type_line("/bg");
+    rig.until_screen(&t(Msg::BgPanelMoved)).await;
+    let fresh = rig.client.root();
+    assert_ne!(fresh, first);
+
+    let question = t(Msg::BgQuitQuestion { count: 1 }).into_owned();
+    rig.term.press(KeyPress::ctrl('d'));
+    rig.until_screen(&question).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    rig.term.press(KeyPress::plain(Key::Enter));
+    rig.until("the screen quit", |rig| rig.running.is_finished())
+        .await;
+    rig.until_background("the background runtime was stopped", |list| list.is_empty())
+        .await;
+
+    let lines =
+        atomcode::exit_resume_hints("atomcode", Some(&fresh), &rig.host.left_behind(), false);
+    assert_eq!(
+        lines,
+        vec![
+            atomcode::resume_hint_line("atomcode", &fresh, false, false),
+            atomcode::resume_hint_line("atomcode", &first, false, false),
+        ],
+        "the foreground's line, then the stopped background session's"
+    );
+    assert!(
+        lines[1].contains(&format!("atomcode resume {first}")),
+        "{lines:?}"
+    );
+}
+
+/// **Space on a session waiting for an answer does not reply to it.** Nothing
+/// is sent; the panel says the session is waiting and Enter opens it.
+#[tokio::test(flavor = "multi_thread")]
+async fn space_on_a_session_waiting_for_an_answer_says_to_open_it() {
+    let rig = Rig::new().await;
+    rig.term.type_line("/background ask me");
+    rig.until_background("the background session is waiting", |list| {
+        list.first()
+            .is_some_and(|s| s.state == BackgroundState::Waiting)
+    })
+    .await;
+    rig.term.type_line("/bg list");
+    rig.until_screen(&t(Msg::BgPlaceholder)).await;
+    let before = rig.script.count.load(Ordering::SeqCst);
+    rig.term.press(KeyPress::ch(' '));
+    rig.until_screen(&t(Msg::BgReplyWaiting)).await;
+    let title = rig.background().await[0].title.clone().unwrap_or_default();
+    assert!(
+        !rig.term
+            .text()
+            .contains(&*t(Msg::BgReplyTo { title: &title })),
+        "no reply box was opened:\n{}",
+        rig.term.text()
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        rig.script.count.load(Ordering::SeqCst),
+        before,
+        "nothing sent"
+    );
+    assert_eq!(rig.background().await[0].state, BackgroundState::Waiting);
+    rig.quit().await;
+}
+
+/// **The panel answers the mouse.** A click selects a row without switching;
+/// a second click on the selected row opens it; the wheel walks the list — so
+/// after scrolling away, a click on that row only selects it again.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_panel_is_worked_with_the_mouse() {
+    let rig = Rig::new().await;
+    let first = rig.client.root();
+    rig.term.type_line("/background hello");
+    rig.until_background("one done", |list| {
+        list.len() == 1 && list[0].state == BackgroundState::Done
+    })
+    .await;
+    rig.term.type_line("/background there");
+    rig.until_background("both done", |list| {
+        list.len() == 2 && list.iter().all(|s| s.state == BackgroundState::Done)
+    })
+    .await;
+    let second = rig.background().await[1].session.clone();
+    rig.term.type_line("/bg list");
+    rig.until_screen(&t(Msg::BgPlaceholder)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The two rows under the one heading, in slot order.
+    let heading = t(Msg::BgGroupCompleted).into_owned();
+    let rows = rig.term.screen();
+    let at = rows
+        .iter()
+        .position(|row| row.contains(&heading))
+        .expect("the completed heading is drawn") as u16;
+    let row_of_second = at + 2;
+    let click = |y: u16| {
+        rig.term.pointer(atomcode_tui::surface::Click::Press, 10, y);
+        rig.term
+            .pointer(atomcode_tui::surface::Click::Release, 10, y);
+    };
+
+    click(row_of_second);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        rig.client.root(),
+        first,
+        "one click selects, it does not open"
+    );
+
+    // Scroll back up: the selection leaves that row, so the next click on it
+    // selects again rather than opening.
+    rig.term
+        .pointer(atomcode_tui::surface::Click::WheelUp, 10, row_of_second);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    click(row_of_second);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        rig.client.root(),
+        first,
+        "the wheel moved the selection away"
+    );
+
+    click(row_of_second);
+    rig.until("a second click on the selected row opens it", |rig| {
+        rig.client.root() == second
+    })
+    .await;
     rig.quit().await;
 }

@@ -1136,6 +1136,8 @@ pub struct Hits {
     rewind: Option<Rect>,
     /// And the resume panel's.
     resume: Option<Rect>,
+    /// And the background panel's.
+    bg: Option<Rect>,
     /// Where the slash menu was drawn, so a press or the pointer on a row finds
     /// the command it is on.
     ///
@@ -3825,6 +3827,52 @@ impl Host {
         true
     }
 
+    /// Which session row of the background panel is under the pointer, in the
+    /// panel's drawn order.
+    pub fn bg_row_at(&self, x: u16, y: u16) -> Option<usize> {
+        let rect = *self.hits.lock().expect("hits poisoned").bg.as_ref()?;
+        if !rect.contains(x, y) {
+            return None;
+        }
+        let m = self.moment.read().expect("moment poisoned");
+        m.bg_panel.as_ref()?;
+        crate::modules::bg::geometry(&m).session_at((y - rect.y) as usize)
+    }
+
+    /// A click on a row of the background panel: the first selects it, a
+    /// second on the selected row opens it — the same step Enter takes.
+    pub fn bg_click(&self, row: usize) -> Option<crate::bg::Step> {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let view = m.bg.clone();
+        let panel = m.bg_panel.as_mut()?;
+        match panel.click(&view, row) {
+            crate::bg::Step::Stay => None,
+            step => Some(step),
+        }
+    }
+
+    /// The wheel over the background panel walks its list.
+    pub fn bg_wheel(&self, x: u16, y: u16, by: i32) -> bool {
+        let over = self
+            .hits
+            .lock()
+            .expect("hits poisoned")
+            .bg
+            .is_some_and(|rect| rect.contains(x, y));
+        if !over {
+            return false;
+        }
+        let mut m = self.moment.write().expect("moment poisoned");
+        let view = m.bg.clone();
+        match m.bg_panel.as_mut() {
+            Some(panel) => {
+                panel.wheel(&view, by);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Run one key against the background panel: whether it changed, and what
     /// the key asked the screen to do.
     pub fn bg_key(&self, press: crate::surface::KeyPress) -> (bool, Option<crate::bg::Step>) {
@@ -4909,6 +4957,7 @@ impl Host {
                         mcp: None,
                         rewind: None,
                         resume: None,
+                        bg: None,
                         menu: None,
                     };
                     *self.last_room.lock().expect("room poisoned") = rect;
@@ -4978,6 +5027,10 @@ impl Host {
                         // And the resume panel, worked with the same pointer.
                         if id == crate::modules::resume::ID {
                             self.hits.lock().expect("hits poisoned").resume = Some(*tail_rect);
+                        }
+                        // And the background panel.
+                        if id == crate::modules::bg::ID {
+                            self.hits.lock().expect("hits poisoned").bg = Some(*tail_rect);
                         }
                         frame.place(id.clone(), *tail_rect, lines);
                     }

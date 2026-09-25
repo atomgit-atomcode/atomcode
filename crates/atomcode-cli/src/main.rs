@@ -151,18 +151,10 @@ fn resolve_working_dir(cli_dir: Option<PathBuf>) -> PathBuf {
 /// form (what continues a pipe run); the TUI shows the `resume <id>` subcommand.
 /// Pure so the wording/forms are unit-tested.
 fn resume_hint_line(session_id: &str, headless: bool, zh: bool) -> String {
-    let cmd = if headless {
-        format!("{BIN_NAME} -p \"…\" --resume {session_id}")
-    } else {
-        format!("{BIN_NAME} resume {session_id}")
-    };
     // The wording lives in the table with everything else; `zh` stays a
     // parameter rather than a read of the global locale because this function
     // is pure and its two forms are unit-tested side by side.
-    use atomcode_config::i18n::{t_with, Msg};
-    use atomcode_config::locale::Locale;
-    let locale = if zh { Locale::ZhCn } else { Locale::En };
-    t_with(locale, Msg::ResumeHint { cmd: &cmd }).into_owned()
+    atomcode::resume_hint_line(BIN_NAME, session_id, headless, zh)
 }
 
 /// What session to resume at launch, unified across `--continue`, `--resume`,
@@ -2667,11 +2659,18 @@ async fn run() -> Result<i32> {
                     Some(spawn),
                 )
                 .await
-                .map(|()| 0)
                 .map_err(|why| anyhow::anyhow!(why));
-                if let Some(id) = &active_session_id {
-                    println!("\n{}", resume_hint_line(id, false, hint_zh));
+                // 前台那句,再加上退出时停掉的每个后台会话一句——同一个格式。
+                let left = result.as_ref().map(Vec::clone).unwrap_or_default();
+                for line in atomcode::exit_resume_hints(
+                    BIN_NAME,
+                    active_session_id.as_deref(),
+                    &left,
+                    hint_zh,
+                ) {
+                    println!("\n{line}");
                 }
+                let result = result.map(|_| 0);
                 // The same flush every other exit path gets below.
                 telemetry
                     .shutdown(std::time::Duration::from_millis(500))

@@ -589,6 +589,7 @@ pub enum Msg<'a> {
         count: usize,
     },
     BgQuitConfirm,
+    BgReplyWaiting,
     BgQuitStay,
     BgWaitingTip {
         slot: usize,

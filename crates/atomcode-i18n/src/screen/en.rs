@@ -408,6 +408,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::BgRefusedWhileAsking => "it is waiting for your answer — answer it first".into(),
         Msg::BgRefusedWhileReconfiguring => "the model is being switched — try again in a moment".into(),
         Msg::BgQuitQuestion { count } => format!("{count} background sessions are still running — quitting stops them (they are saved; /resume brings them back)").into(),
+        Msg::BgReplyWaiting => "this session is waiting for your answer — press Enter to open it".into(),
         Msg::BgQuitConfirm => "quit and stop them".into(),
         Msg::BgQuitStay => "stay".into(),
         Msg::BgWaitingTip { slot, title } => format!("background [{slot}] {title} is waiting for your answer · /bg {slot} opens it").into(),

@@ -1628,6 +1628,10 @@ impl UserInterface for Tui {
                             stale = true;
                             continue;
                         }
+                        if self.host.bg_wheel(x, y, by) {
+                            stale = true;
+                            continue;
+                        }
                         if self.host.providers_wheel(x, y, by) {
                             stale = true;
                             continue;
@@ -1775,6 +1779,18 @@ impl UserInterface for Tui {
                                     self.run_rewind_key(crate::surface::KeyPress::plain(
                                         crate::surface::Key::Enter,
                                     ));
+                                    stale = true;
+                                    continue;
+                                }
+                            }
+                            // And the background panel: a click selects a row, a
+                            // second click on the selected row opens it — so a
+                            // stray click never switches the conversation.
+                            if self.host.bg_open() {
+                                if let Some(row) = self.host.bg_row_at(x, y) {
+                                    if let Some(step) = self.host.bg_click(row) {
+                                        self.run_bg_step(step);
+                                    }
                                     stale = true;
                                     continue;
                                 }
@@ -2729,11 +2745,18 @@ impl Tui {
     /// panel and a typed command cannot come to mean different things. Opening
     /// a session is the end of the panel's job; the rest keep it up.
     fn run_bg_key(&self, press: crate::surface::KeyPress) -> bool {
-        use crate::bg::Step;
         let (changed, asked) = self.host.bg_key(press);
         let Some(step) = asked else {
             return changed;
         };
+        self.run_bg_step(step);
+        true
+    }
+
+    /// Carry out what the background panel asked for, as the command a person
+    /// could type.
+    fn run_bg_step(&self, step: crate::bg::Step) {
+        use crate::bg::Step;
         let line = match step {
             Step::Open { id } => {
                 self.host.close_bg();
@@ -2742,13 +2765,12 @@ impl Tui {
             Step::Start { task } => format!("/background {task}"),
             Step::Tell { id, text } => format!("/bg tell {id} {text}"),
             Step::Drop { id } => format!("/bg drop {id}"),
-            Step::Stay | Step::Close => return true,
+            Step::Stay | Step::Close => return,
         };
         let keys = self.wake.lock().expect("wake poisoned").clone();
         if let Some(keys) = keys {
             let _ = keys.send(Wake::Chose(Some(line)));
         }
-        true
     }
 
     /// One key against the resume panel. The only thing it asks for is a resume,

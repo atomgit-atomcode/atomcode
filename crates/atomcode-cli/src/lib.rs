@@ -63,6 +63,41 @@ pub mod acp;
 /// §2.4), and a Product crate must not carry a front-end contract.
 pub mod host;
 
+/// The line printed after the screen is gone: how to come back to a session.
+///
+/// Here rather than in the binary so the exit path of the full-screen UI can
+/// print one per background session in exactly the foreground's wording.
+/// `bin` is the binary's own name, which only the binary knows.
+pub fn resume_hint_line(bin: &str, session_id: &str, headless: bool, zh: bool) -> String {
+    let cmd = if headless {
+        format!("{bin} -p \"…\" --resume {session_id}")
+    } else {
+        format!("{bin} resume {session_id}")
+    };
+    use atomcode_config::i18n::{t_with, Msg};
+    use atomcode_config::locale::Locale;
+    let locale = if zh { Locale::ZhCn } else { Locale::En };
+    t_with(locale, Msg::ResumeHint { cmd: &cmd }).into_owned()
+}
+
+/// The `resume` lines to print when the full-screen UI exits: the foreground
+/// session's, then one per background session the exit stopped
+/// (`background::Background::left_behind`), none twice.
+pub fn exit_resume_hints(
+    bin: &str,
+    foreground: Option<&str>,
+    background: &[String],
+    zh: bool,
+) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    foreground
+        .into_iter()
+        .chain(background.iter().map(String::as_str))
+        .filter(|id| !id.is_empty() && seen.insert(id.to_string()))
+        .map(|id| resume_hint_line(bin, id, false, zh))
+        .collect()
+}
+
 /// 后台会话:一个屏幕背后的多个 runtime(`docs/plans/2026-09-25-bg-design.md`)。
 pub mod background;
 
@@ -811,7 +846,7 @@ model = "vendor-b"
         telemetry: Option<Arc<atomcode_telemetry::Telemetry>>,
         opening_notice: Option<String>,
         spawn: Option<crate::background::Spawn>,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<String>, String> {
         let (mounted, background) = mount_with_background(
             runtime,
             front_end,
@@ -828,9 +863,15 @@ model = "vendor-b"
         let result = mounted.ui.run(&ctx, None).await;
         // 屏幕没了,后台的会话也停下:取消跑着的回合(半截回复落进日志),放掉租约
         // (`docs/plans/2026-09-25-bg-design.md` §五)。
-        if let Some(background) = background {
-            background.shutdown_all().await;
-        }
-        result
+        //
+        // 回来的是被停掉的后台会话,启动器照前台那句的格式给每个打一行 resume 提示。
+        let left = match background {
+            Some(background) => {
+                background.shutdown_all().await;
+                background.left_behind()
+            }
+            None => Vec::new(),
+        };
+        result.map(|()| left)
     }
 }

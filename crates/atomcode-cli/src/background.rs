@@ -122,6 +122,9 @@ pub struct Background {
     /// 换前台、放后台、丢弃一次只做一件:两件交错,槽位表会被写成两者都没想要的样子。
     op: tokio::sync::Mutex<()>,
     me: Weak<Background>,
+    /// The sessions stopped because the screen went away, in slot order — what
+    /// the launcher prints a `resume` line for after the terminal is back.
+    left: Mutex<Vec<String>>,
 }
 
 /// [`crate::host::connect`],外加后台会话。
@@ -157,6 +160,7 @@ pub fn connect(
         next: AtomicU64::new(1),
         op: tokio::sync::Mutex::new(()),
         me: me.clone(),
+        left: Mutex::new(Vec::new()),
     });
     // 泵在 `Arc` 建好之后才起:起早了,第一条事件升级不了弱引用,泵就停了。
     parts.pump(Arc::downgrade(&background));
@@ -579,7 +583,17 @@ impl Background {
     pub async fn shutdown_all(&self) {
         let _op = self.op.lock().await;
         let slots = std::mem::take(&mut self.state.lock().expect("background poisoned").slots);
+        self.left
+            .lock()
+            .expect("left poisoned")
+            .extend(slots.iter().map(|slot| slot.control.session_id()));
         futures::future::join_all(slots.into_iter().map(stop)).await;
+    }
+
+    /// The background sessions the exit stopped. Each is saved and can be
+    /// resumed; the launcher says how, the way it does for the foreground one.
+    pub fn left_behind(&self) -> Vec<String> {
+        self.left.lock().expect("left poisoned").clone()
     }
 
     fn busy(reason: String) -> HostError {
