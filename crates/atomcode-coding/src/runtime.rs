@@ -4613,7 +4613,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         let _ = done.send(Ok(RewindCatalog {
                             generation: RuntimeGeneration(generation),
                             revision: conversation_revision,
-                            points: hook.rewind_points(),
+                            points: reachable_points(runtime, hook.rewind_points()),
                             code_unavailable: hook.code_rewind_unavailable().map(Into::into),
                         }));
                     }
@@ -4636,21 +4636,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;
                         };
-                        // The same log the undo snapshot is projected from
-                        // (`current_runtime_snapshot`), so the target and the
-                        // conversation it replaces are read off one history.
-                        let events = match runtime.parts.session.as_ref() {
-                            Some(binding) if binding.manager.is_event_session(&binding.id) => {
-                                binding.manager.load_events(&binding.id).map_err(|error| {
-                                    RuntimeError::ReconfigureFailed(format!(
-                                        "could not read the session log: {error}"
-                                    ))
-                                })
-                            }
-                            _ => live_root_agent(runtime)
-                                .map(|live| live.session().events())
-                                .ok_or(RuntimeError::Unavailable),
-                        };
+                        let events = session_events(runtime);
                         let _ = done.send(events.and_then(|events| undo_to_turn_in_log(&events, turn)));
                     }
                     // The two controllers live as locals of this loop, which is
@@ -10034,6 +10020,14 @@ pub fn undo_snapshot_to_prompt(
 ///
 /// A turn a rewind already took back is not a place to go back to: a `Rewound`
 /// to it would also leave out whatever the earlier rewind covered before it.
+///
+/// What comes back to the input box is the first thing the person said in that
+/// turn, and nothing when they said nothing: a turn the harness opened — a team
+/// member's report waking the lead, a `/goal` round — has a `TurnStart` and a
+/// point in the ledger like any other, but no person's words of its own (or
+/// only words that came in mid-turn). Its place in the log is all a rewind
+/// needs; refusing it for want of a prompt is what made 35 of the 710 points on
+/// one machine unreachable.
 pub fn undo_to_turn_in_log(
     events: &[atomcode_harness::session::LoggedEvent],
     turn: u64,
@@ -10056,7 +10050,7 @@ pub fn undo_to_turn_in_log(
             SessionEvent::UserMessage { turn: t, text, .. } if *t == turn => Some(text.clone()),
             _ => None,
         })
-        .ok_or_else(unavailable)?;
+        .unwrap_or_default();
     let mut rewound = events.to_vec();
     rewound.push(LoggedEvent {
         seq: events.iter().map(|e| e.seq).max().unwrap_or(0) + 1,
@@ -10083,6 +10077,51 @@ pub fn undo_to_turn_in_log(
         restored_prompt,
         snapshot,
     })
+}
+
+/// The session's log, as the undo snapshot is projected from it
+/// (`current_runtime_snapshot`), so what a rewind plans and the conversation it
+/// replaces are read off one history. A session not written down has only the
+/// live agent's.
+fn session_events(
+    runtime: &RuntimeResources,
+) -> Result<Vec<atomcode_harness::session::LoggedEvent>, RuntimeError> {
+    match runtime.parts.session.as_ref() {
+        Some(binding) if binding.manager.is_event_session(&binding.id) => {
+            binding.manager.load_events(&binding.id).map_err(|error| {
+                RuntimeError::ReconfigureFailed(format!("could not read the session log: {error}"))
+            })
+        }
+        _ => live_root_agent(runtime)
+            .map(|live| live.session().events())
+            .ok_or(RuntimeError::Unavailable),
+    }
+}
+
+/// The points a person can still go back to: the ledger's, less those whose
+/// turn a rewind or an undo has already taken back.
+///
+/// The ledger is pruned by a rewind (`SnapshotHook::begin_rewind`) but not by an
+/// undo, so after `/undo` it still listed the turns just undone — and picking
+/// one was refused (`RewindPointUnavailable`). Read against the log instead:
+/// what the log says was taken back is not on offer, whichever gesture took it.
+///
+/// Unless it carries a workspace checkpoint: `/undo` takes the conversation
+/// back and leaves the files, so restoring the code to before that turn is
+/// still a thing a person can ask for — and it still works, since a code-only
+/// rewind does not look for the turn in the conversation.
+///
+/// A log that cannot be read leaves the ledger as it is — the catalog is a menu,
+/// and the rewind itself checks again.
+fn reachable_points(runtime: &RuntimeResources, points: Vec<RewindPoint>) -> Vec<RewindPoint> {
+    let Ok(events) = session_events(runtime) else {
+        return points;
+    };
+    let gone = atomcode_harness::session::rewound_turns(&events);
+    points
+        .into_iter()
+        .filter(|point| point.before_tree.is_some() || !gone.contains(&point.turn_id))
+        .collect()
 }
 
 fn compute_runtime_undo(
@@ -10887,6 +10926,28 @@ mod tests {
         assert_eq!(
             texts(&undo_to_turn_in_log(&events, 2).unwrap()),
             vec!["first", "ok"]
+        );
+
+        // A turn the harness opened — a member's report woke the lead — has a
+        // start and no words of the person's: still a place to go back to, with
+        // nothing to hand back.
+        let woken = vec![
+            fact(1, SessionEvent::TurnStart { turn: 1 }),
+            fact(2, said(1, "first")),
+            fact(3, reply(1, "ok")),
+            fact(4, SessionEvent::TurnStart { turn: 2 }),
+            fact(5, reply(2, "the member reported")),
+        ];
+        let before_the_report = undo_to_turn_in_log(&woken, 2).expect("a harness-opened turn");
+        assert_eq!(texts(&before_the_report), vec!["first", "ok"]);
+        assert_eq!(before_the_report.restored_prompt, "");
+        assert_eq!(
+            lands_as(&woken, &before_the_report),
+            vec![SessionEvent::Rewound {
+                turn: 2,
+                to: 4,
+                scope: LogScope::Conversation,
+            }]
         );
     }
 

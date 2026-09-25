@@ -1050,6 +1050,38 @@ async fn a_rewind_point_before_a_compaction_is_still_reachable() {
     runtime.handle.shutdown().await.unwrap();
 }
 
+/// An undone turn is not offered as a place to go back to: `/undo` leaves the
+/// ledger as it was, and the catalog used to list the turn just undone —
+/// picking it was then refused. The catalog is read against the log.
+async fn an_undone_turn_is_not_offered_as_a_rewind_point() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+            .await
+            .unwrap();
+
+    turn(&mut runtime, "first").await;
+    turn(&mut runtime, "second").await;
+    assert_eq!(
+        runtime.handle.rewind_points().await.unwrap().points.len(),
+        2
+    );
+    runtime.handle.undo_to_prompt(None).await.unwrap();
+
+    let offered: Vec<String> = runtime
+        .handle
+        .rewind_points()
+        .await
+        .unwrap()
+        .points
+        .into_iter()
+        .map(|point| point.prompt_preview)
+        .collect();
+    assert_eq!(offered, vec!["first".to_string()], "the undone one is gone");
+    runtime.handle.shutdown().await.unwrap();
+}
+
 /// A restored snapshot is the conversation the next turn continues.
 async fn a_restored_snapshot_is_what_the_model_sees() {
     let env = env();
@@ -5332,6 +5364,7 @@ mod criteria {
         a_changed_directory_is_where_tools_run,
         a_rewound_conversation_is_gone_from_what_the_model_sees,
         a_rewind_point_before_a_compaction_is_still_reachable,
+        an_undone_turn_is_not_offered_as_a_rewind_point,
         a_restored_snapshot_is_what_the_model_sees,
         plan_mode_refuses_a_write_and_says_so,
         accept_edits_applies_a_write_without_asking,
