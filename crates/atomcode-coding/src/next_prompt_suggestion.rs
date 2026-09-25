@@ -3,6 +3,7 @@
 //! This is an auxiliary, stateless provider request owned by `CodingRuntime`.
 //! It never creates a second agent, exposes tools, or mutates the conversation.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use std::{collections::BTreeMap, collections::HashSet, fmt::Write};
@@ -19,26 +20,6 @@ const MAX_TOOL_ARGUMENT_CHARS: usize = 512;
 const MAX_TOOL_RESULT_CHARS: usize = 1_024;
 const SAMPLE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Output-token cap for the prediction request. This is the TOTAL completion
-/// budget (reasoning + visible text): a reasoning model emits its thinking
-/// FIRST, so if the cap is exhausted while thinking, ZERO visible text comes
-/// back (`output_chars=0`) and the suggestion is silently dropped.
-///
-/// Kept small (128) on purpose. A ≤80-char suggestion is ~40 tokens, so this is
-/// ample for a non-reasoning model AND for a light-reasoning one like
-/// deepseek-v4-flash (which reasons briefly at `low` effort and still fits).
-///
-/// A heavy-reasoning model like AtomGit `qwen3.8-27b` (which reasons even at
-/// `low` — its floor, there is no "off") overruns 128 and gets no suggestion.
-/// Raising the cap does NOT help there: its gateway rejects a larger cap with a
-/// generic HTTP 400, so a bigger budget only trades "empty answer" for "failed
-/// request" — no gain, plus error noise. The real fix for such models is
-/// suppressing thinking on this prediction request (`enable_thinking:false` /
-/// `/no_think`), which needs per-endpoint support this qwen gateway does not
-/// reliably offer. Until then a heavy-reasoning model simply gets no
-/// suggestion — acceptable best-effort degradation.
-const SAMPLE_MAX_TOKENS: u32 = 128;
-
 const INSTRUCTIONS: &str = r#"Predict the short message the user is most likely to type next.
 
 FIRST: Look at the user's recent messages and original request. Use the tool execution records as authoritative evidence of what has already happened.
@@ -52,6 +33,48 @@ Never output thanks, praise, a question, an explanation, assistant-language such
 Reply with only one concise suggestion."#;
 
 /// Sample one composer-safe next prompt from a completed conversation.
+///
+/// # Why this request carries no output cap
+///
+/// openai-compat has ONE number for two channels: the thinking and the answer
+/// come out of the same `max_tokens`, thinking FIRST. The answer here is a
+/// handful of tokens (≤80 chars, see [`sanitize_next_prompt_suggestion`]), so
+/// any cap sized for the answer is a cap the thinking eats — the stream ends
+/// with `finish_reason=length`, zero visible text, and the sample is dropped.
+/// Not a corner case: it happened on EVERY self-ended turn of the default
+/// model, which is how this feature came to look as if it were never wired.
+///
+/// Measured (glm-5.3-flash at z.ai, this exact request shape, 2026-09-25):
+///
+/// | cap | effort sent | thinking | answer |
+/// |---|---|---|---|
+/// | 128 | — | 121 | **cut off, nothing** |
+/// | 256 | — | 161 | `提交一下吧` |
+/// | 1024 | — | 124 | `提交` |
+/// | 128 | `low` | 0 | `跑一下测试` |
+///
+/// The thinking straddles both 128 and 256, so a bigger number is a guess and a
+/// wrong guess is silent. Two things bound this request instead, and neither is
+/// a token count: [`SAMPLE_TIMEOUT`], and a sanitizer that refuses anything over
+/// 80 characters. With no cap the model stopped by itself after 127–165 tokens
+/// in every sample above — a cap was never what ended the request.
+///
+/// **The goal evaluator already answered this question, the same way**:
+/// `controllers.rs` sends no `max_tokens` either, pinned by
+/// `evaluator_does_not_apply_a_reasoning_starving_output_cap`. Two auxiliary
+/// requests of one shape should not hold two policies.
+///
+/// `reasoning_effort: Low` is asked for but NOT relied on, for two reasons
+/// measured the same day:
+///
+/// - **It may never reach the wire.** `openai_compat` sends it only when the
+///   endpoint's config declares a level or a list of them
+///   (`endpoint_supports_reasoning_effort`), so an under-declared provider drops
+///   it silently — which is exactly what happened above.
+/// - **On some models it switches thinking ON rather than down.**
+///   `deepseek-chat` answers `ok` in 1 token with the field absent and spends 28
+///   thinking tokens with `low`. A budget resting on "thinking is suppressed"
+///   would be starved by the very field meant to suppress it.
 pub(crate) async fn generate_next_prompt_suggestion(
     provider: Arc<dyn LlmProvider>,
     messages: &[Message],
@@ -60,10 +83,9 @@ pub(crate) async fn generate_next_prompt_suggestion(
     let prompt = format!("{INSTRUCTIONS}\n\nConversation records (JSON Lines):\n{transcript}");
     let request = [Message::user(prompt)];
     let options = ChatOptions {
+        // Asked for, and deliberately with no `max_tokens` beside it — see this
+        // function's own note on why a budget cannot rest on this being honoured.
         reasoning_effort: Some(ReasoningEffort::Low),
-        // TOTAL budget (reasoning + visible). See `SAMPLE_MAX_TOKENS` — too tight
-        // and a reasoning model spends it all thinking and emits no suggestion.
-        max_tokens: Some(SAMPLE_MAX_TOKENS),
         temperature: Some(0.2),
         tool_choice: ToolChoice::None,
         ..ChatOptions::default()
@@ -77,22 +99,35 @@ pub(crate) async fn generate_next_prompt_suggestion(
             }
         };
         let mut raw = String::new();
+        let mut thinking_chars = 0usize;
+        let mut cut_off = false;
         while let Some(event) = stream.next().await {
             match event {
                 StreamEvent::TextDelta(text) => raw.push_str(&text),
+                // Counted, never kept. How much a model spent thinking is the
+                // one number that tells a starved sample from a model with
+                // nothing to say; the thinking itself is none of this
+                // function's business and reaches no one.
+                StreamEvent::Reasoning(text) => {
+                    thinking_chars = thinking_chars.saturating_add(text.chars().count());
+                }
                 StreamEvent::Error(error) => {
                     tracing::debug!(?error, "next prompt suggestion stream failed");
                     return None;
                 }
-                StreamEvent::Done { .. } => break,
+                StreamEvent::Done { truncated } => {
+                    cut_off = truncated;
+                    break;
+                }
                 _ => {}
             }
         }
         let suggestion = sanitize_next_prompt_suggestion(&raw);
         if suggestion.is_none() {
-            tracing::debug!(
-                output_chars = raw.chars().count(),
-                "next prompt suggestion produced no acceptable output"
+            report_nothing(
+                why_nothing(&raw, cut_off),
+                raw.chars().count(),
+                thinking_chars,
             );
         }
         suggestion
@@ -104,6 +139,68 @@ pub(crate) async fn generate_next_prompt_suggestion(
             None
         }
     }
+}
+
+/// Why a sample produced no suggestion.
+///
+/// Three different things that used to reach the log as one line
+/// (`output_chars=0`), which is how a budget too tight to ever reach the answer
+/// stayed invisible for as long as it did: nothing anywhere said the sample was
+/// being cut off rather than declined.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NoSuggestion {
+    /// Cut by `finish_reason=length` with no visible text: the answer was never
+    /// reached. A standing condition rather than a hiccup — whatever ended this
+    /// one will end the next one too.
+    CutOff,
+    /// The model finished and sent nothing at all.
+    NothingToSay,
+    /// Something came back and it is not something a person may be handed —
+    /// including an explicit `<none>`, because [`sanitize_next_prompt_suggestion`]
+    /// is the one place that decides what is usable.
+    Refused,
+}
+
+/// Which of the three it was, from the only two things the stream tells us.
+///
+/// A free function so the judgement can be checked without a provider.
+pub(crate) fn why_nothing(raw: &str, cut_off: bool) -> NoSuggestion {
+    if raw.trim().is_empty() {
+        return match cut_off {
+            true => NoSuggestion::CutOff,
+            false => NoSuggestion::NothingToSay,
+        };
+    }
+    NoSuggestion::Refused
+}
+
+/// Said once per process, so a standing condition is not also a silent one.
+///
+/// A model whose thinking outruns the answer does it on EVERY turn, so the
+/// choice is between one line and nothing: `debug!` is invisible at the default
+/// level (which is how this went unnoticed), and a line per turn would bury a
+/// log people read for real failures. The other two reasons stay at `debug!` —
+/// "the model had nothing to say" is the feature working.
+static CUT_OFF_REPORTED: AtomicBool = AtomicBool::new(false);
+
+fn report_nothing(why: NoSuggestion, output_chars: usize, thinking_chars: usize) {
+    if why == NoSuggestion::CutOff {
+        if !CUT_OFF_REPORTED.swap(true, Ordering::Relaxed) {
+            tracing::info!(
+                thinking_chars,
+                "next prompt suggestion was cut off before it reached the answer \
+                 (the model or its gateway ended the response); no suggestion can \
+                 be offered while its thinking does not fit"
+            );
+        }
+        return;
+    }
+    tracing::debug!(
+        ?why,
+        output_chars,
+        thinking_chars,
+        "next prompt suggestion produced no acceptable output"
+    );
 }
 
 fn recent_stable_transcript(messages: &[Message]) -> Option<String> {
@@ -493,6 +590,92 @@ pub(crate) fn sanitize_next_prompt_suggestion(raw: &str) -> Option<String> {
 mod tests {
     use super::*;
     use atomcode_kernel::tool::ToolCall;
+
+    /// A provider that says what it was asked for, and answers after thinking.
+    struct Recording {
+        options: std::sync::Arc<std::sync::Mutex<Vec<ChatOptions>>>,
+        events: Vec<StreamEvent>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for Recording {
+        fn model_name(&self) -> &str {
+            "recording"
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[atomcode_kernel::tool::ToolDef],
+            options: &ChatOptions,
+        ) -> Result<
+            futures::stream::BoxStream<'static, StreamEvent>,
+            atomcode_kernel::stream::ProviderError,
+        > {
+            self.options.lock().unwrap().push(options.clone());
+            Ok(Box::pin(futures::stream::iter(self.events.clone())))
+        }
+    }
+
+    /// 猜下一句这一次采样,不给输出设上限。
+    ///
+    /// 思考和答案从同一个 `max_tokens` 里出,而思考先出:任何"够答案用"的上限
+    /// 都会在模型想完之前把这一次掐掉,答案一个字都出不来 —— 而它掉在
+    /// `output_chars=0` 里,和"模型没什么可说"长得一模一样。默认模型上这不是
+    /// 边角情况,是每一个自己结束的回合。
+    ///
+    /// 同一道题评判者那边已经答过一次,答案也一样:`controllers.rs` 的
+    /// `evaluator_does_not_apply_a_reasoning_starving_output_cap`。
+    #[tokio::test]
+    async fn a_guess_at_the_next_prompt_is_not_starved_by_an_output_cap() {
+        let options = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = std::sync::Arc::new(Recording {
+            options: options.clone(),
+            // 先想,后答 —— 这个顺序正是上限会咬到答案的原因。
+            events: vec![
+                StreamEvent::Reasoning("盘算了很久".repeat(40)),
+                StreamEvent::TextDelta("提交".into()),
+                StreamEvent::Done { truncated: false },
+            ],
+        });
+
+        let got = generate_next_prompt_suggestion(
+            provider,
+            &[
+                Message::user("修一下登录"),
+                Message::assistant("改成 401 了", vec![]),
+            ],
+        )
+        .await;
+
+        assert_eq!(got.as_deref(), Some("提交"));
+        let recorded = options.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            recorded[0].max_tokens, None,
+            "上限连思考一起算,先被吃掉的是答案"
+        );
+        assert_eq!(
+            recorded[0].reasoning_effort,
+            Some(ReasoningEffort::Low),
+            "能压住思考的时候还是要压"
+        );
+    }
+
+    /// 被掐断和「没什么可说」不是一件事。
+    ///
+    /// 两者原来在日志里是同一句 `output_chars=0`,于是一个每回合都会复发的
+    /// 配置问题,看上去和模型的正常沉默无法区分 —— 这就是它躺了这么久的原因。
+    #[test]
+    fn a_sample_cut_off_mid_thought_is_not_the_same_as_nothing_to_say() {
+        assert_eq!(why_nothing("", true), NoSuggestion::CutOff);
+        assert_eq!(why_nothing("   ", true), NoSuggestion::CutOff);
+        assert_eq!(why_nothing("", false), NoSuggestion::NothingToSay);
+        // 有东西回来但不能交给人 —— 显式的 `<none>` 也走这一条:什么算可用,
+        // 由 `sanitize_next_prompt_suggestion` 一处说了算。
+        assert_eq!(why_nothing("提交一下吧?", false), NoSuggestion::Refused);
+        assert_eq!(why_nothing("<none>", false), NoSuggestion::Refused);
+    }
 
     fn call(id: &str, name: &str, arguments: &str) -> ToolCall {
         ToolCall {
