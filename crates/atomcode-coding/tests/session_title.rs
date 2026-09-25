@@ -142,11 +142,118 @@ async fn the_utility_model_names_it_when_the_row_says_so() {
     );
 }
 
+/// A provider that always answers with one line.
+struct Says(&'static str);
+
+#[async_trait::async_trait]
+impl atomcode_kernel::provider::LlmProvider for Says {
+    fn model_name(&self) -> &str {
+        "says"
+    }
+    async fn chat_stream(
+        &self,
+        _messages: &[atomcode_kernel::message::Message],
+        _tools: &[atomcode_kernel::tool::ToolDef],
+        _options: &atomcode_kernel::provider::ChatOptions,
+    ) -> Result<
+        futures::stream::BoxStream<'static, atomcode_kernel::stream::StreamEvent>,
+        atomcode_kernel::stream::ProviderError,
+    > {
+        use atomcode_kernel::stream::StreamEvent;
+        Ok(Box::pin(futures::stream::iter(vec![
+            StreamEvent::TextDelta(self.0.into()),
+            StreamEvent::Done { truncated: false },
+        ])))
+    }
+}
+
+/// A host catalog with no ranks anywhere — so `llm-utility-selected` would
+/// leave the utility slot empty — whose current model answers `"Repo tour."`.
+struct Unranked;
+
+#[async_trait::async_trait]
+impl atomcode_harness::seams::Models for Unranked {
+    fn list(&self) -> Vec<atomcode_harness::seams::ModelInfo> {
+        vec![atomcode_harness::seams::ModelInfo {
+            id: "the-conversation".into(),
+            display_name: "the conversation's model".into(),
+            context_window: 128_000,
+            supports_vision: false,
+            capable_rank: None,
+            effort_levels: Vec::new(),
+            note: None,
+            account: "here".into(),
+        }]
+    }
+    fn current(&self) -> Option<String> {
+        Some("the-conversation".into())
+    }
+    async fn provider(
+        &self,
+        id: &str,
+    ) -> Result<std::sync::Arc<dyn atomcode_kernel::provider::LlmProvider>, String> {
+        assert_eq!(
+            id, "the-conversation",
+            "borrows the model the conversation is on"
+        );
+        Ok(std::sync::Arc::new(Says("\"Repo tour.\"")))
+    }
+}
+
+struct UnrankedPlugin;
+
+#[async_trait::async_trait]
+impl atomcode_plexus::Plugin for UnrankedPlugin {
+    fn name(&self) -> &'static str {
+        "test-models-unranked"
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["models"]
+    }
+    fn description(&self) -> &'static str {
+        "test: a host catalog with no ranks"
+    }
+    async fn apply(
+        &self,
+        ctx: &atomcode_plexus::Context,
+        _config: &serde_json::Value,
+    ) -> Result<(), String> {
+        let _ = ctx
+            .provide::<atomcode_harness::seams::ModelsSvc>(std::sync::Arc::new(Unranked))
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
 #[tokio::test]
-async fn without_a_utility_model_the_namer_falls_back_to_the_first_prompt() {
-    let dir = scratch("fallback");
-    // `session-title-model` mounted, no `llm-utility` row: it must not borrow
-    // the conversation's model — that would eat the script's next line.
+async fn without_a_utility_model_the_conversation_model_names_it() {
+    let dir = scratch("borrow");
+    // `session-title-model` mounted — the person asked for model-made names —
+    // and no model is ranked, so there is no utility model. The host's
+    // catalog still serves the conversation's own.
+    let models = "[[insert]]\nid = \"models\"\nname = \"test-models-unranked\"";
+    let mut catalog = plugins::catalog();
+    catalog.register(std::sync::Arc::new(UnrankedPlugin));
+    let mut app = App::new(
+        catalog,
+        tree(&dir, &talker(&["the answer"]), &[MODEL_NAMER, models]),
+    );
+    app.start().await.expect("must mount");
+    let agent = create_agent(&app).await.unwrap();
+    let outcome = run_turn(&app, "what is this repository").await.unwrap();
+    assert_eq!(outcome.text, "the answer");
+    assert_eq!(
+        titled(&agent).await.as_deref(),
+        Some("Repo tour"),
+        "named by the conversation's model, not cut from the prompt"
+    );
+}
+
+#[tokio::test]
+async fn with_nothing_to_borrow_the_script_is_not_eaten() {
+    let dir = scratch("no-catalog");
+    // No utility row and no catalog: a fixture driving a scripted `llm`. The
+    // namer must not reach for that script — the turn gets its one line.
     let app = start(tree(&dir, &talker(&["only one answer"]), &[MODEL_NAMER])).await;
     let agent = create_agent(&app).await.unwrap();
     let outcome = run_turn(&app, "what is this repository").await.unwrap();
@@ -154,6 +261,113 @@ async fn without_a_utility_model_the_namer_falls_back_to_the_first_prompt() {
     assert_eq!(
         titled(&agent).await.as_deref(),
         Some("what is this repository")
+    );
+}
+
+#[tokio::test]
+async fn a_namer_that_gets_nothing_back_leaves_the_first_prompt() {
+    let dir = scratch("fallback");
+    // The utility call fails, as a dead gateway or a bad key does: the
+    // session is still named, from what the person said.
+    let utility = "[[insert]]\nid = \"llm-utility\"\nname = \"llm-utility-replay\"\n\
+                   config = { script = [ { fail = \"gateway down\" } ] }";
+    let app = start(tree(
+        &dir,
+        &talker(&["only one answer"]),
+        &[MODEL_NAMER, utility],
+    ))
+    .await;
+    let agent = create_agent(&app).await.unwrap();
+    let outcome = run_turn(&app, "what is this repository").await.unwrap();
+    assert_eq!(outcome.text, "only one answer");
+    assert_eq!(
+        titled(&agent).await.as_deref(),
+        Some("what is this repository")
+    );
+}
+
+/// A side-call model that thinks before it answers, the way the reasoning
+/// models behind openai-compat do: thinking and answer come out of ONE
+/// `max_tokens`, thinking first. Given a cap below what the thinking takes, the
+/// stream ends `finish_reason=length` with no visible text at all.
+struct ThinkingUtility;
+
+const THINKING_TOKENS: u32 = 120;
+
+#[async_trait::async_trait]
+impl atomcode_kernel::provider::LlmProvider for ThinkingUtility {
+    fn model_name(&self) -> &str {
+        "thinking-utility"
+    }
+    async fn chat_stream(
+        &self,
+        _messages: &[atomcode_kernel::message::Message],
+        _tools: &[atomcode_kernel::tool::ToolDef],
+        options: &atomcode_kernel::provider::ChatOptions,
+    ) -> Result<
+        futures::stream::BoxStream<'static, atomcode_kernel::stream::StreamEvent>,
+        atomcode_kernel::stream::ProviderError,
+    > {
+        use atomcode_kernel::stream::StreamEvent;
+        let mut events = vec![StreamEvent::Reasoning("let me think ".repeat(40))];
+        match options.max_tokens {
+            Some(cap) if cap <= THINKING_TOKENS => {
+                events.push(StreamEvent::Done { truncated: true });
+            }
+            _ => {
+                events.push(StreamEvent::TextDelta("Windows build fix".into()));
+                events.push(StreamEvent::Done { truncated: false });
+            }
+        }
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
+struct ThinkingUtilityPlugin;
+
+#[async_trait::async_trait]
+impl atomcode_plexus::Plugin for ThinkingUtilityPlugin {
+    fn name(&self) -> &'static str {
+        "llm-utility-thinking"
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["llm-utility"]
+    }
+    fn description(&self) -> &'static str {
+        "test: a side-call model that thinks before it answers"
+    }
+    async fn apply(
+        &self,
+        ctx: &atomcode_plexus::Context,
+        _config: &serde_json::Value,
+    ) -> Result<(), String> {
+        let _ = ctx
+            .provide::<atomcode_harness::seams::LlmUtilitySvc>(std::sync::Arc::new(ThinkingUtility))
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_model_that_thinks_first_is_not_starved_by_an_output_cap() {
+    let dir = scratch("thinking");
+    let utility = "[[insert]]\nid = \"llm-utility\"\nname = \"llm-utility-thinking\"";
+    let mut catalog = plugins::catalog();
+    catalog.register(std::sync::Arc::new(ThinkingUtilityPlugin));
+    let mut app = App::new(
+        catalog,
+        tree(&dir, &talker(&["ok"]), &[MODEL_NAMER, utility]),
+    );
+    app.start().await.expect("must mount");
+    let agent = create_agent(&app).await.unwrap();
+    run_turn(&app, "make the build stop failing on windows please")
+        .await
+        .unwrap();
+    assert_eq!(
+        titled(&agent).await.as_deref(),
+        Some("Windows build fix"),
+        "a title is a handful of tokens, but the thinking before it is not: a cap \
+         sized for the title is a cap the thinking eats"
     );
 }
 

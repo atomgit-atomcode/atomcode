@@ -21,14 +21,14 @@
 和 key 缺省沿用主行读的环境)和 `llm-utility-replay`(测试用脚本)。BASE 不挂它,
 消费者按需解析。
 
-**2. 消费者不回退到 `llm`。** `session-title-model` 找不到 `llm-utility` 时回退到第一条
+**2. 消费者不回退到 `llm`。**(2026-09-25 对标题已修订,见文末「修订」) `session-title-model` 找不到 `llm-utility` 时回退到第一条
 提问截断,而不是借主模型。理由两条:和第一回合抢同一个 adapter 的限速会把 429 砸在
 用户等着的回答上;测试里会吃掉 replay 脚本的下一行,而且因为并行触发,吃哪一行是
 不确定的。「便宜模型要显式配置」比「静默用贵的」好。
 
 **3. 怎么起名和什么时候起名是两个行。**
 - `session-title-first-prompt` / `session-title-model` 填 `session-title` 缝,回答「怎么起」。
-  模型版:system 说「不超过八个词、用用户的语言、不要引号句号」,`max_tokens` 32、
+  模型版:system 说「不超过八个词、用用户的语言、不要引号句号」,`max_tokens` 32(2026-09-25 起默认不设,见文末)、
   超时 15 秒,回来后取第一行、去引号、按词数字节封顶、去尾部标点;失败回退截断。
 - `session-title-on-first-prompt` 是策略行,回答「什么时候起、落在哪」。监听
   `SessionEventCommitted`,看到 `UserMessage` 且日志没有标题就 spawn 起名任务。第一条
@@ -71,3 +71,36 @@ patch 成模型版且挂 `llm-utility-replay` 时标题来自旁路脚本,主脚
 压缩摘要:做一个 `compaction-summary` 行填 `compaction` 缝,把 capabilities 里
 `OverflowCompaction` 的 stub + 模型摘要接到 harness,摘要走 `llm-utility`。提醒:摘要
 模型不能太便宜,标题起坏了只是难看,摘要写坏了主对话从此带着错误的记忆。
+
+## 修订(2026-09-25):标题借对话模型,且不再设输出上限
+
+**起因。** 产品里 `[ui] ai_session_naming` 默认开,`on_harness` 据此把取名者换成
+`session-title-model`;而 `llm-utility` 由 `llm-utility-selected` 填,它只在模型目录里
+有 `capable_model` 排名时才填。没配排名的机器(实测本机即如此)上这个位置永远是空的,
+于是开关**什么都不做**:每个会话的名字都是第一条提问原文,且没有任何提示。
+
+就算填上了,第二层也会掐死它:openai-compat 的思考和回答共用一个 `max_tokens`、
+思考在前。deepseek-flash 在 32 的上限下思考 106–134 字后 `finish_reason=length`、
+正文为空,每次如此;不设上限时 225–260 token 自然结束,答「查看工作区状态」。同一天
+下一句建议因同一原因去掉了上限(`c1edf150f`)。
+
+**改成。**
+- `session-title-model` 找不到 `llm-utility` 时,向宿主的模型目录要**当前对话模型**
+  (`ModelsSvc::current` + `provider`)。经目录而不是直接借 `llm` 缝:有目录的宿主
+  才是能把当前模型再交出来的宿主(coding 宿主交出的就是活槽,仍是一套凭据);没有
+  目录的树——驱动脚本化 `llm` 的测试夹具——无可借,原第 2 条「不吃主脚本」的保证
+  对它们原样成立(去掉目录这一环时 `assemble_smoke`/`verify_cadence`/
+  `overflow_recovery` 8 条判据当场红过)。
+- 只改标题。`llm-utility` 缝本身不因此被填:team 的 Simple 角色与压缩摘要也读它,
+  那两处该不该落到对话模型是各自的决定。
+- 原第 2 条的代价照付:标题与第一回合争同一网关的限速。每会话一次短请求,是开关
+  本身要的交换。
+- 行配置 `max_tokens` 默认不设;请求由超时、512 字节读取上限与 `tidy` 界定。已知不
+  思考的模型仍可在行上设。
+
+**判据**(`coding/tests/session_title.rs`):
+`without_a_utility_model_the_conversation_model_names_it`、
+`with_nothing_to_borrow_the_script_is_not_eaten`、
+`a_model_that_thinks_first_is_not_starved_by_an_output_cap`、
+`a_namer_that_gets_nothing_back_leaves_the_first_prompt`。第一条在摘掉「经目录借」时红过,第三条在旧的 32 上限下红过;第二条守的是上面那 8 条
+判据在直接借 `llm` 时暴露的问题,它本身没有单独证伪。

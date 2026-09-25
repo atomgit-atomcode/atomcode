@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use atomcode_kernel::message::Message;
-use atomcode_kernel::provider::ChatOptions;
+use atomcode_kernel::provider::{ChatOptions, LlmProvider};
 use atomcode_kernel::stream::StreamEvent;
 use atomcode_plexus::{Context, Plugin};
 use futures::StreamExt;
@@ -24,7 +24,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::events::SessionEventCommitted;
-use crate::seams::{AgentsSvc, LlmUtilitySvc, SessionTitle, SessionTitleSvc};
+use crate::seams::{AgentsSvc, LlmUtilitySvc, ModelsSvc, SessionTitle, SessionTitleSvc};
 use crate::session::{Committed, SessionEvent, SessionLog};
 
 fn parse<T: for<'de> Deserialize<'de> + Default>(config: &Value) -> Result<T, String> {
@@ -139,33 +139,69 @@ const TITLE_SYSTEM: &str = "You name conversations. Given the first message a pe
 reply with a short title for the conversation: at most eight words, in the person's own \
 language, no quotes, no trailing period, and nothing but the title.";
 
-/// Asks the utility model, from the first prompt. Falls back to the first
-/// prompt, truncated, when there is no utility model, it is slow, it fails,
-/// or it answers nothing — a session always gets a name.
+/// Asks a model, from the first prompt: the utility model when one is
+/// mounted, the conversation's own when not (see [`ModelTitle::provider`]). Falls back to the first
+/// prompt, truncated, when the call is slow, fails, or answers nothing — a
+/// session always gets a name.
 ///
-/// Deliberately does **not** fall back to the conversation's `llm` row: a
-/// side call on the same adapter would race the first turn for one gateway's
-/// rate limit, and in a test it would eat the next line of the script.
+/// # Why the conversation's model, when there is no utility model
+///
+/// This row is mounted because the person asked for model-made names
+/// (`[ui] ai_session_naming`). The utility slot is filled only when the host
+/// can SHOW a model is cheaper (`llm-utility-selected` needs a ranked
+/// catalog); an unranked catalog leaves it empty, and the switch then did
+/// nothing at all — every name was the first prompt, silently. The price of
+/// borrowing is the one ADR 0015 named: the title races the first turn for the
+/// same gateway's rate limit. One short request per session is the trade the
+/// switch asks for.
+///
+/// # Why the request carries no output cap
+///
+/// On openai-compat, thinking and answer come out of ONE `max_tokens`,
+/// thinking first. A cap sized for a title (it used to be 32) is a cap the
+/// thinking eats: deepseek-flash spent 106–134 characters of it thinking and
+/// ended `finish_reason=length` with no text, every time (2026-09-25). The
+/// next-prompt suggestion hit the same wall and dropped its cap the same day.
+/// What bounds this request instead: the timeout, the 512-byte read below, and
+/// [`tidy`]. A row may still set `max_tokens` for a model known not to think.
 struct ModelTitle {
     ctx: Context,
     max_words: usize,
     max_bytes: usize,
-    max_tokens: u32,
+    max_tokens: Option<u32>,
     timeout: Duration,
 }
 
 impl ModelTitle {
+    /// The utility model; else the conversation's, as the host's catalog
+    /// serves it.
+    ///
+    /// Through the catalog rather than the `llm` seam: a host with a catalog
+    /// is one whose `current` model is something it can hand out again (the
+    /// coding host serves its live slot, so it is still one set of
+    /// credentials). A tree with no catalog — a fixture driving a scripted
+    /// `llm` — has nothing to borrow, so a title request cannot eat a line the
+    /// turn was waiting for.
+    async fn provider(&self) -> Option<Arc<dyn LlmProvider>> {
+        if let Some(utility) = self.ctx.service::<LlmUtilitySvc>() {
+            return Some(utility);
+        }
+        let models = self.ctx.service::<ModelsSvc>()?;
+        let current = models.current()?;
+        models.provider(&current).await.ok()
+    }
+
     async fn ask(&self, first: &str) -> Option<String> {
-        let provider = self.ctx.service::<LlmUtilitySvc>()?;
         let prompt = vec![
             Message::system(TITLE_SYSTEM),
             Message::user(first.chars().take(2000).collect::<String>()),
         ];
         let options = ChatOptions {
-            max_tokens: Some(self.max_tokens),
+            max_tokens: self.max_tokens,
             ..ChatOptions::default()
         };
         let call = async {
+            let provider = self.provider().await?;
             let mut stream = provider.chat_stream(&prompt, &[], &options).await.ok()?;
             let mut out = String::new();
             while let Some(event) = stream.next().await {
@@ -188,7 +224,8 @@ impl ModelTitle {
 #[async_trait]
 impl SessionTitle for ModelTitle {
     fn describe(&self) -> String {
-        "the utility model, from the first prompt; the first prompt itself when there is none"
+        "a model, from the first prompt — the utility model, or the conversation's when there \
+         is none; the first prompt itself when the call fails"
             .into()
     }
 
@@ -208,14 +245,12 @@ struct ModelTitleRow {
     max_words: usize,
     #[serde(default = "default_bytes")]
     max_bytes: usize,
-    #[serde(default = "default_tokens")]
-    max_tokens: u32,
+    /// Unset by default — see [`ModelTitle`] on why a cap starves a model that
+    /// thinks first.
+    #[serde(default)]
+    max_tokens: Option<u32>,
     #[serde(default = "default_timeout")]
     timeout_secs: u64,
-}
-
-fn default_tokens() -> u32 {
-    32
 }
 
 fn default_timeout() -> u64 {
@@ -227,7 +262,7 @@ impl Default for ModelTitleRow {
         Self {
             max_words: default_words(),
             max_bytes: default_bytes(),
-            max_tokens: default_tokens(),
+            max_tokens: None,
             timeout_secs: default_timeout(),
         }
     }
@@ -241,15 +276,16 @@ impl Plugin for ModelTitlePlugin {
         "session-title-model"
     }
     fn uses(&self) -> &'static [&'static str] {
-        // Resolved per call, so a patch that swaps the utility model applies
-        // to the next title without remounting this row.
-        &["llm-utility"]
+        // Resolved per call, so a patch that swaps the utility model — or a
+        // `/model` that swaps the conversation's — applies to the next title
+        // without remounting this row.
+        &["llm-utility", "models"]
     }
     fn provides(&self) -> &'static [&'static str] {
         &["session-title"]
     }
     fn description(&self) -> &'static str {
-        "name a session by asking the utility model about its first prompt"
+        "name a session by asking a model about its first prompt (the utility model, else the conversation's)"
     }
     async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
         let row: ModelTitleRow = parse(config)?;
