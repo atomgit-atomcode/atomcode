@@ -4845,6 +4845,20 @@ impl Tui {
                 m.caret = 0;
             }
             Action::CaretLeft => {
+                // Nothing typed: left opens the background sessions, where there
+                // are any. On an empty box the key had nothing to move, so it
+                // takes nothing away — unlike right, which takes the suggested
+                // next line. With nothing in the background there is nothing to
+                // open, and the key stays what it was.
+                if m.input.is_empty() && !m.bg.is_empty() {
+                    let view = m.bg.clone();
+                    drop(m);
+                    self.host.show_bg(view);
+                    if !self.host.open_bg(None) {
+                        self.say(&t(Msg::BgNoPanel));
+                    }
+                    return false;
+                }
                 // Step over an `[Image #N]` as one chip rather than into it — the
                 // caret must never land between a marker's characters.
                 if let Some(span) = crate::attach::marker_spans(&m.input)
@@ -4865,20 +4879,6 @@ impl Tui {
                 // gesture. Anywhere else it is still just a caret move, and
                 // with no ghost it does nothing, so the key never surprises.
                 if accept_ghost(&mut m) {
-                    return false;
-                }
-                // Nothing typed and nothing offered: right opens the background
-                // sessions, where there are any — the Claude Code gesture. Before
-                // the ghost it would have taken the one suggestion away, and with
-                // nothing in the background there is nothing to open, so the key
-                // stays what it was.
-                if m.input.is_empty() && !m.bg.is_empty() {
-                    let view = m.bg.clone();
-                    drop(m);
-                    self.host.show_bg(view);
-                    if !self.host.open_bg(None) {
-                        self.say(&t(Msg::BgNoPanel));
-                    }
                     return false;
                 }
                 // Step over an `[Image #N]` as one chip.

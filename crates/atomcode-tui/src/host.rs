@@ -5579,7 +5579,13 @@ pub fn displaces_composer(moment: &Moment) -> bool {
     if moment.secret.is_some() {
         return false;
     }
-    moment.asking.is_some() || moment.settings_panel.is_some() || moment.providers_panel.is_some()
+    // The background panel has a box of its own, where the keys go while it is
+    // up; a second one under it would leave a person asking which one they are
+    // typing into.
+    moment.asking.is_some()
+        || moment.settings_panel.is_some()
+        || moment.providers_panel.is_some()
+        || moment.bg_panel.is_some()
 }
 
 /// The view modules whose rows ride at the foot of the conversation.
@@ -6745,6 +6751,41 @@ mod tests {
     /// asks for is its own business and may change; what has to hold is that
     /// while the panel is up it asks for none, and afterwards for what it did
     /// before.
+    /// The background panel stands where the composer does too: it has a box
+    /// of its own, and the keys go to that one.
+    #[test]
+    fn the_background_panel_takes_the_composers_rows_and_hands_them_back() {
+        let h = host();
+        let w = 60u16;
+        let rows = |id: &str| {
+            let mods = h.modules.clone();
+            let m = h.moment.read().unwrap().clone();
+            crate::host::asked_height(&mods, id, &m, w)
+        };
+        let before = rows(crate::modules::input::ID);
+        assert!(before > 0, "the field has rows to give");
+
+        h.moment.write().unwrap().bg_panel = Some(crate::bg::Panel::new(None));
+        assert_eq!(
+            rows(crate::modules::input::ID),
+            0,
+            "the composer stood aside"
+        );
+        assert_eq!(
+            rows(crate::modules::tip::ID),
+            0,
+            "the reserved row went too"
+        );
+        assert!(displaces_composer(&h.moment.read().unwrap()));
+
+        h.moment.write().unwrap().bg_panel = None;
+        assert_eq!(
+            rows(crate::modules::input::ID),
+            before,
+            "and it is back as it was"
+        );
+    }
+
     #[test]
     fn the_settings_panel_takes_the_composers_rows_and_hands_them_back() {
         let h = host();

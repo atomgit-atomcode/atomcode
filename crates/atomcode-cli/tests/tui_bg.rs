@@ -440,12 +440,12 @@ async fn background_task_runs_without_changing_the_foreground() {
 }
 
 /// **`/bg` and `/background` are one command, the row counts what runs out of
-/// view, and → on an empty box opens it.** `/bg <task>` starts a background
+/// view, and ← on an empty box opens it.** `/bg <task>` starts a background
 /// session like `/background <task>` does; while it runs the status row says so,
-/// and says nothing once it is done; with nothing typed, → opens the panel —
+/// and says nothing once it is done; with nothing typed, ← opens the panel —
 /// and with nothing in the background it opens nothing.
 #[tokio::test(flavor = "multi_thread")]
-async fn bg_takes_a_task_the_row_counts_it_and_right_opens_the_panel() {
+async fn bg_takes_a_task_the_row_counts_it_and_left_opens_the_panel() {
     let rig = Rig::new().await;
     let first = rig.client.root();
     let panel = t(Msg::BgPlaceholder).into_owned();
@@ -455,8 +455,8 @@ async fn bg_takes_a_task_the_row_counts_it_and_right_opens_the_panel() {
     })
     .into_owned();
 
-    // Nothing in the background: → is only a caret move.
-    rig.term.press(KeyPress::plain(Key::Right));
+    // Nothing in the background: ← is only a caret move.
+    rig.term.press(KeyPress::plain(Key::Left));
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(!rig.term.text().contains(&panel), "{}", rig.term.text());
 
@@ -465,7 +465,24 @@ async fn bg_takes_a_task_the_row_counts_it_and_right_opens_the_panel() {
     assert_eq!(rig.client.root(), first, "the foreground did not move");
     rig.until_screen(&counted).await;
 
+    // → is not the gesture: on an empty box it takes a suggested line, and
+    // with none it does nothing.
     rig.term.press(KeyPress::plain(Key::Right));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!rig.term.text().contains(&panel), "{}", rig.term.text());
+
+    // With something typed, ← is a caret move and nothing else.
+    rig.term.type_text("abc");
+    rig.term.press(KeyPress::plain(Key::Left));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!rig.term.text().contains(&panel), "{}", rig.term.text());
+    // ← moved the caret back one; clear the line from its end.
+    rig.term.press(KeyPress::plain(Key::End));
+    for _ in 0..3 {
+        rig.term.press(KeyPress::plain(Key::Backspace));
+    }
+
+    rig.term.press(KeyPress::plain(Key::Left));
     rig.until_screen(&panel).await;
     rig.term.press(KeyPress::plain(Key::Esc));
     rig.until("the panel closed", |rig| !rig.term.text().contains(&panel))
