@@ -265,10 +265,7 @@ fn answer_clause(resp: &UserInputResponse) -> String {
 /// question was declined, degrade to the same "no answer" guidance a single decline gives.
 pub fn format_batch_result(reqs: &[UserInputRequest], resps: &[UserInputResponse]) -> ToolResult {
     if resps.len() >= reqs.len() && resps.iter().all(|r| r.declined) {
-        return ok_result(
-            "No answer was provided. Proceed with your own best judgment; only ask again if you \
-             are truly blocked.",
-        );
+        return ok_result(NO_ANSWER);
     }
     let lines: Vec<String> = reqs
         .iter()
@@ -310,13 +307,158 @@ fn ok_result(msg: impl Into<String>) -> ToolResult {
     }
 }
 
+/// What the model is told when nobody answered — one question or all of a batch.
+pub const NO_ANSWER: &str = "No answer was provided. Proceed with your own best judgment; \
+                             only ask again if you are truly blocked.";
+
+/// One question's answer, as a result read back says it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReadAnswer {
+    /// Closed without an answer: declined, or nobody there.
+    Declined,
+    /// What was picked and what was typed. `text` is `None` when nothing was typed.
+    Given {
+        selected: Vec<String>,
+        text: Option<String>,
+        images: usize,
+    },
+}
+
+/// The answers a result carries, one per question asked, read back from the text
+/// [`format_result`] / [`format_batch_result`] wrote for the model.
+///
+/// The log keeps no other record of them: a model's question goes over the request
+/// round-trip, not the `user-questions` seam, so no `Asked`/`Answered` fact is ever
+/// committed for it — the result text IS the answer, in a resumed session as much
+/// as a live one. Read here, beside the code that writes it, so a change to the
+/// wording breaks the round-trip criterion below instead of a screen that parses
+/// English it does not own.
+///
+/// `questions` is how many were asked (see [`parse_batch`]). `None` for any text
+/// these writers did not produce — an error, a result from an older wording — and
+/// the caller then shows the text as it is.
+pub fn read_result(content: &str, questions: usize) -> Option<Vec<ReadAnswer>> {
+    if questions == 0 {
+        return None;
+    }
+    if content == NO_ANSWER {
+        return Some(vec![ReadAnswer::Declined; questions]);
+    }
+    if questions == 1 {
+        return read_clause(content).map(|one| vec![one]);
+    }
+    let lines: Vec<&str> = content.split('\n').collect();
+    if lines.len() != questions {
+        return None;
+    }
+    lines
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let rest = line.strip_prefix(&format!("Q{} (", i + 1))?;
+            // The header is the asker's own words and may hold `): ` itself; the
+            // clause is the first split that reads as one.
+            rest.match_indices("): ")
+                .find_map(|(at, sep)| read_clause(&rest[at + sep.len()..]))
+        })
+        .collect()
+}
+
+/// One answer clause, the inverse of [`answer_clause`].
+fn read_clause(clause: &str) -> Option<ReadAnswer> {
+    if clause == "No answer (declined)." {
+        return Some(ReadAnswer::Declined);
+    }
+    let (said, images) = match clause.rsplit_once(", and User attached ") {
+        Some((said, count)) => match count
+            .strip_suffix(" images")
+            .or_else(|| count.strip_suffix(" image"))
+            .and_then(|n| n.parse::<usize>().ok())
+        {
+            Some(n) => (said, n),
+            // The words were inside a quoted answer, not the suffix.
+            None => (clause, 0),
+        },
+        None => (clause, 0),
+    };
+    if said == "User selected nothing." {
+        return Some(ReadAnswer::Given {
+            selected: Vec::new(),
+            text: None,
+            images,
+        });
+    }
+    let typed = |rest: &str| -> Option<String> {
+        let (text, after) = read_quoted(rest)?;
+        after.is_empty().then_some(text)
+    };
+    if let Some(rest) = said.strip_prefix("User answered: ") {
+        return Some(ReadAnswer::Given {
+            selected: Vec::new(),
+            text: Some(typed(rest)?),
+            images,
+        });
+    }
+    let mut rest = said.strip_prefix("User selected: ")?;
+    let mut selected = Vec::new();
+    loop {
+        let (label, after) = read_quoted(rest)?;
+        selected.push(label);
+        if after.is_empty() {
+            return Some(ReadAnswer::Given {
+                selected,
+                text: None,
+                images,
+            });
+        }
+        if let Some(text) = after.strip_prefix(", and User answered: ") {
+            return Some(ReadAnswer::Given {
+                selected,
+                text: Some(typed(text)?),
+                images,
+            });
+        }
+        rest = after.strip_prefix(", ")?;
+    }
+}
+
+/// A string as `{:?}` wrote it, and what follows it.
+fn read_quoted(s: &str) -> Option<(String, &str)> {
+    let mut chars = s.strip_prefix('"')?.char_indices();
+    let mut out = String::new();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '"' => return Some((out, &s[1 + i + 1..])),
+            '\\' => match chars.next()?.1 {
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                '0' => out.push('\0'),
+                'u' => {
+                    let mut hex = String::new();
+                    if chars.next()?.1 != '{' {
+                        return None;
+                    }
+                    loop {
+                        match chars.next()?.1 {
+                            '}' => break,
+                            h => hex.push(h),
+                        }
+                    }
+                    out.push(char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?);
+                }
+                other => out.push(other),
+            },
+            c => out.push(c),
+        }
+    }
+    None
+}
+
 /// Map the user's answer to a tool result string.
 pub fn format_result(resp: &UserInputResponse) -> ToolResult {
     if resp.declined {
-        return ok_result(
-            "No answer was provided. Proceed with your own best judgment; only ask again if you \
-             are truly blocked.",
-        );
+        return ok_result(NO_ANSWER);
     }
     ToolResult {
         call_id: String::new(),
@@ -845,5 +987,112 @@ mod tests {
         let r: UserInputResponse =
             serde_json::from_str(r#"{"declined":false,"selected":["A"],"text":null}"#).unwrap();
         assert!(r.images.is_empty());
+    }
+
+    /// Every answer the writers can say reads back as what was answered.
+    ///
+    /// The screen draws a model's question and its answer from the result text
+    /// alone (the log has nothing else, see [`read_result`]), so the reader and
+    /// the writers are one contract: rewording either side must fail here, not
+    /// turn a transcript's answers back into English meant for the model.
+    #[test]
+    fn a_result_reads_back_as_the_answers_it_was_written_from() {
+        let image = || ImageContent {
+            media_type: "image/png".into(),
+            data: "x".into(),
+        };
+        let given = |selected: &[&str], text: Option<&str>, images: usize| UserInputResponse {
+            declined: false,
+            selected: selected.iter().map(|s| s.to_string()).collect(),
+            text: text.map(str::to_string),
+            images: (0..images).map(|_| image()).collect(),
+        };
+        // What each response should read back as: blank words typed beside a
+        // pick are not said to the model, so they are not read back either.
+        let expected = |r: &UserInputResponse| {
+            if r.declined {
+                return ReadAnswer::Declined;
+            }
+            let text = if r.selected.is_empty() {
+                r.text.clone()
+            } else {
+                r.text.clone().filter(|t| !t.trim().is_empty())
+            };
+            ReadAnswer::Given {
+                selected: r.selected.clone(),
+                text,
+                images: r.images.len(),
+            }
+        };
+        let answers = vec![
+            given(&["推"], None, 0),
+            given(&["a", "b"], None, 0),
+            given(&["Python"], Some("plus Rust"), 0),
+            given(&[], Some("看下日志为什么没有生效？"), 0),
+            given(&[], Some("   "), 0),
+            given(&[], None, 0),
+            given(&["x"], Some("  "), 0),
+            given(&["截图"], None, 1),
+            given(&[], Some("见图"), 3),
+            // Words that look like the wording itself, quotes, escapes, lines.
+            given(&[r#"a", "b"#, "): User selected: \"z\""], None, 0),
+            given(
+                &["line\nbreak\ttab\\slash"],
+                Some("bell\u{7}, and User attached 2 images"),
+                0,
+            ),
+            given(&["C. 导航 + 全部操作 🚀"], Some("it's fine"), 2),
+            UserInputResponse::declined(),
+        ];
+
+        for r in &answers {
+            let content = format_result(r).content;
+            assert_eq!(
+                read_result(&content, 1),
+                Some(vec![expected(r)]),
+                "single: {content}"
+            );
+        }
+
+        let req = |header: &str| UserInputRequest {
+            question: "Q?".into(),
+            header: header.into(),
+            mode: UserInputMode::Text,
+            options: vec![],
+            custom: true,
+        };
+        for pair in answers.windows(2) {
+            let reqs = [req("用途"), req("tricky): header")];
+            let content = format_batch_result(&reqs, pair).content;
+            assert_eq!(
+                read_result(&content, 2),
+                Some(pair.iter().map(expected).collect()),
+                "batch: {content}"
+            );
+        }
+        // A batch nobody answered at all is the single-question wording.
+        let none = [UserInputResponse::declined(), UserInputResponse::declined()];
+        let content = format_batch_result(&[req("A"), req("B")], &none).content;
+        assert_eq!(
+            read_result(&content, 2),
+            Some(vec![ReadAnswer::Declined, ReadAnswer::Declined])
+        );
+    }
+
+    /// Text these writers did not produce is not guessed at: the caller shows it
+    /// as it is.
+    #[test]
+    fn a_result_nobody_here_wrote_is_not_read_as_answers() {
+        for content in [
+            "Interactive questions are not supported in this environment.",
+            "invalid request_user_input arguments: missing field `question`",
+            "User selected: unquoted",
+            r#"User selected: "a" and more"#,
+            "",
+        ] {
+            assert_eq!(read_result(content, 1), None, "{content}");
+        }
+        // A batch that does not have one line per question.
+        assert_eq!(read_result(r#"Q1 (A): User selected: "x""#, 2), None);
     }
 }
