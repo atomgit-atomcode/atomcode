@@ -1284,6 +1284,12 @@ pub enum Msg<'a> {
     },
     VerbSkill,
     VerbMemory,
+    /// A question the model put to the person, as its row in the conversation.
+    VerbAsk,
+    /// Pictures the person attached to an answer, after the answer.
+    AskAttachedImages {
+        count: usize,
+    },
     OutcomeInterrupted,
     OutcomeFailedWith {
         first: &'a str,

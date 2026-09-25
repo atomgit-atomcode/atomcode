@@ -794,6 +794,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ToolsFailed { failed } => format!(" · {failed} failed").into(),
         Msg::VerbSkill => "skill".into(),
         Msg::VerbMemory => "memory".into(),
+        Msg::VerbAsk => "asked".into(),
+        Msg::AskAttachedImages { count } => match count {
+            1 => "1 image attached".into(),
+            n => format!("{n} images attached").into(),
+        },
         Msg::OutcomeInterrupted => "stopped".into(),
         Msg::OutcomeFailedWith { first } => format!("failed · {first}").into(),
         Msg::OutcomeLines { lines } => format!("{lines} lines").into(),

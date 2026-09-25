@@ -10408,6 +10408,78 @@ mod tests {
         );
     }
 
+    /// What the person answered is not merged behind a run's lid: the lid says
+    /// how much work the agent did, and a decision the person made is not work
+    /// to be counted — it is the one row in the run they wrote.
+    #[test]
+    fn a_question_between_calls_is_not_behind_their_lid() {
+        let h = host();
+        let call = |id: &str, name: &str, arguments: &str| atomcode_kernel::tool::ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: arguments.into(),
+        };
+        h.absorb(&SessionEvent::AssistantMessage {
+            turn: 1,
+            round: 1,
+            text: String::new(),
+            reasoning: String::new(),
+            tool_calls: vec![
+                call("c1", "read_file", r#"{"path":"a.rs"}"#),
+                call("c2", "read_file", r#"{"path":"b.rs"}"#),
+                call(
+                    "c3",
+                    "request_user_input",
+                    r#"{"question":"现在推吗?","options":[{"label":"推"}]}"#,
+                ),
+                call("c4", "read_file", r#"{"path":"c.rs"}"#),
+            ],
+            reasoning_blocks: Vec::new(),
+            meta: None,
+        });
+        for (id, content) in [
+            ("c1", "a"),
+            ("c2", "b"),
+            ("c3", r#"User selected: "推""#),
+            ("c4", "c"),
+        ] {
+            h.absorb(&SessionEvent::ToolResultLogged {
+                turn: 1,
+                round: 1,
+                call_id: id.into(),
+                content: content.into(),
+                is_error: false,
+                images: Vec::new(),
+            });
+        }
+        h.presentation
+            .write()
+            .unwrap()
+            .set_tool_output(crate::host::ToolOutput::Group);
+        let rows: Vec<String> = h
+            .compose((80, 40))
+            .part("stream")
+            .expect("the conversation")
+            .lines
+            .iter()
+            .map(|l| l.plain())
+            .collect();
+        assert!(
+            rows.iter().any(|r| r.contains("现在推吗? → 推")),
+            "the answer is not on the screen:\n{rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("已执行了 2 个工具")),
+            "the calls before it are not their own lid:\n{rows:#?}"
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.contains("3 个工具") || r.contains("4 个工具")),
+            "a lid swallowed the question:\n{rows:#?}"
+        );
+    }
+
     /// A host holding exactly one finished tool call, folded, with the given
     /// arguments.
     fn host_with_one_call(arguments: &str) -> Host {

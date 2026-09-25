@@ -12,6 +12,9 @@ use crate::i18n::product::{t as pt, Msg as PMsg};
 use crate::i18n::{t, Msg};
 use crate::theme::Role;
 use crate::width;
+use atomcode_capabilities::tools::request_user_input::{
+    parse_batch, read_result, ReadAnswer, REQUEST_USER_INPUT_KIND,
+};
 use atomcode_harness::seams::StopReason;
 
 /// Metadata: the mark on a line, a tool's `· 6 行`, a folded thought.
@@ -842,6 +845,63 @@ impl ToolCallBlock {
         matches!(self.name.as_str(), "todo" | "todowrite")
     }
 
+    /// Each question this call asked, with the answer that came back.
+    ///
+    /// Read from the result text, because that is the only record there is —
+    /// see [`read_result`], which sits beside the code that writes it. `None`
+    /// while it is still open, when it failed, or when the text is not one those
+    /// writers produced; the call is then drawn like any other.
+    fn exchange(&self) -> Option<Vec<(String, ReadAnswer)>> {
+        if self.name != REQUEST_USER_INPUT_KIND {
+            return None;
+        }
+        let Outcome::Ok(content) = &self.outcome else {
+            return None;
+        };
+        let (asked, _) = parse_batch(&self.args_without_reason()).ok()?;
+        let answers = read_result(content, asked.len())?;
+        Some(asked.into_iter().map(|q| q.question).zip(answers).collect())
+    }
+
+    /// `● 提问` over one `question → answer` row per question.
+    ///
+    /// The shape Claude Code gives the same exchange, and for its reason: once
+    /// the panel closes, this is the record of what was decided, and a decision
+    /// reads as the question beside its answer — not as a call's arguments above
+    /// a sentence written for the model. The answer carries the row's weight; the
+    /// question recedes, and no answer is said as such, in grey.
+    fn exchange_lines(
+        &self,
+        w: u16,
+        exchange: &[(String, ReadAnswer)],
+        name_style: Style,
+    ) -> Vec<Line> {
+        let caps = Caps::default();
+        let lead = format!("{} ", caps.g(Glyph::ToolMark));
+        let mut out = crate::markdown::wrap_spans(
+            &[Span::styled(self.display_name(), name_style)],
+            w,
+            &lead,
+            self.mark().1,
+        );
+        let gutter = format!("{}{} ", " ".repeat(GUTTER), caps.g(Glyph::Gutter));
+        let under = " ".repeat(width::str_width(&gutter));
+        for (i, (question, answer)) in exchange.iter().enumerate() {
+            let (said, said_style) = match answer_words(answer) {
+                Some(words) => (words, Style::new()),
+                None => (t(Msg::AskUnanswered).into_owned(), muted()),
+            };
+            let spans = [
+                Span::styled(flatten(question), muted()),
+                Span::styled(" → ".to_string(), muted()),
+                Span::styled(said, said_style),
+            ];
+            let prefix = if i == 0 { &gutter } else { &under };
+            out.extend(crate::markdown::wrap_spans(&spans, w, prefix, muted()));
+        }
+        out
+    }
+
     pub fn pending(
         call_id: impl Into<String>,
         name: impl Into<String>,
@@ -1141,6 +1201,7 @@ pub enum Verb {
     Shell,
     Memory,
     Plan,
+    Ask,
 }
 
 impl Verb {
@@ -1150,6 +1211,7 @@ impl Verb {
             Verb::Shell => "$".to_string(),
             Verb::Memory => t(Msg::VerbMemory).into_owned(),
             Verb::Plan => pt(PMsg::TodoPanelTitle).into_owned(),
+            Verb::Ask => t(Msg::VerbAsk).into_owned(),
         }
     }
 }
@@ -1245,6 +1307,19 @@ pub fn look(tool: &str) -> Look {
             subject: &[],
             ..GENERIC
         },
+        // The subject is read by `subject_of_within` itself: one question sits at
+        // the top level, several sit in an array, and no key names both.
+        //
+        // Never folded, and so never behind a run's lid: what the person decided
+        // is not one more step of the agent's work to be counted. A lid reading
+        // `已执行了 5 个工具` over it would hide the one row in the run the person
+        // wrote. (A turn taken back still takes it along — see the host's
+        // `tells_of_the_turn`.)
+        REQUEST_USER_INPUT_KIND => Look {
+            verb: Some(Verb::Ask),
+            subject: &[],
+            always_open: true,
+        },
         _ => GENERIC,
     }
 }
@@ -1289,6 +1364,18 @@ pub fn subject_of(tool: &str, args: &str) -> String {
 /// judged at all: pinning the folder alone leaves "a shell row asks for it and
 /// a file row does not" resting on nothing.
 pub fn subject_of_within(tool: &str, args: &str, home: Option<&std::path::Path>) -> String {
+    // A question is not something the call acts on: the arguments of
+    // `request_user_input` ARE the words put to the person, and they are the one
+    // payload on this screen written to be *read* rather than scanned. The
+    // generic reader below only knows tools by the key their subject hides under,
+    // and this one has none — so it fell back to the raw arguments, flattening
+    // `{"header":…,"mode":"single","options":[…],"question":…}` across five rows
+    // of the transcript with the question buried in the middle of them.
+    if tool == REQUEST_USER_INPUT_KIND {
+        if let Some(asked) = asked_question(args) {
+            return asked;
+        }
+    }
     let look = look(tool);
     let parsed: Option<serde_json::Value> = serde_json::from_str(args).ok();
     if let Some(obj) = parsed.as_ref().and_then(|v| v.as_object()) {
@@ -1317,6 +1404,48 @@ pub fn subject_of_within(tool: &str, args: &str, home: Option<&std::path::Path>)
     }
     let flat = flatten(args);
     flat.trim_matches(|c| c == '{' || c == '}').to_string()
+}
+
+/// The question a `request_user_input` call puts, when its arguments read as one.
+///
+/// One question rides at the top level, under `question`; several ride in a
+/// `questions` array, and the row then says the first of them — a row that tried
+/// to say four would be a paragraph, and the panel that asks them numbers every
+/// one. This is the row while the question is still open; once it is answered
+/// the call is drawn as its questions and answers (`ToolCallBlock::exchange`). `None` only for a payload with no words left in it, which then falls back
+/// to the raw arguments and at least says what it is.
+fn asked_question(args: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(args).ok()?;
+    let one = match parsed.get("questions") {
+        Some(serde_json::Value::Array(many)) => many.first()?.get("question")?,
+        _ => parsed.get("question")?,
+    };
+    let text = one.as_str()?.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+/// An answer in the person's own words: what they picked, what they typed, and
+/// how many pictures came with it. `None` when there was no answer to say.
+fn answer_words(answer: &ReadAnswer) -> Option<String> {
+    let ReadAnswer::Given {
+        selected,
+        text,
+        images,
+    } = answer
+    else {
+        return None;
+    };
+    let mut parts: Vec<String> = Vec::new();
+    if !selected.is_empty() {
+        parts.push(selected.join(", "));
+    }
+    if let Some(typed) = text.as_deref().map(flatten).filter(|t| !t.is_empty()) {
+        parts.push(typed);
+    }
+    if *images > 0 {
+        parts.push(t(Msg::AskAttachedImages { count: *images }).into_owned());
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
 /// What came back, in a few words.
@@ -1404,6 +1533,9 @@ impl Content for ToolCallBlock {
         let w = ctx.width;
         if w == 0 {
             return Vec::new();
+        }
+        if let Some(exchange) = self.exchange() {
+            return self.exchange_lines(w, &exchange, self.name_style());
         }
         let caps = Caps::default();
         let lead = format!("{} ", caps.g(Glyph::ToolMark));
@@ -1576,7 +1708,21 @@ impl Content for ToolCallBlock {
         let w = ctx.width;
         let style = fold();
         let name = self.display_name();
-        let (note, note_style) = outcome_note(&self.outcome);
+        // An answered question's note is what was answered, not the sentence the
+        // model was told it in.
+        let (note, note_style) = match self.exchange() {
+            Some(exchange) => (
+                exchange
+                    .iter()
+                    .map(|(_, a)| {
+                        answer_words(a).unwrap_or_else(|| t(Msg::AskUnanswered).into_owned())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" / "),
+                muted(),
+            ),
+            None => outcome_note(&self.outcome),
+        };
         // The note is capped to a share of the line. It is the secondary half —
         // the reader is scanning for *what ran* — and an uncapped one-line
         // result (clipped at sixty cells) could otherwise leave no room for the
@@ -3794,6 +3940,142 @@ mod tests {
             !subject_of(&unknown.name, &unknown.args).is_empty(),
             "an unknown tool still gets a subject, or the table would have to \
              track the catalog"
+        );
+    }
+
+    /// The one call whose arguments are words addressed to the reader: the row
+    /// says the question, not the payload it arrived in.
+    ///
+    /// It used to dump the whole wire shape — `("header":…,"mode":"single",
+    /// "options":[…],"question":…)` — across five rows of the transcript, with
+    /// the question buried in the middle of them, while the panel below said the
+    /// same thing in the form the row could have used.
+    #[test]
+    fn a_question_call_reads_as_the_question_not_the_payload() {
+        assert_eq!(
+            subject_of(
+                "request_user_input",
+                r#"{"header":"要不要现在推","question":"现在推到 release/v5.2.0 吗?","mode":"single","options":[{"label":"推"},{"label":"先不推","description":"看完面板再决定"}]}"#
+            ),
+            "现在推到 release/v5.2.0 吗?"
+        );
+
+        // Several questions ride in one call: the row says the first of them and
+        // never the payload, because what an answer means and which one it was
+        // belong to the panel, which numbers every question it asks.
+        assert_eq!(
+            subject_of(
+                "request_user_input",
+                r#"{"questions":[{"header":"A","question":"先做哪个?","mode":"text"},{"header":"B","question":"叫什么?","mode":"text"}]}"#
+            ),
+            "先做哪个?"
+        );
+
+        // Whole, like every subject: the expanded head shows the question as it
+        // was written, and the one-row forms flatten it themselves.
+        assert_eq!(
+            subject_of("request_user_input", r#"{"question":"第一行\n第二行"}"#),
+            "第一行\n第二行"
+        );
+
+        // Words are what this call has; without any, the raw arguments are all
+        // there is to say, and saying them beats an empty row.
+        assert!(!subject_of("request_user_input", r#"{"header":"x"}"#).is_empty());
+    }
+
+    fn answered(args: &str, outcome: Outcome) -> Vec<String> {
+        ToolCallBlock::pending("q", "request_user_input", args)
+            .with(outcome)
+            .lines(&crate::block::RenderCtx::bare(80))
+            .iter()
+            .map(|l| l.plain().trim_end().to_string())
+            .collect()
+    }
+
+    /// An answered question reads as the question beside its answer — the
+    /// person's own words — and never as the sentence the model was told it in.
+    #[test]
+    fn an_answered_question_reads_as_the_question_and_its_answer() {
+        let rows = answered(
+            r#"{"header":"要不要现在推","question":"现在推到 release/v5.2.0 吗?","options":[{"label":"推"},{"label":"先不推"}]}"#,
+            Outcome::Ok(r#"User selected: "推""#.into()),
+        );
+        assert_eq!(
+            rows,
+            vec![
+                "● 提问".to_string(),
+                "  ⎿ 现在推到 release/v5.2.0 吗? → 推".to_string()
+            ]
+        );
+
+        // Several questions: one row each, in the order asked; one nobody
+        // answered says so; words typed beside a pick ride with it.
+        let rows = answered(
+            r#"{"questions":[
+                {"header":"用途","question":"拿来做什么?","options":[{"label":"RAG"}]},
+                {"header":"规模","question":"多少条?","mode":"text"},
+                {"header":"语言","question":"哪些语言?","mode":"multiple","options":[{"label":"Python"},{"label":"Go"}]}
+            ]}"#,
+            Outcome::Ok(
+                "Q1 (用途): User selected: \"RAG\"\n\
+                 Q2 (规模): No answer (declined).\n\
+                 Q3 (语言): User selected: \"Python\", \"Go\", and User answered: \"还有 Rust\""
+                    .into(),
+            ),
+        );
+        assert_eq!(
+            rows,
+            vec![
+                "● 提问".to_string(),
+                "  ⎿ 拿来做什么? → RAG".to_string(),
+                "    多少条? → （未回答）".to_string(),
+                "    哪些语言? → Python, Go · 还有 Rust".to_string(),
+            ]
+        );
+
+        // Nobody answered at all: every question says so.
+        let rows = answered(
+            r#"{"question":"现在推吗?","options":[{"label":"推"}]}"#,
+            Outcome::Ok(atomcode_capabilities::tools::request_user_input::NO_ANSWER.into()),
+        );
+        assert_eq!(rows[1], "  ⎿ 现在推吗? → （未回答）");
+
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.contains("User ") || r.contains("No answer")),
+            "the model's wording leaked onto the screen: {rows:#?}"
+        );
+    }
+
+    /// It is never folded, and the one-row form — what a cancelled turn draws
+    /// it as — says what was answered rather than what the model was told.
+    #[test]
+    fn a_question_is_not_folded_and_its_one_row_says_the_answer() {
+        let block = ToolCallBlock::pending(
+            "q",
+            "request_user_input",
+            r#"{"question":"现在推吗?","options":[{"label":"推"}]}"#,
+        )
+        .with(Outcome::Ok(r#"User selected: "推""#.into()));
+        assert!(block.always_open(), "the answers would fold away");
+        let one = block.summary(&crate::block::RenderCtx::bare(80)).plain();
+        assert!(one.contains("现在推吗?") && one.contains("· 推"), "{one}");
+        assert!(!one.contains("User"), "{one}");
+    }
+
+    /// A question that did not come back as an answer is drawn as the call it
+    /// was: the error is the thing to read, and there is no answer to pair.
+    #[test]
+    fn a_question_that_failed_is_drawn_as_a_call() {
+        let rows = answered(
+            r#"{"question":"现在推吗?","options":[{"label":"推"}]}"#,
+            Outcome::Failed("Interactive questions are not supported in this environment.".into()),
+        );
+        assert!(rows[0].contains("提问(现在推吗?)"), "{rows:#?}");
+        assert!(
+            rows.iter().any(|r| r.contains("not supported")),
+            "{rows:#?}"
         );
     }
 
