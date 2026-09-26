@@ -434,6 +434,17 @@ pub struct Moment {
     /// Travels the road [`Moment::ctx_window`] does, and for the same reason:
     /// the thinking level is the agent's, not a fact the conversation records.
     pub effort: Option<atomcode_kernel::provider::ReasoningEffort>,
+    /// What the last fold left, as the compaction measured it: the model's view
+    /// in bytes when the reading the row holds was measured, and now. A
+    /// compaction is not a request, so nothing else can say the context just
+    /// shrank — the status row scales its reading by this until the provider
+    /// reports a fresh one.
+    ///
+    /// Injected from the compaction's own event rather than folded from the log:
+    /// the log records the fold, not its size. Set through [`Moment::note_fold`]
+    /// and dropped by [`crate::host::Host::absorb_logged`] on a request's own
+    /// report — see `modules::status` for the ratio it carries.
+    pub ctx_shrunk_since_reading: Option<(usize, usize)>,
     /// The agents running under this one, as the registry has them now.
     /// Empty for a screen that never delegates, which is most of them.
     pub members: Vec<MemberNow>,
@@ -781,6 +792,19 @@ pub struct Moment {
 pub use crate::ask::Sheet as Ask;
 
 impl Moment {
+    /// Record that the model's view shrank, as a compaction measured it.
+    ///
+    /// One decision can arrive as several of these — the in-place rewrites, then
+    /// the cut — and each reports its own step (`handle.rs::project_at` measures
+    /// what the log said at that fact), so the base is kept and only the size
+    /// moves. The ratio left behind is the whole decision's rather than its last
+    /// step's, which is the ratio the runtime keeps as it walks the same events.
+    pub fn note_fold(&mut self, bytes_before: usize, bytes_after: usize) {
+        let base = self
+            .ctx_shrunk_since_reading
+            .map_or(bytes_before, |(base, _)| base);
+        self.ctx_shrunk_since_reading = (bytes_after < base).then_some((base, bytes_after));
+    }
     pub fn working(mut self) -> Self {
         self.activity = Activity::Working;
         self
@@ -1248,6 +1272,33 @@ mod tests {
         assert_eq!(m.input, "hi there");
         assert!(m.pastes.is_empty(), "nothing folded");
         assert_eq!(m.caret, "hi there".len());
+    }
+
+    /// One compaction can arrive as several steps — the tool output stubbed in
+    /// place, then the cut — and each reports only its own. The base stays the
+    /// reading's, so the row scales by the whole decision rather than its last
+    /// step, which is what the runtime does as it walks the same events.
+    #[test]
+    fn a_decision_that_arrives_as_steps_keeps_the_whole_decision_s_ratio() {
+        let mut m = Moment::default();
+        m.note_fold(1_000, 400);
+        m.note_fold(400, 100);
+        assert_eq!(
+            m.ctx_shrunk_since_reading,
+            Some((1_000, 100)),
+            "the last step's ratio alone would read as a quarter of the shrink"
+        );
+
+        // A request reported its own prompt in between: the next fold starts from
+        // its own before-size rather than the one before it.
+        m.ctx_shrunk_since_reading = None;
+        m.note_fold(900, 300);
+        assert_eq!(m.ctx_shrunk_since_reading, Some((900, 300)));
+
+        // A step that leaves the view no smaller than the reading says nothing.
+        let mut m = Moment::default();
+        m.note_fold(300, 320);
+        assert_eq!(m.ctx_shrunk_since_reading, None);
     }
 
     #[test]

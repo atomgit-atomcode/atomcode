@@ -1849,6 +1849,19 @@ impl Host {
             }
         }
 
+        // A request is the authority on the prompt it really sent, so its report
+        // retires the fold record and the status row goes back to the measured
+        // number. Here rather than in the status module because this is the one
+        // place that sees both the fact and the reading: cleared on its own, a
+        // frame could paint the pre-fold reading between the two and flash the
+        // very number the fold had just taken down.
+        if matches!(fact, SessionEvent::Usage { .. }) {
+            self.moment
+                .write()
+                .expect("moment poisoned")
+                .ctx_shrunk_since_reading = None;
+        }
+
         // Pinned while the reader is holding a position: what the fact does to
         // the conversation is what moves the reading, and the reading has to
         // move with it or the same words slide out from under the same eyes.
@@ -6273,6 +6286,51 @@ mod tests {
         );
         assert!(!h.settle_working(), "nothing armed to settle");
         assert_eq!(h.moment.read().unwrap().activity, Activity::Idle);
+    }
+
+    /// A fold fact does not touch the record the status row scales its reading
+    /// by; the request that reports a prompt of its own does. Merged, one of the
+    /// two would be applied to the other's number: a fold's ratio onto a reading
+    /// that already includes it, or a scale that outlives the reading it fits.
+    #[test]
+    fn a_requests_report_retires_the_fold() {
+        let h = host();
+        h.moment
+            .write()
+            .expect("moment poisoned")
+            .note_fold(1_000, 250);
+        h.absorb(&SessionEvent::Compacted {
+            turn: 1,
+            through: 3,
+            summary: "folded".into(),
+            from: 1,
+        });
+        assert!(
+            h.moment
+                .read()
+                .expect("moment poisoned")
+                .ctx_shrunk_since_reading
+                .is_some(),
+            "the fold's own fact left the record alone"
+        );
+
+        h.absorb(&SessionEvent::Usage {
+            turn: 1,
+            round: 1,
+            usage: atomcode_kernel::stream::TokenUsage {
+                prompt: 900,
+                completion: 5,
+                cached: 0,
+            },
+        });
+        assert_eq!(
+            h.moment
+                .read()
+                .expect("moment poisoned")
+                .ctx_shrunk_since_reading,
+            None,
+            "a request's own prompt supersedes the fold's estimate"
+        );
     }
 
     /// A session's name is read off the log, and the newest one wins — the

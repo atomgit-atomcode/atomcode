@@ -4409,8 +4409,23 @@ impl Tui {
                 self.host.steered(&texts);
                 true
             }
-            AgentEvent::Compacted { committed, .. } => {
+            AgentEvent::Compacted {
+                committed,
+                bytes_before,
+                bytes_after,
+                ..
+            } => {
                 if committed {
+                    // The window just emptied, and no request has reported it yet:
+                    // hand the sizes to the status row so its reading scales down
+                    // at once instead of standing at the pre-fold figure until the
+                    // next answer. The row lets go of it by itself when a real
+                    // reading arrives — see `modules::status`.
+                    self.host
+                        .moment
+                        .write()
+                        .expect("moment poisoned")
+                        .note_fold(bytes_before, bytes_after);
                     self.say(&t(Msg::Compacted));
                 } else {
                     self.say(&t(Msg::NothingWorthCompacting));

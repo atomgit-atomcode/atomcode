@@ -243,10 +243,13 @@ impl View for Status {
         // a real filesystem path), so the collapse happens here, not at the source.
         let cwd_full = crate::text::collapse_home(&vp.moment.cwd);
         let cwd_base = path_basename(&cwd_full).to_string();
+        // What the model is carrying now: the last request's prompt, or — when a
+        // fold has shrunk the view since it was reported — what the fold left.
+        let used = gauge_tokens(state, vp.moment);
         // Only what means something: a context usage segment appears once there
         // are tokens or a window to report, never as a bare zero.
-        let ctx_str = if state.prompt_tokens > 0 || vp.moment.ctx_window > 0 {
-            format_ctx_usage(state.prompt_tokens as usize, vp.moment.ctx_window as usize)
+        let ctx_str = if used > 0 || vp.moment.ctx_window > 0 {
+            format_ctx_usage(used as usize, vp.moment.ctx_window as usize)
         } else {
             String::new()
         };
@@ -262,7 +265,7 @@ impl View for Status {
         // muted grey, the cache ratio gold, and the context usage green — shifting
         // to yellow then red as the window fills toward the auto-compaction
         // threshold. Separators stay muted.
-        let ctx_style = match ctx_fill_pct(state.prompt_tokens, vp.moment.ctx_window) {
+        let ctx_style = match ctx_fill_pct(used, vp.moment.ctx_window) {
             p if p >= 90 => theme::fg(Role::Error),
             p if p >= 70 => theme::fg(Role::Warning),
             _ => theme::fg(Role::Success),
@@ -380,6 +383,23 @@ fn ctx_fill_pct(used: u32, window: u32) -> u64 {
         0
     } else {
         (used as u64).saturating_mul(100) / window as u64
+    }
+}
+
+/// The context the row reports: the last request's prompt, or — once a fold has
+/// shrunk the view and before the next request reports — what the fold left,
+/// scaled by the byte ratio the compaction measured. The same estimate the
+/// runtime keeps for itself, so the row and the runtime agree on the size.
+///
+/// The record goes when a request reports a prompt of its own
+/// (`Host::absorb_logged`), so a fold's ratio is never applied to a reading that
+/// already contains it.
+fn gauge_tokens(state: &State, moment: &Moment) -> u32 {
+    match moment.ctx_shrunk_since_reading {
+        Some((base, now)) if base > 0 && now < base => {
+            ((state.prompt_tokens as u128 * now as u128) / base as u128) as u32
+        }
+        _ => state.prompt_tokens,
     }
 }
 
@@ -1009,6 +1029,48 @@ mod tests {
             st.prompt_tokens, 40_000,
             "the gauge follows the latest request, it does not stay at the peak"
         );
+    }
+
+    /// A compaction is not a request, so the row cannot wait for one to report
+    /// the drop: it stands on the fold's own byte ratio until a reading lands.
+    #[test]
+    fn the_context_gauge_drops_at_the_fold_rather_than_a_request_later() {
+        use atomcode_kernel::stream::TokenUsage;
+        let mut st = State {
+            prompt_tokens: 700_000,
+            ..Default::default()
+        };
+        let mut m = Moment {
+            ctx_window: 1_000_000,
+            ..Default::default()
+        };
+        let line = Status::render(&st, &Viewport::new(Rect::sized(120, 1), &m))[0].plain();
+        assert!(line.contains("700.0k/1m tok (70%)"), "{line:?}");
+
+        // The fold: the compaction measured the view shrinking to a fifth of its
+        // bytes, and no request has reported since.
+        m.note_fold(2_500_000, 500_000);
+        let line = Status::render(&st, &Viewport::new(Rect::sized(120, 1), &m))[0].plain();
+        assert!(line.contains("140.0k/1m tok (14%)"), "{line:?}");
+
+        // The next request is the authority on its own prompt, so it retires the
+        // estimate rather than being blended with it — the clear `Host` makes on
+        // the same fact (see `host::tests::a_requests_report_retires_the_fold`).
+        Status::absorb(
+            &mut st,
+            &SessionEvent::Usage {
+                turn: 1,
+                round: 2,
+                usage: TokenUsage {
+                    prompt: 150_000,
+                    completion: 10,
+                    cached: 0,
+                },
+            },
+        );
+        m.ctx_shrunk_since_reading = None;
+        let line = Status::render(&st, &Viewport::new(Rect::sized(120, 1), &m))[0].plain();
+        assert!(line.contains("150.0k/1m tok (15%)"), "{line:?}");
     }
 
     #[test]
