@@ -2570,18 +2570,31 @@ impl Content for TurnEndBlock {
         // rides only a clean stop, the way tuix drops it from a failed turn.
         let mut under: Vec<String> = Vec::new();
         let mut caption = short;
-        let with_cached = clean;
+        // 停下但清单还没做完:它**不是失败**,所以没有理由把缓存命中藏起来 —— 藏它是
+        // 给失败那几种留的规矩(命中率挨着一个错误读,像是那个错误的一部分)。
+        let open_items_stop = matches!(self.stop, StopReason::Stopped) && self.open_items > 0;
+        let with_cached = clean || open_items_stop;
         let stats = match (lead, self.stats.caption(with_cached)) {
+            // 这种停下的账另起一行,所以那行开头得有个词把钟点接住(`停下 09:37`):
+            // 干净收尾那行是「词 钟点 · 数字」,两处同一个语序。
+            (Some(at), Some(stats)) if open_items_stop => {
+                Some(format!("{} · {stats}", t(Msg::StopAt { at })))
+            }
             (Some(at), Some(stats)) => Some(format!("{at} · {stats}")),
             (Some(at), None) => Some(at.clone()),
             (None, stats) => stats,
         };
         if let Some(stats) = stats {
             let wider = format!("{caption} · {stats}");
-            if crate::el::caption_fits(&wider, w as usize) {
+            // 这种停下**不做成一行**:上面那句是"为什么停",下面那行是"花了多少",
+            // 两件事各自一行;账那行带 `✻`,和干净收尾那行的数字同一种读法。
+            if !open_items_stop && crate::el::caption_fits(&wider, w as usize) {
                 caption = wider;
             } else {
-                under.push(stats);
+                under.push(match open_items_stop {
+                    true => format!("{} {stats}", caps.g(Glyph::Sparkle)),
+                    false => stats,
+                });
             }
         }
         if let Some(error) = &self.error {
@@ -2603,8 +2616,14 @@ impl Content for TurnEndBlock {
         // figures ride at the margin the way the rule's caption did, minus the
         // rule — nearer `✻ Crunched for …` than `───── ✓ Done ─────`.
         let mut out = vec![Line::styled(width::take_width(&caption, w as usize), style)];
+        // 账用中性色画:那行数字是历史,不是"哪里不对"—— 报警色只管上面那句话。
+        // 出错那条(错误本身也走 `under`)保持报警色,它才是要人停下来看的。
+        let under_style = match self.error.is_some() {
+            true => style,
+            false => muted(),
+        };
         for line in under {
-            out.extend(wrapped(&line, w, style, "  "));
+            out.extend(wrapped(&line, w, under_style, "  "));
         }
         out
     }
@@ -2630,8 +2649,11 @@ mod tests {
             open_items,
             ended_at: Some("21:42".into()),
         }
-        .lines(&RenderCtx::bare(200))[0]
-            .plain()
+        .lines(&RenderCtx::bare(200))
+        .iter()
+        .map(Line::plain)
+        .collect::<Vec<_>>()
+        .join("\n")
     }
 
     /// 一张问道的卡:画出来的是**全文**,不是被压成一行的那句。
@@ -2676,14 +2698,33 @@ mod tests {
         assert!(line.ends_with("% cached"), "{line}");
     }
 
-    /// Any other outcome's words are a sentence — a cause, what to do next — so
-    /// the time does not trail them: it leads the figures.
+    /// 其他收尾的"话"是一句句子 —— 一个原因、接下来该做什么 —— 所以时间不跟在它后
+    /// 面拖:时间领着那串数字。
     #[test]
     fn a_stop_that_is_not_a_finish_leads_its_figures_with_the_time() {
-        for (stop, open) in [(StopReason::MaxRounds, 0), (StopReason::Stopped, 2)] {
-            let line = ended(stop, open);
-            assert!(line.contains(" · 21:42 · 12.5s · "), "{line}");
-        }
+        let line = ended(StopReason::MaxRounds, 0);
+        assert!(line.contains(" · 21:42 · 12.5s · "), "{line}");
+    }
+
+    /// 清单还有没做完的那种停下:一句"为什么"在上面,**账另起一行**带 `✻`,而且连缓存
+    /// 命中一起 —— 它不是失败,没有理由把命中率藏掉(藏它是给失败那几种留的规矩)。
+    #[test]
+    fn a_stop_with_open_items_says_why_and_puts_the_cost_on_the_next_line() {
+        let line = ended(StopReason::Stopped, 2);
+        let rows: Vec<&str> = line.lines().collect();
+        assert!(
+            rows.len() == 2 && rows[0].contains("任务清单还有 2 项没完成"),
+            "上面那句是为什么停:\n{line}"
+        );
+        assert!(
+            !rows[0].contains("tokens") && !rows[0].contains("cached"),
+            "账不在上面那句里:\n{line}"
+        );
+        let word = t(Msg::StopAt { at: "21:42" }).into_owned();
+        assert!(
+            rows[1].contains('✻') && rows[1].contains(&word) && rows[1].contains("% cached"),
+            "下面那行是「✻ {word} · …」:钟点有词接着、缓存命中也在:\n{line}"
+        );
     }
 
     #[test]

@@ -790,6 +790,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StopWithOpenItems { count } => {
             format!("已停下 · 任务清单还有 {count} 项没完成 —— 发一句「继续」接着做").into()
         }
+        Msg::StopAt { at } => format!("停下 {at}").into(),
 
         // ── the live strip and the folded-lines notes (`modules/live.rs`, `host.rs`) ──
         Msg::LiveStopping => "正在停止".into(),

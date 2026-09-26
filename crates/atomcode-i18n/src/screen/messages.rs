@@ -625,6 +625,11 @@ pub enum Msg<'a> {
         title: &'a str,
         answer: &'a str,
     },
+    /// 停下那行的账前头那两个字:让钟点有个落处(`停下 09:37`)。没有它,`✻ 09:37`
+    /// 是一个光秃秃的时刻 —— 干净收尾那行是「词 钟点 · 数字」,这边也得是同一个语序。
+    StopAt {
+        at: &'a str,
+    },
 
     // ── reasoning effort, undo and rewind (`commands.rs`) ──
     EffortAbout,

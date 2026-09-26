@@ -848,6 +848,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "stopped · {count} item(s) on the task list are still open — send \"continue\" to pick them up"
         )
         .into(),
+        Msg::StopAt { at } => format!("stopped {at}").into(),
 
         // ── the live strip and the folded-lines notes (`modules/live.rs`, `host.rs`) ──
         Msg::LiveStopping => "stopping".into(),
