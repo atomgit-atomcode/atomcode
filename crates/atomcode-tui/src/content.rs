@@ -2120,14 +2120,25 @@ impl Content for CommandSaid {
     }
     fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
         let w = ctx.width;
-        let style = if self.refused { bad() } else { muted() };
+        // 不 refused 的那种是"我说了一件事"(`/review 已经在后台启动…`),在对话里该读
+        // 得像一句话而不是一条会淡掉的提示:正常前景色,前头带一个圆点。refused 仍旧
+        // 是红字 —— "这是你的答复"和"这件事没做成"必须一眼分得开,那一条没动。
+        let style = match self.refused {
+            true => bad(),
+            false => Style::new(),
+        };
+        let lead = match self.refused {
+            true => "  ",
+            false => "● ",
+        };
         let mut out = Vec::new();
-        for line in self.text.split('\n') {
+        for (i, line) in self.text.split('\n').enumerate() {
+            let lead = if i == 0 { lead } else { "  " };
             let runs = with_links(line, style);
             if runs.iter().any(|run| run.link.is_some()) && w > 0 {
-                out.extend(crate::markdown::wrap_spans(&runs, w, "  ", muted()));
+                out.extend(crate::markdown::wrap_spans(&runs, w, lead, muted()));
             } else {
-                out.extend(wrapped(line, w, style, "  "));
+                out.extend(wrapped(line, w, style, lead));
             }
         }
         out
