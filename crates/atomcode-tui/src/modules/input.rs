@@ -55,13 +55,12 @@ fn note_shown(moment: &crate::moment::Moment) -> bool {
     moment.interrupted && moment.activity == Activity::Idle && moment.secret.is_none()
 }
 
-/// 建议那一行现在写什么。`None` = 不画。
+/// 输入行里那句暗字建议写什么。`None` = 不画。
 ///
-/// **它不走内联的 ghost 那个位置**,尽管那里也是一句灰字、也是按 → 收下。
-/// 那一条的来源是这个会话自己说过的话(`text::ghost` 的注释写着这件事:
-/// 「不问模型,什么都不编」),而这一句是模型写的。画在同一个位置、同一个
-/// 样子的话,人分不出哪句是自己说过的、哪句是被猜出来的 —— 所以这一句单独
-/// 一行,并且**带着那个键的名字**,像上一代前端那样。
+/// 它和内联的 ghost 画在同一个位置、同一身暗字,只写那句话本身,不带键名,
+/// 也不带任何前缀符号。两者不会同时出现:ghost 只在行里已经打了字时才有
+/// (`text::ghost`),这一句只在行空着时才有 —— 所以空行上的暗字一定是模型
+/// 猜的那一句,打了字之后的暗字一定是自己说过的话。
 ///
 /// 只在编辑区空着、没有回合在跑、也不是在问密码的时候画:它是一个猜测,
 /// 猜测不该盖住人正在写的东西,也不该在人等着回答的时候冒出来。
@@ -74,11 +73,7 @@ fn suggested(moment: &crate::moment::Moment) -> Option<String> {
     {
         return None;
     }
-    Some(format!(
-        "{} {}",
-        moment.caps.g(crate::caps::Glyph::Gutter),
-        t(Msg::ComposerSuggested { text })
-    ))
+    Some(t(Msg::ComposerSuggested { text }).into_owned())
 }
 fn history_caption(moment: &crate::moment::Moment) -> Option<String> {
     let total = moment.history.len();

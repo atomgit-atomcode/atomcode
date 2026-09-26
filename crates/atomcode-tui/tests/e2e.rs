@@ -8540,12 +8540,10 @@ async fn a_guess_at_what_to_say_next_reaches_the_field_and_right_takes_it() {
         "→ 把它收进了输入行:\n{}",
         s.screen()
     );
-    assert!(
-        !shown.contains('→'),
-        "收下之后那一行就该没了,否则它会再被收一次:\n{shown}"
-    );
 
-    // 而它现在是一句真的话:回车发出去,对话区里就有它。
+    // 建议和收下后的字在输入行里读出来是同一串字(只差颜色),所以上面那条
+    // 分不出「收下了」和「还挂着」。回车才分得出:收下了,发出去的是这句话;
+    // 没收下,行是空的,什么也发不出去。
     s.term.press(KeyPress::plain(Key::Enter));
     let mut seen = String::new();
     for _ in 0..200 {
@@ -8564,7 +8562,8 @@ async fn a_guess_at_what_to_say_next_reaches_the_field_and_right_takes_it() {
 }
 
 /// Plain `Tab` takes the guess too — the key the reference front end's hint row
-/// named (`Tab: …`), and the one this screen's row now names beside `→`.
+/// named (`Tab: …`). The guess is drawn in the line without a key name, and
+/// both `→` and `Tab` take it.
 ///
 /// Pinned with `ui.mode_switch_key = "tab"` on purpose: that is the one setting
 /// where plain Tab is somebody else's key, and a guess on an empty line still
@@ -8597,7 +8596,7 @@ async fn a_guess_at_what_to_say_next_is_taken_by_plain_tab() {
     }
     // 建议直接画在输入行里,不再写怎么按下它 —— 但这两个键仍旧收得下它。
     assert!(
-        composer_text(&s).contains("接着把登录那条补上"),
+        shown.contains("接着把登录那条补上"),
         "猜的那句话写在输入行里:\n{}",
         s.screen()
     );
@@ -8631,6 +8630,21 @@ async fn a_guess_at_what_to_say_next_is_taken_by_plain_tab() {
     // reaches the mode key at all.
     s.term.press(KeyPress::plain(Key::Enter));
     s.quiet().await;
+    // 输入行里读不出「收下了」和「还挂着」的差别(同一串字,只差颜色);发出去的
+    // 东西读得出:没收下,回车发的是一行空的,对话区里就没有这句话。
+    let mut seen = String::new();
+    for _ in 0..200 {
+        seen = transcript(&s);
+        if seen.contains("接着把登录那条补上") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        seen.contains("接着把登录那条补上"),
+        "Tab 收下的那句话要能像自己打的一样发出去:\n{}",
+        s.screen()
+    );
     s.term.type_text("接着");
     s.term.press(KeyPress::plain(Key::Tab));
     for _ in 0..200 {
