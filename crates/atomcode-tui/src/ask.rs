@@ -1136,9 +1136,10 @@ pub fn recorded(question: &Question) -> String {
     };
     let what = highlights(&about.arguments)
         .first()
-        // The scrollback record is one line — the full command lives in the panel
-        // that asked; here it is a summary someone scrolling past reads at a glance.
-        .map(|(_, value)| format!(" · {}", one_line(value)))
+        // 留**全文**,不压成一行:这张卡折着的时候自己只画第一行
+        // (`ChoiceBlock::summary_lines`),而唯一另一处存着完整命令的面板,在问题被
+        // 答上的那一刻就没了 —— 一条 heredoc 命令的正文在这里被切掉,就是哪儿都没了。
+        .map(|(_, value)| format!("  {value}"))
         .unwrap_or_default();
     format!("{who}{}{what}", about.tool)
 }

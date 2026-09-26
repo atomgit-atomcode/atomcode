@@ -469,6 +469,12 @@ impl View for Input {
                 ) {
                     row.push(El::styled(rest.to_string(), theme::fg(Role::Muted)));
                 }
+                // 猜你接下来要说的那一句也写在这儿:同一行、同一身暗字,因为它是同一
+                // 类东西 —— 不是人打的字,按一下(→ 或 Tab)就进来。它只在空行上成立
+                // (`suggested` 自己判断),而空行正是这个光标所在的那一行。
+                if let Some(words) = suggested(vp.moment) {
+                    row.push(El::styled(words, theme::fg(Role::Muted)));
+                }
             }
             rows.push(El::row(row));
         }
@@ -482,11 +488,9 @@ impl View for Input {
         // idle: the flag is raised the instant Escape is pressed, but the turn is
         // still landing then, so drawing it before the turn is idle would put a
         // "已中断" line over a turn that is visibly still stopping.
-        // 也许接下来可以说的一句话。和上面那条 `已中断` 同一种形状:只在有话
-        // 说的时候才有这一行,所以它不是一行常驻的装饰。
-        if let Some(words) = suggested(vp.moment) {
-            rows.push(El::styled(words, theme::fg(Role::Muted)));
-        }
+        //
+        // 也许接下来可以说的一句话不走这里了:它画在输入行里,和补全同一个位置 ——
+        // 见上面那段(它是同一类东西:不是人打的字,按一下就进来)。
         if note_shown(vp.moment) {
             let note = format!(
                 "{} {}",
@@ -515,13 +519,13 @@ impl View for Input {
         let body = body_width(width);
         let (text, at) = shown(moment);
         let typed = lay(&text, at, body).0.len().min(MAX_ROWS);
-        // The `已中断` note under the box is one more row while it is up, and
-        // so is the guess at what to say next. Counted here or the row is drawn
-        // into space the layout did not give this part — which is a row that
-        // exists in `render` and nowhere on screen.
+        // The `已中断` note under the box is one more row while it is up. Counted
+        // here or the row is drawn into space the layout did not give this part —
+        // which is a row that exists in `render` and nowhere on screen. The guess
+        // at what to say next is **not** one of these: it is drawn inside the
+        // field, on the row the caret is already on.
         let note = usize::from(note_shown(moment));
-        let guess = usize::from(suggested(moment).is_some());
-        Height::Hug((RULES + typed.max(1) + note + guess) as u16)
+        Height::Hug((RULES + typed.max(1) + note) as u16)
     }
 }
 

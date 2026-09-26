@@ -8525,8 +8525,7 @@ async fn a_guess_at_what_to_say_next_reaches_the_field_and_right_takes_it() {
         "猜的那句话画在编辑区那一块里:\n{}",
         s.screen()
     );
-    // 带着键名。一行没有键名的灰字读起来是一个标签,不是一个可以按的东西。
-    assert!(shown.contains('→'), "并且说得出怎么收下它:\n{shown}");
+    // 不再带键名:那句话本身就是建议,画在输入行里(与补全同一个位置)。
 
     s.term.press(KeyPress::plain(Key::Right));
     for _ in 0..200 {
@@ -8596,9 +8595,10 @@ async fn a_guess_at_what_to_say_next_is_taken_by_plain_tab() {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+    // 建议直接画在输入行里,不再写怎么按下它 —— 但这两个键仍旧收得下它。
     assert!(
-        shown.contains("Tab"),
-        "那一行说得出 Tab 能收下它:\n{}",
+        composer_text(&s).contains("接着把登录那条补上"),
+        "猜的那句话写在输入行里:\n{}",
         s.screen()
     );
 

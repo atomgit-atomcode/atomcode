@@ -1091,7 +1091,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::UsageUnknown { why } => format!("问不到还剩多少：{why}").into(),
         Msg::CopyHandedOver => "（交给了终端；它要是不让复制，这次就没有）".into(),
         Msg::ContextNoPrompt => "这个宿主没有系统提示词可说。".into(),
-        Msg::ComposerSuggested { text } => format!("按 Tab 或 → 接着说：{text}").into(),
+        Msg::ComposerSuggested { text } => text.to_string().into(),
         Msg::FileTooBigToPaste { path, size, cap } => format!(
             "{path} 有 {size}，粘不进来（上限 {cap}）。编辑区里的东西每一轮都要重发；             让模型自己去读这个文件，它只会读要用的那几行。"
         )

@@ -1967,39 +1967,35 @@ pub struct ChoiceBlock {
     pub answer: Option<String>,
 }
 
-impl Content for ChoiceBlock {
-    fn kind(&self) -> &'static str {
-        "choice"
-    }
-    fn content_hash(&self) -> ContentHash {
-        let opts = self.options.join("\u{1}");
-        hash_of(&[
-            "choice",
-            &self.question,
-            &opts,
-            self.answer.as_deref().unwrap_or(""),
-        ])
-    }
-    fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+impl ChoiceBlock {
+    /// 这张卡的两行:一句话(带 `? ` 前缀,超宽就折行)加答案(还没答就是选项)。
+    ///
+    /// **逐行**画,不把整段重新流成一个段落:这是要照着跑的命令,`&&` 落在哪一行是
+    /// 它的一部分(`wrapped` 会把整段当一个段落重折)。
+    fn rows(&self, ctx: &RenderCtx, text: &str) -> Vec<Line> {
         let w = ctx.width;
         if w == 0 {
             return Vec::new();
         }
         let ask = Style::new().fg(Color::role(Role::Secondary));
+        let style = match self.answer {
+            Some(_) => muted(),
+            None => ask,
+        };
+        let mut out: Vec<Line> = Vec::new();
+        for (i, piece) in text.lines().enumerate() {
+            let lead = if i == 0 { "? " } else { "  " };
+            out.extend(wrapped(piece, w, style, lead));
+        }
         match &self.answer {
-            Some(a) => {
-                let mut out = wrapped(&self.question, w, muted(), "? ");
-                out.push(
-                    Line::from_spans(vec![
-                        Span::styled("  → ", muted()),
-                        Span::styled(a.clone(), ok()),
-                    ])
-                    .truncate(w as usize),
-                );
-                out
-            }
+            Some(a) => out.push(
+                Line::from_spans(vec![
+                    Span::styled("  → ", muted()),
+                    Span::styled(a.clone(), ok()),
+                ])
+                .truncate(w as usize),
+            ),
             None => {
-                let mut out = wrapped(&self.question, w, ask, "? ");
                 let choices = self
                     .options
                     .iter()
@@ -2014,9 +2010,32 @@ impl Content for ChoiceBlock {
                     ),
                     ask,
                 ));
-                out
             }
         }
+        out
+    }
+}
+
+impl Content for ChoiceBlock {
+    fn kind(&self) -> &'static str {
+        "choice"
+    }
+    fn content_hash(&self) -> ContentHash {
+        let opts = self.options.join("\u{1}");
+        hash_of(&[
+            "choice",
+            &self.question,
+            &opts,
+            self.answer.as_deref().unwrap_or(""),
+        ])
+    }
+    /// 两行:那句话(`? ` 前缀,超宽折行)加答案。
+    ///
+    /// 那句话里可能是**一条命令的全文**(`recorded` 留着它、不压成一行):这条命令原
+    /// 本只在问它的那张面板里能看全,而面板是一次性的、答完就没了 —— 压成一行之后,
+    /// 剩下的部分就再没有地方能读到。
+    fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+        self.rows(ctx, &self.question)
     }
     fn summary(&self, ctx: &RenderCtx) -> Line {
         let w = ctx.width;
@@ -2613,6 +2632,34 @@ mod tests {
         }
         .lines(&RenderCtx::bare(200))[0]
             .plain()
+    }
+
+    /// 一张问道的卡:画出来的是**全文**,不是被压成一行的那句。
+    ///
+    /// 审批就是这张卡。答完之后,唯一另一处存着完整命令的面板(问它的那张)已经没了,
+    /// 所以一条 heredoc 命令的正文必须留在这里 —— 这一条判的就是它没被切掉。
+    #[test]
+    fn an_ask_card_shows_the_whole_command_not_just_its_first_line() {
+        let card = ChoiceBlock {
+            question: "bash  cd /w && git commit -F - <<'EOF'\n说明正文第一行\n说明正文第二行\nEOF"
+                .into(),
+            options: vec!["本会话允许".into()],
+            answer: Some("本会话允许".into()),
+        };
+        let ctx = RenderCtx::bare(200);
+        let shown = card
+            .lines(&ctx)
+            .iter()
+            .map(Line::plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(shown.contains("git commit -F - <<'EOF'"), "{shown}");
+        assert!(
+            shown.contains("说明正文第二行"),
+            "命令的正文在里面(它只在问它的那张面板里有过,而那张面板已经没了):\n{shown}"
+        );
+        assert!(shown.contains("本会话允许"), "答案那一行也还在:\n{shown}");
     }
 
     /// A clean finish says when it ended, beside its word, and then how long it
