@@ -430,6 +430,24 @@ async fn run_two_round(model: &str, round1_sse: &str) -> Vec<wiremock::Request> 
     server.received_requests().await.unwrap()
 }
 
+/// `deepseek-flash` is the gateway alias of V4 flash (thinking on by default).
+/// Round 2 must echo `reasoning_content` or the real API returns HTTP 400.
+#[tokio::test]
+async fn multi_round_reasoning_is_echoed_back_for_deepseek_flash_alias() {
+    let reqs = run_two_round("deepseek-flash", ROUND1_REASONING_TOOL_SSE).await;
+    assert_eq!(reqs.len(), 2, "two rounds");
+
+    let round2 = String::from_utf8_lossy(&reqs[1].body);
+    assert!(
+        round2.contains("reasoning_content"),
+        "deepseek-flash must echo reasoning_content back in round 2: {round2}"
+    );
+    assert!(
+        round2.contains("I should call get_time."),
+        "round 2 must echo the exact round-1 reasoning: {round2}"
+    );
+}
+
 /// DeepSeek-V4 (Include): the round-1 reasoning the model returned is STORED by the
 /// kernel and ECHOED BACK as `reasoning_content` on the assistant tool-call message in
 /// round 2 — the round-trip DeepSeek-V4 REQUIRES (HTTP 400 "must be passed back" else).

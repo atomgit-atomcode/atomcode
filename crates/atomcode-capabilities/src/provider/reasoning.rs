@@ -7,10 +7,11 @@
 //! Why per-model: OpenAI-compatible "reasoning models" disagree on the round-trip.
 //!
 //! ```text
-//! deepseek-v4*           REQUIRES reasoning_content echoed on assistant tool-call
-//!                        turns (HTTP 400 "must be passed back" otherwise); an empty
-//!                        string is rejected, so a non-empty REASONING_PLACEHOLDER is
-//!                        sent when no reasoning was captured.
+//! deepseek-v4* /         REQUIRES reasoning_content echoed on assistant tool-call
+//! deepseek-flash         turns (HTTP 400 "must be passed back" otherwise).
+//!                        `deepseek-flash` is the gateway alias of V4 flash; thinking
+//!                        is on by default. An empty string is rejected, so a non-empty
+//!                        REASONING_PLACEHOLDER is sent when none was captured.
 //! deepseek-r1/reasoner   FORBIDS echoing reasoning_content (HTTP 400 if sent).
 //! GLM / everything else  safe default: do not echo (GLM does not error either way;
 //!                        omitting keeps requests minimal).
@@ -71,8 +72,9 @@ impl ReasoningPolicy {
         if m.contains("deepseek-reasoner") || m.contains("deepseek-r1") {
             // DeepSeek V3 family: rejects echoed reasoning_content (400).
             ReasoningPolicy::Exclude
-        } else if m.contains("deepseek-v4") {
-            // DeepSeek V4 thinking mode: REQUIRES reasoning_content on tool-call turns.
+        } else if m.contains("deepseek-v4") || m.contains("deepseek-flash") {
+            // V4 thinking mode, including the `deepseek-flash` alias (thinking on by
+            // default). Tool-call turns REQUIRE reasoning_content echoed back.
             ReasoningPolicy::Include
         } else if m.starts_with("kimi-")
             || m.starts_with("moonshot")
@@ -103,6 +105,20 @@ mod tests {
         );
         assert_eq!(
             ReasoningPolicy::derive("DeepSeek-V4", ""),
+            ReasoningPolicy::Include
+        );
+    }
+
+    #[test]
+    fn deepseek_flash_alias_includes() {
+        // 网关把默认开启思考的 V4 flash 暴露成 `deepseek-flash`。
+        // 带工具的下一轮不回传 reasoning_content 会 HTTP 400。
+        assert_eq!(
+            ReasoningPolicy::derive("deepseek-flash", "https://taotoken.net/api/v1"),
+            ReasoningPolicy::Include
+        );
+        assert_eq!(
+            ReasoningPolicy::derive("DeepSeek-Flash", ""),
             ReasoningPolicy::Include
         );
     }

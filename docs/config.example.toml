@@ -61,7 +61,7 @@ context_window = 64000
 # retry_max_attempts = 5
 
 # DeepSeek V4 专属：推理历史回显策略
-# (unset = auto-detect: deepseek-v4* → include, deepseek-reasoner/r1 → exclude)
+# (unset = auto-detect: deepseek-v4* / deepseek-flash → include, deepseek-reasoner/r1 → exclude)
 # reasoning_history = "include"  # 或 "exclude"
 # reasoning_effort = "high"
 
