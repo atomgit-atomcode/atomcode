@@ -57,7 +57,7 @@ pub const SCREEN: &str = r#"
 # `name`; `[[remove]]` it and the conversation simply starts with what was said.
 # What this build calls itself. Before the welcome block, which reads it.
 # `[[patch]] id = "tui-brand"` with a `config` is how a downstream build changes
-# its name, its licence and its mascot without touching Rust — see `BrandRow`.
+# its name, its licence, its mascot and its wordmark without touching Rust — see `BrandRow`.
 [[insert]]
 name = "tui-brand"
 
@@ -612,6 +612,12 @@ impl Plugin for AskPanel {
 /// `mascot = false` is a build with no art at all. Leaving a field out keeps
 /// the shipped value for that field — a fork usually wants its own name and is
 /// happy with everything else.
+///
+/// **Except the wordmark.** It spells `atomcode`, so it is only kept while the
+/// build is still calling itself that: a row that gives its own `name` or asks
+/// for a `mascot` and says nothing about `logo` gets no wordmark, and the
+/// welcome shows its name (and art) instead. `logo = { left = [...], right = [...],
+/// left_colour = 202 }` gives it one of its own; `logo = false` drops ours.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BrandRowConfig {
@@ -621,6 +627,23 @@ struct BrandRowConfig {
     licence: Option<String>,
     #[serde(default)]
     mascot: Option<MascotConfig>,
+    #[serde(default)]
+    logo: Option<LogoConfig>,
+}
+
+/// Either a wordmark, or `false` for none.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum LogoConfig {
+    None(bool),
+    Art {
+        left: Vec<String>,
+        #[serde(default)]
+        right: Vec<String>,
+        /// The left half's 256-colour index; the shipped orange when left out.
+        #[serde(default)]
+        left_colour: Option<u8>,
+    },
 }
 
 /// Either art, or `false` for none.
@@ -647,46 +670,77 @@ impl Plugin for BrandRow {
         &["tui-brand"]
     }
     fn description(&self) -> &'static str {
-        "what this build calls itself: its name, its licence, its mascot"
+        "what this build calls itself: its name, its licence, its mascot, its wordmark"
     }
     async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
-        let row: BrandRowConfig = if config.is_null() {
-            BrandRowConfig::default()
-        } else {
-            serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
-        };
-        let shipped = crate::content::Brand::default();
-        let mascot = match row.mascot {
-            None => shipped.mascot,
-            Some(MascotConfig::None(false)) => None,
-            Some(MascotConfig::None(true)) => shipped.mascot,
-            Some(MascotConfig::Art { rows, palette }) => {
-                let mut legend = std::collections::BTreeMap::new();
-                for (key, colour) in palette {
-                    let mut chars = key.chars();
-                    match (chars.next(), chars.next()) {
-                        (Some(c), None) => {
-                            legend.insert(c, colour);
-                        }
-                        _ => return Err(format!("palette key `{key}` is not a single character")),
-                    }
-                }
-                Some(crate::content::Mascot {
-                    rows,
-                    palette: legend,
-                })
-            }
-        };
-        let brand = crate::content::Brand {
-            name: row.name.unwrap_or(shipped.name),
-            licence: row.licence.unwrap_or(shipped.licence),
-            mascot,
-        };
+        let brand = brand_of(config)?;
         let _ = ctx
             .provide::<crate::plugin::BrandSvc>(Arc::new(brand))
             .map_err(|e| e.to_string())?;
         Ok(())
     }
+}
+
+/// The brand a `tui-brand` config asks for.
+fn brand_of(config: &Value) -> Result<crate::content::Brand, String> {
+    let row: BrandRowConfig = if config.is_null() {
+        BrandRowConfig::default()
+    } else {
+        serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
+    };
+    let shipped = crate::content::Brand::default();
+    // Ours only while the build is still ours — see `BrandRowConfig`. Asking
+    // for a mascot counts: the two are alternative layouts, and one that asked
+    // for the art would not otherwise get it. `mascot = false` does not.
+    let renamed = row.name.is_some()
+        || matches!(
+            row.mascot,
+            Some(MascotConfig::Art { .. } | MascotConfig::None(true))
+        );
+    let logo = match row.logo {
+        None if renamed => None,
+        None | Some(LogoConfig::None(true)) => shipped.logo,
+        Some(LogoConfig::None(false)) => None,
+        Some(LogoConfig::Art {
+            left,
+            right,
+            left_colour,
+        }) => Some(crate::content::Logo {
+            left,
+            right,
+            left_colour: left_colour.unwrap_or(crate::content::Logo::default().left_colour),
+        }),
+    };
+    let mascot = match row.mascot {
+        None => shipped.mascot,
+        Some(MascotConfig::None(false)) => None,
+        // The cat is not in the shipped brand any more — the wordmark took
+        // its place — but `mascot = true` still asks for it by name.
+        Some(MascotConfig::None(true)) => Some(crate::content::Mascot::default()),
+        Some(MascotConfig::Art { rows, palette }) => {
+            let mut legend = std::collections::BTreeMap::new();
+            for (key, colour) in palette {
+                let mut chars = key.chars();
+                match (chars.next(), chars.next()) {
+                    (Some(c), None) => {
+                        legend.insert(c, colour);
+                    }
+                    _ => return Err(format!("palette key `{key}` is not a single character")),
+                }
+            }
+            Some(crate::content::Mascot {
+                rows,
+                palette: legend,
+            })
+        }
+    };
+    let brand = crate::content::Brand {
+        name: row.name.unwrap_or(shipped.name),
+        licence: row.licence.unwrap_or(shipped.licence),
+        mascot,
+        logo,
+    };
+    Ok(brand)
 }
 
 // ---- keys ----------------------------------------------------------------
@@ -853,6 +907,43 @@ impl Plugin for HelpCommandsRow {
 mod tests {
     use super::*;
     use atomcode_plexus::{Layer, Op};
+
+    #[test]
+    fn the_shipped_brand_wears_the_wordmark_and_no_cat() {
+        let brand = brand_of(&Value::Null).expect("no config is the shipped brand");
+        assert_eq!(brand.logo, Some(crate::content::Logo::default()));
+        assert_eq!(brand.mascot, None);
+        // Dropping only the cat, which it no longer has, keeps the mark.
+        let brand = brand_of(&serde_json::json!({ "mascot": false })).expect("parses");
+        assert!(brand.logo.is_some());
+    }
+
+    #[test]
+    fn a_build_that_renames_itself_does_not_keep_our_wordmark() {
+        // The mark spells `atomcode`. A fork that only patched its name would
+        // otherwise open with our word in big letters over its own.
+        let renamed = brand_of(&serde_json::json!({ "name": "◆ LongCode" })).expect("parses");
+        assert_eq!(renamed.logo, None, "{renamed:?}");
+        assert_eq!(renamed.name, "◆ LongCode");
+
+        // Asking for art is the same: it gets the art, not our mark over it.
+        let cat = brand_of(&serde_json::json!({ "mascot": true })).expect("parses");
+        assert_eq!(cat.logo, None);
+        assert_eq!(cat.mascot, Some(crate::content::Mascot::default()));
+
+        // Unless it says so, or brings its own.
+        let kept =
+            brand_of(&serde_json::json!({ "name": "◆ LongCode", "logo": true })).expect("parses");
+        assert_eq!(kept.logo, Some(crate::content::Logo::default()));
+        let own = brand_of(&serde_json::json!({
+            "name": "◆ LongCode",
+            "logo": { "left": ["█▀▀"], "right": ["▀▀█"], "left_colour": 40 },
+        }))
+        .expect("parses");
+        let logo = own.logo.expect("its own mark");
+        assert_eq!(logo.left, vec!["█▀▀".to_string()]);
+        assert_eq!(logo.left_colour, 40);
+    }
 
     /// The rows `SCREEN` inserts, by plugin name.
     fn screen_rows() -> Vec<String> {

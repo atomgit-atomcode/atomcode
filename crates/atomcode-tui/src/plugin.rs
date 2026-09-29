@@ -48,7 +48,7 @@ plexus_service!(ModulesSvc => Modules, "tui-modules", Core, "Mounted stream prod
 plexus_service!(LayoutSvc => crate::layout::Layout, "tui-layout", Core, "The region tree on screen");
 plexus_service!(CommandsSvc => crate::command::Commands, "tui-commands", Core, "Slash commands contributed by rows");
 plexus_service!(KeysSvc => crate::keymap::Keys, "tui-keys", Core, "Key bindings contributed by rows");
-plexus_service!(BrandSvc => crate::content::Brand, "tui-brand", Seam, "What this build calls itself: its name, its licence, its mascot");
+plexus_service!(BrandSvc => crate::content::Brand, "tui-brand", Seam, "What this build calls itself: its name, its licence, its mascot, its wordmark");
 // The welcome block's words, as a seam: a product that already has a
 // localisation provides one and the block follows `/language` with the rest of
 // the product. Left unfilled, the row uses the sentences this build ships

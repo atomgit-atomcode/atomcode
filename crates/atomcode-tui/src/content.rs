@@ -218,8 +218,15 @@ pub struct Brand {
     /// What is shown beside the version, top-right.
     pub licence: String,
     /// The art, when there is any. `None` is a build with no mascot — not a
-    /// blank one: the tips then have the whole width.
+    /// blank one: the tips then have the whole width. Only drawn when there is
+    /// no [`Brand::logo`]: the two are alternative layouts, not two pictures.
     pub mascot: Option<Mascot>,
+    /// The wordmark. When there is one the welcome is **stacked** — the mark,
+    /// then the version, the session's facts and the tips under each other —
+    /// and the name row is dropped, because the mark is the name. When it cannot
+    /// be drawn (narrow, no colour, no Unicode, no cell background) the name
+    /// comes back as the first row, so the block never goes nameless.
+    pub logo: Option<Logo>,
 }
 
 impl Default for Brand {
@@ -227,7 +234,79 @@ impl Default for Brand {
         Self {
             name: "◆ AtomCode".into(),
             licence: "MIT".into(),
-            mascot: Some(Mascot::default()),
+            mascot: None,
+            logo: Some(Logo::default()),
+        }
+    }
+}
+
+/// A wordmark in opencode's shape: rows of block characters, in two halves.
+///
+/// The left half is drawn in [`Logo::left_colour`], the right half in the
+/// terminal's own foreground, both bold. Four characters are not glyphs but
+/// marks for the **shadow** — the darker fill inside a letter that gives it
+/// depth, drawn in `Role::PanelSelBg`, i.e. the background moved a quarter of
+/// the way off itself, so it follows a light terminal as well as a dark one:
+///
+/// | mark | cell |
+/// |------|------|
+/// | `_`  | all shadow |
+/// | `^`  | `▀`: the letter above, shadow below |
+/// | `~`  | `▀` in shadow, nothing below |
+/// | `,`  | `▄` in shadow, nothing above |
+///
+/// Every other character is drawn as itself; a space is transparent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Logo {
+    pub left: Vec<String>,
+    pub right: Vec<String>,
+    /// The left half's colour, as a 256-colour index. A picture's colour and
+    /// not a role, for the reason [`Mascot`] gives: `Role::Brand` is xterm
+    /// slot 13, a magenta, and this is AtomGit's orange.
+    pub left_colour: u8,
+}
+
+impl Logo {
+    /// How many cells wide the mark is: each row's two halves and the one-cell
+    /// gap between them, from the art.
+    pub fn cells(&self) -> usize {
+        (0..self.rows())
+            .map(|i| {
+                let w = |half: &[String]| half.get(i).map_or(0, |r| r.chars().count());
+                w(&self.left) + 1 + w(&self.right)
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn rows(&self) -> usize {
+        self.left.len().max(self.right.len())
+    }
+}
+
+/// `atom` in AtomGit orange, `code` in the terminal's foreground.
+///
+/// The letters are opencode's (`packages/tui/src/logo.ts`): its `c o d e` are
+/// taken as they are, and `a t o m` are drawn in the same hand — `m` is two of
+/// its `n` side by side, which keeps the gaps between the strokes the width of
+/// every other letter's counter.
+impl Default for Logo {
+    fn default() -> Self {
+        let rows = |r: [&str; 4]| r.iter().map(|s| (*s).to_string()).collect();
+        Self {
+            left: rows([
+                "      ▄               ",
+                "▀▀▀█ ▀█▀▀ █▀▀█ █▀▀█▀▀▄",
+                "█^^█  █   █__█ █__█__█",
+                "▀▀▀▀  ▀▀▀ ▀▀▀▀ ▀~~▀~~▀",
+            ]),
+            right: rows([
+                "             ▄     ",
+                "█▀▀▀ █▀▀█ █▀▀█ █▀▀█",
+                "█___ █__█ █__█ █^^^",
+                "▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀",
+            ]),
+            left_colour: 202,
         }
     }
 }
@@ -347,9 +426,6 @@ impl Content for WelcomeBlock {
         let content_w = w - PAD * 2;
         let pad = " ".repeat(PAD);
 
-        // ---- The left column: the mascot, then the two bullets ----
-        let mut left: Vec<Line> = mascot(ctx, content_w, self.brand.mascot.as_ref());
-
         // cwd and model are rendered BELOW the whole block, never zipped into the
         // left column beside the tips. Tuix learned this: when the tips are taller
         // than the mascot the spare rows landed on these two, and the screen read
@@ -414,6 +490,13 @@ impl Content for WelcomeBlock {
                 right.push(Line::from_spans(spans));
             }
         }
+
+        if let Some(logo) = self.brand.logo.as_ref() {
+            return self.stacked(ctx, content_w, &pad, logo, below, right);
+        }
+
+        // ---- The left column: the mascot, then the two bullets ----
+        let mut left: Vec<Line> = mascot(ctx, content_w, self.brand.mascot.as_ref());
 
         let mut rows: Vec<Line> = Vec::new();
 
@@ -506,6 +589,134 @@ impl Content for WelcomeBlock {
         }
         rows
     }
+}
+
+impl WelcomeBlock {
+    /// The layout under a wordmark: everything under each other, nothing beside.
+    ///
+    /// ```text
+    ///   <the mark, four rows>
+    ///
+    ///   v5.1.0 · MIT
+    ///   • ~/proj
+    ///   • a-model
+    ///
+    ///   上手提示
+    ///   /login  …
+    /// ```
+    ///
+    /// Not two columns: the mark is ~42 cells, so tips beside it would start
+    /// past column 46 and a narrow terminal would wrap every one of them. And
+    /// no name row: the mark *is* the name — unless it could not be drawn, and
+    /// then the name leads the version on the first row, so the block is never
+    /// without it.
+    fn stacked(
+        &self,
+        ctx: &RenderCtx,
+        content_w: usize,
+        pad: &str,
+        logo: &Logo,
+        below: Vec<Line>,
+        tips: Vec<Line>,
+    ) -> Vec<Line> {
+        let mut rows: Vec<Line> = Vec::new();
+        let about = format!("v{} · {}", self.version, self.brand.licence);
+        let art = wordmark(ctx, content_w, logo);
+        if art.is_empty() {
+            let name = width::take_width(&self.brand.name, content_w);
+            let room = content_w.saturating_sub(width::str_width(&name));
+            let mut spans = vec![
+                Span::raw(pad.to_string()),
+                Span::styled(name, Style::new().fg(Color::role(Role::Brand))),
+            ];
+            if room > 0 {
+                spans.push(Span::styled(
+                    width::take_width(&format!(" · {about}"), room),
+                    muted(),
+                ));
+            }
+            rows.push(Line::from_spans(spans));
+        } else {
+            rows.extend(art);
+            rows.push(Line::empty());
+            rows.push(Line::styled(
+                format!("{pad}{}", width::take_width(&about, content_w)),
+                muted(),
+            ));
+        }
+        rows.extend(below);
+        if !tips.is_empty() {
+            rows.push(Line::empty());
+            for row in tips {
+                let mut line = Line::from_spans(vec![Span::raw(pad.to_string())]);
+                for span in &row.spans {
+                    line.push(span.clone());
+                }
+                rows.push(line);
+            }
+        }
+        // The same trailing blank the side-by-side layout keeps.
+        rows.push(Line::empty());
+        rows
+    }
+}
+
+/// The wordmark, row by row — or nothing.
+///
+/// The mascot's gate, for the mascot's reason: the shadow is a cell
+/// background, and on a terminal that drops backgrounds the letters lose their
+/// insides. And the whole mark or none of it: a mark cut at the edge reads as
+/// a different word.
+fn wordmark(ctx: &RenderCtx, content_w: usize, logo: &Logo) -> Vec<Line> {
+    let drawable = ctx.caps.colors != crate::caps::Colors::None
+        && ctx.caps.unicode
+        && ctx.caps.cell_background;
+    let cells = logo.cells();
+    if !drawable || cells == 0 || content_w < cells {
+        return Vec::new();
+    }
+    let shadow = Color::role(Role::PanelSelBg);
+    let left_ink = Style::new().fg(Color::picture(logo.left_colour)).bold();
+    let right_ink = Style::new().bold();
+    (0..logo.rows())
+        .map(|i| {
+            let mut spans: Vec<Span> = vec![Span::raw(" ".repeat(PAD))];
+            let mut run = String::new();
+            let mut run_style = Style::new();
+            let halves = [
+                (logo.left.get(i), left_ink),
+                (None, Style::new()),
+                (logo.right.get(i), right_ink),
+            ];
+            for (n, (half, ink)) in halves.into_iter().enumerate() {
+                // The gap between the halves is a plain space.
+                let text: String = if n == 1 {
+                    " ".into()
+                } else {
+                    half.cloned().unwrap_or_default()
+                };
+                for c in text.chars() {
+                    let (glyph, style) = match c {
+                        ' ' => (' ', Style::new()),
+                        '_' => (' ', Style::new().bg(shadow)),
+                        '^' => ('\u{2580}', ink.bg(shadow)),
+                        '~' => ('\u{2580}', Style::new().fg(shadow)),
+                        ',' => ('\u{2584}', Style::new().fg(shadow)),
+                        other => (other, ink),
+                    };
+                    if style != run_style && !run.is_empty() {
+                        spans.push(Span::styled(std::mem::take(&mut run), run_style));
+                    }
+                    run_style = style;
+                    run.push(glyph);
+                }
+            }
+            if !run.is_empty() {
+                spans.push(Span::styled(run, run_style));
+            }
+            Line::from_spans(spans)
+        })
+        .collect()
 }
 
 /// How far the block is set in from the rect it was given.
@@ -3029,6 +3240,19 @@ mod tests {
         }
     }
 
+    /// The side-by-side layout: a brand with the cat and no wordmark, which is
+    /// what a fork that asks for art gets.
+    fn with_cat() -> WelcomeBlock {
+        WelcomeBlock {
+            brand: std::sync::Arc::new(Brand {
+                mascot: Some(Mascot::default()),
+                logo: None,
+                ..Brand::default()
+            }),
+            ..welcome()
+        }
+    }
+
     /// A render context with the two shape bits a caller cares about.
     fn wctx(width: u16, cell_background: bool) -> RenderCtx {
         RenderCtx {
@@ -3051,10 +3275,146 @@ mod tests {
 
     #[test]
     fn the_welcome_says_the_four_things_it_has() {
-        let all = lines_of(&welcome(), 80, true).join("\n");
-        for want in ["AtomCode", "9.9.9", "~/proj", "a-model", "/resume", "/help"] {
-            assert!(all.contains(want), "{want} missing from:\n{all}");
+        // With the mark drawn, the mark is the name; without it, the name is
+        // written out. Either way nothing else goes missing.
+        let drawn = lines_of(&welcome(), 80, true).join("\n");
+        let plain = lines_of(&welcome(), 80, false).join("\n");
+        for all in [&drawn, &plain] {
+            for want in ["9.9.9", "MIT", "~/proj", "a-model", "/resume", "/help"] {
+                assert!(all.contains(want), "{want} missing from:\n{all}");
+            }
         }
+        assert!(plain.contains("AtomCode"), "{plain}");
+        assert!(lines_of(&with_cat(), 80, true)
+            .join("\n")
+            .contains("AtomCode"));
+    }
+
+    #[test]
+    #[allow(
+        clippy::string_slice,
+        reason = "test: offset is a `find` on the same line, a char boundary"
+    )]
+    fn the_wordmark_leads_and_everything_else_stacks_under_it() {
+        let lines = lines_of(&welcome(), 80, true);
+        let at = |want: &str| {
+            lines
+                .iter()
+                .position(|l| l.contains(want))
+                .unwrap_or_else(|| panic!("{want} missing:\n{lines:#?}"))
+        };
+        // The mark first: its rows are block glyphs and nothing else.
+        let mark_rows = Logo::default().rows();
+        for row in &lines[..mark_rows] {
+            assert!(row.contains('▀') || row.contains('▄'), "{lines:#?}");
+            assert!(
+                !row.contains("AtomCode") && !row.contains("MIT"),
+                "{lines:#?}"
+            );
+        }
+        // No name row: the mark is the name.
+        assert!(!lines.join("\n").contains("AtomCode"), "{lines:#?}");
+        // Then, in order: version, where, which model, the tips.
+        let order = [
+            at("v9.9.9 · MIT"),
+            at("~/proj"),
+            at("a-model"),
+            at("上手提示"),
+            at("/resume"),
+        ];
+        assert!(
+            order.windows(2).all(|w| w[0] < w[1]),
+            "{order:?}\n{lines:#?}"
+        );
+        assert!(
+            order[0] > mark_rows,
+            "a blank between the mark and the rest"
+        );
+        assert!(
+            lines[order[2] + 1].trim().is_empty(),
+            "a blank before the tips"
+        );
+        // And flush left on the mark's edge: the version and the tips set in by
+        // the block's padding, the bullets hanging in it so their text lines up.
+        for want in ["v9.9.9", "~/proj", "/resume"] {
+            let row = &lines[at(want)];
+            let col = row[..row.find(want).expect("found")].chars().count();
+            assert_eq!(col, PAD, "{want} starts at column {col}: {row:?}");
+        }
+    }
+
+    #[test]
+    fn the_wordmark_paints_atom_orange_code_in_the_terminals_ink_and_a_shadow() {
+        let lines = welcome().lines(&wctx(80, true));
+        let spans: Vec<&Span> = lines
+            .iter()
+            .take(Logo::default().rows())
+            .flat_map(|line| &line.spans)
+            .collect();
+        let atom = spans
+            .iter()
+            .filter(|s| s.style.fg == Some(Color::picture(202)))
+            .count();
+        assert!(atom > 0, "atom is AtomGit's orange: {spans:?}");
+        // `code` asks for no colour at all — the terminal's own foreground —
+        // and both halves are bold.
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.style.fg.is_none() && s.text.contains('█')),
+            "{spans:?}"
+        );
+        assert!(
+            spans
+                .iter()
+                .filter(|s| s.text.contains('█'))
+                .all(|s| s.style.bold),
+            "{spans:?}"
+        );
+        // The shadow is the theme's step off the background, so it follows a
+        // light terminal too — never a literal index that assumes a dark one.
+        let shadow = Some(Color::role(Role::PanelSelBg));
+        assert!(spans.iter().any(|s| s.style.bg == shadow), "{spans:?}");
+        assert!(spans.iter().any(|s| s.style.fg == shadow), "{spans:?}");
+    }
+
+    #[test]
+    fn a_wordmark_that_cannot_be_drawn_gives_the_name_back() {
+        let need = Logo::default().cells() + PAD * 2;
+        for (why, width, background) in [
+            ("one cell too narrow", need as u16 - 1, true),
+            ("no cell background", 80, false),
+        ] {
+            let lines = lines_of(&welcome(), width, background);
+            let all = lines.join("\n");
+            assert!(
+                !all.contains('▀') && !all.contains('▄') && !all.contains('█'),
+                "{why}: a mark cut or without its insides reads as another word:\n{all}"
+            );
+            assert!(
+                lines[0].contains("AtomCode") && lines[0].contains("v9.9.9 · MIT"),
+                "{why}: the name leads, with the version beside it:\n{all}"
+            );
+        }
+        let fits = lines_of(&welcome(), need as u16, true).join("\n");
+        assert!(fits.contains('▀'), "exactly wide enough draws it:\n{fits}");
+    }
+
+    #[test]
+    fn the_shipped_wordmark_is_well_formed() {
+        let logo = Logo::default();
+        assert_eq!(logo.left.len(), logo.right.len(), "the halves are as tall");
+        for half in [&logo.left, &logo.right] {
+            let w = half[0].chars().count();
+            for row in half {
+                assert_eq!(row.chars().count(), w, "a ragged half: {half:?}");
+                assert!(
+                    row.chars().all(|c| " █▀▄_^~,".contains(c)),
+                    "a character nothing draws: {row:?}"
+                );
+            }
+        }
+        assert_eq!(logo.cells(), 42);
     }
 
     #[test]
@@ -3117,6 +3477,7 @@ mod tests {
                 rows: vec!["oo..oo".into(), "..oo..".into()],
                 palette: [('o', 40u8)].into_iter().collect(),
             }),
+            logo: None,
         };
         let block = WelcomeBlock {
             brand: std::sync::Arc::new(mine.clone()),
@@ -3173,7 +3534,7 @@ mod tests {
         // bug: there is no role in the vocabulary that means "orange". So the art
         // carries literal indices, and the gate below is what protects a terminal
         // that cannot show them.
-        let lines = welcome().lines(&wctx(80, true));
+        let lines = with_cat().lines(&wctx(80, true));
         // Both pixels, because which one a colour lands on is the art's business:
         // the highlight sits *below* the eyebrow in the same cell (`ew`), so it
         // arrives as a background. Collecting foregrounds only would report the
@@ -3235,7 +3596,7 @@ mod tests {
         // drops backgrounds the half-block art fragments — and a version that
         // "coped" by filling both pixels with the upper colour drew a solid orange
         // rectangle that looked like a loading placeholder.
-        let with = lines_of(&welcome(), 80, true).join("\n");
+        let with = lines_of(&with_cat(), 80, true).join("\n");
         assert!(with.contains('▀'), "no mascot at all:\n{with}");
 
         for (why, ctx) in [
@@ -3260,20 +3621,23 @@ mod tests {
                 },
             ),
         ] {
-            let all = welcome()
-                .lines(&ctx)
-                .iter()
-                .map(Line::plain)
-                .collect::<Vec<_>>()
-                .join("\n");
-            assert!(
-                !all.contains('▀') && !all.contains('▄'),
-                "half blocks were drawn with {why} — the art would fragment:\n{all}"
-            );
-            // And no solid-block stand-in either: that was the bug.
-            assert!(!all.contains('█'), "a rectangle is not a cat:\n{all}");
-            // The words are still there: only the art is withheld.
-            assert!(all.contains("AtomCode") && all.contains("~/proj"), "{all}");
+            // The cat and the wordmark share the gate.
+            for block in [with_cat(), welcome()] {
+                let all = block
+                    .lines(&ctx)
+                    .iter()
+                    .map(Line::plain)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(
+                    !all.contains('▀') && !all.contains('▄'),
+                    "half blocks were drawn with {why} — the art would fragment:\n{all}"
+                );
+                // And no solid-block stand-in either: that was the bug.
+                assert!(!all.contains('█'), "a rectangle is not a cat:\n{all}");
+                // The words are still there: only the art is withheld.
+                assert!(all.contains("AtomCode") && all.contains("~/proj"), "{all}");
+            }
         }
     }
 
@@ -3286,18 +3650,20 @@ mod tests {
                 ..wctx(80, true).caps
             },
         };
-        let all = welcome()
-            .lines(&none)
-            .iter()
-            .map(Line::plain)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            !all.contains('█') && !all.contains('▀'),
-            "a grid of tofu is not a picture:\n{all}"
-        );
-        // The words are still there: only the art needs Unicode.
-        assert!(all.contains("AtomCode") && all.contains("~/proj"));
+        for block in [with_cat(), welcome()] {
+            let all = block
+                .lines(&none)
+                .iter()
+                .map(Line::plain)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !all.contains('█') && !all.contains('▀'),
+                "a grid of tofu is not a picture:\n{all}"
+            );
+            // The words are still there: only the art needs Unicode.
+            assert!(all.contains("AtomCode") && all.contains("~/proj"));
+        }
     }
 
     #[test]
@@ -3305,7 +3671,7 @@ mod tests {
         // Tuix's bug, kept as a judgement: when the tips are taller than the cat,
         // the spare rows used to land on these two, and one line read `∙ proj`
         // and `set a goal…` at once.
-        let lines = lines_of(&welcome(), 80, true);
+        let lines = lines_of(&with_cat(), 80, true);
         let cwd_row = lines
             .iter()
             .position(|l| l.contains("~/proj"))
@@ -3358,9 +3724,12 @@ mod tests {
     fn no_row_is_wider_than_the_width_it_was_given() {
         // The invariant every block owes the frame, across widths and both shapes
         // of terminal.
-        for width in [4u16, 9, 20, 40, 61, 80, 120] {
+        for width in [4u16, 9, 20, 40, 45, 46, 47, 61, 80, 120] {
             for cell_background in [true, false] {
-                for line in welcome().lines(&wctx(width, cell_background)) {
+                for line in [welcome(), with_cat()]
+                    .iter()
+                    .flat_map(|b| b.lines(&wctx(width, cell_background)))
+                {
                     assert!(
                         line.width() <= width as usize,
                         "at {width} (background={cell_background}): {line:?} is {} cells",

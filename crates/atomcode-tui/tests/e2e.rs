@@ -681,7 +681,7 @@ async fn a_new_session_opens_with_the_welcome_and_it_then_scrolls_away() {
 
     // 1. It is there at the start, at the top of the conversation.
     let opening = s.screen();
-    assert!(opening.contains("AtomCode"), "the brand row:\n{opening}");
+    assert!(opening.contains("MIT"), "the version row:\n{opening}");
     assert!(opening.contains("上手提示"), "the tips heading:\n{opening}");
     // Where we are, as the block writes it: the same folding the welcome does, so
     // the assertion does not depend on where the scratch directory happens to be.
@@ -732,7 +732,7 @@ async fn a_new_session_opens_with_the_welcome_and_it_then_scrolls_away() {
     s.quiet().await;
     let scrolled = s.screen();
     assert!(
-        scrolled.contains("AtomCode"),
+        scrolled.contains("MIT"),
         "scrolling back up must find the welcome again:\n{scrolled}"
     );
 
