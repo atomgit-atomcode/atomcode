@@ -6382,7 +6382,8 @@ impl Tui {
                 // thing to leave, so the row they pointed at has to stay where
                 // they pointed — and pointing at a row while at the bottom is
                 // the common case, not the exception.
-                self.host.held_while(|| self.host.toggle_block(id, kind));
+                self.host
+                    .held_open_while(x, y, id, || self.host.toggle_block(id, kind));
                 return false;
             }
             // Handing the mouse back is the answer to "I cannot select text

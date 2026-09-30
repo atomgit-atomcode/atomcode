@@ -2267,7 +2267,40 @@ impl Host {
     /// pointed at stays where it was, whether or not they are at the bottom.
     /// See [`Host::pinned`].
     pub fn held_while<F: FnOnce()>(&self, change: F) {
-        self.pinned(false, change)
+        self.pinned(false, change);
+    }
+
+    /// A click that folds or unfolds block `id`, pointed at on row `y` (column
+    /// `x`): held like [`Host::held_while`] — and then, when it opened, moved
+    /// just enough that what opened is on the screen.
+    ///
+    /// Holding the row alone is right for a block near the top and wrong for
+    /// one near the bottom, which is where a person clicks most: the picture
+    /// they just sent, the call that just ran. There the row stays put above
+    /// the composer, everything it opened lands below the edge, and the only
+    /// visible change is that `点击展开` went away — a click that reads as having
+    /// done nothing. So the block's first row keeps its place only while what
+    /// opened fits under it; past that the view follows the opening down until
+    /// it fits or that row reaches the top, and it never goes past the top.
+    pub fn held_open_while<F: FnOnce()>(&self, x: u16, y: u16, id: BlockId, change: F) {
+        let room = *self.last_room.lock().expect("room poisoned");
+        // Where the block starts on screen: the click may have landed on any of
+        // its rows, and it is the first one that must stay in view.
+        let mut first = y;
+        while first > room.y && self.block_at(x, first - 1).map(|(at, _)| at) == Some(id) {
+            first -= 1;
+        }
+        let grew = self.pinned(false, change);
+        if grew <= 0 || room.is_empty() || first < room.y || first >= room.bottom() {
+            return;
+        }
+        let row = (first - room.y) as i64;
+        let short = row + 1 + grew - room.h as i64;
+        let down = short.clamp(0, row);
+        if down > 0 {
+            let mut m = self.moment.write().expect("moment poisoned");
+            m.scroll = crate::moment::ScrollPos((m.scroll.0 as i64 - down).max(0) as usize);
+        }
     }
 
     /// Note words the person said that the model has not been handed yet.
@@ -4774,14 +4807,17 @@ impl Host {
     /// the emitter's thread and an activity on the event loop's, and if both
     /// measure the same change and both compensate for it, the offset moves
     /// twice for one screenful.
-    fn pinned(&self, only_when_held: bool, change: impl FnOnce()) {
+    ///
+    /// Returns how many rows the conversation grew by (negative for shrank),
+    /// or 0 when nothing was measured.
+    fn pinned(&self, only_when_held: bool, change: impl FnOnce()) -> i64 {
         let _gate = self.pin_gate.lock().expect("pin gate poisoned");
         let room = *self.last_room.lock().expect("room poisoned");
         if room.is_empty() {
             // No frame has been composed yet, so there is no "where the reader
             // is" to hold and nothing to measure against.
             change();
-            return;
+            return 0;
         }
         let before = self.moment.read().expect("moment poisoned").clone();
         let held = !only_when_held || before.scroll.0 > 0;
@@ -4794,7 +4830,7 @@ impl Host {
         change();
 
         if !held {
-            return;
+            return 0;
         }
         // Measured again *after* the change, and against the moment as it is
         // now — a fresh read, not the snapshot. The snapshot is what the
@@ -4806,11 +4842,12 @@ impl Host {
         let after_h = self.stream_height_in(room, &after).0;
         let grew = after_h as i64 - before_h as i64;
         if grew == 0 {
-            return;
+            return 0;
         }
         let mut m = self.moment.write().expect("moment poisoned");
         let max = self.scroll_limit((room.w, room.h), &after) as i64;
         m.scroll = crate::moment::ScrollPos((m.scroll.0 as i64 + grew).clamp(0, max) as usize);
+        grew
     }
 
     pub fn painted(&self) -> u64 {
@@ -8980,6 +9017,69 @@ mod tests {
             anchor_row(&after, "ReadFile(anchor-line)"),
             y_before,
             "the row that was clicked moved, so the pin did not hold it"
+        );
+    }
+
+    /// Opened at the bottom, what opened is on the screen.
+    ///
+    /// The reported case: a picture just sent, its recognition folded to
+    /// `● VL 识别图片成功 … 点击展开` right above the composer. The click opened it
+    /// — and held the row where it was, so every line it opened landed below
+    /// the edge and the only change on screen was `点击展开` going away. Now the
+    /// view follows the opening down, as far as the row it starts on can go
+    /// without leaving the top.
+    #[test]
+    fn a_block_opened_at_the_bottom_shows_what_it_opened() {
+        let h = host();
+        for turn in 1..12u64 {
+            h.absorb(&SessionEvent::UserMessage {
+                text: format!("问题 {turn}"),
+                turn,
+                images: Vec::new(),
+            });
+        }
+        let short = "第一行识别\n第二行识别\n第三行识别";
+        let long = format!("{short}\n{}", "更多识别\n".repeat(80));
+        for (turn, caption) in [(12u64, short.to_string()), (13, long)] {
+            let said = crate::i18n::product::t(crate::i18n::product::Msg::VisionRecognised {
+                model: "glm5.3-flash",
+                text: &caption,
+            })
+            .into_owned();
+            h.absorb(&SessionEvent::UserMessage {
+                text: format!("你认可吗？ [Image #1]\n\n{said}"),
+                turn,
+                images: Vec::new(),
+            });
+        }
+
+        let size = (80, 24);
+        let rows = h.compose(size).rows();
+        let y = rows
+            .iter()
+            .rposition(|r| r.contains("点击展开"))
+            .expect("the newest caption is folded on screen") as u16;
+        let (id, kind) = h.block_at(2, y).expect("it answers a click");
+        assert_eq!(kind, "vl_caption");
+
+        h.held_open_while(2, y, id, || h.toggle_block(id, kind));
+        let open = h.compose(size).rows();
+        let shown = open.join("\n");
+        assert!(
+            shown.contains("第一行识别") && shown.contains("第三行识别"),
+            "what the click opened is on the screen:\n{shown}"
+        );
+        assert!(
+            shown.contains("VL 识别图片成功"),
+            "and the row it opened from has not left the top:\n{shown}"
+        );
+        let head = open
+            .iter()
+            .position(|r| r.contains("VL 识别图片成功") && !r.contains("点击展开"))
+            .expect("the opened head");
+        assert!(
+            (head as u16) < y,
+            "it moved up to make room, rather than holding at row {y}:\n{shown}"
         );
     }
 
