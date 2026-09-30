@@ -822,8 +822,8 @@ impl Content for ModelThought {
     /// thought. The lid is how the thought was opened and it is still the thing
     /// to click to put the body away — so it says what a click does in *both*
     /// states, and the whole row is drawn in [`lid_ink`] (see
-    /// [`ModelThought::lid`]). The body below stays `muted()`: the handle is
-    /// brighter, the content recedes.
+    /// [`ModelThought::lid`]). The body below is drawn in `faint()`: the handle
+    /// is brighter, the content recedes.
     fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
         let w = ctx.width;
         let mut lid = self.lid(ctx);

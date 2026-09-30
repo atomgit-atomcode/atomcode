@@ -607,28 +607,26 @@ pub fn resolve(role: Role, caps: Caps) -> Option<Color> {
         }
         // Half the distance the terminal's own text keeps from the surface. Same
         // anchoring as [`muted_ink`]: xterm's default fills the far end when the
-        // terminal answered for its background but not for its own text, and
-        // nothing measured at all falls back to the synthesiser — returning
-        // `None` here would mean "the terminal's full-strength foreground", the
-        // opposite of the role.
+        // terminal did not answer for its own text.
+        //
+        // And when it answered for nothing at all (Windows, where the palette is
+        // never queried; a terminal that ignores OSC 10/11), the same mix from
+        // the assumed ends — xterm's text for the assumed direction, over the
+        // assumed ground. Not the synthesiser: with no truecolor it picks the
+        // *loudest* candidate slot, which is right for an error and the opposite
+        // of this role, and with no candidates it fell to slot 7 — body-text grey
+        // on a dark screen, and 1.26:1 on white, under this role's own floor.
         Role::Faint => {
-            let anchor = p.foreground().or_else(|| {
-                p.background_measured().then(|| match p.theme() {
-                    Theme::Dark => XTERM[7],
-                    Theme::Light => XTERM[0],
-                })
+            let anchor = p.foreground().unwrap_or(match p.theme() {
+                Theme::Dark => XTERM[7],
+                Theme::Light => XTERM[0],
             });
-            match anchor {
-                Some(anchor) => {
-                    let ink = lift(
-                        mix(anchor, p.background(), FAINT_REACH),
-                        p.background(),
-                        floor(role),
-                    );
-                    Some(exact(ink, caps.colors, p))
-                }
-                None => synthesise(role, caps),
-            }
+            let ink = lift(
+                mix(anchor, p.background(), FAINT_REACH),
+                p.background(),
+                floor(role),
+            );
+            Some(exact(ink, caps.colors, p))
         }
         Role::Muted => {
             let need = floor(role);
@@ -1407,6 +1405,41 @@ mod tests {
         };
         let ratio = contrast(seen(Role::Muted, light).unwrap(), (0xff, 0xff, 0xff));
         assert!(ratio >= 4.5, "only {ratio:.2}:1 on paper");
+    }
+
+    /// Faint with nothing measured — Windows, or a terminal that answers no
+    /// colour query — on an indexed terminal: it recedes from the body text on
+    /// a dark screen and still clears its floor on a light one. The fallback
+    /// that took slot 7 did neither.
+    #[test]
+    fn faint_recedes_and_reads_when_nothing_was_measured() {
+        for (theme, colors) in [
+            (Theme::Dark, Colors::Ansi16),
+            (Theme::Dark, Colors::Ansi256),
+            (Theme::Light, Colors::Ansi16),
+            (Theme::Light, Colors::Ansi256),
+        ] {
+            let caps = Caps {
+                palette: Palette::assumed(theme),
+                colors,
+                ..Caps::default()
+            };
+            let bg = caps.palette.background();
+            let faint = seen(Role::Faint, caps).expect("an ink");
+            let body = match theme {
+                Theme::Dark => XTERM[7],
+                Theme::Light => XTERM[0],
+            };
+            let ratio = contrast(faint, bg);
+            assert!(
+                ratio >= floor(Role::Faint),
+                "{theme:?}/{colors:?}: {faint:?} at {ratio:.2}:1 under the floor"
+            );
+            assert!(
+                ratio < contrast(body, bg),
+                "{theme:?}/{colors:?}: {faint:?} at {ratio:.2}:1 is as loud as the text"
+            );
+        }
     }
 
     /// Catppuccin Mocha as Ghostty (and cmux, which reads Ghostty's config)
