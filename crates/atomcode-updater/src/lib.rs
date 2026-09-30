@@ -308,12 +308,20 @@ fn free_rolling_slot_with(exe: &Path, mut remove: impl FnMut(&Path) -> bool) -> 
         .expect("a free slot among u32 names")
 }
 
-/// The first step of a swap refused, said so a person can act on it: on
-/// Windows that is nearly always another atomcode still running.
+/// The first step of a swap refused, said so a person can act on it.
+///
+/// Another atomcode running from this install does not block renaming the
+/// executable itself (Windows allows that); it blocked the rename *slot*,
+/// which [`free_rolling_slot`] now steps around. What is left to refuse is
+/// something holding or guarding the file: security software (Defender's
+/// Controlled Folder Access, an EDR hook, a scanner holding it open), a
+/// permission policy on the install dir — or, rarely, a second upgrade running
+/// at the same moment. So the hint names both.
 fn step_one_hint(error: &std::io::Error) -> &'static str {
     if error.kind() == std::io::ErrorKind::PermissionDenied {
-        "\n  Another atomcode may still be running from this install (a daemon, the \
-         VS Code extension, another terminal) — close it and try again."
+        "\n  Security software (antivirus, Controlled Folder Access) may be guarding the \
+         executable, or another atomcode is upgrading at the same time — allow atomcode \
+         in the security software, close other atomcode windows, and try again."
     } else {
         ""
     }
@@ -2000,9 +2008,13 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_first_step_says_another_atomcode_may_be_running() {
+    fn a_refused_first_step_names_what_may_be_holding_the_file() {
         let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
-        assert!(step_one_hint(&denied).contains("Another atomcode"));
+        let hint = step_one_hint(&denied);
+        assert!(
+            hint.contains("Security software") && hint.contains("another atomcode"),
+            "{hint}"
+        );
         let other = std::io::Error::from(std::io::ErrorKind::NotFound);
         assert_eq!(step_one_hint(&other), "");
     }
