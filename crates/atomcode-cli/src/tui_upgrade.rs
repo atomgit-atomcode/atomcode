@@ -401,6 +401,9 @@ fn rollback_target() -> Result<PathBuf, String> {
     }
     let exe = atomcode_updater::current_exe_path().map_err(|error| format!("{error:#}"))?;
     let backup = atomcode_updater::backup_path(&exe);
+    // As `run_rollback` does: a previous version a swap left in a rename slot
+    // is kept as `.bak` first, rather than answering "nothing to roll back to".
+    atomcode_updater::settle_leftover_slots(&exe);
     if backup.exists() {
         Ok(backup)
     } else {

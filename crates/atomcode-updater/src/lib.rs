@@ -277,7 +277,7 @@ pub fn rolling_path(exe: &Path) -> PathBuf {
 /// not clear is left alone and the next free `-<n>` one is taken instead; the
 /// next swap (or the uninstaller) reaps it once its process is gone.
 pub fn free_rolling_slot(exe: &Path) -> PathBuf {
-    free_rolling_slot_with(exe, try_remove_stale)
+    free_rolling_slot_with(exe, remove_once)
 }
 
 /// [`free_rolling_slot`] with the removal injected: a running image cannot be
@@ -285,27 +285,91 @@ pub fn free_rolling_slot(exe: &Path) -> PathBuf {
 fn free_rolling_slot_with(exe: &Path, mut remove: impl FnMut(&Path) -> bool) -> PathBuf {
     let dir = exe.parent().unwrap_or_else(|| Path::new("."));
     // Every leftover first, so a slot freed now is reused rather than a new
-    // name minted beside it.
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            if name
-                .to_str()
-                .is_some_and(atomcode_config::distribution::is_update_rolling_name)
-            {
-                remove(&entry.path());
-            }
-        }
+    // name minted beside it — once kept as `.bak` if there is none.
+    for slot in settle_leftover_slots(exe) {
+        remove(&slot);
     }
     let plain = rolling_path(exe);
     if !plain.exists() {
         return plain;
     }
     let base = atomcode_config::distribution::update_rolling_name();
+    // Bounded by what is in the directory: the first name not taken is found
+    // long before the names run out.
     (1u32..)
         .map(|n| dir.join(format!("{base}-{n}")))
         .find(|slot| !slot.exists())
-        .expect("a free slot among u32 names")
+        .unwrap_or(plain)
+}
+
+/// The rename slots earlier swaps left next to `exe`, newest first — after
+/// keeping one of them as `.bak` when there is no `.bak`.
+///
+/// A slot is a previous version: the image a swap moved aside and could not
+/// then move to `.bak` (the old `.bak` would not clear, or the move failed).
+/// With a `.bak` in place it is an older copy than the one rollback goes to,
+/// and is only in the way. Without one it may be the only copy of the version
+/// before this one, and deleting it is what would leave `/upgrade rollback`
+/// with nothing to go back to — so the newest is moved there instead.
+pub fn settle_leftover_slots(exe: &Path) -> Vec<PathBuf> {
+    let dir = exe.parent().unwrap_or_else(|| Path::new("."));
+    let mut slots: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(atomcode_config::distribution::is_update_rolling_name)
+                        && e.file_type().is_ok_and(|t| t.is_file())
+                })
+                .map(|e| {
+                    let at = e
+                        .metadata()
+                        .and_then(|m| m.modified())
+                        .unwrap_or(std::time::UNIX_EPOCH);
+                    (at, e.path())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    slots.sort_by(|a, b| b.0.cmp(&a.0));
+    let backup = backup_path(exe);
+    let mut left = Vec::new();
+    for (_, slot) in slots {
+        if !backup.exists() && std::fs::rename(&slot, &backup).is_ok() {
+            continue;
+        }
+        left.push(slot);
+    }
+    // Anything in a slot that is not a file (a directory someone made, say)
+    // is still in the way of the name; it is offered for removal too.
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(atomcode_config::distribution::is_update_rolling_name)
+                && !left.contains(&path)
+                && path != backup
+                && path.exists()
+                && !entry.file_type().is_ok_and(|t| t.is_file())
+            {
+                left.push(path);
+            }
+        }
+    }
+    left
+}
+
+/// One attempt, no wait: a slot a running image holds will still be held half
+/// a second from now, and `/upgrade rollback` runs on the classic screen's own
+/// thread. The slot actually used is renamed by [`robust_rename`], which does
+/// wait out a transient hold.
+fn remove_once(path: &Path) -> bool {
+    clear_readonly(path);
+    std::fs::remove_file(path).is_ok()
 }
 
 /// The first step of a swap refused, said so a person can act on it.
@@ -317,14 +381,42 @@ fn free_rolling_slot_with(exe: &Path, mut remove: impl FnMut(&Path) -> bool) -> 
 /// Controlled Folder Access, an EDR hook, a scanner holding it open), a
 /// permission policy on the install dir — or, rarely, a second upgrade running
 /// at the same moment. So the hint names both.
-fn step_one_hint(error: &std::io::Error) -> &'static str {
+fn step_one_hint(error: &std::io::Error) -> Option<&'static str> {
+    held_or_guarded(error).then_some(
+        "the file is held or guarded — security software (antivirus, Controlled Folder \
+         Access) or another atomcode upgrading at the same time; allow atomcode in the \
+         security software, close other atomcode windows, and try again",
+    )
+}
+
+/// A refusal because something else has the file: access denied — or, on
+/// Windows, a sharing or lock violation (32, 33), which the standard library
+/// does not sort into any `ErrorKind` and which is exactly what a scanner
+/// holding the file without `FILE_SHARE_DELETE` produces.
+fn held_or_guarded(error: &std::io::Error) -> bool {
     if error.kind() == std::io::ErrorKind::PermissionDenied {
-        "\n  Security software (antivirus, Controlled Folder Access) may be guarding the \
-         executable, or another atomcode is upgrading at the same time — allow atomcode \
-         in the security software, close other atomcode windows, and try again."
-    } else {
-        ""
+        return true;
     }
+    #[cfg(windows)]
+    {
+        matches!(error.raw_os_error(), Some(32) | Some(33))
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Step 1 of a swap failed: the rename, and why it may have been refused,
+/// over the OS error itself — kept in the chain, so a caller can still ask it.
+fn step_one_error(error: std::io::Error, what: String) -> anyhow::Error {
+    let hint = step_one_hint(&error);
+    let error = anyhow::Error::new(error);
+    let error = match hint {
+        Some(hint) => error.context(hint),
+        None => error,
+    };
+    error.context(what)
 }
 
 /// Return `Ok(())` iff we can create a file alongside `exe`.
@@ -677,11 +769,13 @@ fn replace_binary(new_bin: &Path, exe: &Path) -> Result<()> {
     // `robust_rename` retries through transient AV/indexer locks that
     // otherwise surface as ERROR_ACCESS_DENIED (os error 5) here.
     robust_rename(exe, &rolling).map_err(|e| {
-        anyhow!(
-            "renaming current binary {} -> {} (swap step 1): {e}{}",
-            exe.display(),
-            rolling.display(),
-            step_one_hint(&e)
+        step_one_error(
+            e,
+            format!(
+                "renaming current binary {} -> {} (swap step 1)",
+                exe.display(),
+                rolling.display()
+            ),
         )
     })?;
 
@@ -1272,6 +1366,9 @@ pub fn run_rollback() -> Result<RollbackSummary> {
     }
     let exe = current_exe_path()?;
     let backup = backup_path(&exe);
+    // A previous version left in a rename slot, with no `.bak`, is the one to
+    // go back to — not a reason to say there is nothing.
+    settle_leftover_slots(&exe);
     if !backup.exists() {
         return Err(anyhow!(
             "no backup found at {} — nothing to roll back to",
@@ -1284,11 +1381,13 @@ pub fn run_rollback() -> Result<RollbackSummary> {
 
     // Step 1: live -> rolling (retry through transient Windows locks)
     robust_rename(&exe, &rolling).map_err(|e| {
-        anyhow!(
-            "renaming {} -> {} (swap step 1): {e}{}",
-            exe.display(),
-            rolling.display(),
-            step_one_hint(&e)
+        step_one_error(
+            e,
+            format!(
+                "renaming {} -> {} (swap step 1)",
+                exe.display(),
+                rolling.display()
+            ),
         )
     })?;
     // Step 2: backup -> live
@@ -2007,16 +2106,124 @@ mod tests {
         assert!(!tmp.path().join(".atomcode.rolling-1").exists(), "reaped");
     }
 
+    /// Why step 1 was refused is said between the rename and the OS error,
+    /// and the OS error stays in the chain — a caller can still ask it.
     #[test]
-    fn a_refused_first_step_names_what_may_be_holding_the_file() {
+    fn a_refused_first_step_says_what_may_hold_the_file_and_keeps_the_os_error() {
         let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
-        let hint = step_one_hint(&denied);
+        let error = step_one_error(denied, "renaming a -> b (swap step 1)".into());
+        let said = format!("{error:#}");
         assert!(
-            hint.contains("Security software") && hint.contains("another atomcode"),
-            "{hint}"
+            said.starts_with("renaming a -> b (swap step 1): "),
+            "{said}"
         );
-        let other = std::io::Error::from(std::io::ErrorKind::NotFound);
-        assert_eq!(step_one_hint(&other), "");
+        assert!(
+            said.contains("security software") && said.contains("another atomcode"),
+            "{said}"
+        );
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().map(|e| e.kind()),
+            Some(std::io::ErrorKind::PermissionDenied),
+            "the OS error is still in the chain"
+        );
+
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let said = format!("{:#}", step_one_error(missing, "renaming".into()));
+        assert!(!said.contains("security software"), "{said}");
+    }
+
+    /// Windows reports a scanner holding the file as a sharing or lock
+    /// violation (32, 33), which the standard library leaves uncategorised:
+    /// matched by code, or the hint is missing exactly when it applies.
+    #[cfg(windows)]
+    #[test]
+    fn a_sharing_or_lock_violation_is_held_too() {
+        for code in [32, 33] {
+            assert!(
+                held_or_guarded(&std::io::Error::from_raw_os_error(code)),
+                "{code}"
+            );
+        }
+    }
+
+    /// With no `.bak`, a previous version left in a rename slot is the only
+    /// copy rollback could go back to: kept there, not deleted.
+    #[test]
+    fn a_leftover_slot_becomes_the_backup_when_there_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp.path().join("atomcode");
+        std::fs::write(&exe, b"LIVE").unwrap();
+        let older = tmp.path().join(".atomcode.rolling-1");
+        std::fs::write(&older, b"OLDER").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(rolling_path(&exe), b"PREVIOUS").unwrap();
+
+        let left = settle_leftover_slots(&exe);
+        assert_eq!(
+            std::fs::read(backup_path(&exe)).unwrap(),
+            b"PREVIOUS",
+            "the newest"
+        );
+        assert_eq!(left, vec![older.clone()], "the rest is offered for removal");
+
+        // With a `.bak` in place, a slot is only an older copy in the way.
+        let left = settle_leftover_slots(&exe);
+        assert_eq!(left, vec![older]);
+        assert_eq!(std::fs::read(backup_path(&exe)).unwrap(), b"PREVIOUS");
+    }
+
+    /// The round trip the numbered slots exist for: one upgrade finds the
+    /// plain slot held and `.bak` stuck, so it moves aside to `-1` and leaves
+    /// it there; once whatever held them has gone, the next upgrade keeps that
+    /// version as `.bak`, goes through the plain slot, and leaves no slot
+    /// behind.
+    #[test]
+    fn a_numbered_slot_is_reclaimed_by_the_next_upgrade() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp.path().join("atomcode");
+        let new = tmp.path().join(".atomcode.download");
+        let held = rolling_path(&exe);
+        let backup = backup_path(&exe);
+        std::fs::write(&exe, b"V1").unwrap();
+        // Held: a non-empty directory neither deletes nor gets replaced.
+        std::fs::create_dir(&held).unwrap();
+        std::fs::write(held.join("in-use"), b"x").unwrap();
+        std::fs::create_dir(&backup).unwrap();
+        std::fs::write(backup.join("in-use"), b"x").unwrap();
+
+        std::fs::write(&new, b"V2").unwrap();
+        replace_binary(&new, &exe).expect("first upgrade");
+        let numbered = tmp.path().join(".atomcode.rolling-1");
+        assert_eq!(std::fs::read(&exe).unwrap(), b"V2");
+        assert_eq!(
+            std::fs::read(&numbered).unwrap(),
+            b"V1",
+            "moved aside and left"
+        );
+
+        // Whatever held the slot and the backup has exited.
+        std::fs::remove_dir_all(&held).unwrap();
+        std::fs::remove_dir_all(&backup).unwrap();
+
+        std::fs::write(&new, b"V3").unwrap();
+        replace_binary(&new, &exe).expect("second upgrade");
+        assert_eq!(std::fs::read(&exe).unwrap(), b"V3");
+        assert_eq!(
+            std::fs::read(&backup).unwrap(),
+            b"V2",
+            "rollback goes one back"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(atomcode_config::distribution::is_update_rolling_name)
+            })
+            .map(|e| e.path())
+            .collect();
+        assert!(leftovers.is_empty(), "no slot left behind: {leftovers:?}");
     }
 
     #[test]
