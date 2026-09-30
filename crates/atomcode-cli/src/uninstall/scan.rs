@@ -41,7 +41,6 @@ pub fn scan(binary_path: &Path, atomcode_dir: &Path) -> Result<Plan> {
         // this sweep quietly matching nothing.
         use atomcode_config::distribution as dist;
         for (name, note) in [
-            (dist::update_rolling_name(), "self-update rename slot"),
             (dist::update_download_name(), "self-update partial download"),
             (dist::update_probe_name(), "self-update probe leftover"),
         ] {
@@ -49,6 +48,26 @@ pub fn scan(binary_path: &Path, atomcode_dir: &Path) -> Result<Plan> {
             if p.exists() {
                 items.push(item(Group::Binary, p, note)?);
             }
+        }
+        // Rename slots are the plain name or a numbered one — taken when the
+        // plain one was held by a still-running old image — so they are
+        // matched, not named.
+        let mut slots: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|e| {
+                        e.file_name()
+                            .to_str()
+                            .is_some_and(dist::is_update_rolling_name)
+                    })
+                    .map(|e| e.path())
+                    .collect()
+            })
+            .unwrap_or_default();
+        slots.sort();
+        for p in slots {
+            items.push(item(Group::Binary, p, "self-update rename slot")?);
         }
     }
 
@@ -159,6 +178,7 @@ mod tests {
         // self-update artifacts
         fs::write(bin_dir.join("atomcode.bak"), b"old").unwrap();
         fs::write(bin_dir.join(".atomcode.rolling"), b"r").unwrap();
+        fs::write(bin_dir.join(".atomcode.rolling-2"), b"r").unwrap();
 
         let data = tmp.path().join(".atomcode");
         fs::create_dir(&data).unwrap();
@@ -185,6 +205,10 @@ mod tests {
         assert!(bin_paths.contains(&exe));
         assert!(bin_paths.contains(&exe.with_file_name("atomcode.bak")));
         assert!(bin_paths.contains(&exe.with_file_name(".atomcode.rolling")));
+        assert!(
+            bin_paths.contains(&exe.with_file_name(".atomcode.rolling-2")),
+            "a numbered slot is a leftover too"
+        );
     }
 
     #[test]

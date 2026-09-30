@@ -305,8 +305,10 @@ impl SelfDeleteStrategy for PlatformSelfDelete {
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
 
-        // Rename live exe to .atomcode.rolling so the install dir can be deleted.
-        let rolling = atomcode_updater::rolling_path(exe);
+        // Rename live exe into a free rolling slot so the install dir can be
+        // deleted — not onto one a still-running old image holds, which
+        // Windows refuses.
+        let rolling = atomcode_updater::free_rolling_slot(exe);
         if exe.file_name() != rolling.file_name() {
             let _ = std::fs::rename(exe, &rolling);
         }

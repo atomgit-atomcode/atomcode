@@ -266,6 +266,59 @@ pub fn rolling_path(exe: &Path) -> PathBuf {
     dir.join(atomcode_config::distribution::update_rolling_name())
 }
 
+/// A rename slot next to `exe` that nothing occupies, after clearing every
+/// slot a previous swap left behind.
+///
+/// Usually that is [`rolling_path`]. But the image renamed into it last time
+/// may still be running — a daemon, another window, still on the old version —
+/// and Windows neither deletes a running executable nor lets a rename replace
+/// one: the swap's first step then failed with ERROR_ACCESS_DENIED (os error 5)
+/// on every `/upgrade`, for as long as that process lived. So a slot that will
+/// not clear is left alone and the next free `-<n>` one is taken instead; the
+/// next swap (or the uninstaller) reaps it once its process is gone.
+pub fn free_rolling_slot(exe: &Path) -> PathBuf {
+    free_rolling_slot_with(exe, try_remove_stale)
+}
+
+/// [`free_rolling_slot`] with the removal injected: a running image cannot be
+/// made on the machines the tests run on, but a removal that fails can.
+fn free_rolling_slot_with(exe: &Path, mut remove: impl FnMut(&Path) -> bool) -> PathBuf {
+    let dir = exe.parent().unwrap_or_else(|| Path::new("."));
+    // Every leftover first, so a slot freed now is reused rather than a new
+    // name minted beside it.
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name
+                .to_str()
+                .is_some_and(atomcode_config::distribution::is_update_rolling_name)
+            {
+                remove(&entry.path());
+            }
+        }
+    }
+    let plain = rolling_path(exe);
+    if !plain.exists() {
+        return plain;
+    }
+    let base = atomcode_config::distribution::update_rolling_name();
+    (1u32..)
+        .map(|n| dir.join(format!("{base}-{n}")))
+        .find(|slot| !slot.exists())
+        .expect("a free slot among u32 names")
+}
+
+/// The first step of a swap refused, said so a person can act on it: on
+/// Windows that is nearly always another atomcode still running.
+fn step_one_hint(error: &std::io::Error) -> &'static str {
+    if error.kind() == std::io::ErrorKind::PermissionDenied {
+        "\n  Another atomcode may still be running from this install (a daemon, the \
+         VS Code extension, another terminal) — close it and try again."
+    } else {
+        ""
+    }
+}
+
 /// Return `Ok(())` iff we can create a file alongside `exe`.
 ///
 /// Testing the *directory* (not the file itself) is what matters:
@@ -608,19 +661,19 @@ fn replace_binary(new_bin: &Path, exe: &Path) -> Result<()> {
     }
 
     let backup = backup_path(exe);
-    let rolling = rolling_path(exe);
-
-    // Clean up any leftover .rolling from a prior interrupted upgrade.
-    try_remove_stale(&rolling);
+    // Leftovers from earlier swaps cleared, and a slot nothing occupies — not
+    // one a still-running old image holds (see `free_rolling_slot`).
+    let rolling = free_rolling_slot(exe);
 
     // Step 1: live binary → rolling (Windows allows renaming a running exe).
     // `robust_rename` retries through transient AV/indexer locks that
     // otherwise surface as ERROR_ACCESS_DENIED (os error 5) here.
-    robust_rename(exe, &rolling).with_context(|| {
-        format!(
-            "renaming current binary {} -> {} (swap step 1)",
+    robust_rename(exe, &rolling).map_err(|e| {
+        anyhow!(
+            "renaming current binary {} -> {} (swap step 1): {e}{}",
             exe.display(),
-            rolling.display()
+            rolling.display(),
+            step_one_hint(&e)
         )
     })?;
 
@@ -1219,17 +1272,15 @@ pub fn run_rollback() -> Result<RollbackSummary> {
     }
     ensure_writable(&exe)?;
 
-    let rolling = rolling_path(&exe);
-    if rolling.exists() {
-        std::fs::remove_file(&rolling).ok();
-    }
+    let rolling = free_rolling_slot(&exe);
 
     // Step 1: live -> rolling (retry through transient Windows locks)
-    robust_rename(&exe, &rolling).with_context(|| {
-        format!(
-            "renaming {} -> {} (swap step 1)",
+    robust_rename(&exe, &rolling).map_err(|e| {
+        anyhow!(
+            "renaming {} -> {} (swap step 1): {e}{}",
             exe.display(),
-            rolling.display()
+            rolling.display(),
+            step_one_hint(&e)
         )
     })?;
     // Step 2: backup -> live
@@ -1900,6 +1951,60 @@ mod tests {
         let bak = backup_path(&exe);
         assert_eq!(std::fs::read(&bak).unwrap(), b"OLD");
         assert!(!rolling.exists());
+    }
+
+    /// The reported failure (v5.0.7 → v5.0.8 on Windows): the rename slot
+    /// was still held by an old image a running process had been started
+    /// from, so it would neither delete nor be replaced, and step 1 failed
+    /// with os error 5 on every `/upgrade`. A non-empty directory in the slot
+    /// is the same obstacle on any OS — `remove_file` fails, and a rename
+    /// cannot replace it. The swap moves aside to a numbered slot instead.
+    #[test]
+    fn replace_binary_steps_around_a_slot_that_will_not_clear() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp.path().join("atomcode");
+        let new = tmp.path().join(".atomcode.download");
+        let held = rolling_path(&exe);
+        std::fs::write(&exe, b"OLD").unwrap();
+        std::fs::write(&new, b"NEW").unwrap();
+        std::fs::create_dir(&held).unwrap();
+        std::fs::write(held.join("in-use"), b"x").unwrap();
+
+        replace_binary(&new, &exe).expect("the upgrade goes through");
+
+        assert_eq!(std::fs::read(&exe).unwrap(), b"NEW");
+        assert_eq!(std::fs::read(backup_path(&exe)).unwrap(), b"OLD");
+        assert!(held.is_dir(), "the held slot was left alone");
+    }
+
+    #[test]
+    fn a_slot_that_will_not_clear_is_skipped_for_the_next_free_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp.path().join("atomcode");
+        let plain = rolling_path(&exe);
+        std::fs::write(&plain, b"held").unwrap();
+        std::fs::write(tmp.path().join(".atomcode.rolling-1"), b"held").unwrap();
+        std::fs::write(tmp.path().join(".atomcode.rolling-3"), b"gone").unwrap();
+
+        // Everything is held except `-3`, which clears.
+        let slot = free_rolling_slot_with(&exe, |p| {
+            p.ends_with(".atomcode.rolling-3") && std::fs::remove_file(p).is_ok()
+        });
+        assert_eq!(slot, tmp.path().join(".atomcode.rolling-2"));
+        assert!(!tmp.path().join(".atomcode.rolling-3").exists(), "reaped");
+
+        // Once the plain slot clears, it is the one used again.
+        let slot = free_rolling_slot_with(&exe, |p| std::fs::remove_file(p).is_ok());
+        assert_eq!(slot, plain);
+        assert!(!tmp.path().join(".atomcode.rolling-1").exists(), "reaped");
+    }
+
+    #[test]
+    fn a_refused_first_step_says_another_atomcode_may_be_running() {
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(step_one_hint(&denied).contains("Another atomcode"));
+        let other = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_eq!(step_one_hint(&other), "");
     }
 
     #[test]
