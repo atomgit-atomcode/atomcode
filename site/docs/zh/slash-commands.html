@@ -115,7 +115,7 @@
           <tr><td><code>/background &lt;任务&gt;</code></td><td>把任务派发给一个隔离的后台 agent(只读为主的工具子集),不污染当前主对话上下文。用于"顺手让它去查一下 X"这类轻探索。详见 <a href="./sessions.html#bg">后台会话</a></td></tr>
           <tr><td><code>/worktree &lt;子命令&gt;</code></td><td>Git worktree 隔离:<code>create</code> 在新分支上拉一份独立 worktree、<code>list</code> 查看现有 worktree、<code>done</code> 把 worktree 改动 squash 回主分支、<code>cleanup</code> 清理已完成的 worktree</td></tr>
           <tr><td><code>/todo</code> · <code>/todo add &lt;任务&gt;</code> · <code>/todo clear</code></td><td>重新打印当前待办清单 —— 从会话记录里派生(定位最近一次 <code>todowrite</code> 工具调用并重渲染),带「进行中 / 已完成」状态标记。<code>/todo add &lt;任务&gt;</code> 确定性地追加一条任务(不走模型);<code>/todo clear</code> 清空清单。清单是无状态派生的,不额外落盘;模型执行长任务时会自己维护它,你也可以随时用此命令查看进度</td></tr>
-          <tr><td><code>/copy</code></td><td>把上一条回复里的代码块复制到剪贴板:<code>/copy</code> 复制唯一代码块、<code>/copy N</code> 复制第 N 个、<code>/copy all</code> 复制全部代码块、<code>/copy msg</code> 复制整条回复的 markdown 原文</td></tr>
+          <tr><td><code>/copy</code></td><td>把上一条回复复制到剪贴板:<code>/copy</code> 复制整条回复的 markdown 原文(整个回合,不含工具输出);<code>/copy code</code> 复制最后一个代码块、<code>/copy code N</code> 复制第 N 个、<code>/copy code all</code> 复制全部代码块(旧写法 <code>/copy N</code>、<code>/copy all</code>、<code>/copy msg</code> 仍可用)。经典界面(<code>--classic</code>)里直接 <code>/copy</code> 仍是复制最后一个代码块</td></tr>
           <tr><td><code>/save</code></td><td>把当前会话导出成 markdown 文件:<code>/save</code> 用自动生成的文件名,<code>/save &lt;文件名&gt;</code> 指定文件名</td></tr>
         </tbody>
       </table>

@@ -514,16 +514,28 @@ pub enum Msg<'a> {
         what: &'a str,
         names: &'a str,
     },
-    CopyWhichBlock {
-        count: usize,
-    },
     CopyNoSuchBlock {
         count: usize,
         asked: &'a str,
     },
     CopyNoBlocks,
-    CopiedLines {
+    /// Nothing has been said to copy.
+    CopyNothingYet,
+    /// A form `/copy` does not take.
+    CopyUsage,
+    CopiedReply {
         lines: usize,
+        chars: usize,
+    },
+    CopiedBlock {
+        n: usize,
+        lines: usize,
+        chars: usize,
+    },
+    CopiedBlocks {
+        count: usize,
+        lines: usize,
+        chars: usize,
     },
     SaveNothingYet,
     SavedTo {

@@ -503,7 +503,7 @@ atomcode --prompt-file task.md
 | `/undo`            | 撤销某一轮的文件编辑（`/undo` 或 `/undo N`）                 |
 | `/view <文件路径>` | 在浮层窗口中查看文件内容                                     |
 | `/paste`           | 从剪贴板粘贴图片（Windows 下 Ctrl+V 被终端拦截时的备用入口） |
-| `/copy`            | 从上一条回复复制代码块（`/copy`、`/copy N`、`/copy all`）    |
+| `/copy`            | 复制上一条回复；`/copy code [N\|all]` 只复制代码块（经典界面里 `/copy` 仍复制代码块） |
 | `/cost`            | 显示本次会话的 token 消耗                                    |
 | `/context`         | 查看上下文预算占用明细                                       |
 | `/compact`         | 压缩对话历史                                                 |

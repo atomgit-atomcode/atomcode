@@ -524,7 +524,7 @@ Type `/` in the TUI to browse the full list with live completion; `/help` shows 
 | `/undo`            | Undo a turn's file edits (`/undo` or `/undo N`)                         |
 | `/view <filepath>` | View file content in an overlay modal                                   |
 | `/paste`           | Attach an image from the clipboard (Windows fallback for Ctrl+V)        |
-| `/copy`            | Copy a code block from the last reply (`/copy`, `/copy N`, `/copy all`) |
+| `/copy`            | Copy the last reply; `/copy code [N\|all]` copies a code block (in the classic screen `/copy` still copies a code block) |
 | `/cost`            | Show token usage for this session                                       |
 | `/context`         | Show the context budget breakdown                                       |
 | `/compact`         | Compact conversation history                                            |

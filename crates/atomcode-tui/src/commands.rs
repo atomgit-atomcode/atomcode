@@ -379,7 +379,7 @@ fn view_file_within(
 
 fn take_away_catalogue() -> Vec<Command> {
     vec![
-        Command::said_taking("copy", "[N|all|msg]".into(), t(Msg::CmdAboutCopy)),
+        Command::said_taking("copy", "[code [N|all]]".into(), t(Msg::CmdAboutCopy)),
         Command::said_taking("save", t(Msg::CmdTakesFilename), t(Msg::CmdAboutSave)),
         // Not `requiring`: a bare `/view` is the list of files to pick one from.
         Command::said_taking("view", t(Msg::CmdTakesPath), t(Msg::CmdAboutView)),
@@ -399,63 +399,15 @@ impl CommandSet for TakeAwayCommands {
             return Outcome::Refused(t(Msg::NoAgent).into_owned());
         };
         match name {
-            // Copying a code block is the one thing people do with an answer
-            // that the answer itself cannot do: the model wrote it to be run,
-            // and dragging across a wrapped terminal is how it ends up with
-            // line numbers and gutters in it.
-            "copy" => {
-                let answer = last_answer(&client.events());
-                // `msg` takes the whole reply, prose and all — the other half of
-                // what people do with an answer. A block is for running; the
-                // whole message is for pasting into an issue or a review, and
-                // that is exactly the case where dragging across a wrapped
-                // terminal picks up gutters and fold marks.
-                if args.trim() == "msg" {
-                    if answer.trim().is_empty() {
-                        return Outcome::Refused(t(Msg::CopyNoBlocks).into_owned());
-                    }
-                    let Some(surface) = ctx.service::<crate::plugin::SurfaceSvc>() else {
-                        return Outcome::Refused(t(Msg::NoClipboard).into_owned());
-                    };
-                    let lines = answer.lines().count();
-                    return Outcome::Said(
-                        surface.copy(&answer).words(t(Msg::CopiedLines { lines })),
-                    );
-                }
-                let blocks = code_blocks(&answer);
-                if blocks.is_empty() {
-                    return Outcome::Refused(t(Msg::CopyNoBlocks).into_owned());
-                }
-                let text = match args.trim() {
-                    "" if blocks.len() == 1 => blocks[0].clone(),
-                    "" => {
-                        return Outcome::Refused(
-                            t(Msg::CopyWhichBlock {
-                                count: blocks.len(),
-                            })
-                            .into_owned(),
-                        )
-                    }
-                    "all" => blocks.join("\n\n"),
-                    n => match n.parse::<usize>().ok().filter(|n| *n >= 1) {
-                        Some(n) if n <= blocks.len() => blocks[n - 1].clone(),
-                        _ => {
-                            return Outcome::Refused(
-                                t(Msg::CopyNoSuchBlock {
-                                    count: blocks.len(),
-                                    asked: n,
-                                })
-                                .into_owned(),
-                            )
-                        }
-                    },
-                };
-                let Some(surface) = ctx.service::<crate::plugin::SurfaceSvc>() else {
-                    return Outcome::Refused(t(Msg::NoClipboard).into_owned());
-                };
-                let lines = text.lines().count();
-                Outcome::Said(surface.copy(&text).words(t(Msg::CopiedLines { lines })))
-            }
+            // The whole reply by default — what codex's `/copy` does, and what a
+            // person reaches for first: pasting an answer into an issue, a
+            // review, a message. Dragging across a wrapped terminal is how it
+            // picks up gutters and fold marks, which is why the command exists.
+            // A code block is `/copy code [N|all]`: the part the model wrote to
+            // be run (2026-09-30, the user's call; it used to be the default,
+            // and a reply with no block answered "no code block" to a plain
+            // `/copy`).
+            "copy" => copy(&client.events(), args, ctx),
             // Markdown rather than the screen's own rendering: what is saved is
             // read elsewhere — in an editor, in a review, in an issue — and the
             // gutters and the fold marks belong to this screen.
@@ -2977,36 +2929,163 @@ fn first_line(s: &str) -> &str {
     s.lines().next().unwrap_or("")
 }
 
-/// The last thing the model said, as text. Empty when it has not said anything
-/// yet — a session that has only been typed into.
-fn last_answer(events: &[atomcode_kernel::session::LoggedEvent]) -> String {
-    derive_messages(events)
-        .into_iter()
-        .rfind(|m| m.role == Role::Assistant)
-        .map(|m| m.text)
-        .unwrap_or_default()
+/// What `/copy` was asked for.
+#[derive(Debug, PartialEq, Eq)]
+enum CopyWhat {
+    /// The whole reply.
+    Reply,
+    /// The last code block.
+    LastBlock,
+    /// Every code block.
+    AllBlocks,
+    /// Block N (1-based), as typed.
+    Block(String),
+}
+
+impl CopyWhat {
+    /// `None` for a form the command does not take. Case does not matter:
+    /// `/copy ALL` and `/copy Code 2` are the same asks.
+    fn of(args: &str) -> Option<Self> {
+        let words: Vec<String> = args.split_whitespace().map(str::to_lowercase).collect();
+        let words: Vec<&str> = words.iter().map(String::as_str).collect();
+        let numbered = |n: &str| n.parse::<usize>().is_ok();
+        match words.as_slice() {
+            // `msg` is the old spelling of the default, kept for fingers that learned it.
+            [] | ["msg"] => Some(Self::Reply),
+            ["code"] => Some(Self::LastBlock),
+            ["code", "all"] | ["all"] => Some(Self::AllBlocks),
+            // `/copy N` is the old spelling of `/copy code N`.
+            ["code", n] | [n] if numbered(n) => Some(Self::Block((*n).to_string())),
+            _ => None,
+        }
+    }
+}
+
+fn copy(events: &[atomcode_kernel::session::LoggedEvent], args: &str, ctx: &Context) -> Outcome {
+    let Some(what) = CopyWhat::of(args) else {
+        return Outcome::Refused(t(Msg::CopyUsage).into_owned());
+    };
+    let reply = last_reply(events);
+    let (text, said) = match what {
+        CopyWhat::Reply => {
+            if reply.is_empty() {
+                return Outcome::Refused(t(Msg::CopyNothingYet).into_owned());
+            }
+            let said = t(Msg::CopiedReply {
+                lines: reply.lines().count(),
+                chars: reply.chars().count(),
+            })
+            .into_owned();
+            (reply, said)
+        }
+        block => {
+            let blocks = code_blocks(&reply);
+            if blocks.is_empty() {
+                return Outcome::Refused(t(Msg::CopyNoBlocks).into_owned());
+            }
+            let count = blocks.len();
+            let (text, n) = match block {
+                CopyWhat::AllBlocks => (blocks.join("\n\n"), None),
+                CopyWhat::Block(asked) => match asked.parse::<usize>().ok().filter(|n| *n >= 1) {
+                    Some(n) if n <= count => (blocks[n - 1].clone(), Some(n)),
+                    _ => {
+                        return Outcome::Refused(
+                            t(Msg::CopyNoSuchBlock {
+                                count,
+                                asked: &asked,
+                            })
+                            .into_owned(),
+                        )
+                    }
+                },
+                // The last one, as the classic screen does: in an answer
+                // that builds up to it, the last block is the one to run.
+                _ => (blocks[count - 1].clone(), Some(count)),
+            };
+            let (lines, chars) = (text.lines().count(), text.chars().count());
+            let said = match n {
+                Some(n) => t(Msg::CopiedBlock { n, lines, chars }),
+                None => t(Msg::CopiedBlocks {
+                    count,
+                    lines,
+                    chars,
+                }),
+            }
+            .into_owned();
+            (text, said)
+        }
+    };
+    let Some(surface) = ctx.service::<crate::plugin::SurfaceSvc>() else {
+        return Outcome::Refused(t(Msg::NoClipboard).into_owned());
+    };
+    Outcome::Said(surface.copy(&text).words(said))
+}
+
+/// What the model said in the last turn: every assistant message after the
+/// last thing the person said, in order, blank-line separated and trimmed.
+/// Not just the final message — an answer that wrote its code, ran a tool and
+/// then summed up would otherwise lose the code — and not the tool output,
+/// which is the tools' words, not the reply. Empty before anything was said.
+///
+/// "The last thing the person said" is a user message the person wrote: the
+/// projection also puts user-role messages *inside* a turn — a todo reminder,
+/// a nudge, a peer's note, the carrier of a tool's images (all `synthetic`),
+/// and the marker a cancel leaves after the partial reply. Counting those as
+/// the turn's start cut the reply short, or left nothing to copy right after
+/// an Esc with the partial answer on screen.
+fn last_reply(events: &[atomcode_kernel::session::LoggedEvent]) -> String {
+    let messages = derive_messages(events);
+    let from = messages
+        .iter()
+        .rposition(|m| m.role == Role::User && !m.synthetic && !m.is_user_interruption())
+        .map_or(0, |at| at + 1);
+    messages[from..]
+        .iter()
+        .filter(|m| m.role == Role::Assistant)
+        .map(|m| m.text.trim())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// A fence line: its character, how many, and what follows them.
+fn fence(line: &str) -> Option<(char, usize, &str)> {
+    let t = line.trim_start();
+    let c = t.chars().next().filter(|c| *c == '`' || *c == '~')?;
+    let n = t.chars().take_while(|x| *x == c).count();
+    if n < 3 {
+        return None;
+    }
+    #[allow(
+        clippy::string_slice,
+        reason = "`n` fence characters are ASCII, so `n` is a char boundary"
+    )]
+    Some((c, n, t[n..].trim()))
 }
 
 /// The fenced code blocks in `text`, in the order they appear, without their
-/// fences. An unclosed fence still counts: a model that stopped mid-block wrote
-/// the part a person wants to run, and refusing to copy it because the closing
-/// line never arrived is the wrong answer.
+/// fences. Both fence kinds (backticks and tildes); a block closes only on the
+/// same character, at least as many of them, and nothing after — so a ```
+/// line inside a ```` block is part of the code, not its end. An unclosed fence
+/// still counts: a model that stopped mid-block wrote the part a person wants
+/// to run, and refusing to copy it because the closing line never arrived is
+/// the wrong answer. Blank blocks are left out; there is nothing to copy.
 fn code_blocks(text: &str) -> Vec<String> {
     let mut blocks = Vec::new();
-    let mut current: Option<Vec<&str>> = None;
+    let mut open: Option<(char, usize, Vec<&str>)> = None;
     for line in text.lines() {
-        let fence = line.trim_start().starts_with("```");
-        match (&mut current, fence) {
-            (None, true) => current = Some(Vec::new()),
-            (Some(_), true) => {
-                let lines = current.take().unwrap_or_default();
-                blocks.push(lines.join("\n"));
+        match (&mut open, fence(line)) {
+            (None, Some((c, n, _))) => open = Some((c, n, Vec::new())),
+            (Some((c, n, _)), Some((c2, n2, rest))) if c2 == *c && n2 >= *n && rest.is_empty() => {
+                if let Some((_, _, lines)) = open.take() {
+                    blocks.push(lines.join("\n"));
+                }
             }
-            (Some(lines), false) => lines.push(line),
-            (None, false) => {}
+            (Some((_, _, lines)), _) => lines.push(line),
+            (None, None) => {}
         }
     }
-    if let Some(lines) = current {
+    if let Some((_, _, lines)) = open {
         blocks.push(lines.join("\n"));
     }
     blocks.retain(|b| !b.trim().is_empty());
@@ -4699,30 +4778,51 @@ mod tests {
         answer: &str,
         host: Arc<Recording>,
     ) -> (App, Arc<Commands>, Arc<crate::surface::Headless>) {
+        answered_in_rounds(&[answer], host)
+    }
+
+    /// One turn whose reply came in several rounds — text, a tool, more text.
+    fn answered_in_rounds(
+        rounds: &[&str],
+        host: Arc<Recording>,
+    ) -> (App, Arc<Commands>, Arc<crate::surface::Headless>) {
+        let mut events = vec![SessionEvent::UserMessage {
+            turn: 1,
+            text: "写个 hello".into(),
+            images: Vec::new(),
+        }];
+        events.extend(
+            rounds
+                .iter()
+                .enumerate()
+                .map(|(i, text)| said_in_round(i as u32 + 1, text)),
+        );
+        with_events(events, host)
+    }
+
+    fn said_in_round(round: u32, text: &str) -> SessionEvent {
+        SessionEvent::AssistantMessage {
+            turn: 1,
+            round,
+            text: text.into(),
+            reasoning: String::new(),
+            tool_calls: Vec::new(),
+            reasoning_blocks: Vec::new(),
+            meta: None,
+        }
+    }
+
+    /// The commands over a session whose log is exactly `events`.
+    fn with_events(
+        events: Vec<SessionEvent>,
+        host: Arc<Recording>,
+    ) -> (App, Arc<Commands>, Arc<crate::surface::Headless>) {
         let app = bare();
         let client = Arc::new(crate::plugin::AgentClient::default());
         let (commands, _agent) = tokio::sync::mpsc::unbounded_channel();
         client.connect(commands, host);
         client.follow("lead");
-        for (seq, event) in [
-            SessionEvent::UserMessage {
-                turn: 1,
-                text: "写个 hello".into(),
-                images: Vec::new(),
-            },
-            SessionEvent::AssistantMessage {
-                turn: 1,
-                round: 1,
-                text: answer.into(),
-                reasoning: String::new(),
-                tool_calls: Vec::new(),
-                reasoning_blocks: Vec::new(),
-                meta: None,
-            },
-        ]
-        .into_iter()
-        .enumerate()
-        {
+        for (seq, event) in events.into_iter().enumerate() {
             client.keep(&atomcode_kernel::session::Committed {
                 session: "lead".into(),
                 seq: seq as u64 + 1,
@@ -4739,37 +4839,174 @@ mod tests {
         (app, all, surface)
     }
 
-    /// `/copy` takes the code out of the last answer and nothing else — not the
-    /// prose around it, not the fences. With more than one block it asks which,
-    /// rather than guessing.
+    /// `/copy code` takes the code out of the last answer and nothing else —
+    /// not the prose around it, not the fences. Bare, it is the last block;
+    /// the old spellings (`/copy N`, `/copy all`) still work, in any case.
     #[tokio::test]
-    async fn copy_takes_the_code_out_of_the_last_answer() {
+    async fn copy_code_takes_the_code_out_of_the_last_answer() {
         let (app, all, surface) =
             answered("这样写:\n\n```rust\nfn main() {}\n```\n\n或者:\n\n```sh\necho hi\n```\n");
-        match all.dispatch("/copy", &app.context()).await {
-            Outcome::Refused(why) => assert!(why.contains("2"), "{why}"),
-            other => panic!("{other:?}"),
-        }
-        assert_eq!(surface.clipboard_text(), None, "nothing was copied yet");
-        let _ = all.dispatch("/copy 2", &app.context()).await;
-        assert_eq!(surface.clipboard_text(), Some("echo hi".into()));
-        let _ = all.dispatch("/copy all", &app.context()).await;
+        let copied = |line: &'static str| {
+            let all = all.clone();
+            let ctx = app.context();
+            let surface = surface.clone();
+            async move {
+                let outcome = all.dispatch(line, &ctx).await;
+                (outcome, surface.clipboard_text())
+            }
+        };
+        assert_eq!(copied("/copy code").await.1, Some("echo hi".into()));
+        assert_eq!(copied("/copy code 1").await.1, Some("fn main() {}".into()));
         assert_eq!(
-            surface.clipboard_text(),
+            copied("/copy CODE ALL").await.1,
             Some("fn main() {}\n\necho hi".into())
         );
+        assert_eq!(copied("/copy 1").await.1, Some("fn main() {}".into()));
+        assert_eq!(
+            copied("/copy all").await.1,
+            Some("fn main() {}\n\necho hi".into())
+        );
+        match copied("/copy code 2").await.0 {
+            Outcome::Said(said) => assert!(said.contains('2') && said.contains('7'), "{said}"),
+            other => panic!("{other:?}"),
+        }
         assert!(matches!(
-            all.dispatch("/copy 9", &app.context()).await,
+            copied("/copy code 9").await.0,
+            Outcome::Refused(_)
+        ));
+        assert!(matches!(
+            copied("/copy nonsense").await.0,
             Outcome::Refused(_)
         ));
 
-        // An answer with no code in it says so rather than copying the prose.
+        // No code in the answer: `/copy code` says so, and says what to do.
         let (app, all, surface) = answered("没有代码,就这么说说");
+        match all.dispatch("/copy code", &app.context()).await {
+            Outcome::Refused(why) => assert!(why.contains("/copy"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(surface.clipboard_text(), None);
+    }
+
+    /// A plain `/copy` is the whole reply — the report was `/copy` answering
+    /// "no code block" to a reply that had none, and copying nothing.
+    #[tokio::test]
+    async fn copy_takes_the_whole_reply_by_default() {
+        let (app, all, surface) = answered("没有代码,就这么说说");
+        match all.dispatch("/copy", &app.context()).await {
+            Outcome::Said(said) => assert!(said.contains("1"), "{said}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(surface.clipboard_text(), Some("没有代码,就这么说说".into()));
+
+        // Before anything was said there is nothing, and it says that — not
+        // "no code block".
+        let (app, all, surface) = answered("");
         assert!(matches!(
             all.dispatch("/copy", &app.context()).await,
             Outcome::Refused(_)
         ));
         assert_eq!(surface.clipboard_text(), None);
+    }
+
+    /// The reply is the whole turn's: code written before a tool ran is still
+    /// in it, and `/copy code` finds it there.
+    #[tokio::test]
+    async fn copy_takes_the_whole_turn_not_only_its_last_round() {
+        let (app, all, surface) = answered_in_rounds(
+            &[
+                "先写代码:\n\n```sh\nmake test\n```",
+                "测试跑完了,全部通过。",
+            ],
+            Arc::new(Recording::default()),
+        );
+        let _ = all.dispatch("/copy", &app.context()).await;
+        let copied = surface.clipboard_text().expect("copied");
+        assert!(
+            copied.contains("make test") && copied.contains("全部通过"),
+            "{copied}"
+        );
+        let _ = all.dispatch("/copy code", &app.context()).await;
+        assert_eq!(surface.clipboard_text(), Some("make test".into()));
+    }
+
+    /// What the projection puts between a turn's rounds as a user message — a
+    /// todo reminder here — is not where the turn began: the code written
+    /// before it is still the reply's.
+    #[tokio::test]
+    async fn copy_reaches_past_a_reminder_in_the_middle_of_the_turn() {
+        let (app, all, surface) = with_events(
+            vec![
+                SessionEvent::UserMessage {
+                    turn: 1,
+                    text: "写个 hello".into(),
+                    images: Vec::new(),
+                },
+                said_in_round(1, "先写代码:\n\n```sh\nmake test\n```"),
+                SessionEvent::Injected {
+                    turn: 1,
+                    text: "remember the todo list".into(),
+                    origin: atomcode_kernel::session::InjectionOrigin::Reminder,
+                },
+                said_in_round(2, "测试跑完了,全部通过。"),
+            ],
+            Arc::new(Recording::default()),
+        );
+        let _ = all.dispatch("/copy code", &app.context()).await;
+        assert_eq!(surface.clipboard_text(), Some("make test".into()));
+        let _ = all.dispatch("/copy", &app.context()).await;
+        let copied = surface.clipboard_text().expect("copied");
+        assert!(
+            copied.contains("make test") && copied.contains("全部通过"),
+            "{copied}"
+        );
+    }
+
+    /// Stopped mid-answer: the partial reply is on screen, and `/copy` takes
+    /// it — the marker the cancel leaves is not something the person said.
+    #[tokio::test]
+    async fn copy_takes_the_partial_reply_after_a_cancel() {
+        let (app, all, surface) = with_events(
+            vec![
+                SessionEvent::UserMessage {
+                    turn: 1,
+                    text: "写个 hello".into(),
+                    images: Vec::new(),
+                },
+                SessionEvent::PartialReply {
+                    turn: 1,
+                    round: 1,
+                    text: "写到一半的回答".into(),
+                    reasoning: String::new(),
+                },
+                SessionEvent::Interrupted {
+                    turn: 1,
+                    undone: false,
+                },
+            ],
+            Arc::new(Recording::default()),
+        );
+        match all.dispatch("/copy", &app.context()).await {
+            Outcome::Said(_) => {}
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(surface.clipboard_text(), Some("写到一半的回答".into()));
+    }
+
+    /// Fences as markdown has them: tildes too, and a longer fence holds a
+    /// shorter one inside it rather than ending on it.
+    #[test]
+    fn code_blocks_read_both_fences_and_their_lengths() {
+        let text = "~~~toml\na = 1\n~~~\n\n````md\n```rs\nfn x() {}\n```\n````\n";
+        assert_eq!(
+            code_blocks(text),
+            vec!["a = 1".to_string(), "```rs\nfn x() {}\n```".to_string()]
+        );
+        // Unclosed: what was written still counts.
+        assert_eq!(
+            code_blocks("```sh\necho half"),
+            vec!["echo half".to_string()]
+        );
     }
 
     /// `/view` opens the file beside the code, without sending anything.
@@ -5223,7 +5460,7 @@ mod tests {
 
         // And the block form still copies only the block, or the two would be
         // one command with a confusing argument.
-        match all.dispatch("/copy", &app.context()).await {
+        match all.dispatch("/copy code", &app.context()).await {
             Outcome::Said(_) => {}
             other => panic!("{other:?}"),
         }
