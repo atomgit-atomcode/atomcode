@@ -123,6 +123,19 @@ pub fn update_rolling_name() -> String {
     format!("{UPDATE_TEMP_PREFIX}.rolling")
 }
 
+/// Whether `name` is a rename slot self-update left behind: the plain
+/// [`update_rolling_name`], or one suffixed `-<n>` — taken when the plain one
+/// was still held by a process running the image renamed into it (Windows
+/// refuses to replace a running executable, so the swap moves aside instead).
+pub fn is_update_rolling_name(name: &str) -> bool {
+    let plain = update_rolling_name();
+    name == plain
+        || name
+            .strip_prefix(&plain)
+            .and_then(|rest| rest.strip_prefix('-'))
+            .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+}
+
 /// `<UPDATE_TEMP_PREFIX>.writable-probe` — touched to test whether the install
 /// dir is writable before an upgrade is attempted.
 pub fn update_probe_name() -> String {
@@ -219,6 +232,22 @@ mod tests {
             ),
             resolver_fallback
         );
+    }
+
+    #[test]
+    fn a_rename_slot_is_the_plain_name_or_one_numbered_after_it() {
+        let plain = update_rolling_name();
+        assert!(is_update_rolling_name(&plain));
+        assert!(is_update_rolling_name(&format!("{plain}-4242")));
+        for not in [
+            format!("{plain}-"),
+            format!("{plain}-x1"),
+            format!("{plain}.bak"),
+            update_download_name(),
+            "atomcode.exe".to_string(),
+        ] {
+            assert!(!is_update_rolling_name(&not), "{not}");
+        }
     }
 
     #[test]
