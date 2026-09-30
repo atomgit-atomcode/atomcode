@@ -71,6 +71,15 @@ pub enum Role {
     Border,
     /// Metadata subordinate to what it describes.
     Muted,
+    /// Half the distance the terminal's own text keeps from the surface.
+    ///
+    /// For text that is skimmed rather than read — the reasoning channel, which
+    /// a person opens when they want the working and skips otherwise. The
+    /// brightness is the classic front end's `resumed:` rule (SGR 2 on the
+    /// default foreground, ~50% intensity); the ink is this module's, so it is a
+    /// colour chosen against a measured palette, held to a floor, and reportable
+    /// by `--probe-terminal` — none of which the terminal's own dimming is.
+    Faint,
     /// Body text — the terminal's own foreground, on purpose.
     Secondary,
     Warning,
@@ -126,11 +135,12 @@ pub const SERIES: u8 = 6;
 pub const HEAT: u8 = 6;
 
 /// Every role, so a check can walk them instead of keeping a list in step.
-pub const ROLES: [Role; 27] = [
+pub const ROLES: [Role; 28] = [
     Role::Brand,
     Role::Accent,
     Role::Border,
     Role::Muted,
+    Role::Faint,
     Role::Secondary,
     Role::Warning,
     Role::Error,
@@ -405,6 +415,11 @@ fn floor(role: Role) -> f32 {
         // Lowered from 6.0 on the release branch, to sit where the classic
         // front end's metadata sits. Kept.
         Role::Muted => 4.5,
+        // Not a legibility target — half of Muted's, which is what the role *is*
+        // (see [`Role::Faint`]). It exists so the sweep over [`ROLES`] has a
+        // number to hold the derived ink to, and it is the one floor here that is
+        // a consequence rather than a decision.
+        Role::Faint => 1.8,
         _ => 7.0,
     }
 }
@@ -427,6 +442,32 @@ const MUTED_REACH: f32 = 0.35;
 /// grey is the same grey by another name keeps it, and one whose quietest
 /// readable slot is a near-white does not.
 const SLOT_LEEWAY: f32 = 1.10;
+
+/// How much of the terminal's own text contrast [`Role::Muted`] may keep.
+///
+/// [`MUTED_REACH`] says where the mix *starts*; this says where it may end up.
+/// Both are needed, because `lift` raises the mix to the floor whenever the
+/// scheme's own text is dim: on a scheme whose prose sits at that floor
+/// (Solarized either polarity, anything around 4.5:1) the lifted ink arrives
+/// level with the prose — measured 0.98× on Solarized Dark and 1.12× on a
+/// 4.05:1 scheme — and "recedes" stops being visible at all. A fifth off reads
+/// as a recession without the metadata going illegible.
+///
+/// The two close one failure from either end: [`SLOT_LEEWAY`] keeps a scheme's
+/// own slot from being louder than the mix, this keeps the mix from being
+/// louder than the prose.
+const MUTED_CEILING: f32 = 0.8;
+
+/// How far [`Role::Faint`] is pulled from the terminal's own text toward its
+/// background — half the way.
+///
+/// Half is not arbitrary: it is the brightness the classic front end draws its
+/// `resumed:` rule and label with (SGR 2 on the default foreground, "~50%
+/// intensity"), so the two front ends agree about how far back "skimmed" text
+/// sits. The look is the classic one; the mechanism is this module's — an ink
+/// chosen against a measured palette, held to a floor, and printable by
+/// `--probe-terminal`, none of which the terminal's own dimming is.
+const FAINT_REACH: f32 = 0.5;
 
 /// Ink for metadata: the terminal's own text colour, moved toward its
 /// background, held at the floor. `None` when nothing measured anchors the
@@ -465,7 +506,12 @@ fn candidates(role: Role) -> &'static [u8] {
         Role::Error | Role::DiffRemove => &[9, 1],
         Role::Success | Role::DiffAdd => &[10, 2],
         Role::Mode => &[12, 4, 13, 5],
-        Role::Secondary | Role::ToolName | Role::PanelFg | Role::PanelBg | Role::PanelSelBg => &[],
+        Role::Secondary
+        | Role::ToolName
+        | Role::Faint
+        | Role::PanelFg
+        | Role::PanelBg
+        | Role::PanelSelBg => &[],
         // Mixed, not chosen: see [`Role::Heat`].
         Role::Heat(_) => &[],
         // Six hues a scheme is near certain to have set apart from each other,
@@ -559,6 +605,31 @@ pub fn resolve(role: Role, caps: Caps) -> Option<Color> {
             };
             Some(exact(ink, caps.colors, p))
         }
+        // Half the distance the terminal's own text keeps from the surface. Same
+        // anchoring as [`muted_ink`]: xterm's default fills the far end when the
+        // terminal answered for its background but not for its own text, and
+        // nothing measured at all falls back to the synthesiser — returning
+        // `None` here would mean "the terminal's full-strength foreground", the
+        // opposite of the role.
+        Role::Faint => {
+            let anchor = p.foreground().or_else(|| {
+                p.background_measured().then(|| match p.theme() {
+                    Theme::Dark => XTERM[7],
+                    Theme::Light => XTERM[0],
+                })
+            });
+            match anchor {
+                Some(anchor) => {
+                    let ink = lift(
+                        mix(anchor, p.background(), FAINT_REACH),
+                        p.background(),
+                        floor(role),
+                    );
+                    Some(exact(ink, caps.colors, p))
+                }
+                None => synthesise(role, caps),
+            }
+        }
         Role::Muted => {
             let need = floor(role);
             // The scheme's own dim slot — but only a slot the terminal said it
@@ -591,6 +662,18 @@ pub fn resolve(role: Role, caps: Caps) -> Option<Color> {
             // stick: the scheme's slot keeps its place while it is within
             // [`SLOT_LEEWAY`] of the mix's loudness, and gives way beyond it.
             let bg = p.background();
+            // Cap before measuring: [`SLOT_LEEWAY`] below compares the scheme's
+            // slot against the mix this role will actually use, so the mix has
+            // to be the capped one — see [`MUTED_CEILING`]. Quieter-than-prose
+            // wins over the floor here: the floor keeps metadata legible, it is
+            // not a target to rise to. And only when the terminal said what its
+            // own text is, like the slot path — an assumed foreground is a guess
+            // about someone else's scheme, and a guess is not a measurement to
+            // cap against.
+            let need = match p.foreground() {
+                Some(fg) => need.min(contrast(fg, p.background()) * MUTED_CEILING),
+                None => need,
+            };
             let mixed = muted_ink(p, need);
             if let Some(n) = quietest(role, caps, true) {
                 let slot = contrast(p.slot(n), bg);
@@ -963,6 +1046,11 @@ mod tests {
     /// background, so the quietest slot that clears the floor is slot 7 — a
     /// near-white louder than the scheme's own body text. Muted must not take it:
     /// reasoning and metadata drawn brighter than the answer read as the answer.
+    ///
+    /// "Not louder" is the floor of the rule; what a person needs is a *visible*
+    /// recession, so the margin is asserted too — see [`MUTED_CEILING`], and note
+    /// the assertion allows a tenth where the ceiling asks for a fifth, because
+    /// `lift` moves in 24 steps.
     #[test]
     fn muted_is_never_louder_than_the_terminals_own_text() {
         let bg = (0x00, 0x2b, 0x36);
@@ -985,6 +1073,33 @@ mod tests {
             "muted {muted:?} ({:.2}) is louder than the text it sits beside ({:.2})",
             contrast(muted, bg),
             contrast(fg, bg)
+        );
+        assert!(
+            contrast(muted, bg) <= contrast(fg, bg) * 0.9,
+            "and quieter by a visible margin, not by a hundredth: muted {muted:?} ({:.2}) against prose ({:.2})",
+            contrast(muted, bg),
+            contrast(fg, bg)
+        );
+
+        // The other polarity of the same failure, and the one the ceiling is
+        // for: a scheme whose own text sits *below* the floor. Lifting the mix
+        // to 4.5 put metadata *above* its prose — measured at 1.12× — so an
+        // expanded thought read brighter than the answer it belongs to.
+        let dim_bg = (0x1e, 0x1e, 0x1e);
+        let dim_fg = (0x7d, 0x7d, 0x7d);
+        let dim = Caps {
+            palette: Palette::assumed(Theme::Dark)
+                .with_background(dim_bg)
+                .with_foreground(dim_fg),
+            colors: Colors::True,
+            ..Caps::default()
+        };
+        let muted = seen(Role::Muted, dim).unwrap();
+        assert!(
+            contrast(muted, dim_bg) <= contrast(dim_fg, dim_bg) * 0.9,
+            "muted {muted:?} ({:.2}) must recede behind a prose of ({:.2})",
+            contrast(muted, dim_bg),
+            contrast(dim_fg, dim_bg)
         );
     }
 

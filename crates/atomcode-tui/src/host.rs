@@ -5474,11 +5474,11 @@ impl Host {
                     let hidden = lines.len() - 2 * HEAD_ROWS;
                     // On the panel ground, so it reads as a seam in the call
                     // rather than as output; in the plain ink every `点击展开`
-                    // takes (`content::expand_hint`), because a click on it
+                    // takes (`content::tail_ink`), because a click on it
                     // opens the call and muted said so to nobody.
                     let note = Span::styled(
                         crate::i18n::t(crate::i18n::Msg::FoldedLines { hidden }).into_owned(),
-                        crate::content::expand_hint()
+                        crate::content::tail_ink()
                             .bg(crate::frame::Color::role(crate::theme::Role::PanelBg)),
                     );
                     clipped.push(Line::from_spans(vec![note]).truncate(room as usize));

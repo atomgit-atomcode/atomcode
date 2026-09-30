@@ -1574,9 +1574,16 @@ pub enum Msg<'a> {
         char_count: usize,
     },
 
-    /// The dim hint on the folded VL-caption block's one-row summary, so it reads
-    /// as something that opens (the recognition is folded away behind it).
-    VlCaptionExpandHint,
+    /// The tail a lid's folded row ends with — `点击展开`, in the terminal's own
+    /// foreground. A lid is a one-line stand-in for a detail — a thought, a VL
+    /// caption, an injected block — and the ones with no identity of their own
+    /// have to say that they open.
+    LidExpandHint,
+    /// The tail a lid's *open* row ends with — `点击收起`. The lid stays on top
+    /// when the body is out (`ModelThought`), and it is still the thing to click
+    /// to put that body away, so it says so rather than relying on the reader
+    /// having watched it open.
+    LidCollapseHint,
 
     /// VL preprocessing failed — shown as a warning. `reason` is the underlying
     /// error; the driver restores the images so the user can retry.

@@ -27,6 +27,14 @@ use atomcode_harness::seams::StopReason;
 fn muted() -> Style {
     Style::new().fg(Color::role(Role::Muted))
 }
+
+/// The thought's own ink: [`Role::Faint`], halfway from the terminal's text back
+/// to the surface — the brightness the classic front end gives its `resumed:`
+/// rule. The reasoning channel is skimmed rather than read, so it sits one clear
+/// step behind the metadata around it.
+fn faint() -> Style {
+    Style::new().fg(Color::role(Role::Faint))
+}
 fn user() -> Style {
     Style::new().fg(Color::role(Role::Accent))
 }
@@ -57,7 +65,8 @@ fn fold() -> Style {
     muted()
 }
 
-/// The `点击展开` a folded row ends with.
+/// The ink a click is announced in — the tail a lid ends with (`点击展开` on a
+/// folded row, `点击收起` on an open one).
 ///
 /// The terminal's own foreground — white on a dark screen — against the muted
 /// grey of the row it ends: a tail in the same grey said "this row opens" to
@@ -66,8 +75,25 @@ fn fold() -> Style {
 /// thing that stands out. Used by every such tail — and by the
 /// `已折叠 N 行，点击展开` seam in a call's preview (`host.rs`) — so "click
 /// here" looks the same wherever it is said.
-pub(crate) fn expand_hint() -> Style {
+///
+/// A *thought's* row is the exception, and by measure: there the whole row is
+/// the click target rather than something a tail is appended to, so it takes
+/// [`lid_ink`] — this ink, in bold.
+pub(crate) fn tail_ink() -> Style {
     Style::new()
+}
+
+/// The ink a thought's lid row is drawn in — its words and the tail on them.
+///
+/// The terminal's own foreground ([`tail_ink`]), in **bold**. That is not a
+/// shortcut around the palette: nothing in this theme is brighter than the
+/// terminal's own text — [`Role::Secondary`] and [`Role::ToolName`] *are* that
+/// foreground (`resolve` returns `None` for them, and
+/// `body_text_keeps_the_terminals_own_foreground` holds that) — and every other
+/// role is a measured step *below* it. Weight is the one lever left above the
+/// prose, and this row is the handle.
+fn lid_ink() -> Style {
+    tail_ink().bold()
 }
 
 fn wrapped(text: &str, w: u16, style: Style, prefix: &str) -> Vec<Line> {
@@ -699,12 +725,12 @@ impl Content for VlCaptionBlock {
     }
     /// Folded: the head line with a `点击展开` tail in the terminal's own
     /// foreground, so a reader who does not know the row opens finds out it does
-    /// (see [`expand_hint`]).
+    /// (see [`tail_ink`]).
     fn summary(&self, ctx: &RenderCtx) -> Line {
         let mut line = self.head_line(ctx);
-        let hint = format!("  {}", pt(PMsg::VlCaptionExpandHint));
+        let hint = format!("  {}", pt(PMsg::LidExpandHint));
         if line.width() + width::str_width(&hint) <= ctx.width as usize {
-            line.spans.push(Span::styled(hint, expand_hint()));
+            line.spans.push(Span::styled(hint, tail_ink()));
         }
         line
     }
@@ -792,16 +818,48 @@ impl Content for ModelThought {
     fn content_hash(&self) -> ContentHash {
         hash_of(&["reasoning", &self.0])
     }
-    /// Open, the lid stays on top: `⎿ thought, N lines`, then the thought. A
-    /// click is how a thought was opened, and without the lid there was nothing
-    /// left that looked like the thing to click to put it away again.
+    /// Open, the lid stays on top: `⎿ thought, N lines  点击收起`, then the
+    /// thought. The lid is how the thought was opened and it is still the thing
+    /// to click to put the body away — so it says what a click does in *both*
+    /// states, and the whole row is drawn in [`lid_ink`] (see
+    /// [`ModelThought::lid`]). The body below stays `muted()`: the handle is
+    /// brighter, the content recedes.
     fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
         let w = ctx.width;
-        let mut out = vec![self.summary(ctx)];
-        out.extend(wrapped(&self.0, w, muted(), "· "));
+        let mut lid = self.lid(ctx);
+        let tail = format!("  {}", pt(PMsg::LidCollapseHint));
+        if lid.width() + width::str_width(&tail) <= w as usize {
+            lid.spans.push(Span::styled(tail, lid_ink()));
+        }
+        let mut out = vec![lid];
+        out.extend(wrapped(&self.0, w, faint(), " "));
         out
     }
+    /// Folded, this one row is all there is — so it says that it opens. The same
+    /// tail the VL caption and the injected block end with, for the same reason:
+    /// a lid with no identity of its own has to announce itself. A tool call's
+    /// does not — `● ReadFile(a.rs)` is already a thing to point at (the call,
+    /// 2026-09-30).
     fn summary(&self, ctx: &RenderCtx) -> Line {
+        let mut line = self.lid(ctx);
+        let tail = format!("  {}", pt(PMsg::LidExpandHint));
+        if line.width() + width::str_width(&tail) <= ctx.width as usize {
+            line.spans.push(Span::styled(tail, lid_ink()));
+        }
+        line
+    }
+}
+
+impl ModelThought {
+    /// The lid itself: `⎿ thought, N lines`. Folded it is the whole block; open
+    /// it is the row the body hangs under.
+    ///
+    /// Drawn in [`lid_ink`] — not the terminal's own foreground — because the
+    /// whole row is the handle: on a scheme whose prose is dim, the terminal's
+    /// ink *is* dim, and the handle would recede along with the body it is
+    /// supposed to stand out from. That leaves the thought beneath it as the
+    /// only `muted()` part of the block, which is the right way round.
+    fn lid(&self, ctx: &RenderCtx) -> Line {
         let w = ctx.width;
         let n = self.0.lines().count().max(1);
         Line::styled(
@@ -812,7 +870,7 @@ impl Content for ModelThought {
                 }),
                 w as usize,
             ),
-            muted(),
+            lid_ink(),
         )
     }
 }
@@ -1999,14 +2057,14 @@ impl Content for InjectedBlock {
         let w = ctx.width;
         if self.result {
             // Folded, the way a finished job is announced: its one line, and a
-            // tail that says the row opens (see [`expand_hint`]). The
+            // tail that says the row opens (see [`tail_ink`]). The
             // conversation that started the job answers right under it in its
             // own words, so the report itself waits behind a click instead of
             // being said twice.
             let mut line = self.result_head(ctx);
-            let hint = format!("  {}", pt(PMsg::VlCaptionExpandHint));
+            let hint = format!("  {}", pt(PMsg::LidExpandHint));
             let room = (w as usize).saturating_sub(line.width());
-            line.push(Span::styled(width::take_width(&hint, room), expand_hint()));
+            line.push(Span::styled(width::take_width(&hint, room), tail_ink()));
             return line;
         }
         Line::styled(
@@ -4333,7 +4391,7 @@ mod tests {
     #[test]
     fn the_click_to_expand_tail_stands_apart_from_the_row_it_ends() {
         let ctx = crate::block::RenderCtx::bare(120);
-        let hint = pt(PMsg::VlCaptionExpandHint).into_owned();
+        let hint = pt(PMsg::LidExpandHint).into_owned();
         let tail_of = |line: &Line| {
             line.spans
                 .iter()
@@ -4509,6 +4567,80 @@ mod tests {
             .summary(&crate::block::RenderCtx::bare(40))
             .plain()
             .contains("思考 3 行"));
+    }
+
+    /// The lid is the only handle a thought has, so it is drawn in [`lid_ink`] —
+    /// the terminal's own foreground, bold, because nothing in this theme is
+    /// brighter — while the thought beneath it is [`faint`], half the prose's own
+    /// distance from the surface. It also says what a click does, in both states:
+    /// folded it opens, open it puts the body away. Saying the wrong one would be
+    /// a lie, and a tail wider than the row would be no hint at all.
+    #[test]
+    fn a_thought_lid_says_what_a_click_does_in_both_states() {
+        let thought = ModelThought("one\ntwo\nthree".into());
+        let ctx = crate::block::RenderCtx::bare(60);
+        let expand = pt(PMsg::LidExpandHint).into_owned();
+        let collapse = pt(PMsg::LidCollapseHint).into_owned();
+        assert_ne!(expand, collapse, "two directions, two sentences");
+        let handles = |line: &Line| {
+            line.spans
+                .iter()
+                .all(|s| s.style.fg.is_none() && s.style.bold)
+        };
+        let body_ink = Some(crate::frame::Color::role(crate::theme::Role::Faint));
+
+        let folded = thought.summary(&ctx);
+        let plain = folded.plain();
+        assert!(plain.contains(&expand), "folded says it opens: {plain:?}");
+        assert!(
+            !plain.contains(&collapse),
+            "and not the other way round: {plain:?}"
+        );
+        assert!(
+            plain.contains("思考 3 行"),
+            "while still saying how much it hides: {plain:?}"
+        );
+        assert!(
+            handles(&folded),
+            "the whole row is the handle: the terminal's own ink, in bold: {folded:?}"
+        );
+
+        let open = thought.lines(&ctx);
+        let lid = open[0].plain();
+        assert!(lid.contains(&collapse), "open says it closes: {lid:?}");
+        assert!(
+            !lid.contains(&expand),
+            "and not the other way round: {lid:?}"
+        );
+        assert!(
+            lid.contains("思考 3 行"),
+            "the lid is still the lid: {lid:?}"
+        );
+        assert!(
+            handles(&open[0]),
+            "the open lid is the same handle: {:?}",
+            open[0]
+        );
+        assert!(open.len() > 1, "the body hangs under it: {open:?}");
+        assert!(
+            open[1..]
+                .iter()
+                .flat_map(|line| &line.spans)
+                // `wrapped` draws each line's lead — the indent, or the `· ` it
+                // was given — in `muted()` whatever the body's ink is, so what
+                // this asks about is the words.
+                .filter(|s| !s.text.trim().is_empty())
+                .all(|s| s.style.fg == body_ink),
+            "the thought itself recedes, half the prose's distance from the surface: {open:?}"
+        );
+
+        // No room for the tail: dropped, never half-written. At 14 cells the lid
+        // itself still fits, so this is about the tail and nothing else.
+        let narrow = thought.summary(&crate::block::RenderCtx::bare(14)).plain();
+        assert!(
+            narrow.contains("思考 3 行") && !narrow.contains(&expand),
+            "the tail yields to the row, and the row keeps its own words: {narrow:?}"
+        );
     }
 
     #[test]

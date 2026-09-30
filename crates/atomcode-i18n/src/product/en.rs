@@ -1269,7 +1269,8 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         // baked in here is one the drawer then has to strip back off.
         Msg::VisionPreprocessSuccess { char_count } =>
             format!("VL recognised image, returned {char_count} chars").into(),
-        Msg::VlCaptionExpandHint => "click to expand".into(),
+        Msg::LidExpandHint => "click to expand".into(),
+        Msg::LidCollapseHint => "click to collapse".into(),
         Msg::VisionPreprocessFailed { reason } =>
             format!("VL preprocessing failed: {reason} · continuing text-only this turn; images restored, retry to re-run recognition").into(),
         Msg::TurnSummary { done, turn_count, tool_call_count, duration, total_tokens, cached_pct } =>
