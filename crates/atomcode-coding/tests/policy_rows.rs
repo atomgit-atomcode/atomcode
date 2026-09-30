@@ -9,7 +9,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use atomcode_harness::agent::OnlySession;
 use atomcode_harness::seams::{
     Question, UserQuestions, UserQuestionsSvc, ANSWER_ALLOW, ANSWER_ALWAYS, ANSWER_DENY,
 };
@@ -101,27 +100,6 @@ async fn start(tree: ConfigTree) -> App {
     let mut app = App::new(registry, tree);
     app.start().await.expect("must mount");
     app
-}
-
-fn transcript(app: &App) -> String {
-    app.context()
-        .only_session()
-        .unwrap()
-        .derive_messages()
-        .iter()
-        .map(|m| m.text.clone())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn write_script(target: &std::path::Path) -> String {
-    script_one(
-        "write_file",
-        &format!(
-            r#"{{ file_path = {:?}, content = "written" }}"#,
-            target.to_string_lossy()
-        ),
-    )
 }
 
 fn bash_script(command: &str) -> String {

@@ -317,68 +317,6 @@ impl ToolMiddleware for WorkerScopeGate {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use atomcode_kernel::event::PolicyIntervention;
-    use atomcode_kernel::message::Message;
-    use atomcode_kernel::middleware::BeforeOutcome;
-    use atomcode_kernel::provider::ChatOptions;
-    use atomcode_kernel::provider::LlmProvider;
-    use atomcode_kernel::stream::{ProviderError, StreamEvent};
-    use atomcode_kernel::tool::ToolDef;
-    use futures::stream::{self, BoxStream};
-    use futures::StreamExt;
-
-    /// Scripted provider: `Some(reply)` → one text turn then clean stop;
-    /// `None` → a terminal open error (simulates a failed child).
-    struct MockProvider {
-        reply: Option<String>,
-    }
-
-    #[async_trait]
-    impl LlmProvider for MockProvider {
-        fn model_name(&self) -> &str {
-            "mock"
-        }
-        async fn chat_stream(
-            &self,
-            _m: &[Message],
-            _t: &[ToolDef],
-            _o: &ChatOptions,
-        ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
-            match &self.reply {
-                Some(text) => {
-                    let evs = vec![
-                        StreamEvent::TextDelta(text.clone()),
-                        StreamEvent::Done { truncated: false },
-                    ];
-                    Ok(stream::iter(evs).boxed())
-                }
-                None => Err(ProviderError {
-                    retryable: false,
-                    message: "mock open failure".into(),
-                    ..Default::default()
-                }),
-            }
-        }
-    }
-
-    struct ChildPolicyGate;
-
-    #[async_trait]
-    impl ToolMiddleware for ChildPolicyGate {
-        async fn before(
-            &self,
-            _call: &mut ToolCall,
-            _tool: &Arc<dyn Tool>,
-            _ctx: &atomcode_kernel::request::RequestCtx,
-        ) -> BeforeOutcome {
-            BeforeOutcome::deny_turn_with_intervention(
-                super::super::credential_bash_gate::CREDENTIAL_BASH_DENIAL_REASON,
-                PolicyIntervention::credential_shell_blocked(),
-            )
-        }
-    }
-
     #[test]
     fn recursive_dir_prefix_only_grants_roots_for_recursive_scopes() {
         use super::recursive_dir_prefix as p;
