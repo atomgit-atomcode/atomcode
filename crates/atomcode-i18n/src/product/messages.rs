@@ -631,6 +631,10 @@ pub enum Msg<'a> {
     /// Persistent footer hint in the `/resume` picker advertising the key
     /// actions (open / delete / search) so they're discoverable.
     SessionPickerHint,
+    /// Status-row hint while the composer is a password field for `sudo` /
+    /// `ssh` (askpass): says it IS a password field, that nothing typed is
+    /// shown or kept, and the two ways out.
+    PasswordPromptHint,
     /// Title row of the `/resume` picker: current 1-based position in the
     /// filtered list, total sessions in the project, and the project name.
     SessionPickerTitle {

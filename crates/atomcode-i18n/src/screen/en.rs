@@ -137,7 +137,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::AskGrantOnly { what } => format!("only {what}").into(),
 
         // ── the input line ──
-        Msg::InputAnswerKeys => "enter to send · esc to withhold".into(),
+        Msg::InputAnswerKeys => "password · hidden · enter to send · esc to withhold".into(),
         Msg::InputHistoryNth { nth, total } => format!("history {nth}/{total}").into(),
         Msg::InputClipboardImage => "Image in clipboard · ctrl+v to paste".into(),
         Msg::InputClipboardImageAltOrCommand => {

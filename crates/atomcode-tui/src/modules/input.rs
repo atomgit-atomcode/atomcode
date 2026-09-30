@@ -1133,6 +1133,10 @@ mod tests {
             out[0].contains("enter 送出") && out[0].contains("esc 不给"),
             "the way out rides the rule: {out:?}"
         );
+        // And says what the field is: the line alone is the asking program's
+        // words on the composer, which was read as a prompt that had escaped
+        // into the input box rather than somewhere to type a password.
+        assert!(out[0].contains("密码"), "the rule names the field: {out:?}");
 
         // The caret sits after the last mask glyph, which is the only place
         // there is to type. `PROMPT` cells for the `❯ `, one row for the rule.

@@ -37,6 +37,23 @@ pub enum ModalActionTest {
     Close,
 }
 
+/// The status row while the composer is a password field: whatever it would
+/// say, with the hint slot saying that this IS a password field.
+///
+/// The line alone is the asking program's words on the ordinary composer —
+/// `❯ 请输入密码` — which reads as a prompt that escaped into the input box
+/// rather than somewhere to type a password. This is the person's own
+/// interaction, so it outranks any passive hint the slot held.
+pub(crate) fn with_password_hint(
+    mut status: crate::render::StatusLine,
+) -> crate::render::StatusLine {
+    status.hint = Some((
+        crate::i18n::t(crate::i18n::Msg::PasswordPromptHint).into_owned(),
+        crate::render::HintSeverity::Info,
+    ));
+    status
+}
+
 // ── Struct ───────────────────────────────────────────────────────────────────
 
 pub struct PasswordModal {
@@ -182,11 +199,12 @@ impl Modal for PasswordModal {
     fn draw(&self, _buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
         let line = self.masked_line();
         let cursor = self.masked_cursor_byte();
+        let status = with_password_hint(build_status(state, ctx));
         renderer.render(UiLine::InputPrompt {
             buf: line,
             cursor_byte: cursor,
             menu: None,
-            status: build_status(state, ctx),
+            status,
             attachments: Vec::new(),
         });
         renderer.flush();
@@ -213,6 +231,27 @@ impl Modal for PasswordModal {
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyModifiers};
+
+    /// The status row says it is a password field, over whatever passive hint
+    /// was there — a reported `❯ 请输入密码` on a bare composer was read as a
+    /// prompt that had escaped into the input box.
+    #[test]
+    fn the_status_row_says_it_is_a_password_field() {
+        let passive = crate::render::StatusLine {
+            hint: Some((
+                "new version available".into(),
+                crate::render::HintSeverity::Warning,
+            )),
+            ..Default::default()
+        };
+        let (hint, severity) = with_password_hint(passive).hint.expect("a hint");
+        assert_eq!(
+            hint,
+            crate::i18n::t(crate::i18n::Msg::PasswordPromptHint).into_owned()
+        );
+        assert_eq!(severity, crate::render::HintSeverity::Info);
+        assert!(!hint.contains("new version"), "{hint}");
+    }
 
     #[test]
     fn enter_sends_typed_password_and_closes() {

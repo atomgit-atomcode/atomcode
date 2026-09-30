@@ -450,8 +450,10 @@ fn shell_tool_description(
         () => {
             "\n\
              Interactive password prompts ARE supported here: a command that needs a \
-             password (e.g. `ssh user@host`, `sudo …`) surfaces a SECURE prompt for the \
-             USER to type it — you never see or handle the password. Just run the command \
+             password (e.g. `ssh user@host`, `sudo …`) turns the user's input box into a \
+             masked password field for them to type it — you never see or handle the \
+             password. Tell the user to type it into the input box (not to wait for a \
+             pop-up). Just run the command \
              normally. Do NOT assume the shell is non-interactive, do NOT add \
              `-o BatchMode=yes` / `-n` / `</dev/null`, and do NOT avoid or give up on such \
              commands. Such a command BLOCKS until the user answers the prompt, so pass a \

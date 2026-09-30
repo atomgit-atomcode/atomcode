@@ -536,6 +536,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "未选中会话".into(),
         Msg::SessionPickerHint =>
             "↑↓ 移动 · Enter 打开 · Ctrl+D×2 删除 · 输入内容搜索 · Esc 取消".into(),
+        Msg::PasswordPromptHint =>
+            "🔒 命令在请求密码 · 输入不显示、不留存 · Enter 提交 · Esc 取消".into(),
         Msg::SessionPickerTitle { n, total, project } =>
             format!("恢复会话（{n}/{total} · {project}）").into(),
         Msg::SessionPickerTitleBare =>
