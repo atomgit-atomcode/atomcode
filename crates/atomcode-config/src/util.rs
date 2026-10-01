@@ -7,11 +7,17 @@ use std::path::{Path, PathBuf};
 /// Stable bucket key shared by session storage and project-scoped trust data.
 /// The `PathBuf` hash is part of the existing on-disk format and must not be
 /// replaced with a plain string hash.
+///
+/// `std::fs::canonicalize` returns a Windows verbatim path (`\\?\C:\\...`),
+/// so the same directory spelled two ways hashed to two buckets and split a
+/// project's sessions in half. Strip that prefix first, which is what
+/// `atomcode_capabilities::pathnorm::strip_verbatim` does and what
+/// `pathnorm::path_case_key` documents this hash as already doing.
 pub fn stable_project_hash(path: &Path) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
-    let mut normalized = path.to_string_lossy().replace('\\', "/");
+    let mut normalized = strip_verbatim_prefix(&path.to_string_lossy()).replace('\\', "/");
     if normalized.len() > 1 && normalized.ends_with('/') {
         normalized.pop();
     }
@@ -21,6 +27,20 @@ pub fn stable_project_hash(path: &Path) -> String {
     let mut hasher = DefaultHasher::new();
     PathBuf::from(normalized).hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+/// Drop the Windows verbatim prefix (`\\?\`) / verbatim-UNC prefix (`\\?\UNC\`).
+///
+/// A no-op on every path that lacks one, including all POSIX paths, so hashes of
+/// paths that were never prefixed are unchanged.
+fn strip_verbatim_prefix(path: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        std::borrow::Cow::Owned(format!(r"\\{rest}"))
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+        std::borrow::Cow::Borrowed(rest)
+    } else {
+        std::borrow::Cow::Borrowed(path)
+    }
 }
 
 /// Resolve the invoking user's real home dir, sudo-aware: under `sudo`, `$HOME`
@@ -109,6 +129,53 @@ mod tests {
         assert_eq!(
             stable_project_hash(Path::new("/tmp/atomcode-trust-golden")),
             "8b6a67e0b2c06dae"
+        );
+    }
+
+    #[test]
+    fn verbatim_prefix_does_not_split_the_bucket() {
+        // `std::fs::canonicalize` hands back `\\?\`-prefixed paths on Windows, so
+        // one directory spelled two ways must not land in two session buckets.
+        let plain = Path::new(r"D:\Work\AI\ComfyUI");
+        let verbatim = Path::new(r"\\?\D:\Work\AI\ComfyUI");
+
+        assert_eq!(stable_project_hash(plain), stable_project_hash(verbatim));
+    }
+
+    #[test]
+    fn verbatim_unc_prefix_is_unfolded() {
+        let plain = Path::new(r"\\server\share\project");
+        let verbatim_unc = Path::new(r"\\?\UNC\server\share\project");
+
+        assert_eq!(
+            stable_project_hash(plain),
+            stable_project_hash(verbatim_unc)
+        );
+    }
+
+    #[test]
+    fn unprefixed_paths_are_left_alone_by_the_strip() {
+        // Stripping must be a no-op for every path that never carried a prefix, so
+        // the two branches of `strip_verbatim_prefix` are both covered: the
+        // verbatim branch and the pass-through one.
+        assert_eq!(strip_verbatim_prefix(r"C:\plain"), r"C:\plain");
+        assert_eq!(strip_verbatim_prefix("/home/u/proj"), "/home/u/proj");
+        assert_eq!(strip_verbatim_prefix(r"\\server\share"), r"\\server\share");
+    }
+
+    #[test]
+    fn verbatim_prefixes_are_stripped_not_truncated() {
+        // The `?` is a marker, not part of the name: stripping must not leave it
+        // behind, and a verbatim-UNC prefix must unfold back to a plain UNC path.
+        assert_eq!(strip_verbatim_prefix(r"\\?\C:\x"), r"C:\x");
+        assert_eq!(strip_verbatim_prefix(r"\\?\UNC\srv\shr"), r"\\srv\shr");
+    }
+
+    #[test]
+    fn trailing_slash_and_separators_still_normalize() {
+        assert_eq!(
+            stable_project_hash(Path::new(r"C:/Users/dev")),
+            stable_project_hash(Path::new(r"C:\\Users\\dev\\"))
         );
     }
 }
