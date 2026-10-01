@@ -860,6 +860,12 @@ pub struct Moment {
     /// 标记:这时滚轮会被终端转成方向键,滚动要用 pgup/pgdn —— 滚轮出怪事时,
     /// 原因得就在眼前,而不是在很久以前滚上去的那一句提示里。
     pub mouse_handed_back: bool,
+    /// The lead's goal ended while a member was on screen: `(session,
+    /// condition, met)`, said when the lead is back on screen
+    /// ([`crate::plugin::flush_held_goal_end`]). Written into the member's view
+    /// it would be in the wrong conversation, and gone when the view switched
+    /// back — the stream is rebuilt from the log, and this is not in it.
+    pub held_goal_end: Option<(String, String, bool)>,
     /// 开屏时问到的「现在发不出回合」的原因(没有可用 provider、登录过期……),
     /// `None` 是能发。画在状态行里、常挂着,而不是写进对话流顶上:和 tuix 一样,
     /// 页面照常打开(欢迎块照画),原因在底下。agent 起来(`Described`)时清掉。

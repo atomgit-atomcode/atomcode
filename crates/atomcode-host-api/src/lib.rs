@@ -1263,6 +1263,21 @@ pub enum HostEvent {
     /// must not be offered in another, which is the whole reason it is here
     /// rather than implied by the connection.
     Suggested { session: String, text: String },
+    /// A goal ended in one of the two ways a vanishing badge cannot tell apart:
+    /// it was `met`, or it stopped without the evaluator being able to say
+    /// whether it was. The other endings (stuck, evaluation failed) come with a
+    /// runtime warning of their own, and a goal the person stopped was already
+    /// answered by the command.
+    ///
+    /// An event of its own, not a line of prose on the error road: a goal met
+    /// is good news, and the only sentence a front end could be handed before
+    /// was drawn as an error — red, read as a failure. What it says and in which
+    /// colour is the front end's to decide.
+    GoalEnded {
+        session: String,
+        condition: String,
+        met: bool,
+    },
     /// The sessions out of view changed: one was put there or taken away, a
     /// turn ended, or one is now waiting for a person. The whole list, in slot
     /// order — the same one [`HostReply::BackgroundSessions`] answers with, so
@@ -1997,6 +2012,11 @@ mod tests {
             HostEvent::BackgroundChanged {
                 sessions: vec![background_session()],
             },
+            HostEvent::GoalEnded {
+                session: "b".into(),
+                condition: "测试全绿".into(),
+                met: true,
+            },
         ];
         for e in &all {
             match e {
@@ -2005,6 +2025,7 @@ mod tests {
                 | HostEvent::ModeChanged { .. }
                 | HostEvent::Suggested { .. }
                 | HostEvent::BackgroundChanged { .. }
+                | HostEvent::GoalEnded { .. }
                 | HostEvent::PersistenceFailed { .. } => {}
             }
         }

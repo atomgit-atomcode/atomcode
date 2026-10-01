@@ -1999,6 +1999,48 @@ impl Content for ToolCallBlock {
     }
 }
 
+/// A goal ended: met, or stopped without the evaluator being able to say.
+///
+/// Met is good news and is drawn as one: a `✓` in the success green before the
+/// sentence in the terminal's own text colour — the classic screen's `✓ Goal
+/// met`. It used to arrive on the error road and came out red, read as a
+/// failure. Undecided is a caution, not an error: `⚠` and the warning colour.
+#[derive(Debug)]
+pub struct GoalEndedBlock {
+    pub condition: String,
+    pub met: bool,
+}
+
+impl Content for GoalEndedBlock {
+    fn kind(&self) -> &'static str {
+        "goal_end"
+    }
+    fn content_hash(&self) -> ContentHash {
+        hash_of(&[
+            "goal_end",
+            &self.condition,
+            if self.met { "met" } else { "undecided" },
+        ])
+    }
+    fn always_open(&self) -> bool {
+        true
+    }
+    fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+        let condition = self.condition.as_str();
+        let (text, mark, mark_style, body) = if self.met {
+            (t(Msg::GoalMet { condition }), "✓ ", ok(), Style::new())
+        } else {
+            let warn = Style::new().fg(Color::role(Role::Warning));
+            (t(Msg::GoalGaveUp { condition }), "⚠ ", warn, warn)
+        };
+        let mut out = wrapped(&text, ctx.width, body, mark);
+        if let Some(lead) = out.first_mut().and_then(|line| line.spans.first_mut()) {
+            lead.style = mark_style;
+        }
+        out
+    }
+}
+
 /// Something the harness did that a person should know and the model must not.
 #[derive(Debug)]
 pub struct NoticeBlock {
@@ -2970,6 +3012,38 @@ impl Content for TurnEndBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A goal met is good news — a success-green `✓`, the words in the plain
+    /// colour — and one that stopped undecided is a caution in the warning
+    /// colour. Neither is the error red it used to come out in.
+    #[test]
+    fn a_goal_end_is_drawn_as_news_not_as_an_error() {
+        let ctx = RenderCtx::bare(80);
+        let met = GoalEndedBlock {
+            condition: "测试全绿".into(),
+            met: true,
+        }
+        .lines(&ctx);
+        assert!(met[0].plain().starts_with("✓ "), "{:?}", met[0].plain());
+        assert!(met[0].plain().contains("测试全绿"));
+        assert_eq!(met[0].spans[0].style, ok());
+        assert_eq!(met[0].spans[1].style, Style::new());
+
+        let undecided = GoalEndedBlock {
+            condition: "测试全绿".into(),
+            met: false,
+        }
+        .lines(&ctx);
+        let warn = Style::new().fg(Color::role(Role::Warning));
+        assert!(undecided[0].plain().starts_with("⚠ "));
+        assert_eq!(undecided[0].spans[0].style, warn);
+        assert_eq!(undecided[0].spans[1].style, warn);
+        for line in met.iter().chain(&undecided) {
+            for span in &line.spans {
+                assert_ne!(span.style, bad(), "never the error colour");
+            }
+        }
+    }
 
     /// Folded, a call's reason is in the terminal's own ink and only the row
     /// under it recedes: the reason is what a person scans a run of steps by,

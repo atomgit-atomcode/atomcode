@@ -286,10 +286,15 @@ pub(crate) fn attach(
                     // 算不算达成,停了」在屏上一模一样 —— 而第二种会被当成第一种。
                     // 另外两种终态(停死、评估失败)运行时自己会发
                     // `ControllerWarning`,不在这儿再说一遍。
-                    if let Some(words) = goal_ending(&progress) {
-                        if out.send(said(words.into())).is_err() {
-                            break;
-                        }
+                    //
+                    // As an event, not as `said(..)`: that road is the error
+                    // road, and a goal met came out red, read as a failure.
+                    if let Some(met) = goal_ending(&progress) {
+                        watched.announce(HostEvent::GoalEnded {
+                            session: session.clone(),
+                            condition: progress.condition.clone(),
+                            met,
+                        });
                     }
                     let ended = progress.terminal.is_some();
                     watched.announce(HostEvent::Autonomy {
@@ -1297,7 +1302,8 @@ fn notify_waiting(control: &RuntimeControl, request: &atomcode_coding::RuntimeRe
     );
 }
 
-/// 一个目标结束时该说的话,`None` 表示不用这里说。
+/// 一个目标结束时要不要说、说哪一种:`Some(true)` 达成,`Some(false)` 停了但判不了
+/// 算不算达成,`None` 不用这里说。说什么、什么颜色由屏幕决定(`HostEvent::GoalEnded`)。
 ///
 /// 只管两种终态:**达成**和**停了但判不了算不算达成**。徒有徽标消失
 /// 的话,这两种在屏上一模一样 —— 而第二种会被当成第一种,人以为目标
@@ -1305,22 +1311,12 @@ fn notify_waiting(control: &RuntimeControl, request: &atomcode_coding::RuntimeRe
 /// `ControllerWarning` 带着原因,在这儿再说一遍就是说两遍。
 ///
 /// `Cancelled` 也不说:那是人自己停的,命令已经答过一句了。
-fn goal_ending(progress: &atomcode_coding::GoalProgress) -> Option<String> {
+fn goal_ending(progress: &atomcode_coding::GoalProgress) -> Option<bool> {
     use atomcode_coding::GoalTerminal;
     match progress.terminal? {
-        GoalTerminal::Met => Some(
-            tr(SMsg::GoalMet {
-                condition: &progress.condition,
-            })
-            .into_owned(),
-        ),
+        GoalTerminal::Met => Some(true),
         // 停下来了、运行时又没给出原因 —— 这正是「评估没有结论」那一种。
-        GoalTerminal::Stopped if progress.last_reason.is_none() => Some(
-            tr(SMsg::GoalGaveUp {
-                condition: &progress.condition,
-            })
-            .into_owned(),
-        ),
+        GoalTerminal::Stopped if progress.last_reason.is_none() => Some(false),
         _ => None,
     }
 }
@@ -3252,10 +3248,12 @@ mod tests {
                 last_reason,
             })
         };
-        let met = ended(GoalTerminal::Met, None).expect("达成要说");
-        let gave_up = ended(GoalTerminal::Stopped, None).expect("判不了也要说");
-        assert!(met.contains("测试全绿 z8k") && gave_up.contains("测试全绿 z8k"));
-        assert_ne!(met, gave_up, "两种结局不能是同一句话");
+        assert_eq!(ended(GoalTerminal::Met, None), Some(true), "达成要说");
+        assert_eq!(
+            ended(GoalTerminal::Stopped, None),
+            Some(false),
+            "判不了也要说,而且和达成不是一种"
+        );
 
         // 运行时已经给了原因的那一种,这里不再说 —— 否则同一件事说两遍。
         assert_eq!(ended(GoalTerminal::Stopped, Some("卡住了".into())), None);

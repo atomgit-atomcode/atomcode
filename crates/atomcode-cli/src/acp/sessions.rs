@@ -56,6 +56,10 @@ pub struct SessionState {
     /// down is a separate fact about the store (see `docs/adr/0024` and the
     /// plan's 6.3 note). Read once at the end of a turn and cleared.
     pub persistence_failure: Arc<Mutex<Option<String>>>,
+    /// What to say about a goal that ended (`HostEvent::GoalEnded`), said at
+    /// the end of the turn it ended in — as the reply's own text, not as an
+    /// error: a goal met is good news.
+    pub goal_ended: Arc<Mutex<Option<String>>>,
     /// Native session id (the single persistence owner's key). The ACP wire id
     /// is `acp-<native_id>`; resume/delete/list all round-trip through it.
     pub native_id: String,
@@ -104,6 +108,17 @@ pub type Sessions = Arc<Mutex<HashMap<String, SessionState>>>;
 ///
 /// For criteria about *what the screen asks of a host* — which is what the
 /// option handlers do now that resolving a model is the host's job.
+/// The sentence a goal's end is said in on this channel — the screen's own
+/// words, `✓`/`⚠` included, so an ACP client reads what the terminal shows.
+pub(crate) fn goal_ended_words(condition: &str, met: bool) -> String {
+    use atomcode_i18n::screen::{t, Msg};
+    if met {
+        format!("✓ {}", t(Msg::GoalMet { condition }))
+    } else {
+        format!("⚠ {}", t(Msg::GoalGaveUp { condition }))
+    }
+}
+
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct RecordingHost {
@@ -338,16 +353,24 @@ pub async fn register_session(
         control,
         ..
     } = connection;
-    // One watcher per session for what the host pushes. Only one kind matters
-    // to this channel today, and it matters at the end of a turn.
+    // One watcher per session for what the host pushes. Two kinds matter to
+    // this channel today, and both matter at the end of a turn.
     let persistence_failure = Arc::new(Mutex::new(None));
+    let goal_ended = Arc::new(Mutex::new(None));
     {
         let mut watch = control.subscribe();
         let seen = persistence_failure.clone();
+        let goal = goal_ended.clone();
         tokio::spawn(async move {
             while let Some(event) = watch.recv().await {
-                if let HostEvent::PersistenceFailed { message, .. } = event {
-                    *seen.lock().await = Some(message);
+                match event {
+                    HostEvent::PersistenceFailed { message, .. } => {
+                        *seen.lock().await = Some(message);
+                    }
+                    HostEvent::GoalEnded { condition, met, .. } => {
+                        *goal.lock().await = Some(goal_ended_words(&condition, met));
+                    }
+                    _ => {}
                 }
             }
         });
@@ -369,6 +392,7 @@ pub async fn register_session(
             events,
             _front_end: front_end,
             persistence_failure,
+            goal_ended,
             native_id,
             cwd,
             current_mode: RuntimeMode::Build,
@@ -567,6 +591,7 @@ pub(crate) mod test_support {
             events: std::sync::Arc::new(tokio::sync::Mutex::new(events)),
             _front_end: FrontEnd::new(),
             persistence_failure: Arc::new(Mutex::new(None)),
+            goal_ended: Arc::new(Mutex::new(None)),
             native_id: native_id.to_string(),
             cwd: std::path::PathBuf::from(cwd),
             current_mode: RuntimeMode::Build,
@@ -624,6 +649,20 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    /// A goal's end reads on ACP as on the screen: `✓` for met, `⚠` for a
+    /// stop the evaluator could not judge — and never the same sentence.
+    #[test]
+    fn a_goal_end_is_said_as_news_on_this_channel_too() {
+        let met = super::goal_ended_words("测试全绿", true);
+        let undecided = super::goal_ended_words("测试全绿", false);
+        assert!(met.starts_with('✓') && met.contains("测试全绿"), "{met}");
+        assert!(
+            undecided.starts_with('⚠') && undecided.contains("测试全绿"),
+            "{undecided}"
+        );
+        assert_ne!(met, undecided);
+    }
+
     use super::test_support::*;
     use super::*;
 
@@ -720,6 +759,7 @@ mod tests {
             events: std::sync::Arc::new(tokio::sync::Mutex::new(events)),
             _front_end: FrontEnd::new(),
             persistence_failure: Arc::new(Mutex::new(None)),
+            goal_ended: Arc::new(Mutex::new(None)),
             native_id: "test-native".to_string(),
             cwd: std::path::PathBuf::from("/work"),
             current_mode: RuntimeMode::Build,

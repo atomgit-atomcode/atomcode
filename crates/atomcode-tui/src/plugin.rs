@@ -1686,6 +1686,15 @@ impl UserInterface for Tui {
                 Wake::Host(HostEvent::Suggested { session, text }) => {
                     stale |= took_suggestion(&self.host.moment, &session, &text);
                 }
+                // A goal ended: said once, in the conversation, as what it is —
+                // good news when met, a caution when it stopped undecided.
+                Wake::Host(HostEvent::GoalEnded {
+                    session,
+                    condition,
+                    met,
+                }) => {
+                    stale |= took_goal_end(&self.host, &session, condition, met);
+                }
                 // The turn finished; the log did not get it. Said loudly and
                 // at once: the log is the session's only authority
                 // (`docs/adr/0024`), so a person who is not told now will find
@@ -4692,6 +4701,9 @@ impl Tui {
         // Back on a lead that is still working, its turn end is still to come
         // — the start was dropped while a member was on screen, not undone.
         m.turn_open = session == self.client.root() && activity.is_some();
+        drop(m);
+        // A goal of this session's that ended while another was on screen.
+        flush_held_goal_end(&self.host);
         true
     }
 
@@ -7625,6 +7637,59 @@ pub fn took_autonomy(
     true
 }
 
+/// Say that a goal ended, in the conversation the person is looking at.
+///
+/// Only into the conversation *on screen*: the stream is the viewed session's,
+/// and a line about another session's goal would be in the wrong place. The
+/// lead's, ending while a member is on screen, is held and said when the lead
+/// is back ([`flush_held_goal_end`]); any other session's is dropped. Returns
+/// whether anything was said.
+pub fn took_goal_end(
+    host: &crate::host::Host,
+    session: &str,
+    condition: String,
+    met: bool,
+) -> bool {
+    {
+        let mut m = host.moment.write().expect("moment poisoned");
+        if m.viewing != session {
+            if m.lead == session {
+                m.held_goal_end = Some((session.to_string(), condition, met));
+            }
+            return false;
+        }
+    }
+    say_goal_end(host, condition, met);
+    true
+}
+
+/// Say a goal end that was held for the session now on screen. Returns whether
+/// anything was said.
+pub fn flush_held_goal_end(host: &crate::host::Host) -> bool {
+    let held = {
+        let mut m = host.moment.write().expect("moment poisoned");
+        match &m.held_goal_end {
+            Some((session, ..)) if *session == m.viewing => m.held_goal_end.take(),
+            _ => None,
+        }
+    };
+    match held {
+        Some((_, condition, met)) => {
+            say_goal_end(host, condition, met);
+            true
+        }
+        None => false,
+    }
+}
+
+fn say_goal_end(host: &crate::host::Host, condition: String, met: bool) {
+    let mut stream = host.stream.write().expect("stream poisoned");
+    stream.writer("commands").emit(
+        crate::block::Coord::default(),
+        Arc::new(crate::content::GoalEndedBlock { condition, met }),
+    );
+}
+
 /// Take the host's word for how much this session may do without asking.
 ///
 /// [`took_autonomy`]'s twin, and split out for the same reason: the loop it is
@@ -8754,7 +8819,7 @@ mod suggestion_tests {
 
 #[cfg(test)]
 mod autonomy_tests {
-    use super::took_autonomy;
+    use super::{flush_held_goal_end, took_autonomy, took_goal_end};
     use crate::moment::Moment;
     use std::sync::RwLock;
 
@@ -8795,6 +8860,52 @@ mod autonomy_tests {
         // Over: the line goes away rather than freezing on round 4.
         assert!(took_autonomy(&moment, "lead", None));
         assert!(moment.read().unwrap().autonomy.is_none());
+    }
+
+    /// A goal that ended is said once in the conversation on screen, and not
+    /// at all for a session nobody is looking at (a member's goal).
+    #[test]
+    fn a_goal_that_ended_is_said_where_it_is_watched() {
+        let host = crate::host::Host::new(
+            std::sync::Arc::new(crate::module::Modules::new()),
+            crate::host::default_layout(),
+        );
+        {
+            let mut m = host.moment.write().unwrap();
+            m.lead = "lead".into();
+            m.viewing = "lead".into();
+        }
+        assert!(!took_goal_end(&host, "lead~scout", "测试全绿".into(), true));
+        assert_eq!(host.stream.read().unwrap().len(), 0);
+        assert!(took_goal_end(&host, "lead", "测试全绿".into(), true));
+        {
+            let stream = host.stream.read().unwrap();
+            assert_eq!(stream.len(), 1);
+            assert_eq!(stream.slots()[0].block().kind(), "goal_end");
+        }
+
+        // The lead's goal ends while a member is on screen: nothing is written
+        // into the member's view; it is said when the lead is back.
+        let host = crate::host::Host::new(
+            std::sync::Arc::new(crate::module::Modules::new()),
+            crate::host::default_layout(),
+        );
+        {
+            let mut m = host.moment.write().unwrap();
+            m.lead = "lead".into();
+            m.viewing = "lead~scout".into();
+        }
+        assert!(!took_goal_end(&host, "lead", "测试全绿".into(), true));
+        assert_eq!(
+            host.stream.read().unwrap().len(),
+            0,
+            "not in the member's view"
+        );
+        assert!(!flush_held_goal_end(&host), "still the member on screen");
+        host.moment.write().unwrap().viewing = "lead".into();
+        assert!(flush_held_goal_end(&host), "said once the lead is back");
+        assert_eq!(host.stream.read().unwrap().len(), 1);
+        assert!(!flush_held_goal_end(&host), "and only once");
     }
 
     /// A member running a goal must not write on the lead's line.

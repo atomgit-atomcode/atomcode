@@ -462,6 +462,22 @@ pub(crate) async fn run_turn<W: TurnWire>(
         }
     };
     let last_error = fold_persistence_failure(last_error, persisted);
+    // A goal that ended with this turn: said as the reply's own text, before
+    // the turn closes — not as `last_error`, which is how it used to arrive
+    // (on the host's error road) and how a goal met read as a failure.
+    let goal = {
+        let map = sessions.lock().await;
+        match map.get(sid) {
+            Some(state) => state.goal_ended.lock().await.take(),
+            None => None,
+        }
+    };
+    if let Some(words) = goal {
+        let said = AgentEvent::TextDelta(format!("\n\n{words}\n"));
+        if let Some(update) = wire.translate(&said, &msg_id) {
+            let _ = wire.notify(update);
+        }
+    }
     wire.finish(terminal, last_error, &msg_id)
 }
 
