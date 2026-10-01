@@ -784,13 +784,37 @@ impl Terminal {
 /// conhost) or cannot be set (stdout is a pipe, a very old host): there it
 /// changes nothing, it does not make the leak worse. A no-op off Windows, where
 /// the terminal interprets VT regardless.
-#[cfg(windows)]
+///
+/// For a caller that only needs the flag on; [`Terminal::enter`] needs the
+/// answer too and asks [`console_speaks_ansi`] directly.
 fn enable_vt_output() {
-    let _ = crossterm::ansi_support::supports_ansi();
+    let _ = console_speaks_ansi();
 }
 
-#[cfg(not(windows))]
-fn enable_vt_output() {}
+/// Whether this console executes the escape sequences this screen is drawn in.
+///
+/// On Windows that is a console **mode**, not a property of the window:
+/// `ENABLE_VIRTUAL_TERMINAL_PROCESSING` on the output handle. Windows Terminal
+/// and VS Code turn it on; the console a plain Windows 10 PowerShell window
+/// opens in does not, and there every byte of every sequence is printed as
+/// text — a screenful of `[?1002h[47;3H…` with the conversation lost inside it.
+/// `enable_raw_mode` only touches the input side, and the classic screen got
+/// the mode turned on as a side effect of drawing through crossterm's
+/// commands, which this screen does not use. So it is asked for here, once
+/// (crossterm remembers the answer), and the answer says whether it took.
+///
+/// `false` only on a Windows console too old to have the mode at all; anywhere
+/// else this screen's sequences are what the terminal speaks.
+pub fn console_speaks_ansi() -> bool {
+    #[cfg(windows)]
+    {
+        crossterm::ansi_support::supports_ansi()
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
 
 impl Terminal {
     /// Take the screen. `theme` forces a palette; `None` means ask the terminal
@@ -801,9 +825,13 @@ impl Terminal {
         mouse: bool,
         overrides: crate::caps::Overrides,
     ) -> std::io::Result<Self> {
-        // Before the first byte of ANSI goes out, or a legacy Windows console
-        // prints it instead of acting on it. See `enable_vt_output`.
-        enable_vt_output();
+        // Before a single byte is written: a console that will not execute
+        // the sequences gets none of them, rather than a screenful of text.
+        if !console_speaks_ansi() {
+            return Err(std::io::Error::other(
+                "this console cannot draw escape sequences; use `--classic`",
+            ));
+        }
         crossterm::terminal::enable_raw_mode()?;
         let mut out = std::io::stdout();
         out.write_all(ansi::ENTER.as_bytes())?;

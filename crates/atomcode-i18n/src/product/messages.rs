@@ -635,6 +635,10 @@ pub enum Msg<'a> {
     /// `ssh` (askpass): says it IS a password field, that nothing typed is
     /// shown or kept, and the two ways out.
     PasswordPromptHint,
+    /// Printed once at launch when the new screen was asked for (the default,
+    /// `--tui`, or `[ui] screen`) and this Windows console cannot execute the
+    /// escape sequences it draws in, so the classic screen opens instead.
+    ClassicScreenFallback,
     /// Title row of the `/resume` picker: current 1-based position in the
     /// filtered list, total sessions in the project, and the project name.
     SessionPickerTitle {

@@ -2334,8 +2334,25 @@ async fn run() -> Result<i32> {
     // `--tui` reaches the runtime through a front end fed from inside its Apps.
     // What was asked for now, else what the configuration says — one rule, in
     // one place (`atomcode::tui_front::screen_for`).
-    let rows_screen = atomcode::tui_front::screen_for(cli.tui, cli.classic, config.ui.screen)
+    //
+    // The new screen draws in escape sequences, and a Windows console too old
+    // to execute them would print every one as text; the classic screen draws
+    // there through the console API. So such a console gets the classic screen
+    // whatever was asked — asking also turns the sequences on where the console
+    // has them and they were merely off (a plain Windows 10 PowerShell window).
+    let asked_for_rows = atomcode::tui_front::screen_for(cli.tui, cli.classic, config.ui.screen)
         == atomcode_config::config::Screen::Rows;
+    let console_draws_rows = is_headless || atomcode_tui::surface::console_speaks_ansi();
+    if asked_for_rows && !console_draws_rows {
+        // Said, not silent: someone who asked for the new screen (or got it as
+        // the default) and sees the old one should be told why and where the
+        // new one runs.
+        eprintln!(
+            "{}",
+            atomcode_config::i18n::t(atomcode_config::i18n::Msg::ClassicScreenFallback)
+        );
+    }
+    let rows_screen = asked_for_rows && console_draws_rows;
     let tui_front_end =
         (rows_screen && !is_headless).then(atomcode_coding::front_end::FrontEnd::new);
     // Bound to the background sessions once the screen is up (`tui_front::run`);

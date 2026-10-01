@@ -564,6 +564,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "No session selected".into(),
         Msg::SessionPickerHint =>
             "↑↓ move · Enter open · Ctrl+D×2 delete · Type to search · Esc cancel".into(),
+        Msg::ClassicScreenFallback =>
+            "This console cannot draw the new screen (no escape-sequence support); opening the classic screen. Windows Terminal runs the new one.".into(),
         Msg::PasswordPromptHint =>
             "🔒 A command is asking for a password · not shown, not kept · Enter send · Esc cancel".into(),
         Msg::SessionPickerTitle { n, total, project } =>

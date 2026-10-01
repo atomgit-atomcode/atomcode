@@ -189,3 +189,32 @@ fn taking_the_screen_arms_both_ways_of_giving_it_back() {
         );
     }
 }
+
+/// Taking the screen asks the console to execute escape sequences before it
+/// writes the first one.
+///
+/// A plain Windows 10 PowerShell window has the mode off: every sequence the
+/// screen wrote was printed as text, a screenful of `[?1002h[47;3H…`. Raw mode
+/// does not turn it on, so `enter` must ask (`console_speaks_ansi`) — and ask
+/// first, before raw mode and before a single byte, so a console that cannot
+/// is left exactly as it was found.
+#[test]
+fn taking_the_screen_asks_for_escape_sequences_first() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/surface.rs");
+    let text = std::fs::read_to_string(&src).expect("surface.rs");
+    let enter = text
+        .split_once("pub fn enter(")
+        .expect("Terminal::enter is where the screen is taken")
+        .1;
+    let enter = enter.split("\n    /// ").next().unwrap_or(enter);
+    let asked = enter
+        .find("console_speaks_ansi()")
+        .expect("`enter` never asks the console to execute escape sequences");
+    for later in ["enable_raw_mode", "write_all"] {
+        let at = enter.find(later).expect(later);
+        assert!(
+            asked < at,
+            "`enter` reaches `{later}` before asking for escape sequences"
+        );
+    }
+}
