@@ -765,6 +765,33 @@ impl Terminal {
     }
 }
 
+/// Turn on the Windows console's VT output processing, so the ANSI this
+/// renderer writes straight to stdout is interpreted rather than printed.
+///
+/// crossterm enables this flag the first time anything goes through its
+/// `execute!`/`queue!` command layer (`ansi_support::supports_ansi` →
+/// `SetConsoleMode(ENABLE_VIRTUAL_TERMINAL_PROCESSING)`), which is how the old
+/// renderer got it for free. This one never uses that layer — it emits its own
+/// diffed ANSI — so on a legacy console host (Windows PowerShell 5.1 / classic
+/// conhost, where the flag defaults off) every escape leaked as literal text:
+/// `\x1b[?1049h`, `\x1b[?25l`, the mouse-tracking toggles, all of it, painted
+/// across the screen instead of acted on. `enable_raw_mode` does not help —
+/// that only clears line/echo/processed input on the *input* handle.
+///
+/// `supports_ansi()` asks for the flag on the current stdout handle and caches
+/// the outcome behind a `Once`, so calling it before each `enter` is free after
+/// the first. Harmless when the flag is already on (Windows Terminal, modern
+/// conhost) or cannot be set (stdout is a pipe, a very old host): there it
+/// changes nothing, it does not make the leak worse. A no-op off Windows, where
+/// the terminal interprets VT regardless.
+#[cfg(windows)]
+fn enable_vt_output() {
+    let _ = crossterm::ansi_support::supports_ansi();
+}
+
+#[cfg(not(windows))]
+fn enable_vt_output() {}
+
 impl Terminal {
     /// Take the screen. `theme` forces a palette; `None` means ask the terminal
     /// what colour it is and follow the answer. `overrides` is what this build
@@ -774,6 +801,9 @@ impl Terminal {
         mouse: bool,
         overrides: crate::caps::Overrides,
     ) -> std::io::Result<Self> {
+        // Before the first byte of ANSI goes out, or a legacy Windows console
+        // prints it instead of acting on it. See `enable_vt_output`.
+        enable_vt_output();
         crossterm::terminal::enable_raw_mode()?;
         let mut out = std::io::stdout();
         out.write_all(ansi::ENTER.as_bytes())?;
@@ -1281,6 +1311,9 @@ fn local_clipboard(text: &str) -> bool {
 pub fn probe_report() -> String {
     use std::fmt::Write as _;
 
+    // Same reason as `enter`: the palette probe writes OSC queries, which a
+    // legacy Windows console would echo as text without this.
+    enable_vt_output();
     let raw = crossterm::terminal::enable_raw_mode().is_ok();
     let palette = measure_palette();
     if raw {
