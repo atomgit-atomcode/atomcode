@@ -9656,3 +9656,166 @@ async fn the_wheel_as_arrows_scrolls_while_the_mouse_is_handed_back() {
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
+
+/// Pick a start screens up, scroll down to where it should end, and click
+/// there: once the start has scrolled off screen, a click carries the
+/// selection on to it — and copies all of it — instead of starting over.
+#[tokio::test]
+async fn a_click_after_scrolling_away_extends_the_selection() {
+    let dir = scratch("click-extends");
+    let s = start(tree(&dir, &replay(&sixty_lines()), &[])).await;
+    let task = s.open().await;
+    s.term.type_line("count to sixty");
+    until(&s, "LINE-60").await;
+    s.quiet().await;
+
+    use atomcode_tui::surface::Click;
+    let stream = s.term.last().unwrap().part("stream").unwrap().rect;
+    for _ in 0..80 {
+        s.term.pointer(Click::WheelUp, stream.x + 2, stream.y + 2);
+    }
+    s.quiet().await;
+    let row_of = |s: &Session, what: &str| {
+        s.screen()
+            .lines()
+            .position(|l| l.contains(what))
+            .unwrap_or_else(|| panic!("{what} on screen:\n{}", s.screen())) as u16
+    };
+    // A line of the answer on screen, wherever the wheel stopped — the second
+    // one, because a drag on the pane's top row scrolls it (that is the edge).
+    let first = s
+        .screen()
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("LINE-").map(|n| format!("LINE-{n}")))
+        .nth(1)
+        .expect("a line of the answer on screen");
+    let from = row_of(&s, &first);
+    s.term.pointer(Click::Press, stream.x, from);
+    s.term.pointer(Click::Drag, stream.right() - 1, from);
+    s.term.pointer(Click::Release, stream.right() - 1, from);
+    s.quiet().await;
+    assert_eq!(
+        s.term.clipboard_text().as_deref().map(str::trim),
+        Some(first.as_str())
+    );
+
+    for _ in 0..80 {
+        s.term.pointer(Click::WheelDown, stream.x + 2, stream.y + 2);
+    }
+    s.quiet().await;
+    assert!(!s.screen().contains(&first), "scrolled away from the start");
+    let to = row_of(&s, "LINE-60");
+    s.term.pointer(Click::Press, stream.right() - 1, to);
+    s.term.pointer(Click::Release, stream.right() - 1, to);
+    s.quiet().await;
+
+    let taken = s.term.clipboard_text().expect("copied");
+    assert!(
+        taken.trim().starts_with(&first) && taken.contains("LINE-30") && taken.ends_with("LINE-60"),
+        "the click carried the selection to the end: {taken}"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+/// While the whole selection is still on screen a click means what it always
+/// has: the selection is put away, not stretched.
+#[tokio::test]
+async fn a_click_beside_a_selection_on_screen_puts_it_away() {
+    let dir = scratch("click-clears");
+    let s = start(tree(&dir, &replay(&sixty_lines()), &[])).await;
+    let task = s.open().await;
+    s.term.type_line("count to sixty");
+    until(&s, "LINE-60").await;
+    s.quiet().await;
+
+    use atomcode_tui::surface::Click;
+    let stream = s.term.last().unwrap().part("stream").unwrap().rect;
+    let row_of = |s: &Session, what: &str| {
+        s.screen()
+            .lines()
+            .position(|l| l.contains(what))
+            .expect("on screen") as u16
+    };
+    let (from, other) = (row_of(&s, "LINE-60"), row_of(&s, "LINE-57"));
+    s.term.pointer(Click::Press, stream.x, from);
+    s.term.pointer(Click::Drag, stream.right() - 1, from);
+    s.term.pointer(Click::Release, stream.right() - 1, from);
+    s.quiet().await;
+    assert_eq!(s.term.clipboard_text().as_deref(), Some("  LINE-60"));
+
+    s.term.pointer(Click::Press, stream.x + 2, other);
+    s.term.pointer(Click::Release, stream.x + 2, other);
+    s.quiet().await;
+    assert_eq!(
+        s.term.clipboard_text().as_deref(),
+        Some("  LINE-60"),
+        "nothing more was copied"
+    );
+    right_click(&s, stream.x + 2, from);
+    s.quiet().await;
+    // The menu's item, not the tip the first copy left ("已复制选中的内容").
+    assert!(
+        !s.screen()
+            .lines()
+            .any(|l| l.contains("复制选中") && !l.contains("已复制选中")),
+        "the click put the selection away:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+/// A press that goes on to drag is a new selection even when the held one has
+/// scrolled off screen: only a click carries the old one on.
+#[tokio::test]
+async fn a_drag_after_scrolling_away_starts_a_new_selection() {
+    let dir = scratch("drag-starts-new");
+    let s = start(tree(&dir, &replay(&sixty_lines()), &[])).await;
+    let task = s.open().await;
+    s.term.type_line("count to sixty");
+    until(&s, "LINE-60").await;
+    s.quiet().await;
+
+    use atomcode_tui::surface::Click;
+    let stream = s.term.last().unwrap().part("stream").unwrap().rect;
+    let row_of = |s: &Session, what: &str| {
+        s.screen()
+            .lines()
+            .position(|l| l.contains(what))
+            .unwrap_or_else(|| panic!("{what} on screen:\n{}", s.screen())) as u16
+    };
+    let last = row_of(&s, "LINE-60");
+    s.term.pointer(Click::Press, stream.x, last);
+    s.term.pointer(Click::Drag, stream.right() - 1, last);
+    s.term.pointer(Click::Release, stream.right() - 1, last);
+    s.quiet().await;
+    assert_eq!(s.term.clipboard_text().as_deref(), Some("  LINE-60"));
+
+    for _ in 0..40 {
+        s.term.pointer(Click::WheelUp, stream.x + 2, stream.y + 2);
+    }
+    s.quiet().await;
+    assert!(!s.screen().contains("LINE-60"), "scrolled away from it");
+    let line = s
+        .screen()
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("LINE-").map(|n| format!("LINE-{n}")))
+        .nth(3)
+        .expect("a line of the answer on screen");
+    let at = row_of(&s, &line);
+    s.term.pointer(Click::Press, stream.x, at);
+    s.term.pointer(Click::Drag, stream.right() - 1, at);
+    s.term.pointer(Click::Release, stream.right() - 1, at);
+    s.quiet().await;
+    assert_eq!(
+        s.term.clipboard_text().as_deref().map(str::trim),
+        Some(line.as_str()),
+        "the drag selected only what it covered"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}

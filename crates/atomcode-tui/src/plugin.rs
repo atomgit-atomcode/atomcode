@@ -1051,6 +1051,11 @@ pub struct Tui {
     files: Mutex<Option<(std::path::PathBuf, FileIndex)>>,
     /// Where the button went down, so a release can tell a click from a drag.
     pressed_at: Mutex<Option<(u16, u16)>>,
+    /// The conversation selection a plain press set aside while it waits to
+    /// learn what it is (`Tui::click_extends`): released where it went down,
+    /// it was a click and this is carried on to it; dragged, it was a new
+    /// selection and this is dropped.
+    extend_on_release: Mutex<Option<crate::moment::StreamSelection>>,
     /// The last press's time, cell, and how many presses have landed on that
     /// cell in a row — so a second press within the window is a double-click
     /// (word) and a third a triple-click (line). The app reproduces what taking
@@ -1786,7 +1791,7 @@ impl UserInterface for Tui {
                     let mut m = self.host.moment.write().expect("moment poisoned");
                     if let Some((x, y)) = m.edge_scroll {
                         if m.stream_selection.is_some() {
-                            self.drag_in_conversation(&mut m, x, y);
+                            self.drag_in_conversation(&mut m, x, y, true);
                         } else {
                             m.edge_scroll = None;
                         }
@@ -1877,6 +1882,15 @@ impl UserInterface for Tui {
                 // history — in the alternate screen that history is the shell's,
                 // so a wheel the terminal keeps would scroll the wrong thing.
                 Wake::Input(Input::Mouse(click, x, y)) => {
+                    // A shift-press is a press in everything but what it does
+                    // to a held selection, which is decided where a press
+                    // becomes a selection gesture (below).
+                    let shift = matches!(click, crate::surface::Click::ShiftPress);
+                    let click = if shift {
+                        crate::surface::Click::Press
+                    } else {
+                        click
+                    };
                     use crate::surface::Click;
                     // The slash menu, before anything else looks at the pointer.
                     // A list with a lit row is something a press can choose from
@@ -2194,13 +2208,54 @@ impl UserInterface for Tui {
                                     *self.pressed_at.lock().expect("press poisoned") = None;
                                     Some(Action::SelectLine(x, y))
                                 }
-                                _ => Some(Action::SelectFrom(x, y)),
+                                // Shift says "carry it on" outright, so it is
+                                // done at once and a drag goes on stretching
+                                // it. The press is forgotten for the same
+                                // reason as above: its release copies the
+                                // longer selection instead of becoming a click.
+                                _ if shift && self.click_extends(shift, x, y) => {
+                                    *self.pressed_at.lock().expect("press poisoned") = None;
+                                    Some(Action::ExtendSelection(x, y))
+                                }
+                                // A plain press cannot say yet: a click carries
+                                // the held selection on, a drag starts a new
+                                // one. So it starts the new one and sets the
+                                // held one aside for the release to decide.
+                                _ => {
+                                    let held = if self.click_extends(shift, x, y) {
+                                        self.host
+                                            .moment
+                                            .read()
+                                            .expect("moment poisoned")
+                                            .stream_selection
+                                    } else {
+                                        None
+                                    };
+                                    *self.extend_on_release.lock().expect("extend poisoned") = held;
+                                    Some(Action::SelectFrom(x, y))
+                                }
                             }
                         }
+                        // Turned into a `Press` (with `shift` kept) where the
+                        // pointer arrives, so none reaches here.
+                        Click::ShiftPress => None,
                         Click::Drag => Some(Action::SelectTo(x, y)),
                         Click::Release => {
                             let from = self.pressed_at.lock().expect("press poisoned").take();
+                            let set_aside = self
+                                .extend_on_release
+                                .lock()
+                                .expect("extend poisoned")
+                                .take();
                             match from {
+                                // A click, with a selection set aside for it:
+                                // carried on to here, then copied whole.
+                                Some(p) if p == (x, y) && set_aside.is_some() => {
+                                    let mut m = self.host.moment.write().expect("moment poisoned");
+                                    m.stream_selection = set_aside;
+                                    self.drag_in_conversation(&mut m, x, y, false);
+                                    Some(Action::CopySelection)
+                                }
                                 Some(p) if p == (x, y) => Some(Action::ClickAt(x, y)),
                                 Some(_) => Some(Action::CopySelection),
                                 // No press to release against: a multi-click
@@ -2580,6 +2635,32 @@ impl UserInterface for Tui {
 }
 
 impl Tui {
+    /// Whether a single press at `(x, y)` carries the held conversation
+    /// selection on to it instead of starting a new one.
+    ///
+    /// With shift, always — where the terminal passes shift-click on at all.
+    /// Without, only once an end of the selection has scrolled off screen:
+    /// then the person has picked a start somewhere else and come here for the
+    /// rest of it, and starting over would throw away the part they can no
+    /// longer see. While the whole selection is still on screen a click means
+    /// what it always has — put the selection away, or fold what it lands on.
+    /// And it is a *click* that extends: a press that goes on to drag is a new
+    /// selection, so for a plain press the release decides.
+    fn click_extends(&self, shift: bool, x: u16, y: u16) -> bool {
+        let m = self.host.moment.read().expect("moment poisoned");
+        let Some(sel) = m.stream_selection else {
+            return false;
+        };
+        let Some(view) = self.host.block_view(self.surface.size(), &m) else {
+            return false;
+        };
+        if view.row_at(y).is_none() || x < view.rect.x || x >= view.rect.right() {
+            return false;
+        }
+        let on_screen = |row: usize| (view.top()..view.top() + view.rect.h as usize).contains(&row);
+        shift || !on_screen(sel.anchor.1) || !on_screen(sel.head.1)
+    }
+
     /// Carry a conversation selection's head to the pointer, scrolling the
     /// view when the pointer is at the conversation's top or bottom row and
     /// there is more that way — the drag that runs past the edge of a screen.
@@ -2587,7 +2668,10 @@ impl Tui {
     /// One row per call: the terminal reports a drag only when the pointer
     /// moves, so while it is held still at an edge the loop calls this again on
     /// a timer (`Moment::edge_scroll`) and the view keeps moving.
-    fn drag_in_conversation(&self, m: &mut crate::moment::Moment, x: u16, y: u16) {
+    ///
+    /// `edge` off keeps the view still: a click that extends names the row it
+    /// landed on, and scrolling under it would select the row after.
+    fn drag_in_conversation(&self, m: &mut crate::moment::Moment, x: u16, y: u16, edge: bool) {
         let size = self.surface.size();
         let Some(view) = self.host.block_view(size, m) else {
             return;
@@ -2595,8 +2679,8 @@ impl Tui {
         let top_edge = view.rect.y;
         let bottom_edge = view.rect.y + view.rect.h.saturating_sub(1);
         let limit = self.host.scroll_limit(size, m);
-        let up = y <= top_edge && view.top() > 0 && m.scroll.0 < limit;
-        let down = y >= bottom_edge && m.scroll.0 > 0;
+        let up = edge && y <= top_edge && view.top() > 0 && m.scroll.0 < limit;
+        let down = edge && y >= bottom_edge && m.scroll.0 > 0;
         if up {
             m.scroll = crate::moment::ScrollPos(m.scroll.0 + 1);
         } else if down {
@@ -5796,6 +5880,7 @@ impl Tui {
                 action,
                 Action::SelectFrom(..)
                     | Action::SelectTo(..)
+                    | Action::ExtendSelection(..)
                     | Action::SelectWord(..)
                     | Action::SelectLine(..)
                     | Action::CopySelection
@@ -6734,9 +6819,17 @@ impl Tui {
                 m.selection = Some(crate::moment::Selection::at(x, y));
                 return false;
             }
+            // The far end moves to the click, and the release that follows
+            // copies the whole of it (`CopySelection`), off-screen rows too.
+            Action::ExtendSelection(x, y) => {
+                if m.stream_selection.is_some() {
+                    self.drag_in_conversation(&mut m, x, y, false);
+                }
+                return false;
+            }
             Action::SelectTo(x, y) => {
                 if m.stream_selection.is_some() {
-                    self.drag_in_conversation(&mut m, x, y);
+                    self.drag_in_conversation(&mut m, x, y, true);
                 } else if let Some(sel) = m.selection.as_mut() {
                     sel.head = (x, y);
                 }
@@ -8328,6 +8421,7 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
             history_asked: Mutex::new(false),
             files: Mutex::new(None),
             pressed_at: Mutex::new(None),
+            extend_on_release: Mutex::new(None),
             click_streak: Mutex::new(None),
             members: Arc::new(Roster::default()),
             named: Mutex::new(None),

@@ -83,6 +83,9 @@ pub enum Action {
     SelectFrom(u16, u16),
     /// Drag it out to here.
     SelectTo(u16, u16),
+    /// A click that carries the held selection on to here — and copies it —
+    /// instead of starting a new one.
+    ExtendSelection(u16, u16),
     /// A double-click: select the word under this cell and copy it. The
     /// terminal's own word-select, which taking the mouse for drag disabled.
     SelectWord(u16, u16),

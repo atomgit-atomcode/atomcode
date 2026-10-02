@@ -111,6 +111,11 @@ pub enum Click {
     /// opened. Two intentions that arrive as the same event shape, told apart
     /// at the only layer that can still tell — the one reading the terminal.
     RightPress,
+    /// The primary button went down with shift held: extend the selection
+    /// there rather than start a new one. Most terminals keep shift-click for
+    /// their own selection while a program has the mouse, so this arrives only
+    /// from the ones that pass it on.
+    ShiftPress,
     /// The pointer moved with the button held. What a drag is made of.
     Drag,
     /// …and came up here. A release at the cell it was pressed on is a click;
@@ -2047,6 +2052,11 @@ pub fn from_crossterm(event: crossterm::event::Event) -> Option<Input> {
         // cost.
         Event::Mouse(m) => {
             let click = match m.kind {
+                MouseEventKind::Down(MouseButton::Left)
+                    if m.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) =>
+                {
+                    Click::ShiftPress
+                }
                 MouseEventKind::Down(MouseButton::Left) => Click::Press,
                 // The secondary button opens a menu; it is never a caret and
                 // never a selection, which is why it is a distinct `Click`
@@ -2475,6 +2485,28 @@ mod tests {
         assert!(
             from_crossterm(Event::Key(release)).is_none(),
             "a release must not read as a second press"
+        );
+    }
+
+    #[test]
+    fn a_shift_press_is_told_apart_from_a_press() {
+        // Shift-click extends a selection where a plain press starts one; the
+        // modifier is only readable here, so it is kept in the `Click`.
+        use crossterm::event::{Event, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let mut down = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3,
+            row: 4,
+            modifiers: KeyModifiers::SHIFT,
+        };
+        assert_eq!(
+            from_crossterm(Event::Mouse(down)),
+            Some(Input::Mouse(Click::ShiftPress, 3, 4))
+        );
+        down.modifiers = KeyModifiers::NONE;
+        assert_eq!(
+            from_crossterm(Event::Mouse(down)),
+            Some(Input::Mouse(Click::Press, 3, 4))
         );
     }
 
