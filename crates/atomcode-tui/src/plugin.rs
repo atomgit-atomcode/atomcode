@@ -867,6 +867,10 @@ enum Wake {
     /// (`Tui::pour_bg_question`).
     PullBgQuestion,
     Tick,
+    /// A drag held still at the conversation's edge is due one more row. Its
+    /// own beat rather than a `Tick`: a tick moves the animations and re-says
+    /// the mouse mode, and neither should run faster because a drag is held.
+    EdgeScroll,
     Closed,
 }
 
@@ -1426,6 +1430,11 @@ impl UserInterface for Tui {
         // Whether the screen could take a background question at the last frame,
         // so the moment it can is seen once (see [`became_ready`]).
         let mut was_ready = false;
+        // When a drag held at the edge is next due a row. Kept across passes so
+        // that other wakes — a streaming answer sends them faster than the beat —
+        // do not keep pushing it back: a timeout made afresh each pass would
+        // never run out while the reply streams.
+        let mut edge_due: Option<tokio::time::Instant> = None;
         while !quit {
             // The composer's menu is the one thing here that follows the
             // pointer, so free motion is on exactly while it is up: with it on,
@@ -1571,18 +1580,40 @@ impl UserInterface for Tui {
                 stale = false;
                 coalesced = 0;
             }
-            let timer = self.host.modules.tick();
+            // A drag held at the conversation's edge needs a beat of its own:
+            // the terminal sends nothing while the pointer is still.
+            let now = tokio::time::Instant::now();
+            let held = self
+                .host
+                .moment
+                .read()
+                .expect("moment poisoned")
+                .edge_scroll
+                .is_some();
+            edge_due = held.then(|| edge_due.unwrap_or(now + EDGE_SCROLL_EVERY));
+            let edge = edge_due.map(|due| due.saturating_duration_since(now));
+            let tick = self.host.modules.tick();
+            let timer = match (tick, edge) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
             let woke = match replay.pop_front() {
                 Some(again) => again,
+                // Due already: the queue kept the loop busy past the beat.
+                None if edge.is_some_and(|left| left.is_zero()) => Wake::EdgeScroll,
                 None => match timer {
                     Some(every) => match tokio::time::timeout(every, wake.recv()).await {
                         Ok(Some(w)) => w,
                         Ok(None) => Wake::Closed,
+                        Err(_) if edge == Some(every) => Wake::EdgeScroll,
                         Err(_) => Wake::Tick,
                     },
                     None => wake.recv().await.unwrap_or(Wake::Closed),
                 },
             };
+            if matches!(woke, Wake::EdgeScroll) {
+                edge_due = None;
+            }
             coalesced += 1;
             // The pointer's own vocabulary, needed in the patterns below rather
             // than only inside an arm body.
@@ -1748,6 +1779,18 @@ impl UserInterface for Tui {
                 Wake::Tick => {
                     let mut m = self.host.moment.write().expect("moment poisoned");
                     m.tick = m.tick.wrapping_add(1);
+                    stale = true;
+                }
+                // A drag held still at the conversation's edge: one more row.
+                Wake::EdgeScroll => {
+                    let mut m = self.host.moment.write().expect("moment poisoned");
+                    if let Some((x, y)) = m.edge_scroll {
+                        if m.stream_selection.is_some() {
+                            self.drag_in_conversation(&mut m, x, y);
+                        } else {
+                            m.edge_scroll = None;
+                        }
+                    }
                     stale = true;
                 }
                 // A move is the one event the tracker sends for a reason we did
@@ -2537,6 +2580,49 @@ impl UserInterface for Tui {
 }
 
 impl Tui {
+    /// Carry a conversation selection's head to the pointer, scrolling the
+    /// view when the pointer is at the conversation's top or bottom row and
+    /// there is more that way — the drag that runs past the edge of a screen.
+    ///
+    /// One row per call: the terminal reports a drag only when the pointer
+    /// moves, so while it is held still at an edge the loop calls this again on
+    /// a timer (`Moment::edge_scroll`) and the view keeps moving.
+    fn drag_in_conversation(&self, m: &mut crate::moment::Moment, x: u16, y: u16) {
+        let size = self.surface.size();
+        let Some(view) = self.host.block_view(size, m) else {
+            return;
+        };
+        let top_edge = view.rect.y;
+        let bottom_edge = view.rect.y + view.rect.h.saturating_sub(1);
+        let limit = self.host.scroll_limit(size, m);
+        let up = y <= top_edge && view.top() > 0 && m.scroll.0 < limit;
+        let down = y >= bottom_edge && m.scroll.0 > 0;
+        if up {
+            m.scroll = crate::moment::ScrollPos(m.scroll.0 + 1);
+        } else if down {
+            m.scroll = crate::moment::ScrollPos(m.scroll.0 - 1);
+        }
+        m.edge_scroll = (up || down).then_some((x, y));
+        let Some(view) = self.host.block_view(size, m) else {
+            return;
+        };
+        let y = y.clamp(top_edge, bottom_edge.max(top_edge));
+        let row = view
+            .row_at(y)
+            .or_else(|| view.last().filter(|_| y >= view.rect.y));
+        if let (Some(row), Some(sel)) = (row, m.stream_selection.as_mut()) {
+            sel.head = (view.col_at(x), row);
+        }
+        // The screen selection follows, so what asks "is anything selected"
+        // (the right-click menu) reads the drag rather than the press.
+        if let Some(sel) = m.stream_selection {
+            m.selection = Some(crate::moment::Selection {
+                anchor: view.screen_of(sel.anchor),
+                head: view.screen_of(sel.head),
+            });
+        }
+    }
+
     /// Whether one ↑/↓ would move the caret inside a draft of several rows
     /// rather than leave it — so that, with the mouse handed back, a lone arrow
     /// still edits a multi-line draft and only an arrow with nowhere to go in it
@@ -5698,15 +5784,26 @@ impl Tui {
         // those cells with different text leaves it pointing at the wrong
         // words, so it is dropped by everything except the gestures that are
         // *about* it.
-        if !matches!(
-            action,
-            Action::SelectFrom(..)
-                | Action::SelectTo(..)
-                | Action::SelectWord(..)
-                | Action::SelectLine(..)
-                | Action::CopySelection
-                | Action::ClearSelection
-        ) {
+        //
+        // A selection held in the conversation by what it covers is the
+        // exception for scrolling: it does not point at screen cells, so moving
+        // the view does not move it off its words — and keeping it is what lets
+        // a person scroll to see the rest of what they picked.
+        let kept_by_scroll = m.stream_selection.is_some()
+            && matches!(action, Action::Scroll(_) | Action::ScrollToBottom);
+        if !kept_by_scroll
+            && !matches!(
+                action,
+                Action::SelectFrom(..)
+                    | Action::SelectTo(..)
+                    | Action::SelectWord(..)
+                    | Action::SelectLine(..)
+                    | Action::CopySelection
+                    | Action::ClearSelection
+            )
+        {
+            m.stream_selection = None;
+            m.edge_scroll = None;
             // Escape does the innermost thing, and the selection is the
             // innermost of them.
             if m.selection.take().is_some() && matches!(action, Action::Escape) {
@@ -6624,12 +6721,23 @@ impl Tui {
                 return self.cycle_mode();
             }
 
+            // A drag that starts on the conversation is held by what it covers
+            // (`StreamSelection`), so it can run past the edge of the screen;
+            // anywhere else it is the screen selection it always was.
             Action::SelectFrom(x, y) => {
+                let size = self.surface.size();
+                m.stream_selection = self.host.block_view(size, &m).and_then(|view| {
+                    view.row_at(y)
+                        .map(|row| crate::moment::StreamSelection::at(view.col_at(x), row))
+                });
+                m.edge_scroll = None;
                 m.selection = Some(crate::moment::Selection::at(x, y));
                 return false;
             }
             Action::SelectTo(x, y) => {
-                if let Some(sel) = m.selection.as_mut() {
+                if m.stream_selection.is_some() {
+                    self.drag_in_conversation(&mut m, x, y);
+                } else if let Some(sel) = m.selection.as_mut() {
                     sel.head = (x, y);
                 }
                 return false;
@@ -6640,6 +6748,8 @@ impl Tui {
             // selection is set back on it, the same drop/compose dance as
             // `CopySelection`.
             Action::SelectWord(x, y) => {
+                m.stream_selection = None;
+                m.edge_scroll = None;
                 drop(m);
                 let frame = self.host.compose(self.surface.size());
                 if let Some(sel) = frame.word_at(x, y) {
@@ -6652,6 +6762,8 @@ impl Tui {
                 return false;
             }
             Action::SelectLine(_x, y) => {
+                m.stream_selection = None;
+                m.edge_scroll = None;
                 drop(m);
                 let frame = self.host.compose(self.surface.size());
                 if let Some(sel) = frame.line_at(y) {
@@ -6665,16 +6777,36 @@ impl Tui {
             }
             Action::ClearSelection => {
                 m.selection = None;
+                m.stream_selection = None;
+                m.edge_scroll = None;
                 return false;
             }
             // Copy on release, the way a terminal does it. The highlight stays
             // up afterwards so a person can see what they took.
             Action::CopySelection => {
+                // The drag is over: whatever held the view at an edge lets go.
+                m.edge_scroll = None;
                 let Some(sel) = m.selection else {
                     return false;
                 };
-                drop(m);
-                let text = self.host.compose(self.surface.size()).selected_text(&sel);
+                let held = m.stream_selection;
+                let size = self.surface.size();
+                // A conversation selection is copied from the conversation's own
+                // rows — the ones scrolled off screen too; a screen one from the
+                // screen, as before.
+                // The moment is let go before anything below takes it again
+                // (the confirmation on the tip row writes to it).
+                let text = match held {
+                    Some(held) => {
+                        let text = self.host.block_text(size, &m, &held);
+                        drop(m);
+                        text
+                    }
+                    None => {
+                        drop(m);
+                        self.host.compose(size).selected_text(&sel)
+                    }
+                };
                 if !text.is_empty() {
                     // Confirm on the tip row, the way the right-click `copy` menu
                     // item does — the auto-copy of a drag-release is still a copy,
@@ -7331,12 +7463,21 @@ impl Tui {
                 // first answer — `复制全文` sent a selection to the clipboard as
                 // the composer's contents, which on a right-click over selected
                 // text copied the wrong thing entirely.
-                let selected = {
+                let (selected, held) = {
                     let m = self.host.moment.read().expect("moment poisoned");
-                    m.selection.filter(|s| !s.is_empty())
+                    (m.selection.filter(|s| !s.is_empty()), m.stream_selection)
                 };
                 if let Some(sel) = selected {
-                    let text = self.host.compose(self.surface.size()).selected_text(&sel);
+                    let size = self.surface.size();
+                    // A conversation selection from the conversation's rows,
+                    // scrolled-off ones included; a screen one from the screen.
+                    let text = match held {
+                        Some(held) => {
+                            let m = self.host.moment.read().expect("moment poisoned");
+                            self.host.block_text(size, &m, &held)
+                        }
+                        None => self.host.compose(size).selected_text(&sel),
+                    };
                     if !text.is_empty() {
                         let how = self.surface.copy(&text);
                         // The reserved row above the field, not the stream: this
@@ -8149,6 +8290,9 @@ async fn pump_input<S>(
         next_up = after;
     }
 }
+
+/// How often a drag held at the conversation's edge scrolls it by a row.
+const EDGE_SCROLL_EVERY: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// How long the mouse notices stay on the tip row: long enough to read the
 /// keys in them, short enough that they are gone before they are furniture.

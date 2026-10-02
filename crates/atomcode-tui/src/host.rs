@@ -1180,6 +1180,68 @@ struct Pane {
     tail: Vec<(String, Rect)>,
 }
 
+/// Where the conversation's blocks are drawn on a screen of some size, and
+/// which of their rows are in view — the geometry a selection is held in.
+///
+/// Rows are counted from the top of the conversation's rendered rows
+/// (`total` of them); the window shows `[top(), top() + rect.h)`. Worked out
+/// the way [`Host::compose`] draws the pane ([`Host::block_view`]), so a row
+/// here and a row on screen are the same row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockView {
+    pub rect: Rect,
+    /// The blocks' own offset from the bottom (`Pane::block_scroll`).
+    pub scroll: usize,
+    pub total: usize,
+}
+
+impl BlockView {
+    /// The first row in view.
+    pub fn top(&self) -> usize {
+        self.total
+            .saturating_sub(self.scroll.saturating_add(self.rect.h as usize))
+    }
+
+    /// The last row there is, if there is one.
+    pub fn last(&self) -> Option<usize> {
+        self.total.checked_sub(1)
+    }
+
+    /// The conversation row drawn at screen row `y`; `None` outside the
+    /// blocks' area or below the last row.
+    pub fn row_at(&self, y: u16) -> Option<usize> {
+        if y < self.rect.y || y >= self.rect.y.saturating_add(self.rect.h) {
+            return None;
+        }
+        let row = self.top() + (y - self.rect.y) as usize;
+        (row < self.total).then_some(row)
+    }
+
+    /// A screen column as a column of the blocks' area.
+    pub fn col_at(&self, x: u16) -> u16 {
+        x.saturating_sub(self.rect.x)
+    }
+
+    /// Where `(col, row)` is on screen, clamped into the visible rows: a point
+    /// above the window lands at the start of the top row, one below at the end
+    /// of the bottom row — so a selection reaching off screen is drawn up to the
+    /// edge and no further.
+    pub fn screen_of(&self, (col, row): (u16, usize)) -> (u16, u16) {
+        let h = self.rect.h.max(1);
+        let top = self.top();
+        if row < top {
+            (self.rect.x, self.rect.y)
+        } else if row >= top + h as usize {
+            (
+                self.rect.x + self.rect.w.saturating_sub(1),
+                self.rect.y + h - 1,
+            )
+        } else {
+            (self.rect.x + col, self.rect.y + (row - top) as u16)
+        }
+    }
+}
+
 /// Which block each row of the stream came from, and where the stream was.
 ///
 /// Composing is where this is known and clicking is where it is needed, so the
@@ -1692,6 +1754,8 @@ impl Host {
         m.activity = crate::moment::Activity::Idle;
         m.scroll = crate::moment::ScrollPos::BOTTOM;
         m.selection = None;
+        m.stream_selection = None;
+        m.edge_scroll = None;
         m.turn_started = None;
         m.quiet_since = None;
         m.steering.clear();
@@ -5483,12 +5547,13 @@ impl Host {
                 }
                 // `<=` because a block whose last row is the first off-screen one
                 // is wholly above the reader. `skipped` never passes `scroll`:
-                // each pass adds n and the guard already proved it fits.
-                if n <= scroll.saturating_sub(skipped) {
-                    skipped += n;
-                    if below.is_some_and(|b| blank_between(kind, b)) {
-                        skipped += 1;
-                    }
+                // each pass adds the block's rows *and the blank under it*, and
+                // the guard proved both fit — counting only `n` let the seam
+                // push `skipped` one past `scroll`, and the window then started
+                // a row higher than the scroll said.
+                let seam = usize::from(below.is_some_and(|b| blank_between(kind, b)));
+                if n + seam <= scroll.saturating_sub(skipped) {
+                    skipped += n + seam;
                     below = Some(kind);
                     continue;
                 }
@@ -5557,11 +5622,9 @@ impl Host {
             if out.len() >= want {
                 break;
             }
-            if n <= scroll.saturating_sub(skipped) {
-                skipped += n;
-                if below.is_some_and(|b| blank_between(kind, b)) {
-                    skipped += 1;
-                }
+            let seam = usize::from(below.is_some_and(|b| blank_between(kind, b)));
+            if n + seam <= scroll.saturating_sub(skipped) {
+                skipped += n + seam;
                 below = Some(kind);
                 continue;
             }
@@ -5630,22 +5693,9 @@ impl Host {
         // road `members` travels. One `Arc` bump per frame: the map is rebuilt on
         // a write, not on a draw.
         moment.rasters = self.rasters.view();
-        // A flow that is up (the onboarding or pairing wizard), drawn into the
-        // moment at this width so the bottom panel that shows it
-        // (`modules::flow`) is as tall as what it says. Here for the reason the
-        // rasters are: a module draws from the moment, and the flow is live
-        // state the host keeps. Without that module mounted, it is drawn in a
-        // box over the screen instead (below).
-        if self.modules.has_view(crate::modules::flow::ID) {
-            if let Some(modal) = self.overlays.current() {
-                let lines = modal.render(&crate::moment::Viewport::new(Rect::sized(w, h), &moment));
-                moment.flow = Some(crate::overlay::Shown {
-                    id: modal.id().to_string(),
-                    title: modal.title(),
-                    lines,
-                });
-            }
-        }
+        // A wizard that is up, into the moment for the same reason the rasters
+        // are: a module draws from the moment. Drawn in a box below otherwise.
+        self.show_flow(&mut moment, size);
         // The shape half of what this terminal can draw, taken once from the
         // moment this frame was composed against and handed down. Built here
         // rather than read inside `rows_at` because `stream_height`'s contract is
@@ -5675,6 +5725,19 @@ impl Host {
                     // frame it did before the split existed.
                     let heights = self.tail_heights_of(&tail, rect.w, &moment);
                     let pane = Self::pane_geometry(rect, moment.scroll.0, &heights);
+                    // A selection held by what it covers is drawn where that is
+                    // now — this frame's window onto it.
+                    if let Some(sel) = moment.stream_selection {
+                        let view = BlockView {
+                            rect: pane.block_rect,
+                            scroll: pane.block_scroll,
+                            total: self.block_total(pane.block_rect.w, &moment),
+                        };
+                        moment.selection = Some(crate::moment::Selection {
+                            anchor: view.screen_of(sel.anchor),
+                            head: view.screen_of(sel.head),
+                        });
+                    }
                     let (lines, owners) = self.stream_lines(
                         pane.block_rect,
                         pane.block_scroll,
@@ -6174,6 +6237,145 @@ impl Host {
         }
         idx.total = acc;
         idx
+    }
+
+    /// The conversation's blocks on a screen of `size` with this moment's
+    /// scroll — the same pane split [`Host::compose`] makes. `None` when the
+    /// layout has no conversation.
+    pub fn block_view(&self, size: (u16, u16), moment: &Moment) -> Option<BlockView> {
+        let (w, h) = size;
+        // The bottom panel a wizard draws into is as tall as what it says, and
+        // that is filled in per frame (`show_flow`) — so laid out here the same
+        // way, or the pane measured is not the pane drawn.
+        let shown;
+        let moment = if self.flow_in_panel() {
+            let mut m = moment.clone();
+            self.show_flow(&mut m, size);
+            shown = m;
+            &shown
+        } else {
+            moment
+        };
+        let modules = self.modules.clone();
+        let pruned = self.layout.tree().prune(&|id| modules.has_view(id));
+        let asked = |id: &str| -> u16 { asked_height(&modules, id, moment, w) };
+        let (rect, tail) = pruned
+            .layout_with(Rect::sized(w, h), &asked)
+            .into_iter()
+            .find_map(|(region, rect)| match region {
+                Region::Stream { tail } => Some((rect, tail)),
+                _ => None,
+            })?;
+        let heights = self.tail_heights_of(&tail, rect.w, moment);
+        let pane = Self::pane_geometry(rect, moment.scroll.0, &heights);
+        Some(BlockView {
+            rect: pane.block_rect,
+            scroll: pane.block_scroll,
+            total: self.block_total(pane.block_rect.w, moment),
+        })
+    }
+
+    /// How many rows the conversation's blocks render to at `width` — the
+    /// painter's own count ([`Host::row_index`]), tail not included.
+    fn block_total(&self, width: u16, moment: &Moment) -> usize {
+        let caps = crate::block::ShapeCaps::of(&moment.caps);
+        let stream = self.stream.read().expect("stream poisoned");
+        let pres = self.presentation.read().expect("presentation poisoned");
+        self.row_index(
+            &crate::block::RenderCtx { width, caps },
+            stream.slots(),
+            &pres,
+            moment.activity,
+        )
+        .total
+    }
+
+    /// The text a conversation selection covers, rendered from the blocks
+    /// themselves — rows scrolled off screen included — and cut by cells the
+    /// way [`crate::frame::Frame::selected_text`] cuts a screen row, so a
+    /// selection copies the same whether it fit on one screen or not.
+    pub fn block_text(
+        &self,
+        size: (u16, u16),
+        moment: &Moment,
+        sel: &crate::moment::StreamSelection,
+    ) -> String {
+        if sel.is_empty() {
+            return String::new();
+        }
+        let Some(view) = self.block_view(size, moment) else {
+            return String::new();
+        };
+        let Some(end) = view.last() else {
+            return String::new();
+        };
+        let ((first_col, first), (last_col, last)) = sel.ends();
+        let last = last.min(end);
+        let first = first.min(last);
+        let rows = last - first + 1;
+        let rect = Rect::new(
+            view.rect.x,
+            0,
+            view.rect.w,
+            rows.min(u16::MAX as usize) as u16,
+        );
+        let (lines, _) = self.stream_lines(
+            rect,
+            end - last,
+            crate::block::ShapeCaps::of(&moment.caps),
+            moment.activity,
+            moment.tick,
+        );
+        let width = view.rect.w;
+        let mut out: Vec<String> = Vec::with_capacity(lines.len());
+        for (i, line) in lines.iter().take(rows).enumerate() {
+            let row = first + i;
+            let a = if row == first { first_col } else { 0 };
+            let b = if row == last {
+                last_col.saturating_add(1).min(width)
+            } else {
+                width
+            };
+            if a >= b {
+                out.push(String::new());
+                continue;
+            }
+            let text = line.plain();
+            let head = crate::width::take_width(&text, a as usize);
+            #[allow(
+                clippy::string_slice,
+                reason = "cut at the length of a take_width prefix, which is a grapheme boundary"
+            )]
+            let rest = &text[head.len()..];
+            let piece = crate::width::take_width(rest, (b - a) as usize);
+            out.push(piece.trim_end().to_string());
+        }
+        out.join("\n")
+    }
+
+    /// Whether a flow that is up (the onboarding or pairing wizard) is drawn
+    /// in its bottom panel rather than in a box over the screen.
+    fn flow_in_panel(&self) -> bool {
+        self.modules.has_view(crate::modules::flow::ID) && self.overlays.current().is_some()
+    }
+
+    /// A flow that is up, drawn into the moment at this width so the bottom
+    /// panel that shows it (`modules::flow`) is as tall as what it says. A
+    /// module draws from the moment, and the flow is live state the host keeps.
+    /// Without that module mounted, it is drawn in a box over the screen
+    /// instead (see [`Host::compose`]).
+    fn show_flow(&self, moment: &mut Moment, (w, h): (u16, u16)) {
+        if !self.modules.has_view(crate::modules::flow::ID) {
+            return;
+        }
+        if let Some(modal) = self.overlays.current() {
+            let lines = modal.render(&crate::moment::Viewport::new(Rect::sized(w, h), moment));
+            moment.flow = Some(crate::overlay::Shown {
+                id: modal.id().to_string(),
+                title: modal.title(),
+                lines,
+            });
+        }
     }
 
     /// [`Host::stream_height`] for a caller that already knows the box.
@@ -10041,6 +10243,64 @@ mod tests {
                 walked.1, jumped.1,
                 "at scroll {scroll} the jump attributed the rows differently, so \
                  a click would fold a different block"
+            );
+        }
+    }
+
+    /// A window of any height at any scroll is the slice of the whole stream
+    /// that scroll names — the property selecting across screens copies by.
+    ///
+    /// The blank seam under a block skipped whole used to be counted *after*
+    /// the guard that proved the block fit, so a window whose bottom row was a
+    /// seam stepped over one row too many and began a row higher than its
+    /// scroll said. Every scroll is checked, because the slip only showed at
+    /// the positions that land on a seam.
+    #[test]
+    fn a_window_at_any_scroll_is_that_slice_of_the_stream() {
+        let h = host();
+        {
+            let mut s = h.stream.write().unwrap();
+            let mut w = s.writer("bench");
+            for i in 0..12usize {
+                w.emit(
+                    crate::block::Coord::default(),
+                    Arc::new(Kinded {
+                        // A user line between answers is what puts seams in.
+                        kind: ["user", "assistant", "assistant"][i % 3],
+                        lines: (0..(1 + i % 3))
+                            .map(|r| format!("note {i} row {r}"))
+                            .collect(),
+                    }),
+                );
+            }
+        }
+        let caps = crate::block::ShapeCaps::of(&crate::caps::Caps::default());
+        let draw = |rows: u16, scroll: usize| -> Vec<String> {
+            h.stream_lines(
+                Rect::sized(80, rows),
+                scroll,
+                caps,
+                crate::moment::Activity::Idle,
+                0,
+            )
+            .0
+            .iter()
+            .map(|l| l.plain())
+            .collect()
+        };
+        let whole = draw(400, 0);
+        let total = whole.iter().rposition(|l| !l.is_empty()).unwrap() + 1;
+        let whole = &whole[..total];
+        assert!(
+            whole.iter().any(String::is_empty),
+            "the fixture must have seams to land on: {whole:?}"
+        );
+        for scroll in 0..total {
+            let row = total - 1 - scroll;
+            assert_eq!(
+                draw(1, scroll),
+                vec![whole[row].clone()],
+                "one row at scroll {scroll} is row {row} of the stream"
             );
         }
     }

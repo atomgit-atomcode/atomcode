@@ -3967,6 +3967,154 @@ async fn a_drag_selection_confirms_the_copy_right_away() {
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
 
+/// A reply of sixty lines, numbered, for the selections that run past a screen.
+fn sixty_lines() -> String {
+    let lines: Vec<String> = (1..=60).map(|n| format!("LINE-{n:02}")).collect();
+    format!(r#"{{ text = "{}" }}"#, lines.join("\\n\\n"))
+}
+
+/// Press on the newest line of a long reply and drag to the conversation's top
+/// edge: each drag there scrolls the view a row and the selection follows, so
+/// what is copied reaches lines that were never on the first screen — the
+/// selection is held by the text it covers, not by screen cells.
+#[tokio::test]
+async fn a_drag_past_the_top_edge_selects_beyond_the_screen() {
+    let dir = scratch("drag-past-edge");
+    let s = start(tree(&dir, &replay(&sixty_lines()), &[])).await;
+    let task = s.open().await;
+    s.term.type_line("count to sixty");
+    until(&s, "LINE-60").await;
+    s.quiet().await;
+    assert!(!s.screen().contains("LINE-10"), "line 10 starts off screen");
+
+    let row = s
+        .screen()
+        .lines()
+        .position(|l| l.contains("LINE-60"))
+        .expect("the last line is on screen") as u16;
+    let stream = s.term.last().unwrap().part("stream").unwrap().rect;
+    use atomcode_tui::surface::Click;
+    s.term.pointer(Click::Press, stream.right() - 1, row);
+    for _ in 0..120 {
+        s.term.pointer(Click::Drag, stream.x, stream.y);
+    }
+    s.term.pointer(Click::Release, stream.x, stream.y);
+    s.quiet().await;
+
+    let copied = s.term.clipboard_text().expect("the drag copied");
+    assert!(
+        copied.contains("LINE-10"),
+        "reached past the screen:\n{copied}"
+    );
+    assert!(
+        copied.contains("LINE-60"),
+        "and kept where it started:\n{copied}"
+    );
+    let order = (copied.find("LINE-10"), copied.find("LINE-60"));
+    assert!(
+        matches!(order, (Some(a), Some(b)) if a < b),
+        "in reading order"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+/// Held still at the edge, the view keeps scrolling: the terminal reports a
+/// drag only when the pointer moves, so a timer carries it on.
+#[tokio::test]
+async fn a_drag_held_at_the_edge_keeps_scrolling() {
+    let dir = scratch("drag-held-at-edge");
+    let s = start(tree(&dir, &replay(&sixty_lines()), &[])).await;
+    let task = s.open().await;
+    s.term.type_line("count to sixty");
+    until(&s, "LINE-60").await;
+    s.quiet().await;
+
+    let row = s
+        .screen()
+        .lines()
+        .position(|l| l.contains("LINE-60"))
+        .expect("the last line is on screen") as u16;
+    let stream = s.term.last().unwrap().part("stream").unwrap().rect;
+    use atomcode_tui::surface::Click;
+    s.term.pointer(Click::Press, stream.right() - 1, row);
+    s.term.pointer(Click::Drag, stream.x, stream.y);
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    s.term.pointer(Click::Release, stream.x, stream.y);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let copied = s.term.clipboard_text().expect("the drag copied");
+    let first = copied.lines().find(|l| l.contains("LINE-")).unwrap_or("");
+    let earliest: u32 = first
+        .trim()
+        .trim_start_matches("LINE-")
+        .parse()
+        .unwrap_or(99);
+    assert!(
+        earliest < 40,
+        "the view kept moving while the pointer was still (got to {first:?}):\n{copied}"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+/// The wheel moves the view and leaves a conversation selection where it was:
+/// scrolled away and back, it is still there for the menu to copy.
+#[tokio::test]
+async fn a_selection_survives_the_wheel() {
+    let dir = scratch("selection-wheel");
+    let s = start(tree(&dir, &replay(&sixty_lines()), &[])).await;
+    let task = s.open().await;
+    s.term.type_line("count to sixty");
+    until(&s, "LINE-60").await;
+    s.quiet().await;
+
+    let at = |s: &Session, what: &str| {
+        s.screen()
+            .lines()
+            .position(|l| l.contains(what))
+            .expect("on screen") as u16
+    };
+    let (from, to) = (at(&s, "LINE-58"), at(&s, "LINE-60"));
+    let stream = s.term.last().unwrap().part("stream").unwrap().rect;
+    use atomcode_tui::surface::Click;
+    s.term.pointer(Click::Press, stream.x, from);
+    s.term.pointer(Click::Drag, stream.right() - 1, to);
+    s.term.pointer(Click::Release, stream.right() - 1, to);
+    s.quiet().await;
+    let taken = s.term.clipboard_text().expect("copied");
+    assert!(
+        taken.contains("LINE-58") && taken.contains("LINE-60"),
+        "{taken}"
+    );
+
+    for _ in 0..3 {
+        s.term.pointer(Click::WheelUp, stream.x + 2, stream.y + 2);
+    }
+    s.quiet().await;
+    for _ in 0..3 {
+        s.term.pointer(Click::WheelDown, stream.x + 2, stream.y + 2);
+    }
+    s.quiet().await;
+
+    right_click(&s, stream.x + 2, from);
+    s.quiet().await;
+    assert!(
+        s.screen().contains("复制选中"),
+        "the selection outlived the wheel:\n{}",
+        s.screen()
+    );
+    s.term.set_clipboard_text("<untouched>");
+    s.term.press(KeyPress::plain(Key::Enter));
+    s.quiet().await;
+    assert_eq!(s.term.clipboard_text().as_deref(), Some(taken.as_str()));
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
 #[tokio::test]
 async fn right_click_over_a_selection_copies_the_selection_and_not_the_field() {
     // A right-click usually lands on text that was just selected, and the menu

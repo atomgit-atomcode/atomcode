@@ -115,6 +115,47 @@ impl Selection {
     }
 }
 
+/// A selection in the conversation, held by **what it covers** rather than by
+/// where that is on screen: `(column, row)`, the row counted from the top of
+/// the conversation's rendered rows and the column from the left of the blocks'
+/// area. A screen selection stops meaning anything the moment the view
+/// scrolls; this one keeps covering the same text, which is what lets a drag
+/// carry on past the edge of the screen (the view scrolls under it) and lets
+/// the wheel move the view without losing what was picked.
+///
+/// The painter still draws a [`Selection`] in cells: this one is projected onto
+/// the screen each frame ([`crate::host::BlockView::screen_of`]), clamped to the
+/// visible rows, and copied from the conversation's own rows, on screen or off
+/// ([`crate::host::Host::block_text`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StreamSelection {
+    pub anchor: (u16, usize),
+    pub head: (u16, usize),
+}
+
+impl StreamSelection {
+    pub fn at(col: u16, row: usize) -> Self {
+        Self {
+            anchor: (col, row),
+            head: (col, row),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.anchor == self.head
+    }
+
+    /// The two ends in reading order.
+    pub fn ends(&self) -> ((u16, usize), (u16, usize)) {
+        let (a, h) = (self.anchor, self.head);
+        if (a.1, a.0) <= (h.1, h.0) {
+            (a, h)
+        } else {
+            (h, a)
+        }
+    }
+}
+
 /// How long a [`Notice`] is shown for, in milliseconds.
 ///
 /// Three seconds: long enough to read a short line without hunting for it, short
@@ -403,6 +444,14 @@ pub struct Moment {
     /// What the pointer has selected, if anything. Screen state, not a fact —
     /// which is exactly what this struct is for.
     pub selection: Option<Selection>,
+    /// The selection in the conversation, by what it covers — set when a drag
+    /// starts on the conversation's rows. While it is up, [`Self::selection`]
+    /// is its projection onto the screen. See [`StreamSelection`].
+    pub stream_selection: Option<StreamSelection>,
+    /// Where the pointer is while a drag holds it at the conversation's top or
+    /// bottom edge: the view keeps scrolling under it on a timer, because the
+    /// terminal reports a drag only when the pointer moves.
+    pub edge_scroll: Option<(u16, u16)>,
     /// Everything the person has said this session, oldest first.
     ///
     /// Folded from the log rather than appended at submit, so a resumed session
