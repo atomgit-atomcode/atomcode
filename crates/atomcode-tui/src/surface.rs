@@ -805,14 +805,69 @@ fn enable_vt_output() {
 ///
 /// `false` only on a Windows console too old to have the mode at all; anywhere
 /// else this screen's sequences are what the terminal speaks.
+///
+/// crossterm's answer alone is not enough: when turning the mode on fails it
+/// still says yes if `TERM` is set (for Git Bash's mintty, which is no console
+/// at all), and `TERM=xterm` is what Git and MSYS leave in many Windows
+/// developers' environment. On a console too old for the mode that was a yes,
+/// and the screenful of escape text again. So where the output *is* a console,
+/// its mode is read back and is the answer ([`speaks_ansi_given`]).
 pub fn console_speaks_ansi() -> bool {
     #[cfg(windows)]
     {
-        crossterm::ansi_support::supports_ansi()
+        // First, so the mode is asked for before it is read back.
+        let crossterm_said = crossterm::ansi_support::supports_ansi();
+        speaks_ansi_given(crossterm_said, win_console::output_vt_mode())
     }
     #[cfg(not(windows))]
     {
         true
+    }
+}
+
+/// What the console's own mode says, over what crossterm said: `Some(on)` when
+/// the output is a console (its `ENABLE_VIRTUAL_TERMINAL_PROCESSING` bit, read
+/// after crossterm asked for it), `None` when it is not one — a pipe, or a
+/// pseudo-terminal like mintty's — where crossterm's `TERM` reading is the
+/// only answer there is.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn speaks_ansi_given(crossterm_said: bool, console_vt: Option<bool>) -> bool {
+    console_vt.unwrap_or(crossterm_said)
+}
+
+/// The two kernel32 calls it takes to read a console's mode. kernel32 is
+/// linked by the standard library on Windows already, so declaring them costs
+/// no new dependency.
+#[cfg(windows)]
+mod win_console {
+    type Handle = *mut core::ffi::c_void;
+    /// `(DWORD)-11`.
+    const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5;
+    const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetStdHandle(which: u32) -> Handle;
+        fn GetConsoleMode(console: Handle, mode: *mut u32) -> i32;
+    }
+
+    /// Whether the standard output's console executes VT sequences; `None`
+    /// when standard output is not a console.
+    pub(super) fn output_vt_mode() -> Option<bool> {
+        // SAFETY: `GetStdHandle` takes a constant and returns a handle we only
+        // pass on; `GetConsoleMode` writes one `u32` through a pointer to a
+        // local. Neither keeps either pointer.
+        unsafe {
+            let handle = GetStdHandle(STD_OUTPUT_HANDLE);
+            if handle.is_null() || handle as isize == -1 {
+                return None;
+            }
+            let mut mode = 0u32;
+            if GetConsoleMode(handle, &mut mode) == 0 {
+                return None;
+            }
+            Some(mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0)
+        }
     }
 }
 
@@ -2047,6 +2102,22 @@ pub fn from_crossterm(event: crossterm::event::Event) -> Option<Input> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A console's own mode is the answer where there is a console: crossterm
+    /// says yes whenever `TERM` is set even if turning the mode on failed, and
+    /// on a console too old for the mode that yes was a screen of escape text.
+    /// Where the output is not a console (mintty, a pipe), crossterm's reading
+    /// of `TERM` is all there is.
+    #[test]
+    fn a_console_that_did_not_take_the_mode_does_not_speak_ansi() {
+        assert!(!speaks_ansi_given(true, Some(false)), "TERM set, mode off");
+        assert!(speaks_ansi_given(false, Some(true)), "the mode is on");
+        assert!(
+            speaks_ansi_given(true, None),
+            "not a console: crossterm's say"
+        );
+        assert!(!speaks_ansi_given(false, None));
+    }
     use crate::frame::{Line, Rect};
 
     /// 一次不能确认的复制,不许说成一次复制好了的。
