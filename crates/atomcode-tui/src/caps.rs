@@ -208,14 +208,19 @@ impl Default for Caps {
 ///   re-frames mouse reports as `CSI u` keys while it is on, so moving the
 ///   pointer typed coordinates into the composer.
 ///
-/// `ATOMCODE_KITTY` forces it either way; `ATOMCODE_JEDITERM` says what the
-/// terminal is when a launcher dropped `TERMINAL_EMULATOR`.
+/// `ATOMCODE_KITTY` forces it either way — except on Windows, where nothing can
+/// read what it turns on, so forcing it would only bring the bug back (tuix
+/// gates the same way). `ATOMCODE_JEDITERM` says what the terminal is when a
+/// launcher dropped `TERMINAL_EMULATOR`.
 pub fn wants_keyboard_protocol() -> bool {
     keyboard_protocol_for(cfg!(windows), |k| std::env::var(k).ok())
 }
 
 fn keyboard_protocol_for(windows: bool, env: impl Fn(&str) -> Option<String>) -> bool {
     let truthy = |v: String| v == "1" || v.eq_ignore_ascii_case("true");
+    if windows {
+        return false;
+    }
     if let Some(forced) = env("ATOMCODE_KITTY").filter(|v| !v.is_empty()) {
         return truthy(forced);
     }
@@ -223,7 +228,7 @@ fn keyboard_protocol_for(windows: bool, env: impl Fn(&str) -> Option<String>) ->
         Some(forced) => truthy(forced),
         None => env("TERMINAL_EMULATOR").as_deref() == Some("JetBrains-JediTerm"),
     };
-    !windows && !jediterm
+    !jediterm
 }
 
 impl Caps {
@@ -647,8 +652,12 @@ mod tests {
             env(&[("ATOMCODE_JEDITERM", "1")])
         ));
         assert!(
-            keyboard_protocol_for(true, env(&[("ATOMCODE_KITTY", "1")])),
+            keyboard_protocol_for(false, env(&[("ATOMCODE_KITTY", "1")])),
             "forced on"
+        );
+        assert!(
+            !keyboard_protocol_for(true, env(&[("ATOMCODE_KITTY", "1")])),
+            "not even forced on Windows: nothing there can read it"
         );
         assert!(
             !keyboard_protocol_for(false, env(&[("ATOMCODE_KITTY", "0")])),
