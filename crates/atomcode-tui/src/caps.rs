@@ -273,17 +273,7 @@ impl Caps {
 
         let unicode = !(ascii_forced || term == "dumb" || posix_locale || legacy_conhost);
 
-        let colors = if env("NO_COLOR").is_some() || term == "dumb" {
-            Colors::None
-        } else if env("COLORTERM").is_some_and(|v| v.contains("truecolor") || v.contains("24bit")) {
-            Colors::True
-        } else if term.contains("256") || term.contains("kitty") || env("WT_SESSION").is_some() {
-            Colors::Ansi256
-        } else if term.is_empty() {
-            Colors::None
-        } else {
-            Colors::Ansi16
-        };
+        let colors = colors_for(&env, cfg!(windows));
 
         // Only what the environment states outright. Kitty and iTerm2 announce
         // themselves; sixel does not, and a guess here would have a component
@@ -424,6 +414,39 @@ fn ascii_for(ch: char) -> Option<&'static str> {
 ///
 /// Borrowed (zero-copy) when nothing needs doing, which is the common case on
 /// every modern terminal — the shield costs a scan, not an allocation.
+/// How many colours, from what the environment says.
+///
+/// An empty `TERM` means nothing on Windows, where no console sets it: Windows
+/// Terminal, VS Code and the console a PowerShell window opens in all leave it
+/// unset. Read as "no colour", that turned the screen black-and-white whenever
+/// the one variable that is set — Windows Terminal's `WT_SESSION` — did not
+/// survive the launch, which it does not when PowerShell is started first and
+/// handed to Windows Terminal as the default terminal. The classic screen
+/// coloured that same session (it colours any tty without `NO_COLOR`), so it
+/// read as a regression of the new one. On Windows this screen only runs once
+/// the console has agreed to execute escape sequences
+/// ([`crate::surface::console_speaks_ansi`]), and every console that can has
+/// 256 colours — so that is the answer there. Elsewhere an empty `TERM` is
+/// still a terminal that has said nothing about itself, and stays uncoloured.
+pub fn colors_for(env: &dyn Fn(&str) -> Option<String>, windows: bool) -> Colors {
+    let term = env("TERM").unwrap_or_default();
+    if env("NO_COLOR").is_some() || term == "dumb" {
+        Colors::None
+    } else if env("COLORTERM").is_some_and(|v| v.contains("truecolor") || v.contains("24bit")) {
+        Colors::True
+    } else if term.contains("256") || term.contains("kitty") || env("WT_SESSION").is_some() {
+        Colors::Ansi256
+    } else if term.is_empty() {
+        if windows {
+            Colors::Ansi256
+        } else {
+            Colors::None
+        }
+    } else {
+        Colors::Ansi16
+    }
+}
+
 pub fn downgrade(text: &str, unicode: bool) -> Cow<'_, str> {
     if unicode || text.is_ascii() || !text.chars().any(|c| ascii_for(c).is_some()) {
         return Cow::Borrowed(text);
@@ -965,6 +988,36 @@ mod tests {
             SPINNER[3],
             "a terminal that can draw braille did not get it"
         );
+    }
+
+    /// A Windows console with nothing set — the session Windows Terminal hosts
+    /// when PowerShell was started first and handed over, which arrives without
+    /// `WT_SESSION` — is coloured, as the classic screen colours it. Elsewhere
+    /// an empty `TERM` still says nothing, and `NO_COLOR` wins everywhere.
+    #[test]
+    fn a_windows_console_that_names_no_terminal_is_still_coloured() {
+        let with = |vars: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                vars.iter()
+                    .find(|(name, _)| *name == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let bare = with(&[]);
+        assert_eq!(colors_for(&bare, true), Colors::Ansi256);
+        assert_eq!(colors_for(&bare, false), Colors::None);
+
+        let wt = with(&[("WT_SESSION", "abc")]);
+        assert_eq!(colors_for(&wt, true), Colors::Ansi256);
+
+        let refused = with(&[("NO_COLOR", "1")]);
+        assert_eq!(colors_for(&refused, true), Colors::None);
+
+        let truecolor = with(&[("COLORTERM", "truecolor")]);
+        assert_eq!(colors_for(&truecolor, true), Colors::True);
+
+        let dumb = with(&[("TERM", "dumb")]);
+        assert_eq!(colors_for(&dumb, true), Colors::None);
     }
 
     #[test]
