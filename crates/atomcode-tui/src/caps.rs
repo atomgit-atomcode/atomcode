@@ -193,6 +193,39 @@ impl Default for Caps {
     }
 }
 
+/// Whether to ask the terminal for the keyboard protocol ([`crate::ansi::KEYS_ON`]).
+///
+/// tuix's rule (`should_enable_kitty_keyboard`), which is not kept twice for
+/// nothing — both exclusions are bug reports:
+///
+/// - **Windows.** Keys are read through the console API, which has no `CSI u`
+///   decoder: a terminal that honours the request (VS Code since 1.109,
+///   Windows Terminal) encodes esc as `ESC [ 27 u`, and ConPTY delivers it as
+///   the characters `[27u` into the composer. Esc stopped nothing, ctrl-c
+///   (`[99;5u`) cancelled nothing. Shift-enter is distinguishable there
+///   without the protocol: the console API reports the modifier.
+/// - **JediTerm** (IntelliJ-platform terminals). It advertises the protocol and
+///   re-frames mouse reports as `CSI u` keys while it is on, so moving the
+///   pointer typed coordinates into the composer.
+///
+/// `ATOMCODE_KITTY` forces it either way; `ATOMCODE_JEDITERM` says what the
+/// terminal is when a launcher dropped `TERMINAL_EMULATOR`.
+pub fn wants_keyboard_protocol() -> bool {
+    keyboard_protocol_for(cfg!(windows), |k| std::env::var(k).ok())
+}
+
+fn keyboard_protocol_for(windows: bool, env: impl Fn(&str) -> Option<String>) -> bool {
+    let truthy = |v: String| v == "1" || v.eq_ignore_ascii_case("true");
+    if let Some(forced) = env("ATOMCODE_KITTY").filter(|v| !v.is_empty()) {
+        return truthy(forced);
+    }
+    let jediterm = match env("ATOMCODE_JEDITERM").filter(|v| !v.is_empty()) {
+        Some(forced) => truthy(forced),
+        None => env("TERMINAL_EMULATOR").as_deref() == Some("JetBrains-JediTerm"),
+    };
+    !windows && !jediterm
+}
+
 impl Caps {
     /// The plainest terminal: ASCII, no colour. What CI and a pipe get.
     pub fn plain() -> Self {
@@ -582,6 +615,46 @@ pub fn glyph(unicode: bool, glyph: Glyph) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The keyboard protocol is asked for only where its keys can be read:
+    /// not on Windows (`[27u` typed for esc in VS Code), not in JediTerm
+    /// (mouse moves typed as keys), and either way when forced.
+    #[test]
+    fn the_keyboard_protocol_is_asked_for_only_where_it_can_be_read() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(name, _)| *name == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let vscode: &[(&str, &str)] = &[("TERM_PROGRAM", "vscode")];
+        assert!(
+            !keyboard_protocol_for(true, env(vscode)),
+            "VS Code on Windows"
+        );
+        assert!(
+            keyboard_protocol_for(false, env(vscode)),
+            "VS Code elsewhere"
+        );
+        assert!(!keyboard_protocol_for(
+            false,
+            env(&[("TERMINAL_EMULATOR", "JetBrains-JediTerm")])
+        ));
+        assert!(!keyboard_protocol_for(
+            false,
+            env(&[("ATOMCODE_JEDITERM", "1")])
+        ));
+        assert!(
+            keyboard_protocol_for(true, env(&[("ATOMCODE_KITTY", "1")])),
+            "forced on"
+        );
+        assert!(
+            !keyboard_protocol_for(false, env(&[("ATOMCODE_KITTY", "0")])),
+            "forced off"
+        );
+    }
     use crate::width;
 
     /// A build says what its terminals do, and detection does not get a vote on

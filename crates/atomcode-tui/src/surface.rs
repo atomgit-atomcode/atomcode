@@ -835,6 +835,9 @@ impl Terminal {
         crossterm::terminal::enable_raw_mode()?;
         let mut out = std::io::stdout();
         out.write_all(ansi::ENTER.as_bytes())?;
+        if crate::caps::wants_keyboard_protocol() {
+            out.write_all(ansi::KEYS_ON.as_bytes())?;
+        }
         // Before anything names the window, so leaving can put back whatever a
         // person had called it.
         out.write_all(ansi::SAVE_TITLE.as_bytes())?;

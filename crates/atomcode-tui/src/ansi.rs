@@ -56,14 +56,23 @@ pub const ERASE_LINE: &str = "\x1b[K";
 /// next prompt. With it the terminal wraps the text in markers and it arrives
 /// as one event, which is what `Input::Paste` was always written for.
 ///
-/// The last part asks the terminal to *disambiguate* keys (the keyboard
-/// protocol's flag 1). Without it a terminal sends the same byte — a carriage
-/// return — for enter, shift-enter and ctrl-enter, so "shift-enter inserts a
-/// newline" is not something an application can implement: the modifier never
-/// arrives. With it the key comes as `CSI 13;2u` and the difference is real.
-/// Terminals that do not know the sequence ignore it, and `ctrl-j` is bound to
-/// the same action for them.
-pub const ENTER: &str = "\x1b[?1049h\x1b[?7l\x1b[?2004h\x1b[?1004h\x1b[>1u\x1b[?25l";
+/// The keyboard protocol is not in here: it is [`KEYS_ON`], asked for only
+/// where the input reader can read what it turns on
+/// (`crate::caps::wants_keyboard_protocol`).
+pub const ENTER: &str = "\x1b[?1049h\x1b[?7l\x1b[?2004h\x1b[?1004h\x1b[?25l";
+/// Ask the terminal to *disambiguate* keys (the keyboard protocol's flag 1).
+/// Without it a terminal sends the same byte — a carriage return — for enter,
+/// shift-enter and ctrl-enter, so "shift-enter inserts a newline" is not
+/// something an application can implement: the modifier never arrives. With it
+/// the key comes as `CSI 13;2u` and the difference is real. Terminals that do
+/// not know the sequence ignore it, and `ctrl-j` is bound to the same action
+/// for them.
+///
+/// Only where the keys it turns on can be read back: on Windows the reader is
+/// the console API, which hands over a `CSI u` key as the characters it is
+/// made of — VS Code (which honours the request since 1.109) put `[27u` in the
+/// composer for esc and `[99;5u` for ctrl-c, and neither stopped anything.
+pub const KEYS_ON: &str = "\x1b[>1u";
 /// `?1004` is focus reporting: the terminal says when the window gains or loses
 /// focus. It is asked for so a finished turn can tell whether anybody was
 /// looking — a notification for work a person watched happen is noise, and the
@@ -71,9 +80,11 @@ pub const ENTER: &str = "\x1b[?1049h\x1b[?7l\x1b[?2004h\x1b[?1004h\x1b[>1u\x1b[?
 /// terminal that does not know the mode ignores it and the answer stays
 /// "unknown", which the notifier treats as "say it anyway".
 ///
-/// The exact inverse of [`ENTER`]. Popping the keyboard flags matters as much
-/// as leaving the alternate screen: a shell that inherits them sees every key
-/// in a form it does not expect.
+/// The exact inverse of [`ENTER`] and [`KEYS_ON`]. Popping the keyboard flags
+/// matters as much as leaving the alternate screen: a shell that inherits them
+/// sees every key in a form it does not expect. Popped whether or not they were
+/// pushed — a pop with nothing pushed changes nothing, and one that finds flags
+/// left behind clears them.
 pub const LEAVE: &str = "\x1b[?25h\x1b[<u\x1b[?1004l\x1b[?2004l\x1b[?7h\x1b[?1049l";
 /// Ask the terminal to report the pointer: button presses (1000) with SGR
 /// coordinates (1006), so columns past 223 are reportable at all.
@@ -965,7 +976,11 @@ mod tests {
         assert!(ENTER.contains("?2004h") && LEAVE.contains("?2004l"));
         // The keyboard protocol is pushed and popped, not just pushed: a shell
         // that inherits it sees every key in a form it does not expect.
-        assert!(ENTER.contains("[>1u") && LEAVE.contains("[<u"));
+        assert!(KEYS_ON == "\x1b[>1u" && LEAVE.contains("[<u"));
+        assert!(
+            !ENTER.contains("[>1u"),
+            "asked for apart, where it can be read"
+        );
         // Mouse reporting is separate because it is optional, but it has the
         // same obligation: a shell left reporting the pointer prints garbage
         // on every click.
