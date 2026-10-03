@@ -827,6 +827,16 @@ export interface ApprovalModeResponse {
   mode: ApprovalMode;
 }
 
+export interface LiveGoalProgress {
+  active: boolean;
+  round: number;
+  elapsed_secs: number;
+  condition: string;
+  terminal: string | null;
+  phase: string;
+  last_reason: string | null;
+}
+
 export interface TurnStats {
   duration_ms: number;
   rounds: number;
@@ -850,7 +860,8 @@ export interface PolicyInterventionEvent {
 }
 
 export type LiveWireEvent =
-  | { type: 'snapshot'; messages: SessionMessage[]; session_id: string; project_hash: string; provider: string; mode: ApprovalMode }
+  | { type: 'snapshot'; messages: SessionMessage[]; session_id: string; project_hash: string; provider: string; mode: ApprovalMode; goal?: LiveGoalProgress | null }
+  | ({ type: 'goal_changed' } & LiveGoalProgress)
   | { type: 'provider'; provider: string }
   | { type: 'reasoning_effort'; provider: string; effort: string | null; applicable: boolean }
   | { type: 'mode'; mode: ApprovalMode }
@@ -989,6 +1000,36 @@ export async function postLiveCompact(): Promise<{ accepted: boolean }> {
   if (!resp.ok) throw new Error(`live compact failed: ${resp.status}`);
   const body = await resp.json() as { accepted?: boolean };
   return { accepted: body.accepted === true };
+}
+
+export async function postLiveGoalStart(
+  condition: string,
+  sessionId?: string | null,
+): Promise<{ accepted: boolean; error?: string }> {
+  const resp = await fetch('/live/goal/start', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ condition, ...(sessionId ? { session_id: sessionId } : {}) }),
+  });
+  if (!resp.ok) throw new Error(`start live goal failed: ${resp.status}`);
+  const body = await resp.json() as { accepted?: boolean; error?: string };
+  return {
+    accepted: body.accepted === true,
+    ...(body.error ? { error: body.error } : {}),
+  };
+}
+
+export async function postLiveGoalStop(): Promise<{ accepted: boolean; error?: string }> {
+  const resp = await fetch('/live/goal/stop', {
+    method: 'POST',
+    headers: authHeaders(),
+  });
+  if (!resp.ok) throw new Error(`stop live goal failed: ${resp.status}`);
+  const body = await resp.json() as { accepted?: boolean; error?: string };
+  return {
+    accepted: body.accepted === true,
+    ...(body.error ? { error: body.error } : {}),
+  };
 }
 
 /** Ask the bound native runtime to resume an existing session. */

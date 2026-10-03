@@ -499,3 +499,33 @@ test('getActiveChatSessions reads the authoritative detached chat registry', asy
     globalThis.fetch = originalFetch;
   }
 });
+
+test('goal requests use the live runtime and preserve rejection details', async () => {
+  const calls: Array<{ url: string; init?: RequestInit }> = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+    calls.push({ url: String(url), init });
+    const body = calls.length === 1
+      ? { accepted: true }
+      : { accepted: false, error: 'goal is not active' };
+    return new Response(JSON.stringify(body), { status: 200 });
+  }) as typeof fetch;
+
+  try {
+    const { postLiveGoalStart, postLiveGoalStop } = await import('./api.ts');
+    assert.deepEqual(await postLiveGoalStart('finish the report', 'session-1'), { accepted: true });
+    assert.equal(calls[0].url, '/live/goal/start');
+    assert.deepEqual(JSON.parse(String(calls[0].init?.body)), {
+      condition: 'finish the report',
+      session_id: 'session-1',
+    });
+    assert.deepEqual(await postLiveGoalStop(), {
+      accepted: false,
+      error: 'goal is not active',
+    });
+    assert.equal(calls[1].url, '/live/goal/stop');
+    assert.equal(calls[1].init?.method, 'POST');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
