@@ -953,10 +953,21 @@ impl Listener<TurnStopping> for ToolLoopGuard {
 ///
 /// So this one keys on the call signature alone, with a higher threshold: nudge
 /// first, and only stop if the nudge does not change anything.
+///
+/// **Waiting is not looping.** A round whose calls ran for `poll_after` or
+/// longer is not counted: that is the model watching something that takes time
+/// — the same `sh -c 'while …; do sleep 55; done; grep …'` every round while a
+/// 1237-case regression creeps from 1115 to 1147 — and it was stopped at round
+/// six of a job that was going fine. A loop this fuse exists for burns a round
+/// in seconds; one that spends minutes per round is spending neither tokens nor
+/// the budget fast, and still meets every other stop (round cap, runaway fuse,
+/// a person).
 struct RepeatFuse {
     ctx: Context,
     nudge_at: u32,
     stop_at: u32,
+    /// `None`: every round counts, however long it ran.
+    poll_after: Option<std::time::Duration>,
     state: Mutex<RepeatState>,
 }
 
@@ -1013,7 +1024,21 @@ impl Waterfall<ToolsExecuteBatch> for RepeatFuse {
             state.rounds
         };
 
+        let started = tokio::time::Instant::now();
         let results = next.run(batch).await;
+
+        // It waited: a watch, not a loop. Not counted, and not nudged — the
+        // same call next round starts the count afresh.
+        if self
+            .poll_after
+            .is_some_and(|after| started.elapsed() >= after)
+        {
+            let mut state = self.state.lock().expect("repeat fuse poisoned");
+            if state.signature == round_signature(&batch.calls) {
+                state.rounds = 0;
+            }
+            return results;
+        }
 
         if rounds >= self.nudge_at {
             let mut state = self.state.lock().expect("repeat fuse poisoned");
@@ -1071,6 +1096,10 @@ impl Plugin for RepeatFusePlugin {
             nudge_at: u32,
             #[serde(default = "default_stop_at")]
             stop_at: u32,
+            /// A round that ran this long is a wait, not a repeat; `0`
+            /// counts every round.
+            #[serde(default = "default_poll_after_secs")]
+            poll_after_secs: u64,
         }
         fn default_nudge_at() -> u32 {
             3
@@ -1078,12 +1107,19 @@ impl Plugin for RepeatFusePlugin {
         fn default_stop_at() -> u32 {
             6
         }
-        let (nudge_at, stop_at) = if config.is_null() {
-            (default_nudge_at(), default_stop_at())
+        fn default_poll_after_secs() -> u64 {
+            60
+        }
+        let (nudge_at, stop_at, poll_after_secs) = if config.is_null() {
+            (
+                default_nudge_at(),
+                default_stop_at(),
+                default_poll_after_secs(),
+            )
         } else {
             let row: Row =
                 serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?;
-            (row.nudge_at, row.stop_at)
+            (row.nudge_at, row.stop_at, row.poll_after_secs)
         };
         if nudge_at >= stop_at {
             return Err("nudge_at must be lower than stop_at".into());
@@ -1092,6 +1128,8 @@ impl Plugin for RepeatFusePlugin {
             ctx: ctx.clone(),
             nudge_at,
             stop_at,
+            poll_after: (poll_after_secs > 0)
+                .then(|| std::time::Duration::from_secs(poll_after_secs)),
             state: Mutex::new(RepeatState::default()),
         });
         let _ = ctx.on_waterfall::<ToolsExecuteBatch>(fuse.clone(), false);

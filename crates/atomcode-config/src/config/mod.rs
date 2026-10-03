@@ -69,6 +69,11 @@ pub fn platform_rules() -> &'static str {
 pub struct CodingConfig {
     pub max_rounds: u32,
     pub shell_guard_policy: ShellGuardPolicy,
+    /// After how many rounds of the very same tool calls a turn is stopped as a
+    /// loop (`repeat-fuse`). Absent: the built-in 6. `0`: never. A round that
+    /// waited a minute or more is not counted either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat_stop_rounds: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -242,6 +247,7 @@ impl Default for CodingConfig {
         Self {
             max_rounds: 0,
             shell_guard_policy: ShellGuardPolicy::Prompt,
+            repeat_stop_rounds: None,
         }
     }
 }
