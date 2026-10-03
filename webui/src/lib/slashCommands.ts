@@ -32,6 +32,9 @@ export interface SlashHandlers {
   openSlashSkillsMenu(): void;
   notice(text: string): void;
   submitPrompt?(text: string): void | Promise<void>;
+  startGoal(condition: string): void | Promise<void>;
+  stopGoal(): void | Promise<void>;
+  showGoalStatus(): void | Promise<void>;
   execServerCommand(command: string, arg: string): void | Promise<void>;
   t(key: string, params?: Record<string, string | number>): string;
 }
@@ -67,6 +70,18 @@ export const FRONTEND_COMMANDS: SlashCommandDef[] = [
   { name: 'reload', descKey: 'cmd.reload.desc', run: (_a, h) => h.reloadConfig() },
   { name: 'skills', descKey: 'cmd.skills.desc', run: (_a, h) => h.openSlashSkillsMenu() },
   { name: 'help', descKey: 'cmd.help.desc', run: (_a, h) => h.notice(buildHelpText(h.t)) },
+  {
+    name: 'goal',
+    descKey: 'cmd.goal.desc',
+    argHint: '[condition|status|clear]',
+    run: (arg, h) => {
+      const command = arg.trim().toLowerCase();
+      if (!command || command === 'status') return h.showGoalStatus();
+      if (['clear', 'stop', 'off', 'reset', 'none', 'cancel'].includes(command)) return h.stopGoal();
+      if (['help', '?', '-h', '--help'].includes(command)) return h.notice(h.t('cmd.goal.help'));
+      return h.startGoal(arg);
+    },
+  },
   {
     name: 'review',
     descKey: 'cmd.review.desc',

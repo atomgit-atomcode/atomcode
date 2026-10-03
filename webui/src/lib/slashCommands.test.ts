@@ -55,6 +55,9 @@ function fakeHandlers(): { h: SlashHandlers; calls: string[] } {
     reloadConfig: () => { calls.push('reloadConfig'); },
     openSlashSkillsMenu: () => { calls.push('openSlashSkillsMenu'); },
     notice: (t) => { calls.push(`notice:${t}`); },
+    startGoal: (condition) => { calls.push(`goal:start:${condition}`); },
+    stopGoal: () => { calls.push('goal:stop'); },
+    showGoalStatus: () => { calls.push('goal:status'); },
     execServerCommand: (cmd, arg) => { calls.push(`exec:${cmd}:${arg}`); },
     t: (k) => k,
   };
@@ -107,6 +110,26 @@ test('/help notice lists command names', async () => {
   await dispatchSlashCommand('/help', map, h);
   assert.match(calls[0], /\/plan/);
   assert.match(calls[0], /\/model/);
+  assert.match(calls[0], /\/goal/);
+});
+
+test('/goal is visible and routes start, status, stop, and help', async () => {
+  const map = buildCommandMap(FRONTEND_COMMANDS);
+  const { h, calls } = fakeHandlers();
+  const items = buildSlashMenuItems(FRONTEND_COMMANDS, [], 'goal', (key) => key);
+  assert.deepEqual(items.map((item) => item.name), ['goal']);
+  await dispatchSlashCommand('/goal finish the report', map, h);
+  await dispatchSlashCommand('/goal', map, h);
+  await dispatchSlashCommand('/goal status', map, h);
+  await dispatchSlashCommand('/goal clear', map, h);
+  await dispatchSlashCommand('/goal help', map, h);
+  assert.deepEqual(calls, [
+    'goal:start:finish the report',
+    'goal:status',
+    'goal:status',
+    'goal:stop',
+    'notice:cmd.goal.help',
+  ]);
 });
 
 import { buildSlashMenuItems } from './slashCommands.ts';
@@ -141,6 +164,7 @@ test('/undo /remember /forget /memory dispatch to execServerCommand', async () =
     setMode: () => {}, openModelPicker: () => {}, setProvider: () => {},
     changeDir: () => {}, openSessionSidebar: () => {}, reloadConfig: () => {},
     openSlashSkillsMenu: () => {}, notice: (t) => { calls.push(`notice:${t}`); },
+    startGoal: () => {}, stopGoal: () => {}, showGoalStatus: () => {},
     execServerCommand: (cmd, arg) => { calls.push(`exec:${cmd}:${arg}`); },
     t: (k) => k,
   };
@@ -158,6 +182,7 @@ test('/context and /compact dispatch to execServerCommand', async () => {
     setMode: () => {}, openModelPicker: () => {}, setProvider: () => {}, changeDir: () => {},
     openSessionSidebar: () => {}, reloadConfig: () => {}, openSlashSkillsMenu: () => {},
     notice: () => {}, execServerCommand: (cmd, arg) => { calls.push(`exec:${cmd}:${arg}`); }, t: (k) => k,
+    startGoal: () => {}, stopGoal: () => {}, showGoalStatus: () => {},
   };
   const map = buildCommandMap(FRONTEND_COMMANDS);
   await dispatchSlashCommand('/context', map, h);
@@ -171,6 +196,7 @@ test('display commands dispatch to execServerCommand', async () => {
     setMode: () => {}, openModelPicker: () => {}, setProvider: () => {}, changeDir: () => {},
     openSessionSidebar: () => {}, reloadConfig: () => {}, openSlashSkillsMenu: () => {},
     notice: () => {}, execServerCommand: (cmd, arg) => { calls.push(`${cmd}:${arg}`); }, t: (k) => k,
+    startGoal: () => {}, stopGoal: () => {}, showGoalStatus: () => {},
   };
   const map = buildCommandMap(FRONTEND_COMMANDS);
   for (const c of ['whoami','status','config','diff','cost','todo']) await dispatchSlashCommand(`/${c}`, map, h);
@@ -183,6 +209,7 @@ test('/remember and /forget without arg emit a notice', async () => {
     setMode: () => {}, openModelPicker: () => {}, setProvider: () => {},
     changeDir: () => {}, openSessionSidebar: () => {}, reloadConfig: () => {},
     openSlashSkillsMenu: () => {}, notice: (t) => { calls.push(t); },
+    startGoal: () => {}, stopGoal: () => {}, showGoalStatus: () => {},
     execServerCommand: (cmd, arg) => { calls.push(`exec:${cmd}:${arg}`); },
     t: (k) => k,
   };
@@ -198,6 +225,7 @@ test('/review dispatches an explicit code_review scope through chat', async () =
     setMode: () => {}, openModelPicker: () => {}, setProvider: () => {},
     changeDir: () => {}, openSessionSidebar: () => {}, reloadConfig: () => {},
     openSlashSkillsMenu: () => {}, notice: () => {},
+    startGoal: () => {}, stopGoal: () => {}, showGoalStatus: () => {},
     submitPrompt: (text) => { prompts.push(text); },
     execServerCommand: () => {}, t: (k) => k,
   };
@@ -213,6 +241,7 @@ test('/review range JSON-escapes the ref without duplicating it into prose', asy
     setMode: () => {}, openModelPicker: () => {}, setProvider: () => {},
     changeDir: () => {}, openSessionSidebar: () => {}, reloadConfig: () => {},
     openSlashSkillsMenu: () => {}, notice: () => {},
+    startGoal: () => {}, stopGoal: () => {}, showGoalStatus: () => {},
     submitPrompt: (text) => { prompts.push(text); },
     execServerCommand: () => {}, t: (k) => k,
   };

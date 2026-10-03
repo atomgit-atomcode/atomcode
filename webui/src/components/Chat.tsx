@@ -27,7 +27,7 @@
 
 import { VNode } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, LiveWireEvent, SessionMessage, getSkills, SkillInfo, listDir, searchFiles, changeDir, postConfigReload, postCommand, postLiveCompact, postUserInputAnswer, postLivePolicyInterventionResolution, openWorkspaceFile, type CommandResult, type RoutedUserInputRequest, type PolicyInterventionEvent, type TurnStats } from '../api';
+import { streamChat, stopChat, cancelDetachedChat, getActiveChatSessions, SSEEvent, getSession, SessionMetaWithProject, getModels, ImageData, streamLive, postLiveMessage, postLiveStop, postLivePermission, postLiveProvider, postLiveMode, getApprovalMode, ApprovalMode, postLiveSwitchSession, postLiveGoalStart, postLiveGoalStop, LiveWireEvent, LiveGoalProgress, SessionMessage, getSkills, SkillInfo, listDir, searchFiles, changeDir, postConfigReload, postCommand, postLiveCompact, postUserInputAnswer, postLivePolicyInterventionResolution, openWorkspaceFile, type CommandResult, type RoutedUserInputRequest, type PolicyInterventionEvent, type TurnStats } from '../api';
 import {
   parseSlashCommand,
   buildCommandMap,
@@ -591,6 +591,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   });
   const syncRef = useRef(sync);
   syncRef.current = sync;
+  const liveGoalRef = useRef<LiveGoalProgress | null>(null);
   // Pending live-session permission request (shown as PermissionCard, calls /live/permission).
   // Kept separate from the non-sync `onPermission` prop so the /chat path is untouched.
   const [livePending, setLivePending] = useState<{ tool_name: string; reason: string; call_id: string; arguments: string } | null>(null);
@@ -1442,6 +1443,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     // snapshot：确立实时会话 id 并把视图切到它（连上即对齐）。
     if (e.type === 'snapshot') {
       liveSessionIdRef.current = e.session_id || null;
+      liveGoalRef.current = e.goal ?? null;
       // Historical timestamps come from the daemon's native transcript projection.
       // Older sessions may not have transcript records; leave those timestamps absent
       // instead of relabelling the whole conversation with the reconnect wall clock.
@@ -1486,6 +1488,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
         loadedForRef.current = e.session_id;
         onSessionId(e.session_id);
       }
+      return;
+    }
+    if (e.type === 'goal_changed') {
+      liveGoalRef.current = e.phase === 'ended' ? null : e;
       return;
     }
     // 模型切换是进程级（全局），与正在查看哪个会话无关。provider 事件是运行时
@@ -1963,6 +1969,47 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
           return;
         }
         void deliver(text, [], modeState.confirmedMode);
+      },
+      startGoal: async (condition) => {
+        const command = `/goal ${condition}`;
+        if (!syncRef.current) {
+          setInput((current) => current || command);
+          pushCommandNotice(t('cmd.goal.syncRequired'));
+          return;
+        }
+        if (busyRef.current) {
+          setInput((current) => current || command);
+          pushCommandNotice(t('cmd.session.busy'));
+          return;
+        }
+        try {
+          const result = await postLiveGoalStart(condition, liveSessionIdRef.current ?? sessionId);
+          if (!result.accepted) setInput((current) => current || command);
+          pushCommandNotice(result.accepted
+            ? t('cmd.goal.startRequested')
+            : (result.error ?? t('cmd.goal.rejected')));
+        } catch (error) {
+          setInput((current) => current || command);
+          throw error;
+        }
+      },
+      stopGoal: async () => {
+        if (!syncRef.current) { pushCommandNotice(t('cmd.goal.syncRequired')); return; }
+        const result = await postLiveGoalStop();
+        pushCommandNotice(result.accepted
+          ? t('cmd.goal.stopRequested')
+          : (result.error ?? t('cmd.goal.rejected')));
+      },
+      showGoalStatus: () => {
+        if (!syncRef.current) { pushCommandNotice(t('cmd.goal.syncRequired')); return; }
+        const goal = liveGoalRef.current;
+        if (!goal) { pushCommandNotice(t('cmd.goal.none')); return; }
+        let phase = goal.phase;
+        if (phase === 'pursuing') phase = t('cmd.goal.phase.pursuing');
+        if (phase === 'paused') phase = t('cmd.goal.phase.paused');
+        if (phase === 'paused_at_cap') phase = t('cmd.goal.phase.pausedAtCap');
+        if (phase === 'satisfied') phase = t('cmd.goal.phase.satisfied');
+        pushCommandNotice(t('cmd.goal.status', { condition: goal.condition, phase }));
       },
       execServerCommand: async (command, arg) => {
         const SESSION_MUTATING = new Set(['undo', 'compact']);
