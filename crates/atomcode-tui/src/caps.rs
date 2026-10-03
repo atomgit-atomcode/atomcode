@@ -84,9 +84,10 @@ pub enum Graphics {
 /// Detection reads the environment, and the environment lies in both
 /// directions: a corporate image ships `TERM=xterm` on an emulator that does
 /// 24-bit colour, and a CI runner claims a colour terminal while rendering into
-/// a log file. `ATOMCODE_ASCII` was the only way to say otherwise, and it
-/// answers one of the three questions — which is why a downstream build that
-/// ships to a fixed fleet of terminals ended up patching detection itself.
+/// a log file. `ATOMCODE_ASCII`/`ATOMCODE_UNICODE` were the only way to say
+/// otherwise, and they answer one of the three questions — which is why a
+/// downstream build that ships to a fixed fleet of terminals ended up patching
+/// detection itself.
 ///
 /// Empty by default: nothing overridden, detection stands. Set from the surface
 /// row's config (`unicode`, `colors`, `cell_background`), so a fleet states what
@@ -251,27 +252,19 @@ impl Caps {
 
     /// Read the environment. Called once, by the surface row.
     ///
-    /// The rules are `atomcode-tuix`'s, unchanged — they encode real bug
-    /// reports (legacy conhost showing `□`, `LANG=C` containers), and a second
-    /// set of heuristics would mean the two front ends disagree about the same
+    /// The rules are `atomcode-tuix`'s, with one deliberate divergence: Windows
+    /// no longer forces ASCII when it announces neither `WT_SESSION` nor
+    /// `TERM_PROGRAM` (see [`unicode_for`]), because this screen only runs on a
+    /// Windows console that already speaks ANSI — the same guarantee
+    /// [`colors_for`] leans on. The rest is kept because it encodes real bug
+    /// reports (`LANG=C` containers, `TERM=dumb`), and a second set of
+    /// heuristics would mean the two front ends disagree about the same
     /// terminal.
     pub fn detect() -> Self {
         let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
         let term = env("TERM").unwrap_or_default();
 
-        let ascii_forced = env("ATOMCODE_ASCII").is_some_and(|v| v != "0");
-        let posix_locale = ["LC_ALL", "LC_CTYPE", "LANG"]
-            .iter()
-            .filter_map(|k| env(k))
-            .any(|v| {
-                let v = v.to_ascii_uppercase();
-                v == "C" || v == "POSIX" || v.contains("ANSI_X3.4-1968")
-            });
-        // Windows before Terminal: conhost sets neither of these.
-        let legacy_conhost =
-            cfg!(windows) && env("WT_SESSION").is_none() && env("TERM_PROGRAM").is_none();
-
-        let unicode = !(ascii_forced || term == "dumb" || posix_locale || legacy_conhost);
+        let unicode = unicode_for(&env);
 
         let colors = colors_for(&env, cfg!(windows));
 
@@ -445,6 +438,37 @@ pub fn colors_for(env: &dyn Fn(&str) -> Option<String>, windows: bool) -> Colors
     } else {
         Colors::Ansi16
     }
+}
+
+/// Whether decorative Unicode renders, from what the environment says.
+///
+/// Mirror of [`colors_for`]'s Windows reasoning, and the reason there is no
+/// Windows arm here any more. This screen only runs on Windows once the console
+/// has agreed to execute escape sequences ([`crate::surface::console_speaks_ansi`])
+/// — a modern console, or a real VT pseudo-terminal like mintty — both of which
+/// draw box-drawing and the Geometric-Shapes chrome this UI uses. The old rule
+/// forced ASCII on any Windows console that announced neither `WT_SESSION` nor
+/// `TERM_PROGRAM`, written when bare conhost shipped fonts that drew `┌`/`✓`/`❯`
+/// as `□`; it predated that gate and handed a capable console `+--+`, which the
+/// classic screen drew as `┌──┐`, so the new screen read as a regression there —
+/// the same shape of bug as the black-and-white colours [`colors_for`] fixed. So
+/// Windows is no longer special: the two explicit overrides have the last word,
+/// and a font that truly lacks the glyphs is handled by `ATOMCODE_ASCII=1`.
+pub fn unicode_for(env: &dyn Fn(&str) -> Option<String>) -> bool {
+    if env("ATOMCODE_UNICODE").is_some_and(|v| v != "0") {
+        // "My font has the glyphs" — the opt-in kept from tuix, winning over
+        // every guess below.
+        return true;
+    }
+    let term = env("TERM").unwrap_or_default();
+    let posix_locale = ["LC_ALL", "LC_CTYPE", "LANG"]
+        .iter()
+        .filter_map(|k| env(k))
+        .any(|v| {
+            let v = v.to_ascii_uppercase();
+            v == "C" || v == "POSIX" || v.contains("ANSI_X3.4-1968")
+        });
+    !(env("ATOMCODE_ASCII").is_some_and(|v| v != "0") || term == "dumb" || posix_locale)
 }
 
 pub fn downgrade(text: &str, unicode: bool) -> Cow<'_, str> {
@@ -1030,5 +1054,54 @@ mod tests {
             caps.colors,
             Colors::None | Colors::Ansi16 | Colors::Ansi256 | Colors::True
         ));
+    }
+
+    /// A terminal that names itself no longer has to, to draw Unicode.
+    ///
+    /// The regression this pins: a Windows console that announced neither
+    /// `WT_SESSION` nor `TERM_PROGRAM` used to be forced to ASCII `+--+`, which
+    /// the classic screen drew as `┌──┐` — strictly worse. The new screen only
+    /// runs on Windows once the console speaks ANSI (same guarantee `colors_for`
+    /// leans on), so there is no Windows arm here; the decision is a pure
+    /// function of the environment, reachable on any machine. The two explicit
+    /// overrides still rule in both directions.
+    #[test]
+    fn a_console_that_names_nothing_still_draws_unicode() {
+        let with = |vars: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                vars.iter()
+                    .find(|(name, _)| *name == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        // The case that used to fall to ASCII: nothing announced at all.
+        assert!(unicode_for(&with(&[])), "a bare console must draw Unicode");
+        // The overrides, both directions, and the opt-in winning the tie.
+        assert!(
+            !unicode_for(&with(&[("ATOMCODE_ASCII", "1")])),
+            "ASCII forced"
+        );
+        assert!(
+            unicode_for(&with(&[("ATOMCODE_UNICODE", "1")])),
+            "Unicode forced"
+        );
+        assert!(
+            unicode_for(&with(&[("ATOMCODE_UNICODE", "1"), ("ATOMCODE_ASCII", "1")])),
+            "ATOMCODE_UNICODE wins the tie, the way tuix's did"
+        );
+        assert!(
+            unicode_for(&with(&[("ATOMCODE_ASCII", "0")])),
+            "=0 is not a force"
+        );
+        // The real-bug-report cases are still ASCII.
+        assert!(!unicode_for(&with(&[("TERM", "dumb")])), "dumb is ASCII");
+        assert!(
+            !unicode_for(&with(&[("LANG", "C")])),
+            "POSIX locale is ASCII"
+        );
+        assert!(
+            !unicode_for(&with(&[("LC_ALL", "POSIX")])),
+            "LC_ALL POSIX is ASCII"
+        );
     }
 }

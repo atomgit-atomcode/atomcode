@@ -8546,9 +8546,9 @@ struct SurfaceRow {
     ///
     /// For a fleet: an image whose `TERM` says `xterm` on emulators that do
     /// 24-bit colour states it once here rather than exporting a variable on
-    /// every machine. `ATOMCODE_ASCII` remains, and still wins — it is the
-    /// per-session escape hatch, and a person on one bad terminal must be able
-    /// to override the tree they share.
+    /// every machine. `ATOMCODE_ASCII`/`ATOMCODE_UNICODE` remain, and still win —
+    /// they are the per-session escape hatch in either direction, and a person on
+    /// one bad terminal must be able to override the tree they share.
     #[serde(default)]
     unicode: Option<bool>,
     #[serde(default)]
