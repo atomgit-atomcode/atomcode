@@ -86,6 +86,36 @@ pub const KEYS_ON: &str = "\x1b[>1u";
 /// pushed — a pop with nothing pushed changes nothing, and one that finds flags
 /// left behind clears them.
 pub const LEAVE: &str = "\x1b[?25h\x1b[<u\x1b[?1004l\x1b[?2004l\x1b[?7h\x1b[?1049l";
+/// Off the alternate screen for `/raw`, with line wrap back on: what is
+/// printed next goes where the shell left off and into the terminal's own
+/// scrollback. Raw mode, bracketed paste and the keyboard flags stay, because a
+/// key is still read here — it is the way back.
+///
+/// The keyboard flags are popped first, on the screen they were pushed on: a
+/// terminal keeps one stack per screen, and [`TRANSCRIPT_BACK`]'s caller pushes
+/// them again, so the depth comes out the same however the terminal treats
+/// the two stacks.
+pub const TRANSCRIPT_OUT: &str = "\x1b[<u\x1b[?7h\x1b[?1049l";
+/// Leaving the alternate screen — the tail of [`LEAVE`], which a way out that
+/// is already on the ordinary screen leaves off.
+pub const ALT_SCREEN_OFF: &str = "\x1b[?1049l";
+/// Back onto the alternate screen after `/raw`, cleared, line wrap off again —
+/// the half of [`ENTER`] that [`TRANSCRIPT_OUT`] undid. The pointer mode is
+/// said by the surface, which knows which one is in force.
+pub const TRANSCRIPT_BACK: &str = "\x1b[?1049h\x1b[?7l\x1b[?25l\x1b[H\x1b[2J";
+
+/// Rows of the conversation as the terminal's own lines — styled, each ended
+/// with a reset and `\r\n` (raw mode does not turn `\n` into a return). For
+/// `/raw`, where they are printed rather than painted at a position.
+pub fn transcript(lines: &[Line], width: u16, caps: crate::caps::Caps) -> String {
+    let mut out = String::new();
+    for line in lines {
+        write_line(&mut out, line, width, caps);
+        out.push_str("\x1b[0m\r\n");
+    }
+    out
+}
+
 /// Ask the terminal to report the pointer: button presses (1000) with SGR
 /// coordinates (1006), so columns past 223 are reportable at all.
 ///
@@ -956,6 +986,32 @@ mod tests {
             "one open, one close; the unstyled span emits nothing"
         );
         assert!(s.contains("\x1b[1mhi\x1b[0m"));
+    }
+
+    /// `/raw` steps off the alternate screen with wrapping on, and comes back
+    /// cleared with wrapping off — and its lines end in `\r\n` with the style
+    /// reset, because raw mode does not return the carriage and a colour left
+    /// open would bleed into the next line and the shell after.
+    #[test]
+    fn the_transcript_steps_out_and_back_and_ends_its_lines() {
+        assert!(
+            LEAVE.ends_with(ALT_SCREEN_OFF),
+            "an exit while away strips it"
+        );
+        assert!(TRANSCRIPT_OUT.contains("1049l") && TRANSCRIPT_OUT.contains("?7h"));
+        assert!(TRANSCRIPT_BACK.contains("1049h") && TRANSCRIPT_BACK.contains("?7l"));
+        let text = transcript(
+            &[Line::from_spans(vec![crate::frame::Span::styled(
+                "hello".to_string(),
+                Style::default(),
+            )])],
+            80,
+            crate::caps::Caps::default(),
+        );
+        assert!(
+            text.contains("hello") && text.ends_with("\x1b[0m\r\n"),
+            "{text:?}"
+        );
     }
 
     #[test]

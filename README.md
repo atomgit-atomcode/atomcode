@@ -474,6 +474,8 @@ Most keys are the same as above; these differ. Type `/keys` in a session for the
 | `Ctrl+T` | Tool output: all / one summary each / summarised in groups, cycles |
 | `Ctrl+G` | Hand the mouse to the terminal (use its own selection), again to take it back (also `/mouse`) |
 
+With the mouse handed back, the terminal can only select what is on one screen (a full-screen UI has no scrollback). To select across screens, type `/raw`: the whole conversation is printed into the terminal for its own selection, scrolling and search, and any key comes back. With the mouse kept, dragging to the edge scrolls and selects across screens.
+
 ### Slash Commands
 
 Type `/` in the TUI to browse the full list with live completion; `/help` shows commands and shortcuts.

@@ -390,6 +390,7 @@ pub enum Msg<'a> {
     CmdAboutTools,
     CmdAboutShowInject,
     CmdAboutMouse,
+    CmdAboutRaw,
     CmdAboutKeys,
     CmdAboutTodo,
     CmdAboutTeam,
@@ -1380,6 +1381,10 @@ pub enum Msg<'a> {
     /// Most important first — how to take the mouse back — because the tip
     /// row is one right-aligned row that cuts what does not fit at the end.
     MouseHandedBack,
+    /// Printed above the conversation `/raw` puts on the terminal's own screen.
+    RawTop,
+    /// …and under it: what this screen is for and the way back.
+    RawBottom,
     /// Said once at start when `[ui] mouse = false` hands the pointer to the
     /// terminal from the first frame.
     MouseHandedBackAtStart,

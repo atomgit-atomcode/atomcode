@@ -6290,6 +6290,47 @@ impl Host {
         .total
     }
 
+    /// Every row of the conversation's blocks at `width`, top to bottom — what
+    /// `/raw` prints. The painter's own rows (`stream_lines`), so it reads as
+    /// the screen does; drawn in slices because a rect is at most `u16` rows
+    /// tall and a long session is not.
+    pub fn transcript_lines(&self, width: u16, moment: &Moment) -> Vec<Line> {
+        let total = self.block_total(width, moment);
+        let caps = crate::block::ShapeCaps::of(&moment.caps);
+        // A question in flight with no panel to ride is drawn under the
+        // blocks in every window (`stream_lines`), taking rows the count above
+        // does not know about; each slice asks for that much more room so the
+        // blocks keep theirs, and the question is left off — it is not part of
+        // the conversation yet.
+        let asked = if self.ask_panel_mounted() {
+            0
+        } else {
+            self.asks.current().map_or(0, |asked| {
+                crate::block::Content::lines(
+                    &fallback_question(&asked),
+                    &crate::block::RenderCtx::bare(width),
+                )
+                .len()
+            })
+        };
+        let most = (u16::MAX as usize).saturating_sub(asked).max(1);
+        let mut out = Vec::with_capacity(total);
+        let mut start = 0usize;
+        while start < total {
+            let rows = (total - start).min(most);
+            let (lines, _) = self.stream_lines(
+                Rect::new(0, 0, width, (rows + asked).min(u16::MAX as usize) as u16),
+                total - start - rows,
+                caps,
+                moment.activity,
+                moment.tick,
+            );
+            out.extend(lines.into_iter().take(rows));
+            start += rows;
+        }
+        out
+    }
+
     /// The text a conversation selection covers, rendered from the blocks
     /// themselves — rows scrolled off screen included — and cut by cells the
     /// way [`crate::frame::Frame::selected_text`] cuts a screen row, so a

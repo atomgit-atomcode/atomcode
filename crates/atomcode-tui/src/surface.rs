@@ -263,6 +263,28 @@ pub trait Surface: Send + Sync {
     /// class of damage by brute force. This is the way back from it.
     fn forget(&self) {}
 
+    /// Step out of the full screen onto the terminal's own and print `text`
+    /// there — the whole conversation, as `/raw` asks — so the terminal's own
+    /// scrollback, selection and search work on it. The full screen has no
+    /// scrollback: a selection made in it can only ever cover one screenful.
+    ///
+    /// Until [`Surface::back_from_transcript`] nothing else is written: no
+    /// frame, no mouse mode. Returns whether it stepped out at all; a surface
+    /// with no screen of its own to step onto does not.
+    fn show_transcript(&self, _text: &str) -> bool {
+        false
+    }
+
+    /// Whether the transcript is up — the loop's cue that a key is the way
+    /// back rather than something typed.
+    fn showing_transcript(&self) -> bool {
+        false
+    }
+
+    /// Take the full screen back after [`Surface::show_transcript`] and repaint
+    /// it from scratch on the next frame.
+    fn back_from_transcript(&self) {}
+
     /// Name the window.
     ///
     /// The surface's job for the same reason the clipboard is: only this layer
@@ -406,6 +428,8 @@ pub struct Headless {
     /// terminal reads as "no mouse at all", while the flag it was asserted
     /// against said the same thing either way.
     escapes: Mutex<Vec<String>>,
+    /// What `/raw` printed on the terminal's own screen, while it is up.
+    transcript: Mutex<Option<String>>,
 }
 
 impl Headless {
@@ -424,6 +448,7 @@ impl Headless {
             hover: std::sync::atomic::AtomicBool::new(false),
             state: std::sync::atomic::AtomicU8::new(pointer_state(crate::ansi::Pointer::Buttons)),
             escapes: Mutex::new(Vec::new()),
+            transcript: Mutex::new(None),
         });
         *me.me.lock().expect("headless poisoned") = Some(Arc::downgrade(&me));
         me
@@ -448,6 +473,11 @@ impl Headless {
     /// another window. What a real clipboard is for, scripted.
     pub fn set_clipboard_text(&self, text: impl Into<String>) {
         *self.clipboard_text.lock().expect("headless poisoned") = Some(text.into());
+    }
+
+    /// What `/raw` printed on the terminal's own screen, while it is up.
+    pub fn transcript_text(&self) -> Option<String> {
+        self.transcript.lock().expect("headless poisoned").clone()
     }
 
     /// What a copy under test put on the clipboard. Text, so a test can assert
@@ -613,6 +643,10 @@ impl Surface for Headless {
         *self.size.lock().expect("headless poisoned")
     }
     fn present(&self, frame: &Frame) {
+        // Nothing reaches a screen that is not up, as with the terminal.
+        if self.showing_transcript() {
+            return;
+        }
         self.frames
             .lock()
             .expect("headless poisoned")
@@ -620,6 +654,16 @@ impl Surface for Headless {
     }
     fn take_input(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<Input>> {
         self.incoming.lock().expect("headless poisoned").take()
+    }
+    fn show_transcript(&self, text: &str) -> bool {
+        *self.transcript.lock().expect("headless poisoned") = Some(text.to_string());
+        true
+    }
+    fn showing_transcript(&self) -> bool {
+        self.transcript.lock().expect("headless poisoned").is_some()
+    }
+    fn back_from_transcript(&self) {
+        *self.transcript.lock().expect("headless poisoned") = None;
     }
     fn set_title(&self, title: &str) {
         *self.title.lock().expect("headless poisoned") = Some(title.to_string());
@@ -739,6 +783,9 @@ pub struct Terminal {
     hover: std::sync::atomic::AtomicBool,
     caps: crate::caps::Caps,
     painted: LastPainted,
+    /// Whether `/raw` has stepped out onto the terminal's own screen
+    /// ([`Surface::show_transcript`]): while it has, nothing is written.
+    away: std::sync::atomic::AtomicBool,
     /// Where stderr was sent while we hold the screen, and the descriptor it
     /// came from. See [`Terminal::take_stderr`].
     stderr: Option<StderrHeld>,
@@ -938,6 +985,7 @@ impl Terminal {
             hover: std::sync::atomic::AtomicBool::new(false),
             caps,
             painted: LastPainted::default(),
+            away: std::sync::atomic::AtomicBool::new(false),
             stderr,
         })
     }
@@ -965,6 +1013,11 @@ impl Terminal {
             return;
         };
         self.state.store(pointer_state(want), Ordering::SeqCst);
+        // Recorded but not said while the transcript is up: coming back says
+        // the whole state at once.
+        if self.away.load(Ordering::SeqCst) {
+            return;
+        }
         let mut out = std::io::stdout();
         let _ = out.write_all(escape.as_bytes());
         let _ = out.flush();
@@ -985,6 +1038,12 @@ impl Terminal {
 /// are the whole of what it needs, and an atomic swap makes sure the hook and
 /// `restore` cannot both do it.
 static SCREEN_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Whether `/raw` has the terminal on its own screen right now. Static for the
+/// reason [`SCREEN_HELD`] is: the way out on a panic or a kill has no `self`,
+/// and leaving the alternate screen a second time from the ordinary one moves
+/// the cursor back to where it was saved — above the transcript, so the shell
+/// prompt would be written over it.
+static AWAY_FROM_SCREEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 #[cfg(unix)]
 static STDERR_ORIGINAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
@@ -1025,7 +1084,14 @@ fn emergency_restore() {
     let mut out = std::io::stdout();
     let _ = out.write_all(ansi::MOUSE_OFF.as_bytes());
     let _ = out.write_all(ansi::RESTORE_TITLE.as_bytes());
-    let _ = out.write_all(ansi::LEAVE.as_bytes());
+    let leave = if AWAY_FROM_SCREEN.swap(false, Ordering::SeqCst) {
+        ansi::LEAVE
+            .strip_suffix(ansi::ALT_SCREEN_OFF)
+            .unwrap_or(ansi::LEAVE)
+    } else {
+        ansi::LEAVE
+    };
+    let _ = out.write_all(leave.as_bytes());
     let _ = out.flush();
     let _ = crossterm::terminal::disable_raw_mode();
     #[cfg(unix)]
@@ -1772,6 +1838,11 @@ impl Surface for Terminal {
         crossterm::terminal::size().unwrap_or((80, 24))
     }
     fn present(&self, frame: &Frame) {
+        // The transcript is on the terminal's own screen; a frame drawn now
+        // would be drawn over it.
+        if self.showing_transcript() {
+            return;
+        }
         // Only the rows that moved, and silence for a screen that did not.
         let patch = self.patch(frame);
         if patch.is_empty() {
@@ -1831,8 +1902,9 @@ impl Surface for Terminal {
     fn heal_mouse(&self) {
         use std::sync::atomic::Ordering;
         // Nothing to say while the pointer is the terminal's: the state we
-        // would be repeating is the one already in force.
-        if !self.grab.load(Ordering::SeqCst) {
+        // would be repeating is the one already in force. Nor while the
+        // transcript is up, where taking the pointer would take the selection.
+        if !self.grab.load(Ordering::SeqCst) || self.showing_transcript() {
             return;
         }
         let mut out = std::io::stdout();
@@ -1840,6 +1912,49 @@ impl Surface for Terminal {
         let _ = out.flush();
     }
     fn forget(&self) {
+        self.painted.forget();
+    }
+    /// Off the alternate screen, with the pointer and line wrap the
+    /// terminal's again, and the text printed where the shell left off — so it
+    /// lands in the terminal's own scrollback.
+    fn show_transcript(&self, text: &str) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.away.swap(true, Ordering::SeqCst) {
+            return true;
+        }
+        AWAY_FROM_SCREEN.store(true, Ordering::SeqCst);
+        let mut out = std::io::stdout();
+        let _ = out.write_all(ansi::MOUSE_OFF.as_bytes());
+        let _ = out.write_all(ansi::TRANSCRIPT_OUT.as_bytes());
+        let _ = out.write_all(text.as_bytes());
+        let _ = out.flush();
+        true
+    }
+    fn showing_transcript(&self) -> bool {
+        self.away.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn back_from_transcript(&self) {
+        use std::sync::atomic::Ordering;
+        if !self.away.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        let mut out = std::io::stdout();
+        let _ = out.write_all(ansi::TRANSCRIPT_BACK.as_bytes());
+        AWAY_FROM_SCREEN.store(false, Ordering::SeqCst);
+        // Pushed again on this screen: they were popped on the way out, so the
+        // stack is the same depth it was whatever the terminal keeps per screen.
+        if crate::caps::wants_keyboard_protocol() {
+            let _ = out.write_all(ansi::KEYS_ON.as_bytes());
+        }
+        // The whole mode, not the step from a remembered one: going out turned
+        // the buttons and their SGR coordinates off, and the hover escape on
+        // its own (`?1003h`) would bring motion back without them.
+        let pointer = self.pointer_mode();
+        if pointer != ansi::Pointer::Terminal {
+            let _ = out.write_all(ansi::MOUSE_ON.as_bytes());
+        }
+        let _ = out.write_all(pointer.escape().as_bytes());
+        let _ = out.flush();
         self.painted.forget();
     }
     fn set_title(&self, title: &str) {

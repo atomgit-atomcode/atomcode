@@ -9819,3 +9819,50 @@ async fn a_drag_after_scrolling_away_starts_a_new_selection() {
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
+
+/// `/raw` puts the whole conversation — the lines scrolled off screen too — on
+/// the terminal's own screen, where its own selection reaches across screens;
+/// nothing is drawn over it while it is up, and a key comes back without
+/// being typed.
+#[tokio::test]
+async fn raw_prints_the_whole_conversation_and_a_key_comes_back() {
+    let dir = scratch("raw-transcript");
+    let s = start(tree(&dir, &replay(&sixty_lines()), &[])).await;
+    let task = s.open().await;
+    s.term.type_line("count to sixty");
+    until(&s, "LINE-60").await;
+    s.quiet().await;
+    assert!(!s.screen().contains("LINE-01"), "the start is off screen");
+
+    s.term.type_line("/raw");
+    s.quiet().await;
+    let printed = s.term.transcript_text().expect("the transcript is up");
+    assert!(
+        printed.contains("count to sixty")
+            && printed.contains("LINE-01")
+            && printed.contains("LINE-60"),
+        "the whole conversation: {printed}"
+    );
+    assert!(printed.contains("\r\n"), "lines end the way raw mode needs");
+
+    let frames = s.term.frames().len();
+    s.term.pointer(atomcode_tui::surface::Click::WheelUp, 2, 2);
+    s.quiet().await;
+    assert_eq!(s.term.frames().len(), frames, "nothing drawn over it");
+
+    s.term.press(KeyPress::plain(Key::Char('x')));
+    s.quiet().await;
+    assert!(s.term.transcript_text().is_none(), "the key came back");
+    assert!(
+        s.term.frames().len() > frames,
+        "and the screen was drawn again"
+    );
+    assert!(
+        !s.screen().contains("❯ x"),
+        "the key was the way back, not typing:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}

@@ -1620,6 +1620,27 @@ impl UserInterface for Tui {
                 edge_due = None;
             }
             coalesced += 1;
+            // `/raw` has the conversation on the terminal's own screen. A key
+            // is the way back, whichever key; a paste or anything the pointer
+            // does belongs to that screen, not to this one. Everything else
+            // (the turn streaming on, a resize) goes on as usual — the frames
+            // it asks for are not drawn until the screen is back.
+            if self.surface.showing_transcript() {
+                match &woke {
+                    Wake::Input(Input::Key(_)) => {
+                        self.surface.back_from_transcript();
+                        stale = true;
+                        continue;
+                    }
+                    Wake::Input(
+                        Input::Paste(_)
+                        | Input::Mouse(..)
+                        | Input::ArrowBurst { .. }
+                        | Input::Focus(_),
+                    ) => continue,
+                    _ => {}
+                }
+            }
             // The pointer's own vocabulary, needed in the patterns below rather
             // than only inside an arm body.
             use crate::surface::Click;
@@ -6584,6 +6605,37 @@ impl Tui {
             // any more", so the answer has to say so where it will be read —
             // and say how to get selection without giving the pointer up at
             // all, which most people would rather do.
+            // The rows as the screen draws them, at the terminal's width,
+            // between a line that says what this is and one that says how to
+            // get back — the terminal's own screen has no status row.
+            // Those two are not cut to the width: wrapping is the terminal's
+            // again out there, so a narrow window wraps them instead.
+            Action::ShowTranscript => {
+                let (w, _) = self.surface.size();
+                let caps = self.surface.caps();
+                let lines = self.host.transcript_lines(w, &m);
+                drop(m);
+                let mut text = String::from("\r\n");
+                let rule = |words: &str| {
+                    crate::frame::Line::from_spans(vec![crate::frame::Span::styled(
+                        words.to_string(),
+                        crate::theme::fg(crate::theme::Role::Muted),
+                    )])
+                };
+                text.push_str(&crate::ansi::transcript(
+                    &[rule(&t(Msg::RawTop))],
+                    u16::MAX,
+                    caps,
+                ));
+                text.push_str(&crate::ansi::transcript(&lines, w, caps));
+                text.push_str(&crate::ansi::transcript(
+                    &[rule(&t(Msg::RawBottom))],
+                    u16::MAX,
+                    caps,
+                ));
+                self.surface.show_transcript(&text);
+                return false;
+            }
             Action::ToggleMouse => {
                 drop(m);
                 let on = !self.surface.mouse();

@@ -64,6 +64,9 @@ pub enum Action {
     /// Take the pointer, or hand it back to the terminal so click-drag selects
     /// text again.
     ToggleMouse,
+    /// `/raw`: the whole conversation on the terminal's own screen, for its
+    /// own selection, scrolling and search; any key comes back.
+    ShowTranscript,
     /// Forget what is believed to be on screen and paint all of it again.
     Redraw,
     /// A line break inside what is being typed, rather than sending it.
