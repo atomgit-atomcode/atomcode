@@ -1446,7 +1446,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     if (e.type === 'snapshot') {
       liveSessionIdRef.current = e.session_id || null;
       liveGoalRef.current = goalFromLiveEvent(e);
-      liveGoalObservedAtRef.current = Date.now();
+      liveGoalObservedAtRef.current = performance.now();
       // Historical timestamps come from the daemon's native transcript projection.
       // Older sessions may not have transcript records; leave those timestamps absent
       // instead of relabelling the whole conversation with the reconnect wall clock.
@@ -1495,7 +1495,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
     }
     if (e.type === 'goal_changed') {
       liveGoalRef.current = goalFromLiveEvent(e);
-      liveGoalObservedAtRef.current = Date.now();
+      liveGoalObservedAtRef.current = performance.now();
       return;
     }
     // 模型切换是进程级（全局），与正在查看哪个会话无关。provider 事件是运行时
@@ -1994,7 +1994,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       },
       showGoalStatus: () => {
         if (!syncRef.current) { pushCommandNotice(t('cmd.goal.syncRequired')); return; }
-        const secondsSinceEvent = (Date.now() - liveGoalObservedAtRef.current) / 1000;
+        const secondsSinceEvent = (performance.now() - liveGoalObservedAtRef.current) / 1000;
         pushCommandNotice(goalStatusNotice(liveGoalRef.current, t, secondsSinceEvent));
       },
       execServerCommand: async (command, arg) => {
