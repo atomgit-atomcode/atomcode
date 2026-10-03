@@ -1,0 +1,33 @@
+name: stable compatibility
+
+on:
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compatibility:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo check (all crates, all targets)
+        run: cargo check --workspace --all-targets --locked
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check

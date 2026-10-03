@@ -24,7 +24,7 @@ jobs:
 
       # 2️⃣ 安装 Rust
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.88.0
 
       # 3️⃣ 添加 macOS 双架构 target
       - name: Add macOS targets
@@ -108,7 +108,7 @@ jobs:
 
       # 2️⃣ 安装 Rust
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.88.0
 
       # 3️⃣ 安装 musl 交叉编译工具链
       - name: Install cross-compilation tools
@@ -203,7 +203,7 @@ jobs:
 
       # 2️⃣ 安装 Rust
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.88.0
 
       # 3️⃣ 添加 Windows targets
       - name: Add Windows targets
@@ -279,7 +279,7 @@ jobs:
           echo "159.138.147.37 file.gitcode.com" | sudo tee -a /etc/hosts
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.88.0
 
       - name: Build with distro-pm feature
         run: cargo build -p atomcode --features distro-pm
