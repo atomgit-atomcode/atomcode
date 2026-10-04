@@ -26,8 +26,14 @@ use image::ImageEncoder;
 const MAX_EDGE: u32 = 1568;
 
 /// Re-encode target for the RAW (pre-base64) bytes. base64 inflates ~33%, so the
-/// on-wire payload stays ~2 MB. Images already under this are left untouched.
-const TARGET_BYTES: usize = 1_500_000;
+/// on-wire payload stays ~0.7 MB. Images already under this are left untouched.
+///
+/// Was 1.5 MB (~2 MB on the wire). An image a tool read rides every later
+/// request, so ten frames read one by one put a request past a gateway's 20 MB
+/// body limit (`HTTP 413`). oh-my-pi's resizer aims at 500 KiB; at this size the
+/// request budget (`atomcode-harness`'s `image-budget` row) holds three times as
+/// many. A 1568-px screenshot of text still fits as PNG or a high-quality JPEG.
+const TARGET_BYTES: usize = 512 * 1024;
 
 /// Absolute pixel-count guard against decompression bombs: refuse to process an image
 /// whose declared dimensions exceed this (checked from the header BEFORE decoding, so
@@ -415,10 +421,10 @@ mod tests {
 
     #[test]
     fn compressible_huge_dimension_small_byte_image_is_still_capped() {
-        // A 6000×6000 solid-color PNG compresses to well under the byte budget, so a
-        // byte-only gate would pass it through at 6000px — past the ~8000px provider
-        // limit territory. The header dimension probe must still trigger a resize.
-        let mut buf = image::RgbaImage::new(6000, 6000);
+        // A 4000×4000 solid-color PNG compresses to well under the byte budget, so a
+        // byte-only gate would pass it through at 4000px — far past the edge cap. The
+        // header dimension probe must still trigger a resize.
+        let mut buf = image::RgbaImage::new(4000, 4000);
         for p in buf.pixels_mut() {
             *p = image::Rgba([10, 20, 30, 255]);
         }

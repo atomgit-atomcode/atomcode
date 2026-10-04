@@ -7,6 +7,7 @@ pub mod capabilities;
 pub mod compaction;
 pub mod findings;
 pub mod handle;
+pub mod image_budget;
 pub mod llm;
 pub mod loop_policy;
 pub mod opener;
@@ -109,6 +110,7 @@ pub fn catalog() -> PluginRegistry {
         .register(Arc::new(truncation::TruncationPlugin))
         .register(Arc::new(recovery::ReasoningFilterPlugin))
         .register(Arc::new(recovery::StreamRecoveryPlugin))
+        .register(Arc::new(image_budget::ImageBudgetPlugin))
         .register(Arc::new(loop_policy::CompactionPlugin))
         .register(Arc::new(compaction::CompactionSummaryPlugin))
         .register(Arc::new(reasoning_effort::ReasoningEffortPlugin))

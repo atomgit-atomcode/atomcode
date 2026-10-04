@@ -148,6 +148,13 @@ config = { max_continuations = 4 }
 name = "llm-stream-recovery"
 config = { max_recoveries = 1 }
 
+# Images a tool returned stay in the log and ride every later request: the
+# oldest are left out of a request past this many bytes, and a request the
+# provider still refuses for size is sent again with half (`image_budget.rs`).
+[[insert]]
+name = "image-budget"
+config = { max_bytes = 8388608 }
+
 [[insert]]
 name = "reasoning-filter"
 
