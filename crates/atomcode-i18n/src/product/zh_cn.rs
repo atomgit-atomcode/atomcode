@@ -107,6 +107,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         }
         Msg::NetworkConnectHint =>
             "网络连接失败。若浏览器能打开，可能是代理/防火墙差异：用 /proxy 配置代理或设置 HTTPS_PROXY，或在浏览器打开上面的登录链接完成扫码。可按 Esc 跳过，稍后 /login 重试。".into(),
+        Msg::NetworkConnectHintNoResolver =>
+            "网络连接失败，且本机 /etc/resolv.conf 不可读。Linux 产物静态链接 musl，拿不到该文件时解析器会把查询发往 127.0.0.1，Android / Termux 等环境因此解析不了域名。可把系统的解析配置挂进去，例如：proot -b $PREFIX/etc/resolv.conf:/etc/resolv.conf atomcode。".into(),
         Msg::CpSetupHeader =>
             "  {brand} CodingPlan 配置：\n\n".into(),
         Msg::CpLoggedIn { who, username, email } =>

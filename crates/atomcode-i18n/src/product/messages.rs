@@ -102,6 +102,10 @@ pub enum Msg<'a> {
     /// endpoint is reachable from a browser but the client was reset — likely a
     /// proxy/firewall path difference. Points at the actionable knobs.
     NetworkConnectHint,
+    /// Hint for a login connection failure when the resolver configuration is
+    /// unreadable. Static musl builds fall back to `127.0.0.1` in that case, so
+    /// name resolution — not a proxy — is what fails, and the hint names that.
+    NetworkConnectHintNoResolver,
     // SetupReport renderer (core/coding_plan/setup.rs)
     CpSetupHeader,
     CpLoggedIn {

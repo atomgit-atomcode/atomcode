@@ -82,15 +82,42 @@ fn apply_blocking_proxy_policy(
     }
 }
 
+/// Path the statically linked Linux artifacts' resolver reads. musl compiles it
+/// in, and there is no environment override for the nameserver list.
+const RESOLVER_CONFIG: &str = "/etc/resolv.conf";
+
+/// True when the resolver configuration musl reads cannot be opened.
+///
+/// musl answers from `127.0.0.1` when it cannot read `/etc/resolv.conf`. On
+/// Android / Termux that file does not exist, so every lookup goes to a loopback
+/// address with no resolver behind it and every connection fails.
+fn resolver_config_unreadable() -> bool {
+    std::fs::metadata(RESOLVER_CONFIG).is_err()
+}
+
+/// Which hint to append to a connection-level login failure.
+///
+/// A missing resolver configuration is not a proxy difference — nothing resolves
+/// at all, so the proxy knobs in the usual hint do not apply. Kept separate so
+/// both branches are testable without provoking a real network failure.
+fn connect_hint_message(resolver_unreadable: bool) -> atomcode_config::i18n::Msg<'static> {
+    if resolver_unreadable {
+        atomcode_config::i18n::Msg::NetworkConnectHintNoResolver
+    } else {
+        atomcode_config::i18n::Msg::NetworkConnectHint
+    }
+}
+
 /// The localized network hint for a login HTTP failure, or `None` when the
 /// error is not connection-level. Connect resets (e.g. Windows os error 10054)
 /// and timeouts mean the endpoint was unreachable on THIS client's path while a
-/// browser may still work — usually a proxy/firewall difference.
+/// browser may still work — usually a proxy/firewall difference, unless the
+/// resolver configuration itself is missing.
 fn network_connect_hint(err: &reqwest::Error) -> Option<std::borrow::Cow<'static, str>> {
     if err.is_connect() || err.is_timeout() {
-        Some(atomcode_config::i18n::t(
-            atomcode_config::i18n::Msg::NetworkConnectHint,
-        ))
+        Some(atomcode_config::i18n::t(connect_hint_message(
+            resolver_config_unreadable(),
+        )))
     } else {
         None
     }
@@ -1231,6 +1258,21 @@ pub fn current_user(user_dir: &Path) -> Option<UserInfo> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn connect_hint_names_the_resolver_when_it_is_unreadable() {
+        // A missing /etc/resolv.conf makes musl answer from 127.0.0.1, which the
+        // proxy hint does not describe; the split exists so this mapping is
+        // checked without a network failure.
+        assert_eq!(
+            connect_hint_message(true),
+            atomcode_config::i18n::Msg::NetworkConnectHintNoResolver
+        );
+        assert_eq!(
+            connect_hint_message(false),
+            atomcode_config::i18n::Msg::NetworkConnectHint
+        );
+    }
     use super::*;
 
     #[test]

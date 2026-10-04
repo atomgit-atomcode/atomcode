@@ -649,6 +649,24 @@ mod tests {
     }
 
     #[test]
+    fn network_connect_hint_no_resolver_present_both_langs() {
+        let _g = test_lock();
+        let en = t_with(Locale::En, Msg::NetworkConnectHintNoResolver);
+        let zh = t_with(Locale::ZhCn, Msg::NetworkConnectHintNoResolver);
+        assert!(!en.trim().is_empty(), "en hint must be non-empty");
+        assert!(!zh.trim().is_empty(), "zh hint must be non-empty");
+        // Names both the file and the workaround, so the reader can act on it.
+        assert!(
+            en.contains("/etc/resolv.conf") && en.contains("proot"),
+            "en: {en}"
+        );
+        assert!(
+            zh.contains("/etc/resolv.conf") && zh.contains("proot"),
+            "zh: {zh}"
+        );
+    }
+
+    #[test]
     fn plugin_install_toast_reports_the_reload_it_already_did() {
         let _g = test_lock();
         // `reload_plugins` runs immediately before this toast is rendered, so
