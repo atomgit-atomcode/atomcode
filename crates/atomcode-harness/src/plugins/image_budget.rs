@@ -35,43 +35,64 @@ use crate::events::{AgentRequest, ModelRequest, ModelResponse, RequestError};
 pub const IMAGE_LEFT_OUT: &str = "[an earlier image was left out of this request to keep it \
 under the size limit — read the file again if you need to see it]";
 
+/// How many images are left out at a time.
+///
+/// The cut moves in steps, not image by image: a request that drops one more
+/// old picture every round changes its prefix every round, and a provider's
+/// prompt cache — 97% on the session this was reported from — is matched by
+/// prefix. Leaving out four at once holds the cut still for the next several
+/// pictures, and the cut is still worked out from the log every time, with no
+/// state to keep.
+const STEP: usize = 4;
+
 /// Leave the oldest images out of `messages` until what is left fits in
-/// `budget` bytes (of the encoded data, which is what goes on the wire). The
-/// newest are kept. Returns how many were left out.
+/// `budget` bytes (of the encoded data, which is what goes on the wire),
+/// leaving them out [`STEP`] at a time. The newest are kept. Returns how many
+/// were left out.
 pub fn keep_within(messages: &mut [Message], budget: usize) -> usize {
-    let mut kept = 0usize;
-    let mut left_out = 0usize;
-    for message in messages.iter_mut().rev() {
+    // Every image, oldest first, by size.
+    let sizes: Vec<usize> = messages
+        .iter()
+        .flat_map(|m| m.images.iter().map(|image| image.data.len()))
+        .collect();
+    let total: usize = sizes.iter().sum();
+    if total <= budget {
+        return 0;
+    }
+    // The fewest oldest that have to go for the rest to fit…
+    let mut over = total - budget;
+    let mut fewest: usize = 0;
+    for size in &sizes {
+        if over == 0 {
+            break;
+        }
+        over = over.saturating_sub(*size);
+        fewest += 1;
+    }
+    // …rounded up to a whole step, so the cut stays put while pictures arrive.
+    let left_out = fewest.div_ceil(STEP).saturating_mul(STEP).min(sizes.len());
+
+    let mut to_drop = left_out;
+    for message in messages.iter_mut() {
+        if to_drop == 0 {
+            break;
+        }
         if message.images.is_empty() {
             continue;
         }
-        let before = message.images.len();
-        // Newest first within a message too: the last picture in it is the one
-        // the model was looking at.
-        let mut keep = Vec::with_capacity(before);
-        for image in message.images.drain(..).rev() {
-            let size = image.data.len();
-            if kept + size <= budget {
-                kept += size;
-                keep.push(image);
-            }
-        }
-        keep.reverse();
-        let dropped = before - keep.len();
-        message.images = keep;
-        if dropped > 0 {
-            left_out += dropped;
-            let note = if dropped == 1 {
-                IMAGE_LEFT_OUT.to_string()
-            } else {
-                format!("{IMAGE_LEFT_OUT} (×{dropped})")
-            };
-            if message.text.is_empty() {
-                message.text = note;
-            } else {
-                message.text.push_str("\n\n");
-                message.text.push_str(&note);
-            }
+        let dropped = to_drop.min(message.images.len());
+        message.images.drain(..dropped);
+        to_drop -= dropped;
+        let note = if dropped == 1 {
+            IMAGE_LEFT_OUT.to_string()
+        } else {
+            format!("{IMAGE_LEFT_OUT} (×{dropped})")
+        };
+        if message.text.is_empty() {
+            message.text = note;
+        } else {
+            message.text.push_str("\n\n");
+            message.text.push_str(&note);
         }
     }
     left_out
@@ -170,30 +191,45 @@ mod tests {
 
     #[test]
     fn the_oldest_pictures_are_left_out_first_and_said_so() {
-        let mut messages = vec![
-            carrying("", vec![picture(4)]),
-            Message::assistant("looked", vec![]),
-            carrying("", vec![picture(4)]),
-            carrying("frame", vec![picture(4)]),
-        ];
-        assert_eq!(keep_within(&mut messages, 9), 1);
-        assert!(messages[0].images.is_empty(), "the oldest went");
-        assert_eq!(messages[0].text, IMAGE_LEFT_OUT);
-        assert_eq!(messages[2].images.len(), 1);
-        assert_eq!(messages[3].images.len(), 1, "the newest stays");
-        assert_eq!(messages[3].text, "frame", "a kept one is untouched");
+        let mut messages: Vec<Message> = (0..6)
+            .map(|n| carrying(&format!("frame {n}"), vec![picture(4)]))
+            .collect();
+        // 24 bytes over a 20-byte budget: one has to go, so a whole step goes.
+        assert_eq!(keep_within(&mut messages, 20), 4);
+        for gone in &messages[..4] {
+            assert!(gone.images.is_empty());
+            assert!(gone.text.ends_with(IMAGE_LEFT_OUT), "{}", gone.text);
+        }
+        assert_eq!(messages[4].images.len(), 1);
+        assert_eq!(messages[5].images.len(), 1, "the newest stays");
+        assert_eq!(messages[5].text, "frame 5", "a kept one is untouched");
+    }
+
+    /// The cut holds still while pictures keep arriving, so the request's
+    /// prefix — what a prompt cache matches — does not change every round.
+    #[test]
+    fn the_cut_moves_a_step_at_a_time_not_every_round() {
+        let cut = |n: usize| {
+            let mut messages: Vec<Message> =
+                (0..n).map(|_| carrying("", vec![picture(4)])).collect();
+            keep_within(&mut messages, 20)
+        };
+        assert_eq!(cut(5), 0);
+        assert_eq!([cut(6), cut(7), cut(8), cut(9)], [4, 4, 4, 4]);
+        assert_eq!(cut(10), 8, "and then a whole step more");
     }
 
     #[test]
-    fn within_one_message_the_last_picture_is_kept() {
+    fn within_one_message_the_oldest_go_first() {
         let mut messages = vec![carrying("two", vec![picture(5), picture(5)])];
-        assert_eq!(keep_within(&mut messages, 6), 1);
-        assert_eq!(messages[0].images.len(), 1);
+        assert_eq!(keep_within(&mut messages, 6), 2, "a step takes both");
+        assert!(messages[0].images.is_empty());
         assert!(
             messages[0].text.starts_with("two\n\n"),
             "{}",
             messages[0].text
         );
+        assert!(messages[0].text.ends_with("(×2)"), "{}", messages[0].text);
     }
 
     #[test]

@@ -97,13 +97,14 @@ fn picture() -> ImageContent {
     }
 }
 
-/// A request over the budget goes out with the newest picture and a line where
-/// each older one was; refused for size anyway, it goes again with half the
-/// budget, and the turn ends normally. The log still has all three.
+/// A request over the budget goes out with the newest pictures and a line where
+/// the older ones were (a step of four at a time); refused for size anyway, it
+/// goes again with half the budget, and the turn ends normally. The log still
+/// has all six.
 #[tokio::test]
 async fn the_oldest_pictures_are_left_out_and_a_413_is_sent_again_with_half() {
     let dir = scratch("budget");
-    let mut app = App::new(atomcode_coding::on_harness::catalog(), tree(&dir, 10));
+    let mut app = App::new(atomcode_coding::on_harness::catalog(), tree(&dir, 20));
     app.start().await.expect("must mount");
     let attempts = Arc::new(Mutex::new(Vec::new()));
     let _gateway = app.context().on_waterfall::<AgentRequest>(
@@ -118,15 +119,16 @@ async fn the_oldest_pictures_are_left_out_and_a_413_is_sent_again_with_half() {
     agent.send_full(
         "check these frames",
         MessageOrigin::User,
-        vec![picture(), picture(), picture()],
+        (0..6).map(|_| picture()).collect(),
     );
     let outcome = drive(&app, &agent).await.unwrap();
 
     assert_eq!(outcome.stop, StopReason::Stopped, "{:?}", outcome.error);
     assert_eq!(
         *attempts.lock().unwrap(),
-        vec![(1, 1), (0, 1)],
-        "first: the newest only; again after the 413: none, each note in its message"
+        vec![(2, 1), (0, 1)],
+        "first: the newest two (36 bytes over 20: a step of four goes); again after \
+         the 413, at half: none — one note in the message each time"
     );
     let logged: usize = app
         .context()
@@ -136,7 +138,7 @@ async fn the_oldest_pictures_are_left_out_and_a_413_is_sent_again_with_half() {
         .iter()
         .map(|m| m.images.len())
         .sum();
-    assert_eq!(logged, 3, "the log keeps every picture");
+    assert_eq!(logged, 6, "the log keeps every picture");
 }
 
 /// Under the budget the request is what the log says.
