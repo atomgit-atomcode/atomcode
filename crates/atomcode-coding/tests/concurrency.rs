@@ -455,6 +455,84 @@ async fn the_coarse_fuse_catches_what_the_exact_guard_misses() {
     );
 }
 
+/// The same call that takes its time each round: a model watching a long job.
+struct Waits {
+    calls: Arc<AtomicU32>,
+}
+
+#[async_trait]
+impl Tool for Waits {
+    fn name(&self) -> &str {
+        "waits"
+    }
+    fn description(&self) -> &str {
+        "waits a while, then says how far a job has got"
+    }
+    fn parameters_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+    fn read_only_hint(&self) -> bool {
+        true
+    }
+    async fn execute(&self, _args: &str, _ctx: &ToolContext) -> ToolResult {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        ToolResult {
+            call_id: String::new(),
+            content: format!("{} of 1237 done", 1100 + n * 10),
+            is_error: false,
+            images: vec![],
+        }
+    }
+}
+
+/// **Waiting is not looping.** The same call round after round, each one
+/// spending longer than `poll_after_secs`, is a model watching a job — the
+/// regression it was stopped at round six of was going fine. The fuse lets it
+/// run; the round cap still ends the turn.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_call_that_waits_each_round_is_not_a_loop() {
+    let dir = scratch("repeat-waits");
+    let calls = Arc::new(AtomicU32::new(0));
+    let rows = "[[patch]]\nid = \"round-cap\"\nconfig = { max_rounds = 10 }\n\n\
+                [[patch]]\nid = \"repeat-fuse\"\nconfig = { nudge_at = 2, stop_at = 3, poll_after_secs = 1 }";
+    let app = start_with(
+        tree(&dir, &repeats("waits"), &[rows]),
+        vec![Arc::new(Waits {
+            calls: calls.clone(),
+        })],
+    )
+    .await;
+
+    let agent = create_agent(&app).await.unwrap();
+    agent.send("go");
+    let outcome = drive(&app, &agent).await.unwrap();
+
+    assert_ne!(
+        outcome.stop,
+        StopReason::ToolLoopDetected,
+        "watching a job is not a loop"
+    );
+    assert!(
+        calls.load(Ordering::SeqCst) > 3,
+        "it ran past stop_at: {} calls",
+        calls.load(Ordering::SeqCst)
+    );
+    let transcript = app
+        .context()
+        .only_session()
+        .unwrap()
+        .derive_messages()
+        .iter()
+        .map(|m| m.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !transcript.contains("SAME tool call"),
+        "and it was not told to stop repeating itself"
+    );
+}
+
 #[tokio::test]
 async fn changing_the_call_resets_the_fuse() {
     let dir = scratch("repeat-reset");

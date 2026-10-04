@@ -352,6 +352,7 @@ pub(crate) fn chat_runtime_config(
             config.coding.max_rounds,
             std::env::var("ATOMCODE_TURN_MAX_ROUNDS").ok().as_deref(),
         ),
+        repeat_stop_rounds: config.coding.repeat_stop_rounds,
         subagent_config: Some(Arc::new(config.clone())),
         // Daemon path has no TUI checkpoint picker; keep the hard round-cap.
         round_cap_checkpoint: false,

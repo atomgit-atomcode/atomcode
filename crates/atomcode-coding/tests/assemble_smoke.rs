@@ -171,3 +171,56 @@ async fn coding_assembly_can_disable_exact_guard_for_intentional_repetition() {
     assert_eq!(outcome.stop, Some(StopReason::Stopped));
     assert_eq!(outcome.tool_results.len(), 4);
 }
+
+/// Seven rounds of the very same call, with only `repeat-fuse` watching (the
+/// exact guard is off): what `[coding] repeat_stop_rounds` makes of them.
+async fn seven_repeats_with(repeat_stop_rounds: Option<u32>) -> Option<StopReason> {
+    let project = tempfile::tempdir().unwrap();
+    let mut rounds: Vec<Vec<StreamEvent>> =
+        (1..=7).map(|n| list_round(&n.to_string(), ".")).collect();
+    rounds.push(vec![
+        StreamEvent::TextDelta("watched it to the end".into()),
+        StreamEvent::Done { truncated: false },
+    ]);
+    let provider = Arc::new(MockProvider::new(rounds));
+    let mut cfg = CodingAgentConfig::new(
+        "k",
+        "http://localhost:0",
+        "mock-model",
+        project.path(),
+        atomcode_coding::config::product_dirs_from_env(),
+    );
+    cfg.max_rounds = 20;
+    cfg.tool_loop_policy = None;
+    cfg.repeat_stop_rounds = repeat_stop_rounds;
+    let mut mounted = mount(&cfg, quiet_options(), provider).await;
+    turn(&mut mounted.handle, "watch the job", allow())
+        .await
+        .stop
+}
+
+/// `[coding] repeat_stop_rounds` reaches the fuse: `0` removes it, a number
+/// moves where it stops, and unset keeps the built-in six.
+#[tokio::test]
+async fn repeat_stop_rounds_moves_or_removes_the_repeat_fuse() {
+    assert_eq!(
+        seven_repeats_with(Some(0)).await,
+        Some(StopReason::Stopped),
+        "0: never stopped for repeating"
+    );
+    assert_eq!(
+        seven_repeats_with(Some(8)).await,
+        Some(StopReason::Stopped),
+        "8: seven rounds are not yet a loop"
+    );
+    assert_eq!(
+        seven_repeats_with(Some(3)).await,
+        Some(StopReason::ToolLoopDetected),
+        "3: stopped early"
+    );
+    assert_eq!(
+        seven_repeats_with(None).await,
+        Some(StopReason::ToolLoopDetected),
+        "unset: the built-in six"
+    );
+}

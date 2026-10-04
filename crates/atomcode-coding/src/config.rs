@@ -92,6 +92,11 @@ pub struct CodingAgentConfig {
     /// `[coding].max_rounds` or `ATOMCODE_TURN_MAX_ROUNDS`; exact repetition guards remain
     /// active independently.
     pub max_rounds: u32,
+    /// When the coarse repetition fuse (`repeat-fuse`) stops a turn: after this
+    /// many rounds of the very same tool calls. `None` keeps the row's own (6);
+    /// `Some(0)` removes the fuse. Rounds that waited a minute or more are not
+    /// counted whatever this says — that is a model watching a job.
+    pub repeat_stop_rounds: Option<u32>,
     /// Enables the kernel's fixed interactive safety checkpoints (round cap and
     /// exhausted output-limit recovery). Default false; only the TUI sets it.
     pub round_cap_checkpoint: bool,
@@ -299,6 +304,8 @@ pub struct CodingRuntimeConfig {
     pub upstream_retry_max_attempts: Option<u32>,
     pub loop_max_rounds: u32,
     pub turn_max_rounds: u32,
+    /// `[coding] repeat_stop_rounds`; see [`CodingAgentConfig::repeat_stop_rounds`].
+    pub repeat_stop_rounds: Option<u32>,
     pub subagent_config: Option<Arc<atomcode_config::config::Config>>,
     /// Enables TUI-owned interactive safety checkpoints. A `max_rounds` hit
     /// sends `ROUND_CAP_CHECKPOINT_KIND`; exhausted output-limit recovery sends
@@ -387,7 +394,9 @@ pub fn describe_config_file(config_file: &std::path::Path) -> String {
          - `evaluator_provider`: the model that judges whether a `/goal` is met.\n\
          - `[permissions]` `allow` / `deny`: rules such as `Bash(git *)`, `Read(<path>)` or \
          `mcp__<server>__<tool>`. `deny` wins, and `allow` never opens a sensitive path.\n\
-         - `[coding]` `max_rounds` (per turn; 0 = no cap; `ATOMCODE_TURN_MAX_ROUNDS` wins) \
+         - `[coding]` `max_rounds` (per turn; 0 = no cap; `ATOMCODE_TURN_MAX_ROUNDS` wins), \
+         `repeat_stop_rounds` (stop a turn after this many rounds of the very same tool \
+         calls; default 6, 0 = never; a round that waited a minute or more is not counted) \
          and `shell_guard_policy`: a shell command that reaches for credentials is asked \
          about (`prompt`, the default), refused and the turn ended (`strict`), or left to \
          the ordinary approval rules (`off`).\n\
@@ -542,6 +551,7 @@ impl CodingRuntimeConfig {
                 config.coding.max_rounds,
                 std::env::var("ATOMCODE_TURN_MAX_ROUNDS").ok().as_deref(),
             ),
+            repeat_stop_rounds: config.coding.repeat_stop_rounds,
             subagent_config: Some(Arc::new(config.clone())),
             // Default off; only the interactive TUI opts in (see the CLI's
             // TUI spawn sites and `event_loop::reload_runtime_provider_from`).
@@ -596,6 +606,7 @@ impl CodingRuntimeConfig {
         config.upstream_retry_max_attempts = self.upstream_retry_max_attempts;
         config.loop_max_rounds = self.loop_max_rounds;
         config.max_rounds = self.turn_max_rounds;
+        config.repeat_stop_rounds = self.repeat_stop_rounds;
         config.subagent_config = self.subagent_config.clone();
         config.interactive = self.interactive;
         if self.interactive {
@@ -1069,6 +1080,7 @@ impl CodingAgentConfig {
             request_timeout: Some(Duration::from_secs(300)),
             max_continuations: 50,
             max_rounds: default_turn_max_rounds(),
+            repeat_stop_rounds: None,
             round_cap_checkpoint: false,
             next_prompt_suggestions: false,
             interactive: false,

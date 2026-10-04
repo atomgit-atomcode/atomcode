@@ -798,6 +798,15 @@ struct LoopGuardPatch {
     stop_after: u32,
 }
 
+/// The whole of `repeat-fuse`'s config — a patch replaces a row's config, so a
+/// field left out is a field reset to its default, not one left alone.
+#[derive(serde::Serialize)]
+struct RepeatFusePatch {
+    nudge_at: u32,
+    stop_at: u32,
+    poll_after_secs: u64,
+}
+
 #[derive(serde::Serialize)]
 struct CompactionTailPatch {
     threshold: f32,
@@ -882,6 +891,26 @@ pub fn config_rows(cfg: &crate::CodingAgentConfig) -> Result<Layer, String> {
                 },
             )
             .map_err(|e| e.to_string())?;
+    }
+    // The coarse repetition fuse, where `[coding] repeat_stop_rounds` says when it
+    // stops: `0` removes it, a number moves the stop (the nudge comes before it,
+    // at the third round or the one before the stop). Unset keeps the row's own.
+    match cfg.repeat_stop_rounds {
+        None => {}
+        Some(0) => out = out.disable("repeat-fuse"),
+        Some(stop) => {
+            let stop_at = stop.max(2);
+            out = out
+                .patch(
+                    "repeat-fuse",
+                    RepeatFusePatch {
+                        nudge_at: 3.min(stop_at - 1),
+                        stop_at,
+                        poll_after_secs: 60,
+                    },
+                )
+                .map_err(|e| e.to_string())?;
+        }
     }
     // The exact-repeat guard. `None` is the person turning it off.
     out = match cfg.tool_loop_policy {
