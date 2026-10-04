@@ -1636,7 +1636,7 @@ mod tests {
         // nothing to do with the proxy path.
         if super::resolver_config_unreadable() {
             assert!(
-                chain.contains(RESOLVER_CONFIG) || chain.contains("proot"),
+                chain.contains("/etc/resolv.conf") || chain.contains("proot"),
                 "resolver hint present: {chain}"
             );
         } else {
