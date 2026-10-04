@@ -84,6 +84,7 @@ fn apply_blocking_proxy_policy(
 
 /// Path the statically linked Linux artifacts' resolver reads. musl compiles it
 /// in, and there is no environment override for the nameserver list.
+#[cfg(target_os = "linux")]
 const RESOLVER_CONFIG: &str = "/etc/resolv.conf";
 
 /// True when the resolver configuration musl reads cannot be opened.
@@ -91,8 +92,20 @@ const RESOLVER_CONFIG: &str = "/etc/resolv.conf";
 /// musl answers from `127.0.0.1` when it cannot read `/etc/resolv.conf`. On
 /// Android / Termux that file does not exist, so every lookup goes to a loopback
 /// address with no resolver behind it and every connection fails.
+///
+/// Only Linux is asked. The path is a property of the musl resolver table in the
+/// Linux artifacts; on Windows and macOS it is simply absent, which says nothing
+/// about whether lookups work — reporting it as a resolver problem there would
+/// point every connection failure at a file those platforms never consult.
 fn resolver_config_unreadable() -> bool {
-    std::fs::metadata(RESOLVER_CONFIG).is_err()
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::metadata(RESOLVER_CONFIG).is_err()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
 }
 
 /// Which hint to append to a connection-level login failure.
