@@ -100,7 +100,10 @@ const RESOLVER_CONFIG: &str = "/etc/resolv.conf";
 fn resolver_config_unreadable() -> bool {
     #[cfg(target_os = "linux")]
     {
-        std::fs::metadata(RESOLVER_CONFIG).is_err()
+        // Open, not stat: the question is whether the resolver can read its
+        // configuration, which a path that exists but cannot be opened answers
+        // the same way musl's own attempt would.
+        std::fs::File::open(RESOLVER_CONFIG).is_err()
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -1626,9 +1629,21 @@ mod tests {
             chain.starts_with("Failed to call /auth/test"),
             "ctx must lead: {chain}"
         );
-        assert!(
-            chain.contains("/proxy") || chain.contains("HTTPS_PROXY"),
-            "hint present: {chain}"
-        );
+        // Which hint follows the context depends on whether the resolver
+        // configuration the musl artifacts read exists on this host, so the
+        // expectation follows that too. Pinning the proxy wording alone would fail
+        // on a host without the file — a container, a chroot — for a case that has
+        // nothing to do with the proxy path.
+        if super::resolver_config_unreadable() {
+            assert!(
+                chain.contains(RESOLVER_CONFIG) || chain.contains("proot"),
+                "resolver hint present: {chain}"
+            );
+        } else {
+            assert!(
+                chain.contains("/proxy") || chain.contains("HTTPS_PROXY"),
+                "hint present: {chain}"
+            );
+        }
     }
 }
