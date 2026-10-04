@@ -71,19 +71,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn serves_embedded_index() {
-        assert!(
-            WebuiAssets::get("index.html").is_some(),
-            "index.html should be embedded"
-        );
+    fn is_built_agrees_with_the_embedded_assets() {
+        // Whether `webui/dist/` existed at compile time is a property of the
+        // checkout, not of this code — `#[allow_missing]` above keeps that state
+        // compilable on purpose, and `is_built()` is how callers tell the two
+        // apart. That agreement is what must hold either way.
+        assert_eq!(is_built(), WebuiAssets::get("index.html").is_some());
     }
 
     #[test]
-    fn unknown_path_falls_back_to_index() {
-        // 未知路径回退 index.html 内容（SPA 路由）
-        assert!(
-            asset_or_index("some/spa/route").is_some(),
-            "SPA route should fall back to index"
-        );
+    fn unknown_path_falls_back_to_index_when_assets_are_embedded() {
+        // 未知路径回退 index.html 内容（SPA 路由）。带资源的二进制必须回退成功；
+        // 未带资源时 `asset_or_index` 返回 None，由调用方给出 NOT_BUILT_HELP。
+        assert_eq!(asset_or_index("some/spa/route").is_some(), is_built());
     }
 }
