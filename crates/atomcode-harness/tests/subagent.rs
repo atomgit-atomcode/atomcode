@@ -702,3 +702,47 @@ config = { script = [
         .await;
     assert_eq!(outcome.stop, StopReason::MaxRounds, "{outcome:?}");
 }
+
+/// A child is listed by what it was delegated to do, not by its minted
+/// session id: the label the delegation carried is on its description from the
+/// moment it exists — which is when a front end first lists it.
+#[tokio::test]
+async fn a_child_is_described_by_its_label() {
+    use atomcode_harness::events::{AgentCreated, AgentInfo};
+    use atomcode_harness::seams::AgentsSvc;
+
+    let dir = scratch("labelled");
+    let script = r#"
+[[patch]]
+id = "llm"
+name = "llm-replay"
+config = { script = [ { text = "Done." } ] }
+"#;
+    let app = start(tree(&dir, script, &[YOLO])).await;
+    let seen = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+    let spy = seen.clone();
+    let agents = app.context().service::<AgentsSvc>().unwrap();
+    let _listening = app
+        .context()
+        .on_emit::<AgentCreated>(move |info: &AgentInfo| {
+            let label = agents.get(info.id).and_then(|a| a.describe().label);
+            spy.lock().unwrap().push(label);
+        });
+
+    let _ = app
+        .context()
+        .service::<SubagentsSvc>()
+        .unwrap()
+        .spawn(atomcode_harness::seams::Delegation {
+            task: "You are auditing ONE file for real, concrete bugs",
+            label: "Audit Chat.tsx",
+            instructions: "do the task",
+            ..Default::default()
+        })
+        .await;
+
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![Some("Audit Chat.tsx".to_string())]
+    );
+}

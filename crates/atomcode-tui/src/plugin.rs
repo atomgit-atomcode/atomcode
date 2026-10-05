@@ -511,6 +511,46 @@ impl AgentClient {
         });
     }
 
+    /// Let a member go once it has left the team — unless it is on screen,
+    /// where its facts are what is being read. Its figures stay on the
+    /// roster; its facts would otherwise be kept for the life of the session,
+    /// one more subagent's every tool result at a time. Looking at it later
+    /// (`/agents`) follows it afresh from its first fact.
+    pub(crate) fn unwatch_member(&self, session: &str) {
+        {
+            let mut views = self.view.lock().expect("client poisoned");
+            if views.on_screen == session || views.root == session {
+                return;
+            }
+            if views.sessions.remove(session).is_none() {
+                return;
+            }
+        }
+        self.command(AgentCommand::Unsubscribe {
+            session: session.to_string(),
+        });
+    }
+
+    /// Follow a member of the team from its first fact without putting it on
+    /// screen — so the team panel can say how far it has got (its context
+    /// size), and looking at it later draws what is already here instead of
+    /// waiting for a replay.
+    pub(crate) fn watch_member(&self, session: &str) {
+        {
+            let mut views = self.view.lock().expect("client poisoned");
+            if views.sessions.contains_key(session) {
+                return;
+            }
+            views
+                .sessions
+                .insert(session.to_string(), SessionView::default());
+        }
+        self.command(AgentCommand::Subscribe {
+            session: session.to_string(),
+            from: 0,
+        });
+    }
+
     /// Put `session` — the root or a member of its team — on screen. `None` when
     /// it already is; otherwise what is known of it so far, to draw from. A
     /// member looked at for the first time is followed from its first fact, and
@@ -890,6 +930,30 @@ struct Member {
     turns: u64,
     /// Stopped and gone from the registry: kept, so it can still be looked at.
     gone: bool,
+    /// What it is listed as when its name is a minted id — a subagent's
+    /// description ([`AgentDescription::label`]).
+    label: Option<String>,
+    /// The time it has worked, turn after turn — idle gaps not counted — and
+    /// when the turn it is in now began.
+    worked: Option<std::time::Duration>,
+    since: Option<std::time::Instant>,
+    /// Its context size, from its newest reply.
+    tokens: u32,
+}
+
+impl Member {
+    fn new(name: String, label: Option<String>, gone: bool) -> Self {
+        Self {
+            name,
+            status: AgentStatus::Idle,
+            turns: 0,
+            gone,
+            label,
+            worked: None,
+            since: None,
+            tokens: 0,
+        }
+    }
 }
 
 /// Every member this screen has heard of, stopped ones included.
@@ -947,11 +1011,24 @@ impl Roster {
             Some(member) => {
                 if status == AgentStatus::Working && member.status != AgentStatus::Working {
                     member.turns += 1;
+                    member.since = Some(std::time::Instant::now());
+                    member.worked.get_or_insert_default();
+                }
+                if status == AgentStatus::Idle {
+                    if let (Some(worked), Some(since)) = (&mut member.worked, member.since.take()) {
+                        *worked += since.elapsed();
+                    }
                 }
                 member.status = status;
                 true
             }
             None => false,
+        }
+    }
+    /// Its newest reply's context size.
+    fn used(&self, session: &str, tokens: u32) {
+        if let Some(member) = self.0.lock().expect("roster poisoned").get_mut(session) {
+            member.tokens = tokens;
         }
     }
     /// Every member, as `MemberNow` — what the team panel is drawn from.
@@ -972,6 +1049,11 @@ impl Roster {
                 turn: member.turns,
                 session: session.clone(),
                 gone: member.gone,
+                label: member.label.clone(),
+                elapsed: member.worked.map(|worked| {
+                    worked + member.since.map_or_else(Default::default, |s| s.elapsed())
+                }),
+                tokens: member.tokens,
             })
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -984,15 +1066,7 @@ impl Roster {
     /// through `AgentAdded`.
     #[cfg(test)]
     pub(crate) fn note_for_test(&self, session: &str, name: &str, gone: bool) {
-        self.note(
-            session,
-            Member {
-                name: name.to_string(),
-                status: AgentStatus::Idle,
-                turns: 0,
-                gone,
-            },
-        );
+        self.note(session, Member::new(name.to_string(), None, gone));
     }
 }
 
@@ -5143,6 +5217,15 @@ impl Tui {
         match event {
             // Content: a fact of the session on screen, folded once.
             AgentEvent::Fact(committed) => {
+                // A member's reply says how big its context has grown, which is
+                // what the team panel shows of it.
+                if let atomcode_kernel::session::SessionEvent::AssistantMessage {
+                    meta: Some(meta),
+                    ..
+                } = &committed.event
+                {
+                    self.members.used(&committed.session, meta.used_tokens);
+                }
                 if !self.client.keep(&committed) {
                     return false;
                 }
@@ -5434,13 +5517,10 @@ impl Tui {
                     });
                 self.members.note(
                     &description.session,
-                    Member {
-                        name,
-                        status: AgentStatus::Idle,
-                        turns: 0,
-                        gone: false,
-                    },
+                    Member::new(name, description.label.clone(), false),
                 );
+                // Followed from the start, for what the panel says of it.
+                self.client.watch_member(&description.session);
                 true
             }
             AgentEvent::AgentRemoved { session } => {
@@ -5457,6 +5537,9 @@ impl Tui {
                     let root = self.client.root();
                     self.switch_to(&root);
                 }
+                // After the screen has left it, so a member that was on screen
+                // is let go too.
+                self.client.unwatch_member(&session);
                 kept
             }
             // The turn events on this connection are the root's: a member on

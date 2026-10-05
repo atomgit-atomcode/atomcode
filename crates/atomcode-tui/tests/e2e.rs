@@ -6234,7 +6234,7 @@ async fn the_keyboard_switches_the_screen_to_a_member_and_back() {
     until(&s, "scout reporting in").await;
     s.quiet().await;
     assert!(!s.screen().contains("MEMBER-THINKING-OUT-LOUD"));
-    assert!(panel_text(&s).contains("主"), "{}", panel_text(&s));
+    assert!(panel_text(&s).contains("main"), "{}", panel_text(&s));
 
     s.term.press(KeyPress::plain(Key::Tab));
     until(&s, "Enter 切换").await;

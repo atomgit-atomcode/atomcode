@@ -1039,6 +1039,8 @@ pub trait Findings: Send + Sync {
 pub struct Delegation<'a> {
     /// What the child should accomplish.
     pub task: &'a str,
+    /// How the child is listed to a person ([`atomcode_kernel::agent::AgentDescription::label`]).
+    pub label: &'a str,
     /// Standing instructions for the child.
     pub instructions: &'a str,
     /// A selection id from the [`Models`] seam, or `None` to run the child on

@@ -250,6 +250,7 @@ impl Subagents for InProcessSubagents {
                 Err(e) => return SubagentOutcome::failed(e),
             };
         let (task, instructions) = (work.task, work.instructions);
+        let label = work.label.to_string();
         let (Some(agents), Some(driver), Some(parent_tools)) = (
             self.ctx.service::<AgentsSvc>(),
             self.ctx.service::<AgentLoopSvc>(),
@@ -312,6 +313,19 @@ impl Subagents for InProcessSubagents {
                             .map_err(|e| e.to_string())?,
                     );
                 }
+                // What a front end lists it as: its id is minted and says
+                // nothing to the person watching.
+                let described = child_session.clone();
+                let label = label.clone();
+                held.push(realm.on_emit::<crate::events::DescribeAgent>(
+                    move |describing: &crate::events::Describing| {
+                        let mut description =
+                            describing.description.lock().expect("description poisoned");
+                        if description.session == described && !label.is_empty() {
+                            description.label = Some(label.clone());
+                        }
+                    },
+                ));
                 if let Some(effort) = effort {
                     held.extend(RoleEffort { effort }.mount(realm, child_session));
                 }
@@ -441,12 +455,90 @@ struct TaskArgs {
     /// Optional extra standing instructions for the child.
     #[serde(default)]
     instructions: Option<String>,
+    /// A few words for the person watching, shown where the child is listed.
+    #[serde(default)]
+    description: Option<String>,
     /// A selection id from the model catalog. Absent ⇒ this conversation's model.
     #[serde(default)]
     model: Option<String>,
     /// How hard the child should think. Absent ⇒ whatever the tree is set to.
     #[serde(default)]
     effort: Option<String>,
+}
+
+/// How a child is listed: the model's own short description when it gave one,
+/// else the task's first sentence, cut — a weak model may leave the label out,
+/// and a minted session id is no name for a person. Empty when neither says
+/// anything worth reading; the child is then listed by its id.
+fn child_label(description: Option<&str>, task: &str) -> String {
+    const MOST: usize = 48;
+    let given = description.map(str::trim).filter(|d| !d.is_empty());
+    let text = match given {
+        Some(given) => given.to_string(),
+        None => first_sentence(task),
+    };
+    // A word or two is a heading or a stray mark, not a description: two
+    // children labelled "Goal" would be told apart by nothing.
+    if text.chars().filter(|c| !c.is_whitespace()).count() < 3 {
+        return String::new();
+    }
+    let mut chars = text.chars();
+    let cut: String = chars.by_ref().take(MOST).collect();
+    if chars.next().is_some() {
+        format!("{}…", cut.trim_end())
+    } else {
+        cut
+    }
+}
+
+/// The task's first sentence: past a list number (`1.`, `-`) and a short
+/// heading (`Goal:`), up to the first stop. A full-width stop ends a sentence
+/// wherever it is; an ASCII one only before a space or the end — `Chat.tsx` is
+/// a name, not two sentences.
+fn first_sentence(task: &str) -> String {
+    let line = task
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or_default();
+    let line = line
+        .trim_start_matches(|c: char| c.is_ascii_digit())
+        .trim_start_matches(['.', ')', '-', '*', '•', '、'])
+        .trim_start();
+    // `Goal: …` — the heading says what kind of thing follows, the rest says
+    // what it is.
+    let line = match line.find([':', '：']) {
+        Some(at) if line[..at].chars().count() <= 20 => {
+            #[allow(
+                clippy::string_slice,
+                reason = "`at` is where `find` matched a char, so `at` and the char after are boundaries"
+            )]
+            let rest = &line[at..];
+            let rest = rest.trim_start_matches([':', '：']).trim_start();
+            if rest.is_empty() {
+                line
+            } else {
+                rest
+            }
+        }
+        _ => line,
+    };
+    let mut end = line.len();
+    let mut chars = line.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        let next_is_space = chars.peek().is_none_or(|(_, n)| n.is_whitespace());
+        if matches!(c, '。' | '！' | '？' | '：')
+            || (matches!(c, '.' | '!' | '?' | ':') && next_is_space)
+        {
+            end = at;
+            break;
+        }
+    }
+    #[allow(
+        clippy::string_slice,
+        reason = "`end` is a char boundary from `char_indices`, or the length"
+    )]
+    line[..end].trim().to_string()
 }
 
 const DEFAULT_INSTRUCTIONS: &str = "\
@@ -477,6 +569,7 @@ impl Tool for TaskTool {
         json!({
             "type": "object",
             "properties": {
+                "description": { "type": "string", "description": "A short (3-6 word) label for the person watching, in their language — shown where running subagents are listed, e.g. \"Audit Chat.tsx for bugs\"" },
                 "task": { "type": "string", "description": "The complete task, stated so it needs no follow-up" },
                 "instructions": { "type": "string", "description": "Extra standing instructions for the subagent" },
                 "model": { "type": "string", "description": "Run this subagent on a different model: a selection id from `describe_self(aspect=\"models\")`. Omit to use this conversation's model." },
@@ -528,6 +621,7 @@ impl Tool for TaskTool {
         let outcome = subagents
             .spawn(crate::seams::Delegation {
                 task: &args.task,
+                label: &child_label(args.description.as_deref(), &args.task),
                 instructions,
                 model: args.model.as_deref(),
                 effort: args.effort.as_deref(),
@@ -780,5 +874,44 @@ impl Plugin for ModelCatalogPlugin {
         }
         contribute_prompt(ctx, "model-catalog", 56, CATALOG_POINTER);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::child_label;
+
+    #[test]
+    fn the_given_description_is_the_label() {
+        assert_eq!(
+            child_label(Some("  Audit Chat.tsx "), "long task"),
+            "Audit Chat.tsx"
+        );
+    }
+
+    /// A weak model may leave it out: the task's first sentence stands in,
+    /// cut, so the row still says something a person can read.
+    #[test]
+    fn without_one_the_first_sentence_of_the_task_stands_in() {
+        assert_eq!(
+            child_label(None, "Read the parser. Then report."),
+            "Read the parser"
+        );
+        assert_eq!(
+            child_label(Some("  "), "审查 Chat.tsx。然后汇报"),
+            "审查 Chat.tsx"
+        );
+        // A heading and a list number are skipped, not taken for the label.
+        assert_eq!(
+            child_label(None, "Goal: audit the parser. Then report."),
+            "audit the parser"
+        );
+        assert_eq!(child_label(None, "1. Read X and Y."), "Read X and Y");
+        assert_eq!(child_label(None, "目标：审查 api.ts"), "审查 api.ts");
+        // Nothing worth reading is no label: the id it is listed by instead.
+        assert_eq!(child_label(None, "：ok"), "");
+        assert_eq!(child_label(None, "Go."), "");
+        let long = child_label(None, &"x".repeat(100));
+        assert!(long.ends_with('…') && long.chars().count() == 49, "{long}");
     }
 }

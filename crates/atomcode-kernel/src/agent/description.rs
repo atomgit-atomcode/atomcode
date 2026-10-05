@@ -47,6 +47,12 @@ pub struct AgentDescription {
     /// Set for a team member.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub member: Option<MemberIdentity>,
+    /// A few words a person reads to know which agent this is, when its
+    /// session id says nothing — a subagent's is minted. Set by whatever
+    /// created it (the delegation's own short description). Additive on the
+    /// wire: an older reader ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     /// The model id the agent's requests go to, when one is mounted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,

@@ -53,6 +53,14 @@ pub struct MemberNow {
     /// Gone from the team — stopped — and still there to be looked at: its log
     /// is kept (`docs/adr/0023` §5).
     pub gone: bool,
+    /// What to list it as when its name is a minted id: a subagent's short
+    /// description.
+    pub label: Option<String>,
+    /// How long it has worked — running while it does, frozen once idle.
+    /// `None` until it has started.
+    pub elapsed: Option<std::time::Duration>,
+    /// Its context size, from its newest reply. `0` until it has replied.
+    pub tokens: u32,
 }
 
 /// How far the stream is scrolled from the bottom, in rendered lines.

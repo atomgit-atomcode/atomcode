@@ -711,6 +711,7 @@ mod tests {
                 name: "scout".into(),
                 role: "explorer".into(),
             }),
+            label: Some("survey the parser".into()),
             model: Some("glm-5".into()),
             context_window: Some(131_072),
             supports_vision: true,

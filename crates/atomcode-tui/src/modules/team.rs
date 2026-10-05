@@ -95,6 +95,9 @@ enum Pending {
 
 /// How wide a name or a role column may get before it is cut.
 const NAME_CAP: usize = 14;
+/// A subagent is listed by what it was asked to do, which runs longer than a
+/// name a lead picks.
+const LABEL_CAP: usize = 40;
 const ROLE_CAP: usize = 12;
 
 pub struct Team;
@@ -293,8 +296,31 @@ impl View for Team {
         // row a press or `Enter` would take.
         let lit = |i: usize| pointing && vp.moment.team_cursor == Some(i);
         let here = |session: &str| !vp.moment.viewing.is_empty() && vp.moment.viewing == session;
-        let band = |line: Vec<El>, lit: bool| -> Vec<Line> {
-            let lines = El::row(line).lay(w);
+        // A row's own words on the left, and how long it has run and how big
+        // its context is at the right edge — when the row is wide enough for
+        // both, which is what keeps the figures from pushing the name off.
+        let lay = |line: Vec<El>, right: Option<String>| -> Vec<Line> {
+            let Some(right) = right else {
+                return El::row(line).lay(w);
+            };
+            let right_w = width::str_width(&right);
+            if (w as usize) < right_w + 24 {
+                return El::row(line).lay(w);
+            }
+            let room = w as usize - right_w - 2;
+            let mut lines = El::row(line).lay(room as u16);
+            if let Some(first) = lines.first_mut() {
+                let used = first.width();
+                let mut spans = std::mem::take(&mut first.spans);
+                spans.push(crate::frame::Span::raw(
+                    " ".repeat(w as usize - used - right_w),
+                ));
+                spans.push(crate::frame::Span::styled(right, theme::fg(Role::Muted)));
+                *first = Line::from_spans(spans);
+            }
+            lines
+        };
+        let band = |lines: Vec<Line>, lit: bool| -> Vec<Line> {
             if !lit {
                 return lines;
             }
@@ -320,21 +346,30 @@ impl View for Team {
                 })
                 .collect()
         };
+        // The agent on screen is the one filled in and in full ink; every
+        // other is a hollow ring, muted — Claude Code's agent list, where the
+        // mark says which one you are looking at and the words say the rest.
+        let mark_of = |session: &str| -> (String, crate::frame::Style) {
+            // `●`, the conversation's own dot — `Bullet` is the smaller `•`.
+            if here(session) {
+                (
+                    caps.g(Glyph::ToolMark).to_string(),
+                    theme::fg(Role::Secondary),
+                )
+            } else {
+                (caps.g(Glyph::Hollow).to_string(), muted)
+            }
+        };
         if !switchable.is_empty() {
-            let mark = if here(&vp.moment.lead) { "› " } else { "  " };
+            let (mark, ink) = mark_of(&vp.moment.lead);
             out.extend(band(
-                vec![
-                    El::styled(mark.to_string(), theme::fg(Role::Accent)),
-                    El::styled(t(Msg::TeamLead).into_owned(), theme::fg(Role::Secondary)),
-                    El::styled(
-                        if here(&vp.moment.lead) {
-                            t(Msg::TeamViewing).into_owned()
-                        } else {
-                            String::new()
-                        },
-                        muted,
-                    ),
-                ],
+                lay(
+                    vec![
+                        El::styled(format!("{mark} "), ink),
+                        El::styled(t(Msg::TeamLead).into_owned(), ink),
+                    ],
+                    None,
+                ),
                 lit(0),
             ));
         }
@@ -343,7 +378,9 @@ impl View for Team {
         // hunting: the longest name, capped, and the same for roles.
         let name_w = rows
             .iter()
-            .map(|r| width::str_width(&r.member.name).min(NAME_CAP))
+            .map(|r| {
+                width::str_width(&r.member.name).min(if r.labelled { LABEL_CAP } else { NAME_CAP })
+            })
             .max()
             .unwrap_or(0);
         let role_w = rows
@@ -354,49 +391,44 @@ impl View for Team {
 
         for row in &rows {
             let selectable = switchable.iter().position(|s| *s == row.session);
-            let (mark, mark_style) = match row.state {
-                Shown::Working => (
-                    caps.spinner(vp.moment.tick).to_string(),
-                    theme::fg(Role::Warning),
-                ),
-                Shown::Idle => (caps.g(Glyph::Ok).to_string(), theme::fg(Role::Success)),
-            };
+            let (mark, ink) = mark_of(&row.session);
+            // Only idle says so. Working is what the running time at the edge
+            // already shows; a turn count said `第 1 轮` for every subagent,
+            // which only ever runs one.
             let said = match row.state {
-                Shown::Working => t(Msg::TeamWorkingRound {
-                    round: row.turn.max(1),
-                })
-                .into_owned(),
-                Shown::Idle => pt(PMsg::BgStateIdle).into_owned(),
+                Shown::Working => String::new(),
+                Shown::Idle => format!(" {}", pt(PMsg::BgStateIdle)),
             };
             let mut line: Vec<El> = Vec::new();
-            if !switchable.is_empty() {
-                line.push(El::styled(
-                    if here(&row.session) { "› " } else { "  " }.to_string(),
-                    theme::fg(Role::Accent),
-                ));
-            }
-            line.push(El::styled(format!("{mark} "), mark_style));
-            line.push(El::styled(
-                pad(&row.member.name, name_w),
-                theme::fg(Role::Secondary),
-            ));
+            line.push(El::styled(format!("{mark} "), ink));
+            line.push(El::styled(pad(&row.member.name, name_w), ink));
             if role_w > 0 {
                 line.push(El::styled(
                     format!(" {}", pad(&row.member.role, role_w)),
                     muted,
                 ));
             }
-            line.push(El::styled(format!(" {said}"), muted));
-            if here(&row.session) {
-                line.push(El::styled(t(Msg::TeamViewing).into_owned(), muted));
-            }
+            line.push(El::styled(said, muted));
             if !row.member.last.is_empty() {
                 line.push(El::styled(
                     format!(" {} {}", caps.g(Glyph::Separator), row.member.last),
                     muted,
                 ));
             }
-            out.extend(band(line, selectable.is_some_and(lit)));
+            // `1 分 52 秒 · ↓ 61.6k tok`: the figures a person scans the list
+            // for — which one is still going, and how much it has read.
+            let figures = row.elapsed.map(|took| {
+                let took = crate::text::spoken_duration(took.as_secs());
+                match row.tokens {
+                    0 => took,
+                    n => format!(
+                        "{took} {} ↓ {} tok",
+                        caps.g(Glyph::Separator),
+                        crate::content::token_count(n)
+                    ),
+                }
+            });
+            out.extend(band(lay(line, figures), selectable.is_some_and(lit)));
         }
         out
     }
@@ -438,8 +470,11 @@ enum Shown {
 
 struct Row {
     member: Member,
+    /// Its name is the label it was delegated with, not one a lead gave it.
+    labelled: bool,
+    elapsed: Option<std::time::Duration>,
+    tokens: u32,
     state: Shown,
-    turn: u64,
     /// Empty for a member only this log knows of, which cannot be switched to.
     session: String,
 }
@@ -466,16 +501,21 @@ fn rows(state: &State, moment: &Moment) -> Vec<Row> {
         if live.gone || logged.is_some_and(|m| m.stopped) {
             continue;
         }
+        // One this log never delegated — a subagent the `task` tool made — is
+        // listed by what it was asked to do: its name is a minted id.
+        let labelled = logged.is_none() && live.label.is_some();
         out.push(Row {
             member: logged.cloned().unwrap_or_else(|| Member {
-                name: live.name.clone(),
+                name: live.label.clone().unwrap_or_else(|| live.name.clone()),
                 ..Member::default()
             }),
+            labelled,
+            elapsed: live.elapsed,
+            tokens: live.tokens,
             state: match live.activity {
                 Activity::Idle => Shown::Idle,
                 _ => Shown::Working,
             },
-            turn: live.turn,
             session: live.session.clone(),
         });
     }
@@ -487,8 +527,10 @@ fn rows(state: &State, moment: &Moment) -> Vec<Row> {
         }
         out.push(Row {
             member: member.clone(),
+            labelled: false,
+            elapsed: None,
+            tokens: 0,
             state: Shown::Working,
-            turn: 0,
             session: String::new(),
         });
     }
@@ -548,6 +590,48 @@ mod tests {
             .map(|l| l.plain())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// A subagent the `task` tool made is listed by what it was asked to do —
+    /// its session id is minted and says nothing — with how long it has run
+    /// and how big its context is at the right edge; the lead is `main`.
+    #[test]
+    fn a_subagent_is_listed_by_its_label_with_its_time_and_context() {
+        let live = Moment::default()
+            .with_lead("lead-1")
+            .with_members(vec![MemberNow {
+                name: "sub-1791210735".into(),
+                activity: Activity::Working,
+                turn: 1,
+                session: "sub-1791210735".into(),
+                label: Some("审查 Chat.tsx 缺陷".into()),
+                elapsed: Some(std::time::Duration::from_secs(112)),
+                tokens: 61_600,
+                ..MemberNow::default()
+            }]);
+        let live = Moment {
+            viewing: "lead-1".into(),
+            ..live
+        };
+        let screen = drew(&State::default(), &live);
+        // Claude Code's marks: the one on screen filled, every other hollow.
+        assert!(
+            screen.contains("● main"),
+            "the lead is on screen:\n{screen}"
+        );
+        assert!(screen.contains("○ 审查"), "the subagent is not:\n{screen}");
+        let row = screen
+            .lines()
+            .find(|l| l.contains("审查 Chat.tsx 缺陷"))
+            .unwrap_or_else(|| panic!("listed by its label:\n{screen}"));
+        assert!(
+            !screen.contains("sub-1791210735"),
+            "not by its id:\n{screen}"
+        );
+        assert!(
+            row.trim_end().ends_with("↓ 61.6k tok") && row.contains("1 分 52 秒"),
+            "time and context at the right edge: {row:?}"
+        );
     }
 
     fn fold(facts: &[SessionEvent]) -> State {
@@ -614,8 +698,8 @@ mod tests {
                 ..MemberNow::default()
             }]);
         assert!(
-            drew(&state, &live).contains("第 2 轮"),
-            "{}",
+            drew(&state, &live).contains("scout") && !drew(&state, &live).contains("轮"),
+            "a working member is drawn, without a turn count:\n{}",
             drew(&state, &live)
         );
         assert_eq!(targets(&live), vec!["lead-1", "lead-1/scout"]);
@@ -630,6 +714,7 @@ mod tests {
                 turn: 2,
                 session: "lead-1/scout".into(),
                 gone: true,
+                ..MemberNow::default()
             }]);
         let screen = drew(&state, &stopped);
         assert!(

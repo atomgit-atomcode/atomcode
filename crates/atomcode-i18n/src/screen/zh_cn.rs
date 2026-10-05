@@ -141,7 +141,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("团队 · {count} 名成员 · ↑↓ 选 · Enter 切换 · Esc 返回").into()
         }
         Msg::TeamHeader { count } => format!("团队 · {count} 名成员 · Tab 切换查看").into(),
-        Msg::TeamLead => "主".into(),
+        Msg::TeamLead => "main".into(),
         Msg::TeamViewing => " 正在看".into(),
         Msg::TeamWorkingRound { round } => format!("第 {round} 轮").into(),
 
@@ -406,7 +406,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ContextCounts { turn, messages, facts } => format!("{turn} 轮 · {messages} 条模型可见消息 · {facts} 条事实").into(),
         Msg::NothingSaidYet => "还没有对话".into(),
         Msg::NoRoster => "这块屏幕没有 agent 名册:启动器没有提供 `tui-team-roster`".into(),
-        Msg::AgentsLead => "主 · 这个会话本身".into(),
+        Msg::AgentsLead => "main · 这个会话本身".into(),
         Msg::AgentsStopped { name } => format!("{name} · 已停,日志还在").into(),
         Msg::AgentsNoneYet => "这个会话底下还没有别的 agent".into(),
         Msg::AgentsPickerHint => "看谁 · enter 切过去".into(),

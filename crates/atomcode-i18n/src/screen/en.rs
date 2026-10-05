@@ -164,7 +164,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("team · {count} members · ↑↓ to pick · Enter to switch · Esc to go back").into()
         }
         Msg::TeamHeader { count } => format!("team · {count} members · Tab to switch view").into(),
-        Msg::TeamLead => "lead".into(),
+        Msg::TeamLead => "main".into(),
         Msg::TeamViewing => " viewing".into(),
         Msg::TeamWorkingRound { round } => format!("round {round}").into(),
 
@@ -443,7 +443,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ContextCounts { turn, messages, facts } => format!("{turn} turns · {messages} messages the model can see · {facts} facts").into(),
         Msg::NothingSaidYet => "nothing has been said yet".into(),
         Msg::NoRoster => "this screen has no agent roster: the launcher provided no `tui-team-roster`".into(),
-        Msg::AgentsLead => "lead · this session itself".into(),
+        Msg::AgentsLead => "main · this session itself".into(),
         Msg::AgentsStopped { name } => format!("{name} · stopped; its log is still here").into(),
         Msg::AgentsNoneYet => "there is no other agent under this session yet".into(),
         Msg::AgentsPickerHint => "read which one · enter switches to it".into(),

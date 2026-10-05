@@ -6193,7 +6193,7 @@ mod tests {
         // The lead is a row, and so is every member — the stopped one included,
         // saying that it has stopped so nobody wonders why the strip is bare.
         let said = sheet_text(&sheet);
-        assert!(said.contains('主'), "the lead is a row:\n{said}");
+        assert!(said.contains("main"), "the lead is a row:\n{said}");
         assert!(said.contains("scout"), "the running one:\n{said}");
         assert!(
             said.contains("lib") && said.contains("已停"),
