@@ -424,6 +424,13 @@ export interface ProviderInfo {
    * auto-detect from the model. (`"include"` — always echo, placeholder when
    * missing — is also accepted but reserved for auto-detected models.) */
   reasoning_history?: string | null;
+  max_tokens?: number | null;
+  /** The account this model hangs off (missing from an older daemon). */
+  account?: string | null;
+  /** The model's own display name. */
+  display_name?: string | null;
+  /** CodingPlan-managed: shown, never edited (server-decided). */
+  managed?: boolean;
 }
 
 export interface ProviderAccountInfo {
@@ -436,6 +443,16 @@ export interface ProviderAccountInfo {
   model_ids: string[];
   legacy: boolean;
   managed: boolean;
+  /** What to call it: its own name, else its id, else the vendor's. */
+  label?: string;
+  /** The vendor or protocol it speaks, by name. */
+  preset_name?: string;
+  /** A generic protocol pointed at the person's own endpoint. */
+  custom?: boolean;
+  /** Its models can be listed from the endpoint. */
+  discoverable?: boolean;
+  /** Its endpoint can be checked after a save. */
+  probeable?: boolean;
 }
 
 export interface ProviderPresetInfo {
@@ -446,6 +463,8 @@ export interface ProviderPresetInfo {
   requires_api_key: boolean;
   /** Missing when a newer WebUI is temporarily paired with an older daemon. */
   model_source?: 'embedded' | 'discovery_api' | 'manual';
+  /** Its models can be listed from the endpoint. */
+  discoverable?: boolean;
 }
 
 export interface DiscoveredModelInfo {
@@ -470,6 +489,8 @@ export interface ConfigInfo {
   provider_accounts?: ProviderAccountInfo[];
   /** Compiled provider catalog shared with the TUI add-provider flow. */
   provider_presets?: ProviderPresetInfo[];
+  /** Generic protocols for a custom endpoint (OpenAI-compatible, …). */
+  provider_protocols?: ProviderPresetInfo[];
   /** 完成通知配置；旧 daemon 未暴露时为 undefined，前端回退默认值。 */
   notifications?: NotificationConfigInfo;
 }
@@ -598,53 +619,6 @@ export async function getTunnelStatus(): Promise<TunnelStatus> {
 
 // --- Provider CRUD ---
 
-export interface CreateProviderBody {
-  name: string;
-  type: string;       // 'openai' | 'claude' | 'ollama'
-  model: string;
-  api_key?: string;
-  base_url?: string;
-  context_window?: number;
-  set_default?: boolean;
-  /** `"preserve"` / `"exclude"`; omit for auto-detect. */
-  reasoning_history?: string;
-}
-
-export async function createProvider(body: CreateProviderBody): Promise<unknown> {
-  const r = await fetch('/providers', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify(body),
-  });
-  if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error((e as any).error || `HTTP ${r.status}`); }
-  return r.json();
-}
-
-export interface CreateAccountModelBody {
-  selection_id?: string;
-  model: string;
-  display_name?: string;
-  context_window?: number;
-  max_tokens?: number;
-  supports_vision?: boolean;
-}
-
-export async function createModelsForAccount(
-  account: string,
-  models: CreateAccountModelBody[],
-): Promise<{ created: string[]; config: ConfigInfo }> {
-  const r = await fetch(`/provider-accounts/${encodeURIComponent(account)}/models`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ models }),
-  });
-  if (!r.ok) {
-    const e = await r.json().catch(() => ({}));
-    throw new Error((e as { error?: string }).error || `HTTP ${r.status}`);
-  }
-  return r.json();
-}
-
 export async function discoverProviderModels(body: {
   type: string;
   base_url: string;
@@ -665,44 +639,126 @@ export async function discoverProviderModels(body: {
   return payload.models as DiscoveredModelInfo[];
 }
 
-export async function deleteProvider(name: string): Promise<void> {
-  const r = await fetch(`/providers/${encodeURIComponent(name)}`, { method: 'DELETE', headers: authHeaders() });
-  if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error((e as any).error || `HTTP ${r.status}`); }
+// --- Provider accounts (account → models), written by the shared provider book ---
+
+/** A refusal from the daemon: `code` names it so the page can say it in the
+ * person's language; `message` is the daemon's own words. */
+export class ApiCallError extends Error {
+  code?: string;
+  status: number;
+  constructor(message: string, status: number, code?: string) {
+    super(message);
+    this.status = status;
+    this.code = code;
+  }
 }
 
-export interface UpdateProviderBody {
-  // 重命名：传新 name 即把该 provider 改名（后端按 key 迁移并修正默认项）；省略=保持原名。
-  name?: string;
-  type?: string;
-  model?: string;
-  // 省略字段=保持不变；传字符串=覆盖。
-  api_key?: string;
-  base_url?: string;
+async function call<T>(method: string, path: string, body?: unknown): Promise<T> {
+  const r = await fetch(path, {
+    method,
+    headers: body === undefined ? authHeaders() : { 'Content-Type': 'application/json', ...authHeaders() },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const e = (await r.json().catch(() => ({}))) as { error?: string; code?: string };
+    throw new ApiCallError(e.error || `HTTP ${r.status}`, r.status, e.code);
+  }
+  return r.json() as Promise<T>;
+}
+
+const enc = encodeURIComponent;
+
+export interface NewModelBody {
+  model: string;
+  display_name?: string;
   context_window?: number;
-  // `"preserve"`/`"exclude"` 覆盖；传 null 清空(回到自动判定);省略=保持不变。
-  reasoning_history?: string | null;
+  max_tokens?: number;
+  supports_vision?: boolean;
 }
 
-/** PATCH /providers/:name —— 部分更新已有 provider（可改名：body.name 传新名）。 */
-export async function updateProvider(name: string, body: UpdateProviderBody): Promise<unknown> {
-  const r = await fetch(`/providers/${encodeURIComponent(name)}`, {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify(body),
-  });
-  if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error((e as any).error || `HTTP ${r.status}`); }
-  return r.json();
+export interface CreateAccountBody {
+  /** Required for a custom protocol; a vendor preset defaults to its own id. */
+  id?: string;
+  /** A vendor preset id or a protocol id. */
+  provider: string;
+  display_name?: string;
+  base_url?: string;
+  api_key?: string;
+  models: NewModelBody[];
+  set_default?: boolean;
 }
 
-/** POST /providers/:name/default —— 设为默认 provider。 */
-export async function setDefaultProvider(name: string): Promise<unknown> {
-  const r = await fetch(`/providers/${encodeURIComponent(name)}/default`, {
-    method: 'POST',
-    headers: authHeaders(),
-  });
-  if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error((e as any).error || `HTTP ${r.status}`); }
-  return r.json();
+/** POST /provider-accounts — an account and its models in one write. */
+export function createAccount(body: CreateAccountBody) {
+  return call<{ account: string; models: string[]; config: ConfigInfo }>('POST', '/provider-accounts', body);
 }
+
+export interface EditAccountBody {
+  /** Empty clears the name. */
+  display_name?: string;
+  /** Empty falls back to the protocol's own endpoint. */
+  base_url?: string;
+  /** Empty or omitted keeps the stored key. */
+  api_key?: string;
+}
+
+/** PATCH /provider-accounts/:id — the connection every model on it shares. */
+export function editAccount(id: string, body: EditAccountBody) {
+  return call<{ config: ConfigInfo }>('PATCH', `/provider-accounts/${enc(id)}`, body);
+}
+
+/** DELETE /provider-accounts/:id — the account and every model on it. */
+export function deleteAccount(id: string) {
+  return call<{ config: ConfigInfo }>('DELETE', `/provider-accounts/${enc(id)}`);
+}
+
+/** POST /provider-accounts/:id/models */
+export function addAccountModels(id: string, models: NewModelBody[]) {
+  return call<{ created: string[]; config: ConfigInfo }>('POST', `/provider-accounts/${enc(id)}/models`, { models });
+}
+
+export interface EditModelBody {
+  model?: string;
+  /** Empty clears the name. */
+  display_name?: string;
+  context_window?: number;
+  max_tokens?: number;
+  clear_max_tokens?: boolean;
+  supports_vision?: boolean;
+  clear_supports_vision?: boolean;
+}
+
+/** PATCH /model-profiles/:id — one model's own settings; its account is untouched. */
+export function editModelProfile(id: string, body: EditModelBody) {
+  return call<{ config: ConfigInfo }>('PATCH', `/model-profiles/${enc(id)}`, body);
+}
+
+/** DELETE /model-profiles/:id */
+export function deleteModelProfile(id: string) {
+  return call<{ config: ConfigInfo }>('DELETE', `/model-profiles/${enc(id)}`);
+}
+
+/** POST /model-profiles/:id/default */
+export function setDefaultModel(id: string) {
+  return call<{ config: ConfigInfo }>('POST', `/model-profiles/${enc(id)}/default`);
+}
+
+export type ProbeResult =
+  | { probed: false; reason: 'managed' | 'no_endpoint' | 'unsupported_protocol' }
+  | {
+      probed: true;
+      ok: boolean;
+      kind: 'reachable' | 'key_rejected' | 'model_missing' | 'wrong_path' | 'unreachable' | 'unexpected';
+      message: string;
+      /** A base URL that answered, when the saved one is a `/v1` away. */
+      fix?: string | null;
+    };
+
+/** POST /provider-accounts/:id/probe — one request to the endpoint as saved. */
+export function probeAccount(id: string, selection?: string) {
+  return call<ProbeResult>('POST', `/provider-accounts/${enc(id)}/probe`, selection ? { selection } : {});
+}
+
 
 // --- Filesystem browsing ---
 

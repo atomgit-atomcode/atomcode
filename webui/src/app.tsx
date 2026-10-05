@@ -4,7 +4,8 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { Chat } from './components/Chat';
 import { Sidebar } from './components/Sidebar';
-import { ThemeDialog, LanguageDialog, ModelConfigDialog, RemoteAccessDialog, NotificationsDialog } from './components/SettingsDialogs';
+import { ThemeDialog, LanguageDialog, RemoteAccessDialog, NotificationsDialog } from './components/SettingsDialogs';
+import { ModelConfigDialog } from './components/ModelProviders';
 import { RenameDialog, DeleteDialog } from './components/SessionDialogs';
 import { CwdPicker } from './components/CwdPicker';
 import { resolvePendingAfterDecision } from './lib/pendingPermission';

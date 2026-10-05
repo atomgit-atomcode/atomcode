@@ -1857,6 +1857,66 @@ mod tests {
         assert!(!config.provider_accounts.contains_key("taotoken"));
     }
 
+    /// Anthropic lists its models where its chat adapter would look —
+    /// `{base}/v1/models` — and authenticates the way that adapter does:
+    /// `x-api-key` and `anthropic-version`, never a Bearer header.
+    #[tokio::test]
+    async fn anthropic_discovery_uses_its_own_path_and_headers() {
+        assert_eq!(
+            discovery_url("https://api.anthropic.com", "anthropic")
+                .unwrap()
+                .as_str(),
+            "https://api.anthropic.com/v1/models"
+        );
+        let router = Router::new().route(
+            "/v1/models",
+            get(|headers: HeaderMap| async move {
+                let key = headers.get("x-api-key").and_then(|v| v.to_str().ok());
+                let version = headers
+                    .get("anthropic-version")
+                    .and_then(|v| v.to_str().ok());
+                if key != Some("sk-ant")
+                    || version.is_none()
+                    || headers.contains_key(header::AUTHORIZATION)
+                {
+                    return Response::builder()
+                        .status(StatusCode::UNAUTHORIZED)
+                        .body(Body::empty())
+                        .unwrap();
+                }
+                Response::builder()
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"data":[{"id":"claude-x","display_name":"Claude X","type":"model"}]}"#,
+                    ))
+                    .unwrap()
+            }),
+        );
+        let models_url = spawn_discovery_server(router).await;
+        let base = format!(
+            "http://{}",
+            models_url
+                .host_str()
+                .map(|h| format!("{h}:{}", models_url.port().unwrap()))
+                .unwrap()
+        );
+        let url = discovery_url(&base, "anthropic").unwrap();
+        let body = fetch_discovery_body(
+            url,
+            "anthropic",
+            &DiscoveryTransport {
+                api_key: Some("sk-ant".into()),
+                ..Default::default()
+            },
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let models = parse_discovered_models("anthropic", &body).unwrap();
+        assert_eq!(models[0].id, "claude-x");
+        assert_eq!(models[0].name.as_deref(), Some("Claude X"));
+    }
+
     #[tokio::test]
     async fn discovery_http_sends_bound_auth_and_user_agent() {
         let router = Router::new().route(
