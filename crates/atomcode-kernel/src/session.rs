@@ -921,12 +921,23 @@ fn taken_back(events: &[LoggedEvent]) -> impl Fn(SeqNo) -> bool {
 /// **不是** tool 结果的消息时（或日志走完时）才作为一条 user 承载消息落下，紧跟这一批
 /// 结果之后。这与回合引擎 live 路径的时机一致：`agent/engine.rs` 把一批图片攒进
 /// `turn_images`，批结束后才落一条。
+///
+/// 图片之外，任何**在一批调用还等着结果时**写进日志的非 tool 消息也是同一个问题：工具批
+/// 执行期间提交的 `Injected`（重复调用熔断的提示、人停掉团队成员的通知）在日志里排在
+/// 结果前面，按日志顺序落下就成了 `assistant(tool_calls) → user → tool`。这类消息先压在
+/// [`held`](Self::held) 里，这批调用的结果到齐（或下一条 assistant、日志走完）再放，
+/// 排在图片承载消息之后。日志本身不改：已经写成这个顺序的会话照样能恢复（与 oh-my-pi
+/// `transformMessages` 把结果提到夹进来的消息之前同向）。
 struct Projection {
     messages: Vec<TracedMessage>,
     /// 已收下、还没落成承载消息的图片。
     pending: Vec<ImageContent>,
     /// 第一条带图结果的序号，给承载消息做 provenance。
     pending_from: SeqNo,
+    /// 最近一条 assistant 要的、还没见到结果的调用。
+    awaiting: Vec<String>,
+    /// 在 `awaiting` 非空时落下的非 tool 消息，等这批结果到齐再放。
+    held: Vec<TracedMessage>,
 }
 
 impl Projection {
@@ -935,16 +946,48 @@ impl Projection {
             messages: Vec::new(),
             pending: Vec::new(),
             pending_from: 0,
+            awaiting: Vec::new(),
+            held: Vec::new(),
         }
     }
 
     /// 落一条消息。落下之前，若这一条不是 tool 结果而手里还攒着图片，说明上一批结果
     /// 已经走完：先把承载消息落了，图片才不会挤进这批结果中间。
     fn push(&mut self, message: Message, source: Provenance) {
-        if message.role != Role::Tool {
-            self.flush_images();
+        match message.role {
+            Role::Tool => {
+                let id = message.tool_call_id.clone();
+                self.messages.push(TracedMessage { message, source });
+                if let Some(id) = id {
+                    let was_open = !self.awaiting.is_empty();
+                    self.awaiting.retain(|waiting| *waiting != id);
+                    if was_open && self.awaiting.is_empty() {
+                        self.release();
+                    }
+                }
+            }
+            // 一条新的 assistant：上一批还缺的结果不会再来了（取消的调用由
+            // `Interrupted` 补位，补不上的是日志本身缺），压着的消息按原位置放出。
+            Role::Assistant => {
+                self.awaiting.clear();
+                self.release();
+                self.awaiting = message.tool_calls.iter().map(|c| c.id.clone()).collect();
+                self.messages.push(TracedMessage { message, source });
+            }
+            _ if !self.awaiting.is_empty() => {
+                self.held.push(TracedMessage { message, source });
+            }
+            _ => {
+                self.flush_images();
+                self.messages.push(TracedMessage { message, source });
+            }
         }
-        self.messages.push(TracedMessage { message, source });
+    }
+
+    /// 一批结果走完：先落图片承载消息，再放压着的消息。
+    fn release(&mut self) {
+        self.flush_images();
+        self.messages.append(&mut self.held);
     }
 
     /// 收下一条工具结果带的图片，**不**当场落消息（理由见 struct 的说明）。
@@ -960,7 +1003,7 @@ impl Projection {
 
     /// 日志走完：攒着的图片也要落下。
     fn finish(mut self) -> Vec<TracedMessage> {
-        self.flush_images();
+        self.release();
         self.messages
     }
 
@@ -1214,10 +1257,6 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<TracedMessage> {
                 } else {
                     content.clone()
                 };
-                projection.push(
-                    Message::tool_result(call_id, &shown, *is_error),
-                    Provenance::Event(seq),
-                );
                 // A provider serializes images on a user message and rejects
                 // them on a tool one, so the picture rides in a carrier user
                 // message of its own — but only once this batch's results have
@@ -1228,7 +1267,13 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<TracedMessage> {
                 // session permanently, since every request is rebuilt from this
                 // projection. `Projection` holds them until the run of tool
                 // messages ends (or the log does).
+                // Taken before the result is pushed: the result that completes
+                // the batch releases the carrier, and its own pictures belong in it.
                 projection.take_images(seq, images);
+                projection.push(
+                    Message::tool_result(call_id, &shown, *is_error),
+                    Provenance::Event(seq),
+                );
             }
             // Chunks, headers, usage and turn boundaries are facts about the
             // session, not content the model receives.

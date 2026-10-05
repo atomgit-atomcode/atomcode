@@ -453,6 +453,30 @@ async fn the_coarse_fuse_catches_what_the_exact_guard_misses() {
         transcript.contains("SAME tool call"),
         "the model gets a chance to change course before the turn is taken away"
     );
+
+    // Said after the round's results, never between a call and its result: a
+    // nudge logged inside the batch projected as `assistant(tool_calls) → user
+    // → tool`, which a strict provider rejects on every request after it.
+    use atomcode_kernel::session::SessionEvent;
+    let events = app.context().only_session().unwrap().events();
+    let mut waiting = std::collections::HashSet::new();
+    for logged in &events {
+        match &logged.event {
+            SessionEvent::AssistantMessage { tool_calls, .. } => {
+                waiting = tool_calls.iter().map(|c| c.id.clone()).collect();
+            }
+            SessionEvent::ToolResultLogged { call_id, .. } => {
+                waiting.remove(call_id);
+            }
+            SessionEvent::Injected { text, .. } if text.contains("SAME tool call") => {
+                assert!(
+                    waiting.is_empty(),
+                    "the nudge was logged while calls {waiting:?} still awaited results"
+                );
+            }
+            _ => {}
+        }
+    }
 }
 
 /// The same call that takes its time each round: a model watching a long job.

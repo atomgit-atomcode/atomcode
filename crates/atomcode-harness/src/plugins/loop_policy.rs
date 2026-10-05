@@ -976,6 +976,8 @@ struct RepeatState {
     signature: String,
     rounds: u32,
     nudged: bool,
+    /// The session owed the nudge, said once its round's results are logged.
+    owed: Option<Arc<crate::session::SessionLog>>,
 }
 
 const REPEAT_NUDGE: &str = "\
@@ -1044,23 +1046,52 @@ impl Waterfall<ToolsExecuteBatch> for RepeatFuse {
             let mut state = self.state.lock().expect("repeat fuse poisoned");
             if !state.nudged {
                 state.nudged = true;
-                drop(state);
-                // Logged as a fact with provenance, like every other thing the
-                // harness tells the model on its own initiative.
-                if let Some(session) = crate::agent::scoped(&self.ctx).service::<SessionSvc>() {
-                    crate::session::commit(
-                        &self.ctx,
-                        &session,
-                        SessionEvent::Injected {
-                            turn: session.current_turn(),
-                            text: REPEAT_NUDGE.to_string(),
-                            origin: InjectionOrigin::Continuation,
-                        },
-                    );
-                }
+                // Owed, not said: this batch's results are logged only after
+                // the waterfall returns, and a nudge committed now would sit
+                // between the calls and their results — the request a provider
+                // rejects with "insufficient tool messages following
+                // tool_calls message". Said at the round's `StepEnd` instead.
+                state.owed = crate::agent::scoped(&self.ctx).service::<SessionSvc>();
             }
         }
         results
+    }
+}
+
+impl RepeatFuse {
+    /// Say the owed nudge, once the round that earned it has logged its results.
+    fn on_committed(&self, committed: &crate::session::Committed) {
+        // A backstop: the loop logs `StepEnd` after every batch, a cancelled one
+        // included, so the nudge is normally said by then. Should a turn end
+        // without it, the nudge goes with the turn rather than into the next.
+        let ends_turn = matches!(committed.event, SessionEvent::TurnEnd { .. });
+        if !ends_turn && !matches!(committed.event, SessionEvent::StepEnd { .. }) {
+            return;
+        }
+        // Taken under the lock, said outside it: committing re-enters this
+        // listener through `SessionEventCommitted`.
+        let session = {
+            let mut state = self.state.lock().expect("repeat fuse poisoned");
+            match &state.owed {
+                Some(owed) if owed.id() == committed.session => state.owed.take(),
+                _ => None,
+            }
+        };
+        let session = session.filter(|_| !ends_turn);
+        let Some(session) = session else {
+            return;
+        };
+        // Logged as a fact with provenance, like every other thing the harness
+        // tells the model on its own initiative.
+        crate::session::commit(
+            &self.ctx,
+            &session,
+            SessionEvent::Injected {
+                turn: session.current_turn(),
+                text: REPEAT_NUDGE.to_string(),
+                origin: InjectionOrigin::Continuation,
+            },
+        );
     }
 }
 
@@ -1133,7 +1164,10 @@ impl Plugin for RepeatFusePlugin {
             state: Mutex::new(RepeatState::default()),
         });
         let _ = ctx.on_waterfall::<ToolsExecuteBatch>(fuse.clone(), false);
-        let _ = ctx.on_serial::<TurnStopping>(fuse);
+        let _ = ctx.on_serial::<TurnStopping>(fuse.clone());
+        let _ = ctx.on_emit::<crate::events::SessionEventCommitted>(move |committed| {
+            fuse.on_committed(committed)
+        });
         Ok(())
     }
 }
