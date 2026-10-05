@@ -10872,8 +10872,6 @@ mod tests {
             .collect()
     }
 
-    #[test]
-
     /// A question in the tail holds the bottom of the pane at every scroll, the
     /// rest of the tail rolls away first as before, and the top of the
     /// conversation is reached at the same limit.
@@ -10923,6 +10921,7 @@ mod tests {
         assert_eq!(p.block_scroll, 0);
     }
 
+    #[test]
     fn a_pin_that_would_leave_the_top_empty_is_pulled_back() {
         // The other side of the same coin: pinned past the new limit, the
         // scroll would sit above the oldest line — which reads as the

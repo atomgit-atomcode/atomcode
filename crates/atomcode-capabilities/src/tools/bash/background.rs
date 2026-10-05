@@ -245,13 +245,16 @@ pub(crate) fn kill(job_id: &str) -> Result<String, String> {
     if job.kill.send(()).is_err() {
         let status = job.shared.status.lock().unwrap().clone();
         return Ok(format!(
-            "Background job {job_id} had already finished ({}); nothing was running to stop. \
-             Poll it once more to collect its output.",
+            "Background job {job_id} (`{}`) had already finished ({}); nothing was running to \
+             stop. Poll it once more to collect its output.",
+            job.command,
             status_line(&status).trim_start_matches("status: ")
         ));
     }
     Ok(format!(
-        "Signalled background job {job_id} to stop. Poll it once more to collect final output."
+        "Signalled background job {job_id} (`{}`) to stop. Poll it once more to collect final \
+         output.",
+        job.command
     ))
 }
 
