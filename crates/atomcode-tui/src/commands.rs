@@ -2157,6 +2157,38 @@ impl CommandSet for SessionCommands {
             // somewhere — this is the one place that says it all at once.
             "status" => {
                 let described = client.described();
+                // Everything the Status page says — who is signed in, the plan
+                // and when it runs out, what is left of the allowance, where the
+                // configuration came from — gathered and laid out by the same
+                // code the page uses. This command said only the session, the
+                // model and the directory, and the account and the plan's expiry
+                // the other front end's `/status` showed went missing.
+                if let Some(control) = control.clone() {
+                    let page = crate::settings::gather_status(
+                        control.clone(),
+                        root.clone(),
+                        described.clone(),
+                        None,
+                    )
+                    .await;
+                    let mut said = crate::modules::settings::status_text(&page);
+                    if let Ok(HostReply::Autonomy {
+                        running: Some(running),
+                    }) = control
+                        .call(HostCommand::Autonomy {
+                            session: root.clone(),
+                        })
+                        .await
+                    {
+                        said.push_str("\n\n");
+                        said.push_str(&t(Msg::StatusAutonomyLine {
+                            what: &running.what,
+                            round: running.round,
+                            took: &crate::text::spoken_duration(running.elapsed_secs),
+                        }));
+                    }
+                    return Outcome::Said(said);
+                }
                 let model = described
                     .as_ref()
                     .and_then(|d| d.model.clone())
@@ -3380,6 +3412,91 @@ mod tests {
         let all = Arc::new(Commands::new());
         let _ = all.add(Arc::new(SessionCommands));
         (app, client, all)
+    }
+
+    /// A host that answers each question by what it is, whatever order the
+    /// questions arrive in — `/status` asks five of them at once.
+    struct Answering;
+
+    #[async_trait]
+    impl atomcode_host_api::HostControl for Answering {
+        async fn call(&self, command: HostCommand) -> Result<HostReply, HostError> {
+            Ok(match command {
+                HostCommand::WhoAmI { .. } => HostReply::Identity {
+                    signed_in: true,
+                    who: Some("lichao".into()),
+                    detail: Some("lichao@example.com".into()),
+                    stored_at: None,
+                },
+                HostCommand::Usage { .. } => HostReply::Usage {
+                    windows: Vec::new(),
+                    unavailable: None,
+                    plan: Some(atomcode_host_api::Entitlement {
+                        plan: "CodingPlan Pro".into(),
+                        active: true,
+                        claimed_at: "2026-07-01".into(),
+                        expires_at: "2026-12-31".into(),
+                        remaining_days: 86,
+                        total_days: 183,
+                    }),
+                    stats: None,
+                },
+                HostCommand::Sources { .. } => HostReply::Sources {
+                    groups: vec![atomcode_host_api::SourceGroup {
+                        label: "指令文件".into(),
+                        files: vec![atomcode_host_api::SourceFile {
+                            label: "项目".into(),
+                            path: "/work/AGENTS.md".into(),
+                            present: false,
+                        }],
+                    }],
+                },
+                _ => HostReply::Done,
+            })
+        }
+        fn subscribe(&self) -> tokio::sync::mpsc::UnboundedReceiver<atomcode_host_api::HostEvent> {
+            tokio::sync::mpsc::unbounded_channel().1
+        }
+    }
+
+    /// `/status` says what the Status page says: who is signed in, the plan and
+    /// when it runs out — which is what the other front end's `/status` showed
+    /// and this one had dropped — and where the configuration came from.
+    #[tokio::test]
+    async fn status_says_who_is_signed_in_and_when_the_plan_runs_out() {
+        let app = bare();
+        let client = Arc::new(crate::plugin::AgentClient::default());
+        let (commands, _agent) = tokio::sync::mpsc::unbounded_channel();
+        client.connect(commands, Arc::new(Answering));
+        client.follow("lead");
+        let _ = app
+            .context()
+            .provide::<crate::plugin::AgentClientSvc>(client.clone());
+        let all = Arc::new(Commands::new());
+        let _ = all.add(Arc::new(SessionCommands));
+        let said = match all.dispatch("/status", &app.context()).await {
+            Outcome::Said(said) => said,
+            other => panic!("{other:?}"),
+        };
+        for expected in [
+            "lead",
+            "lichao",
+            "lichao@example.com",
+            "CodingPlan Pro",
+            "2026-12-31",
+            "86",
+            "183",
+            "AGENTS.md",
+        ] {
+            assert!(
+                said.contains(expected),
+                "{expected:?} missing from:\n{said}"
+            );
+        }
+        assert!(
+            said.contains(t(Msg::SettingsNotFound).as_ref()),
+            "a missing file is said in words:\n{said}"
+        );
     }
 
     /// `/undo` asks the host about the session this screen follows, based on the

@@ -965,6 +965,40 @@ fn status_lines(page: Option<&crate::settings::StatusPage>) -> Vec<UsageLine> {
     out
 }
 
+/// The Status page as text, for `/status`: the same rows, in the same order.
+///
+/// Walked from [`status_lines`] rather than written again, so the command and
+/// the page cannot drift. A file row says it was not found in words rather
+/// than with a mark: a command's answer is text, and which glyphs this terminal
+/// can draw is not known to it.
+pub fn status_text(page: &crate::settings::StatusPage) -> String {
+    let mut out = Vec::new();
+    for line in status_lines(Some(page)) {
+        out.push(match line {
+            UsageLine::Columns { text } => text,
+            UsageLine::Head(text) | UsageLine::Note(text) => text,
+            UsageLine::File {
+                present,
+                label,
+                path,
+            } => {
+                let mut row = format!(
+                    "  {}{}",
+                    pad_right(&label, 14),
+                    crate::text::collapse_home(&path)
+                );
+                if !present {
+                    row.push_str(&t(Msg::SettingsNotFound));
+                }
+                row
+            }
+            UsageLine::Gap => String::new(),
+            _ => continue,
+        });
+    }
+    out.join("\n")
+}
+
 /// The MCP servers counted by what they are doing, worst first.
 ///
 /// Counted rather than listed: a person on this page wants to know whether

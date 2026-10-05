@@ -553,6 +553,91 @@ pub struct StatusPage {
     pub sources: Vec<atomcode_host_api::SourceGroup>,
 }
 
+/// Ask the host for everything the Status page shows.
+///
+/// Five questions, asked at once rather than one after another: they are five
+/// round trips about one screen, and a page that took five times as long to
+/// appear is a page that feels broken. Each stands on its own — a host that
+/// will not say who is signed in is not a reason to leave the working
+/// directory blank.
+///
+/// One gathering for the two places that show it — the Status page and
+/// `/status` — so the command cannot come to say less than the page, which is
+/// what it did: the account and the plan's expiry were on the page and not in
+/// the command.
+pub async fn gather_status(
+    control: Arc<dyn atomcode_host_api::HostControl>,
+    session: String,
+    described: Option<atomcode_kernel::agent::AgentDescription>,
+    title: Option<String>,
+) -> StatusPage {
+    use atomcode_host_api::{HostCommand, HostReply};
+    let ask = |command| {
+        let control = control.clone();
+        async move { control.call(command).await.ok() }
+    };
+    let (context, who, mcp, usage, sources) = tokio::join!(
+        ask(HostCommand::Context {
+            session: session.clone(),
+            prompt: false,
+        }),
+        ask(HostCommand::WhoAmI {
+            session: session.clone()
+        }),
+        ask(HostCommand::McpStatus {
+            session: session.clone()
+        }),
+        ask(HostCommand::Usage {
+            session: session.clone(),
+            windows_only: false,
+        }),
+        ask(HostCommand::Sources {
+            session: session.clone()
+        }),
+    );
+    let cwd = match context {
+        Some(HostReply::Context { working_dir, .. }) => working_dir,
+        _ => String::new(),
+    };
+    let who = match who {
+        Some(HostReply::Identity {
+            signed_in: true,
+            who: Some(who),
+            detail,
+            ..
+        }) => Some((who, detail)),
+        _ => None,
+    };
+    let mcp = match mcp {
+        Some(HostReply::McpServers { servers }) => servers,
+        _ => Vec::new(),
+    };
+    let (plan, window) = match usage {
+        Some(HostReply::Usage { plan, windows, .. }) => (plan, windows.into_iter().next()),
+        _ => (None, None),
+    };
+    let sources = match sources {
+        Some(HostReply::Sources { groups }) => groups,
+        _ => Vec::new(),
+    };
+    StatusPage {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        session,
+        title,
+        cwd,
+        who,
+        model: described.as_ref().and_then(|d| d.model.clone()),
+        effort: described
+            .as_ref()
+            .and_then(|d| d.reasoning_effort)
+            .map(|level| level.as_str().to_string()),
+        plan,
+        window,
+        mcp,
+        sources,
+    }
+}
+
 /// What this session is using of the model's context window.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContextUse {
