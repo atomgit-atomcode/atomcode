@@ -528,8 +528,9 @@ pub trait Process: Send + Sync {
     /// inherits stdout and keeps it open; waiting for EOF waited for the server
     /// to stop, so the call sat until its timeout and the timeout killed the
     /// server it had just started. Once the process has exited, what is still
-    /// coming is read for at most [`POST_EXIT_DRAIN`] and the result returned
-    /// (codex waits 2 s, oh-my-pi up to 2 s).
+    /// coming is read until the pipes go quiet for [`POST_EXIT_IDLE`], and for
+    /// at most [`POST_EXIT_DRAIN`], and the result returned (oh-my-pi: 250 ms
+    /// idle, 2 s cap; codex a flat 2 s).
     ///
     /// Provided rather than required so a world implements the three primitives
     /// and inherits this, and so it cannot disagree with them.
@@ -577,10 +578,14 @@ pub trait Process: Send + Sync {
                 exit = self.wait() => {
                     let exit = exit?;
                     let drained = tokio::time::Instant::now() + POST_EXIT_DRAIN;
-                    while let Ok(Some(chunk)) =
-                        tokio::time::timeout_at(drained, self.next_chunk()).await
-                    {
-                        take(chunk);
+                    loop {
+                        let quiet = tokio::time::Instant::now() + POST_EXIT_IDLE;
+                        match tokio::time::timeout_at(drained.min(quiet), self.next_chunk())
+                            .await
+                        {
+                            Ok(Some(chunk)) => take(chunk),
+                            Ok(None) | Err(_) => break,
+                        }
                     }
                     break exit;
                 }
@@ -599,6 +604,13 @@ pub trait Process: Send + Sync {
 /// for output still in the pipes — and no longer, since a process the command
 /// left running may hold them open for as long as it lives.
 pub const POST_EXIT_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long the pipes may stay silent after the process has exited before
+/// [`Process::collect`] stops reading. What the process itself wrote is
+/// already in the pipe when it exits; a server it left running that has
+/// nothing to say should not make the answer wait the whole
+/// [`POST_EXIT_DRAIN`].
+pub const POST_EXIT_IDLE: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Why a command could not be started — the same split as [`FsError::is_denied`],
 /// because a caller reports the two halves differently.

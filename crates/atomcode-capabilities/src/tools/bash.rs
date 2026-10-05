@@ -3257,6 +3257,42 @@ mod seam_tests {
         panic!("the backgrounded child died writing to the pipe it inherited");
     }
 
+    /// A silent server left running holds the pipe without writing; the answer
+    /// comes once the pipe goes quiet, not after the whole drain cap.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_silent_child_holding_the_pipe_costs_only_the_idle_wait() {
+        let process = LocalShell
+            .spawn("sleep 30 & echo started", &here())
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let collected = process.collect().await.unwrap();
+        assert_eq!(collected.stdout, b"started\n");
+        assert!(
+            started.elapsed() < crate::world::POST_EXIT_DRAIN,
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Output that keeps coming after the exit keeps the drain going: each
+    /// chunk resets the quiet timer, up to the cap.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn output_still_flowing_after_the_exit_is_still_read() {
+        let process = LocalShell
+            .spawn(
+                "(for i in 1 2 3 4; do echo tick$i; sleep 0.1; done) & echo started",
+                &here(),
+            )
+            .await
+            .unwrap();
+        let collected = process.collect().await.unwrap();
+        let out = String::from_utf8(collected.stdout).unwrap();
+        assert!(out.contains("tick4"), "{out:?}");
+    }
+
     /// A limit shorter than the post-exit drain must not turn a command that
     /// finished into one that timed out.
     #[cfg(unix)]
