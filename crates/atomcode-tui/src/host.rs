@@ -5303,31 +5303,33 @@ impl Host {
     /// `tail` is empty for every layout that declares none, and then this is the
     /// identity: the whole pane is the block rect and `block_scroll == scroll`.
     ///
-    /// **A question on screen does not scroll away.** The tail getting out of
-    /// the way first is right for what has already been read — the live line,
-    /// the todo list — and wrong for a question still waiting: the reason to
-    /// scroll back while one is up is to read what it is asking about, and the
-    /// wheel used to spend its first notches rolling the question off the
-    /// screen instead, conversation unmoved. So the question, and whatever rides
-    /// below it, holds the bottom of the pane, and the rest of the pane scrolls
-    /// exactly as above. The limit is unchanged — `(B + T_rest) - (H - T_held)`
-    /// is the same `(B + T) - H` — so nothing that bounds the scroll has to know.
+    /// **A panel a hand is working in does not scroll away** — a question, or
+    /// one of [`HELD`]. The tail getting out of the way first is right for what
+    /// has already been read — the live line, the todo list — and wrong for a
+    /// panel still in use: the wheel used to spend its first notches rolling a
+    /// question off the screen, conversation unmoved, and one notch over the
+    /// conversation took a row from `/model`'s level list, which re-laid itself
+    /// out in what was left and showed one level of three. So the first such
+    /// panel, and whatever rides below it, holds the bottom of the pane, and the
+    /// rest of the pane scrolls exactly as above. The limit is unchanged —
+    /// `(B + T_rest) - (H - T_held)` is the same `(B + T) - H` — so nothing that
+    /// bounds the scroll has to know.
     ///
-    /// Held only while it leaves the conversation at least half the pane: a
-    /// question taller than that on a short terminal would leave a strip of a
-    /// row or two to read back through, and then rolling it away as before is
-    /// the better of the two.
+    /// Held only while the conversation keeps [`HOLD_LEAVES`] rows: a panel
+    /// taller than that on a short terminal would leave a strip of a row or two
+    /// to read back through, and then rolling it away as before is the better of
+    /// the two.
     fn pane_geometry(pane: Rect, scroll: usize, heights: &[(String, u16)]) -> Pane {
         let capped = Self::cap_tail(heights.to_vec(), pane.h);
         let held_from = capped
             .iter()
-            .position(|(id, h)| id == crate::modules::ask::ID && *h > 0);
+            .position(|(id, h)| HELD.contains(&id.as_str()) && *h > 0);
         let Some(held_from) = held_from else {
             return Self::pane_geometry_capped(pane, scroll, &capped);
         };
         let (rolling, held) = capped.split_at(held_from);
         let held_h: u16 = held.iter().map(|(_, h)| *h).sum();
-        if held_h > pane.h / 2 {
+        if pane.h.saturating_sub(held_h) < HOLD_LEAVES {
             return Self::pane_geometry_capped(pane, scroll, &capped);
         }
         let above = Rect::new(pane.x, pane.y, pane.w, pane.h.saturating_sub(held_h));
@@ -6856,6 +6858,28 @@ pub const TAIL: &[&str] = &[
     crate::modules::ask::ID,
     crate::modules::steering::ID,
 ];
+
+/// The panels in [`TAIL`] a hand is working in — every one of them but the
+/// todo list, the live line and the steering bars, which are read rather than
+/// used. Scrolling the conversation leaves them where they are
+/// (`Host::pane_geometry`).
+pub const HELD: &[&str] = &[
+    crate::modules::settings::ID,
+    crate::modules::providers::ID,
+    crate::modules::plugins::ID,
+    crate::modules::tools::ID,
+    crate::modules::mcp::ID,
+    crate::modules::rewind::ID,
+    crate::modules::resume::ID,
+    crate::modules::sheet::ID,
+    crate::modules::flow::ID,
+    crate::modules::bg::ID,
+    crate::modules::ask::ID,
+];
+
+/// How many rows of conversation a held panel has to leave, or it rolls away
+/// with the rest of the tail after all.
+const HOLD_LEAVES: u16 = 5;
 
 /// The conversation, with [`TAIL`] riding at its foot.
 ///
@@ -10928,16 +10952,39 @@ mod tests {
         assert_eq!(p.block_scroll + p.block_rect.h as usize, blocks);
     }
 
-    /// A question taller than half the pane is not held: holding it would
-    /// leave a strip to read back through.
+    /// A question that would leave the conversation fewer than
+    /// [`HOLD_LEAVES`] rows is not held: holding it would leave a strip to read
+    /// back through.
     #[test]
     fn a_tall_question_rolls_away_as_the_tail_always_did() {
         let pane = Rect::new(0, 0, 80, 20);
-        let heights = vec![(crate::modules::ask::ID.to_string(), 15u16)];
-        let p = Host::pane_geometry(pane, 15, &heights);
+        let heights = vec![(crate::modules::ask::ID.to_string(), 16u16)];
+        let p = Host::pane_geometry(pane, 16, &heights);
         assert!(p.tail.is_empty(), "{:?}", p.tail);
         assert_eq!(p.block_rect.h, 20);
         assert_eq!(p.block_scroll, 0);
+    }
+
+    /// `/model`'s level list, a panel a hand is working in: a notch of the wheel
+    /// over the conversation moves the conversation and leaves the panel its
+    /// rows. It used to take one from it, and the list — three levels and the
+    /// chrome around them — re-laid itself out in nine rows and showed one level.
+    #[test]
+    fn a_panel_being_worked_in_keeps_its_rows_while_the_conversation_scrolls() {
+        let pane = Rect::new(0, 0, 80, 20);
+        let heights = vec![
+            ("live".to_string(), 1u16),
+            (crate::modules::providers::ID.to_string(), 10),
+        ];
+        for scroll in [0, 1, 3, 10] {
+            let p = Host::pane_geometry(pane, scroll, &heights);
+            let panel = p
+                .tail
+                .iter()
+                .find(|(id, _)| id == crate::modules::providers::ID)
+                .map(|(_, r)| *r);
+            assert_eq!(panel, Some(Rect::new(0, 10, 80, 10)), "{scroll}");
+        }
     }
 
     #[test]
