@@ -1883,7 +1883,15 @@ async fn a_turn_the_model_never_answers_says_so_and_stops_spinning() {
     // cat rather than the words it replaced: `运行中` is *also* what a pending
     // tool row says (`content.rs`), which would have kept this passing for a
     // reason that has nothing to do with the status line.
-    for frame in atomcode_tui::modules::status::WORKING_FRAMES {
+    //
+    // **Both** frame tables: a terminal without Unicode is handed
+    // `ASCII_WORKING_FRAMES` rather than a spinner and a word, so a control over
+    // the rich set alone would pass on the strength of frames this screen could
+    // never have drawn — which is what it did while the two sets were one.
+    for frame in atomcode_tui::modules::status::WORKING_FRAMES
+        .into_iter()
+        .chain(atomcode_tui::modules::status::ASCII_WORKING_FRAMES)
+    {
         assert!(
             !screen.contains(frame),
             "the status line must not claim a finished turn is running:\n{screen}"

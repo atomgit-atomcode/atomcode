@@ -703,36 +703,48 @@ fn autonomy_badge(running: &atomcode_host_api::Running) -> String {
 /// the frames is exactly how the two would come to disagree about what the
 /// product's cat does while it works.
 ///
-/// The frames are why [`working_indicator`] has a fallback at all: neither `·`
-/// nor `ω` is ASCII, and a frame is not something a downgrade table can rewrite
-/// (see [`crate::caps::SPINNER`]).
 pub const WORKING_FRAMES: [&str; 4] = ["(=^·^=)", "(=^-^=)", "(=^ω^=)", "(=^-^=)"];
+
+/// The same four phases for a terminal that cannot draw `·` or `ω`.
+///
+/// A **second set** rather than a rewrite, for the reason
+/// [`crate::caps::SPINNER`] gives: a frame is not a string a downgrade table
+/// can take apart, so a terminal that cannot draw one has to be handed a
+/// different frame. What it used to be handed instead was the word `running`
+/// and a spinner — that is, no cat at all — over a gap of two characters, when
+/// two of the four frames are already pure ASCII.
+///
+/// Every frame here is the same seven columns as the one it stands in for, so
+/// the row does not shift while the animation runs. `open`/`shut`/`mouth` are
+/// the same three phases, not a second cat: `·` becomes `.`, `ω` becomes `o`.
+pub const ASCII_WORKING_FRAMES: [&str; 4] = ["(=^.^=)", "(=^-^=)", "(=^o^=)", "(=^-^=)"];
 
 /// The frame for this tick. The phase is the injected tick and never a clock
 /// read in `render` — the same rule the strip follows (`docs/adr/0008`).
-fn working_frame(tick: u64) -> &'static str {
-    WORKING_FRAMES[(tick as usize) % WORKING_FRAMES.len()]
+///
+/// The one way to take a frame, for the reason [`crate::caps::SPINNER`] gives
+/// for [`crate::caps::ASCII_SPINNER`]: a module that indexed
+/// [`WORKING_FRAMES`] itself would hand a kaomoji to a terminal that has already
+/// said it stays inside ASCII, and it would arrive as tofu on the one row that
+/// is *all* motion.
+fn working_frame(unicode: bool, tick: u64) -> &'static str {
+    let frames = if unicode {
+        &WORKING_FRAMES[..]
+    } else {
+        &ASCII_WORKING_FRAMES[..]
+    };
+    frames[(tick as usize) % frames.len()]
 }
 
 /// What the status line says while a turn is in flight.
 ///
-/// The cat, not the words: it replaced `{spinner} 运行中` wholesale on this row.
-/// Where the terminal said it cannot draw `·` or `ω` the words come back, and
-/// that is not decoration — this row is on every screen, unlike the strip, and
-/// a kaomoji arrives on a bare ssh client as tofu, which indicates nothing
-/// (`Caps::unicode`).
+/// The cat, not the words: it replaced `{spinner} 运行中` wholesale on this row,
+/// on every terminal. Where `·` or `ω` cannot be drawn it is still the cat, one
+/// [`ASCII_WORKING_FRAMES`] frame narrower in glyphs and no narrower in columns
+/// — this row is on every screen, unlike the strip, and a word where the animal
+/// was says less than the animal did.
 fn working_indicator(m: &Moment) -> String {
-    if m.caps.unicode {
-        working_frame(m.tick).to_string()
-    } else {
-        // The word is the product's — the other front end says "running" about
-        // a subagent with the same meaning, so this reaches for that entry.
-        format!(
-            "{} {}",
-            m.caps.spinner(m.tick),
-            crate::i18n::product::t(crate::i18n::product::Msg::SubagentStatusRunning)
-        )
-    }
+    working_frame(m.caps.unicode, m.tick).to_string()
 }
 
 /// A cat that reacts to what the agent is doing.
@@ -749,6 +761,34 @@ pub enum Mood {
     Thinking,
     Happy,
     Sad,
+}
+
+/// The frames for one mood, in a set the terminal can draw.
+///
+/// [`Mood::Thinking`] is [`WORKING_FRAMES`] and not a second table: the status
+/// line and this view draw the same animal, and two copies of its frames are
+/// exactly how the two would come to disagree about what it does while it
+/// works.
+///
+/// Every ASCII frame is seven columns — `(=^v^=)` for `▽`, `(=;o;=)` for the two
+/// `；` and the `ω`. That is the width of the rich frame beside it in every mood
+/// but one: `Sad` is **nine** columns rich, because `；` is a fullwidth U+FF1B at
+/// two columns each. The two sets are not obliged to agree and these do not.
+/// Nothing shifts, because `Sad` has one frame and never changes phase.
+///
+/// `Idle` is one frame too, which is why `tick` changes nothing for it and an
+/// idle screen does not repaint — see [`Mascot::tick`].
+fn mood_frames(mood: Mood, unicode: bool) -> &'static [&'static str] {
+    match (mood, unicode) {
+        (Mood::Idle, true) => &["(=^·^=)"],
+        (Mood::Idle, false) => &["(=^.^=)"],
+        (Mood::Thinking, true) => &WORKING_FRAMES,
+        (Mood::Thinking, false) => &ASCII_WORKING_FRAMES,
+        (Mood::Happy, true) => &["(=^▽^=)"],
+        (Mood::Happy, false) => &["(=^v^=)"],
+        (Mood::Sad, true) => &["(=；ω；=)"],
+        (Mood::Sad, false) => &["(=;o;=)"],
+    }
 }
 
 impl View for Mascot {
@@ -769,15 +809,7 @@ impl View for Mascot {
     }
 
     fn render(mood: &Mood, vp: &Viewport<'_>) -> Vec<Line> {
-        let frames: &[&str] = match mood {
-            // Idle has one frame, so `tick` changes nothing and an idle screen
-            // does not repaint — the reason `tick()` below is conditional.
-            Mood::Idle => &["(=^·^=)"],
-            // The same frames the status line draws: one cat, not two.
-            Mood::Thinking => &WORKING_FRAMES,
-            Mood::Happy => &["(=^▽^=)"],
-            Mood::Sad => &["(=；ω；=)"],
-        };
+        let frames = mood_frames(*mood, vp.moment.caps.unicode);
         let f = frames[(vp.moment.tick as usize) % frames.len()];
         vec![Line::styled(
             width::take_width(f, vp.rect.w as usize),
@@ -1504,7 +1536,7 @@ mod tests {
     }
 
     #[test]
-    fn the_cat_animates_here_and_the_words_come_back_without_unicode() {
+    fn the_cat_animates_here_and_stays_the_cat_without_unicode() {
         let at = |tick: u64| {
             let m = Moment::default().working().at_tick(tick);
             Status::render(&State::default(), &Viewport::new(Rect::sized(70, 1), &m))[0].plain()
@@ -1515,9 +1547,11 @@ mod tests {
             at(WORKING_FRAMES.len() as u64),
             "and it loops rather than running off the end of the table"
         );
-        // The row is on every screen, so a terminal that has said it cannot
-        // draw `·`/`ω` gets the sentence this line used to say — not tofu,
-        // which would indicate nothing at all.
+        // The row is on every screen, so a terminal that has said it cannot draw
+        // `·`/`ω` still gets the animal — a different frame, not a different
+        // thing. It used to be handed `running` and a spinner here, which is to
+        // say no cat at all, over a gap of two characters, when two of the four
+        // frames were already pure ASCII.
         let bare = Moment {
             caps: crate::caps::Caps {
                 unicode: false,
@@ -1526,13 +1560,41 @@ mod tests {
             ..Moment::default()
         }
         .working();
-        let plain =
-            Status::render(&State::default(), &Viewport::new(Rect::sized(70, 1), &bare))[0].plain();
-        assert!(plain.contains("运行中"), "{plain:?}");
+        let plain_at = |tick: u64| {
+            let m = bare.clone().at_tick(tick);
+            Status::render(&State::default(), &Viewport::new(Rect::sized(70, 1), &m))[0].plain()
+        };
+        let plain = plain_at(0);
         assert!(
-            !plain.contains("(=^"),
-            "not a cat it cannot draw: {plain:?}"
+            plain.contains(ASCII_WORKING_FRAMES[0]),
+            "the cat, drawn in a set this terminal can draw: {plain:?}"
         );
+        assert!(
+            plain.is_ascii(),
+            "nothing on this row it cannot draw: {plain:?}"
+        );
+        assert!(
+            !plain.contains("运行中") && !plain.to_lowercase().contains("running"),
+            "the words were replaced, not added to: {plain:?}"
+        );
+        // The same four phases, in the same order: an ASCII terminal sees the
+        // cat blink and open its mouth, not a frozen picture of it.
+        for tick in 0..ASCII_WORKING_FRAMES.len() as u64 {
+            assert!(
+                plain_at(tick).contains(ASCII_WORKING_FRAMES[tick as usize]),
+                "phase {tick} did not reach the row: {:?}",
+                plain_at(tick)
+            );
+        }
+        // And it costs no columns, so the row beside it does not move as the
+        // animation runs.
+        for tick in 0..ASCII_WORKING_FRAMES.len() as u64 {
+            assert_eq!(
+                width::str_width(ASCII_WORKING_FRAMES[tick as usize]),
+                width::str_width(WORKING_FRAMES[tick as usize]),
+                "phase {tick} is a different width than the frame it stands in for"
+            );
+        }
     }
 
     /// While the `再按 Ctrl+C 退出` hint is up it takes the whole status row,
@@ -1964,16 +2026,53 @@ mod tests {
 
     #[test]
     fn every_mood_and_phase_is_well_formed() {
-        // 4 moods × 12 phases, all asserted. Animation is exhaustively testable
-        // because the frame is a value and the time is injected.
+        // 4 moods × 12 phases, both terminals, all asserted. Animation is
+        // exhaustively testable because the frame is a value and the time is
+        // injected.
         for mood in [Mood::Idle, Mood::Thinking, Mood::Happy, Mood::Sad] {
             for tick in 0..12u64 {
-                let m = Moment::default().at_tick(tick);
-                let vp = Viewport::new(Rect::sized(20, 1), &m);
-                let lines = Mascot::render(&mood, &vp);
-                assert_eq!(lines.len(), 1);
-                assert!(lines[0].width() <= 20);
-                assert!(!lines[0].plain().is_empty());
+                for unicode in [true, false] {
+                    let m = Moment {
+                        caps: crate::caps::Caps {
+                            unicode,
+                            ..crate::caps::Caps::default()
+                        },
+                        ..Moment::default()
+                    }
+                    .at_tick(tick);
+                    let vp = Viewport::new(Rect::sized(20, 1), &m);
+                    let lines = Mascot::render(&mood, &vp);
+                    assert_eq!(lines.len(), 1);
+                    assert!(lines[0].width() <= 20);
+                    let frame = lines[0].plain();
+                    assert!(!frame.is_empty());
+                    if !unicode {
+                        // It used to draw `·`, `ω`, `▽` and a fullwidth `；` raw
+                        // — this view never asked — so a `--mascot` build on such
+                        // a terminal was a row of tofu, which indicates nothing.
+                        assert!(
+                            frame.is_ascii(),
+                            "{mood:?} at phase {tick} drew {frame:?}, which it cannot draw"
+                        );
+                    }
+                }
+            }
+
+            // The one invariant that keeps the row still: within a mood, every
+            // phase is the same number of columns, so nothing beside this one
+            // moves while it animates. It is a fact about the frames rather than
+            // about any tick, so it is asserted once per mood — and *per set*
+            // rather than across the two, because the two sets are not obliged to
+            // agree: `Sad` is nine columns rich (two fullwidth `；`) and seven
+            // ASCII. That difference is not a shift, since `Sad` never changes
+            // phase.
+            for unicode in [true, false] {
+                let frames = mood_frames(mood, unicode);
+                let widths: Vec<usize> = frames.iter().map(|f| width::str_width(f)).collect();
+                assert!(
+                    widths.iter().all(|w| *w == widths[0]),
+                    "{mood:?} unicode={unicode}: {frames:?} are {widths:?} columns wide"
+                );
             }
         }
     }
