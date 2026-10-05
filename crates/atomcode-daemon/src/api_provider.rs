@@ -396,7 +396,8 @@ fn discovery_url(base_url: &str, provider_type: &str) -> anyhow::Result<reqwest:
     }
     let path = format!("{}{}", url.path().trim_end_matches('/'), suffix);
     url.set_path(&path);
-    url.set_query(None);
+    // Anthropic pages its list (20 by default); one request for all of them.
+    url.set_query((suffix == "/v1/models").then_some("limit=1000"));
     url.set_fragment(None);
     Ok(url)
 }
@@ -681,8 +682,12 @@ async fn fetch_discovery_body(
     transport: &DiscoveryTransport,
     timeout: Duration,
 ) -> Result<Vec<u8>, DiscoveryRequestError> {
+    // No redirects: a key is bound to the endpoint it was saved for, and a 30x
+    // to another host would carry it there — reqwest strips `Authorization`
+    // across hosts, but not Anthropic's `x-api-key`.
     let mut client = reqwest::Client::builder()
         .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
         .danger_accept_invalid_certs(transport.skip_tls_verify);
     if let Some(user_agent) = transport.user_agent.as_deref() {
         client = client.user_agent(user_agent);
@@ -827,6 +832,7 @@ pub(crate) async fn create_account_models(
                 .models
                 .into_iter()
                 .map(|m| crate::api_provider_accounts::NewModelRequest {
+                    selection_id: m.selection_id,
                     model: m.model,
                     display_name: m.display_name,
                     context_window: m.context_window,
@@ -1886,7 +1892,7 @@ mod tests {
             discovery_url("https://api.anthropic.com", "anthropic")
                 .unwrap()
                 .as_str(),
-            "https://api.anthropic.com/v1/models"
+            "https://api.anthropic.com/v1/models?limit=1000"
         );
         let router = Router::new().route(
             "/v1/models",

@@ -6,7 +6,7 @@
 // account endpoints, which share one writer with the terminal's `/provider`
 // panel and patch the file in place, leaving a person's comments alone.
 
-import { useEffect, useMemo, useState } from 'preact/hooks';
+import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import {
   getConfig,
   ConfigInfo,
@@ -63,6 +63,12 @@ const ERROR_CODES = new Set([
   'unknown_provider',
   'write_failed',
   'invalid_effort',
+  'legacy_display_name',
+  'model_count',
+  'invalid_model',
+  'invalid_capacity',
+  'invalid_selection_id',
+  'invalid_reasoning_history',
 ]);
 
 /** The levels a form offers: the daemon's list, or this build's own when an
@@ -106,6 +112,12 @@ type Panel =
 
 type ProbeState = ProbeResult | 'checking';
 
+function forget<V>(record: Record<string, V>, key: string): Record<string, V> {
+  const next = { ...record };
+  delete next[key];
+  return next;
+}
+
 function samePanel(a: Panel | null, b: Panel): boolean {
   if (!a || a.kind !== b.kind) return false;
   return a.kind === 'add' || (a as { id: string }).id === (b as { id: string }).id;
@@ -141,17 +153,21 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
 
   /** Check an account's endpoint as saved; a model is named so its name is
    * checked too. Skipped where the daemon cannot probe. */
+  // Only the newest probe of an account may land: two quick ones can finish
+  // out of order, and the older answer must not overwrite the newer.
+  const probeSeq = useRef<Record<string, number>>({});
   async function probe(account: string, selection?: string) {
+    const mine = (probeSeq.current[account] ?? 0) + 1;
+    probeSeq.current[account] = mine;
     setProbes((p) => ({ ...p, [account]: 'checking' }));
+    const settle = (next: (p: Record<string, ProbeState>) => Record<string, ProbeState>) => {
+      if (probeSeq.current[account] === mine) setProbes(next);
+    };
     try {
       const result = await probeAccount(account, selection);
-      setProbes((p) => ({ ...p, [account]: result }));
+      settle((p) => ({ ...p, [account]: result }));
     } catch {
-      setProbes((p) => {
-        const next = { ...p };
-        delete next[account];
-        return next;
-      });
+      settle((p) => forget(p, account));
     }
   }
 
@@ -163,6 +179,17 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
     } catch (error) {
       setActionError(errorText(error, t));
     }
+  }
+
+  /** For a confirm dialog: a refusal is thrown back so the dialog stays open
+   * and says it, rather than closing as if the delete had happened. */
+  async function actOrThrow(run: () => Promise<unknown>) {
+    try {
+      await run();
+    } catch (error) {
+      throw new Error(errorText(error, t));
+    }
+    await reload();
   }
 
   const toggle = (next: Panel) => setPanel((cur) => (samePanel(cur, next) ? null : next));
@@ -290,7 +317,15 @@ export function ModelConfigDialog({ onClose }: { onClose: () => void }) {
           confirmLabel={t('settings.delete')}
           cancelLabel={t('common.cancel')}
           onConfirm={() =>
-            act(() => (confirm.kind === 'account' ? deleteAccount(confirm.id) : deleteModelProfile(confirm.id)))
+            actOrThrow(async () => {
+              if (confirm.kind === 'account') {
+                await deleteAccount(confirm.id);
+                probeSeq.current[confirm.id] = (probeSeq.current[confirm.id] ?? 0) + 1;
+                setProbes((p) => forget(p, confirm.id));
+              } else {
+                await deleteModelProfile(confirm.id);
+              }
+            })
           }
           onClose={() => setConfirm(null)}
         />
@@ -424,7 +459,13 @@ function AccountCard({
               </div>
             </div>
             {samePanel(panel, { kind: 'model', id: m.name }) && (
-              <ModelEditor model={m} levels={levelsOf(config)} onCancel={onClosePanel} onSaved={() => onSaved(m.name)} />
+              <ModelEditor
+                model={m}
+                legacy={account.legacy}
+                levels={levelsOf(config)}
+                onCancel={onClosePanel}
+                onSaved={() => onSaved(m.name)}
+              />
             )}
           </div>
         ))}
@@ -486,6 +527,7 @@ function KeyInput({
     <input
       class="menu-input"
       type="password"
+      aria-label="API Key"
       autocomplete="new-password"
       spellcheck={false}
       value={value}
@@ -516,10 +558,14 @@ function AddProviderCard({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const draft = mode === 'preset' ? preset : custom;
+  const typed = mode === 'preset' ? preset : custom;
   const setDraft = mode === 'preset' ? setPreset : setCustom;
   const choices = mode === 'preset' ? presets : protocols;
-  const chosen: ProviderPresetInfo | undefined = choices.find((p) => p.id === draft.provider);
+  const chosen: ProviderPresetInfo | undefined = choices.find((p) => p.id === typed.provider);
+  // A local Ollama takes no key: one typed before switching to it is hidden,
+  // so it is neither judged nor sent.
+  const keyless = chosen?.type === 'ollama';
+  const draft = keyless ? { ...typed, apiKey: '' } : typed;
   const takenIds = (config.provider_accounts ?? []).map((a) => a.id);
   const blocker = firstBlocker(draft, {
     takenIds,
@@ -576,7 +622,7 @@ function AddProviderCard({
         <Select
           value={draft.provider}
           options={choices.map((p) => ({ value: p.id, label: p.display_name }))}
-          onChange={(v) => setDraft({ ...draft, provider: v })}
+          onChange={(v) => setDraft({ ...typed, provider: v })}
         />
       </div>
 
@@ -589,7 +635,8 @@ function AddProviderCard({
             spellcheck={false}
             placeholder="my-gateway"
             value={draft.id}
-            onInput={(e) => setDraft({ ...draft, id: (e.target as HTMLInputElement).value })}
+            aria-label={t('providers.accountId')}
+            onInput={(e) => setDraft({ ...typed, id: (e.target as HTMLInputElement).value })}
           />
           <span class="field-hint">{t('providers.accountIdHint')}</span>
         </div>
@@ -603,8 +650,9 @@ function AddProviderCard({
             type="url"
             spellcheck={false}
             placeholder={chosen?.type === 'anthropic' ? 'https://gateway.example' : 'https://gateway.example/v1'}
+            aria-label={t('providers.baseUrl')}
             value={draft.baseUrl}
-            onInput={(e) => setDraft({ ...draft, baseUrl: (e.target as HTMLInputElement).value })}
+            onInput={(e) => setDraft({ ...typed, baseUrl: (e.target as HTMLInputElement).value })}
           />
         </div>
       )}
@@ -616,7 +664,7 @@ function AddProviderCard({
         ) : (
           <KeyInput
             value={draft.apiKey}
-            onInput={(v) => setDraft({ ...draft, apiKey: v })}
+            onInput={(v) => setDraft({ ...typed, apiKey: v })}
             placeholder={mode === 'custom' ? t('providers.apiKeyOptional') : 'sk-…'}
           />
         )}
@@ -633,7 +681,8 @@ function AddProviderCard({
             type="text"
             value={draft.displayName}
             placeholder={chosen?.display_name ?? ''}
-            onInput={(e) => setDraft({ ...draft, displayName: (e.target as HTMLInputElement).value })}
+            aria-label={t('providers.displayName')}
+            onInput={(e) => setDraft({ ...typed, displayName: (e.target as HTMLInputElement).value })}
           />
         </div>
         {mode === 'preset' && (
@@ -644,8 +693,9 @@ function AddProviderCard({
               type="url"
               spellcheck={false}
               placeholder={chosen?.default_base_url ?? ''}
+              aria-label={t('providers.baseUrl')}
               value={draft.baseUrl}
-              onInput={(e) => setDraft({ ...draft, baseUrl: (e.target as HTMLInputElement).value })}
+              onInput={(e) => setDraft({ ...typed, baseUrl: (e.target as HTMLInputElement).value })}
             />
             {chosen?.default_base_url && (
               <span class="field-hint">{t('providers.baseUrlDefault', { url: chosen.default_base_url })}</span>
@@ -655,9 +705,10 @@ function AddProviderCard({
       </details>
 
       <ModelRowsEditor
+        key={mode}
         rows={draft.models}
         levels={levelsOf(config)}
-        setRows={(models) => setDraft({ ...draft, models })}
+        setRows={(models) => setDraft({ ...typed, models })}
         discover={
           chosen?.discoverable !== false && endpoint && validBaseUrl(endpoint) && !apiKeyProblem(draft.apiKey)
             ? () =>
@@ -922,6 +973,11 @@ function ReasoningFields({
               options={[
                 { value: '', label: t('providers.reasoningDefaultAuto') },
                 ...value.levels.map((level) => ({ value: level, label: level })),
+                // A value the file holds that no level names (`auto`, or one a
+                // hand-written list leaves out) is still shown as it is.
+                ...(value.effort && !value.levels.includes(value.effort)
+                  ? [{ value: value.effort, label: value.effort }]
+                  : []),
               ]}
               onChange={(v) => onChange({ ...value, effort: v || null })}
             />
@@ -1069,7 +1125,7 @@ function AccountEditor({
     setError(null);
     try {
       await editAccount(account.id, {
-        display_name: displayName.trim(),
+        ...(account.legacy ? {} : { display_name: displayName.trim() }),
         base_url: baseUrl.trim(),
         ...(apiKey.trim() ? { api_key: apiKey.trim() } : {}),
       });
@@ -1084,22 +1140,26 @@ function AccountEditor({
   return (
     <div class="inline-editor">
       <span class="field-hint">{t('providers.editAccountHint', { n: modelCount })}</span>
-      <div class="add-model-field">
-        <label class="add-model-label">{t('providers.displayName')}</label>
-        <input
-          class="menu-input"
-          type="text"
-          value={displayName}
-          placeholder={account.preset_name ?? account.id}
-          onInput={(e) => setDisplayName((e.target as HTMLInputElement).value)}
-        />
-      </div>
+      {!account.legacy && (
+        <div class="add-model-field">
+          <label class="add-model-label">{t('providers.displayName')}</label>
+          <input
+            class="menu-input"
+            type="text"
+            value={displayName}
+            placeholder={account.preset_name ?? account.id}
+            aria-label={t('providers.displayName')}
+            onInput={(e) => setDisplayName((e.target as HTMLInputElement).value)}
+          />
+        </div>
+      )}
       <div class="add-model-field">
         <label class="add-model-label">{t('providers.baseUrl')}</label>
         <input
           class="menu-input"
           type="url"
           spellcheck={false}
+          aria-label={t('providers.baseUrl')}
           value={baseUrl}
           onInput={(e) => setBaseUrl((e.target as HTMLInputElement).value)}
         />
@@ -1208,11 +1268,14 @@ function AddModelsPanel({
 /** One model's own settings. Its account is not touched. */
 function ModelEditor({
   model,
+  legacy,
   levels,
   onCancel,
   onSaved,
 }: {
   model: ProviderInfo;
+  /** A legacy entry: keyed by its name, with no display name of its own. */
+  legacy: boolean;
   levels: string[];
   onCancel: () => void;
   onSaved: () => Promise<void>;
@@ -1228,15 +1291,20 @@ function ModelEditor({
         ? 'on'
         : 'off',
   );
-  const [reasoning, setReasoning] = useState<ReasoningDraft>(() =>
-    reasoningFrom(model.reasoning_effort_levels, model.reasoning_effort),
+  // What the form started from, so only what was changed is sent: a file
+  // holding values the form cannot express is left as it is.
+  const [startReasoning] = useState<ReasoningDraft>(() =>
+    reasoningFrom(model.reasoning_effort_levels, model.reasoning_effort, levels),
   );
+  const [reasoning, setReasoning] = useState<ReasoningDraft>(startReasoning);
+  const startHistory = model.reasoning_history ?? '';
+  const [history, setHistory] = useState<string>(startHistory);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const parsedWindow = parseTokens(ctxWindow);
   const parsedMax = parseTokens(maxTokens);
   const blocker =
-    parsedWindow === null
+    parsedWindow === null || parsedWindow === undefined
       ? t('providers.block.model_window', { row: 1 })
       : parsedMax === null
         ? t('providers.block.model_max_tokens', { row: 1 })
@@ -1249,8 +1317,9 @@ function ModelEditor({
     setSaving(true);
     setError(null);
     try {
+      const reasoningChanged = JSON.stringify(reasoning) !== JSON.stringify(startReasoning);
       await editModelProfile(model.name, {
-        display_name: displayName.trim(),
+        ...(legacy ? {} : { display_name: displayName.trim() }),
         ...(typeof parsedWindow === 'number' ? { context_window: parsedWindow } : {}),
         ...(typeof parsedMax === 'number'
           ? { max_tokens: parsedMax }
@@ -1258,7 +1327,12 @@ function ModelEditor({
             ? { clear_max_tokens: true }
             : {}),
         ...(vision === 'auto' ? { clear_supports_vision: true } : { supports_vision: vision === 'on' }),
-        ...reasoningEditBody(reasoning),
+        ...(reasoningChanged ? reasoningEditBody(reasoning) : {}),
+        ...(history === startHistory
+          ? {}
+          : history
+            ? { reasoning_history: history }
+            : { clear_reasoning_history: true }),
       });
       await onSaved();
     } catch (e) {
@@ -1279,10 +1353,12 @@ function ModelEditor({
           placeholder={t('providers.displayName')}
           aria-label={t('providers.displayName')}
           value={displayName}
+          disabled={legacy}
+          title={legacy ? t('providers.legacyNoName') : undefined}
           onInput={(e) => setDisplayName((e.target as HTMLInputElement).value)}
         />
         <input
-          class={'menu-input model-draft-num' + (parsedWindow === null ? ' invalid' : '')}
+          class={'menu-input model-draft-num' + (parsedWindow === null || parsedWindow === undefined ? ' invalid' : '')}
           type="text"
           placeholder={t('providers.contextWindowPlaceholder')}
           aria-label={t('providers.contextWindow')}
@@ -1310,6 +1386,19 @@ function ModelEditor({
         />
       </div>
       <ReasoningFields value={reasoning} levels={levels} onChange={setReasoning} />
+      <div class="reasoning-row">
+        <span class="add-model-label">{t('providers.reasoningHistory')}</span>
+        <Select
+          value={history}
+          options={[
+            { value: '', label: t('providers.reasoningHistoryAuto') },
+            { value: 'preserve', label: t('providers.reasoningHistoryPreserve') },
+            { value: 'exclude', label: t('providers.reasoningHistoryExclude') },
+            ...(history === 'include' ? [{ value: 'include', label: 'include' }] : []),
+          ]}
+          onChange={(v) => setHistory(v)}
+        />
+      </div>
       {error && (
         <div class="modal-error" role="alert">
           {error}

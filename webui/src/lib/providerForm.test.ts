@@ -132,9 +132,14 @@ test('a model row is sent with only what was set', () => {
 const ALL = ['low', 'medium', 'high', 'xhigh', 'max'];
 
 test('reasoning starts from what the file declares', () => {
-  assert.deepEqual(reasoningFrom(null, null), { enabled: false, levels: [], effort: null });
-  assert.deepEqual(reasoningFrom([], 'high'), { enabled: true, levels: [], effort: 'high' });
-  assert.deepEqual(reasoningFrom(['high', 'max'], null), { enabled: true, levels: ['high', 'max'], effort: null });
+  assert.deepEqual(reasoningFrom(null, null, ALL), { enabled: false, levels: [], effort: null });
+  assert.deepEqual(
+    reasoningFrom([], 'high', ALL),
+    { enabled: true, levels: ALL, effort: 'high' },
+    'a default with no list offers every level, so the form opens valid',
+  );
+  assert.deepEqual(reasoningFrom(['high', 'max'], null, ALL), { enabled: true, levels: ['high', 'max'], effort: null });
+  assert.deepEqual(reasoningFrom(null, 'auto', ALL).effort, 'auto');
 });
 
 test('toggling a level keeps canonical order and drops a default no longer offered', () => {
@@ -144,6 +149,8 @@ test('toggling a level keeps canonical order and drops a default no longer offer
   r = toggleLevel(r, 'high', ALL);
   assert.deepEqual(r.levels, ['low']);
   assert.equal(r.effort, null, 'the default went with its level');
+  const auto = toggleLevel({ enabled: true, levels: ['high'], effort: 'auto' }, 'low', ALL);
+  assert.equal(auto.effort, 'auto', 'auto is no level and stays');
 });
 
 test('reasoning switched on needs a level, and an edit clears what was turned off', () => {

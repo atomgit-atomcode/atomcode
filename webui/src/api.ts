@@ -738,6 +738,9 @@ export interface EditModelBody {
   clear_reasoning_effort?: boolean;
   reasoning_effort_levels?: string[];
   clear_reasoning_effort_levels?: boolean;
+  /** `preserve` / `exclude` / `include`. */
+  reasoning_history?: string;
+  clear_reasoning_history?: boolean;
 }
 
 /** PATCH /model-profiles/:id — one model's own settings; its account is untouched. */

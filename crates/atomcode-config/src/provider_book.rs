@@ -44,6 +44,13 @@ pub enum BookError {
     ManagedModelDelete(String),
     /// Nothing by this id in the file.
     NotFound(String),
+    /// An id the caller chose is already in the file (any case, for accounts).
+    IdTaken(String),
+    /// The account already has this model.
+    ModelExists(String),
+    /// A legacy `[providers.*]` entry is keyed by its name: there is no display
+    /// name to set.
+    LegacyNoDisplayName(String),
     /// The file could not be read or written.
     Write(String),
 }
@@ -61,6 +68,9 @@ pub struct AccountInput<'a> {
     pub endpoint: &'a str,
     /// Empty stores nothing.
     pub key: Option<&'a str>,
+    /// `name` is the id as chosen: taken is [`BookError::IdTaken`], not a
+    /// silent `-2` the person did not ask for.
+    pub exact_id: bool,
 }
 
 /// An edit to an account's connection.
@@ -78,6 +88,8 @@ pub struct AccountEdit<'a> {
 pub struct ModelInput<'a> {
     pub account: &'a str,
     pub model: &'a str,
+    /// A selection id the caller chose; `None` is `<account>/<model>`.
+    pub id: Option<&'a str>,
     pub display_name: Option<&'a str>,
     /// `None` is the protocol's default window.
     pub window: Option<usize>,
@@ -102,6 +114,7 @@ pub struct ModelEdit<'a> {
     pub levels: Edit<&'a [String]>,
     pub display_name: Edit<&'a str>,
     pub max_tokens: Edit<usize>,
+    pub reasoning_history: Edit<&'a str>,
     pub default: bool,
 }
 
@@ -142,22 +155,27 @@ impl ProviderBook {
             .map_err(|error| BookError::Write(format!("{error:#}")))
     }
 
-    /// The id a new account of this name would get in `config`.
-    pub fn account_id_for(config: &Config, name: &str) -> Result<String, BookError> {
-        let base = sanitize(name);
-        if base.is_empty() {
-            return Err(BookError::NameRules);
+    /// One patch whose decisions are made **inside** the lock, against the
+    /// document as it is then: an id picked from a read taken before the lock
+    /// is an id a concurrent write may already have taken, and the second
+    /// writer would patch over the first. A refusal decided in there comes
+    /// back as itself.
+    fn write_deciding<F>(&self, mutate: F) -> Result<Config, BookError>
+    where
+        F: FnOnce(&mut toml_edit::DocumentMut) -> Result<(), BookError>,
+    {
+        let mut refused: Option<BookError> = None;
+        let result = ConfigStore::new(self.path.clone()).update_document(|document| {
+            mutate(document).map_err(|error| {
+                refused = Some(error);
+                anyhow::anyhow!("refused")
+            })
+        });
+        match (result, refused) {
+            (_, Some(error)) => Err(error),
+            (Ok(commit), None) => Ok(commit.snapshot.config),
+            (Err(error), None) => Err(BookError::Write(format!("{error:#}"))),
         }
-        // Not into the gateway's namespace, or it would be taken for a managed
-        // account: undeletable, and never asked for a key.
-        let base = match is_codingplan_provider_name(&base) {
-            true => format!("custom-{base}"),
-            false => base,
-        };
-        Ok(free_id(&base, |candidate| {
-            config.provider_accounts.contains_key(candidate)
-                || config.providers.contains_key(candidate)
-        }))
     }
 
     pub fn add_account(&self, input: &AccountInput<'_>) -> Result<String, BookError> {
@@ -174,30 +192,38 @@ impl ProviderBook {
         input: &AccountInput<'_>,
         models: &[ModelInput<'_>],
     ) -> Result<(String, Vec<String>), BookError> {
-        let config = self.load();
-        let id = Self::account_id_for(&config, input.name)?;
         let preset = provider_preset::preset_or_compatible(input.protocol);
         if input.endpoint.trim().is_empty() && preset.default_base_url.is_none() {
             return Err(BookError::ProtocolNeedsEndpoint);
         }
-        for model in models {
-            if model.model.trim().is_empty() {
-                return Err(BookError::ModelNameEmpty);
-            }
+        if models.iter().any(|m| m.model.trim().is_empty()) {
+            return Err(BookError::ModelNameEmpty);
         }
+        let base = base_id(input.name)?;
         let endpoint = endpoint_override(input.endpoint, preset.id);
         let key = written_key(input.key);
         let display_name = input
             .display_name
             .map(str::trim)
             .filter(|name| !name.is_empty());
-        let planned = plan_models(&config, &id, preset.provider_type.wire(), models);
-        let ids: Vec<String> = planned.iter().map(|p| p.id.clone()).collect();
-        let account = id.clone();
-        self.write(move |document| {
+        let wire = preset.provider_type.wire();
+        let exact = input.exact_id;
+        let mut made: (String, Vec<String>) = Default::default();
+        self.write_deciding(|document| {
+            let mut taken = table_keys(document, "provider_accounts");
+            taken.extend(table_keys(document, "providers"));
+            let id = if exact {
+                if taken.iter().any(|t| t.eq_ignore_ascii_case(&base)) {
+                    return Err(BookError::IdTaken(base.clone()));
+                }
+                base.clone()
+            } else {
+                free_id(&base, |candidate| taken.iter().any(|t| t == candidate))
+            };
+            let planned = plan_models(document, &id, wire, models, false)?;
             provider_edit::put_account(
                 document,
-                &account,
+                &id,
                 &AccountPatch {
                     provider: preset.id,
                     base_url: endpoint,
@@ -207,10 +233,13 @@ impl ProviderBook {
                         None => Edit::Keep,
                     },
                 },
-            )?;
-            write_planned(document, &account, &planned)
+            )
+            .map_err(written)?;
+            write_planned(document, &id, &planned).map_err(written)?;
+            made = (id, planned.into_iter().map(|p| p.id).collect());
+            Ok(())
         })?;
-        Ok((id, ids))
+        Ok(made)
     }
 
     pub fn edit_account(&self, id: &str, edit: &AccountEdit<'_>) -> Result<(), BookError> {
@@ -246,6 +275,9 @@ impl ProviderBook {
         let key = written_key(edit.key);
         let endpoint = edit.endpoint.trim();
         if legacy {
+            if matches!(edit.display_name, Edit::Set(_)) {
+                return Err(BookError::LegacyNoDisplayName(id.to_string()));
+            }
             let wire = moved.then(|| wanted.provider_type.wire());
             // The flat table's writer takes what to set, or nothing: there is no
             // keyless legacy protocol to clear one for.
@@ -263,6 +295,15 @@ impl ProviderBook {
         }
         let provider = if moved { wanted.id.to_string() } else { stored };
         let endpoint = endpoint_override(edit.endpoint, &provider).map(str::to_string);
+        // A protocol with no endpoint of its own, and none stored: every model
+        // on the account would stop resolving.
+        if endpoint.is_none()
+            && provider_preset::preset_or_compatible(&provider)
+                .default_base_url
+                .is_none()
+        {
+            return Err(BookError::ProtocolNeedsEndpoint);
+        }
         // A protocol with no credential of its own drops a key left over from
         // the one before it: a local Ollama carrying an OpenAI key is a file
         // holding a secret nothing will ever send.
@@ -313,7 +354,7 @@ impl ProviderBook {
     }
 
     pub fn add_model(&self, input: &ModelInput<'_>) -> Result<String, BookError> {
-        self.add_models(input.account, std::slice::from_ref(input))
+        self.add_models(input.account, std::slice::from_ref(input), false)
             .map(|mut ids| ids.remove(0))
     }
 
@@ -323,10 +364,14 @@ impl ProviderBook {
     /// An offer — a preset id with no account in the file yet — becomes an
     /// account here: adding a model to it is the gesture that turns "this build
     /// knows about deepseek" into "you have one".
+    ///
+    /// `reject_existing` refuses a model the account already has (or one named
+    /// twice in the batch) rather than adding a second row with a `-2` id.
     pub fn add_models(
         &self,
         account: &str,
         models: &[ModelInput<'_>],
+        reject_existing: bool,
     ) -> Result<Vec<String>, BookError> {
         let config = self.load();
         if config.account_is_codingplan_managed(account) {
@@ -335,50 +380,70 @@ impl ProviderBook {
         if models.is_empty() || models.iter().any(|m| m.model.trim().is_empty()) {
             return Err(BookError::ModelNameEmpty);
         }
-        let fresh = !config.provider_accounts.contains_key(account)
-            && !config.providers.contains_key(account);
         let preset_id = config
             .logical_accounts()
             .get(account)
             .map(|account| account.provider.clone())
             .unwrap_or_else(|| account.to_string());
         let preset = provider_preset::preset_or_compatible(&preset_id);
-        let planned = plan_models(&config, account, preset.provider_type.wire(), models);
-        let ids: Vec<String> = planned.iter().map(|p| p.id.clone()).collect();
+        let wire = preset.provider_type.wire();
         // A key typed beside a model is the account's; the first one wins.
         let key = written_key(models.iter().find_map(|m| m.key));
-        let account = account.to_string();
-        let endpoint = preset.default_base_url;
-        let provider = preset.id;
-        self.write(move |document| {
-            if fresh {
+        let mut made: Vec<String> = Vec::new();
+        self.write_deciding(|document| {
+            let in_schema = table_keys(document, "provider_accounts")
+                .iter()
+                .any(|t| t == account);
+            let legacy = table_keys(document, "providers")
+                .iter()
+                .any(|t| t == account);
+            if !in_schema && !legacy {
                 provider_edit::put_account(
                     document,
-                    &account,
+                    account,
                     &AccountPatch {
-                        provider,
-                        base_url: endpoint,
+                        provider: preset.id,
+                        base_url: preset.default_base_url,
                         api_key: key,
                         display_name: Edit::Keep,
                     },
-                )?;
-            } else if matches!(key, KeyWrite::Set(_)) {
-                let provider = provider_of(document, &account, provider);
-                let base_url = base_url_of(document, &account);
-                provider_edit::put_account(
-                    document,
-                    &account,
-                    &AccountPatch {
-                        provider: &provider,
-                        base_url: base_url.as_deref(),
-                        api_key: key,
-                        display_name: Edit::Keep,
-                    },
-                )?;
+                )
+                .map_err(written)?;
+            } else if let KeyWrite::Set(typed) = key {
+                if in_schema {
+                    let provider = provider_of(document, account, preset.id);
+                    let base_url = base_url_of(document, account);
+                    provider_edit::put_account(
+                        document,
+                        account,
+                        &AccountPatch {
+                            provider: &provider,
+                            base_url: base_url.as_deref(),
+                            api_key: key,
+                            display_name: Edit::Keep,
+                        },
+                    )
+                    .map_err(written)?;
+                } else {
+                    // A legacy entry keeps its key where its endpoint is: a new
+                    // `[provider_accounts]` table beside it would take over the
+                    // id and point every model on it at the preset's endpoint.
+                    provider_edit::patch_legacy_provider(
+                        document,
+                        account,
+                        None,
+                        None,
+                        Some(typed),
+                    )
+                    .map_err(written)?;
+                }
             }
-            write_planned(document, &account, &planned)
+            let planned = plan_models(document, account, wire, models, reject_existing)?;
+            write_planned(document, account, &planned).map_err(written)?;
+            made = planned.into_iter().map(|p| p.id).collect();
+            Ok(())
         })?;
-        Ok(ids)
+        Ok(made)
     }
 
     pub fn edit_model(&self, id: &str, edit: &ModelEdit<'_>) -> Result<(), BookError> {
@@ -393,6 +458,9 @@ impl ProviderBook {
         let legacy = !config.models.contains_key(id) && config.providers.contains_key(id);
         if !legacy && !config.models.contains_key(id) {
             return Err(BookError::NotFound(id.to_string()));
+        }
+        if legacy && matches!(edit.display_name, Edit::Set(_)) {
+            return Err(BookError::LegacyNoDisplayName(id.to_string()));
         }
         let logical = config.logical_models();
         let existing = logical.get(id);
@@ -414,6 +482,7 @@ impl ProviderBook {
                 reasoning_effort_levels: edit.levels,
                 display_name: edit.display_name,
                 max_tokens: edit.max_tokens,
+                reasoning_history: edit.reasoning_history,
             };
             match legacy {
                 true => provider_edit::patch_legacy_model(document, &id, &patch)?,
@@ -526,46 +595,110 @@ struct Planned {
     default: bool,
 }
 
-/// Ids and settings for `models` under `account`, each id free of the file
-/// *and* of the ones planned before it — two models of one batch must not be
-/// given the same id.
+/// Ids and settings for `models` under `account`, decided against the document
+/// under the lock: each id free of the file *and* of the ones planned before it
+/// — two models of one batch must not be given the same id.
 fn plan_models(
-    config: &Config,
+    document: &toml_edit::DocumentMut,
     account: &str,
     wire: &str,
     models: &[ModelInput<'_>],
-) -> Vec<Planned> {
-    let mut taken: Vec<String> = Vec::new();
-    models
-        .iter()
-        .map(|input| {
-            let model = input.model.trim().to_string();
-            let base = format!("{account}/{model}");
-            let id = free_id(&base, |candidate| {
-                config.models.contains_key(candidate)
-                    || config.providers.contains_key(candidate)
-                    || taken.iter().any(|t| t == candidate)
-            });
-            taken.push(id.clone());
-            Planned {
-                id,
-                model,
-                display_name: input
-                    .display_name
-                    .map(str::trim)
-                    .filter(|name| !name.is_empty())
-                    .map(str::to_string),
-                window: input
-                    .window
-                    .unwrap_or_else(|| default_context_window_for(wire)),
-                max_tokens: input.max_tokens,
-                vision: input.vision,
-                effort: input.effort.map(str::to_string),
-                levels: input.levels.map(<[String]>::to_vec),
-                default: input.default,
+    reject_existing: bool,
+) -> Result<Vec<Planned>, BookError> {
+    let mut taken = table_keys(document, "models");
+    taken.extend(table_keys(document, "providers"));
+    let mut names = if reject_existing {
+        models_of(document, account)
+    } else {
+        Vec::new()
+    };
+    let mut planned = Vec::with_capacity(models.len());
+    for input in models {
+        let model = input.model.trim().to_string();
+        if reject_existing {
+            if names.iter().any(|n| n == &model) {
+                return Err(BookError::ModelExists(model));
             }
+            names.push(model.clone());
+        }
+        let id = match input.id.map(str::trim).filter(|id| !id.is_empty()) {
+            Some(chosen) => {
+                if taken.iter().any(|t| t == chosen) {
+                    return Err(BookError::IdTaken(chosen.to_string()));
+                }
+                chosen.to_string()
+            }
+            None => free_id(&format!("{account}/{model}"), |candidate| {
+                taken.iter().any(|t| t == candidate)
+            }),
+        };
+        taken.push(id.clone());
+        planned.push(Planned {
+            id,
+            model,
+            display_name: input
+                .display_name
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string),
+            window: input
+                .window
+                .unwrap_or_else(|| default_context_window_for(wire)),
+            max_tokens: input.max_tokens,
+            vision: input.vision,
+            effort: input.effort.map(str::to_string),
+            levels: input.levels.map(<[String]>::to_vec),
+            default: input.default,
+        });
+    }
+    Ok(planned)
+}
+
+/// The keys of `[<parent>.*]` as the document holds them now.
+fn table_keys(document: &toml_edit::DocumentMut, parent: &str) -> Vec<String> {
+    document
+        .get(parent)
+        .and_then(|item| item.as_table_like())
+        .map(|table| table.iter().map(|(key, _)| key.to_string()).collect())
+        .unwrap_or_default()
+}
+
+/// The model names `account` already has in the document.
+fn models_of(document: &toml_edit::DocumentMut, account: &str) -> Vec<String> {
+    document
+        .get("models")
+        .and_then(|item| item.as_table_like())
+        .map(|table| {
+            table
+                .iter()
+                .filter(|(_, item)| item.get("account").and_then(|a| a.as_str()) == Some(account))
+                .filter_map(|(_, item)| {
+                    item.get("model")
+                        .and_then(|m| m.as_str())
+                        .map(str::to_string)
+                })
+                .collect()
         })
-        .collect()
+        .unwrap_or_default()
+}
+
+/// A patch that failed in the document writer.
+fn written(error: anyhow::Error) -> BookError {
+    BookError::Write(format!("{error:#}"))
+}
+
+/// The id a name becomes before it is checked against the file: sanitised,
+/// and kept out of the gateway's namespace, where it would be taken for a
+/// managed account — undeletable, and never asked for a key.
+fn base_id(name: &str) -> Result<String, BookError> {
+    let base = sanitize(name);
+    if base.is_empty() {
+        return Err(BookError::NameRules);
+    }
+    Ok(match is_codingplan_provider_name(&base) {
+        true => format!("custom-{base}"),
+        false => base,
+    })
 }
 
 fn write_planned(
@@ -593,6 +726,7 @@ fn write_planned(
                     Some(n) => Edit::Set(n),
                     None => Edit::Keep,
                 },
+                reasoning_history: Edit::Keep,
             },
         )?;
         if model.default {
@@ -734,6 +868,7 @@ reasoning_effort_levels = ["low", "high"]
                     display_name: Some("我的 DeepSeek"),
                     endpoint: "",
                     key: Some("sk-ds"),
+                    exact_id: false,
                 },
                 &[
                     ModelInput {
@@ -808,7 +943,9 @@ reasoning_effort_levels = ["low", "high"]
     #[test]
     fn one_batch_never_gives_two_models_one_id() {
         let (book, _) = book("batch-ids", HAND);
-        let ids = book.add_models("mine", &[model("b"), model("b")]).unwrap();
+        let ids = book
+            .add_models("mine", &[model("b"), model("b")], false)
+            .unwrap();
         assert_eq!(ids, vec!["mine/b", "mine/b-2"]);
         assert_eq!(book.load().models.len(), 3);
     }
@@ -926,8 +1063,143 @@ reasoning_effort_levels = ["low", "high"]
             Err(BookError::NotFound("nobody/here".into()))
         );
         book.add_model(&model("b")).ok();
-        book.add_models("mine", &[model("b")]).unwrap();
+        book.add_models("mine", &[model("b")], false).unwrap();
         book.set_default("mine/b").unwrap();
         assert_eq!(book.load().default_model.as_deref(), Some("mine/b"));
+    }
+
+    /// A chosen id that is taken — in any case — is refused, not suffixed; a
+    /// chosen selection id is kept as given, and refused when taken.
+    #[test]
+    fn a_chosen_id_is_kept_or_refused_never_suffixed() {
+        let (book, path) = book("chosen", HAND);
+        let before = text(&path);
+        let custom = |name: &'static str| AccountInput {
+            name,
+            protocol: "openai-compatible",
+            endpoint: "https://gw.example/v1",
+            exact_id: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            book.create_account(&custom("MINE"), &[model("m")]),
+            Err(BookError::IdTaken("MINE".into()))
+        );
+        assert_eq!(text(&path), before, "a refusal writes nothing");
+        let (id, models) = book
+            .create_account(
+                &custom("gw"),
+                &[ModelInput {
+                    id: Some("fast"),
+                    ..model("m")
+                }],
+            )
+            .unwrap();
+        assert_eq!((id.as_str(), models), ("gw", vec!["fast".to_string()]));
+        assert_eq!(
+            book.add_models(
+                "gw",
+                &[ModelInput {
+                    id: Some("fast"),
+                    ..model("n")
+                }],
+                false
+            ),
+            Err(BookError::IdTaken("fast".into()))
+        );
+    }
+
+    /// Asked to, the book refuses a model the account already has, or one
+    /// named twice in a batch — and writes none of the batch.
+    #[test]
+    fn an_existing_model_is_refused_when_asked() {
+        let (book, path) = book("exists", HAND);
+        let before = text(&path);
+        assert_eq!(
+            book.add_models("mine", &[model("c"), model("a")], true),
+            Err(BookError::ModelExists("a".into()))
+        );
+        assert_eq!(
+            book.add_models("mine", &[model("c"), model("c")], true),
+            Err(BookError::ModelExists("c".into()))
+        );
+        assert_eq!(text(&path), before);
+    }
+
+    /// A key typed beside a model for a legacy entry goes into that entry: a
+    /// new account table of the same name would take the id over and point
+    /// every model on it somewhere else.
+    #[test]
+    fn a_key_for_a_legacy_entry_stays_in_it() {
+        let legacy = "[providers.vllm]\ntype = \"openai\"\nmodel = \"q\"\nbase_url = \"http://10.0.0.5:8000/v1\"\n";
+        let (book, _) = book("legacy-key", legacy);
+        book.add_model(&ModelInput {
+            account: "vllm",
+            key: Some("sk-local"),
+            ..model("q2")
+        })
+        .unwrap();
+        let config = book.load();
+        assert!(!config.provider_accounts.contains_key("vllm"));
+        assert_eq!(
+            config.providers["vllm"].api_key.as_deref(),
+            Some("sk-local")
+        );
+        assert_eq!(
+            config.providers["vllm"].base_url.as_deref(),
+            Some("http://10.0.0.5:8000/v1")
+        );
+    }
+
+    /// Moving an account onto a protocol with no endpoint of its own, with none
+    /// stored, would leave every model on it unresolvable: refused.
+    #[test]
+    fn a_protocol_move_without_an_endpoint_is_refused() {
+        let local = "[provider_accounts.local]\nprovider = \"ollama\"\n";
+        let (book, _) = book("move", local);
+        assert_eq!(
+            book.edit_account(
+                "local",
+                &AccountEdit {
+                    protocol: "anthropic-compatible",
+                    endpoint: "",
+                    ..Default::default()
+                }
+            ),
+            Err(BookError::ProtocolNeedsEndpoint)
+        );
+        assert_eq!(book.load().provider_accounts["local"].provider, "ollama");
+    }
+
+    /// A legacy entry has no display name to set; clearing one is no change.
+    #[test]
+    fn a_legacy_entry_takes_no_display_name() {
+        let legacy = "[providers.old]\ntype = \"openai\"\nmodel = \"m\"\nbase_url = \"https://x.example/v1\"\n";
+        let (book, _) = book("legacy-name", legacy);
+        assert_eq!(
+            book.edit_model(
+                "old",
+                &ModelEdit {
+                    model: "m",
+                    display_name: Edit::Set("Old"),
+                    ..Default::default()
+                }
+            ),
+            Err(BookError::LegacyNoDisplayName("old".into()))
+        );
+        book.edit_model(
+            "old",
+            &ModelEdit {
+                model: "m",
+                display_name: Edit::Clear,
+                reasoning_history: Edit::Set("exclude"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            book.load().providers["old"].reasoning_history.as_deref(),
+            Some("exclude")
+        );
     }
 }

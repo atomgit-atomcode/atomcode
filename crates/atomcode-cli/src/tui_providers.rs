@@ -304,6 +304,7 @@ impl Providers for ConfigProviders {
                 display_name: None,
                 endpoint: &draft.endpoint,
                 key: draft.key.as_deref(),
+                exact_id: false,
             })
             .map_err(said)
     }
@@ -331,6 +332,7 @@ impl Providers for ConfigProviders {
             .add_model(&ModelInput {
                 account: &draft.account,
                 model: &draft.model,
+                id: None,
                 display_name: None,
                 window: draft.window,
                 max_tokens: None,
@@ -357,6 +359,7 @@ impl Providers for ConfigProviders {
                     levels: Edit::from_option(draft.levels.as_deref()),
                     display_name: Edit::Keep,
                     max_tokens: Edit::Keep,
+                    reasoning_history: Edit::Keep,
                     default: draft.default,
                 },
             )
@@ -434,6 +437,13 @@ fn said(error: BookError) -> String {
         BookError::ManagedModelEdit(id) => tr(SMsg::ManagedCannotEdit { id: &id }).into_owned(),
         BookError::ManagedModelDelete(id) => tr(SMsg::ManagedCannotDelete { id: &id }).into_owned(),
         BookError::NotFound(id) => tr(SMsg::NotInConfig { id: &id }).into_owned(),
+        BookError::IdTaken(id) => tr(SMsg::IdAlreadyInConfig { id: &id }).into_owned(),
+        BookError::ModelExists(model) => {
+            tr(SMsg::ModelAlreadyUnderAccount { model: &model }).into_owned()
+        }
+        BookError::LegacyNoDisplayName(id) => {
+            tr(SMsg::LegacyHasNoDisplayName { id: &id }).into_owned()
+        }
         BookError::Write(why) => why,
     }
 }

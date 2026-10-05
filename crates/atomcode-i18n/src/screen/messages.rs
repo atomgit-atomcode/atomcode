@@ -1671,6 +1671,15 @@ pub enum Msg<'a> {
     NotInConfig {
         id: &'a str,
     },
+    IdAlreadyInConfig {
+        id: &'a str,
+    },
+    ModelAlreadyUnderAccount {
+        model: &'a str,
+    },
+    LegacyHasNoDisplayName {
+        id: &'a str,
+    },
     AccountModelsManaged {
         account: &'a str,
     },

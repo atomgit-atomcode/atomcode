@@ -68,11 +68,17 @@ export function noReasoning(): ReasoningDraft {
   return { enabled: false, levels: [], effort: null };
 }
 
-/** What the configuration declares, as a form starts from it. */
-export function reasoningFrom(levels?: string[] | null, effort?: string | null): ReasoningDraft {
+/** What the configuration declares, as a form starts from it. A default level
+ * with no declared list offers every level — what the runtime allows it — so
+ * the form opens valid rather than blocked on a list nobody wrote. */
+export function reasoningFrom(
+  levels: string[] | null | undefined,
+  effort: string | null | undefined,
+  all: string[],
+): ReasoningDraft {
   const declared = levels?.filter(Boolean) ?? [];
   if (declared.length === 0 && !effort) return noReasoning();
-  return { enabled: true, levels: declared, effort: effort ?? null };
+  return { enabled: true, levels: declared.length ? declared : [...all], effort: effort ?? null };
 }
 
 /** Toggle one level, in the canonical order `all` gives, dropping a default
@@ -80,7 +86,9 @@ export function reasoningFrom(levels?: string[] | null, effort?: string | null):
 export function toggleLevel(r: ReasoningDraft, level: string, all: string[]): ReasoningDraft {
   const on = r.levels.includes(level);
   const levels = all.filter((l) => (l === level ? !on : r.levels.includes(l)));
-  return { ...r, levels, effort: r.effort && levels.includes(r.effort) ? r.effort : null };
+  // `auto` is no level: it stays whatever the levels are.
+  const keep = r.effort && (r.effort === 'auto' || levels.includes(r.effort));
+  return { ...r, levels, effort: keep ? r.effort : null };
 }
 
 /** One model row in a form. Capacities are kept as typed, parsed on submit. */

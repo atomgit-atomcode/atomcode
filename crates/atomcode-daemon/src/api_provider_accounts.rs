@@ -27,6 +27,9 @@ use crate::{api_config::config_response, coded_json_error};
 /// One model in a create or add request.
 #[derive(Debug, Deserialize)]
 pub(crate) struct NewModelRequest {
+    /// A selection id the caller chose; left out, it is `<account>/<model>`.
+    #[serde(default)]
+    pub selection_id: Option<String>,
     pub model: String,
     pub display_name: Option<String>,
     pub context_window: Option<usize>,
@@ -94,6 +97,11 @@ pub(crate) struct EditModelRequest {
     /// is no longer offered a level picker.
     #[serde(default)]
     pub clear_reasoning_effort_levels: bool,
+    /// `preserve` / `exclude` / `include`: whether prior reasoning is sent back.
+    pub reasoning_history: Option<String>,
+    /// Back to deciding it from the model.
+    #[serde(default)]
+    pub clear_reasoning_history: bool,
 }
 
 /// POST /provider-accounts/:id/probe
@@ -135,6 +143,21 @@ fn refused(error: BookError) -> axum::response::Response {
             "not_found",
             format!("'{id}' is not in the configuration"),
         ),
+        BookError::IdTaken(id) => (
+            StatusCode::CONFLICT,
+            "id_taken",
+            format!("'{id}' is already in the configuration"),
+        ),
+        BookError::ModelExists(model) => (
+            StatusCode::CONFLICT,
+            "model_exists",
+            format!("'{model}' is already under this account"),
+        ),
+        BookError::LegacyNoDisplayName(id) => (
+            StatusCode::BAD_REQUEST,
+            "legacy_display_name",
+            format!("'{id}' is a legacy entry and has no display name; add a model to upgrade it"),
+        ),
         BookError::Write(why) => (StatusCode::INTERNAL_SERVER_ERROR, "write_failed", why),
     };
     coded_json_error(status, code, message, false).into_response()
@@ -170,6 +193,8 @@ pub(crate) fn normalized_effort(
     };
     let effort = match effort.map(str::trim).filter(|e| !e.is_empty()) {
         None => None,
+        // A stored value the runtime passes through as-is: the model decides.
+        Some(e) if e.eq_ignore_ascii_case("auto") => Some("auto".to_string()),
         Some(e) => {
             let allowed = atomcode_config::config::allowed_effort_levels(levels.as_deref());
             let Some(level) = allowed.iter().find(|k| k.eq_ignore_ascii_case(e)) else {
@@ -182,6 +207,67 @@ pub(crate) fn normalized_effort(
         }
     };
     Ok((effort, levels))
+}
+
+/// What a text field may not carry: these break a TOML key or a terminal line.
+fn has_control(text: &str) -> bool {
+    text.chars()
+        .any(|ch| matches!(ch, '\0' | '\n' | '\r' | '\t' | '\\'))
+}
+
+/// The same limits the older add-models endpoint enforced: 1 to 100 models, a
+/// name with no control characters, no zero window or output cap, a usable
+/// chosen selection id, and no model twice in one batch.
+fn validate_new_models(models: &[NewModelRequest]) -> Result<(), axum::response::Response> {
+    if models.is_empty() || models.len() > 100 {
+        return Err(bad_request(
+            "model_count",
+            "Select between 1 and 100 models",
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for m in models {
+        let name = m.model.trim();
+        if name.is_empty() {
+            return Err(refused(BookError::ModelNameEmpty));
+        }
+        if has_control(name) {
+            return Err(bad_request(
+                "invalid_model",
+                "A model name may not contain control characters or a backslash",
+            ));
+        }
+        if m.context_window == Some(0) || m.max_tokens == Some(0) {
+            return Err(bad_request(
+                "invalid_capacity",
+                "context_window and max_tokens must be greater than zero",
+            ));
+        }
+        if let Some(id) = m.selection_id.as_deref() {
+            if id.trim().is_empty() || has_control(id) {
+                return Err(bad_request(
+                    "invalid_selection_id",
+                    "A selection id is empty or contains an invalid character",
+                ));
+            }
+        }
+        if !seen.insert(name.to_string()) {
+            return Err(refused(BookError::ModelExists(name.to_string())));
+        }
+    }
+    Ok(())
+}
+
+/// An endpoint a person may type: never the CodingPlan gateway, which `/login`
+/// owns — an account pointed there reads as managed and can then be neither
+/// edited nor deleted from here.
+fn refuse_gateway(base_url: Option<&str>) -> Result<(), axum::response::Response> {
+    match base_url.map(str::trim).filter(|u| !u.is_empty()) {
+        Some(url) if atomcode_auth::gateway_crypto::is_atomgit_gateway(url) => Err(refused(
+            BookError::ManagedAccountEdit("AtomGit".to_string()),
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Normalize every model's reasoning fields in place, or refuse the request.
@@ -237,6 +323,7 @@ fn model_inputs<'a>(models: &'a [NewModelRequest], set_default: bool) -> Vec<Mod
         .enumerate()
         .map(|(i, m)| ModelInput {
             model: &m.model,
+            id: m.selection_id.as_deref(),
             display_name: m.display_name.as_deref(),
             window: m.context_window,
             max_tokens: m.max_tokens,
@@ -251,11 +338,15 @@ fn model_inputs<'a>(models: &'a [NewModelRequest], set_default: bool) -> Vec<Mod
 
 /// POST /provider-accounts — an account and its models in one write.
 pub(crate) async fn create_account(Json(mut req): Json<CreateAccountRequest>) -> impl IntoResponse {
+    if let Err(refusal) = validate_new_models(&req.models) {
+        return refusal;
+    }
     if let Err(refusal) = normalize_models(&mut req.models) {
         return refusal;
     }
-    let book = ProviderBook::default_book();
-    let config = book.load();
+    if let Err(refusal) = refuse_gateway(req.base_url.as_deref()) {
+        return refusal;
+    }
     let provider = req.provider.trim();
     let Some(preset) = provider_preset::preset(provider) else {
         return bad_request("unknown_provider", format!("Unknown provider '{provider}'"));
@@ -269,48 +360,36 @@ pub(crate) async fn create_account(Json(mut req): Json<CreateAccountRequest>) ->
     {
         return refused(BookError::ManagedAccountEdit(preset.id.to_string()));
     }
-    if req.models.is_empty() || req.models.iter().any(|m| m.model.trim().is_empty()) {
-        return refused(BookError::ModelNameEmpty);
-    }
-    let custom = is_custom_protocol(preset.id);
     let typed_id = req.id.as_deref().map(str::trim).filter(|id| !id.is_empty());
-    let name = match (typed_id, custom) {
-        (Some(id), _) => {
+    // A name the person chose is theirs: taken is a conflict (decided by the
+    // book under the lock, case-insensitively), not a silent `-2`. With none,
+    // a protocol that has an endpoint of its own (a vendor, or a local Ollama)
+    // is named after itself; a bare protocol pointed at someone's endpoint has
+    // nothing to be named after and needs one.
+    let (name, exact_id) = match typed_id {
+        Some(id) => {
             if !valid_account_id(id) {
                 return bad_request(
                     "invalid_id",
                     "Account id may only use letters, digits, '-', '_' and '.'",
                 );
             }
-            // A name the person chose is theirs: taken is a conflict, not a
-            // silent `-2` they did not ask for. Case-insensitive, so two
-            // accounts are never told apart by case alone.
-            let taken = config
-                .logical_accounts()
-                .keys()
-                .any(|existing| existing.eq_ignore_ascii_case(id));
-            if taken {
-                return coded_json_error(
-                    StatusCode::CONFLICT,
-                    "id_taken",
-                    format!("An account named '{id}' already exists"),
-                    false,
-                )
-                .into_response();
-            }
-            id
+            (id, true)
         }
-        (None, true) => return bad_request("id_required", "A custom account needs an id"),
-        (None, false) => preset.id,
+        None if is_custom_protocol(preset.id) && preset.default_base_url.is_none() => {
+            return bad_request("id_required", "A custom account needs an id")
+        }
+        None => (preset.id, false),
     };
     let models = model_inputs(&req.models, req.set_default);
-    match book.create_account(
+    match ProviderBook::default_book().create_account(
         &AccountInput {
             name,
             protocol: preset.id,
             display_name: req.display_name.as_deref(),
             endpoint: req.base_url.as_deref().unwrap_or_default(),
             key: req.api_key.as_deref(),
+            exact_id,
         },
         &models,
     ) {
@@ -327,6 +406,9 @@ pub(crate) async fn edit_account(
     Path(id): Path<String>,
     Json(req): Json<EditAccountRequest>,
 ) -> impl IntoResponse {
+    if let Err(refusal) = refuse_gateway(req.base_url.as_deref()) {
+        return refusal;
+    }
     let book = ProviderBook::default_book();
     let config = book.load();
     let Some(account) = config.logical_accounts().remove(&id) else {
@@ -382,29 +464,16 @@ pub(crate) fn add_models(
     account: &str,
     models: &mut [NewModelRequest],
 ) -> axum::response::Response {
+    if let Err(refusal) = validate_new_models(models) {
+        return refusal;
+    }
     if let Err(refusal) = normalize_models(models) {
         return refusal;
     }
-    let book = ProviderBook::default_book();
-    let config = book.load();
-    // The same model twice under one account is a second row nobody can tell
-    // apart from the first.
-    if let Some(dup) = models.iter().find(|m| {
-        config
-            .models
-            .values()
-            .any(|p| p.account == account && p.model == m.model.trim())
-    }) {
-        return coded_json_error(
-            StatusCode::CONFLICT,
-            "model_exists",
-            format!("'{}' is already under '{account}'", dup.model.trim()),
-            false,
-        )
-        .into_response();
-    }
     let inputs = model_inputs(models, false);
-    match book.add_models(account, &inputs) {
+    // The same model twice under one account is a second row nobody can tell
+    // apart from the first: refused, decided by the book under the lock.
+    match ProviderBook::default_book().add_models(account, &inputs, true) {
         Ok(created) => written(
             StatusCode::CREATED,
             serde_json::json!({ "created": created }),
@@ -425,13 +494,41 @@ pub(crate) async fn edit_model(
     let Some(existing) = config.logical_models().remove(&id) else {
         return refused(BookError::NotFound(id));
     };
+    if req.context_window == Some(0) || req.max_tokens == Some(0) {
+        return bad_request(
+            "invalid_capacity",
+            "context_window and max_tokens must be greater than zero",
+        );
+    }
+    if req.model.as_deref().is_some_and(has_control) {
+        return bad_request(
+            "invalid_model",
+            "A model name may not contain control characters or a backslash",
+        );
+    }
+    let reasoning_history = match (
+        req.clear_reasoning_history,
+        req.reasoning_history.as_deref(),
+    ) {
+        (true, _) => Edit::Clear,
+        (false, Some(value)) if matches!(value, "preserve" | "exclude" | "include") => {
+            Edit::Set(value)
+        }
+        (false, Some(value)) => {
+            return bad_request(
+                "invalid_reasoning_history",
+                format!("reasoning_history '{value}' is not preserve, exclude or include"),
+            )
+        }
+        (false, None) => Edit::Keep,
+    };
     let model = req
         .model
         .as_deref()
         .map(str::trim)
         .filter(|m| !m.is_empty())
         .map(str::to_string)
-        .unwrap_or(existing.model);
+        .unwrap_or(existing.model.clone());
     let display_name = match req.display_name.as_deref().map(str::trim) {
         None => Edit::Keep,
         Some("") => Edit::Clear,
@@ -447,27 +544,36 @@ pub(crate) async fn edit_model(
         (false, Some(can)) => Edit::Set(can),
         (false, None) => Edit::Keep,
     };
-    // The default level is judged against the level list as it will be after
-    // this edit — the one sent, or the one the file keeps.
-    let levels_after: Option<Vec<String>> = match (
-        req.clear_reasoning_effort_levels,
-        req.reasoning_effort_levels.as_deref(),
-    ) {
-        (true, _) => None,
-        (false, Some(list)) => Some(list.to_vec()),
-        (false, None) => existing.reasoning_effort_levels.clone(),
-    };
-    let effort_after: Option<String> =
-        match (req.clear_reasoning_effort, req.reasoning_effort.as_deref()) {
+    // Only what this request touches is judged: a model whose file holds a
+    // level the form never offered (`auto`, or one outside a hand-written list)
+    // must still take a rename. The default level is judged against the level
+    // list as it will be after this edit — the one sent, or the one kept.
+    let touches_effort = req.clear_reasoning_effort
+        || req.reasoning_effort.is_some()
+        || req.clear_reasoning_effort_levels
+        || req.reasoning_effort_levels.is_some();
+    let (effort_norm, levels_norm) = if touches_effort {
+        let levels_after: Option<Vec<String>> = match (
+            req.clear_reasoning_effort_levels,
+            req.reasoning_effort_levels.as_deref(),
+        ) {
+            (true, _) => None,
+            (false, Some(list)) => Some(list.to_vec()),
+            (false, None) => existing.reasoning_effort_levels.clone(),
+        };
+        // A default the request does not send is kept, not re-judged.
+        let effort_sent = match (req.clear_reasoning_effort, req.reasoning_effort.as_deref()) {
             (true, _) => None,
             (false, Some(e)) => Some(e.to_string()),
-            (false, None) => existing.reasoning_effort.clone(),
+            (false, None) => None,
         };
-    let (effort_norm, levels_norm) =
-        match normalized_effort(effort_after.as_deref(), levels_after.as_deref()) {
+        match normalized_effort(effort_sent.as_deref(), levels_after.as_deref()) {
             Ok(pair) => pair,
             Err(why) => return bad_request("invalid_effort", why),
-        };
+        }
+    } else {
+        (None, None)
+    };
     let levels_edit = if req.clear_reasoning_effort_levels
         || (req.reasoning_effort_levels.is_some() && levels_norm.is_none())
     {
@@ -497,6 +603,7 @@ pub(crate) async fn edit_model(
             max_tokens,
             effort: effort_edit,
             levels: levels_edit,
+            reasoning_history,
             ..Default::default()
         },
     ) {
@@ -600,6 +707,18 @@ pub(crate) async fn probe_account(
     }
     if config.account_is_codingplan_managed(&account) {
         return Json(serde_json::json!({ "probed": false, "reason": "managed" })).into_response();
+    }
+    // The model named must be this account's own, and not one `/login` set up:
+    // a probe of an unmanaged account must not reach the gateway by naming a
+    // CodingPlan model.
+    if let Some(selection) = req.selection.as_deref() {
+        let owned = config
+            .logical_models()
+            .get(selection)
+            .is_some_and(|m| m.account == account);
+        if !owned || config.selection_is_codingplan_managed(selection) {
+            return refused(BookError::NotFound(selection.to_string()));
+        }
     }
     let Some((wire, target)) = probe_target(&config, &account, req.selection.as_deref()) else {
         return Json(serde_json::json!({ "probed": false, "reason": "no_endpoint" }))
@@ -851,6 +970,136 @@ mod tests {
         }
     }
 
+    /// What the review found the page could not do, or could do wrongly, over
+    /// HTTP against a scratch config: a local Ollama added as a preset needs no
+    /// id; a model whose file holds `reasoning_effort = "auto"` still takes a
+    /// rename; a chosen selection id is kept; a zero window, a model twice in
+    /// one batch, an endpoint on the CodingPlan gateway, and a probe naming
+    /// another account's model are refused.
+    #[tokio::test]
+    async fn the_page_is_refused_what_would_break_the_file() {
+        use axum::routing::{patch, post};
+        let _home = crate::atomcode_home_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!(
+            "atomcode-accounts-refusals-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let previous = std::env::var_os("ATOMCODE_HOME");
+        std::env::set_var("ATOMCODE_HOME", &home);
+        let path = atomcode_config::config::Config::default_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "[provider_accounts.mine]\nprovider = \"openai-compatible\"\nbase_url = \"http://127.0.0.1:9/v1\"\n\n\
+             [models.\"mine/a\"]\naccount = \"mine\"\nmodel = \"a\"\nreasoning_effort = \"auto\"\n\n\
+             [provider_accounts.other]\nprovider = \"openai-compatible\"\nbase_url = \"http://127.0.0.1:9/v1\"\n\n\
+             [models.\"other/b\"]\naccount = \"other\"\nmodel = \"b\"\n",
+        )
+        .unwrap();
+
+        let app = axum::Router::new()
+            .route("/provider-accounts", post(create_account))
+            .route("/provider-accounts/:account", patch(edit_account))
+            .route(
+                "/provider-accounts/:account/models",
+                post(crate::api_provider::create_account_models),
+            )
+            .route("/provider-accounts/:account/probe", post(probe_account))
+            .route("/model-profiles/:id", patch(edit_model));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let config = || atomcode_config::config::Config::load(&path).unwrap();
+        let post_json = |url: String, body: serde_json::Value| {
+            let http = http.clone();
+            async move { http.post(url).json(&body).send().await.unwrap().status() }
+        };
+
+        // A local Ollama, picked as a preset: named after itself.
+        let ollama = post_json(
+            format!("{base}/provider-accounts"),
+            serde_json::json!({ "provider": "ollama", "models": [{ "model": "qwen3" }] }),
+        )
+        .await;
+        assert_eq!(ollama, StatusCode::CREATED);
+        assert!(config().provider_accounts.contains_key("ollama"));
+
+        // `auto` in the file does not block an edit that does not touch it.
+        let renamed = http
+            .patch(format!("{base}/model-profiles/mine%2Fa"))
+            .json(&serde_json::json!({ "display_name": "A", "context_window": 64000 }))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(renamed, StatusCode::OK);
+        let a = config().models["mine/a"].clone();
+        assert_eq!(a.display_name.as_deref(), Some("A"));
+        assert_eq!(
+            a.reasoning_effort.as_deref(),
+            Some("auto"),
+            "kept as it was"
+        );
+
+        // A chosen selection id is the id.
+        let chosen = post_json(
+            format!("{base}/provider-accounts/mine/models"),
+            serde_json::json!({ "models": [{ "model": "c", "selection_id": "fast" }] }),
+        )
+        .await;
+        assert_eq!(chosen, StatusCode::CREATED);
+        assert_eq!(config().models["fast"].model, "c");
+
+        let zero = post_json(
+            format!("{base}/provider-accounts/mine/models"),
+            serde_json::json!({ "models": [{ "model": "d", "context_window": 0 }] }),
+        )
+        .await;
+        assert_eq!(zero, StatusCode::BAD_REQUEST);
+        let twice = post_json(
+            format!("{base}/provider-accounts/mine/models"),
+            serde_json::json!({ "models": [{ "model": "d" }, { "model": "d" }] }),
+        )
+        .await;
+        assert_eq!(twice, StatusCode::CONFLICT);
+        assert!(
+            !config().models.values().any(|m| m.model == "d"),
+            "nothing written"
+        );
+
+        let gateway = post_json(
+            format!("{base}/provider-accounts"),
+            serde_json::json!({
+                "id": "lookalike",
+                "provider": "openai-compatible",
+                "base_url": "https://llm-api.atomgit.com/v1",
+                "models": [{ "model": "m" }]
+            }),
+        )
+        .await;
+        assert_eq!(gateway, StatusCode::FORBIDDEN);
+
+        let borrowed = post_json(
+            format!("{base}/provider-accounts/mine/probe"),
+            serde_json::json!({ "selection": "other/b" }),
+        )
+        .await;
+        assert_eq!(borrowed, StatusCode::NOT_FOUND);
+
+        match previous {
+            Some(value) => std::env::set_var("ATOMCODE_HOME", value),
+            None => std::env::remove_var("ATOMCODE_HOME"),
+        }
+    }
+
     /// Levels are stored the way the build names them — lowercase, canonical
     /// order, once — and a default must be one of the levels on offer.
     #[test]
@@ -873,6 +1122,11 @@ mod tests {
         assert!(normalized_effort(Some("medium"), Some(&list(&["high", "max"]))).is_err());
         assert!(normalized_effort(None, Some(&list(&["turbo"]))).is_err());
         assert!(normalized_effort(Some("turbo"), None).is_err());
+        assert_eq!(
+            normalized_effort(Some("AUTO"), Some(&list(&["high"]))),
+            Ok((Some("auto".into()), Some(list(&["high"])))),
+            "auto is a stored value the runtime passes through"
+        );
     }
 
     #[test]

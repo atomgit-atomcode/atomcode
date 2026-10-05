@@ -140,6 +140,9 @@ pub struct ModelPatch<'a> {
     pub display_name: Edit<&'a str>,
     /// The output cap. Cleared falls back to the protocol's default.
     pub max_tokens: Edit<usize>,
+    /// Whether prior reasoning is sent back (`preserve` / `exclude` /
+    /// `include`). Cleared is decided from the model.
+    pub reasoning_history: Edit<&'a str>,
 }
 
 /// Write one account under `[provider_accounts.<id>]`, creating it if it is new.
@@ -206,6 +209,11 @@ fn write_model_keys(table: &mut Table, patch: &ModelPatch<'_>) {
         Edit::Clear => Edit::Clear,
     };
     edit_key(table, "max_tokens", max_tokens);
+    edit_key(
+        table,
+        "reasoning_history",
+        str_item(patch.reasoning_history),
+    );
 }
 
 /// Change what a legacy `[providers.<id>]` entry points at, in place.
@@ -447,6 +455,7 @@ note = "hand-written"
                 reasoning_effort_levels: Edit::Set(&["low".to_string(), "high".to_string()]),
                 display_name: Edit::Keep,
                 max_tokens: Edit::Keep,
+                reasoning_history: Edit::Keep,
             },
         )
         .unwrap();
@@ -487,6 +496,7 @@ origin = "openrouter-free"
                 reasoning_effort_levels: Edit::Clear,
                 display_name: Edit::Keep,
                 max_tokens: Edit::Keep,
+                reasoning_history: Edit::Keep,
             },
         )
         .unwrap();
@@ -510,6 +520,7 @@ origin = "openrouter-free"
                 reasoning_effort_levels: Edit::Set(&["high".to_string()]),
                 display_name: Edit::Keep,
                 max_tokens: Edit::Keep,
+                reasoning_history: Edit::Keep,
             },
         )
         .unwrap();
@@ -525,6 +536,7 @@ origin = "openrouter-free"
                 reasoning_effort_levels: Edit::Clear,
                 display_name: Edit::Keep,
                 max_tokens: Edit::Keep,
+                reasoning_history: Edit::Keep,
             },
         )
         .unwrap();
