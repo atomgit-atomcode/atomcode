@@ -10050,3 +10050,63 @@ async fn with_the_mouse_handed_back_arrows_walk_the_team_panel() {
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
+
+/// Scrolled back, the "↓ 还有 N 行" badge sits on the conversation's last row
+/// — the row the slash menu's last row covers, and where the lit row stays as
+/// the arrows walk down the list. While the menu is up the badge is not drawn,
+/// so the row being chosen is never covered.
+#[tokio::test]
+async fn the_slash_menu_s_lit_row_is_not_covered_by_the_scroll_badge() {
+    let dir = scratch("menu-over-badge");
+    let s = start(tree(&dir, &replay(&sixty_lines()), &[])).await;
+    let task = s.open().await;
+    s.term.type_line("count to sixty");
+    until(&s, "LINE-60").await;
+    s.quiet().await;
+    let stream = s.term.last().unwrap().part("stream").unwrap().rect;
+    for _ in 0..5 {
+        s.term.pointer(
+            atomcode_tui::surface::Click::WheelUp,
+            stream.x + 2,
+            stream.y + 2,
+        );
+    }
+    s.quiet().await;
+    assert!(
+        s.term.last().unwrap().part("jump-to-bottom").is_some(),
+        "scrolled back"
+    );
+
+    s.term.type_text("/");
+    s.quiet().await;
+    for _ in 0..12 {
+        s.term.press(KeyPress::plain(Key::Down));
+    }
+    s.quiet().await;
+    let frame = s.term.last().unwrap();
+    assert!(
+        frame.part("jump-to-bottom").is_none(),
+        "no badge over the list:\n{}",
+        s.screen()
+    );
+    let lit = atomcode_tui::frame::Color::role(atomcode_tui::theme::Role::PanelSelBg);
+    let menu = frame.part("menu").expect("the menu is up");
+    let lit_row = menu
+        .lines
+        .iter()
+        .position(|l| l.spans.iter().any(|sp| sp.style.bg == Some(lit)))
+        .expect("a row is lit");
+    let on_screen = s
+        .screen()
+        .lines()
+        .nth(menu.rect.y as usize + lit_row)
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        on_screen.contains(menu.lines[lit_row].plain().trim()),
+        "the lit row is what the screen shows there: {on_screen:?}"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}

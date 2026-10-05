@@ -5963,6 +5963,14 @@ impl Host {
         // Drawn *over* the stream's last row rather than inside it, so the
         // badge costs no line of content: later parts win the cells they cover,
         // and only those.
+        //
+        // Not where a list rising out of the prompt (the slash menu, a `Ctrl+R`
+        // search) covers that row: it is the list's last, and walking down a
+        // list keeps the lit row there — so the badge sat on the very row being
+        // chosen, and on a terminal that repainted it whole the highlight was
+        // simply gone ("the cursor ran off the list"). Nor is its rect left in
+        // `hits` then, or a press on that row would be read as "back to the
+        // bottom". A short list that ends above the row leaves the badge be.
         if let (Some(rect), true) = (stream_rect, moment.scroll.0 > 0) {
             let caps = moment.caps;
             let label = crate::i18n::t(crate::i18n::Msg::MoreBelow {
@@ -5978,10 +5986,21 @@ impl Host {
                     want as u16,
                     1,
                 );
-                let style = crate::theme::bg(crate::theme::Role::PanelBg)
-                    .under(crate::theme::fg(crate::theme::Role::PanelFg));
-                frame.place("jump-to-bottom", badge, vec![Line::styled(label, style)]);
-                self.hits.lock().expect("hits poisoned").jump = Some(badge);
+                let covered = ["menu", "history-search"].iter().any(|id| {
+                    frame.part(id).is_some_and(|list| {
+                        let r = list.rect;
+                        r.y <= badge.y
+                            && badge.y < r.bottom()
+                            && r.x < badge.x + badge.w
+                            && badge.x < r.x + r.w
+                    })
+                });
+                if !covered {
+                    let style = crate::theme::bg(crate::theme::Role::PanelBg)
+                        .under(crate::theme::fg(crate::theme::Role::PanelFg));
+                    frame.place("jump-to-bottom", badge, vec![Line::styled(label, style)]);
+                    self.hits.lock().expect("hits poisoned").jump = Some(badge);
+                }
             }
         }
 
