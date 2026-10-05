@@ -29,6 +29,7 @@ mod api_auth;
 mod api_codingplan;
 mod api_config;
 mod api_provider;
+mod api_provider_accounts;
 pub mod approval_mode;
 mod commands;
 pub(crate) mod kernel_runtime;
@@ -178,6 +179,11 @@ pub(crate) struct ConfigResponse {
     /// Compiled provider presets used by the TUI and WebUI add-provider flows.
     /// This contains connection metadata only; no credentials are exposed.
     pub provider_presets: Vec<ProviderPresetInfo>,
+    /// The generic protocols a person points at their own endpoint
+    /// (OpenAI-compatible, Anthropic-compatible, OpenAI Responses, Ollama).
+    /// Apart from `provider_presets` so a caller that lists vendors keeps
+    /// seeing only vendors.
+    pub provider_protocols: Vec<ProviderPresetInfo>,
     /// Sanitized completion-notification config (webui reads it for defaults).
     pub notifications: NotificationConfigInfo,
 }
@@ -195,6 +201,16 @@ pub(crate) struct ProviderAccountInfo {
     pub model_ids: Vec<String>,
     pub legacy: bool,
     pub managed: bool,
+    /// What a screen calls it: its own name, else its id, else the vendor's.
+    pub label: String,
+    /// The vendor or protocol it speaks, by name (`DeepSeek`, `OpenAI-compatible endpoint`).
+    pub preset_name: String,
+    /// It is a generic protocol pointed at a person's own endpoint.
+    pub custom: bool,
+    /// Its models can be listed from the endpoint.
+    pub discoverable: bool,
+    /// Its endpoint can be checked after a save (the chat/completions wire).
+    pub probeable: bool,
 }
 
 /// Sanitized view of one compiled provider preset.
@@ -207,6 +223,9 @@ pub(crate) struct ProviderPresetInfo {
     pub default_base_url: Option<String>,
     pub requires_api_key: bool,
     pub model_source: String,
+    /// Its models can be listed from the endpoint.
+    #[serde(default)]
+    pub discoverable: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -253,6 +272,13 @@ pub(crate) struct ProviderInfo {
     pub reasoning_effort: Option<String>,
     pub skip_tls_verify: bool,
     pub ephemeral: bool,
+    /// The account this model hangs off, when it is in the new schema or folded
+    /// in from a legacy entry (whose account is itself).
+    pub account: Option<String>,
+    /// The model's own display name.
+    pub display_name: Option<String>,
+    /// CodingPlan-managed: shown, never edited.
+    pub managed: bool,
 }
 
 /// Login attempts stay addressable while a blocking poll is in flight. Per-record
@@ -6742,8 +6768,29 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
             post(api_provider::discover_models).layer(DefaultBodyLimit::max(64 * 1024)),
         )
         .route(
+            "/provider-accounts",
+            post(api_provider_accounts::create_account).layer(DefaultBodyLimit::max(256 * 1024)),
+        )
+        .route(
+            "/provider-accounts/:account",
+            patch(api_provider_accounts::edit_account)
+                .delete(api_provider_accounts::delete_account),
+        )
+        .route(
             "/provider-accounts/:account/models",
             post(api_provider::create_account_models).layer(DefaultBodyLimit::max(256 * 1024)),
+        )
+        .route(
+            "/provider-accounts/:account/probe",
+            post(api_provider_accounts::probe_account),
+        )
+        .route(
+            "/model-profiles/:id",
+            patch(api_provider_accounts::edit_model).delete(api_provider_accounts::delete_model),
+        )
+        .route(
+            "/model-profiles/:id/default",
+            post(api_provider_accounts::set_default),
         )
         .route(
             "/providers/:name",

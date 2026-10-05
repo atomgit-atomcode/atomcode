@@ -489,6 +489,30 @@ impl ProviderBook {
     }
 }
 
+/// What to call an account on a screen.
+///
+/// Its own `display_name` first, then the id — never the preset's name for a
+/// custom account, or two accounts a person made on one vendor would be drawn
+/// with one label and become indistinguishable.
+pub fn account_label(config: &Config, id: &str) -> String {
+    if let Some(account) = config.provider_accounts.get(id) {
+        if let Some(name) = account
+            .display_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            return name.to_string();
+        }
+        if account.provider != id {
+            return id.to_string();
+        }
+    }
+    provider_preset::preset(id)
+        .map(|preset| preset.display_name.to_string())
+        .unwrap_or_else(|| id.to_string())
+}
+
 /// One model about to be written, decided against the file as it was read.
 struct Planned {
     id: String,

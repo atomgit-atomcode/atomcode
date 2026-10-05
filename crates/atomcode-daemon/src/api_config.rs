@@ -44,7 +44,17 @@ pub(crate) fn config_response(config: &Config) -> ConfigResponse {
         .iter()
         .filter_map(|id| {
             config.provider_config_for_selection(id).map(|p| {
-                provider_info(id, &p, config.model_vision_override(id), &default_selection)
+                let mut info =
+                    provider_info(id, &p, config.model_vision_override(id), &default_selection);
+                let logical = logical_models.get(id);
+                info.account = logical.map(|m| m.account.clone());
+                info.display_name = config
+                    .models
+                    .get(id)
+                    .and_then(|m| m.display_name.clone())
+                    .filter(|name| !name.trim().is_empty());
+                info.managed = config.selection_is_codingplan_managed(id) || info.requires_login;
+                info
             })
         })
         .collect();
@@ -79,10 +89,17 @@ pub(crate) fn config_response(config: &Config) -> ConfigResponse {
                         .api_key
                         .as_deref()
                         .is_some_and(|key| !key.trim().is_empty());
-                    let managed = base_url
-                        .as_deref()
-                        .is_some_and(atomcode_auth::gateway_crypto::is_atomgit_gateway);
+                    let managed = config.account_is_codingplan_managed(&id)
+                        || base_url
+                            .as_deref()
+                            .is_some_and(atomcode_auth::gateway_crypto::is_atomgit_gateway);
+                    let wire = preset.provider_type.wire();
                     ProviderAccountInfo {
+                        label: atomcode_config::provider_book::account_label(config, &id),
+                        preset_name: preset.display_name.to_string(),
+                        custom: is_generic_protocol(preset.id),
+                        discoverable: crate::api_provider::discovery_protocol(wire).is_some(),
+                        probeable: wire == "openai",
                         id: id.clone(),
                         provider: account.provider,
                         display_name: account.display_name,
@@ -111,24 +128,12 @@ pub(crate) fn config_response(config: &Config) -> ConfigResponse {
                     "atomgit" | "openai-compatible" | "anthropic-compatible"
                 )
             })
-            .map(|preset| ProviderPresetInfo {
-                id: preset.id.to_string(),
-                display_name: preset.display_name.to_string(),
-                provider_type: preset.provider_type.wire().to_string(),
-                default_base_url: preset.default_base_url.map(str::to_string),
-                requires_api_key: !matches!(
-                    preset.auth_kind,
-                    atomcode_config::config::provider_preset::AuthKind::None
-                ),
-                model_source: match preset.model_source {
-                    atomcode_config::config::provider_preset::ModelSource::Embedded => "embedded",
-                    atomcode_config::config::provider_preset::ModelSource::DiscoveryApi => {
-                        "discovery_api"
-                    }
-                    atomcode_config::config::provider_preset::ModelSource::Manual => "manual",
-                }
-                .to_string(),
-            })
+            .map(preset_info)
+            .collect(),
+        provider_protocols: GENERIC_PROTOCOLS
+            .iter()
+            .filter_map(|id| atomcode_config::config::provider_preset::preset(id))
+            .map(preset_info)
             .collect(),
         notifications: crate::NotificationConfigInfo {
             enabled: config.notifications.enabled,
@@ -139,6 +144,40 @@ pub(crate) fn config_response(config: &Config) -> ConfigResponse {
 }
 
 /// Build a sanitized ProviderInfo from a name + ProviderConfig.
+/// The protocols a person points at their own endpoint, in the order a form
+/// offers them.
+const GENERIC_PROTOCOLS: [&str; 4] = [
+    "openai-compatible",
+    "anthropic-compatible",
+    "openai-responses",
+    "ollama",
+];
+
+fn is_generic_protocol(id: &str) -> bool {
+    GENERIC_PROTOCOLS.contains(&id)
+}
+
+fn preset_info(
+    preset: &atomcode_config::config::provider_preset::ProviderPreset,
+) -> ProviderPresetInfo {
+    use atomcode_config::config::provider_preset::{AuthKind, ModelSource};
+    ProviderPresetInfo {
+        id: preset.id.to_string(),
+        display_name: preset.display_name.to_string(),
+        provider_type: preset.provider_type.wire().to_string(),
+        default_base_url: preset.default_base_url.map(str::to_string),
+        requires_api_key: !matches!(preset.auth_kind, AuthKind::None),
+        model_source: match preset.model_source {
+            ModelSource::Embedded => "embedded",
+            ModelSource::DiscoveryApi => "discovery_api",
+            ModelSource::Manual => "manual",
+        }
+        .to_string(),
+        discoverable: crate::api_provider::discovery_protocol(preset.provider_type.wire())
+            .is_some(),
+    }
+}
+
 pub(crate) fn provider_info(
     name: &str,
     p: &ProviderConfig,
@@ -168,6 +207,9 @@ pub(crate) fn provider_info(
         reasoning_effort: p.reasoning_effort.clone(),
         skip_tls_verify: p.skip_tls_verify,
         ephemeral: p.ephemeral,
+        account: None,
+        display_name: None,
+        managed: false,
     }
 }
 

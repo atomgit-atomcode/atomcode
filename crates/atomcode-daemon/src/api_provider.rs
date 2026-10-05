@@ -156,8 +156,17 @@ fn apply_patch_to_new_schema_model(
     // Connection fields → the SHARED account (chosen "account is the connection"
     // semantics). Presence guaranteed by the up-front check above.
     if let Some(account) = config.provider_accounts.get_mut(&account_id) {
+        use atomcode_config::config::provider_preset::preset_or_compatible;
         if let Some(value) = req.provider_type {
-            account.provider = value;
+            // The page sends the wire it shows (`openai`) for an account that
+            // names a vendor (`deepseek`). The same wire is no change: rewriting
+            // the vendor into its wire would drop what the preset knows — its
+            // endpoint, its key variable — for every model on the account.
+            let same_wire = preset_or_compatible(&account.provider).provider_type
+                == preset_or_compatible(&value).provider_type;
+            if !same_wire {
+                account.provider = value;
+            }
         }
         if req.clear_api_key {
             account.api_key = None;
@@ -167,7 +176,16 @@ fn apply_patch_to_new_schema_model(
         if req.clear_base_url {
             account.base_url = None;
         } else if let Some(value) = req.base_url {
-            account.base_url = value;
+            // The page sends back the endpoint it was shown. Unchanged is no
+            // change: writing the preset's own default would pin a URL that
+            // should follow the build, on an account other models share.
+            let effective = account
+                .base_url
+                .as_deref()
+                .or(preset_or_compatible(&account.provider).default_base_url);
+            if value.as_deref() != effective {
+                account.base_url = value;
+            }
         }
         if req.clear_user_agent {
             account.user_agent = None;
@@ -358,10 +376,12 @@ struct OllamaModelEntry {
 }
 
 fn discovery_url(base_url: &str, provider_type: &str) -> anyhow::Result<reqwest::Url> {
-    let suffix = if provider_type == "ollama" {
-        "/api/tags"
-    } else {
-        "/models"
+    // Each wire's own listing, relative to the base the adapter sends chat to:
+    // Anthropic's base carries no version (the adapter appends `/v1/messages`).
+    let suffix = match discovery_protocol(provider_type) {
+        Some("ollama") => "/api/tags",
+        Some("anthropic") => "/v1/models",
+        _ => "/models",
     };
     let mut url = reqwest::Url::parse(base_url.trim())?;
     if !matches!(url.scheme(), "http" | "https") {
@@ -377,7 +397,7 @@ fn discovery_url(base_url: &str, provider_type: &str) -> anyhow::Result<reqwest:
     Ok(url)
 }
 
-fn discovery_protocol(provider_type: &str) -> Option<&'static str> {
+pub(crate) fn discovery_protocol(provider_type: &str) -> Option<&'static str> {
     match provider_type.trim().to_ascii_lowercase().as_str() {
         // The Responses adapter targets an OpenAI-shaped endpoint, so model
         // discovery uses the SAME `/models` transport as the chat/completions
@@ -385,6 +405,8 @@ fn discovery_protocol(provider_type: &str) -> Option<&'static str> {
         // None and the add-model / discovery flow silently rejects it.
         "openai" | "openai-compat" | "openai_compat" | "responses" => Some("openai"),
         "ollama" => Some("ollama"),
+        // `GET /v1/models`, the same `data` array shape as OpenAI's.
+        "anthropic" => Some("anthropic"),
         _ => None,
     }
 }
@@ -639,6 +661,7 @@ enum DiscoveryRequestError {
 
 async fn fetch_discovery_body(
     url: reqwest::Url,
+    protocol: &str,
     transport: &DiscoveryTransport,
     timeout: Duration,
 ) -> Result<Vec<u8>, DiscoveryRequestError> {
@@ -652,7 +675,13 @@ async fn fetch_discovery_body(
         .build()
         .map_err(|_| DiscoveryRequestError::Transport)?;
     let mut request = client.get(url).header("accept", "application/json");
-    if let Some(key) = transport.api_key.as_deref() {
+    if protocol == "anthropic" {
+        // Anthropic authenticates the way its chat adapter does.
+        request = request.header("anthropic-version", "2023-06-01");
+        if let Some(key) = transport.api_key.as_deref() {
+            request = request.header("x-api-key", key.trim());
+        }
+    } else if let Some(key) = transport.api_key.as_deref() {
         request = request.bearer_auth(key.trim());
     }
     let response = request.send().await.map_err(|error| {
@@ -695,16 +724,13 @@ fn normalize_discovered_models(mut models: Vec<DiscoveredModelInfo>) -> Vec<Disc
 /// the existing provider's resolved credential.
 pub(crate) async fn discover_models(Json(req): Json<DiscoverModelsRequest>) -> impl IntoResponse {
     let provider_type = req.provider_type.trim().to_ascii_lowercase();
-    if !matches!(
-        provider_type.as_str(),
-        "openai" | "openai-compat" | "openai_compat" | "ollama"
-    ) {
+    let Some(protocol) = discovery_protocol(&provider_type) else {
         return json_error(
             StatusCode::BAD_REQUEST,
             "This provider protocol has no supported model listing; enter the model manually",
         )
         .into_response();
-    }
+    };
     let url = match discovery_url(&req.base_url, &provider_type) {
         Ok(url) => url,
         Err(error) => {
@@ -723,7 +749,7 @@ pub(crate) async fn discover_models(Json(req): Json<DiscoverModelsRequest>) -> i
         transport.api_key = Some(api_key);
     }
 
-    let body = match fetch_discovery_body(url, &transport, DISCOVERY_TIMEOUT).await {
+    let body = match fetch_discovery_body(url, protocol, &transport, DISCOVERY_TIMEOUT).await {
         Ok(body) => body,
         Err(DiscoveryRequestError::Timeout) => {
             return json_error(StatusCode::GATEWAY_TIMEOUT, "Model discovery timed out")
@@ -776,6 +802,25 @@ pub(crate) async fn create_account_models(
     Path(account): Path<String>,
     Json(req): Json<CreateAccountModelsRequest>,
 ) -> impl IntoResponse {
+    // An account in the new schema is written by the book the terminal panel
+    // writes through, as a document patch. A legacy `[providers.*]` entry is
+    // upgraded below first — once, and then it is an account like any other.
+    if let Ok(config) = load_config() {
+        if config.provider_accounts.contains_key(&account) {
+            let models: Vec<_> = req
+                .models
+                .into_iter()
+                .map(|m| crate::api_provider_accounts::NewModelRequest {
+                    model: m.model,
+                    display_name: m.display_name,
+                    context_window: m.context_window,
+                    max_tokens: m.max_tokens,
+                    supports_vision: m.supports_vision,
+                })
+                .collect();
+            return crate::api_provider_accounts::add_models(&account, &models);
+        }
+    }
     let mut created = Vec::new();
     let mut missing = false;
     let mut managed = false;
@@ -1179,13 +1224,21 @@ pub(crate) async fn delete_provider(Path(name): Path<String>) -> impl IntoRespon
         Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
     };
 
-    let providers: Vec<ProviderInfo> = config
-        .providers
+    // The same catalog `GET /providers` lists: answering a delete with only
+    // the legacy table told a caller that every new-schema model had gone too.
+    let default_selection = config.effective_model_selection().unwrap_or_default();
+    let mut ids: Vec<String> = config.logical_models().into_keys().collect();
+    ids.sort();
+    let providers: Vec<ProviderInfo> = ids
         .iter()
-        .map(|(n, p)| provider_info(n, p, p.supports_vision, &config.default_provider))
+        .filter_map(|id| {
+            config.provider_config_for_selection(id).map(|p| {
+                provider_info(id, &p, config.model_vision_override(id), &default_selection)
+            })
+        })
         .collect();
     Json(serde_json::json!({
-        "default_provider": config.default_provider,
+        "default_provider": default_selection,
         "providers": providers,
     }))
     .into_response()
@@ -1461,6 +1514,55 @@ mod tests {
     // config.provider_accounts (corrupted / half-migrated config) must NOT have its
     // connection-field edits silently dropped while per-model fields save. The helper
     // reports the account was unresolved so the caller can refuse the whole edit.
+    /// The page sends the wire and endpoint it was shown back with every edit.
+    /// Unchanged, they change nothing: a `deepseek` account stays `deepseek`
+    /// rather than becoming `openai`, and its preset endpoint is not pinned.
+    #[test]
+    fn an_unchanged_wire_and_endpoint_leave_a_vendor_account_alone() {
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": {
+                "deepseek": { "provider": "deepseek", "api_key": "sk" }
+            },
+            "models": {
+                "deepseek/v4": { "account": "deepseek", "model": "deepseek-v4-flash" }
+            }
+        }))
+        .unwrap();
+        let default_url = atomcode_config::config::provider_preset::preset("deepseek")
+            .and_then(|p| p.default_base_url)
+            .unwrap();
+        let req: PatchProviderRequest = serde_json::from_value(serde_json::json!({
+            "type": "openai",
+            "base_url": default_url,
+            "context_window": 64000
+        }))
+        .unwrap();
+        assert!(apply_patch_to_new_schema_model(
+            &mut config,
+            "deepseek/v4",
+            req
+        ));
+        let account = &config.provider_accounts["deepseek"];
+        assert_eq!(account.provider, "deepseek");
+        assert_eq!(account.base_url, None);
+        assert_eq!(config.models["deepseek/v4"].context_window, 64000);
+
+        // A real move still moves.
+        let req: PatchProviderRequest = serde_json::from_value(serde_json::json!({
+            "type": "anthropic",
+            "base_url": "https://gw.example"
+        }))
+        .unwrap();
+        assert!(apply_patch_to_new_schema_model(
+            &mut config,
+            "deepseek/v4",
+            req
+        ));
+        let account = &config.provider_accounts["deepseek"];
+        assert_eq!(account.provider, "anthropic");
+        assert_eq!(account.base_url.as_deref(), Some("https://gw.example"));
+    }
+
     #[test]
     fn patch_new_schema_model_reports_missing_account_and_leaves_model_untouched() {
         let mut config: Config = serde_json::from_value(serde_json::json!({
@@ -1783,6 +1885,7 @@ mod tests {
         let url = spawn_discovery_server(router).await;
         let body = fetch_discovery_body(
             url,
+            "openai",
             &DiscoveryTransport {
                 api_key: Some("secret-value".into()),
                 user_agent: Some("AtomCode-Test/1".into()),
@@ -1817,6 +1920,7 @@ mod tests {
         assert!(matches!(
             fetch_discovery_body(
                 slow_url,
+                "openai",
                 &DiscoveryTransport::default(),
                 Duration::from_millis(10)
             )
@@ -1832,6 +1936,7 @@ mod tests {
         assert!(matches!(
             fetch_discovery_body(
                 oversized_url,
+                "openai",
                 &DiscoveryTransport::default(),
                 Duration::from_secs(1)
             )
@@ -1845,6 +1950,7 @@ mod tests {
         assert!(matches!(
             fetch_discovery_body(
                 unauthorized_url,
+                "openai",
                 &DiscoveryTransport::default(),
                 Duration::from_secs(1)
             )
