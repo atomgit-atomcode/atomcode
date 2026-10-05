@@ -317,6 +317,15 @@ function AccountCard({
   const models = modelsOf(config, account);
   const local = account.type === 'ollama';
   const ready = account.managed || account.has_api_key || local;
+  // A custom endpoint may need no key at all; its missing one is not an error.
+  const optionalKey = !ready && !!account.custom;
+  const health = local
+    ? t('providers.local')
+    : ready
+      ? t('providers.keyReady')
+      : optionalKey
+        ? t('providers.keyOptional')
+        : t('providers.keyMissing');
   const label = account.label ?? account.id;
   const editable = !account.managed;
   return (
@@ -325,10 +334,10 @@ function AccountCard({
         <div class="provider-identity">
           <span class="provider-name">{label}</span>
           <span
-            class={'provider-health' + (ready ? ' ready' : '')}
+            class={'provider-health' + (ready ? ' ready' : optionalKey ? ' neutral' : '')}
             role="img"
-            aria-label={local ? t('providers.local') : ready ? t('providers.keyReady') : t('providers.keyMissing')}
-            title={local ? t('providers.local') : ready ? t('providers.keyReady') : t('providers.keyMissing')}
+            aria-label={health}
+            title={health}
           />
         </div>
         {account.preset_name && account.preset_name !== label && (
@@ -416,7 +425,7 @@ function ProbeLine({
     return onProbe ? (
       <span class="probe-line">
         <button class="link-btn" type="button" onClick={onProbe}>
-          {t('providers.probeAgain')}
+          {t('providers.probeNow')}
         </button>
       </span>
     ) : null;
@@ -714,6 +723,7 @@ function ModelRowsEditor({
       </div>
       {fetchError && <div class="modal-error">{fetchError}</div>}
       <div class="model-draft-list">
+        <ModelColumns removable />
         {rows.map((row, i) => (
           <div key={i} class="model-draft-row">
             <input
@@ -754,9 +764,9 @@ function ModelRowsEditor({
             <Select
               value={row.vision === null ? 'auto' : row.vision ? 'on' : 'off'}
               options={[
-                { value: 'auto', label: `${t('providers.vision')}: ${t('providers.visionAuto')}` },
-                { value: 'on', label: `${t('providers.vision')}: ${t('providers.visionOn')}` },
-                { value: 'off', label: `${t('providers.vision')}: ${t('providers.visionOff')}` },
+                { value: 'auto', label: t('providers.visionAuto') },
+                { value: 'on', label: t('providers.visionOn') },
+                { value: 'off', label: t('providers.visionOff') },
               ]}
               onChange={(v) => update(i, { vision: v === 'auto' ? null : v === 'on' })}
             />
@@ -787,6 +797,22 @@ function ModelRowsEditor({
           }}
         />
       )}
+    </div>
+  );
+}
+
+/** The column names over model rows: the placeholders alone said too little
+ * once a value was typed over them. */
+function ModelColumns({ removable }: { removable?: boolean }) {
+  const { t } = useSettings();
+  return (
+    <div class={'model-draft-row model-draft-head' + (removable ? '' : ' no-remove')} aria-hidden="true">
+      <span>{t('providers.modelId')}</span>
+      <span>{t('providers.displayName')}</span>
+      <span>{t('providers.contextWindow')}</span>
+      <span>{t('providers.maxTokens')}</span>
+      <span>{t('providers.vision')}</span>
+      {removable && <span />}
     </div>
   );
 }
@@ -1117,7 +1143,8 @@ function ModelEditor({
 
   return (
     <div class="inline-editor">
-      <div class="model-draft-row">
+      <ModelColumns />
+      <div class="model-draft-row no-remove">
         <input class="menu-input model-draft-id" type="text" value={model.model} disabled aria-label={t('providers.modelId')} />
         <input
           class="menu-input"
@@ -1148,9 +1175,9 @@ function ModelEditor({
         <Select
           value={vision}
           options={[
-            { value: 'auto', label: `${t('providers.vision')}: ${t('providers.visionAuto')}` },
-            { value: 'on', label: `${t('providers.vision')}: ${t('providers.visionOn')}` },
-            { value: 'off', label: `${t('providers.vision')}: ${t('providers.visionOff')}` },
+            { value: 'auto', label: t('providers.visionAuto') },
+            { value: 'on', label: t('providers.visionOn') },
+            { value: 'off', label: t('providers.visionOff') },
           ]}
           onChange={(v) => setVision(v)}
         />

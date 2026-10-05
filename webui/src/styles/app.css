@@ -2738,6 +2738,8 @@ body {
   background: var(--app-error-foreground);
 }
 .provider-health.ready { background: var(--app-success-foreground); }
+/* No key where a key is optional: not an error, just nothing set. */
+.provider-health.neutral { background: var(--app-secondary-foreground); opacity: 0.5; }
 .provider-managed-badge {
   padding: 2px 7px;
   border: 1px solid var(--app-input-border);
@@ -3084,14 +3086,22 @@ body {
   gap: 6px;
   align-items: center;
 }
-.inline-editor .model-draft-row { grid-template-columns: minmax(140px, 2fr) minmax(100px, 1.5fr) minmax(90px, 1fr) minmax(90px, 1fr) minmax(120px, 1fr); }
+.model-draft-row.no-remove { grid-template-columns: minmax(140px, 2fr) minmax(100px, 1.5fr) minmax(90px, 1fr) minmax(90px, 1fr) minmax(120px, 1fr); }
 .model-draft-id { font-family: var(--app-monospace-font-family); }
+.model-draft-head span { font-size: 0.6875rem; color: var(--app-secondary-foreground); }
 .model-draft-num.invalid { border-color: var(--app-error-foreground); }
 @media (max-width: 720px) {
   .model-draft-row,
-  .inline-editor .model-draft-row { grid-template-columns: 1fr 1fr; }
+  .model-draft-row.no-remove { grid-template-columns: 1fr 1fr; }
+  .model-draft-head { display: none; }
 }
 .model-picker-modal .model-discovery-results { max-height: 50vh; }
+/* Here the id is the row's text, not a note beside a name. */
+.model-picker-modal .model-discovery-option code {
+  max-width: none;
+  color: var(--app-primary-foreground);
+  font-family: var(--app-monospace-font-family);
+}
 .model-picker-bulk { display: flex; gap: 12px; }
 
 /* === Model Selector === */
