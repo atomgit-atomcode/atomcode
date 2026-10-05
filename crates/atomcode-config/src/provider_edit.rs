@@ -42,8 +42,68 @@ pub struct AccountPatch<'a> {
     /// `None` takes the key out of the file, so the preset's own default stands.
     pub base_url: Option<&'a str>,
     pub api_key: KeyWrite<'a>,
-    /// `None` leaves the name alone.
-    pub display_name: Option<&'a str>,
+    pub display_name: Edit<&'a str>,
+}
+
+/// What a write does to one optional key.
+///
+/// Three states for the same reason [`KeyWrite`] has them: a form that does not
+/// show a field has not asked for it to be cleared. The terminal panel edits
+/// effort and its levels; the web page does not — and an edit made from the
+/// page must leave a level list written from the terminal where it is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Edit<T> {
+    /// Leave whatever is in the file alone.
+    #[default]
+    Keep,
+    /// Write this value.
+    Set(T),
+    /// Take the key out, so the default stands.
+    Clear,
+}
+
+impl<T> Edit<T> {
+    /// `Some` sets, `None` clears — the two-state reading a form that always
+    /// shows the field means.
+    pub fn from_option(value: Option<T>) -> Self {
+        match value {
+            Some(value) => Edit::Set(value),
+            None => Edit::Clear,
+        }
+    }
+}
+
+/// Apply one [`Edit`] to `key`.
+fn edit_key(table: &mut Table, key: &str, edit: Edit<Item>) {
+    match edit {
+        Edit::Keep => {}
+        Edit::Set(item) => set_key(table, key, item),
+        Edit::Clear => {
+            table.remove(key);
+        }
+    }
+}
+
+fn str_item(edit: Edit<&str>) -> Edit<Item> {
+    match edit {
+        Edit::Keep => Edit::Keep,
+        Edit::Set(v) => Edit::Set(value(v)),
+        Edit::Clear => Edit::Clear,
+    }
+}
+
+fn levels_item(edit: Edit<&[String]>) -> Edit<Item> {
+    match edit {
+        Edit::Keep => Edit::Keep,
+        Edit::Set(levels) => {
+            let mut array = toml_edit::Array::new();
+            for level in levels {
+                array.push(Value::from(level.as_str()));
+            }
+            Edit::Set(Item::Value(Value::Array(array)))
+        }
+        Edit::Clear => Edit::Clear,
+    }
 }
 
 /// What a write does to the stored credential.
@@ -71,11 +131,15 @@ pub struct ModelPatch<'a> {
     pub account: &'a str,
     pub model: &'a str,
     pub context_window: usize,
-    /// `None` is "decide for me", and is written by taking the key out.
-    pub supports_vision: Option<bool>,
-    pub reasoning_effort: Option<&'a str>,
-    /// `None` is unrestricted, and is written by taking the key out.
-    pub reasoning_effort_levels: Option<&'a [String]>,
+    /// Cleared is "decide for me".
+    pub supports_vision: Edit<bool>,
+    pub reasoning_effort: Edit<&'a str>,
+    /// Cleared is unrestricted.
+    pub reasoning_effort_levels: Edit<&'a [String]>,
+    /// What the model is called on screen. Cleared falls back to its id.
+    pub display_name: Edit<&'a str>,
+    /// The output cap. Cleared falls back to the protocol's default.
+    pub max_tokens: Edit<usize>,
 }
 
 /// Write one account under `[provider_accounts.<id>]`, creating it if it is new.
@@ -97,9 +161,7 @@ pub fn put_account(document: &mut DocumentMut, id: &str, patch: &AccountPatch<'_
             table.remove("api_key");
         }
     }
-    if let Some(name) = patch.display_name {
-        set_key(table, "display_name", value(name));
-    }
+    edit_key(table, "display_name", str_item(patch.display_name));
     Ok(())
 }
 
@@ -117,40 +179,33 @@ pub fn put_model(document: &mut DocumentMut, id: &str, patch: &ModelPatch<'_>) -
     table.remove("rank");
     set_key(table, "account", value(patch.account));
     set_key(table, "model", value(patch.model));
-    set_key(table, "context_window", value(patch.context_window as i64));
-    match patch.supports_vision {
-        Some(can) => {
-            set_key(table, "supports_vision", value(can));
-        }
-        None => {
-            table.remove("supports_vision");
-        }
-    }
-    match patch.reasoning_effort {
-        Some(effort) => {
-            set_key(table, "reasoning_effort", value(effort));
-        }
-        None => {
-            table.remove("reasoning_effort");
-        }
-    }
-    match patch.reasoning_effort_levels {
-        Some(levels) => {
-            let mut array = toml_edit::Array::new();
-            for level in levels {
-                array.push(Value::from(level.as_str()));
-            }
-            set_key(
-                table,
-                "reasoning_effort_levels",
-                Item::Value(Value::Array(array)),
-            );
-        }
-        None => {
-            table.remove("reasoning_effort_levels");
-        }
-    }
+    edit_key(table, "display_name", str_item(patch.display_name));
+    write_model_keys(table, patch);
     Ok(())
+}
+
+/// The keys both table shapes share: `[models.<id>]` and a legacy
+/// `[providers.<id>]` carry the same per-model settings under the same names.
+fn write_model_keys(table: &mut Table, patch: &ModelPatch<'_>) {
+    set_key(table, "context_window", value(patch.context_window as i64));
+    let vision = match patch.supports_vision {
+        Edit::Keep => Edit::Keep,
+        Edit::Set(can) => Edit::Set(value(can)),
+        Edit::Clear => Edit::Clear,
+    };
+    edit_key(table, "supports_vision", vision);
+    edit_key(table, "reasoning_effort", str_item(patch.reasoning_effort));
+    edit_key(
+        table,
+        "reasoning_effort_levels",
+        levels_item(patch.reasoning_effort_levels),
+    );
+    let max_tokens = match patch.max_tokens {
+        Edit::Keep => Edit::Keep,
+        Edit::Set(n) => Edit::Set(value(n as i64)),
+        Edit::Clear => Edit::Clear,
+    };
+    edit_key(table, "max_tokens", max_tokens);
 }
 
 /// Change what a legacy `[providers.<id>]` entry points at, in place.
@@ -195,39 +250,8 @@ pub fn patch_legacy_model(
         anyhow::bail!("配置里没有 [providers.{id}]");
     };
     set_key(table, "model", value(patch.model));
-    set_key(table, "context_window", value(patch.context_window as i64));
-    match patch.supports_vision {
-        Some(can) => {
-            set_key(table, "supports_vision", value(can));
-        }
-        None => {
-            table.remove("supports_vision");
-        }
-    }
-    match patch.reasoning_effort {
-        Some(effort) => {
-            set_key(table, "reasoning_effort", value(effort));
-        }
-        None => {
-            table.remove("reasoning_effort");
-        }
-    }
-    match patch.reasoning_effort_levels {
-        Some(levels) => {
-            let mut array = toml_edit::Array::new();
-            for level in levels {
-                array.push(Value::from(level.as_str()));
-            }
-            set_key(
-                table,
-                "reasoning_effort_levels",
-                Item::Value(Value::Array(array)),
-            );
-        }
-        None => {
-            table.remove("reasoning_effort_levels");
-        }
-    }
+    // A flat entry has no display name of its own: its key is its name.
+    write_model_keys(table, patch);
     Ok(())
 }
 
@@ -347,7 +371,7 @@ note = "hand-written"
                 provider: "openai-compatible",
                 base_url: Some("https://two.example.com/v1"),
                 api_key: KeyWrite::Keep,
-                display_name: None,
+                display_name: Edit::Keep,
             },
         )
         .unwrap();
@@ -375,7 +399,7 @@ note = "hand-written"
                 provider: "ollama",
                 base_url: None,
                 api_key: KeyWrite::Keep,
-                display_name: None,
+                display_name: Edit::Keep,
             },
         )
         .unwrap();
@@ -396,7 +420,7 @@ note = "hand-written"
                 provider: "openai-compatible",
                 base_url: Some("https://fresh.example.com/v1"),
                 api_key: KeyWrite::Set("sk-fresh"),
-                display_name: None,
+                display_name: Edit::Keep,
             },
         )
         .unwrap();
@@ -418,9 +442,11 @@ note = "hand-written"
                 account: "mine",
                 model: "a-2",
                 context_window: 200_000,
-                supports_vision: Some(true),
-                reasoning_effort: None,
-                reasoning_effort_levels: Some(&["low".to_string(), "high".to_string()]),
+                supports_vision: Edit::Set(true),
+                reasoning_effort: Edit::Clear,
+                reasoning_effort_levels: Edit::Set(&["low".to_string(), "high".to_string()]),
+                display_name: Edit::Keep,
+                max_tokens: Edit::Keep,
             },
         )
         .unwrap();
@@ -456,9 +482,11 @@ origin = "openrouter-free"
                 account: "openrouter",
                 model: "a:free",
                 context_window: 64_000,
-                supports_vision: None,
-                reasoning_effort: None,
-                reasoning_effort_levels: None,
+                supports_vision: Edit::Clear,
+                reasoning_effort: Edit::Clear,
+                reasoning_effort_levels: Edit::Clear,
+                display_name: Edit::Keep,
+                max_tokens: Edit::Keep,
             },
         )
         .unwrap();
@@ -477,9 +505,11 @@ origin = "openrouter-free"
                 account: "mine",
                 model: "a",
                 context_window: 128_000,
-                supports_vision: Some(false),
-                reasoning_effort: Some("high"),
-                reasoning_effort_levels: Some(&["high".to_string()]),
+                supports_vision: Edit::Set(false),
+                reasoning_effort: Edit::Set("high"),
+                reasoning_effort_levels: Edit::Set(&["high".to_string()]),
+                display_name: Edit::Keep,
+                max_tokens: Edit::Keep,
             },
         )
         .unwrap();
@@ -490,9 +520,11 @@ origin = "openrouter-free"
                 account: "mine",
                 model: "a",
                 context_window: 128_000,
-                supports_vision: None,
-                reasoning_effort: None,
-                reasoning_effort_levels: None,
+                supports_vision: Edit::Clear,
+                reasoning_effort: Edit::Clear,
+                reasoning_effort_levels: Edit::Clear,
+                display_name: Edit::Keep,
+                max_tokens: Edit::Keep,
             },
         )
         .unwrap();
@@ -513,7 +545,7 @@ origin = "openrouter-free"
                 provider: "ollama",
                 base_url: None,
                 api_key: KeyWrite::Clear,
-                display_name: None,
+                display_name: Edit::Keep,
             },
         )
         .unwrap();

@@ -30,7 +30,10 @@ use async_trait::async_trait;
 use atomcode_capabilities::provider::probe::{probe_chat_endpoint, ProbeTarget};
 use atomcode_config::config::provider::model_list_order;
 use atomcode_config::config::{provider_preset, Config};
-use atomcode_config::provider_edit::{self, AccountPatch, KeyWrite, ModelPatch};
+use atomcode_config::provider_book::{
+    AccountEdit, AccountInput, BookError, ModelEdit, ModelInput, ProviderBook,
+};
+use atomcode_config::provider_edit::Edit;
 use atomcode_plexus::{Context, Plugin};
 use atomcode_tui::module::{Modules, Mounted};
 use atomcode_tui::plugin::ModulesSvc;
@@ -109,11 +112,14 @@ impl ConfigProviders {
         Arc::new(Self { path })
     }
 
+    /// Every write goes through the book the web page uses too, so the two
+    /// screens cannot come to disagree about what a gesture does to the file.
+    fn book(&self) -> ProviderBook {
+        ProviderBook::new(self.path.clone())
+    }
+
     fn load(&self) -> Config {
-        // A file that will not parse is not an error here: the panel shows what
-        // the build would use. Refusing to open it because the file is broken
-        // would leave a person with no way to see what is wrong.
-        Config::load(&self.path).unwrap_or_default()
+        self.book().load()
     }
 
     fn read(&self) -> ProvidersView {
@@ -127,17 +133,6 @@ impl ConfigProviders {
                 .map(|level| level.to_string())
                 .collect(),
         )
-    }
-
-    /// One patch, under the same lock every other config transaction takes.
-    fn write<F>(&self, mutate: F) -> Result<(), String>
-    where
-        F: FnOnce(&mut toml_edit::DocumentMut) -> anyhow::Result<()>,
-    {
-        atomcode_config::ConfigStore::new(self.path.clone())
-            .update_document(mutate)
-            .map(|_| ())
-            .map_err(|error| format!("{error:#}"))
     }
 }
 
@@ -278,20 +273,6 @@ fn protocol_label(ty: provider_preset::ProviderType) -> String {
     .to_string()
 }
 
-/// What a typed key field means for the file.
-///
-/// Empty is **keep**, not clear: the stored credential is not readable from the
-/// panel, so there is nothing to prefill the field with — and a person who
-/// opened a form to change an endpoint has not asked for their key to be thrown
-/// away. Clearing one is what moving to a keyless protocol does, and that is
-/// decided from the protocol rather than from an empty field.
-fn written_key(typed: Option<&str>) -> KeyWrite<'_> {
-    match typed.map(str::trim).filter(|key| !key.is_empty()) {
-        Some(key) => KeyWrite::Set(key),
-        None => KeyWrite::Keep,
-    }
-}
-
 /// Whether a credential is stored for this account.
 ///
 /// A bool, and only a bool: this is the whole of what the screen is told about a
@@ -329,326 +310,80 @@ fn label_for(config: &Config, id: &str) -> String {
         .unwrap_or_else(|| id.to_string())
 }
 
-/// An id a TOML table can be keyed by, from whatever a person typed.
-fn sanitize(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    for ch in name.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-            out.push(ch);
-        } else if !out.ends_with('-') {
-            out.push('-');
-        }
-    }
-    out.trim_matches('-').to_string()
-}
-
-/// `base`, or the first `base-N` nobody has taken.
-fn free_id(base: &str, taken: impl Fn(&str) -> bool) -> String {
-    if !taken(base) {
-        return base.to_string();
-    }
-    (2..)
-        .map(|n| format!("{base}-{n}"))
-        .find(|candidate| !taken(candidate))
-        .unwrap_or_else(|| base.to_string())
-}
-
-/// The endpoint worth storing: `None` when it is the protocol's own default,
-/// which keeps a file from pinning a URL that should follow the build.
-fn endpoint_override<'a>(endpoint: &'a str, preset_id: &str) -> Option<&'a str> {
-    let endpoint = endpoint.trim();
-    if endpoint.is_empty() {
-        return None;
-    }
-    let default = provider_preset::preset(preset_id).and_then(|p| p.default_base_url);
-    (Some(endpoint) != default).then_some(endpoint)
-}
-
 impl Providers for ConfigProviders {
     fn rows(&self) -> ProvidersView {
         self.read()
     }
 
     fn add_account(&self, draft: &AccountDraft) -> Result<String, String> {
-        let base = sanitize(&draft.name);
-        if base.is_empty() {
-            return Err(tr(SMsg::ProviderNameRules).into_owned());
-        }
-        // Not into the gateway's namespace, or it would be taken for a managed
-        // account: undeletable here, and never asked for a key.
-        let base = match atomcode_config::config::is_codingplan_provider_name(&base) {
-            true => format!("custom-{base}"),
-            false => base,
-        };
-        let config = self.load();
-        let id = free_id(&base, |candidate| {
-            config.provider_accounts.contains_key(candidate)
-                || config.providers.contains_key(candidate)
-        });
-        let preset = provider_preset::preset_or_compatible(&draft.protocol);
-        if draft.endpoint.trim().is_empty() && preset.default_base_url.is_none() {
-            return Err(tr(SMsg::ProtocolNeedsEndpoint).into_owned());
-        }
-        let endpoint = endpoint_override(&draft.endpoint, &draft.protocol);
-        let key = written_key(draft.key.as_deref());
-        let written = id.clone();
-        self.write(move |document| {
-            provider_edit::put_account(
-                document,
-                &written,
-                &AccountPatch {
-                    provider: preset.id,
-                    base_url: endpoint,
-                    api_key: key,
-                    display_name: None,
-                },
-            )
-        })?;
-        Ok(id)
+        self.book()
+            .add_account(&AccountInput {
+                name: &draft.name,
+                protocol: &draft.protocol,
+                display_name: None,
+                endpoint: &draft.endpoint,
+                key: draft.key.as_deref(),
+            })
+            .map_err(said)
     }
 
     fn edit_account(&self, id: &str, draft: &AccountDraft) -> Result<(), String> {
-        let config = self.load();
-        if config.account_is_codingplan_managed(id) {
-            return Err(tr(SMsg::ManagedCannotEditUseLogin { id }).into_owned());
-        }
-        let wanted = provider_preset::preset_or_compatible(&draft.protocol);
-        let legacy =
-            !config.provider_accounts.contains_key(id) && config.providers.contains_key(id);
-        let stored = if legacy {
-            config
-                .providers
-                .get(id)
-                .map(|p| p.provider_type.clone())
-                .unwrap_or_default()
-        } else {
-            config
-                .provider_accounts
-                .get(id)
-                .map(|a| a.provider.clone())
-                .unwrap_or_else(|| id.to_string())
-        };
-        // The panel offers four *protocols*; a stored account may name a vendor
-        // preset (`deepseek`) that speaks one of them. Leaving the protocol
-        // where it was must not rewrite `deepseek` into `openai-compatible`, so
-        // the wire is compared rather than the id — the guard tuix keeps as
-        // `vendor_changed`.
-        let moved =
-            provider_preset::preset_or_compatible(&stored).provider_type != wanted.provider_type;
-        let key = written_key(draft.key.as_deref());
-        let endpoint = draft.endpoint.trim();
-        if legacy {
-            let wire = moved.then(|| wanted.provider_type.wire());
-            // The flat table's writer takes what to set, or nothing: there is no
-            // keyless legacy protocol to clear one for.
-            let key = match key {
-                KeyWrite::Set(key) => Some(key),
-                KeyWrite::Keep | KeyWrite::Clear => None,
-            };
-            let endpoint = (!endpoint.is_empty()).then_some(endpoint);
-            let id = id.to_string();
-            return self
-                .write(move |document| {
-                    provider_edit::patch_legacy_provider(document, &id, wire, endpoint, key)
-                })
-                .map(|_| ());
-        }
-        let provider = if moved { wanted.id.to_string() } else { stored };
-        let endpoint = endpoint_override(&draft.endpoint, &provider).map(str::to_string);
-        // A protocol with no credential of its own drops a key left over from
-        // the one before it: a local Ollama carrying an OpenAI key is a file
-        // holding a secret nothing will ever send.
-        let clears = moved && matches!(wanted.auth_kind, provider_preset::AuthKind::None);
-        let id = id.to_string();
-        self.write(move |document| {
-            provider_edit::put_account(
-                document,
-                &id,
-                &AccountPatch {
-                    provider: &provider,
-                    base_url: endpoint.as_deref(),
-                    api_key: if clears { KeyWrite::Clear } else { key },
-                    display_name: None,
+        self.book()
+            .edit_account(
+                id,
+                &AccountEdit {
+                    protocol: &draft.protocol,
+                    endpoint: &draft.endpoint,
+                    key: draft.key.as_deref(),
+                    display_name: Edit::Keep,
                 },
             )
-        })
+            .map_err(said)
     }
 
     fn delete_account(&self, id: &str) -> Result<(), String> {
-        let config = self.load();
-        if config.account_is_codingplan_managed(id) {
-            return Err(tr(SMsg::ManagedCannotDeleteUseLogout { id }).into_owned());
-        }
-        if !config.provider_accounts.contains_key(id) && !config.providers.contains_key(id) {
-            return Err(tr(SMsg::NotInConfig { id }).into_owned());
-        }
-        // Its models go with it: a model profile pointing at an account that is
-        // gone is a selection that cannot resolve, and leaving those behind
-        // would be leaving the file in a state nothing can start from.
-        let orphans: Vec<String> = config
-            .models
-            .iter()
-            .filter(|(_, model)| model.account == id)
-            .map(|(model_id, _)| model_id.clone())
-            .collect();
-        let gone = id.to_string();
-        self.write(move |document| {
-            provider_edit::remove_account(document, &gone);
-            provider_edit::remove_legacy_provider(document, &gone);
-            for model in &orphans {
-                provider_edit::remove_model(document, model);
-            }
-            Ok(())
-        })?;
-        self.clear_dangling_default()
+        self.book().delete_account(id).map_err(said)
     }
 
     fn add_model(&self, draft: &ModelDraft) -> Result<String, String> {
-        let config = self.load();
-        if config.account_is_codingplan_managed(&draft.account) {
-            return Err(tr(SMsg::AccountModelsManaged {
+        self.book()
+            .add_model(&ModelInput {
                 account: &draft.account,
+                model: &draft.model,
+                display_name: None,
+                window: draft.window,
+                max_tokens: None,
+                vision: draft.vision,
+                effort: draft.effort.as_deref(),
+                levels: draft.levels.as_deref(),
+                key: draft.key.as_deref(),
+                default: draft.default,
             })
-            .into_owned());
-        }
-        let model = draft.model.trim().to_string();
-        if model.is_empty() {
-            return Err(tr(SMsg::ModelNameCannotBeEmpty).into_owned());
-        }
-        // An offer picked off the account list has no account in the file yet.
-        // Adding a model to it is what configures it, which is the one gesture
-        // that turns "this build knows about deepseek" into "you have one".
-        let fresh = !config.provider_accounts.contains_key(&draft.account)
-            && !config.providers.contains_key(&draft.account);
-        let preset_id = config
-            .logical_accounts()
-            .get(&draft.account)
-            .map(|account| account.provider.clone())
-            .unwrap_or_else(|| draft.account.clone());
-        let preset = provider_preset::preset_or_compatible(&preset_id);
-        let window = draft.window.unwrap_or_else(|| {
-            atomcode_config::config::provider::default_context_window_for(
-                preset.provider_type.wire(),
-            )
-        });
-        let base = format!("{}/{model}", draft.account);
-        let id = free_id(&base, |candidate| {
-            config.models.contains_key(candidate) || config.providers.contains_key(candidate)
-        });
-        let key = written_key(draft.key.as_deref());
-        let account = draft.account.clone();
-        let levels = draft.levels.clone();
-        let effort = draft.effort.clone();
-        let vision = draft.vision;
-        let default = draft.default;
-        let written = id.clone();
-        let endpoint = preset.default_base_url;
-        let provider = preset.id;
-        self.write(move |document| {
-            if fresh {
-                provider_edit::put_account(
-                    document,
-                    &account,
-                    &AccountPatch {
-                        provider,
-                        base_url: endpoint,
-                        api_key: key,
-                        display_name: None,
-                    },
-                )?;
-            } else if matches!(key, KeyWrite::Set(_)) {
-                provider_edit::put_account(
-                    document,
-                    &account,
-                    &AccountPatch {
-                        provider: &provider_of(document, &account, provider),
-                        base_url: None,
-                        api_key: key,
-                        display_name: None,
-                    },
-                )?;
-            }
-            provider_edit::put_model(
-                document,
-                &written,
-                &ModelPatch {
-                    account: &account,
-                    model: &model,
-                    context_window: window,
-                    supports_vision: vision,
-                    reasoning_effort: effort.as_deref(),
-                    reasoning_effort_levels: levels.as_deref(),
-                },
-            )?;
-            if default {
-                provider_edit::set_default_model(document, Some(&written));
-            }
-            Ok(())
-        })?;
-        Ok(id)
+            .map_err(said)
     }
 
+    /// The panel shows every field it owns, so each one is set or cleared —
+    /// and the two it does not show (a display name, an output cap) are kept.
     fn edit_model(&self, id: &str, draft: &ModelDraft) -> Result<(), String> {
-        let config = self.load();
-        if config.selection_is_codingplan_managed(id) {
-            return Err(tr(SMsg::ManagedCannotEdit { id }).into_owned());
-        }
-        let model = draft.model.trim().to_string();
-        if model.is_empty() {
-            return Err(tr(SMsg::ModelNameCannotBeEmpty).into_owned());
-        }
-        let legacy = !config.models.contains_key(id) && config.providers.contains_key(id);
-        if !legacy && !config.models.contains_key(id) {
-            return Err(tr(SMsg::NotInConfig { id }).into_owned());
-        }
-        let window = draft.window.unwrap_or_else(|| {
-            config
-                .logical_models()
-                .get(id)
-                .map(|m| m.context_window)
-                .unwrap_or(128_000)
-        });
-        let id = id.to_string();
-        let account = draft.account.clone();
-        let levels = draft.levels.clone();
-        let effort = draft.effort.clone();
-        let vision = draft.vision;
-        let default = draft.default;
-        self.write(move |document| {
-            let patch = ModelPatch {
-                account: &account,
-                model: &model,
-                context_window: window,
-                supports_vision: vision,
-                reasoning_effort: effort.as_deref(),
-                reasoning_effort_levels: levels.as_deref(),
-            };
-            match legacy {
-                true => provider_edit::patch_legacy_model(document, &id, &patch)?,
-                false => provider_edit::put_model(document, &id, &patch)?,
-            }
-            if default {
-                provider_edit::set_default_model(document, Some(&id));
-            }
-            Ok(())
-        })
+        self.book()
+            .edit_model(
+                id,
+                &ModelEdit {
+                    model: &draft.model,
+                    window: draft.window,
+                    vision: Edit::from_option(draft.vision),
+                    effort: Edit::from_option(draft.effort.as_deref()),
+                    levels: Edit::from_option(draft.levels.as_deref()),
+                    display_name: Edit::Keep,
+                    max_tokens: Edit::Keep,
+                    default: draft.default,
+                },
+            )
+            .map_err(said)
     }
 
     fn delete_model(&self, id: &str) -> Result<(), String> {
-        let config = self.load();
-        if config.selection_is_codingplan_managed(id) {
-            return Err(tr(SMsg::ManagedCannotDelete { id }).into_owned());
-        }
-        if !config.models.contains_key(id) && !config.providers.contains_key(id) {
-            return Err(tr(SMsg::NotInConfig { id }).into_owned());
-        }
-        let gone = id.to_string();
-        self.write(move |document| {
-            provider_edit::remove_model(document, &gone);
-            provider_edit::remove_legacy_provider(document, &gone);
-            Ok(())
-        })?;
-        self.clear_dangling_default()
+        self.book().delete_model(id).map_err(said)
     }
 
     /// One request to the endpoint just saved (`atomcode_capabilities::provider::probe`),
@@ -700,49 +435,26 @@ impl Providers for ConfigProviders {
     }
 }
 
-impl ConfigProviders {
-    /// Take a default that no longer resolves out of the file.
-    ///
-    /// Read after the delete rather than predicted before it: whether a
-    /// selection still resolves is a question about the configuration as a
-    /// whole, and the honest way to answer it is to ask the configuration that
-    /// is now on disk. A default left pointing at something deleted is a session
-    /// that will not start.
-    fn clear_dangling_default(&self) -> Result<(), String> {
-        let config = self.load();
-        let stale_model = config
-            .default_model
-            .as_deref()
-            .is_some_and(|id| config.resolve_model(Some(id)).is_err());
-        let stale_legacy = !config.default_provider.is_empty()
-            && config
-                .resolve_model(Some(&config.default_provider))
-                .is_err();
-        if !stale_model && !stale_legacy {
-            return Ok(());
+/// A refusal from the shared provider book, in this screen's words.
+fn said(error: BookError) -> String {
+    match error {
+        BookError::NameRules => tr(SMsg::ProviderNameRules).into_owned(),
+        BookError::ProtocolNeedsEndpoint => tr(SMsg::ProtocolNeedsEndpoint).into_owned(),
+        BookError::ModelNameEmpty => tr(SMsg::ModelNameCannotBeEmpty).into_owned(),
+        BookError::ManagedAccountEdit(id) => {
+            tr(SMsg::ManagedCannotEditUseLogin { id: &id }).into_owned()
         }
-        self.write(move |document| {
-            if stale_model {
-                provider_edit::set_default_model(document, None);
-            }
-            if stale_legacy {
-                provider_edit::clear_default_provider(document);
-            }
-            Ok(())
-        })
+        BookError::ManagedAccountDelete(id) => {
+            tr(SMsg::ManagedCannotDeleteUseLogout { id: &id }).into_owned()
+        }
+        BookError::ManagedAccountModels(account) => {
+            tr(SMsg::AccountModelsManaged { account: &account }).into_owned()
+        }
+        BookError::ManagedModelEdit(id) => tr(SMsg::ManagedCannotEdit { id: &id }).into_owned(),
+        BookError::ManagedModelDelete(id) => tr(SMsg::ManagedCannotDelete { id: &id }).into_owned(),
+        BookError::NotFound(id) => tr(SMsg::NotInConfig { id: &id }).into_owned(),
+        BookError::Write(why) => why,
     }
-}
-
-/// What an account already says it speaks, so setting a key does not also move
-/// its protocol. Falls back to the preset the caller resolved.
-fn provider_of(document: &toml_edit::DocumentMut, id: &str, fallback: &str) -> String {
-    document
-        .get("provider_accounts")
-        .and_then(|table| table.get(id))
-        .and_then(|account| account.get("provider"))
-        .and_then(|item| item.as_str())
-        .unwrap_or(fallback)
-        .to_string()
 }
 
 #[cfg(test)]

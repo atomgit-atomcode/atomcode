@@ -54,6 +54,10 @@ pub mod settings;
 /// without disturbing the rest of a person's file.
 pub mod provider_edit;
 
+/// Adding, editing and deleting provider accounts and models: the decisions
+/// both the terminal panel and the web page make, made once.
+pub mod provider_book;
+
 /// Pure parsers for OS system-proxy descriptions: Windows ProxyServer/ProxyOverride
 /// and macOS `scutil --proxy` output → normalized HTTP(S)_PROXY / NO_PROXY values.
 pub mod system_proxy;
