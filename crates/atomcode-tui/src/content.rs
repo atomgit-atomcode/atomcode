@@ -2924,10 +2924,11 @@ impl Content for TurnEndBlock {
     /// did not fit going under it, wrapped — the same ladder the cause of a failed
     /// turn already climbed.
     fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
-        // A turn you stopped yourself closes on the composer, not here: the dim
-        // `已中断 · …` line under the field carries it (driven by
-        // `moment.interrupted`), so the transcript drops the centered separator
-        // for a cancel rather than draw a boundary the composer already draws.
+        // A turn you stopped yourself closes at the foot of the conversation,
+        // not here: the dim `⎿ 已中断 · …` line the tail draws carries it
+        // (`live::stopped_note`, driven by `moment.interrupted`), so the
+        // transcript drops the centered separator for a cancel rather than draw
+        // a boundary that line already draws.
         if matches!(self.stop, StopReason::Cancelled) {
             return Vec::new();
         }
@@ -3904,7 +3905,8 @@ mod tests {
         );
 
         // A turn you stopped yourself draws no separator at all: it closes on the
-        // dim `已中断` line under the composer instead (see `modules::input`), so
+        // dim `已中断` line at the conversation's foot instead (see
+        // `live::stopped_note`), so
         // the transcript block is empty. Its label still exists for that line —
         // `turn_end_note` below proves the mark — it just is not drawn here.
         let cancelled = drawn(StopReason::Cancelled);

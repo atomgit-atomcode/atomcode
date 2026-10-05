@@ -169,7 +169,20 @@ impl View for Live {
             return Vec::new();
         }
         let Some(words) = showing(state, vp.moment) else {
-            return match waiting_on_background(state, vp.moment) {
+            // A turn the person stopped closes here, hanging under the last
+            // thing it did the way a tool's result hangs under its call —
+            // Claude Code's `⎿ Interrupted · What should Claude do instead?`.
+            let mut out = Vec::new();
+            let note = u16::from(stopped_note(vp.moment));
+            if note > 0 {
+                let note = format!(
+                    "  {} {}",
+                    vp.moment.caps.g(Glyph::Gutter),
+                    t(Msg::ComposerInterrupted)
+                );
+                out.extend(El::row(vec![El::styled(note, theme::fg(Role::Muted))]).lay(w));
+            }
+            out.extend(match waiting_on_background(state, vp.moment) {
                 Some(words) => {
                     // `✻ 等待 1 个后台任务完成`: no spinner and no figures — nothing
                     // here is running, the line only says results are on their
@@ -177,14 +190,18 @@ impl View for Live {
                     // they arrive as is (`InjectedBlock`).
                     let head = format!("{} {words}", vp.moment.caps.g(Glyph::Sparkle));
                     let mut out = Vec::with_capacity(ROWS as usize);
-                    if vp.rect.h >= ROWS {
+                    // The margin only where there is room for it beside the
+                    // note above: a short rect keeps the words and drops the
+                    // blank row, rather than the other way round.
+                    if vp.rect.h >= ROWS + note {
                         out.extend((0..MARGIN).map(|_| Line::empty()));
                     }
                     out.extend(El::row(vec![El::styled(head, Style::new())]).lay(w));
                     out
                 }
                 None => Vec::new(),
-            };
+            });
+            return out;
         };
 
         let muted = theme::fg(Role::Muted);
@@ -279,10 +296,17 @@ impl View for Live {
         if moment.asking.is_some() {
             return Height::Hug(0);
         }
-        match showing(state, moment).or_else(|| waiting_on_background(state, moment)) {
-            Some(_) => Height::Hug(ROWS),
-            None => Height::Hug(0),
+        if showing(state, moment).is_some() {
+            return Height::Hug(ROWS);
         }
+        // Between turns: the stopped note, then the background line under it.
+        let note = u16::from(stopped_note(moment));
+        let waiting = if waiting_on_background(state, moment).is_some() {
+            ROWS
+        } else {
+            0
+        };
+        Height::Hug(note + waiting)
     }
 
     /// The spinner needs frames, and so does the clock: a timer that only moves
@@ -339,6 +363,18 @@ const ROWS: u16 = 1 + MARGIN;
 /// `moment.scroll` and withdrew. See `docs/adr/0020`.
 fn showing(state: &State, moment: &Moment) -> Option<String> {
     doing(state, moment)
+}
+
+/// Whether the turn the person stopped is closed with the dim
+/// `⎿ 已中断 · 接下来做什么？` line: they stopped it themselves (Escape — not a
+/// cancel the runtime made, such as a model switch), and it is idle now, so the
+/// line does not sit under a turn still landing. It stays until the next
+/// prompt is sent (`moment.interrupted`, cleared in `Action::Submit`). Not
+/// while a password is being asked — a "what next?" over a masked field the
+/// person is answering is two prompts at once. `render` and `height` both ask
+/// this, so the row reserved and the row drawn cannot disagree.
+pub(crate) fn stopped_note(moment: &Moment) -> bool {
+    moment.interrupted && moment.activity == Activity::Idle && moment.secret.is_none()
 }
 
 /// Between turns, while work this conversation started runs out of view:
@@ -570,6 +606,44 @@ mod tests {
     fn draw(state: &State, moment: &Moment, w: u16, h: u16) -> Vec<String> {
         let vp = Viewport::new(Rect::sized(w, h), moment);
         Live::render(state, &vp).iter().map(|l| l.plain()).collect()
+    }
+
+    /// The `已中断` line is up only while idle — never under a turn still
+    /// running or landing — and never over a password being answered.
+    #[test]
+    fn the_stopped_note_shows_only_idle_and_not_over_a_password() {
+        let mut m = Moment::default();
+        assert!(!stopped_note(&m), "nothing was stopped, no note");
+
+        m.interrupted = true;
+        assert!(stopped_note(&m), "stopped and idle: the note is up");
+
+        for busy in [Activity::Working, Activity::Stopping] {
+            m.activity = busy;
+            assert!(!stopped_note(&m), "no note under a turn that is {busy:?}");
+        }
+        m.activity = Activity::Idle;
+
+        m.secret = Some(crate::secret::Asking::default());
+        assert!(!stopped_note(&m), "no note while a password is asked");
+        m.secret = None;
+        assert!(stopped_note(&m), "and back once the password is answered");
+    }
+
+    /// A stopped turn is closed at the foot of the conversation — this tail
+    /// row, under the last thing the turn did — hanging the way a result hangs
+    /// under its call, and the row is counted in the height it asks for.
+    #[test]
+    fn a_stopped_turn_is_closed_under_the_conversation() {
+        let mut m = Moment::default();
+        m.interrupted = true;
+        let state = State::default();
+        let drawn = line_at(&state, &m, 80);
+        assert!(
+            drawn.trim_start().starts_with("⎿ 已中断"),
+            "hangs like a result: {drawn:?}"
+        );
+        assert_eq!(Live::height(&state, &m, 80), Height::Hug(1));
     }
 
     /// The line, or an empty string when there is none.

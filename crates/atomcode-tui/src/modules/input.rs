@@ -37,24 +37,6 @@ fn secret_caption(moment: &crate::moment::Moment) -> Option<String> {
         .then(|| t(Msg::InputAnswerKeys).into_owned())
 }
 
-/// Where in the history the field is being browsed from, for the left shoulder
-/// of the rule — or `None` when nobody is arrowing through it, which is
-/// otherwise unanswerable from the screen (browsing looked exactly like having
-/// typed the same words yourself). 1-based and counted from the newest, the
-/// direction a person arrows: the first press is 1, not `history.len()`.
-///
-/// A free function so it can be judged without a terminal.
-/// Whether the dim `已中断` line under the box is on screen: a turn the person
-/// stopped, and the turn is idle now so the line does not sit over one still
-/// landing. Not while a password is being asked — the field is the asking
-/// program's then, not the composer, and a "what next?" prompt under a masked
-/// line the person is answering is two prompts at once. The one predicate
-/// `render` and `height` both ask, so the row they reserve and the row they
-/// draw cannot disagree.
-fn note_shown(moment: &crate::moment::Moment) -> bool {
-    moment.interrupted && moment.activity == Activity::Idle && moment.secret.is_none()
-}
-
 /// 输入行里那句暗字建议写什么。`None` = 不画。
 ///
 /// 它和内联的 ghost 画在同一个位置、同一身暗字,只写那句话本身,不带键名,
@@ -75,6 +57,14 @@ fn suggested(moment: &crate::moment::Moment) -> Option<String> {
     }
     Some(t(Msg::ComposerSuggested { text }).into_owned())
 }
+
+/// Where in the history the field is being browsed from, for the left shoulder
+/// of the rule — or `None` when nobody is arrowing through it, which is
+/// otherwise unanswerable from the screen (browsing looked exactly like having
+/// typed the same words yourself). 1-based and counted from the newest, the
+/// direction a person arrows: the first press is 1, not `history.len()`.
+///
+/// A free function so it can be judged without a terminal.
 fn history_caption(moment: &crate::moment::Moment) -> Option<String> {
     let total = moment.history.len();
     // A search says where it is in the same place, and instead: two counters on
@@ -497,24 +487,13 @@ impl View for Input {
 
         rows.push(rule());
 
-        // A turn you stopped yourself closes here, under the box, rather than on
-        // a centered separator up in the transcript: one dim gutter line, the way
-        // a tool result hangs under its call. It stays until the next prompt is
-        // sent (`moment.interrupted`, cleared in `Action::Submit`). Only while
-        // idle: the flag is raised the instant Escape is pressed, but the turn is
-        // still landing then, so drawing it before the turn is idle would put a
-        // "已中断" line over a turn that is visibly still stopping.
+        // A turn you stopped yourself is closed at the foot of the conversation,
+        // under the last thing it did (`live::stopped_note`), not here: under
+        // the box it read as part of the composer rather than as how the turn
+        // ended.
         //
         // 也许接下来可以说的一句话不走这里了:它画在输入行里,和补全同一个位置 ——
         // 见上面那段(它是同一类东西:不是人打的字,按一下就进来)。
-        if note_shown(vp.moment) {
-            let note = format!(
-                "{} {}",
-                vp.moment.caps.g(crate::caps::Glyph::Gutter),
-                t(Msg::ComposerInterrupted)
-            );
-            rows.push(El::styled(note, theme::fg(Role::Muted)));
-        }
 
         // The slash menu is not drawn here any more. It used to hang below this
         // rule and be counted in `height`, which meant opening it pushed the
@@ -535,13 +514,9 @@ impl View for Input {
         let body = body_width(width);
         let (text, at) = shown(moment);
         let typed = lay(&text, at, body).0.len().min(MAX_ROWS);
-        // The `已中断` note under the box is one more row while it is up. Counted
-        // here or the row is drawn into space the layout did not give this part —
-        // which is a row that exists in `render` and nowhere on screen. The guess
-        // at what to say next is **not** one of these: it is drawn inside the
+        // The guess at what to say next adds no row: it is drawn inside the
         // field, on the row the caret is already on.
-        let note = usize::from(note_shown(moment));
-        Height::Hug((RULES + typed.max(1) + note) as u16)
+        Height::Hug((RULES + typed.max(1)) as u16)
     }
 }
 
@@ -577,29 +552,6 @@ mod tests {
     use crate::moment::Moment;
 
     crate::tui_conformance!(view Input as input_conformance);
-
-    /// The `已中断` note is up only while the field is the composer and idle:
-    /// never over a turn still running (or landing), and never over a password
-    /// the person is answering.
-    #[test]
-    fn the_interrupted_note_shows_only_idle_and_not_over_a_password() {
-        let mut m = Moment::default();
-        assert!(!note_shown(&m), "nothing was stopped, no note");
-
-        m.interrupted = true;
-        assert!(note_shown(&m), "stopped and idle: the note is up");
-
-        for busy in [Activity::Working, Activity::Stopping] {
-            m.activity = busy;
-            assert!(!note_shown(&m), "no note over a turn that is {busy:?}");
-        }
-        m.activity = Activity::Idle;
-
-        m.secret = Some(crate::secret::Asking::default());
-        assert!(!note_shown(&m), "no note under a masked password field");
-        m.secret = None;
-        assert!(note_shown(&m), "and back once the password is answered");
-    }
 
     fn draw(state: &State, moment: &Moment, w: u16, h: u16) -> Vec<String> {
         let vp = Viewport::new(Rect::sized(w, h), moment);

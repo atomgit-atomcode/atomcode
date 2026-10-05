@@ -610,7 +610,7 @@ pub struct Moment {
     /// of the conversation too — see [`Retract`]. `None` once decided either way.
     pub retract: Option<Retract>,
     /// Whether the last turn ended because you stopped it. Drives the dim
-    /// `已中断 · …` line under the composer, and is cleared the moment the next
+    /// `⎿ 已中断 · …` line at the conversation's foot, and is cleared the moment the next
     /// turn starts — screen state, not a fact, the same as the rest here.
     pub interrupted: bool,
     /// The clipboard as last looked at, and whether a picture there is being

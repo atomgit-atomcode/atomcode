@@ -7224,7 +7224,7 @@ impl Tui {
                     // kernel cancels a turn for its own reasons too (a mid-turn
                     // model switch reconfigures and cancels), and only a stop the
                     // person asked for is theirs to be told about. The note waits
-                    // for the turn to be idle before it draws (see `modules::input`),
+                    // for the turn to be idle before it draws (see `live::stopped_note`),
                     // so it never overlaps the turn it closes.
                     m.interrupted = true;
                     // What was queued behind the turn stops with it (the
