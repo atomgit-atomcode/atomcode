@@ -1025,6 +1025,14 @@ impl Roster {
             None => false,
         }
     }
+    /// What it is listed as, when that is a label rather than its name.
+    fn label_of(&self, session: &str) -> Option<String> {
+        self.0
+            .lock()
+            .expect("roster poisoned")
+            .get(session)
+            .and_then(|member| member.label.clone())
+    }
     /// Its newest reply's context size.
     fn used(&self, session: &str, tokens: u32) {
         if let Some(member) = self.0.lock().expect("roster poisoned").get_mut(session) {
@@ -1943,6 +1951,23 @@ impl UserInterface for Tui {
                 // else (a panel, a menu, a question: things whose list the
                 // arrows walk) they are the keys they were, taken again in order.
                 Wake::Input(Input::ArrowBurst { up, n }) => {
+                    // A lone ↓ the composer and the conversation have no use
+                    // for steps into the team panel, as a pressed one does.
+                    if !up && n == 1 && self.down_reaches_team() && self.host.focus_team() {
+                        stale = true;
+                        continue;
+                    }
+                    // The wheel over a team panel that has the keyboard walks
+                    // its rows and stays in it: replayed as keys, ↑ off the
+                    // first row would leave, and the rest of the notch would
+                    // recall old prompts into the composer. A lone arrow is a
+                    // key pressed, and is taken as one.
+                    if n > 1 && self.host.team_focused() {
+                        let rows = n.min(i32::MAX as usize) as i32;
+                        self.host.move_team_by(if up { -rows } else { rows });
+                        stale = true;
+                        continue;
+                    }
                     if !self.surface.mouse()
                         && self.arrows_reach_the_composer()
                         && !(n == 1 && self.caret_moves_within_draft(up))
@@ -2654,6 +2679,19 @@ impl UserInterface for Tui {
                 {
                     stale = true;
                 }
+                // ↓ with nowhere left to go — the caret on the draft's last row,
+                // no history being walked, the conversation at its bottom —
+                // steps down into the team panel, the way Claude Code's agent
+                // list is reached. Anywhere ↓ still means something, it keeps
+                // meaning it; Tab reaches the panel from anywhere.
+                Wake::Input(Input::Key(press))
+                    if matches!(press.key, crate::surface::Key::Down)
+                        && press.mods == crate::surface::Mods::NONE
+                        && self.down_reaches_team()
+                        && self.host.focus_team() =>
+                {
+                    stale = true;
+                }
                 // Plain Tab takes the guess at what to say next — the gesture the
                 // hint row names, and the reference front end's. Above the mode
                 // key and below the arms before it, which is that order ported:
@@ -2815,6 +2853,24 @@ impl Tui {
                 head: view.screen_of(sel.head),
             });
         }
+    }
+
+    /// Whether ↓ has nothing left to do short of the team panel below the
+    /// composer: there is a team, the arrows are the composer's (no panel,
+    /// menu, question or search has them — and the team panel does not have
+    /// them already), the caret is on the draft's last row, no history is
+    /// being walked, and the conversation is not scrolled back.
+    fn down_reaches_team(&self) -> bool {
+        if !self.arrows_reach_the_composer() {
+            return false;
+        }
+        if self.caret_moves_within_draft(false) {
+            return false;
+        }
+        let m = self.host.moment.read().expect("moment poisoned");
+        m.history_at.is_none()
+            && m.scroll.is_at_bottom()
+            && !crate::modules::team::targets(&m).is_empty()
     }
 
     /// Whether one ↑/↓ would move the caret inside a draft of several rows
@@ -5066,8 +5122,12 @@ impl Tui {
     fn team_key(&self, press: crate::surface::KeyPress) -> bool {
         use crate::surface::{Key, Mods};
         match (press.key, press.mods) {
+            // ↑ off the first row goes back up to the composer — the way ↓
+            // came down into the panel.
             (Key::Up, _) | (Key::Char('k'), Mods::CTRL) => {
-                self.host.move_team_by(-1);
+                if !self.host.move_team_by(-1) {
+                    self.host.unfocus_team();
+                }
             }
             (Key::Down, _) | (Key::Char('j'), Mods::CTRL) => {
                 self.host.move_team_by(1);
@@ -5090,10 +5150,13 @@ impl Tui {
     /// Switch the screen, and say where it went.
     fn switch_to(&self, session: &str) {
         if self.look_at(session) {
+            // A subagent by what it was asked to do: its id is minted.
             let name = if session == self.client.root() {
                 t(Msg::TeamLead).into_owned()
             } else {
-                session.rsplit('/').next().unwrap_or(session).to_string()
+                self.members
+                    .label_of(session)
+                    .unwrap_or_else(|| session.rsplit('/').next().unwrap_or(session).to_string())
             };
             self.host
                 .say(t(Msg::NowViewing { name: &name }).into_owned(), false);

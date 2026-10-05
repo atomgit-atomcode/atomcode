@@ -163,7 +163,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::TeamHeaderFocused { count } => {
             format!("team · {count} members · ↑↓ to pick · Enter to switch · Esc to go back").into()
         }
-        Msg::TeamHeader { count } => format!("team · {count} members · Tab to switch view").into(),
+        Msg::TeamHeader { count } => format!("team · {count} members · ↓ to pick one to view").into(),
         Msg::TeamLead => "main".into(),
         Msg::TeamViewing => " viewing".into(),
         Msg::TeamWorkingRound { round } => format!("round {round}").into(),

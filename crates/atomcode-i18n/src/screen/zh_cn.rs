@@ -140,7 +140,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::TeamHeaderFocused { count } => {
             format!("团队 · {count} 名成员 · ↑↓ 选 · Enter 切换 · Esc 返回").into()
         }
-        Msg::TeamHeader { count } => format!("团队 · {count} 名成员 · Tab 切换查看").into(),
+        Msg::TeamHeader { count } => format!("团队 · {count} 名成员 · ↓ 选择查看").into(),
         Msg::TeamLead => "main".into(),
         Msg::TeamViewing => " 正在看".into(),
         Msg::TeamWorkingRound { round } => format!("第 {round} 轮").into(),

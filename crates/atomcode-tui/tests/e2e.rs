@@ -9928,3 +9928,69 @@ async fn raw_prints_the_whole_conversation_and_a_key_comes_back() {
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
+
+/// ↓ from an empty composer steps down into the team panel — no Tab needed —
+/// and ↑ off its first row comes back up; ↓ again walks to a member and
+/// Enter puts it on screen.
+#[tokio::test]
+async fn down_steps_into_the_team_panel_and_up_steps_back_out() {
+    let dir = scratch("down-into-team");
+    let (script, member) = team_with_a_busy_member(&dir);
+    let s = start(tree(&dir, &script, &[&member])).await;
+    let task = s.open().await;
+    s.term.type_line("have someone look around");
+    until(&s, "Delegated.").await;
+    s.quiet().await;
+    assert!(panel_text(&s).contains("↓ 选择查看"), "{}", panel_text(&s));
+
+    s.term.press(KeyPress::plain(Key::Down));
+    until(&s, "Enter 切换").await;
+    s.term.press(KeyPress::plain(Key::Up));
+    until(&s, "↓ 选择查看").await;
+
+    s.term.press(KeyPress::plain(Key::Down));
+    until(&s, "Enter 切换").await;
+    s.term.press(KeyPress::plain(Key::Down));
+    s.term.press(KeyPress::plain(Key::Enter));
+    until(&s, "正在看 scout").await;
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+/// With the mouse handed back every arrow arrives as a burst. A lone ↓ still
+/// steps into the panel and then walks it — it does not snap back to the row
+/// on screen — and a wheel notch over the focused panel walks its rows without
+/// leaving it, so no old prompt is recalled into the composer.
+#[tokio::test]
+async fn with_the_mouse_handed_back_arrows_walk_the_team_panel() {
+    let dir = scratch("handed-back-team");
+    let (script, member) = team_with_a_busy_member(&dir);
+    let s = start(tree(&dir, &script, &[&member])).await;
+    let task = s.open().await;
+    s.term.type_line("have someone look around");
+    until(&s, "Delegated.").await;
+    s.quiet().await;
+    s.term.press(KeyPress::ctrl('g'));
+    s.quiet().await;
+
+    s.term.arrows(false, 1);
+    until(&s, "Enter 切换").await;
+    // A wheel notch up over the panel: still in it, and the composer is
+    // untouched.
+    s.term.arrows(true, 3);
+    s.quiet().await;
+    assert!(panel_text(&s).contains("Enter 切换"), "{}", panel_text(&s));
+    assert!(
+        !part_text(&s, "input").contains("have someone"),
+        "the wheel recalled an old prompt: {}",
+        part_text(&s, "input")
+    );
+
+    s.term.arrows(false, 1);
+    s.term.press(KeyPress::plain(Key::Enter));
+    until(&s, "正在看 scout").await;
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
