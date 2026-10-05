@@ -429,6 +429,10 @@ export interface ProviderInfo {
   account?: string | null;
   /** The model's own display name. */
   display_name?: string | null;
+  /** The default reasoning level; absent/null is the endpoint's own default. */
+  reasoning_effort?: string | null;
+  /** The levels this model declares; absent/null is no declaration. */
+  reasoning_effort_levels?: string[] | null;
   /** CodingPlan-managed: shown, never edited (server-decided). */
   managed?: boolean;
 }
@@ -491,6 +495,8 @@ export interface ConfigInfo {
   provider_presets?: ProviderPresetInfo[];
   /** Generic protocols for a custom endpoint (OpenAI-compatible, …). */
   provider_protocols?: ProviderPresetInfo[];
+  /** Every reasoning level this build knows, in canonical order. */
+  reasoning_effort_levels?: string[];
   /** 完成通知配置；旧 daemon 未暴露时为 undefined，前端回退默认值。 */
   notifications?: NotificationConfigInfo;
 }
@@ -674,6 +680,8 @@ export interface NewModelBody {
   context_window?: number;
   max_tokens?: number;
   supports_vision?: boolean;
+  reasoning_effort?: string;
+  reasoning_effort_levels?: string[];
 }
 
 export interface CreateAccountBody {
@@ -726,6 +734,10 @@ export interface EditModelBody {
   clear_max_tokens?: boolean;
   supports_vision?: boolean;
   clear_supports_vision?: boolean;
+  reasoning_effort?: string;
+  clear_reasoning_effort?: boolean;
+  reasoning_effort_levels?: string[];
+  clear_reasoning_effort_levels?: boolean;
 }
 
 /** PATCH /model-profiles/:id — one model's own settings; its account is untouched. */

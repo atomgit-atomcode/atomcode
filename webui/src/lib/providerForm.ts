@@ -55,6 +55,34 @@ export function validBaseUrl(raw: string): boolean {
   }
 }
 
+/** A model's reasoning settings in a form. Declaring levels is what makes a
+ * model offer a level picker in the chat; `effort` is the level requests carry
+ * by default, `null` for the endpoint's own default. */
+export interface ReasoningDraft {
+  enabled: boolean;
+  levels: string[];
+  effort: string | null;
+}
+
+export function noReasoning(): ReasoningDraft {
+  return { enabled: false, levels: [], effort: null };
+}
+
+/** What the configuration declares, as a form starts from it. */
+export function reasoningFrom(levels?: string[] | null, effort?: string | null): ReasoningDraft {
+  const declared = levels?.filter(Boolean) ?? [];
+  if (declared.length === 0 && !effort) return noReasoning();
+  return { enabled: true, levels: declared, effort: effort ?? null };
+}
+
+/** Toggle one level, in the canonical order `all` gives, dropping a default
+ * that is no longer on offer. */
+export function toggleLevel(r: ReasoningDraft, level: string, all: string[]): ReasoningDraft {
+  const on = r.levels.includes(level);
+  const levels = all.filter((l) => (l === level ? !on : r.levels.includes(l)));
+  return { ...r, levels, effort: r.effort && levels.includes(r.effort) ? r.effort : null };
+}
+
 /** One model row in a form. Capacities are kept as typed, parsed on submit. */
 export interface ModelDraft {
   model: string;
@@ -63,10 +91,11 @@ export interface ModelDraft {
   maxTokens: string;
   /** `null` is "decide for me". */
   vision: boolean | null;
+  reasoning: ReasoningDraft;
 }
 
 export function emptyModelDraft(model = ''): ModelDraft {
-  return { model, displayName: '', window: '', maxTokens: '', vision: null };
+  return { model, displayName: '', window: '', maxTokens: '', vision: null, reasoning: noReasoning() };
 }
 
 /** The add form, in either mode. */
@@ -94,7 +123,8 @@ export type Blocker =
   | { kind: 'model_name'; row: number }
   | { kind: 'model_duplicate'; row: number }
   | { kind: 'model_window'; row: number }
-  | { kind: 'model_max_tokens'; row: number };
+  | { kind: 'model_max_tokens'; row: number }
+  | { kind: 'model_reasoning'; row: number };
 
 export interface DraftContext {
   /** Account ids already in the configuration, any case. */
@@ -133,6 +163,7 @@ export function modelsBlocker(models: ModelDraft[], existing: string[] = []): Bl
     seen.add(name);
     if (parseTokens(m.window) === null) return { kind: 'model_window', row };
     if (parseTokens(m.maxTokens) === null) return { kind: 'model_max_tokens', row };
+    if (m.reasoning.enabled && m.reasoning.levels.length === 0) return { kind: 'model_reasoning', row };
   }
   return null;
 }
@@ -144,6 +175,8 @@ export function modelBody(m: ModelDraft): {
   context_window?: number;
   max_tokens?: number;
   supports_vision?: boolean;
+  reasoning_effort?: string;
+  reasoning_effort_levels?: string[];
 } {
   const window = parseTokens(m.window);
   const maxTokens = parseTokens(m.maxTokens);
@@ -153,6 +186,22 @@ export function modelBody(m: ModelDraft): {
     ...(typeof window === 'number' ? { context_window: window } : {}),
     ...(typeof maxTokens === 'number' ? { max_tokens: maxTokens } : {}),
     ...(m.vision !== null ? { supports_vision: m.vision } : {}),
+    ...(m.reasoning.enabled ? { reasoning_effort_levels: m.reasoning.levels } : {}),
+    ...(m.reasoning.enabled && m.reasoning.effort ? { reasoning_effort: m.reasoning.effort } : {}),
+  };
+}
+
+/** An edit's reasoning fields: set what is on, clear what was turned off. */
+export function reasoningEditBody(r: ReasoningDraft): {
+  reasoning_effort?: string;
+  clear_reasoning_effort?: boolean;
+  reasoning_effort_levels?: string[];
+  clear_reasoning_effort_levels?: boolean;
+} {
+  if (!r.enabled) return { clear_reasoning_effort: true, clear_reasoning_effort_levels: true };
+  return {
+    reasoning_effort_levels: r.levels,
+    ...(r.effort ? { reasoning_effort: r.effort } : { clear_reasoning_effort: true }),
   };
 }
 

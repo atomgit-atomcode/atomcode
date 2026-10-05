@@ -184,6 +184,8 @@ pub(crate) struct ConfigResponse {
     /// Apart from `provider_presets` so a caller that lists vendors keeps
     /// seeing only vendors.
     pub provider_protocols: Vec<ProviderPresetInfo>,
+    /// Every reasoning level this build knows, in the order a form lists them.
+    pub reasoning_effort_levels: Vec<String>,
     /// Sanitized completion-notification config (webui reads it for defaults).
     pub notifications: NotificationConfigInfo,
 }
@@ -277,6 +279,8 @@ pub(crate) struct ProviderInfo {
     pub account: Option<String>,
     /// The model's own display name.
     pub display_name: Option<String>,
+    /// The reasoning levels this model declares; `None` is no declaration.
+    pub reasoning_effort_levels: Option<Vec<String>>,
     /// CodingPlan-managed: shown, never edited.
     pub managed: bool,
 }

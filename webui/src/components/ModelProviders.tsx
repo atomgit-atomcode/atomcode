@@ -43,6 +43,10 @@ import {
   formatTokens,
   apiKeyProblem,
   validBaseUrl,
+  ReasoningDraft,
+  reasoningFrom,
+  toggleLevel,
+  reasoningEditBody,
 } from '../lib/providerForm';
 
 type T = (key: MsgKey, params?: Record<string, string | number>) => string;
@@ -58,7 +62,15 @@ const ERROR_CODES = new Set([
   'id_required',
   'unknown_provider',
   'write_failed',
+  'invalid_effort',
 ]);
+
+/** The levels a form offers: the daemon's list, or this build's own when an
+ * older daemon does not send one. */
+const FALLBACK_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'];
+function levelsOf(config: ConfigInfo): string[] {
+  return config.reasoning_effort_levels?.length ? config.reasoning_effort_levels : FALLBACK_LEVELS;
+}
 
 /** A refusal in the person's language: the daemon's code when it sent one. */
 function errorText(error: unknown, t: T): string {
@@ -77,6 +89,7 @@ function blockerText(b: Blocker, t: T): string {
     case 'model_duplicate':
     case 'model_window':
     case 'model_max_tokens':
+    case 'model_reasoning':
       return t(`providers.block.${b.kind}` as MsgKey, { row: b.row + 1 });
     default:
       return t(`providers.block.${b.kind}` as MsgKey);
@@ -369,7 +382,13 @@ function AccountCard({
         <AccountEditor account={account} modelCount={models.length} onCancel={onClosePanel} onSaved={() => onSaved(models[0]?.name)} />
       )}
       {samePanel(panel, { kind: 'models', id: account.id }) && (
-        <AddModelsPanel account={account} existing={models.map((m) => m.model)} onCancel={onClosePanel} onSaved={onSaved} />
+        <AddModelsPanel
+          account={account}
+          levels={levelsOf(config)}
+          existing={models.map((m) => m.model)}
+          onCancel={onClosePanel}
+          onSaved={onSaved}
+        />
       )}
       <div class="account-models">
         {models.length === 0 && <div class="field-hint">{t('providers.noModels')}</div>}
@@ -380,6 +399,11 @@ function AccountCard({
               {m.display_name && <code>{m.model}</code>}
               {m.context_window ? <span class="account-model-meta">{formatTokens(m.context_window)}</span> : null}
               {m.supports_vision && <span class="account-model-meta">{t('providers.vision')}</span>}
+              {(m.reasoning_effort || (m.reasoning_effort_levels?.length ?? 0) > 0) && (
+                <span class="account-model-meta" title={(m.reasoning_effort_levels ?? []).join(' / ')}>
+                  {t('providers.reasoning')} {m.reasoning_effort ?? (m.reasoning_effort_levels ?? []).join('/')}
+                </span>
+              )}
               {m.is_default && <span class="provider-default-badge">{t('settings.default')}</span>}
               <div class="provider-card-actions">
                 {!m.is_default && (
@@ -400,7 +424,7 @@ function AccountCard({
               </div>
             </div>
             {samePanel(panel, { kind: 'model', id: m.name }) && (
-              <ModelEditor model={m} onCancel={onClosePanel} onSaved={() => onSaved(m.name)} />
+              <ModelEditor model={m} levels={levelsOf(config)} onCancel={onClosePanel} onSaved={() => onSaved(m.name)} />
             )}
           </div>
         ))}
@@ -632,6 +656,7 @@ function AddProviderCard({
 
       <ModelRowsEditor
         rows={draft.models}
+        levels={levelsOf(config)}
         setRows={(models) => setDraft({ ...draft, models })}
         discover={
           chosen?.discoverable !== false && endpoint && validBaseUrl(endpoint) && !apiKeyProblem(draft.apiKey)
@@ -677,12 +702,14 @@ function blankDraft(mode: 'preset' | 'custom', provider: string): ProviderDraft 
 function ModelRowsEditor({
   rows,
   setRows,
+  levels,
   discover,
   discoverable,
   existing = [],
 }: {
   rows: ModelDraft[];
   setRows: (rows: ModelDraft[]) => void;
+  levels: string[];
   /** `null` while the form has not got what a listing needs yet. */
   discover: (() => Promise<DiscoveredModelInfo[]>) | null;
   discoverable: boolean;
@@ -692,6 +719,8 @@ function ModelRowsEditor({
   const [fetching, setFetching] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [picking, setPicking] = useState<DiscoveredModelInfo[] | null>(null);
+  // One row's reasoning settings open at a time, under that row.
+  const [reasoningRow, setReasoningRow] = useState<number | null>(null);
 
   async function fetchModels() {
     if (!discover) return;
@@ -725,7 +754,8 @@ function ModelRowsEditor({
       <div class="model-draft-list">
         <ModelColumns removable />
         {rows.map((row, i) => (
-          <div key={i} class="model-draft-row">
+          <div key={i}>
+          <div class="model-draft-row">
             <input
               class="menu-input model-draft-id"
               type="text"
@@ -771,13 +801,28 @@ function ModelRowsEditor({
               onChange={(v) => update(i, { vision: v === 'auto' ? null : v === 'on' })}
             />
             <button
+              class={'provider-action-btn reasoning-toggle' + (reasoningRow === i ? ' active' : '')}
+              type="button"
+              aria-expanded={reasoningRow === i}
+              onClick={() => setReasoningRow(reasoningRow === i ? null : i)}
+            >
+              {reasoningSummary(row.reasoning, t)}
+            </button>
+            <button
               class="provider-action-btn danger"
               type="button"
               disabled={rows.length === 1}
-              onClick={() => setRows(rows.filter((_, j) => j !== i))}
+              onClick={() => {
+                setRows(rows.filter((_, j) => j !== i));
+                setReasoningRow(null);
+              }}
             >
               {t('providers.removeRow')}
             </button>
+          </div>
+          {reasoningRow === i && (
+            <ReasoningFields value={row.reasoning} levels={levels} onChange={(reasoning) => update(i, { reasoning })} />
+          )}
           </div>
         ))}
       </div>
@@ -812,7 +857,78 @@ function ModelColumns({ removable }: { removable?: boolean }) {
       <span>{t('providers.contextWindow')}</span>
       <span>{t('providers.maxTokens')}</span>
       <span>{t('providers.vision')}</span>
+      {removable && <span>{t('providers.reasoning')}</span>}
       {removable && <span />}
+    </div>
+  );
+}
+
+/** A row's reasoning settings, in a word or two. */
+function reasoningSummary(r: ReasoningDraft, t: T): string {
+  if (!r.enabled) return `${t('providers.reasoning')}: ${t('providers.reasoningOff')}`;
+  const n = t('providers.reasoningSummary', { n: r.levels.length });
+  return r.effort ? `${n} · ${t('providers.reasoningSummaryDefault', { level: r.effort })}` : n;
+}
+
+/** Whether a model offers a reasoning level picker, which levels, and the one
+ * requests carry by default. */
+function ReasoningFields({
+  value,
+  levels,
+  onChange,
+}: {
+  value: ReasoningDraft;
+  levels: string[];
+  onChange: (r: ReasoningDraft) => void;
+}) {
+  const { t } = useSettings();
+  return (
+    <div class="reasoning-fields">
+      <label class="add-provider-default">
+        <input
+          type="checkbox"
+          checked={value.enabled}
+          onChange={() =>
+            onChange(
+              value.enabled
+                ? { ...value, enabled: false }
+                : { enabled: true, levels: value.levels.length ? value.levels : levels, effort: value.effort },
+            )
+          }
+        />
+        <span>{t('providers.reasoningEnable')}</span>
+      </label>
+      {value.enabled && (
+        <>
+          <div class="reasoning-row">
+            <span class="add-model-label">{t('providers.reasoningLevels')}</span>
+            <div class="reasoning-levels">
+              {levels.map((level) => (
+                <label key={level} class={'reasoning-level' + (value.levels.includes(level) ? ' on' : '')}>
+                  <input
+                    type="checkbox"
+                    checked={value.levels.includes(level)}
+                    onChange={() => onChange(toggleLevel(value, level, levels))}
+                  />
+                  <span>{level}</span>
+                </label>
+              ))}
+            </div>
+          </div>
+          <div class="reasoning-row">
+            <span class="add-model-label">{t('providers.reasoningDefault')}</span>
+            <Select
+              value={value.effort ?? ''}
+              options={[
+                { value: '', label: t('providers.reasoningDefaultAuto') },
+                ...value.levels.map((level) => ({ value: level, label: level })),
+              ]}
+              onChange={(v) => onChange({ ...value, effort: v || null })}
+            />
+          </div>
+        </>
+      )}
+      <span class="field-hint">{t('providers.reasoningHint')}</span>
     </div>
   );
 }
@@ -1020,11 +1136,13 @@ function AccountEditor({
  * list them and never comes back to the browser. */
 function AddModelsPanel({
   account,
+  levels,
   existing,
   onCancel,
   onSaved,
 }: {
   account: ProviderAccountInfo;
+  levels: string[];
   existing: string[];
   onCancel: () => void;
   onSaved: (selection?: string) => Promise<void>;
@@ -1055,6 +1173,7 @@ function AddModelsPanel({
       <ModelRowsEditor
         rows={rows}
         setRows={setRows}
+        levels={levels}
         existing={existing}
         discoverable={discoverable}
         discover={
@@ -1089,10 +1208,12 @@ function AddModelsPanel({
 /** One model's own settings. Its account is not touched. */
 function ModelEditor({
   model,
+  levels,
   onCancel,
   onSaved,
 }: {
   model: ProviderInfo;
+  levels: string[];
   onCancel: () => void;
   onSaved: () => Promise<void>;
 }) {
@@ -1107,6 +1228,9 @@ function ModelEditor({
         ? 'on'
         : 'off',
   );
+  const [reasoning, setReasoning] = useState<ReasoningDraft>(() =>
+    reasoningFrom(model.reasoning_effort_levels, model.reasoning_effort),
+  );
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const parsedWindow = parseTokens(ctxWindow);
@@ -1116,7 +1240,9 @@ function ModelEditor({
       ? t('providers.block.model_window', { row: 1 })
       : parsedMax === null
         ? t('providers.block.model_max_tokens', { row: 1 })
-        : null;
+        : reasoning.enabled && reasoning.levels.length === 0
+          ? t('providers.block.model_reasoning', { row: 1 })
+          : null;
 
   async function save() {
     if (blocker || saving) return;
@@ -1132,6 +1258,7 @@ function ModelEditor({
             ? { clear_max_tokens: true }
             : {}),
         ...(vision === 'auto' ? { clear_supports_vision: true } : { supports_vision: vision === 'on' }),
+        ...reasoningEditBody(reasoning),
       });
       await onSaved();
     } catch (e) {
@@ -1182,6 +1309,7 @@ function ModelEditor({
           onChange={(v) => setVision(v)}
         />
       </div>
+      <ReasoningFields value={reasoning} levels={levels} onChange={setReasoning} />
       {error && (
         <div class="modal-error" role="alert">
           {error}

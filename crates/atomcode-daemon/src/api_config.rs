@@ -130,6 +130,10 @@ pub(crate) fn config_response(config: &Config) -> ConfigResponse {
             })
             .map(preset_info)
             .collect(),
+        reasoning_effort_levels: atomcode_config::config::REASONING_EFFORT_LEVELS
+            .iter()
+            .map(|level| level.to_string())
+            .collect(),
         provider_protocols: GENERIC_PROTOCOLS
             .iter()
             .filter_map(|id| atomcode_config::config::provider_preset::preset(id))
@@ -209,6 +213,7 @@ pub(crate) fn provider_info(
         ephemeral: p.ephemeral,
         account: None,
         display_name: None,
+        reasoning_effort_levels: p.reasoning_effort_levels.clone(),
         managed: false,
     }
 }

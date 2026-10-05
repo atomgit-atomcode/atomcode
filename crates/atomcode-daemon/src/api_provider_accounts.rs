@@ -32,6 +32,13 @@ pub(crate) struct NewModelRequest {
     pub context_window: Option<usize>,
     pub max_tokens: Option<usize>,
     pub supports_vision: Option<bool>,
+    /// The level requests carry by default; `None` is the endpoint's own default.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    /// The levels this model offers. Declaring any is what makes a model
+    /// effort-capable: the chat's level picker appears, offering exactly these.
+    #[serde(default)]
+    pub reasoning_effort_levels: Option<Vec<String>>,
 }
 
 /// POST /provider-accounts
@@ -78,6 +85,15 @@ pub(crate) struct EditModelRequest {
     /// Back to "decide for me".
     #[serde(default)]
     pub clear_supports_vision: bool,
+    pub reasoning_effort: Option<String>,
+    /// Back to the endpoint's own default level.
+    #[serde(default)]
+    pub clear_reasoning_effort: bool,
+    pub reasoning_effort_levels: Option<Vec<String>>,
+    /// Takes the declaration out; with no default level left either, the model
+    /// is no longer offered a level picker.
+    #[serde(default)]
+    pub clear_reasoning_effort_levels: bool,
 }
 
 /// POST /provider-accounts/:id/probe
@@ -124,6 +140,64 @@ fn refused(error: BookError) -> axum::response::Response {
     coded_json_error(status, code, message, false).into_response()
 }
 
+/// A level list and a default level as the configuration stores them: every
+/// level one this build knows, lowercase, in canonical order, once; the
+/// default one of the listed levels (or of all of them, with no list). An empty
+/// list is no declaration.
+pub(crate) fn normalized_effort(
+    effort: Option<&str>,
+    levels: Option<&[String]>,
+) -> Result<(Option<String>, Option<Vec<String>>), String> {
+    use atomcode_config::config::REASONING_EFFORT_LEVELS;
+    let levels = match levels {
+        None => None,
+        Some(list) => {
+            for level in list {
+                let known = REASONING_EFFORT_LEVELS
+                    .iter()
+                    .any(|k| k.eq_ignore_ascii_case(level.trim()));
+                if !known {
+                    return Err(format!("Unknown reasoning level '{}'", level.trim()));
+                }
+            }
+            let ordered: Vec<String> = REASONING_EFFORT_LEVELS
+                .iter()
+                .filter(|k| list.iter().any(|l| l.trim().eq_ignore_ascii_case(k)))
+                .map(|k| k.to_string())
+                .collect();
+            (!ordered.is_empty()).then_some(ordered)
+        }
+    };
+    let effort = match effort.map(str::trim).filter(|e| !e.is_empty()) {
+        None => None,
+        Some(e) => {
+            let allowed = atomcode_config::config::allowed_effort_levels(levels.as_deref());
+            let Some(level) = allowed.iter().find(|k| k.eq_ignore_ascii_case(e)) else {
+                return Err(format!(
+                    "Reasoning level '{e}' is not one this model offers ({})",
+                    allowed.join(", ")
+                ));
+            };
+            Some(level.to_string())
+        }
+    };
+    Ok((effort, levels))
+}
+
+/// Normalize every model's reasoning fields in place, or refuse the request.
+fn normalize_models(models: &mut [NewModelRequest]) -> Result<(), axum::response::Response> {
+    for m in models.iter_mut() {
+        let (effort, levels) = normalized_effort(
+            m.reasoning_effort.as_deref(),
+            m.reasoning_effort_levels.as_deref(),
+        )
+        .map_err(|why| bad_request("invalid_effort", why))?;
+        m.reasoning_effort = effort;
+        m.reasoning_effort_levels = levels;
+    }
+    Ok(())
+}
+
 fn bad_request(code: &str, message: impl Into<String>) -> axum::response::Response {
     coded_json_error(StatusCode::BAD_REQUEST, code, message, false).into_response()
 }
@@ -167,6 +241,8 @@ fn model_inputs<'a>(models: &'a [NewModelRequest], set_default: bool) -> Vec<Mod
             window: m.context_window,
             max_tokens: m.max_tokens,
             vision: m.supports_vision,
+            effort: m.reasoning_effort.as_deref(),
+            levels: m.reasoning_effort_levels.as_deref(),
             default: set_default && i == 0,
             ..Default::default()
         })
@@ -174,7 +250,10 @@ fn model_inputs<'a>(models: &'a [NewModelRequest], set_default: bool) -> Vec<Mod
 }
 
 /// POST /provider-accounts — an account and its models in one write.
-pub(crate) async fn create_account(Json(req): Json<CreateAccountRequest>) -> impl IntoResponse {
+pub(crate) async fn create_account(Json(mut req): Json<CreateAccountRequest>) -> impl IntoResponse {
+    if let Err(refusal) = normalize_models(&mut req.models) {
+        return refusal;
+    }
     let book = ProviderBook::default_book();
     let config = book.load();
     let provider = req.provider.trim();
@@ -299,7 +378,13 @@ pub(crate) async fn delete_account(Path(id): Path<String>) -> impl IntoResponse 
 ///
 /// The caller has already sent a legacy `[providers.*]` account down the path
 /// that upgrades it.
-pub(crate) fn add_models(account: &str, models: &[NewModelRequest]) -> axum::response::Response {
+pub(crate) fn add_models(
+    account: &str,
+    models: &mut [NewModelRequest],
+) -> axum::response::Response {
+    if let Err(refusal) = normalize_models(models) {
+        return refusal;
+    }
     let book = ProviderBook::default_book();
     let config = book.load();
     // The same model twice under one account is a second row nobody can tell
@@ -362,6 +447,46 @@ pub(crate) async fn edit_model(
         (false, Some(can)) => Edit::Set(can),
         (false, None) => Edit::Keep,
     };
+    // The default level is judged against the level list as it will be after
+    // this edit — the one sent, or the one the file keeps.
+    let levels_after: Option<Vec<String>> = match (
+        req.clear_reasoning_effort_levels,
+        req.reasoning_effort_levels.as_deref(),
+    ) {
+        (true, _) => None,
+        (false, Some(list)) => Some(list.to_vec()),
+        (false, None) => existing.reasoning_effort_levels.clone(),
+    };
+    let effort_after: Option<String> =
+        match (req.clear_reasoning_effort, req.reasoning_effort.as_deref()) {
+            (true, _) => None,
+            (false, Some(e)) => Some(e.to_string()),
+            (false, None) => existing.reasoning_effort.clone(),
+        };
+    let (effort_norm, levels_norm) =
+        match normalized_effort(effort_after.as_deref(), levels_after.as_deref()) {
+            Ok(pair) => pair,
+            Err(why) => return bad_request("invalid_effort", why),
+        };
+    let levels_edit = if req.clear_reasoning_effort_levels
+        || (req.reasoning_effort_levels.is_some() && levels_norm.is_none())
+    {
+        Edit::Clear
+    } else if req.reasoning_effort_levels.is_some() {
+        Edit::Set(levels_norm.as_deref().unwrap_or_default())
+    } else {
+        Edit::Keep
+    };
+    let effort_edit = if req.clear_reasoning_effort {
+        Edit::Clear
+    } else if req.reasoning_effort.is_some() {
+        match effort_norm.as_deref() {
+            Some(level) => Edit::Set(level),
+            None => Edit::Clear,
+        }
+    } else {
+        Edit::Keep
+    };
     match book.edit_model(
         &id,
         &ModelEdit {
@@ -370,6 +495,8 @@ pub(crate) async fn edit_model(
             vision,
             display_name,
             max_tokens,
+            effort: effort_edit,
+            levels: levels_edit,
             ..Default::default()
         },
     ) {
@@ -546,7 +673,8 @@ mod tests {
                 "api_key": "sk-ds",
                 "set_default": true,
                 "models": [
-                    { "model": "deepseek-v4-flash", "display_name": "Flash", "context_window": 1000000 },
+                    { "model": "deepseek-v4-flash", "display_name": "Flash", "context_window": 1000000,
+                      "reasoning_effort_levels": ["high", "max"], "reasoning_effort": "max" },
                     { "model": "deepseek-v4-pro" }
                 ]
             }))
@@ -562,6 +690,12 @@ mod tests {
         assert_eq!(
             after.default_model.as_deref(),
             Some("deepseek/deepseek-v4-flash")
+        );
+        let flash = &after.models["deepseek/deepseek-v4-flash"];
+        assert_eq!(flash.reasoning_effort.as_deref(), Some("max"));
+        assert_eq!(
+            flash.reasoning_effort_levels.as_ref().map(Vec::len),
+            Some(2)
         );
 
         // A custom protocol needs an id, and a taken one is a conflict.
@@ -630,6 +764,49 @@ mod tests {
         assert_eq!(pro.supports_vision, Some(true));
         assert_eq!(after.provider_accounts["deepseek"].provider, "deepseek");
 
+        // Reasoning: declared with a default, a level the model does not
+        // offer refused, the declaration taken out.
+        let effort = http
+            .patch(format!("{base}/model-profiles/deepseek%2Fdeepseek-v4-pro"))
+            .json(&serde_json::json!({
+                "reasoning_effort_levels": ["MAX", "high"],
+                "reasoning_effort": "high"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(effort.status(), StatusCode::OK);
+        let pro = config().models["deepseek/deepseek-v4-pro"].clone();
+        assert_eq!(
+            pro.reasoning_effort_levels.as_deref(),
+            Some(&["high".to_string(), "max".to_string()][..])
+        );
+        assert_eq!(pro.reasoning_effort.as_deref(), Some("high"));
+        let refused = http
+            .patch(format!("{base}/model-profiles/deepseek%2Fdeepseek-v4-pro"))
+            .json(&serde_json::json!({ "reasoning_effort": "low" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            refused.status(),
+            StatusCode::BAD_REQUEST,
+            "low is not on offer"
+        );
+        let cleared = http
+            .patch(format!("{base}/model-profiles/deepseek%2Fdeepseek-v4-pro"))
+            .json(&serde_json::json!({
+                "clear_reasoning_effort": true,
+                "clear_reasoning_effort_levels": true
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cleared.status(), StatusCode::OK);
+        let pro = config().models["deepseek/deepseek-v4-pro"].clone();
+        assert_eq!(pro.reasoning_effort, None);
+        assert_eq!(pro.reasoning_effort_levels, None);
+
         let moved = http
             .post(format!(
                 "{base}/model-profiles/deepseek%2Fdeepseek-v4-pro/default"
@@ -672,6 +849,30 @@ mod tests {
             Some(value) => std::env::set_var("ATOMCODE_HOME", value),
             None => std::env::remove_var("ATOMCODE_HOME"),
         }
+    }
+
+    /// Levels are stored the way the build names them — lowercase, canonical
+    /// order, once — and a default must be one of the levels on offer.
+    #[test]
+    fn reasoning_levels_are_normalized_and_the_default_must_be_offered() {
+        let list = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            normalized_effort(Some("HIGH"), Some(&list(&["max", "High", "high", "LOW"]))),
+            Ok((Some("high".into()), Some(list(&["low", "high", "max"]))))
+        );
+        assert_eq!(
+            normalized_effort(None, Some(&[])),
+            Ok((None, None)),
+            "empty is no declaration"
+        );
+        assert_eq!(
+            normalized_effort(Some("medium"), None),
+            Ok((Some("medium".into()), None)),
+            "no list: any known level"
+        );
+        assert!(normalized_effort(Some("medium"), Some(&list(&["high", "max"]))).is_err());
+        assert!(normalized_effort(None, Some(&list(&["turbo"]))).is_err());
+        assert!(normalized_effort(Some("turbo"), None).is_err());
     }
 
     #[test]

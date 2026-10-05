@@ -346,6 +346,10 @@ pub(crate) struct CreateAccountModelRequest {
     pub context_window: Option<usize>,
     pub max_tokens: Option<usize>,
     pub supports_vision: Option<bool>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort_levels: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -523,6 +527,11 @@ fn insert_account_models(
         if request.max_tokens == Some(0) {
             anyhow::bail!("max_tokens must be greater than zero");
         }
+        crate::api_provider_accounts::normalized_effort(
+            request.reasoning_effort.as_deref(),
+            request.reasoning_effort_levels.as_deref(),
+        )
+        .map_err(anyhow::Error::msg)?;
         if !batch_models.insert(model.to_string()) {
             return Err(account_model_conflict(format!(
                 "duplicate model `{model}` in request"
@@ -562,6 +571,13 @@ fn insert_account_models(
             .to_string();
     let mut created = Vec::with_capacity(prepared.len());
     for (selection_id, model, request) in prepared {
+        // Validated above; stored the way the book stores it.
+        let (reasoning_effort, reasoning_effort_levels) =
+            crate::api_provider_accounts::normalized_effort(
+                request.reasoning_effort.as_deref(),
+                request.reasoning_effort_levels.as_deref(),
+            )
+            .unwrap_or_default();
         config.models.insert(
             selection_id.clone(),
             ModelProfileConfig {
@@ -581,8 +597,8 @@ fn insert_account_models(
                 thinking_type: None,
                 thinking_keep: None,
                 reasoning_history: None,
-                reasoning_effort: None,
-                reasoning_effort_levels: None,
+                reasoning_effort,
+                reasoning_effort_levels,
                 thinking_enabled: None,
                 thinking_budget: None,
                 retry_max_attempts: None,
@@ -807,7 +823,7 @@ pub(crate) async fn create_account_models(
     // upgraded below first — once, and then it is an account like any other.
     if let Ok(config) = load_config() {
         if config.provider_accounts.contains_key(&account) {
-            let models: Vec<_> = req
+            let mut models: Vec<_> = req
                 .models
                 .into_iter()
                 .map(|m| crate::api_provider_accounts::NewModelRequest {
@@ -816,9 +832,11 @@ pub(crate) async fn create_account_models(
                     context_window: m.context_window,
                     max_tokens: m.max_tokens,
                     supports_vision: m.supports_vision,
+                    reasoning_effort: m.reasoning_effort,
+                    reasoning_effort_levels: m.reasoning_effort_levels,
                 })
                 .collect();
-            return crate::api_provider_accounts::add_models(&account, &models);
+            return crate::api_provider_accounts::add_models(&account, &mut models);
         }
     }
     let mut created = Vec::new();
@@ -1758,6 +1776,8 @@ mod tests {
             context_window: Some(200_000),
             max_tokens: None,
             supports_vision: None,
+            reasoning_effort: None,
+            reasoning_effort_levels: None,
         }
     }
 

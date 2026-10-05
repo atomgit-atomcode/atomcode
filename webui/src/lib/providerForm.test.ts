@@ -11,6 +11,9 @@ import {
   modelBody,
   adoptPicked,
   emptyModelDraft,
+  reasoningFrom,
+  toggleLevel,
+  reasoningEditBody,
   type ProviderDraft,
 } from './providerForm.ts';
 
@@ -106,9 +109,54 @@ test('model rows are judged one by one, against the account too', () => {
 test('a model row is sent with only what was set', () => {
   assert.deepEqual(modelBody(emptyModelDraft(' m ')), { model: 'm' });
   assert.deepEqual(
-    modelBody({ model: 'm', displayName: 'M', window: '1M', maxTokens: '32K', vision: true }),
-    { model: 'm', display_name: 'M', context_window: 1000000, max_tokens: 32000, supports_vision: true },
+    modelBody({
+      model: 'm',
+      displayName: 'M',
+      window: '1M',
+      maxTokens: '32K',
+      vision: true,
+      reasoning: { enabled: true, levels: ['high', 'max'], effort: 'max' },
+    }),
+    {
+      model: 'm',
+      display_name: 'M',
+      context_window: 1000000,
+      max_tokens: 32000,
+      supports_vision: true,
+      reasoning_effort_levels: ['high', 'max'],
+      reasoning_effort: 'max',
+    },
   );
+});
+
+const ALL = ['low', 'medium', 'high', 'xhigh', 'max'];
+
+test('reasoning starts from what the file declares', () => {
+  assert.deepEqual(reasoningFrom(null, null), { enabled: false, levels: [], effort: null });
+  assert.deepEqual(reasoningFrom([], 'high'), { enabled: true, levels: [], effort: 'high' });
+  assert.deepEqual(reasoningFrom(['high', 'max'], null), { enabled: true, levels: ['high', 'max'], effort: null });
+});
+
+test('toggling a level keeps canonical order and drops a default no longer offered', () => {
+  let r = { enabled: true, levels: ['high'], effort: 'high' as string | null };
+  r = toggleLevel(r, 'low', ALL);
+  assert.deepEqual(r.levels, ['low', 'high'], 'canonical order, not click order');
+  r = toggleLevel(r, 'high', ALL);
+  assert.deepEqual(r.levels, ['low']);
+  assert.equal(r.effort, null, 'the default went with its level');
+});
+
+test('reasoning switched on needs a level, and an edit clears what was turned off', () => {
+  const on = { ...emptyModelDraft('m'), reasoning: { enabled: true, levels: [], effort: null } };
+  assert.deepEqual(modelsBlocker([on]), { kind: 'model_reasoning', row: 0 });
+  assert.deepEqual(reasoningEditBody({ enabled: false, levels: ['high'], effort: 'high' }), {
+    clear_reasoning_effort: true,
+    clear_reasoning_effort_levels: true,
+  });
+  assert.deepEqual(reasoningEditBody({ enabled: true, levels: ['high', 'max'], effort: null }), {
+    reasoning_effort_levels: ['high', 'max'],
+    clear_reasoning_effort: true,
+  });
 });
 
 test('a discovery pick adds new rows with what the endpoint reported, never twice', () => {
