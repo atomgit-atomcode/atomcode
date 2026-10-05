@@ -163,14 +163,28 @@ impl Plugin for BashWorldToolPlugin {
             atomcode_capabilities::tools::SensitivePaths::of(&*crate::product_dirs(ctx)?);
         super::tools::mount(
             ctx,
-            vec![Arc::new(BashTool::with_world(shell.clone(), sensitive))],
+            vec![
+                Arc::new(BashTool::with_world(shell.clone(), sensitive.clone())),
+                Arc::new(
+                    atomcode_capabilities::tools::bash::BashStartTool::with_world(
+                        shell.clone(),
+                        sensitive,
+                    ),
+                ),
+                Arc::new(atomcode_capabilities::tools::bash::BashPollTool),
+                Arc::new(atomcode_capabilities::tools::bash::BashKillTool),
+            ],
         )?;
         super::tools::contribute_prompt(
             ctx,
             "tool-bash-world",
             51,
             &format!(
-                "Shell commands run through: {}. Quote paths that contain spaces.",
+                "Shell commands run through: {}. Quote paths that contain spaces. \
+                 Anything meant to keep running — a dev server, a watcher, `npm run dev` — goes through \
+                 `bash_start`: read its output with `bash_poll` and stop it with `bash_kill`. Do not \
+                 background it inside `bash` (`&`, `nohup`, `start`); a `bash` call is for a command that \
+                 finishes.",
                 shell.describe()
             ),
         );

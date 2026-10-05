@@ -519,21 +519,46 @@ pub trait Process: Send + Sync {
         self.kill().await;
     }
 
-    /// Drain the output to EOF, then wait — the shape a caller that only wants
-    /// the finished result would otherwise write for itself.
+    /// Read the output until the process has exited and its output has ended,
+    /// then answer — the shape a caller that only wants the finished result
+    /// would otherwise write for itself.
+    ///
+    /// **The process exiting ends the wait, not its pipes closing.** Something
+    /// the command left running on purpose — `node server.js &`, `start /b` —
+    /// inherits stdout and keeps it open; waiting for EOF waited for the server
+    /// to stop, so the call sat until its timeout and the timeout killed the
+    /// server it had just started. Once the process has exited, what is still
+    /// coming is read for at most [`POST_EXIT_DRAIN`] and the result returned
+    /// (codex waits 2 s, oh-my-pi up to 2 s).
     ///
     /// Provided rather than required so a world implements the three primitives
     /// and inherits this, and so it cannot disagree with them.
     async fn collect(&self) -> Result<Collected, String> {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        while let Some(chunk) = self.next_chunk().await {
-            match chunk {
-                Chunk::Stdout(bytes) => stdout.extend_from_slice(&bytes),
-                Chunk::Stderr(bytes) => stderr.extend_from_slice(&bytes),
+        let mut take = |chunk: Chunk| match chunk {
+            Chunk::Stdout(bytes) => stdout.extend_from_slice(&bytes),
+            Chunk::Stderr(bytes) => stderr.extend_from_slice(&bytes),
+        };
+        let exit = loop {
+            tokio::select! {
+                chunk = self.next_chunk() => match chunk {
+                    Some(chunk) => take(chunk),
+                    // Output ended first: the process is ending or has.
+                    None => break self.wait().await?,
+                },
+                exit = self.wait() => {
+                    let exit = exit?;
+                    let deadline = tokio::time::Instant::now() + POST_EXIT_DRAIN;
+                    while let Ok(Some(chunk)) =
+                        tokio::time::timeout_at(deadline, self.next_chunk()).await
+                    {
+                        take(chunk);
+                    }
+                    break exit;
+                }
             }
-        }
-        let exit = self.wait().await?;
+        };
         Ok(Collected {
             stdout,
             stderr,
@@ -541,6 +566,11 @@ pub trait Process: Send + Sync {
         })
     }
 }
+
+/// How long [`Process::collect`] keeps reading after the process has exited,
+/// for output still in the pipes — and no longer, since a process the command
+/// left running may hold them open for as long as it lives.
+pub const POST_EXIT_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Why a command could not be started — the same split as [`FsError::is_denied`],
 /// because a caller reports the two halves differently.

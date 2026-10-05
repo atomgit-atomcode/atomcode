@@ -2955,6 +2955,14 @@ impl crate::world::Process for LocalProcess {
         #[cfg(target_os = "windows")]
         let status = child.wait().await;
         let status = status.map_err(|e| e.to_string())?;
+        // Windows: the same disarm. The shell exited, so what it left running it
+        // started on purpose (`start /b`, `&`, a dev server); closing the job must
+        // not kill that. A timeout or a cancel has already terminated the tree
+        // through `kill` before this point, so nothing is spared that should go.
+        #[cfg(target_os = "windows")]
+        if let Some(job) = &self.job {
+            job.preserve_descendants();
+        }
         #[cfg(unix)]
         let signal = {
             use std::os::unix::process::ExitStatusExt;
@@ -3174,6 +3182,31 @@ mod seam_tests {
         assert_eq!(collected.stderr, b"err");
         assert_eq!(collected.exit.code, Some(3));
         assert!(!collected.exit.success());
+    }
+
+    /// Something the command left running holds stdout open. The command has
+    /// finished, so the call answers — after at most the post-exit drain — and
+    /// does not wait for the server it just started to stop (which, at the
+    /// timeout, was the timeout killing it).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_background_child_holding_the_pipe_does_not_hold_the_answer() {
+        let process = LocalShell
+            .spawn("sleep 30 & echo started", &here())
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let collected = tokio::time::timeout(Duration::from_secs(10), process.collect())
+            .await
+            .expect("answered long before the background child ends")
+            .unwrap();
+        assert_eq!(collected.stdout, b"started\n");
+        assert!(collected.exit.success());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]

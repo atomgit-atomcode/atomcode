@@ -71,6 +71,37 @@ impl JobHandle {
             unsafe { TerminateJobObject(self.0, 1) };
         }
     }
+
+    /// Let what the job's root left running outlive the job: clear
+    /// `KILL_ON_JOB_CLOSE`, so closing the handle no longer kills it.
+    ///
+    /// For a root that **exited on its own**. Kill-on-close is how a timed-out
+    /// or cancelled command's whole tree goes (the `mvn` → `java` orphans this
+    /// job exists for), but it also reaped, the moment a command returned,
+    /// every process the command started on purpose — `start /b`, `&`, a dev
+    /// server — so on Windows an agent could not leave a server running at all,
+    /// and spent turns finding out why. Unix already keeps them (the pgroup
+    /// reaper is disarmed on a normal exit); this is the same, and it is what
+    /// codex's job object does (`preserve_descendants`). [`Self::terminate`]
+    /// still kills the tree after this, while the handle is held.
+    pub fn preserve_descendants(&self) {
+        use windows_sys::Win32::System::JobObjects::{
+            JobObjectExtendedLimitInformation, SetInformationJobObject,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        };
+        if self.0.is_null() {
+            return;
+        }
+        unsafe {
+            let info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            SetInformationJobObject(
+                self.0,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const core::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]

@@ -432,34 +432,35 @@ async fn unloading_the_world_takes_its_tools_with_it() {
 
 #[tokio::test]
 async fn a_routed_world_mounts_no_process_path_that_bypasses_it() {
-    // The production crate also ships `bash_start` / `bash_poll` / `bash_kill`.
-    // They route through the same seam now, but only when handed the world —
-    // `BashStartTool::default()` is this machine. A tree whose `shell` points
-    // elsewhere must not offer the default form: a "read-only sandbox" with a
-    // side door to the host is worse than no sandbox, because the model is told
-    // it is contained. No row mounts them today; if one does, it goes through
-    // `with_world` and this assertion moves to "mounted, and routed".
+    // `bash_start` / `bash_poll` / `bash_kill` are mounted beside `bash` — the
+    // way to leave a dev server running. `BashStartTool::default()` is this
+    // machine, and a tree whose `shell` points elsewhere must not offer that: a
+    // "read-only sandbox" with a side door to the host is worse than no sandbox,
+    // because the model is told it is contained. So they are mounted, and
+    // routed: a background job starts in the world `shell` names.
     let dir = scratch("no-side-door");
     let recorder = Arc::new(RecordingShell::default());
     let mut registry = atomcode_coding::on_harness::catalog();
-    registry.register(Arc::new(RecordingShellPlugin(recorder)));
+    registry.register(Arc::new(RecordingShellPlugin(recorder.clone())));
     let swap = "[[patch]]\nid = \"shell\"\nname = \"shell-recording\"";
     let mut app = App::new(
         registry,
         tree(
             &dir,
-            &script_one("bash", r#"{ command = "true" }"#),
-            &[swap],
+            &script_one("bash_start", r#"{ command = "npm run dev" }"#),
+            &[YOLO, swap],
         ),
     );
     app.start().await.unwrap();
 
     let names = app.context().service::<ToolsSvc>().unwrap().names();
-    assert!(names.contains(&"bash".to_string()), "{names:?}");
-    for side_door in ["bash_start", "bash_poll", "bash_kill"] {
-        assert!(
-            !names.contains(&side_door.to_string()),
-            "`{side_door}` spawns on this machine, not in the mounted world: {names:?}"
-        );
+    for tool in ["bash", "bash_start", "bash_poll", "bash_kill"] {
+        assert!(names.contains(&tool.to_string()), "`{tool}`: {names:?}");
     }
+    run_turn(&app, "start the server").await.unwrap();
+    assert_eq!(
+        *recorder.seen.lock().unwrap(),
+        vec!["npm run dev".to_string()],
+        "the background job started in the mounted world, not on this machine"
+    );
 }

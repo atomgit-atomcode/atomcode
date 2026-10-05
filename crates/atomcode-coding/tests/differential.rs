@@ -3923,6 +3923,18 @@ const KNOWN_TOOL_DIFFERENCES: &[(&str, &str)] = &[
         "chain-only, and not a port: it lists coding's own `SessionManager`          sessions, while the harness keeps its own JSONL log. A `list_sessions`          here would list different things under the same name.",
     ),
     (
+        "bash_start",
+        "tree-only, and deliberately: the way to leave a dev server or a watcher running.          Inside `bash` a backgrounded process was reaped when the call returned on          Windows (the job object) or held the call open until its timeout (the pipe),          so an agent asked to start a server spent turns finding out why it died.",
+    ),
+    (
+        "bash_poll",
+        "tree-only, with `bash_start`: reads a background job's output. One decision          with `bash_start`, not a second gap.",
+    ),
+    (
+        "bash_kill",
+        "tree-only, with `bash_start`: stops a background job's whole tree. One          decision with `bash_start`, not a second gap.",
+    ),
+    (
         "describe_self",
         "tree-only, and deliberately: the harness persona tells the model to call          it rather than guess what it is made of, which is true of an agent          assembled from rows at runtime and not of a fixed chain.",
     ),

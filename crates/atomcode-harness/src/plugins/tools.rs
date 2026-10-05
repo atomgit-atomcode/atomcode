@@ -165,12 +165,28 @@ impl Plugin for BashToolPlugin {
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
         let sensitive =
             atomcode_capabilities::tools::SensitivePaths::of(&*crate::product_dirs(ctx)?);
-        mount(ctx, vec![Arc::new(BashTool::new(sensitive))])?;
+        // The background trio beside it: a dev server, a watcher or anything
+        // else meant to keep running goes through `bash_start`, not `bash`.
+        mount(
+            ctx,
+            vec![
+                Arc::new(BashTool::new(sensitive.clone())),
+                Arc::new(atomcode_capabilities::tools::bash::BashStartTool::new(
+                    sensitive,
+                )),
+                Arc::new(atomcode_capabilities::tools::bash::BashPollTool),
+                Arc::new(atomcode_capabilities::tools::bash::BashKillTool),
+            ],
+        )?;
         contribute_prompt(
             ctx,
             "tool-bash",
             51,
-            "Use `bash` for builds, tests, and git. Quote paths that contain spaces.",
+            "Use `bash` for builds, tests, and git. Quote paths that contain spaces. \
+             Anything meant to keep running — a dev server, a watcher, `npm run dev` — goes through \
+             `bash_start`: read its output with `bash_poll` and stop it with `bash_kill`. Do not \
+             background it inside `bash` (`&`, `nohup`, `start`); a `bash` call is for a command that \
+             finishes.",
         );
         Ok(())
     }
