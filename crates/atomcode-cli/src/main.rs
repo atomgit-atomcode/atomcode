@@ -3302,7 +3302,8 @@ fn should_fork_busy_continue(
 ///
 /// A request only reaches this point when a gate (BashWorkspaceGate /
 /// ApprovalMiddleware) already escalated the tool call — i.e. it is NOT
-/// trivially safe.  `-p` (skip_permissions) blanket-approves bash; scheduled
+/// trivially safe.  `-p` approves an escalated shell command (`bash` / `bash_start`);
+/// skip_permissions blanket-approves everything; scheduled
 /// runs (strict_unattended=true) refuse everything because no human is present
 /// to vet a destructive or out-of-workspace command.
 pub(crate) fn headless_auto_approve(
@@ -3313,7 +3314,9 @@ pub(crate) fn headless_auto_approve(
     if strict_unattended {
         return false; // scheduled: deny everything that was escalated to approval
     }
-    skip_permissions || tool == "bash" // -p: current behaviour unchanged
+    // -p approves an escalated shell command — backgrounded through `bash_start` as
+    // much as run through `bash`, since it is the same command.
+    skip_permissions || atomcode_capabilities::tools::is_command_shell_tool(tool)
 }
 
 fn write_headless_json_event(event: &headless_json::HeadlessEvent) -> io::Result<()> {

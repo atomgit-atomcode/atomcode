@@ -50,10 +50,11 @@ const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 /// the overflow into a clear, actionable error rather than a silent leak.
 const MAX_BACKGROUND_JOBS: usize = 64;
 
-/// After the tracked shell exits, how long to keep draining its pipes before finalizing.
-/// A grandchild that inherited stdout (`some-daemon &`) keeps the pipe open after the shell
-/// itself exits; without this bound the reader would wait on that pipe forever and the job
-/// would report `running` indefinitely. 200ms matches `PgroupChild::terminate`'s grace.
+/// After the tracked shell exits, how long its pipes get to close before the job counts as
+/// having left something running. A grandchild that inherited stdout (`some-daemon &`)
+/// keeps the pipe open after the shell itself exits; past this the job reports the shell's
+/// exit, keeps reading what the grandchild writes, and stays killable until it is done.
+/// 200ms matches `PgroupChild::terminate`'s grace.
 const POST_EXIT_DRAIN_GRACE: Duration = Duration::from_millis(200);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -104,6 +105,15 @@ impl Buf {
 struct Shared {
     output: Mutex<Buf>,
     status: Mutex<Status>,
+    /// The shell has exited but something it started still holds its output open. The
+    /// job stays in the store — and `bash_kill` can still reach the tree — until it is gone.
+    left_running: std::sync::atomic::AtomicBool,
+}
+
+impl Shared {
+    fn left_running(&self) -> bool {
+        self.left_running.load(Ordering::Acquire)
+    }
 }
 
 struct Job {
@@ -133,6 +143,8 @@ pub(crate) struct PollResult {
     pub(crate) text: String,
     pub(crate) truncated: bool,
     pub(crate) status: Status,
+    /// The shell exited but what it started is still running (see [`Shared`]).
+    pub(crate) left_running: bool,
 }
 
 /// Spawn `command` in `world`, register it, and return its job id. The world is what
@@ -168,6 +180,7 @@ pub(crate) async fn start(
             total: 0,
         }),
         status: Mutex::new(Status::Running),
+        left_running: std::sync::atomic::AtomicBool::new(false),
     });
     let (kill_tx, kill_rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(reader_task(process, Arc::clone(&shared), kill_rx));
@@ -198,10 +211,12 @@ pub(crate) fn poll(job_id: &str) -> Result<PollResult, String> {
     let (raw, new_delivered, truncated) = job.shared.output.lock().unwrap().since(job.delivered);
     job.delivered = new_delivered;
     let status = job.shared.status.lock().unwrap().clone();
+    let left_running = job.shared.left_running();
     let world = Arc::clone(&job.world);
-    if !matches!(status, Status::Running) {
-        // Terminal status is only set AFTER the reader finalizes, so everything is delivered
-        // by the `since` above — safe to drop the entry now.
+    if !matches!(status, Status::Running) && !left_running {
+        // Terminal status is only set AFTER the reader finalizes, and `left_running` only
+        // clears once the output has ended, so everything is delivered by the `since`
+        // above — safe to drop the entry now.
         guard.remove(job_id);
     }
     // The world decodes (non-UTF8/GBK/UTF-16 is *its* code page); the ANSI/CSI strip is
@@ -211,20 +226,33 @@ pub(crate) fn poll(job_id: &str) -> Result<PollResult, String> {
         text,
         truncated,
         status,
+        left_running,
     })
 }
 
-/// Signal the job's reader to kill the whole process tree. The status flips to `Killed`;
-/// the entry is reaped by the next `poll` (which also delivers any final output).
+/// Signal the job's reader to kill the whole process tree — including what the shell left
+/// running after it exited. The status flips to `Killed`; the entry is reaped by the next
+/// `poll` (which also delivers any final output). Returns what to tell the model: a job
+/// that had already finished with nothing left running is said to have finished, not to
+/// have been stopped.
 pub(crate) fn kill(job_id: &str) -> Result<String, String> {
     let guard = store().lock().unwrap();
-    match guard.get(job_id) {
-        Some(job) => {
-            let _ = job.kill.send(());
-            Ok(job.command.clone())
-        }
-        None => Err(format!("bash_kill: no background job '{job_id}'")),
+    let Some(job) = guard.get(job_id) else {
+        return Err(format!("bash_kill: no background job '{job_id}'"));
+    };
+    // The reader holds the receiving end for as long as anything of the job is alive, so a
+    // send that fails means there was nothing left to stop.
+    if job.kill.send(()).is_err() {
+        let status = job.shared.status.lock().unwrap().clone();
+        return Ok(format!(
+            "Background job {job_id} had already finished ({}); nothing was running to stop. \
+             Poll it once more to collect its output.",
+            status_line(&status).trim_start_matches("status: ")
+        ));
     }
+    Ok(format!(
+        "Signalled background job {job_id} to stop. Poll it once more to collect final output."
+    ))
 }
 
 /// Drain the process's output into `shared` until its pipes close. Arrival order across
@@ -242,17 +270,7 @@ fn exit_code_of(exit: Result<Exit, String>) -> i32 {
     exit.map(|e| e.code_or_signal()).unwrap_or(-1)
 }
 
-/// Give the pump a bounded grace to drain buffered output, then finalize the status. The
-/// grace bounds the grandchild-holds-pipe hang; a normal fast exit closes its pipes so the
-/// pump completes immediately and no time is wasted.
-async fn finalize(
-    shared: &Arc<Shared>,
-    pump: &mut tokio::task::JoinHandle<()>,
-    killed: bool,
-    code: i32,
-) {
-    let _ = tokio::time::timeout(POST_EXIT_DRAIN_GRACE, &mut *pump).await;
-    pump.abort();
+fn set_status(shared: &Shared, killed: bool, code: i32) {
     *shared.status.lock().unwrap() = if killed {
         Status::Killed
     } else {
@@ -282,9 +300,42 @@ async fn reader_task(
             exit = process.wait() => break exit_code_of(exit),
         }
     };
-    finalize(&shared, &mut pump, killed, code).await;
-    // `process` drops here → the local world's reaper (pgroup / KILL_ON_JOB_CLOSE job)
-    // takes anything still in the tree with it.
+    // A normal fast exit closes its pipes, so the pump completes at once and no time is
+    // spent here.
+    if tokio::time::timeout(POST_EXIT_DRAIN_GRACE, &mut pump)
+        .await
+        .is_err()
+    {
+        if killed {
+            // A holder that escaped the tree we killed: stop reading for it.
+            pump.abort();
+        } else {
+            // The shell exited and left something running that still writes here — a
+            // server it backgrounded. Report the exit, keep collecting what the server
+            // says, and keep the tree killable until its output ends. Aborting the pump
+            // instead would close the pipe under the server and kill it at its next write.
+            shared.left_running.store(true, Ordering::Release);
+            set_status(&shared, false, code);
+            tokio::select! {
+                _ = &mut pump => {}
+                Some(()) = kill_rx.recv() => {
+                    killed = true;
+                    process.kill().await;
+                    if tokio::time::timeout(POST_EXIT_DRAIN_GRACE, &mut pump)
+                        .await
+                        .is_err()
+                    {
+                        pump.abort();
+                    }
+                }
+            }
+        }
+    }
+    set_status(&shared, killed, code);
+    shared.left_running.store(false, Ordering::Release);
+    // `process` drops here. A shell that was killed takes its tree with it through the
+    // local world's reaper (pgroup / job object); one that exited by itself had nothing
+    // left holding its output by now.
 }
 
 fn status_line(status: &Status) -> String {
@@ -292,6 +343,18 @@ fn status_line(status: &Status) -> String {
         Status::Running => "status: running".to_string(),
         Status::Exited(code) => format!("status: exited (code {code})"),
         Status::Killed => "status: killed".to_string(),
+    }
+}
+
+fn poll_status_line(r: &PollResult) -> String {
+    if r.left_running {
+        format!(
+            "{}; what it started is still running and writing here — keep polling, or stop it \
+             with bash_kill",
+            status_line(&r.status)
+        )
+    } else {
+        status_line(&r.status)
     }
 }
 
@@ -439,7 +502,7 @@ impl Tool for BashPollTool {
                 if !body.is_empty() && !body.ends_with('\n') {
                     body.push('\n');
                 }
-                body.push_str(&status_line(&r.status));
+                body.push_str(&poll_status_line(&r));
                 ok(body)
             }
             Err(e) => err(e),
@@ -479,10 +542,7 @@ impl Tool for BashKillTool {
             }
         };
         match kill(&a.job_id) {
-            Ok(_) => ok(format!(
-                "Signalled background job {} to stop. Poll it once more to collect final output.",
-                a.job_id
-            )),
+            Ok(message) => ok(message),
             Err(e) => err(e),
         }
     }
@@ -535,7 +595,8 @@ mod tests {
         }
     }
 
-    /// Poll at 20ms until terminal or a ~2s budget, accumulating every chunk.
+    /// Poll at 20ms until finished (nothing left running) or a ~2s budget, accumulating
+    /// every chunk.
     async fn drain(id: &str) -> (String, Status) {
         let mut collected = String::new();
         let mut status = Status::Running;
@@ -544,7 +605,7 @@ mod tests {
                 Ok(r) => {
                     collected.push_str(&r.text);
                     status = r.status.clone();
-                    if !matches!(status, Status::Running) {
+                    if !matches!(status, Status::Running) && !r.left_running {
                         break;
                     }
                 }
@@ -654,6 +715,92 @@ mod tests {
         let (out, status) = drain(&id).await;
         assert!(out.contains("launched"), "output was {out:?}");
         assert_eq!(status, Status::Exited(0), "must not stay Running forever");
+    }
+
+    /// What the shell left running survives it, keeps reporting through the job, and the
+    /// job stays until it is done — rather than the pipe closing under it and its next
+    /// write killing it.
+    #[tokio::test]
+    async fn what_a_job_left_running_keeps_writing_through_it() {
+        let d = tempfile::tempdir().unwrap();
+        let marker = d.path().join("survived");
+        let command = format!(
+            "(sleep 0.6; echo later && touch '{}') & echo launched",
+            marker.display()
+        );
+        let id = start(&local(), &command, &ctx(d.path())).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let first = poll(&id).unwrap();
+        assert!(first.text.contains("launched"), "{:?}", first.text);
+        assert_eq!(first.status, Status::Exited(0));
+        assert!(
+            first.left_running,
+            "the shell's child still holds the output"
+        );
+        assert!(poll_status_line(&first).contains("bash_kill"));
+        let mut later = String::new();
+        for _ in 0..100 {
+            match poll(&id) {
+                Ok(r) => {
+                    later.push_str(&r.text);
+                    if !r.left_running {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(later.contains("later"), "{later:?}");
+        assert!(marker.exists(), "the child died writing to its output");
+        assert!(poll(&id).is_err(), "reaped once nothing is left running");
+    }
+
+    /// `bash_kill` still reaches what the shell left running after it exited.
+    #[tokio::test]
+    async fn kill_reaches_what_an_exited_job_left_running() {
+        let d = tempfile::tempdir().unwrap();
+        let pidfile = d.path().join("pid");
+        let command = format!(
+            "sleep 30 & echo $! > '{}'; echo launched",
+            pidfile.display()
+        );
+        let id = start(&local(), &command, &ctx(d.path())).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let r = poll(&id).unwrap();
+        assert!(r.left_running);
+        let message = kill(&id).unwrap();
+        assert!(message.contains("Signalled"), "{message}");
+        let (_out, status) = drain(&id).await;
+        assert_eq!(status, Status::Killed);
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // Reparented to init once its shell went, so give init a moment to reap it.
+        let mut alive = true;
+        for _ in 0..40 {
+            alive = unsafe { libc::kill(pid, 0) } == 0;
+            if !alive {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!alive, "the backgrounded sleep {pid} outlived bash_kill");
+    }
+
+    /// A job that finished with nothing left running is not "stopped" by `bash_kill`.
+    #[tokio::test]
+    async fn kill_after_a_job_finished_says_so() {
+        let d = tempfile::tempdir().unwrap();
+        let id = start(&local(), "echo hi", &ctx(d.path())).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let message = kill(&id).unwrap();
+        assert!(message.contains("already finished"), "{message}");
+        assert!(message.contains("exited (code 0)"), "{message}");
+        let r = poll(&id).unwrap();
+        assert!(r.text.contains("hi"));
     }
 
     /// Invalid UTF-8 bytes in the middle of output must NOT truncate the stream (the old

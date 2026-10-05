@@ -534,6 +534,30 @@ pub trait Process: Send + Sync {
     /// Provided rather than required so a world implements the three primitives
     /// and inherits this, and so it cannot disagree with them.
     async fn collect(&self) -> Result<Collected, String> {
+        Ok(self
+            .collect_within(None)
+            .await?
+            .expect("no limit, so collection never gives up"))
+    }
+
+    /// [`collect`](Self::collect) that gives up — `Ok(None)` — if the process
+    /// is still running when `limit` runs out.
+    ///
+    /// The limit covers the process running, never the drain after it exits:
+    /// a caller that wrapped `collect` in a timeout could land the timeout
+    /// inside those two seconds, kill what the command had just left running,
+    /// and report a command that finished as one that timed out.
+    async fn collect_within(
+        &self,
+        limit: Option<std::time::Duration>,
+    ) -> Result<Option<Collected>, String> {
+        let deadline = limit.map(|limit| tokio::time::Instant::now() + limit);
+        let running_out = || async move {
+            match deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending().await,
+            }
+        };
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut take = |chunk: Chunk| match chunk {
@@ -545,25 +569,29 @@ pub trait Process: Send + Sync {
                 chunk = self.next_chunk() => match chunk {
                     Some(chunk) => take(chunk),
                     // Output ended first: the process is ending or has.
-                    None => break self.wait().await?,
+                    None => tokio::select! {
+                        exit = self.wait() => break exit?,
+                        _ = running_out() => return Ok(None),
+                    },
                 },
                 exit = self.wait() => {
                     let exit = exit?;
-                    let deadline = tokio::time::Instant::now() + POST_EXIT_DRAIN;
+                    let drained = tokio::time::Instant::now() + POST_EXIT_DRAIN;
                     while let Ok(Some(chunk)) =
-                        tokio::time::timeout_at(deadline, self.next_chunk()).await
+                        tokio::time::timeout_at(drained, self.next_chunk()).await
                     {
                         take(chunk);
                     }
                     break exit;
                 }
+                _ = running_out() => return Ok(None),
             }
         };
-        Ok(Collected {
+        Ok(Some(Collected {
             stdout,
             stderr,
             exit,
-        })
+        }))
     }
 }
 

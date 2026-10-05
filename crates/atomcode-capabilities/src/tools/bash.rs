@@ -298,24 +298,23 @@ impl Tool for BashTool {
                 // just wraps into several redundant error lines.
                 err("bash: cancelled before completion.".to_string())
             }
-            res = tokio::time::timeout(dur, process.collect()) => match res {
-                Ok(Ok(collected)) => format_output(
+            // The limit is on the command running, not on reading what it left
+            // behind: a timeout landing in the post-exit drain would kill what the
+            // command had just started and call a finished command a timeout.
+            res = process.collect_within(Some(dur)) => match res {
+                Ok(Some(collected)) => format_output(
                     &self.world.decode(&collected.stdout),
                     &self.world.decode(&collected.stderr),
                     collected.exit.code,
                 ),
-                Ok(Err(e)) => err(format!("bash: error running command: {e}")),
+                Err(e) => err(format!("bash: error running command: {e}")),
                 // Don't echo the command (see the cancel arm); point at the actionable knob —
                 // a larger `timeout` — BUT only while that knob still has room. Once the run
                 // was already at MAX_TIMEOUT_SECS, "pass a larger timeout" is advice that
                 // provably cannot work, and the model reads tool output as ground truth and
                 // retries it. At the ceiling `timeout_message` names the ceiling and points at
-                // the one escape that ACTUALLY works on THIS platform: background+file on Unix
-                // (a detached child survives our reap — we only kill on cancel/timeout), but
-                // split-into-steps on Windows, where the KILL_ON_JOB_CLOSE job reaps anything
-                // left running the moment we return (this tool has no background path there —
-                // see the job-object comment in `LocalShell::spawn`).
-                Err(_) => {
+                // `bash_start`, the background path every platform has.
+                Ok(None) => {
                     process.kill().await;
                     err(timeout_message(secs))
                 }
@@ -2717,11 +2716,12 @@ struct LocalProcess {
     /// One stream, both pipes, in arrival order. Behind a lock because the seam
     /// hands out `&self`; only one consumer drains at a time.
     chunks: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<crate::world::Chunk>>,
-    /// The pipe readers. Aborted when the handle goes, so the read ends close
-    /// the way they did when `wait_with_output` was dropped — a grandchild that
-    /// escaped the process group and still holds stdout then gets EPIPE on its
-    /// next write instead of keeping a reader task alive forever.
+    /// The pipe readers. What happens to them when the handle goes depends on
+    /// how the shell ended — see [`Drop`](#impl-Drop-for-LocalProcess).
     pumps: Vec<tokio::task::JoinHandle<()>>,
+    /// The shell exited by itself (as opposed to never having been waited on,
+    /// or being killed). Read by `Drop`, which cannot take the async lock.
+    exited: std::sync::atomic::AtomicBool,
     state: tokio::sync::Mutex<ChildState>,
     #[cfg(not(target_os = "windows"))]
     pgid: i32,
@@ -2752,12 +2752,18 @@ async fn pump<R>(
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
     let mut buf = vec![0u8; 65536];
+    // Once nobody is listening the bytes are discarded, but the pipe is still
+    // read: a process the command left running holds its write end, and
+    // closing ours would kill it at its next write.
+    let mut tx = Some(tx);
     loop {
         match pipe.read(&mut buf).await {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                if tx.send(wrap(buf[..n].to_vec())).is_err() {
-                    break;
+                if let Some(sender) = &tx {
+                    if sender.send(wrap(buf[..n].to_vec())).is_err() {
+                        tx = None;
+                    }
                 }
             }
         }
@@ -2912,6 +2918,7 @@ impl crate::world::Shell for LocalShell {
         Ok(std::sync::Arc::new(LocalProcess {
             chunks: tokio::sync::Mutex::new(rx),
             pumps,
+            exited: std::sync::atomic::AtomicBool::new(false),
             state: tokio::sync::Mutex::new(ChildState {
                 child: Some(child),
                 exit: None,
@@ -2927,7 +2934,19 @@ impl crate::world::Shell for LocalShell {
 }
 
 impl Drop for LocalProcess {
+    /// A shell that exited by itself may have left something running on
+    /// purpose — `node server.js &`, `start /b` — still writing to the stdout
+    /// it inherited. Closing the read end would kill it at its next write
+    /// (SIGPIPE; on Windows the write fails and most runtimes exit), the very
+    /// death the call returning early was meant to prevent. So the pumps are
+    /// left to read and discard until the last writer closes the pipe.
+    ///
+    /// Anything else — never waited on, killed by a timeout or a cancel — had
+    /// its tree taken down with it, and the readers go now, as they always did.
     fn drop(&mut self) {
+        if self.exited.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         for pump in &self.pumps {
             pump.abort();
         }
@@ -2975,6 +2994,8 @@ impl crate::world::Process for LocalProcess {
             signal,
         };
         state.exit = Some(exit);
+        self.exited
+            .store(true, std::sync::atomic::Ordering::Release);
         Ok(exit)
     }
 
@@ -3207,6 +3228,64 @@ mod seam_tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    /// Returning early is only half of it: what the command left running must
+    /// also survive the answer. A server writes its log to the stdout it
+    /// inherited; if the handle going closed the read end, its next write would
+    /// kill it (SIGPIPE) — or, with SIGPIPE ignored, fail — and the marker
+    /// after the write would never appear.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn what_the_command_left_running_still_writes_after_the_answer() {
+        let d = tempfile::tempdir().unwrap();
+        let marker = d.path().join("survived");
+        let command = format!(
+            "(sleep 3; echo tick && touch '{}') & echo started",
+            marker.display()
+        );
+        let process = LocalShell.spawn(&command, &here()).await.unwrap();
+        let collected = process.collect().await.unwrap();
+        assert_eq!(collected.stdout, b"started\n");
+        drop(process);
+        for _ in 0..60 {
+            if marker.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("the backgrounded child died writing to the pipe it inherited");
+    }
+
+    /// A limit shorter than the post-exit drain must not turn a command that
+    /// finished into one that timed out.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_limit_that_lands_in_the_drain_is_not_a_timeout() {
+        let process = LocalShell
+            .spawn("sleep 30 & echo started", &here())
+            .await
+            .unwrap();
+        let collected = process
+            .collect_within(Some(Duration::from_secs(1)))
+            .await
+            .unwrap()
+            .expect("the command exited well inside its limit");
+        assert_eq!(collected.stdout, b"started\n");
+        assert!(collected.exit.success());
+    }
+
+    /// And a command still running at its limit is reported as such.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_command_still_running_at_its_limit_gives_up() {
+        let process = LocalShell.spawn("sleep 30", &here()).await.unwrap();
+        let collected = process
+            .collect_within(Some(Duration::from_millis(300)))
+            .await
+            .unwrap();
+        assert!(collected.is_none());
+        process.kill().await;
     }
 
     #[tokio::test]

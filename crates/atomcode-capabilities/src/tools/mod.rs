@@ -77,7 +77,8 @@ pub mod write_approval;
 /// or stop an existing job and carry no command. Single source of truth so a newly added
 /// command-running tool can't silently slip past these gates (this exists because a review
 /// caught `bash_start` bypassing all three when they hard-coded the literal `"bash"`).
-pub(crate) fn is_command_shell_tool(name: &str) -> bool {
+/// Public because a driver's approval policy keys on the same thing (the CLI's `-p`).
+pub fn is_command_shell_tool(name: &str) -> bool {
     matches!(name, "bash" | "bash_start")
 }
 

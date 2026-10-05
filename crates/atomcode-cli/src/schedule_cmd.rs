@@ -661,6 +661,11 @@ mod tests {
         assert!(!crate::headless_auto_approve(true, false, "bash"));
         // scheduled (strict): non-bash tool needs approval → deny (no human present).
         assert!(!crate::headless_auto_approve(true, false, "edit_file"));
+        // -p treats a backgrounded command like the foreground one; strict denies both.
+        assert!(crate::headless_auto_approve(false, false, "bash_start"));
+        assert!(!crate::headless_auto_approve(true, false, "bash_start"));
+        // ...but reading or stopping a job is not a command.
+        assert!(!crate::headless_auto_approve(false, false, "bash_kill"));
         // strict + skip_permissions still denies (scheduled never skips, but defensive).
         assert!(!crate::headless_auto_approve(true, true, "bash"));
         // non-strict + skip_permissions (-p flag) → skip_permissions dominates, any tool allowed.
