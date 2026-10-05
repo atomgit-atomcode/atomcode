@@ -3417,6 +3417,54 @@ async fn enter_takes_the_lit_row_and_a_command_that_wants_an_argument_asks() {
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
 
+/// `/todo` takes words after its name — `add <task>` above all — so taking its
+/// row from the menu stops on the line for them rather than running it bare,
+/// which printed the plan and left `add` out of reach of the menu. The bare
+/// name, entered, still prints the plan.
+#[tokio::test]
+async fn taking_todo_from_the_menu_waits_for_what_comes_after_it() {
+    let dir = scratch("menu-todo");
+    let s = start(tree(
+        &dir,
+        &replay(r#"{ text = "ok" }"#),
+        &["[[remove]]\nid = \"tui-panel-welcome\"\n"],
+    ))
+    .await;
+    let task = s.open().await;
+    let field = |s: &Session| -> String {
+        s.term
+            .last()
+            .and_then(|f| {
+                f.part("input")
+                    .map(|p| p.lines.iter().map(|l| l.plain()).collect())
+            })
+            .unwrap_or_default()
+    };
+
+    s.term.type_text("/tod");
+    until(&s, "/todo").await;
+    s.term.press(KeyPress::plain(Key::Enter));
+    s.quiet().await;
+    assert!(
+        field(&s).contains("/todo "),
+        "the row was completed onto the line, not run:\n{}",
+        s.screen()
+    );
+
+    s.term.type_line("add 写一个回归测试");
+    s.quiet().await;
+    s.term.type_text("/todo");
+    s.quiet().await;
+    // Enter on the lit row completes; enter again runs the bare name.
+    s.term.press(KeyPress::plain(Key::Enter));
+    s.quiet().await;
+    s.term.press(KeyPress::plain(Key::Enter));
+    until(&s, "写一个回归测试").await;
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
 #[tokio::test]
 async fn tab_completes_a_command_that_takes_an_argument_and_leaves_a_space() {
     // What the registry is asked for and the label only shows: a name completed

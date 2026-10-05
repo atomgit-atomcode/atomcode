@@ -41,7 +41,15 @@ fn screen_catalogue() -> Vec<Command> {
         Command::said("mouse", t(Msg::CmdAboutMouse)),
         Command::said("raw", t(Msg::CmdAboutRaw)),
         Command::said("keys", t(Msg::CmdAboutKeys)),
-        Command::said("todo", t(Msg::CmdAboutTodo)),
+        // Taking its row stops on the line (`/todo `) for `add <task>` and the
+        // rest to be typed; enter on the bare name still prints the plan. Run
+        // bare from the menu, `add` could never be reached from it.
+        Command::said_taking(
+            "todo",
+            "[add <task>|clear|show|hide]".into(),
+            t(Msg::CmdAboutTodo),
+        )
+        .requiring(),
         Command::said("team", t(Msg::CmdAboutTeam)),
         Command::said_taking("paste", t(Msg::CmdTakesPath), t(Msg::CmdAboutPaste)),
         Command::said("config", t(Msg::CmdAboutConfig)),

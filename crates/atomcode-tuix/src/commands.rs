@@ -244,7 +244,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "copy",    desc: "Copy a code block from the last reply to the clipboard (/copy, /copy N, /copy all, /copy msg)", needs_args: false, hidden: false, acp: false },
     Command { name: "save",    desc: "Save the current conversation to a markdown file (/save, /save [filename])", needs_args: false, hidden: false, acp: false },
     Command { name: "view",    desc: "View file content in an overlay modal", needs_args: true, hidden: false, acp: false },
-    Command { name: "todo",    desc: "Show the todo list; /todo add <task> appends one, /todo clear wipes it", needs_args: false, hidden: false, acp: true },
+    Command { name: "todo",    desc: "Show the todo list; /todo add <task> appends one, /todo clear wipes it", needs_args: true, hidden: false, acp: true },
     Command { name: "schedule", desc: "List scheduled tasks and next run times", needs_args: false, hidden: false, acp: false },
     Command { name: "desktop", desc: "Open the AtomCode desktop app (or show the download link)", needs_args: false, hidden: false, acp: false },
 ];
@@ -553,6 +553,15 @@ mod tests {
             goal.needs_args,
             "/goal selection must wait for the goal text"
         );
+    }
+
+    #[test]
+    fn todo_needs_args_so_selection_waits_for_add() {
+        // Selecting `/todo` must stop at `/todo ` so `add <task>` can be typed;
+        // run bare it only printed the list. Enter on `/todo ` still prints it.
+        let reg = CommandRegistry::builtin();
+        let todo = reg.find("todo").expect("/todo must be a built-in command");
+        assert!(todo.needs_args, "/todo selection must wait for add/clear");
     }
 
     #[test]
