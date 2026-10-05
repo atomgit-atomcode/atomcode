@@ -922,7 +922,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
             setSync(false);
             setBusy(false);
             setQueued([]);
-            setHistoryHint(t('sync.switchFailed', { error: String(error) }));
+            reportFailure(t('sync.switchFailed', { error: String(error) }));
           });
       }
     }
@@ -1761,7 +1761,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
             })
             .catch((error) => {
               setSync(false);
-              setHistoryHint(t('sync.switchFailed', { error: String(error) }));
+              reportFailure(t('sync.switchFailed', { error: String(error) }));
             });
         } else {
           startLiveStream();
@@ -1810,6 +1810,14 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   // 命令输出以独立 system 消息追加进转录，与 assistant 消息分离。
   // 若流式 assistant 回复正在进行（busy），把 notice 插到它之前，
   // 确保 appendToLastAssistant 始终以真正的 assistant 气泡为最后一条。
+  // A failure the person has to see. The history hint alone is drawn only over
+  // an empty conversation, and a synced page always carries the terminal's —
+  // so a refused send used to flash its bubble and vanish without a word.
+  function reportFailure(text: string) {
+    setHistoryHint(text);
+    pushCommandNotice(text);
+  }
+
   function pushCommandNotice(text: string) {
     setMessages((prev) => {
       const last = prev[prev.length - 1];
@@ -1891,7 +1899,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       providerRef.current = previous;
       setProvider(previous);
       providerPinnedRef.current = false;
-      setHistoryHint(t('chat.connError', { msg: String(error) }));
+      reportFailure(t('chat.connError', { msg: String(error) }));
     });
   }
 
@@ -2531,7 +2539,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
           turnStartedAtRef.current = null;
         }
         setQueued([]);
-        setHistoryHint(t('chat.connError', { msg: String(error) }));
+        reportFailure(t('chat.connError', { msg: String(error) }));
         return false;
       }
       // 消息发出后延迟刷新侧栏列表，给后端落盘时间；

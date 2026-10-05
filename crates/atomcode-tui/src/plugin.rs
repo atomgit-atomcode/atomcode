@@ -365,15 +365,6 @@ impl AgentClient {
             .map(|link| link.control.clone())
     }
 
-    /// Something this screen sent the agent on screen has not been taken by a
-    /// turn yet.
-    pub(crate) fn sent_and_waiting(&self) -> bool {
-        let views = self.view.lock().expect("client poisoned");
-        views
-            .screen()
-            .is_some_and(|view| !view.outstanding.is_empty())
-    }
-
     /// Nothing sent to the agent on screen is still waiting for a turn, and it
     /// says it is idle.
     pub fn settled(&self) -> bool {
@@ -930,38 +921,6 @@ enum Wake {
 #[serde(deny_unknown_fields)]
 struct Row {}
 
-/// Whether a fact is the line a turn opens with on screen — what the working
-/// line, armed at `TurnStarted`, waits for so it never draws above it.
-///
-/// A person's message, normally, or the model's first word for a turn nobody
-/// typed. And a report coming home — a background session's result or a team
-/// member's — which opens a turn of its own on the lead: waiting for the
-/// model's first word there left the screen with no working line for as long
-/// as the model thought before answering (a minute, reported, of nothing
-/// moving under "后台「…」的结果回来了").
-///
-/// But only a report that opened the turn itself. One that arrived as a
-/// person stopped the last turn is kept and written at the start of the next —
-/// ahead of the person's own message, when it is the person who starts it —
-/// and the line must not come up above that message. `person_coming(turn)`
-/// says a message of theirs is on its way into that turn: sent and not taken
-/// yet, or taken by it already.
-fn opens_a_turn_on_screen(
-    fact: &atomcode_kernel::session::SessionEvent,
-    person_coming: impl Fn(u64) -> bool,
-) -> bool {
-    use atomcode_kernel::session::{InjectionOrigin, SessionEvent};
-    match fact {
-        SessionEvent::UserMessage { .. } | SessionEvent::AssistantMessage { .. } => true,
-        SessionEvent::Injected {
-            origin: InjectionOrigin::Peer { .. },
-            turn,
-            ..
-        } => !person_coming(*turn),
-        _ => false,
-    }
-}
-
 /// A member of the session on screen, as its events have told it.
 #[derive(Clone)]
 struct Member {
@@ -1174,10 +1133,6 @@ pub struct Tui {
     files: Mutex<Option<(std::path::PathBuf, FileIndex)>>,
     /// Where the button went down, so a release can tell a click from a drag.
     pressed_at: Mutex<Option<(u16, u16)>>,
-    /// The newest turn a message this screen sent was taken by
-    /// (`AgentEvent::Accepted`): a report folded into that turn is not what
-    /// opened it — see [`opens_a_turn_on_screen`].
-    person_turn: Mutex<Option<u64>>,
     /// The conversation selection a plain press set aside while it waits to
     /// learn what it is (`Tui::click_extends`): released where it went down,
     /// it was a click and this is carried on to it; dragged, it was a new
@@ -5390,12 +5345,11 @@ impl Tui {
                 ) {
                     self.host.stop_recognizing();
                 }
-                let person_coming = |turn: u64| {
-                    self.client.sent_and_waiting()
-                        || *self.person_turn.lock().expect("person turn poisoned") == Some(turn)
-                };
-                if opens_a_turn_on_screen(&committed.event, person_coming)
-                    && !self.host.settle_working()
+                if matches!(
+                    committed.event,
+                    atomcode_kernel::session::SessionEvent::UserMessage { .. }
+                        | atomcode_kernel::session::SessionEvent::AssistantMessage { .. }
+                ) && !self.host.settle_working()
                 {
                     // Nothing was armed — the turn's start has not reached
                     // this screen yet. The facts come by the feed and the
@@ -5471,11 +5425,8 @@ impl Tui {
                 // that knows both moved.
                 changed | self.refresh_providers()
             }
-            AgentEvent::Accepted { command, turn, .. } => {
+            AgentEvent::Accepted { command, .. } => {
                 self.client.answered(&command);
-                if turn.is_some() {
-                    *self.person_turn.lock().expect("person turn poisoned") = turn;
-                }
                 // The turn has the message, so what was waiting has stopped
                 // waiting: off the panel, by the receipt this screen sent it
                 // under. The transcript draws it from here on — for a line that
@@ -8690,7 +8641,6 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
             history_asked: Mutex::new(false),
             files: Mutex::new(None),
             pressed_at: Mutex::new(None),
-            person_turn: Mutex::new(None),
             extend_on_release: Mutex::new(None),
             click_streak: Mutex::new(None),
             members: Arc::new(Roster::default()),
@@ -11113,77 +11063,5 @@ mod link_click_tests {
         assert_eq!(link_to_open("vscode://file/x"), None);
         assert_eq!(link_to_open("javascript:alert(1)"), None);
         assert_eq!(link_to_open("https://a.example/\u{1b}]52;c;x"), None);
-    }
-}
-
-#[cfg(test)]
-mod opening_line_tests {
-    use super::opens_a_turn_on_screen;
-    use atomcode_kernel::session::{InjectionOrigin, SessionEvent};
-
-    fn injected(origin: InjectionOrigin) -> SessionEvent {
-        SessionEvent::Injected {
-            turn: 3,
-            text: "后台「审查」的结果回来了".into(),
-            origin,
-        }
-    }
-
-    /// A report coming home opens the lead's turn on screen, as a person's
-    /// message does — so the working line comes up under it rather than
-    /// waiting out however long the model thinks before its first word.
-    #[test]
-    fn a_report_coming_home_opens_the_turn_on_screen() {
-        let nobody = |_: u64| false;
-        let from_background = injected(InjectionOrigin::Peer {
-            from: "bg-1".into(),
-            outside: true,
-        });
-        let from_a_member = injected(InjectionOrigin::Peer {
-            from: "lead/scout".into(),
-            outside: false,
-        });
-        let typed = SessionEvent::UserMessage {
-            turn: 3,
-            text: "hi".into(),
-            images: vec![],
-        };
-        assert!(opens_a_turn_on_screen(&from_background, nobody));
-        assert!(opens_a_turn_on_screen(&from_a_member, nobody));
-        assert!(opens_a_turn_on_screen(&typed, nobody));
-    }
-
-    /// A report kept from a stopped turn is written ahead of the person's next
-    /// message: when that message is on its way into the same turn, the
-    /// message opens it, not the report.
-    #[test]
-    fn a_report_ahead_of_a_person_s_message_does_not_open_the_turn() {
-        let report = injected(InjectionOrigin::Peer {
-            from: "lead/scout".into(),
-            outside: false,
-        });
-        assert!(!opens_a_turn_on_screen(&report, |turn| turn == 3));
-        assert!(
-            opens_a_turn_on_screen(&report, |turn| turn == 2),
-            "a message taken by an earlier turn says nothing about this one"
-        );
-    }
-
-    /// What the runtime slips in on its own is not a line a turn opens with:
-    /// a reminder written ahead of the person's message must not raise the
-    /// working line above that message.
-    #[test]
-    fn what_the_runtime_slips_in_does_not() {
-        let nobody = |_: u64| false;
-        assert!(!opens_a_turn_on_screen(
-            &injected(InjectionOrigin::Reminder),
-            nobody
-        ));
-        assert!(!opens_a_turn_on_screen(
-            &injected(InjectionOrigin::Memory),
-            nobody
-        ));
-        let step = SessionEvent::StepStart { turn: 3, step: 1 };
-        assert!(!opens_a_turn_on_screen(&step, nobody));
     }
 }

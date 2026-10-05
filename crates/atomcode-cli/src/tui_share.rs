@@ -20,9 +20,10 @@
 //! 这里的静态槽里,`/webui`、`/app`、`/sync` 共用它(经典界面同样如此)。
 
 use atomcode_i18n::screen::{t as tr, Msg as SMsg};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use atomcode_coding::{CodingRuntimeHandle, SequencedRuntimeEvent, UserInput};
+use atomcode_coding::{CodingRuntimeEvent, CodingRuntimeHandle, SequencedRuntimeEvent, UserInput};
 use atomcode_daemon::live_hub::LiveBinding;
 
 /// 活着的那个 runtime,照共享要用的样子。
@@ -70,7 +71,12 @@ pub async fn attach(config_path: &std::path::Path) -> Result<(), String> {
         .ok_or_else(|| tr(SMsg::HostUnavailable).into_owned())?;
     let handle = live.handle();
     let session_id = live.session();
-    let working_dir = live.working_dir();
+    // 运行时此刻在哪儿,不是启动时在哪儿:`/cd` 之后再开 `/webui`,拿启动目录去挂,
+    // 下一条「换了会话」就会被当成身份变了,网页端随之连不上。
+    let working_dir = match handle.context_stats().await {
+        Ok(stats) => stats.working_dir,
+        Err(_) => live.working_dir(),
+    };
     let config =
         atomcode_config::config::Config::load(config_path).map_err(|error| error.to_string())?;
     let (selection, _model) = resolved_selection(&config);
@@ -187,6 +193,82 @@ pub fn publish(event: &SequencedRuntimeEvent) {
         return;
     };
     let _ = atomcode_daemon::native_live::publish(binding, event.clone());
+    // 换了会话(`/clear`、`/resume`、`/cd`):hub 收到这条就把手上的快照作废,等
+    // 新会话的快照交上来 —— 在那之前网页端连不上、发的话一律被拒。经典界面换完
+    // 会话自己交;这块屏幕原先不交,于是 hub 一直等到下一个终端回合跑完。
+    if let CodingRuntimeEvent::SessionChanged(changed) = &event.event {
+        let session = changed
+            .session_id
+            .clone()
+            .unwrap_or_else(|| binding.session_id.clone());
+        if session != binding.session_id || changed.working_dir != binding.working_dir {
+            let epoch = SESSION_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+            let handle = live().lock().expect("live poisoned").clone();
+            if let Some(handle) = handle.map(|live| live.handle()) {
+                tokio::spawn(hand_over_snapshot(
+                    epoch,
+                    binding.id,
+                    handle,
+                    session,
+                    changed.working_dir.clone(),
+                ));
+            }
+        }
+    }
+    // 一个回合开始了:还在路上的那份快照是回合之前取的,交上去会把 hub 刚记下的
+    // 这一回合(进行中、等着答的问询)一并清掉。不交了 —— 回合结束时 hub 拿回合末的
+    // 快照自己补上,和它在终端回合后自愈是同一条路。
+    if matches!(
+        &event.event,
+        CodingRuntimeEvent::Agent(atomcode_kernel::event::AgentEvent::TurnStarted { .. })
+            | CodingRuntimeEvent::Request(_)
+    ) {
+        SESSION_EPOCH.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// 第几次换会话(回合开始也算一次)。交快照的那一趟回来时若已经又变过,它手里的
+/// 已经不是 hub 该要的那份,不交 —— 交了就把 hub 拨回到旧会话上,或清掉一个正在
+/// 跑的回合。
+static SESSION_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 取新会话的快照交给 hub,并换上它交回来的绑定。
+///
+/// 交不上就留在原样:hub 继续等,终端下一个回合跑完时它自己补上。记一笔,否则网页端
+/// 连不上的那段时间里没有任何痕迹。
+async fn hand_over_snapshot(
+    epoch: u64,
+    binding_id: u64,
+    handle: CodingRuntimeHandle,
+    session: String,
+    working_dir: std::path::PathBuf,
+) {
+    let snapshot = match handle.snapshot().await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::warn!(%error, "live share: no snapshot for the new session");
+            return;
+        }
+    };
+    let mut guard = bound().lock().expect("binding poisoned");
+    if SESSION_EPOCH.load(Ordering::SeqCst) != epoch {
+        return;
+    }
+    // 中途 `/sync off` 又挂上了:这一趟属于上一个绑定。
+    let Some(binding) = guard.as_ref().filter(|binding| binding.id == binding_id) else {
+        return;
+    };
+    match atomcode_daemon::native_live::commit_runtime_snapshot(
+        binding,
+        session,
+        working_dir,
+        (*snapshot).clone(),
+    ) {
+        Ok(next) => *guard = Some(next),
+        Err(error) => {
+            tracing::warn!(?error, "live share: the new session's snapshot was refused");
+        }
+    }
 }
 
 /// 模式换了,远端的徽标跟着换。没共享就什么也不做。
