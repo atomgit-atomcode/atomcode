@@ -5308,6 +5308,68 @@ async fn a_question_asks_the_terminal_for_the_pointer_only_while_it_is_up() {
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
 
+/// Reading back while a question waits: the reason to scroll then is to read
+/// what it is asking about, so the wheel and the page keys move the
+/// conversation, and the question stays on screen while they do. They used to
+/// roll the question off first — the conversation not moving for the first
+/// notches, then the question gone — and the page keys were swallowed.
+#[tokio::test]
+async fn a_question_holds_still_while_the_conversation_is_read_back() {
+    let dir = scratch("ask-scroll-back");
+    let lines: Vec<String> = (1..=60).map(|n| format!("LINE-{n:02}")).collect();
+    let script = replay(&format!(
+        r#"{{ text = "{}", calls = [ {{ name = "write_file", args = {{ file_path = "out.txt", content = "written" }} }} ] }},
+           {{ text = "Done." }}"#,
+        lines.join("\\n\\n")
+    ));
+    let s = start(asking(&dir, &script)).await;
+    let task = s.open().await;
+    s.term.type_line("write it");
+    until(&s, "↑↓ 选择").await;
+    let before = s.screen();
+    assert!(before.contains("LINE-60"), "{before}");
+    assert!(
+        !before.contains("LINE-55"),
+        "the test needs a scroll: {before}"
+    );
+    let stream = s.term.last().unwrap().part("stream").unwrap().rect;
+
+    use atomcode_tui::surface::Click;
+    for _ in 0..3 {
+        s.term.pointer(Click::WheelUp, stream.x + 2, stream.y + 2);
+    }
+    until(&s, "LINE-56").await;
+    let wheeled = s.screen();
+    assert!(
+        wheeled.contains("↑↓ 选择") && wheeled.contains("允许一次"),
+        "the wheel rolled the question away:\n{wheeled}"
+    );
+
+    s.term.press(KeyPress::plain(Key::PageUp));
+    until(&s, "LINE-51").await;
+    let paged = s.screen();
+    assert!(
+        paged.contains("↑↓ 选择") && paged.contains("允许一次"),
+        "paging rolled the question away:\n{paged}"
+    );
+
+    // And it is still the question's to answer: the keys it takes still reach it.
+    s.term.press(KeyPress::ch('1'));
+    for _ in 0..200 {
+        if dir.join("out.txt").exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        dir.join("out.txt").exists(),
+        "the allow did not reach the call"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
 /// The prompt marker this terminal draws.
 fn caps_prompt() -> &'static str {
     atomcode_tui::caps::Caps::default().g(atomcode_tui::caps::Glyph::Prompt)

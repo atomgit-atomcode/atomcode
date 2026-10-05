@@ -2517,8 +2517,23 @@ impl UserInterface for Tui {
                 {
                     stale |= self.run_bg_key(press);
                 }
-                // A question on screen gets first refusal on every key. It is a
-                // panel riding the tail now, not a modal, so this is the only
+                // Paging the conversation, past a question that is up: reading
+                // what it asks about is the reason to page back while it waits,
+                // and the question has no use for these keys itself.
+                Wake::Input(Input::Key(press))
+                    if self.host.asks.is_waiting() && pages_the_conversation(press) =>
+                {
+                    // Only as a scroll: a keymap that rebinds the key to
+                    // something else has not made it the question's business.
+                    if let Some(action @ (Action::Scroll(_) | Action::ScrollToBottom)) =
+                        self.keys.resolve(press)
+                    {
+                        quit = self.act(action, &client);
+                    }
+                    stale = true;
+                }
+                // A question on screen gets first refusal on every other key. It
+                // is a panel riding the tail now, not a modal, so this is the only
                 // place its keys are routed — and focus is still arbitration,
                 // not composition: exactly one thing can hold it.
                 Wake::Input(Input::Key(press)) if self.host.asks.is_waiting() => {
@@ -8101,6 +8116,13 @@ pub fn took_suggestion(
     }
     m.suggestion = Some(text);
     true
+}
+
+/// PageUp / PageDown, unmodified: the keys that page the conversation and that
+/// a question on screen never answers with.
+fn pages_the_conversation(press: crate::surface::KeyPress) -> bool {
+    use crate::surface::{Key, Mods};
+    press.mods == Mods::NONE && matches!(press.key, Key::PageUp | Key::PageDown)
 }
 
 /// Whether this action puts a pending guess away: every gesture on the field

@@ -5302,8 +5302,45 @@ impl Host {
     ///
     /// `tail` is empty for every layout that declares none, and then this is the
     /// identity: the whole pane is the block rect and `block_scroll == scroll`.
+    ///
+    /// **A question on screen does not scroll away.** The tail getting out of
+    /// the way first is right for what has already been read — the live line,
+    /// the todo list — and wrong for a question still waiting: the reason to
+    /// scroll back while one is up is to read what it is asking about, and the
+    /// wheel used to spend its first notches rolling the question off the
+    /// screen instead, conversation unmoved. So the question, and whatever rides
+    /// below it, holds the bottom of the pane, and the rest of the pane scrolls
+    /// exactly as above. The limit is unchanged — `(B + T_rest) - (H - T_held)`
+    /// is the same `(B + T) - H` — so nothing that bounds the scroll has to know.
+    ///
+    /// Held only while it leaves the conversation at least half the pane: a
+    /// question taller than that on a short terminal would leave a strip of a
+    /// row or two to read back through, and then rolling it away as before is
+    /// the better of the two.
     fn pane_geometry(pane: Rect, scroll: usize, heights: &[(String, u16)]) -> Pane {
-        Self::pane_geometry_capped(pane, scroll, &Self::cap_tail(heights.to_vec(), pane.h))
+        let capped = Self::cap_tail(heights.to_vec(), pane.h);
+        let held_from = capped
+            .iter()
+            .position(|(id, h)| id == crate::modules::ask::ID && *h > 0);
+        let Some(held_from) = held_from else {
+            return Self::pane_geometry_capped(pane, scroll, &capped);
+        };
+        let (rolling, held) = capped.split_at(held_from);
+        let held_h: u16 = held.iter().map(|(_, h)| *h).sum();
+        if held_h > pane.h / 2 {
+            return Self::pane_geometry_capped(pane, scroll, &capped);
+        }
+        let above = Rect::new(pane.x, pane.y, pane.w, pane.h.saturating_sub(held_h));
+        let mut out = Self::pane_geometry_capped(above, scroll, rolling);
+        let mut y = above.y + above.h;
+        for (id, h) in held {
+            if *h > 0 {
+                out.tail
+                    .push((id.clone(), Rect::new(pane.x, y, pane.w, *h)));
+            }
+            y += *h;
+        }
+        out
     }
 
     fn pane_geometry_capped(pane: Rect, scroll: usize, heights: &[(String, u16)]) -> Pane {
@@ -10836,6 +10873,56 @@ mod tests {
     }
 
     #[test]
+
+    /// A question in the tail holds the bottom of the pane at every scroll, the
+    /// rest of the tail rolls away first as before, and the top of the
+    /// conversation is reached at the same limit.
+    #[test]
+    fn a_question_in_the_tail_holds_the_bottom_while_the_rest_scrolls() {
+        let pane = Rect::new(0, 0, 80, 20);
+        let heights = vec![
+            ("live".to_string(), 2u16),
+            (crate::modules::ask::ID.to_string(), 6),
+            ("steering".to_string(), 1),
+        ];
+        let blocks = 50usize;
+        let limit = blocks + 9 - 20;
+        for scroll in [0, 1, 2, 5, limit] {
+            let p = Host::pane_geometry(pane, scroll, &heights);
+            let at = |id: &str| p.tail.iter().find(|(i, _)| i == id).map(|(_, r)| *r);
+            assert_eq!(
+                at(crate::modules::ask::ID),
+                Some(Rect::new(0, 13, 80, 6)),
+                "{scroll}"
+            );
+            assert_eq!(at("steering"), Some(Rect::new(0, 19, 80, 1)), "{scroll}");
+            // The live line rolls off first, and only then does the conversation move.
+            let live = 2usize.saturating_sub(scroll) as u16;
+            assert_eq!(
+                at("live").map(|r| r.h),
+                (live > 0).then_some(live),
+                "{scroll}"
+            );
+            assert_eq!(p.block_rect.h, 13 - live, "{scroll}");
+            assert_eq!(p.block_scroll, scroll.saturating_sub(2), "{scroll}");
+        }
+        // At the limit the conversation's first row is the window's first row.
+        let p = Host::pane_geometry(pane, limit, &heights);
+        assert_eq!(p.block_scroll + p.block_rect.h as usize, blocks);
+    }
+
+    /// A question taller than half the pane is not held: holding it would
+    /// leave a strip to read back through.
+    #[test]
+    fn a_tall_question_rolls_away_as_the_tail_always_did() {
+        let pane = Rect::new(0, 0, 80, 20);
+        let heights = vec![(crate::modules::ask::ID.to_string(), 15u16)];
+        let p = Host::pane_geometry(pane, 15, &heights);
+        assert!(p.tail.is_empty(), "{:?}", p.tail);
+        assert_eq!(p.block_rect.h, 20);
+        assert_eq!(p.block_scroll, 0);
+    }
+
     fn a_pin_that_would_leave_the_top_empty_is_pulled_back() {
         // The other side of the same coin: pinned past the new limit, the
         // scroll would sit above the oldest line — which reads as the
