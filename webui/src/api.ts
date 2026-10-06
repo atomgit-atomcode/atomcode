@@ -16,6 +16,23 @@ export function getToken(): string {
   return token;
 }
 
+/**
+ * The body of a response that succeeded, or an `ApiCallError` saying which
+ * status it was and what the daemon said.
+ *
+ * A failed request used to come back as its error body cast to the success
+ * type — `{error}` read as a config, a skill list, a directory listing — and
+ * failed somewhere downstream with nothing naming the endpoint; an HTML error
+ * page from a proxy failed as `Unexpected token '<'`.
+ */
+async function readJson<T>(r: Response): Promise<T> {
+  if (!r.ok) {
+    const e = (await r.json().catch(() => ({}))) as { error?: string; code?: string };
+    throw new ApiCallError(e.error || `HTTP ${r.status} ${r.url}`, r.status, e.code);
+  }
+  return r.json() as Promise<T>;
+}
+
 export type SSEEvent =
   | { type: 'runtime_info'; provider: string; model: string }
   | { type: 'session_assigned'; session_id: string }
@@ -221,7 +238,12 @@ export async function respondPermission(
     },
     body: JSON.stringify({ session_id: sessionId, decision, tool_name: toolName }),
   });
-  return resp.json();
+  // A request that did not land throws: the card must stay up to be answered
+  // again, or the person thinks it was approved while the turn waits on an
+  // answer nobody can give any more. `success: false` is a different thing —
+  // the question is already gone (answered elsewhere, or timed out) — and is
+  // returned for the caller to close on.
+  return readJson<{ success: boolean; error?: string }>(resp);
 }
 
 // --- Session types ---
@@ -285,7 +307,7 @@ export interface SessionDetail {
 // lookups where 50 is enough (e.g. URL-restore of a recent session).
 export async function listSessions(): Promise<SessionMetaWithProject[]> {
   const resp = await fetch('/sessions', { headers: authHeaders() });
-  return resp.json();
+  return readJson(resp);
 }
 
 // A single project's sessions, UNCAPPED (reads one bucket directly). This is
@@ -503,7 +525,7 @@ export interface ConfigInfo {
 
 export async function getConfig(): Promise<ConfigInfo> {
   const resp = await fetch('/config', { headers: authHeaders() });
-  return resp.json();
+  return readJson(resp);
 }
 
 /** Trigger a hot-reload of config from disk (POST /config/reload). */
@@ -550,7 +572,7 @@ export interface ProjectState {
 
 export async function getProject(): Promise<ProjectState> {
   const resp = await fetch('/project', { headers: authHeaders() });
-  return resp.json();
+  return readJson(resp);
 }
 
 
@@ -595,7 +617,7 @@ export interface SkillInfo {
 
 export async function getSkills(): Promise<SkillInfo[]> {
   const resp = await fetch('/skills', { headers: authHeaders() });
-  return resp.json();
+  return readJson(resp);
 }
 
 // --- Remote access (蒲公英 / Oray PGY) status ---
@@ -665,11 +687,7 @@ async function call<T>(method: string, path: string, body?: unknown): Promise<T>
     headers: body === undefined ? authHeaders() : { 'Content-Type': 'application/json', ...authHeaders() },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
-  if (!r.ok) {
-    const e = (await r.json().catch(() => ({}))) as { error?: string; code?: string };
-    throw new ApiCallError(e.error || `HTTP ${r.status}`, r.status, e.code);
-  }
-  return r.json() as Promise<T>;
+  return readJson<T>(r);
 }
 
 const enc = encodeURIComponent;
@@ -788,7 +806,7 @@ export async function listDir(path: string): Promise<FsListResult> {
   const resp = await fetch('/fs/list?path=' + encodeURIComponent(path), {
     headers: authHeaders(),
   });
-  return resp.json();
+  return readJson(resp);
 }
 
 /** One `@`-mention search hit: `path` is relative to the searched dir,
@@ -816,7 +834,7 @@ export async function searchFiles(
     '/fs/search?path=' + encodeURIComponent(dir) + '&q=' + encodeURIComponent(token),
     { headers: authHeaders(), signal },
   );
-  return resp.json();
+  return readJson(resp);
 }
 
 // --- Create directory ---
@@ -865,7 +883,7 @@ export async function changeDir(path: string, setDefault = false): Promise<CdRes
     },
     body: JSON.stringify({ path, set_default: setDefault }),
   });
-  return resp.json();
+  return readJson(resp);
 }
 
 /** Delete a historical project and its sessions catalog. */

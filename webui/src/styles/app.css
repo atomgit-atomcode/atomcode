@@ -2216,6 +2216,10 @@ body {
   color: var(--app-secondary-foreground);
   margin: 0;
 }
+/* The answer did not reach the daemon: said in the card, which stays up. */
+.permission-failed {
+  color: var(--app-error-foreground);
+}
 /* Args sit in one soft panel instead of bare text, so the body stays quiet. */
 .permission-card .field-group .tool-body-row-content {
   background: var(--app-tool-background);

@@ -499,3 +499,58 @@ test('getActiveChatSessions reads the authoritative detached chat registry', asy
     globalThis.fetch = originalFetch;
   }
 });
+
+/** Serve every request with this one response, for the length of `body`. */
+async function serving<T>(status: number, text: string, contentType: string, body: () => Promise<T>): Promise<T> {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(text, { status, headers: { 'Content-Type': contentType } })) as typeof fetch;
+  try {
+    return await body();
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+test('a failed request throws with what the daemon said instead of reading the error as data', async () => {
+  const api = await import('./api.ts');
+  const calls: Array<[string, () => Promise<unknown>]> = [
+    ['getConfig', () => api.getConfig()],
+    ['listSessions', () => api.listSessions()],
+    ['getProject', () => api.getProject()],
+    ['getSkills', () => api.getSkills()],
+    ['listDir', () => api.listDir('/w')],
+    ['searchFiles', () => api.searchFiles('/w', 'x')],
+    ['changeDir', () => api.changeDir('/w')],
+  ];
+  for (const [name, call] of calls) {
+    await serving(500, '{"error":"disk on fire"}', 'application/json', async () => {
+      await assert.rejects(call, (e: unknown) => {
+        assert.ok(e instanceof api.ApiCallError, name);
+        assert.equal((e as InstanceType<typeof api.ApiCallError>).status, 500, name);
+        assert.match((e as Error).message, /disk on fire/, name);
+        return true;
+      });
+    });
+  }
+  // A proxy's HTML error page is a status, not a JSON parse error.
+  await serving(502, '<html>Bad Gateway</html>', 'text/html', async () => {
+    await assert.rejects(() => api.getConfig(), /HTTP 502/);
+  });
+});
+
+test('a permission answer that did not land throws; one whose question is gone does not', async () => {
+  const api = await import('./api.ts');
+  await serving(500, '{"error":"boom"}', 'application/json', async () => {
+    await assert.rejects(() => api.respondPermission('s1', 'allow', 'bash'), /boom/);
+  });
+  await serving(
+    200,
+    '{"success":false,"error":"no pending permission for session"}',
+    'application/json',
+    async () => {
+      const r = await api.respondPermission('s1', 'allow', 'bash');
+      assert.equal(r.success, false);
+    },
+  );
+});

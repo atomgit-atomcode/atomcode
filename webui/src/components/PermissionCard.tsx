@@ -46,22 +46,30 @@ function formatArgs(args: unknown): string {
 export function PermissionCard({ req, onDone, onDecide }: PermissionCardProps) {
   const t = useT();
   const [loading, setLoading] = useState(false);
+  const [failed, setFailed] = useState<string | null>(null);
 
   async function decide(decision: 'allow' | 'deny' | 'always_allow' | 'allow_persist' | 'allow_all_bash') {
     if (loading) return;
     setLoading(true);
+    setFailed(null);
     try {
       if (onDecide) {
         await onDecide(decision, req.tool_name);
       } else {
         await respondPermission(req.session_id, decision, req.tool_name);
       }
-    } catch {
-      // Best-effort; proceed to dismiss regardless
-    } finally {
+    } catch (error) {
+      // The answer never reached the daemon. Closing here used to read as
+      // "approved" while the turn kept waiting with nothing left on screen to
+      // answer it — so the card stays, says why, and can be answered again.
       setLoading(false);
-      onDone();
+      setFailed(String(error instanceof Error ? error.message : error));
+      return;
     }
+    // Delivered, or the question was already gone (answered elsewhere, timed
+    // out): either way there is nothing left here to answer.
+    setLoading(false);
+    onDone();
   }
 
   const argsDisplay = formatArgs(req.arguments);
@@ -109,6 +117,7 @@ export function PermissionCard({ req, onDone, onDecide }: PermissionCardProps) {
       }
     >
       {req.reason && <p class="permission-lead">{req.reason}</p>}
+      {failed && <p class="permission-lead permission-failed">{t('perm.sendFailed', { error: failed })}</p>}
       <div class="field-group">
         <span class="modal-label">{t('perm.args')}</span>
         <pre class="tool-body-row-content">{argsDisplay}</pre>

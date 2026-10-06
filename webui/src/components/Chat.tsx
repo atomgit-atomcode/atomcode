@@ -2727,7 +2727,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       const mergedItems = buildSlashMenuItems(FRONTEND_COMMANDS, slashSkills ?? [], slashQuery, t as (k: string) => string, slashSkillsOnly);
       if (e.key === 'ArrowDown') {
         e.preventDefault();
-        setSlashIndex((i) => Math.min(i + 1, mergedItems.length - 1));
+        // Never below 0: on an empty list `length - 1` is -1, and the skills
+        // arriving afterwards would leave Enter reading `mergedItems[-1]`.
+        setSlashIndex((i) => Math.max(0, Math.min(i + 1, mergedItems.length - 1)));
         return;
       }
       if (e.key === 'ArrowUp') {
@@ -2737,7 +2739,10 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       }
       if (e.key === 'Enter' && mergedItems.length > 0) {
         e.preventDefault();
-        insertSkill(mergedItems[slashIndex].name);
+        // The list can change under the index (the skills land after the menu
+        // opened), so the lit row is clamped into it rather than trusted.
+        const at = Math.min(Math.max(slashIndex, 0), mergedItems.length - 1);
+        insertSkill(mergedItems[at].name);
         return;
       }
       if (e.key === 'Escape') {

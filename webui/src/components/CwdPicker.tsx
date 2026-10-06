@@ -53,6 +53,7 @@ export function CwdPicker({ current, onPick, onClose }: CwdPickerProps) {
   const [dirError, setDirError] = useState<string | null>(null);
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
   const [confirming, setConfirming] = useState(false);
+  const [confirmError, setConfirmError] = useState<string | null>(null);
   const [newFolder, setNewFolder] = useState('');
   const [mkdirError, setMkdirError] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -129,14 +130,20 @@ export function CwdPicker({ current, onPick, onClose }: CwdPickerProps) {
     const finalPath = browsePath.trim() || inputPath.trim();
     if (!finalPath) return;
     setConfirming(true);
+    setConfirmError(null);
     try {
-      await changeDir(finalPath);
-      onPick(finalPath);
+      // The daemon's answer decides: it is where the session will actually
+      // work. Switching the page anyway — what this did on a refusal — left
+      // the page showing one directory while the daemon stayed in another.
+      const res = await changeDir(finalPath);
+      if (!res.success) {
+        setConfirmError(res.message);
+        return;
+      }
+      onPick(res.current_dir || finalPath);
       onClose();
-    } catch {
-      // Best-effort; still switch cwd locally
-      onPick(finalPath);
-      onClose();
+    } catch (error) {
+      setConfirmError(String(error instanceof Error ? error.message : error));
     } finally {
       setConfirming(false);
     }
@@ -267,6 +274,7 @@ export function CwdPicker({ current, onPick, onClose }: CwdPickerProps) {
           )}
         </div>
 
+        {confirmError && <div class="dir-note error">{confirmError}</div>}
         <div class="modal-footer">
           <button class="btn" onClick={onClose}>
             {t('cwd.cancel')}

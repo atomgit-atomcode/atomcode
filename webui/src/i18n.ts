@@ -341,6 +341,7 @@ const zh = {
 
   // Permission card
   'perm.title': '工具请求批准',
+  'perm.sendFailed': '没能提交到后台（{error}），请再点一次',
   'perm.args': '参数',
   'perm.deny': '拒绝',
   'perm.approve': '批准',
@@ -879,6 +880,7 @@ const en: Record<MsgKey, string> = {
   'cwd.confirm': 'Confirm',
 
   'perm.title': 'Tool approval request',
+  'perm.sendFailed': 'Your answer did not reach the daemon ({error}). Try again.',
   'perm.args': 'Arguments',
   'perm.deny': 'Deny',
   'perm.approve': 'Approve',
