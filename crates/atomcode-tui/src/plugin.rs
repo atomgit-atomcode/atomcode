@@ -7912,8 +7912,9 @@ impl Tui {
             // Back to whoever asked, before `deliver` consumes it. A modal or
             // an action has nothing to send: what they do shows up in the
             // session's own facts, which the far end is already watching.
-            if let crate::command::Outcome::Said(text) | crate::command::Outcome::Refused(text) =
-                &outcome
+            if let crate::command::Outcome::Said(text)
+            | crate::command::Outcome::Refused(text)
+            | crate::command::Outcome::Document(text) = &outcome
             {
                 remote.said(format!("{display}\n{text}"));
             }
@@ -8006,6 +8007,17 @@ fn deliver(
     outcome: crate::command::Outcome,
 ) {
     let said = match outcome {
+        crate::command::Outcome::Document(text) => {
+            let mut stream = host.stream.write().expect("stream poisoned");
+            let mut w = stream.writer("commands");
+            w.emit(
+                crate::block::Coord::default(),
+                Arc::new(crate::content::CommandDocument { text }),
+            );
+            drop(stream);
+            let _ = keys.send(Wake::Fact);
+            None
+        }
         crate::command::Outcome::Said(text) => Some((text, false)),
         crate::command::Outcome::Refused(why) => Some((why, true)),
         crate::command::Outcome::Quiet => None,

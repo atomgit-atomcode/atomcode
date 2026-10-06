@@ -105,6 +105,10 @@ pub struct Row {
     pub figures: Vec<Piece>,
     /// 标签前一个实心 / 空心圆点:这一项是不是正在用的那个(`/proxy` 的三种模式)。
     pub on: Option<bool>,
+    /// 光标停在这一行时,列表下面那几行预览 —— `/changelog` 里一个版本的要点。和
+    /// `/resume` 选中会话时底下那几句是同一件事:列表说得出「是哪个」,说不出「里面
+    /// 是什么」,而后者才是人决定要不要打开它的依据。
+    pub preview: Vec<String>,
 }
 
 impl Row {
@@ -116,6 +120,7 @@ impl Row {
             tag: None,
             figures: Vec::new(),
             on: None,
+            preview: Vec::new(),
         }
     }
 
@@ -136,6 +141,11 @@ impl Row {
 
     pub fn figures(mut self, figures: Vec<Piece>) -> Self {
         self.figures = figures;
+        self
+    }
+
+    pub fn preview(mut self, preview: Vec<String>) -> Self {
+        self.preview = preview;
         self
     }
 }

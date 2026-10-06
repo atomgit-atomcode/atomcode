@@ -17,6 +17,12 @@ use crate::width;
 pub const ID: &str = "sheet";
 /// 单子最多画这么多行,和别的面板占同一块地方。
 const MOST: usize = 12;
+/// 选中那行的预览最多几行。
+///
+/// 预览块的高度按**整张单子里最长的那份**定、与选中哪行无关 —— 面板贴底往上长,
+/// 预览多一行面板上沿就抬一行,上下选的时候整张列表就在屏幕上跳(`/resume` 的
+/// `PREVIEW_ROWS` 是同一个理由)。
+const PREVIEW_MOST: usize = 6;
 
 #[derive(Default)]
 pub struct State;
@@ -84,6 +90,8 @@ enum Row {
     },
     /// 读的那页的第几行(原始下标)。
     Line(usize),
+    /// 选中那行预览的第几行([`crate::sheet::Row::preview`])。
+    Preview(usize),
     Legend,
 }
 
@@ -96,12 +104,15 @@ fn layout(sheet: &Sheet, h: usize) -> Vec<Row> {
             }
             rows.extend([Row::BoxTop, Row::Search, Row::BoxBottom]);
             let listed = list.listed();
+            let preview = preview_rows(list);
+            // 预览块(一行空行加它自己)也从同一份高度里出。
+            let preview_room = if preview > 0 { preview + 1 } else { 0 };
             if listed.is_empty() {
                 rows.push(Row::Nothing);
             } else {
                 // chrome 之外、底下空行加提示之后还剩多少行;`h == usize::MAX` 是
                 // `height` 在问要多少,答案是整张单子,仍夹在上限里。
-                let cap = h.saturating_sub(rows.len() + 2).min(MOST);
+                let cap = h.saturating_sub(rows.len() + 2 + preview_room).min(MOST);
                 let (from, to) = if listed.len() > cap {
                     // 那条「还有多少没画」自己也占一行,从同一份预算里扣。
                     let room = cap.saturating_sub(1).max(1);
@@ -119,6 +130,12 @@ fn layout(sheet: &Sheet, h: usize) -> Vec<Row> {
                     row: listed[at],
                 }));
             }
+            // 列表下面、图例上面:它说的是「这一行里是什么」,贴着列表;它是读的
+            // 不是挑的,所以不进列表本身。筛空了也照样占着,面板不因此变矮。
+            if preview > 0 {
+                rows.push(Row::Blank);
+                rows.extend((0..preview).map(Row::Preview));
+            }
         }
         Page::Read(read) => {
             rows.push(Row::Blank);
@@ -133,6 +150,17 @@ fn layout(sheet: &Sheet, h: usize) -> Vec<Row> {
     rows.push(Row::Blank);
     rows.push(Row::Legend);
     rows
+}
+
+/// 预览块占几行:单子里最长的那份,夹在 [`PREVIEW_MOST`] 里。没有一行带预览就是 0,
+/// 面板和从前一样。
+fn preview_rows(list: &List) -> usize {
+    list.rows
+        .iter()
+        .map(|row| row.preview.len())
+        .max()
+        .unwrap_or(0)
+        .min(PREVIEW_MOST)
 }
 
 /// 一份长为 `len` 的单子里,让 `cursor` 留在视野中的那 `room` 行。
@@ -190,6 +218,17 @@ fn draw(sheet: &Sheet, row: Row, w: usize, caps: Caps, room: usize) -> Line {
         Row::Line(at) => match &sheet.page {
             Page::Read(read) => read_line(read, at, w, caps),
             Page::List(_) => Line::empty(),
+        },
+        Row::Preview(at) => match &sheet.page {
+            Page::List(list) => {
+                let said = list
+                    .selected()
+                    .and_then(|row| row.preview.get(at))
+                    .map(|line| crate::text::for_screen(line).into_owned())
+                    .unwrap_or_default();
+                Line::styled(format!("  {said}"), muted).truncate(w)
+            }
+            Page::Read(_) => Line::empty(),
         },
         Row::Legend => {
             let said = match &sheet.page {
@@ -395,6 +434,56 @@ mod tests {
             .into_iter()
             .map(|row| draw(sheet, row, w, Caps::default(), read_room(usize::MAX)).plain())
             .collect()
+    }
+
+    fn versions(cursor: usize) -> Sheet {
+        let mut list = List::new(
+            "changelog",
+            "pick one",
+            vec![
+                Item::new("/changelog v5.2.1", "v5.2.1")
+                    .preview(vec!["• 网页端按服务商管理模型".into(), "• 推理强度".into()]),
+                Item::new("/changelog v5.2.0", "v5.2.0").preview(vec!["• 只有一点".into()]),
+                Item::new("/changelog v5.1.0", "v5.1.0"),
+            ],
+        );
+        list.cursor = cursor;
+        Sheet::list(list)
+    }
+
+    /// 光标停在哪一行,列表下面就是那一行的预览 —— `/resume` 选中会话时底下那几句
+    /// 是同一件事。
+    #[test]
+    fn the_selected_row_shows_its_preview_under_the_list() {
+        let first = drawn(&versions(0), 60).join("\n");
+        assert!(first.contains("网页端按服务商管理模型"), "{first}");
+        assert!(
+            !first.contains("只有一点"),
+            "only the selected row's: {first}"
+        );
+        let second = drawn(&versions(1), 60).join("\n");
+        assert!(second.contains("只有一点"), "{second}");
+        assert!(!second.contains("网页端"), "{second}");
+    }
+
+    /// 预览长短不一、甚至这一行没有预览,面板一样高:它贴底往上长,高度一变整张
+    /// 列表就跳。
+    #[test]
+    fn the_sheet_is_as_tall_whichever_row_is_selected() {
+        let heights: Vec<usize> = (0..3).map(|at| drawn(&versions(at), 60).len()).collect();
+        assert!(heights.iter().all(|h| *h == heights[0]), "{heights:?}");
+    }
+
+    /// 一行都不带预览的单子,和从前一模一样。
+    #[test]
+    fn a_list_without_previews_is_what_it_was() {
+        let plain = Sheet::list(List::new(
+            "cd",
+            "",
+            vec![Item::new("/cd a", "a"), Item::new("/cd b", "b")],
+        ));
+        let rows = layout(&plain, usize::MAX);
+        assert!(!rows.iter().any(|row| matches!(row, Row::Preview(_))));
     }
 
     /// 单子:表头说是哪个命令的、这一张是什么;选中那行有指针;靠右的数画全,

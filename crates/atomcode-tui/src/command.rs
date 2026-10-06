@@ -230,6 +230,10 @@ impl Command {
 pub enum Outcome {
     /// Say this on screen.
     Said(String),
+    /// Put this markdown document in the conversation, drawn the way an answer
+    /// is — headings, lists, emphasis — rather than as a one-line remark.
+    /// What `/changelog` answers with: something to read, not a reply.
+    Document(String),
     /// Do this instead — so a command and a key can share one implementation.
     Do(Action),
     /// Nothing to report.
@@ -245,6 +249,7 @@ impl std::fmt::Debug for Outcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Outcome::Said(t) => write!(f, "Said({t:?})"),
+            Outcome::Document(t) => write!(f, "Document({t:?})"),
             Outcome::Do(a) => write!(f, "Do({a:?})"),
             Outcome::Quiet => write!(f, "Quiet"),
             Outcome::Refused(t) => write!(f, "Refused({t:?})"),
@@ -257,6 +262,7 @@ impl PartialEq for Outcome {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Outcome::Said(a), Outcome::Said(b)) => a == b,
+            (Outcome::Document(a), Outcome::Document(b)) => a == b,
             (Outcome::Do(a), Outcome::Do(b)) => a == b,
             (Outcome::Quiet, Outcome::Quiet) => true,
             (Outcome::Refused(a), Outcome::Refused(b)) => a == b,

@@ -2478,6 +2478,36 @@ impl Content for CommandSaid {
     }
 }
 
+/// A document a command put in the conversation ([`crate::command::Outcome::Document`]):
+/// release notes out of `/changelog`. Drawn as markdown, the way an answer is,
+/// because it is read like one — headings and lists, not a remark.
+#[derive(Debug)]
+pub struct CommandDocument {
+    pub text: String,
+}
+
+impl Content for CommandDocument {
+    fn kind(&self) -> &'static str {
+        "command"
+    }
+    fn content_hash(&self) -> ContentHash {
+        hash_of(&["command_document", &self.text])
+    }
+    fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+        crate::markdown::render(&self.text, ctx.width, Style::new())
+    }
+    fn summary(&self, ctx: &RenderCtx) -> Line {
+        let first = self
+            .text
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or_default()
+            .trim_start_matches('#')
+            .trim();
+        Line::styled(width::take_width(first, ctx.width as usize), muted())
+    }
+}
+
 /// What a `!` command printed, under the line that ran it.
 ///
 /// Grows while the command runs — a line at a time, because a person ran it to
