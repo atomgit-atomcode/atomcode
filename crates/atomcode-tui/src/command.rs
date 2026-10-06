@@ -326,6 +326,67 @@ pub trait CommandObserver: Send + Sync {
     fn ran(&self, run: &CommandRun<'_>);
 }
 
+/// The commands people actually type, most used first — the order the slash
+/// menu offers them in ([`Commands::matching`]).
+///
+/// From the product's usage counts (2026-10): `/cd` 47k uses, `/login` 44k,
+/// `/model` 38k, … `/remember` 119. A name this build does not have is simply
+/// never matched; one it has and this list does not name comes after all of
+/// these, alphabetically. Reorder from newer counts, not from taste: what the
+/// first row under a letter is, is muscle memory — `/q` is `/quit`, `/m` is
+/// `/model`.
+pub const MOST_USED: &[&str] = &[
+    "cd",
+    "login",
+    "model",
+    "webui",
+    "resume",
+    "quit",
+    "delete_session",
+    "provider",
+    "stop",
+    "session",
+    "usage",
+    "skills",
+    "status",
+    "clear",
+    "auto",
+    "logout",
+    "plan",
+    "effort",
+    "goal",
+    "openrouter",
+    "mcp",
+    "bg",
+    "build",
+    "compact",
+    "rename",
+    "app",
+    "think",
+    "plugin",
+    "cost",
+    "upgrade",
+    "init",
+    "language",
+    "mode",
+    "setup",
+    "reload",
+    "undo",
+    "review",
+    "loop",
+    "context",
+    "config",
+    "save",
+    "whoami",
+    "memory",
+    "sync",
+    "help",
+    "desktop",
+    "copy",
+    "proxy",
+    "remember",
+];
+
 /// Every command mounted, with conflicts refused at mount time.
 #[derive(Default)]
 pub struct Commands {
@@ -434,12 +495,41 @@ impl Commands {
 
     /// Matches for what has been typed after the slash — by command name or by
     /// any alias, so `/ne` surfaces the `session` command while it stays one row.
+    ///
+    /// **Ranked, not alphabetical** — the first row is the one Enter takes, so
+    /// it has to be the one a person typing `/q` or `/m` means. In order:
+    ///
+    /// 1. the command the typed word *is* (its name or an alias);
+    /// 2. the commands in [`MOST_USED`], most used first;
+    /// 3. the rest of this build's own commands, alphabetically;
+    /// 4. the agent's catalog — one row per skill — alphabetically.
+    ///
+    /// Sorted by name alone, `/q` + Enter ran a skill called `quantify-agent`,
+    /// `/m` opened `/mcp`, and the skills a person installed sat between the
+    /// commands they came for. The classic screen kept its own order and its
+    /// skills behind `/skills`, and that order is what fingers learned.
     pub fn matching(&self, prefix: &str) -> Vec<Command> {
         let p = prefix.to_lowercase();
-        self.all()
-            .into_iter()
-            .filter(|c| c.matches_prefix(&p))
-            .collect()
+        let mut out: Vec<(Command, bool)> = Vec::new();
+        for set in self.sets.read().expect("commands poisoned").iter() {
+            let own = set.in_help();
+            for command in set.commands() {
+                if !out.iter().any(|(c, _)| c.name == command.name) {
+                    out.push((command, own));
+                }
+            }
+        }
+        out.retain(|(c, _)| c.matches_prefix(&p));
+        let rank = |(c, own): &(Command, bool)| {
+            let exact = !p.is_empty() && c.answers_to(&p);
+            let used = MOST_USED
+                .iter()
+                .position(|n| c.name.eq_ignore_ascii_case(n))
+                .unwrap_or(usize::MAX);
+            (!exact, used, !*own, c.name.to_lowercase())
+        };
+        out.sort_by_cached_key(rank);
+        out.into_iter().map(|(c, _)| c).collect()
     }
 
     /// The command this name would run, as the registry would run it.
@@ -678,6 +768,92 @@ mod tests {
                 .any(|x| x.name == "playwright-best-practices"),
             "技能仍能从菜单里搜到"
         );
+    }
+
+    /// The first row under a letter is the one Enter takes, so it is the one
+    /// people use most — not the first in the alphabet, and never a skill that
+    /// happens to sort early. The typed word, when it is a command, beats both.
+    #[test]
+    fn the_menu_offers_what_people_use_first_and_skills_last() {
+        struct Builtins;
+        #[async_trait]
+        impl CommandSet for Builtins {
+            fn id(&self) -> &'static str {
+                "row-a"
+            }
+            fn commands(&self) -> Vec<Command> {
+                [
+                    "mcp",
+                    "memory",
+                    "mode",
+                    "model",
+                    "mouse",
+                    "queue",
+                    "cancel-all",
+                    "cd",
+                    "clear",
+                    "config",
+                ]
+                .iter()
+                .map(|n| Command::said(n, "".into()))
+                .chain([Command::said("quit", "".into()).with_aliases(&["exit"])])
+                .collect()
+            }
+            async fn run(&self, name: &str, _args: &str, _ctx: &Context) -> Outcome {
+                Outcome::Said(name.into())
+            }
+        }
+        struct Skills;
+        #[async_trait]
+        impl CommandSet for Skills {
+            fn id(&self) -> &'static str {
+                "cmd-agent-catalog"
+            }
+            fn in_help(&self) -> bool {
+                false
+            }
+            fn commands(&self) -> Vec<Command> {
+                ["quantify-agent", "chrome-browser", "code", "morning"]
+                    .iter()
+                    .map(|n| Command::said(n, "a skill".into()))
+                    .collect()
+            }
+            async fn run(&self, name: &str, _args: &str, _ctx: &Context) -> Outcome {
+                Outcome::Said(name.into())
+            }
+        }
+        let c = Commands::new();
+        c.add(Arc::new(Builtins)).unwrap();
+        c.add(Arc::new(Skills)).unwrap();
+        let names = |typed: &str| -> Vec<String> {
+            c.matching(typed)
+                .into_iter()
+                .map(|x| x.name.into())
+                .collect()
+        };
+        assert_eq!(names("q"), ["quit", "queue", "quantify-agent"]);
+        assert_eq!(
+            names("m"),
+            ["model", "mcp", "mode", "memory", "mouse", "morning"]
+        );
+        assert_eq!(
+            names("c"),
+            [
+                "cd",
+                "clear",
+                "config",
+                "cancel-all",
+                "chrome-browser",
+                "code"
+            ]
+        );
+        // The word typed in full is the command it names, wherever it ranks.
+        assert_eq!(names("mode")[0], "mode");
+        assert_eq!(names("exit")[0], "quit");
+        // Nothing typed: still most used first, skills at the end.
+        let all = names("");
+        assert_eq!(all[0], "cd");
+        assert_eq!(all.last().map(String::as_str), Some("quantify-agent"));
     }
 
     /// An alias shares its command's single row: it is searchable by its own

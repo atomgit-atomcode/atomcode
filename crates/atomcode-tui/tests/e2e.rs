@@ -3091,17 +3091,17 @@ async fn typing_a_slash_shows_what_is_available_and_narrows_as_you_type() {
     s.term.type_text("/");
     s.quiet().await;
     let all = s.screen();
-    // Two that are alphabetically near the top, because the menu shows the
+    // Two from the top of the most-used order, because the menu shows the
     // first ten of what matches and this one is about opening and narrowing,
     // not about which commands the build happens to ship.
-    assert!(all.contains("/clear"), "the menu opens:\n{all}");
-    assert!(all.contains("/compact"), "{all}");
+    assert!(all.contains("/cd"), "the menu opens:\n{all}");
+    assert!(all.contains("/model"), "{all}");
 
     s.term.type_text("comp");
     s.quiet().await;
     let narrowed = s.screen();
     assert!(narrowed.contains("/compact"), "{narrowed}");
-    assert!(!narrowed.contains("/clear"), "it narrows:\n{narrowed}");
+    assert!(!narrowed.contains("/model"), "it narrows:\n{narrowed}");
 
     // And it closes again when the slash goes away.
     for _ in 0..5 {
@@ -3267,7 +3267,7 @@ async fn enter_takes_the_lit_row_even_before_a_name_is_typed() {
     let task = s.open().await;
 
     s.term.type_text("/");
-    until(&s, "/cancel-all").await;
+    until(&s, "/cd").await;
     let lit = lit_slash_name(&s).expect("a lit row");
     assert!(
         !lit.is_empty(),
@@ -3290,9 +3290,12 @@ async fn enter_takes_the_lit_row_even_before_a_name_is_typed() {
         .and_then(|frame| frame.part("input").cloned())
         .map(|part| part.lines.iter().map(|l| l.plain()).collect())
         .unwrap_or_default();
+    // Taken means run, or — for a command that wants an argument, as the first
+    // row `/cd` does — completed onto the line for it. Either way the line is
+    // no longer the bare slash it was.
     assert!(
-        !line.contains('/'),
-        "the line still holds the slash, so nothing was taken:\n{}",
+        !line.contains('/') || line.contains(&format!("/{lit} ")),
+        "enter did not take the lit row `{lit}`:\n{}",
         s.screen()
     );
 
@@ -3320,15 +3323,16 @@ async fn the_arrows_choose_the_row_that_enter_then_takes() {
     .await;
     let task = s.open().await;
 
+    // `context` is used more than `config`, so it is the first row.
     s.term.type_text("/con");
     until(&s, "/config").await;
-    assert_eq!(lit_slash_name(&s).as_deref(), Some("config"));
+    assert_eq!(lit_slash_name(&s).as_deref(), Some("context"));
 
     s.term.press(KeyPress::plain(Key::Down));
     s.quiet().await;
     assert_eq!(
         lit_slash_name(&s).as_deref(),
-        Some("context"),
+        Some("config"),
         "the arrow moved the highlight:\n{}",
         s.screen()
     );
@@ -3336,8 +3340,8 @@ async fn the_arrows_choose_the_row_that_enter_then_takes() {
     s.term.press(KeyPress::plain(Key::Enter));
     s.quiet().await;
     assert!(
-        s.screen().contains("条事实"),
-        "enter took the row the arrows chose, not the first one:\n{}",
+        !s.screen().contains("条事实"),
+        "enter took the first row, not the one the arrows chose:\n{}",
         s.screen()
     );
 
