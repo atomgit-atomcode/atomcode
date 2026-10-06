@@ -7,21 +7,24 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-/// 接入模式:空 arg → OAuth PKCE 浏览器流,非空 → 直接使用已有 key。
-/// 由 `/openrouter` 命令处理器构造并传给 `spawn_openrouter_connect`。
+/// 接入模式。由 `/openrouter` 命令处理器构造并传给 `spawn_openrouter_connect`。
 pub enum ConnectMode {
+    /// OAuth PKCE 浏览器流。
     Oauth,
+    /// 人给的 key。
     ProvidedKey(String),
+    /// 上次授权保存下来的 key:OpenRouter 还认就用,不认才走浏览器。
+    Saved(String),
 }
 
-/// 解析 `/openrouter [arg]` 的参数:trim 后为空则走 OAuth,否则为 ProvidedKey。
-/// 由 `/openrouter` 命令处理器调用。
-pub fn parse_connect_mode(arg: &str) -> ConnectMode {
-    let t = arg.trim();
-    if t.is_empty() {
-        ConnectMode::Oauth
-    } else {
-        ConnectMode::ProvidedKey(t.to_string())
+/// 解析 `/openrouter [arg]` 的参数:空 → 有保存的 key 就用它(`Saved`),没有走 OAuth;
+/// `login` → 不管存没存过都走 OAuth(换账号);其余 → ProvidedKey。
+/// 由 `/openrouter` 命令处理器调用,`saved` 是配置里 OpenRouter 账号现有的 key。
+pub fn parse_connect_mode(arg: &str, saved: Option<String>) -> ConnectMode {
+    match arg.trim() {
+        "" => saved.map_or(ConnectMode::Oauth, ConnectMode::Saved),
+        word if word.eq_ignore_ascii_case("login") => ConnectMode::Oauth,
+        given => ConnectMode::ProvidedKey(given.to_string()),
     }
 }
 
@@ -31,6 +34,8 @@ pub enum OpenRouterConnectEvent {
     AwaitingBrowser {
         auth_url: String,
     },
+    /// 过程中值得说一句的事(用了保存的 key、保存的 key 已失效)。
+    Note(String),
     Ready {
         api_key: String,
         models: Vec<FreeModel>,
@@ -55,29 +60,60 @@ pub fn spawn_openrouter_connect(
     use atomcode_auth::openrouter as or;
     std::thread::spawn(move || {
         let result: Result<(String, or::FreeCatalog), String> = (|| {
+            let oauth = || -> Result<String, String> {
+                let pkce = or::generate_pkce();
+                let cb = or::start_local_callback().map_err(|e| format!("{e:#}"))?;
+                let callback_url = format!("http://127.0.0.1:{}/callback", cb.port());
+                let auth_url = or::build_auth_url(Some(&callback_url), &pkce.challenge);
+                let _ = atomcode_auth::oauth::open_browser(&auth_url);
+                // 把授权 URL 回传主循环显给用户:浏览器没自动打开(headless /
+                // 无 DISPLAY / SSH)时用户仍能手动复制访问,而不是干等超时。
+                let _ = event_tx.send(OpenRouterConnectEvent::AwaitingBrowser { auth_url });
+                let _ = wake_tx.blocking_send(());
+                // 等最长 3 分钟;cancel 由 ESC 置位。
+                let code = cb
+                    .wait_for_code(std::time::Duration::from_secs(180), &cancel)
+                    .map_err(|e| format!("{e:#}"))?
+                    .ok_or_else(|| "已取消或超时".to_string())?;
+                or::exchange_code_for_key(&code, &pkce.verifier).map_err(|e| format!("{e:#}"))
+            };
+            let note = |text: &str| {
+                let _ = event_tx.send(OpenRouterConnectEvent::Note(text.to_string()));
+                let _ = wake_tx.blocking_send(());
+            };
             let key = match mode {
                 ConnectMode::ProvidedKey(k) => k,
-                ConnectMode::Oauth => {
-                    let pkce = or::generate_pkce();
-                    let cb = or::start_local_callback().map_err(|e| format!("{e:#}"))?;
-                    let callback_url = format!("http://127.0.0.1:{}/callback", cb.port());
-                    let auth_url = or::build_auth_url(Some(&callback_url), &pkce.challenge);
-                    let _ = atomcode_auth::oauth::open_browser(&auth_url);
-                    // 把授权 URL 回传主循环显给用户:浏览器没自动打开(headless /
-                    // 无 DISPLAY / SSH)时用户仍能手动复制访问,而不是干等超时。
-                    let _ = event_tx.send(OpenRouterConnectEvent::AwaitingBrowser { auth_url });
-                    let _ = wake_tx.blocking_send(());
-                    // 等最长 3 分钟;cancel 由 ESC 置位。
-                    let code = cb
-                        .wait_for_code(std::time::Duration::from_secs(180), &cancel)
-                        .map_err(|e| format!("{e:#}"))?
-                        .ok_or_else(|| "已取消或超时".to_string())?;
-                    or::exchange_code_for_key(&code, &pkce.verifier)
-                        .map_err(|e| format!("{e:#}"))?
+                ConnectMode::Oauth => oauth()?,
+                // 授权过一次就不再每次去浏览器:OpenRouter 还认就用;明确不认
+                // (被吊销、过期)才重新授权。查不了(断网、代理)不算不认。
+                ConnectMode::Saved(k) => {
+                    match or::check_key(&k) {
+                        or::KeyCheck::Rejected => {
+                            note("上次保存的 key 已经失效,重新授权一次。");
+                            oauth()?
+                        }
+                        or::KeyCheck::Valid => {
+                            note("用的是上次授权保存的 key,不用再去浏览器(要换账号:/openrouter login)。");
+                            k
+                        }
+                        or::KeyCheck::Unknown(_) => {
+                            note("没能确认上次保存的 key 还有没有效(网络或代理?),先照用;后面失败的话用 /openrouter login 重新授权。");
+                            k
+                        }
+                    }
                 }
             };
+            // ESC 之后这里不能再往下:取消了还发 Ready,主循环照样装配——再敲一次
+            // /openrouter 就是两个线程各装配一遍。原本只有浏览器那一步看 cancel。
+            let cancelled = || cancel.load(std::sync::atomic::Ordering::Relaxed);
+            if cancelled() {
+                return Err("已取消".to_string());
+            }
             let catalog =
                 or::fetch_free_catalog(&key, FREE_MODEL_LIMIT).map_err(|e| format!("{e:#}"))?;
+            if cancelled() {
+                return Err("已取消".to_string());
+            }
             if catalog.free.is_empty() {
                 return Err("OpenRouter 未返回可用免费模型".to_string());
             }
@@ -199,9 +235,21 @@ provider = "atomgit"
 
     #[test]
     fn arg_parsing_selects_mode() {
-        assert!(matches!(parse_connect_mode(""), ConnectMode::Oauth));
-        assert!(matches!(parse_connect_mode("   "), ConnectMode::Oauth));
-        match parse_connect_mode("  sk-or-v1-abc  ") {
+        assert!(matches!(parse_connect_mode("", None), ConnectMode::Oauth));
+        assert!(matches!(
+            parse_connect_mode("   ", None),
+            ConnectMode::Oauth
+        ));
+        // 授权过:空 arg 用保存的 key;login 照样走浏览器。
+        assert!(matches!(
+            parse_connect_mode("", Some("sk-saved".into())),
+            ConnectMode::Saved(k) if k == "sk-saved"
+        ));
+        assert!(matches!(
+            parse_connect_mode("login", Some("sk-saved".into())),
+            ConnectMode::Oauth
+        ));
+        match parse_connect_mode("  sk-or-v1-abc  ", Some("sk-saved".into())) {
             ConnectMode::ProvidedKey(k) => assert_eq!(k, "sk-or-v1-abc"),
             _ => panic!("expected ProvidedKey"),
         }

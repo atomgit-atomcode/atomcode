@@ -1922,6 +1922,12 @@ pub enum Msg<'a> {
     CmdAboutOpenRouter,
     OpenRouterTakes,
     OpenRouterConnecting,
+    /// A bare `/openrouter` went on with the key saved last time.
+    OpenRouterUsingSavedKey,
+    /// The saved key was refused; the browser is next.
+    OpenRouterSavedKeyRejected,
+    /// The saved key could not be checked (offline, a proxy); used anyway.
+    OpenRouterSavedKeyUnchecked,
     OpenRouterAuthorise {
         url: &'a str,
     },

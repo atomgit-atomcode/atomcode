@@ -1166,8 +1166,17 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::DesktopLaunchFailed { path, error } => format!("{path} 没能启动:{error}").into(),
         Msg::DesktopNotInstalled { url } => format!("这台机器上没装桌面端——{url}").into(),
         Msg::CmdAboutSchedule => "排了哪些定时任务，各自下次什么时候跑".into(),
-        Msg::CmdAboutOpenRouter => "接上 OpenRouter 的免费模型".into(),
-        Msg::OpenRouterTakes => "[api key]".into(),
+        Msg::CmdAboutOpenRouter => {
+            "接上 OpenRouter 的免费模型(授权过就直接用保存的 key;login 重新授权)".into()
+        }
+        Msg::OpenRouterTakes => "[api key | login]".into(),
+        Msg::OpenRouterUsingSavedKey => {
+            "用的是上次授权保存的 key,不用再去浏览器(要换账号:/openrouter login)。".into()
+        }
+        Msg::OpenRouterSavedKeyRejected => "上次保存的 key 已经失效,重新授权一次。".into(),
+        Msg::OpenRouterSavedKeyUnchecked => {
+            "没能确认上次保存的 key 还有没有效(网络或代理?),先照用;后面失败的话用 /openrouter login 重新授权。".into()
+        }
         Msg::OpenRouterConnecting => "正在接 OpenRouter…".into(),
         Msg::OpenRouterAuthorise { url } => {
             format!("去浏览器里授权。没自动打开的话:{url}").into()
@@ -1199,7 +1208,9 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::OpenRouterNotReloaded { error } => {
             format!("OpenRouter 接上并已保存,但这次会话没重载({error});下次启动生效。").into()
         }
-        Msg::OpenRouterFailed { error } => format!("OpenRouter 没接上:{error}").into(),
+        Msg::OpenRouterFailed { error } => {
+            format!("OpenRouter 没接上:{error}。可以重试,或用 /openrouter login 重新授权。").into()
+        }
         Msg::ScheduleNone => "还没有定时任务。用 `atomcode schedule add` 排一个。".into(),
         Msg::ScheduleTaskLine {
             id,

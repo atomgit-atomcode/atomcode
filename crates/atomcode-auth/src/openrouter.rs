@@ -13,6 +13,9 @@ use std::time::{Duration, Instant};
 pub const OPENROUTER_AUTH_URL: &str = "https://openrouter.ai/auth";
 pub const OPENROUTER_KEYS_URL: &str = "https://openrouter.ai/api/v1/auth/keys";
 pub const OPENROUTER_MODELS_URL: &str = "https://openrouter.ai/api/v1/models";
+/// The key's own information — answers 401 to a key that is not (or no longer)
+/// valid, which the models list does not: that one is public.
+pub const OPENROUTER_KEY_INFO_URL: &str = "https://openrouter.ai/api/v1/key";
 /// The page whose "Free models" list ranks free models by how much they are
 /// used. Not an API: see [`parse_discover_free_ranking`].
 pub const OPENROUTER_DISCOVER_URL: &str = "https://openrouter.ai/discover";
@@ -430,14 +433,23 @@ pub fn provision_with_listed(
         .provider_type
         .wire()
         .to_string();
+    // A key that is already where it comes from — written as `$VAR`, or only
+    // in `OPENROUTER_API_KEY` — stays a reference: writing it out would put a
+    // secret on disk the person chose to keep in their environment.
+    let already_there = saved_key(config).as_deref() == Some(api_key);
+    let from_the_environment = openrouter_env_key().as_deref() == Some(api_key);
     config
         .provider_accounts
         .entry(OPENROUTER_ACCOUNT_ID.to_string())
-        .and_modify(|account| account.api_key = Some(api_key.to_string()))
+        .and_modify(|account| {
+            if !already_there {
+                account.api_key = Some(api_key.to_string());
+            }
+        })
         .or_insert_with(|| ProviderAccountConfig {
             provider: OPENROUTER_ACCOUNT_ID.to_string(),
             display_name: None,
-            api_key: Some(api_key.to_string()),
+            api_key: (!from_the_environment).then(|| api_key.to_string()),
             base_url: None,
             user_agent: None,
             skip_tls_verify: false,
@@ -716,6 +728,77 @@ fn blocking_client() -> Result<reqwest::blocking::Client> {
     // exchange and /models fetch could ignore the configured proxy. OpenRouter
     // is a standard TLS 1.3 endpoint, so no TLS 1.2 cap (force_tls12 = false).
     crate::oauth::blocking_client_with_tls12(false)
+}
+
+/// The key a previous `/openrouter` saved, when there is one: authorised once,
+/// it does not have to be authorised again.
+///
+/// Read the way the account's requests read it — `$VAR`/`${VAR}` expanded, a
+/// bare variable name looked up — and, with nothing written on the account,
+/// `OPENROUTER_API_KEY`. Not the generic fallbacks a request goes on to
+/// (`OPENAI_API_KEY`, `ATOMCODE_API_KEY`): this key is sent to OpenRouter to be
+/// checked, and another provider's key is not OpenRouter's to see.
+pub fn saved_key(config: &atomcode_config::config::Config) -> Option<String> {
+    let written = config
+        .provider_accounts
+        .get(OPENROUTER_ACCOUNT_ID)
+        .and_then(|account| account.api_key.as_deref())
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty());
+    let key = match written {
+        Some(raw) if raw.contains('$') => {
+            Some(atomcode_config::config::provider::expand_env_vars(raw))
+        }
+        Some(raw) => Some(std::env::var(raw).unwrap_or_else(|_| raw.to_string())),
+        None => openrouter_env_key(),
+    };
+    key.filter(|key| !key.trim().is_empty())
+}
+
+/// OpenRouter's own variable — the preset's `api_key_env`.
+fn openrouter_env_key() -> Option<String> {
+    atomcode_config::config::provider_preset::preset_or_compatible(OPENROUTER_ACCOUNT_ID)
+        .api_key_env
+        .and_then(|name| std::env::var(name).ok())
+        .filter(|key| !key.trim().is_empty())
+}
+
+/// What OpenRouter says of a key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyCheck {
+    /// It answers to it.
+    Valid,
+    /// It refused it (401/403): revoked, expired, deleted. Authorise again.
+    Rejected,
+    /// No answer that says either — offline, a proxy, a server error. Not a
+    /// reason to send a person through the browser again: the key is used, and
+    /// what fails next says why in its own words.
+    Unknown(String),
+}
+
+/// Ask OpenRouter whether `api_key` is still good, without spending anything:
+/// `GET /api/v1/key`.
+pub fn check_key(api_key: &str) -> KeyCheck {
+    let client = match blocking_client() {
+        Ok(client) => client,
+        Err(error) => return KeyCheck::Unknown(format!("{error:#}")),
+    };
+    match client
+        .get(OPENROUTER_KEY_INFO_URL)
+        .bearer_auth(api_key)
+        .send()
+    {
+        Ok(resp) => key_check_of(resp.status().as_u16()),
+        Err(error) => KeyCheck::Unknown(error.to_string()),
+    }
+}
+
+fn key_check_of(status: u16) -> KeyCheck {
+    match status {
+        200..=299 => KeyCheck::Valid,
+        401 | 403 => KeyCheck::Rejected,
+        other => KeyCheck::Unknown(format!("HTTP {other}")),
+    }
 }
 
 /// POST /api/v1/auth/keys {code, code_verifier, code_challenge_method:"S256"} → key。
@@ -1091,6 +1174,50 @@ mod tests {
             assert!(c
                 .models
                 .contains_key("openrouter/stealth/space-bunny-alpha"));
+        }
+
+        #[test]
+        fn a_saved_key_is_the_account_s_and_an_answer_says_whether_it_holds() {
+            let mut c = Config::default();
+            assert_eq!(saved_key(&c), None);
+            provision(&mut c, "sk-or-1", &[free("a/x:free")]);
+            assert_eq!(saved_key(&c).as_deref(), Some("sk-or-1"));
+            c.provider_accounts
+                .get_mut(OPENROUTER_ACCOUNT_ID)
+                .unwrap()
+                .api_key = Some("  ".into());
+            assert_eq!(saved_key(&c), None, "a blank key is no key");
+
+            // A reference is read, and left a reference when it is the key.
+            let var = "ATOMCODE_TEST_OPENROUTER_KEY_REF";
+            std::env::set_var(var, "sk-or-from-env");
+            c.provider_accounts
+                .get_mut(OPENROUTER_ACCOUNT_ID)
+                .unwrap()
+                .api_key = Some(format!("${{{var}}}"));
+            assert_eq!(saved_key(&c).as_deref(), Some("sk-or-from-env"));
+            provision(&mut c, "sk-or-from-env", &[free("a/x:free")]);
+            assert_eq!(
+                c.provider_accounts[OPENROUTER_ACCOUNT_ID]
+                    .api_key
+                    .as_deref(),
+                Some(format!("${{{var}}}").as_str()),
+                "not written out over the reference"
+            );
+            provision(&mut c, "sk-or-new", &[free("a/x:free")]);
+            assert_eq!(
+                c.provider_accounts[OPENROUTER_ACCOUNT_ID]
+                    .api_key
+                    .as_deref(),
+                Some("sk-or-new"),
+                "a different key replaces it"
+            );
+            std::env::remove_var(var);
+
+            assert_eq!(key_check_of(200), KeyCheck::Valid);
+            assert_eq!(key_check_of(401), KeyCheck::Rejected);
+            assert_eq!(key_check_of(403), KeyCheck::Rejected);
+            assert!(matches!(key_check_of(502), KeyCheck::Unknown(_)));
         }
 
         #[test]

@@ -163,7 +163,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "whoami",  desc: "Show current logged-in user", needs_args: false, hidden: false, acp: false },
     Command { name: "model",   desc: "Switch provider / model", needs_args: false, hidden: false, acp: true },
     Command { name: "provider", desc: "Manage providers (add / edit / delete)", needs_args: false, hidden: false, acp: false },
-    Command { name: "openrouter", desc: "Connect to OpenRouter free models (/openrouter for OAuth, /openrouter <key> with existing key)", needs_args: false, hidden: false, acp: false },
+    Command { name: "openrouter", desc: "Connect to OpenRouter free models (/openrouter reuses the saved key, or OAuth the first time; /openrouter login authorises again; /openrouter <key> uses that key)", needs_args: false, hidden: false, acp: false },
     Command { name: "proxy",   desc: "Switch outbound proxy mode", needs_args: false, hidden: false, acp: false },
     Command { name: "status",  desc: "Show session status", needs_args: false, hidden: false, acp: true },
     Command { name: "config",  desc: "Show config path", needs_args: false, hidden: false, acp: true },

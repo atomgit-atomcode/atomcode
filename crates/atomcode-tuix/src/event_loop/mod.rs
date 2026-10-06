@@ -9564,6 +9564,10 @@ fn handle_openrouter_connect_event(
             )));
             renderer.flush();
         }
+        OpenRouterConnectEvent::Note(text) => {
+            renderer.render(UiLine::Muted(text));
+            renderer.flush();
+        }
         OpenRouterConnectEvent::Ready {
             api_key,
             models,
@@ -9629,7 +9633,7 @@ fn handle_openrouter_connect_event(
         }
         OpenRouterConnectEvent::Failed(reason) => {
             renderer.render(UiLine::Error(format!(
-                "OpenRouter 接入失败: {reason}。可重试 /openrouter,或 /openrouter <你的key> 直接接入。"
+                "OpenRouter 接入失败: {reason}。可重试 /openrouter,/openrouter login 重新授权,或 /openrouter <你的key> 直接接入。"
             )));
             renderer.flush();
         }

@@ -1,8 +1,10 @@
 //! `/openrouter`:一条命令接上 OpenRouter 的免费模型。
 //!
-//! 经典界面的同名命令在新屏幕上的对应(翻默认后原有功能不能丢)。两种给 key 的方式,
-//! 与经典界面一致:`/openrouter` 走浏览器授权(PKCE + 本机回调),`/openrouter <key>`
-//! 直接用人给的 key。拿到 key 之后一样:拉前几个免费模型、写进配置、让活着的东西重载。
+//! 经典界面的同名命令在新屏幕上的对应(翻默认后原有功能不能丢)。给 key 的方式与经典
+//! 界面一致:`/openrouter` 先用上次授权保存下来的 key——还认就不再去浏览器,不认
+//! (被吊销、过期)才走浏览器授权(PKCE + 本机回调);`/openrouter login` 直接重新授权
+//! (换账号);`/openrouter <key>` 用人给的 key。拿到 key 之后一样:拉前几个免费模型、
+//! 写进配置、让活着的东西重载。
 //!
 //! **为什么在 cli**:凭据与配置文件是宿主的事,屏幕只负责显示说了什么
 //! (`docs/adr/0022` §3,与 `/login`、`/proxy` 同一条线)。
@@ -77,7 +79,9 @@ impl Plugin for OpenRouterRow {
 /// 人怎么给 key。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Mode {
-    /// 浏览器授权。
+    /// 上次保存的 key 还认就用它,没有或不认才去浏览器。
+    Saved,
+    /// 浏览器授权,不管存没存过(`login`:换账号、或想重新授权)。
     Browser,
     /// 人自己贴的 key。
     Given(String),
@@ -85,11 +89,43 @@ pub(crate) enum Mode {
 
 impl Mode {
     pub(crate) fn of(args: &str) -> Self {
-        let given = args.trim();
-        if given.is_empty() {
-            Mode::Browser
-        } else {
-            Mode::Given(given.to_string())
+        match args.trim() {
+            "" => Mode::Saved,
+            // A key is never this word, so it cannot be mistaken for one.
+            word if word.eq_ignore_ascii_case("login") => Mode::Browser,
+            given => Mode::Given(given.to_string()),
+        }
+    }
+}
+
+/// The key a bare `/openrouter` goes on with: the one saved last time, unless
+/// OpenRouter refuses it — authorised once, a person is not sent through the
+/// browser again every time. A check that could not be made (offline, a proxy)
+/// is not a refusal: the saved key is used, and whatever fails next says why.
+fn saved_or_authorised(
+    saved: Option<String>,
+    check: &dyn Fn(&str) -> atomcode_auth::openrouter::KeyCheck,
+    authorise: &dyn Fn(&dyn Fn(String)) -> Result<String, String>,
+    say: &dyn Fn(String),
+) -> Result<String, String> {
+    use atomcode_auth::openrouter::KeyCheck;
+    let Some(key) = saved else {
+        return authorise(say);
+    };
+    match check(&key) {
+        KeyCheck::Rejected => {
+            say(tr(SMsg::OpenRouterSavedKeyRejected).into_owned());
+            authorise(say)
+        }
+        KeyCheck::Valid => {
+            say(tr(SMsg::OpenRouterUsingSavedKey).into_owned());
+            Ok(key)
+        }
+        // Not said as a success: nobody confirmed it, and if what follows
+        // fails, `login` is the way out rather than the same key again.
+        KeyCheck::Unknown(_) => {
+            say(tr(SMsg::OpenRouterSavedKeyUnchecked).into_owned());
+            Ok(key)
         }
     }
 }
@@ -113,9 +149,21 @@ impl World {
         // spawns — the same reason `/login` takes one.
         let runtime = tokio::runtime::Handle::current();
         Self {
-            key: Arc::new(|mode, say| match mode {
-                Mode::Given(key) => Ok(key),
-                Mode::Browser => authorise(say),
+            key: Arc::new({
+                let path = config_path.clone();
+                move |mode, say| match mode {
+                    Mode::Given(key) => Ok(key),
+                    Mode::Browser => authorise(say),
+                    Mode::Saved => saved_or_authorised(
+                        atomcode_config::config::Config::load(&path)
+                            .ok()
+                            .as_ref()
+                            .and_then(atomcode_auth::openrouter::saved_key),
+                        &atomcode_auth::openrouter::check_key,
+                        &|say| authorise(say),
+                        say,
+                    ),
+                }
             }),
             models: Arc::new(|key| {
                 atomcode_auth::openrouter::fetch_free_catalog(key, FREE_MODEL_LIMIT)
@@ -260,6 +308,70 @@ mod tests {
     use atomcode_auth::openrouter::FreeModel;
     use std::sync::Mutex;
 
+    #[test]
+    fn a_bare_command_reuses_login_reauthorises_anything_else_is_a_key() {
+        assert_eq!(Mode::of(""), Mode::Saved);
+        assert_eq!(Mode::of("  "), Mode::Saved);
+        assert_eq!(Mode::of("login"), Mode::Browser);
+        assert_eq!(Mode::of("LOGIN"), Mode::Browser);
+        assert_eq!(Mode::of("sk-or-v1-x"), Mode::Given("sk-or-v1-x".into()));
+    }
+
+    /// Authorised once, not again: a saved key OpenRouter still answers to is
+    /// used as it is, and so is one that could not be checked (offline); only a
+    /// key it refuses sends the person back to the browser — and is said so.
+    #[test]
+    fn a_saved_key_is_reused_until_openrouter_refuses_it() {
+        use atomcode_auth::openrouter::KeyCheck;
+        let browser = std::cell::Cell::new(0);
+        let authorise = |_: &dyn Fn(String)| -> Result<String, String> {
+            browser.set(browser.get() + 1);
+            Ok("fresh".into())
+        };
+        let said = Mutex::new(Vec::<String>::new());
+        let say = |line: String| said.lock().unwrap().push(line);
+
+        let key = saved_or_authorised(Some("old".into()), &|_| KeyCheck::Valid, &authorise, &say);
+        assert_eq!(key.as_deref(), Ok("old"));
+        let key = saved_or_authorised(
+            Some("old".into()),
+            &|_| KeyCheck::Unknown("offline".into()),
+            &authorise,
+            &say,
+        );
+        assert_eq!(
+            key.as_deref(),
+            Ok("old"),
+            "a check that could not be made is no refusal"
+        );
+        assert_eq!(browser.get(), 0, "no browser while the key holds");
+        assert_eq!(
+            *said.lock().unwrap(),
+            vec![
+                tr(SMsg::OpenRouterUsingSavedKey).into_owned(),
+                tr(SMsg::OpenRouterSavedKeyUnchecked).into_owned(),
+            ],
+            "an unchecked key is not said to be fine"
+        );
+
+        let key = saved_or_authorised(
+            Some("old".into()),
+            &|_| KeyCheck::Rejected,
+            &authorise,
+            &say,
+        );
+        assert_eq!(key.as_deref(), Ok("fresh"));
+        assert_eq!(browser.get(), 1);
+        assert!(said
+            .lock()
+            .unwrap()
+            .contains(&tr(SMsg::OpenRouterSavedKeyRejected).into_owned()));
+
+        let key = saved_or_authorised(None, &|_| KeyCheck::Valid, &authorise, &say);
+        assert_eq!(key.as_deref(), Ok("fresh"), "nothing saved: the browser");
+        assert_eq!(browser.get(), 2);
+    }
+
     fn model(id: &str) -> FreeModel {
         FreeModel {
             id: id.to_string(),
@@ -285,7 +397,7 @@ mod tests {
             World {
                 key: Arc::new(|mode, _say| match mode {
                     Mode::Given(key) => Ok(key),
-                    Mode::Browser => Ok("from-the-browser".into()),
+                    Mode::Browser | Mode::Saved => Ok("from-the-browser".into()),
                 }),
                 models: Arc::new(move |_| models.clone()),
                 save: Arc::new(move |_, catalog| {

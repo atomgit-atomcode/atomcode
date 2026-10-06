@@ -2056,7 +2056,10 @@ fn execute_slash_command_impl(
             *active_modal = Some(Box::new(crate::modals::ProviderPanel::open()));
         }
         "openrouter" => {
-            let mode = crate::event_loop::openrouter_connect::parse_connect_mode(arg);
+            let mode = crate::event_loop::openrouter_connect::parse_connect_mode(
+                arg,
+                atomcode_auth::openrouter::saved_key(&ctx.config),
+            );
             // 取消任何仍在跑的上一次连接,再给本次分派一个全新的 cancel flag。
             // 复用同一 Arc + store(false) 会让"ESC 取消旧任务后立刻再 /openrouter"
             // 的 store(false) 把旧任务反取消,两个后台线程都发 Ready → 重复装配。

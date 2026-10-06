@@ -1243,8 +1243,19 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("The desktop app is not installed here — {url}").into()
         }
         Msg::CmdAboutSchedule => "the scheduled tasks, and when each runs next".into(),
-        Msg::CmdAboutOpenRouter => "connect OpenRouter's free models".into(),
-        Msg::OpenRouterTakes => "[api key]".into(),
+        Msg::CmdAboutOpenRouter => {
+            "connect OpenRouter's free models (reuses the saved key once authorised; login authorises again)".into()
+        }
+        Msg::OpenRouterTakes => "[api key | login]".into(),
+        Msg::OpenRouterUsingSavedKey => {
+            "Using the key saved last time — no browser needed (to switch accounts: /openrouter login).".into()
+        }
+        Msg::OpenRouterSavedKeyRejected => {
+            "The saved key is no longer valid; authorising again.".into()
+        }
+        Msg::OpenRouterSavedKeyUnchecked => {
+            "Could not check whether the saved key still works (network or proxy?); using it anyway — if what follows fails, authorise again with /openrouter login.".into()
+        }
         Msg::OpenRouterConnecting => "Connecting OpenRouter…".into(),
         Msg::OpenRouterAuthorise { url } => {
             format!("Authorise in the browser. If it did not open: {url}").into()
@@ -1281,7 +1292,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "OpenRouter is connected and saved, but this session was not reloaded ({error}); it takes effect on the next launch."
         )
         .into(),
-        Msg::OpenRouterFailed { error } => format!("OpenRouter was not connected: {error}").into(),
+        Msg::OpenRouterFailed { error } => format!(
+            "OpenRouter was not connected: {error}. Try again, or authorise again with /openrouter login."
+        )
+        .into(),
         Msg::ScheduleNone => {
             "Nothing is scheduled. `atomcode schedule add` sets one up.".into()
         }
