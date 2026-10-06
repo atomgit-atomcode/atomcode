@@ -40,6 +40,14 @@ pub enum Msg<'a> {
         suggestion: Option<&'a str>,
         detail: &'a str,
     },
+    /// A 404 about the model rather than the address: the base_url is right and
+    /// the server has nothing behind that model — taken down, renamed, no longer
+    /// free, or unable to serve what the request asks (OpenRouter's
+    /// "No endpoints found for …").
+    ChatModelUnavailable {
+        code: u16,
+        detail: &'a str,
+    },
     /// A streaming request answered with a JSON error instead of a stream — an
     /// overload or a rate limit sent as 200. The address is right; the error is
     /// passed on in the server's words.

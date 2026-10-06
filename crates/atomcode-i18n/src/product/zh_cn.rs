@@ -33,6 +33,17 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             )
             .into()
         }
+        Msg::ChatModelUnavailable { code, detail } => {
+            let said = if detail.trim().is_empty() {
+                String::new()
+            } else {
+                format!("服务端返回：{}", detail.trim())
+            };
+            format!(
+                "这个模型现在用不了（HTTP {code}）：服务端没有能接它的端点——多半已下架、改了名或不再免费，也可能不支持这次请求要用的能力（如工具调用）。用 /model 换一个模型。{said}"
+            )
+            .into()
+        }
         Msg::ChatUpstreamErrorBody { url, detail } => format!(
             "上游没有返回流式数据，而是回了一条错误：{detail}（POST {url}）。多半是上游临时故障或限流，稍后再试。"
         )

@@ -1186,6 +1186,13 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             )
             .into(),
         },
+        Msg::OpenRouterDefaultRetired { from, to } => {
+            format!("原来的默认模型 `{from}` OpenRouter 已经不再提供,已换成 `{to}`。").into()
+        }
+        Msg::OpenRouterRetired { names } => format!(
+            "另外删掉了 OpenRouter 已经不再提供的模型(不管是不是你自己加的,留着只会一用就 404):{names}。"
+        )
+        .into(),
         Msg::OpenRouterDefaultReplaced { from, to } => {
             format!("原来的默认模型 `{from}` 不在这次的免费推荐里,已换成 `{to}`。").into()
         }

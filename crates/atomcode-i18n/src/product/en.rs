@@ -31,6 +31,17 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             )
             .into()
         }
+        Msg::ChatModelUnavailable { code, detail } => {
+            let said = if detail.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" The server said: {}", detail.trim())
+            };
+            format!(
+                "This model cannot be used right now (HTTP {code}): the server has no endpoint for it — most likely taken down, renamed or no longer free, or unable to serve what this request needs (such as tool calls). Switch with /model.{said}"
+            )
+            .into()
+        }
         Msg::ChatUpstreamErrorBody { url, detail } => format!(
             "The upstream answered with an error instead of a stream: {detail} (POST {url}). Most likely a temporary outage or rate limit; try again shortly."
         )

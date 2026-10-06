@@ -1265,6 +1265,14 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             )
             .into(),
         },
+        Msg::OpenRouterDefaultRetired { from, to } => format!(
+            "The default `{from}` is no longer offered by OpenRouter; it is now `{to}`."
+        )
+        .into(),
+        Msg::OpenRouterRetired { names } => format!(
+            "Also removed, because OpenRouter no longer offers them (whoever added them; kept, they only answer 404): {names}."
+        )
+        .into(),
         Msg::OpenRouterDefaultReplaced { from, to } => {
             format!("The default `{from}` is not in this recommendation; it is now `{to}`.")
                 .into()

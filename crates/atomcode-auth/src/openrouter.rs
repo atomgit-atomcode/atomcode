@@ -89,6 +89,29 @@ pub fn parse_key_response(body: &str) -> Result<String> {
         .context("/auth/keys response missing `key`")
 }
 
+/// Every model id `/api/v1/models` lists — what OpenRouter offers at all, free
+/// or not. What [`provision_with_listed`] checks the configured models against.
+pub fn listed_model_ids(models_json: &str) -> Result<std::collections::HashSet<String>> {
+    #[derive(Deserialize)]
+    struct ModelsResp {
+        data: Vec<Listed>,
+    }
+    #[derive(Deserialize)]
+    struct Listed {
+        id: String,
+    }
+    let resp: ModelsResp = serde_json::from_str(models_json).context("parse /models response")?;
+    Ok(resp.data.into_iter().map(|m| m.id).collect())
+}
+
+/// What one look at OpenRouter's model list found: the free models to offer,
+/// and every id it lists at all.
+#[derive(Debug, Default, Clone)]
+pub struct FreeCatalog {
+    pub free: Vec<FreeModel>,
+    pub listed: std::collections::HashSet<String>,
+}
+
 pub fn select_top_free_models(models_json: &str, limit: usize) -> Result<Vec<FreeModel>> {
     select_top_free_models_ranked(models_json, &[], limit)
 }
@@ -329,7 +352,13 @@ pub struct Provisioned {
     pub added: Vec<String>,
     /// Free models a previous run added that are no longer among the current
     /// ones — gone from the list, paid now, or overtaken — and were removed.
+    /// Includes [`Self::retired`].
     pub removed: Vec<String>,
+    /// Of `removed`, entries this command did not mark — added by hand, or by
+    /// a build older than the mark — taken out because OpenRouter does not
+    /// offer the model at all any more: it cannot answer anybody, and kept it
+    /// stays on the list to be picked and fail.
+    pub retired: Vec<String>,
     /// The default model after this run.
     pub default_model: Option<String>,
     /// The default this run replaced, when the default was one of the removed
@@ -364,6 +393,32 @@ pub fn provision(
     config: &mut atomcode_config::config::Config,
     api_key: &str,
     models: &[FreeModel],
+) -> Provisioned {
+    provision_with_listed(config, api_key, models, &std::collections::HashSet::new())
+}
+
+/// [`provision`], knowing every model OpenRouter lists (`listed`, from the same
+/// `/api/v1/models` the free ones were picked from).
+///
+/// One more thing is removed then, whoever added it: an entry on the OpenRouter
+/// account whose model OpenRouter no longer offers at all. Its being unmarked
+/// is why `provision` leaves the person's own models alone, and that is still
+/// so for every model OpenRouter offers; one it has taken down cannot be
+/// called by anyone, and left in place it is picked and answers 404 ("No
+/// endpoints found"). An empty `listed` says nothing is known, and nothing
+/// more is removed.
+///
+/// A variant suffix the list does not spell out (`x:online`, `x:nitro`) is
+/// judged by its base model; `:free` is not a variant but a model of its own,
+/// so a free model gone while its paid twin stays is gone. Only ids shaped like
+/// the list's own — `vendor/model`, no `@`/`~` prefix — are judged at all:
+/// OpenRouter answers ids it never lists (`@preset/…`), and an entry that is
+/// not on the list's terms is not known to be gone. Case is not a difference.
+pub fn provision_with_listed(
+    config: &mut atomcode_config::config::Config,
+    api_key: &str,
+    models: &[FreeModel],
+    listed: &std::collections::HashSet<String>,
 ) -> Provisioned {
     use atomcode_config::config::provider::{
         default_context_window_for, ModelProfileConfig, ProviderAccountConfig,
@@ -407,12 +462,43 @@ pub fn provision(
         .map(|m| format!("{OPENROUTER_ACCOUNT_ID}/{}", m.id))
         .collect();
 
-    let removed: Vec<String> = config
+    let listed: std::collections::HashSet<String> =
+        listed.iter().map(|id| id.to_ascii_lowercase()).collect();
+    let judged = |model: &str| {
+        !model.starts_with(['@', '~'])
+            && model
+                .split_once('/')
+                .is_some_and(|(vendor, name)| !vendor.is_empty() && !name.is_empty())
+    };
+    let offered = |model: &str| {
+        let model = model.to_ascii_lowercase();
+        listed.contains(&model)
+            || model
+                .rsplit_once(':')
+                .is_some_and(|(base, variant)| variant != "free" && listed.contains(base))
+    };
+    let retired: Vec<String> = match listed.is_empty() {
+        true => Vec::new(),
+        false => config
+            .models
+            .iter()
+            .filter(|(id, m)| {
+                m.account == OPENROUTER_ACCOUNT_ID
+                    && !managed(m)
+                    && !wanted.contains(id)
+                    && judged(&m.model)
+                    && !offered(&m.model)
+            })
+            .map(|(id, _)| id.clone())
+            .collect(),
+    };
+    let mut removed: Vec<String> = config
         .models
         .iter()
         .filter(|(id, m)| managed(m) && !wanted.contains(id))
         .map(|(id, _)| id.clone())
         .collect();
+    removed.extend(retired.iter().cloned());
     for id in &removed {
         config.models.remove(id);
     }
@@ -491,6 +577,7 @@ pub fn provision(
     Provisioned {
         added,
         removed,
+        retired,
         default_model: config.default_model.clone(),
         default_replaced,
     }
@@ -654,6 +741,12 @@ pub fn exchange_code_for_key(code: &str, verifier: &str) -> Result<String> {
 /// GET /api/v1/models(Bearer)→ 过滤 free,按 OpenRouter「Free models」榜单(用量)
 /// 排序、榜单外按 context 降序,取 limit。榜单取不到时整体退回按 context 排。
 pub fn fetch_top_free_models(api_key: &str, limit: usize) -> Result<Vec<FreeModel>> {
+    fetch_free_catalog(api_key, limit).map(|catalog| catalog.free)
+}
+
+/// [`fetch_top_free_models`], with every id the list carries beside them — one
+/// request for both, for [`provision_with_listed`].
+pub fn fetch_free_catalog(api_key: &str, limit: usize) -> Result<FreeCatalog> {
     let client = blocking_client()?;
     let resp = client
         .get(OPENROUTER_MODELS_URL)
@@ -666,7 +759,10 @@ pub fn fetch_top_free_models(api_key: &str, limit: usize) -> Result<Vec<FreeMode
         anyhow::bail!("OpenRouter /models 返回 HTTP {}", status.as_u16());
     }
     let ranking = fetch_discover_ranking(&client);
-    select_top_free_models_ranked(&body, &ranking, limit)
+    Ok(FreeCatalog {
+        free: select_top_free_models_ranked(&body, &ranking, limit)?,
+        listed: listed_model_ids(&body)?,
+    })
 }
 
 #[cfg(test)]
@@ -894,6 +990,116 @@ mod tests {
             m.rank = None;
             m.context_window = 7;
             m
+        }
+
+        fn listed(ids: &[&str]) -> std::collections::HashSet<String> {
+            ids.iter().map(|s| s.to_string()).collect()
+        }
+
+        /// The reported case: a model an older build added, unmarked, that
+        /// OpenRouter has since taken down. It is removed — whoever added it, it
+        /// cannot answer anybody — and the default that named it moves on.
+        /// Everything OpenRouter still offers stays the person's.
+        #[test]
+        fn a_model_openrouter_no_longer_offers_is_removed_whoever_added_it() {
+            let mut c = Config::default();
+            c.models.insert(
+                "openrouter/stealth/space-bunny-alpha".into(),
+                own("openrouter", "stealth/space-bunny-alpha"),
+            );
+            c.models.insert(
+                "openrouter/openai/gpt-5".into(),
+                own("openrouter", "openai/gpt-5"),
+            );
+            c.models.insert(
+                "openrouter/openai/gpt-5:online".into(),
+                own("openrouter", "openai/gpt-5:online"),
+            );
+            c.models.insert(
+                "openrouter/vendor/gone:free".into(),
+                own("openrouter", "vendor/gone:free"),
+            );
+            c.models.insert(
+                "elsewhere/stealth".into(),
+                own("elsewhere", "stealth/space-bunny-alpha"),
+            );
+            c.models.insert(
+                "openrouter/@preset/my-coding".into(),
+                own("openrouter", "@preset/my-coding"),
+            );
+            c.models.insert(
+                "openrouter/OpenAI/GPT-5".into(),
+                own("openrouter", "OpenAI/GPT-5"),
+            );
+            c.default_model = Some("openrouter/stealth/space-bunny-alpha".into());
+
+            let out = provision_with_listed(
+                &mut c,
+                "k",
+                &[free("a/x:free")],
+                &listed(&["a/x:free", "openai/gpt-5", "vendor/gone"]),
+            );
+
+            let mut retired = out.retired.clone();
+            retired.sort();
+            assert_eq!(
+                retired,
+                vec![
+                    "openrouter/stealth/space-bunny-alpha",
+                    "openrouter/vendor/gone:free"
+                ],
+                "taken down: gone, and a free model whose paid twin stays"
+            );
+            assert!(out.retired.iter().all(|id| out.removed.contains(id)));
+            assert!(
+                c.models.contains_key("openrouter/openai/gpt-5"),
+                "offered: theirs"
+            );
+            assert!(
+                c.models.contains_key("openrouter/openai/gpt-5:online"),
+                "a variant of an offered model: theirs"
+            );
+            assert!(
+                c.models.contains_key("elsewhere/stealth"),
+                "another account: not ours to judge"
+            );
+            assert!(
+                c.models.contains_key("openrouter/@preset/my-coding"),
+                "an id the list never carries is not known to be gone"
+            );
+            assert!(
+                c.models.contains_key("openrouter/OpenAI/GPT-5"),
+                "case is not a difference"
+            );
+            assert_eq!(
+                out.default_replaced.as_deref(),
+                Some("openrouter/stealth/space-bunny-alpha")
+            );
+            assert_eq!(c.default_model.as_deref(), Some("openrouter/a/x:free"));
+        }
+
+        /// Not knowing what OpenRouter lists is not knowing a model is gone.
+        #[test]
+        fn without_the_list_nothing_unmarked_is_removed() {
+            let mut c = Config::default();
+            c.models.insert(
+                "openrouter/stealth/space-bunny-alpha".into(),
+                own("openrouter", "stealth/space-bunny-alpha"),
+            );
+            let out = provision(&mut c, "k", &[free("a/x:free")]);
+            assert!(out.retired.is_empty());
+            assert!(c
+                .models
+                .contains_key("openrouter/stealth/space-bunny-alpha"));
+        }
+
+        #[test]
+        fn every_listed_id_is_read_off_the_models_response() {
+            let ids = listed_model_ids(
+                r#"{"data":[{"id":"a/x:free"},{"id":"openai/gpt-5","name":"GPT"}]}"#,
+            )
+            .unwrap();
+            assert_eq!(ids, listed(&["a/x:free", "openai/gpt-5"]));
         }
 
         #[test]

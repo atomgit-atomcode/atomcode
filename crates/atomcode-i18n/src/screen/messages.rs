@@ -1941,6 +1941,16 @@ pub enum Msg<'a> {
         from: &'a str,
         to: &'a str,
     },
+    /// The default was a model OpenRouter no longer offers; it is now `to`.
+    OpenRouterDefaultRetired {
+        from: &'a str,
+        to: &'a str,
+    },
+    /// Models removed because OpenRouter no longer offers them at all, whoever
+    /// added them.
+    OpenRouterRetired {
+        names: &'a str,
+    },
     OpenRouterNotReloaded {
         error: &'a str,
     },

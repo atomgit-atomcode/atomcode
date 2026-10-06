@@ -20,7 +20,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use atomcode_auth::openrouter::{provision, FreeModel, Provisioned};
+use atomcode_auth::openrouter::{provision_with_listed, FreeCatalog, Provisioned};
 use atomcode_harness::seams::{UiSvc, UserInterface};
 use atomcode_host_api::HostCommand;
 use atomcode_plexus::{Context, Plugin};
@@ -98,10 +98,10 @@ impl Mode {
 struct World {
     /// 拿到 key:人给的,或走一趟授权(过程中说自己在干什么)。
     key: Arc<dyn Fn(Mode, &dyn Fn(String)) -> Result<String, String> + Send + Sync>,
-    /// 这个 key 能用的免费模型。
-    models: Arc<dyn Fn(&str) -> Result<Vec<FreeModel>, String> + Send + Sync>,
+    /// 这个 key 能用的免费模型,以及 OpenRouter 现在列出的全部模型。
+    models: Arc<dyn Fn(&str) -> Result<FreeCatalog, String> + Send + Sync>,
     /// 写进配置文件。
-    save: Arc<dyn Fn(&str, &[FreeModel]) -> Result<Provisioned, String> + Send + Sync>,
+    save: Arc<dyn Fn(&str, &FreeCatalog) -> Result<Provisioned, String> + Send + Sync>,
     /// 告诉活着的东西配置变了。
     reload: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
 }
@@ -118,14 +118,15 @@ impl World {
                 Mode::Browser => authorise(say),
             }),
             models: Arc::new(|key| {
-                atomcode_auth::openrouter::fetch_top_free_models(key, FREE_MODEL_LIMIT)
+                atomcode_auth::openrouter::fetch_free_catalog(key, FREE_MODEL_LIMIT)
                     .map_err(|error| format!("{error:#}"))
             }),
-            save: Arc::new(move |key, models| {
+            save: Arc::new(move |key, catalog| {
                 let mut outcome = Provisioned::default();
                 atomcode_config::ConfigStore::new(path.clone())
                     .update(|config| {
-                        outcome = provision(config, key, models);
+                        outcome =
+                            provision_with_listed(config, key, &catalog.free, &catalog.listed);
                         Ok(())
                     })
                     .map_err(|error| error.to_string())?;
@@ -219,7 +220,7 @@ fn connect(world: &World, mode: Mode, say: &dyn Fn(String)) {
         Ok(models) => models,
         Err(error) => return say(tr(SMsg::OpenRouterFailed { error: &error }).into_owned()),
     };
-    if models.is_empty() {
+    if models.free.is_empty() {
         return say(tr(SMsg::OpenRouterNoFreeModels).into_owned());
     }
     let outcome = match (world.save)(&key, &models) {
@@ -227,14 +228,26 @@ fn connect(world: &World, mode: Mode, say: &dyn Fn(String)) {
         Err(error) => return say(tr(SMsg::OpenRouterFailed { error: &error }).into_owned()),
     };
     let default = outcome.default_model.clone().unwrap_or_default();
+    // The swapped-out free models only: the ones OpenRouter took down are said
+    // on their own line below, because "your own models were not touched" is
+    // not true of them.
     say(tr(SMsg::OpenRouterConnected {
         added: outcome.added.len(),
-        removed: outcome.removed.len(),
+        removed: outcome.removed.len() - outcome.retired.len(),
         default: &default,
     })
     .into_owned());
+    // 「你自己配置的模型没有改动」对这几条不成立,所以单独说:哪几条、为什么。
+    if !outcome.retired.is_empty() {
+        let names = outcome.retired.join("、");
+        say(tr(SMsg::OpenRouterRetired { names: &names }).into_owned());
+    }
     if let Some(from) = &outcome.default_replaced {
-        say(tr(SMsg::OpenRouterDefaultReplaced { from, to: &default }).into_owned());
+        let said = match outcome.retired.contains(from) {
+            true => SMsg::OpenRouterDefaultRetired { from, to: &default },
+            false => SMsg::OpenRouterDefaultReplaced { from, to: &default },
+        };
+        say(tr(said).into_owned());
     }
     if let Err(error) = (world.reload)() {
         say(tr(SMsg::OpenRouterNotReloaded { error: &error }).into_owned());
@@ -244,6 +257,7 @@ fn connect(world: &World, mode: Mode, say: &dyn Fn(String)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atomcode_auth::openrouter::FreeModel;
     use std::sync::Mutex;
 
     fn model(id: &str) -> FreeModel {
@@ -262,6 +276,10 @@ mod tests {
 
     impl Fake {
         fn world(&self, models: Result<Vec<FreeModel>, String>) -> World {
+            let models = models.map(|free| FreeCatalog {
+                free,
+                ..FreeCatalog::default()
+            });
             let saved = self.saved.clone();
             let reloaded = self.reloaded.clone();
             World {
@@ -270,8 +288,9 @@ mod tests {
                     Mode::Browser => Ok("from-the-browser".into()),
                 }),
                 models: Arc::new(move |_| models.clone()),
-                save: Arc::new(move |_, models| {
+                save: Arc::new(move |_, catalog| {
                     *saved.lock().unwrap() += 1;
+                    let models = &catalog.free;
                     Ok(Provisioned {
                         added: models.iter().map(|m| m.id.clone()).collect(),
                         default_model: Some(models[0].id.clone()),
@@ -316,11 +335,20 @@ mod tests {
         let said = Arc::new(Mutex::new(Vec::new()));
         let world = World {
             key: Arc::new(|_, _| Ok("k".into())),
-            models: Arc::new(|_| Ok(vec![model("b/free")])),
+            models: Arc::new(|_| {
+                Ok(FreeCatalog {
+                    free: vec![model("b/free")],
+                    ..FreeCatalog::default()
+                })
+            }),
             save: Arc::new(|_, _| {
                 Ok(Provisioned {
                     added: vec!["openrouter/b/free".into()],
-                    removed: vec!["openrouter/a/free".into()],
+                    removed: vec![
+                        "openrouter/a/free".into(),
+                        "openrouter/stealth/space-bunny-alpha".into(),
+                    ],
+                    retired: vec!["openrouter/stealth/space-bunny-alpha".into()],
                     default_model: Some("openrouter/b/free".into()),
                     default_replaced: Some("openrouter/a/free".into()),
                 })
@@ -337,6 +365,14 @@ mod tests {
                 added: 1,
                 removed: 1,
                 default: "openrouter/b/free",
+            })),
+            "{said}"
+        );
+        // A model OpenRouter took down is named, since "your own models were
+        // not touched" is not true of it.
+        assert!(
+            said.contains(&*tr(SMsg::OpenRouterRetired {
+                names: "openrouter/stealth/space-bunny-alpha",
             })),
             "{said}"
         );

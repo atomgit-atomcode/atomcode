@@ -2921,8 +2921,8 @@ impl Content for TurnEndBlock {
     /// The cost rides that same line because its end is exactly where a person asks
     /// "what did that take". It is the *last* thing added and the first dropped: the
     /// line is built widest-first and falls back to the outcome alone, with whatever
-    /// did not fit going under it, wrapped — the same ladder the cause of a failed
-    /// turn already climbed.
+    /// did not fit going under it, wrapped. The cause of a failed turn is never on
+    /// that line: it hangs directly under the outcome (`⎿`), before the figures.
     fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
         // A turn you stopped yourself closes at the foot of the conversation,
         // not here: the dim `⎿ 已中断 · …` line the tail draws carries it
@@ -2978,18 +2978,6 @@ impl Content for TurnEndBlock {
                 });
             }
         }
-        if let Some(error) = &self.error {
-            // A cause can be long: a provider sentence for a dead network is
-            // wider than the screen. Set into the rule it would be dropped
-            // whole, and the turn would look like it ended in silence — so a
-            // long one goes under the rule, wrapped, however long it is.
-            let wider = format!("{caption} · {error}");
-            if crate::el::caption_fits(&wider, w as usize) {
-                caption = wider;
-            } else {
-                under.push(error.clone());
-            }
-        }
 
         // A light, left-aligned line rather than a full-width captioned rule: a
         // screen of ─ boundaries reads as noise, and a turn's end is already set
@@ -2997,14 +2985,20 @@ impl Content for TurnEndBlock {
         // figures ride at the margin the way the rule's caption did, minus the
         // rule — nearer `✻ Crunched for …` than `───── ✓ Done ─────`.
         let mut out = vec![Line::styled(width::take_width(&caption, w as usize), style)];
+        // The cause hangs directly under the line that names the outcome, the
+        // way a tool's result hangs under its call (`⎿`), in the ordinary ink:
+        // the outcome above is the one thing in alarm colour. A paragraph of red
+        // read as a different screen from everything around it, and a long
+        // provider sentence wrapped there was a block of it. Wrapped to the
+        // width however long it is, so a cause is never cut to nothing. Before
+        // the figures, which are what it cost and not why it stopped.
+        if let Some(error) = &self.error {
+            let gutter = format!("  {} ", caps.g(Glyph::Gutter));
+            out.extend(wrapped(error, w, Style::new(), &gutter));
+        }
         // 账用中性色画:那行数字是历史,不是"哪里不对"—— 报警色只管上面那句话。
-        // 出错那条(错误本身也走 `under`)保持报警色,它才是要人停下来看的。
-        let under_style = match self.error.is_some() {
-            true => style,
-            false => muted(),
-        };
         for line in under {
-            out.extend(wrapped(&line, w, under_style, "  "));
+            out.extend(wrapped(&line, w, muted(), "  "));
         }
         out
     }
@@ -3817,7 +3811,9 @@ mod tests {
             assert!(line.width() <= 100, "{:?}", line.plain());
         }
 
-        // A short cause still sits in the rule, on one line.
+        // A short cause hangs under the outcome too, the way a result hangs
+        // under its call — in the ordinary ink, the outcome above being the one
+        // thing in alarm colour.
         let short = TurnEndBlock {
             stop: StopReason::ProviderError,
             error: Some("quota reached".into()),
@@ -3827,8 +3823,19 @@ mod tests {
             ended_at: None,
         };
         let lines = short.lines(&crate::block::RenderCtx::bare(100));
-        assert_eq!(lines.len(), 1);
-        assert!(lines[0].plain().contains("已中断 · quota reached"));
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].plain().contains("已中断"));
+        assert!(!lines[0].plain().contains("quota reached"));
+        assert_eq!(lines[1].plain().trim_end(), "  ⎿ quota reached");
+        let cause = lines[1]
+            .spans
+            .iter()
+            .find(|s| s.text.contains("quota"))
+            .expect("the cause");
+        assert_ne!(
+            cause.style.fg, lines[0].spans[0].style.fg,
+            "the cause is not in the outcome's alarm colour"
+        );
     }
 
     /// The reason a turn stopped is a value, and a person reads words. This is

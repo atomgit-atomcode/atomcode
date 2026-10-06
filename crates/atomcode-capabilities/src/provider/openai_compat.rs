@@ -907,10 +907,30 @@ pub(crate) fn names_a_missing_model(detail: &str, provider_code: Option<&str>) -
         return true;
     }
     let d = detail.to_ascii_lowercase();
-    d.contains("model")
-        && ["not exist", "not found", "does not exist", "no such"]
-            .iter()
-            .any(|p| d.contains(p))
+    // OpenRouter's wording for a model it no longer routes: "No endpoints found
+    // for stealth/space-bunny-alpha." — no "model" in it, and the address is
+    // right all the same.
+    d.contains("no endpoints found")
+        || d.contains("model")
+            && ["not exist", "not found", "does not exist", "no such"]
+                .iter()
+                .any(|p| d.contains(p))
+}
+
+/// OpenRouter saying it routes this model nowhere: taken down, renamed, no
+/// longer free. Not its "matching your data policy" form — that one is fixed
+/// in the person's OpenRouter privacy settings, not by switching models — and
+/// not another provider's "model not found", which is as likely a typo in the
+/// profile as a model that went away.
+fn no_endpoint_for_the_model(detail: &str) -> bool {
+    let d = detail.to_ascii_lowercase();
+    d.contains("no endpoints found") && !d.contains("data policy")
+}
+
+/// The error for a 404 that is about the model, not the address.
+fn model_unavailable_message(code: u16, detail: &str) -> String {
+    atomcode_config::i18n::t(atomcode_config::i18n::Msg::ChatModelUnavailable { code, detail })
+        .into_owned()
 }
 
 /// The error for a request that reached a path the server does not have.
@@ -1089,12 +1109,15 @@ pub(crate) async fn open_stream(
                     let detail = extract_error_detail(&text);
                     let envelope = serde_json::from_str::<serde_json::Value>(&text).ok();
                     let provider_code = envelope.as_ref().and_then(provider_error_code);
-                    let message = if matches!(code, 404 | 405)
-                        && !names_a_missing_model(&detail, provider_code.as_deref())
-                    {
-                        endpoint_not_found_message(code, url, &detail)
-                    } else {
-                        super::friendly_http_error(code, &detail)
+                    let message = match (
+                        matches!(code, 404 | 405),
+                        names_a_missing_model(&detail, provider_code.as_deref()),
+                    ) {
+                        (true, false) => endpoint_not_found_message(code, url, &detail),
+                        (true, true) if code == 404 && no_endpoint_for_the_model(&detail) => {
+                            model_unavailable_message(code, &detail)
+                        }
+                        _ => super::friendly_http_error(code, &detail),
                     };
                     return Err(ProviderError {
                         retryable: retry::is_retryable_status(code),
@@ -2434,6 +2457,45 @@ mod tests {
             .await;
         let err = open_err(&format!("{}/v1", server.uri())).await;
         assert!(!err.message.contains("base_url"), "{}", err.message);
+    }
+
+    /// OpenRouter's answer for a model it took down — "No endpoints found for
+    /// …", with no "model" in it — is about the model too: the person is told
+    /// to switch models with `/model`, not to fix a base_url that is right.
+    #[tokio::test]
+    async fn a_model_with_no_endpoints_says_switch_models() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(404).set_body_string(
+                r#"{"error":{"message":"No endpoints found for stealth/space-bunny-alpha.","code":404}}"#,
+            ))
+            .mount(&server)
+            .await;
+        let err = open_err(&format!("{}/v1", server.uri())).await;
+        let m = &err.message;
+        assert!(!m.contains("base_url"), "{m}");
+        assert!(m.contains("/model"), "{m}");
+        assert!(
+            m.contains("No endpoints found for stealth/space-bunny-alpha"),
+            "{m}"
+        );
+    }
+
+    /// Only OpenRouter's "no endpoints" is told to switch models. Its data-policy
+    /// form is fixed in the person's privacy settings, and another provider's
+    /// "model not found" is as likely a typo in the profile — both keep the
+    /// server's own words.
+    #[test]
+    fn only_a_model_routed_nowhere_is_told_to_switch() {
+        assert!(no_endpoint_for_the_model(
+            "No endpoints found for stealth/space-bunny-alpha."
+        ));
+        assert!(!no_endpoint_for_the_model(
+            "No endpoints found matching your data policy (Free model publication)."
+        ));
+        assert!(!no_endpoint_for_the_model(
+            "The model `gpt-5o` does not exist or you do not have access to it."
+        ));
     }
 
     /// A gateway that answers an unknown path with its web page (200, text/html —

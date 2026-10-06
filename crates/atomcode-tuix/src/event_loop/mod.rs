@@ -9564,10 +9564,16 @@ fn handle_openrouter_connect_event(
             )));
             renderer.flush();
         }
-        OpenRouterConnectEvent::Ready { api_key, models } => {
+        OpenRouterConnectEvent::Ready {
+            api_key,
+            models,
+            listed,
+        } => {
             let mut outcome = atomcode_auth::openrouter::Provisioned::default();
             match ctx.config_store.update(|latest| {
-                outcome = atomcode_auth::openrouter::provision(latest, &api_key, &models);
+                outcome = atomcode_auth::openrouter::provision_with_listed(
+                    latest, &api_key, &models, &listed,
+                );
                 Ok(())
             }) {
                 Ok(commit) => {
@@ -9587,18 +9593,30 @@ fn handle_openrouter_connect_event(
                         renderer,
                     );
                     let added = outcome.added.len();
-                    let removed = outcome.removed.len();
+                    // 只数换掉的旧免费模型;OpenRouter 下架而删的另起一行说。
+                    let removed = outcome.removed.len() - outcome.retired.len();
                     renderer.render(UiLine::CommandOutput(match removed {
                         0 => format!("已接入 OpenRouter,新增 {added} 个免费模型。/model 可切换。"),
                         _ => format!(
                             "已接入 OpenRouter,新增 {added} 个免费模型,移除 {removed} 个不在这次推荐里的旧免费模型(下架、开始收费或被挤出前 5;你自己配置的模型没有改动)。/model 可切换。"
                         ),
                     }));
+                    // 「你自己配置的模型没有改动」对这几条不成立,单独说清。
+                    if !outcome.retired.is_empty() {
+                        renderer.render(UiLine::CommandOutput(format!(
+                            "另外删掉了 OpenRouter 已经不再提供的模型(不管是不是你自己加的,留着只会一用就 404):{}。",
+                            outcome.retired.join("、")
+                        )));
+                    }
                     if let (Some(from), Some(to)) =
                         (&outcome.default_replaced, &outcome.default_model)
                     {
+                        let why = match outcome.retired.contains(from) {
+                            true => "OpenRouter 已经不再提供",
+                            false => "不在这次的免费推荐里",
+                        };
                         renderer.render(UiLine::CommandOutput(format!(
-                            "原来的默认模型 `{from}` 不在这次的免费推荐里,已换成 `{to}`。"
+                            "原来的默认模型 `{from}` {why},已换成 `{to}`。"
                         )));
                     }
                     renderer.flush();

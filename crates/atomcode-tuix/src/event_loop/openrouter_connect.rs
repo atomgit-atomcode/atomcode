@@ -34,6 +34,9 @@ pub enum OpenRouterConnectEvent {
     Ready {
         api_key: String,
         models: Vec<FreeModel>,
+        /// Every model id OpenRouter lists, for `provision_with_listed` to take
+        /// out the ones it no longer offers.
+        listed: std::collections::HashSet<String>,
     },
     Failed(String),
 }
@@ -51,7 +54,7 @@ pub fn spawn_openrouter_connect(
 ) {
     use atomcode_auth::openrouter as or;
     std::thread::spawn(move || {
-        let result: Result<(String, Vec<or::FreeModel>), String> = (|| {
+        let result: Result<(String, or::FreeCatalog), String> = (|| {
             let key = match mode {
                 ConnectMode::ProvidedKey(k) => k,
                 ConnectMode::Oauth => {
@@ -73,16 +76,20 @@ pub fn spawn_openrouter_connect(
                         .map_err(|e| format!("{e:#}"))?
                 }
             };
-            let models =
-                or::fetch_top_free_models(&key, FREE_MODEL_LIMIT).map_err(|e| format!("{e:#}"))?;
-            if models.is_empty() {
+            let catalog =
+                or::fetch_free_catalog(&key, FREE_MODEL_LIMIT).map_err(|e| format!("{e:#}"))?;
+            if catalog.free.is_empty() {
                 return Err("OpenRouter 未返回可用免费模型".to_string());
             }
-            Ok((key, models))
+            Ok((key, catalog))
         })();
 
         let event = match result {
-            Ok((api_key, models)) => OpenRouterConnectEvent::Ready { api_key, models },
+            Ok((api_key, catalog)) => OpenRouterConnectEvent::Ready {
+                api_key,
+                models: catalog.free,
+                listed: catalog.listed,
+            },
             Err(reason) => OpenRouterConnectEvent::Failed(reason),
         };
         let _ = event_tx.send(event);
