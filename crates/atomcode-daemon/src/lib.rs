@@ -5695,7 +5695,8 @@ fn primary_lan_ipv4() -> Option<String> {
 /// （webui 的访问 URL 是生成的，端口号对用户无感；被占时仍会向上扫描）。
 pub const WEBUI_DEFAULT_PORT: u16 = atomcode_config::distribution::WEBUI_PORT;
 
-/// 确保进程内 webui server 已起（已停止则重启），mint 一次性 token，开浏览器。
+/// 确保进程内 webui server 已起（已停止则重启），mint 一次性 token；`open_browser`
+/// 为 `true` 时自动打开浏览器，`false` 时跳过（脚本/桌面客户端集成场景），URL 仍随状态串返回。
 ///
 /// 返回给用户展示的状态串。在 `atomcode` 主程序（已有 tokio runtime）内调用。
 /// `host` 为绑定地址（默认 `127.0.0.1`；`0.0.0.0` 暴露到局域网/外网）。
@@ -5704,7 +5705,7 @@ pub const WEBUI_DEFAULT_PORT: u16 = atomcode_config::distribution::WEBUI_PORT;
 /// 不再轮询等待绑定：先在本函数内同步绑定端口（亚毫秒级，且借此拿到真实端口、
 /// 支持动态端口），再把已绑定的 listener 交给后台 `run_server`。浏览器随即打开，
 /// 页面靠 SPA 自带 loading 态在 server bootstrap 完成前过渡。
-pub async fn ensure_server_and_open(host: &str, port: u16, sync: bool) -> String {
+pub async fn ensure_server_and_open(host: &str, port: u16, sync: bool, open_browser: bool) -> String {
     // 1) 短临界区判定能否复用仍在运行的 server（std Mutex guard 不可跨 .await）。
     //    复用时连同其绑定地址一起取出：换绑需先 /webui stop。
     let reuse = {
@@ -5803,8 +5804,9 @@ pub async fn ensure_server_and_open(host: &str, port: u16, sync: bool) -> String
         "http://{}:{}/?token={}{}",
         open_host, actual_port, token, sync_suffix
     );
-    let opened = atomcode_auth::oauth::open_browser(&local_url).is_ok();
-    let mut msg = if opened {
+    let mut msg = if !open_browser {
+        format!("webui 已启动（未自动打开浏览器）：{local_url}")
+    } else if atomcode_auth::oauth::open_browser(&local_url).is_ok() {
         format!("已在浏览器打开 webui：{local_url}")
     } else {
         format!("请手动在浏览器打开：{local_url}")
