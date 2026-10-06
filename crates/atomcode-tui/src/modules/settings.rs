@@ -88,7 +88,15 @@ impl View for Settings {
                         present,
                         label,
                         path,
-                    } => file_line(present, &label, &path, w, vp.moment.caps),
+                        same_as,
+                    } => file_line(
+                        present,
+                        &label,
+                        &path,
+                        same_as.as_deref(),
+                        w,
+                        vp.moment.caps,
+                    ),
                     UsageLine::Columns { text } => {
                         Line::styled(width::take_width(&format!("  {text}"), w), Style::new())
                     }
@@ -678,6 +686,10 @@ enum UsageLine {
         present: bool,
         label: String,
         path: String,
+        /// The label of a file listed above that is this same file. Started in
+        /// the home directory, the project's memory *is* the global memory,
+        /// and two rows naming one path read as two files.
+        same_as: Option<String>,
     },
     /// A blank line inside the page.
     Gap,
@@ -953,14 +965,26 @@ fn status_lines(page: Option<&crate::settings::StatusPage>) -> Vec<UsageLine> {
         })
         .collect();
 
+    // Which label each path was first listed under, across every group.
+    let mut seen: Vec<(&str, &str)> = Vec::new();
     for group in &page.sources {
         out.push(UsageLine::Gap);
         out.push(UsageLine::Head(group.label.clone()));
-        out.extend(group.files.iter().map(|file| UsageLine::File {
-            present: file.present,
-            label: file.label.clone(),
-            path: file.path.clone(),
-        }));
+        for file in &group.files {
+            let same_as = seen
+                .iter()
+                .find(|(path, _)| *path == file.path)
+                .map(|(_, label)| label.to_string());
+            if same_as.is_none() {
+                seen.push((&file.path, &file.label));
+            }
+            out.push(UsageLine::File {
+                present: file.present,
+                label: file.label.clone(),
+                path: file.path.clone(),
+                same_as,
+            });
+        }
     }
     out
 }
@@ -981,17 +1005,25 @@ pub fn status_text(page: &crate::settings::StatusPage) -> String {
                 present,
                 label,
                 path,
-            } => {
-                let mut row = format!(
+                same_as,
+            } => match same_as {
+                Some(other) => format!(
                     "  {}{}",
                     pad_right(&label, 14),
-                    crate::text::collapse_home(&path)
-                );
-                if !present {
-                    row.push_str(&t(Msg::SettingsNotFound));
+                    t(Msg::SourceSameFileAs { label: &other })
+                ),
+                None => {
+                    let mut row = format!(
+                        "  {}{}",
+                        pad_right(&label, 14),
+                        crate::text::collapse_home(&path)
+                    );
+                    if !present {
+                        row.push_str(&t(Msg::SettingsNotFound));
+                    }
+                    row
                 }
-                row
-            }
+            },
             UsageLine::Gap => String::new(),
             _ => continue,
         });
@@ -1643,12 +1675,33 @@ pub fn stats_page_at(col: usize) -> Option<crate::settings::StatsPage> {
 /// terminal without them gets `ok` and `--` rather than two boxes — and the
 /// colour is the second answer, not the only one: a person reading a
 /// transcript of this page has no colour and still has to be able to tell.
-fn file_line(present: bool, label: &str, path: &str, w: usize, caps: crate::caps::Caps) -> Line {
+fn file_line(
+    present: bool,
+    label: &str,
+    path: &str,
+    same_as: Option<&str>,
+    w: usize,
+    caps: crate::caps::Caps,
+) -> Line {
     use crate::caps::Glyph;
+    // Missing is not failing: every one of these files is optional, and an
+    // `✗` read as something being broken. The empty circle says "not there"
+    // without saying "wrong".
     let (mark, ink) = match present {
         true => (caps.g(Glyph::Ok), theme::fg(Role::Success)),
-        false => (caps.g(Glyph::Fail), theme::fg(Role::Muted)),
+        false => (caps.g(Glyph::Hollow), theme::fg(Role::Muted)),
     };
+    if let Some(other) = same_as {
+        return Line::from_spans(vec![
+            Span::styled(format!("    {mark} "), ink),
+            Span::styled(pad_right(label, 14), theme::fg(Role::Muted)),
+            Span::styled(
+                t(Msg::SourceSameFileAs { label: other }).into_owned(),
+                theme::fg(Role::Muted),
+            ),
+        ])
+        .truncate(w);
+    }
     let mut spans = vec![
         Span::styled(format!("    {mark} "), ink),
         Span::styled(pad_right(label, 14), theme::fg(Role::Muted)),
@@ -3343,10 +3396,57 @@ mod tests {
             row("AGENTS.md")
         );
         assert!(
-            row("ATOMCODE.md").contains('✗') && row("ATOMCODE.md").contains("未找到"),
+            row("ATOMCODE.md").contains('○') && row("ATOMCODE.md").contains("未创建"),
             "and the one that is not, said twice — mark and words: {:?}",
             row("ATOMCODE.md")
         );
+    }
+
+    /// Started in the home directory, the project's memory is the global
+    /// memory: one path, listed once, and the second row says it is the same
+    /// file rather than naming it again — two rows with one path read as two
+    /// files that both happen to be missing. Same on the page and in `/status`.
+    #[test]
+    fn a_file_listed_twice_is_said_to_be_the_same_file() {
+        use atomcode_host_api::{SourceFile, SourceGroup};
+        let page = crate::settings::StatusPage {
+            version: "5.2.2".into(),
+            session: "abc".into(),
+            cwd: "/home/me".into(),
+            sources: vec![SourceGroup {
+                label: "记忆文件".into(),
+                files: vec![
+                    SourceFile {
+                        label: "全局".into(),
+                        path: "/home/me/.tree/memory.md".into(),
+                        present: false,
+                    },
+                    SourceFile {
+                        label: "项目".into(),
+                        path: "/home/me/.tree/memory.md".into(),
+                        present: false,
+                    },
+                ],
+            }],
+            ..Default::default()
+        };
+        let text = status_text(&page);
+        let drawn = drawn(&status_page(page), 92, 30).join("\n");
+        for shown in [&text, &drawn] {
+            assert_eq!(
+                shown.matches("memory.md").count(),
+                1,
+                "the path is named once:\n{shown}"
+            );
+            let second = shown
+                .lines()
+                .find(|line| line.contains("项目"))
+                .unwrap_or_else(|| panic!("{shown}"));
+            assert!(
+                second.contains(t(Msg::SourceSameFileAs { label: "全局" }).as_ref()),
+                "{second:?}"
+            );
+        }
     }
 
     /// The page says what the session is running as, from what the host

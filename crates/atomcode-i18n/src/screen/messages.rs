@@ -1244,6 +1244,11 @@ pub enum Msg<'a> {
     SettingHintToggle,
     SettingHintEdit,
     SettingsNotFound,
+    /// A configuration file listed a second time under another name — the
+    /// project's memory when the project is the home directory.
+    SourceSameFileAs {
+        label: &'a str,
+    },
     LegendSave,
     LegendCancel,
     LegendChangePage,
