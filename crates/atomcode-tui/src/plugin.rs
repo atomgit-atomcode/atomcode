@@ -6776,6 +6776,19 @@ impl Tui {
                 self.surface.show_transcript(&text);
                 return false;
             }
+            // Stopped here until the shell's `fg`; on Windows there is no job
+            // control to stop under, and that is said rather than nothing.
+            Action::Suspend => {
+                drop(m);
+                if self.surface.suspend() {
+                    // The shell named the window while it had it; say ours again.
+                    *self.named.lock().expect("named poisoned") = None;
+                } else {
+                    self.host
+                        .say(t(Msg::SuspendUnsupported).into_owned(), false);
+                }
+                return false;
+            }
             Action::ToggleMouse => {
                 drop(m);
                 let on = !self.surface.mouse();

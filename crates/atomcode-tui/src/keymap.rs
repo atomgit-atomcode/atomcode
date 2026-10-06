@@ -64,6 +64,8 @@ pub enum Action {
     /// Take the pointer, or hand it back to the terminal so click-drag selects
     /// text again.
     ToggleMouse,
+    /// Ctrl+Z: give the terminal back to the shell and stop; `fg` returns.
+    Suspend,
     /// `/raw`: the whole conversation on the terminal's own screen, for its
     /// own selection, scrolling and search; any key comes back.
     ShowTranscript,
@@ -486,6 +488,10 @@ impl Keymap for Default_ {
             // one of the few control keys neither a terminal nor a shell's line
             // editor claims.
             (KeyPress::ctrl('g'), Action::ToggleMouse),
+            // What Ctrl+Z does in every program a shell runs — taken back from
+            // raw mode, which turns the key into a keystroke. `!cmd` runs one
+            // command; this is the shell itself, all of it, with `fg` to return.
+            (KeyPress::ctrl('z'), Action::Suspend),
             (KeyPress::ctrl('p'), Action::HistoryBack),
             (KeyPress::ctrl('n'), Action::HistoryForward),
             // ctrl-l is "redraw" in every terminal there has ever been, and

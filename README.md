@@ -473,6 +473,7 @@ Most keys are the same as above; these differ. Type `/keys` in a session for the
 | `Ctrl+O` | Reasoning: one line / in full / folded, cycles (also `/reasoning`; `Alt+R` works too when the terminal sends Option as Meta) |
 | `Ctrl+T` | Tool output: all / one summary each / summarised in groups, cycles |
 | `Ctrl+G` | Hand the mouse to the terminal (use its own selection), again to take it back (also `/mouse`) |
+| `Ctrl+Z` | Suspend to the shell (over ssh too); `fg` brings it back. Not on Windows |
 
 With the mouse handed back, the terminal can only select what is on one screen (a full-screen UI has no scrollback). To select across screens, type `/raw`: the whole conversation is printed into the terminal for its own selection, scrolling and search, and any key comes back. With the mouse kept, dragging to the edge scrolls and selects across screens.
 

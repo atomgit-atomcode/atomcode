@@ -10114,3 +10114,31 @@ async fn the_slash_menu_s_lit_row_is_not_covered_by_the_scroll_badge() {
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
+
+/// Ctrl+Z stops for the shell — the key raw mode would otherwise turn into a
+/// keystroke — and nothing is typed into the composer; when it is back the
+/// screen is painted again.
+#[tokio::test]
+async fn ctrl_z_suspends_for_the_shell() {
+    let dir = scratch("ctrl-z");
+    let s = start(tree(&dir, &replay(r#"{ text = "hi" }"#), &[])).await;
+    let task = s.open().await;
+    s.quiet().await;
+    let frames = s.term.frames().len();
+
+    s.term.press(KeyPress::ctrl('z'));
+    s.quiet().await;
+    assert_eq!(s.term.suspended(), 1, "stopped for the shell once");
+    assert!(
+        !part_text(&s, "input").contains('z'),
+        "the key was not typed: {}",
+        part_text(&s, "input")
+    );
+    assert!(
+        s.term.frames().len() > frames,
+        "and painted again on the way back"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}

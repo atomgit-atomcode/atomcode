@@ -390,6 +390,9 @@ pub enum Msg<'a> {
     CmdAboutTools,
     CmdAboutShowInject,
     CmdAboutMouse,
+    /// Ctrl+Z where it cannot stop: no job control (Windows), or started with
+    /// suspending switched off.
+    SuspendUnsupported,
     CmdAboutRaw,
     CmdAboutKeys,
     CmdAboutTodo,

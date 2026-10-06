@@ -285,6 +285,15 @@ pub trait Surface: Send + Sync {
     /// it from scratch on the next frame.
     fn back_from_transcript(&self) {}
 
+    /// Hand the terminal back to the shell and stop, as Ctrl+Z does in any
+    /// program run from one; the shell's `fg` brings it back, and it returns
+    /// then with the screen taken again, to be painted whole. `false` where
+    /// there is no job control to stop under — Windows, or a surface with no
+    /// terminal — and nothing was done.
+    fn suspend(&self) -> bool {
+        false
+    }
+
     /// Name the window.
     ///
     /// The surface's job for the same reason the clipboard is: only this layer
@@ -430,6 +439,8 @@ pub struct Headless {
     escapes: Mutex<Vec<String>>,
     /// What `/raw` printed on the terminal's own screen, while it is up.
     transcript: Mutex<Option<String>>,
+    /// How many times it was asked to stop for the shell (Ctrl+Z).
+    suspended: std::sync::atomic::AtomicUsize,
 }
 
 impl Headless {
@@ -449,6 +460,7 @@ impl Headless {
             state: std::sync::atomic::AtomicU8::new(pointer_state(crate::ansi::Pointer::Buttons)),
             escapes: Mutex::new(Vec::new()),
             transcript: Mutex::new(None),
+            suspended: std::sync::atomic::AtomicUsize::new(0),
         });
         *me.me.lock().expect("headless poisoned") = Some(Arc::downgrade(&me));
         me
@@ -473,6 +485,11 @@ impl Headless {
     /// another window. What a real clipboard is for, scripted.
     pub fn set_clipboard_text(&self, text: impl Into<String>) {
         *self.clipboard_text.lock().expect("headless poisoned") = Some(text.into());
+    }
+
+    /// How many times Ctrl+Z stopped this surface for the shell.
+    pub fn suspended(&self) -> usize {
+        self.suspended.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// What `/raw` printed on the terminal's own screen, while it is up.
@@ -664,6 +681,11 @@ impl Surface for Headless {
     }
     fn back_from_transcript(&self) {
         *self.transcript.lock().expect("headless poisoned") = None;
+    }
+    fn suspend(&self) -> bool {
+        self.suspended
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        true
     }
     fn set_title(&self, title: &str) {
         *self.title.lock().expect("headless poisoned") = Some(title.to_string());
@@ -1190,6 +1212,46 @@ extern "C" fn on_fatal_signal(sig: libc::c_int) {
     unsafe {
         libc::signal(sig, libc::SIG_DFL);
         libc::raise(sig);
+    }
+}
+
+/// Which signal stops the process group, as the terminal would have on Ctrl+Z
+/// had raw mode not taken the key — or `None` when it is not to be stopped.
+///
+/// `SIGTSTP` while its action is the default. `SIGSTOP` when a handler has
+/// claimed it: the handler would swallow it and nothing would stop (oh-my-pi
+/// hit exactly that), and `SIGSTOP` cannot be caught. `None` when it is
+/// *ignored*: that is whoever started this saying it must not stop — an
+/// orphaned group, `setsid`, a terminal's `-e` — where nothing would ever send
+/// the `SIGCONT` to wake it, and forcing a stop would hang it for good.
+#[cfg(unix)]
+fn stop_signal() -> Option<libc::c_int> {
+    // SAFETY: reads the current action into a zeroed local.
+    let current = unsafe {
+        let mut current: libc::sigaction = std::mem::zeroed();
+        if libc::sigaction(libc::SIGTSTP, std::ptr::null(), &mut current) != 0 {
+            return Some(libc::SIGTSTP);
+        }
+        current.sa_sigaction
+    };
+    match current {
+        libc::SIG_DFL => Some(libc::SIGTSTP),
+        libc::SIG_IGN => None,
+        _ => Some(libc::SIGSTOP),
+    }
+}
+
+/// Keys pressed while stopped were the shell's, not this screen's.
+#[cfg(unix)]
+fn drop_typed_while_stopped() {
+    use std::io::IsTerminal;
+    let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        use std::os::fd::AsRawFd;
+        // SAFETY: stdin's descriptor, borrowed for the length of the call.
+        unsafe {
+            libc::tcflush(stdin.as_raw_fd(), libc::TCIFLUSH);
+        }
     }
 }
 
@@ -1956,6 +2018,58 @@ impl Surface for Terminal {
         let _ = out.write_all(pointer.escape().as_bytes());
         let _ = out.flush();
         self.painted.forget();
+    }
+    /// The screen given back the way `restore` gives it — pointer, keys,
+    /// paste and focus reporting off, the alternate screen left, the line
+    /// discipline the shell's again — then the whole process group stopped, so
+    /// a wrapper that started this (a shell script, `npx`) stops with it and
+    /// the shell gets its prompt back. On `fg` everything is taken again, keys
+    /// typed while stopped are dropped (they were meant for the shell), and the
+    /// next frame is painted in full at whatever size the window is now.
+    #[cfg(unix)]
+    fn suspend(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        // Decided before the screen is touched: when it cannot stop, nothing
+        // on screen may move.
+        let Some(signal) = stop_signal() else {
+            return false;
+        };
+        let mut out = std::io::stdout();
+        let _ = out.write_all(ansi::MOUSE_OFF.as_bytes());
+        let _ = out.write_all(ansi::RESTORE_TITLE.as_bytes());
+        let _ = out.write_all(ansi::LEAVE.as_bytes());
+        let _ = out.flush();
+        let _ = crossterm::terminal::disable_raw_mode();
+        // The screen is the shell's while stopped: a kill or a hang-up that
+        // arrives then must not write the way out over the shell's own screen
+        // (and, from a background group, stop again on SIGTTOU instead of
+        // exiting). Handed back now, and taken again below.
+        SCREEN_HELD.store(false, Ordering::SeqCst);
+        // SAFETY: signals this process's own group.
+        unsafe {
+            libc::kill(0, signal);
+        }
+        // Back: `fg` sent SIGCONT. The shell may have put its own terminal
+        // settings back meanwhile, so raw mode is asked for afresh.
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::terminal::enable_raw_mode();
+        SCREEN_HELD.store(true, Ordering::SeqCst);
+        drop_typed_while_stopped();
+        let _ = out.write_all(ansi::ENTER.as_bytes());
+        // Whatever the shell called the window meanwhile is put away again;
+        // the next frame names it (the screen forgets what it last said).
+        let _ = out.write_all(ansi::SAVE_TITLE.as_bytes());
+        if crate::caps::wants_keyboard_protocol() {
+            let _ = out.write_all(ansi::KEYS_ON.as_bytes());
+        }
+        let pointer = self.pointer_mode();
+        if pointer != ansi::Pointer::Terminal {
+            let _ = out.write_all(ansi::MOUSE_ON.as_bytes());
+        }
+        let _ = out.write_all(pointer.escape().as_bytes());
+        let _ = out.flush();
+        self.painted.forget();
+        true
     }
     fn set_title(&self, title: &str) {
         let mut out = std::io::stdout();

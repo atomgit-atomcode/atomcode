@@ -271,6 +271,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdAboutTools => "tool output: all of it, one summary each, summarised in groups; cycles with no argument".into(),
         Msg::CmdAboutShowInject => "injected context: folded, label only, in full — cycles; all of them with no name".into(),
         Msg::CmdAboutMouse => "hand the mouse back to the terminal, or take it back".into(),
+        Msg::SuspendUnsupported => {
+            "Suspending (Ctrl+Z) is not available here — not on Windows, or whatever started this switched it off. Run one command with !cmd, or open another terminal.".into()
+        }
         Msg::CmdAboutRaw => "print the whole conversation into the terminal, for its own selection, scrolling and search; any key comes back".into(),
         Msg::CmdAboutKeys => "list the key bindings".into(),
         Msg::CmdAboutTodo => "print the plan; `add <task>`, `clear`; `show`/`hide` the panel".into(),
@@ -367,6 +370,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
     Shift+Enter / Ctrl+J            insert a new line
     Ctrl+W                          delete the previous word
     Ctrl+D                          quit
+    Ctrl+Z                          suspend to the shell, fg to return (not on Windows)
     Up / Down                       move the caret, and page through history once at the end
     Ctrl+P / Ctrl+N                 page through history (with the mouse handed back, ↑↓ scroll instead)
     click the composer              put the caret where you clicked

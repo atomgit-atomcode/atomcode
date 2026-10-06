@@ -63,22 +63,29 @@ fn the_adjustable_layout_is_gone() {
     assert!(found.is_empty(), "{found:#?}");
 }
 
-/// No key rearranges the screen: `ctrl-f` (a preset) and `ctrl-z` (undo a
-/// layout change) are unbound, and `ctrl-n` — once "toggle the mascot" — may
-/// only be the history's forward step again (2026-09-30: with the mouse handed
-/// back ↑/↓ scroll, and the history moved to ctrl-p/ctrl-n, the readline
-/// pair). What this guards is layout keys coming back, not the letter.
+/// No key rearranges the screen: `ctrl-f` (a preset) is unbound, `ctrl-z` —
+/// once "undo a layout change" — may only be the shell's suspend again
+/// (2026-10-06: what it is in every program a shell runs), and `ctrl-n` — once
+/// "toggle the mascot" — may only be the history's forward step again
+/// (2026-09-30: with the mouse handed back ↑/↓ scroll, and the history moved to
+/// ctrl-p/ctrl-n, the readline pair). What this guards is layout keys coming
+/// back, not the letter.
 #[test]
 fn no_key_rearranges_the_screen() {
     let bindings = Default_.bindings();
     let bound: Vec<KeyPress> = bindings.iter().map(|(k, _)| *k).collect();
-    for key in ['f', 'z'] {
-        assert!(
-            !bound.contains(&KeyPress::ctrl(key)),
-            "ctrl-{key} is bound again"
-        );
-    }
+    assert!(
+        !bound.contains(&KeyPress::ctrl('f')),
+        "ctrl-f is bound again"
+    );
     for (key, action) in &bindings {
+        if *key == KeyPress::ctrl('z') {
+            assert_eq!(
+                *action,
+                atomcode_tui::keymap::Action::Suspend,
+                "ctrl-z is bound to something other than suspending"
+            );
+        }
         if *key == KeyPress::ctrl('n') {
             assert_eq!(
                 *action,

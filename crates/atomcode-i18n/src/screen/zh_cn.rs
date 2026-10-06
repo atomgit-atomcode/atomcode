@@ -240,6 +240,9 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdAboutTools => "工具输出:全部、单个摘要、成组摘要;不带参数则循环".into(),
         Msg::CmdAboutShowInject => "环境注入:收起、只留标签、全文,循环;不带名字则全部".into(),
         Msg::CmdAboutMouse => "把鼠标交还终端,或收回来".into(),
+        Msg::SuspendUnsupported => {
+            "这里没法挂起(Ctrl+Z):Windows 没有,或启动方设成了不许挂起。单条命令可以用 !命令,或另开一个终端。".into()
+        }
         Msg::CmdAboutRaw => "把整段对话原样打到终端里,用终端自己的拖选、滚动、搜索;按任意键回来".into(),
         Msg::CmdAboutKeys => "列出快捷键".into(),
         Msg::CmdAboutTodo => "列出计划清单;`add <任务>` 加一项、`clear` 清空;`show`/`hide` 开关面板".into(),
@@ -334,6 +337,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
     Shift+Enter / Ctrl+J            插入换行
     Ctrl+W                          删除前一个单词
     Ctrl+D                          退出
+    Ctrl+Z                          挂起回到 shell，fg 回来（Windows 不支持）
     Up / Down                       在输入里移动游标，到头则翻历史
     Ctrl+P / Ctrl+N                 翻历史（鼠标交还终端时 ↑↓ 用来滚动对话）
     点击输入框                      定位游标
