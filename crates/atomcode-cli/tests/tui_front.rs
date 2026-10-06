@@ -1049,10 +1049,132 @@ async fn the_launchers_own_commands_are_in_the_menu() {
         .into_iter()
         .map(|c| c.name.into_owned())
         .collect();
-    for name in ["proxy", "schedule", "openrouter", "onboarding", "config"] {
+    for name in [
+        "proxy",
+        "schedule",
+        "openrouter",
+        "onboarding",
+        "config",
+        "changelog",
+    ] {
         assert!(
             offered.contains(&name.to_string()),
             "`/{name}` is mounted: {offered:?}"
         );
     }
+}
+
+/// `/changelog` is picked the way `/resume` is: the releases rise from the
+/// bottom, the selected one's points under the list, and Enter puts its notes in
+/// the conversation as a document — the panel goes away.
+#[tokio::test]
+async fn the_changelog_is_picked_from_a_list_and_read_in_the_conversation() {
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("ATOMCODE_HOME", home.path());
+    let project = tempfile::tempdir().unwrap();
+    let count = Arc::new(Count::default());
+    let config_path = home.path().join("config.toml");
+    let _locale = atomcode_config::i18n::test_lock();
+    atomcode_config::i18n::set_locale(atomcode_config::locale::Locale::ZhCn);
+
+    let front_end = FrontEnd::new();
+    let (start, config) = start(
+        project.path(),
+        &count,
+        SessionMode::Fresh,
+        Some(front_end.clone()),
+    );
+    let runtime = CodingRuntime::start(start).await.expect("starts");
+    let screen = Screen {
+        headless: Some((120, 40)),
+        ..Screen::default()
+    };
+    let mounted = tui_front::mount(
+        runtime,
+        front_end,
+        config,
+        None,
+        &screen,
+        config_path,
+        None,
+        None,
+    )
+    .await
+    .expect("the screen mounts");
+    let term = mounted
+        .app
+        .context()
+        .service::<atomcode_tui::plugin::SurfaceSvc>()
+        .and_then(|surface| surface.as_any_headless())
+        .expect("a headless surface");
+    let ui = mounted.ui.clone();
+    let ctx = mounted.app.context();
+    let running = tokio::spawn(async move {
+        let _ = ui.run(&ctx, None).await;
+    });
+
+    let newest = atomcode_config::changelog::shipped()
+        .into_iter()
+        .find(|r| r.version <= atomcode_config::changelog::Version::current())
+        .expect("this build ships notes for itself or an earlier release");
+    let first_point = newest.highlights().first().cloned().expect("a point");
+
+    term.type_line("/changelog");
+    let listed = until_shown(&term, "选一个版本查看更新内容").await;
+    if std::env::var_os("SHOW_SCREEN").is_some() {
+        eprintln!("{listed}");
+    }
+    assert!(listed.contains(&newest.version.to_string()), "{listed}");
+    assert!(
+        listed.contains(&first_point),
+        "the selected release's points show under the list:\n{listed}"
+    );
+
+    term.press(atomcode_tui::surface::KeyPress::plain(
+        atomcode_tui::surface::Key::Enter,
+    ));
+    let read = until_gone(&term, "选一个版本查看更新内容").await;
+    if std::env::var_os("SHOW_SCREEN").is_some() {
+        eprintln!("{read}");
+    }
+    assert!(
+        !read.contains("选一个版本查看更新内容"),
+        "the list is put away:\n{read}"
+    );
+    assert!(
+        read.contains(&first_point) && !read.contains("**"),
+        "the notes are in the conversation, drawn as markdown:\n{read}"
+    );
+    assert_eq!(
+        count.0.load(Ordering::SeqCst),
+        0,
+        "nothing was sent as a prompt"
+    );
+
+    term.press(atomcode_tui::surface::KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), running).await;
+}
+
+async fn until_shown(term: &atomcode_tui::surface::Headless, what: &str) -> String {
+    let mut text = String::new();
+    for _ in 0..200 {
+        text = term.text();
+        if text.contains(what) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    text
+}
+
+async fn until_gone(term: &atomcode_tui::surface::Headless, what: &str) -> String {
+    let mut text = String::new();
+    for _ in 0..200 {
+        text = term.text();
+        if !text.contains(what) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    text
 }

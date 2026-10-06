@@ -620,6 +620,11 @@ pub struct UiConfig {
     /// shows emoji as monochrome tofu boxes.
     #[serde(default = "default_terminal_status_glyph")]
     pub terminal_status_glyph: bool,
+    /// On the first launch after an upgrade, one line naming what the release
+    /// brought and pointing at `/changelog` (`crate::changelog`). Default on;
+    /// off keeps the launch quiet, and `/changelog` still answers.
+    #[serde(default = "default_true")]
+    pub whats_new: bool,
     /// Maximum number of already-wrapped transcript rows written to the host
     /// terminal when a session is resumed. `None` selects a terminal-aware
     /// default; `Some(0)` disables the cap and restores the legacy full replay.
@@ -668,6 +673,7 @@ impl Default for UiConfig {
             auto_copy_code_blocks: default_auto_copy_code_blocks(),
             ai_session_naming: default_ai_session_naming(),
             terminal_status_glyph: default_terminal_status_glyph(),
+            whats_new: true,
             history_replay_max_rows: None,
             truncate_resumed_history: true,
             brand_name: default_brand_name(),

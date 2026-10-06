@@ -58,6 +58,10 @@ pub mod provider_edit;
 /// both the terminal panel and the web page make, made once.
 pub mod provider_book;
 
+/// What changed in each release (`CHANGELOG.md`, compiled in), and whether this
+/// launch is the first after an upgrade.
+pub mod changelog;
+
 /// Pure parsers for OS system-proxy descriptions: Windows ProxyServer/ProxyOverride
 /// and macOS `scutil --proxy` output → normalized HTTP(S)_PROXY / NO_PROXY values.
 pub mod system_proxy;

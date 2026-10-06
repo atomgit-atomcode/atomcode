@@ -302,6 +302,14 @@ pub static SETTINGS: &[SettingSpec] = &[
         ApplyPolicy::ImmediateUi,
     ),
     bool_setting(
+        "ui.whats_new",
+        &["ui", "whats_new"],
+        "Tell what's new after an upgrade",
+        "升级后提示更新内容",
+        &["changelog", "release notes", "更新日志", "新功能"],
+        ApplyPolicy::NextStartup,
+    ),
+    bool_setting(
         "ui.truncate_resumed_history",
         &["ui", "truncate_resumed_history"],
         "Truncate resumed history",
@@ -449,6 +457,7 @@ impl SettingSpec {
             "ui.auto_copy_code_blocks" => config.ui.auto_copy_code_blocks.to_string(),
             "ui.ai_session_naming" => config.ui.ai_session_naming.to_string(),
             "ui.terminal_status_glyph" => config.ui.terminal_status_glyph.to_string(),
+            "ui.whats_new" => config.ui.whats_new.to_string(),
             "ui.truncate_resumed_history" => (config.ui.truncate_resumed_history
                 && config.ui.history_replay_max_rows != Some(0))
             .to_string(),

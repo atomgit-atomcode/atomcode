@@ -30,6 +30,7 @@ pub mod askpass;
 pub mod desktop;
 pub mod relay;
 pub mod tui_bg;
+pub mod tui_changelog;
 pub mod tui_command_meter;
 pub mod tui_elsewhere;
 pub mod tui_login;
@@ -274,6 +275,7 @@ pub mod tui_front {
             crate::tui_opening::row_layer(),
             crate::tui_shell::row_layer(),
             crate::tui_upgrade::row_layer(),
+            crate::tui_changelog::row_layer(),
             crate::tui_elsewhere::row_layer(),
             crate::tui_proxy::row_layer(),
             crate::tui_schedule::row_layer(),
@@ -306,6 +308,11 @@ pub mod tui_front {
                 keys: keys_note,
             }),
             Arc::new(crate::tui_upgrade::UpgradeRow),
+            Arc::new(crate::tui_changelog::ChangelogRow {
+                seen: atomcode_config::changelog::seen_path(
+                    &atomcode_config::config::Config::config_dir(),
+                ),
+            }),
             Arc::new(crate::tui_shell::ShellRow {
                 working_dir: working_dir.clone(),
             }),

@@ -1351,6 +1351,31 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         }
         Msg::ContextNoPrompt => "This host assembles no system prompt.".into(),
         Msg::ComposerSuggested { text } => text.to_string().into(),
+        Msg::CmdAboutChangelog => "What changed in each release".into(),
+        Msg::ChangelogPickerTitle => "pick a release to read what changed".into(),
+        Msg::ChangelogNewTag => "new".into(),
+        Msg::ChangelogThisBuild => "this build".into(),
+        Msg::ChangelogNoSuchRelease { asked } => {
+            format!("No notes for {asked}. Type /changelog to pick from the list.").into()
+        }
+        Msg::ChangelogEmpty => "This build ships no release notes.".into(),
+        Msg::WhatsNewNotice {
+            from,
+            to,
+            releases,
+            highlights,
+            more,
+        } => {
+            let highlights = highlights.join(", ");
+            let more = if more { ", and more" } else { "" };
+            match from {
+                Some(from) if releases > 1 => format!(
+                    "Updated from {from} to {to} ({releases} releases): {highlights}{more}. Type /changelog for the full notes"
+                ),
+                _ => format!("Updated to {to}: {highlights}{more}. Type /changelog for the full notes"),
+            }
+            .into()
+        }
         Msg::FileTooBigToPaste { path, size, cap } => format!(
             "{path} is {size}, too big to paste (the limit is {cap}). What is in the              composer is re-sent every turn; ask the model to read the file itself and              it will read only the lines it needs."
         )

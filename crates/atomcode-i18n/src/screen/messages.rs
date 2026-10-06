@@ -2031,4 +2031,28 @@ pub enum Msg<'a> {
     ComposerSuggested {
         text: &'a str,
     },
+    /// `/changelog` in the command menu and the welcome tips.
+    CmdAboutChangelog,
+    /// The header of `/changelog`'s list of releases.
+    ChangelogPickerTitle,
+    /// The tag on a release that is news to this person.
+    ChangelogNewTag,
+    /// After the date of the release this build is.
+    ChangelogThisBuild,
+    /// `/changelog <version>` for a release with no notes.
+    ChangelogNoSuchRelease {
+        asked: &'a str,
+    },
+    /// This build ships no notes at all.
+    ChangelogEmpty,
+    /// The one line on the first launch after an upgrade. `from` is the release
+    /// last told about, when known; `releases` how many with notes lie between;
+    /// `highlights` the points to name; `more` when there are more than named.
+    WhatsNewNotice {
+        from: Option<&'a str>,
+        to: &'a str,
+        releases: usize,
+        highlights: &'a [String],
+        more: bool,
+    },
 }

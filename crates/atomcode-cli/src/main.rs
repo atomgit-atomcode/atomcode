@@ -2106,6 +2106,10 @@ async fn run() -> Result<i32> {
     // Default: start TUI
 
     let config_path = cli.config.clone().unwrap_or_else(Config::default_path);
+    // Whether someone used this machine before — asked before anything below can
+    // seed or write a configuration. A fresh install is not told what changed
+    // in a release it never lived through (`atomcode::tui_changelog`).
+    let had_config = config_path.exists();
 
     // FIRST-RUN seed for offline / managed deploys (e.g. a government intranet
     // that ships a bundled default config): if the user has no config yet and a
@@ -2432,6 +2436,27 @@ async fn run() -> Result<i32> {
             &untrusted_plugin_hooks(),
         ),
     );
+    // The first interactive launch on a new release says, in one line, what it
+    // brought and where to read the rest; never a headless one, which would spend
+    // the notice where nobody reads it. Only on the row-assembled screen: the
+    // notice points at `/changelog`, which the classic screen does not have.
+    // Last among the notices: it is news, not something wrong with this launch.
+    let whats_new = (!is_headless && rows_screen).then(|| {
+        atomcode::tui_changelog::Launch::decide(
+            config.ui.whats_new,
+            had_config,
+            &Config::config_dir(),
+        )
+    });
+    let startup_notice = match whats_new.as_ref().and_then(|w| w.notice.clone()) {
+        Some(news) => {
+            // It already says which release this is: the "upgraded vA → vB" line
+            // a restart from `/upgrade` would add is the same news twice.
+            std::env::remove_var(UPGRADED_FROM_ENV);
+            merge_startup_notices(startup_notice, Some(news))
+        }
+        None => startup_notice,
+    };
     let (mut native_headless_runtime, mut native_tui_runtime) = if is_headless {
         (Some(native_runtime), None)
     } else {
@@ -2708,6 +2733,9 @@ async fn run() -> Result<i32> {
                             >
                     })
                 };
+                if let Some(whats_new) = &whats_new {
+                    whats_new.told();
+                }
                 let result = atomcode::tui_front::run(
                     runtime,
                     front_end,

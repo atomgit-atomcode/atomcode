@@ -1248,6 +1248,31 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CopyHandedOver => "（交给了终端；它要是不让复制，这次就没有）".into(),
         Msg::ContextNoPrompt => "这个宿主没有系统提示词可说。".into(),
         Msg::ComposerSuggested { text } => text.to_string().into(),
+        Msg::CmdAboutChangelog => "查看各版本的更新内容".into(),
+        Msg::ChangelogPickerTitle => "选一个版本查看更新内容".into(),
+        Msg::ChangelogNewTag => "新".into(),
+        Msg::ChangelogThisBuild => "当前版本".into(),
+        Msg::ChangelogNoSuchRelease { asked } => {
+            format!("没有 {asked} 的更新说明。输入 /changelog 从列表里选。").into()
+        }
+        Msg::ChangelogEmpty => "这个构建没有附带更新说明。".into(),
+        Msg::WhatsNewNotice {
+            from,
+            to,
+            releases,
+            highlights,
+            more,
+        } => {
+            let highlights = highlights.join("、");
+            let more = if more { " 等" } else { "" };
+            match from {
+                Some(from) if releases > 1 => format!(
+                    "已从 {from} 更新到 {to}（{releases} 个版本）：{highlights}{more}。输入 /changelog 查看完整更新说明"
+                ),
+                _ => format!("已更新到 {to}：{highlights}{more}。输入 /changelog 查看完整更新说明"),
+            }
+            .into()
+        }
         Msg::FileTooBigToPaste { path, size, cap } => format!(
             "{path} 有 {size}，粘不进来（上限 {cap}）。编辑区里的东西每一轮都要重发；             让模型自己去读这个文件，它只会读要用的那几行。"
         )
