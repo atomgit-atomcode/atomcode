@@ -5634,6 +5634,36 @@ struct WebuiHandle {
 
 static WEBUI: std::sync::Mutex<Option<WebuiHandle>> = std::sync::Mutex::new(None);
 
+/// The port this process's webui is serving on, while it is serving.
+///
+/// `None` when it never started (the bind failed) or has stopped since — which
+/// `atomcode webui` asks so that it exits instead of staying up with nothing
+/// listening, the shape that let a launcher script pile up idle processes.
+pub fn webui_port() -> Option<u16> {
+    let guard = WEBUI.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .as_ref()
+        .filter(|handle| !handle.abort.is_finished())
+        .map(|handle| handle.port)
+}
+
+/// What to try when a port cannot be bound for a reason other than being in
+/// use. On Windows that is usually WSAEACCES (10013): the port sits in a range
+/// reserved for Hyper-V / WSL / Docker (WinNAT), which moves on a reboot or a
+/// network service restart — a port that worked yesterday refuses today, and
+/// trying the next one up rarely helps because the ranges are blocks.
+fn bind_failure_hint(error: &anyhow::Error) -> &'static str {
+    let denied = error.downcast_ref::<std::io::Error>().is_some_and(|e| {
+        e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(10013)
+    });
+    if !denied {
+        return "";
+    }
+    "。这个端口可能落在 Windows 的保留端口范围里（Hyper-V / WSL / Docker 会保留，重启后会变），\
+     可在 PowerShell 运行 `netsh int ipv4 show excludedportrange protocol=tcp` 查看，\
+     并用 `--port` 换一个不在范围内的端口。"
+}
+
 /// 从 `start_port` 起尝试绑定 `host`，遇 `AddrInUse` 递增端口，直到成功或试满
 /// `max_tries` 个端口。返回已绑定的监听器与其真实端口（取自 `local_addr`，
 /// 故 `start_port == 0` 时也会回填 OS 分配的端口）。其他绑定错误立即返回。
@@ -5730,9 +5760,22 @@ pub async fn ensure_server_and_open(
         let (listener, actual_port) = match bind_scanning(host, port, 100).await {
             Ok(v) => v,
             Err(e) => {
-                return format!("webui 启动失败：{host}:{port} 起的端口绑定失败（{e}）");
+                // Into the log as well as the answer: `atomcode webui` run from a
+                // script prints the answer where nobody reads it, and a failed
+                // start used to leave nothing in `atomcode.log` at all.
+                tracing::error!(target: "atomcode::webui", %host, port, error = %e, "webui failed to bind");
+                return format!(
+                    "webui 启动失败：{host}:{port} 起的端口绑定失败（{e}）{}",
+                    bind_failure_hint(&e)
+                );
             }
         };
+        if actual_port != port {
+            // An installed app (PWA) is tied to the port it was installed from;
+            // on another one it finds nothing. Said where it can be found later.
+            tracing::warn!(target: "atomcode::webui", requested = port, actual = actual_port, "webui port was in use; bound the next free one");
+        }
+        tracing::info!(target: "atomcode::webui", %host, port = actual_port, "webui listening");
         let tokens = auth_token::WebuiTokenStore::new();
         let opts = ServerOpts {
             host: host.to_string(),
@@ -5762,6 +5805,7 @@ pub async fn ensure_server_and_open(
         };
         let task = tokio::spawn(async move {
             if let Err(e) = run_server(opts).await {
+                tracing::error!(target: "atomcode::webui", error = %e, "webui server stopped with an error");
                 eprintln!("webui server error: {e}");
             }
         });
@@ -9447,6 +9491,24 @@ done
         let (listener, port) = bind_scanning("127.0.0.1", 0, 1).await.unwrap();
         assert_ne!(port, 0);
         assert_eq!(listener.local_addr().unwrap().port(), port);
+    }
+
+    /// A port refused rather than taken — Windows' reserved ranges answer
+    /// WSAEACCES (10013) — gets the hint that names where to look; a port that
+    /// is simply unavailable does not.
+    #[test]
+    fn a_refused_port_is_told_where_to_look_and_others_are_not() {
+        let denied =
+            anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(bind_failure_hint(&denied).contains("excludedportrange"));
+        let wsaeacces = anyhow::Error::from(std::io::Error::from_raw_os_error(10013));
+        if cfg!(windows) {
+            assert!(bind_failure_hint(&wsaeacces).contains("excludedportrange"));
+        }
+        let unavailable =
+            anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::AddrNotAvailable));
+        assert_eq!(bind_failure_hint(&unavailable), "");
+        assert_eq!(bind_failure_hint(&anyhow::anyhow!("no free port")), "");
     }
 
     #[tokio::test]
