@@ -49,6 +49,13 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SheetListLegend { typed: true } => "↑↓ select · enter opens (what you typed, when nothing matches) · tab completes · esc closes".into(),
         Msg::SheetReadLegend { back: false } => "↑↓ scroll · PgUp/PgDn page · Home/End ends · esc closes".into(),
         Msg::SheetReadLegend { back: true } => "↑↓ scroll · PgUp/PgDn page · Home/End ends · esc back to the list".into(),
+        Msg::SheetDocLegend { back, tabs, links } => format!(
+            "{}↑↓ scroll · PgUp/PgDn page · {}esc {}",
+            if tabs { "tab switches · " } else { "" },
+            if links { "click a title to open it · " } else { "" },
+            if back { "back to the list" } else { "closes" },
+        )
+        .into(),
         Msg::DiffListTitle { workspace: false } => "files this session changed".into(),
         Msg::DiffListTitle { workspace: true } => "uncommitted changes in the working tree (git)".into(),
         Msg::DiffFilesChanged { count } => format!("{count} files changed  ").into(),
@@ -1358,6 +1365,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdAboutChangelog => "What changed in each release".into(),
         Msg::ChangelogPickerTitle => "pick a release to read what changed".into(),
         Msg::ChangelogNewTag => "new".into(),
+        Msg::ChangelogOverviewTab => "Overview".into(),
+        Msg::ChangelogIssuesTab { count } => format!("Issues ({count})").into(),
         Msg::ChangelogThisBuild => "this build".into(),
         Msg::ChangelogNoSuchRelease { asked } => {
             format!("No notes for {asked}. Type /changelog to pick from the list.").into()

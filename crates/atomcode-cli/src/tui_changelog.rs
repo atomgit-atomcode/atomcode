@@ -28,7 +28,7 @@ use atomcode_plexus::{Context, Plugin};
 use atomcode_tui::command::{Command, CommandSet, Outcome};
 use atomcode_tui::keymap::Action;
 use atomcode_tui::plugin::CommandsSvc;
-use atomcode_tui::sheet::{List, Piece, Row, Sheet, Tone};
+use atomcode_tui::sheet::{Doc, DocTab, List, Piece, Row, Sheet, Tone};
 use serde_json::Value;
 
 /// The row's name.
@@ -114,9 +114,41 @@ fn answer(args: &str, releases: &[Release], current: Version, seen: Seen) -> Out
         ))));
     }
     match Version::parse(asked).and_then(|v| releases.iter().find(|r| r.version == v)) {
-        Some(release) => Outcome::Document(release.markdown()),
+        Some(release) => Outcome::Do(Action::OpenSheet(Sheet::doc(release_doc(release, current)))),
         None => Outcome::Refused(tr(SMsg::ChangelogNoSuchRelease { asked }).into_owned()),
     }
+}
+
+/// One release as a document on the sheet: 概览 (what it is about, then what
+/// changed) and, when it lists any, Issues — each a title that opens its link.
+/// Picked out of the list, Esc comes back to the list with the cursor on it
+/// (`Host::settle_sheet_pick` keeps the list behind a page of the same command).
+fn release_doc(release: &Release, current: Version) -> Doc {
+    let parts = release.parts();
+    let overview = [parts.overview.as_str(), parts.changes.as_str()]
+        .into_iter()
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let mut tabs = vec![DocTab::new(tr(SMsg::ChangelogOverviewTab), overview)];
+    let issues = parts.issue_count();
+    if issues > 0 {
+        tabs.push(DocTab::new(
+            tr(SMsg::ChangelogIssuesTab { count: issues }),
+            parts.issues.clone(),
+        ));
+    }
+    let mut title = vec![Piece::new(release.version.to_string(), Tone::Plain)];
+    if let Some(date) = &release.date {
+        title.push(Piece::new(format!("  {date}"), Tone::Muted));
+    }
+    if release.version == current {
+        title.push(Piece::new(
+            format!("  {}", tr(SMsg::ChangelogThisBuild)),
+            Tone::Muted,
+        ));
+    }
+    Doc::new("changelog", title, tabs)
 }
 
 /// The releases as a list to pick from: newest first, the cursor on the newest.
@@ -312,15 +344,48 @@ mod tests {
         assert!(list.rows[1].figures.is_empty(), "5.2.0 was told before");
     }
 
-    /// 选中(或直接打)一个版本:那一节整份作为文档进对话。
+    fn doc_of(outcome: Outcome) -> Doc {
+        let Outcome::Do(Action::OpenSheet(sheet)) = outcome else {
+            panic!("a sheet: {outcome:?}");
+        };
+        let atomcode_tui::sheet::Page::Doc(doc) = sheet.page else {
+            panic!("a document page");
+        };
+        doc
+    }
+
+    /// 选中(或直接打)一个版本:在面板里打开它 —— 概览一页;列了 Issues 的再多一页。
     #[test]
-    fn a_release_named_is_its_notes_as_a_document() {
+    fn a_release_named_opens_as_a_document_with_its_tabs() {
+        let _locale = atomcode_config::i18n::test_lock();
+        atomcode_config::i18n::set_locale(atomcode_config::locale::Locale::ZhCn);
         let said = answer_doc("v5.2.0", DOC, v("5.2.1"), Seen::default());
-        assert_eq!(
-            said,
-            Outcome::Document("## v5.2.0\n\n- **后台会话**".into())
-        );
+        let doc = doc_of(said.clone());
+        assert_eq!(doc.tabs.len(), 1, "no issues, no Issues tab");
+        assert_eq!(doc.tabs[0].markdown, "- **后台会话**");
         assert_eq!(answer_doc("5.2.0", DOC, v("5.2.1"), Seen::default()), said);
+
+        let with_parts = "## v5.2.1 (2026-10-08)\n\n### 概览\n核心是架构。\n\n### 更新内容\n- **全新架构**\n\n### Issues\n- [#1182 二维码](https://example.com/1182)\n";
+        let doc = doc_of(answer_doc(
+            "v5.2.1",
+            with_parts,
+            v("5.2.1"),
+            Seen::default(),
+        ));
+        let names: Vec<&str> = doc.tabs.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["概览", "Issues (1)"]);
+        assert_eq!(
+            doc.tabs[0].markdown, "核心是架构。\n\n- **全新架构**",
+            "overview, then changes"
+        );
+        assert!(doc.tabs[1]
+            .markdown
+            .contains("[#1182 二维码](https://example.com/1182)"));
+        let title: String = doc.title.iter().map(|p| p.text.as_str()).collect();
+        assert!(
+            title.contains("v5.2.1") && title.contains("2026-10-08"),
+            "{title}"
+        );
         assert!(matches!(
             answer_doc("v4.0.0", DOC, v("5.2.1"), Seen::default()),
             Outcome::Refused(_)

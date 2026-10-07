@@ -40,12 +40,24 @@ pub fn shipped() -> Vec<Release> {
 /// `zh` and `en` read as one set of notes for `locale`: in English, each
 /// release's English section where there is one and its Chinese one where there
 /// is not — a release is never missing because nobody translated it yet.
+///
+/// Issues are kept once, in the Chinese file, under their own titles: an
+/// English section without an Issues part shows the Chinese section's.
 pub fn localized(zh: &str, en: &str, locale: crate::locale::Locale) -> Vec<Release> {
     let chinese = releases(zh);
     if locale != crate::locale::Locale::En {
         return chinese;
     }
     let mut out = releases(en);
+    for release in &mut out {
+        let Some(twin) = chinese.iter().find(|r| r.version == release.version) else {
+            continue;
+        };
+        let issues = twin.parts().issues;
+        if release.parts().issues.is_empty() && !issues.is_empty() {
+            release.body = format!("{}\n\n### Issues\n\n{issues}", release.body.trim_end());
+        }
+    }
     for release in chinese {
         if !out.iter().any(|r| r.version == release.version) {
             out.push(release);
@@ -104,24 +116,90 @@ pub struct Release {
     pub body: String,
 }
 
+/// A release's section split into what `/changelog` shows on its tabs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Parts {
+    /// Under `### 概览` / `### Overview`: a paragraph or two on what the release
+    /// is about. Empty when the section has none.
+    pub overview: String,
+    /// Everything else: under `### 更新内容` / `### Changes`, under any other
+    /// subheading (`### 新功能`, kept as written), and above the first one.
+    pub changes: String,
+    /// Under `### Issues` / `### 问题`: one issue per item,
+    /// `- [#1182 标题](链接)`.
+    pub issues: String,
+}
+
+impl Parts {
+    /// How many issues the release lists: its top-level items.
+    pub fn issue_count(&self) -> usize {
+        self.issues.lines().filter(|line| is_item(line)).count()
+    }
+}
+
+/// Which part a `### …` subheading opens, when it is one of the three.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Part {
+    Overview,
+    Changes,
+    Issues,
+}
+
+fn part_named(name: &str) -> Option<Part> {
+    match name.trim().to_lowercase().as_str() {
+        "概览" | "overview" => Some(Part::Overview),
+        "更新内容" | "changes" => Some(Part::Changes),
+        "issues" | "问题" => Some(Part::Issues),
+        _ => None,
+    }
+}
+
+fn is_item(line: &str) -> bool {
+    line.starts_with("- ") || line.starts_with("* ")
+}
+
 impl Release {
-    /// The section as a document of its own, heading included.
-    pub fn markdown(&self) -> String {
-        let heading = match &self.date {
-            Some(date) => format!("## {} ({date})", self.version),
-            None => format!("## {}", self.version),
-        };
-        format!("{heading}\n\n{}", self.body.trim())
+    /// The section in its parts. A section written before the parts existed —
+    /// no `###` of the three — is all changes.
+    pub fn parts(&self) -> Parts {
+        let mut parts = Parts::default();
+        let mut into = Part::Changes;
+        for line in self.body.lines() {
+            if let Some(name) = line.strip_prefix("### ") {
+                match part_named(name) {
+                    Some(part) => {
+                        into = part;
+                        continue;
+                    }
+                    // Any other subheading is a group of changes, and stays.
+                    None => into = Part::Changes,
+                }
+            }
+            let to = match into {
+                Part::Overview => &mut parts.overview,
+                Part::Changes => &mut parts.changes,
+                Part::Issues => &mut parts.issues,
+            };
+            to.push_str(line);
+            to.push('\n');
+        }
+        for text in [&mut parts.overview, &mut parts.changes, &mut parts.issues] {
+            *text = text.trim().to_string();
+        }
+        parts
     }
 
     /// The release's points in a few words each, in the order written: the bold
-    /// lead of each top-level list item (`- **网页端按服务商管理模型**:……`), or
-    /// the whole item, inline marks taken off, when it has none. A nested item is
-    /// detail of the one above it and not a point of its own.
+    /// lead of each top-level list item of its changes (`- **网页端按服务商管理模型**:
+    /// ……`), or the whole item, inline marks taken off, when it has none. A nested
+    /// item is detail of the one above it and not a point of its own; the
+    /// overview and the issues are not points.
     pub fn highlights(&self) -> Vec<String> {
-        self.body
+        self.parts()
+            .changes
             .lines()
-            .filter_map(|line| line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")))
+            .filter(|line| is_item(line))
+            .filter_map(|line| line.get(2..))
             .map(|item| {
                 let item = item.trim();
                 let lead = item
@@ -380,9 +458,61 @@ mod tests {
             !all[0].body.contains("给写的人看的"),
             "the preamble is nobody's"
         );
-        assert!(all[0]
-            .markdown()
-            .starts_with("## v5.2.1 (2026-10-08)\n\n### 新功能"));
+        assert!(all[0].body.starts_with("### 新功能"), "{:?}", all[0].body);
+    }
+
+    /// 一节按三个小标题分开:概览、更新内容、Issues;别的小标题(新功能、修复)
+    /// 留在更新内容里;要点只取更新内容的,不取概览和 Issues。
+    #[test]
+    fn a_section_splits_into_overview_changes_and_issues() {
+        let doc = "\
+## v5.2.2
+
+### 概览
+这一版的核心是架构。
+
+### 更新内容
+- **全新架构**:分层
+
+### 修复
+- 修了一个
+
+### Issues
+- [#1182 二维码](https://example.com/1182)
+- [#1183 颜色](https://example.com/1183)
+  - 细节不算一条
+";
+        let release = &releases(doc)[0];
+        let parts = release.parts();
+        assert_eq!(parts.overview, "这一版的核心是架构。");
+        assert!(
+            parts.changes.starts_with("- **全新架构**"),
+            "{:?}",
+            parts.changes
+        );
+        assert!(
+            parts.changes.contains("### 修复\n- 修了一个"),
+            "{:?}",
+            parts.changes
+        );
+        assert!(!parts.changes.contains("1182"));
+        assert_eq!(parts.issue_count(), 2);
+        assert_eq!(release.highlights(), ["全新架构", "修了一个"]);
+        let english = &releases(
+            &doc.replace("### 概览", "### Overview")
+                .replace("### 更新内容", "### Changes"),
+        )[0];
+        assert_eq!(english.parts(), parts, "the English names mean the same");
+    }
+
+    /// 没写小标题的旧格式,整节都是更新内容。
+    #[test]
+    fn a_section_without_parts_is_all_changes() {
+        let release = &releases(DOC)[2];
+        let parts = release.parts();
+        assert_eq!(parts.overview, "");
+        assert_eq!(parts.issues, "");
+        assert_eq!(parts.changes, release.body);
     }
 
     #[test]
@@ -537,5 +667,25 @@ mod tests {
         );
         let chinese = localized(DOC, en, Locale::ZhCn);
         assert_eq!(chinese[0].highlights()[0], "网页端按服务商管理模型");
+    }
+
+    /// Issues 只写在中文那份里:英文界面里同一个版本照样有它们,标题是原文。
+    #[test]
+    fn english_shows_the_issues_written_once_in_chinese() {
+        use crate::locale::Locale;
+        let zh = "## v5.2.1\n### 概览\n中文\n### 更新内容\n- **一点**\n### Issues\n- [#1 二维码](https://example.com/1)\n";
+        let en = "## v5.2.1\n### Overview\nEnglish\n### Changes\n- **A point**\n";
+        let english = &localized(zh, en, Locale::En)[0];
+        let parts = english.parts();
+        assert_eq!(parts.overview, "English");
+        assert_eq!(english.highlights(), ["A point"], "the English changes");
+        assert_eq!(parts.issues, "- [#1 二维码](https://example.com/1)");
+        let own =
+            "## v5.2.1\n### Changes\n- **A point**\n### Issues\n- [#1 QR](https://example.com/1)\n";
+        assert_eq!(
+            localized(zh, own, Locale::En)[0].parts().issues,
+            "- [#1 QR](https://example.com/1)",
+            "an English Issues part of its own wins"
+        );
     }
 }

@@ -2306,6 +2306,13 @@ impl UserInterface for Tui {
                             // And the bottom sheet's list: a click is Enter on
                             // the row, the same as the resume panel.
                             if self.host.sheet_open() {
+                                // A document's page tabs, chrome first — the
+                                // same order the other panels' headers keep.
+                                if let Some(tab) = self.host.sheet_tab_at(x, y) {
+                                    let _ = self.host.show_sheet_tab(tab);
+                                    stale = true;
+                                    continue;
+                                }
                                 if let Some(row) = self.host.sheet_row_at(x, y) {
                                     let _ = self.host.point_sheet_at(row);
                                     self.run_sheet_key(crate::surface::KeyPress::plain(
@@ -7925,9 +7932,8 @@ impl Tui {
             // Back to whoever asked, before `deliver` consumes it. A modal or
             // an action has nothing to send: what they do shows up in the
             // session's own facts, which the far end is already watching.
-            if let crate::command::Outcome::Said(text)
-            | crate::command::Outcome::Refused(text)
-            | crate::command::Outcome::Document(text) = &outcome
+            if let crate::command::Outcome::Said(text) | crate::command::Outcome::Refused(text) =
+                &outcome
             {
                 remote.said(format!("{display}\n{text}"));
             }
@@ -8020,17 +8026,6 @@ fn deliver(
     outcome: crate::command::Outcome,
 ) {
     let said = match outcome {
-        crate::command::Outcome::Document(text) => {
-            let mut stream = host.stream.write().expect("stream poisoned");
-            let mut w = stream.writer("commands");
-            w.emit(
-                crate::block::Coord::default(),
-                Arc::new(crate::content::CommandDocument { text }),
-            );
-            drop(stream);
-            let _ = keys.send(Wake::Fact);
-            None
-        }
         crate::command::Outcome::Said(text) => Some((text, false)),
         crate::command::Outcome::Refused(why) => Some((why, true)),
         crate::command::Outcome::Quiet => None,
@@ -11002,6 +10997,38 @@ mod link_click_tests {
             );
             assert!(!refused);
         }
+    }
+
+    /// An issue on `/changelog`'s Issues tab is a title with no address on
+    /// screen — and a click on the title opens the issue, the same as a link in
+    /// a reply. The sheet is a panel, not the stream, so this is the panel's
+    /// cells being read off the same painted frame.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_click_on_an_issue_title_in_the_sheet_opens_it() {
+        let url = "https://atomgit.com/atomgit_atomcode/atomcode/issues/1182";
+        let (host, tui, recorded) = screen_saying("hi");
+        let mut doc = crate::sheet::Doc::new(
+            "changelog",
+            Vec::new(),
+            vec![
+                crate::sheet::DocTab::new("概览", "- **一点**"),
+                crate::sheet::DocTab::new(
+                    "Issues (1)",
+                    format!("- [#1182 Windows 终端二维码显示异常]({url})"),
+                ),
+            ],
+        );
+        doc.show(1);
+        host.modules
+            .add_view(Arc::new(crate::module::Mounted::<
+                crate::modules::sheet::SheetView,
+            >::new()))
+            .expect("the sheet mounts");
+        assert!(host.open_sheet(crate::sheet::Sheet::doc(doc)));
+        let cells = cells_of(&host, url);
+        assert!(!cells.is_empty(), "the title is drawn as the link");
+        tui.act(Action::ClickAt(cells[0].0, cells[0].1), &tui.client);
+        assert_eq!(opened(&recorded).await, vec![url.to_string()]);
     }
 
     /// A second press inside the double-click window is a double-click —

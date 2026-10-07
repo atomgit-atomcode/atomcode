@@ -10,7 +10,7 @@ use crate::i18n::{t, Msg};
 use crate::module::{Height, View};
 use crate::modules::chrome::{self, box_edge, pad_to, panel_edge, search_line};
 use crate::moment::{Moment, Viewport};
-use crate::sheet::{read_room, List, Mark, Page, Piece, Read, Sheet, Tone};
+use crate::sheet::{doc_width, read_room, Doc, List, Mark, Page, Piece, Read, Sheet, Tone};
 use crate::theme::{self, Role};
 use crate::width;
 
@@ -48,6 +48,9 @@ impl View for SheetView {
         }
         let caps = vp.moment.caps;
         let h = vp.rect.h as usize;
+        if let Page::Doc(doc) = &sheet.page {
+            return doc_lines(sheet, doc, h, w, caps);
+        }
         layout(sheet, h)
             .into_iter()
             .map(|row| draw(sheet, row, w, caps, read_room(h)))
@@ -61,6 +64,10 @@ impl View for SheetView {
         };
         if width == 0 {
             return Height::Hug(0);
+        }
+        if let Page::Doc(doc) = &sheet.page {
+            let rows = doc_lines(sheet, doc, usize::MAX, width as usize, moment.caps).len();
+            return Height::Hug(rows.min(u16::MAX as usize) as u16);
         }
         Height::Hug(layout(sheet, usize::MAX).len().min(u16::MAX as usize) as u16)
     }
@@ -137,6 +144,10 @@ fn layout(sheet: &Sheet, h: usize) -> Vec<Row> {
                 rows.extend((0..preview).map(Row::Preview));
             }
         }
+        // Drawn whole by `doc_lines`: its rows depend on the width, which this
+        // layout does not know. Only the hit test comes here, and a document has
+        // no rows to pick.
+        Page::Doc(_) => {}
         Page::Read(read) => {
             rows.push(Row::Blank);
             if read.lines.is_empty() {
@@ -188,12 +199,12 @@ fn draw(sheet: &Sheet, row: Row, w: usize, caps: Caps, room: usize) -> Line {
         Row::Header => header(sheet, w, room),
         Row::Summary => match &sheet.page {
             Page::List(list) => pieces_line("  ", &list.summary, w),
-            Page::Read(_) => Line::empty(),
+            Page::Read(_) | Page::Doc(_) => Line::empty(),
         },
         Row::BoxTop => box_edge(w, caps, true),
         Row::Search => match &sheet.page {
             Page::List(list) => search_line(&list.query, Some(list.query.len()), w, caps),
-            Page::Read(_) => Line::empty(),
+            Page::Read(_) | Page::Doc(_) => Line::empty(),
         },
         Row::BoxBottom => box_edge(w, caps, false),
         Row::Blank => Line::empty(),
@@ -204,7 +215,7 @@ fn draw(sheet: &Sheet, row: Row, w: usize, caps: Caps, room: usize) -> Line {
                 }
                 Page::List(_) => t(Msg::OverlayNoMatch).trim().to_string(),
                 Page::Read(read) if !read.empty.is_empty() => read.empty.clone(),
-                Page::Read(_) => t(Msg::OverlayEmptyFile).trim().to_string(),
+                Page::Read(_) | Page::Doc(_) => t(Msg::OverlayEmptyFile).trim().to_string(),
             };
             Line::styled(width::take_width(&format!("  {said}"), w), muted)
         }
@@ -213,11 +224,11 @@ fn draw(sheet: &Sheet, row: Row, w: usize, caps: Caps, room: usize) -> Line {
         }
         Row::Item { at, row } => match &sheet.page {
             Page::List(list) => item_line(list, at, row, w, caps),
-            Page::Read(_) => Line::empty(),
+            Page::Read(_) | Page::Doc(_) => Line::empty(),
         },
         Row::Line(at) => match &sheet.page {
             Page::Read(read) => read_line(read, at, w, caps),
-            Page::List(_) => Line::empty(),
+            Page::List(_) | Page::Doc(_) => Line::empty(),
         },
         Row::Preview(at) => match &sheet.page {
             Page::List(list) => {
@@ -228,7 +239,7 @@ fn draw(sheet: &Sheet, row: Row, w: usize, caps: Caps, room: usize) -> Line {
                     .unwrap_or_default();
                 Line::styled(format!("  {said}"), muted).truncate(w)
             }
-            Page::Read(_) => Line::empty(),
+            Page::Read(_) | Page::Doc(_) => Line::empty(),
         },
         Row::Legend => {
             let said = match &sheet.page {
@@ -237,6 +248,11 @@ fn draw(sheet: &Sheet, row: Row, w: usize, caps: Caps, room: usize) -> Line {
                 }),
                 Page::Read(_) => t(Msg::SheetReadLegend {
                     back: sheet.back.is_some(),
+                }),
+                Page::Doc(doc) => t(Msg::SheetDocLegend {
+                    back: sheet.back.is_some(),
+                    tabs: doc.tabs.len() > 1,
+                    links: doc.has_links(),
                 }),
             };
             Line::styled(format!("  {said}"), muted).truncate(w)
@@ -261,8 +277,95 @@ fn header(sheet: &Sheet, w: usize, room: usize) -> Line {
                 ));
             }
         }
+        Page::Doc(doc) => return Line::from_spans(doc_header(doc).0).truncate(w),
     }
     Line::from_spans(spans).truncate(w)
+}
+
+/// 文档页([`Doc`]):规则线、表头、空行、正文(按面板宽度渲染的 markdown)、空行、
+/// 提示。和读的那页同一副骨架,只是正文是渲染过的,没有行号。
+fn doc_lines(sheet: &Sheet, doc: &Doc, h: usize, w: usize, caps: Caps) -> Vec<Line> {
+    let muted = theme::fg(Role::Muted);
+    let room = read_room(h);
+    let body = doc.lines(doc_width(w));
+    let from = doc.top.min(body.len().saturating_sub(room));
+    let to = (from + room).min(body.len());
+    let (mut header, _) = doc_header(doc);
+    if body.len() > room {
+        header.push(Span::styled(
+            format!("  {}-{}/{}", from + 1, to, body.len()),
+            muted,
+        ));
+    }
+    let mut out = vec![
+        panel_edge(w, caps),
+        Line::from_spans(header).truncate(w),
+        Line::empty(),
+    ];
+    if body.is_empty() {
+        out.push(Line::styled(
+            width::take_width(&format!("  {}", t(Msg::OverlayEmptyFile).trim()), w),
+            muted,
+        ));
+    }
+    for line in &body[from..to] {
+        let mut spans = vec![Span::styled("  ".to_string(), Style::new())];
+        spans.extend(line.spans.iter().cloned());
+        out.push(Line::from_spans(spans).truncate(w));
+    }
+    out.push(Line::empty());
+    out.push(
+        Line::styled(
+            format!(
+                "  {}",
+                t(Msg::SheetDocLegend {
+                    back: sheet.back.is_some(),
+                    tabs: doc.tabs.len() > 1,
+                    links: doc.has_links(),
+                })
+            ),
+            muted,
+        )
+        .truncate(w),
+    );
+    out
+}
+
+/// 文档页的表头:命令名,版本与日期,然后是页签;以及每个页签占哪几列(点页签用)。
+/// 只有一页时不画页签 —— 一个页签没有可切换的。
+fn doc_header(doc: &Doc) -> (Vec<Span>, Vec<(usize, usize, usize)>) {
+    let labels: Vec<&str> = if doc.tabs.len() > 1 {
+        doc.tabs.iter().map(|tab| tab.name.as_str()).collect()
+    } else {
+        Vec::new()
+    };
+    let (mut spans, ranges) = chrome::header_parts(doc.id, &labels, doc.tab);
+    // `header_parts` 是「两格、命令名、三格、页签……」:版本号插在命令名之后、页签之前,
+    // 页签的列跟着右移同样的宽度 —— 画的和点的用同一份。
+    let mut title: Vec<Span> = doc.title.iter().map(piece_span).collect();
+    if !labels.is_empty() {
+        title.push(Span::styled("    ".to_string(), Style::new()));
+    }
+    let shift: usize = title.iter().map(|span| width::str_width(&span.text)).sum();
+    let at = spans.len().min(3);
+    spans.splice(at..at, title);
+    let ranges = ranges
+        .into_iter()
+        .map(|(tab, from, to)| (tab, from + shift, to + shift))
+        .collect();
+    (spans, ranges)
+}
+
+/// 文档页第 `row` 行、第 `col` 列落在哪个页签上。表头是第二行(规则线之下)。
+pub fn doc_tab_at(doc: &Doc, row: usize, col: usize) -> Option<usize> {
+    if row != 1 {
+        return None;
+    }
+    doc_header(doc)
+        .1
+        .into_iter()
+        .find(|&(_, from, to)| col >= from && col < to)
+        .map(|(tab, _, _)| tab)
 }
 
 fn tone_style(tone: Tone) -> Style {
@@ -484,6 +587,125 @@ mod tests {
         ));
         let rows = layout(&plain, usize::MAX);
         assert!(!rows.iter().any(|row| matches!(row, Row::Preview(_))));
+    }
+
+    fn release() -> Doc {
+        Doc::new(
+            "changelog",
+            vec![Piece::new("v5.2.2", Tone::Plain)],
+            vec![
+                crate::sheet::DocTab::new(
+                    "概览",
+                    "这一版的核心是**架构**。\n\n- **全新架构**:分层",
+                ),
+                crate::sheet::DocTab::new(
+                    "Issues (1)",
+                    "- [#1182 Windows 终端二维码显示异常](https://atomgit.com/x/issues/1182)",
+                ),
+            ],
+        )
+    }
+
+    fn doc_text(sheet: &Sheet, w: usize) -> Vec<String> {
+        let Page::Doc(doc) = &sheet.page else {
+            panic!("a document");
+        };
+        doc_lines(sheet, doc, usize::MAX, w, Caps::default())
+            .into_iter()
+            .map(|line| line.plain())
+            .collect()
+    }
+
+    /// 文档页:表头是命令名、版本、页签;正文按 markdown 画 —— 加粗没有星号,
+    /// 列表是圆点。
+    #[test]
+    fn a_document_draws_its_markdown_under_its_tabs() {
+        let sheet = Sheet::doc(release());
+        let text = doc_text(&sheet, 80);
+        assert!(text[1].contains("changelog"), "{text:?}");
+        assert!(
+            text[1].contains("v5.2.2")
+                && text[1].contains("概览")
+                && text[1].contains("Issues (1)")
+        );
+        let body = text.join("\n");
+        assert!(body.contains("这一版的核心是架构"), "{body}");
+        assert!(!body.contains("**"), "drawn, not source: {body}");
+    }
+
+    /// Issues 那一页:看到的是编号和标题,地址不露出来 —— 它是标题上的链接。
+    #[test]
+    fn an_issue_shows_its_title_and_links_it_without_printing_the_url() {
+        let mut doc = release();
+        doc.show(1);
+        let sheet = Sheet::doc(doc.clone());
+        let lines = doc_lines(&sheet, &doc, usize::MAX, 80, Caps::default());
+        let text: String = lines
+            .iter()
+            .map(|l| l.plain())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("#1182 Windows 终端二维码显示异常"), "{text}");
+        assert!(!text.contains("https://"), "{text}");
+        let linked = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|span| span.text.contains("#1182"))
+            .and_then(|span| span.link.clone());
+        assert_eq!(linked.as_deref(), Some("https://atomgit.com/x/issues/1182"));
+    }
+
+    /// 点表头上的页签就换到那一页 —— 版本号挤在前面,点的列也跟着挪。
+    #[test]
+    fn a_click_on_a_tab_finds_the_tab_drawn_there() {
+        let doc = release();
+        let header = doc_text(&Sheet::doc(doc.clone()), 80)[1].clone();
+        let col = |label: &str| width::str_width(header.split(label).next().unwrap_or_default());
+        assert_eq!(doc_tab_at(&doc, 1, col("概览")), Some(0));
+        assert_eq!(doc_tab_at(&doc, 1, col("Issues")), Some(1));
+        assert_eq!(
+            doc_tab_at(&doc, 1, col("v5.2.2")),
+            None,
+            "the title is no tab"
+        );
+        assert_eq!(
+            doc_tab_at(&doc, 2, col("Issues")),
+            None,
+            "only the header row"
+        );
+    }
+
+    /// 一个版本没有 Issues 时只有一页,不画页签,提示里也不说 tab。
+    #[test]
+    fn a_document_with_one_page_draws_no_tabs() {
+        let doc = Doc::new(
+            "changelog",
+            vec![Piece::new("v5.0.0", Tone::Plain)],
+            vec![crate::sheet::DocTab::new("概览", "- **一点**")],
+        );
+        let text = doc_text(&Sheet::doc(doc), 80);
+        assert!(!text[1].contains("概览"), "{text:?}");
+        assert!(!text.last().unwrap().contains("tab"), "{text:?}");
+    }
+
+    /// 面板一样高:正文比一屏长时,往下翻不改变高度。
+    #[test]
+    fn a_long_document_is_as_tall_wherever_it_is_scrolled() {
+        let long: String = (1..=80).map(|n| format!("- point {n}\n")).collect();
+        let mut doc = Doc::new(
+            "changelog",
+            Vec::new(),
+            vec![crate::sheet::DocTab::new("a", long)],
+        );
+        let top = doc_lines(&Sheet::doc(doc.clone()), &doc, 30, 80, Caps::default()).len();
+        doc.top = 40;
+        let scrolled = doc_lines(&Sheet::doc(doc.clone()), &doc, 30, 80, Caps::default());
+        assert_eq!(scrolled.len(), top);
+        assert!(
+            scrolled[1].plain().contains("41-"),
+            "where it is: {:?}",
+            scrolled[1].plain()
+        );
     }
 
     /// 单子:表头说是哪个命令的、这一张是什么;选中那行有指针;靠右的数画全,

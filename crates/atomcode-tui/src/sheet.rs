@@ -40,6 +40,14 @@ impl Sheet {
         }
     }
 
+    pub fn doc(doc: Doc) -> Self {
+        Self {
+            page: Page::Doc(doc),
+            back: None,
+            pending: None,
+        }
+    }
+
     pub fn read(read: Read) -> Self {
         Self {
             page: Page::Read(read),
@@ -53,6 +61,7 @@ impl Sheet {
 pub enum Page {
     List(List),
     Read(Read),
+    Doc(Doc),
 }
 
 impl Page {
@@ -61,6 +70,7 @@ impl Page {
         match self {
             Page::List(list) => list.id,
             Page::Read(read) => read.id,
+            Page::Doc(doc) => doc.id,
         }
     }
 }
@@ -358,6 +368,108 @@ impl Read {
     }
 }
 
+/// 分页签读的一份文档:`/changelog` 里的一个版本,「概览」与「Issues」各一页。
+///
+/// 和 [`Read`] 不同,正文是 markdown,按面板的宽度折行 —— 链接画成可点的字、地址不
+/// 露出来,标题、列表、加粗照回复的样子画。所以「滚到哪儿为止」要按**画出来的**行数
+/// 算,按键这一层因此要知道宽度([`doc_width`]),和画的那一层用同一个数。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Doc {
+    pub id: &'static str,
+    /// 表头里命令名后面那段:版本号、日期。
+    pub title: Vec<Piece>,
+    pub tabs: Arc<Vec<DocTab>>,
+    /// 正在看第几页。
+    pub tab: usize,
+    /// 视野从画出来的第几行开始。
+    pub top: usize,
+}
+
+/// 文档的一页。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DocTab {
+    /// 表头里的页签名。
+    pub name: String,
+    pub markdown: String,
+}
+
+impl DocTab {
+    pub fn new(name: impl Into<String>, markdown: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            markdown: markdown.into(),
+        }
+    }
+}
+
+impl Doc {
+    pub fn new(id: &'static str, title: Vec<Piece>, tabs: Vec<DocTab>) -> Self {
+        Self {
+            id,
+            title,
+            tabs: Arc::new(tabs),
+            tab: 0,
+            top: 0,
+        }
+    }
+
+    /// 正在看的那一页,宽 `width` 时画出来的样子。
+    pub fn lines(&self, width: usize) -> Vec<crate::frame::Line> {
+        match self.tabs.get(self.tab) {
+            Some(tab) => crate::markdown::render(
+                &tab.markdown,
+                width.clamp(1, u16::MAX as usize) as u16,
+                crate::frame::Style::new(),
+            ),
+            None => Vec::new(),
+        }
+    }
+
+    /// 视野最多往下走到哪一行开始:最后一屏满着(理由同 [`Read`])。
+    fn last_top(&self, room: usize, width: usize) -> usize {
+        self.lines(width).len().saturating_sub(room.max(1))
+    }
+
+    fn scroll(&mut self, by: isize, room: usize, width: usize) {
+        self.top = self
+            .top
+            .saturating_add_signed(by)
+            .min(self.last_top(room, width));
+    }
+
+    /// 换到前一页 / 后一页,绕回;换了页从头读。只有一页时什么都不做。
+    fn switch(&mut self, by: isize) {
+        let n = self.tabs.len();
+        if n <= 1 {
+            return;
+        }
+        self.tab = (self.tab as isize + by).rem_euclid(n as isize) as usize;
+        self.top = 0;
+    }
+
+    /// 正在看的那一页有没有可点的链接 —— 提示里才说「点击标题打开链接」。
+    pub fn has_links(&self) -> bool {
+        self.tabs
+            .get(self.tab)
+            .is_some_and(|tab| tab.markdown.contains("]("))
+    }
+
+    /// 直接换到第 `tab` 页(点了页签)。动了返回 `true`。
+    pub fn show(&mut self, tab: usize) -> bool {
+        if tab >= self.tabs.len() || tab == self.tab {
+            return false;
+        }
+        self.tab = tab;
+        self.top = 0;
+        true
+    }
+}
+
+/// 面板宽 `w` 时文档正文按多宽折行:左边空两格,和面板里别的字对齐;右边留两格。
+pub fn doc_width(w: usize) -> usize {
+    w.saturating_sub(4).max(1)
+}
+
 /// 读的那一页最多画多少行字。高度是这一块自己要的,宿主再按屏幕夹 —— 和别的面板
 /// 一样按能画下的算,不按屏幕给了多少。
 pub const READ_ROWS: usize = 24;
@@ -479,9 +591,18 @@ pub enum Step {
 /// 列表每次翻一页走几行。
 const LIST_PAGE: usize = 10;
 
+/// 文档页不知道面板多宽时按这个宽度折行(测试,以及还没画过的那一刻)。
+pub const DOC_WIDTH: usize = 80;
+
 /// 跑一个键。自由函数、纯的:单子写回去,挑中什么由 [`Step::Chose`] 说出去。
 /// `room` 是读的那页此刻画出来的正文行数([`read_room`]),翻页与滚到底按它算。
 pub fn key(sheet: &mut Sheet, press: KeyPress, room: usize) -> Step {
+    key_in(sheet, press, room, DOC_WIDTH)
+}
+
+/// [`key`],知道面板有多宽:文档页按画出来的行数滚,而行数跟着宽度变
+/// ([`doc_width`])。
+pub fn key_in(sheet: &mut Sheet, press: KeyPress, room: usize, width: usize) -> Step {
     // Ctrl-C 哪一页都是「不要了」:不回到背后那张,整个收起来。
     if matches!((press.key, press.mods), (Key::Char('c'), Mods::CTRL)) {
         return Step::Close;
@@ -506,6 +627,41 @@ pub fn key(sheet: &mut Sheet, press: KeyPress, room: usize) -> Step {
             read_key(read, press, room);
             Step::Stay
         }
+        Page::Doc(doc) => {
+            // 左右键在这儿是换页签,所以只有 esc / q 是离开 —— 和读的那页一样,
+            // 背后有一张单子就回到它。
+            if matches!(
+                (press.key, press.mods),
+                (Key::Esc, _) | (Key::Char('q'), Mods::NONE)
+            ) {
+                return match sheet.back.take() {
+                    Some(page) => {
+                        sheet.page = *page;
+                        Step::Stay
+                    }
+                    None => Step::Close,
+                };
+            }
+            doc_key(doc, press, room, doc_width(width));
+            Step::Stay
+        }
+    }
+}
+
+fn doc_key(doc: &mut Doc, press: KeyPress, room: usize, width: usize) {
+    let page = room.saturating_sub(1).max(1) as isize;
+    match (press.key, press.mods) {
+        (Key::Tab, _) | (Key::Right, _) | (Key::Char('l'), Mods::NONE) => doc.switch(1),
+        (Key::BackTab, _) | (Key::Left, _) | (Key::Char('h'), Mods::NONE) => doc.switch(-1),
+        (Key::Up, _) | (Key::Char('k'), Mods::NONE) => doc.scroll(-1, room, width),
+        (Key::Down, _) | (Key::Char('j'), Mods::NONE) => doc.scroll(1, room, width),
+        (Key::PageUp, _) => doc.scroll(-page, room, width),
+        (Key::PageDown, _) | (Key::Char(' '), Mods::NONE) => doc.scroll(page, room, width),
+        (Key::Home, _) | (Key::Char('g'), Mods::NONE) => doc.top = 0,
+        (Key::End, _) | (Key::Char('G'), Mods::NONE | Mods::SHIFT) => {
+            doc.top = doc.last_top(room, width)
+        }
+        _ => {}
     }
 }
 
@@ -590,6 +746,11 @@ fn read_key(read: &mut Read, press: KeyPress, room: usize) {
 
 /// 滚轮:列表挪光标,读的那页挪视野。
 pub fn wheel(sheet: &mut Sheet, by: i32, room: usize) {
+    wheel_in(sheet, by, room, DOC_WIDTH)
+}
+
+/// [`wheel`],知道面板有多宽(理由同 [`key_in`])。
+pub fn wheel_in(sheet: &mut Sheet, by: i32, room: usize, width: usize) {
     match &mut sheet.page {
         Page::List(list) => {
             let rows = list.listed().len();
@@ -597,6 +758,7 @@ pub fn wheel(sheet: &mut Sheet, by: i32, room: usize) {
                 (list.cursor as i64 + by as i64).clamp(0, rows.saturating_sub(1) as i64) as usize;
         }
         Page::Read(read) => read.scroll(by as isize, room),
+        Page::Doc(doc) => doc.scroll(by as isize, room, doc_width(width)),
     }
 }
 
@@ -629,8 +791,73 @@ mod tests {
     fn cursor(sheet: &Sheet) -> usize {
         match &sheet.page {
             Page::List(list) => list.cursor,
-            Page::Read(_) => panic!("a list"),
+            Page::Read(_) | Page::Doc(_) => panic!("a list"),
         }
+    }
+
+    fn doc() -> Sheet {
+        let overview: String = (1..=60).map(|n| format!("- point {n}\n")).collect();
+        Sheet::doc(Doc::new(
+            "changelog",
+            vec![Piece::new("v5.2.2", Tone::Plain)],
+            vec![
+                DocTab::new("Overview", overview),
+                DocTab::new("Issues (1)", "- [#1182 QR codes](https://example.com/1182)"),
+            ],
+        ))
+    }
+
+    fn doc_of(sheet: &Sheet) -> &Doc {
+        match &sheet.page {
+            Page::Doc(doc) => doc,
+            _ => panic!("a document"),
+        }
+    }
+
+    /// Tab 往后、Shift+Tab 往前,绕回;换了页从头读。
+    #[test]
+    fn a_document_switches_tabs_and_starts_each_from_the_top() {
+        let mut sheet = doc();
+        key(&mut sheet, press(Key::Down), 10);
+        assert_eq!(doc_of(&sheet).top, 1);
+        key(&mut sheet, press(Key::Tab), 10);
+        assert_eq!((doc_of(&sheet).tab, doc_of(&sheet).top), (1, 0));
+        key(&mut sheet, press(Key::Tab), 10);
+        assert_eq!(doc_of(&sheet).tab, 0, "wraps");
+        key(&mut sheet, press(Key::BackTab), 10);
+        assert_eq!(doc_of(&sheet).tab, 1);
+        key(&mut sheet, press(Key::Left), 10);
+        assert_eq!(doc_of(&sheet).tab, 0);
+    }
+
+    /// 滚到底停在最后一屏满着的地方,按画出来的行数算,不越过去。
+    #[test]
+    fn a_document_scrolls_no_further_than_its_last_screen() {
+        let mut sheet = doc();
+        let lines = doc_of(&sheet).lines(doc_width(DOC_WIDTH)).len();
+        key(&mut sheet, press(Key::End), 10);
+        assert_eq!(doc_of(&sheet).top, lines - 10);
+        key(&mut sheet, press(Key::PageDown), 10);
+        assert_eq!(doc_of(&sheet).top, lines - 10, "no further");
+        key(&mut sheet, press(Key::Home), 10);
+        assert_eq!(doc_of(&sheet).top, 0);
+        wheel(&mut sheet, 3, 10);
+        assert_eq!(doc_of(&sheet).top, 3);
+    }
+
+    /// 从单子里点进来的文档,esc 回到单子;直接打开的,esc 收起。
+    #[test]
+    fn esc_on_a_document_goes_back_to_the_list_it_came_from() {
+        let mut sheet = doc();
+        assert_eq!(key(&mut sheet, press(Key::Esc), 10), Step::Close);
+        let mut sheet = doc();
+        let mut behind = list();
+        if let Page::List(list) = &mut behind.page {
+            list.cursor = 2;
+        }
+        sheet.back = Some(Box::new(behind.page));
+        assert_eq!(key(&mut sheet, press(Key::Esc), 10), Step::Stay);
+        assert_eq!(cursor(&sheet), 2, "the cursor where it was");
     }
 
     /// 上下走、不绕回;回车派发那一行的命令;esc 收起。
@@ -669,7 +896,7 @@ mod tests {
         key(&mut sheet, press(Key::Tab), READ_ROWS);
         match &sheet.page {
             Page::List(list) => assert_eq!(list.query, "lib/c.rs"),
-            Page::Read(_) => unreachable!(),
+            Page::Read(_) | Page::Doc(_) => unreachable!(),
         }
 
         let mut sheet = list();
@@ -692,7 +919,7 @@ mod tests {
         let mut sheet = Sheet::read(Read::file("view", Vec::new(), &text));
         let top = |sheet: &Sheet| match &sheet.page {
             Page::Read(read) => read.top,
-            Page::List(_) => panic!("a reader"),
+            Page::List(_) | Page::Doc(_) => panic!("a reader"),
         };
         key(&mut sheet, press(Key::Up), READ_ROWS);
         assert_eq!(top(&sheet), 0);

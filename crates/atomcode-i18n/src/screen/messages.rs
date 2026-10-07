@@ -51,6 +51,14 @@ pub enum Msg<'a> {
     SheetReadLegend {
         back: bool,
     },
+    /// The bottom sheet's document page (`/changelog`'s release): `tabs` when
+    /// there is more than one page to switch between, `links` when the page
+    /// showing has links to click.
+    SheetDocLegend {
+        back: bool,
+        tabs: bool,
+        links: bool,
+    },
     /// `/diff`'s list: what it lists, the agent's changes or the working tree's.
     DiffListTitle {
         workspace: bool,
@@ -2040,6 +2048,12 @@ pub enum Msg<'a> {
     ChangelogPickerTitle,
     /// The tag on a release that is news to this person.
     ChangelogNewTag,
+    /// A release's first tab: what it is about, and what changed.
+    ChangelogOverviewTab,
+    /// A release's issues tab.
+    ChangelogIssuesTab {
+        count: usize,
+    },
     /// After the date of the release this build is.
     ChangelogThisBuild,
     /// `/changelog <version>` for a release with no notes.

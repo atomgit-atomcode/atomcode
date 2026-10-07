@@ -35,6 +35,13 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::SheetListLegend { typed: true } => "↑↓ 选 · enter 打开(没有匹配时去打的那个)· tab 补全 · esc 关闭".into(),
         Msg::SheetReadLegend { back: false } => "↑↓ 滚动 · PgUp/PgDn 翻页 · Home/End 首尾 · esc 关闭".into(),
         Msg::SheetReadLegend { back: true } => "↑↓ 滚动 · PgUp/PgDn 翻页 · Home/End 首尾 · esc 回到列表".into(),
+        Msg::SheetDocLegend { back, tabs, links } => format!(
+            "{}↑↓ 滚动 · PgUp/PgDn 翻页 · {}esc {}",
+            if tabs { "tab 切换 · " } else { "" },
+            if links { "点击标题打开链接 · " } else { "" },
+            if back { "回到列表" } else { "关闭" },
+        )
+        .into(),
         Msg::DiffListTitle { workspace: false } => "这个会话改过的文件".into(),
         Msg::DiffListTitle { workspace: true } => "工作区里还没提交的改动(git)".into(),
         Msg::DiffFilesChanged { count } => format!("{count} 个文件有改动  ").into(),
@@ -1255,6 +1262,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdAboutChangelog => "查看各版本的更新内容".into(),
         Msg::ChangelogPickerTitle => "选一个版本查看更新内容".into(),
         Msg::ChangelogNewTag => "新".into(),
+        Msg::ChangelogOverviewTab => "概览".into(),
+        Msg::ChangelogIssuesTab { count } => format!("Issues ({count})").into(),
         Msg::ChangelogThisBuild => "当前版本".into(),
         Msg::ChangelogNoSuchRelease { asked } => {
             format!("没有 {asked} 的更新说明。输入 /changelog 从列表里选。").into()

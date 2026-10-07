@@ -4138,6 +4138,17 @@ impl Host {
             .unwrap_or(crate::sheet::READ_ROWS)
     }
 
+    /// How wide the sheet was last drawn: a document page wraps to it, so how
+    /// far it scrolls depends on it ([`crate::sheet::doc_width`]).
+    fn sheet_width(&self) -> usize {
+        self.hits
+            .lock()
+            .expect("hits poisoned")
+            .sheet
+            .map(|rect| rect.w as usize)
+            .unwrap_or(crate::sheet::DOC_WIDTH)
+    }
+
     /// Run one key against the sheet: whether anything changed, and what was
     /// picked — the command, and the token its answer has to bring back
     /// ([`Self::settle_sheet_pick`]).
@@ -4147,12 +4158,13 @@ impl Host {
     /// one question.
     pub fn sheet_key(&self, press: crate::surface::KeyPress) -> (bool, Option<(String, u64)>) {
         let room = self.sheet_room();
+        let width = self.sheet_width();
         let mut m = self.moment.write().expect("moment poisoned");
         let Some(sheet) = m.sheet.as_mut() else {
             return (false, None);
         };
         let before = sheet.clone();
-        match crate::sheet::key(sheet, press, room) {
+        match crate::sheet::key_in(sheet, press, room, width) {
             crate::sheet::Step::Stay => {
                 let changed = *sheet != before;
                 (changed, None)
@@ -4196,7 +4208,7 @@ impl Host {
         m.sheet = match next {
             Some(mut next) => {
                 let behind = m.sheet.take().map(|sheet| sheet.page);
-                if let (Page::Read(_), None, Some(list @ Page::List(_))) =
+                if let (Page::Read(_) | Page::Doc(_), None, Some(list @ Page::List(_))) =
                     (&next.page, &next.back, behind)
                 {
                     if list.id() == next.page.id() {
@@ -4222,10 +4234,11 @@ impl Host {
             return false;
         }
         let room = self.sheet_room();
+        let width = self.sheet_width();
         let mut m = self.moment.write().expect("moment poisoned");
         match m.sheet.as_mut() {
             Some(sheet) => {
-                crate::sheet::wheel(sheet, by, room);
+                crate::sheet::wheel_in(sheet, by, room, width);
                 true
             }
             None => false,
@@ -4241,6 +4254,29 @@ impl Host {
         let m = self.moment.read().expect("moment poisoned");
         let vp = crate::moment::Viewport::new(rect, &m);
         crate::modules::sheet::geometry(&m, &vp).listed_at((y - rect.y) as usize)
+    }
+
+    /// Which page tab of a document sheet is under the pointer — the header
+    /// row, read off the same ranges the header was drawn from.
+    pub fn sheet_tab_at(&self, x: u16, y: u16) -> Option<usize> {
+        let rect = *self.hits.lock().expect("hits poisoned").sheet.as_ref()?;
+        if !rect.contains(x, y) {
+            return None;
+        }
+        let m = self.moment.read().expect("moment poisoned");
+        let crate::sheet::Page::Doc(doc) = &m.sheet.as_ref()?.page else {
+            return None;
+        };
+        crate::modules::sheet::doc_tab_at(doc, (y - rect.y) as usize, (x - rect.x) as usize)
+    }
+
+    /// Show a document sheet's page `tab`. True when it changed.
+    pub fn show_sheet_tab(&self, tab: usize) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        match m.sheet.as_mut().map(|sheet| &mut sheet.page) {
+            Some(crate::sheet::Page::Doc(doc)) => doc.show(tab),
+            _ => false,
+        }
     }
 
     /// Point the sheet's list at a row. True when it moved.

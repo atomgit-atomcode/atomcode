@@ -1065,10 +1065,11 @@ async fn the_launchers_own_commands_are_in_the_menu() {
 }
 
 /// `/changelog` is picked the way `/resume` is: the releases rise from the
-/// bottom, the selected one's points under the list, and Enter puts its notes in
-/// the conversation as a document — the panel goes away.
+/// bottom, the selected one's points under the list. Enter opens the release in
+/// the same panel, drawn as markdown — and Esc comes back to the list, with the
+/// cursor where it was, so reading one release leads to the next.
 #[tokio::test]
-async fn the_changelog_is_picked_from_a_list_and_read_in_the_conversation() {
+async fn the_changelog_is_picked_from_a_list_read_in_the_panel_and_left_back_to_it() {
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("ATOMCODE_HOME", home.path());
     let project = tempfile::tempdir().unwrap();
@@ -1133,17 +1134,45 @@ async fn the_changelog_is_picked_from_a_list_and_read_in_the_conversation() {
     term.press(atomcode_tui::surface::KeyPress::plain(
         atomcode_tui::surface::Key::Enter,
     ));
-    let read = until_gone(&term, "选一个版本查看更新内容").await;
+    let read = until_shown(&term, "esc 回到列表").await;
     if std::env::var_os("SHOW_SCREEN").is_some() {
         eprintln!("{read}");
     }
     assert!(
         !read.contains("选一个版本查看更新内容"),
-        "the list is put away:\n{read}"
+        "the release is open in place of the list:\n{read}"
     );
     assert!(
         read.contains(&first_point) && !read.contains("**"),
-        "the notes are in the conversation, drawn as markdown:\n{read}"
+        "the notes are drawn as markdown:\n{read}"
+    );
+
+    // The newest release lists issues: Tab shows them, each a title with no
+    // address printed — the address is the link under it.
+    let issues = newest.parts().issues;
+    if let Some(first_issue) = issues
+        .lines()
+        .find_map(|line| line.strip_prefix("- ["))
+        .and_then(|rest| rest.split("](").next())
+    {
+        term.press(atomcode_tui::surface::KeyPress::plain(
+            atomcode_tui::surface::Key::Tab,
+        ));
+        let listed = until_shown(&term, first_issue).await;
+        if std::env::var_os("SHOW_SCREEN").is_some() {
+            eprintln!("{listed}");
+        }
+        assert!(listed.contains(first_issue), "{listed}");
+        assert!(!listed.contains("https://atomgit.com"), "{listed}");
+    }
+
+    term.press(atomcode_tui::surface::KeyPress::plain(
+        atomcode_tui::surface::Key::Esc,
+    ));
+    let back = until_shown(&term, "选一个版本查看更新内容").await;
+    assert!(
+        back.contains("选一个版本查看更新内容") && !back.contains("esc 回到列表"),
+        "Esc is back on the list:\n{back}"
     );
     assert_eq!(
         count.0.load(Ordering::SeqCst),
@@ -1160,18 +1189,6 @@ async fn until_shown(term: &atomcode_tui::surface::Headless, what: &str) -> Stri
     for _ in 0..200 {
         text = term.text();
         if text.contains(what) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    text
-}
-
-async fn until_gone(term: &atomcode_tui::surface::Headless, what: &str) -> String {
-    let mut text = String::new();
-    for _ in 0..200 {
-        text = term.text();
-        if !text.contains(what) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
