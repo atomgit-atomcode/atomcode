@@ -5705,7 +5705,12 @@ pub const WEBUI_DEFAULT_PORT: u16 = atomcode_config::distribution::WEBUI_PORT;
 /// 不再轮询等待绑定：先在本函数内同步绑定端口（亚毫秒级，且借此拿到真实端口、
 /// 支持动态端口），再把已绑定的 listener 交给后台 `run_server`。浏览器随即打开，
 /// 页面靠 SPA 自带 loading 态在 server bootstrap 完成前过渡。
-pub async fn ensure_server_and_open(host: &str, port: u16, sync: bool, open_browser: bool) -> String {
+pub async fn ensure_server_and_open(
+    host: &str,
+    port: u16,
+    sync: bool,
+    open_browser: bool,
+) -> String {
     // 1) 短临界区判定能否复用仍在运行的 server（std Mutex guard 不可跨 .await）。
     //    复用时连同其绑定地址一起取出：换绑需先 /webui stop。
     let reuse = {

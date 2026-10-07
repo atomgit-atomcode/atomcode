@@ -595,7 +595,8 @@ impl atomcode_tui::command::CommandSet for ShareCommands {
                     atomcode_daemon::ensure_server_and_open(
                         &host,
                         atomcode_daemon::WEBUI_DEFAULT_PORT,
-                        true,
+                        true, // sync
+                        true, // open_browser: /webui keeps opening the page
                     )
                     .await,
                 )
