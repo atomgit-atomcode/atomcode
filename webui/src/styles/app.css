@@ -35,7 +35,7 @@ body {
 
 #app {
   display: flex;
-  height: 100dvh;
+  height: 100vh; height: 100dvh;
   width: 100%;
   max-width: 100%;
   overflow: hidden;
@@ -44,7 +44,7 @@ body {
 .app {
   display: flex;
   flex-direction: row;
-  height: 100dvh;
+  height: 100vh; height: 100dvh;
   width: 100%;
   overflow: hidden;
 }
@@ -68,7 +68,7 @@ body {
   gap: 6px;
   padding: 10px 24px;
   flex-shrink: 0;
-  background: color-mix(in srgb, var(--app-primary-background), transparent 12%);
+  background: var(--app-primary-background); background: color-mix(in srgb, var(--app-primary-background), transparent 12%);
   backdrop-filter: blur(8px);
   -webkit-backdrop-filter: blur(8px);
   z-index: 5;
@@ -400,7 +400,7 @@ body {
 /* 焦点可见性:用整框高亮替代输入环,避免内部光环打断胶囊观感。 */
 .msg-search-float:focus-within {
   border-color: var(--app-brand);
-  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.08), 0 0 0 2px color-mix(in srgb, var(--app-brand) 25%, transparent);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.08), 0 0 0 2px rgba(128, 128, 128, 0.15); box-shadow: 0 4px 18px rgba(0, 0, 0, 0.08), 0 0 0 2px color-mix(in srgb, var(--app-brand) 25%, transparent);
 }
 .msg-search-count {
   flex: 0 0 auto;
@@ -464,7 +464,7 @@ body {
 
 /* === 字符背景高亮 (搜索定位效果) === */
 .msg-search-highlight {
-  background: color-mix(in srgb, var(--app-brand) 32%, rgba(230, 180, 0, 0.35));
+  background: rgba(230, 180, 0, 0.35); background: color-mix(in srgb, var(--app-brand) 32%, rgba(230, 180, 0, 0.35));
   color: inherit;
   border-radius: 2px;
   padding: 0 1px;
@@ -476,7 +476,7 @@ body {
 }
 .timeline-message.is-active-search-match,
 .user-message-wrapper.is-active-search-match .user-message-bubble {
-  outline: 2px solid color-mix(in srgb, var(--app-brand) 40%, transparent);
+  outline: 2px solid rgba(128, 128, 128, 0.24); outline: 2px solid color-mix(in srgb, var(--app-brand) 40%, transparent);
   outline-offset: 2px;
 }
 
@@ -508,7 +508,7 @@ body {
   letter-spacing: 0.03em;
   padding: 1px 6px;
   border-radius: 999px;
-  background: color-mix(in srgb, var(--app-brand), transparent 82%);
+  background: rgba(128, 128, 128, 0.11); background: color-mix(in srgb, var(--app-brand), transparent 82%);
   color: var(--app-brand);
 }
 .queued-remove {
@@ -531,7 +531,7 @@ body {
    folds it into the turn (the fold ack unmounts the badge) — a gentle pulse
    makes the queued→applied transition easy to catch. */
 .user-message-wrapper.steer-pending .user-message-bubble {
-  border: 1px dashed color-mix(in srgb, var(--app-brand), transparent 55%);
+  border: 1px dashed rgba(128, 128, 128, 0.27); border: 1px dashed color-mix(in srgb, var(--app-brand), transparent 55%);
 }
 .steer-pending-badge {
   align-self: flex-end;
@@ -541,7 +541,7 @@ body {
   font-size: 0.75rem;
   font-weight: 600;
   letter-spacing: 0.03em;
-  background: color-mix(in srgb, var(--app-brand), transparent 82%);
+  background: rgba(128, 128, 128, 0.11); background: color-mix(in srgb, var(--app-brand), transparent 82%);
   color: var(--app-brand);
   animation: steer-pending-pulse 1.4s ease-in-out infinite;
 }
@@ -632,7 +632,7 @@ body {
    visually distinct from a red error and never merged into the reply text. */
 .msg-notice {
   color: var(--app-warning-accent);
-  background: color-mix(in srgb, var(--app-warning-accent), transparent 88%);
+  background: rgba(128, 128, 128, 0.07); background: color-mix(in srgb, var(--app-warning-accent), transparent 88%);
   border-radius: 6px;
   padding: 4px 10px;
   margin: 6px 0;
@@ -643,7 +643,7 @@ body {
 
 .msg-notice.command-output {
   color: var(--app-primary-foreground);
-  background: color-mix(in srgb, var(--app-tool-background), var(--app-primary-background) 30%);
+  background: var(--app-tool-background); background: color-mix(in srgb, var(--app-tool-background), var(--app-primary-background) 30%);
   border: 1px solid var(--app-input-border);
   font-family: var(--app-monospace-font-family);
   font-size: 0.875rem;
@@ -784,7 +784,7 @@ body {
   font-family: var(--app-monospace-font-family);
   font-size: var(--app-monospace-font-size);
   line-height: 1.65;
-  background: color-mix(in srgb, var(--app-tool-background), var(--app-primary-background) 30%);
+  background: var(--app-tool-background); background: color-mix(in srgb, var(--app-tool-background), var(--app-primary-background) 30%);
   border: 1px solid var(--app-input-border);
   color: var(--app-primary-foreground);
 }
@@ -848,7 +848,7 @@ body {
   border-radius: 3px;
   padding: 1px 5px;
   font-size: 0.9em;
-  background: color-mix(in srgb, var(--app-secondary-background), transparent 40%);
+  background: var(--app-secondary-background); background: color-mix(in srgb, var(--app-secondary-background), transparent 40%);
   color: var(--app-primary-foreground);
 }
 .markdown-root pre code { padding: 0; background: none; }
@@ -870,11 +870,11 @@ body {
   vertical-align: top;
 }
 .markdown-root th {
-  background: color-mix(in srgb, var(--app-tool-background), var(--app-primary-background) 30%);
+  background: var(--app-tool-background); background: color-mix(in srgb, var(--app-tool-background), var(--app-primary-background) 30%);
   font-weight: 600;
 }
 .markdown-root tbody tr:nth-child(even) td {
-  background: color-mix(in srgb, var(--app-secondary-background), transparent 55%);
+  background: rgba(128, 128, 128, 0.27); background: color-mix(in srgb, var(--app-secondary-background), transparent 55%);
 }
 
 /* === Input === */
@@ -889,7 +889,7 @@ body {
   gap: 8px;
   padding: 7px 10px;
   color: var(--app-warning-accent);
-  background: color-mix(in srgb, var(--app-warning-accent), transparent 88%);
+  background: rgba(128, 128, 128, 0.07); background: color-mix(in srgb, var(--app-warning-accent), transparent 88%);
   border-radius: 6px;
   font-size: 0.8125rem;
   line-height: 1.45;
@@ -924,7 +924,7 @@ body {
   border: 1px solid var(--app-border-strong);
   border-radius: var(--corner-radius-large);
   background: var(--app-layer-2-background);
-  box-shadow: 0 1px 0 color-mix(in srgb, var(--app-primary-foreground), transparent 94%);
+  box-shadow: 0 1px 0 rgba(128, 128, 128, 0.06); box-shadow: 0 1px 0 color-mix(in srgb, var(--app-primary-foreground), transparent 94%);
 }
 
 .todo-progress-head {
@@ -944,7 +944,7 @@ body {
 }
 
 .todo-progress-head:hover {
-  background: color-mix(in srgb, var(--app-primary-foreground), transparent 96%);
+  background: rgba(128, 128, 128, 0.06); background: color-mix(in srgb, var(--app-primary-foreground), transparent 96%);
 }
 
 .todo-progress-head:focus-visible {
@@ -1132,7 +1132,7 @@ body {
 .input-box:focus-within {
   --focus-ring-color: var(--app-brand);
   border-color: var(--focus-ring-color);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--focus-ring-color) 12%, transparent), 0 1px 2px color-mix(in srgb, var(--focus-ring-color), transparent 80%);
+  box-shadow: 0 0 0 3px rgba(128, 128, 128, 0.07), 0 1px 2px rgba(128, 128, 128, 0.12); box-shadow: 0 0 0 3px color-mix(in srgb, var(--focus-ring-color) 12%, transparent), 0 1px 2px color-mix(in srgb, var(--focus-ring-color), transparent 80%);
 }
 
 .message-input {
@@ -1243,8 +1243,8 @@ body {
 }
 .btn-sync:hover { background: var(--app-ghost-button-hover-background); color: var(--app-primary-foreground); }
 /* Active = brand-tinted square (matches the design's #d977572e fill + brand icon). */
-.btn-sync.active { background: color-mix(in srgb, var(--app-brand) 18%, transparent); color: var(--app-brand); }
-.btn-sync.active:hover { background: color-mix(in srgb, var(--app-brand) 24%, transparent); color: var(--app-brand); }
+.btn-sync.active { background: rgba(128, 128, 128, 0.11); background: color-mix(in srgb, var(--app-brand) 18%, transparent); color: var(--app-brand); }
+.btn-sync.active:hover { background: rgba(128, 128, 128, 0.14); background: color-mix(in srgb, var(--app-brand) 24%, transparent); color: var(--app-brand); }
 
 /* === Sidebar / session list === */
 .session-list {
@@ -1703,7 +1703,9 @@ body {
   pointer-events: auto;
 }
 .session-item:hover .session-item-meta,
-.session-item.menu-open .session-item-meta,
+.session-item.menu-open .session-item-meta { visibility: hidden; }
+/* Its own rule: a browser without :has() (Chromium < 105) drops a whole
+   selector list it cannot parse, and would take the hover above with it. */
 .session-item:has(.session-item-kebab:focus-visible) .session-item-meta { visibility: hidden; }
 .session-item-kebab:hover {
   background: var(--app-ghost-button-hover-background);
@@ -1760,7 +1762,7 @@ body {
 /* --- Session search dialog (centered modal — reuses .modal-overlay/.modal-card) --- */
 .modal-card.search-modal-card {
   width: min(840px, 100%);
-  height: 60dvh;
+  height: 60vh; height: 60dvh;
 }
 .search-input-row {
   display: flex;
@@ -2038,7 +2040,7 @@ body {
   gap: 6px;
   padding: 8px 10px;
   border-radius: var(--corner-radius-small);
-  background: color-mix(in srgb, var(--app-warning-accent), transparent 88%);
+  background: rgba(128, 128, 128, 0.07); background: color-mix(in srgb, var(--app-warning-accent), transparent 88%);
   color: var(--app-warning-accent);
   font-size: 0.8125rem;
   line-height: 1.4;
@@ -2080,7 +2082,7 @@ body {
 
 .modal-card {
   width: min(560px, 100%);
-  max-height: 85dvh;
+  max-height: 85vh; max-height: 85dvh;
   /* (a small variant for the rename/delete dialogs is defined below) */
   display: flex;
   flex-direction: column;
@@ -2110,7 +2112,7 @@ body {
   font-size: 0.75rem;
   padding: 2px 8px;
   border-radius: 3px;
-  background: color-mix(in srgb, var(--app-warning-accent), transparent 80%);
+  background: rgba(128, 128, 128, 0.12); background: color-mix(in srgb, var(--app-warning-accent), transparent 80%);
   color: var(--app-warning-accent);
 }
 .modal-close { margin-left: auto; }
@@ -2152,7 +2154,7 @@ body {
 
 .interaction-dock-card {
   width: 100%;
-  max-height: min(48dvh, 520px);
+  max-height: min(48vh, 520px); max-height: min(48dvh, 520px);
   display: flex;
   flex-direction: column;
   min-height: 0;
@@ -2206,7 +2208,7 @@ body {
   color: var(--app-brand-text) !important;
 }
 .permission-card .permission-tag {
-  background: color-mix(in srgb, var(--app-brand), transparent 84%);
+  background: rgba(128, 128, 128, 0.10); background: color-mix(in srgb, var(--app-brand), transparent 84%);
   color: var(--app-brand);
 }
 /* Brief lead-in line under the header. */
@@ -2312,7 +2314,7 @@ body {
   outline: none;
 }
 .user-input-text::placeholder { color: var(--app-input-placeholder-foreground); }
-.user-input-text:focus { border-color: var(--app-input-active-border, var(--app-brand)); box-shadow: 0 0 0 2px color-mix(in srgb, var(--app-brand) 15%, transparent); }
+.user-input-text:focus { border-color: var(--app-input-active-border, var(--app-brand)); box-shadow: 0 0 0 2px rgba(128, 128, 128, 0.09); box-shadow: 0 0 0 2px color-mix(in srgb, var(--app-brand) 15%, transparent); }
 .user-input-text:disabled { opacity: 0.5; cursor: default; }
 
 /* Multi-line textarea (text mode). */
@@ -2331,7 +2333,7 @@ body {
   outline: none;
 }
 .user-input-textarea::placeholder { color: var(--app-input-placeholder-foreground); }
-.user-input-textarea:focus { border-color: var(--app-input-active-border, var(--app-brand)); box-shadow: 0 0 0 2px color-mix(in srgb, var(--app-brand) 15%, transparent); }
+.user-input-textarea:focus { border-color: var(--app-input-active-border, var(--app-brand)); box-shadow: 0 0 0 2px rgba(128, 128, 128, 0.09); box-shadow: 0 0 0 2px color-mix(in srgb, var(--app-brand) 15%, transparent); }
 .user-input-textarea:disabled { opacity: 0.5; cursor: default; }
 
 /* Inline error message below the options/input. */
@@ -2366,6 +2368,9 @@ body {
 .tool-body-row {
   grid-column: 1 / -1;
   display: grid;
+  /* The parent's own columns, for a browser without subgrid (Chromium < 117):
+     the rows no longer share one label width, but stay two columns. */
+  grid-template-columns: max-content minmax(0, 1fr);
   grid-template-columns: subgrid;
   border-top: 0.5px solid var(--app-input-border);
   padding: 0;
@@ -2381,7 +2386,7 @@ body {
   font-size: 0.85em;
   padding: 8px 10px;
   user-select: none;
-  background: color-mix(in srgb, var(--app-tool-background), var(--app-primary-background) 35%);
+  background: var(--app-tool-background); background: color-mix(in srgb, var(--app-tool-background), var(--app-primary-background) 35%);
 }
 
 .tool-body-row-content {
@@ -2654,7 +2659,7 @@ body {
 .provider-delete-btn:hover {
   border-color: var(--app-error-foreground);
   color: var(--app-error-foreground);
-  background: color-mix(in srgb, var(--app-error-foreground) 10%, transparent);
+  background: rgba(128, 128, 128, 0.06); background: color-mix(in srgb, var(--app-error-foreground) 10%, transparent);
 }
 
 /* Provider card edit button. */
@@ -2674,14 +2679,14 @@ body {
 .provider-edit-btn:hover {
   border-color: var(--app-brand-button);
   color: var(--app-primary-foreground);
-  background: color-mix(in srgb, var(--app-brand-button) 12%, transparent);
+  background: rgba(128, 128, 128, 0.07); background: color-mix(in srgb, var(--app-brand-button) 12%, transparent);
 }
 
 /* Harness-inspired model manager. Scoped to the model dialog so the shared
    modal chrome and unrelated settings keep their existing dimensions. */
 .modal-card.model-config-modal {
   width: min(920px, 100%);
-  height: min(760px, 85dvh);
+  height: min(760px, 85vh); height: min(760px, 85dvh);
 }
 .model-config-page {
   display: flex;
@@ -2724,7 +2729,7 @@ body {
 }
 .model-provider-card.default {
   border-color: var(--app-brand);
-  box-shadow: 0 0 0 1px color-mix(in srgb, var(--app-brand) 16%, transparent);
+  box-shadow: 0 0 0 1px rgba(128, 128, 128, 0.10); box-shadow: 0 0 0 1px color-mix(in srgb, var(--app-brand) 16%, transparent);
 }
 .model-provider-card .provider-card-head { margin-bottom: 10px; }
 .provider-identity {
@@ -2817,7 +2822,7 @@ body {
 }
 
 @media (max-width: 700px) {
-  .modal-card.model-config-modal { height: 85dvh; }
+  .modal-card.model-config-modal { height: 85vh; height: 85dvh; }
   .model-config-intro { flex-direction: column; gap: 10px; }
   .model-config-path { max-width: 100%; width: 100%; box-sizing: border-box; }
   .model-provider-card .provider-card-head { flex-wrap: wrap; }
@@ -3064,7 +3069,7 @@ body {
   margin-top: 8px;
   padding: 10px;
   border-radius: var(--corner-radius-small);
-  background: color-mix(in srgb, var(--app-input-border), transparent 75%);
+  background: rgba(128, 128, 128, 0.15); background: color-mix(in srgb, var(--app-input-border), transparent 75%);
 }
 .add-provider-card { margin-top: 10px; padding: 12px; }
 .add-provider-advanced summary {
@@ -3306,7 +3311,7 @@ body {
 .mode-selector-trigger.mode-bypass {
   color: #c2410c;
   border-color: #c2410c;
-  background: color-mix(in srgb, #c2410c 8%, transparent);
+  background: rgba(128, 128, 128, 0.06); background: color-mix(in srgb, #c2410c 8%, transparent);
 }
 .mode-selector-trigger.mode-bypass .effort-prefix { color: inherit; }
 
@@ -3352,7 +3357,7 @@ body {
     padding: 6px 8px max(8px, env(safe-area-inset-bottom));
   }
   .interaction-dock-card {
-    max-height: min(58dvh, 520px);
+    max-height: min(58vh, 520px); max-height: min(58dvh, 520px);
     border-radius: var(--corner-radius-medium);
   }
   .interaction-dock-card .permission-header {
@@ -3412,7 +3417,7 @@ body {
   .modal-card {
     width: 100%;
     max-width: 100%;
-    max-height: 85dvh;
+    max-height: 85vh; max-height: 85dvh;
     border-bottom-left-radius: 0;
     border-bottom-right-radius: 0;
     border-top-left-radius: var(--corner-radius-large);
@@ -3421,7 +3426,7 @@ body {
   /* 搜索弹窗：手机端占满宽度、几乎全高，作为底部抽屉更顺手 */
   .modal-card.search-modal-card {
     width: 100%;
-    height: 85dvh;
+    height: 85vh; height: 85dvh;
   }
 }
 
@@ -3914,3 +3919,49 @@ body {
 .turn-artifact-chip:focus-visible { outline: 2px solid var(--app-brand); outline-offset: 2px; }
 .turn-artifact-more { align-self: center; color: var(--app-tertiary-foreground); }
 .turn-artifact-error { flex-basis: 100%; color: var(--app-error-fg, #b3261e); font-size: 0.8125rem; }
+
+/* === Old browser notice / opened without the link === */
+.compat-notice {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 16px;
+  background: var(--app-tool-background);
+  border-bottom: 1px solid var(--app-warning-accent);
+  color: var(--app-primary-foreground);
+  font-size: 0.875rem;
+}
+.compat-notice span { flex: 1; }
+.compat-notice-close {
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  font-size: 1.1rem;
+  line-height: 1;
+}
+.auth-required {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100vh;
+  padding: 24px;
+  background: var(--app-primary-background);
+  color: var(--app-primary-foreground);
+}
+.auth-required-card {
+  max-width: 520px;
+  padding: 28px 32px;
+  border: 1px solid var(--app-primary-border-color);
+  border-radius: var(--corner-radius-medium);
+  background: var(--app-tool-background);
+}
+.auth-required-card h1 { margin: 0 0 12px; font-size: 1.25rem; }
+.auth-required-card p { margin: 0 0 10px; line-height: 1.6; }
+.auth-required-hint { color: var(--app-secondary-foreground); font-size: 0.875rem; }

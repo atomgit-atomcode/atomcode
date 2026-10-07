@@ -558,11 +558,21 @@ const zh = {
   // Common
   'common.readonly': '只读',
   'common.cancel': '取消',
+  'compat.oldBrowser': '当前浏览器内核较旧，页面部分样式可能显示异常。建议使用 Chrome / Edge {version} 及以上版本。',
+  'compat.dismiss': '不再提示',
+  'auth.required.title': '需要从终端打开',
+  'auth.required.body': '这个页面需要终端给出的链接才能访问。请在 AtomCode 终端里运行 /webui，复制它打印的那条带 token 的链接，粘贴到这个浏览器的地址栏打开。',
+  'auth.required.hint': '这条链接在本次 webui 运行期间可以在任意浏览器使用；webui 重启后需要重新获取。',
 } as const;
 
 export type MsgKey = keyof typeof zh;
 
 const en: Record<MsgKey, string> = {
+  'compat.oldBrowser': 'This browser engine is older than this page was built for, so parts of it may look wrong. Chrome / Edge {version} or newer is recommended.',
+  'compat.dismiss': "Don't show again",
+  'auth.required.title': 'Open it from the terminal',
+  'auth.required.body': 'This page needs the link the terminal gives. Run /webui in AtomCode, copy the link with the token it prints, and open it in this browser.',
+  'auth.required.hint': 'That link works in any browser for as long as this webui runs; after a restart, get a new one.',
   'header.menu': 'Menu',
   'header.sessionList': 'Session list',
   'header.switchCwd': 'Switch working directory',

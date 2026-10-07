@@ -113,18 +113,31 @@ html {
    standard props can't style :hover), so the base opacity carries visibility. */
 * {
   scrollbar-width: thin;
-  scrollbar-color: color-mix(in srgb, var(--app-secondary-foreground) 55%, transparent) transparent;
+  scrollbar-color: rgba(128, 128, 128, 0.30) transparent; scrollbar-color: color-mix(in srgb, var(--app-secondary-foreground) 55%, transparent) transparent;
 }
 /* Safari fallback only (Chrome/Edge/Firefox render via the standard props above). */
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb {
-  background: color-mix(in srgb, var(--app-secondary-foreground) 55%, transparent);
+  background: rgba(128, 128, 128, 0.30); background: color-mix(in srgb, var(--app-secondary-foreground) 55%, transparent);
   border-radius: var(--corner-radius-small);
   border: 2px solid transparent;                     /* inset the thumb via padding-box */
   background-clip: padding-box;
 }
 ::-webkit-scrollbar-thumb:hover {                     /* background-clip inherits from base */
-  background: color-mix(in srgb, var(--app-secondary-foreground) 75%, transparent);
+  background: var(--app-secondary-foreground); background: color-mix(in srgb, var(--app-secondary-foreground) 75%, transparent);
 }
 ::-webkit-scrollbar-corner { background: transparent; }
+
+/* Browsers without color-mix() (Chromium < 111 — Huawei's, older 360/QQ
+   builds): a custom property holding color-mix() is still "valid", so a
+   plain fallback declaration before it would lose; it then fails where it is
+   used and the menu loses its hover and selection. Neutral tints, the same in
+   every theme. Ordinary declarations carry their own fallback in place
+   (`app.css`). */
+@supports not (color: color-mix(in srgb, red, blue)) {
+  :root {
+    --app-command-menu-hover-background: rgba(128, 128, 128, 0.14) !important;
+    --app-command-menu-active-background: rgba(128, 128, 128, 0.24) !important;
+  }
+}
