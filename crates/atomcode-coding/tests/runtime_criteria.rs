@@ -5522,6 +5522,117 @@ async fn a_skipped_role_file_reaches_the_driver_as_a_warning() {
     );
 }
 
+/// A role file left out is said once in a session, not at every turn: six bad
+/// files repeated at the top of every turn buried the conversation they were in.
+async fn a_skipped_role_file_is_said_once_not_every_turn() {
+    let env = env();
+    let agents = env
+        .project
+        .path()
+        .join(atomcode_config::distribution::PROJECT_DIR_NAME)
+        .join("agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(
+        agents.join("broken.md"),
+        "---\nname: broken\ndescription: x\n---\nnope\n",
+    )
+    .unwrap();
+    let recorder = Arc::new(Recorder::default());
+    let mut started = start(env.project.path(), &recorder, SessionMode::Fresh);
+    started.prepare.subagents = SubagentPolicy::Enabled;
+    let mut runtime = CodingRuntime::start(started).await.unwrap();
+
+    let mut told = 0;
+    for turn in ["hello", "again", "and again"] {
+        runtime.handle.submit(UserInput::from(turn)).await.unwrap();
+        loop {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(10), runtime.events.recv())
+                    .await
+                    .expect("turn did not finish")
+                    .expect("runtime event stream closed");
+            match event.event {
+                CodingRuntimeEvent::TurnFinished(_) => break,
+                CodingRuntimeEvent::Agent(atomcode_kernel::event::AgentEvent::Warning(text))
+                    if text.contains("`broken`") =>
+                {
+                    told += 1
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(
+        told, 1,
+        "the left-out role was said {told} times over three turns"
+    );
+}
+
+/// The same, across launches of one session: the webui's standalone chat runs
+/// every message on a runtime of its own, resumed from the log, so "once per
+/// launch" was once per message there — the role files were listed again at
+/// the top of every turn. What the log already says is not said again.
+async fn a_skipped_role_file_is_not_said_again_when_the_session_is_resumed() {
+    let env = env();
+    let agents = env
+        .project
+        .path()
+        .join(atomcode_config::distribution::PROJECT_DIR_NAME)
+        .join("agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(
+        agents.join("broken.md"),
+        "---\nname: broken\ndescription: x\n---\nnope\n",
+    )
+    .unwrap();
+    let recorder = Arc::new(Recorder::default());
+    async fn told_in_a_turn(runtime: &mut CodingRuntime, text: &str) -> usize {
+        runtime.handle.submit(UserInput::from(text)).await.unwrap();
+        let mut told = 0;
+        loop {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(10), runtime.events.recv())
+                    .await
+                    .expect("turn did not finish")
+                    .expect("runtime event stream closed");
+            match event.event {
+                CodingRuntimeEvent::TurnFinished(_) => return told,
+                CodingRuntimeEvent::Agent(atomcode_kernel::event::AgentEvent::Warning(text))
+                    if text.contains("`broken`") =>
+                {
+                    told += 1
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut started = start(env.project.path(), &recorder, SessionMode::Fresh);
+    started.prepare.subagents = SubagentPolicy::Enabled;
+    let mut first = CodingRuntime::start(started).await.unwrap();
+    let id = first.session.clone().unwrap().id;
+    let mut told = told_in_a_turn(&mut first, "hello").await;
+    first.handle.shutdown().await.unwrap();
+    let _ = first.task.await;
+
+    for text in ["again", "and again"] {
+        let mut started = start(
+            env.project.path(),
+            &recorder,
+            SessionMode::Resume(id.clone()),
+        );
+        started.prepare.subagents = SubagentPolicy::Enabled;
+        let mut next = CodingRuntime::start(started).await.unwrap();
+        told += told_in_a_turn(&mut next, text).await;
+        next.handle.shutdown().await.unwrap();
+        let _ = next.task.await;
+    }
+    assert_eq!(
+        told, 1,
+        "the left-out role was said {told} times over three launches"
+    );
+}
+
 /// What the configuration asked for that was left out is told to the person
 /// when the runtime starts — as `ControllerWarning`s, which every front end
 /// renders — whether the config reader found it (a malformed permission rule)
@@ -5683,6 +5794,8 @@ mod criteria {
         a_runtime_under_another_name_keeps_to_its_own_dirs,
         our_own_skills_lead_the_catalog,
         a_skipped_role_file_reaches_the_driver_as_a_warning,
+        a_skipped_role_file_is_said_once_not_every_turn,
+        a_skipped_role_file_is_not_said_again_when_the_session_is_resumed,
         what_the_configuration_lost_is_said_when_the_runtime_starts,
     );
 }

@@ -831,6 +831,11 @@
         "body": "在 ~/.atomcode/config.toml 中调整子代理池： [subagent] max_concurrent = 3 # 同时并行的子代理数（最小 1） timeout_secs = 900 # 每个子任务的墙钟超时，秒（最小 30） max_rounds = 200 # 每个子任务的模型轮次上限（0 = 不限） 键 默认 含义 max_concurrent 3 并行运行的子代理数 timeout_secs 900 每个子任务的墙钟超时（下限 30 秒） max_rounds 200 每个子任务的模型轮次上限； 0 = 不限 环境变量覆盖： ATOMCODE_SUBAGENT_TIMEOUT 和 ATOMCODE_SUBAGENT_MAX_ROUNDS 优先于配置值。"
       },
       {
+        "id": "自定义团队角色",
+        "heading": "自定义团队角色",
+        "body": "团队（ team ）派活时按 角色 挑成员。除了内置角色，你可以用 Markdown 文件自己定义，放在下面两个目录之一： <项目>/.atomcode/agents/<角色名>.md ——只在这个项目里生效； ~/.atomcode/agents/<角色名>.md ——所有项目通用。 文件名（不含 .md ）就是角色名。和内置角色同名的文件会替换它；两个目录有同名文件时，用户目录的生效。 文件由 --- 包住的头部字段和后面的角色说明（人设）组成： --- permission: explore # 必填：explore（只看、不改任何东西）| worker（可以改文件、跑命令） difficulty: hard # 必填：simple（用快模型）| hard（用强模型） effort: high # 可选：思考强度，low | medium | high | xhigh | max model: glm-4.6 # 可选：指定模型（选择 id），优先于 difficulty when: 需要做架构设计时 # 可选：一句话说明什么时候派给它 tools: read_file, grep # 可选：限定可用工具，只能从 permission 允许的工具里选 --- 你负责架构设计。先读现有代码，再给出方案，列出取舍。 字段 是否必填 取值 permission 必填 explore （只读调查）或 worker （受范围限制的写入执行） difficulty 必填 simple （快模型）或 hard （强模型） effort 可选 low / medium / high / xhigh / max model 可选 模型选择 id；不写则按 difficulty 选 when 可选 一句话：什么时候该派给这个角色 tools 可选 逗号分隔的工具名，只能是 permission 默认工具的子集 注意两点： 这里的 permission 和命令行的 --permission-mode （ plan / accept_edits / auto ）是两回事，只是名字相同：前者决定这个成员能不能动手，后者是整个会话的审批方式。 它不是 Claude Code 的 agent 文件格式。 name 、 description 、 allowed_tools 、 user_invocable 这些字段不会被读取：角色名取自文件名，可用工具用 tools 限定。 格式不对的角色文件会被跳过，不影响会话启动。会话里会提示一次哪个文件被跳过、缺了或写错了哪些字段（一次列全），同一个会话里不会重复提示；和内置角色同名的文件被跳过时，继续使用内置角色。"
+      },
+      {
         "id": "关闭该功能",
         "heading": "关闭该功能",
         "body": "task 工具默认开启。若要彻底移除它，设置： ATOMCODE_SUBAGENT=0 atomcode 0 、 false 、 off 任一都会关闭；不设置（或其它值）则保持开启。"

@@ -290,6 +290,11 @@ fn parse_role_file(path: &Path) -> Result<Role, String> {
     let mut permission = None;
     let mut difficulty = None;
     let mut effort = None;
+    // Every problem with the file, said together. Saying the first and stopping
+    // made fixing a role three rounds of edit → restart → read the next one.
+    let mut problems: Vec<String> = Vec::new();
+    let mut permission_said = false;
+    let mut difficulty_said = false;
     let mut when = String::new();
     let mut tools: Option<Vec<String>> = None;
     let mut model = None;
@@ -312,43 +317,35 @@ fn parse_role_file(path: &Path) -> Result<Role, String> {
                 .trim_matches('"');
             match key.trim() {
                 "permission" => {
-                    permission = Some(match value {
-                        "explore" => Permission::Explore,
-                        "worker" => Permission::Worker,
-                        other => {
-                            return Err(format!(
-                                "{}: permission must be explore or worker, not `{other}`",
-                                path.display()
-                            ))
-                        }
-                    })
+                    permission_said = true;
+                    match value {
+                        "explore" => permission = Some(Permission::Explore),
+                        "worker" => permission = Some(Permission::Worker),
+                        other => problems.push(format!(
+                            "permission must be explore or worker, not `{other}`"
+                        )),
+                    }
                 }
                 "difficulty" => {
-                    difficulty = Some(match value {
-                        "simple" => Difficulty::Simple,
-                        "hard" => Difficulty::Hard,
-                        other => {
-                            return Err(format!(
-                                "{}: difficulty must be simple or hard, not `{other}`",
-                                path.display()
-                            ))
-                        }
-                    })
+                    difficulty_said = true;
+                    match value {
+                        "simple" => difficulty = Some(Difficulty::Simple),
+                        "hard" => difficulty = Some(Difficulty::Hard),
+                        other => problems
+                            .push(format!("difficulty must be simple or hard, not `{other}`")),
+                    }
                 }
                 // A typo here would be a member that quietly thinks at the
                 // default rate while the file says otherwise — the same silent
                 // no-op `permission` and `difficulty` refuse, so this refuses it
                 // too rather than falling back to no opinion.
-                "effort" => {
-                    effort = Some(ReasoningEffort::from_config(Some(value)).ok_or_else(|| {
-                        format!(
-                            "{}: effort must be one of {}, not `{other}`",
-                            path.display(),
-                            REASONING_EFFORT_LEVELS.join(", "),
-                            other = value
-                        )
-                    })?)
-                }
+                "effort" => match ReasoningEffort::from_config(Some(value)) {
+                    Some(level) => effort = Some(level),
+                    None => problems.push(format!(
+                        "effort must be one of {}, not `{value}`",
+                        REASONING_EFFORT_LEVELS.join(", ")
+                    )),
+                },
                 "when" => when = value.to_string(),
                 // Not validated here: the catalog is a runtime fact and this
                 // file is read at mount. An id that is not on offer fails at
@@ -376,13 +373,27 @@ fn parse_role_file(path: &Path) -> Result<Role, String> {
     }
     let persona = body.trim().to_string();
     if persona.is_empty() {
-        return Err(format!(
-            "{}: no persona after the frontmatter",
-            path.display()
-        ));
+        problems.push("no persona after the frontmatter".to_string());
     }
-    let permission =
-        permission.ok_or_else(|| format!("{}: `permission` is required", path.display()))?;
+    // Missing fields name the values they take: the person writing the file
+    // should not have to find them by trying.
+    if !permission_said {
+        problems.push(
+            "`permission` is required: explore (looks, changes nothing) or worker (may edit \
+             files and run commands)"
+                .to_string(),
+        );
+    }
+    if !difficulty_said {
+        problems.push(
+            "`difficulty` is required: simple (the fast model) or hard (the strong one)"
+                .to_string(),
+        );
+    }
+    let (Some(permission), Some(difficulty), true) = (permission, difficulty, problems.is_empty())
+    else {
+        return Err(format!("{}: {}", path.display(), problems.join("; ")));
+    };
     // A member's tools are chosen from what its permission allows, never beyond:
     // a role file in a cloned repository must not hand a member a shell.
     if let Some(listed) = &tools {
@@ -402,8 +413,7 @@ fn parse_role_file(path: &Path) -> Result<Role, String> {
     Ok(Role {
         id,
         permission,
-        difficulty: difficulty
-            .ok_or_else(|| format!("{}: `difficulty` is required", path.display()))?,
+        difficulty,
         persona,
         when,
         tools,
@@ -447,6 +457,14 @@ fn load_roles(dirs: &[PathBuf]) -> Result<(Vec<Role>, Vec<(String, String)>), St
                         .and_then(|s| s.to_str())
                         .unwrap_or_default()
                         .to_string();
+                    // A file named like a built-in that does not parse leaves
+                    // the built-in in place — said, so "left out" is not read
+                    // as the role being gone.
+                    let reason = if roles.iter().any(|r| r.id == id) {
+                        format!("{reason} (the built-in `{id}` is used instead)")
+                    } else {
+                        reason
+                    };
                     skipped.push((id, reason));
                     continue;
                 }
@@ -1706,8 +1724,8 @@ impl Plugin for TeamPlugin {
         // At the agent's first turn of this launch, not when it is created: a
         // runtime makes a fresh session's file after the agent, and a fact
         // committed before that has nowhere to be written — the store fails
-        // closed on it. Once per session per launch, so a resumed conversation
-        // is told again (the file is still bad) and a long one is told once.
+        // closed on it. Once per session: a long conversation is told once, and
+        // so is one resumed with the same bad file (the notice is in its log).
         if !team.skipped_roles.is_empty() {
             let telling = ctx.clone();
             let skipped = team.skipped_roles.clone();
@@ -1732,14 +1750,36 @@ impl Plugin for TeamPlugin {
                     {
                         return;
                     }
+                    // What this session's log already says is not said again.
+                    // "Once per launch" is not once per conversation: the webui's
+                    // standalone chat runs every message on a runtime of its own,
+                    // resumed from the log, and the role files were listed again
+                    // at the top of every turn. A file whose problem changed is
+                    // a different notice and is said.
+                    let said: std::collections::HashSet<String> = log
+                        .events()
+                        .into_iter()
+                        .filter_map(|logged| match logged.event {
+                            SessionEvent::Notice {
+                                notice: crate::session::NoticeKind::ConfigSkipped,
+                                detail,
+                                ..
+                            } => Some(detail),
+                            _ => None,
+                        })
+                        .collect();
                     for (id, why) in &skipped {
+                        let detail = format!("team role `{id}` was left out: {why}");
+                        if said.contains(&detail) {
+                            continue;
+                        }
                         crate::session::commit(
                             &scoped,
                             &log,
                             SessionEvent::Notice {
                                 turn: log.current_turn(),
                                 notice: crate::session::NoticeKind::ConfigSkipped,
-                                detail: format!("team role `{id}` was left out: {why}"),
+                                detail,
                                 retry: None,
                             },
                         );

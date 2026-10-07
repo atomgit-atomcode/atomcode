@@ -496,6 +496,67 @@ async fn a_bad_role_file_is_skipped_and_says_why() {
     .await;
 }
 
+/// Everything wrong with a role file is said at once, with the values each
+/// field takes — not the first problem, then the next after a restart. A file
+/// written the way another tool's agents are (no `permission`, no
+/// `difficulty`) used to take three rounds to fix.
+#[tokio::test]
+async fn a_role_file_is_told_everything_wrong_with_it_at_once() {
+    let dir = scratch("role-all-problems");
+    write_role(
+        &dir,
+        "designer",
+        "---\nname: designer\ndescription: designs things\nallowed_tools: Read, Grep\n---\nYou design.\n",
+    );
+    let (app, lead) = skipping(&dir).await;
+    assert_skipped(
+        &app,
+        &lead,
+        "designer",
+        &[
+            "`permission` is required",
+            "explore",
+            "worker",
+            "`difficulty` is required",
+            "simple",
+            "hard",
+        ],
+    )
+    .await;
+}
+
+/// A file named like a built-in that does not parse leaves the built-in in
+/// place, and the notice says so — "left out" alone read as the role being gone.
+#[tokio::test]
+async fn a_bad_file_over_a_built_in_says_the_built_in_is_used() {
+    let dir = scratch("role-over-built-in");
+    write_role(
+        &dir,
+        "architect",
+        "---\nname: architect\n---\nYou design.\n",
+    );
+    let (_app, lead) = skipping(&dir).await;
+    let told: Vec<String> = lead
+        .session()
+        .events()
+        .into_iter()
+        .filter_map(|e| match e.event {
+            SessionEvent::Notice {
+                notice: atomcode_harness::session::NoticeKind::ConfigSkipped,
+                detail,
+                ..
+            } => Some(detail),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        told.iter()
+            .any(|d| d.contains("`architect`")
+                && d.contains("the built-in `architect` is used instead")),
+        "{told:?}"
+    );
+}
+
 /// Mount a team tree over `dir`, which holds a role file that must be skipped,
 /// and take the lead.
 async fn skipping(dir: &std::path::Path) -> (App, Arc<Agent>) {
