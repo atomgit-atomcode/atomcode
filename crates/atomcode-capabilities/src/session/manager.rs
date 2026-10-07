@@ -6615,6 +6615,30 @@ mod tests {
         ));
     }
 
+    /// A backup directory left inside a bucket by hand (`bak_dual_fix_…`, a
+    /// copy of the bucket's own sessions) is not a second location: the
+    /// catalog reads a bucket's files, not what is under it, so the id stays
+    /// unique and the webui does not answer 409. Pinned because a report
+    /// against 5.2.0 blamed exactly this for an `AmbiguousId`.
+    #[test]
+    fn a_backup_directory_inside_a_bucket_is_not_a_second_location() {
+        let root = tempfile::tempdir().unwrap();
+        let bucket = root.path().join("1111111111111111");
+        write_legacy_catalog_session(&bucket, "same", "/one", 1);
+        write_legacy_catalog_session(
+            &bucket.join("bak_dual_fix_20260725_155917"),
+            "same",
+            "/one",
+            1,
+        );
+        let scan = SessionManager::scan_catalog(root.path());
+        assert_eq!(scan.entries.len(), 1, "{:?}", scan.entries);
+        assert_eq!(
+            scan.find("same").unwrap().unwrap().project_bucket,
+            "1111111111111111"
+        );
+    }
+
     #[test]
     fn catalog_reports_orphan_native_sidecars_but_ignores_persistent_locks() {
         let root = tempfile::tempdir().unwrap();

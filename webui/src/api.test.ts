@@ -554,3 +554,37 @@ test('a permission answer that did not land throws; one whose question is gone d
     },
   );
 });
+
+test('what the daemon said in a failure reaches the error, in whichever shape it said it', async () => {
+  const api = await import('./api.ts');
+  const make = (status: number, text: string, statusText = '') =>
+    new Response(text, { status, statusText });
+  // `{error, code}` — most routes.
+  let e = await api.failure(make(409, '{"error":"This session already has an active chat operation","code":"session_busy"}', 'Conflict'));
+  assert.equal(e.message, 'This session already has an active chat operation');
+  assert.equal(e.status, 409);
+  assert.equal(e.code, 'session_busy');
+  // A bare JSON string — `/sessions/resolve/:id` names the duplicated buckets this way.
+  e = await api.failure(make(409, JSON.stringify('session query "abc" is ambiguous across 2 locations: abc (bucket 1111111111111111), abc (bucket 2222222222222222)')));
+  assert.match(e.message, /ambiguous across 2 locations/);
+  assert.match(e.message, /2222222222222222/);
+  // A proxy's HTML page: the status, not the markup.
+  e = await api.failure(make(502, '<html><body>Bad Gateway</body></html>'));
+  assert.doesNotMatch(e.message, /<html/);
+  assert.match(e.message, /HTTP 502/);
+});
+
+test('a chat refused with 409 says why, not only the status', async () => {
+  const api = await import('./api.ts');
+  await serving(
+    409,
+    '{"success":false,"error":"This session already has an active chat operation","code":"session_busy","retryable":true}',
+    'application/json',
+    async () => {
+      await assert.rejects(
+        () => api.streamChat({ message: 'hi' } as Parameters<typeof api.streamChat>[0], () => undefined),
+        /already has an active chat operation/,
+      );
+    },
+  );
+});
