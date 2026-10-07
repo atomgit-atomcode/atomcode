@@ -3965,3 +3965,26 @@ body {
 .auth-required-card h1 { margin: 0 0 12px; font-size: 1.25rem; }
 .auth-required-card p { margin: 0 0 10px; line-height: 1.6; }
 .auth-required-hint { color: var(--app-secondary-foreground); font-size: 0.875rem; }
+
+/* === Sign-in in progress / why it stopped === */
+.login-status {
+  margin: 0 8px 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--app-primary-border-color);
+  border-radius: var(--corner-radius-small);
+  background: var(--app-tool-background);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+.login-status p { margin: 0 0 6px; }
+.login-status--problem { border-color: var(--app-error-foreground); }
+.login-status--problem p { margin: 0; color: var(--app-error-foreground); }
+.login-status-actions { display: flex; align-items: center; gap: 10px; }
+.login-status-actions a { color: var(--app-brand); }
+.login-status-cancel {
+  margin-left: auto;
+  background: none;
+  border: none;
+  color: var(--app-secondary-foreground);
+  cursor: pointer;
+}

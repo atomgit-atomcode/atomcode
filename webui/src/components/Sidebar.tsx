@@ -1493,6 +1493,39 @@ export function Sidebar({
         })}
       </div>
 
+      {(auth.pending || auth.problem) && (
+        <div class={auth.problem ? 'login-status login-status--problem' : 'login-status'} role="status">
+          {auth.pending && (
+            <>
+              <p>{auth.pending.blocked ? auth.labels.blocked : auth.labels.waiting}</p>
+              <div class="login-status-actions">
+                <a
+                  href={auth.pending.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    auth.reopenLogin();
+                  }}
+                >
+                  {auth.pending.blocked ? auth.labels.openAgain : auth.labels.notSeen}
+                </a>
+                <button type="button" class="login-status-cancel" onClick={auth.cancelLogin}>
+                  {auth.labels.cancel}
+                </button>
+              </div>
+            </>
+          )}
+          {auth.problem && (
+            <div class="login-status-actions">
+              <p>{auth.problem}</p>
+              <button type="button" class="login-status-cancel" onClick={auth.dismissProblem}>
+                ×
+              </button>
+            </div>
+          )}
+        </div>
+      )}
       <div class="sidebar-bottom">
         {auth.loggedIn && !auth.expired ? (
           <div

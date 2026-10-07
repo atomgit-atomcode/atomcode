@@ -13,14 +13,34 @@ import { CompatNotice } from './components/CompatNotice';
 import { signedIn } from './lib/compat';
 import { getToken } from './api';
 
-// Asked before the app mounts: opened without the link the terminal printed,
-// every request the app makes would be refused, and what it would draw is an
-// empty shell. A definite 401 shows where to get the link instead.
+import { useEffect, useState } from 'preact/hooks';
+import { UNAUTHORIZED_EVENT } from './components/LoginButton';
+
+/**
+ * The app, or — when the daemon does not know this page — where to get the
+ * link that it does know.
+ *
+ * Asked once before the app mounts (opened without the link the terminal
+ * printed) and again whenever the app hears a 401 (the webui restarted under
+ * an open page, with a new token): from then on every request would be
+ * refused, signing in included, and what the app would show is a button that
+ * does nothing.
+ */
+function Root({ signedIn: initially }: { signedIn: boolean }) {
+  const [ok, setOk] = useState(initially);
+  useEffect(() => {
+    const lost = () => setOk(false);
+    window.addEventListener(UNAUTHORIZED_EVENT, lost);
+    return () => window.removeEventListener(UNAUTHORIZED_EVENT, lost);
+  }, []);
+  return ok ? <App /> : <AuthRequired />;
+}
+
 void signedIn(fetch, getToken()).then((ok) => {
   render(
     <SettingsProvider>
       <CompatNotice />
-      {ok ? <App /> : <AuthRequired />}
+      <Root signedIn={ok} />
     </SettingsProvider>,
     document.getElementById('app')!,
   );
