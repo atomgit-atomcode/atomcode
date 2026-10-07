@@ -8,13 +8,28 @@ For whoever edits this file; this block is never shown.
   shown from the Chinese file instead.
 - Each section starts `## vX.Y.Z`, optionally followed by a date:
   `## v5.2.2 (2026-10-08)`. Newest first (order is by version number anyway).
+- A section has three parts under these subheadings (tabs in `/changelog`):
+  - `### Overview`: a paragraph or two on what the release is about, shown at
+    the top of the Overview tab.
+  - `### Changes`: the list of features and fixes, shown under the overview.
+    Other subheadings inside it (`### Fixes`) count as changes too.
+  - Issues are written once, in `CHANGELOG.md`, under their original titles; the
+    English UI shows them from there. Leave them out of this file (an `### Issues`
+    part written here would take their place).
+  - Without any of the three, the whole section is changes.
 - The one-line notice after an upgrade names the **bold lead** of the first
-  three top-level list items, so lead with what matters most:
+  three top-level items under Changes, so lead with what matters most:
   `- **Providers on the web page**: ...`
 - Compiled into the binary; rebuild to see a change.
 -->
 
 ## v5.2.2
+
+### Overview
+
+This release is about **rebuilding the architecture and the terminal UI**: the runtime is rewritten in layers, every front end shares one runtime, and a session is a log of events that comes back whole; the new full-screen terminal UI is the default, with settings, models, MCP, plugins and background sessions in panels.
+
+### Changes
 
 - **A new architecture**: the runtime is rebuilt in layers (agent loop / capability assembly / coding runtime) and the old engine is retired; the terminal, web UI, VS Code and ACP share one runtime and behave alike. A session is now a log of events: undo, rewind and compaction are appended rather than rewriting history, so a session comes back whole after an interruption or a crash.
 - **The new terminal UI is the default**: running atomcode opens the new full-screen UI (switch back with --classic or [ui] screen); click, double-click a word, triple-click a line, right-click for a menu, drag-select across screens with auto-scroll, and click links and file paths to open them; the terminal title and tab show the session name and flag the session that is waiting for you.
@@ -29,6 +44,12 @@ For whoever edits this file; this block is never shown.
 
 ## v5.1.0 (2026-09-18)
 
+### Overview
+
+This release widens what you can connect: the OpenAI Responses API and OpenRouter's free models, stronger AtomGit tools and code graph, plus opt-in code rewind and a daily work recap.
+
+### Changes
+
 - **More providers**: support for the OpenAI Responses API.
 - **AtomGit tools and code graph**: atomgit_issue can update and close issues; atomgit_pr can list your own PRs (list_mine) and update a PR; the code-graph tools (list_symbols / read_symbol / trace_callers) now understand Kotlin.
 - **Sessions and memory**: a new list_sessions tool lists this project's past sessions; a new machine-local memory layer (global > project > local).
@@ -40,6 +61,12 @@ For whoever edits this file; this block is never shown.
 
 ## v5.0.9 (2026-08-27)
 
+### Overview
+
+This release lets AtomCode bring in more help: Codex and Claude Code as external subagents, a deep code-review mode, reasoning effort driven by configuration, and the ACP v2 protocol.
+
+### Changes
+
 - **External subagents (Codex / Claude Code)**: use Codex or Claude Code as a subagent backend.
 - **Deep code review**: /review deep and verify review along several dimensions in parallel, check every finding on its own, then merge the duplicates.
 - **Reasoning effort from configuration, with a new xhigh level**: effort levels come from configuration, including reasoning_effort_levels sent by the server.
@@ -50,6 +77,12 @@ For whoever edits this file; this block is never shown.
 
 ## v5.0.8 (2026-08-20)
 
+### Overview
+
+This release improves selecting and copying in the terminal, adds a Zhipu Coding Plan preset and more hook events, and cuts the round trips weak models make on large files.
+
+### Changes
+
 - **Select and copy with the mouse**: double-click a word, triple-click a line, and the selection is copied; tool blocks such as bash commands and output can be drag-selected too; mouse capture is now off by default, so the terminal's own selection works.
 - **Zhipu Coding Plan preset**: add Zhipu Coding Plan straight from /provider; the protocol toggle gains Ollama, filling in the local address when left empty.
 - **New hook events**: Stop, StopFailure and PostToolUseFailure let plugins see a turn end, an API error, or a failed tool call.
@@ -59,6 +92,12 @@ For whoever edits this file; this block is never shown.
 
 ## v5.0.7 (2026-08-19)
 
+### Overview
+
+This release focuses on the web UI: manage providers and discover models there, and install it as a desktop app; reasoning effort can be set per model, and the terminal gets much better interaction.
+
+### Changes
+
 - **Providers and model discovery in the web UI**: manage providers, discover and add models, and reuse an existing account when adding a model.
 - **Install the web UI as an app, with notifications**: install it as a desktop app (PWA) and get a browser notification when a task finishes; a persistent Todo panel, a reworked sidebar, adjustable font size, and per-turn stats.
 - **Reasoning effort per model**: configure effort levels per model; /provider in the TUI takes several at once, the web UI offers only what the endpoint supports, and the choice stays in sync across clients.
@@ -67,6 +106,12 @@ For whoever edits this file; this block is never shown.
 - **Fixes**: IME input being overwritten, sidebar flicker, the waiting indicator, lost turn timestamps, the notification permission prompt, and message queueing and sync in the web UI; Orca terminal support, table rendering on Windows, and a proxy loopback leak; truncated session tab titles in VS Code and the model dropdown highlight in JetBrains; duplicate plugin scans of the home directory, per-project prompt history, and folded Team tool output.
 
 ## v5.0.6 (2026-08-12)
+
+### Overview
+
+This release brings agents working in parallel (Agent Team) and semantic code intelligence (LSP) when you want it, more reliable recovery for long tasks, and an interactive configuration editor.
+
+### Changes
 
 - **Agent Team**: several agents work in parallel, with each member's status, task details and token use shown live.
 - **Semantic code intelligence**: enable LSP when you need it for symbol reading, reference search and call-chain analysis, making large projects easier to analyze.
@@ -79,6 +124,12 @@ For whoever edits this file; this block is never shown.
 
 ## v5.0.5 (2026-08-07)
 
+### Overview
+
+This release makes a goal something you can keep pursuing, lets you steer a running task and suggests the next step when a turn ends, and edits GBK-encoded files in place.
+
+### Changes
+
 - **Persistent goals**: a goal stays after it is met or runs out of rounds, and your next message carries it on; Esc pauses it and your next submit resumes it; its status stays on screen.
 - **Steer mid-task, with next-step suggestions**: add guidance while a task runs; when a turn ends you get a suggested next prompt based on its results.
 - **Edit GBK / GB18030 files in place**: the edit tools keep a file's original encoding.
@@ -88,6 +139,12 @@ For whoever edits this file; this block is never shown.
 
 ## v5.0.4 (2026-08-03)
 
+### Overview
+
+This release adds local scheduled tasks that run unattended through the system scheduler, along with a /rewind command and input history search.
+
+### Changes
+
 - **Local scheduled tasks**: a new atomcode schedule subcommand (add / list / remove / enable / disable) registers with the system scheduler (launchd, systemd, Windows Task Scheduler) and refuses risky commands in unattended runs; /schedule lists the tasks in the TUI.
 - **/rewind and history search**: /rewind opens the checkpoint picker; Ctrl+R searches your input history.
 - **CodingPlan models sync after sign-in**: signing in to CodingPlan fetches the available models.
@@ -95,6 +152,12 @@ For whoever edits this file; this block is never shown.
 - **Fixes**: output received before a dropped connection is kept, with a hint at a likely proxy cause (10054); pasting screenshots on Windows; overlapping tool blocks; unreadable grey text on dark themes; updating the bundled binary in the VS Code and JetBrains plugins; faster startup.
 
 ## v5.0.3 (2026-07-30)
+
+### Overview
+
+This release rebuilds the /provider panel and adds checkpoint-based rewind, an archive for tool output and a round-limit checkpoint, keeping long sessions under control.
+
+### Changes
 
 - **Rebuilt /provider panel**: separate Accounts and Models tabs, adding from vendor presets (TaoToken added), and editing accounts and models; /model groups models by account.
 - **Safe rewind**: workspace checkpoints take the conversation and its code changes back to an earlier step together.
@@ -106,12 +169,24 @@ For whoever edits this file; this block is never shown.
 
 ## v5.0.2 (2026-07-24)
 
+### Overview
+
+A stability update: custom command arguments work, a broken configuration no longer stops startup, and network compatibility improves.
+
+### Changes
+
 - **Custom command arguments work**: the args field of a custom command now takes effect, filled into the command's text.
 - **Tolerant configuration**: an invalid provider section is set aside instead of stopping startup, and writes such as /model still go through.
 - **Network compatibility**: AtomGit connections retry over TLS 1.2; one broken system root certificate no longer stops all networking.
 - **Fixes**: the web UI keeps the TUI in sync when switching projects and polls the model selector less; the install script matches whole PATH entries.
 
 ## v5.0.1 (2026-07-24)
+
+### Overview
+
+This release lets the model ask you questions right in the UI, tightens trust for project MCP servers and plugin hooks, and connects better on corporate networks.
+
+### Changes
 
 - **Answer questions right in the UI**: when the model needs a decision, the TUI or web UI shows a single-choice, multiple-choice or free-text question, and several questions can be answered at once; on by default.
 - **Trust for project MCP servers**: servers in a project's .mcp.json connect only after /mcp trust, and /mcp untrust takes it back; .mcp.json accepts comments; plugin hooks run only once trusted, and you are asked again when a plugin changes.
@@ -121,6 +196,12 @@ For whoever edits this file; this block is never shown.
 - **Fixes**: a bash timeout or cancel ends the whole process tree (Windows / Unix); the edit tool tolerates whitespace differences; wide tables, QR codes in Windows Terminal, and arrow keys under TERM=dumb; a third-party model's 429 is no longer reported as CodingPlan quota exhaustion; room is kept for the reply near the context limit.
 
 ## v5.0.0 (2026-07-17)
+
+### Overview
+
+The first AtomCode 5.0 release: four unified execution modes with approvals, read-only tools in parallel, a new /usage panel, and a better Todo panel, plugin marketplace and /init.
+
+### Changes
 
 - **Better Todo panel**: tasks update one item at a time, the in-progress item is checked every round to stop drift, and the run continues once more when items are left; /todo clear empties the list.
 - **Unified execution modes and approvals**: Tab cycles four modes: plan, build, auto (no approvals) and accept edits.
