@@ -312,7 +312,7 @@
 - [#1321 [Windows] Session transcript save fails with 拒绝访问 (os error 5) since auto-update — all session .jsonl stay 0 bytes](https://atomgit.com/atomgit_atomcode/atomcode/issues/1321)
 - [#1323 [BUG] session transcript 拒写 os error 5: append_jsonl_line lock_exclusive 撞同session snapshot写流程排它锁规律触发](https://atomgit.com/atomgit_atomcode/atomcode/issues/1323)
 
-## v5.0.4 (2026-08-03)
+## v5.0.4 (2026-08-04)
 
 ### 概览
 
@@ -546,3 +546,652 @@ AtomCode 5.0 的第一个版本：统一四种执行模式与审批，只读工�
 - [#1109 [Bug] 删除插件市场时需手工先卸载插件，应自动卸载并弹确认框](https://atomgit.com/atomgit_atomcode/atomcode/issues/1109)
 - [#1110 插件市场顶部 tab "Browse Marketplaces" 展示的是 plugin 而非 marketplace，建议调整名称](https://atomgit.com/atomgit_atomcode/atomcode/issues/1110)
 - [#1111 [Bug] 插件详情页未展示 Marketplace 和 Version 字段](https://atomgit.com/atomgit_atomcode/atomcode/issues/1111)
+
+## v4.26.0 (2026-07-09)
+
+### 概览
+
+这一版带来强弱模型协作的子代理委派、/loop 持续循环和 Todo 任务管理，WebUI 大幅增强，上下文压缩也更聪明。
+
+### 更新内容
+
+- **子代理强弱模型委派**：主模型负责编排，按服务商能力自动分档路由（强模型规划、快模型执行），多个子任务可以并行；默认关闭，设置环境变量 ATOMCODE_SUBAGENT=1 开启。
+- **/loop 持续循环**：支持自定步调和固定间隔两种模式，Agent 按节奏自动重复推进任务，停止、轮数上限与取消都有完整处理。
+- **/app 连接 GitCode APP**：GitCode APP 与 AtomCode 配对后，可以在 GitCode 上连接使用 AtomCode。
+- **Todo 任务**：todowrite 工具管理任务清单，每轮把当前清单告诉模型，底栏显示当前任务和进度（N/M），/todo 命令查看清单。
+- **WebUI 大幅增强**：斜杠命令全面接入（/undo、/compact、/context、/status、/config、/diff、/cost、/memory、/skills 等）；三档审批模式选择（Build / Plan / Bypass）；跨项目会话侧栏；会话内消息搜索与定位；消息时间标记；只在底部时自动跟随输出，并提供回到底部按钮。
+- **上下文与压缩优化**：上下文溢出时自动多级压缩（机械压缩加 LLM 总结），压缩时保留近期工作上下文并限制摘要输入规模，历史压缩对缓存更友好；切换模型后按当前模型的窗口重新计算压缩压力。
+- **导出与复制**：/save 把当前对话导出为 Markdown，/copy msg 复制完整回复；/provider 可设置 context_window，并提示 128k / 256k / 512k / 1m 等窗口档位。
+- **若干修复**：修复 grep 把大文件整个读进内存、导致低配机器卡死的问题，以及其他体验问题。
+
+### Issues
+
+- [#844 [共创大赛][Bug] atomcode经常出现堆栈缓冲区溢出的问题](https://atomgit.com/atomgit_atomcode/atomcode/issues/844)
+- [#917 bug：VSCode插件中，一旦输出"示例（Pandoc）"，输出结果就会断层，无后续内容返回](https://atomgit.com/atomgit_atomcode/atomcode/issues/917)
+- [#936 bug： 报错Failed to buffer the request body: length limit exceeded](https://atomgit.com/atomgit_atomcode/atomcode/issues/936)
+- [#950 [共创大赛][Bug] vscode 终端运行atomcode，调整终端大小时atomcode界面会异常](https://atomgit.com/atomgit_atomcode/atomcode/issues/950)
+- [#970 [共创大赛][Bug] harmonyos ctrl+v无法粘贴图片](https://atomgit.com/atomgit_atomcode/atomcode/issues/970)
+- [#978 [Bug] 终端 UI：任务执行完成后转圈动画未清除](https://atomgit.com/atomgit_atomcode/atomcode/issues/978)
+- [#979 【功能请求】新增内置 Todo List 待办清单功能](https://atomgit.com/atomgit_atomcode/atomcode/issues/979)
+- [#980 [TUI][Bug] 从历史记录翻页回访 prompt 时 $ 前缀丢失，skill 无法调用](https://atomgit.com/atomgit_atomcode/atomcode/issues/980)
+- [#983 [共创大赛][Bug] 当前会话的Token上下文剩余量无法正常查看](https://atomgit.com/atomgit_atomcode/atomcode/issues/983)
+- [#985 鸿蒙pc无法黏贴图片](https://atomgit.com/atomgit_atomcode/atomcode/issues/985)
+- [#987 [共创大赛]webui界面，模型输出时自动滚动增加开关，允许用户自由浏览历史记录](https://atomgit.com/atomgit_atomcode/atomcode/issues/987)
+- [#993 [Bug] Windows 路径大小写漂移导致重启后历史对话列表为空（写入归一化但过滤未归一化）](https://atomgit.com/atomgit_atomcode/atomcode/issues/993)
+- [#997 [Bug] 在历史对话中续聊必报 HTTP 400 "glm-5.2 is not a multimodal model"，新对话正常](https://atomgit.com/atomgit_atomcode/atomcode/issues/997)
+- [#998 bug：输入的提示词和输出的结果被截断 （</script>截断）](https://atomgit.com/atomgit_atomcode/atomcode/issues/998)
+- [#1001 [共创大赛][Bug] JetBrains插件输入报错400](https://atomgit.com/atomgit_atomcode/atomcode/issues/1001)
+- [#1002 bug：VSCode插件中，排队中的提示词一直没被触发(整个对话结束了都没触发)](https://atomgit.com/atomgit_atomcode/atomcode/issues/1002)
+- [#1003 [Bug] /app 扫码连接文案错误："AtomCode App" 应为 "GitCode App"](https://atomgit.com/atomgit_atomcode/atomcode/issues/1003)
+- [#1005 [Bug] 手机 App 缺少 "Always Allow" 审批选项，且审批决策后卡片状态未同步](https://atomgit.com/atomgit_atomcode/atomcode/issues/1005)
+- [#1010 [共创大赛]-[Feature] tui输入框在触发 bash 模式后，给用户交互提示](https://atomgit.com/atomgit_atomcode/atomcode/issues/1010)
+- [#1012 bug：从「deepseek-v4-flash」模型切换到「GLM-5.2」模型后报错](https://atomgit.com/atomgit_atomcode/atomcode/issues/1012)
+- [#1013 自动升级最新版本后不能使用了，网络有代理？](https://atomgit.com/atomgit_atomcode/atomcode/issues/1013)
+- [#1016 [Bug] Android App 上弹了两个相同的审批卡片](https://atomgit.com/atomgit_atomcode/atomcode/issues/1016)
+- [#1017 优化：AtomGit Bash的OUT的结果无法输出中文路径，显示问号](https://atomgit.com/atomgit_atomcode/atomcode/issues/1017)
+- [#1019 [Bug] GitCode App 扫码连接后会话名称未展示](https://atomgit.com/atomgit_atomcode/atomcode/issues/1019)
+- [#1020 [共创大赛][Bug] SKILL脚本调用失效](https://atomgit.com/atomgit_atomcode/atomcode/issues/1020)
+- [#1034 [Bug] TUI/WebUI 中发送 prompt，App 显示 2 条相同消息，执行完后变为 1 条](https://atomgit.com/atomgit_atomcode/atomcode/issues/1034)
+
+## v4.25.9 (2026-07-04)
+
+### 概览
+
+这一版让会话自动起名，终端标签页显示会话名和运行状态，一眼就能分清多个窗口。
+
+### 更新内容
+
+- **会话自动命名**：第一轮结束后由 AI 给会话起名，不会覆盖你用 /rename 设的名字，WebUI 同步显示；可在 [ui] ai_session_naming 关闭。
+- **标签页状态灯**：终端标签标题显示会话名，并以 🟢 空闲、🟡 运行中、🔴 等待审批标示状态；可在 [ui] terminal_status_glyph 关闭。
+- **/compact 不再卡住**：生成压缩摘要最多等 120 秒，超时即结束。
+- **若干修复**：Windows 下 /cd 的路径不再带 \\?\ 前缀，/cd 目录列表去重；Git Bash 下的 > nul 自动改写为 /dev/null；Windows 下 WebUI 能正确打开浏览器；WebUI 的输出不再搅乱 TUI 画面；Ctrl+O 展开提示在工具开始时就显示。
+
+### Issues
+
+- [#945 [共创大赛][Bug] 版本显示不统一，如图](https://atomgit.com/atomgit_atomcode/atomcode/issues/945)
+- [#966 [共创大赛]-[Feature] cli程序在标题栏添加一个工作状态标记](https://atomgit.com/atomgit_atomcode/atomcode/issues/966)
+- [#967 [共创大赛][Bug] win下概率生成nul这个异常文件](https://atomgit.com/atomgit_atomcode/atomcode/issues/967)
+- [#969 [共创大赛][Bug]](https://atomgit.com/atomgit_atomcode/atomcode/issues/969)
+- [#975 [共创大赛][Bug] 疑似 ACP 协议不兼容](https://atomgit.com/atomgit_atomcode/atomcode/issues/975)
+- [#976 Windows下WebUI处理prompt时TUI切换目录触发同步快照回放及daemon日志泄漏](https://atomgit.com/atomgit_atomcode/atomcode/issues/976)
+
+## v4.25.8 (2026-07-03)
+
+### 概览
+
+这一版完善了 WebUI 的复制与导出，/status 能看清登录状态，@ 提及支持逐级进入目录，并改进了 Windows 下的 bash 识别。
+
+### 更新内容
+
+- **WebUI 复制与导出**：消息新增复制按钮，可复制整轮内容（含工具调用）；会话可导出为 Markdown 文件；历史图片正常显示，回合进行中被强行关闭也不再丢掉整轮。
+- **/status 显示登录状态**：首行显示是否登录及昵称（用户名），登录过期时明确提示运行 /login；去掉 Token 行。
+- **@ 提及进入目录**：@ 补全可以逐级进入子目录，选中项自动滚动到可见处；/ 与 @ 菜单的选中颜色统一。
+- **Windows bash 识别**：能找到装在非 C 盘的 Git Bash，不再把 WSL 的应用别名当成 bash，并如实告诉模型当前用的是 Git Bash 还是 cmd.exe。
+- **VS Code 插件**：支持 @ 引用文件、上下键翻输入历史，界面支持中英文。
+- **若干修复**：自动复制代码块默认关闭，开启时也只在回复恰好一个代码块时复制；web_fetch 按页面编码解码，中文网页不再乱码、非 ASCII 页面不再崩溃；模型给出的路径支持 ~；MCP 工具参数显示上限放宽到 450 字；添加插件市场后提示可安装的插件和命令；resume 历史会话的工具名显示正常；回复过程中输入框光标正常显示；Windows 下 WebUI 打开浏览器不再失败。
+
+### Issues
+
+- [#63 [Feature] 支持acp](https://atomgit.com/atomgit_atomcode/atomcode/issues/63)
+- [#447 [共创大赛]-[Feature] 支持acp和a2a以及 尝试支持claude code 的plugins市场](https://atomgit.com/atomgit_atomcode/atomcode/issues/447)
+- [#811 [共创大赛][feat] 修改TUI 根据系统来制定不同的渲染方案，并设计降级策略，确保在不同的终端更好的交互。](https://atomgit.com/atomgit_atomcode/atomcode/issues/811)
+- [#858 【Bug】VSCode 插件未处理 artifact 事件，可能导致代码块内容不展示](https://atomgit.com/atomgit_atomcode/atomcode/issues/858)
+- [#868 [共创大赛]-[Feature] ACP 支持](https://atomgit.com/atomgit_atomcode/atomcode/issues/868)
+- [#889 [共创大赛]-[Feature] 希望能够增加ACP支持](https://atomgit.com/atomgit_atomcode/atomcode/issues/889)
+- [#893 [共创大赛]-[Feature] 优化微信插件消息](https://atomgit.com/atomgit_atomcode/atomcode/issues/893)
+- [#902 [共创大赛][Bug]](https://atomgit.com/atomgit_atomcode/atomcode/issues/902)
+- [#903 [共创大赛][Bug] BYPASS模式，使用 /skill 调用技能，还是会出现审批](https://atomgit.com/atomgit_atomcode/atomcode/issues/903)
+- [#905 [共创大赛][Bug] Windows版本，如果用户没有启动浏览器，输入/webui命令，不会自动打开默认浏览器](https://atomgit.com/atomgit_atomcode/atomcode/issues/905)
+- [#907 4.25.7 版本无法执行命令，windows环境](https://atomgit.com/atomgit_atomcode/atomcode/issues/907)
+- [#908 [共创大赛][Bug] Windows版：会话中断重启后记录丢失（应有2条仅剩1条）](https://atomgit.com/atomgit_atomcode/atomcode/issues/908)
+- [#909 [共创大赛]-[Feature] AtomCode for VS Code 增加 “输入历史记录导航（方向键 ↑/↓）” 功能](https://atomgit.com/atomgit_atomcode/atomcode/issues/909)
+- [#910 [Bug] /resume 恢复会话后工具名称显示为原始 snake_case 而非 PascalCase](https://atomgit.com/atomgit_atomcode/atomcode/issues/910)
+- [#912 长代码块内容被截断/横向滚动失效](https://atomgit.com/atomgit_atomcode/atomcode/issues/912)
+- [#915 [共创大赛][Bug]](https://atomgit.com/atomgit_atomcode/atomcode/issues/915)
+- [#916 在上一个问题回复过程中，输入框中光标不显示](https://atomgit.com/atomgit_atomcode/atomcode/issues/916)
+- [#920 [共创大赛][Bug] ATOMCODE_PLAIN=1 模式下 OSC 11 终端探测响应泄漏为 ANSI 乱码](https://atomgit.com/atomgit_atomcode/atomcode/issues/920)
+- [#921 [共创大赛][Bug] ATOMCODE_PLAIN=1 模式下自更新 eprintln 抢占启动输出](https://atomgit.com/atomgit_atomcode/atomcode/issues/921)
+- [#928 [共创大赛]-[Feature] vscode插件通过@可引用文件夹/文件](https://atomgit.com/atomgit_atomcode/atomcode/issues/928)
+- [#931 [共创大赛]-[Feature] 导出atomcode对话为markdown文件](https://atomgit.com/atomgit_atomcode/atomcode/issues/931)
+- [#932 [共创大赛]-[Feature] 不要自动复制代码到剪切板](https://atomgit.com/atomgit_atomcode/atomcode/issues/932)
+- [#933 bug：服务商返回空响应Provider returned an empty response](https://atomgit.com/atomgit_atomcode/atomcode/issues/933)
+- [#934 bug：阅读文件时报错中断任务(no reasoning detected)](https://atomgit.com/atomgit_atomcode/atomcode/issues/934)
+- [#935 [共创大赛][feat] webui 对话标题点击可以下来，修改对话标题，导出、删除功能](https://atomgit.com/atomgit_atomcode/atomcode/issues/935)
+- [#937 [共创大赛][feat] webui用户发送的消息下面增加复制功能，还有大模型返回内容下面增加复制功能。](https://atomgit.com/atomgit_atomcode/atomcode/issues/937)
+- [#940 [Feature] TUI 的 CodeReview 调用时未显示参数信息](https://atomgit.com/atomgit_atomcode/atomcode/issues/940)
+- [#946 fix(acp): 内核死亡时 cmd_tx.send 错误被 .ok() 吞掉，客户端收到假 EndTurn](https://atomgit.com/atomgit_atomcode/atomcode/issues/946)
+- [#947 refactor: 两个 crate 重复定义 strip_reasoning_filler 函数，应共享实现](https://atomgit.com/atomgit_atomcode/atomcode/issues/947)
+- [#948 执行命令为啥一定要强制通过wsl？](https://atomgit.com/atomgit_atomcode/atomcode/issues/948)
+- [#949 VS Code插件/命令列表无法滚动查看且高亮状态残留](https://atomgit.com/atomgit_atomcode/atomcode/issues/949)
+- [#952 [BadCase] ReadFile 对 ~ 开头路径未展开家目录，被当作相对路径处理](https://atomgit.com/atomgit_atomcode/atomcode/issues/952)
+- [#965 /app 命令的说明缺少中文 i18n 翻译](https://atomgit.com/atomgit_atomcode/atomcode/issues/965)
+
+## v4.25.7 (2026-06-30)
+
+### 概览
+
+这一版重点改善了限流和长任务体验：遇到 429 会按套餐窗口自动等待或暂停，sudo 密码可以在界面里输入，/goal 更稳，压缩提示也更统一。
+
+### 更新内容
+
+- **限流自动等待**：遇到 429 时按真实的重置时间决定自动等待后继续，还是暂停并显示倒计时；TUI 和 WebUI 都会显示重置时间，不再当成报错。
+- **sudo 密码输入框**：命令需要 sudo 或 ssh 密码时，在 TUI 里弹出隐藏输入框，可用 Ctrl+C 取消，回合结束自动关闭。
+- **/goal 更稳**：遇到可恢复的中断会继续推进，新增轮数和时长上限，连续没有进展时停止，不再出现目标结束后又复活。
+- **压缩提示统一**：自动和手动压缩用同一种进度提示和分隔标记；底栏始终显示上下文占用百分比。
+- **双击 Esc 撤销**：输入框为空时连按两次 Esc 撤销上一轮，第一次会提示再按一次。
+- **视觉模型能看图片**：用视觉模型时，read_file 读到的图片会直接交给模型。
+- **长输出不再截断**：回复被输出上限截断时自动接着写，大文件改为分段写入。
+- **若干修复**：模型把答案放进推理内容时也能正常显示；Windows 下 bash 检测、引号与中文 Python 输出问题修复；粘贴的文本在历史回溯和提交后正确展开；终端被信号结束后恢复正常；todo 更新显示任务标题；web_search 显示结果来源域名；波浪号不再被当成删除线；/login 显示真实套餐名。
+
+### Issues
+
+- [#540 [共创大赛][Bug] 拖拽程序窗口大小，会导致程序闪退](https://atomgit.com/atomgit_atomcode/atomcode/issues/540)
+- [#736 [共创大赛][Bug] windows 上面 cmd和powershell 在对话中，用户不能线上滚动，一滚动又被强制回到了底部](https://atomgit.com/atomgit_atomcode/atomcode/issues/736)
+- [#819 JetBrains插件需要增加插件主页，方便用户了解使用，支持中英文](https://atomgit.com/atomgit_atomcode/atomcode/issues/819)
+- [#825 [WebUI][Bug] 同步模式下路径前的 ~ 指示符丢失](https://atomgit.com/atomgit_atomcode/atomcode/issues/825)
+- [#827 [WebUI][Bug] sync 同步异常时 TUI prompt 未同步到 WebUI，且无法终止](https://atomgit.com/atomgit_atomcode/atomcode/issues/827)
+- [#843 [共创大赛][Bug] 历史对话复制的内容无法使用](https://atomgit.com/atomgit_atomcode/atomcode/issues/843)
+- [#845 [共创大赛][Bug] webui开启同步，切换session对话，TUI应该也要同步切换对话](https://atomgit.com/atomgit_atomcode/atomcode/issues/845)
+- [#847 【Bug】JetBrains 插件 代码块（code block）无法正常显示](https://atomgit.com/atomgit_atomcode/atomcode/issues/847)
+- [#848 JetBrains插件市场安装AtomCode下载失败且概览未加载](https://atomgit.com/atomgit_atomcode/atomcode/issues/848)
+- [#850 [共创大赛][Bug] webui未开启同步的情况，新建对话TUI也会新建，应该不需要](https://atomgit.com/atomgit_atomcode/atomcode/issues/850)
+- [#851 [共创大赛][feat] webui字体优化](https://atomgit.com/atomgit_atomcode/atomcode/issues/851)
+- [#857 上下文使用进度条 / Context Usage Progress Bar](https://atomgit.com/atomgit_atomcode/atomcode/issues/857)
+- [#861 能不能把那个gitbash集成到atomcode里, 现在这种终端兼容性太差了, 空格都识别不了, 而且经常出现cmd/pwsh/PowerShell混用的问题](https://atomgit.com/atomgit_atomcode/atomcode/issues/861)
+- [#872 [共创大赛] 上下文超200K后系统失效：5层防御缺口导致不可恢复](https://atomgit.com/atomgit_atomcode/atomcode/issues/872)
+- [#884 [共创大赛]-[Feature] Ctrl+C 中断对话后保留已生成的上下文记忆](https://atomgit.com/atomgit_atomcode/atomcode/issues/884)
+- [#885 [共创大赛][Bug] Codingplan Pro 中的 Qwen/Qwen3-VL-8B-Instruct 无法正常使用](https://atomgit.com/atomgit_atomcode/atomcode/issues/885)
+- [#891 TUI中/skills技能执行内容未在WebUI同步展示](https://atomgit.com/atomgit_atomcode/atomcode/issues/891)
+- [#892 [共创大赛][Bug] todo工具并行调用，未展示任务名称](https://atomgit.com/atomgit_atomcode/atomcode/issues/892)
+
+## v4.25.6 (2026-06-25)
+
+### 概览
+
+这一版集中修了 Windows 下的大量问题，改进了自动压缩和 /cd，并新增统一的网络代理设置；WebUI 与 JetBrains 插件也有较多改进。
+
+### 更新内容
+
+- **统一代理设置**：新增 [network.proxy] 配置，可选跟随系统、固定代理或不走代理，覆盖所有对外连接；TUI 里用 /proxy 切换，/status 查看。
+- **Windows 体验**：bash 工具不再每次闪出控制台窗口；命令输出按控制台编码正确解码；CRLF 换行和中文 GBK 文件不再让读取、编辑失败；/quit 不再卡住退不出。
+- **自动压缩更可靠**：上下文接近上限时像 /compact 一样做摘要，不再只折叠工具结果；超长粘贴不再反复空跑摘要；压缩时显示进度。
+- **/cd 更好用**：选择器里打字即过滤最近目录，也可以直接输入路径；切换目录后 /resume 列出的是新项目的会话。
+- **编辑容错**：tab 与空格不一致时也能匹配上，不再逼模型改用脚本修改文件。
+- **WebUI 改进**：新增欢迎页、技能与 MCP 菜单、会话搜索和按日期分组；新会话立刻出现在侧栏；同步开关刷新后保持；多开实例不再互相顶掉登录。
+- **JetBrains 插件**：新增欢迎页和启动引导，支持粘贴或拖拽文件、粘贴图片作为附件，跟随 IDE 主题色。
+- **若干修复**：MCP 的 trust/autoApprove 配置生效，「总是允许」对 MCP 持久；/setup 安装的 MCP 写到能被读取的 .mcp.json；流式中途连接重置自动重连并给出可读提示；/login 后不再报认证过期；窗口缩放后不再出现重复输出；会话改名后不再被覆盖；parallel_edit 显示逐文件进度。
+
+### Issues
+
+- [#173 [共创大赛][Bug] permission channel 关闭时静默返回 Deny，导致工具被误拒绝且缺少可观测性](https://atomgit.com/atomgit_atomcode/atomcode/issues/173)
+- [#175 [共创大赛][Bug] OpenAI 流式 tool call：`ToolCallStart` 事件可能发送空 name，UI 显示空白工具名](https://atomgit.com/atomgit_atomcode/atomcode/issues/175)
+- [#177 [共创大赛][Bug] 文件编辑跟踪依赖工具输出文本格式（“Edited …”），输出措辞变化/本地化会导致跟踪失效](https://atomgit.com/atomgit_atomcode/atomcode/issues/177)
+- [#703 Windows下窗口全屏/缩放后会话历史重复，内容错乱表格未对齐](https://atomgit.com/atomgit_atomcode/atomcode/issues/703)
+- [#709 [共创大赛][Bug] windows 11、10 PowerShell 放大缩小后，历史记录会多出2条](https://atomgit.com/atomgit_atomcode/atomcode/issues/709)
+- [#713 [共创大赛]-[Feature] 非 JSON SSE 数据不应该显示空响应，应区分有数据但非法 和 没数据](https://atomgit.com/atomgit_atomcode/atomcode/issues/713)
+- [#714 [共创大赛][Bug] 使用 atomcode -y 偶尔还是需要执行确认](https://atomgit.com/atomgit_atomcode/atomcode/issues/714)
+- [#715 JetBrains插件输入栏按钮布局与快捷键说明UI优化建议](https://atomgit.com/atomgit_atomcode/atomcode/issues/715)
+- [#716 JetBrains插件背景色需随编辑器主题联动，增加与编辑器的分隔线](https://atomgit.com/atomgit_atomcode/atomcode/issues/716)
+- [#718 JetBrains插件未展示会话列表，不支持新建会话](https://atomgit.com/atomgit_atomcode/atomcode/issues/718)
+- [#719 JetBrains插件没有打开的会话时设置按钮点击无效](https://atomgit.com/atomgit_atomcode/atomcode/issues/719)
+- [#724 JetBrains插件建议支持文件拖拽、@选择文件和/命令](https://atomgit.com/atomgit_atomcode/atomcode/issues/724)
+- [#725 [共创大赛][Bug] [错误：stream read error: error decoding response body: error reading a body from connection: unexpected EOF during chunk size line]](https://atomgit.com/atomgit_atomcode/atomcode/issues/725)
+- [#727 [共创大赛][Bug] mcp服务权限问题](https://atomgit.com/atomgit_atomcode/atomcode/issues/727)
+- [#735 额度耗尽错误被误判为可重试:识别英文/结构化 quota 文案,避免 ~45s 无谓重试](https://atomgit.com/atomgit_atomcode/atomcode/issues/735)
+- [#759 JetBrains插件建议支持粘贴截图](https://atomgit.com/atomgit_atomcode/atomcode/issues/759)
+- [#760 JetBrains插件快捷键文本提示建议用placeholder展示在输入框内](https://atomgit.com/atomgit_atomcode/atomcode/issues/760)
+- [#799 [共创大赛][feat] webui 改造](https://atomgit.com/atomgit_atomcode/atomcode/issues/799)
+- [#813 [共创大赛][Bug] 频繁的读不到内容](https://atomgit.com/atomgit_atomcode/atomcode/issues/813)
+- [#816 [共创大赛][Bug] webui 同步按钮开启和取消浏览器的sync参数要跟着变化，不然用户刷新一下又开启了](https://atomgit.com/atomgit_atomcode/atomcode/issues/816)
+- [#818 # Bug: 多项目目录下先后执行 `/webui`，前一个 Web UI 页面 token 失效](https://atomgit.com/atomgit_atomcode/atomcode/issues/818)
+- [#820 [共创大赛][Bug] webui 发送对话，左侧sessions列表不刷新、或者标题不止那是问题](https://atomgit.com/atomgit_atomcode/atomcode/issues/820)
+- [#824 [WebUI][Bug] 重命名会话后发送消息，会话名称被重置为默认名称](https://atomgit.com/atomgit_atomcode/atomcode/issues/824)
+- [#826 [Bug] TUI 中切换目录未同步到 WebUI（/sync 会话）](https://atomgit.com/atomgit_atomcode/atomcode/issues/826)
+- [#828 [共创大赛][Bug] 微信clawbot 调用OpenClaw 调用 atomcode去干活，cmd窗口一直在闪](https://atomgit.com/atomgit_atomcode/atomcode/issues/828)
+- [#829 [Bug] /setup 安装 MCP 到 .atomcode/mcp.json 但加载器不识别该路径](https://atomgit.com/atomgit_atomcode/atomcode/issues/829)
+- [#859 Windows下TUI执行任务时无法向上翻页查看历史消息，固定在底部且翻动闪烁](https://atomgit.com/atomgit_atomcode/atomcode/issues/859)
+
+## v4.25.5 (2026-06-23)
+
+### 概览
+
+这是一个稳定性修复：坏掉的插件 hook 不再卡住每次提问，模型偶发空回复时自动重试。
+
+### 更新内容
+
+- **坏 hook 不再卡死**：插件 hook 启动失败或没给出原因就退出时，不再被当成拦截，提问和工具调用照常进行。
+- **空回复自动重试**：服务偶尔返回完全空的回复时，自动重试几次并给出提示，不再让回合悄悄中断。
+- **若干修复**：以管理员权限运行时的提示改为建议以普通权限运行。
+
+### Issues
+
+- [#635 [共创大赛][Bug] Provider returned an empty response (no text, no tool calls). no reason 无回应](https://atomgit.com/atomgit_atomcode/atomcode/issues/635)
+
+## v4.25.4 (2026-06-23)
+
+### 概览
+
+这一版新增会话内代码审查 /review 和持续目标 /goal，推出 JetBrains IDE 插件，并优化了上下文压缩。
+
+### 更新内容
+
+- **/review 代码审查**：在会话中直接审查代码改动，内置各语言的审查规则，标注 diff 行号，按变更文件逐一覆盖。
+- **/goal 持续目标**：设定一个目标后，Agent 会跨轮次自动朝它推进，并在每轮评估进展。
+- **JetBrains IDE 插件**：提供多标签页聊天、会话状态管理和 diff 查看，与 IDE 界面集成。
+- **上下文与压缩优化**：上下文溢出时自动多级压缩（机械压缩加 LLM 总结），历史压缩对缓存更友好。
+- **若干修复**：切换模型后上下文窗口未刷新；/clear 真正新开会话；审批与回合展示优化等。
+
+### Issues
+
+- [#619 [共创大赛][Bug] ParallelEditFiles时仅能看到第一个文件名称](https://atomgit.com/atomgit_atomcode/atomcode/issues/619)
+- [#633 [Bug] 插件市场 Skill 详情移动端页面留白太多，需优化](https://atomgit.com/atomgit_atomcode/atomcode/issues/633)
+- [#686 /skills skill name 过滤应使用子串匹配而非前缀匹配](https://atomgit.com/atomgit_atomcode/atomcode/issues/686)
+- [#694 [共创大赛][Bug] 使用GLM-5.2模型时，他无法使用复制的到CLI中的内容。](https://atomgit.com/atomgit_atomcode/atomcode/issues/694)
+- [#697 [共创大赛]-[Feature] todo工具优化](https://atomgit.com/atomgit_atomcode/atomcode/issues/697)
+- [#698 [共创大赛][Bug] 最近一直Web UI一直提示[错误: [warning] conversation compacted]文字变成红色，但任务继续进行。](https://atomgit.com/atomgit_atomcode/atomcode/issues/698)
+- [#699 [共创大赛][Bug]](https://atomgit.com/atomgit_atomcode/atomcode/issues/699)
+- [#700 长文本粘贴被截断成多段，显示异常](https://atomgit.com/atomgit_atomcode/atomcode/issues/700)
+- [#701 bash命令执行后转义序列未过滤，输入框出现乱码panic](https://atomgit.com/atomgit_atomcode/atomcode/issues/701)
+- [#702 [共创大赛][Bug] skill hub 安装命令直接运行会报错](https://atomgit.com/atomgit_atomcode/atomcode/issues/702)
+- [#704 邀请页登录授权后重新进入需再次登录，登录态未持久化](https://atomgit.com/atomgit_atomcode/atomcode/issues/704)
+- [#705 收款信息手机号输入未做校验，允许输入无效非数字字符](https://atomgit.com/atomgit_atomcode/atomcode/issues/705)
+- [#706 强制杀进程后终端残留ANSI乱码](https://atomgit.com/atomgit_atomcode/atomcode/issues/706)
+- [#707 WebUI停止按钮无法终止运行中的任务](https://atomgit.com/atomgit_atomcode/atomcode/issues/707)
+- [#708 Markdown表格渲染时CJK字符导致表格边框|未对齐](https://atomgit.com/atomgit_atomcode/atomcode/issues/708)
+
+## v4.25.3 (2026-06-20)
+
+### 概览
+
+这是一个小更新：文件写入审批恢复按路径区分，Windows 终端的鼠标操作恢复正常。
+
+### 更新内容
+
+- **写入审批按路径区分**：工作区内的普通文件改动自动放行；工作区外的文件按路径单独记住「总是允许」；敏感文件（如 .env、SSH 密钥）每次都询问。
+- **Windows 鼠标恢复原生**：不再改动控制台模式，conhost 与 Windows Terminal 上的滚轮、拖选、复制、右键粘贴都恢复正常。
+- **若干修复**：JetBrains 内置终端不再因鼠标移动出现乱码输入。
+
+### Issues
+
+- [#687 README 缺失 /wechat、/review、/goal 等斜杠命令的文档说明](https://atomgit.com/atomgit_atomcode/atomcode/issues/687)
+- [#688 [共创大赛][Bug] 《总是》授权无法正确使用，目前《总是》授权后，还需要多次授权](https://atomgit.com/atomgit_atomcode/atomcode/issues/688)
+- [#689 # AtomCode 聊天窗口鼠标失灵 Bug 报告](https://atomgit.com/atomgit_atomcode/atomcode/issues/689)
+- [#690 鼠标移动后出现乱码](https://atomgit.com/atomgit_atomcode/atomcode/issues/690)
+- [#691 [共创大赛][Bug] 更新后power shell 窗口不能上下滚动](https://atomgit.com/atomgit_atomcode/atomcode/issues/691)
+
+## v4.25.2 (2026-06-19)
+
+### 概览
+
+这一版换上了新的 agent 引擎，取消、审批、用量显示更可靠，并修了大量 WebUI 同步方面的问题。
+
+### 更新内容
+
+- **取消即撤回**：按 Esc 取消的回合不再留在上下文里，模型之后不会再提起；卡在连接阶段的回合也能立即取消。
+- **/compact 可指定重点**：/compact 后面可以加上重点，摘要会围绕它来写。
+- **底栏用量更真实**：每轮显示实际计费的 token 和缓存命中比例，不再把每轮重发的上下文重复累加；token 数以 K/M 显示。
+- **读取敏感文件需确认**：读取 SSH 密钥、.env、云凭证等文件前会先请求审批。
+- **若干修复**：交互式审批一直等你回应，不再超时自动拒绝；新增 /exit；响应慢时提示「响应较慢」；私有插件市场按登录状态拉取，git 操作不再卡住界面；长时间连接失效后自动恢复；流式超时放宽到 300 秒；web_fetch 支持 Markdown 输出；嵌套目录里的技能可被发现；深色主题下表格边框可见；输入框最高 6 行；/model 切换后旧审批不再重复弹出；WebUI 新建对话后侧栏及时刷新。
+
+### Issues
+
+- [#213 [共创大赛][Bug] 读文件经常出BLOCKED，这究竟是什么意思？](https://atomgit.com/atomgit_atomcode/atomcode/issues/213)
+- [#220 [共创大赛][Bug] 总是试图在未授权路径查询代码](https://atomgit.com/atomgit_atomcode/atomcode/issues/220)
+- [#495 [共创大赛][Bug] websearch功能不能使用](https://atomgit.com/atomgit_atomcode/atomcode/issues/495)
+- [#605 no reasoning removed)](https://atomgit.com/atomgit_atomcode/atomcode/issues/605)
+- [#606 bug：长文本复制粘贴不全](https://atomgit.com/atomgit_atomcode/atomcode/issues/606)
+- [#610 [共创大赛][Bug] skills只能识别到相对于skills/目录下一级目录下的SKILL.md, 无法识别二级目录下的SKILL.md](https://atomgit.com/atomgit_atomcode/atomcode/issues/610)
+- [#614 [共创大赛][Bug] atomcode --help i18n 问题](https://atomgit.com/atomgit_atomcode/atomcode/issues/614)
+- [#615 [共创大赛][Bug] cancel之后会覆盖输入框中已有内容](https://atomgit.com/atomgit_atomcode/atomcode/issues/615)
+- [#629 [Bug] Skill 翻译描述只支持中文，翻译 README 抛 504 Gateway Time-out](https://atomgit.com/atomgit_atomcode/atomcode/issues/629)
+- [#637 [共创大赛][feat] skills hub 发布skill 需要支持 atomgit.com](https://atomgit.com/atomgit_atomcode/atomcode/issues/637)
+- [#640 [共创大赛][feat] skill hub 默认排序调整，根据star](https://atomgit.com/atomgit_atomcode/atomcode/issues/640)
+- [#641 TUI resume切换会话时界面闪动](https://atomgit.com/atomgit_atomcode/atomcode/issues/641)
+- [#642 turn运行中时ESC和Ctrl+C无法取消或终止运行](https://atomgit.com/atomgit_atomcode/atomcode/issues/642)
+- [#643 [共创大赛][Bug] WriteFile工具显示异常](https://atomgit.com/atomgit_atomcode/atomcode/issues/643)
+- [#644 [共创大赛][Bug] v2引擎缺少工具并行调用时的显示](https://atomgit.com/atomgit_atomcode/atomcode/issues/644)
+- [#645 [共创大赛][Bug] v2引擎不支持OpenFile工具](https://atomgit.com/atomgit_atomcode/atomcode/issues/645)
+- [#646 [共创大赛][Bug] BYPASS模式下，WriteFile依旧弹出了审批](https://atomgit.com/atomgit_atomcode/atomcode/issues/646)
+- [#647 [共创大赛][Bug] 审批确认信息中，SearchReplace工具和mcp调用工具的参数显示错误](https://atomgit.com/atomgit_atomcode/atomcode/issues/647)
+- [#648 [共创大赛][Bug] OpenFile工具显示异常](https://atomgit.com/atomgit_atomcode/atomcode/issues/648)
+- [#650 [共创大赛][feat] skill_hub 发布支持 test.gitcode.net](https://atomgit.com/atomgit_atomcode/atomcode/issues/650)
+- [#651 [共创大赛][Bug] skill hub 定时更新，仓库的 star、download数据](https://atomgit.com/atomgit_atomcode/atomcode/issues/651)
+- [#652 [共创大赛][feat] skill hub 控制台skill管理，翻译频率限制，避免用户一直点翻译](https://atomgit.com/atomgit_atomcode/atomcode/issues/652)
+- [#653 [共创大赛][Bug] skill hub发布skill没有 home page 数据](https://atomgit.com/atomgit_atomcode/atomcode/issues/653)
+- [#654 [共创大赛][Bug] 每次对话结束后下方的token显示异常](https://atomgit.com/atomgit_atomcode/atomcode/issues/654)
+- [#655 [共创大赛][Bug] v2引擎无法识别图片，缺少VL预处理](https://atomgit.com/atomgit_atomcode/atomcode/issues/655)
+- [#656 [共创大赛][Bug] 使用/model切换模型后，不应该出现黄色warning信息](https://atomgit.com/atomgit_atomcode/atomcode/issues/656)
+- [#657 [共创大赛][Bug] /compact功能不可用](https://atomgit.com/atomgit_atomcode/atomcode/issues/657)
+- [#658 [共创大赛][Bug] v2 下重试机制/UI 渲染变了](https://atomgit.com/atomgit_atomcode/atomcode/issues/658)
+- [#659 [共创大赛][Bug] 切换模型后，询问agent当前模型，回答的仍是上一个的模型](https://atomgit.com/atomgit_atomcode/atomcode/issues/659)
+- [#660 WebUI打开后TUI执行过程未同步展示，仅展示结果](https://atomgit.com/atomgit_atomcode/atomcode/issues/660)
+- [#661 插件市场简介和README翻译后，英文语言下仍展示中文内容](https://atomgit.com/atomgit_atomcode/atomcode/issues/661)
+- [#663 [共创大赛][Bug] EditFile工具参数显示异常，而且diff也不显示了](https://atomgit.com/atomgit_atomcode/atomcode/issues/663)
+- [#664 engine v2 provider提示在每次turn完成后重复显示，应仅在provider实际变化时打印](https://atomgit.com/atomgit_atomcode/atomcode/issues/664)
+- [#665 bug: /setup 后 bridge respawn 失败导致 atomcode 直接退出](https://atomgit.com/atomgit_atomcode/atomcode/issues/665)
+- [#666 [共创大赛][Bug] 终端添加市场源，填写git配置失败，导致终端卡死](https://atomgit.com/atomgit_atomcode/atomcode/issues/666)
+- [#667 [v2 engine] 缺少 VL 图片预处理逻辑，图片被直接发送给纯文本模型导致 400 错误](https://atomgit.com/atomgit_atomcode/atomcode/issues/667)
+- [#668 Skill Hub 同一仓库地址可创建多个重复 Skill，应做后台限制](https://atomgit.com/atomgit_atomcode/atomcode/issues/668)
+- [#670 [共创大赛][feat] skill hub 新增运维工具，支持手动同步，skill的 star和download数](https://atomgit.com/atomgit_atomcode/atomcode/issues/670)
+- [#671 [共创大赛][feat] skillhub homepage 数据替换脚本](https://atomgit.com/atomgit_atomcode/atomcode/issues/671)
+- [#672 [共创大赛][feat] skill hub 控制台菜单切换支持刷新恢复](https://atomgit.com/atomgit_atomcode/atomcode/issues/672)
+- [#673 [共创大赛][Bug] TraceChain工具缺少了参数的显示](https://atomgit.com/atomgit_atomcode/atomcode/issues/673)
+- [#674 Token数量展示不友好，大数值建议以K/M单位显示](https://atomgit.com/atomgit_atomcode/atomcode/issues/674)
+- [#675 [共创大赛][Bug] v2引擎会导致开源构建直接崩溃，TUI启动后几秒自动退出](https://atomgit.com/atomgit_atomcode/atomcode/issues/675)
+- [#677 [共创大赛][Bug] webui 开始使用一个无法使用的模型对话，然后再切换到一个可以用的模型对话，结果无法切换还是使用的上一个模型始终报错](https://atomgit.com/atomgit_atomcode/atomcode/issues/677)
+- [#679 /goal help 命令的 Notes 以及 help 文案需要中文 i18n 支持](https://atomgit.com/atomgit_atomcode/atomcode/issues/679)
+- [#680 图文一起发送后，文本未立即显示，跑完后才出现](https://atomgit.com/atomgit_atomcode/atomcode/issues/680)
+- [#681 [共创大赛][Bug] webui 输出内容回答中，点击新建对话，此时TUI中内容还在输出上一个对话的内容。](https://atomgit.com/atomgit_atomcode/atomcode/issues/681)
+- [#682 goal执行过程中Esc/Ctrl+C/goal clear均无法中断](https://atomgit.com/atomgit_atomcode/atomcode/issues/682)
+- [#683 取消prompt A后切换模型，旧的pending工具调用重新触发执行](https://atomgit.com/atomgit_atomcode/atomcode/issues/683)
+- [#684 [共创大赛][Bug] webui 首次对话完成后，第二次对话，TUI就没有任何输出](https://atomgit.com/atomgit_atomcode/atomcode/issues/684)
+- [#685 goal执行时在状态栏常驻显示goal状态，/goal status信息被刷走看不到](https://atomgit.com/atomgit_atomcode/atomcode/issues/685)
+
+## v4.25.1 (2026-06-12)
+
+### 概览
+
+这一版新增 /view 查看文件和微信渠道接入，默认网页搜索改用 Exa，并改进了大目录下的性能与终端渲染。
+
+### 更新内容
+
+- **/view 查看文件**：用 /view <文件路径> 在终端界面里直接查看代码文件。
+- **微信渠道接入**：可以用个人微信 ClawBot 与 AtomCode 对话，插件用法见 AtomCode-Channel 仓库。
+- **网页搜索默认接入 Exa**：WebSearch 默认使用 Exa 搜索，并保留 web_access 技能兜底。
+- **性能与渲染优化**：超大目录下 @ 文件索引更快；修复 DevEco 终端中文整行渲染问题；加固 WebFetch 的 SSRF 防护。
+- **若干修复**：以及其他问题修复。
+
+### Issues
+
+- [#243 [共创大赛][Bug] 经常读写某个文件报告没有权限，但是又用BASH命令读到了](https://atomgit.com/atomgit_atomcode/atomcode/issues/243)
+- [#542 [共创大赛]-[Feature] 请求给win11增加任务完成后的系统通知](https://atomgit.com/atomgit_atomcode/atomcode/issues/542)
+- [#570 [共创大赛][Bug] 为什么在VS Code里一直压缩上下文？在终端里没发现这种情况](https://atomgit.com/atomgit_atomcode/atomcode/issues/570)
+- [#571 [共创大赛][Bug] webui tools的调用没有根据宽度来展示，后面会有很大一个空白](https://atomgit.com/atomgit_atomcode/atomcode/issues/571)
+- [#595 @符号 新创建的文件@不出来](https://atomgit.com/atomgit_atomcode/atomcode/issues/595)
+- [#598 [共创大赛] web_fetch SSRF防护存在TOCTOU竞态窗口和IPv4映射绕过](https://atomgit.com/atomgit_atomcode/atomcode/issues/598)
+- [#604 [共创大赛]-[Feature] 弹出来的让人工选择项A,Y,N 能否给个默认值？然后让按Enter可以继续](https://atomgit.com/atomgit_atomcode/atomcode/issues/604)
+- [#608 deepseek-v4-flash 模型频繁出现 (no reasoning recorded) 占位符，导致对话卡顿/中断](https://atomgit.com/atomgit_atomcode/atomcode/issues/608)
+- [#609 [共创大赛][Bug] 经常提示(no reasoning detected)后中断执行](https://atomgit.com/atomgit_atomcode/atomcode/issues/609)
+- [#611 [Bug] 用户昵称展示长度未限制，登录与修改资料后展示不一致](https://atomgit.com/atomgit_atomcode/atomcode/issues/611)
+- [#616 [共创大赛][Bug] PLAN模型，直接去写代码了](https://atomgit.com/atomgit_atomcode/atomcode/issues/616)
+- [#617 [共创大赛][Bug] 使用 MCP cpu占用率100%，任务完成后也持续占用](https://atomgit.com/atomgit_atomcode/atomcode/issues/617)
+- [#618 [共创大赛][Bug] Always提权无效](https://atomgit.com/atomgit_atomcode/atomcode/issues/618)
+- [#621 [Bug] 发布 skill 到 marketplace 时 source.path 指向了 SKILL.md 文件而非目录](https://atomgit.com/atomgit_atomcode/atomcode/issues/621)
+- [#622 [Windows] webui切换工作目录带 `\\?\` 前缀导致会话分组 hash 不同步，WebUI 与 TUI 之间无法同步会话记录](https://atomgit.com/atomgit_atomcode/atomcode/issues/622)
+- [#624 [Bug] 安装 wechat channel 插件后 slash 命令 /wechat 未加载](https://atomgit.com/atomgit_atomcode/atomcode/issues/624)
+- [#625 [共创大赛][Bug] 大小窗口问题，小窗口渲染丢失了内容，大窗口展示的内容完整](https://atomgit.com/atomgit_atomcode/atomcode/issues/625)
+- [#626 [Bug] WebUI 提交 prompt 后无任何返回，但 TUI 有正常返回](https://atomgit.com/atomgit_atomcode/atomcode/issues/626)
+- [#627 [Feature] [共创大赛] TUI样式优化](https://atomgit.com/atomgit_atomcode/atomcode/issues/627)
+- [#630 [Bug] /api/admin/skills 查询过滤结果不准确，包含不相关条目](https://atomgit.com/atomgit_atomcode/atomcode/issues/630)
+- [#631 [Optimization] 用户昵称展示长度过长，UI 显示不协调](https://atomgit.com/atomgit_atomcode/atomcode/issues/631)
+
+## v4.25.0 (2026-06-06)
+
+### 概览
+
+这一版新增 ! 直接执行命令和 DeepSeek V4 推理强度控制，简化了审批逻辑，并提升了 WebFetch 与 WebUI 的体验。
+
+### 更新内容
+
+- **! 直接执行命令**：输入 ! 加命令即可直接执行，比如 !git status，输出会进入模型的上下文。
+- **DeepSeek V4 推理强度**：用 /effort 在 high 和 max 两档之间选择推理强度。
+- **审批逻辑简化**：审批规则更简单，说明见官网的审批文档。
+- **WebFetch 更快**：去掉 max_chars 限制，取回 HTML 后转换成 Markdown。
+- **WebUI 增强**：在网页中切换工作目录、模型与推理强度更顺畅。
+- **若干修复**：以及其他问题修复。
+
+### Issues
+
+- [#152 [共创大赛][Bug] 以Administrator运行缺少安全提示](https://atomgit.com/atomgit_atomcode/atomcode/issues/152)
+- [#222 [共创大赛][Bug] 往符号连接写好像有问题](https://atomgit.com/atomgit_atomcode/atomcode/issues/222)
+- [#325 [共创大赛][Bug] window11下 powershell 终端中打开 atomcode 输入中文有乱码](https://atomgit.com/atomgit_atomcode/atomcode/issues/325)
+- [#364 [共创大赛][Bug] AtomCode在WSL2 Ubuntu环境下不可用](https://atomgit.com/atomgit_atomcode/atomcode/issues/364)
+- [#489 【Feature】MCP 工具调用审批弹窗需展示完整入参信息](https://atomgit.com/atomgit_atomcode/atomcode/issues/489)
+- [#530 [共创大赛][Bug] 在执行bash等命令时，下面的输入框在不停地闪烁](https://atomgit.com/atomgit_atomcode/atomcode/issues/530)
+- [#561 [Bug] Sync 模式下 TUI 和 WebUI 不在同一会话，三端历史互相独立、刷新后丢失 sync 对话](https://atomgit.com/atomgit_atomcode/atomcode/issues/561)
+- [#572 [共创大赛][Bug] webui 信息流顺序和 TUI 不一致，不正确。](https://atomgit.com/atomgit_atomcode/atomcode/issues/572)
+- [#573 [共创大赛][Bug] webui 模型选择下拉框，会溢出屏幕](https://atomgit.com/atomgit_atomcode/atomcode/issues/573)
+- [#574 [共创大赛][Bug] 卸载插件后，终端会卡死无法输入](https://atomgit.com/atomgit_atomcode/atomcode/issues/574)
+- [#575 [共创大赛][Bug] upgrade命令异常](https://atomgit.com/atomgit_atomcode/atomcode/issues/575)
+- [#576 [共创大赛][Bug] /skills命令显示后，删掉下面会有文字残留](https://atomgit.com/atomgit_atomcode/atomcode/issues/576)
+- [#581 [Feature] MCP 工具调用展示样式优化 + 审批提示样式优化](https://atomgit.com/atomgit_atomcode/atomcode/issues/581)
+- [#583 [Bug] /webui --host 后终端输出的"访问地址"缺少 sync=1，且浏览器打开的 URL 丢失 token](https://atomgit.com/atomgit_atomcode/atomcode/issues/583)
+- [#585 [Enhancement] WebUI 工具调用展示格式对齐 TUI：点号分隔 + key:value 参数](https://atomgit.com/atomgit_atomcode/atomcode/issues/585)
+- [#588 atomecode打开窗口在会话中不能调整大小，只要改变大小，界面布局就会乱](https://atomgit.com/atomgit_atomcode/atomcode/issues/588)
+
+## v4.24.2 (2026-06-03)
+
+### 概览
+
+这一版新增 /undo 回退对话，WebUI 与 TUI 同步更紧密，并修复了几处导致缓存命中率周期性下降的问题。
+
+### 更新内容
+
+- **/undo 回退对话**：把对话记忆退回到之前的某条提问，之后的内容不再进入上下文。
+- **WebUI 与 TUI 同步**：两边切换模型实时互通；/webui 直接打开 TUI 当前会话；同步模式下 TUI 审批生效，同一回合的第二个工具不再被秒拒。
+- **恢复会话更完整**：恢复对话时还原每轮之间的分隔线和 token、工具统计。
+- **缓存更稳定**：会话级系统提示固定不变，Plan 模式提示和压缩摘要移出系统提示，旧的读文件结果不再变动，前缀缓存不再周期性失效。
+- **图片路径识别**：手敲或在 Windows 上粘贴的本地图片路径，发送时会作为图片附件。
+- **若干修复**：限流重试按网关给出的冷却时间等待；WebUI 实时输出不再串到其他会话、完成后不再残留审批卡片、默认端口改为 13457 避免与 VSCode 冲突；Windows 系统目录受敏感路径保护，Windows 路径与多行内容不再被误转义；显式指定 .atomcode、.claude 等目录时可以搜到文件；CodingPlan 不再误报模型列表漂移。
+
+### Issues
+
+- [#534 安装 skill/plugin 时未提示安装到用户全局位置还是项目目录位置](https://atomgit.com/atomgit_atomcode/atomcode/issues/534)
+- [#563 [共创大赛][Bug] 恢复对话之后，模型最终输出和用户输入之间没有间隔，token统计和tool调用统计间隔丢失](https://atomgit.com/atomgit_atomcode/atomcode/issues/563)
+- [#564 关于/undo的使用问题](https://atomgit.com/atomgit_atomcode/atomcode/issues/564)
+- [#565 修复 referral install_completed 客户端上报可靠性问题](https://atomgit.com/atomgit_atomcode/atomcode/issues/565)
+- [#568 [Bug] WebUI 请求 TUI 审批时，第二次审批自动 deny（response_rx 未按 call_id 区分）](https://atomgit.com/atomgit_atomcode/atomcode/issues/568)
+
+## v4.24.1 (2026-06-03)
+
+### 概览
+
+这一版推出全新的 WebUI 本地界面，与终端共享同一会话实时互通；同时新增 $ 技能菜单，并简化了 /provider 添加流程。
+
+### 更新内容
+
+- **全新 WebUI 本地界面**：/webui 在进程内启动 Web 服务并自动打开浏览器，支持流式聊天、工具执行展示、权限审批、会话侧栏和切换工作目录；终端与网页使用同一个会话、实时互通，也支持远程访问。
+- **$ 技能菜单**：在行首输入 $ 列出并过滤技能，Tab 补全，输入 $名称 加参数直接调用。
+- **/provider 添加更简单**：自动识别粘贴的 curl、JSON、TOML 内容，优先填写 Base URL，类型自动预填。
+- **Bash 增强**：支持在后台运行长任务（run_in_background），执行破坏性命令前给出拦截提示。
+- **若干修复**：以及其他问题修复。
+
+### Issues
+
+- [#513 [共创大赛]-[Feature] 建议curl命令下载时不体现版本号](https://atomgit.com/atomgit_atomcode/atomcode/issues/513)
+- [#523 【Feature】webui页面支持](https://atomgit.com/atomgit_atomcode/atomcode/issues/523)
+- [#541 [共创大赛][Bug] 现在atomcode如何 设置不审批？回复没有 atomcode --dangerously-skip-permissions 或者 atomcode -y](https://atomgit.com/atomgit_atomcode/atomcode/issues/541)
+- [#544 [共创大赛][Bug] skills hub 缺少 atomcode provider](https://atomgit.com/atomgit_atomcode/atomcode/issues/544)
+- [#547 [共创大赛][Bug] [错误：auto-update: auto-update of marketplace atomcode-plugins-official failed: spawn git pull]](https://atomgit.com/atomgit_atomcode/atomcode/issues/547)
+- [#548 [共创大赛][Bug] 鸿蒙系统启动报错 错误: auto-install: auto-install of marketplace https://atomgit.com/atomgit_atomcode/atomcode-plugins-official.git failed: clone https://atomgit.com/atomgit_atomcode/atomcode-plugin](https://atomgit.com/atomgit_atomcode/atomcode/issues/548)
+- [#549 [Bug] webui 执行过程中输入框被禁用，用户无法键入](https://atomgit.com/atomgit_atomcode/atomcode/issues/549)
+- [#551 [Enhancement] 编辑模型对话框增加 context_window 上下文大小配置](https://atomgit.com/atomgit_atomcode/atomcode/issues/551)
+- [#552 [Bug] 编辑模型时，模型名称字段无法修改](https://atomgit.com/atomgit_atomcode/atomcode/issues/552)
+- [#553 [Bug] 新建模型时名称重复直接覆盖原有配置，无提示](https://atomgit.com/atomgit_atomcode/atomcode/issues/553)
+- [#555 [Bug] 移动端页面设置菜单部分被遮挡](https://atomgit.com/atomgit_atomcode/atomcode/issues/555)
+- [#557 [Doc] 文档和 Ask 中增加虚拟组网（手机端访问 WebUI）相关指引](https://atomgit.com/atomgit_atomcode/atomcode/issues/557)
+- [#558 [Bug] WebUI 上传文件只能选择当前目录层级下的文件](https://atomgit.com/atomgit_atomcode/atomcode/issues/558)
+- [#559 [Bug] 虚拟组网后手机端 WebUI 会话消息需手动刷新才能同步（无实时推送）](https://atomgit.com/atomgit_atomcode/atomcode/issues/559)
+- [#562 [共创大赛][Bug] bash调用playwright会阻塞主会话，直到用户主动按ESC取消](https://atomgit.com/atomgit_atomcode/atomcode/issues/562)
+
+## v4.24.0 (2026-06-01)
+
+### 概览
+
+这一版重点是插件：新增交互式 /plugin 管理器和官方插件市场，同时加入跳过权限确认的 -y 选项，并大幅提高提示词缓存命中率。
+
+### 更新内容
+
+- **交互式插件管理器**：直接输入 /plugin 打开管理界面，浏览插件市场、一键安装或卸载，不必再记 name@marketplace；也可以只用插件名安装、卸载。
+- **官方插件市场**：官方市场成为默认来源，启动时自动同步市场并安装新增插件；支持 git 子目录形式的插件来源。
+- **跳过权限确认**：新增 --dangerously-skip-permissions（简写 -y），开启后底栏显示红色 BYPASS 标记。
+- **缓存命中率提升**：系统提示词在不同次启动间保持一致，压缩不再无谓触发，缓存命中率从约 79% 提到约 96%。
+- **支持 AGENTS.md**：项目里的 AGENTS.md 会被当作项目说明读取；新增 /guide 查询使用方法；新增可配置的 hooks（含 webhook）。
+- **若干修复**：出错的轮次显示「已中断」而非成功横幅；流式输出时输入框不再闪动；粘贴含 Tab 缩进的文本光标不再错位；粘贴时去掉 shell 提示符；Windows 上不再引导模型写 bash 语法；鸿蒙系统自动升级取对应的安装包；CodingPlan 月度额度耗尽时提示正确；UserPromptSubmit hook 失败不再阻断对话。
+
+### Issues
+
+- [#26 [Feature] 面向编程小白的入门引导建议](https://atomgit.com/atomgit_atomcode/atomcode/issues/26)
+- [#109 [Feature] 希望支持hook机制](https://atomgit.com/atomgit_atomcode/atomcode/issues/109)
+- [#208 [共创大赛]-[Feature] 支持 AGENTS.md 标准](https://atomgit.com/atomgit_atomcode/atomcode/issues/208)
+- [#286 插件包安装的skill在建议 superpower:brainstrorming 冒号前后都支持自动筛选并tab补全，方便快速定位到对应的skill](https://atomgit.com/atomgit_atomcode/atomcode/issues/286)
+- [#326 [共创大赛]-[Feature] 从 Claude Code 已安装的插件中加载 skills/commands，避免重复安装](https://atomgit.com/atomgit_atomcode/atomcode/issues/326)
+- [#440 [共创大赛][Bug] 已经取消的prompt，再下个prompt对话时仍然执行并返回了结果](https://atomgit.com/atomgit_atomcode/atomcode/issues/440)
+- [#456 [共创大赛][Bug] 工具调用详细描述和resume提示线颜色与正文一样产生视觉混淆](https://atomgit.com/atomgit_atomcode/atomcode/issues/456)
+- [#467 [共创大赛][Bug] skills name包含大写字母时抛错误提示](https://atomgit.com/atomgit_atomcode/atomcode/issues/467)
+- [#468 [共创大赛][Bug] 已经安装的 plugin 提示存在问题，应该告诉用户已经安装了，如果需要重新安装使用什么命令先卸载，在重新执行什么命令安装](https://atomgit.com/atomgit_atomcode/atomcode/issues/468)
+- [#471 [共创大赛][Bug] ParallelEditFiles 审批的时候，没有展示细节，不知道 ParallelEditFiles 需要干啥](https://atomgit.com/atomgit_atomcode/atomcode/issues/471)
+- [#472 [共创大赛][Bug] ParallelEditFiles 是 AutoApprove，而 edit_file 是 RequireApprovalAlways](https://atomgit.com/atomgit_atomcode/atomcode/issues/472)
+- [#478 [共创大赛]-[Feature] vscode插件能否增加选中文字添加到对话中这个功能点？](https://atomgit.com/atomgit_atomcode/atomcode/issues/478)
+- [#501 [共创大赛][Bug] 鸿蒙版本每次自动升级后，都无法运行](https://atomgit.com/atomgit_atomcode/atomcode/issues/501)
+- [#504 [共创大赛][Bug] 在windows上模型生成多行命令的情况都会调用失败，经历几次尝试最终都会变成使用临时文件传递参数或调用命令](https://atomgit.com/atomgit_atomcode/atomcode/issues/504)
+- [#507 [共创大赛][Bug] 当◐ Running Grep… · 320.4s 时 esc 无法取消](https://atomgit.com/atomgit_atomcode/atomcode/issues/507)
+- [#509 [共创大赛]-[Feature] 请求添加类似cc的--dangerously-skip-permissions, gemini cli的 --yolo 启动参数来让cli全自动默认允许通过审批任何权限相关工具/命令](https://atomgit.com/atomgit_atomcode/atomcode/issues/509)
+- [#520 怎么总是会操作一些不属于当前项目，也不属于他自己的目录？](https://atomgit.com/atomgit_atomcode/atomcode/issues/520)
+- [#521 [共创大赛]-[Feature] 增加atomcode官方插件市场和优化plugin命令](https://atomgit.com/atomgit_atomcode/atomcode/issues/521)
+- [#522 [共创大赛][bug] marketplace 始终没有更新，启动时自动 git pull 同步 marketplace](https://atomgit.com/atomgit_atomcode/atomcode/issues/522)
+- [#524 [共创大赛][Bug] /plugin 在 marketplace 安装成功，实际/skills 中没有](https://atomgit.com/atomgit_atomcode/atomcode/issues/524)
+- [#525 [共创大赛][Bug] /plugin 已安装里面 -> 卸载插件 提示卸载成功了，但是 /skills 里面还能看到](https://atomgit.com/atomgit_atomcode/atomcode/issues/525)
+- [#527 [共创大赛][Bug] /plugin 在 “浏览并安装” 里面选择插件回车安装，会卡住，此时没有任何交互，卡了很久安装成功了才有提示，优化一下交互，中间可能会去clone 仓库下来，会比较慢](https://atomgit.com/atomgit_atomcode/atomcode/issues/527)
+- [#528 [共创大赛]-[Feature] 优化粘贴代码后光标的位置](https://atomgit.com/atomgit_atomcode/atomcode/issues/528)
+- [#532 [共创大赛][Bug] 优化一个 /plugin install 安装问题， 目前按照 /plugin install control-ui-e2e@atomcode，后面还需要@对应 marketplace 这样很不方便，直接根据名字去安装即可。](https://atomgit.com/atomgit_atomcode/atomcode/issues/532)
+- [#533 [共创大赛][Bug] /plugin uninstall control-ui-e2e 卸载一个不存在的 plugin 时，提示不够友好。](https://atomgit.com/atomgit_atomcode/atomcode/issues/533)
+- [#535 [Enhancement] --dangerously-skip-permissions 提示文案优化：badge 红色+BYpass、banner 参考 CC 详细警告](https://atomgit.com/atomgit_atomcode/atomcode/issues/535)
+- [#536 [共创大赛][feat] atomcode 官网新增 插件菜单和链接](https://atomgit.com/atomgit_atomcode/atomcode/issues/536)
+- [#537 [共创大赛][feat] 文档更新 --dangerously-skip-permissions 和 -y 说明](https://atomgit.com/atomgit_atomcode/atomcode/issues/537)
+- [#538 [Bug] atomcode 启动没有触发更新市场和插件](https://atomgit.com/atomgit_atomcode/atomcode/issues/538)
+
+## v4.23.3 (2026-05-28)
+
+### 概览
+
+这是一个修复更新，重点改善 Windows 终端的显示与中文输出，以及思考型模型在长回合中的上下文占用。
+
+### 更新内容
+
+- **Windows 终端改进**：修复 PowerShell 7 等环境下中文字符重复和输入框闪烁；bash 输出的中文不再乱码。
+- **长回合不再撑爆上下文**：压缩时按 token 量保留最近内容，思考内容很多的模型不会因此超出上下文窗口。
+- **CodingPlan 用量提示**：本月额度用完时只显示一行"本月用量已耗尽，等 N 天后再使用"，/status 与 /login 的时长显示一致。
+- **若干修复**：斜杠命令进入输入历史，可用上键找回；按 Ctrl+C 取消时网络搜索能立即停止；路径末尾多出的 {} 会自动去掉；1M 上下文窗口显示为 1m；Markdown 表格边框和宽度计算更准确；uninstall 时不再先触发自动更新。
+
+### Issues
+
+- [#476 [共创大赛][Bug] autocode 使用微信扫描登录后运行/codingplan 失败](https://atomgit.com/atomgit_atomcode/atomcode/issues/476)
+- [#493 atomcode uninstall卸载触发更新](https://atomgit.com/atomgit_atomcode/atomcode/issues/493)
+- [#500 【Feature】支持npm和brew安装](https://atomgit.com/atomgit_atomcode/atomcode/issues/500)
+
+## v4.23.2 (2026-05-28)
+
+### 概览
+
+这一版主要改善终端界面：历史内容进入终端原生的回滚区，鼠标滚轮、选中和复制交还给终端；同时修复了大量 Windows 显示问题，破坏性命令始终需要审批。
+
+### 更新内容
+
+- **终端原生滚动与复制**：不再占用鼠标，可以直接用滚轮翻看历史、用终端自己的方式选中和复制。
+- **Windows 显示修复**：修复中文环境下字符重复、错位和菜单导航卡顿等问题，宽字符和表情的宽度计算更准确。
+- **破坏性操作始终审批**：rm -rf、强制推送等危险命令和修改 .env、密钥等敏感文件，不会因为本会话已允许而跳过审批。
+- **npm 安装**：新增通过 npm 安装 AtomCode 的方式，支持鸿蒙系统。
+- **启动更快**：插件与技能市场的初始化放到后台，输入框更早可用，装好的技能无需重启即可出现。
+- **兼容更多模型**：识别 Qwen3 等模型以文本形式输出的工具调用，不再当作普通文字显示。
+- **CodingPlan 用量更清楚**：/codingplan status 按时间窗口显示用量，本月额度用完时明确提示。
+- **若干修复**：压缩后 /resume 的会话仍从原始问题开始；读取大文件更省内存；取消或超时时一并结束 bash 的子进程；Windows 路径中的 \t 等不再被误读成转义字符；/setup 完成后自动刷新技能，/plugin 新增 reload；表格中的代码和 \| 正确拆分；两个令牌都过期时不再启动崩溃。
+
+### Issues
+
+- [#424 为什么不能上划,进行到哪一步,就只能看当前这一屏幕的内容,上面的就看不到了](https://atomgit.com/atomgit_atomcode/atomcode/issues/424)
+- [#451 [共创大赛][Bug] 使用setup生成的skill，无法正常修改](https://atomgit.com/atomgit_atomcode/atomcode/issues/451)
+- [#460 会话历史只能查看到终端高度的内容，无法滚动查看到之前的内容](https://atomgit.com/atomgit_atomcode/atomcode/issues/460)
+- [#461 工具执行结果中 `└` 树形连接符出现在折行文本行首，导致渲染异常](https://atomgit.com/atomgit_atomcode/atomcode/issues/461)
+- [#462 [共创大赛][Bug] 使用 /setup 安装的skills，没有重新加载skills，导致安装的skills无法使用，也没有提示](https://atomgit.com/atomgit_atomcode/atomcode/issues/462)
+- [#464 [共创大赛][Bug] /plugin 命令后面没有 reload 提示，和i18n处理](https://atomgit.com/atomgit_atomcode/atomcode/issues/464)
+- [#466 [共创大赛][Bug] windows下 Waiting for approval 展示不正常，输入Y后上一个的 Waiting for approval 还存在](https://atomgit.com/atomgit_atomcode/atomcode/issues/466)
+- [#474 【Feature】TUI改版](https://atomgit.com/atomgit_atomcode/atomcode/issues/474)
+- [#480 【冒烟测试】Step 7 search_replace 步骤标题重复显示，审批后变为一个](https://atomgit.com/atomgit_atomcode/atomcode/issues/480)
+- [#481 【冒烟测试】小窗口下 WriteFile 文字显示错位断裂](https://atomgit.com/atomgit_atomcode/atomcode/issues/481)
+- [#485 【Bug】小窗口下执行 /help 指令，文案重叠](https://atomgit.com/atomgit_atomcode/atomcode/issues/485)
+- [#486 Ctrl+O 详细模式展示存在重复行及 ANSI 序列泄漏问题](https://atomgit.com/atomgit_atomcode/atomcode/issues/486)
+- [#488 【Bug】并行 bash 调用计数与显示数量不一致：「Running N calls in parallel」N 值与实际列出的调用数不匹配](https://atomgit.com/atomgit_atomcode/atomcode/issues/488)
+
+## v4.23.1 (2026-05-24)
+
+### 概览
+
+这是一个修复更新：审批提示更清楚可靠，读取工作区外文件需要确认，并修复 bash 偶发长时间卡住的问题。
+
+### 更新内容
+
+- **审批提示改进**：提示里显示替换详情，窄窗口下自动换行确保 Y/A/N 可见；确认后输入框不再消失；等待审批时 spinner 显示"等待审批"而不是一直计时。
+- **更严的权限**：始终需要审批的操作不再被本会话的授权绕过；在工作区外搜索、诊断、列符号也需要确认。
+- **修复 bash 卡死**：执行前后的工作区快照加了超时，不会再拖住命令数分钟。
+- **ATOMCODE_HOME 语义统一**：设置 ATOMCODE_HOME 后直接用作配置目录，不再多加一层 .atomcode。
+- **若干修复**：Tab 在输入框有文字时也能切换模式；令牌过期时自动刷新重试一次，静默刷新不再往输入框写字；扫码步骤按回车可在浏览器打开链接；无界面模式下思考内容不再逐字换行；~ 开头的路径正确解析；新增 Linux ARM64 自动升级。
+
+### Issues
+
+- [#351 [共创大赛][Bug] 从Jebtbrain IDEA中进入以后 随机乱码](https://atomgit.com/atomgit_atomcode/atomcode/issues/351)
+- [#400 [共创大赛][Bug]atomcode的会话内容和iterm中git log日志内容混在一起](https://atomgit.com/atomgit_atomcode/atomcode/issues/400)
+- [#446 [共创大赛][Bug] 等待审核 命令超长没有换行，导致审核指令看不到了](https://atomgit.com/atomgit_atomcode/atomcode/issues/446)
+- [#448 【Bug】查询终端背景色超时污染了输入缓冲区](https://atomgit.com/atomgit_atomcode/atomcode/issues/448)
+- [#450 [共创大赛][Bug] 工具调用的权限决定阶段出现语义丢失问题，RequireApproval覆盖了RequireApprovalAlways](https://atomgit.com/atomgit_atomcode/atomcode/issues/450)
+- [#453 [共创大赛][Bug] 审批后输入框消失，resize 后恢复](https://atomgit.com/atomgit_atomcode/atomcode/issues/453)
+- [#454 [共创大赛][Bug] 待审批一行就够，换行了](https://atomgit.com/atomgit_atomcode/atomcode/issues/454)
+- [#455 [共创大赛][Bug] 待审批输入 Y 后，输入框没了](https://atomgit.com/atomgit_atomcode/atomcode/issues/455)
+- [#457 【Bug】审批过后，之前等待审批的行占位还在](https://atomgit.com/atomgit_atomcode/atomcode/issues/457)
+- [#458 【Bug】SearchReplace等待审批时，无法知道替换内容，审批过后才知道](https://atomgit.com/atomgit_atomcode/atomcode/issues/458)
+
+## v4.23.0 (2026-05-21)
+
+### 概览
+
+这一版重做了首次启动：微信扫码登录、自动领取 CodingPlan，一页完成；同时新增 /setup 项目配置推荐、浅色/深色主题与代码块语法高亮。
+
+### 更新内容
+
+- **扫码快速上手**：首次启动直接显示二维码，手机微信扫码后自动检测完成、保存登录并领取 CodingPlan，随后进入界面。
+- **/setup 推荐配置**：分析当前项目，推荐合适的技能、MCP、hooks 等并一键安装；也可在命令行运行 atomcode setup。
+- **浅色/深色主题**：自动识别终端背景色切换配色，浅色下对比度更高；代码块按语言做语法高亮。
+- **默认技能市场**：首次启动自动安装官方技能市场，升级后自动更新已安装的市场。
+- **打开文件预览**：新增 open_file 工具，按系统用默认程序打开生成的网页、PDF、图片；在 SSH 或无界面环境下会明确说明打不开。
+- **/keys 快捷键说明**：列出所有键盘快捷键，并标注哪些换行组合在你的终端里可能不可用；多行输入时上下键先在行间移动，再翻历史。
+- **更安全的 git 命令**：强制推送、改写历史、交互式 rebase、强制切换或删除分支、跳过 hooks 等操作需要审批。
+- **若干修复**：并行调用同名文件时审批提示能区分；已在本会话自动允许的工具不再重复弹审批；上游报错显示更清楚（429 简化为一行）；请求总超时放宽到 30 分钟；Ghostty 支持完成通知；VS Code 扩展支持多标签页会话、批量删除会话和工作区文件选择。
+
+### Issues
+
+- [#405 [共创大赛]-[Feature] 是否可以添加色彩支持，提升视觉交互体验](https://atomgit.com/atomgit_atomcode/atomcode/issues/405)
+- [#423 【Feature】错误上报细分](https://atomgit.com/atomgit_atomcode/atomcode/issues/423)
+- [#425 [共创大赛][Bug] 快速安装中的命令未按平台分别提供复制命令按钮](https://atomgit.com/atomgit_atomcode/atomcode/issues/425)
+- [#426 [共创大赛]-[Feature] vs code插件中的会话列表，建议支持多选删除](https://atomgit.com/atomgit_atomcode/atomcode/issues/426)
+- [#429 [共创大赛][Bug] ATOMCODE_HOME 设置后 Skills 运行异常 现象](https://atomgit.com/atomgit_atomcode/atomcode/issues/429)
+- [#432 [共创大赛][Bug] API error (429 Too Many Requests)](https://atomgit.com/atomgit_atomcode/atomcode/issues/432)
+- [#437 [共创大赛][Bug] 优化Tools并行调用展示问题](https://atomgit.com/atomgit_atomcode/atomcode/issues/437)
+- [#439 [共创大赛][Bug] tools并行调用，用户审批不知道是审批哪一项](https://atomgit.com/atomgit_atomcode/atomcode/issues/439)
+- [#441 [共创大赛][Bug] 修复 /setup 安装后，没有刷新 skills](https://atomgit.com/atomgit_atomcode/atomcode/issues/441)
+- [#443 [共创大赛][Bug] /setup 支持国际化i18n](https://atomgit.com/atomgit_atomcode/atomcode/issues/443)
+- [#444 [共创大赛][feat] /setup 交互优化不再需要 /recommend 来触发](https://atomgit.com/atomgit_atomcode/atomcode/issues/444)
+- [#445 [共创大赛][bug] 修复/setup 设置 ATOMCODE_HOME 无法运行问题](https://atomgit.com/atomgit_atomcode/atomcode/issues/445)
+
+## v4.22.3 (2026-05-18)
+
+### 概览
+
+这一版新增后台会话命令，官网全新升级，并修复了几处影响使用的问题。
+
+### 更新内容
+
+- **后台会话**：新增 /bg 系列命令，可以把会话放到后台运行、列出后台会话并恢复。
+- **官网全新升级**：官网 atomcode.atomgit.com 全新改版。
+- **若干修复**：修复 /codingplan 401 错误；修复 Windows 下 Ctrl+C 无法复制选中内容；修复 WebFetch 解析错误；修复 cd 自动切换目录的问题。
+
+### Issues
+
+- [#267 用户能成功要求atomcode删除系统skill目录下的文件，没做权限控制？](https://atomgit.com/atomgit_atomcode/atomcode/issues/267)
+- [#376 [共创大赛][Bug] Linux下登录链接](https://atomgit.com/atomgit_atomcode/atomcode/issues/376)
+- [#394 [共创大赛][Bug] 在全局路径:~/.atomcode/skills/下的SKILL在TUI下无法发现](https://atomgit.com/atomgit_atomcode/atomcode/issues/394)
+- [#396 [共创大赛][Bug] 通过/plugin安装karpathy-skills无法使用](https://atomgit.com/atomgit_atomcode/atomcode/issues/396)
+- [#403 [共创大赛][feat] 优化 /login 二维码太大，连接太长问题](https://atomgit.com/atomgit_atomcode/atomcode/issues/403)
+- [#414 [共创大赛][Bug] /bg 命令，中途需要确认的会话，切后台后，重新恢复，没展示之前的prompt和输出内容](https://atomgit.com/atomgit_atomcode/atomcode/issues/414)
+- [#415 [共创大赛][Bug] /bg bash命令申请情况，/bg 回来，内容为空](https://atomgit.com/atomgit_atomcode/atomcode/issues/415)
+- [#417 [共创大赛]-[Feature] bg命令的说明内容需要支持中文语言下的中文内容](https://atomgit.com/atomgit_atomcode/atomcode/issues/417)
+- [#421 【Feature】site站点风格和样式更新](https://atomgit.com/atomgit_atomcode/atomcode/issues/421)

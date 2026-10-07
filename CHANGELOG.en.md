@@ -137,7 +137,7 @@ This release makes a goal something you can keep pursuing, lets you steer a runn
 - **Every server address is configurable**: change any service address in configuration, for private deployments.
 - **Fixes**: comments in .mcp.json, normalized MCP tool names and protocol negotiation; the first transient 429 is retried silently; a missing path suggests its nearest existing parent; credential shell commands are no longer retried in a loop; text contrast on light and dark terminals; reflow after resizing the legacy Windows console.
 
-## v5.0.4 (2026-08-03)
+## v5.0.4 (2026-08-04)
 
 ### Overview
 
@@ -211,3 +211,280 @@ The first AtomCode 5.0 release: four unified execution modes with approvals, rea
 - **Better /init**: an agent analyzes the repository and writes AGENTS.md; skills in ~/.agents/skills and .agents/skills are found and shared across agents.
 - **Context, stability and terminals**: tighter tool-output limits keep long sessions lean; the web UI reconnects on its own and saves incrementally on a crash.
 - **Fixes**: the context window now reloads after a model switch, /clear really starts a new session, and approvals and turns display better.
+
+## v4.26.0 (2026-07-09)
+
+### Overview
+
+This release brings subagent delegation across strong and fast models, /loop, and Todo tasks, a much stronger web UI, and smarter context compaction.
+
+### Changes
+
+- **Subagents across strong and fast models**: the main model orchestrates and routes by provider capability (a strong model plans, a fast one executes), with subtasks in parallel; off by default, turn it on with ATOMCODE_SUBAGENT=1.
+- **/loop**: repeat a task on a self-paced rhythm or a fixed interval, with stopping, a round limit and cancellation all handled.
+- **/app for the GitCode app**: pair the GitCode app with AtomCode to use AtomCode from GitCode.
+- **Todo tasks**: the todowrite tool manages a task list, the current list is given to the model each round, the footer shows the current task and progress (N/M), and /todo shows the list.
+- **A much stronger web UI**: slash commands throughout (/undo, /compact, /context, /status, /config, /diff, /cost, /memory, /skills and more); three approval modes (Build / Plan / Bypass); a cross-project session sidebar; searching and jumping within a session; message timestamps; output follows only when you are at the bottom, with a back-to-bottom button.
+- **Context and compaction**: multi-level compaction on overflow (mechanical plus an LLM summary) that keeps recent working context and bounds the summary's input, cache-friendly history compaction, and compaction pressure recomputed for the new model's window after a switch.
+- **Export and copy**: /save exports the conversation as Markdown and /copy msg copies a whole reply; /provider can set context_window and suggests 128k / 256k / 512k / 1m.
+- **Fixes**: grep no longer reads a whole large file into memory and freezes low-end machines, plus other fixes.
+
+## v4.25.9 (2026-07-04)
+
+### Overview
+
+Sessions now name themselves, and the terminal tab shows the session name and its status, so several windows are easy to tell apart.
+
+### Changes
+
+- **Automatic session names**: after the first turn the AI names the session, never overriding a name you set with /rename, and the web UI shows it too; turn it off with [ui] ai_session_naming.
+- **Tab status light**: the terminal tab title shows the session name with 🟢 idle, 🟡 working or 🔴 waiting for approval; turn it off with [ui] terminal_status_glyph.
+- **/compact no longer hangs**: generating the summary is capped at 120 seconds.
+- **Fixes**: /cd paths on Windows no longer carry the \\?\ prefix, and the /cd picker lists each directory once; > nul is rewritten to /dev/null under Git Bash; the web UI opens the browser correctly on Windows; web UI output no longer corrupts the TUI screen; the Ctrl+O expand hint appears as soon as a tool starts.
+
+## v4.25.8 (2026-07-03)
+
+### Overview
+
+This release rounds out copying and exporting in the web UI, makes login state clear in /status, lets @ mentions step into directories, and improves bash detection on Windows.
+
+### Changes
+
+- **Web UI copy and export**: a copy button on messages copies the whole turn, tool calls included; sessions export to a Markdown file; image history displays properly, and a hard stop mid-turn no longer loses the whole turn.
+- **Login state in /status**: the first line shows whether you are signed in and as whom (nickname and username), and an expired login clearly says to run /login; the Token line is gone.
+- **@ mentions into directories**: @ completion steps into subdirectories and keeps the selected item in view; the / and @ menus share one highlight color.
+- **Windows bash detection**: Git Bash is found on drives other than C:, WSL's app aliases are no longer mistaken for bash, and the model is told truthfully whether it is using Git Bash or cmd.exe.
+- **VS Code extension**: @ file references, input history with the arrow keys, and an interface in Chinese and English.
+- **Fixes**: auto-copy of code blocks is off by default and, when on, copies only when a reply has exactly one block; web_fetch decodes pages by their charset, so Chinese pages no longer garble and non-ASCII pages no longer crash it; paths from the model accept ~; MCP tool arguments show up to 450 characters; adding a plugin marketplace lists its plugins and the install command; tool names display correctly in resumed sessions; the input cursor shows while a reply streams; the web UI opens the browser reliably on Windows.
+
+## v4.25.7 (2026-06-30)
+
+### Overview
+
+This release focuses on rate limits and long tasks: a 429 now waits or pauses based on your plan's window, sudo passwords can be entered in the interface, /goal is steadier, and compaction notices are unified.
+
+### Changes
+
+- **Waiting out rate limits**: on a 429, AtomCode uses the real reset time to decide whether to wait and resume automatically or pause with a countdown; the TUI and web UI show the reset time instead of an error.
+- **sudo password prompt**: when a command needs a sudo or ssh password, the TUI shows a hidden input box; Ctrl+C cancels it and it closes when the turn ends.
+- **Steadier /goal**: it keeps going after recoverable interruptions, gains round and duration limits, stops after repeated rounds without progress, and no longer comes back after the goal has ended.
+- **Unified compaction notices**: automatic and manual compaction share one progress indicator and divider; the footer always shows how much context is used.
+- **Double Esc to undo**: with an empty input box, press Esc twice to undo the last turn; the first press tells you to press again.
+- **Vision models see images**: with a vision model, images read by read_file are passed to the model.
+- **Long output no longer cut off**: when a reply hits the output limit it continues automatically, and large files are written in parts.
+- **Fixes**: answers a model puts in its reasoning are shown instead of a blank turn; Windows bash detection, quoting and Chinese Python output are fixed; pasted text expands correctly in history recall and after sending; the terminal is restored after the process is killed by a signal; todo updates show the task title; web_search shows source domains; tildes are no longer read as strikethrough; /login shows your real plan name.
+
+## v4.25.6 (2026-06-25)
+
+### Overview
+
+This release fixes a long list of Windows problems, improves automatic compaction and /cd, and adds a single network proxy setting; the web UI and JetBrains plugin also get many improvements.
+
+### Changes
+
+- **Unified proxy setting**: a new [network.proxy] section lets you follow the system proxy, pin a proxy, or use none, for every outbound connection; switch with /proxy in the TUI and check it with /status.
+- **Windows experience**: the bash tool no longer flashes a console window each time; command output is decoded with the console's code page; CRLF line endings and GBK-encoded files no longer break reading and editing; /quit no longer hangs.
+- **More reliable auto-compaction**: near the context limit it summarizes like /compact instead of only folding tool results; a very long paste no longer triggers empty summaries over and over; progress is shown while compacting.
+- **Better /cd**: typing in the picker filters recent directories, and you can type a path directly; after changing directory, /resume lists that project's sessions.
+- **Forgiving edits**: edits still match when tabs and spaces differ, so the model is no longer pushed into rewriting files with scripts.
+- **Web UI**: a new welcome page, Skills and MCP menus, session search and date grouping; new sessions appear in the sidebar right away; the sync toggle survives a refresh; several instances no longer sign each other out.
+- **JetBrains plugin**: a welcome page and onboarding, pasting or dragging in files, pasting images as attachments, and colors that follow the IDE theme.
+- **Fixes**: MCP trust/autoApprove settings take effect and "Always" sticks for MCP tools; /setup writes MCP servers to the .mcp.json that is actually read; a connection reset mid-stream reconnects with a readable message; no more "authentication expired" after /login; resizing no longer duplicates output; a renamed session keeps its name; parallel_edit shows per-file progress.
+
+## v4.25.5 (2026-06-23)
+
+### Overview
+
+A stability fix: a broken plugin hook no longer blocks every prompt, and empty model replies are retried automatically.
+
+### Changes
+
+- **Broken hooks no longer block**: a plugin hook that fails to launch or exits without giving a reason is no longer treated as a block, so prompts and tool calls go through.
+- **Empty replies retried**: when the service occasionally returns a completely empty reply, AtomCode retries a few times with a notice instead of silently ending the turn.
+- **Fixes**: the warning shown when running with administrator rights now advises running without elevation.
+
+## v4.25.4 (2026-06-23)
+
+### Overview
+
+This release adds in-session code review with /review and persistent goals with /goal, ships a JetBrains IDE plugin, and improves context compaction.
+
+### Changes
+
+- **/review code review**: review your changes inside the session, with built-in rules per language, diff line numbers, and coverage driven by the changed files.
+- **/goal persistent goals**: set a goal and the agent keeps working toward it across turns, checking progress each round.
+- **JetBrains IDE plugin**: multi-tab chat, session state and a diff viewer, integrated with the IDE.
+- **Context and compaction**: multi-level compaction on overflow (mechanical plus an LLM summary) and cache-friendly history compaction.
+- **Fixes**: the context window now reloads after a model switch, /clear really starts a new session, and approvals and turns display better.
+
+## v4.25.3 (2026-06-20)
+
+### Overview
+
+A small update: write approvals are scoped by path again, and mouse handling in Windows terminals works normally.
+
+### Changes
+
+- **Path-aware write approval**: ordinary edits inside the workspace are approved automatically; "Always" is remembered per path for files outside it; sensitive files such as .env or SSH keys are asked about every time.
+- **Native mouse on Windows**: AtomCode no longer changes the console mode, so wheel scrolling, drag-select, copy and right-click paste all work on conhost and Windows Terminal.
+- **Fixes**: no more garbled input from mouse movement in the JetBrains terminal.
+
+## v4.25.2 (2026-06-19)
+
+### Overview
+
+This release moves to a new agent engine, makes cancelling, approvals and usage display more reliable, and fixes many web UI sync problems.
+
+### Changes
+
+- **Cancel means undo**: a turn cancelled with Esc no longer stays in the context, so the model won't bring it up later; a turn stuck while connecting can be cancelled at once.
+- **A focus for /compact**: add a focus after /compact and the summary is written around it.
+- **Truer usage in the footer**: each turn shows the tokens actually billed and the cache-hit share, instead of counting the re-sent context every round; token counts use K/M.
+- **Sensitive reads need approval**: reading SSH keys, .env files, cloud credentials and similar files asks for approval first.
+- **Fixes**: interactive approvals wait for your answer instead of timing out into a denial; new /exit; a "slow response" hint when the model is slow; private plugin marketplaces use your login and git no longer freezes the UI; stale connections recover on their own; the stream timeout rises to 300 seconds; web_fetch can return Markdown; skills in nested folders are found; table borders show on dark themes; the input box tops out at 6 rows; cancelled approvals no longer reappear after a /model switch; the web UI sidebar refreshes after starting a new chat.
+
+## v4.25.1 (2026-06-12)
+
+### Overview
+
+This release adds /view for files and a WeChat channel, switches web search to Exa by default, and improves performance and rendering in large directories.
+
+### Changes
+
+- **/view files**: /view <path> shows a code file right in the terminal UI.
+- **WeChat channel**: talk to AtomCode through a personal WeChat ClawBot; see the AtomCode-Channel repository for the plugin.
+- **Exa web search by default**: WebSearch uses Exa by default, with the web_access skill as a fallback.
+- **Performance and rendering**: faster @ file indexing in very large directories, whole-line CJK rendering fixed in the DevEco terminal, and stronger SSRF protection in WebFetch.
+- **Fixes**: and other fixes.
+
+## v4.25.0 (2026-06-06)
+
+### Overview
+
+This release adds ! to run commands directly and reasoning effort for DeepSeek V4, simplifies approvals, and improves WebFetch and the web UI.
+
+### Changes
+
+- **Run commands with !**: type ! and a command, such as !git status, to run it directly; its output goes into the model's context.
+- **DeepSeek V4 reasoning effort**: pick high or max with /effort.
+- **Simpler approvals**: approval rules are simpler; see the approvals page in the docs.
+- **Faster WebFetch**: no more max_chars limit, and fetched HTML is converted to Markdown.
+- **Web UI**: switching the working directory, model and effort in the browser works better.
+- **Fixes**: and other fixes.
+
+## v4.24.2 (2026-06-03)
+
+### Overview
+
+This release adds /undo to roll back the conversation, ties the web UI and TUI more closely together, and fixes several causes of periodic drops in the cache hit rate.
+
+### Changes
+
+- **/undo the conversation**: roll the conversation's memory back to an earlier prompt, so what came after leaves the context.
+- **Web UI and TUI in sync**: model switches carry over both ways in real time; /webui opens the TUI's current session; approvals from the TUI work in sync mode, and a second tool in the same turn is no longer denied instantly.
+- **Fuller session restore**: resuming a conversation brings back the dividers between turns along with each turn's token and tool counts.
+- **Steadier caching**: the session's system prompt stays fixed, Plan mode notes and compaction summaries move out of it, and earlier file reads stay unchanged, so the prefix cache no longer collapses periodically.
+- **Image paths recognised**: a local image path typed in, or pasted on Windows, is sent as an image attachment.
+- **Fixes**: rate-limit retries wait for the cooldown the gateway suggests; web UI live output no longer leaks into other sessions, finished turns no longer leave approval cards behind, and the default port moves to 13457 to avoid clashing with VSCode; Windows system folders get sensitive-path protection, and Windows paths and multi-line content are no longer mis-escaped; files are found when you point at .atomcode, .claude and similar folders explicitly; CodingPlan no longer falsely reports model-list drift.
+
+## v4.24.1 (2026-06-03)
+
+### Overview
+
+This release introduces a new local web UI that shares the same live session with the terminal, adds the $ skills menu, and simplifies adding a provider.
+
+### Changes
+
+- **A new local web UI**: /webui starts a web server in-process and opens the browser, with streaming chat, tool runs, approvals, a session sidebar and directory switching; the terminal and the browser share one live session, and remote access is supported.
+- **$ skills menu**: type $ at the start of a line to list and filter skills, Tab to complete, and $name with arguments to run one.
+- **Simpler /provider add**: pasted curl, JSON or TOML is recognized, the Base URL comes first and the type is filled in.
+- **Bash**: long tasks can run in the background (run_in_background), and destructive commands are flagged before they run.
+- **Fixes**: and other fixes.
+
+## v4.24.0 (2026-06-01)
+
+### Overview
+
+This release centers on plugins, with an interactive /plugin manager and an official marketplace, and adds a -y flag to skip permission prompts and a much higher prompt cache hit rate.
+
+### Changes
+
+- **Interactive plugin manager**: type /plugin on its own to browse marketplaces and install or uninstall plugins in one step, with no name@marketplace to remember; plugins can also be installed and removed by name alone.
+- **Official marketplace**: the official marketplace is now the default, marketplaces sync at startup and newly added plugins install automatically; plugins can come from a git subdirectory.
+- **Skip permission prompts**: new --dangerously-skip-permissions (short form -y), shown as a red BYPASS badge in the footer.
+- **Higher cache hit rate**: the system prompt stays identical across launches and compaction no longer fires needlessly, lifting the cache hit rate from about 79% to about 96%.
+- **AGENTS.md support**: a project's AGENTS.md is read as project instructions; new /guide to ask how to use AtomCode; configurable hooks, including webhooks.
+- **Fixes**: a failed turn shows "interrupted" instead of the success banner; the input box no longer flickers while streaming; pasting tab-indented text no longer misplaces the cursor; shell prompt characters are stripped from pastes; Windows no longer steers the model toward bash syntax; HarmonyOS self-update picks the right package; CodingPlan reports an exhausted monthly quota correctly; a failing UserPromptSubmit hook no longer blocks the conversation.
+
+## v4.23.3 (2026-05-28)
+
+### Overview
+
+A fix update focused on display and Chinese output in Windows terminals, and on how much context thinking models use in long turns.
+
+### Changes
+
+- **Windows terminal improvements**: fixes duplicated Chinese characters and a flickering input box in PowerShell 7 and similar setups; Chinese text in bash output is no longer garbled.
+- **Long turns stay within context**: compaction keeps recent content by token count, so models with heavy thinking output no longer overflow the context window.
+- **CodingPlan usage notice**: when the monthly quota is used up, a single line says how many days to wait, and /status shows durations the same way as /login.
+- **Fixes**: slash commands go into input history and come back with Up; web searches stop immediately on Ctrl+C; a stray {} at the end of a path is removed automatically; a 1M context window shows as 1m; Markdown table borders and widths are measured correctly; uninstall no longer triggers an automatic update first.
+
+## v4.23.2 (2026-05-28)
+
+### Overview
+
+This release mostly improves the terminal interface: history flows into the terminal's native scrollback and the mouse wheel, selection and copy go back to the terminal. It also fixes many Windows display problems, and destructive commands always need approval.
+
+### Changes
+
+- **Native scrolling and copy**: AtomCode no longer captures the mouse, so the wheel scrolls through history and selection and copy work the terminal's own way.
+- **Windows display fixes**: duplicated or shifted characters in Chinese locales and laggy menu navigation are fixed, and wide characters and emoji are measured more accurately.
+- **Destructive actions always ask**: dangerous commands such as rm -rf or a force push, and edits to sensitive files such as .env or keys, are never skipped because of a session-wide grant.
+- **Install with npm**: AtomCode can now be installed through npm, including on HarmonyOS.
+- **Faster startup**: plugin and skills marketplace setup runs in the background, so the input box is ready sooner and new skills appear without a restart.
+- **More models supported**: tool calls that Qwen3 and similar models write as text are recognised instead of shown as plain text.
+- **Clearer CodingPlan usage**: /codingplan status shows usage per time window and says plainly when the monthly quota is used up.
+- **Fixes**: sessions resumed after compression still begin with the original request; reading large files uses less memory; cancelling or timing out ends bash's child processes too; \t and similar sequences in Windows paths are no longer read as escapes; skills refresh after /setup, and /plugin gains reload; table rows with code or \| split correctly; startup no longer crashes when both tokens have expired.
+
+## v4.23.1 (2026-05-24)
+
+### Overview
+
+A fix update: approval prompts are clearer and more reliable, reading outside the workspace needs confirmation, and an occasional long bash hang is fixed.
+
+### Changes
+
+- **Better approval prompts**: prompts show the replacement details and wrap in narrow windows so Y/A/N stay visible; the input box no longer disappears after you answer; while waiting the spinner says it is waiting for approval instead of counting up.
+- **Stricter permissions**: actions that always need approval can no longer be passed by a session-wide grant; searching, diagnostics and symbol listing outside the workspace also ask first.
+- **Bash hang fixed**: the workspace snapshot taken around each command now times out instead of holding a command up for minutes.
+- **Consistent ATOMCODE_HOME**: when set, ATOMCODE_HOME is used as the config directory itself, without an extra .atomcode level.
+- **Fixes**: Tab switches modes even with text in the input box; an expired token is refreshed and retried once, and silent refreshes no longer type into the input box; Enter on the QR step opens the link in a browser; headless mode no longer breaks thinking output onto a line per token; paths starting with ~ resolve correctly; automatic upgrades for Linux ARM64.
+
+## v4.23.0 (2026-05-21)
+
+### Overview
+
+This release rebuilds first launch around a WeChat QR sign-in that also claims CodingPlan on one page, and adds /setup project recommendations, light and dark themes, and syntax highlighting in code blocks.
+
+### Changes
+
+- **QR quick start**: first launch shows a QR code; scan it with WeChat and AtomCode detects completion, saves the sign-in, claims CodingPlan and opens the interface.
+- **/setup recommendations**: analyses the current project and recommends skills, MCP servers, hooks and more, installed in one step; also available as atomcode setup on the command line.
+- **Light and dark themes**: colours follow the terminal's background automatically, with higher contrast on light backgrounds; code blocks are syntax-highlighted by language.
+- **Default skills marketplace**: the official skills marketplace is installed on first launch, and installed marketplaces update after an upgrade.
+- **Open files for preview**: a new open_file tool opens generated pages, PDFs and images in the system's default app, and says so plainly over SSH or without a display.
+- **/keys shortcut reference**: lists every keyboard shortcut and notes which newline combinations your terminal may not pass through; in multi-line input Up and Down move between lines before browsing history.
+- **Safer git commands**: force pushes, history rewrites, interactive rebases, forced checkouts or branch deletions, and skipping hooks now need approval.
+- **Fixes**: approval prompts tell apart parallel calls on files with the same name; tools already allowed for the session no longer prompt again; upstream errors read more clearly (429 shortened to one line); the total request timeout rises to 30 minutes; finish notifications in Ghostty; the VS Code extension gains sessions in multiple tabs, bulk session deletion and a workspace file picker.
+
+## v4.22.3 (2026-05-18)
+
+### Overview
+
+This release adds background session commands, launches the redesigned website, and fixes a few problems that got in the way.
+
+### Changes
+
+- **Background sessions**: the new /bg commands run a session in the background, list background sessions, and bring one back.
+- **Redesigned website**: atomcode.atomgit.com has a new look.
+- **Fixes**: the /codingplan 401 error; Ctrl+C failing to copy a selection on Windows; WebFetch parsing errors; cd switching directories by itself.
