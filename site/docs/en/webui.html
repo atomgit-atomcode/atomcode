@@ -92,6 +92,31 @@
         <p>The webui binds <code>127.0.0.1</code>, reachable only from this machine. To open it from a phone, do <strong>not</strong> expose it with <code>--host 0.0.0.0</code>; use the 蒲公英 virtual-LAN approach instead — see <a href="./webui-remote-access.html">Remote Access</a>.</p>
       </div>
 
+      <h3 id="two-ways-to-run">Two ways to run it, and when each stops</h3>
+      <p>The webui server lives in the process that started it; when that process exits, the server stops:</p>
+      <table>
+        <thead>
+          <tr><th>Started by</th><th>Stops when</th><th>Good for</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/webui</code> inside AtomCode</td><td>you run <code>/webui stop</code>, or that AtomCode exits</td><td>using the terminal and the browser together, synced to one session</td></tr>
+          <tr><td><code>atomcode webui</code> in a terminal</td><td>you press <code>Ctrl+C</code> there, or close that terminal window</td><td>using only the browser, or the webui installed as a desktop app</td></tr>
+        </tbody>
+      </table>
+      <pre><code># Run the webui on its own, without any AtomCode terminal UI
+atomcode webui
+
+# Do not open a browser (scripts, desktop app); only print the link
+atomcode webui --no-open
+
+# Choose the port or the address to bind
+atomcode webui --port 13457 --host 127.0.0.1</code></pre>
+      <ul>
+        <li>Every start mints a new token and the old link stops working; open the link this start printed. That link works in any browser for as long as this run lasts.</li>
+        <li>If the default port <code>13457</code> is taken (say a <code>/webui</code> is already running), the next free port is used — go by the printed link.</li>
+        <li>With the webui installed as a desktop app (Chrome / Edge “Install app”), opening the app while nothing is running shows a page that says how to start it, instead of the browser's “can't reach this page”. Once started, open the newly printed link once.</li>
+      </ul>
+
       <h2 id="what-the-interface-offers">What the interface offers</h2>
       <p>The browser UI brings the terminal's capabilities into a graphical interface:</p>
       <table>

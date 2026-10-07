@@ -92,6 +92,31 @@
         <p>webui 默认绑定 <code>127.0.0.1</code>，只有本机能访问。要让手机等设备访问，<strong>不要</strong>直接用 <code>--host 0.0.0.0</code> 暴露到公网，请走蒲公英虚拟局域网方案 —— 见 <a href="./webui-remote-access.html">远程访问指南</a>。</p>
       </div>
 
+      <h3 id="两种启动方式与生命周期">两种启动方式与生命周期</h3>
+      <p>webui 服务跟着启动它的那个进程走，进程退出，服务就停：</p>
+      <table>
+        <thead>
+          <tr><th>启动方式</th><th>什么时候停止</th><th>适合</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>在 AtomCode 里输入 <code>/webui</code></td><td>运行 <code>/webui stop</code>，或这个 AtomCode 退出时</td><td>边用终端边用浏览器，两边实时同步同一个会话</td></tr>
+          <tr><td>在终端运行 <code>atomcode webui</code></td><td>在这个终端按 <code>Ctrl+C</code>，或关闭这个终端窗口时</td><td>只用浏览器，或把 webui 装成桌面应用来用</td></tr>
+        </tbody>
+      </table>
+      <pre><code># 独立运行 webui，不依赖任何 AtomCode 终端界面
+atomcode webui
+
+# 不自动打开浏览器（脚本或桌面应用场景），只打印访问链接
+atomcode webui --no-open
+
+# 指定端口或绑定地址
+atomcode webui --port 13457 --host 127.0.0.1</code></pre>
+      <ul>
+        <li>每次启动都会生成新的令牌，旧链接随之失效，请用这次启动打印的链接打开。这条链接在本次运行期间可以在任意浏览器里使用。</li>
+        <li>默认端口 <code>13457</code> 被占用时（比如已经有一个 <code>/webui</code> 在跑），会自动顺延到下一个空闲端口，以打印出来的链接为准。</li>
+        <li>把 webui 安装成桌面应用（Chrome / Edge 的“安装应用”）后，服务没在运行时，打开应用会看到一个引导页，告诉你怎么启动，不再只显示浏览器的“无法访问此网站”。启动后用新打印的链接打开一次即可。</li>
+      </ul>
+
       <h2 id="界面功能">界面功能</h2>
       <p>浏览器界面把终端里的能力搬到了图形界面上，主要包括：</p>
       <table>

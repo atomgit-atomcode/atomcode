@@ -36,6 +36,16 @@ function Root({ signedIn: initially }: { signedIn: boolean }) {
   return ok ? <App /> : <AuthRequired />;
 }
 
+// The installed app's answer for when the webui is not running (`public/sw.js`):
+// a page that says how to start it, instead of the browser's "can't reach this
+// page". Only where the browser allows a worker — localhost is a secure
+// context; a plain-http LAN address is not, and simply goes without.
+if ('serviceWorker' in navigator && window.isSecureContext) {
+  navigator.serviceWorker.register('./sw.js', { scope: './' }).catch(() => {
+    /* no offline page; everything else works as before */
+  });
+}
+
 void signedIn(fetch, getToken()).then((ok) => {
   render(
     <SettingsProvider>
