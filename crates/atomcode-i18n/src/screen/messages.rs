@@ -390,6 +390,8 @@ pub enum Msg<'a> {
     CmdAboutTools,
     CmdAboutShowInject,
     CmdAboutMouse,
+    /// The word a `※ recap:` line opens with.
+    RecapLabel,
     /// Ctrl+Z where it cannot stop: no job control (Windows), or started with
     /// suspending switched off.
     SuspendUnsupported,

@@ -1155,11 +1155,12 @@ struct RuntimeResources {
     parts: crate::CodingParts,
     /// The mounted tree, on the harness engine. `None` on the chain.
     ///
-    /// Held, never read: unloading it would tear down every row under a live
-    /// handle. When the harness carries the reassembly paths too, this is what
-    /// `ControlSvc::patch` will be reached through.
+    /// Held for its `Drop`: unloading it would tear down every row under a
+    /// live handle. When the harness carries the reassembly paths too, this is
+    /// what `ControlSvc::patch` will be reached through.
     ///
-    /// Never read ON PURPOSE — it is held for its `Drop`, not its value.
+    /// Read in one place only, for a service the tree provides and nothing else
+    /// reaches: the side-call model ([`side_call_provider`]).
     harness_app: Option<atomcode_plexus::App>,
     /// The provider table the `llm` row reads by id. Holding it is what makes a
     /// `/model` switch a patch rather than a rebuild — see
@@ -1168,6 +1169,31 @@ struct RuntimeResources {
     wakeup_tx: mpsc::UnboundedSender<WakeupRequest>,
     loop_active: Arc<std::sync::atomic::AtomicBool>,
     image_preprocessor: Option<Arc<dyn ImagePreprocessor>>,
+}
+
+/// The model a side call runs on: the tree's side-call model (`llm-utility` —
+/// titles, summaries, the cheapest on offer) when one is mounted, else the
+/// conversation's own, built the way the next-prompt guess builds it. `None`
+/// when neither can be had.
+fn side_call_provider(runtime: &RuntimeResources) -> Option<Arc<dyn LlmProvider>> {
+    runtime
+        .harness_app
+        .as_ref()
+        .and_then(|app| {
+            app.context()
+                .service::<atomcode_harness::seams::LlmUtilitySvc>()
+        })
+        .or_else(|| {
+            let session_id = runtime
+                .parts
+                .session
+                .as_ref()
+                .map(|binding| binding.id.as_str());
+            runtime
+                .provider_factory
+                .build(&runtime.config, session_id)
+                .ok()
+        })
 }
 
 /// The `/mcp` panel's rows for the tree mounted right now: every configured server
@@ -2177,6 +2203,28 @@ impl CodingRuntimeHandle {
             ))),
             Err(error) => Err(error),
         }
+    }
+
+    /// One or two sentences on where the conversation stands and what is
+    /// next, for a person coming back to it — `None` when the model had
+    /// nothing worth saying, declined, or did not answer in time.
+    ///
+    /// Read off the conversation as it is now and never added to it: not a
+    /// fact in the log, not something the model reads back. The model is
+    /// asked for inside the loop (it is the loop's to know) and the request
+    /// runs here, outside it, so a slow side call holds nothing up.
+    pub async fn recap(&self) -> Result<Option<String>, RuntimeError> {
+        let state = self.state.load(Ordering::Acquire);
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::SideCallProvider {
+                generation: runtime_state_generation(state),
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        let provider = result.await.map_err(|_| RuntimeError::Unavailable)??;
+        let snapshot = self.snapshot().await?;
+        Ok(crate::recap::generate_recap(provider, &snapshot.messages).await)
     }
 
     /// What the model can call right now, what the person turned off, and what
@@ -3246,6 +3294,12 @@ pub enum CodingRuntimeControl {
     ToolCatalog {
         generation: u64,
         done: oneshot::Sender<Result<Vec<atomcode_harness::seams::ToolListing>, RuntimeError>>,
+    },
+    /// The model a side call (the recap) runs on — see [`side_call_provider`].
+    /// Answered at once; the call itself runs outside the loop.
+    SideCallProvider {
+        generation: u64,
+        done: oneshot::Sender<Result<Arc<dyn LlmProvider>, RuntimeError>>,
     },
     SwitchTool {
         generation: u64,
@@ -5587,6 +5641,17 @@ fn spawn_runtime_owner_with_optional_agent(
                             generation: RuntimeGeneration(generation),
                             servers,
                         }));
+                    }
+                    Some(CodingRuntimeControl::SideCallProvider {
+                        generation: request_generation,
+                        done,
+                    }) => {
+                        if request_generation != generation {
+                            let _ = done.send(Err(RuntimeError::Busy));
+                            continue;
+                        }
+                        let provider = resources.as_ref().and_then(side_call_provider);
+                        let _ = done.send(provider.ok_or(RuntimeError::Unavailable));
                     }
                     Some(CodingRuntimeControl::ToolCatalog {
                         generation: request_generation,
@@ -8694,6 +8759,9 @@ fn reject_runtime_control(
         // like every other awaited control.
         CodingRuntimeControl::ToolCatalog { done, .. }
         | CodingRuntimeControl::SwitchTool { done, .. } => {
+            let _ = done.send(Err(RuntimeError::Unavailable));
+        }
+        CodingRuntimeControl::SideCallProvider { done, .. } => {
             let _ = done.send(Err(RuntimeError::Unavailable));
         }
         CodingRuntimeControl::Respond { done, .. }

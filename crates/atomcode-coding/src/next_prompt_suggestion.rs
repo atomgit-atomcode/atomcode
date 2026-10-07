@@ -81,10 +81,42 @@ pub(crate) async fn generate_next_prompt_suggestion(
 ) -> Option<String> {
     let transcript = recent_stable_transcript(messages)?;
     let prompt = format!("{INSTRUCTIONS}\n\nConversation records (JSON Lines):\n{transcript}");
+    let sample =
+        sample_side_call(provider, prompt, SAMPLE_TIMEOUT, "next prompt suggestion").await?;
+    let suggestion = sanitize_next_prompt_suggestion(&sample.raw);
+    if suggestion.is_none() {
+        report_nothing(
+            why_nothing(&sample.raw, sample.cut_off),
+            sample.raw.chars().count(),
+            sample.thinking_chars,
+        );
+    }
+    suggestion
+}
+
+/// What one side call sent back: the visible text, whether the response was
+/// cut off, and how much the model spent thinking (counted, never kept).
+pub(crate) struct SideSample {
+    pub raw: String,
+    pub cut_off: bool,
+    pub thinking_chars: usize,
+}
+
+/// One stateless, tool-less request whose answer a program reads — the shape
+/// every side call of the runtime takes (the next-prompt guess, the recap), so
+/// they hold one policy: low effort asked for, no output cap (see
+/// [`generate_next_prompt_suggestion`] for why), a timeout instead. `None` on
+/// any failure or the timeout; `what` names it in the debug log.
+pub(crate) async fn sample_side_call(
+    provider: Arc<dyn LlmProvider>,
+    prompt: String,
+    timeout: Duration,
+    what: &'static str,
+) -> Option<SideSample> {
     let request = [Message::user(prompt)];
     let options = ChatOptions {
-        // Asked for, and deliberately with no `max_tokens` beside it — see this
-        // function's own note on why a budget cannot rest on this being honoured.
+        // Asked for, and deliberately with no `max_tokens` beside it — see
+        // `generate_next_prompt_suggestion` on why a budget cannot rest on this.
         reasoning_effort: Some(ReasoningEffort::Low),
         temperature: Some(0.2),
         tool_choice: ToolChoice::None,
@@ -94,7 +126,7 @@ pub(crate) async fn generate_next_prompt_suggestion(
         let mut stream = match provider.chat_stream(&request, &[], &options).await {
             Ok(stream) => stream,
             Err(error) => {
-                tracing::debug!(?error, "next prompt suggestion failed before sampling");
+                tracing::debug!(?error, what, "side call failed before sampling");
                 return None;
             }
         };
@@ -106,13 +138,12 @@ pub(crate) async fn generate_next_prompt_suggestion(
                 StreamEvent::TextDelta(text) => raw.push_str(&text),
                 // Counted, never kept. How much a model spent thinking is the
                 // one number that tells a starved sample from a model with
-                // nothing to say; the thinking itself is none of this
-                // function's business and reaches no one.
+                // nothing to say; the thinking itself reaches no one.
                 StreamEvent::Reasoning(text) => {
                     thinking_chars = thinking_chars.saturating_add(text.chars().count());
                 }
                 StreamEvent::Error(error) => {
-                    tracing::debug!(?error, "next prompt suggestion stream failed");
+                    tracing::debug!(?error, what, "side call stream failed");
                     return None;
                 }
                 StreamEvent::Done { truncated } => {
@@ -122,20 +153,16 @@ pub(crate) async fn generate_next_prompt_suggestion(
                 _ => {}
             }
         }
-        let suggestion = sanitize_next_prompt_suggestion(&raw);
-        if suggestion.is_none() {
-            report_nothing(
-                why_nothing(&raw, cut_off),
-                raw.chars().count(),
-                thinking_chars,
-            );
-        }
-        suggestion
+        Some(SideSample {
+            raw,
+            cut_off,
+            thinking_chars,
+        })
     };
-    match tokio::time::timeout(SAMPLE_TIMEOUT, sample).await {
-        Ok(suggestion) => suggestion,
+    match tokio::time::timeout(timeout, sample).await {
+        Ok(sample) => sample,
         Err(_) => {
-            tracing::debug!("next prompt suggestion timed out");
+            tracing::debug!(what, "side call timed out");
             None
         }
     }
@@ -203,7 +230,7 @@ fn report_nothing(why: NoSuggestion, output_chars: usize, thinking_chars: usize)
     );
 }
 
-fn recent_stable_transcript(messages: &[Message]) -> Option<String> {
+pub(crate) fn recent_stable_transcript(messages: &[Message]) -> Option<String> {
     let visible: Vec<&Message> = messages
         .iter()
         .filter(|message| {

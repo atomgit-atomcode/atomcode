@@ -43,6 +43,11 @@ pub const STATUS_DOT: &str = "ui.terminal_status_glyph";
 /// terminal but the phone can send.
 pub const MODE_SWITCH_KEY: &str = "ui.mode_switch_key";
 
+/// The id of the setting that decides whether a turn the person was away from
+/// (or that ran long) gets a `※ recap:` line. Here for the reason
+/// [`STATUS_DOT`] is; no row at all is this build's default, on.
+pub const RECAP: &str = "ui.recap";
+
 /// What a value is, as far as editing it goes.
 ///
 /// Not a type system for settings — a description of the *gesture*. Three

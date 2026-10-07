@@ -271,6 +271,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdAboutTools => "tool output: all of it, one summary each, summarised in groups; cycles with no argument".into(),
         Msg::CmdAboutShowInject => "injected context: folded, label only, in full — cycles; all of them with no name".into(),
         Msg::CmdAboutMouse => "hand the mouse back to the terminal, or take it back".into(),
+        Msg::RecapLabel => "※ recap:".into(),
         Msg::SuspendUnsupported => {
             "Suspending (Ctrl+Z) is not available here — not on Windows, or whatever started this switched it off. Run one command with !cmd, or open another terminal.".into()
         }

@@ -257,6 +257,9 @@ mod tests {
             | C::McpRows { .. }
             | C::McpDetail { .. }
             | C::ToolCatalog { .. }
+            // The model a recap is written on: a read, and the recap is the
+            // screen's alone — the model never reads it back.
+            | C::SideCallProvider { .. }
             | C::PendingPolicyIntervention { .. }
             | C::RewindCatalog { .. }
             // A read of the log; the `ApplyUndo` that uses it is what is told.

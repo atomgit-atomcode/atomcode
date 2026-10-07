@@ -619,6 +619,32 @@ fn ink(index: u8) -> Style {
     Style::new().fg(Color::picture(index))
 }
 
+/// Where a turn the person was away from stands, and what is next — the
+/// `※ recap:` line under it ([`crate::host::Host::show_recap`]).
+///
+/// The screen's alone: written by no fact, so it is not in the log, a resumed
+/// session does not show it, and the model never reads it.
+#[derive(Debug)]
+pub struct RecapBlock(pub String);
+
+impl Content for RecapBlock {
+    fn kind(&self) -> &'static str {
+        "recap"
+    }
+    fn content_hash(&self) -> ContentHash {
+        hash_of(&["recap", &self.0])
+    }
+    fn always_open(&self) -> bool {
+        true
+    }
+    /// The mark and the word, then the recap, all in the receded ink a turn's
+    /// figures take — something to read on the way back in, not news.
+    fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+        let label = format!("{} ", t(Msg::RecapLabel));
+        wrapped(&self.0, ctx.width, muted(), &label)
+    }
+}
+
 impl Content for UserSaid {
     fn kind(&self) -> &'static str {
         "user"
@@ -5403,5 +5429,37 @@ mod tests {
             !done.iter().any(|r| r.contains("20 行")),
             "a successful result is what expanding the call is for: {done:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod recap_block_tests {
+    use super::*;
+
+    /// The mark and the word lead, the recap wraps under its own start, and
+    /// the whole of it is in the receded ink — something to read on the way
+    /// back in, not news.
+    #[test]
+    fn a_recap_reads_as_one_receded_line() {
+        let block = RecapBlock("正在修端口绑定;下一步等你确认第 1~3 条改动。".repeat(3));
+        let lines = block.lines(&RenderCtx::bare(40));
+        assert!(lines.len() > 1, "wraps: {lines:?}");
+        assert!(
+            lines[0].plain().starts_with("※ 回顾: 正在修"),
+            "{:?}",
+            lines[0].plain()
+        );
+        let indent = crate::width::str_width("※ 回顾: ");
+        assert!(
+            lines[1].plain().starts_with(&" ".repeat(indent)),
+            "{:?}",
+            lines[1].plain()
+        );
+        assert!(lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .filter(|s| !s.text.trim().is_empty())
+            .all(|s| s.style.fg == muted().fg));
+        assert!(block.always_open());
     }
 }

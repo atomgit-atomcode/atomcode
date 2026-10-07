@@ -240,6 +240,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdAboutTools => "工具输出:全部、单个摘要、成组摘要;不带参数则循环".into(),
         Msg::CmdAboutShowInject => "环境注入:收起、只留标签、全文,循环;不带名字则全部".into(),
         Msg::CmdAboutMouse => "把鼠标交还终端,或收回来".into(),
+        Msg::RecapLabel => "※ 回顾:".into(),
         Msg::SuspendUnsupported => {
             "这里没法挂起(Ctrl+Z):Windows 没有,或启动方设成了不许挂起。单条命令可以用 !命令,或另开一个终端。".into()
         }

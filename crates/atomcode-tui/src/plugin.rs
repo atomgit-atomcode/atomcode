@@ -962,6 +962,31 @@ fn opens_a_turn_on_screen(
     }
 }
 
+/// How long a turn has to run for its end to get a recap on that alone.
+const RECAP_AFTER: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Whether a turn that ended by itself gets a `※ recap:` line: the person
+/// looked away while it ran, or it ran two minutes or more, or what it said
+/// ran past a screenful — the turns a person comes back to rather than watched.
+/// Any other turn ends without one: a line under every answer would be noise.
+fn wants_recap(
+    ran: Option<std::time::Duration>,
+    away: bool,
+    reply_rows: usize,
+    screen: u16,
+) -> bool {
+    away || ran.is_some_and(|ran| ran >= RECAP_AFTER) || reply_rows > screen as usize
+}
+
+/// About how many rows `text` takes at a width of `w` — enough to tell "fits
+/// on a screen" from "does not".
+fn reply_rows(text: &str, w: u16) -> usize {
+    let room = (w as usize).saturating_sub(2).max(1);
+    text.lines()
+        .map(|line| crate::width::str_width(line).div_ceil(room).max(1))
+        .sum()
+}
+
 /// A member of the session on screen, as its events have told it.
 #[derive(Clone)]
 struct Member {
@@ -1178,6 +1203,20 @@ pub struct Tui {
     /// (`AgentEvent::Accepted`): a report folded into that turn is not what
     /// opened it — see [`opens_a_turn_on_screen`].
     person_turn: Mutex<Option<u64>>,
+    /// What a `※ recap:` is decided from ([`Tui::maybe_recap`]): when the
+    /// lead's turn on screen began, whether the window lost focus during it,
+    /// and the last thing it said. `recaps` is bumped by every new turn and
+    /// switch, so a recap that comes back after one is dropped.
+    turn_began: Mutex<Option<std::time::Instant>>,
+    away_this_turn: std::sync::atomic::AtomicBool,
+    last_reply: Mutex<String>,
+    recaps: Arc<std::sync::atomic::AtomicU64>,
+    /// The side call a recap is waiting on, aborted when it stops being wanted
+    /// so a dropped recap is not one still paid for.
+    recap_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Whether the window has focus, as the terminal last said — so a turn
+    /// that starts while the person is already elsewhere counts as unwatched.
+    focused: std::sync::atomic::AtomicBool,
     /// The conversation selection a plain press set aside while it waits to
     /// learn what it is (`Tui::click_extends`): released where it went down,
     /// it was a click and this is carried on to it; dragged, it was a new
@@ -1826,6 +1865,12 @@ impl UserInterface for Tui {
                 // one, from its first fact, in a stream of its own.
                 Wake::Host(HostEvent::SessionChanged { session, .. }) => {
                     if session != client.root() {
+                        // What a recap would be about is the conversation that
+                        // just left the screen.
+                        self.drop_recap();
+                        *self.turn_began.lock().expect("turn poisoned") = None;
+                        self.away_this_turn.store(false, Ordering::SeqCst);
+                        self.last_reply.lock().expect("reply poisoned").clear();
                         self.members.clear();
                         self.host.switch_session();
                         client.follow(&session);
@@ -1988,7 +2033,14 @@ impl UserInterface for Tui {
                     stale = true;
                 }
                 // Acted on above; a change of focus draws nothing by itself.
-                Wake::Input(Input::Focus(_)) => {}
+                // Looking away during a turn is one of the reasons it gets a
+                // recap when it ends.
+                Wake::Input(Input::Focus(gained)) => {
+                    self.focused.store(gained, Ordering::SeqCst);
+                    if !gained && self.host.moment.read().expect("moment poisoned").turn_open {
+                        self.away_this_turn.store(true, Ordering::SeqCst);
+                    }
+                }
                 // The wheel, as the terminal's arrow keys (see `pump_input`).
                 // Where those arrows would have reached the composer — and
                 // recalled old prompts into it, one per notch — they scroll the
@@ -5122,8 +5174,67 @@ impl Tui {
         false
     }
 
+    /// Ask for a `※ recap:` under the turn that just ended, when it is one a
+    /// person needs help coming back to — see [`wants_recap`]. In the
+    /// background: the side call takes seconds, and the screen paints on. What
+    /// comes back after a new turn or a switch is dropped (`recaps`), and a
+    /// recap that cannot be had is no line at all.
+    fn maybe_recap(&self) {
+        let began = self.turn_began.lock().expect("turn poisoned").take();
+        let away = self.away_this_turn.swap(false, Ordering::SeqCst);
+        let (w, h) = self.surface.size();
+        let rows = reply_rows(&self.last_reply.lock().expect("reply poisoned"), w);
+        let (on, autonomous) = {
+            let m = self.host.moment.read().expect("moment poisoned");
+            (m.recap_on(), m.autonomy.is_some())
+        };
+        // A goal or a loop runs turn after turn on its own: a recap of each
+        // would be a paid side call per round, nearly all of them never read.
+        if !on || autonomous || self.client.session() != self.client.root() {
+            return;
+        }
+        if !wants_recap(began.map(|b| b.elapsed()), away, rows, h) {
+            return;
+        }
+        let Some(control) = self.client.control() else {
+            return;
+        };
+        let session = self.client.root();
+        let host = self.host.clone();
+        let keys = self.wake.lock().expect("wake poisoned").clone();
+        let recaps = self.recaps.clone();
+        let ticket = recaps.load(Ordering::SeqCst);
+        let task = tokio::spawn(async move {
+            let Ok(HostReply::Recap { text: Some(text) }) =
+                control.call(HostCommand::Recap { session }).await
+            else {
+                return;
+            };
+            if recaps.load(Ordering::SeqCst) != ticket {
+                return;
+            }
+            host.show_recap(text);
+            if let Some(keys) = keys {
+                let _ = keys.send(Wake::Fact);
+            }
+        });
+        *self.recap_task.lock().expect("recap poisoned") = Some(task);
+    }
+
+    /// A recap on its way is no longer wanted — a new turn, a new prompt, a
+    /// different conversation on screen: it is dropped if it comes back, and
+    /// the side call is stopped so it is not paid for either.
+    fn drop_recap(&self) {
+        self.recaps.fetch_add(1, Ordering::SeqCst);
+        if let Some(task) = self.recap_task.lock().expect("recap poisoned").take() {
+            task.abort();
+        }
+    }
+
     /// Switch the screen, and say where it went.
     fn switch_to(&self, session: &str) {
+        // A recap on its way was about the conversation that was on screen.
+        self.drop_recap();
         if self.look_at(session) {
             // A subagent by what it was asked to do: its id is minted.
             let name = if session == self.client.root() {
@@ -5266,6 +5377,15 @@ impl Tui {
                 }
                 if !self.client.keep(&committed) {
                     return false;
+                }
+                // The lead's latest words, for whether its turn ran past a
+                // screenful — one of the reasons for a recap.
+                if let atomcode_kernel::session::SessionEvent::AssistantMessage { text, .. } =
+                    &committed.event
+                {
+                    if !text.trim().is_empty() && committed.session == self.client.root() {
+                        *self.last_reply.lock().expect("reply poisoned") = text.clone();
+                    }
                 }
                 self.host
                     .absorb_logged(&atomcode_kernel::session::LoggedEvent {
@@ -5606,6 +5726,14 @@ impl Tui {
                 // wake-up — and the guess then outlived the turn it was about.
                 m.suggestion = None;
                 drop(m);
+                // A new turn: what decides its recap starts afresh, and one
+                // still on its way for the last turn is no longer wanted. A
+                // person already elsewhere when it starts has not watched it.
+                self.drop_recap();
+                *self.turn_began.lock().expect("turn poisoned") = Some(std::time::Instant::now());
+                self.away_this_turn
+                    .store(!self.focused.load(Ordering::SeqCst), Ordering::SeqCst);
+                self.last_reply.lock().expect("reply poisoned").clear();
                 self.host.arm_working()
             }
             // A cancel (whoever asked for it) or a failure can end the turn with
@@ -5635,6 +5763,20 @@ impl Tui {
                     }
                     self.settle_withdrawn();
                     self.try_retract();
+                    if matches!(
+                        event,
+                        AgentEvent::TurnComplete {
+                            reason: atomcode_kernel::event::StopReason::Stopped,
+                            ..
+                        }
+                    ) {
+                        self.maybe_recap();
+                    } else {
+                        // Ended some other way: no recap, and its start must not
+                        // be read as the start of a later turn this screen did
+                        // not see begin.
+                        *self.turn_began.lock().expect("turn poisoned") = None;
+                    }
                     // The turn thought, and it is off the screen with no lid to
                     // say so: tell the person the key, once.
                     if self.host.last_turn_reasoning_hidden()
@@ -6111,6 +6253,9 @@ impl Tui {
         match action {
             Action::Quit => return true,
             Action::Submit => {
+                // A recap of the last turn landing now would go under this new
+                // prompt.
+                self.drop_recap();
                 // The composer shows `[Pasted #N …]` markers to stay terse; the
                 // model gets the whole paste — put the bodies back before
                 // anything reads the text.
@@ -8646,6 +8791,12 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
             files: Mutex::new(None),
             pressed_at: Mutex::new(None),
             person_turn: Mutex::new(None),
+            turn_began: Mutex::new(None),
+            away_this_turn: std::sync::atomic::AtomicBool::new(false),
+            last_reply: Mutex::new(String::new()),
+            recaps: Arc::default(),
+            recap_task: Mutex::new(None),
+            focused: std::sync::atomic::AtomicBool::new(true),
             extend_on_release: Mutex::new(None),
             click_streak: Mutex::new(None),
             members: Arc::new(Roster::default()),
@@ -11140,5 +11291,31 @@ mod opening_line_tests {
         ));
         let step = SessionEvent::StepStart { turn: 3, step: 1 };
         assert!(!opens_a_turn_on_screen(&step, nobody));
+    }
+}
+
+#[cfg(test)]
+mod recap_tests {
+    use super::{reply_rows, wants_recap, RECAP_AFTER};
+    use std::time::Duration;
+
+    /// Only a turn a person comes back to gets one: looked away, ran long, or
+    /// said more than a screen holds. A short answer someone watched does not.
+    #[test]
+    fn a_recap_is_for_a_turn_a_person_comes_back_to() {
+        let short = Some(Duration::from_secs(5));
+        assert!(!wants_recap(short, false, 10, 24), "short, watched, fits");
+        assert!(wants_recap(short, true, 10, 24), "looked away");
+        assert!(wants_recap(Some(RECAP_AFTER), false, 10, 24), "ran long");
+        assert!(wants_recap(short, false, 25, 24), "past a screenful");
+        assert!(!wants_recap(None, false, 0, 24), "nothing known: none");
+    }
+
+    #[test]
+    fn rows_count_wrapping_at_the_width() {
+        assert_eq!(reply_rows("", 80), 0);
+        assert_eq!(reply_rows("a\nb", 80), 2);
+        assert_eq!(reply_rows(&"x".repeat(156), 80), 2, "78 cells a row");
+        assert_eq!(reply_rows("\n", 80), 1, "a blank line is a row");
     }
 }

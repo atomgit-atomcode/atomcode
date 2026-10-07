@@ -161,6 +161,10 @@ pub enum HostCommand {
     /// because the person said so, or absent because the tree was configured
     /// without it (`docs/tool-catalog-policy.md`).
     ToolCatalog { session: String },
+    /// One or two sentences on where `session` stands and what is next, for a
+    /// person coming back to it. For the screen only: nothing is added to the
+    /// conversation, and the model never reads it back.
+    Recap { session: String },
     /// Turn one tool off or back on for `session`. `pattern` is a tool name or
     /// a glob — `mcp__github__*` is one server's tools — so hiding a whole MCP
     /// server and hiding one of its tools are the same command. The connection
@@ -366,6 +370,7 @@ impl HostCommand {
             | Self::McpDetail { session, .. }
             | Self::McpAct { session, .. }
             | Self::ToolCatalog { session }
+            | Self::Recap { session }
             | Self::SwitchTool { session, .. }
             | Self::WithdrawMcpTools { session }
             | Self::Reload { session }
@@ -467,6 +472,11 @@ pub enum HostReply {
     /// The tool catalog, as a screen offering the switch needs it.
     ToolCatalog {
         tools: Vec<CatalogTool>,
+    },
+    /// The recap [`HostCommand::Recap`] asked for; `None` when there was
+    /// nothing worth saying or no answer in time.
+    Recap {
+        text: Option<String>,
     },
     /// The settings a person may change, each with what it is set to now.
     Settings {
@@ -1599,6 +1609,9 @@ mod tests {
             HostCommand::ToolCatalog {
                 session: "a".into(),
             },
+            HostCommand::Recap {
+                session: "a".into(),
+            },
             HostCommand::SwitchTool {
                 session: "a".into(),
                 pattern: "mcp__github__*".into(),
@@ -1658,6 +1671,7 @@ mod tests {
                 | HostCommand::McpDetail { .. }
                 | HostCommand::McpAct { .. }
                 | HostCommand::ToolCatalog { .. }
+                | HostCommand::Recap { .. }
                 | HostCommand::SwitchTool { .. }
                 | HostCommand::WithdrawMcpTools { .. }
                 | HostCommand::Reload { .. }
@@ -1910,6 +1924,9 @@ mod tests {
                     }],
                 }],
             },
+            HostReply::Recap {
+                text: Some("在修端口绑定;下一步等你确认。".into()),
+            },
             HostReply::ToolCatalog {
                 tools: vec![CatalogTool {
                     name: "write_file".into(),
@@ -1971,6 +1988,7 @@ mod tests {
                 | HostReply::Identity { .. }
                 | HostReply::Sources { .. }
                 | HostReply::ToolCatalog { .. }
+                | HostReply::Recap { .. }
                 | HostReply::Backgrounded { .. }
                 | HostReply::BackgroundSessions { .. }
                 | HostReply::BackgroundQuestion { .. }
