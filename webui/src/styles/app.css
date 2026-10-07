@@ -876,6 +876,18 @@ body {
 .markdown-root tbody tr:nth-child(even) td {
   background: color-mix(in srgb, var(--app-secondary-background), transparent 55%);
 }
+/* Math (KaTeX)：颜色继承 currentColor，深浅主题免配。
+   .markdown-root 是 overflow-x: clip，长公式需要在自己的容器内滚动。 */
+.markdown-root .katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 2px 0;
+}
+/* KaTeX 渲染失败/异常时的降级原文（lib/markdownMath.ts renderKatex）。 */
+.markdown-root code.math-fallback {
+  color: var(--app-error-foreground);
+  white-space: pre-wrap;
+}
 
 /* === Input === */
 .persistence-warning {
