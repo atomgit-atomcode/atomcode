@@ -6352,8 +6352,13 @@ impl Tui {
                 // erroring with "没有 /Users/… 这条命令".
                 if crate::command::looks_like_command(&text) {
                     // Echoed before anything is said about it, so what follows
-                    // (the refusal below, the command's answer) reads under it.
-                    self.host.echo_command(&text);
+                    // (the refusal below, the command's answer) reads under it —
+                    // with the answer instead while a turn runs, for the reason
+                    // `run_typed_command` gives.
+                    let with_answer = self.turn_running();
+                    if !with_answer {
+                        self.host.echo_command(&text);
+                    }
                     // A command carries no pictures — no command takes them —
                     // and `take_shown` above has already drained them off the
                     // composer. Until one does, **say so**: a screenshot
@@ -6366,7 +6371,7 @@ impl Tui {
                             count: images.len(),
                         }));
                     }
-                    self.run_command(&text);
+                    self.spawn_command(&text, false, with_answer);
                     return false;
                 }
                 // One command. Whether it starts a turn or folds into the one
@@ -8028,15 +8033,32 @@ impl Tui {
     /// On its own task: a command may reconfigure the tree or call a model, and
     /// the loop must keep painting and keep accepting keys while it does.
     fn run_command(&self, line: &str) {
-        self.spawn_command(line, false);
+        self.spawn_command(line, false, false);
     }
 
     /// [`Tui::run_command`] for a command the person typed (or picked from the
     /// slash menu): the line goes into the conversation first, so what the
     /// command says has the question it answers above it.
+    ///
+    /// While a turn runs, the line goes in *with* the answer rather than
+    /// before it. The reply is still arriving: an echo put in now and an answer
+    /// put in when the command is done (`/status` waits on the account and the
+    /// plan, a second or two on a slow network) had the reply's paragraphs
+    /// between them — the question above the answer, the answer under someone
+    /// else's words. Between turns nothing else writes, so it is echoed at
+    /// once, and a slow command shows it was taken.
     fn run_typed_command(&self, line: &str) {
+        if self.turn_running() {
+            self.spawn_command(line, false, true);
+            return;
+        }
         self.host.echo_command(line);
         self.run_command(line);
+    }
+
+    /// Whether a turn is running on this screen right now.
+    fn turn_running(&self) -> bool {
+        self.host.moment.read().expect("moment poisoned").turn_open
     }
 
     /// Run a slash command and put what it said on the screen, unless it
@@ -8045,13 +8067,14 @@ impl Tui {
     /// news. A refusal still says itself: there the person would otherwise
     /// be left thinking the change had landed.
     fn run_command_quietly(&self, line: &str) {
-        self.spawn_command(line, true);
+        self.spawn_command(line, true, false);
     }
 
     /// The one spawn/dispatch/deliver body both callers share; `quiet_success`
     /// folds a success's `Said` into `Quiet` so the success stays off the
-    /// screen while a refusal keeps talking.
-    fn spawn_command(&self, line: &str, quiet_success: bool) {
+    /// screen while a refusal keeps talking. `echo` puts the line itself in the
+    /// conversation just before what it said ([`Tui::run_typed_command`]).
+    fn spawn_command(&self, line: &str, quiet_success: bool, echo: bool) {
         let (Some(ctx), Some(keys)) = (
             self.ctx.lock().expect("ctx poisoned").clone(),
             self.wake.lock().expect("wake poisoned").clone(),
@@ -8066,6 +8089,9 @@ impl Tui {
                 crate::command::Outcome::Said(_) if quiet_success => crate::command::Outcome::Quiet,
                 other => other,
             };
+            if echo {
+                host.echo_command(&line);
+            }
             deliver(&host, &keys, outcome);
         });
     }
@@ -11392,5 +11418,68 @@ mod recap_tests {
         assert_eq!(reply_rows("a\nb", 80), 2);
         assert_eq!(reply_rows(&"x".repeat(156), 80), 2, "78 cells a row");
         assert_eq!(reply_rows("\n", 80), 1, "a blank line is a row");
+    }
+}
+
+#[cfg(test)]
+mod midturn_command_tests {
+    use super::*;
+    use atomcode_plexus::{App, ConfigTree, PluginRegistry};
+
+    fn screen() -> (Arc<Host>, Tui, mpsc::UnboundedReceiver<Wake>) {
+        let (host, tui) = assemble(Headless::new(100, 24));
+        let (wake, woken) = mpsc::unbounded_channel();
+        *tui.wake.lock().expect("wake poisoned") = Some(wake);
+        let app = App::new(PluginRegistry::new(), ConfigTree::default());
+        *tui.ctx.lock().expect("ctx poisoned") = Some(app.context());
+        (host, tui, woken)
+    }
+
+    /// The kinds the conversation holds, in order.
+    fn kinds(host: &Arc<Host>) -> Vec<&'static str> {
+        let stream = host.stream.read().expect("stream poisoned");
+        stream.slots().iter().map(|s| s.block().kind()).collect()
+    }
+
+    async fn answered(woken: &mut mpsc::UnboundedReceiver<Wake>) {
+        let woke = tokio::time::timeout(std::time::Duration::from_secs(5), woken.recv()).await;
+        assert!(matches!(woke, Ok(Some(Wake::Fact))), "the command answered");
+    }
+
+    /// `/status` typed while a reply was still arriving had its echo put in at
+    /// once and its answer seconds later, with the reply's paragraphs between
+    /// them. While a turn runs the line goes in with its answer, the two
+    /// together at the end.
+    #[tokio::test]
+    async fn a_command_typed_mid_turn_lands_with_its_answer() {
+        let (host, tui, mut woken) = screen();
+        host.moment.write().expect("moment poisoned").turn_open = true;
+        let before = kinds(&host).len();
+        tui.run_typed_command("/no-such-command");
+        assert_eq!(
+            kinds(&host).len(),
+            before,
+            "nothing in the conversation before the answer: {:?}",
+            kinds(&host)
+        );
+        answered(&mut woken).await;
+        let after = kinds(&host);
+        assert_eq!(
+            &after[before..],
+            &["user", "command"],
+            "the line, then what it said, side by side"
+        );
+    }
+
+    /// Between turns nothing else writes: the line is echoed at once, so a slow
+    /// command shows it was taken.
+    #[tokio::test]
+    async fn a_command_typed_between_turns_is_echoed_at_once() {
+        let (host, tui, mut woken) = screen();
+        let before = kinds(&host).len();
+        tui.run_typed_command("/no-such-command");
+        assert_eq!(&kinds(&host)[before..], &["user"]);
+        answered(&mut woken).await;
+        assert_eq!(&kinds(&host)[before..], &["user", "command"]);
     }
 }
