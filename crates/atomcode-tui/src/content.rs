@@ -579,6 +579,7 @@ fn mascot(ctx: &RenderCtx, content_w: usize, art: Option<&Mascot>) -> Vec<Line> 
     if cells == 0 || content_w < cells {
         return Vec::new();
     }
+    let lower_only = ctx.caps.basic_glyphs && !ctx.caps.unicode;
     art.rows
         .iter()
         .map(|row| {
@@ -591,11 +592,21 @@ fn mascot(ctx: &RenderCtx, content_w: usize, art: Option<&Mascot>) -> Vec<Line> 
                 // pixel is the transparent one, so the ears' empty half does not
                 // paint a default-foreground bar across them — the bug that line
                 // exists to prevent.
-                let (glyph, style) = match (top, bottom) {
-                    (None, None) => (" ", Style::new()),
-                    (Some(t), None) => ("\u{2580}", ink(t)),
-                    (None, Some(b)) => ("\u{2584}", ink(b)),
-                    (Some(t), Some(b)) => ("\u{2580}", ink(t).bg(Color::picture(b))),
+                //
+                // A basic console font has `▄` but not `▀` (GBK stops at U+2581),
+                // so there every cell is `▄`: the lower pixel in the foreground,
+                // the upper in the background — and an upper pixel over a
+                // transparent one has the ground itself as its foreground.
+                let (glyph, style) = match (top, bottom, lower_only) {
+                    (None, None, _) => (" ", Style::new()),
+                    (None, Some(b), _) => ("\u{2584}", ink(b)),
+                    (Some(t), None, false) => ("\u{2580}", ink(t)),
+                    (Some(t), Some(b), false) => ("\u{2580}", ink(t).bg(Color::picture(b))),
+                    (Some(t), None, true) => (
+                        "\u{2584}",
+                        Style::new().fg(Color::Ground).bg(Color::picture(t)),
+                    ),
+                    (Some(t), Some(b), true) => ("\u{2584}", ink(b).bg(Color::picture(t))),
                 };
                 if style == run_style {
                     run.push_str(glyph);
@@ -3674,8 +3685,10 @@ mod tests {
 
     #[test]
     fn a_console_with_basic_glyphs_still_gets_the_mascot() {
-        // `▀` and `▄` are all the art is made of, and a basic console font
-        // draws both — a PowerShell window gets the cat Git Bash's mintty got.
+        // A PowerShell window gets the cat Git Bash's mintty got — drawn with
+        // `▄` alone, since a GBK console font has no `▀` (it came out as tofu
+        // over the cat), and the ground as the ink where the lower pixel is
+        // transparent.
         let basic = RenderCtx {
             width: 80,
             caps: crate::block::ShapeCaps {
@@ -3690,7 +3703,17 @@ mod tests {
             .map(Line::plain)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(all.contains('▀') || all.contains('▄'), "{all}");
+        assert!(all.contains('▄'), "{all}");
+        assert!(!all.contains('▀'), "no upper half block: {all}");
+        let grounded = welcome().lines(&basic).iter().any(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.style.fg == Some(Color::Ground) && span.text.contains('▄'))
+        });
+        assert!(
+            grounded,
+            "a top pixel over nothing is drawn over the ground"
+        );
     }
 
     /// The welcome's foot can carry two asides — the keys line and the

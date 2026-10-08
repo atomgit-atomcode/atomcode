@@ -214,10 +214,10 @@ impl Raster {
                 // its runs rather than its cells.
                 let mut spans: Vec<Span> = Vec::new();
                 for cell in slice {
-                    let style = style_of(cell, caps);
+                    let (ch, style) = cell_as_drawn(cell, caps);
                     match spans.last_mut() {
-                        Some(last) if last.style == style => last.text.push(cell.ch),
-                        _ => spans.push(Span::styled(cell.ch.to_string(), style)),
+                        Some(last) if last.style == style => last.text.push(ch),
+                        _ => spans.push(Span::styled(ch.to_string(), style)),
                     }
                 }
                 Line::from_spans(spans)
@@ -262,6 +262,23 @@ fn colour(word: u32, index: usize) -> Result<Option<crate::theme::Rgb>, RasterEr
             why: "colour word is neither 0x00RRGGBB nor 0x01000000",
         }),
     }
+}
+
+/// A cell as this terminal draws it. On a basic console font (`▄` but not `▀`,
+/// see [`crate::caps::console_safe`]) an upper half block is drawn as the lower
+/// one with its two colours swapped — the same picture, the QR code still
+/// scannable — and a transparent lower half becomes the measured ground.
+fn cell_as_drawn(cell: &Cell, caps: crate::caps::Caps) -> (char, Style) {
+    if cell.ch == '\u{2580}' && caps.basic_glyphs && !caps.unicode {
+        if let Some(top) = cell.fg {
+            let lower = cell.bg.unwrap_or(caps.palette.background());
+            let style = Style::new()
+                .fg(crate::theme::exact_colour(lower, caps))
+                .bg(crate::theme::exact_colour(top, caps));
+            return ('\u{2584}', style);
+        }
+    }
+    (cell.ch, style_of(cell, caps))
 }
 
 fn style_of(cell: &Cell, caps: crate::caps::Caps) -> Style {

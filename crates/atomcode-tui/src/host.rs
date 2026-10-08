@@ -6046,9 +6046,14 @@ impl Host {
             })
             .into_owned();
             let want = crate::width::str_width(&label);
-            if rect.h > 0 && want <= rect.w as usize {
+            // One cell short of the right edge, like the tip row: a badge written
+            // into the last column is one miscounted width (an ambiguous `·` on a
+            // CJK console) away from the console wrapping its tail onto the next
+            // row.
+            let margin = 1usize;
+            if rect.h > 0 && want + margin <= rect.w as usize {
                 let badge = Rect::new(
-                    rect.x + rect.w - want as u16,
+                    rect.x + rect.w - (want + margin) as u16,
                     rect.bottom() - 1,
                     want as u16,
                     1,
@@ -14502,9 +14507,9 @@ mod tests {
         let menu = after.part("context-menu").expect("the menu is on screen");
         assert_eq!(menu.rect.x, 6, "it opens at the cell it was asked for");
         assert_eq!(
-            menu.rect.y,
+            menu.rect.y + 1,
             field.y + 1,
-            "its first item sits under the pointer"
+            "its first item sits under the pointer, its frame one row above"
         );
         let drawn: Vec<String> = menu.lines.iter().map(|l| l.plain()).collect();
         assert!(
@@ -14601,7 +14606,7 @@ mod tests {
         );
         let rect = h.compose((80, 24)).part("context-menu").expect("open").rect;
         assert_eq!(
-            h.context_menu_click(rect.x, rect.y + 1, (80, 24)),
+            h.context_menu_click(rect.x, rect.y + 2, (80, 24)),
             ContextClick::Picked(crate::menu::Step::Picked("send".into())),
             "the row under the pointer is the row that is chosen"
         );

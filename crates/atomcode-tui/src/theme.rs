@@ -982,6 +982,7 @@ mod tests {
             Color::Ansi(n) => Some(caps.palette.rendered(n)),
             Color::Role(_) => unreachable!("resolution does not produce a role"),
             Color::Picture(_) => unreachable!("resolution does not produce a picture colour"),
+            Color::Ground => unreachable!("resolution does not produce the ground"),
         }
     }
 

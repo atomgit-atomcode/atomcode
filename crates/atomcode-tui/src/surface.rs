@@ -253,6 +253,16 @@ pub trait Surface: Send + Sync {
     /// there is nothing to take back.
     fn heal_mouse(&self) {}
 
+    /// Whether this terminal reports every pointer movement while the mouse is
+    /// taken, whether or not motion was asked for. A Windows console does: its
+    /// mouse input mode delivers every move as an input record. There an
+    /// unrequested move is no sign the terminal reset its tracker — reading it
+    /// as one said "the terminal took the mouse back" on every move of a mouse
+    /// that was never lost.
+    fn reports_every_move(&self) -> bool {
+        false
+    }
+
     /// Forget what is believed to be on screen, so the next frame is painted
     /// in full.
     ///
@@ -924,6 +934,16 @@ mod win_console {
         fn GetStdHandle(which: u32) -> Handle;
         fn GetConsoleMode(console: Handle, mode: *mut u32) -> i32;
         fn GetConsoleScreenBufferInfoEx(console: Handle, info: *mut ScreenBufferInfoEx) -> i32;
+        fn GetOEMCP() -> u32;
+    }
+
+    /// Whether the system's console code page is Chinese, Japanese or Korean —
+    /// what decides the console's default font, and so whether it draws East
+    /// Asian ambiguous characters two cells wide. The OEM page and not the
+    /// console's output page: the launcher sets that to UTF-8 at startup.
+    pub(super) fn cjk_codepage() -> bool {
+        // SAFETY: no arguments, returns a number.
+        matches!(unsafe { GetOEMCP() }, 932 | 936 | 949 | 950)
     }
 
     /// `CONSOLE_SCREEN_BUFFER_INFOEX`.
@@ -1014,6 +1034,10 @@ impl Terminal {
         out.flush()?;
         console_mouse(pointer != ansi::Pointer::Terminal);
         let mut caps = crate::caps::Caps::detect_with(overrides);
+        // A classic console with a CJK font draws ambiguous characters wide;
+        // widths everywhere have to count them that way (`crate::width`).
+        #[cfg(windows)]
+        crate::width::set_ambiguous_wide(caps.basic_glyphs && win_console::cjk_codepage());
         // Inside the alternate screen on purpose: a terminal that does not know
         // the queries may echo them, and here the first frame paints over it.
         //
@@ -1131,10 +1155,9 @@ fn arm_panic_restore(#[allow(unused_variables)] original: Option<i32>) {
 /// Give the screen back, from anywhere, at most once.
 ///
 /// A classic Windows console window — not Windows Terminal (`WT_SESSION`), not
-/// a terminal that names itself (`TERM_PROGRAM`: mintty, VS Code). Only there
-/// are the console API's input modes and colour table the terminal's own: a
-/// pseudo-console behind another terminal has a default table, not the scheme
-/// on screen, and its mouse already arrives the terminal's way.
+/// a terminal that names itself (`TERM_PROGRAM`: mintty, VS Code). Only there is
+/// the console API's colour table the terminal's own: a pseudo-console behind
+/// another terminal has a default table, not the scheme on screen.
 #[cfg(windows)]
 fn classic_console() -> bool {
     std::env::var_os("WT_SESSION").is_none() && std::env::var_os("TERM_PROGRAM").is_none()
@@ -1151,11 +1174,19 @@ fn classic_console() -> bool {
 /// the wheel did not scroll, and a drag was QuickEdit's selection, which copies
 /// nothing until Enter. crossterm's mouse capture is exactly that mode switch on
 /// Windows (and nothing else — it writes no escape there); off puts back the
-/// mode it found. Only on a classic console ([`classic_console`]); elsewhere —
-/// Windows Terminal, mintty, any other platform — this does nothing.
+/// mode it found.
+///
+/// Every Windows console, not only the classic one: behind Windows Terminal or
+/// a ConPTY Git Bash (mintty) the program's console is a pseudo-console, which
+/// keeps the `?1002h` this screen writes to itself and asks the real terminal
+/// for mouse reports only once this input mode is on — and hands them on as the
+/// same input records. Without it Git Bash scrolled its own scrollback on the
+/// wheel, past this screen into whatever the shell printed before it. Where
+/// standard input is no console at all (an old pipe-based mintty) the mode
+/// cannot be set and this does nothing. Not Windows: nothing.
 fn console_mouse(on: bool) {
     #[cfg(windows)]
-    if classic_console() {
+    {
         let mut out = std::io::stdout();
         let _ = if on {
             crossterm::execute!(out, crossterm::event::EnableMouseCapture)
@@ -1555,6 +1586,16 @@ fn local_clipboard(text: &str) -> bool {
 
     if std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some() {
         return false;
+    }
+    // Windows: the clipboard API itself, in UTF-16. `clip.exe` reads its input
+    // in the system's ANSI code page, so Chinese piped to it as UTF-8 arrived
+    // garbled; it stays as the fallback.
+    #[cfg(windows)]
+    if arboard::Clipboard::new()
+        .and_then(|mut board| board.set_text(text.to_string()))
+        .is_ok()
+    {
+        return true;
     }
     let helpers: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
         &[("pbcopy", &[])]
@@ -2066,6 +2107,9 @@ impl Surface for Terminal {
             return;
         }
         self.refresh_pointer();
+    }
+    fn reports_every_move(&self) -> bool {
+        cfg!(windows)
     }
     fn motion(&self) -> bool {
         self.pointer_mode() == ansi::Pointer::ButtonsAndHover

@@ -162,6 +162,14 @@ pub enum Color {
     /// holds the capabilities — resolves it, passing 202 through where the cube
     /// exists and taking the nearest real slot where it does not.
     Picture(u8),
+    /// The terminal's own background, as a colour to draw *with*.
+    ///
+    /// As a background it is no colour at all — the cell's own. It exists for the
+    /// foreground: a half-block picture drawn with `▄` alone (a console font that
+    /// has `▄` but not `▀`, see `crate::caps::console_safe`) puts a pixel that is
+    /// transparent below in the foreground of the lower half, and transparent is
+    /// whatever the ground is. Resolved by the encoder from the measured palette.
+    Ground,
 }
 
 impl Color {

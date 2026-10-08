@@ -520,12 +520,21 @@ pub fn basic_glyphs_for(env: &dyn Fn(&str) -> Option<String>, windows: bool) -> 
 pub fn console_safe(ch: char) -> bool {
     matches!(ch,
         '\u{2500}'..='\u{257F}'          // box drawing
-        | '\u{2580}'..='\u{2593}'        // block elements (the QR code's halves)
+        // Block elements a GBK font carries: the lower eighths to the full
+        // block, the left eighths, and the dark shade. Not `▀` (U+2580): it is
+        // outside GBK, and drawn as tofu on a Chinese console — half-block
+        // pictures there are drawn with `▄` alone.
+        | '\u{2581}'..='\u{258F}' | '\u{2593}'
         | '\u{2190}'..='\u{2193}'        // ← ↑ → ↓
         | '\u{2022}' | '\u{00B7}'         // • ·
         | '\u{25CB}' | '\u{25CF}' | '\u{25C6}' | '\u{25C7}' | '\u{25CE}' // ○ ● ◆ ◇ ◎
         | '\u{2026}'                      // …
     )
+}
+
+/// Whether a basic console gets an ASCII stand-in for `ch` rather than `ch`.
+pub fn rewritten_on_basic(ch: char) -> bool {
+    !console_safe(ch) && ascii_for(ch).is_some()
 }
 
 /// A glyph for a terminal that is full Unicode, basic ([`Caps::basic_glyphs`])
@@ -552,16 +561,20 @@ pub fn downgrade_keeping(text: &str, unicode: bool, basic: bool) -> Cow<'_, str>
     if !basic || unicode {
         return downgrade(text, unicode);
     }
+    // The emoji variation selector goes too: a console font has no emoji, and
+    // the selector it does not know arrives as a `□` after the symbol. It takes
+    // no cell, so dropping it moves nothing.
     if text.is_ascii()
         || !text
             .chars()
-            .any(|c| !console_safe(c) && ascii_for(c).is_some())
+            .any(|c| c == '\u{FE0F}' || rewritten_on_basic(c))
     {
         return Cow::Borrowed(text);
     }
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
         match ascii_for(c) {
+            _ if c == '\u{FE0F}' => {}
             Some(stand_in) if !console_safe(c) => out.push_str(stand_in),
             _ => out.push(c),
         }
@@ -823,9 +836,12 @@ mod tests {
             "plain ASCII untouched"
         );
 
-        let text = "⚑ 已更新 · ❯ ▸ ✓ ─┌┐ • ● ← ▀▄ ⏸";
+        let text = "⚑ 已更新 · ❯ ▸ ✓ ─┌┐ • ● ← ▀▄█ ⏸";
         let kept = downgrade_keeping(text, false, true);
-        assert_eq!(kept, "! 已更新 · > > v ─┌┐ • ● ← ▀▄ =");
+        assert_eq!(
+            kept, "! 已更新 · > > v ─┌┐ • ● ← #▄█ =",
+            "`▀` is not in the font"
+        );
         assert_eq!(
             crate::width::str_width(&kept),
             crate::width::str_width(text),
@@ -835,6 +851,11 @@ mod tests {
             downgrade_keeping(text, true, true),
             text,
             "full Unicode untouched"
+        );
+        assert_eq!(
+            downgrade_keeping("晴 ☀\u{FE0F}", false, true),
+            "晴 ☀",
+            "the emoji selector the font lacks goes"
         );
         assert_eq!(
             downgrade_keeping(text, false, false),

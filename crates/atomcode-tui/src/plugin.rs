@@ -2021,8 +2021,14 @@ impl UserInterface for Tui {
                 // the slash menu is the fourth such thing, and it is the one that
                 // is up while a person is typing — the moment a spurious "the
                 // terminal took your mouse" notice would be most visible.
+                //
+                // And none of it holds where every move is reported whatever was
+                // asked (`Surface::reports_every_move`, a Windows console): an
+                // unrequested hover there is the terminal working as it always
+                // does, and the notice fired on every move.
                 Wake::Input(Input::Mouse(Click::Hover, ..))
-                    if !self.host.context_menu_open()
+                    if !self.surface.reports_every_move()
+                        && !self.host.context_menu_open()
                         && !self.host.menu_open()
                         && !self.host.asks.is_waiting()
                         && !self.team_on_screen() =>
@@ -5808,11 +5814,17 @@ impl Tui {
                         *self.turn_began.lock().expect("turn poisoned") = None;
                     }
                     // The turn thought, and it is off the screen with no lid to
-                    // say so: tell the person the key, once.
+                    // say so: tell the person the key, once. On the tip row, not
+                    // in the conversation — it is a hint about the screen, not
+                    // something that happened in the session, and a `●` line in
+                    // the transcript read as one more thing the agent said. Held
+                    // longer than a "saved": it arrives as the turn ends, when
+                    // the eyes are on the answer.
                     if self.host.last_turn_reasoning_hidden()
                         && !self.reasoning_hinted.swap(true, Ordering::Relaxed)
                     {
-                        self.say(&t(Msg::ReasoningHiddenHint));
+                        self.host
+                            .say_for(t(Msg::ReasoningHiddenHint).into_owned(), false, 10_000);
                     }
                 }
                 // A turn just spent some of the allowance, so this is the

@@ -8,18 +8,72 @@
 //! `unicode-width` is the authority here, not our own table — an
 //! implementation-independent oracle for the tests that check this.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+/// Whether East Asian *ambiguous* characters take two cells on this screen.
+///
+/// They take one by Unicode's default and in every terminal that follows it —
+/// but a classic Windows console on a Chinese, Japanese or Korean system draws
+/// them with its CJK font, where `℃` `·` `…` `←` `●` and the curly quotes are
+/// full-width glyphs. Counted as one, each pushed the rest of its row right by a
+/// cell: a table's right border stepped out on every row with a `℃` in it, and a
+/// right-aligned tip wrapped its last character onto the next row. Set once, by
+/// the surface, when it is that console (`crate::surface`).
+static AMBIGUOUS_WIDE: AtomicBool = AtomicBool::new(false);
+
+/// See [`AMBIGUOUS_WIDE`].
+pub fn set_ambiguous_wide(on: bool) {
+    AMBIGUOUS_WIDE.store(on, Ordering::Relaxed);
+}
+
+/// An ambiguous character that this screen draws two cells wide.
+///
+/// Not box drawing or block elements (U+2500–U+259F): the console draws those
+/// narrow whatever the font — a table's rules line up with its `│` there — and
+/// they are this UI's frames. Not a character the basic glyph set rewrites to
+/// ASCII either: what reaches the console is the one-cell stand-in.
+fn widened(c: char) -> bool {
+    widened_when(AMBIGUOUS_WIDE.load(Ordering::Relaxed), c)
+}
+
+fn widened_when(wide: bool, c: char) -> bool {
+    wide && UnicodeWidthChar::width(c) == Some(1)
+        && UnicodeWidthChar::width_cjk(c) == Some(2)
+        && !('\u{2500}'..='\u{259F}').contains(&c)
+        && !crate::caps::rewritten_on_basic(c)
+}
 
 /// Cells one character occupies. Control characters count as zero rather than
 /// as one: they are not printed, and counting them shifts everything after.
 pub fn char_width(c: char) -> usize {
-    UnicodeWidthChar::width(c).unwrap_or(0)
+    UnicodeWidthChar::width(c).unwrap_or(0) + usize::from(widened(c))
 }
 
 /// Cells a string occupies.
 pub fn str_width(s: &str) -> usize {
-    UnicodeWidthStr::width(s)
+    str_width_when(AMBIGUOUS_WIDE.load(Ordering::Relaxed), s)
+}
+
+/// [`str_width`] with the ambiguous rule stated rather than read — what the
+/// tests use, since the switch is process-wide.
+fn str_width_when(wide: bool, s: &str) -> usize {
+    if !wide {
+        return UnicodeWidthStr::width(s);
+    }
+    // Per grapheme, so a sequence unicode-width already counts as a whole
+    // (`☀` + VS16 is an emoji, two cells) is not widened a second time.
+    s.graphemes(true)
+        .map(|g| {
+            let mut chars = g.chars();
+            let base = UnicodeWidthStr::width(g);
+            match (chars.next(), chars.next()) {
+                (Some(c), None) if widened_when(wide, c) => base + 1,
+                _ => base,
+            }
+        })
+        .sum()
 }
 
 /// The longest prefix of `s` that fits in `max` cells, cut on grapheme
@@ -152,6 +206,31 @@ pub fn wrap(s: &str, max: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// On a CJK console, the ambiguous characters a full-width font draws wide
+    /// count two — `℃` is the table cell that pushed its border out — while the
+    /// frames (box drawing, blocks) stay one, and so does everything else.
+    #[test]
+    fn ambiguous_characters_count_two_where_the_console_draws_them_wide() {
+        let cell = "12~26℃(当前约 22℃)";
+        assert_eq!(str_width_when(true, cell), str_width_when(false, cell) + 2);
+        assert_eq!(
+            str_width_when(true, "· … ← ●"),
+            str_width_when(false, "· … ← ●") + 4
+        );
+        assert_eq!(str_width_when(true, "─┌┐│▄█"), 6, "frames stay narrow");
+        assert_eq!(
+            str_width_when(true, "abc 中文"),
+            str_width_when(false, "abc 中文")
+        );
+        // An emoji sequence is already two; it is not widened again.
+        assert_eq!(
+            str_width_when(true, "☀\u{FE0F}"),
+            str_width_when(false, "☀\u{FE0F}")
+        );
+        // A character the basic set rewrites reaches the console as one cell.
+        assert_eq!(str_width_when(true, "▶"), 1);
+    }
 
     #[test]
     fn the_authority_is_unicode_width_not_our_own_table() {

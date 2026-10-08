@@ -333,6 +333,11 @@ fn sgr(style: &Style, caps: crate::caps::Caps) -> String {
             Some(Color::Rgb(r, g, b)) => parts.push(format!("38;2;{r};{g};{b}")),
             _ => {}
         },
+        Some(Color::Ground) => match crate::theme::exact_colour(caps.palette.background(), caps) {
+            Color::Ansi(n) => parts.push(format!("38;5;{n}")),
+            Color::Rgb(r, g, b) => parts.push(format!("38;2;{r};{g};{b}")),
+            _ => {}
+        },
         None => {}
     }
     match style.bg {
@@ -348,7 +353,8 @@ fn sgr(style: &Style, caps: crate::caps::Caps) -> String {
             _ => {}
         },
         Some(Color::Rgb(r, g, b)) => parts.push(format!("48;2;{r};{g};{b}")),
-        None => {}
+        // The cell's own background is what no SGR says.
+        Some(Color::Ground) | None => {}
     }
     if parts.is_empty() {
         String::new()

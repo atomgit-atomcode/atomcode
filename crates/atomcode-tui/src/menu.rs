@@ -135,7 +135,8 @@ impl Menu {
     /// clipped, because a menu half off the edge is a menu whose last item
     /// cannot be reached.
     pub fn rect(&self, screen_w: u16, screen_h: u16) -> Rect {
-        let h = (self.items.len() as u16).min(screen_h);
+        // The items, and a frame of one cell round them (see `render`).
+        let h = (self.items.len() as u16 + 2).min(screen_h);
         if h == 0 {
             return Rect::new(0, 0, 0, 0);
         }
@@ -144,12 +145,15 @@ impl Menu {
             .iter()
             .map(|i| self.line_width(i))
             .max()
-            .unwrap_or(0) as u16;
+            .unwrap_or(0) as u16
+            + 2;
         let w = want.min(screen_w);
+        // One row higher for the frame's top edge, so the pointed-at item is
+        // still the row under the pointer.
         let y = self
             .at
             .1
-            .saturating_sub(self.cursor as u16)
+            .saturating_sub(self.cursor as u16 + 1)
             .min(screen_h.saturating_sub(h));
         let x = self.at.0.min(screen_w.saturating_sub(w));
         Rect::new(x, y, w, h)
@@ -206,7 +210,8 @@ impl Menu {
         if !rect.contains(x, y) {
             return None;
         }
-        let row = (y - rect.y) as usize;
+        // The frame is no item: a press on it is a press beside the menu.
+        let row = ((y - rect.y) as usize).checked_sub(1)?;
         if row >= self.items.len() {
             return None;
         }
@@ -230,7 +235,9 @@ impl Menu {
         if !rect.contains(x, y) {
             return false;
         }
-        let row = (y - rect.y) as usize;
+        let Some(row) = ((y - rect.y) as usize).checked_sub(1) else {
+            return false;
+        };
         if row >= self.items.len() || row == self.cursor {
             return false;
         }
@@ -257,24 +264,62 @@ impl Menu {
             return Vec::new();
         }
         let panel = theme::bg(Role::PanelBg).under(theme::fg(Role::PanelFg));
+        // A frame round it, like the menus a desktop draws: this menu opens over
+        // a selection, and a selection is drawn in the very panel colour the
+        // menu used to light its row with — so the menu over it was a grey
+        // patch in a grey patch, its edge nowhere. The frame is its edge.
+        let edge = theme::fg(Role::Muted).under(panel);
+        let caps = vp.moment.caps;
+        let g = |glyph| caps.g(glyph);
+        let inner = w.saturating_sub(2);
+        let rule = |left, right| {
+            Line::from_spans(vec![Span::styled(
+                format!(
+                    "{}{}{}",
+                    g(left),
+                    g(crate::caps::Glyph::Horizontal).repeat(inner),
+                    g(right)
+                ),
+                edge,
+            )])
+            .truncate(w)
+        };
+        let rows = (vp.rect.h as usize).saturating_sub(2);
         let mut out: Vec<Line> = Vec::with_capacity(vp.rect.h as usize);
-        for (i, item) in self.items.iter().enumerate().take(vp.rect.h as usize) {
+        out.push(rule(
+            crate::caps::Glyph::TopLeft,
+            crate::caps::Glyph::TopRight,
+        ));
+        for (i, item) in self.items.iter().enumerate().take(rows) {
             let here = i == self.cursor;
-            // The pointed-at row is the same panel one step brighter. Reverse is
-            // what it used to be, and reverse is not a colour: the terminal
-            // decides what it means, and on a dark terminal it is a near-white
-            // bar across a near-black panel — the loudest thing on the screen,
-            // for a row that is only being pointed at.
+            // The pointed-at row in the accent, the way a desktop menu lights
+            // its row — not the panel's own brighter step, which is also the
+            // selection's colour and so vanished into the selection under it.
+            // Not reverse either: the terminal decides what reverse is.
             let base = if here {
-                theme::bg(Role::PanelSelBg).under(theme::fg(Role::PanelFg))
+                theme::bg(Role::Accent).under(theme::fg(Role::PanelBg))
             } else {
                 panel
             };
-            let mut spans = vec![Span::styled("  ", base)];
+            let mut spans = vec![Span::styled(" ", base)];
             spans.push(Span::styled(item.label.clone(), base));
             spans.extend(after_the_name(item, base, here, panel));
-            out.push(pad(Line::from_spans(spans), w, base));
+            let row = pad(Line::from_spans(spans), inner, base);
+            let mut framed = vec![Span::styled(
+                g(crate::caps::Glyph::Vertical).to_string(),
+                edge,
+            )];
+            framed.extend(row.spans);
+            framed.push(Span::styled(
+                g(crate::caps::Glyph::Vertical).to_string(),
+                edge,
+            ));
+            out.push(Line::from_spans(framed).truncate(w));
         }
+        out.push(rule(
+            crate::caps::Glyph::BottomLeft,
+            crate::caps::Glyph::BottomRight,
+        ));
         out
     }
 }
@@ -610,15 +655,16 @@ mod tests {
         let menu = Menu::new((10, 10), items()).unwrap();
         let rect = menu.rect(80, 24);
         assert_eq!(
-            rect.y, 10,
-            "the first item sits on the cell that was clicked"
+            rect.y + 1,
+            10,
+            "the first item sits on the cell that was clicked, under the frame"
         );
         assert_eq!(
             menu.rect(80, 24).x,
             10,
             "and the menu starts at the cell that was clicked"
         );
-        assert_eq!(rect.h, 4);
+        assert_eq!(rect.h, 6, "four items and the frame");
     }
 
     #[test]
@@ -629,7 +675,7 @@ mod tests {
         let rect = menu.rect(80, 24);
         assert!(rect.right() <= 80, "runs off the right edge: {rect:?}");
         assert!(rect.bottom() <= 24, "runs off the bottom edge: {rect:?}");
-        assert_eq!(rect.h, 4, "the menu kept all of its items");
+        assert_eq!(rect.h, 6, "the menu kept all of its items");
     }
 
     #[test]
@@ -663,7 +709,7 @@ mod tests {
         let mut menu = Menu::new((0, 0), items()).unwrap();
         let rect = menu.rect(80, 24);
         assert_eq!(
-            menu.click(rect.x, rect.y + 2, 80, 24),
+            menu.click(rect.x, rect.y + 3, 80, 24),
             Some(Step::Picked("clear".into()))
         );
     }
@@ -691,7 +737,7 @@ mod tests {
         for (i, want) in ["copy", "paste", "clear", "send"].iter().enumerate() {
             let mut menu = menu.clone();
             assert_eq!(
-                menu.click(rect.x, rect.y + i as u16, 80, 24),
+                menu.click(rect.x, rect.y + 1 + i as u16, 80, 24),
                 Some(Step::Picked((*want).into())),
                 "row {i} of the menu is not the row that was clicked on"
             );
@@ -708,12 +754,12 @@ mod tests {
         assert!(menu.hover(12, 12, 80, 24), "a move onto row 2 is news");
         let m = Moment::default();
         let lines = menu.render(&Viewport::new(menu.rect(80, 24), &m));
-        let pointed = Some(crate::frame::Color::role(Role::PanelSelBg));
+        let pointed = Some(crate::frame::Color::role(Role::Accent));
         for (i, line) in lines.iter().enumerate() {
-            let bright = line.spans[0].style.bg == pointed;
+            let bright = line.spans.iter().any(|s| s.style.bg == pointed);
             assert_eq!(
                 bright,
-                i == 2,
+                i == 3, // row 2, under the frame's top edge
                 "row {i} is{} the row the pointer is on",
                 if bright { "" } else { " not" }
             );
@@ -731,9 +777,9 @@ mod tests {
         // slide and let a broken hover look correct.
         let mut menu = Menu::new((10, 10), items()).unwrap();
         let rect = menu.rect(80, 24);
-        assert_eq!(rect.y, 10, "this menu sits where it was opened");
+        assert_eq!(rect.y + 1, 10, "this menu sits where it was opened");
         for (i, want) in ["copy", "paste", "clear", "send"].iter().enumerate() {
-            let y = rect.y + i as u16;
+            let y = rect.y + 1 + i as u16;
             menu.hover(rect.x, y, 80, 24);
             assert_eq!(
                 menu.rect(80, 24),
@@ -759,7 +805,7 @@ mod tests {
             "this menu has to slide, or the case is not under test"
         );
         for (i, want) in ["copy", "paste", "clear", "send"].iter().enumerate() {
-            let y = rect.y + i as u16;
+            let y = rect.y + 1 + i as u16;
             menu.hover(rect.x, y, 80, 24);
             assert_eq!(
                 menu.rect(80, 24),
@@ -828,13 +874,34 @@ mod tests {
         let rect = menu.rect(80, 24);
         let lines = menu.render(&Viewport::new(rect, &m));
         let plain = Some(crate::frame::Color::role(Role::PanelBg));
-        let pointed = Some(crate::frame::Color::role(Role::PanelSelBg));
+        let pointed = Some(crate::frame::Color::role(Role::Accent));
+        assert_eq!(
+            lines.len(),
+            rect.h as usize,
+            "the frame's two edges and the items"
+        );
         for (i, line) in lines.iter().enumerate() {
-            let want = if i == menu.cursor() { pointed } else { plain };
             assert_eq!(line.width(), rect.w as usize, "row {i} is not filled");
+            // The frame's own cells are the panel; inside, the pointed-at row is
+            // the accent and the rest the panel.
+            let edge = i == 0 || i == lines.len() - 1;
+            let want = if !edge && i - 1 == menu.cursor() {
+                pointed
+            } else {
+                plain
+            };
+            let inside: Vec<_> = if edge {
+                line.spans.iter().collect()
+            } else {
+                line.spans[1..line.spans.len() - 1].iter().collect()
+            };
             assert!(
-                line.spans.iter().all(|s| s.style.bg == want),
+                inside.iter().all(|s| s.style.bg == want),
                 "row {i} has a cell with no background"
+            );
+            assert!(
+                line.spans.iter().all(|s| s.style.bg.is_some()),
+                "row {i} shows the screen through"
             );
         }
     }
@@ -854,20 +921,24 @@ mod tests {
                 "row {i} is drawn inverted"
             );
         }
+        let lit = &lines[menu.cursor() + 1];
+        let next = &lines[menu.cursor() + 2];
         assert_ne!(
-            lines[menu.cursor()].spans[0].style.bg,
-            lines[menu.cursor() + 1].spans[0].style.bg,
+            lit.spans[1].style.bg, next.spans[1].style.bg,
             "the pointed-at row is the same patch as the rows around it"
         );
-        // And the two patches come from the same resolution, so the step is a
-        // step and not two independent guesses at a colour.
-        let text = theme::resolve(Role::PanelFg, crate::caps::Caps::default());
+        // Not the selection's colour: the menu opens over a selection, and a row
+        // lit in the selection's own panel step disappeared into it.
         assert!(
-            lines[menu.cursor()]
-                .spans
+            lit.spans
                 .iter()
-                .all(|s| s.style.fg == Some(crate::frame::Color::Role(Role::PanelFg))),
-            "the pointed-at row keeps the panel's ink: {text:?}"
+                .all(|s| s.style.bg != Some(crate::frame::Color::role(Role::PanelSelBg))),
+            "the pointed-at row is lit in the selection's colour"
+        );
+        assert_eq!(
+            lit.spans[1].style.fg,
+            Some(crate::frame::Color::Role(Role::PanelBg)),
+            "the panel's own colour as ink on the accent"
         );
     }
 
@@ -875,13 +946,18 @@ mod tests {
     fn the_label_and_its_gloss_are_both_drawn() {
         let menu = Menu::new((0, 0), items()).unwrap();
         let rows = drawn(&menu, 80, 24);
-        assert_eq!(rows.first().unwrap().trim(), "复制全文");
+        assert!(rows[1].contains("复制全文"), "{rows:?}");
         // And the about text, where one is given.
         let with_about =
             Menu::new((0, 0), vec![Item::new("x", "复制全文").about("放剪贴板")]).unwrap();
         let rows = drawn(&with_about, 80, 24);
         assert!(
-            rows[0].contains("复制全文") && rows[0].contains("放剪贴板"),
+            rows[1].contains("复制全文") && rows[1].contains("放剪贴板"),
+            "{rows:?}"
+        );
+        // Framed: the first and last rows are its edges.
+        assert!(
+            rows[0].starts_with('┌') && rows[2].starts_with('└'),
             "{rows:?}"
         );
     }
