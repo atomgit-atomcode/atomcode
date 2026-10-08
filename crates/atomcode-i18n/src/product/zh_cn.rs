@@ -1120,6 +1120,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdDescClear => "开始新对话（清空上下文和屏幕）".into(),
         Msg::CmdDescSession => "开始新会话（清除对话）".into(),
         Msg::CmdDescCost => "显示本会话 Token 用量".into(),
+        Msg::WebuiServerStopped => "webui 服务已停止，进程退出。".into(),
         Msg::CmdDescUsage => "显示 CodingPlan 用量（标签：当前窗口 / 总览 / 模型）".into(),
         Msg::CmdDescContext => "显示上下文预算明细".into(),
         Msg::CmdDescWorklog => "跨所有项目的每日工作复盘（/worklog [today|yesterday|月/日]）".into(),

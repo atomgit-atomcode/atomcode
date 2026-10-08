@@ -1920,7 +1920,12 @@ async fn run() -> Result<i32> {
                         }
                         _ = stopped => {
                             tracing::error!(target: "atomcode::webui", "atomcode webui exiting: the server stopped");
-                            eprintln!("webui 服务已停止，进程退出。");
+                            eprintln!(
+                                "{}",
+                                atomcode_config::i18n::t(
+                                    atomcode_config::i18n::Msg::WebuiServerStopped
+                                )
+                            );
                             1
                         }
                     }

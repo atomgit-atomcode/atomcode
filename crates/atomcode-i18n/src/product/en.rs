@@ -1151,6 +1151,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdDescClear => "Start a new conversation (clears context + screen)".into(),
         Msg::CmdDescSession => "Start a new session (clears conversation)".into(),
         Msg::CmdDescCost => "Show session token usage".into(),
+        Msg::WebuiServerStopped => "The webui server stopped; exiting.".into(),
         Msg::CmdDescUsage => "Show CodingPlan usage (tabs: current / overview / models)".into(),
         Msg::CmdDescContext => "Show context budget breakdown".into(),
         Msg::CmdDescWorklog => "Daily work recap across all projects (/worklog [today|yesterday|M/D])".into(),

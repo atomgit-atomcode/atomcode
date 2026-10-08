@@ -1366,6 +1366,8 @@ pub enum Msg<'a> {
     CmdDescClear,
     CmdDescSession,
     CmdDescCost,
+    /// `atomcode webui`: the server it was serving stopped, so the process exits.
+    WebuiServerStopped,
     /// Description for the `/usage` slash command — opens the CodingPlan usage modal.
     CmdDescUsage,
     CmdDescContext,
