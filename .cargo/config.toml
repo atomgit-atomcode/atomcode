@@ -42,3 +42,14 @@ rustflags = ["-C", "target-feature=+crt-static"]
 # 下一次编译是全量。
 [build]
 incremental = false
+
+# tree-sitter 的各语言语法包(codeintel / bash 解析)在 Windows 上把入口函数标成
+# `__declspec(dllexport)`,链进来的 exe 于是带了导出表,MSVC link.exe 每次都打印
+# 「正在创建库 xxx.lib 和对象 xxx.exp」,新版 rustc 把它报成 `linker_messages`
+# 警告,还在 target/ 里多留一对没人用的 .lib/.exp。我们只静态链接这些语法,不需要
+# 导出;它们的 parser.c 认 `TREE_SITTER_HIDE_SYMBOLS`,定义了就不加 dllexport。
+# cc 读 `CFLAGS_<target>`,所以只作用于 Windows MSVC 目标;`[env]` 会传给 build
+# script,外部已设的同名变量优先。
+[env]
+CFLAGS_x86_64_pc_windows_msvc = "-DTREE_SITTER_HIDE_SYMBOLS"
+CFLAGS_aarch64_pc_windows_msvc = "-DTREE_SITTER_HIDE_SYMBOLS"

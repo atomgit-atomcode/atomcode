@@ -1481,6 +1481,15 @@ pub fn look(tool: &str) -> Look {
             always_open: true,
             ..GENERIC
         },
+        // A replace across many files changed the workspace too. It draws no
+        // diff — its result is which files and how many replacements — but that
+        // list is the change, and folded into a run's `已执行了 N 个工具` it was
+        // a set of edited files nobody could see.
+        "search_replace" => Look {
+            subject: &["search", "glob", "path"],
+            always_open: true,
+            ..GENERIC
+        },
         "read_file" | "list_directory" => Look {
             subject: &["file_path", "path"],
             ..GENERIC
