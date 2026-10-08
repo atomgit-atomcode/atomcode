@@ -13,6 +13,7 @@ import {
   reduceLiveLifecycle,
   resolveUserInputRequest,
   restoreLiveSnapshot,
+  sessionHeldElsewhere,
   syncAttachDisposition,
 } from './chatTerminal.ts';
 
@@ -219,4 +220,13 @@ test('a live user-input terminal clears only its matching prompt', () => {
   assert.equal(resolveUserInputRequest(current, 42), null);
   assert.equal(resolveUserInputRequest(current, 41), current);
   assert.equal(resolveUserInputRequest(null, 42), null);
+});
+
+test('a session another atomcode holds is told apart from other failures', () => {
+  assert.equal(
+    sessionHeldElsewhere('session "3f5a" is already in use by another runtime'),
+    true,
+  );
+  assert.equal(sessionHeldElsewhere('HTTP 500'), false);
+  assert.equal(sessionHeldElsewhere(undefined), false);
 });

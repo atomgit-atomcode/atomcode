@@ -2928,7 +2928,7 @@ fn classify_delete_session_error(error: &anyhow::Error) -> (StatusCode, Json<Api
         Some(SessionStoreError::SessionInUse { .. }) => delete_session_api_error(
             StatusCode::CONFLICT,
             "SESSION_IN_USE",
-            "This session is active. Switch to or create another session, then try again.",
+            "This session is open elsewhere: in another atomcode process, or still running a task here. Close it there or let the task finish, then try again.",
         ),
         Some(SessionStoreError::NotFound { .. }) => delete_session_api_error(
             StatusCode::NOT_FOUND,
@@ -3117,7 +3117,7 @@ fn classify_repair_session_error(
         SessionStoreError::SessionInUse { .. } => delete_session_api_error(
             StatusCode::CONFLICT,
             "SESSION_IN_USE",
-            "This session is active. Switch to or create another session, then try again.",
+            "This session is open elsewhere: in another atomcode process, or still running a task here. Close it there or let the task finish, then try again.",
         )
         .into_response(),
         SessionStoreError::NotFound { path }
@@ -3208,7 +3208,8 @@ async fn delete_session(
         // A displayed session can still be the runtime's idle binding, which
         // keeps its lease for the whole binding lifetime. Do not bypass that
         // lease: ask the single runtime owner to transition to a fresh staged
-        // session first. Active turns fail closed as SESSION_IN_USE.
+        // session first. Its active turn fails closed as SESSION_BUSY; a lease held
+        // by anyone else (another atomcode, a /chat run here) as SESSION_IN_USE.
         let current_binding = match crate::native_live::binding()
             .ok()
             .filter(|binding| binding.session_id == id)
@@ -3263,7 +3264,7 @@ async fn delete_session(
                     crate::live_hub::HubError::ActiveTurn => {
                         return delete_session_api_error(
                             StatusCode::CONFLICT,
-                            "SESSION_IN_USE",
+                            "SESSION_BUSY",
                             "This session has an active turn. Stop it, then try again.",
                         )
                         .into_response();
@@ -7595,6 +7596,8 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body.code.as_deref(), Some("SESSION_IN_USE"));
         assert!(!body.error.contains("active.lease"));
+        // A lease is not only an active turn: it names where else it may be open.
+        assert!(body.error.contains("another atomcode process"));
 
         let missing = anyhow::Error::new(SessionStoreError::NotFound {
             path: PathBuf::from("missing.meta"),

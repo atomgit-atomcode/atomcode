@@ -237,3 +237,12 @@ export function resolveUserInputRequest<T extends { request_id: number }>(
 ): T | null {
   return current?.request_id === resolvedRequestId ? null : current;
 }
+
+/**
+ * Whether a runtime failure is a session another atomcode holds (a terminal
+ * window, VS Code). The session store's own wording is all the wire carries,
+ * so this is where it is read — one place, not a `.includes` per caller.
+ */
+export function sessionHeldElsewhere(message: string | undefined): boolean {
+  return !!message && message.includes('already in use');
+}

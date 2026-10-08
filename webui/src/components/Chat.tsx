@@ -85,6 +85,7 @@ import {
   reduceLiveLifecycle,
   resolveUserInputRequest,
   restoreLiveSnapshot,
+  sessionHeldElsewhere,
   syncAttachDisposition,
   type ChatRecoveryEvent,
   type ChatRecoveryState,
@@ -935,7 +936,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
             // refused, where it failed again with a line that named nothing.
             if (prevId) {
               const why = result.error ?? 'live runtime rejected the session switch';
-              noticeAfterSwitchRef.current = why.includes('already in use')
+              noticeAfterSwitchRef.current = sessionHeldElsewhere(why)
                 ? t('sync.sessionInUse')
                 : t('sync.switchFailed', { error: why });
               onSessionId(prevId);
@@ -2357,7 +2358,14 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       case 'error':
         stampLastAssistantCompletion();
         resetTodoBatch(false);
-        appendToLastAssistant('\n\n' + t('chat.error', { msg: event.message }));
+        // A session another atomcode holds says so in words, with what to do —
+        // not the session store's own line about leases.
+        appendToLastAssistant(
+          '\n\n' +
+            (sessionHeldElsewhere(event.message)
+              ? t('chat.sessionInUse')
+              : t('chat.error', { msg: event.message })),
+        );
         transitionChatRecovery({ type: 'authoritative_terminal' });
         setBusy(false);
         setQueued([]); // 出错：丢弃排队消息

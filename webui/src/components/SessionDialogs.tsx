@@ -103,6 +103,7 @@ export function DeleteDialog({ session, onClose, onDone }: DeleteDialogProps) {
       const localized =
         cause instanceof DeleteSessionError
           ? ({
+              SESSION_BUSY: t('delete.busy'),
               SESSION_IN_USE: t('delete.inUse'),
               SESSION_NOT_FOUND: t('delete.notFound'),
               INVALID_SESSION: t('delete.invalid'),
