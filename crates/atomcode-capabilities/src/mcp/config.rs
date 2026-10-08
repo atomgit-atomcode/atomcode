@@ -1,7 +1,19 @@
 //! MCP configuration loading.
+//!
+//! Servers are configured in two places: the user-level `<user tree>/mcp.json`
+//! (every project) and the project's `.mcp.json` (that project; it overrides the
+//! user-level entry of the same name).
+//!
+//! The free functions read and write those files. Every edit is also offered on a
+//! config's text alone (`*_in_text`, [`parse_mcp_servers`]), for a host that keeps
+//! the user-level config itself — it holds credentials, and the host may keep it
+//! encrypted — and reads and stores it its own way. [`McpStorage`] is the two
+//! together: the files, or the host's documents for the user-level config and the
+//! OAuth tokens. See `docs/mcp.md` §3.1.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Map, Value};
@@ -196,7 +208,14 @@ fn merge_configs(project_dir: &Path, user_dir: &Path) -> Result<Vec<McpServerCon
     let project_config =
         load_config_file(&project_dir.join(".mcp.json"), McpConfigSource::Project)?;
 
-    // Merge: project overrides user
+    Ok(project_over_user(user_config, project_config))
+}
+
+/// Project overrides user for a server of the same name.
+fn project_over_user(
+    user_config: Vec<McpServerConfig>,
+    project_config: Vec<McpServerConfig>,
+) -> Vec<McpServerConfig> {
     let mut merged: BTreeMap<String, McpServerConfig> = BTreeMap::new();
 
     for config in user_config {
@@ -207,7 +226,215 @@ fn merge_configs(project_dir: &Path, user_dir: &Path) -> Result<Vec<McpServerCon
         merged.insert(config.name.clone(), config);
     }
 
-    Ok(merged.into_values().collect())
+    merged.into_values().collect()
+}
+
+// ---- where one project's MCP servers are kept -------------------------------------
+
+/// Where one project's MCP servers are configured, and their OAuth tokens kept.
+///
+/// [`McpStorage::new`] is the files every front end of this workspace uses: the
+/// project's `.mcp.json`, and the user tree's `mcp.json` and `mcp_auth.toml` — the
+/// same reads and writes as the free functions in this module, byte for byte.
+///
+/// A host that keeps the two user-level documents itself — they hold credentials,
+/// and it may keep them encrypted — hands them in as
+/// [`atomcode_config::DocumentStore`]s ([`with_user_config`](Self::with_user_config),
+/// [`with_tokens`](Self::with_tokens)). Every read goes through `read` and every
+/// edit through `update`, so the library never touches those documents' storage and
+/// never writes them as plain text. The project's `.mcp.json` is written by hand and
+/// usually committed; it stays a plain file in every case.
+///
+/// A document the host cannot read is an error naming it, never an empty config:
+/// an edit reads first and stops there, so an unreadable document is not
+/// overwritten with an empty one.
+#[derive(Clone, Debug)]
+pub struct McpStorage {
+    project_dir: PathBuf,
+    user_dir: PathBuf,
+    user_config: Option<Arc<dyn atomcode_config::DocumentStore>>,
+    tokens: Option<Arc<dyn atomcode_config::DocumentStore>>,
+}
+
+/// How a host-kept user-level config is named in an error.
+const HOSTED_USER_CONFIG: &str = "the user-level MCP config the host keeps";
+
+impl McpStorage {
+    /// The project's `.mcp.json` and the user tree's files.
+    pub fn new(project_dir: impl Into<PathBuf>, user_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            project_dir: project_dir.into(),
+            user_dir: user_dir.into(),
+            user_config: None,
+            tokens: None,
+        }
+    }
+
+    /// The user-level config (what `mcp.json` holds) is kept by the host.
+    pub fn with_user_config(mut self, store: Arc<dyn atomcode_config::DocumentStore>) -> Self {
+        self.user_config = Some(store);
+        self
+    }
+
+    /// The OAuth tokens (what `mcp_auth.toml` holds, in its format) are kept by the host.
+    pub fn with_tokens(mut self, store: Arc<dyn atomcode_config::DocumentStore>) -> Self {
+        self.tokens = Some(store);
+        self
+    }
+
+    /// The directory whose `.mcp.json` is the project config.
+    pub fn project_dir(&self) -> &Path {
+        &self.project_dir
+    }
+
+    /// The user tree: still where the project trust store is, whoever keeps the rest.
+    pub fn user_dir(&self) -> &Path {
+        &self.user_dir
+    }
+
+    /// Where the OAuth tokens are kept.
+    pub fn tokens(&self) -> super::oauth::McpTokenStore {
+        match &self.tokens {
+            Some(store) => super::oauth::McpTokenStore::hosted(store.clone()),
+            None => super::oauth::McpTokenStore::in_tree(&self.user_dir),
+        }
+    }
+
+    /// [`load_mcp_config`] over this storage.
+    pub fn load(&self) -> Result<Vec<McpServerConfig>> {
+        Ok(self
+            .load_including_disabled()?
+            .into_iter()
+            .filter(|c| !c.disabled)
+            .collect())
+    }
+
+    /// [`load_mcp_config_including_disabled`] over this storage.
+    pub fn load_including_disabled(&self) -> Result<Vec<McpServerConfig>> {
+        let Some(store) = &self.user_config else {
+            return load_mcp_config_including_disabled(&self.project_dir, &self.user_dir);
+        };
+        let user_config = match store
+            .read()
+            .with_context(|| format!("Failed to read {HOSTED_USER_CONFIG}"))?
+        {
+            Some(text) => servers_in(&text, McpConfigSource::User, &HOSTED_USER_CONFIG)?,
+            None => Vec::new(),
+        };
+        let project_config = load_config_file(
+            &self.project_dir.join(".mcp.json"),
+            McpConfigSource::Project,
+        )?;
+        Ok(project_over_user(user_config, project_config))
+    }
+
+    /// The file a server of this source is read from: [`config_path_for_source`], and
+    /// `None` for a user-level config the host keeps — there is no file of it to show
+    /// or open.
+    pub fn path_for(&self, source: McpConfigSource) -> Option<PathBuf> {
+        match source {
+            McpConfigSource::User if self.user_config.is_some() => None,
+            _ => config_path_for_source(&self.project_dir, &self.user_dir, source),
+        }
+    }
+
+    /// [`set_mcp_server_disabled_in_json_file`] on the config `source` is read from.
+    pub fn set_server_disabled(
+        &self,
+        source: McpConfigSource,
+        server_key: &str,
+        disabled: bool,
+    ) -> Result<()> {
+        match (source, &self.user_config) {
+            (McpConfigSource::User, Some(store)) => {
+                if server_key.is_empty() {
+                    bail!("MCP server name must not be empty");
+                }
+                store.update(&mut |text| {
+                    let text = text.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "MCP server '{server_key}' is not defined in {HOSTED_USER_CONFIG}"
+                        )
+                    })?;
+                    with_server_disabled(text, server_key, disabled, &HOSTED_USER_CONFIG).map(Some)
+                })
+            }
+            _ => {
+                set_mcp_server_disabled_in_json_file(&self.file_for(source)?, server_key, disabled)
+            }
+        }
+    }
+
+    /// [`merge_stdio_mcp_server_into_json_file`] on the config `source` is read from.
+    pub fn merge_stdio_server(
+        &self,
+        source: McpConfigSource,
+        server_key: &str,
+        program: &str,
+        args: &[String],
+    ) -> Result<()> {
+        match (source, &self.user_config) {
+            (McpConfigSource::User, Some(store)) => {
+                check_stdio_entry(server_key, program)?;
+                store.update(&mut |text| {
+                    with_stdio_server(text, server_key, program, args, &HOSTED_USER_CONFIG)
+                        .map(Some)
+                })
+            }
+            _ => merge_stdio_mcp_server_into_json_file(
+                &self.file_for(source)?,
+                server_key,
+                program,
+                args,
+            ),
+        }
+    }
+
+    /// [`merge_http_oauth_mcp_server_into_json_file`] on the config `source` is read from.
+    pub fn merge_http_oauth_server(
+        &self,
+        source: McpConfigSource,
+        server_key: &str,
+        url: &str,
+        provider: &str,
+    ) -> Result<()> {
+        match (source, &self.user_config) {
+            (McpConfigSource::User, Some(store)) => {
+                check_http_oauth_entry(server_key, url, provider)?;
+                store.update(&mut |text| {
+                    with_http_oauth_server(text, server_key, url, provider, &HOSTED_USER_CONFIG)
+                        .map(Some)
+                })
+            }
+            _ => merge_http_oauth_mcp_server_into_json_file(
+                &self.file_for(source)?,
+                server_key,
+                url,
+                provider,
+            ),
+        }
+    }
+
+    /// [`add_auto_approved_tool`] over this storage: the project file when it defines
+    /// `server`, else the user-level config.
+    pub fn add_auto_approved_tool(&self, server: &str, tool: &str) -> Result<()> {
+        let Some(store) = &self.user_config else {
+            return add_auto_approved_tool(&self.project_dir, &self.user_dir, server, tool);
+        };
+        let project_path = self.project_dir.join(".mcp.json");
+        if file_defines_server(&project_path, server) {
+            return write_auto_approved_tool(&project_path, server, tool);
+        }
+        store.update(&mut |text| {
+            with_auto_approved_tool(text, server, tool, &HOSTED_USER_CONFIG).map(Some)
+        })
+    }
+
+    fn file_for(&self, source: McpConfigSource) -> Result<PathBuf> {
+        config_path_for_source(&self.project_dir, &self.user_dir, source).ok_or_else(|| {
+            anyhow::anyhow!("a driver-supplied MCP server has no config file to edit")
+        })
+    }
 }
 
 /// Load and merge MCP configurations from project and user levels.
@@ -259,7 +486,7 @@ pub fn config_path_for_source(
 /// (`McpServerEntry::disabled` is `#[serde(default)]`).
 ///
 /// Bails, leaving the file byte-identical, when the file carries JSONC comments (see
-/// [`read_json_for_rewrite`]) or when it does not define `server_key`. This edits an existing
+/// `json_for_rewrite`) or when it does not define `server_key`. This edits an existing
 /// entry; it never adds a server.
 pub fn set_mcp_server_disabled_in_json_file(
     path: &Path,
@@ -269,8 +496,35 @@ pub fn set_mcp_server_disabled_in_json_file(
     if server_key.is_empty() {
         bail!("MCP server name must not be empty");
     }
+    let text = read_config_text(path)?;
+    let out = with_server_disabled(&text, server_key, disabled, &path.display())?;
+    std::fs::write(path, out)
+        .with_context(|| format!("Failed to write MCP config to {}", path.display()))?;
 
-    let mut root: Value = read_json_for_rewrite(path)?;
+    Ok(())
+}
+
+/// [`set_mcp_server_disabled_in_json_file`] on a config's text rather than its file:
+/// the text it should be stored as afterwards. Refuses the same things.
+pub fn set_mcp_server_disabled_in_text(
+    text: &str,
+    server_key: &str,
+    disabled: bool,
+) -> Result<String> {
+    with_server_disabled(text, server_key, disabled, &GIVEN_TEXT)
+}
+
+fn with_server_disabled(
+    text: &str,
+    server_key: &str,
+    disabled: bool,
+    origin: &dyn std::fmt::Display,
+) -> Result<String> {
+    if server_key.is_empty() {
+        bail!("MCP server name must not be empty");
+    }
+
+    let mut root: Value = json_for_rewrite(text, origin)?;
 
     let root_obj = root
         .as_object_mut()
@@ -279,12 +533,9 @@ pub fn set_mcp_server_disabled_in_json_file(
     // Merge the legacy `servers` key into `mcpServers` first, so the edit lands on the entry
     // a reader would resolve — and is written back in one place.
     let mut servers = collect_merged_mcp_server_maps(root_obj);
-    let entry = servers.get_mut(server_key).ok_or_else(|| {
-        anyhow::anyhow!(
-            "MCP server '{server_key}' is not defined in {}",
-            path.display()
-        )
-    })?;
+    let entry = servers
+        .get_mut(server_key)
+        .ok_or_else(|| anyhow::anyhow!("MCP server '{server_key}' is not defined in {origin}"))?;
     let entry_obj = entry
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("MCP server '{server_key}' entry is not an object"))?;
@@ -299,10 +550,16 @@ pub fn set_mcp_server_disabled_in_json_file(
     root_obj.remove("servers");
 
     let text = serde_json::to_string_pretty(&root).context("Failed to serialize MCP config")?;
-    std::fs::write(path, format!("{text}\n"))
-        .with_context(|| format!("Failed to write MCP config to {}", path.display()))?;
+    Ok(format!("{text}\n"))
+}
 
-    Ok(())
+/// What the text functions name as the config's origin in an error, where the
+/// file functions name the file.
+const GIVEN_TEXT: &str = "the given text";
+
+fn read_config_text(path: &Path) -> Result<String> {
+    std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read MCP config from {}", path.display()))
 }
 
 /// True when `text` carries JSONC comments, i.e. rewriting it as plain JSON would
@@ -317,18 +574,15 @@ fn has_json_comments(text: &str) -> bool {
 /// comment in the file. Refuse instead: the read path tolerates comments, so the config
 /// still works — it just cannot be edited for you. Losing someone's annotations without
 /// telling them is worse than making them edit by hand.
-fn read_json_for_rewrite(path: &Path) -> Result<Value> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read MCP config from {}", path.display()))?;
-    if has_json_comments(&text) {
+fn json_for_rewrite(text: &str, origin: &dyn std::fmt::Display) -> Result<Value> {
+    if has_json_comments(text) {
         bail!(
-            "{} contains comments, and rewriting it would delete them. \
-             Edit the file by hand, or remove the comments and retry.",
-            path.display()
+            "{origin} contains comments, and rewriting it would delete them. \
+             Edit the file by hand, or remove the comments and retry."
         );
     }
-    serde_json::from_str(&text)
-        .with_context(|| format!("Failed to parse MCP config JSON from {}", path.display()))
+    serde_json::from_str(text)
+        .with_context(|| format!("Failed to parse MCP config JSON from {origin}"))
 }
 
 fn load_config_file(path: &Path, source: McpConfigSource) -> Result<Vec<McpServerConfig>> {
@@ -336,11 +590,27 @@ fn load_config_file(path: &Path, source: McpConfigSource) -> Result<Vec<McpServe
         return Ok(Vec::new());
     }
 
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read MCP config from {}", path.display()))?;
+    let content = read_config_text(path)?;
+    servers_in(&content, source, &path.display())
+}
 
-    let raw: McpConfigFile = serde_json::from_str(&crate::jsonc::strip_comments(&content))
-        .with_context(|| format!("Failed to parse MCP config from {}", path.display()))?;
+/// The servers a config's text configures, read as a file of `source` would be:
+/// comments tolerated, the legacy `servers` key accepted, `disabled` entries kept
+/// (filter them the way [`load_mcp_config`] does when building a tool catalog).
+///
+/// For a host that keeps the config somewhere other than a plain file — encrypted,
+/// say — and reads it itself.
+pub fn parse_mcp_servers(text: &str, source: McpConfigSource) -> Result<Vec<McpServerConfig>> {
+    servers_in(text, source, &GIVEN_TEXT)
+}
+
+fn servers_in(
+    content: &str,
+    source: McpConfigSource,
+    origin: &dyn std::fmt::Display,
+) -> Result<Vec<McpServerConfig>> {
+    let raw: McpConfigFile = serde_json::from_str(&crate::jsonc::strip_comments(content))
+        .with_context(|| format!("Failed to parse MCP config from {origin}"))?;
 
     let mut configs = Vec::new();
 
@@ -470,17 +740,59 @@ pub fn merge_stdio_mcp_server_into_json_file(
     program: &str,
     args: &[String],
 ) -> Result<()> {
+    check_stdio_entry(server_key, program)?;
+    let existing = if path.exists() {
+        Some(read_config_text(path)?)
+    } else {
+        None
+    };
+    let out = with_stdio_server(
+        existing.as_deref(),
+        server_key,
+        program,
+        args,
+        &path.display(),
+    )?;
+    create_parent(path)?;
+    std::fs::write(path, out)
+        .with_context(|| format!("Failed to write MCP config to {}", path.display()))?;
+
+    Ok(())
+}
+
+/// [`merge_stdio_mcp_server_into_json_file`] on a config's text — `None` for a config
+/// that does not exist yet: the text it should be stored as afterwards.
+pub fn merge_stdio_mcp_server_into_text(
+    text: Option<&str>,
+    server_key: &str,
+    program: &str,
+    args: &[String],
+) -> Result<String> {
+    with_stdio_server(text, server_key, program, args, &GIVEN_TEXT)
+}
+
+fn check_stdio_entry(server_key: &str, program: &str) -> Result<()> {
     if server_key.is_empty() {
         bail!("MCP server name must not be empty");
     }
     if program.is_empty() {
         bail!("command must not be empty");
     }
+    Ok(())
+}
 
-    let mut root: Value = if path.exists() {
-        read_json_for_rewrite(path)?
-    } else {
-        json!({})
+fn with_stdio_server(
+    existing: Option<&str>,
+    server_key: &str,
+    program: &str,
+    args: &[String],
+    origin: &dyn std::fmt::Display,
+) -> Result<String> {
+    check_stdio_entry(server_key, program)?;
+
+    let mut root: Value = match existing {
+        Some(text) => json_for_rewrite(text, origin)?,
+        None => json!({}),
     };
 
     let root_obj = root
@@ -496,6 +808,11 @@ pub fn merge_stdio_mcp_server_into_json_file(
     root_obj.insert("mcpServers".to_string(), Value::Object(servers));
     root_obj.remove("servers");
 
+    let text = serde_json::to_string_pretty(&root).context("Failed to serialize MCP config")?;
+    Ok(format!("{text}\n"))
+}
+
+fn create_parent(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).with_context(|| {
@@ -503,11 +820,6 @@ pub fn merge_stdio_mcp_server_into_json_file(
             })?;
         }
     }
-
-    let text = serde_json::to_string_pretty(&root).context("Failed to serialize MCP config")?;
-    std::fs::write(path, format!("{text}\n"))
-        .with_context(|| format!("Failed to write MCP config to {}", path.display()))?;
-
     Ok(())
 }
 
@@ -518,6 +830,37 @@ pub fn merge_http_oauth_mcp_server_into_json_file(
     url: &str,
     provider: &str,
 ) -> Result<()> {
+    check_http_oauth_entry(server_key, url, provider)?;
+    let existing = if path.exists() {
+        Some(read_config_text(path)?)
+    } else {
+        None
+    };
+    let out = with_http_oauth_server(
+        existing.as_deref(),
+        server_key,
+        url,
+        provider,
+        &path.display(),
+    )?;
+    create_parent(path)?;
+    std::fs::write(path, out)
+        .with_context(|| format!("Failed to write MCP config to {}", path.display()))?;
+    Ok(())
+}
+
+/// [`merge_http_oauth_mcp_server_into_json_file`] on a config's text — `None` for a
+/// config that does not exist yet: the text it should be stored as afterwards.
+pub fn merge_http_oauth_mcp_server_into_text(
+    text: Option<&str>,
+    server_key: &str,
+    url: &str,
+    provider: &str,
+) -> Result<String> {
+    with_http_oauth_server(text, server_key, url, provider, &GIVEN_TEXT)
+}
+
+fn check_http_oauth_entry(server_key: &str, url: &str, provider: &str) -> Result<()> {
     if server_key.is_empty() {
         bail!("MCP server name must not be empty");
     }
@@ -527,11 +870,21 @@ pub fn merge_http_oauth_mcp_server_into_json_file(
     if provider.is_empty() {
         bail!("provider must not be empty");
     }
+    Ok(())
+}
 
-    let mut root: Value = if path.exists() {
-        read_json_for_rewrite(path)?
-    } else {
-        json!({})
+fn with_http_oauth_server(
+    existing: Option<&str>,
+    server_key: &str,
+    url: &str,
+    provider: &str,
+    origin: &dyn std::fmt::Display,
+) -> Result<String> {
+    check_http_oauth_entry(server_key, url, provider)?;
+
+    let mut root: Value = match existing {
+        Some(text) => json_for_rewrite(text, origin)?,
+        None => json!({}),
     };
 
     let root_obj = root
@@ -550,18 +903,8 @@ pub fn merge_http_oauth_mcp_server_into_json_file(
     root_obj.insert("mcpServers".to_string(), Value::Object(servers));
     root_obj.remove("servers");
 
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("Failed to create parent directory for {}", path.display())
-            })?;
-        }
-    }
-
     let pretty = serde_json::to_string_pretty(&root).context("Failed to serialize MCP config")?;
-    std::fs::write(path, format!("{}\n", pretty))
-        .with_context(|| format!("Failed to write MCP config to {}", path.display()))?;
-    Ok(())
+    Ok(format!("{}\n", pretty))
 }
 
 /// Expand environment variables in a string.
@@ -647,27 +990,64 @@ pub fn add_auto_approved_tool(
     let project_path = project_dir.join(".mcp.json");
     let user_path = user_dir.join("mcp.json");
 
-    let defines = |p: &Path| -> bool {
-        std::fs::read_to_string(p)
-            .ok()
-            .and_then(|s| serde_json::from_str::<Value>(&crate::jsonc::strip_comments(&s)).ok())
-            .and_then(|v| {
-                let obj = v.get("mcpServers").or_else(|| v.get("servers")).cloned()?;
-                obj.as_object().map(|m| m.contains_key(server))
-            })
-            .unwrap_or(false)
-    };
-
-    let target = if defines(&project_path) {
+    let target = if file_defines_server(&project_path, server) {
         project_path
     } else {
         user_path
     };
 
-    let mut root: Value = if target.exists() {
-        read_json_for_rewrite(&target)?
+    write_auto_approved_tool(&target, server, tool)
+}
+
+/// Whether the config file at `path` defines `server` — anything unreadable or
+/// unparseable does not.
+fn file_defines_server(path: &Path, server: &str) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&crate::jsonc::strip_comments(&s)).ok())
+        .and_then(|v| {
+            let obj = v.get("mcpServers").or_else(|| v.get("servers")).cloned()?;
+            obj.as_object().map(|m| m.contains_key(server))
+        })
+        .unwrap_or(false)
+}
+
+fn write_auto_approved_tool(target: &Path, server: &str, tool: &str) -> Result<()> {
+    let existing = if target.exists() {
+        Some(read_config_text(target)?)
     } else {
-        serde_json::json!({ "mcpServers": {} })
+        None
+    };
+    let out = with_auto_approved_tool(existing.as_deref(), server, tool, &target.display())?;
+
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(target, out)?;
+    Ok(())
+}
+
+/// The edit [`add_auto_approved_tool`] makes to whichever file it picks, on a config's
+/// text — `None` for a config that does not exist yet: the text it should be stored as
+/// afterwards. Choosing the file (the project's when it defines `server`, else the
+/// user-level one) stays with the caller.
+pub fn add_auto_approved_tool_to_text(
+    text: Option<&str>,
+    server: &str,
+    tool: &str,
+) -> Result<String> {
+    with_auto_approved_tool(text, server, tool, &GIVEN_TEXT)
+}
+
+fn with_auto_approved_tool(
+    existing: Option<&str>,
+    server: &str,
+    tool: &str,
+    origin: &dyn std::fmt::Display,
+) -> Result<String> {
+    let mut root: Value = match existing {
+        Some(text) => json_for_rewrite(text, origin)?,
+        None => serde_json::json!({ "mcpServers": {} }),
     };
 
     let key = if root.get("servers").is_some() && root.get("mcpServers").is_none() {
@@ -698,11 +1078,7 @@ pub fn add_auto_approved_tool(
         arr.push(Value::String(tool.to_string()));
     }
 
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&target, serde_json::to_string_pretty(&root)?)?;
-    Ok(())
+    Ok(serde_json::to_string_pretty(&root)?)
 }
 
 #[cfg(test)]
@@ -1222,5 +1598,432 @@ mod example_template_tests {
             configs.iter().all(|c| c.disabled),
             "every template server must ship disabled"
         );
+    }
+}
+
+/// The text functions are the file functions without the file: for one config,
+/// the same edit yields exactly the bytes the file function writes, and the
+/// same refusals — so a host that keeps the config elsewhere (encrypted, say)
+/// gets the edits the product makes to its own file, not a second version.
+#[cfg(test)]
+mod text_tests {
+    use super::*;
+
+    const START: &str = r#"{
+  "keep": 1,
+  "servers": { "old": { "command": "a" } },
+  "mcpServers": { "srv": { "command": "npx", "args": ["x"] } }
+}"#;
+
+    /// Run `file_edit` on a file holding `start` (or no file for `None`) and
+    /// return what it wrote.
+    fn file_result(start: Option<&str>, file_edit: impl FnOnce(&Path) -> Result<()>) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        if let Some(start) = start {
+            std::fs::write(&path, start).unwrap();
+        }
+        file_edit(&path).unwrap();
+        std::fs::read_to_string(&path).unwrap()
+    }
+
+    #[test]
+    fn each_text_edit_is_byte_for_byte_its_file_edit() {
+        for start in [Some(START), None] {
+            let args = vec!["-y".to_string(), "pkg".to_string()];
+            assert_eq!(
+                merge_stdio_mcp_server_into_text(start, "new", "node", &args).unwrap(),
+                file_result(start, |p| merge_stdio_mcp_server_into_json_file(
+                    p, "new", "node", &args
+                ))
+            );
+            assert_eq!(
+                merge_http_oauth_mcp_server_into_text(start, "web", "https://m.test", "github")
+                    .unwrap(),
+                file_result(start, |p| merge_http_oauth_mcp_server_into_json_file(
+                    p,
+                    "web",
+                    "https://m.test",
+                    "github"
+                ))
+            );
+            assert_eq!(
+                add_auto_approved_tool_to_text(start, "srv", "query").unwrap(),
+                file_result(start, |p| {
+                    let user = p.parent().unwrap();
+                    let project = tempfile::tempdir().unwrap();
+                    add_auto_approved_tool(project.path(), user, "srv", "query")
+                })
+            );
+        }
+        for disabled in [true, false] {
+            assert_eq!(
+                set_mcp_server_disabled_in_text(START, "srv", disabled).unwrap(),
+                file_result(Some(START), |p| set_mcp_server_disabled_in_json_file(
+                    p, "srv", disabled
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn parsing_text_reads_what_reading_the_file_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        // Not `START`: a file carrying both the legacy and the current key does not
+        // parse on the read path (they are aliases), and that is the file's to say.
+        let commented = r#"// a note
+{ "mcpServers": { "a": { "command": "x" }, "b": { "url": "https://b.test", "disabled": true } } }"#;
+        std::fs::write(&path, commented).unwrap();
+        let from_file = load_config_file(&path, McpConfigSource::User).unwrap();
+        let from_text = parse_mcp_servers(commented, McpConfigSource::User).unwrap();
+        let names = |c: &[McpServerConfig]| {
+            c.iter()
+                .map(|s| (s.name.clone(), s.source, s.disabled))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&from_text), names(&from_file));
+        assert_eq!(names(&from_text).len(), 2, "disabled entries are kept");
+    }
+
+    /// The same refusals, naming the text where the file functions name the file;
+    /// and a refused edit hands back no text to store.
+    #[test]
+    fn the_text_edits_refuse_what_the_file_edits_refuse() {
+        let commented = format!("// a note\n{START}");
+        let error = set_mcp_server_disabled_in_text(&commented, "srv", true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with("the given text contains comments"),
+            "{error}"
+        );
+        let error = set_mcp_server_disabled_in_text(START, "nope", true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("'nope' is not defined in the given text"),
+            "{error}"
+        );
+        let error = format!(
+            "{:#}",
+            merge_stdio_mcp_server_into_text(Some("{not json"), "s", "c", &[]).unwrap_err()
+        );
+        assert!(
+            error.contains("Failed to parse MCP config JSON from the given text"),
+            "{error}"
+        );
+        let error = format!(
+            "{:#}",
+            parse_mcp_servers("{not json", McpConfigSource::User).unwrap_err()
+        );
+        assert!(
+            error.contains("Failed to parse MCP config from the given text"),
+            "{error}"
+        );
+        assert!(merge_stdio_mcp_server_into_text(None, "", "c", &[]).is_err());
+        assert!(merge_http_oauth_mcp_server_into_text(None, "s", "", "p").is_err());
+    }
+}
+
+/// What [`McpStorage`] does with documents the host keeps: reads them through
+/// `read`, edits them through `update`, never touches the user tree's files for
+/// them, and never takes an unreadable document for an empty one.
+#[cfg(test)]
+mod hosted_tests {
+    use super::*;
+    use crate::mcp::oauth::{McpOAuthToken, McpTokenStore};
+    use std::sync::Mutex;
+
+    /// A document kept "sealed": stored with a prefix the library must never see
+    /// or write. `update` holds the lock across read, edit and write, as a host's
+    /// store would hold its own.
+    #[derive(Debug, Default)]
+    struct Sealed {
+        stored: Mutex<Option<String>>,
+        updates: Mutex<usize>,
+    }
+
+    const SEAL: &str = "SEALED:";
+
+    impl Sealed {
+        fn holding(plain: &str) -> Arc<Self> {
+            let doc = Self::default();
+            *doc.stored.lock().unwrap() = Some(format!("{SEAL}{plain}"));
+            Arc::new(doc)
+        }
+        fn raw(&self) -> Option<String> {
+            self.stored.lock().unwrap().clone()
+        }
+        fn plain(&self) -> String {
+            self.raw()
+                .and_then(|raw| raw.strip_prefix(SEAL).map(str::to_string))
+                .expect("stored sealed")
+        }
+        fn open(raw: &Option<String>) -> Result<Option<String>> {
+            match raw {
+                None => Ok(None),
+                Some(raw) => match raw.strip_prefix(SEAL) {
+                    Some(plain) => Ok(Some(plain.to_string())),
+                    None => bail!("not sealed with this key"),
+                },
+            }
+        }
+    }
+
+    impl atomcode_config::DocumentStore for Sealed {
+        fn read(&self) -> Result<Option<String>> {
+            Self::open(&self.stored.lock().unwrap())
+        }
+        fn update(
+            &self,
+            edit: &mut dyn FnMut(Option<&str>) -> Result<Option<String>>,
+        ) -> Result<()> {
+            let mut stored = self.stored.lock().unwrap();
+            let plain = Self::open(&stored)?;
+            let next = edit(plain.as_deref())?;
+            *stored = next.map(|text| format!("{SEAL}{text}"));
+            *self.updates.lock().unwrap() += 1;
+            Ok(())
+        }
+    }
+
+    const USER: &str =
+        r#"{ "mcpServers": { "u": { "command": "uu", "env": { "TOKEN": "s3cret" } } } }"#;
+
+    struct Dirs {
+        project: tempfile::TempDir,
+        user: tempfile::TempDir,
+    }
+
+    fn dirs() -> Dirs {
+        let dirs = Dirs {
+            project: tempfile::tempdir().unwrap(),
+            user: tempfile::tempdir().unwrap(),
+        };
+        std::fs::write(
+            dirs.project.path().join(".mcp.json"),
+            r#"{ "mcpServers": { "p": { "command": "pp" } } }"#,
+        )
+        .unwrap();
+        // A user-tree file that must never be read or written once the host keeps
+        // the config: reading it would fail, writing it would change it.
+        std::fs::write(dirs.user.path().join("mcp.json"), "not json at all").unwrap();
+        dirs
+    }
+
+    fn storage(dirs: &Dirs, doc: &Arc<Sealed>) -> McpStorage {
+        McpStorage::new(dirs.project.path(), dirs.user.path()).with_user_config(doc.clone())
+    }
+
+    fn untouched_user_file(dirs: &Dirs) {
+        assert_eq!(
+            std::fs::read_to_string(dirs.user.path().join("mcp.json")).unwrap(),
+            "not json at all",
+            "the user tree's file is not the config any more"
+        );
+    }
+
+    #[test]
+    fn a_hosted_user_config_is_read_through_its_store_and_the_project_file_as_a_file() {
+        let dirs = dirs();
+        let doc = Sealed::holding(USER);
+        let servers = storage(&dirs, &doc).load_including_disabled().unwrap();
+        let names: Vec<_> = servers
+            .iter()
+            .map(|s| (s.name.as_str(), s.source))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("p", McpConfigSource::Project),
+                ("u", McpConfigSource::User)
+            ]
+        );
+        assert_eq!(storage(&dirs, &doc).path_for(McpConfigSource::User), None);
+        assert_eq!(
+            storage(&dirs, &doc).path_for(McpConfigSource::Project),
+            Some(dirs.project.path().join(".mcp.json"))
+        );
+        untouched_user_file(&dirs);
+    }
+
+    #[test]
+    fn edits_to_a_hosted_user_config_go_through_update_and_keep_what_was_there() {
+        let dirs = dirs();
+        let doc = Sealed::holding(USER);
+        let storage = storage(&dirs, &doc);
+
+        storage
+            .merge_stdio_server(McpConfigSource::User, "n", "nn", &["-x".to_string()])
+            .unwrap();
+        storage
+            .set_server_disabled(McpConfigSource::User, "u", true)
+            .unwrap();
+        storage.add_auto_approved_tool("u", "query").unwrap();
+
+        let plain: Value = serde_json::from_str(&doc.plain()).unwrap();
+        let servers = &plain["mcpServers"];
+        assert_eq!(servers["n"]["command"], "nn", "{plain}");
+        assert_eq!(servers["u"]["disabled"], true, "{plain}");
+        assert_eq!(
+            servers["u"]["env"]["TOKEN"], "s3cret",
+            "the rest of the entry stays"
+        );
+        assert_eq!(servers["u"]["autoApprove"], json!(["query"]), "{plain}");
+        assert_eq!(*doc.updates.lock().unwrap(), 3, "one update per edit");
+        assert!(
+            doc.raw().unwrap().starts_with(SEAL),
+            "stored as the host keeps it"
+        );
+        untouched_user_file(&dirs);
+    }
+
+    #[test]
+    fn an_always_allow_for_a_project_server_lands_in_the_project_file() {
+        let dirs = dirs();
+        let doc = Sealed::holding(USER);
+        storage(&dirs, &doc)
+            .add_auto_approved_tool("p", "run")
+            .unwrap();
+        let project: Value = serde_json::from_str(
+            &std::fs::read_to_string(dirs.project.path().join(".mcp.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(project["mcpServers"]["p"]["autoApprove"], json!(["run"]));
+        assert_eq!(
+            *doc.updates.lock().unwrap(),
+            0,
+            "the host's document is not touched"
+        );
+    }
+
+    /// An unreadable document is an error naming it — and the edits that read it
+    /// first stop there, so it is not replaced by an empty config.
+    #[test]
+    fn a_hosted_config_that_cannot_be_read_is_an_error_and_is_left_as_it_is() {
+        let dirs = dirs();
+        let doc = Arc::new(Sealed::default());
+        *doc.stored.lock().unwrap() = Some("sealed with another key".to_string());
+        let storage = storage(&dirs, &doc);
+
+        let error = format!("{:#}", storage.load().unwrap_err());
+        assert!(
+            error.contains(HOSTED_USER_CONFIG) && error.contains("not sealed with this key"),
+            "{error}"
+        );
+        assert!(storage
+            .merge_stdio_server(McpConfigSource::User, "n", "nn", &[])
+            .is_err());
+        assert!(storage
+            .set_server_disabled(McpConfigSource::User, "u", true)
+            .is_err());
+        assert!(storage.add_auto_approved_tool("u", "query").is_err());
+        assert_eq!(
+            doc.raw().as_deref(),
+            Some("sealed with another key"),
+            "nothing was written over it"
+        );
+        untouched_user_file(&dirs);
+    }
+
+    /// Without hosted documents, the storage is the user tree's files: the same
+    /// bytes as the free functions write.
+    #[test]
+    fn without_hosted_documents_the_storage_is_the_files() {
+        let via_storage = tempfile::tempdir().unwrap();
+        let via_functions = tempfile::tempdir().unwrap();
+        for dir in [&via_storage, &via_functions] {
+            std::fs::write(dir.path().join("mcp.json"), USER).unwrap();
+        }
+        let storage = McpStorage::new(via_storage.path(), via_storage.path());
+        storage
+            .merge_stdio_server(McpConfigSource::User, "n", "nn", &[])
+            .unwrap();
+        storage
+            .set_server_disabled(McpConfigSource::User, "u", true)
+            .unwrap();
+        storage.add_auto_approved_tool("u", "query").unwrap();
+        let path = via_functions.path().join("mcp.json");
+        merge_stdio_mcp_server_into_json_file(&path, "n", "nn", &[]).unwrap();
+        set_mcp_server_disabled_in_json_file(&path, "u", true).unwrap();
+        add_auto_approved_tool(via_functions.path(), via_functions.path(), "u", "query").unwrap();
+        assert_eq!(
+            std::fs::read(via_storage.path().join("mcp.json")).unwrap(),
+            std::fs::read(path).unwrap()
+        );
+        assert_eq!(
+            storage.path_for(McpConfigSource::User),
+            Some(via_storage.path().join("mcp.json"))
+        );
+    }
+
+    fn token(access: &str) -> McpOAuthToken {
+        McpOAuthToken {
+            access_token: access.to_string(),
+            refresh_token: Some("r".to_string()),
+            expires_at: None,
+            client_id: None,
+            client_secret_env: None,
+            token_endpoint: None,
+            issuer: None,
+            resource: None,
+            scopes: Vec::new(),
+            provider: "p".to_string(),
+            token_type: "Bearer".to_string(),
+        }
+    }
+
+    /// Tokens the host keeps are saved, read and deleted through its store, in
+    /// `mcp_auth.toml`'s format, and nothing lands in the user tree. Saves from
+    /// two threads at once each keep the other's token: every save is one update.
+    #[test]
+    fn hosted_tokens_go_through_the_store_and_concurrent_saves_both_stay() {
+        let user = tempfile::tempdir().unwrap();
+        let doc = Arc::new(Sealed::default());
+        let storage = McpStorage::new(user.path(), user.path()).with_tokens(doc.clone());
+        let tokens = storage.tokens();
+
+        let threads: Vec<_> = (0..8)
+            .map(|n| {
+                let tokens = tokens.clone();
+                std::thread::spawn(move || {
+                    tokens
+                        .save_token(&format!("s{n}"), token(&format!("a{n}")))
+                        .unwrap()
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        for n in 0..8 {
+            assert_eq!(
+                tokens
+                    .load_token(&format!("s{n}"))
+                    .unwrap()
+                    .unwrap()
+                    .access_token,
+                format!("a{n}")
+            );
+        }
+        assert!(tokens.delete_token("s3").unwrap());
+        assert!(tokens.load_token("s3").unwrap().is_none());
+        assert!(!tokens.delete_token("s3").unwrap());
+        assert!(
+            doc.plain().contains("[servers.s0]"),
+            "mcp_auth.toml's format"
+        );
+        assert!(
+            !user.path().join("mcp_auth.toml").exists(),
+            "nothing written to the user tree"
+        );
+
+        let unreadable = Arc::new(Sealed::default());
+        *unreadable.stored.lock().unwrap() = Some("sealed with another key".to_string());
+        let tokens = McpTokenStore::hosted(unreadable.clone());
+        assert!(tokens.load_token("s0").is_err());
+        assert!(tokens.save_token("s0", token("x")).is_err());
+        assert_eq!(unreadable.raw().as_deref(), Some("sealed with another key"));
     }
 }

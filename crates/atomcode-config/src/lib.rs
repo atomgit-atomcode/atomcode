@@ -47,6 +47,10 @@ pub mod config;
 /// Transactional, cross-process-safe access to `config.toml`.
 pub mod store;
 
+/// A document the host keeps for the libraries — read, and edited in one step —
+/// for the ones that hold secrets and may be kept encrypted, elsewhere, or both.
+pub mod document;
+
 /// Safe, UI-neutral catalog of editable non-provider settings.
 pub mod settings;
 
@@ -70,4 +74,5 @@ pub mod system_proxy;
 pub mod schedule;
 
 pub use config::{provider::ProviderConfig, Config};
+pub use document::{DocumentResult, DocumentStore};
 pub use store::{ConfigCommit, ConfigRevision, ConfigSnapshot, ConfigStore};

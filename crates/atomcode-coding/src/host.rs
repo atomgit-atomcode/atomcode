@@ -26,6 +26,10 @@ use std::sync::Arc;
 
 pub use crate::parts::HostPlugins;
 pub use crate::persona::ProductIdentity;
+/// What a host implements to keep a document that holds secrets itself — the
+/// user-level MCP config and the MCP OAuth tokens (`PrepareOptions::mcp_user_config`,
+/// `PrepareOptions::mcp_tokens`): read, and edited in one step.
+pub use atomcode_config::{DocumentResult, DocumentStore};
 pub use atomcode_plexus::{Context, Entry, Layer, Plugin};
 
 /// Rows of coding's a host may address and keep addressing.

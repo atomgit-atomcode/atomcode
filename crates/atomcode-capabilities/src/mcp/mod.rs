@@ -45,17 +45,22 @@ pub mod trust;
 pub mod types;
 mod util;
 
+/// What a host implements to keep the user-level config or the OAuth tokens itself
+/// ([`McpStorage::with_user_config`], [`McpStorage::with_tokens`]).
+pub use atomcode_config::{DocumentResult, DocumentStore};
 pub use client::{McpClient, McpToolInfo};
 pub use config::{
-    config_path_for_source, load_mcp_config, load_mcp_config_including_disabled,
-    merge_http_oauth_mcp_server_into_json_file, merge_stdio_mcp_server_into_json_file,
-    McpConfigSource, McpHttpAuthConfig, McpOAuthConfig, McpServerConfig, McpTransportConfig,
-    McpTransportKind,
+    add_auto_approved_tool_to_text, config_path_for_source, load_mcp_config,
+    load_mcp_config_including_disabled, merge_http_oauth_mcp_server_into_json_file,
+    merge_http_oauth_mcp_server_into_text, merge_stdio_mcp_server_into_json_file,
+    merge_stdio_mcp_server_into_text, parse_mcp_servers, set_mcp_server_disabled_in_text,
+    McpConfigSource, McpHttpAuthConfig, McpOAuthConfig, McpServerConfig, McpStorage,
+    McpTransportConfig, McpTransportKind,
 };
 pub use oauth::{
-    login_github_oauth, login_mcp_oauth, login_mcp_oauth_until, refresh_mcp_oauth_token,
-    token_is_expired, McpOAuthLoginOptions, McpOAuthLoginStop, McpOAuthStep, McpOAuthToken,
-    McpTokenStore,
+    login_github_oauth, login_mcp_oauth, login_mcp_oauth_saving_to, login_mcp_oauth_until,
+    refresh_mcp_oauth_token, token_is_expired, McpOAuthLoginOptions, McpOAuthLoginStop,
+    McpOAuthStep, McpOAuthToken, McpTokenStore,
 };
 pub use registry::{project_trust_key, ConnectAttempt, McpConnectEvent, McpRegistry};
 pub use tool::{mcp_tool_full_name, sanitize_name_segment, McpToolAdapter};

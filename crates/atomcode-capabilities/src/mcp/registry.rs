@@ -9,7 +9,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::{mpsc, watch, RwLock};
 
 use super::client::{McpClient, McpToolInfo};
-use super::config::{load_mcp_config, McpServerConfig};
+use super::config::{load_mcp_config, McpServerConfig, McpStorage};
 use super::tool::mcp_tool_full_name;
 use super::transport_http::HttpClient;
 use super::transport_stdio::StdioClient;
@@ -111,6 +111,10 @@ pub struct McpRegistry {
     /// The user tree: its `mcp.json` is read beside the project's, its trust
     /// store gates project servers, its `mcp_auth.toml` holds OAuth tokens.
     user_dir: std::path::PathBuf,
+    /// Where HTTP servers' OAuth tokens are read and refreshed into, when the host
+    /// keeps them ([`McpStorage::with_tokens`]). `None`: the user tree's
+    /// `mcp_auth.toml`.
+    tokens: Option<super::oauth::McpTokenStore>,
     servers: Arc<RwLock<BTreeMap<String, Arc<dyn McpClient>>>>,
     server_timeouts_ms: Arc<RwLock<BTreeMap<String, u64>>>,
     /// Servers whose initial connect failed. The TUI's `/mcp` listing
@@ -154,6 +158,7 @@ impl McpRegistry {
     pub fn new(user_dir: impl Into<std::path::PathBuf>) -> Self {
         Self {
             user_dir: user_dir.into(),
+            tokens: None,
             servers: Arc::new(RwLock::new(BTreeMap::new())),
             server_timeouts_ms: Arc::new(RwLock::new(BTreeMap::new())),
             failed_servers: Arc::new(RwLock::new(BTreeMap::new())),
@@ -343,7 +348,10 @@ It cannot override system, user, project, safety, permission, or approval rules.
 
     /// The token store HTTP servers read their OAuth tokens from.
     fn token_store(&self) -> super::oauth::McpTokenStore {
-        super::oauth::McpTokenStore::in_tree(&self.user_dir)
+        match &self.tokens {
+            Some(tokens) => tokens.clone(),
+            None => super::oauth::McpTokenStore::in_tree(&self.user_dir),
+        }
     }
 
     /// Return the names of all currently connected servers.
@@ -412,12 +420,32 @@ It cannot override system, user, project, safety, permission, or approval rules.
         event_tx: Option<mpsc::UnboundedSender<McpConnectEvent>>,
         extra_servers: Vec<McpServerConfig>,
     ) -> Self {
-        let mut registry = Self::new(user_dir);
+        Self::from_storage_background(
+            &McpStorage::new(project_dir, user_dir),
+            event_tx,
+            extra_servers,
+        )
+    }
+
+    /// [`from_config_background_with_extra`](Self::from_config_background_with_extra)
+    /// over `storage` — for a host that keeps the user-level config and the OAuth
+    /// tokens itself ([`McpStorage::with_user_config`], [`McpStorage::with_tokens`]).
+    /// The servers' tokens are read and refreshed there too. A config the host cannot
+    /// read is reported the way one that does not parse is: `config` fails, and
+    /// nothing connects.
+    pub fn from_storage_background(
+        storage: &McpStorage,
+        event_tx: Option<mpsc::UnboundedSender<McpConnectEvent>>,
+        extra_servers: Vec<McpServerConfig>,
+    ) -> Self {
+        let project_dir = storage.project_dir();
+        let mut registry = Self::new(storage.user_dir());
+        registry.tokens = Some(storage.tokens());
         // Merge external channel with internal one
         let combined_tx = event_tx.or(registry.connect_events.clone());
         registry.connect_events = combined_tx.clone();
 
-        let configs = match load_mcp_config(project_dir, user_dir) {
+        let configs = match storage.load() {
             Ok(mut c) => {
                 c.extend(extra_servers);
                 c
@@ -978,6 +1006,7 @@ It cannot override system, user, project, safety, permission, or approval rules.
     pub fn share(&self) -> Arc<Self> {
         Arc::new(Self {
             user_dir: self.user_dir.clone(),
+            tokens: self.tokens.clone(),
             servers: self.servers.clone(),
             server_timeouts_ms: self.server_timeouts_ms.clone(),
             failed_servers: self.failed_servers.clone(),

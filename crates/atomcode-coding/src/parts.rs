@@ -116,6 +116,18 @@ pub struct PrepareOptions {
     /// the injecting driver is the trust boundary. Ignored when `mcp` is
     /// false (no registry is created).
     pub extra_mcp_servers: Vec<McpServerConfig>,
+    /// The user-level MCP config — what `<user tree>/mcp.json` holds — when the host
+    /// keeps it itself (encrypted, say). Every read and edit this runtime makes of
+    /// it goes through the store: connecting at start and on every rebuild, the
+    /// `/mcp` rows, enabling and disabling a server, an "always allow" kept for an
+    /// MCP tool. The project's `.mcp.json` is a plain file regardless. `None`: the
+    /// file in the user tree.
+    pub mcp_user_config: Option<Arc<dyn atomcode_config::DocumentStore>>,
+    /// MCP servers' OAuth tokens — what `<user tree>/mcp_auth.toml` holds, in its
+    /// format — when the host keeps them itself: read when an HTTP server connects,
+    /// written when one refreshes, read by the `/mcp` rows, deleted on sign-out.
+    /// `None`: the file in the user tree.
+    pub mcp_tokens: Option<Arc<dyn atomcode_config::DocumentStore>>,
     /// External-agent subagent instances (`[[subagent.external]]` profiles) to
     /// mount as named `subagent_<name>` tools. Each drives Claude Code / Codex as
     /// a subagent. A profile whose binary is missing on PATH is skipped. Empty =
@@ -253,6 +265,8 @@ impl Default for PrepareOptions {
             plugin_skill_dirs: Vec::new(),
             mcp: true,
             extra_mcp_servers: Vec::new(),
+            mcp_user_config: None,
+            mcp_tokens: None,
             external_subagents: Vec::new(),
             memory: true,
             web: true,
@@ -932,9 +946,8 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             }
         };
         (
-            Some(Arc::new(McpRegistry::from_config_background_with_extra(
-                &cfg.working_dir,
-                cfg.dirs.user(),
+            Some(Arc::new(McpRegistry::from_storage_background(
+                &mcp_storage(cfg, &opts),
                 Some(event_tx),
                 opts.extra_mcp_servers.clone(),
             ))),
@@ -1628,18 +1641,33 @@ pub async fn mcp_row_facts(
     registry: &atomcode_capabilities::mcp::McpRegistry,
     tool_counts: &[(String, usize)],
 ) -> Result<Vec<McpRowFacts>, String> {
+    mcp_row_facts_in(
+        &atomcode_capabilities::mcp::McpStorage::new(working_dir, user_dir),
+        registry,
+        tool_counts,
+    )
+    .await
+}
+
+/// [`mcp_row_facts`] over `storage` — the runtime's, which is where the host keeps
+/// the user-level config and the OAuth tokens when it keeps them itself.
+pub async fn mcp_row_facts_in(
+    storage: &atomcode_capabilities::mcp::McpStorage,
+    registry: &atomcode_capabilities::mcp::McpRegistry,
+    tool_counts: &[(String, usize)],
+) -> Result<Vec<McpRowFacts>, String> {
     use atomcode_capabilities::mcp::{
-        config_path_for_source, load_mcp_config_including_disabled, token_is_expired,
-        McpHttpAuthConfig, McpTokenStore, McpTransportConfig, ServerStatus,
+        token_is_expired, McpHttpAuthConfig, McpTransportConfig, ServerStatus,
     };
     use std::collections::HashMap;
 
-    let configs =
-        load_mcp_config_including_disabled(working_dir, user_dir).map_err(|e| format!("{e:#}"))?;
+    let configs = storage
+        .load_including_disabled()
+        .map_err(|e| format!("{e:#}"))?;
     let live: HashMap<String, ServerStatus> =
         registry.server_statuses().await.into_iter().collect();
     let counts: HashMap<&str, usize> = tool_counts.iter().map(|(n, c)| (n.as_str(), *c)).collect();
-    let tokens = McpTokenStore::in_tree(user_dir);
+    let tokens = storage.tokens();
 
     Ok(configs
         .into_iter()
@@ -1661,7 +1689,7 @@ pub async fn mcp_row_facts(
                 && matches!(tokens.load_token(&config.name), Ok(Some(t)) if !token_is_expired(&t));
             let disabled = config.disabled;
             McpRowFacts {
-                config_path: config_path_for_source(working_dir, user_dir, config.source),
+                config_path: storage.path_for(config.source),
                 status: if disabled {
                     // Not in the tree: the session has no status for it, and
                     // must not be asked for one.
@@ -1764,24 +1792,59 @@ pub async fn mcp_set_enabled(
     server: &str,
     enabled: bool,
 ) -> Result<(), String> {
-    // All three live in `mcp::config`. `set_mcp_server_disabled_in_json_file` is
-    // not re-exported from `atomcode_capabilities::mcp` (the module's re-export
-    // list has never carried it), so they are taken from where they are defined.
-    use atomcode_capabilities::mcp::config::{
-        config_path_for_source, load_mcp_config_including_disabled,
-        set_mcp_server_disabled_in_json_file,
-    };
+    mcp_set_enabled_in(
+        &atomcode_capabilities::mcp::McpStorage::new(working_dir, user_dir),
+        server,
+        enabled,
+    )
+    .await
+}
 
-    let configs =
-        load_mcp_config_including_disabled(working_dir, user_dir).map_err(|e| e.to_string())?;
+/// [`mcp_set_enabled`] over `storage` — the runtime's, so a server in a user-level
+/// config the host keeps is switched there, not in a file.
+pub async fn mcp_set_enabled_in(
+    storage: &atomcode_capabilities::mcp::McpStorage,
+    server: &str,
+    enabled: bool,
+) -> Result<(), String> {
+    use atomcode_capabilities::mcp::McpConfigSource;
+
+    let configs = storage
+        .load_including_disabled()
+        .map_err(|e| e.to_string())?;
     let config = configs
         .iter()
         .find(|c| c.name == server)
         .ok_or_else(|| format!("MCP server '{server}' is not configured"))?;
-    let path = config_path_for_source(working_dir, user_dir, config.source)
-        .ok_or_else(|| format!("MCP server '{server}' has no config file to edit"))?;
+    if config.source == McpConfigSource::Driver {
+        return Err(format!("MCP server '{server}' has no config file to edit"));
+    }
 
-    set_mcp_server_disabled_in_json_file(&path, server, !enabled).map_err(|e| format!("{e:#}"))
+    storage
+        .set_server_disabled(config.source, server, !enabled)
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Where this runtime's MCP servers are configured and their tokens kept: `cfg`'s
+/// project and user tree, with what the host keeps itself (`opts.mcp_user_config`,
+/// `opts.mcp_tokens`).
+///
+/// One constructor for every path that touches them — connecting, the `/mcp` rows,
+/// enabling and disabling, an "always allow", signing out — so none of them can be
+/// the one that reads the host's document as a file.
+pub(crate) fn mcp_storage(
+    cfg: &CodingAgentConfig,
+    opts: &PrepareOptions,
+) -> atomcode_capabilities::mcp::McpStorage {
+    let mut storage =
+        atomcode_capabilities::mcp::McpStorage::new(&cfg.working_dir, cfg.dirs.user());
+    if let Some(store) = &opts.mcp_user_config {
+        storage = storage.with_user_config(store.clone());
+    }
+    if let Some(store) = &opts.mcp_tokens {
+        storage = storage.with_tokens(store.clone());
+    }
+    storage
 }
 
 /// Fill the providers this capability graph's own sub-agents run on, for `cfg`'s
@@ -2350,6 +2413,8 @@ mod tests {
             plugin_skill_dirs: Vec::new(),
             mcp: true,
             extra_mcp_servers: Vec::new(),
+            mcp_user_config: None,
+            mcp_tokens: None,
             external_subagents: Vec::new(),
             memory: false,
             web: false,
@@ -2643,6 +2708,8 @@ mod tests {
             plugin_skill_dirs: Vec::new(),
             mcp: false,
             extra_mcp_servers: Vec::new(),
+            mcp_user_config: None,
+            mcp_tokens: None,
             external_subagents: Vec::new(),
             memory: false,
             web: false,
