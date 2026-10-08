@@ -7974,9 +7974,15 @@ impl Tui {
             // or not there is one (`copy-selected`): copying the composer from a
             // press over the conversation would be copying what is not under the
             // pointer.
-            vec![
+            let copy = if selected {
                 crate::menu::Item::new("copy-selected", t(Msg::MenuCopySelection))
-                    .about(t(Msg::MenuCopySelectionAbout)),
+                    .about(t(Msg::MenuCopySelectionAbout))
+            } else {
+                crate::menu::Item::new("copy-selected", t(Msg::MenuCopy))
+                    .about(t(Msg::MenuCopyNothingAbout))
+            };
+            vec![
+                copy,
                 crate::menu::Item::new("paste", t(Msg::MenuPaste)).about(t(Msg::MenuPasteAbout)),
             ]
         };
@@ -11602,7 +11608,9 @@ mod paste_habit_tests {
             .collect();
         let all = drawn.join("\n");
         assert!(
-            all.contains(&*t(Msg::MenuCopySelection)) && all.contains(&*t(Msg::MenuPaste)),
+            all.contains(&*t(Msg::MenuCopy))
+                && !all.contains(&*t(Msg::MenuCopySelection))
+                && all.contains(&*t(Msg::MenuPaste)),
             "{all}"
         );
         tui.run_menu_item("copy-selected", &tui.client);

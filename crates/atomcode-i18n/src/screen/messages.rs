@@ -1442,6 +1442,9 @@ pub enum Msg<'a> {
     CopiedSelection,
     MenuCopySelection,
     MenuCopySelectionAbout,
+    /// The conversation menu's copy with nothing selected.
+    MenuCopy,
+    MenuCopyNothingAbout,
     MenuCopyAll,
     MenuCopyAllAbout,
     MenuPaste,

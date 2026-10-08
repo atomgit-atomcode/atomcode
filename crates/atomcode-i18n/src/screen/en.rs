@@ -916,6 +916,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CopiedSelection => "the selection was copied".into(),
         Msg::MenuCopySelection => "copy the selection".into(),
         Msg::MenuCopySelectionAbout => "put the selected text on the clipboard".into(),
+        Msg::MenuCopy => "Copy".into(),
+        Msg::MenuCopyNothingAbout => "select text with a drag first".into(),
         Msg::MenuCopyAll => "copy all of it".into(),
         Msg::MenuCopyAllAbout => "put the composer on the clipboard".into(),
         Msg::MenuPaste => "paste".into(),

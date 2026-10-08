@@ -855,6 +855,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CopiedSelection => "已复制选中的内容".into(),
         Msg::MenuCopySelection => "复制选中".into(),
         Msg::MenuCopySelectionAbout => "把选中的文字写到剪贴板".into(),
+        Msg::MenuCopy => "复制".into(),
+        Msg::MenuCopyNothingAbout => "先拖选要复制的文字".into(),
         Msg::MenuCopyAll => "复制全文".into(),
         Msg::MenuCopyAllAbout => "把输入框写到剪贴板".into(),
         Msg::MenuPaste => "粘贴".into(),

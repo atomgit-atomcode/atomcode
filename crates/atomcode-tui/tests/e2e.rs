@@ -4367,7 +4367,8 @@ async fn copying_says_so_on_the_tip_row_and_not_in_the_conversation() {
 async fn a_right_click_outside_the_composer_offers_only_what_belongs_there() {
     // 清空 and 发送 act on what is being typed, so a press over the conversation
     // must not offer them: they belong to a box the pointer is not in. What is
-    // left is what is still true of the press — the text it landed on.
+    // left is a terminal's own menu — copy what is selected, paste into the
+    // composer — which is what people who right-click to paste reach for.
     let dir = scratch("menu-outside");
     let s = start(tree(&dir, &replay(r#"{ text = "the model spoke" }"#), &[])).await;
     let task = s.open().await;
@@ -4375,8 +4376,8 @@ async fn a_right_click_outside_the_composer_offers_only_what_belongs_there() {
     s.term.type_line("ask a question");
     s.quiet().await;
 
-    // In the conversation, with nothing selected: nothing a press here can ask
-    // for, so nothing is offered.
+    // In the conversation, with nothing selected: copy (of nothing yet) and
+    // paste, and nothing of the field's.
     let stream = s
         .term
         .last()
@@ -4388,13 +4389,20 @@ async fn a_right_click_outside_the_composer_offers_only_what_belongs_there() {
     s.quiet().await;
     let screen = s.screen();
     assert!(
-        !screen.contains("清空") && !screen.contains("发送") && !screen.contains("粘贴"),
+        screen.contains("复制") && !screen.contains("复制选中") && screen.contains("粘贴"),
+        "copy and paste, as a terminal's own menu has them:\n{screen}"
+    );
+    assert!(
+        !screen.contains("清空") && !screen.contains("发送"),
         "no composer verbs outside the composer:\n{screen}"
     );
     assert!(
         !screen.contains("复制全文"),
         "and not the field's copy either — the field is not what was pressed:\n{screen}"
     );
+    // Put away before the drag below, as a press does.
+    s.term.press(KeyPress::plain(Key::Esc));
+    s.quiet().await;
 
     // With something selected, the menu is about those words: copy them, and
     // nothing that would act on the composer.
@@ -4417,12 +4425,12 @@ async fn a_right_click_outside_the_composer_offers_only_what_belongs_there() {
     s.quiet().await;
     let screen = s.screen();
     assert!(
-        screen.contains("复制选中"),
-        "the menu copies what is selected:\n{screen}"
+        screen.contains("复制选中") && screen.contains("粘贴"),
+        "the menu copies what is selected, and pastes:\n{screen}"
     );
     assert!(
-        !screen.contains("清空") && !screen.contains("发送") && !screen.contains("粘贴"),
-        "and offers nothing that belongs to the composer:\n{screen}"
+        !screen.contains("清空") && !screen.contains("发送"),
+        "and offers nothing that acts on what is being typed:\n{screen}"
     );
 
     s.term.press(KeyPress::ctrl('d'));
