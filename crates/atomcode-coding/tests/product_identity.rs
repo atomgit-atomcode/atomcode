@@ -165,6 +165,8 @@ impl Env {
                 plugin_skill_dirs: Vec::new(),
                 mcp: false,
                 extra_mcp_servers: Vec::new(),
+                mcp_user_config: None,
+                mcp_tokens: None,
                 external_subagents: Vec::new(),
                 memory: false,
                 web: false,

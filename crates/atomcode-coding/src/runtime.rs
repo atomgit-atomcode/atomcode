@@ -1213,9 +1213,8 @@ async fn mcp_rows_of(runtime: &RuntimeResources) -> Result<Vec<crate::parts::Mcp
         .collect();
     match &runtime.parts.mcp_registry {
         Some(registry) => {
-            crate::parts::mcp_row_facts(
-                &runtime.config.working_dir,
-                runtime.config.dirs.user(),
+            crate::parts::mcp_row_facts_in(
+                &crate::parts::mcp_storage(&runtime.config, &runtime.prepare),
                 registry,
                 &counts,
             )
@@ -1285,15 +1284,15 @@ async fn apply_mcp_action(
         }
         McpAction::Logout => {
             runtime.parts.withdraw_mcp_tools().await;
-            atomcode_capabilities::mcp::McpTokenStore::in_tree(runtime.config.dirs.user())
+            crate::parts::mcp_storage(&runtime.config, &runtime.prepare)
+                .tokens()
                 .delete_token(&server)
                 .map(|_| ())
                 .map_err(|e| format!("{e:#}"))
         }
         McpAction::Disable => {
-            crate::parts::mcp_set_enabled(
-                &runtime.config.working_dir,
-                runtime.config.dirs.user(),
+            crate::parts::mcp_set_enabled_in(
+                &crate::parts::mcp_storage(&runtime.config, &runtime.prepare),
                 &server,
                 false,
             )
@@ -1309,9 +1308,8 @@ async fn apply_mcp_action(
             Ok(())
         }
         McpAction::Enable => {
-            crate::parts::mcp_set_enabled(
-                &runtime.config.working_dir,
-                runtime.config.dirs.user(),
+            crate::parts::mcp_set_enabled_in(
+                &crate::parts::mcp_storage(&runtime.config, &runtime.prepare),
                 &server,
                 true,
             )
@@ -5756,12 +5754,11 @@ fn spawn_runtime_owner_with_optional_agent(
                         // rewritten (a commented `.mcp.json` is refused) must not
                         // cost the person the answer they just gave.
                         registry.mark_tool_auto_approved(&alias);
-                        let persist_error = atomcode_capabilities::mcp::config::add_auto_approved_tool(
-                            &runtime.config.working_dir,
-                            runtime.config.dirs.user(),
-                            &server,
-                            &tool,
+                        let persist_error = crate::parts::mcp_storage(
+                            &runtime.config,
+                            &runtime.prepare,
                         )
+                        .add_auto_approved_tool(&server, &tool)
                         .err()
                         .map(|error| format!("{error:#}"));
                         let _ = done.send(Ok(Some(McpToolApproval {
@@ -11342,6 +11339,8 @@ pub mod testkit {
             plugin_skill_dirs: Vec::new(),
             mcp: false,
             extra_mcp_servers: Vec::new(),
+            mcp_user_config: None,
+            mcp_tokens: None,
             external_subagents: Vec::new(),
             memory: false,
             web: false,
@@ -12476,6 +12475,8 @@ mod tests {
                 plugin_skill_dirs: Vec::new(),
                 mcp: false,
                 extra_mcp_servers: Vec::new(),
+                mcp_user_config: None,
+                mcp_tokens: None,
                 external_subagents: Vec::new(),
                 memory: false,
                 web: false,

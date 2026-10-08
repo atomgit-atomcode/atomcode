@@ -108,7 +108,7 @@ TUI 里等价的是 `/mcp login <server>` / `/mcp logout <server>`。token 存 `
 
 ## 3. 运行时行为
 
-**单一装配路径**：TUI / 无头 / clix 都走 `McpRegistry::from_config_background_with_events`（`atomcode-coding/src/parts.rs:490`）——后台并行连接，不阻塞启动。区别只在要不要等：
+**单一装配路径**：TUI / 无头 / clix 都走 `McpRegistry::from_storage_background`（`atomcode-coding/src/parts.rs` 的 `prepare`，配置来源见 §3.1）——后台并行连接，不阻塞启动。区别只在要不要等：
 
 | 模式 | 是否等待 |
 |---|---|
@@ -120,6 +120,47 @@ TUI 里等价的是 `/mcp login <server>` / `/mcp logout <server>`。token 存 `
 MCP 总开关：`CodingRuntimeConfig.mcp` 默认 `true`。**没有命令行全局开关**——`--no-mcp` 是随 `atomcode-clix` 一起删掉的（2026-09-19），按 server 用 `"disabled": true`。
 
 > **缓存红线**：MCP 工具定义属于 provider 请求的缓存前缀，所以连接在首轮之前发起、工具集不在会话中途原地变更；`/mcp reload` 是重建（新前缀世代），不是原地改。
+
+### 3.1 嵌入方自己保管用户级配置与令牌
+
+用户级 `mcp.json`（`env`、`headers`、`bearer` 里有凭据）和 `mcp_auth.toml`（OAuth 令牌）是敏感文件。
+以库的方式跑 `CodingRuntime` 的产品可以自己保管它们——加密落盘、放钥匙串、放数据库都行——
+把它们作为 `DocumentStore` 交进来，内核只处理文本，不碰它们怎么存：
+
+```rust
+// atomcode_coding::host::{DocumentStore, DocumentResult}
+impl DocumentStore for SealedFile {
+    fn read(&self) -> DocumentResult<Option<String>> { /* 读文件、解密；没有就 None */ }
+    fn update(&self, edit: &mut dyn FnMut(Option<&str>) -> DocumentResult<Option<String>>)
+        -> DocumentResult<()> {
+        /* 在自己的锁里：读、解密 → edit(明文) → 加密、写；edit 返回 None 表示删除 */
+    }
+}
+
+let prepare = PrepareOptions {
+    mcp_user_config: Some(Arc::new(SealedFile::new(user_dir.join("mcp.json")))),
+    mcp_tokens: Some(Arc::new(SealedFile::new(user_dir.join("mcp_auth.toml")))),
+    ..PrepareOptions::default()
+};
+```
+
+- **为什么是 `update` 不是 `write`**：这些文档都是「读整份 → 改一条 → 写整份」。只有 `write` 的话，
+  两个编辑者（同一进程里的两个运行时、命令行和 daemon）各写回自己读到的版本，后写的会冲掉先写的——
+  刷新过的令牌丢了、「总是允许」没了。锁只有宿主知道是什么，所以内核把改法交给宿主，宿主在自己的锁里做完。
+- **运行时哪些地方经过它**：启动与每次重建时连接 MCP、`/mcp` 面板列表、启用 / 停用、「总是允许」写回
+  `autoApprove`、HTTP server 读取与刷新令牌、面板登出删除令牌。项目级 `.mcp.json` 始终是明文文件，不经过它。
+- **读不出来是错误，不是空配置**：`read` 报错时，运行时的 MCP 和配置 JSON 解析失败时一样——`config`
+  标为失败、什么都不连，`/mcp` 面板报出原因；写操作都先读，读失败就停下，宿主的文档原样不动。
+- **兼容旧明文由宿主决定**：比如解密时发现是明文 JSON 就原样返回，下一次写就会以密文存回去。
+- **不交就是现在的文件**：`<用户树>/mcp.json` 与 `<用户树>/mcp_auth.toml`，读写与之前逐字节一致。
+
+不经运行时、自己管这两份文档的宿主（比如自己的 MCP 管理界面）用纯文本函数：
+`parse_mcp_servers`、`set_mcp_server_disabled_in_text`、`merge_stdio_mcp_server_into_text`、
+`merge_http_oauth_mcp_server_into_text`、`add_auto_approved_tool_to_text`（读、解密 → 调函数 → 加密、存），
+或用 `McpStorage::new(project_dir, user_dir).with_user_config(..).with_tokens(..)` 走同一套读写；
+OAuth 登录要把令牌存进宿主的文档时用 `login_mcp_oauth_saving_to`。判据：
+`crates/atomcode-coding/tests/mcp_hosted_storage.rs`、`crates/atomcode-capabilities/src/mcp/config.rs` 的
+`hosted_tests` 与 `text_tests`。
 
 ---
 
@@ -191,7 +232,7 @@ MCP 总开关：`CodingRuntimeConfig.mcp` 默认 `true`。**没有命令行全�
 | 文件 | 职责 |
 |---|---|
 | `mod.rs` | 导出 + `register_mcp_tools` + `CONNECT_TIMEOUT` |
-| `config.rs` | `.mcp.json` 解析、两级合并、env/`~` 展开、`add_auto_approved_tool` |
+| `config.rs` | `.mcp.json` 解析、两级合并、env/`~` 展开、`add_auto_approved_tool`；纯文本版本的读与改；`McpStorage`（宿主保管的用户级配置与令牌，见 §3.1） |
 | `types.rs` | JSON-RPC / initialize / list / call 类型、`MCP_PROTOCOL_VERSION`、`initialize_params()`、`ServerStatus`、工具注解判定 |
 | `client.rs` | `McpClient` trait + `McpToolInfo` |
 | `registry.rs` | `McpRegistry`：后台并行连接、trust 分区、`tools/list`、`call_tool`、状态、`McpConnectEvent` |

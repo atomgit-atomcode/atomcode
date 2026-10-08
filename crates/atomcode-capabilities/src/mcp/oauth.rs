@@ -171,10 +171,21 @@ struct AuthorizationServerMetadata {
     _scopes_supported: Vec<String>,
 }
 
+/// Where MCP servers' OAuth tokens are kept: `mcp_auth.toml` in the user tree, or
+/// a document the host keeps ([`McpTokenStore::hosted`]) — the same TOML either way.
 #[derive(Clone, Debug)]
 pub struct McpTokenStore {
-    path: PathBuf,
+    backing: TokenBacking,
 }
+
+#[derive(Clone, Debug)]
+enum TokenBacking {
+    File(PathBuf),
+    Hosted(Arc<dyn atomcode_config::DocumentStore>),
+}
+
+/// How a host-kept token document is named in an error.
+const HOSTED_TOKENS: &str = "the MCP OAuth tokens the host keeps";
 
 impl McpTokenStore {
     /// The store in a user tree: `<user tree>/mcp_auth.toml`.
@@ -183,40 +194,99 @@ impl McpTokenStore {
     }
 
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            backing: TokenBacking::File(path),
+        }
+    }
+
+    /// Tokens the host keeps — encrypted, say — in the format `mcp_auth.toml` has.
+    /// Every save and delete is one [`update`](atomcode_config::DocumentStore::update),
+    /// so two refreshes at once each keep the other's token.
+    pub fn hosted(store: Arc<dyn atomcode_config::DocumentStore>) -> Self {
+        Self {
+            backing: TokenBacking::Hosted(store),
+        }
     }
 
     pub fn load_token(&self, server_name: &str) -> Result<Option<McpOAuthToken>> {
-        Ok(self.load_file()?.servers.remove(server_name))
+        match &self.backing {
+            TokenBacking::File(path) => Ok(load_auth_file(path)?.servers.remove(server_name)),
+            TokenBacking::Hosted(store) => {
+                let text = store
+                    .read()
+                    .with_context(|| format!("Failed to read {HOSTED_TOKENS}"))?;
+                Ok(parse_hosted_tokens(text.as_deref())?
+                    .servers
+                    .remove(server_name))
+            }
+        }
     }
 
     pub fn save_token(&self, server_name: &str, token: McpOAuthToken) -> Result<()> {
-        let mut file = self.load_file()?;
-        file.servers.insert(server_name.to_string(), token);
-        self.save_file(&file)
+        match &self.backing {
+            TokenBacking::File(path) => {
+                let mut file = load_auth_file(path)?;
+                file.servers.insert(server_name.to_string(), token);
+                save_auth_file(path, &file)
+            }
+            TokenBacking::Hosted(store) => {
+                let mut token = Some(token);
+                store.update(&mut |text| {
+                    let mut file = parse_hosted_tokens(text)?;
+                    if let Some(token) = token.take() {
+                        file.servers.insert(server_name.to_string(), token);
+                    }
+                    Ok(Some(serialize_tokens(&file)?))
+                })
+            }
+        }
     }
 
     pub fn delete_token(&self, server_name: &str) -> Result<bool> {
-        let mut file = self.load_file()?;
-        let removed = file.servers.remove(server_name).is_some();
-        self.save_file(&file)?;
-        Ok(removed)
-    }
-
-    fn load_file(&self) -> Result<McpAuthFile> {
-        if !self.path.exists() {
-            return Ok(McpAuthFile::default());
+        match &self.backing {
+            TokenBacking::File(path) => {
+                let mut file = load_auth_file(path)?;
+                let removed = file.servers.remove(server_name).is_some();
+                save_auth_file(path, &file)?;
+                Ok(removed)
+            }
+            TokenBacking::Hosted(store) => {
+                let mut removed = false;
+                store.update(&mut |text| {
+                    let mut file = parse_hosted_tokens(text)?;
+                    removed = file.servers.remove(server_name).is_some();
+                    Ok(Some(serialize_tokens(&file)?))
+                })?;
+                Ok(removed)
+            }
         }
-        let text = std::fs::read_to_string(&self.path)
-            .with_context(|| format!("Failed to read {}", self.path.display()))?;
-        toml::from_str(&text).with_context(|| format!("Invalid {}", self.path.display()))
     }
+}
 
-    fn save_file(&self, file: &McpAuthFile) -> Result<()> {
-        let text = toml::to_string_pretty(file).context("Failed to serialize MCP auth")?;
-        crate::fs::atomic_write(&self.path, text.as_bytes(), 0o600)
-            .with_context(|| format!("Failed to write {}", self.path.display()))
+fn load_auth_file(path: &Path) -> Result<McpAuthFile> {
+    if !path.exists() {
+        return Ok(McpAuthFile::default());
     }
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    toml::from_str(&text).with_context(|| format!("Invalid {}", path.display()))
+}
+
+fn save_auth_file(path: &Path, file: &McpAuthFile) -> Result<()> {
+    let text = serialize_tokens(file)?;
+    crate::fs::atomic_write(path, text.as_bytes(), 0o600)
+        .with_context(|| format!("Failed to write {}", path.display()))
+}
+
+fn parse_hosted_tokens(text: Option<&str>) -> Result<McpAuthFile> {
+    match text {
+        None => Ok(McpAuthFile::default()),
+        Some(text) => toml::from_str(text).with_context(|| format!("Invalid {HOSTED_TOKENS}")),
+    }
+}
+
+fn serialize_tokens(file: &McpAuthFile) -> Result<String> {
+    toml::to_string_pretty(file).context("Failed to serialize MCP auth")
 }
 
 pub fn token_is_expired(token: &McpOAuthToken) -> bool {
@@ -331,7 +401,22 @@ pub fn login_mcp_oauth(
     user_dir: &Path,
     announce: &dyn Fn(McpOAuthStep<'_>),
 ) -> Result<McpOAuthToken> {
-    login_mcp_oauth_with(server, opts, user_dir, None, announce)
+    let tokens = McpTokenStore::in_tree(user_dir);
+    login_mcp_oauth_with(server, opts, user_dir, &tokens, None, announce)
+}
+
+/// [`login_mcp_oauth_until`], saving the token in `tokens` — for a host that keeps
+/// them itself ([`McpTokenStore::hosted`]) — rather than in `user_dir`'s
+/// `mcp_auth.toml`. `stop` is optional, as the two functions above differ by it.
+pub fn login_mcp_oauth_saving_to(
+    server: &McpServerConfig,
+    opts: McpOAuthLoginOptions,
+    user_dir: &Path,
+    tokens: &McpTokenStore,
+    stop: Option<&McpOAuthLoginStop>,
+    announce: &dyn Fn(McpOAuthStep<'_>),
+) -> Result<McpOAuthToken> {
+    login_mcp_oauth_with(server, opts, user_dir, tokens, stop, announce)
 }
 
 /// [`login_mcp_oauth`], but giving up when `stop` says so: when its flag is
@@ -347,13 +432,15 @@ pub fn login_mcp_oauth_until(
     stop: &McpOAuthLoginStop,
     announce: &dyn Fn(McpOAuthStep<'_>),
 ) -> Result<McpOAuthToken> {
-    login_mcp_oauth_with(server, opts, user_dir, Some(stop), announce)
+    let tokens = McpTokenStore::in_tree(user_dir);
+    login_mcp_oauth_with(server, opts, user_dir, &tokens, Some(stop), announce)
 }
 
 fn login_mcp_oauth_with(
     server: &McpServerConfig,
     opts: McpOAuthLoginOptions,
     user_dir: &Path,
+    tokens: &McpTokenStore,
     stop: Option<&McpOAuthLoginStop>,
     announce: &dyn Fn(McpOAuthStep<'_>),
 ) -> Result<McpOAuthToken> {
@@ -392,7 +479,7 @@ fn login_mcp_oauth_with(
             } else {
                 &opts.scopes
             },
-            user_dir,
+            tokens,
             stop,
             announce,
         );
@@ -502,7 +589,7 @@ fn login_mcp_oauth_with(
         client_secret_env,
         Some(discovered.metadata.token_endpoint),
     );
-    McpTokenStore::in_tree(user_dir).save_token(&server.name, token.clone())?;
+    tokens.save_token(&server.name, token.clone())?;
     Ok(token)
 }
 
@@ -521,7 +608,7 @@ pub fn login_github_oauth(
         client_id,
         client_secret_env,
         scopes,
-        user_dir,
+        &McpTokenStore::in_tree(user_dir),
         None,
         announce,
     )
@@ -532,7 +619,7 @@ fn login_github_oauth_with(
     client_id: &str,
     client_secret_env: Option<&str>,
     scopes: &[String],
-    user_dir: &Path,
+    tokens: &McpTokenStore,
     stop: Option<&McpOAuthLoginStop>,
     announce: &dyn Fn(McpOAuthStep<'_>),
 ) -> Result<McpOAuthToken> {
@@ -610,7 +697,7 @@ fn login_github_oauth_with(
         Some(client_secret_env.to_string()),
         Some(GITHUB_TOKEN_URL.to_string()),
     );
-    McpTokenStore::in_tree(user_dir).save_token(server_name, token.clone())?;
+    tokens.save_token(server_name, token.clone())?;
     Ok(token)
 }
 

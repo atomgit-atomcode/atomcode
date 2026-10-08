@@ -203,6 +203,9 @@ e2e = ["provider"]
 # login/refresh flow; transport_http uses the async reqwest client. OAuth's callback
 # listener is std::net (no tokio/net needed).
 mcp = [
+    # `atomcode-config` for `DocumentStore`: a host may keep the user-level
+    # `mcp.json` and `mcp_auth.toml` itself (encrypted, say) and hand them in.
+    "dep:atomcode-config",
     "dep:anyhow", "dep:sha2", "dep:uuid", "dep:dirs", "dep:toml", "dep:tempfile",
     "dep:reqwest", "reqwest/blocking", "dep:url",
     "tokio/process", "tokio/io-util",
