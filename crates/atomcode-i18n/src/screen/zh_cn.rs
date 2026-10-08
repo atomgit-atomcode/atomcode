@@ -183,7 +183,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::RewindPanelNoCodeChanges => "没有代码改动".into(),
         Msg::RewindPanelFiles { files } => format!("{files} 个文件").into(),
         Msg::RewindPanelScopeAsk => "  回到那儿，把什么一起带回去？".into(),
-        Msg::RewindCodeNotEnabled => "设置 ATOMCODE_CODE_REWIND=1 开启工作区回退".into(),
+        Msg::RewindCodeNotEnabled => "工作区回退已被 ATOMCODE_CODE_REWIND 关闭，去掉这个环境变量即可开启".into(),
         Msg::RewindCodeNoSession => "这次会话不落盘，工作区回不去".into(),
         Msg::RewindCodeFailed { why } => format!("工作区回不去：{why}").into(),
         Msg::RewindPanelTurnNoFiles => "这一回合没改过文件，能回的只有对话".into(),
@@ -485,7 +485,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── reasoning effort, undo and rewind (`commands.rs`) ──
         Msg::EffortAbout => "这个会话的思考强度".into(),
-        Msg::EffortDefaultAbout => "交给端点决定".into(),
+        Msg::EffortDefaultAbout => "交给端点决定(也可以写 auto)".into(),
         Msg::EffortPickerTitle { level } => format!("思考强度 · 现在 {level} · enter 改").into(),
         Msg::EffortPickerTitleDefault => "思考强度 · 现在交给端点 · enter 改".into(),
         Msg::EffortUnknown { wanted, levels } => format!("未知强度 `{wanted}`;可选:{levels}, default").into(),
@@ -1265,6 +1265,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         }
         Msg::CompactAfterTurn => "这一轮结束后就压缩".into(),
         Msg::RuntimeBusy => "正在忙(回复、压缩或重新装配进行中),稍后再试".into(),
+        Msg::EffortNotForThisModel { wanted, levels } => {
+            format!("当前模型不支持 {wanted};它支持:{levels}, default(或 auto)").into()
+        }
+        Msg::ClipboardImageUnsupportedHere => "鸿蒙暂不支持读取系统剪贴板里的图片。把图片存成文件，用 /paste <图片路径> 添加，或直接在输入框里写图片的绝对路径".into(),
         Msg::CmdAboutChangelog => "查看各版本的更新内容".into(),
         Msg::ChangelogPickerTitle => "选一个版本查看更新内容".into(),
         Msg::ChangelogNewTag => "新".into(),

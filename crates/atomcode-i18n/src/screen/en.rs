@@ -206,7 +206,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::RewindPanelNoCodeChanges => "no code changes".into(),
         Msg::RewindPanelFiles { files } => format!("{files} files").into(),
         Msg::RewindPanelScopeAsk => "  going back there takes what with it?".into(),
-        Msg::RewindCodeNotEnabled => "set ATOMCODE_CODE_REWIND=1 to rewind the workspace too".into(),
+        Msg::RewindCodeNotEnabled => "workspace rewind is turned off by ATOMCODE_CODE_REWIND; unset it to turn it back on".into(),
         Msg::RewindCodeNoSession => "this session is not written down, so the workspace cannot go back".into(),
         Msg::RewindCodeFailed { why } => format!("the workspace cannot go back: {why}").into(),
         Msg::RewindPanelTurnNoFiles => "this turn changed no file — only the conversation can go back".into(),
@@ -527,7 +527,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── reasoning effort, undo and rewind (`commands.rs`) ──
         Msg::EffortAbout => "this session's reasoning effort".into(),
-        Msg::EffortDefaultAbout => "leave it to the endpoint".into(),
+        Msg::EffortDefaultAbout => "leave it to the endpoint (auto works too)".into(),
         Msg::EffortPickerTitle { level } => format!("reasoning effort · now {level} · enter changes it").into(),
         Msg::EffortPickerTitleDefault => "reasoning effort · left to the endpoint · enter changes it".into(),
         Msg::EffortUnknown { wanted, levels } => format!("no such effort `{wanted}`; it takes {levels}, default").into(),
@@ -1369,6 +1369,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         .into(),
         Msg::CompactAfterTurn => "Will compact once this turn ends".into(),
         Msg::RuntimeBusy => "Busy (a reply, a compaction or a rebuild is under way); try again shortly".into(),
+        Msg::EffortNotForThisModel { wanted, levels } => {
+            format!("this model does not take {wanted}; it takes {levels}, default (or auto)").into()
+        }
+        Msg::ClipboardImageUnsupportedHere => "Reading a picture from the clipboard is not supported on HarmonyOS yet. Save it to a file and add it with /paste <path>, or type its absolute path in the composer".into(),
         Msg::CmdAboutChangelog => "What changed in each release".into(),
         Msg::ChangelogPickerTitle => "pick a release to read what changed".into(),
         Msg::ChangelogNewTag => "new".into(),

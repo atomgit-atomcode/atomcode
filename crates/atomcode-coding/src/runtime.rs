@@ -18770,6 +18770,10 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         std::env::set_var("ATOMCODE_HOME", home.path());
+        // Code Rewind is on by default; turned off here so the code scope is
+        // refused and the conversation scope is shown to stand on its own.
+        let code_rewind = std::env::var("ATOMCODE_CODE_REWIND").ok();
+        std::env::set_var("ATOMCODE_CODE_REWIND", "0");
         let status = std::process::Command::new("git")
             .args(["init", "-q"])
             .current_dir(project.path())
@@ -18825,6 +18829,10 @@ mod tests {
             .all(|message| message.text != "first rewind prompt"));
         assert_eq!(runtime.handle.status().phase, RuntimePhase::Ready);
         runtime.handle.shutdown().await.unwrap();
+        match code_rewind {
+            Some(value) => std::env::set_var("ATOMCODE_CODE_REWIND", value),
+            None => std::env::remove_var("ATOMCODE_CODE_REWIND"),
+        }
     }
 
     async fn mutating_rewind_runtime(

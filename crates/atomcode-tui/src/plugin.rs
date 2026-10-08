@@ -6676,7 +6676,7 @@ impl Tui {
                 // was" is easier to keep true when nothing was touched yet.
                 let Some(image) = self.surface.clipboard_image() else {
                     drop(m);
-                    self.say_refused(&t(Msg::ClipboardHasNoImage));
+                    self.say_refused(&t(no_clipboard_picture(Msg::ClipboardHasNoImage)));
                     return false;
                 };
                 // Read with the picture, which is where it is still the same
@@ -6694,8 +6694,9 @@ impl Tui {
             Action::PasteFrom(from) => {
                 drop(m);
                 let found = match from.as_deref() {
-                    None => crate::attach::from_clipboard(self.surface.as_ref())
-                        .ok_or_else(|| t(Msg::ClipboardHasNothing).into_owned()),
+                    None => crate::attach::from_clipboard(self.surface.as_ref()).ok_or_else(|| {
+                        t(no_clipboard_picture(Msg::ClipboardHasNothing)).into_owned()
+                    }),
                     // Already placed by the command: `client.root()` here is
                     // the session id, not a directory to resolve against.
                     Some(path) => {
@@ -8165,6 +8166,18 @@ impl McpPhase for Phases {
 /// `Refused` and **dropped the rest**, so a modal whose pick opened another
 /// modal did nothing at all, silently. A wizard's last step is exactly that
 /// shape, which is how this was found.
+/// What to say when the clipboard gave nothing. On HarmonyOS there is no
+/// clipboard this process can read at all — so "the clipboard is empty" would
+/// send the person off to copy the picture again; say what works instead
+/// (`/paste <path>`). Elsewhere, `otherwise`.
+fn no_clipboard_picture(otherwise: Msg<'static>) -> Msg<'static> {
+    if cfg!(target_env = "ohos") {
+        Msg::ClipboardImageUnsupportedHere
+    } else {
+        otherwise
+    }
+}
+
 fn deliver(
     host: &Arc<crate::host::Host>,
     keys: &mpsc::UnboundedSender<Wake>,

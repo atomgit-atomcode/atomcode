@@ -2054,6 +2054,15 @@ pub enum Msg<'a> {
     /// The runtime refused because it is busy (a turn, a compaction or a
     /// rebuild under way) — what the host says in place of its own words.
     RuntimeBusy,
+    /// `/effort <level>` with a level this model does not take; `levels` are
+    /// the ones it does.
+    EffortNotForThisModel {
+        wanted: &'a str,
+        levels: &'a str,
+    },
+    /// Reading the clipboard picture is not possible on this platform
+    /// (HarmonyOS): what to do instead.
+    ClipboardImageUnsupportedHere,
     /// `/changelog` in the command menu and the welcome tips.
     CmdAboutChangelog,
     /// The header of `/changelog`'s list of releases.

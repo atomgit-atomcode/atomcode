@@ -27,13 +27,17 @@ const STORE_VERSION: &str = "atomcode-rewind-v1";
 pub(crate) const LEDGER_VERSION: u32 = 2;
 pub(crate) const TRANSACTION_VERSION: u32 = 1;
 
-/// Returns true if `ATOMCODE_CODE_REWIND` environment variable is set to one of
-/// the recognized opt-in values: "1", "true", "on", or "yes" (case-sensitive).
-/// Returns false if unset or set to any other value.
-pub fn code_rewind_opt_in() -> bool {
-    matches!(
+/// Whether Code Rewind (workspace snapshots, so `/rewind` can put files back)
+/// is on. **On by default**: the store is bounded now — objects shared with the
+/// real repository, large files and build/dependency dirs skipped, a 2 GiB free
+/// disk floor and a 500 MiB budget with eager gc (`docs/superpowers/plans/
+/// 2026-08-28-bounded-code-rewind.md`) — so the disk-exhaustion reason it was
+/// switched off for in v5.0.5 no longer holds. `ATOMCODE_CODE_REWIND` set to
+/// `0`, `false`, `off` or `no` turns it off; any other value, or none, leaves it on.
+pub fn code_rewind_enabled() -> bool {
+    !matches!(
         std::env::var("ATOMCODE_CODE_REWIND").ok().as_deref(),
-        Some("1" | "true" | "on" | "yes")
+        Some("0" | "false" | "off" | "no")
     )
 }
 
@@ -1590,12 +1594,19 @@ mod tests {
     }
 
     #[test]
-    fn code_rewind_is_off_by_default_and_on_when_opted_in() {
+    fn code_rewind_is_on_by_default_and_off_when_turned_off() {
         let prev = std::env::var("ATOMCODE_CODE_REWIND").ok();
         std::env::remove_var("ATOMCODE_CODE_REWIND");
-        assert!(!crate::session::rewind::code_rewind_opt_in());
+        assert!(
+            crate::session::rewind::code_rewind_enabled(),
+            "on by default"
+        );
+        for off in ["0", "false", "off", "no"] {
+            std::env::set_var("ATOMCODE_CODE_REWIND", off);
+            assert!(!crate::session::rewind::code_rewind_enabled(), "{off}");
+        }
         std::env::set_var("ATOMCODE_CODE_REWIND", "1");
-        assert!(crate::session::rewind::code_rewind_opt_in());
+        assert!(crate::session::rewind::code_rewind_enabled());
         match prev {
             Some(v) => std::env::set_var("ATOMCODE_CODE_REWIND", v),
             None => std::env::remove_var("ATOMCODE_CODE_REWIND"),

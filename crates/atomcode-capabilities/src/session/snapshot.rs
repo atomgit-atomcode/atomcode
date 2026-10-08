@@ -135,10 +135,9 @@ struct PendingRewindPoint {
 /// it is.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CodeRewindUnavailable {
-    /// Off by default, to protect disk space. The person can opt in with
-    /// `ATOMCODE_CODE_REWIND=1`.
+    /// Turned off with `ATOMCODE_CODE_REWIND=0` (it is on by default).
     NotEnabled,
-    /// Opted in, but the checkpoint could not be set up — with the cause,
+    /// On, but the checkpoint could not be set up — with the cause,
     /// which is a fact about this machine and travels as text.
     SetupFailed(String),
 }
@@ -149,14 +148,10 @@ impl std::fmt::Display for CodeRewindUnavailable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotEnabled => f.write_str(
-                "Code Rewind (workspace file restore) is off by default to protect disk \
-                 space; set ATOMCODE_CODE_REWIND=1 to opt in. Conversation Rewind remains \
-                 available.",
+                "Code Rewind (workspace file restore) is turned off by ATOMCODE_CODE_REWIND; \
+                 unset it to turn it back on. Conversation Rewind remains available.",
             ),
-            Self::SetupFailed(why) => write!(
-                f,
-                "Code Rewind unavailable (ATOMCODE_CODE_REWIND=1 is set but setup failed): {why}"
-            ),
+            Self::SetupFailed(why) => write!(f, "Code Rewind unavailable (setup failed): {why}"),
         }
     }
 }
@@ -203,11 +198,11 @@ impl SnapshotHook {
     ) -> Self {
         let session_id = session_id.into();
         let working_dir = working_dir.into();
-        // Code Rewind is off by default.  When the user opts in via
-        // ATOMCODE_CODE_REWIND=1 we construct the bounded workspace checkpoint
+        // Code Rewind is on unless ATOMCODE_CODE_REWIND turns it off: we
+        // construct the bounded workspace checkpoint
         // whose store lives under <user tree>/rewind/<bucket>/<session_id> —
         // NOT inside the worktree or on a hard-coded C: path.
-        let (checkpoint, unavailable) = if crate::session::rewind::code_rewind_opt_in() {
+        let (checkpoint, unavailable) = if crate::session::rewind::code_rewind_enabled() {
             match WorkspaceCheckpoint::for_session(
                 std::path::Path::new(&working_dir),
                 &session_id,
@@ -1333,9 +1328,9 @@ mod tests {
     #[test]
     #[serial_test::serial(atomcode_code_rewind_env)]
     fn pending_code_rewind_restores_workspace_after_interrupted_transaction() {
-        // Ensure Code Rewind is off so the recovered hook reports unavailable.
+        // Turn Code Rewind off so the recovered hook reports unavailable.
         let prev = std::env::var("ATOMCODE_CODE_REWIND").ok();
-        std::env::remove_var("ATOMCODE_CODE_REWIND");
+        std::env::set_var("ATOMCODE_CODE_REWIND", "0");
         let worktree = tempfile::tempdir().unwrap();
         git(worktree.path(), &["init", "--quiet"]);
         std::fs::write(worktree.path().join("tracked.txt"), "before\n").unwrap();
@@ -2287,11 +2282,10 @@ mod tests {
         assert!(points[0].before_tree.is_none());
         assert!(points[0].after_tree.is_none());
         assert!(points[0].files.is_empty());
-        assert!(hook
-            .code_rewind_unavailable()
-            // "off by default" is UNIQUE to the disabled reason (the
-            // opted-in-setup-failed error also mentions ATOMCODE_CODE_REWIND).
-            .is_some_and(|reason| matches!(reason, CodeRewindUnavailable::NotEnabled)));
+        // No workspace to snapshot here — this directory is no Git worktree,
+        // and Code Rewind may also be turned off by a test beside this one —
+        // and the conversation point is kept all the same.
+        assert!(hook.code_rewind_unavailable().is_some());
         assert_eq!(
             manager
                 .load_rewind_ledger("conversation-rewind")
@@ -2343,13 +2337,14 @@ mod tests {
 
     #[test]
     #[serial_test::serial(atomcode_code_rewind_env)]
-    fn snapshot_hook_keeps_code_rewind_off_by_default() {
+    fn snapshot_hook_turns_code_rewind_off_when_asked() {
         let prev = std::env::var("ATOMCODE_CODE_REWIND").ok();
-        std::env::remove_var("ATOMCODE_CODE_REWIND");
-        let (hook, _mgr, _worktree, _store) = make_test_hook_with_worktree("hook-default-off");
-        assert!(
-            hook.code_rewind_unavailable().is_some(),
-            "Code Rewind must be unavailable when ATOMCODE_CODE_REWIND is unset"
+        std::env::set_var("ATOMCODE_CODE_REWIND", "0");
+        let (hook, _mgr, _worktree, _store) = make_test_hook_with_worktree("hook-turned-off");
+        assert_eq!(
+            hook.code_rewind_unavailable(),
+            Some(CodeRewindUnavailable::NotEnabled),
+            "Code Rewind must be off when ATOMCODE_CODE_REWIND=0"
         );
         match prev {
             Some(v) => std::env::set_var("ATOMCODE_CODE_REWIND", v),
@@ -2359,13 +2354,13 @@ mod tests {
 
     #[test]
     #[serial_test::serial(atomcode_code_rewind_env)]
-    fn snapshot_hook_enables_code_rewind_when_opted_in_and_bounded_store_builds() {
+    fn snapshot_hook_has_code_rewind_by_default_when_the_bounded_store_builds() {
         let prev = std::env::var("ATOMCODE_CODE_REWIND").ok();
-        std::env::set_var("ATOMCODE_CODE_REWIND", "1");
-        let (hook, _mgr, _worktree, _store) = make_test_hook_with_worktree("hook-opted-in");
+        std::env::remove_var("ATOMCODE_CODE_REWIND");
+        let (hook, _mgr, _worktree, _store) = make_test_hook_with_worktree("hook-default-on");
         assert!(
             hook.code_rewind_unavailable().is_none(),
-            "Code Rewind must be available when ATOMCODE_CODE_REWIND=1 and worktree is valid"
+            "Code Rewind must be available by default in a valid worktree"
         );
         match prev {
             Some(v) => std::env::set_var("ATOMCODE_CODE_REWIND", v),
@@ -2378,7 +2373,7 @@ mod tests {
         // The wording moved from a constant onto the enum's `Display`; what
         // the judgement is for did not. A reason that names the release it was
         // written in goes stale the moment the next one ships, and it is read
-        // by a person deciding whether to opt in.
+        // by a person deciding whether to turn it back on.
         assert!(
             !CodeRewindUnavailable::NotEnabled
                 .to_string()

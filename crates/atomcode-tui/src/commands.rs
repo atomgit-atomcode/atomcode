@@ -1398,10 +1398,42 @@ impl CommandSet for SessionCommands {
             // A level is the session's, not the model route's, so this survives
             // a model switch. Whether a route can reason at all is the model's.
             "effort" => {
-                let wanted = args.trim();
-                // One vocabulary, taken from the place that defines it, so this
-                // command cannot offer a level nothing parses.
-                let levels = atomcode_harness::REASONING_EFFORT_LEVELS;
+                // `auto` is how people (and the test plans) say "leave it to the
+                // endpoint": the same as `default`.
+                let wanted = match args.trim() {
+                    "auto" => "default",
+                    other => other,
+                };
+                // The levels THIS model takes, when it says: the same answer the
+                // `/model` picker offers (`ModelRow::effort_pick`). A model that
+                // declares nothing is not restricted — there is nothing to go by.
+                // Offering every level regardless sent a `max` to a model that only
+                // takes `low`/`medium`, and the endpoint refused the turn.
+                let supported: Option<Vec<String>> = ctx
+                    .service::<crate::plugin::ProvidersSvc>()
+                    .and_then(|port| {
+                        // The selection `/model` just chose first: `/model x high`
+                        // lands here before the description of the new model has
+                        // arrived, and judging `high` by the old model would refuse
+                        // what the new one takes.
+                        let live = client
+                            .selection()
+                            .or_else(|| client.described().and_then(|d| d.model));
+                        port.rows()
+                            .with_current(live.as_deref())
+                            .live_row()
+                            .and_then(crate::providers::ModelRow::effort_pick)
+                    })
+                    .map(|levels| levels.into_iter().filter(|l| l != "default").collect());
+                let all: Vec<&str> = atomcode_harness::REASONING_EFFORT_LEVELS.to_vec();
+                let levels: Vec<&str> = match &supported {
+                    Some(only) => all
+                        .iter()
+                        .copied()
+                        .filter(|level| only.iter().any(|o| o == level))
+                        .collect(),
+                    None => all.clone(),
+                };
                 // With nothing after it, the command reports rather than opens a
                 // modal: the levels are offered inline in the slash menu (one row
                 // each — see `effort_options`), so a bare `/effort` that reaches
@@ -1414,12 +1446,12 @@ impl CommandSet for SessionCommands {
                         .and_then(|d| d.reasoning_effort)
                         .map(|level| level.as_str().to_string());
                     let now = current.as_deref().unwrap_or("default");
-                    let mut all = levels.to_vec();
-                    all.push("default");
+                    let mut offered = levels.clone();
+                    offered.push("default");
                     return Outcome::Said(
                         t(Msg::EffortCurrent {
                             now,
-                            levels: &all.join(", "),
+                            levels: &offered.join(", "),
                         })
                         .into_owned(),
                     );
@@ -1428,6 +1460,15 @@ impl CommandSet for SessionCommands {
                     None
                 } else if levels.contains(&wanted) {
                     ReasoningEffort::from_config(Some(wanted))
+                } else if all.contains(&wanted) {
+                    // A real level, just not this model's.
+                    return Outcome::Refused(
+                        t(Msg::EffortNotForThisModel {
+                            wanted,
+                            levels: &levels.join(", "),
+                        })
+                        .into_owned(),
+                    );
                 } else {
                     return Outcome::Refused(
                         t(Msg::EffortUnknown {
@@ -3818,6 +3859,114 @@ mod tests {
 
     /// 换到一个声明了思考强度的模型,屏上要把档位递上来让人挑;
     /// 没声明的,一句「模型 → X」就够,不多问。
+    /// `/effort` offers and takes only the levels the model on screen takes —
+    /// the ones `/model` offers for it — and says which when asked for another;
+    /// `auto` is `default`. A model that declares nothing is not restricted.
+    #[tokio::test]
+    async fn effort_keeps_to_the_levels_the_model_takes() {
+        struct Rows;
+        impl crate::providers::Providers for Rows {
+            fn rows(&self) -> crate::providers::ProvidersView {
+                let row = |id: &str, levels: Vec<String>| crate::providers::ModelRow {
+                    id: id.into(),
+                    account: "a".into(),
+                    model: id.into(),
+                    window: 1000,
+                    vision: None,
+                    effort: None,
+                    levels,
+                    current: false,
+                    managed: false,
+                };
+                crate::providers::ProvidersView::new(
+                    Vec::new(),
+                    vec![
+                        row("glm", vec!["low".into(), "high".into()]),
+                        row("plain", Vec::new()),
+                    ],
+                    Vec::new(),
+                    Vec::new(),
+                )
+            }
+            fn add_account(&self, _: &crate::providers::AccountDraft) -> Result<String, String> {
+                Ok("x".into())
+            }
+            fn edit_account(
+                &self,
+                _: &str,
+                _: &crate::providers::AccountDraft,
+            ) -> Result<(), String> {
+                Ok(())
+            }
+            fn delete_account(&self, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+            fn add_model(&self, _: &crate::providers::ModelDraft) -> Result<String, String> {
+                Ok("x".into())
+            }
+            fn edit_model(&self, _: &str, _: &crate::providers::ModelDraft) -> Result<(), String> {
+                Ok(())
+            }
+            fn delete_model(&self, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let _locale = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::ZhCn);
+        let on = |model: &str| {
+            let host = Arc::new(Recording::default());
+            let (app, client, all) = following(&host);
+            let _ = app
+                .context()
+                .provide::<crate::plugin::ProvidersSvc>(Arc::new(Rows));
+            client.describe(&atomcode_kernel::agent::AgentDescription {
+                session: "lead".into(),
+                model: Some(model.into()),
+                ..Default::default()
+            });
+            (host, app, all)
+        };
+
+        let (host, app, all) = on("glm");
+        match all.dispatch("/effort max", &app.context()).await {
+            Outcome::Refused(why) => {
+                assert!(why.contains("不支持 max"), "{why}");
+                assert!(why.contains("low, high"), "{why}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            host.asked.lock().unwrap().is_empty(),
+            "nothing sent to the endpoint"
+        );
+        match all.dispatch("/effort", &app.context()).await {
+            Outcome::Said(said) => {
+                assert!(said.contains("low, high, default"), "{said}");
+                assert!(!said.contains("max"), "{said}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let _ = all.dispatch("/effort auto", &app.context()).await;
+        assert!(
+            matches!(
+                host.asked.lock().unwrap().last(),
+                Some(HostCommand::SetReasoningEffort { level: None, .. })
+            ),
+            "auto is default: {:?}",
+            host.asked.lock().unwrap()
+        );
+
+        let (host, app, all) = on("plain");
+        let _ = all.dispatch("/effort max", &app.context()).await;
+        assert!(
+            matches!(
+                host.asked.lock().unwrap().last(),
+                Some(HostCommand::SetReasoningEffort { level: Some(_), .. })
+            ),
+            "a model that declares nothing is not restricted"
+        );
+    }
+
     #[tokio::test]
     async fn a_model_that_declares_effort_levels_offers_them_to_pick() {
         struct Declares;
