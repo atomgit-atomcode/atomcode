@@ -2115,6 +2115,16 @@ impl UserInterface for Tui {
                         click
                     };
                     use crate::surface::Click;
+                    // The middle button pastes into the composer, wherever it is
+                    // pressed — a terminal's own gesture, which taking the mouse
+                    // took from it. A menu that is up is put away first: the
+                    // press was not for it.
+                    if matches!(click, Click::MiddlePress) {
+                        self.host.close_context_menu();
+                        quit = self.paste_clipboard_text(&client);
+                        stale = true;
+                        continue;
+                    }
                     // The slash menu, before anything else looks at the pointer.
                     // A list with a lit row is something a press can choose from
                     // and a pointer can travel over, and both of those are the
@@ -2587,7 +2597,7 @@ impl UserInterface for Tui {
                             continue;
                         }
                         // Handled above, and never reached.
-                        Click::RightPress => None,
+                        Click::RightPress | Click::MiddlePress => None,
                     };
                     if let Some(action) = action {
                         quit = self.act(action, &client);
@@ -6714,6 +6724,27 @@ impl Tui {
                 return false;
             }
             Action::AttachImage => {
+                // Read first, mutate second: a clipboard with no image in it
+                // must leave the composer exactly as it was, and "exactly as it
+                // was" is easier to keep true when nothing was touched yet.
+                //
+                // No picture but text: Ctrl+V is paste. A terminal that keeps
+                // the chord for itself (Windows Terminal) never sends it here;
+                // one that passes it on (most Linux terminals, MobaXterm) left
+                // a person pasting text with the key they always paste with
+                // told 「剪贴板里没有图片」.
+                let Some(image) = self.surface.clipboard_image() else {
+                    drop(m);
+                    if self
+                        .surface
+                        .clipboard_text()
+                        .is_some_and(|text| !text.is_empty())
+                    {
+                        return self.paste_clipboard_text(client);
+                    }
+                    self.say_refused(&t(no_clipboard_picture(Msg::ClipboardHasNoImage)));
+                    return false;
+                };
                 // Refused only when there is no model at all; a text-only model
                 // has the runtime caption the image (a configured or auto-detected
                 // VL helper) or report on send that it could not.
@@ -6722,14 +6753,6 @@ impl Tui {
                     self.say_refused(&reason);
                     return false;
                 }
-                // Read first, mutate second: a clipboard with no image in it
-                // must leave the composer exactly as it was, and "exactly as it
-                // was" is easier to keep true when nothing was touched yet.
-                let Some(image) = self.surface.clipboard_image() else {
-                    drop(m);
-                    self.say_refused(&t(no_clipboard_picture(Msg::ClipboardHasNoImage)));
-                    return false;
-                };
                 // Read with the picture, which is where it is still the same
                 // picture: the look on the next keystroke has to recognize what
                 // was just taken instead of reading it as a new one.
@@ -7944,18 +7967,34 @@ impl Tui {
                 crate::menu::Item::new("clear", t(Msg::MenuClear)).about(t(Msg::MenuClearAbout)),
                 crate::menu::Item::new("send", t(Msg::MenuSend)).about(t(Msg::MenuSendAbout)),
             ]
-        } else if selected {
-            // Over the conversation with something selected: the press is about
-            // those words, so copying them is the whole menu. No second entry
-            // and nothing that acts on the composer.
-            vec![copy]
         } else {
-            // Nothing was selected, so there is nothing a press here can ask
-            // for. An empty menu opens nothing rather than a menu of verbs that
-            // would act somewhere the pointer is not.
-            Vec::new()
+            // Over the conversation: copy what is selected and paste into the
+            // composer — the two a terminal's own menu has, and what people who
+            // right-click to paste reach for. Copy names the selection whether
+            // or not there is one (`copy-selected`): copying the composer from a
+            // press over the conversation would be copying what is not under the
+            // pointer.
+            vec![
+                crate::menu::Item::new("copy-selected", t(Msg::MenuCopySelection))
+                    .about(t(Msg::MenuCopySelectionAbout)),
+                crate::menu::Item::new("paste", t(Msg::MenuPaste)).about(t(Msg::MenuPasteAbout)),
+            ]
         };
         self.host.open_context_menu((x, y), items);
+    }
+
+    /// Paste the clipboard's text into the composer: the menu's `粘贴`, the
+    /// middle button, and Ctrl+V with no picture to attach. Returns `true` to
+    /// quit, as `act` does.
+    fn paste_clipboard_text(&self, client: &AgentClient) -> bool {
+        let Some(text) = self.surface.clipboard_text().filter(|t| !t.is_empty()) else {
+            // A refusal of the gesture, so it belongs on the tip row with the
+            // rest of them rather than in the conversation.
+            self.host
+                .say(t(Msg::ClipboardHasNoTextShort).into_owned(), true);
+            return false;
+        };
+        self.act(Action::Paste(text), client)
     }
 
     /// Do what a menu item says. Returns `true` to quit.
@@ -7966,6 +8005,22 @@ impl Tui {
     /// here is a second implementation of paste or send.
     fn run_menu_item(&self, value: &str, client: &AgentClient) -> bool {
         match value {
+            // Only the selection: with none, say so rather than fall back to the
+            // composer's text.
+            "copy-selected" => {
+                let selected = self
+                    .host
+                    .moment
+                    .read()
+                    .expect("moment poisoned")
+                    .selection
+                    .is_some_and(|s| !s.is_empty());
+                if !selected {
+                    self.host.say(t(Msg::NothingToCopy).into_owned(), true);
+                    return false;
+                }
+                self.run_menu_item("copy", client)
+            }
             "copy" => {
                 // A selection first: it is what is on screen and what the menu
                 // is about when it exists. The field is the fallback, not the
@@ -8030,16 +8085,7 @@ impl Tui {
                 );
                 false
             }
-            "paste" => {
-                let Some(text) = self.surface.clipboard_text() else {
-                    // The menu's own refusal, so it belongs on the tip row with
-                    // the rest of them rather than in the conversation.
-                    self.host
-                        .say(t(Msg::ClipboardHasNoTextShort).into_owned(), true);
-                    return false;
-                };
-                self.act(Action::Paste(text), client)
-            }
+            "paste" => self.paste_clipboard_text(client),
             "clear" => self.act(Action::Clear, client),
             "send" => self.act(Action::Submit, client),
             _ => false,
@@ -11499,5 +11545,71 @@ mod midturn_command_tests {
         assert_eq!(&kinds(&host)[before..], &["user"]);
         answered(&mut woken).await;
         assert_eq!(&kinds(&host)[before..], &["user", "command"]);
+    }
+}
+
+#[cfg(test)]
+mod paste_habit_tests {
+    use super::*;
+
+    fn screen() -> (Arc<Host>, Tui) {
+        let (host, tui) = assemble(Headless::new(60, 24));
+        host.modules
+            .add_view(Arc::new(crate::module::Mounted::<
+                crate::modules::input::Input,
+            >::new()))
+            .unwrap();
+        (host, tui)
+    }
+
+    fn typed(host: &Host) -> String {
+        host.moment.read().expect("moment poisoned").input.clone()
+    }
+
+    /// What people who copy with a drag paste with: the middle button, the
+    /// menu's 粘贴, and Ctrl+V with text on the clipboard — all into the
+    /// composer. Ctrl+V said 「剪贴板里没有图片」 where the terminal passes the
+    /// chord on.
+    #[test]
+    fn text_on_the_clipboard_is_pasted_by_every_paste_gesture() {
+        for gesture in ["middle", "menu", "ctrl-v"] {
+            let (host, tui) = screen();
+            tui.surface.copy("复制来的一句");
+            let _ = match gesture {
+                "middle" => tui.paste_clipboard_text(&tui.client),
+                "menu" => tui.run_menu_item("paste", &tui.client),
+                _ => tui.act(Action::AttachImage, &tui.client),
+            };
+            assert_eq!(typed(&host), "复制来的一句", "{gesture}");
+        }
+    }
+
+    /// Right-click over the conversation offers copy and paste whether or not
+    /// anything is selected — a terminal's own menu — and copy with nothing
+    /// selected says so instead of copying the composer.
+    #[test]
+    fn the_conversation_s_menu_has_copy_and_paste() {
+        let (host, tui) = screen();
+        host.moment.write().expect("moment poisoned").input = "草稿".into();
+        tui.open_composer_menu(5, 2);
+        let menu = host.compose((60, 24));
+        let drawn: Vec<String> = menu
+            .part("context-menu")
+            .expect("a menu opens with nothing selected")
+            .lines
+            .iter()
+            .map(|l| l.plain())
+            .collect();
+        let all = drawn.join("\n");
+        assert!(
+            all.contains(&*t(Msg::MenuCopySelection)) && all.contains(&*t(Msg::MenuPaste)),
+            "{all}"
+        );
+        tui.run_menu_item("copy-selected", &tui.client);
+        assert_eq!(
+            tui.surface.clipboard_text(),
+            None,
+            "the composer is not what a press over the conversation copies"
+        );
     }
 }

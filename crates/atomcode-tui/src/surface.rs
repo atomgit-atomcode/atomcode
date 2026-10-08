@@ -116,6 +116,10 @@ pub enum Click {
     /// their own selection while a program has the mouse, so this arrives only
     /// from the ones that pass it on.
     ShiftPress,
+    /// The middle button went down here: paste, the way a terminal does it.
+    /// Taking the mouse takes this from the terminal too, and people who copy
+    /// with a drag paste with this button without thinking about it.
+    MiddlePress,
     /// The pointer moved with the button held. What a drag is made of.
     Drag,
     /// …and came up here. A release at the cell it was pressed on is a click;
@@ -2522,6 +2526,7 @@ pub fn from_crossterm(event: crossterm::event::Event) -> Option<Input> {
                 // never a selection, which is why it is a distinct `Click`
                 // rather than a second `Press`.
                 MouseEventKind::Down(MouseButton::Right) => Click::RightPress,
+                MouseEventKind::Down(MouseButton::Middle) => Click::MiddlePress,
                 MouseEventKind::Drag(MouseButton::Left) => Click::Drag,
                 MouseEventKind::Up(MouseButton::Left) => Click::Release,
                 MouseEventKind::Moved => Click::Hover,
@@ -2988,6 +2993,23 @@ mod tests {
         assert_eq!(
             from_crossterm(Event::Mouse(down)),
             Some(Input::Mouse(Click::Press, 3, 4))
+        );
+    }
+
+    #[test]
+    fn the_middle_button_arrives_as_its_own_press() {
+        // Pasted with, the way a terminal pastes with it — so it has to reach
+        // the screen rather than be dropped as a button nobody reads.
+        use crossterm::event::{Event, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let down = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Middle),
+            column: 3,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            from_crossterm(Event::Mouse(down)),
+            Some(Input::Mouse(Click::MiddlePress, 3, 4))
         );
     }
 
