@@ -19,6 +19,9 @@
 //! There is NO opaque signature on this path — reasoning is plain text — so the flat
 //! kernel `reasoning: Option<String>` is fully sufficient (see its FUTURE doc note for
 //! the signed-provider extension).
+//!
+//! Whether thinking goes back is [`ReasoningPolicy`]'s question; under which NAME it
+//! goes back (`reasoning_content` or vLLM's `reasoning`) is [`ReasoningField`]'s.
 
 /// Placeholder echoed when a model REQUIRES `reasoning_content` on a historical
 /// assistant message but none was captured (resumed/compacted history, or a turn
@@ -30,6 +33,65 @@
 /// emit it as its only assistant text, stalling the turn. A bare middle-dot satisfies the
 /// non-empty requirement without giving the model prose to echo (ported from core 54c9e4bb).
 pub const REASONING_PLACEHOLDER: &str = "·";
+
+/// The name a server streams its thinking under — and so the name that thinking
+/// is handed back under on the next request ([`ReasoningPolicy`] decides whether
+/// it is handed back at all).
+///
+/// Two names are in use and neither is a standard: OpenAI's own chat completions
+/// stream no thinking at all. DeepSeek introduced `reasoning_content`, which
+/// SGLang and Kimi follow, and DeepSeek answers 400 when a tool-calling turn comes
+/// back without it. vLLM renamed its field to `reasoning` and, from 0.16, reads
+/// only `reasoning` off an assistant message in a request — thinking handed back
+/// under the other name never reaches the chat template. No one name serves both,
+/// so the echo goes back in the dialect the server was heard speaking — for the
+/// models that tolerate its absence ([`ReasoningPolicy::Preserve`]), where a wrong
+/// name is merely ignored. The models that require it ([`ReasoningPolicy::Include`])
+/// keep `reasoning_content`: their own APIs take that name, and a wrong one is a 400.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ReasoningField {
+    /// DeepSeek's name, and the one sent until a server is heard using the other.
+    #[default]
+    ReasoningContent,
+    /// vLLM's name.
+    Reasoning,
+}
+
+impl ReasoningField {
+    /// The key on an assistant message in a request body.
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::ReasoningContent => "reasoning_content",
+            Self::Reasoning => "reasoning",
+        }
+    }
+}
+
+/// The name a provider last heard its server stream thinking under.
+///
+/// Shared between a provider and the streams it opens, which outlive the call
+/// that opened them: a stream records what it hears, and the next request reads
+/// it. Starts at [`ReasoningField::ReasoningContent`], so a server never heard
+/// thinking is answered exactly as before.
+#[derive(Debug, Default)]
+pub(crate) struct HeardReasoningField(std::sync::atomic::AtomicBool);
+
+impl HeardReasoningField {
+    pub(crate) fn get(&self) -> ReasoningField {
+        if self.0.load(std::sync::atomic::Ordering::Relaxed) {
+            ReasoningField::Reasoning
+        } else {
+            ReasoningField::ReasoningContent
+        }
+    }
+
+    pub(crate) fn heard(&self, field: ReasoningField) {
+        self.0.store(
+            field == ReasoningField::Reasoning,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
 
 /// Whether a model echoes prior-turn `reasoning_content` back on the next request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
