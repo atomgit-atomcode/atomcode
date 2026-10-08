@@ -1,4 +1,3 @@
-use std::io;
 use std::path::Path;
 use std::sync::{mpsc, Arc};
 use std::thread;
@@ -289,7 +288,7 @@ impl CbreakGuard {
     #[cfg(not(target_os = "windows"))]
     fn new() -> Option<Self> {
         use std::os::unix::io::AsRawFd;
-        let fd = io::stdin().as_raw_fd();
+        let fd = std::io::stdin().as_raw_fd();
         let mut orig: libc::termios = unsafe { std::mem::zeroed() };
         if unsafe { libc::tcgetattr(fd, &mut orig) } != 0 {
             return None;

@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -595,7 +594,7 @@ fn is_binary_summary(summary: &str) -> bool {
 #[cfg(unix)]
 fn bytes_to_path(bytes: &[u8]) -> PathBuf {
     use std::os::unix::ffi::OsStringExt;
-    PathBuf::from(OsString::from_vec(bytes.to_vec()))
+    PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec()))
 }
 
 #[cfg(not(unix))]

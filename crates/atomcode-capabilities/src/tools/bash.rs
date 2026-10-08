@@ -21,9 +21,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 
-#[cfg(target_os = "windows")]
-use std::os::windows::process::CommandExt;
-
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
 const MAX_TIMEOUT_SECS: u64 = 300;
 

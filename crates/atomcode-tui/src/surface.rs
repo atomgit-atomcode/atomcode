@@ -1623,6 +1623,7 @@ pub fn probe_report() -> String {
 ///
 /// A pure function of the variable, not a read of it, so the list of terminals
 /// can be judged without owning this machine's environment.
+#[cfg(any(unix, test))]
 fn answers_in_order(term_program: Option<&str>) -> bool {
     !term_program.is_some_and(|program| program.eq_ignore_ascii_case("orca"))
 }
@@ -1762,6 +1763,7 @@ fn readable(fd: std::os::fd::RawFd, within: std::time::Duration) -> bool {
 ///
 /// Checked structurally rather than by looking for a `c`, because `c` is also a
 /// hex digit and the colour reply is full of them.
+#[cfg(any(unix, test))]
 fn answered_da1(seen: &[u8]) -> bool {
     let mut from = 0;
     while let Some(at) = seen[from..].iter().position(|&b| b == 0x1b) {
@@ -1788,6 +1790,7 @@ fn answered_da1(seen: &[u8]) -> bool {
 /// Scanned rather than pattern-matched on the whole buffer because seventeen
 /// answers arrive interleaved with a device-attributes reply, in an order the
 /// terminal chooses.
+#[cfg(any(unix, test))]
 fn osc_payloads(seen: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
     let mut i = 0usize;
@@ -1816,6 +1819,7 @@ fn osc_payloads(seen: &[u8]) -> Vec<String> {
 ///
 /// Components are one to four hex digits: xterm answers in sixteen bits per
 /// channel, others in eight. Both scale to the top byte.
+#[cfg(any(unix, test))]
 fn parse_colour(spec: &str) -> Option<Rgb> {
     let spec = spec.trim();
     let hex = match spec.strip_prefix("rgb:") {
@@ -1844,6 +1848,7 @@ fn parse_colour(spec: &str) -> Option<Rgb> {
 }
 
 /// The background, from an OSC 11 reply.
+#[cfg(any(unix, test))]
 fn parse_osc11(seen: &[u8]) -> Option<Rgb> {
     osc_payloads(seen)
         .iter()
@@ -1853,6 +1858,7 @@ fn parse_osc11(seen: &[u8]) -> Option<Rgb> {
 /// The terminal's own text colour, from an OSC 10 reply. Absent on terminals
 /// that do not implement the query — `Secondary` and `ToolName` need no number
 /// at all, so only metadata feels it.
+#[cfg(any(unix, test))]
 fn parse_osc10(seen: &[u8]) -> Option<Rgb> {
     osc_payloads(seen)
         .iter()
@@ -1861,6 +1867,7 @@ fn parse_osc10(seen: &[u8]) -> Option<Rgb> {
 
 /// The slots, from the OSC 4 replies. Slots the terminal did not answer for are
 /// simply absent — the palette falls back to xterm's value for each.
+#[cfg(any(unix, test))]
 fn parse_osc4(seen: &[u8]) -> Vec<(u8, Rgb)> {
     osc_payloads(seen)
         .iter()
