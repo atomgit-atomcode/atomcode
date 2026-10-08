@@ -1461,9 +1461,10 @@ pub(crate) fn prepare_catalog_session_resume_any_project_in_root(
 }
 
 /// Shared implementation for the exact-bucket resume prepare. With
-/// `fork_on_busy = false` a `SessionInUse` propagates (the webui/importer
-/// behaviour); with `true` the interactive `/resume` forks a native copy of the
-/// busy session instead (see [`prepare_catalog_session_resume_or_fork_in_project`]).
+/// `fork_on_busy = false` a `SessionInUse` propagates (a directory change's
+/// paired switch, the importer); with `true` the interactive `/resume` and the
+/// webui's sync switch fork a native copy of the busy session instead
+/// (see [`prepare_catalog_session_resume_or_fork_in_project`]).
 pub(crate) fn prepare_catalog_session_resume_in_project_root(
     sessions_root: &std::path::Path,
     project_bucket: &str,

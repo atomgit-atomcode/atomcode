@@ -1784,7 +1784,12 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
               if (!result.ok) {
                 throw new Error(result.error ?? 'live runtime rejected the session switch');
               }
-              if (result.forkedFrom) pushCommandNotice(t('sync.sessionForked'));
+              // The runtime is on a copy now: follow it, or this page would
+              // keep naming the original while every message lands in the copy.
+              if (result.forkedFrom && result.sessionId) {
+                noticeAfterSwitchRef.current = t('sync.sessionForked');
+                onSessionId(result.sessionId);
+              }
               startLiveStream();
             })
             .catch((error) => {
