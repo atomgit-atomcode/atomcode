@@ -123,6 +123,43 @@ max_rounds     = 200   # per-subtask model-round cap (0 = unbounded)</code></pre
       </table>
       <p>Environment overrides: <code>ATOMCODE_SUBAGENT_TIMEOUT</code> and <code>ATOMCODE_SUBAGENT_MAX_ROUNDS</code> take precedence over the config values.</p>
 
+      <h2 id="custom-team-roles">Custom team roles</h2>
+      <p>The team (<code>team</code>) picks members by <strong>role</strong>. Besides the built-in roles you can define your own as Markdown files in either of:</p>
+      <ul>
+        <li><code>&lt;project&gt;/.atomcode/agents/&lt;role&gt;.md</code> — this project only;</li>
+        <li><code>~/.atomcode/agents/&lt;role&gt;.md</code> — every project.</li>
+      </ul>
+      <p>The file name (without <code>.md</code>) is the role's name. A file named like a built-in role replaces it; when both directories have a file of the same name, the one in your home directory wins.</p>
+      <p>A role file is a header of fields between <code>---</code> lines, then the role's instructions:</p>
+      <pre><code>---
+permission: explore      # required: explore (looks, changes nothing) | worker (may edit files and run commands)
+difficulty: hard         # required: simple (the fast model) | hard (the strong one)
+effort: high             # optional: low | medium | high | xhigh | max
+model: glm-4.6           # optional: a model selection id, overriding difficulty
+when: designing systems  # optional: one line on when to hand it work
+tools: read_file, grep   # optional: limit its tools, chosen from what permission allows
+---
+You design. Read the existing code first, then propose a design and its trade-offs.</code></pre>
+      <table>
+        <thead>
+          <tr><th>Field</th><th>Required</th><th>Values</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>permission</code></td><td>yes</td><td><code>explore</code> (read-only investigation) or <code>worker</code> (scoped writes)</td></tr>
+          <tr><td><code>difficulty</code></td><td>yes</td><td><code>simple</code> (fast model) or <code>hard</code> (strong model)</td></tr>
+          <tr><td><code>effort</code></td><td>no</td><td><code>low</code> / <code>medium</code> / <code>high</code> / <code>xhigh</code> / <code>max</code></td></tr>
+          <tr><td><code>model</code></td><td>no</td><td>A model selection id; without it, chosen by <code>difficulty</code></td></tr>
+          <tr><td><code>when</code></td><td>no</td><td>One line on when to hand this role work</td></tr>
+          <tr><td><code>tools</code></td><td>no</td><td>Comma-separated tool names, a subset of what <code>permission</code> allows</td></tr>
+        </tbody>
+      </table>
+      <p>Two things to note:</p>
+      <ul>
+        <li>This <code>permission</code> is not the CLI's <code>--permission-mode</code> (<code>plan</code> / <code>accept_edits</code> / <code>auto</code>); they only share a name. This one decides whether the member may change anything; that one is how the whole session asks for approval.</li>
+        <li>This is not Claude Code's agent file format. <code>name</code>, <code>description</code>, <code>allowed_tools</code> and <code>user_invocable</code> are not read: the role's name is the file name, and its tools are limited with <code>tools</code>.</li>
+      </ul>
+      <p>A role file that does not parse is skipped and the session starts anyway. You are told once per session which file was skipped and everything that is missing or wrong in it; a file named like a built-in role leaves the built-in in use.</p>
+
       <h2 id="turning-it-off">Turning it off</h2>
       <p>The <code>task</code> tool is enabled by default. To remove it entirely, set:</p>
       <pre><code>ATOMCODE_SUBAGENT=0 atomcode</code></pre>

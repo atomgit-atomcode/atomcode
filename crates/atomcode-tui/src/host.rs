@@ -1459,6 +1459,8 @@ pub struct Host {
 /// amending it away never touches a transcript block, and so `settle_all` on any
 /// other producer leaves it alone.
 const ECHO: &str = "echo";
+/// The writer the `※ recap:` lines go out under ([`Host::show_recap`]).
+const RECAP: &str = "recap";
 
 /// A block amended to nothing: it draws no rows, and a slot that draws no rows is
 /// not a neighbour, so the seams around where it was stay where they were
@@ -2234,6 +2236,19 @@ impl Host {
                 .compacting_since = None;
         });
         true
+    }
+
+    /// Put a `※ recap:` line at the foot of the conversation. The screen's
+    /// alone — nothing writes it to the log — and settled as it is put there.
+    pub fn show_recap(&self, text: String) {
+        if text.trim().is_empty() {
+            return;
+        }
+        let mut stream = self.stream.write().expect("stream poisoned");
+        stream.writer(RECAP).emit(
+            crate::block::Coord::default(),
+            Arc::new(crate::content::RecapBlock(text)),
+        );
     }
 
     /// Echo the message the person just submitted into the conversation, now,

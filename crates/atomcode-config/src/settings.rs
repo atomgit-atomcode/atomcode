@@ -302,6 +302,14 @@ pub static SETTINGS: &[SettingSpec] = &[
         ApplyPolicy::ImmediateUi,
     ),
     bool_setting(
+        "ui.recap",
+        &["ui", "recap"],
+        "Recap after a long or unwatched turn",
+        "回合结束后的进度回顾(recap)",
+        &["recap", "summary", "回顾", "总结"],
+        ApplyPolicy::ImmediateUi,
+    ),
+    bool_setting(
         "ui.whats_new",
         &["ui", "whats_new"],
         "Tell what's new after an upgrade",
@@ -458,6 +466,7 @@ impl SettingSpec {
             "ui.ai_session_naming" => config.ui.ai_session_naming.to_string(),
             "ui.terminal_status_glyph" => config.ui.terminal_status_glyph.to_string(),
             "ui.whats_new" => config.ui.whats_new.to_string(),
+            "ui.recap" => config.ui.recap.to_string(),
             "ui.truncate_resumed_history" => (config.ui.truncate_resumed_history
                 && config.ui.history_replay_max_rows != Some(0))
             .to_string(),

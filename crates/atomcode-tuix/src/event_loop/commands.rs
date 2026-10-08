@@ -2357,7 +2357,8 @@ fn execute_slash_command_impl(
                         atomcode_daemon::ensure_server_and_open(
                             &host,
                             atomcode_daemon::WEBUI_DEFAULT_PORT,
-                            true,
+                            true, // sync
+                            true, // open_browser：TUI /webui 保持自动打开行为
                         ),
                     )
                 });

@@ -123,6 +123,43 @@ max_rounds     = 200   # 每个子任务的模型轮次上限（0 = 不限）</c
       </table>
       <p>环境变量覆盖：<code>ATOMCODE_SUBAGENT_TIMEOUT</code> 和 <code>ATOMCODE_SUBAGENT_MAX_ROUNDS</code> 优先于配置值。</p>
 
+      <h2 id="自定义团队角色">自定义团队角色</h2>
+      <p>团队（<code>team</code>）派活时按<strong>角色</strong>挑成员。除了内置角色，你可以用 Markdown 文件自己定义，放在下面两个目录之一：</p>
+      <ul>
+        <li><code>&lt;项目&gt;/.atomcode/agents/&lt;角色名&gt;.md</code>——只在这个项目里生效；</li>
+        <li><code>~/.atomcode/agents/&lt;角色名&gt;.md</code>——所有项目通用。</li>
+      </ul>
+      <p>文件名（不含 <code>.md</code>）就是角色名。和内置角色同名的文件会替换它；两个目录有同名文件时，用户目录的生效。</p>
+      <p>文件由 <code>---</code> 包住的头部字段和后面的角色说明（人设）组成：</p>
+      <pre><code>---
+permission: explore      # 必填：explore（只看、不改任何东西）| worker（可以改文件、跑命令）
+difficulty: hard         # 必填：simple（用快模型）| hard（用强模型）
+effort: high             # 可选：思考强度，low | medium | high | xhigh | max
+model: glm-4.6           # 可选：指定模型（选择 id），优先于 difficulty
+when: 需要做架构设计时     # 可选：一句话说明什么时候派给它
+tools: read_file, grep   # 可选：限定可用工具，只能从 permission 允许的工具里选
+---
+你负责架构设计。先读现有代码，再给出方案，列出取舍。</code></pre>
+      <table>
+        <thead>
+          <tr><th>字段</th><th>是否必填</th><th>取值</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>permission</code></td><td>必填</td><td><code>explore</code>（只读调查）或 <code>worker</code>（受范围限制的写入执行）</td></tr>
+          <tr><td><code>difficulty</code></td><td>必填</td><td><code>simple</code>（快模型）或 <code>hard</code>（强模型）</td></tr>
+          <tr><td><code>effort</code></td><td>可选</td><td><code>low</code> / <code>medium</code> / <code>high</code> / <code>xhigh</code> / <code>max</code></td></tr>
+          <tr><td><code>model</code></td><td>可选</td><td>模型选择 id；不写则按 <code>difficulty</code> 选</td></tr>
+          <tr><td><code>when</code></td><td>可选</td><td>一句话：什么时候该派给这个角色</td></tr>
+          <tr><td><code>tools</code></td><td>可选</td><td>逗号分隔的工具名，只能是 <code>permission</code> 默认工具的子集</td></tr>
+        </tbody>
+      </table>
+      <p>注意两点：</p>
+      <ul>
+        <li>这里的 <code>permission</code> 和命令行的 <code>--permission-mode</code>（<code>plan</code> / <code>accept_edits</code> / <code>auto</code>）是两回事，只是名字相同：前者决定这个成员能不能动手，后者是整个会话的审批方式。</li>
+        <li>它不是 Claude Code 的 agent 文件格式。<code>name</code>、<code>description</code>、<code>allowed_tools</code>、<code>user_invocable</code> 这些字段不会被读取：角色名取自文件名，可用工具用 <code>tools</code> 限定。</li>
+      </ul>
+      <p>格式不对的角色文件会被跳过，不影响会话启动。会话里会提示一次哪个文件被跳过、缺了或写错了哪些字段（一次列全），同一个会话里不会重复提示；和内置角色同名的文件被跳过时，继续使用内置角色。</p>
+
       <h2 id="关闭该功能">关闭该功能</h2>
       <p><code>task</code> 工具默认开启。若要彻底移除它，设置：</p>
       <pre><code>ATOMCODE_SUBAGENT=0 atomcode</code></pre>

@@ -625,6 +625,11 @@ pub struct UiConfig {
     /// off keeps the launch quiet, and `/changelog` still answers.
     #[serde(default = "default_true")]
     pub whats_new: bool,
+    /// After a turn a person was away from, or that ran long, one dim line
+    /// under it saying where things stand and what is next (`※ recap:`).
+    /// Default on; off saves the side call it costs.
+    #[serde(default = "default_true")]
+    pub recap: bool,
     /// Maximum number of already-wrapped transcript rows written to the host
     /// terminal when a session is resumed. `None` selects a terminal-aware
     /// default; `Some(0)` disables the cap and restores the legacy full replay.
@@ -674,6 +679,7 @@ impl Default for UiConfig {
             ai_session_naming: default_ai_session_naming(),
             terminal_status_glyph: default_terminal_status_glyph(),
             whats_new: true,
+            recap: true,
             history_replay_max_rows: None,
             truncate_resumed_history: true,
             brand_name: default_brand_name(),

@@ -10142,3 +10142,90 @@ async fn ctrl_z_suspends_for_the_shell() {
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
+
+/// A host that answers a recap itself, and counts the asks. The e2e host has
+/// no runtime to write one; writing it is the runtime's criterion
+/// (`atomcode-coding` `recap`). What is the screen's is asking only for a turn
+/// that needs one, and drawing what comes back under it.
+struct RecapHost {
+    inner: Arc<dyn atomcode_host_api::HostControl>,
+    asked: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl atomcode_host_api::HostControl for RecapHost {
+    async fn call(
+        &self,
+        command: atomcode_host_api::HostCommand,
+    ) -> Result<atomcode_host_api::HostReply, atomcode_host_api::HostError> {
+        if matches!(command, atomcode_host_api::HostCommand::Recap { .. }) {
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Ok(atomcode_host_api::HostReply::Recap {
+                text: Some("RECAP-在修端口绑定,下一步等你确认。".into()),
+            });
+        }
+        self.inner.call(command).await
+    }
+    fn subscribe(&self) -> tokio::sync::mpsc::UnboundedReceiver<atomcode_host_api::HostEvent> {
+        self.inner.subscribe()
+    }
+}
+
+/// A turn whose answer runs past a screenful ends with a `※ recap:` line —
+/// asked of the host after the turn and drawn under it. A short turn the
+/// person watched is not asked about at all.
+#[tokio::test]
+async fn a_long_answer_ends_with_a_recap_and_a_short_one_does_not() {
+    let dir = scratch("recap");
+    let long: Vec<String> = (1..=60).map(|n| format!("ROW-{n:02}")).collect();
+    let script = replay(&format!(
+        r#"{{ text = "short answer" }},
+           {{ text = "{}" }}"#,
+        long.join("\\n")
+    ));
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let s = start_full(
+        tree(&dir, &script, &[]),
+        {
+            let asked = asked.clone();
+            move |connection| atomcode_host_api::HostConnection {
+                control: Arc::new(RecapHost {
+                    inner: connection.control,
+                    asked,
+                }),
+                ..connection
+            }
+        },
+        Ports::default(),
+    )
+    .await;
+    let task = s.open().await;
+
+    s.term.type_line("a quick one");
+    until(&s, "short answer").await;
+    s.quiet().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        asked.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a short watched turn is not asked about"
+    );
+
+    s.term.type_line("a long one");
+    until(&s, "ROW-60").await;
+    for _ in 0..100 {
+        if s.term.text().contains("RECAP-") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let screen = s.term.text();
+    assert!(
+        screen.contains("※ 回顾:") && screen.contains("RECAP-在修端口绑定"),
+        "the long turn got its recap:\n{screen}"
+    );
+    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}

@@ -26,11 +26,40 @@ export function getToken(): string {
  * page from a proxy failed as `Unexpected token '<'`.
  */
 async function readJson<T>(r: Response): Promise<T> {
-  if (!r.ok) {
-    const e = (await r.json().catch(() => ({}))) as { error?: string; code?: string };
-    throw new ApiCallError(e.error || `HTTP ${r.status} ${r.url}`, r.status, e.code);
-  }
+  if (!r.ok) throw await failure(r);
   return r.json() as Promise<T>;
+}
+
+/**
+ * What a failed response said, as an error to throw.
+ *
+ * The daemon answers a failure as `{error, code}` on most routes and as a bare
+ * JSON string on some (`/sessions/resolve/:id`'s 409 names the buckets an id is
+ * duplicated across). Either way that sentence is the part a person can act
+ * on, and "HTTP 409 Conflict" alone is the part they cannot. An HTML error
+ * page from a proxy is not shown — only its status.
+ */
+export async function failure(r: Response): Promise<ApiCallError> {
+  const status = `HTTP ${r.status}${r.statusText ? ' ' + r.statusText : ''}`;
+  const text = await r.text().catch(() => '');
+  let said = '';
+  let code: string | undefined;
+  try {
+    const body: unknown = JSON.parse(text);
+    if (typeof body === 'string') {
+      said = body;
+    } else if (body && typeof body === 'object') {
+      const e = body as { error?: unknown; code?: unknown };
+      if (typeof e.error === 'string') said = e.error;
+      if (typeof e.code === 'string') code = e.code;
+    }
+  } catch {
+    if (text && !/^\s*</.test(text)) said = text.trim().slice(0, 500);
+  }
+  // The daemon's sentence alone when it gave one — that is what the person
+  // reads, and the model settings page shows it verbatim; the status stays on
+  // `.status` for code that branches on it.
+  return new ApiCallError(said || `${status} ${r.url}`, r.status, code);
 }
 
 export type SSEEvent =
@@ -152,7 +181,7 @@ export async function streamChat(
   });
 
   if (!resp.ok) {
-    throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
+    throw await failure(resp);
   }
 
   const reader = resp.body!.getReader();
@@ -342,7 +371,7 @@ export async function resolveSession(id: string): Promise<SessionMetaWithProject
     headers: authHeaders(),
   });
   if (resp.status === 404) return null;
-  if (!resp.ok) throw new Error(`resolve session failed: ${resp.status}`);
+  if (!resp.ok) throw await failure(resp);
   return resp.json();
 }
 

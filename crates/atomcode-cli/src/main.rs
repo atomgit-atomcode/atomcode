@@ -963,6 +963,9 @@ enum Commands {
         /// 绑定地址（默认 127.0.0.1；用 0.0.0.0 暴露到局域网/外网，注意仅 token 保护、无 TLS）
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
+        /// 不自动打开浏览器（脚本/桌面客户端集成场景）；访问 URL 仍会打印
+        #[arg(long)]
+        no_open: bool,
     },
     /// Telemetry controls
     Telemetry {
@@ -1870,7 +1873,11 @@ async fn run() -> Result<i32> {
                 }
                 return Ok(0);
             }
-            Commands::Webui { port, host } => {
+            Commands::Webui {
+                port,
+                host,
+                no_open,
+            } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
                 // Fail before binding a port and opening a browser: without the
                 // assets every page would be a 404, and the cause is a build
@@ -1879,15 +1886,49 @@ async fn run() -> Result<i32> {
                     eprint!("{}", atomcode_daemon::webui::NOT_BUILT_HELP);
                     return Ok(1);
                 }
-                let msg = atomcode_daemon::ensure_server_and_open(&host, port, false).await;
+                let msg =
+                    atomcode_daemon::ensure_server_and_open(&host, port, false, !no_open).await;
                 eprintln!("{msg}");
-                // server 是后台 task；保持进程存活直到用户 Ctrl+C
-                let _ = tokio::signal::ctrl_c().await;
-                // Shutdown telemetry after Ctrl+C.
+                // Nothing is listening: say so and exit non-zero. Waiting on
+                // Ctrl+C anyway is what left a launcher script piling up idle
+                // `atomcode webui` processes, none of them serving, with no
+                // exit code to tell it the start had failed.
+                let code = if atomcode_daemon::webui_port().is_none() {
+                    tracing::error!(target: "atomcode::webui", "atomcode webui exiting: the server did not start");
+                    1
+                } else {
+                    // Serve until Ctrl+C or until the server stops on its own.
+                    // A process started without a console (a hidden window, a
+                    // script) may not be able to listen for Ctrl+C at all; that
+                    // is logged and the server keeps running rather than the
+                    // process taking the failure for a Ctrl+C and quitting.
+                    let ctrl_c = async {
+                        if let Err(error) = tokio::signal::ctrl_c().await {
+                            tracing::warn!(target: "atomcode::webui", %error, "cannot listen for Ctrl+C; serving until the server stops");
+                            std::future::pending::<()>().await;
+                        }
+                    };
+                    let stopped = async {
+                        while atomcode_daemon::webui_port().is_some() {
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        }
+                    };
+                    tokio::select! {
+                        _ = ctrl_c => {
+                            tracing::info!(target: "atomcode::webui", "atomcode webui exiting: Ctrl+C");
+                            0
+                        }
+                        _ = stopped => {
+                            tracing::error!(target: "atomcode::webui", "atomcode webui exiting: the server stopped");
+                            eprintln!("webui 服务已停止，进程退出。");
+                            1
+                        }
+                    }
+                };
                 telemetry
                     .shutdown(std::time::Duration::from_millis(500))
                     .await;
-                return Ok(0);
+                return Ok(code);
             }
             Commands::Telemetry { action } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);

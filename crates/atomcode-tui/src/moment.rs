@@ -1091,6 +1091,17 @@ impl Moment {
             .is_none_or(|row| row.value == "true")
     }
 
+    /// Whether a turn the person was away from, or that ran long, is followed
+    /// by a `※ recap:` line (`ui.recap`). On for no row at all, on the terms
+    /// [`Moment::status_dot_on`] keeps.
+    pub fn recap_on(&self) -> bool {
+        self.settings
+            .rows()
+            .iter()
+            .find(|row| row.id == crate::settings::RECAP)
+            .is_none_or(|row| row.value == "true")
+    }
+
     /// Whether plain Tab cycles the execution mode, rather than reserving itself
     /// for the completion menu (`ui.mode_switch_key = "tab"`).
     ///
@@ -1829,5 +1840,16 @@ mod tests {
         // must never read as one press from exit.
         let m = Moment::default().with_notice("已复制", false, Timestamp::millis(0));
         assert!(!m.exit_hint_live(), "a copy hint is not the exit hint");
+    }
+}
+
+#[cfg(test)]
+mod recap_setting_tests {
+    use super::*;
+
+    #[test]
+    fn a_recap_is_on_unless_the_setting_says_off() {
+        let m = Moment::default();
+        assert!(m.recap_on(), "no row: this build's default, on");
     }
 }

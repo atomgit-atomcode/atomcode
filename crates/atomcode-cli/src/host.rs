@@ -2377,6 +2377,12 @@ impl HostControl for RuntimeControl {
                 let tools = self.handle.mcp_tools(server).await.map_err(refused)?;
                 Ok(HostReply::McpTools { tools: tools.tools })
             }
+            // Read off the conversation and handed back; nothing is added to it.
+            HostCommand::Recap { session } => {
+                self.addressed(&session)?;
+                let text = self.handle.recap().await.map_err(refused)?;
+                Ok(HostReply::Recap { text })
+            }
             // The catalog is the tree's, read through the runtime that owns it
             // — the screen may not reach into the agent's App
             // (`docs/adr/0022` §3).

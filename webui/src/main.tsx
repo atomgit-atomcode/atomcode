@@ -8,9 +8,50 @@ import './styles/theme.css';
 import './styles/app.css';
 import './index.css';
 
-render(
-  <SettingsProvider>
-    <App />
-  </SettingsProvider>,
-  document.getElementById('app')!,
-);
+import { AuthRequired } from './components/AuthRequired';
+import { CompatNotice } from './components/CompatNotice';
+import { signedIn } from './lib/compat';
+import { getToken } from './api';
+
+import { useEffect, useState } from 'preact/hooks';
+import { UNAUTHORIZED_EVENT } from './components/LoginButton';
+
+/**
+ * The app, or — when the daemon does not know this page — where to get the
+ * link that it does know.
+ *
+ * Asked once before the app mounts (opened without the link the terminal
+ * printed) and again whenever the app hears a 401 (the webui restarted under
+ * an open page, with a new token): from then on every request would be
+ * refused, signing in included, and what the app would show is a button that
+ * does nothing.
+ */
+function Root({ signedIn: initially }: { signedIn: boolean }) {
+  const [ok, setOk] = useState(initially);
+  useEffect(() => {
+    const lost = () => setOk(false);
+    window.addEventListener(UNAUTHORIZED_EVENT, lost);
+    return () => window.removeEventListener(UNAUTHORIZED_EVENT, lost);
+  }, []);
+  return ok ? <App /> : <AuthRequired />;
+}
+
+// The installed app's answer for when the webui is not running (`public/sw.js`):
+// a page that says how to start it, instead of the browser's "can't reach this
+// page". Only where the browser allows a worker — localhost is a secure
+// context; a plain-http LAN address is not, and simply goes without.
+if ('serviceWorker' in navigator && window.isSecureContext) {
+  navigator.serviceWorker.register('./sw.js', { scope: './' }).catch(() => {
+    /* no offline page; everything else works as before */
+  });
+}
+
+void signedIn(fetch, getToken()).then((ok) => {
+  render(
+    <SettingsProvider>
+      <CompatNotice />
+      <Root signedIn={ok} />
+    </SettingsProvider>,
+    document.getElementById('app')!,
+  );
+});

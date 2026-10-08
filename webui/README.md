@@ -4,6 +4,18 @@ A local browser UI for AtomCode (Preact + Vite + Tailwind), served by the
 `atomcode-daemon` HTTP server. Launch it with `/webui` inside the TUI or
 `atomcode webui` from the CLI — both open a loopback-only page in your browser.
 
+## Browsers
+
+Chrome / Edge 111 or newer draws the page as designed. Older engines down to
+Chromium 99 (Huawei's browser, older 360/QQ builds) still work: the build
+targets them (`vite.config.ts`), every newer CSS feature has a fallback, and the
+page says at the top that it is running on an old engine. Below that, nothing
+is promised.
+
+Opening the page needs the link `/webui` prints — it carries the token. The
+link works in any browser for as long as that webui runs; a browser that opens
+the page without it is shown where to get it.
+
 ## Develop the frontend
 
 ```bash
