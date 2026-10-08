@@ -610,7 +610,7 @@ impl AgentClient {
         on_screen
     }
 
-    fn describe(&self, description: &AgentDescription) {
+    pub(crate) fn describe(&self, description: &AgentDescription) {
         let mut views = self.view.lock().expect("client poisoned");
         if let Some(view) = views.sessions.get_mut(&description.session) {
             view.described = Some(description.clone());
@@ -628,7 +628,7 @@ impl AgentClient {
     }
 
     /// `true` when it is the session on screen.
-    fn status(&self, session: &str, status: AgentStatus) -> bool {
+    pub(crate) fn status(&self, session: &str, status: AgentStatus) -> bool {
         let mut views = self.view.lock().expect("client poisoned");
         if let Some(view) = views.sessions.get_mut(session) {
             view.status = Some(status);

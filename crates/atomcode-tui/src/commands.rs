@@ -1095,6 +1095,16 @@ impl CommandSet for SessionCommands {
         let host = |control: Option<std::sync::Arc<dyn atomcode_host_api::HostControl>>| {
             control.ok_or_else(|| Outcome::Refused(t(Msg::NoHost).into_owned()))
         };
+        // A command that replaces the conversation (a new session, another
+        // session, another directory, a reload) or rewinds it, typed while the
+        // lead's turn runs. The runtime refuses it until the turn is over, and
+        // its own word for that is "busy" — which says neither why nor what to
+        // do. Said here instead, before anything is asked: wait for the turn, or
+        // stop it with Esc.
+        let waits_for_the_turn = |command: &str| {
+            (!client.root_settled())
+                .then(|| Outcome::Refused(t(Msg::WaitsForTheTurn { command }).into_owned()))
+        };
         match name {
             "cancel-all" => {
                 let members = client.cancel_all();
@@ -1116,8 +1126,15 @@ impl CommandSet for SessionCommands {
                 // and is said then; saying "done" here would be saying it
                 // before it is true.
                 let focus = args.trim();
+                // Running, it waits for the turn: say so, or the command reads as
+                // ignored until the turn ends and the compaction appears.
+                let queued = !client.root_settled();
                 client.compact((!focus.is_empty()).then(|| focus.to_string()));
-                Outcome::Quiet
+                if queued {
+                    Outcome::Said(t(Msg::CompactAfterTurn).into_owned())
+                } else {
+                    Outcome::Quiet
+                }
             }
             "context" => {
                 // `/context prompt`:这个会话到底跑在哪份系统提示词上。人想看
@@ -1223,6 +1240,9 @@ impl CommandSet for SessionCommands {
                 let Some(control) = control else {
                     return Outcome::Refused(t(Msg::NoHost).into_owned());
                 };
+                if let Some(refused) = waits_for_the_turn(name) {
+                    return refused;
+                }
                 match control
                     .call(HostCommand::NewSession {
                         session: root.clone(),
@@ -1359,6 +1379,11 @@ impl CommandSet for SessionCommands {
                         Err(error) => Outcome::Refused(refusal(error)),
                     };
                 }
+                // The list above is only a look and is fine mid-turn; going to
+                // another session is not.
+                if let Some(refused) = waits_for_the_turn(name) {
+                    return refused;
+                }
                 match control
                     .call(HostCommand::Resume {
                         session: root.clone(),
@@ -1436,6 +1461,12 @@ impl CommandSet for SessionCommands {
                     Ok(control) => control,
                     Err(refused) => return refused,
                 };
+                // Refused rather than queued: undone after the turn, "the last
+                // turn" would be the one running now, not the one meant. And the
+                // rewind panel is not put up only to say it cannot list turns.
+                if let Some(refused) = waits_for_the_turn(name) {
+                    return refused;
+                }
                 if client.session() != root {
                     return Outcome::Refused(t(Msg::UndoLeadOnly).into_owned());
                 }
@@ -1825,6 +1856,11 @@ impl CommandSet for SessionCommands {
                     Ok(control) => control,
                     Err(refused) => return refused,
                 };
+                // The picker above and the bookmarks are fine mid-turn; moving is
+                // a new session, and that waits for the turn.
+                if let Some(refused) = waits_for_the_turn(name) {
+                    return refused;
+                }
                 match control
                     .call(HostCommand::ChangeDirectory {
                         session: root,
@@ -2380,6 +2416,11 @@ impl CommandSet for SessionCommands {
                     Ok(control) => control,
                     Err(refused) => return refused,
                 };
+                if name == "reload" {
+                    if let Some(refused) = waits_for_the_turn(name) {
+                        return refused;
+                    }
+                }
                 let (command, done) = match name {
                     "reload" => (HostCommand::Reload { session: root }, t(Msg::Reloaded)),
                     "logout" => (HostCommand::SignOut { session: root }, t(Msg::SignedOut)),
@@ -3412,6 +3453,82 @@ mod tests {
         let all = Arc::new(Commands::new());
         let _ = all.add(Arc::new(SessionCommands));
         (app, client, all)
+    }
+
+    /// The lead's turn is running: what replaces or rewinds the conversation
+    /// says, in the person's words, that it waits for the turn and that Esc stops
+    /// it — and asks the host nothing, so no "busy" comes back from below.
+    #[tokio::test]
+    async fn a_command_that_replaces_the_conversation_waits_for_the_turn_and_says_so() {
+        let _locale = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::ZhCn);
+        for line in [
+            "/clear",
+            "/session",
+            "/resume other",
+            "/cd /tmp",
+            "/undo",
+            "/rewind",
+            "/rewind 1",
+            "/reload",
+        ] {
+            let host = Arc::new(Recording::default());
+            let (app, client, all) = following(&host);
+            client.status("lead", atomcode_kernel::agent::AgentStatus::Working);
+            match all.dispatch(line, &app.context()).await {
+                Outcome::Refused(why) => {
+                    assert!(why.contains("要等这一轮结束"), "{line}: {why}");
+                    assert!(why.contains("Esc"), "{line}: {why}");
+                }
+                other => panic!("{line}: {other:?}"),
+            }
+            assert!(
+                host.asked.lock().unwrap().is_empty(),
+                "{line} asked the host"
+            );
+        }
+    }
+
+    /// The same commands between turns go to the host as before.
+    #[tokio::test]
+    async fn between_turns_they_are_asked_of_the_host() {
+        let host = Arc::new(Recording::default());
+        let (app, client, all) = following(&host);
+        client.status("lead", atomcode_kernel::agent::AgentStatus::Idle);
+        let _ = all.dispatch("/clear", &app.context()).await;
+        assert!(
+            matches!(
+                host.asked.lock().unwrap().first(),
+                Some(HostCommand::NewSession { .. })
+            ),
+            "asked: {:?}",
+            host.asked.lock().unwrap()
+        );
+    }
+
+    /// `/compact` during a turn waits behind it — and says so, instead of
+    /// nothing until the turn ends.
+    #[tokio::test]
+    async fn compact_during_a_turn_says_it_comes_after() {
+        let _locale = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::ZhCn);
+        let host = Arc::new(Recording::default());
+        let (app, client, all) = following(&host);
+        client.describe(&atomcode_kernel::agent::AgentDescription {
+            session: "lead".into(),
+            compaction: true,
+            ..Default::default()
+        });
+        client.status("lead", atomcode_kernel::agent::AgentStatus::Working);
+        assert_eq!(
+            all.dispatch("/compact", &app.context()).await,
+            Outcome::Said("这一轮结束后就压缩".into())
+        );
+        client.status("lead", atomcode_kernel::agent::AgentStatus::Idle);
+        assert_eq!(
+            all.dispatch("/compact", &app.context()).await,
+            Outcome::Quiet
+        );
     }
 
     /// A host that answers each question by what it is, whatever order the

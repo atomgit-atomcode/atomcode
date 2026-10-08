@@ -1340,7 +1340,7 @@ fn said(message: std::borrow::Cow<'_, str>) -> AgentEvent {
 fn command_error(error: RuntimeError) -> CommandError {
     match error {
         RuntimeError::Busy => CommandError::Busy {
-            reason: "the runtime is busy".into(),
+            reason: tr(SMsg::RuntimeBusy).into_owned(),
         },
         RuntimeError::StaleRequest { .. } => CommandError::StaleQuestion,
         _ => CommandError::Unavailable,
@@ -2932,7 +2932,7 @@ pub fn refused(error: RuntimeError) -> HostError {
     {
         match error {
             RuntimeError::Busy => HostError::Busy {
-                reason: "the runtime is busy".into(),
+                reason: tr(SMsg::RuntimeBusy).into_owned(),
             },
             RuntimeError::Cancelled => HostError::Cancelled,
             RuntimeError::SessionInUse { id } => HostError::SessionInUse { id },

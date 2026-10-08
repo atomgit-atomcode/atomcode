@@ -51,6 +51,42 @@ impl LlmProvider for Scripted {
     }
 }
 
+/// The first request answers a little and then never finishes, so a turn
+/// stays in flight for as long as a test needs it to.
+struct HangsFirst(Arc<Count>);
+
+#[async_trait::async_trait]
+impl LlmProvider for HangsFirst {
+    fn model_name(&self) -> &str {
+        "scripted"
+    }
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDef],
+        _options: &ChatOptions,
+    ) -> Result<futures::stream::BoxStream<'static, StreamEvent>, ProviderError> {
+        use futures::StreamExt;
+        self.0 .0.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::pin(
+            futures::stream::iter(vec![StreamEvent::TextDelta("正在思考中".into())])
+                .chain(futures::stream::pending()),
+        ))
+    }
+}
+
+struct HangingFactory(Arc<Count>);
+
+impl CodingProviderFactory for HangingFactory {
+    fn build(
+        &self,
+        _config: &CodingAgentConfig,
+        _session_id: Option<&str>,
+    ) -> Result<Arc<dyn LlmProvider>, ProviderBuildError> {
+        Ok(Arc::new(HangsFirst(self.0.clone())))
+    }
+}
+
 struct Factory(Arc<Count>);
 
 impl CodingProviderFactory for Factory {
@@ -1194,4 +1230,77 @@ async fn until_shown(term: &atomcode_tui::surface::Headless, what: &str) -> Stri
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     text
+}
+
+/// Mid-turn, a command that replaces the conversation says plainly that it
+/// waits for the turn and that Esc stops it — not the runtime's "busy" — and
+/// `/compact` says it comes after the turn. Neither stops the turn.
+#[tokio::test]
+async fn commands_typed_mid_turn_say_what_they_wait_for() {
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("ATOMCODE_HOME", home.path());
+    let project = tempfile::tempdir().unwrap();
+    let count = Arc::new(Count::default());
+    let config_path = home.path().join("config.toml");
+    let _locale = atomcode_config::i18n::test_lock();
+    atomcode_config::i18n::set_locale(atomcode_config::locale::Locale::ZhCn);
+
+    let front_end = FrontEnd::new();
+    let (mut start, config) = start(
+        project.path(),
+        &count,
+        SessionMode::Fresh,
+        Some(front_end.clone()),
+    );
+    start.provider_factory = Arc::new(HangingFactory(count.clone()));
+    let runtime = CodingRuntime::start(start).await.expect("starts");
+    let screen = Screen {
+        headless: Some((120, 40)),
+        ..Screen::default()
+    };
+    let mounted = tui_front::mount(
+        runtime,
+        front_end,
+        config,
+        None,
+        &screen,
+        config_path,
+        None,
+        None,
+    )
+    .await
+    .expect("the screen mounts");
+    let term = mounted
+        .app
+        .context()
+        .service::<atomcode_tui::plugin::SurfaceSvc>()
+        .and_then(|surface| surface.as_any_headless())
+        .expect("a headless surface");
+    let ui = mounted.ui.clone();
+    let ctx = mounted.app.context();
+    let running = tokio::spawn(async move {
+        let _ = ui.run(&ctx, None).await;
+    });
+
+    term.type_line("帮我做件事");
+    until_shown(&term, "正在思考中").await;
+
+    term.type_line("/clear");
+    let said = until_shown(&term, "要等这一轮结束").await;
+    assert!(said.contains("/clear 要等这一轮结束"), "{said}");
+    assert!(!said.contains("busy"), "{said}");
+
+    term.type_line("/compact");
+    let said = until_shown(&term, "这一轮结束后就压缩").await;
+    assert!(said.contains("这一轮结束后就压缩"), "{said}");
+
+    assert_eq!(
+        count.0.load(Ordering::SeqCst),
+        1,
+        "the turn is the same one"
+    );
+    term.press(atomcode_tui::surface::KeyPress::ctrl('c'));
+    term.press(atomcode_tui::surface::KeyPress::ctrl('d'));
+    term.press(atomcode_tui::surface::KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), running).await;
 }

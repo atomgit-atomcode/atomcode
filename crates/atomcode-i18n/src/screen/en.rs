@@ -1362,6 +1362,12 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         }
         Msg::ContextNoPrompt => "This host assembles no system prompt.".into(),
         Msg::ComposerSuggested { text } => text.to_string().into(),
+        Msg::WaitsForTheTurn { command } => format!(
+            "A reply is in progress: /{command} has to wait for this turn to end; Esc stops the turn now"
+        )
+        .into(),
+        Msg::CompactAfterTurn => "Will compact once this turn ends".into(),
+        Msg::RuntimeBusy => "Busy (a reply, a compaction or a rebuild is under way); try again shortly".into(),
         Msg::CmdAboutChangelog => "What changed in each release".into(),
         Msg::ChangelogPickerTitle => "pick a release to read what changed".into(),
         Msg::ChangelogNewTag => "new".into(),

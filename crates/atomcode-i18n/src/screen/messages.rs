@@ -2042,6 +2042,16 @@ pub enum Msg<'a> {
     ComposerSuggested {
         text: &'a str,
     },
+    /// A command that replaces or rewinds the conversation, typed while a turn
+    /// is running: it has to wait for the turn, and Esc stops the turn now.
+    WaitsForTheTurn {
+        command: &'a str,
+    },
+    /// `/compact` typed while a turn is running: queued behind it.
+    CompactAfterTurn,
+    /// The runtime refused because it is busy (a turn, a compaction or a
+    /// rebuild under way) — what the host says in place of its own words.
+    RuntimeBusy,
     /// `/changelog` in the command menu and the welcome tips.
     CmdAboutChangelog,
     /// The header of `/changelog`'s list of releases.

@@ -1055,7 +1055,8 @@ fn runtime_errors_are_host_errors_by_the_table() {
         (
             RuntimeError::Busy,
             HostError::Busy {
-                reason: "the runtime is busy".into(),
+                reason: atomcode_i18n::screen::t(atomcode_i18n::screen::Msg::RuntimeBusy)
+                    .into_owned(),
             },
         ),
         (RuntimeError::Cancelled, HostError::Cancelled),

@@ -1259,6 +1259,11 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CopyHandedOver => "（交给了终端；它要是不让复制，这次就没有）".into(),
         Msg::ContextNoPrompt => "这个宿主没有系统提示词可说。".into(),
         Msg::ComposerSuggested { text } => text.to_string().into(),
+        Msg::WaitsForTheTurn { command } => {
+            format!("正在回复,/{command} 要等这一轮结束再用;按 Esc 可以先停下这一轮").into()
+        }
+        Msg::CompactAfterTurn => "这一轮结束后就压缩".into(),
+        Msg::RuntimeBusy => "正在忙(回复、压缩或重新装配进行中),稍后再试".into(),
         Msg::CmdAboutChangelog => "查看各版本的更新内容".into(),
         Msg::ChangelogPickerTitle => "选一个版本查看更新内容".into(),
         Msg::ChangelogNewTag => "新".into(),
