@@ -7805,6 +7805,78 @@ mod tests {
     /// Read that way, a change the person had taken back stayed on the screen as
     /// a whole diff, in a conversation whose visible half then disagreed with the
     /// model's.
+    /// A replace across files changed the workspace: among reads that fold into
+    /// one run, its result — which files, how many replacements — stays on
+    /// screen, the way an edit's diff does. Folded into `已执行了 N 个工具` it
+    /// was a set of changed files nobody could see.
+    #[test]
+    fn a_replace_across_files_is_never_folded_into_a_run() {
+        let h = host();
+        let call = |id: &str, name: &str, args: &str| atomcode_kernel::tool::ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: args.into(),
+        };
+        h.absorb(&SessionEvent::AssistantMessage {
+            turn: 1,
+            round: 1,
+            text: String::new(),
+            reasoning: String::new(),
+            tool_calls: vec![
+                call("r1", "read_file", r#"{"file_path":"a.css"}"#),
+                call(
+                    "s1",
+                    "search_replace",
+                    r#"{"search":"btn-old","replace":"btn-new"}"#,
+                ),
+                call("r2", "read_file", r#"{"file_path":"b.css"}"#),
+            ],
+            reasoning_blocks: Vec::new(),
+            meta: None,
+        });
+        for (id, content) in [
+            ("r1", "a"),
+            (
+                "s1",
+                "Replaced 'btn-old' → 'btn-new': 3 replacements across 2 files.\n  a.css (2 replacements)\n  b.css (1 replacements)",
+            ),
+            ("r2", "b"),
+        ] {
+            h.absorb(&SessionEvent::ToolResultLogged {
+                turn: 1,
+                round: 1,
+                call_id: id.into(),
+                content: content.into(),
+                is_error: false,
+                images: Vec::new(),
+            });
+        }
+        h.absorb(&SessionEvent::AssistantMessage {
+            turn: 1,
+            round: 2,
+            text: "改好了".into(),
+            reasoning: String::new(),
+            tool_calls: Vec::new(),
+            reasoning_blocks: Vec::new(),
+            meta: None,
+        });
+        let shown = h
+            .compose((100, 40))
+            .part("stream")
+            .map(|part| {
+                part.lines
+                    .iter()
+                    .map(|line| line.plain())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        assert!(
+            shown.contains("a.css (2 replacements)") && shown.contains("b.css (1 replacements)"),
+            "the files the replace changed are on screen:\n{shown}"
+        );
+    }
+
     #[test]
     fn a_call_that_refuses_to_fold_still_goes_when_its_turn_does() {
         let edited = || {
