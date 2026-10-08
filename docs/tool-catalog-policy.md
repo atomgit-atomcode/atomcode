@@ -1,10 +1,98 @@
 # 下游产品怎么卸载、新增、替换工具
 
-面向的是**在本仓库之外**装配 agent 的产品：它自己建树（`HostState.plugins` + `extra_layers`，
-或直接 `App::new(catalog, tree)`）。三个动作各自的入口如下。
+面向的是**在本仓库之外**装配 agent 的产品。三种装法，交插件与配置层的地方不同，
+层的写法一样：
 
-判据：`crates/atomcode-harness/tests/tool_policy.rs`（机制）与
-`crates/atomcode-coding/tests/tool_policy.rs`（经过 coding 产品装配之后仍然成立）。
+| 装法 | 宿主交进来的东西放在哪 |
+|---|---|
+| 以库的方式跑 `CodingRuntime`（`CodingRuntime::start`） | `PrepareOptions.host_plugins`（`atomcode_coding::HostPlugins`） |
+| 自己拿 `AgentHandle`（`on_harness::mount_hosted`） | `HostState.plugins` + `extra_layers` |
+| 自己建树 | `App::new(catalog, tree)` |
+
+三个动作各自的入口在下面几节。
+
+判据：`crates/atomcode-harness/tests/tool_policy.rs`（机制）、
+`crates/atomcode-coding/tests/tool_policy.rs`（经过 coding 产品装配之后仍然成立）、
+`crates/atomcode-coding/tests/host_plugins.rs`（经过 `CodingRuntime` 之后仍然成立，包括重建）。
+
+## 经 `CodingRuntime` 交进来
+
+`HostPlugins` 里的插件只是「有这个名字」，挂哪几行由层决定。宿主的层排在**最后**，
+在产品自己的行和人写在 `config.toml` 里的设置之后，所以它对任何一行都说了算。
+`PrepareOptions` 跟着运行时走，撤销、恢复快照、换模型、重新 prepare 重建的每一棵树都会再读它，
+宿主不用在重建后补交。同一进程里每个运行时各拿各的，不经过环境变量或全局状态。
+
+最小例子：换掉人设，再裁掉几个工具和整块代码分析。
+
+```rust
+use atomcode_coding::host::{self, Context, HostPlugins, Layer, Plugin};
+
+struct HostPersona;
+
+#[async_trait::async_trait]
+impl Plugin for HostPersona {
+    fn name(&self) -> &'static str { "host-persona" }
+    fn inject(&self) -> &'static [&'static str] { &[host::seams::SYSTEM_PROMPT] }
+    async fn apply(&self, ctx: &Context, config: &serde_json::Value) -> Result<(), String> {
+        // 换模型时运行时改写的就是这份配置，这一行会跟着重挂
+        let row = host::PersonaConfig::from_config(config)?;
+        host::contribute_prompt(ctx, "host-persona", host::PERSONA_RANK,
+            &format!("你是某某产品的助手，运行 {} 模型。", row.model));
+        Ok(())
+    }
+}
+
+let host = HostPlugins::new()
+    .with_plugin(std::sync::Arc::new(HostPersona))
+    .with_layer(Layer::from_toml(r#"
+        [[patch]]
+        id = "persona-atomcode"
+        name = "host-persona"
+
+        [[patch]]
+        id = "tools"
+        config = { exclude = ["recall", "list_sessions", "schedule_wakeup",
+                              "mcp__github__*"] }
+
+        [[patch]]
+        id = "codeintel"
+        disabled = true
+
+        [[patch]]
+        id = "code-graph"
+        disabled = true
+
+        [[patch]]
+        id = "tool-ast-grep"
+        disabled = true
+    "#)?);
+// PrepareOptions { host_plugins: host, .. }
+```
+
+**能碰什么、哪些算数。** 任何行都能碰。`atomcode_coding::host::PUBLISHED_ROWS` 列出的那几行
+（`persona-atomcode`、`tools`、`codeintel`、`code-graph`、`tool-ast-grep`）、它们的配置形状
+（`PersonaConfig`；`tools` 的 `exclude`/`include`）以及 `host` 模块里的东西是**承诺稳定的**：
+要改名、拆分或删掉，会先让旧 id 继续能用一个版本，并在启动时提示。
+别的行 id，以及宿主自己直接依赖 harness 用到的东西，都能用，但内核会改；改了之后宿主的
+`start` 当场失败，报出是哪一行。以下三种都是 `start` 返回的错误，不会 panic，
+也不会挂出一棵别的树：
+
+- 宿主插件和已有插件重名，或宿主自己注册了两遍同名插件：报出插件名；
+- 层里的行指向没注册的插件：报出行 id 和插件名；
+- 补丁指向没有任何层插入过的行：报出行 id。
+
+没有模型可挂的启动（`ProviderBootstrap::Unavailable`，等登录）也照样检查这三条，不会等到登录之后才报。
+
+**关行用 `disabled = true`，不要 `[[remove]]`**：运行时自己也会补丁一些行（每次 `/model`
+都会补 `persona-atomcode`），补丁够不着已经被删掉的行。
+
+**`exclude` 和关行不一样**：`exclude` 只把工具从目录里拿掉，那一行贡献的提示词片段还在；
+关掉整行才是工具和片段一起走。比如只排除 `trace_callers` 时，`code-graph` 行那句「改共享
+函数前先用 `trace_callers` 或 `blast_radius`」还在。片段不记录它讲的是哪个工具，所以排除之前
+先看一眼系统提示词里有没有提到它；有，就关那一行或换掉写它的那段。
+
+`tools` 行的配置运行时从来不写，宿主的补丁就是它的全部（补丁会整体替换 `config`，见下面
+「两件要知道的」）。
 
 ## 为什么不是「关掉那一行」
 

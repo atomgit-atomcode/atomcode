@@ -132,6 +132,7 @@ fn start(
                 rate_limit_source: None,
                 front_end,
                 review_delegate: None,
+                host_plugins: Default::default(),
             },
             provider_factory: Arc::new(Factory(count.clone())),
             plugin_hooks: Arc::new(StaticPluginHookSource::default()),
