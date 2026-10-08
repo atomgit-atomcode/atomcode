@@ -3771,6 +3771,26 @@ async fn the_menu_s_paste_reads_the_clipboard_into_what_is_being_typed() {
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
 
+/// The screen row the context menu drew `words` on, read off the drawn part —
+/// so a frame, a header or a reordering changes nothing here. The menu gained a
+/// border once, and two tests that had counted rows from its top clicked the
+/// row above the one they meant.
+fn menu_row_of(s: &Session, words: &str) -> u16 {
+    let part = s
+        .term
+        .last()
+        .expect("a frame")
+        .part("context-menu")
+        .expect("the menu is open")
+        .clone();
+    let at = part
+        .lines
+        .iter()
+        .position(|line| line.plain().contains(words))
+        .unwrap_or_else(|| panic!("`{words}` is not a row of the menu:\n{}", s.screen()));
+    part.rect.y + at as u16
+}
+
 #[tokio::test]
 async fn a_pointer_chooses_the_row_the_words_were_drawn_on() {
     // The menu is opened by the secondary button, so the primary button has to
@@ -3797,7 +3817,7 @@ async fn a_pointer_chooses_the_row_the_words_were_drawn_on() {
         .expect("the menu opened")
         .rect;
     // The row "粘贴" was drawn on, read off the part rather than re-derived.
-    let paste = menu.y + 1;
+    let paste = menu_row_of(&s, "粘贴");
     s.term
         .pointer(atomcode_tui::surface::Click::Press, menu.x + 2, paste);
     s.quiet().await;
@@ -3933,9 +3953,9 @@ async fn moving_the_pointer_over_a_row_makes_it_the_highlighted_one() {
         .part("context-menu")
         .expect("the menu opened")
         .rect;
-    let bright = Some(atomcode_tui::Color::role(
-        atomcode_tui::theme::Role::PanelSelBg,
-    ));
+    // The lit row's background, looked for anywhere on the row: the row also
+    // carries the menu's frame, whose edge is not lit.
+    let bright = Some(atomcode_tui::Color::role(atomcode_tui::theme::Role::Accent));
     let lit_row = |s: &Session| -> Option<u16> {
         let part = s
             .term
@@ -3944,23 +3964,29 @@ async fn moving_the_pointer_over_a_row_makes_it_the_highlighted_one() {
             .part("context-menu")?
             .clone();
         (0..part.lines.len())
-            .find(|i| part.lines[*i].spans[0].style.bg == bright)
+            .find(|i| {
+                part.lines[*i]
+                    .spans
+                    .iter()
+                    .any(|span| span.style.bg == bright)
+            })
             .map(|i| part.rect.y + i as u16)
     };
 
     assert_eq!(
         lit_row(&s),
-        Some(menu.y),
+        Some(menu_row_of(&s, "复制全文")),
         "the menu opens pointing at its first row"
     );
 
-    // Onto "粘贴", one row down.
+    // Onto "粘贴", the next row.
+    let paste = menu_row_of(&s, "粘贴");
     s.term
-        .pointer(atomcode_tui::surface::Click::Hover, menu.x + 2, menu.y + 1);
+        .pointer(atomcode_tui::surface::Click::Hover, menu.x + 2, paste);
     s.quiet().await;
     assert_eq!(
         lit_row(&s),
-        Some(menu.y + 1),
+        Some(paste),
         "the row the pointer is over is not the row drawn brighter:\n{}",
         s.screen()
     );
