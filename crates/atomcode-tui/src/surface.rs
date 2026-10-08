@@ -928,11 +928,13 @@ mod win_console {
     /// `(DWORD)-11`.
     const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5;
     const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+    const ENABLE_WRAP_AT_EOL_OUTPUT: u32 = 0x0002;
 
     #[link(name = "kernel32")]
     extern "system" {
         fn GetStdHandle(which: u32) -> Handle;
         fn GetConsoleMode(console: Handle, mode: *mut u32) -> i32;
+        fn SetConsoleMode(console: Handle, mode: u32) -> i32;
         fn GetConsoleScreenBufferInfoEx(console: Handle, info: *mut ScreenBufferInfoEx) -> i32;
         fn GetOEMCP() -> u32;
     }
@@ -977,6 +979,54 @@ mod win_console {
                 return None;
             }
             Some((info.attributes, info.color_table))
+        }
+    }
+
+    /// Whether the console found its output wrapping at the end of a row, read
+    /// the first time this screen turned it off: 0 not yet read, 1 off, 2 on.
+    static WRAP_FOUND: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+    /// Turn the output's wrap at the end of a row off, or back to what it was.
+    ///
+    /// The console-API side of `?7l`, which Win10's conhost does not honour:
+    /// there a row one cell too long — one ambiguous `·` counted narrow — was
+    /// wrapped onto the next, and on the bottom row that scrolled the whole
+    /// screen up a row, every frame. Off, an overlong row loses its tail and
+    /// nothing moves. Nothing where standard output is no console.
+    pub(super) fn wrap_at_eol(on: bool) {
+        use std::sync::atomic::Ordering;
+        // SAFETY: as in `output_vt_mode`; `SetConsoleMode` takes the handle and
+        // a value and keeps neither.
+        unsafe {
+            let handle = GetStdHandle(STD_OUTPUT_HANDLE);
+            if handle.is_null() || handle as isize == -1 {
+                return;
+            }
+            let mut mode = 0u32;
+            if GetConsoleMode(handle, &mut mode) == 0 {
+                return;
+            }
+            let found = WRAP_FOUND.load(Ordering::SeqCst);
+            let want = if on {
+                // Back to what it was — on, unless it was found off.
+                if found == 1 {
+                    return;
+                }
+                mode | ENABLE_WRAP_AT_EOL_OUTPUT
+            } else {
+                if found == 0 {
+                    let was = if mode & ENABLE_WRAP_AT_EOL_OUTPUT != 0 {
+                        2
+                    } else {
+                        1
+                    };
+                    WRAP_FOUND.store(was, Ordering::SeqCst);
+                }
+                mode & !ENABLE_WRAP_AT_EOL_OUTPUT
+            };
+            if want != mode {
+                SetConsoleMode(handle, want);
+            }
         }
     }
 
@@ -1032,6 +1082,7 @@ impl Terminal {
         };
         out.write_all(pointer.escape().as_bytes())?;
         out.flush()?;
+        console_wrap(false);
         console_mouse(pointer != ansi::Pointer::Terminal);
         let mut caps = crate::caps::Caps::detect_with(overrides);
         // A classic console with a CJK font draws ambiguous characters wide;
@@ -1184,6 +1235,15 @@ fn classic_console() -> bool {
 /// wheel, past this screen into whatever the shell printed before it. Where
 /// standard input is no console at all (an old pipe-based mintty) the mode
 /// cannot be set and this does nothing. Not Windows: nothing.
+/// The Win32 half of `?7l` / `?7h` ([`win_console::wrap_at_eol`]): off while
+/// this screen is up, back when the terminal's own text is.
+fn console_wrap(on: bool) {
+    #[cfg(windows)]
+    win_console::wrap_at_eol(on);
+    #[cfg(not(windows))]
+    let _ = on;
+}
+
 fn console_mouse(on: bool) {
     #[cfg(windows)]
     {
@@ -1221,6 +1281,7 @@ fn emergency_restore() {
     };
     let _ = out.write_all(leave.as_bytes());
     let _ = out.flush();
+    console_wrap(true);
     let _ = crossterm::terminal::disable_raw_mode();
     #[cfg(unix)]
     {
@@ -2152,6 +2213,8 @@ impl Surface for Terminal {
         let _ = out.write_all(ansi::MOUSE_OFF.as_bytes());
         console_mouse(false);
         let _ = out.write_all(ansi::TRANSCRIPT_OUT.as_bytes());
+        let _ = out.flush();
+        console_wrap(true);
         let _ = out.write_all(text.as_bytes());
         let _ = out.flush();
         true
@@ -2166,6 +2229,8 @@ impl Surface for Terminal {
         }
         let mut out = std::io::stdout();
         let _ = out.write_all(ansi::TRANSCRIPT_BACK.as_bytes());
+        let _ = out.flush();
+        console_wrap(false);
         AWAY_FROM_SCREEN.store(false, Ordering::SeqCst);
         // Pushed again on this screen: they were popped on the way out, so the
         // stack is the same depth it was whatever the terminal keeps per screen.
