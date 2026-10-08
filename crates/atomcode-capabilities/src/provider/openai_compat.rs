@@ -11,11 +11,16 @@
 //!     automatic), so prefix BYTE-STABILITY is the only cache lever — the request
 //!     body is built from ordered `serde_json` literals (BTreeMap-backed `Map`, no
 //!     `preserve_order`), with no timestamps/uuids, so the same `(messages, tools)`
-//!     always serialize identically.
-//!   - `reasoning_content` round-trip is policy-driven ([`ReasoningPolicy`]); the
-//!     kernel stores reasoning, this adapter decides Include/Exclude.
+//!     always serialize identically — given the same name for handed-back thinking,
+//!     which changes once at most: when a provider first hears its server use
+//!     vLLM's name (below).
+//!   - The thinking round-trip is policy-driven ([`ReasoningPolicy`]): the kernel
+//!     stores reasoning, this adapter decides Include/Preserve/Exclude, and hands it
+//!     back under the name the server was heard streaming it under ([`ReasoningField`]).
 
-use super::reasoning::{ReasoningPolicy, REASONING_PLACEHOLDER};
+use super::reasoning::{
+    HeardReasoningField, ReasoningField, ReasoningPolicy, REASONING_PLACEHOLDER,
+};
 use super::retry::{self, RetryPolicy};
 use super::sign::{RequestSigner, RequestSigningError};
 use async_trait::async_trait;
@@ -340,6 +345,13 @@ pub struct OpenAiCompatProvider {
     /// re-trigger the same 400. Session-scoped: a `/session` switch rebuilds the
     /// provider and resets this.
     effort_unsupported: std::sync::atomic::AtomicBool,
+    /// The name this server was last heard streaming thinking under, which is
+    /// the name the next request hands it back under where the policy lets it
+    /// vary (`Preserve`; see [`ReasoningField`]).
+    /// Written by the streams this provider opens. Session-scoped like
+    /// `effort_unsupported`: a rebuilt provider starts from `reasoning_content`
+    /// again and relearns from the first thinking it hears.
+    reasoning_field: std::sync::Arc<HeardReasoningField>,
 }
 
 impl OpenAiCompatProvider {
@@ -364,6 +376,7 @@ impl OpenAiCompatProvider {
             url,
             session_id: std::sync::OnceLock::new(),
             effort_unsupported: std::sync::atomic::AtomicBool::new(false),
+            reasoning_field: std::sync::Arc::default(),
         })
     }
 }
@@ -626,6 +639,7 @@ impl LlmProvider for OpenAiCompatProvider {
             options,
             &self.cfg,
             self.policy,
+            self.reasoning_field.get(),
         );
         super::wire_dump_request(self.cfg.wire_dump_dir.as_deref(), &self.cfg.model, &body); // byte-level dump (ATOMCODE_WIRE_DUMP=1)
                                                                                              // Serialize once and reuse the exact bytes across retries (hence `.body()`
@@ -656,6 +670,7 @@ impl LlmProvider for OpenAiCompatProvider {
         let first_token = self.cfg.first_token_timeout;
         let open_timeout = self.cfg.open_timeout;
         let rate_limit_retry_owner = options.rate_limit_retry_owner;
+        let reasoning_field = self.reasoning_field.clone();
         let resp = match open_stream(
             &client,
             &url,
@@ -707,7 +722,9 @@ impl LlmProvider for OpenAiCompatProvider {
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("")
                     .to_string();
-                let mut dec = SseDecoder::new().reading(&url, &content_type);
+                let mut dec = SseDecoder::new()
+                    .reading(&url, &content_type)
+                    .hearing(reasoning_field.clone());
                 let mut emitted_replay_sensitive = false;
                 let mut pending_metadata = Vec::new();
                 let byte_stream = resp.bytes_stream();
@@ -1200,6 +1217,7 @@ pub(crate) async fn open_stream(
 fn format_messages(
     messages: &[Message],
     policy: ReasoningPolicy,
+    field: ReasoningField,
     supports_vision: bool,
 ) -> Vec<Value> {
     let mut out = Vec::with_capacity(messages.len());
@@ -1302,20 +1320,30 @@ fn format_messages(
                 match policy {
                     // Requires a non-empty value on every assistant message: echo
                     // the reasoning, or the placeholder when none was captured.
+                    // Always under `reasoning_content`, whatever the server was heard
+                    // streaming: the models that require the echo answer 400 when it
+                    // is missing, and their own APIs take it under that name. A
+                    // gateway that renamed their thinking to `reasoning` on the way
+                    // out but forwards requests as they are would turn the other
+                    // name into that 400; under this name the worst case is a
+                    // server that ignores it (vLLM 0.16+), which is where it stood.
                     ReasoningPolicy::Include => {
                         let echo = m
                             .reasoning
                             .as_deref()
                             .filter(|s| !s.is_empty())
                             .unwrap_or(REASONING_PLACEHOLDER);
-                        obj.insert("reasoning_content".into(), json!(echo));
+                        obj.insert(ReasoningField::ReasoningContent.key().into(), json!(echo));
                     }
                     // Retain the train of thought without noise: echo only when this
                     // turn actually produced reasoning; send nothing otherwise (no
-                    // placeholder), so a non-thinking turn adds no `reasoning_content`.
+                    // placeholder), so a non-thinking turn adds no reasoning. Under the
+                    // name the server was heard streaming it: these models tolerate
+                    // the echo's absence, so a wrong name costs nothing, and the right
+                    // one is what lets vLLM 0.16+ hand it to the chat template.
                     ReasoningPolicy::Preserve => {
                         if let Some(r) = m.reasoning.as_deref().filter(|s| !s.is_empty()) {
-                            obj.insert("reasoning_content".into(), json!(r));
+                            obj.insert(field.key().into(), json!(r));
                         }
                     }
                     ReasoningPolicy::Exclude => {}
@@ -1347,12 +1375,18 @@ fn build_request_body(
     options: &ChatOptions,
     cfg: &OpenAiCompatConfig,
     policy: ReasoningPolicy,
+    field: ReasoningField,
 ) -> Value {
     let mut body = Map::new();
     body.insert("model".into(), json!(model));
     body.insert(
         "messages".into(),
-        json!(format_messages(messages, policy, cfg.supports_vision)),
+        json!(format_messages(
+            messages,
+            policy,
+            field,
+            cfg.supports_vision
+        )),
     );
     body.insert("stream".into(), json!(true));
     body.insert("stream_options".into(), json!({ "include_usage": true }));
@@ -1806,6 +1840,9 @@ struct SseDecoder {
     /// layer has no reasoning parser configured. Per decoder, so an unclosed
     /// block cannot reach the next response — see [`InlineThink`].
     think: super::reasoning::InlineThink,
+    /// Where to record the name thinking came under in its own field, for the
+    /// provider to answer in. `None` in tests that feed bytes directly.
+    heard: Option<std::sync::Arc<HeardReasoningField>>,
 }
 
 impl SseDecoder {
@@ -1825,12 +1862,18 @@ impl SseDecoder {
             tool_call_delta_count: 0,
             last_tool_idx: 0,
             think: super::reasoning::InlineThink::new(),
+            heard: None,
         }
     }
 
     /// Decode the body `url` answered, which claimed to be `content_type`.
     fn reading(mut self, url: &str, content_type: &str) -> Self {
         self.reading = Some((url.to_string(), content_type.to_string()));
+        self
+    }
+
+    fn hearing(mut self, heard: std::sync::Arc<HeardReasoningField>) -> Self {
+        self.heard = Some(heard);
         self
     }
 
@@ -2089,10 +2132,24 @@ impl SseDecoder {
                 }
             }
         }
-        if let Some(r) = choice.delta.reasoning_content {
-            if !r.is_empty() {
-                out.push(StreamEvent::Reasoning(r));
+        // The thinking in its own field, under either of the two names in use
+        // (see `Delta::reasoning`). `reasoning_content` wins when both carry
+        // text; an empty one counts as absent, so a gateway that fills one name
+        // with `""` while translating does not hide the other. The name it came
+        // under is the name the next request hands it back under.
+        let reasoning = match (
+            choice.delta.reasoning_content.filter(|r| !r.is_empty()),
+            choice.delta.reasoning.filter(|r| !r.is_empty()),
+        ) {
+            (Some(r), _) => Some((ReasoningField::ReasoningContent, r)),
+            (None, Some(r)) => Some((ReasoningField::Reasoning, r)),
+            (None, None) => None,
+        };
+        if let Some((field, r)) = reasoning {
+            if let Some(heard) = &self.heard {
+                heard.heard(field);
             }
+            out.push(StreamEvent::Reasoning(r));
         }
         if let Some(tcs) = choice.delta.tool_calls {
             if self.seen_finish || self.tool_call_delta_count >= MAX_TOOL_CALL_DELTAS {
@@ -2257,6 +2314,19 @@ struct Delta {
     content: Option<String>,
     #[serde(default)]
     reasoning_content: Option<String>,
+    /// The same thinking under vLLM's name. vLLM made `reasoning` its standard
+    /// field and is retiring `reasoning_content`, which DeepSeek and SGLang
+    /// still send. A model served by vLLM — directly, or through a gateway that
+    /// forwards its chunks as they are — streams its whole thinking phase here
+    /// with an empty `content`. Read under the other name only, those chunks
+    /// produce no event at all: the stream looks idle until an idle timeout
+    /// cuts the request off, and the thinking that did arrive is dropped.
+    ///
+    /// A field of its own rather than `#[serde(alias = "reasoning")]`: a gateway
+    /// translating between protocols may send both names in one chunk, and an
+    /// alias makes that a duplicate-field error that fails the whole chunk.
+    #[serde(default)]
+    reasoning: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<DeltaToolCall>>,
 }
@@ -2940,7 +3010,12 @@ mod tests {
             Message::assistant("ans", vec![]),
             Message::tool_result("call_1", "result text", false),
         ];
-        let out = format_messages(&msgs, ReasoningPolicy::Exclude, true);
+        let out = format_messages(
+            &msgs,
+            ReasoningPolicy::Exclude,
+            ReasoningField::ReasoningContent,
+            true,
+        );
         assert_eq!(out[0], json!({"role":"system","content":"sys"}));
         assert_eq!(out[1], json!({"role":"user","content":"hi"}));
         assert_eq!(out[2]["role"], "assistant");
@@ -2964,7 +3039,12 @@ mod tests {
             Message::system("MEMORY\n- fact"),
             Message::user("hi"),
         ];
-        let out = format_messages(&msgs, ReasoningPolicy::Exclude, true);
+        let out = format_messages(
+            &msgs,
+            ReasoningPolicy::Exclude,
+            ReasoningField::ReasoningContent,
+            true,
+        );
         let systems = out.iter().filter(|v| v["role"] == "system").count();
         assert_eq!(
             systems, 1,
@@ -2988,7 +3068,12 @@ mod tests {
             Message::user("continue"),
         ];
 
-        let out = format_messages(&msgs, ReasoningPolicy::Exclude, true);
+        let out = format_messages(
+            &msgs,
+            ReasoningPolicy::Exclude,
+            ReasoningField::ReasoningContent,
+            true,
+        );
 
         assert_eq!(
             out[0],
@@ -3032,7 +3117,12 @@ mod tests {
             note,
         ];
 
-        let out = format_messages(&msgs, ReasoningPolicy::Exclude, true);
+        let out = format_messages(
+            &msgs,
+            ReasoningPolicy::Exclude,
+            ReasoningField::ReasoningContent,
+            true,
+        );
 
         assert_eq!(out[0]["role"], "system");
         assert_eq!(
@@ -3061,7 +3151,12 @@ mod tests {
     fn user_without_images_stays_a_content_string() {
         // Byte-identical to the pre-multimodal path → a no-image conversation's prefix
         // cache is unperturbed.
-        let out = format_messages(&[Message::user("hi")], ReasoningPolicy::Exclude, true);
+        let out = format_messages(
+            &[Message::user("hi")],
+            ReasoningPolicy::Exclude,
+            ReasoningField::ReasoningContent,
+            true,
+        );
         assert_eq!(out[0], json!({"role":"user","content":"hi"}));
     }
 
@@ -3075,7 +3170,12 @@ mod tests {
                 data: "QUJD".into(),
             }],
         );
-        let out = format_messages(&[m], ReasoningPolicy::Exclude, true);
+        let out = format_messages(
+            &[m],
+            ReasoningPolicy::Exclude,
+            ReasoningField::ReasoningContent,
+            true,
+        );
         let c = &out[0]["content"];
         assert!(c.is_array(), "multimodal content must be an array: {c}");
         assert_eq!(c[0], json!({"type":"text","text":"look"}));
@@ -3098,7 +3198,12 @@ mod tests {
                 data: "QUJD".into(),
             }],
         );
-        let out = format_messages(&[m], ReasoningPolicy::Exclude, false);
+        let out = format_messages(
+            &[m],
+            ReasoningPolicy::Exclude,
+            ReasoningField::ReasoningContent,
+            false,
+        );
         let c = &out[0]["content"];
         assert!(
             c.is_string(),
@@ -3135,7 +3240,12 @@ mod tests {
                 data: "eHl6".into(),
             }],
         );
-        let out = format_messages(&[m], ReasoningPolicy::Exclude, true);
+        let out = format_messages(
+            &[m],
+            ReasoningPolicy::Exclude,
+            ReasoningField::ReasoningContent,
+            true,
+        );
         let c = out[0]["content"].as_array().unwrap();
         assert_eq!(c.len(), 1, "no text part when text is empty");
         assert_eq!(c[0]["type"], "image_url");
@@ -3154,7 +3264,12 @@ mod tests {
             }],
         );
         assert_eq!(
-            format_messages(&[m], ReasoningPolicy::Exclude, true)[0],
+            format_messages(
+                &[m],
+                ReasoningPolicy::Exclude,
+                ReasoningField::ReasoningContent,
+                true
+            )[0],
             json!({"role":"user","content":""})
         );
     }
@@ -3169,7 +3284,12 @@ mod tests {
                 data: "QUJD".into(),
             }],
         );
-        let out = format_messages(&[m], ReasoningPolicy::Exclude, true);
+        let out = format_messages(
+            &[m],
+            ReasoningPolicy::Exclude,
+            ReasoningField::ReasoningContent,
+            true,
+        );
         assert_eq!(
             out[0]["content"][1]["image_url"]["url"],
             "data:application/octet-stream;base64,QUJD"
@@ -3186,7 +3306,12 @@ mod tests {
                 arguments: "{\"path\":\"a\"}".into(),
             }],
         );
-        let out = format_messages(&[m], ReasoningPolicy::Exclude, true);
+        let out = format_messages(
+            &[m],
+            ReasoningPolicy::Exclude,
+            ReasoningField::ReasoningContent,
+            true,
+        );
         let a = &out[0];
         assert_eq!(a["role"], "assistant");
         assert_eq!(a["content"], ""); // present even when empty
@@ -3216,7 +3341,12 @@ mod tests {
                         .into(),
             }],
         );
-        let out = format_messages(&[m], ReasoningPolicy::Exclude, true);
+        let out = format_messages(
+            &[m],
+            ReasoningPolicy::Exclude,
+            ReasoningField::ReasoningContent,
+            true,
+        );
         let args = out[0]["tool_calls"][0]["function"]["arguments"]
             .as_str()
             .unwrap();
@@ -3241,7 +3371,12 @@ mod tests {
                 arguments: "{\"path\":\"a\"}".into(),
             }],
         );
-        let out = format_messages(&[m], ReasoningPolicy::Exclude, true);
+        let out = format_messages(
+            &[m],
+            ReasoningPolicy::Exclude,
+            ReasoningField::ReasoningContent,
+            true,
+        );
         assert_eq!(
             out[0]["tool_calls"][0]["function"]["arguments"],
             "{\"path\":\"a\"}"
@@ -3260,7 +3395,12 @@ mod tests {
                 arguments: "not json at all <tool_result>".into(),
             }],
         );
-        let out = format_messages(&[m], ReasoningPolicy::Exclude, true);
+        let out = format_messages(
+            &[m],
+            ReasoningPolicy::Exclude,
+            ReasoningField::ReasoningContent,
+            true,
+        );
         let args = out[0]["tool_calls"][0]["function"]["arguments"]
             .as_str()
             .unwrap();
@@ -3275,7 +3415,12 @@ mod tests {
         let mut with = Message::assistant("ans", vec![]);
         with.reasoning = Some("because".into());
         let no = Message::assistant("ans2", vec![]);
-        let out = format_messages(&[with, no], ReasoningPolicy::Include, true);
+        let out = format_messages(
+            &[with, no],
+            ReasoningPolicy::Include,
+            ReasoningField::ReasoningContent,
+            true,
+        );
         assert_eq!(out[0]["reasoning_content"], "because");
         assert_eq!(out[1]["reasoning_content"], REASONING_PLACEHOLDER);
     }
@@ -3284,7 +3429,12 @@ mod tests {
     fn reasoning_exclude_never_echoes() {
         let mut with = Message::assistant("ans", vec![]);
         with.reasoning = Some("because".into());
-        let out = format_messages(&[with], ReasoningPolicy::Exclude, true);
+        let out = format_messages(
+            &[with],
+            ReasoningPolicy::Exclude,
+            ReasoningField::ReasoningContent,
+            true,
+        );
         assert!(out[0].get("reasoning_content").is_none());
     }
 
@@ -3297,7 +3447,12 @@ mod tests {
         let no = Message::assistant("ans2", vec![]);
         let mut empty = Message::assistant("ans3", vec![]);
         empty.reasoning = Some(String::new());
-        let out = format_messages(&[with, no, empty], ReasoningPolicy::Preserve, true);
+        let out = format_messages(
+            &[with, no, empty],
+            ReasoningPolicy::Preserve,
+            ReasoningField::ReasoningContent,
+            true,
+        );
         assert_eq!(out[0]["reasoning_content"], "because");
         assert!(
             out[1].get("reasoning_content").is_none(),
@@ -3307,6 +3462,64 @@ mod tests {
             out[2].get("reasoning_content").is_none(),
             "empty reasoning → nothing"
         );
+    }
+
+    /// Under `Preserve` (models that tolerate the echo's absence), thinking heard
+    /// under vLLM's name goes back under it, and the other name is not sent
+    /// alongside.
+    #[test]
+    fn reasoning_is_echoed_under_the_name_it_was_heard_under() {
+        let mut with = Message::assistant("ans", vec![]);
+        with.reasoning = Some("because".into());
+        let no = Message::assistant("ans2", vec![]);
+        let out = format_messages(
+            &[with.clone(), no],
+            ReasoningPolicy::Preserve,
+            ReasoningField::Reasoning,
+            true,
+        );
+        assert_eq!(out[0]["reasoning"], "because");
+        for m in &out {
+            assert!(m.get("reasoning_content").is_none(), "{m}");
+        }
+        assert!(
+            out[1].get("reasoning").is_none(),
+            "no thinking, nothing sent"
+        );
+        let out = format_messages(
+            &[with],
+            ReasoningPolicy::Exclude,
+            ReasoningField::Reasoning,
+            true,
+        );
+        assert!(out[0].get("reasoning").is_none() && out[0].get("reasoning_content").is_none());
+    }
+
+    /// Under `Include` (models that answer 400 without the echo) the name stays
+    /// `reasoning_content` whatever was heard: a gateway that renamed their
+    /// thinking on the way out but forwards requests unchanged would turn the
+    /// other name into that 400.
+    #[test]
+    fn reasoning_required_by_the_model_keeps_its_own_name() {
+        let mut with = Message::assistant("ans", vec![]);
+        with.reasoning = Some("because".into());
+        let no = Message::assistant("ans2", vec![]);
+        for field in [ReasoningField::ReasoningContent, ReasoningField::Reasoning] {
+            let out = format_messages(
+                &[with.clone(), no.clone()],
+                ReasoningPolicy::Include,
+                field,
+                true,
+            );
+            assert_eq!(out[0]["reasoning_content"], "because", "{field:?}");
+            assert_eq!(
+                out[1]["reasoning_content"], REASONING_PLACEHOLDER,
+                "{field:?}"
+            );
+            for m in &out {
+                assert!(m.get("reasoning").is_none(), "{field:?}: {m}");
+            }
+        }
     }
 
     #[test]
@@ -3320,6 +3533,7 @@ mod tests {
             &opts,
             &cfg,
             ReasoningPolicy::Exclude,
+            ReasoningField::ReasoningContent,
         );
         assert_eq!(body["stream"], true);
         assert_eq!(body["stream_options"]["include_usage"], true);
@@ -3346,6 +3560,7 @@ mod tests {
             &opts,
             &cfg,
             ReasoningPolicy::Exclude,
+            ReasoningField::ReasoningContent,
         );
         assert_eq!(body["tool_choice"]["type"], "function");
         assert_eq!(body["tool_choice"]["function"]["name"], "todowrite");
@@ -3365,6 +3580,7 @@ mod tests {
             &opts,
             &cfg,
             ReasoningPolicy::Exclude,
+            ReasoningField::ReasoningContent,
         );
         assert!(
             body.get("tool_choice").is_none(),
@@ -3388,6 +3604,7 @@ mod tests {
             &opts,
             &cfg,
             ReasoningPolicy::Include,
+            ReasoningField::ReasoningContent,
         );
         assert!(
             body.get("tool_choice").is_none(),
@@ -3413,6 +3630,7 @@ mod tests {
             &opts,
             &cfg,
             ReasoningPolicy::Include,
+            ReasoningField::ReasoningContent,
         );
         assert!(
             body.get("tool_choice").is_none(),
@@ -3471,6 +3689,7 @@ mod tests {
             &opts,
             &cfg,
             ReasoningPolicy::Include,
+            ReasoningField::ReasoningContent,
         );
         assert!(
             body.get("tool_choice").is_none(),
@@ -3530,6 +3749,7 @@ mod tests {
             &ChatOptions::default(),
             &cfg,
             ReasoningPolicy::Exclude,
+            ReasoningField::ReasoningContent,
         );
 
         assert_eq!(
@@ -3610,6 +3830,7 @@ mod tests {
             &opts,
             &cfg,
             ReasoningPolicy::Include,
+            ReasoningField::ReasoningContent,
         );
         assert_eq!(body["reasoning_effort"], "max");
     }
@@ -3628,6 +3849,7 @@ mod tests {
             &opts,
             &cfg,
             ReasoningPolicy::Exclude,
+            ReasoningField::ReasoningContent,
         );
         assert!(
             body.get("reasoning_effort").is_none(),
@@ -3650,6 +3872,7 @@ mod tests {
             &opts,
             &cfg,
             ReasoningPolicy::Exclude,
+            ReasoningField::ReasoningContent,
         );
         assert_eq!(body["reasoning_effort"], "medium");
     }
@@ -3666,6 +3889,7 @@ mod tests {
             &ChatOptions::default(),
             &cfg,
             ReasoningPolicy::Exclude,
+            ReasoningField::ReasoningContent,
         );
         assert_eq!(body["thinking"], json!({"type":"enabled","keep":"all"}));
     }
@@ -3680,6 +3904,7 @@ mod tests {
             &ChatOptions::default(),
             &cfg,
             ReasoningPolicy::Exclude,
+            ReasoningField::ReasoningContent,
         );
         assert!(
             body.get("thinking").is_none(),
@@ -3701,6 +3926,7 @@ mod tests {
             &opts,
             &cfg,
             ReasoningPolicy::Exclude,
+            ReasoningField::ReasoningContent,
         );
         assert_eq!(body["tool_choice"], "none");
     }
@@ -3710,8 +3936,18 @@ mod tests {
         let h1 = vec![Message::system("s"), Message::user("u1")];
         let mut h2 = h1.clone();
         h2.push(Message::assistant("a1", vec![]));
-        let f1 = format_messages(&h1, ReasoningPolicy::Exclude, true);
-        let f2 = format_messages(&h2, ReasoningPolicy::Exclude, true);
+        let f1 = format_messages(
+            &h1,
+            ReasoningPolicy::Exclude,
+            ReasoningField::ReasoningContent,
+            true,
+        );
+        let f2 = format_messages(
+            &h2,
+            ReasoningPolicy::Exclude,
+            ReasoningField::ReasoningContent,
+            true,
+        );
         for i in 0..f1.len() {
             assert_eq!(
                 serde_json::to_string(&f1[i]).unwrap(),
@@ -3749,6 +3985,7 @@ mod tests {
             &opts,
             &cfg,
             ReasoningPolicy::Include,
+            ReasoningField::ReasoningContent,
         ))
         .unwrap();
         for _ in 0..100 {
@@ -3759,6 +3996,7 @@ mod tests {
                 &opts,
                 &cfg,
                 ReasoningPolicy::Include,
+                ReasoningField::ReasoningContent,
             ))
             .unwrap();
             assert_eq!(
@@ -3769,6 +4007,160 @@ mod tests {
     }
 
     // ---- SSE decoding ----
+
+    /// Every event the decoder makes of one chunk whose delta is `delta`.
+    fn reasoning_of(delta: Value) -> Vec<StreamEvent> {
+        SseDecoder::new().feed(line(json!({"choices":[{"delta":delta}]})).as_bytes())
+    }
+
+    fn reasoning_text(ev: &[StreamEvent]) -> Vec<&str> {
+        ev.iter()
+            .filter_map(|e| match e {
+                StreamEvent::Reasoning(r) => Some(r.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// vLLM's name for the thinking field. A decoder that reads only
+    /// `reasoning_content` turns these chunks into nothing, and a stream that is
+    /// all thinking looks idle until it is timed out.
+    #[test]
+    fn sse_reasoning_under_vllms_name_is_reasoning() {
+        let ev = reasoning_of(json!({"reasoning":"think"}));
+        assert_eq!(kinds(&ev), vec!["reason"]);
+        assert_eq!(reasoning_text(&ev), vec!["think"]);
+    }
+
+    /// The decoder records the name the thinking it read came under: the last
+    /// one heard wins, `reasoning_content` when a chunk carries both, and
+    /// neither empty fields nor a `<think>` block in `content` count.
+    #[test]
+    fn sse_records_the_name_thinking_was_heard_under() {
+        let heard_after = |deltas: &[Value]| {
+            let heard = std::sync::Arc::new(HeardReasoningField::default());
+            let mut d = SseDecoder::new().hearing(heard.clone());
+            for delta in deltas {
+                d.feed(line(json!({"choices":[{"delta":delta}]})).as_bytes());
+            }
+            heard.get()
+        };
+        assert_eq!(
+            heard_after(&[]),
+            ReasoningField::ReasoningContent,
+            "the default"
+        );
+        assert_eq!(
+            heard_after(&[json!({"reasoning":"t"})]),
+            ReasoningField::Reasoning
+        );
+        assert_eq!(
+            heard_after(&[json!({"reasoning":"t"}), json!({"reasoning_content":"t"})]),
+            ReasoningField::ReasoningContent,
+            "the last heard wins"
+        );
+        assert_eq!(
+            heard_after(&[json!({"reasoning_content":"a","reasoning":"b"})]),
+            ReasoningField::ReasoningContent,
+            "the name the text was read from"
+        );
+        assert_eq!(
+            heard_after(&[json!({"reasoning_content":"","reasoning":"b"})]),
+            ReasoningField::Reasoning,
+            "an empty field is not where it came from"
+        );
+        assert_eq!(
+            heard_after(&[
+                json!({"reasoning":"t"}),
+                json!({"reasoning_content":""}),
+                json!({"content":"<think>x</think>y"}),
+            ]),
+            ReasoningField::Reasoning,
+            "neither an empty field nor inline <think> changes what was heard"
+        );
+    }
+
+    /// The older name, as DeepSeek and SGLang send it, is read as before.
+    #[test]
+    fn sse_reasoning_content_is_still_reasoning() {
+        let ev = reasoning_of(json!({"reasoning_content":"A"}));
+        assert_eq!(kinds(&ev), vec!["reason"]);
+        assert_eq!(reasoning_text(&ev), vec!["A"]);
+    }
+
+    /// Both names in one chunk — a gateway translating between protocols does
+    /// this. The chunk still parses (an `alias` would make it a duplicate-field
+    /// error and lose the whole chunk) and `reasoning_content` is the one read.
+    #[test]
+    fn sse_both_reasoning_names_parse_and_reasoning_content_wins() {
+        let ev = reasoning_of(json!({"reasoning_content":"A","reasoning":"B"}));
+        assert_eq!(
+            kinds(&ev),
+            vec!["reason"],
+            "both names must not fail the chunk"
+        );
+        assert_eq!(reasoning_text(&ev), vec!["A"]);
+    }
+
+    /// Empty is absent: it emits nothing on its own, and does not hide text
+    /// under the other name.
+    #[test]
+    fn sse_empty_reasoning_counts_as_absent() {
+        for delta in [
+            json!({"reasoning":""}),
+            json!({"reasoning":null}),
+            json!({"reasoning_content":""}),
+            json!({"reasoning_content":null}),
+            json!({"reasoning_content":"","reasoning":""}),
+        ] {
+            let ev = reasoning_of(delta.clone());
+            assert!(ev.is_empty(), "{delta}: {:?}", kinds(&ev));
+        }
+        assert_eq!(
+            reasoning_text(&reasoning_of(
+                json!({"reasoning_content":"","reasoning":"B"})
+            )),
+            vec!["B"],
+            "an empty `reasoning_content` must not hide `reasoning`"
+        );
+    }
+
+    /// Text and thinking in one chunk come out in the same order whichever name
+    /// the thinking used.
+    #[test]
+    fn sse_reasoning_beside_content_keeps_the_order_of_reasoning_content() {
+        let vllm = reasoning_of(json!({"content":"said","reasoning":"thought"}));
+        let classic = reasoning_of(json!({"content":"said","reasoning_content":"thought"}));
+        assert_eq!(kinds(&vllm), vec!["text", "reason"]);
+        assert_eq!(kinds(&vllm), kinds(&classic));
+    }
+
+    /// A captured gateway sequence: mostly thinking under `reasoning`, a little
+    /// text between. Before the fix only the text came through.
+    #[test]
+    fn sse_live_gateway_chunk_sequence_keeps_reasoning() {
+        let fixture = [
+            json!({"choices":[{"delta":{"role":"assistant","content":""}}]}),
+            json!({"choices":[{"delta":{"reasoning":"the user"}}]}),
+            json!({"choices":[{"delta":{"reasoning":" asks"}}]}),
+            json!({"choices":[{"delta":{"content":"This picture"}}]}),
+            json!({"choices":[{"delta":{"reasoning":"sum up"}}]}),
+            json!({"choices":[{"delta":{"content":" is red"}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+        ];
+        let mut sse = String::new();
+        for v in &fixture {
+            sse.push_str(&line(v.clone()));
+        }
+        sse.push_str("data: [DONE]\n");
+
+        let mut d = SseDecoder::new();
+        let ev = d.feed(sse.as_bytes());
+        assert_eq!(
+            kinds(&ev),
+            vec!["reason", "reason", "text", "reason", "text", "done"]
+        );
+    }
 
     fn kinds(ev: &[StreamEvent]) -> Vec<&'static str> {
         ev.iter()
@@ -4771,6 +5163,112 @@ mod tests {
                 return;
             }
         }
+    }
+
+    /// A request's body, read off the socket in full.
+    fn read_http_request_body(s: &mut std::net::TcpStream) -> String {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        loop {
+            let n = match s.read(&mut tmp) {
+                Ok(0) | Err(_) => return String::new(),
+                Ok(n) => n,
+            };
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&buf[..pos]).to_lowercase();
+                let clen = headers
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                while buf.len() < pos + 4 + clen {
+                    match s.read(&mut tmp) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                    }
+                }
+                return String::from_utf8_lossy(&buf[pos + 4..]).into_owned();
+            }
+        }
+    }
+
+    /// The whole loop through a real provider: thinking handed back goes under
+    /// `reasoning_content` until the server is heard streaming it as
+    /// `reasoning`, and under `reasoning` from the next request on.
+    #[tokio::test]
+    async fn thinking_goes_back_under_the_name_the_server_streamed_it_under() {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let mut bodies = Vec::new();
+            for _ in 0..2 {
+                let (mut s, _) = listener.accept().unwrap();
+                bodies.push(read_http_request_body(&mut s));
+                let sse = "data: {\"choices\":[{\"delta\":{\"reasoning\":\"weighing\"}}]}\n\n\
+                           data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n\
+                           data: [DONE]\n\n";
+                s.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse}"
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+                s.flush().unwrap();
+            }
+            bodies
+        });
+
+        // A thinking model whose policy hands thinking back on the turns that had it.
+        let cfg = OpenAiCompatConfig::new("k", format!("http://127.0.0.1:{port}"), "glm-test");
+        let provider = OpenAiCompatProvider::new(cfg).unwrap();
+        let mut earlier = Message::assistant("an earlier answer", vec![]);
+        earlier.reasoning = Some("earlier thinking".into());
+        let history = vec![Message::user("q1"), earlier, Message::user("q2")];
+
+        for _ in 0..2 {
+            let events: Vec<StreamEvent> = provider
+                .chat_stream(&history, &[], &ChatOptions::default())
+                .await
+                .expect("open")
+                .collect()
+                .await;
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, StreamEvent::Reasoning(r) if r == "weighing")),
+                "the streamed thinking is read: {events:?}"
+            );
+        }
+
+        let bodies = server.join().unwrap();
+        let assistant = |body: &str| {
+            let v: Value = serde_json::from_str(body).expect("a JSON body");
+            v["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["role"] == "assistant")
+                .cloned()
+                .unwrap()
+        };
+        let first = assistant(&bodies[0]);
+        assert_eq!(
+            first["reasoning_content"], "earlier thinking",
+            "before hearing: {first}"
+        );
+        assert!(first.get("reasoning").is_none(), "{first}");
+        let second = assistant(&bodies[1]);
+        assert_eq!(
+            second["reasoning"], "earlier thinking",
+            "after hearing: {second}"
+        );
+        assert!(second.get("reasoning_content").is_none(), "{second}");
     }
 
     #[tokio::test]
