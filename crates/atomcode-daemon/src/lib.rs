@@ -3779,6 +3779,23 @@ mod chat_event_type_tests {
     }
 
     #[test]
+    fn a_turn_that_never_ended_is_reported_with_the_runtime_s_own_error() {
+        let mut projector = ChatRuntimeProjector::default();
+        let _ = projector.project_agent(atomcode_kernel::event::AgentEvent::Error {
+            message: "session \"s\" is already in use by another runtime".into(),
+            http_status: None,
+            code: None,
+            retryable: None,
+            ends_turn: false,
+        });
+        assert!(projector.unterminated_reason().contains("already in use"));
+        // With nothing said, the generic line.
+        assert!(ChatRuntimeProjector::default()
+            .unterminated_reason()
+            .contains("closed before turn terminal"));
+    }
+
+    #[test]
     fn native_usage_updates_chat_summary() {
         let mut projector = ChatRuntimeProjector::default();
         let meta = atomcode_kernel::message::MessageMeta {
@@ -4620,6 +4637,18 @@ impl ChatRuntimeProjector {
     fn finish(&mut self) -> Option<ChatEvent> {
         self.artifacts.finish()
     }
+
+    /// What to say when the runtime went away without ending the turn.
+    ///
+    /// The runtime's own error, when it said one: a runtime that could not
+    /// start (the session in use by another atomcode, say) reports why as a
+    /// non-terminal error, which is shown only as a warning — and the generic
+    /// line stood in red over the real reason.
+    fn unterminated_reason(&mut self) -> String {
+        self.last_error
+            .take()
+            .unwrap_or_else(|| "coding runtime event stream closed before turn terminal".into())
+    }
 }
 
 /// POST /chat - Stream chat response with SSE
@@ -5111,7 +5140,7 @@ async fn process_chat_request(
             let _ = event_tx.send(event);
         }
         let _ = event_tx.send(ChatEvent::Error {
-            message: "coding runtime event stream closed before turn terminal".into(),
+            message: projector.unterminated_reason(),
         });
     }
 

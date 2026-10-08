@@ -317,7 +317,11 @@ pub async fn resume_session(
         &session_id,
     ) {
         Ok(Some(prepared)) => prepared,
-        _ => crate::legacy_convert::prepare_catalog_session_resume_any_project(&session_id)
+        // Found here but not to be had (in use by another runtime, unreadable):
+        // that is the answer, not a reason to look in every other project and
+        // report whatever the second search says instead.
+        Err(error) => return Err(HubError::RuntimeRejected(error.to_string())),
+        Ok(None) => crate::legacy_convert::prepare_catalog_session_resume_any_project(&session_id)
             .map_err(|error| HubError::RuntimeRejected(error.to_string()))?
             .ok_or_else(|| {
                 HubError::RuntimeRejected(format!("session {session_id:?} not found in catalog"))

@@ -656,6 +656,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
   const loadedForRef = useRef<string | null>(null);
   // Cache of session messages, used to preserve in-progress streaming turns when switching sessions.
   const messageCacheRef = useRef<Map<string, Message[]>>(new Map());
+  // A notice for the session being switched back to: put in once that session's
+  // messages are back, since restoring them replaces the list it would be in.
+  const noticeAfterSwitchRef = useRef<string | null>(null);
   // Mirror of messages state to read the latest value without dependency tracking.
   const messagesRef = useRef<Message[]>([]);
   useEffect(() => {
@@ -890,6 +893,9 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       } else {
         setMessages([]);
       }
+      const carried = noticeAfterSwitchRef.current;
+      noticeAfterSwitchRef.current = null;
+      if (carried) pushCommandNotice(carried);
 
       // bot review P2: 切换会话时重置搜索状态,避免残留关键词过滤新会话、matchIdx 超界致计数错乱。
       setSearch('');
@@ -910,8 +916,21 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
           .then((result) => {
             if (result.ok || sessionGenerationRef.current !== switchGeneration) return;
             if (result.activeTurn && prevId) {
+              noticeAfterSwitchRef.current = t('cmd.session.busy');
               onSessionId(prevId);
-              pushCommandNotice(t('cmd.session.busy'));
+              return;
+            }
+            // The runtime answered and said no (the session is held by another
+            // atomcode, say): it is still there and still shared, so go back to
+            // the session it has and say why — rather than leave sync and send
+            // the next message, over /chat, to the very session that just
+            // refused, where it failed again with a line that named nothing.
+            if (prevId) {
+              const why = result.error ?? 'live runtime rejected the session switch';
+              noticeAfterSwitchRef.current = why.includes('already in use')
+                ? t('sync.sessionInUse')
+                : t('sync.switchFailed', { error: why });
+              onSessionId(prevId);
               return;
             }
             throw new Error(result.error ?? 'live runtime rejected the session switch');
