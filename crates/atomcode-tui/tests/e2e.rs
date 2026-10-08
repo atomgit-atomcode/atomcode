@@ -9863,6 +9863,106 @@ async fn a_click_after_scrolling_away_extends_the_selection() {
         "the click carried the selection to the end: {taken}"
     );
 
+    // That was the one-time "and the rest of it". The start is still off
+    // screen, but the next plain click means what a click always means: the
+    // selection is put away, not carried on again.
+    let elsewhere = row_of(&s, "LINE-55");
+    s.term.pointer(Click::Press, stream.x + 2, elsewhere);
+    s.term.pointer(Click::Release, stream.x + 2, elsewhere);
+    s.quiet().await;
+    assert_eq!(
+        s.term.clipboard_text().as_deref(),
+        Some(taken.as_str()),
+        "the second click copied again instead of putting the selection away"
+    );
+    right_click(&s, stream.x + 2, to);
+    s.quiet().await;
+    assert!(
+        !s.screen()
+            .lines()
+            .any(|l| l.contains("复制选中") && !l.contains("已复制选中")),
+        "the selection is still held after a plain click:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+/// Shift-click, as a native selection does it: held, every click carries the
+/// selection on; let go, the next plain click puts it away — it does not count
+/// as the one plain-click extension.
+#[tokio::test]
+async fn shift_click_extends_each_time_and_a_plain_click_after_puts_it_away() {
+    let dir = scratch("shift-click-extends");
+    let s = start(tree(&dir, &replay(&sixty_lines()), &[])).await;
+    let task = s.open().await;
+    s.term.type_line("count to sixty");
+    until(&s, "LINE-60").await;
+    s.quiet().await;
+
+    use atomcode_tui::surface::Click;
+    let stream = s.term.last().unwrap().part("stream").unwrap().rect;
+    for _ in 0..80 {
+        s.term.pointer(Click::WheelUp, stream.x + 2, stream.y + 2);
+    }
+    s.quiet().await;
+    let row_of = |s: &Session, what: &str| {
+        s.screen()
+            .lines()
+            .position(|l| l.contains(what))
+            .unwrap_or_else(|| panic!("{what} on screen:\n{}", s.screen())) as u16
+    };
+    let first = s
+        .screen()
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("LINE-").map(|n| format!("LINE-{n}")))
+        .nth(1)
+        .expect("a line of the answer on screen");
+    let from = row_of(&s, &first);
+    s.term.pointer(Click::Press, stream.x, from);
+    s.term.pointer(Click::Drag, stream.right() - 1, from);
+    s.term.pointer(Click::Release, stream.right() - 1, from);
+    s.quiet().await;
+    for _ in 0..80 {
+        s.term.pointer(Click::WheelDown, stream.x + 2, stream.y + 2);
+    }
+    s.quiet().await;
+
+    // Shift held: to LINE-60, then back to LINE-58 — both carry it on.
+    for (line, ends) in [("LINE-60", "LINE-60"), ("LINE-58", "LINE-58")] {
+        let at = row_of(&s, line);
+        s.term.pointer(Click::ShiftPress, stream.right() - 1, at);
+        s.term.pointer(Click::Release, stream.right() - 1, at);
+        s.quiet().await;
+        let taken = s.term.clipboard_text().expect("copied");
+        assert!(
+            taken.trim().starts_with(&first) && taken.trim_end().ends_with(ends),
+            "shift-click to {line} carried the selection there: {taken}"
+        );
+    }
+
+    // Shift let go: a plain click puts it away.
+    let held = s.term.clipboard_text();
+    let elsewhere = row_of(&s, "LINE-55");
+    s.term.pointer(Click::Press, stream.x + 2, elsewhere);
+    s.term.pointer(Click::Release, stream.x + 2, elsewhere);
+    s.quiet().await;
+    assert_eq!(
+        s.term.clipboard_text(),
+        held,
+        "the plain click extended it again"
+    );
+    right_click(&s, stream.x + 2, row_of(&s, "LINE-58"));
+    s.quiet().await;
+    assert!(
+        !s.screen()
+            .lines()
+            .any(|l| l.contains("复制选中") && !l.contains("已复制选中")),
+        "the selection is still held after a plain click:\n{}",
+        s.screen()
+    );
+
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }

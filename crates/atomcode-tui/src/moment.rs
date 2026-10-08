@@ -139,6 +139,16 @@ impl Selection {
 pub struct StreamSelection {
     pub anchor: (u16, usize),
     pub head: (u16, usize),
+    /// A click — plain, or with shift — has already carried this selection on.
+    /// The plain-click extension past the edge of the screen is a one-time
+    /// gesture ("and the rest of it, down to here", for terminals that keep
+    /// shift-click for themselves), so the next plain click means what a click
+    /// always means and puts the selection away; without this the end left off
+    /// screen kept every later click extending, and the selection could not be
+    /// cleared. Shift-click still extends, as often as it is pressed — and
+    /// after it, too, a plain click puts the selection away, as a native one
+    /// does.
+    pub extended: bool,
 }
 
 impl StreamSelection {
@@ -146,6 +156,7 @@ impl StreamSelection {
         Self {
             anchor: (col, row),
             head: (col, row),
+            extended: false,
         }
     }
 

@@ -2482,7 +2482,11 @@ impl UserInterface for Tui {
                                 // carried on to here, then copied whole.
                                 Some(p) if p == (x, y) && set_aside.is_some() => {
                                     let mut m = self.host.moment.write().expect("moment poisoned");
-                                    m.stream_selection = set_aside;
+                                    // Once: the next plain click puts it away.
+                                    m.stream_selection = set_aside.map(|mut sel| {
+                                        sel.extended = true;
+                                        sel
+                                    });
                                     self.drag_in_conversation(&mut m, x, y, false);
                                     Some(Action::CopySelection)
                                 }
@@ -2903,7 +2907,9 @@ impl Tui {
     /// longer see. While the whole selection is still on screen a click means
     /// what it always has — put the selection away, or fold what it lands on.
     /// And it is a *click* that extends: a press that goes on to drag is a new
-    /// selection, so for a plain press the release decides.
+    /// selection, so for a plain press the release decides. Once: a selection a
+    /// click has already carried on (`StreamSelection::extended`) still has an
+    /// end off screen, and every click after would have extended it again.
     fn click_extends(&self, shift: bool, x: u16, y: u16) -> bool {
         let m = self.host.moment.read().expect("moment poisoned");
         let Some(sel) = m.stream_selection else {
@@ -2916,7 +2922,7 @@ impl Tui {
             return false;
         }
         let on_screen = |row: usize| (view.top()..view.top() + view.rect.h as usize).contains(&row);
-        shift || !on_screen(sel.anchor.1) || !on_screen(sel.head.1)
+        shift || (!sel.extended && (!on_screen(sel.anchor.1) || !on_screen(sel.head.1)))
     }
 
     /// Carry a conversation selection's head to the pointer, scrolling the
@@ -7227,6 +7233,13 @@ impl Tui {
             Action::ExtendSelection(x, y) => {
                 if m.stream_selection.is_some() {
                     self.drag_in_conversation(&mut m, x, y, false);
+                    // Shift-click extends as often as it is pressed, but once
+                    // shift is let go a plain click puts the selection away —
+                    // as a native selection does — rather than counting as the
+                    // first plain-click extension.
+                    if let Some(sel) = m.stream_selection.as_mut() {
+                        sel.extended = true;
+                    }
                 }
                 return false;
             }
