@@ -2,10 +2,8 @@ use atomcode_config::config::provider::{
     default_context_window_for, ModelProfileConfig, ProviderConfig,
 };
 use axum::{extract::Path, http::StatusCode, response::IntoResponse, Json};
-use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::time::Duration;
 
 use crate::{
     api_config::{
@@ -14,9 +12,18 @@ use crate::{
     json_error, DiscoveredModelInfo, ProviderInfo,
 };
 
-const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
-const DISCOVERY_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
-const DISCOVERY_MAX_MODELS: usize = 2_000;
+// The listing itself — URL, request, parsing — is shared with the terminal's
+// `/provider` panel (`atomcode_capabilities::provider::discovery`); what stays
+// here is the HTTP surface and resolving a saved account's transport.
+pub(crate) use atomcode_capabilities::provider::discovery::discovery_protocol;
+use atomcode_capabilities::provider::discovery::{
+    discovery_url, fetch_discovery_body, parse_discovered_models, DiscoveryRequestError,
+    DiscoveryTransport, DISCOVERY_TIMEOUT,
+};
+#[cfg(test)]
+use atomcode_capabilities::provider::discovery::{
+    normalize_discovered_models, DISCOVERY_MAX_RESPONSE_BYTES,
+};
 
 #[derive(Debug)]
 struct AccountModelConflict(String);
@@ -352,77 +359,6 @@ pub(crate) struct CreateAccountModelRequest {
     pub reasoning_effort_levels: Option<Vec<String>>,
 }
 
-#[derive(Debug, Deserialize)]
-struct OpenAiModelsResponse {
-    data: Vec<OpenAiModelEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiModelEntry {
-    id: String,
-    name: Option<String>,
-    display_name: Option<String>,
-    context_window: Option<usize>,
-    context_length: Option<usize>,
-    max_tokens: Option<usize>,
-    max_output_tokens: Option<usize>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OllamaModelsResponse {
-    models: Vec<OllamaModelEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OllamaModelEntry {
-    name: Option<String>,
-    model: Option<String>,
-}
-
-fn discovery_url(base_url: &str, provider_type: &str) -> anyhow::Result<reqwest::Url> {
-    // Each wire's own listing, relative to the base the adapter sends chat to:
-    // Anthropic's base carries no version (the adapter appends `/v1/messages`).
-    let suffix = match discovery_protocol(provider_type) {
-        Some("ollama") => "/api/tags",
-        Some("anthropic") => "/v1/models",
-        _ => "/models",
-    };
-    let mut url = reqwest::Url::parse(base_url.trim())?;
-    if !matches!(url.scheme(), "http" | "https") {
-        anyhow::bail!("model discovery supports only http and https URLs");
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        anyhow::bail!("model discovery URL must not contain credentials");
-    }
-    let path = format!("{}{}", url.path().trim_end_matches('/'), suffix);
-    url.set_path(&path);
-    // Anthropic pages its list (20 by default); one request for all of them.
-    url.set_query((suffix == "/v1/models").then_some("limit=1000"));
-    url.set_fragment(None);
-    Ok(url)
-}
-
-pub(crate) fn discovery_protocol(provider_type: &str) -> Option<&'static str> {
-    match provider_type.trim().to_ascii_lowercase().as_str() {
-        // The Responses adapter targets an OpenAI-shaped endpoint, so model
-        // discovery uses the SAME `/models` transport as the chat/completions
-        // ("openai") provider — without this arm a Responses account resolves to
-        // None and the add-model / discovery flow silently rejects it.
-        "openai" | "openai-compat" | "openai_compat" | "responses" => Some("openai"),
-        "ollama" => Some("ollama"),
-        // `GET /v1/models`, the same `data` array shape as OpenAI's.
-        "anthropic" => Some("anthropic"),
-        _ => None,
-    }
-}
-
-#[derive(Debug, Default)]
-struct DiscoveryTransport {
-    api_key: Option<String>,
-    user_agent: Option<String>,
-    skip_tls_verify: bool,
-}
-
 /// Saved transport settings may only be reused for the endpoint they belong to.
 /// Otherwise a caller could name an existing provider while supplying an
 /// unrelated URL and make the daemon forward that provider's secret or weaker
@@ -610,130 +546,6 @@ fn insert_account_models(
         created.push(selection_id);
     }
     Ok(created)
-}
-
-fn parse_discovered_models(
-    provider_type: &str,
-    body: &[u8],
-) -> anyhow::Result<Vec<DiscoveredModelInfo>> {
-    let models = if provider_type == "ollama" {
-        serde_json::from_slice::<OllamaModelsResponse>(body)?
-            .models
-            .into_iter()
-            .filter_map(|entry| entry.model.or(entry.name))
-            .map(|id| DiscoveredModelInfo {
-                id,
-                name: None,
-                context_window: None,
-                max_tokens: None,
-            })
-            .collect()
-    } else {
-        serde_json::from_slice::<OpenAiModelsResponse>(body)?
-            .data
-            .into_iter()
-            .map(|entry| DiscoveredModelInfo {
-                id: entry.id,
-                name: entry.name.or(entry.display_name),
-                context_window: entry.context_window.or(entry.context_length),
-                max_tokens: entry.max_output_tokens.or(entry.max_tokens),
-            })
-            .collect()
-    };
-    Ok(normalize_discovered_models(models))
-}
-
-#[derive(Debug)]
-enum DiscoveryReadError {
-    ResponseTooLarge,
-    Transport(reqwest::Error),
-}
-
-async fn read_bounded_response(response: reqwest::Response) -> Result<Vec<u8>, DiscoveryReadError> {
-    if response
-        .content_length()
-        .is_some_and(|size| size > DISCOVERY_MAX_RESPONSE_BYTES as u64)
-    {
-        return Err(DiscoveryReadError::ResponseTooLarge);
-    }
-    let mut body = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(DiscoveryReadError::Transport)?;
-        if body.len().saturating_add(chunk.len()) > DISCOVERY_MAX_RESPONSE_BYTES {
-            return Err(DiscoveryReadError::ResponseTooLarge);
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
-}
-
-#[derive(Debug)]
-enum DiscoveryRequestError {
-    Timeout,
-    ResponseTooLarge,
-    UpstreamStatus(u16),
-    Transport,
-}
-
-async fn fetch_discovery_body(
-    url: reqwest::Url,
-    protocol: &str,
-    transport: &DiscoveryTransport,
-    timeout: Duration,
-) -> Result<Vec<u8>, DiscoveryRequestError> {
-    // No redirects: a key is bound to the endpoint it was saved for, and a 30x
-    // to another host would carry it there — reqwest strips `Authorization`
-    // across hosts, but not Anthropic's `x-api-key`.
-    let mut client = reqwest::Client::builder()
-        .timeout(timeout)
-        .redirect(reqwest::redirect::Policy::none())
-        .danger_accept_invalid_certs(transport.skip_tls_verify);
-    if let Some(user_agent) = transport.user_agent.as_deref() {
-        client = client.user_agent(user_agent);
-    }
-    let client = client
-        .build()
-        .map_err(|_| DiscoveryRequestError::Transport)?;
-    let mut request = client.get(url).header("accept", "application/json");
-    if protocol == "anthropic" {
-        // Anthropic authenticates the way its chat adapter does.
-        request = request.header("anthropic-version", "2023-06-01");
-        if let Some(key) = transport.api_key.as_deref() {
-            request = request.header("x-api-key", key.trim());
-        }
-    } else if let Some(key) = transport.api_key.as_deref() {
-        request = request.bearer_auth(key.trim());
-    }
-    let response = request.send().await.map_err(|error| {
-        if error.is_timeout() {
-            DiscoveryRequestError::Timeout
-        } else {
-            DiscoveryRequestError::Transport
-        }
-    })?;
-    if !response.status().is_success() {
-        return Err(DiscoveryRequestError::UpstreamStatus(
-            response.status().as_u16(),
-        ));
-    }
-    read_bounded_response(response)
-        .await
-        .map_err(|error| match error {
-            DiscoveryReadError::ResponseTooLarge => DiscoveryRequestError::ResponseTooLarge,
-            DiscoveryReadError::Transport(error) if error.is_timeout() => {
-                DiscoveryRequestError::Timeout
-            }
-            DiscoveryReadError::Transport(_) => DiscoveryRequestError::Transport,
-        })
-}
-
-fn normalize_discovered_models(mut models: Vec<DiscoveredModelInfo>) -> Vec<DiscoveredModelInfo> {
-    models.retain(|model| !model.id.trim().is_empty());
-    models.sort_by(|a, b| a.id.cmp(&b.id));
-    models.dedup_by(|a, b| a.id == b.id);
-    models.truncate(DISCOVERY_MAX_MODELS);
-    models
 }
 
 // ============================================================================

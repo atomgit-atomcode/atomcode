@@ -29,7 +29,8 @@ use crate::modules::chrome::{
 };
 use crate::moment::{Moment, Viewport};
 use crate::providers::{
-    AccountField, AccountForm, Form, Listed, ModelField, ModelForm, Panel, ProvidersView, Tab,
+    picked_rows, AccountField, AccountForm, Form, Listed, ModelField, ModelForm, Panel, Picking,
+    ProvidersView, Tab,
 };
 use crate::theme::{self, Role};
 use crate::width;
@@ -132,10 +133,56 @@ enum Row {
     /// What the form is for: `添加账号`, `改 deepseek`, …
     FormHead,
     Legend,
+    /// The model picker over the add form: the listing is on its way.
+    PickLoading,
+    /// …what is typed to filter it.
+    PickFilter,
+    /// …one listed model, by its index into the filtered rows.
+    Pick(usize),
 }
 
 fn layout(view: &ProvidersView, panel: &Panel, h: usize) -> Vec<Row> {
     let mut rows = vec![Row::Rule, Row::Header];
+    if let Some(Form::Model(ModelForm {
+        picking: Some(picking),
+        ..
+    })) = &panel.form
+    {
+        rows.push(Row::FormHead);
+        rows.push(Row::Blank);
+        match picking {
+            Picking::Loading { .. } => rows.push(Row::PickLoading),
+            Picking::Ready {
+                items,
+                query,
+                cursor,
+            } => {
+                rows.push(Row::PickFilter);
+                let listed = picked_rows(items, query).len();
+                if listed == 0 {
+                    rows.push(Row::Nothing);
+                } else {
+                    // The same budget and window the list keeps (below).
+                    let cap = h.saturating_sub(rows.len() + 2).min(MOST);
+                    let (from, to) = if listed > cap {
+                        let room = cap.saturating_sub(1).max(1);
+                        let (from, to) = window(listed, *cursor, room);
+                        rows.push(Row::Scroll {
+                            above: from,
+                            below: listed - to,
+                        });
+                        (from, to)
+                    } else {
+                        (0, listed)
+                    };
+                    rows.extend((from..to).map(Row::Pick));
+                }
+            }
+        }
+        rows.push(Row::Blank);
+        rows.push(Row::Legend);
+        return rows;
+    }
     match &panel.form {
         Some(form) => {
             rows.push(Row::FormHead);
@@ -232,12 +279,68 @@ fn draw(view: &ProvidersView, panel: &Panel, row: Row, w: usize, caps: crate::ca
             theme::fg(Role::Brand),
         ),
         Row::Field(at) => field_line(view, panel, at, w, caps),
+        Row::PickLoading => Line::styled(
+            width::take_width(&format!("  {}", t(Msg::ProviderDiscovering)), w),
+            theme::fg(Role::Muted),
+        ),
+        Row::PickFilter => {
+            let query = match &panel.form {
+                Some(Form::Model(ModelForm {
+                    picking: Some(Picking::Ready { query, .. }),
+                    ..
+                })) => query.as_str(),
+                _ => "",
+            };
+            Line::styled(
+                width::take_width(&format!("  {}", t(Msg::ProviderPickFilter { query })), w),
+                theme::fg(Role::Secondary),
+            )
+        }
+        Row::Pick(at) => pick_line(panel, at, w),
         Row::Legend => Line::styled(
             format!("  {}", crate::widget::keys(&legend(panel), caps)),
             theme::fg(Role::Muted),
         )
         .truncate(w),
     }
+}
+
+/// One row of the model picker: the id, and the context window the listing
+/// gave at the right when it gave one. The row the arrows are on is lit.
+fn pick_line(panel: &Panel, at: usize, w: usize) -> Line {
+    let Some(Form::Model(ModelForm {
+        picking:
+            Some(Picking::Ready {
+                items,
+                query,
+                cursor,
+            }),
+        ..
+    })) = &panel.form
+    else {
+        return Line::empty();
+    };
+    let rows = picked_rows(items, query);
+    let Some(item) = rows.get(at) else {
+        return Line::empty();
+    };
+    let here = at == *cursor;
+    let mark = if here { "› " } else { "  " };
+    let window = item
+        .window
+        .map(|n| crate::content::token_count(n as u32))
+        .unwrap_or_default();
+    let left = format!("  {mark}{}", item.id);
+    let room = w.saturating_sub(width::str_width(&window) + 1);
+    let left = width::take_width(&left, room);
+    let pad = w.saturating_sub(width::str_width(&left) + width::str_width(&window));
+    let text = format!("{left}{}{window}", " ".repeat(pad));
+    let style = if here {
+        theme::bg(Role::PanelSelBg).under(theme::fg(Role::PanelFg))
+    } else {
+        theme::fg(Role::Secondary)
+    };
+    Line::styled(text, style).truncate(w)
 }
 
 fn form_title(panel: &Panel) -> String {
@@ -728,6 +831,24 @@ fn levels_text(
 fn legend(panel: &Panel) -> Vec<(String, String)> {
     let key = |k: &str, msg: Msg<'_>| (k.to_string(), t(msg).into_owned());
     match &panel.form {
+        Some(Form::Model(ModelForm {
+            picking: Some(picking),
+            ..
+        })) => match picking {
+            Picking::Loading { .. } => vec![key("esc", Msg::LegendCancel)],
+            Picking::Ready { .. } => {
+                vec![(t(Msg::ProviderPickKeys).into_owned(), String::new())]
+            }
+        },
+        // Adding, on the model field: the id can be picked rather than typed.
+        Some(Form::Model(form)) if form.focus == ModelField::Model && form.editing.is_none() => {
+            vec![
+                key("^f", Msg::ProviderDiscoverHint),
+                key("⇥", Msg::LegendNextField),
+                key("⏎", Msg::LegendSave),
+                key("esc", Msg::LegendCancel),
+            ]
+        }
         // On the levels row the keys do something the other fields' legend
         // does not say: Space turns the bracketed level on or off, and the
         // arrows move between levels rather than change a value. Said where
@@ -940,6 +1061,72 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn picker_panel(picking: Picking) -> Panel {
+        let mut form = ModelForm::add(&view(), Some("local")).expect("an account");
+        form.focus = ModelField::Model;
+        form.picking = Some(picking);
+        Panel {
+            tab: Tab::Models,
+            form: Some(Form::Model(form)),
+            ..Panel::new()
+        }
+    }
+
+    /// The picker draws over the add form: what is being filtered, the rows
+    /// that match with the window the listing gave, the lit one first, and
+    /// its keys — and never wider than its rect.
+    #[test]
+    fn the_model_picker_is_drawn_over_the_form() {
+        let items = vec![
+            crate::providers::Discovered {
+                id: "qwen3-coder".into(),
+                window: Some(256_000),
+            },
+            crate::providers::Discovered {
+                id: "glm-5".into(),
+                window: None,
+            },
+        ];
+        let m = moment(Some(picker_panel(Picking::Ready {
+            items: items.clone(),
+            query: "qwen".into(),
+            cursor: 0,
+        })));
+        let screen = drawn(&m, 60, 24);
+        assert!(screen.contains("筛选:qwen"), "{screen}");
+        assert!(screen.contains("› qwen3-coder"), "{screen}");
+        assert!(screen.contains("256.0k"), "{screen}");
+        assert!(!screen.contains("glm-5"), "filtered out:\n{screen}");
+        assert!(screen.contains("Enter 填入"), "{screen}");
+        for w in [4u16, 20, 60] {
+            for line in lines(&m, w, 24) {
+                assert!(line.width() <= w as usize, "{} > {w}", line.width());
+            }
+        }
+
+        let loading = moment(Some(picker_panel(Picking::Loading {
+            account: "local".into(),
+        })));
+        assert!(drawn(&loading, 60, 24).contains("正在从服务端拉取"));
+    }
+
+    /// Adding, on the model field: the legend names the key that picks it.
+    #[test]
+    fn the_add_form_says_the_model_can_be_fetched() {
+        let mut form = ModelForm::add(&view(), Some("local")).expect("an account");
+        form.focus = ModelField::Model;
+        let m = moment(Some(Panel {
+            tab: Tab::Models,
+            form: Some(Form::Model(form)),
+            ..Panel::new()
+        }));
+        let screen = drawn(&m, 80, 24);
+        assert!(
+            screen.contains("^f") && screen.contains("从服务端拉取"),
+            "{screen}"
+        );
     }
 
     #[test]

@@ -771,6 +771,40 @@ pub struct ModelForm {
     pub focus: ModelField,
     /// Where the next character goes in the focused text field.
     pub caret: usize,
+    /// Picking the model from what the endpoint lists (Ctrl+F on the model
+    /// field), instead of typing it. `None` is the form as usual.
+    pub picking: Option<Picking>,
+}
+
+/// One model the account's endpoint lists, as the picker shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Discovered {
+    pub id: String,
+    /// The context window the listing gave, when it gave one.
+    pub window: Option<usize>,
+}
+
+/// The model picker over the form, while it is up.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Picking {
+    /// The listing has been asked for and has not come back.
+    Loading { account: String },
+    /// What it listed — less what the account already has — filtered by
+    /// what is typed; the arrows walk the filtered rows.
+    Ready {
+        items: Vec<Discovered>,
+        query: String,
+        cursor: usize,
+    },
+}
+
+/// The rows of `items` whose id holds `query`, case aside.
+pub fn picked_rows<'a>(items: &'a [Discovered], query: &str) -> Vec<&'a Discovered> {
+    let query = query.trim().to_lowercase();
+    items
+        .iter()
+        .filter(|item| query.is_empty() || item.id.to_lowercase().contains(&query))
+        .collect()
 }
 
 impl ModelForm {
@@ -798,6 +832,7 @@ impl ModelForm {
             key_len: 0,
             focus: ModelField::Account,
             caret: 0,
+            picking: None,
         })
     }
 
@@ -825,7 +860,26 @@ impl ModelForm {
             key_len: 0,
             caret: row.model.len(),
             focus: ModelField::Model,
+            picking: None,
         })
+    }
+
+    /// Take a row the picker offered: its id in the model field, and the
+    /// context window its listing gave — on a preset when it is one, as typed
+    /// otherwise. Nothing else is touched; the rest is the person's to set.
+    pub fn take_discovered(&mut self, item: &Discovered) {
+        self.model = item.id.clone();
+        self.caret = self.model.len();
+        self.focus = ModelField::Model;
+        if let Some(window) = item.window {
+            if WINDOW_PRESETS.contains(&window) {
+                self.window = Some(window);
+                self.window_typed = None;
+            } else {
+                self.window_typed = Some(window.to_string());
+            }
+        }
+        self.picking = None;
     }
 
     pub fn account_id(&self) -> &str {
@@ -1207,6 +1261,11 @@ pub enum Step {
     DeleteModel {
         id: String,
     },
+    /// List the models `account`'s endpoint offers, for the picker over the
+    /// add form. The answer comes back through [`discovered`].
+    Discover {
+        account: String,
+    },
 }
 
 /// Run one key against the panel.
@@ -1556,10 +1615,30 @@ fn model_key(
     secret: &mut String,
     press: KeyPress,
 ) -> Step {
+    if form.picking.is_some() {
+        picker_key(&mut form, press);
+        panel.form = Some(Form::Model(form));
+        return Step::Stay;
+    }
     match (press.key, press.mods) {
         (Key::Esc, _) | (Key::Char('c'), Mods::CTRL) => {
             leave_form(panel, secret);
             return Step::Stay;
+        }
+        // Pick the model from the endpoint's own listing rather than type it.
+        // Only while adding: an edited model's id is what it is.
+        (Key::Char('f'), Mods::CTRL)
+            if form.focus == ModelField::Model && form.editing.is_none() =>
+        {
+            let account = form.account_id().to_string();
+            if account.is_empty() {
+                return Step::Stay;
+            }
+            form.picking = Some(Picking::Loading {
+                account: account.clone(),
+            });
+            panel.form = Some(Form::Model(form));
+            return Step::Discover { account };
         }
         (Key::Enter, _) => return save_model(view, panel, &form, secret),
         (Key::Tab, _) | (Key::Down, _) => form.step_focus(view, true),
@@ -1647,6 +1726,97 @@ fn model_key(
     Step::Stay
 }
 
+/// A key while the picker is up: arrows walk it, typing filters it, Enter
+/// takes the row, Esc puts it away — and the form under it is as it was.
+fn picker_key(form: &mut ModelForm, press: KeyPress) {
+    let Some(picking) = form.picking.as_mut() else {
+        return;
+    };
+    if matches!(press.key, Key::Esc) || press == KeyPress::ctrl('c') {
+        form.picking = None;
+        return;
+    }
+    let Picking::Ready {
+        items,
+        query,
+        cursor,
+    } = picking
+    else {
+        return;
+    };
+    let rows = picked_rows(items, query).len();
+    match (press.key, press.mods) {
+        (Key::Up, _) => *cursor = cursor.saturating_sub(1),
+        (Key::Down, _) => *cursor = (*cursor + 1).min(rows.saturating_sub(1)),
+        (Key::Backspace, _) => {
+            query.pop();
+            *cursor = 0;
+        }
+        (Key::Char(c), Mods::NONE) | (Key::Char(c), Mods::SHIFT) => {
+            query.push(c);
+            *cursor = 0;
+        }
+        (Key::Enter, _) => {
+            let Some(item) = picked_rows(items, query)
+                .get(*cursor)
+                .map(|row| (*row).clone())
+            else {
+                return;
+            };
+            form.take_discovered(&item);
+        }
+        _ => {}
+    }
+}
+
+/// The listing for `account` came back. Fills the picker when it is still
+/// waiting for that account — less the models the account already has — and
+/// answers with what to tell the person when there is nothing to pick from.
+pub fn discovered(
+    view: &ProvidersView,
+    panel: &mut Panel,
+    account: &str,
+    listed: Result<Vec<Discovered>, String>,
+) -> Option<String> {
+    let Some(Form::Model(form)) = panel.form.as_mut() else {
+        return None;
+    };
+    let waiting = matches!(
+        &form.picking,
+        Some(Picking::Loading { account: asked }) if asked == account
+    );
+    if !waiting {
+        return None;
+    }
+    let items = match listed {
+        Ok(items) => items,
+        Err(why) => {
+            form.picking = None;
+            return Some(why);
+        }
+    };
+    let have: Vec<&str> = view
+        .models()
+        .iter()
+        .filter(|row| row.account == account)
+        .map(|row| row.model.as_str())
+        .collect();
+    let items: Vec<Discovered> = items
+        .into_iter()
+        .filter(|item| !have.contains(&item.id.as_str()))
+        .collect();
+    if items.is_empty() {
+        form.picking = None;
+        return Some(crate::i18n::t(crate::i18n::Msg::ProviderDiscoverNothingNew).into_owned());
+    }
+    form.picking = Some(Picking::Ready {
+        items,
+        query: String::new(),
+        cursor: 0,
+    });
+    None
+}
+
 fn save_model(
     view: &ProvidersView,
     panel: &mut Panel,
@@ -1732,6 +1902,17 @@ pub fn paste(panel: &mut Panel, secret: &mut String, text: &str) -> bool {
             true
         }
         Some(Form::Model(form)) => {
+            // The picker over the form has the keyboard, so a paste filters
+            // it the way typing does; the hidden fields stay as they were.
+            match form.picking.as_mut() {
+                Some(Picking::Ready { query, cursor, .. }) => {
+                    query.push_str(line.trim());
+                    *cursor = 0;
+                    return true;
+                }
+                Some(Picking::Loading { .. }) => return false,
+                None => {}
+            }
             if form.focus == ModelField::Key {
                 secret.push_str(&line);
                 form.key_len = secret.chars().count();
@@ -1813,7 +1994,20 @@ pub trait Providers: Send + Sync {
     fn probe(&self, _account: &str, _selection: Option<&str>) -> Option<ProbeFuture> {
         None
     }
+
+    /// The models `account`'s endpoint lists, for the picker over the add form
+    /// — asked of its saved address and key, so nothing is typed twice. `Err`
+    /// is what to tell the person. `None` when this port cannot list models at
+    /// all; the default, so a port need not know listing exists.
+    fn discover(&self, _account: &str) -> Option<DiscoverFuture> {
+        None
+    }
 }
+
+/// See [`Providers::discover`].
+pub type DiscoverFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Vec<Discovered>, String>> + Send + 'static>,
+>;
 
 /// See [`Providers::probe`]: what to say, and whether all is well.
 pub type ProbeFuture =
@@ -2648,6 +2842,180 @@ mod tests {
         assert_eq!(parse_window("1e9"), None);
         assert_eq!(parse_window("-5k"), None);
         assert_eq!(parse_window("inf"), None);
+    }
+
+    fn listed(ids: &[(&str, Option<usize>)]) -> Vec<Discovered> {
+        ids.iter()
+            .map(|(id, window)| Discovered {
+                id: (*id).into(),
+                window: *window,
+            })
+            .collect()
+    }
+
+    fn picking(panel: &Panel) -> Option<Picking> {
+        match &panel.form {
+            Some(Form::Model(form)) => form.picking.clone(),
+            _ => None,
+        }
+    }
+
+    /// Ctrl+F on the model field of an add form asks for the account's listing;
+    /// what comes back is offered less what the account already has; typing
+    /// filters it; Enter fills the id and the window in; the form is as it was
+    /// otherwise.
+    #[test]
+    fn a_model_is_picked_from_the_endpoint_listing() {
+        let view = view();
+        let mut form = ModelForm::add(&view, Some("local")).expect("an account");
+        form.focus = ModelField::Model;
+        let mut panel = Panel {
+            form: Some(Form::Model(form)),
+            ..Panel::new()
+        };
+        let mut secret = String::new();
+
+        let step = key(&view, &mut panel, &mut secret, ctrl('f'));
+        assert_eq!(
+            step,
+            Step::Discover {
+                account: "local".into()
+            }
+        );
+        assert_eq!(
+            picking(&panel),
+            Some(Picking::Loading {
+                account: "local".into()
+            })
+        );
+
+        let said = discovered(
+            &view,
+            &mut panel,
+            "local",
+            Ok(listed(&[
+                ("local/a", None),
+                ("qwen3-coder", Some(256_000)),
+                ("qwen3-mini", Some(40_000)),
+            ])),
+        );
+        assert_eq!(said, None);
+        let Some(Picking::Ready { items, .. }) = picking(&panel) else {
+            panic!("the picker is up");
+        };
+        assert_eq!(
+            items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+            vec!["qwen3-coder", "qwen3-mini"],
+            "what the account already has is not offered"
+        );
+
+        for c in "mini".chars() {
+            key(&view, &mut panel, &mut secret, press(Key::Char(c)));
+        }
+        key(&view, &mut panel, &mut secret, press(Key::Enter));
+        let Some(Form::Model(form)) = panel.form.clone() else {
+            panic!("the form stays open");
+        };
+        assert_eq!(form.picking, None);
+        assert_eq!(form.model, "qwen3-mini");
+        assert_eq!(
+            form.window_typed.as_deref(),
+            Some("40000"),
+            "not a preset: typed"
+        );
+
+        // A preset window lands on the preset.
+        let mut form = form;
+        form.picking = Some(Picking::Ready {
+            items: listed(&[("qwen3-coder", Some(256_000))]),
+            query: String::new(),
+            cursor: 0,
+        });
+        panel.form = Some(Form::Model(form));
+        key(&view, &mut panel, &mut secret, press(Key::Enter));
+        let Some(Form::Model(form)) = panel.form.clone() else {
+            panic!("the form stays open");
+        };
+        assert_eq!(form.model, "qwen3-coder");
+        assert_eq!((form.window, form.window_typed), (Some(256_000), None));
+    }
+
+    /// Esc puts the picker away and leaves the form; a listing that failed,
+    /// or that has nothing new, says so and leaves the field to be typed; an
+    /// edited model's id is not picked again.
+    #[test]
+    fn the_picker_gets_out_of_the_way() {
+        let view = view();
+        let mut form = ModelForm::add(&view, Some("local")).expect("an account");
+        form.focus = ModelField::Model;
+        form.model = "typed".into();
+        let mut panel = Panel {
+            form: Some(Form::Model(form)),
+            ..Panel::new()
+        };
+        let mut secret = String::new();
+        key(&view, &mut panel, &mut secret, ctrl('f'));
+        key(&view, &mut panel, &mut secret, press(Key::Esc));
+        let Some(Form::Model(form)) = panel.form.clone() else {
+            panic!("Esc leaves the picker, not the form");
+        };
+        assert_eq!((form.picking, form.model.as_str()), (None, "typed"));
+
+        key(&view, &mut panel, &mut secret, ctrl('f'));
+        let said = discovered(&view, &mut panel, "local", Err("connection refused".into()));
+        assert_eq!(said.as_deref(), Some("connection refused"));
+        assert_eq!(picking(&panel), None);
+
+        key(&view, &mut panel, &mut secret, ctrl('f'));
+        let said = discovered(&view, &mut panel, "local", Ok(listed(&[("local/b", None)])));
+        assert!(said.is_some(), "nothing new is said");
+        assert_eq!(picking(&panel), None);
+
+        // An answer for an account the picker is not waiting on is not taken.
+        key(&view, &mut panel, &mut secret, ctrl('f'));
+        assert_eq!(
+            discovered(&view, &mut panel, "deepseek", Ok(listed(&[("x", None)]))),
+            None
+        );
+        assert!(matches!(picking(&panel), Some(Picking::Loading { .. })));
+
+        let mut edited = ModelForm::edit(&view, &view.models()[1]).expect("an edit form");
+        edited.focus = ModelField::Model;
+        let mut panel = Panel {
+            form: Some(Form::Model(edited)),
+            ..Panel::new()
+        };
+        assert_eq!(key(&view, &mut panel, &mut secret, ctrl('f')), Step::Stay);
+        assert_eq!(picking(&panel), None);
+    }
+
+    /// A paste while the picker is up filters it, as typing does; the model
+    /// field under it is left as it was.
+    #[test]
+    fn a_paste_into_the_picker_filters_it() {
+        let view = view();
+        let mut form = ModelForm::add(&view, Some("local")).expect("an account");
+        form.focus = ModelField::Model;
+        form.model = "typed".into();
+        form.picking = Some(Picking::Ready {
+            items: listed(&[("qwen3-coder", None), ("glm-5", None)]),
+            query: String::new(),
+            cursor: 1,
+        });
+        let mut panel = Panel {
+            form: Some(Form::Model(form)),
+            ..Panel::new()
+        };
+        let mut secret = String::new();
+        assert!(paste(&mut panel, &mut secret, "qwen\n"));
+        let Some(Form::Model(form)) = panel.form.clone() else {
+            panic!("the form stays open");
+        };
+        assert_eq!(form.model, "typed");
+        let Some(Picking::Ready { query, cursor, .. }) = form.picking else {
+            panic!("the picker stays up");
+        };
+        assert_eq!((query.as_str(), cursor), ("qwen", 0));
     }
 
     /// A paste on the window row is typing: it starts a custom window from a

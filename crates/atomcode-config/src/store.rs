@@ -5,7 +5,7 @@
 //! applies one delta, and atomically replaces the config. Consumers use the content
 //! revision to reconcile cached UI/runtime state without treating mtimes as reliable.
 
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -351,7 +351,7 @@ fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<()> {
 
     // Persist the directory entry as well on platforms that support syncing directories.
     #[cfg(unix)]
-    File::open(parent)
+    std::fs::File::open(parent)
         .and_then(|directory| directory.sync_all())
         .with_context(|| format!("Failed to sync config directory: {}", parent.display()))?;
     Ok(())

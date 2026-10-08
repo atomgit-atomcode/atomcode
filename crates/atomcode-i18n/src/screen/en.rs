@@ -279,6 +279,27 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdAboutShowInject => "injected context: folded, label only, in full — cycles; all of them with no name".into(),
         Msg::CmdAboutMouse => "hand the mouse back to the terminal, or take it back".into(),
         Msg::RecapLabel => "※ recap:".into(),
+        Msg::ProviderDiscoverNothingNew => {
+            "Every model the endpoint lists is already on this account; type another by hand.".into()
+        }
+        Msg::ProviderDiscoverUnsupported => {
+            "This protocol has no model listing; type the model id by hand.".into()
+        }
+        Msg::ProviderDiscovering => "Fetching the model list from the endpoint… (Esc to cancel)".into(),
+        Msg::ProviderDiscoverHint => "fetch from the endpoint".into(),
+        Msg::ProviderPickKeys => "↑↓ pick · Enter fill in · Esc back · type to filter".into(),
+        Msg::ProviderPickFilter { query } => format!("filter: {query}").into(),
+        Msg::DiscoverNotAListing => "the endpoint did not answer with a model list".into(),
+        Msg::DiscoverTimedOut => "the endpoint did not answer within 10 seconds".into(),
+        Msg::DiscoverTooLarge => "the list is over 4 MiB".into(),
+        Msg::DiscoverStatus { status, key } => match key {
+            true => format!("the endpoint answered HTTP {status}; check the API key").into(),
+            false => format!("the endpoint answered HTTP {status}").into(),
+        },
+        Msg::DiscoverUnreachable => "could not reach the endpoint".into(),
+        Msg::ProviderDiscoverFailed { why } => {
+            format!("Could not fetch the model list: {why}. Type the model id by hand.").into()
+        }
         Msg::SuspendUnsupported => {
             "Suspending (Ctrl+Z) is not available here — not on Windows, or whatever started this switched it off. Run one command with !cmd, or open another terminal.".into()
         }

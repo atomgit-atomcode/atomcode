@@ -230,16 +230,9 @@ pub(crate) struct ProviderPresetInfo {
     pub discoverable: bool,
 }
 
-#[derive(Debug, Serialize)]
-pub(crate) struct DiscoveredModelInfo {
-    pub id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub context_window: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_tokens: Option<usize>,
-}
+/// One model a provider's listing offers — the shared type, under the name
+/// this API has always used.
+pub(crate) use atomcode_capabilities::provider::discovery::DiscoveredModel as DiscoveredModelInfo;
 
 /// Sanitized notification config view (subset of `NotificationConfig`).
 #[derive(Debug, Serialize)]
