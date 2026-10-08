@@ -1158,9 +1158,6 @@ struct RuntimeResources {
     /// Held for its `Drop`: unloading it would tear down every row under a
     /// live handle. When the harness carries the reassembly paths too, this is
     /// what `ControlSvc::patch` will be reached through.
-    ///
-    /// Read in one place only, for a service the tree provides and nothing else
-    /// reaches: the side-call model ([`side_call_provider`]).
     harness_app: Option<atomcode_plexus::App>,
     /// The provider table the `llm` row reads by id. Holding it is what makes a
     /// `/model` switch a patch rather than a rebuild — see
@@ -1171,18 +1168,18 @@ struct RuntimeResources {
     image_preprocessor: Option<Arc<dyn ImagePreprocessor>>,
 }
 
-/// The model a side call runs on: the tree's side-call model (`llm-utility` —
-/// titles, summaries, the cheapest on offer) when one is mounted, else the
-/// conversation's own, built the way the next-prompt guess builds it. `None`
-/// when neither can be had.
+/// The model a side call runs on: the conversation's own — the one the `llm`
+/// row is serving right now, else one built from the config the way the
+/// next-prompt guess builds it. `None` when neither can be had.
+///
+/// Never the side-call model (`llm-utility`): the recap reads the transcript,
+/// and that model may be another vendor's than the one the person chose to
+/// send this conversation to.
 fn side_call_provider(runtime: &RuntimeResources) -> Option<Arc<dyn LlmProvider>> {
     runtime
-        .harness_app
+        .harness_providers
         .as_ref()
-        .and_then(|app| {
-            app.context()
-                .service::<atomcode_harness::seams::LlmUtilitySvc>()
-        })
+        .and_then(|slots| slots.current())
         .or_else(|| {
             let session_id = runtime
                 .parts

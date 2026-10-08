@@ -5391,6 +5391,44 @@ async fn a_failed_mcp_connection_is_metered() {
     );
 }
 
+/// The recap is written by the model this conversation runs on — the very
+/// provider the turn just used, not one built beside it, and never the
+/// side-call model, which may be another vendor's than the one the person
+/// chose to send this transcript to.
+async fn the_recap_is_written_by_the_conversation_model() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+            .await
+            .unwrap();
+    turn(&mut runtime, "remember pineapple").await;
+    let built = recorder.built.lock().unwrap().len();
+    let asked = recorder.requests.lock().unwrap().len();
+
+    let recap = runtime.handle.recap().await.unwrap();
+
+    assert!(recap.is_some(), "the conversation model answered a recap");
+    let requests = recorder.requests.lock().unwrap();
+    assert_eq!(requests.len(), asked + 1, "one request for the recap");
+    assert!(
+        requests
+            .last()
+            .unwrap()
+            .iter()
+            .any(|m| m.text.contains("Write a recap")),
+        "the last request is the recap: {:?}",
+        requests.last()
+    );
+    drop(requests);
+    assert_eq!(
+        recorder.built.lock().unwrap().len(),
+        built,
+        "the recap ran on the live provider, not a second one"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
 /// A program that embeds the runtime under its own name hands in its own
 /// dirs, and that is the whole of where the runtime writes: the session lands
 /// in its tree, the project gets its dir name, and neither this product's
@@ -5792,6 +5830,7 @@ mod criteria {
         a_capability_the_runtime_mounts_itself_still_describes_itself,
         a_runtime_configured_from_a_file_describes_the_file,
         a_runtime_under_another_name_keeps_to_its_own_dirs,
+        the_recap_is_written_by_the_conversation_model,
         our_own_skills_lead_the_catalog,
         a_skipped_role_file_reaches_the_driver_as_a_warning,
         a_skipped_role_file_is_said_once_not_every_turn,
