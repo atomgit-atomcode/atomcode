@@ -25,8 +25,12 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parent
+# Keys may be quoted (`"token": …`) and values may be quoted (`"token": "…"` or
+# `"authorization": "Bearer …"`), which is what these fields look like when the
+# recorded output is JSON. Capture the opening quote separately so it survives the
+# substitution and the closing quote still terminates the value.
 SECRET_RE = re.compile(
-    r"(?i)(authorization\s*[:=]\s*(?:bearer\s+)?|api[_-]?key\s*[:=]\s*|token\s*[:=]\s*)([^\s\"']+)"
+    r"(?i)((?:authorization|api[_-]?key|token)['\"]?\s*[:=]\s*)(['\"]?)((?:bearer\s+)?)([^\s\"',}]+)"
 )
 TOKEN_RE = re.compile(r"\[tokens\]\s+prompt=(\d+)\s+completion=(\d+)\s+cached=(\d+)")
 
@@ -39,7 +43,7 @@ def atomic_json(path: Path, value: Any) -> None:
 
 
 def scrub(text: str) -> str:
-    return SECRET_RE.sub(lambda m: m.group(1) + "[REDACTED]", text)
+    return SECRET_RE.sub(lambda m: "".join(m.group(1, 2, 3)) + "[REDACTED]", text)
 
 
 def digest(path: Path) -> str:
