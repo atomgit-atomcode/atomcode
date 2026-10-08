@@ -9471,6 +9471,7 @@ fn harness_host_state(
         // What a host outside this workspace brought. Registered only: the
         // rows that mount them come in its layers, last (see `mount`).
         plugins: prepare.host_plugins.plugins.clone(),
+        identity: prepare.identity.clone(),
         session_context: Some(crate::on_harness::HostContext {
             hook: Arc::new(atomcode_capabilities::session::SessionContextHook::new(
                 &config.working_dir,
@@ -11350,6 +11351,7 @@ pub mod testkit {
             front_end: None,
             review_delegate: None,
             host_plugins: Default::default(),
+            identity: Default::default(),
         };
         let plugin_hooks = Arc::new(crate::plugin_hooks::StaticPluginHookSource::default());
         let parts = crate::parts::prepare_with_plugin_hook_source(
@@ -12483,6 +12485,7 @@ mod tests {
                 front_end: None,
                 review_delegate: None,
                 host_plugins: Default::default(),
+                identity: Default::default(),
             },
             provider_factory: Arc::new(TestProviderFactory {
                 fail: fail_provider,

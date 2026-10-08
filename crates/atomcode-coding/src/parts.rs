@@ -158,6 +158,16 @@ pub struct PrepareOptions {
     /// restored snapshot, a reprepare, a provider coming back — so what the host
     /// asked for cannot fall out of the second tree.
     pub host_plugins: HostPlugins,
+    /// Who the agent says it is: the product's name and provider, in coding's
+    /// own persona and in the config a host's persona on that row receives
+    /// (`host::PersonaConfig`). The default is this product's own.
+    ///
+    /// Here for the reason `host_plugins` is: these options stay with the
+    /// runtime and are read again on every rebuild, while the
+    /// `CodingAgentConfig` is replaced by whatever a driver hands `/model` or a
+    /// reprepare — so an identity on it would last until the first driver that
+    /// built that config from scratch.
+    pub identity: crate::persona::ProductIdentity,
 }
 
 /// A host's own rows, for [`crate::CodingRuntime`] to mount alongside the
@@ -253,6 +263,7 @@ impl Default for PrepareOptions {
             front_end: None,
             review_delegate: None,
             host_plugins: HostPlugins::default(),
+            identity: crate::persona::ProductIdentity::default(),
         }
     }
 }
@@ -2349,6 +2360,7 @@ mod tests {
             front_end: None,
             review_delegate: None,
             host_plugins: Default::default(),
+            identity: Default::default(),
         };
 
         let prepared =
@@ -2641,6 +2653,7 @@ mod tests {
             front_end: None,
             review_delegate: None,
             host_plugins: Default::default(),
+            identity: Default::default(),
         }
     }
 

@@ -58,7 +58,8 @@ pub use status_reminder::StatusReminderHook;
 pub use transcript::{ToolRecord, TurnRecord, TurnTimestamp, UsageRecord};
 pub use usage_provider::UsageRecordingProvider;
 pub use worklog::{
-    build_worklog_prompt, collect_day_turns, local_day_window_ms, resolve_worklog_date, WorklogTurn,
+    build_worklog_prompt, build_worklog_prompt_for, collect_day_turns, local_day_window_ms,
+    resolve_worklog_date, WorklogTurn,
 };
 
 /// Current wall-clock as epoch MILLISECONDS, UTC. The single L1 time source the

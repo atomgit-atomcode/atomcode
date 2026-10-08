@@ -53,6 +53,7 @@ async fn sensitive_read_is_gated_and_fails_closed_through_full_assembly() {
         front_end: None,
         review_delegate: None,
         host_plugins: Default::default(),
+        identity: Default::default(),
     };
     let parts = prepare(&cfg, opts.clone()).await.unwrap();
 

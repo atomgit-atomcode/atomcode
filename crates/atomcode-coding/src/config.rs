@@ -376,8 +376,18 @@ pub fn permission_rules_from_config(
 /// document somewhere else. Sections a front end reads (`[ui]`,
 /// `[notifications]`, the proxy) are the front end's to describe.
 pub fn describe_config_file(config_file: &std::path::Path) -> String {
+    describe_config_file_for(config_file, &crate::persona::ProductIdentity::default())
+}
+
+/// [`describe_config_file`] for a product that goes by `identity`: the home the
+/// file is in is that product's.
+pub fn describe_config_file_for(
+    config_file: &std::path::Path,
+    identity: &crate::persona::ProductIdentity,
+) -> String {
+    let product = identity.name();
     format!(
-        "CONFIG FILE. This runtime was configured from `{file}` — the AtomCode home's \
+        "CONFIG FILE. This runtime was configured from `{file}` — the {product} home's \
          `config.toml`, unless the front end was started with `--config <file>`. It read \
          the file when it was built and does not watch it: an edit reaches a runtime \
          built after the file is read again (a new session, or a restart). Switching the \
@@ -1118,6 +1128,31 @@ impl CodingAgentConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The home the config file is in is the product's: AtomCode's by default,
+    /// in the words it always used, and the configured product's otherwise.
+    #[test]
+    fn the_config_file_is_described_as_the_product_s() {
+        let file = std::path::Path::new("/h/config.toml");
+        let stock = describe_config_file(file);
+        assert!(
+            stock.contains("— the AtomCode home's `config.toml`"),
+            "{stock}"
+        );
+        assert_eq!(
+            stock,
+            describe_config_file_for(file, &crate::persona::ProductIdentity::default())
+        );
+        let renamed = describe_config_file_for(
+            file,
+            &crate::persona::ProductIdentity::new("OtherCode", "示例数据服务中心"),
+        );
+        assert!(
+            renamed.contains("— the OtherCode home's `config.toml`"),
+            "{renamed}"
+        );
+        assert!(!renamed.contains("AtomCode"), "{renamed}");
+    }
 
     /// The whole point of the `[permissions]` table is that it reaches the GATE. Assert the
     /// full TOML → `CodingRuntimeConfig` → `CodingAgentConfig` path, because a config that

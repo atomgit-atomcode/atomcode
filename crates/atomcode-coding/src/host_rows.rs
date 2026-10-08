@@ -108,7 +108,11 @@ impl std::fmt::Debug for SessionSeed {
 }
 
 /// `session-native`: the runtime's session, handed to the tree.
-pub(crate) struct SessionNativePlugin(pub(crate) Arc<SessionSeed>);
+pub(crate) struct SessionNativePlugin(
+    pub(crate) Arc<SessionSeed>,
+    /// Whose session store this is, as the agent says it.
+    pub(crate) crate::persona::ProductIdentity,
+);
 
 impl SessionNativePlugin {
     /// What this row keeps, said by this row.
@@ -127,13 +131,16 @@ impl SessionNativePlugin {
         use atomcode_harness::plugins::self_knowledge::{describes, describes_live};
         use atomcode_harness::seams::Aspect;
 
+        let product = self.1.name();
         let (Some(id), Some(store)) = (self.0.id.clone(), self.0.store()) else {
             describes(
                 ctx,
                 "sessions",
                 10,
-                "SESSIONS. This conversation is not kept in the AtomCode session \
-                 store: it is not in the session list and cannot be resumed later.",
+                format!(
+                    "SESSIONS. This conversation is not kept in the {product} session \
+                     store: it is not in the session list and cannot be resumed later."
+                ),
             );
             describes_live(ctx, Aspect::Session, "sessions/this-session", 10, |_| {
                 Some(
@@ -149,7 +156,7 @@ impl SessionNativePlugin {
             "sessions",
             10,
             format!(
-                "SESSIONS. Sessions are kept per project in the AtomCode session \
+                "SESSIONS. Sessions are kept per project in the {product} session \
                  store; this project's is `{root}`. For a session id: \
                  `<id>.events` is the session's log — every fact of the \
                  conversation, appended as it happens; a resume replays that file \
@@ -1025,7 +1032,11 @@ impl Plugin for SkillsHostPlugin {
 /// descriptions are that function's neighbours in `config.rs` and the settings
 /// catalog's own renderer — so a runtime no file configured is never told to
 /// edit one.
-pub(crate) struct ConfigFilePlugin(pub(crate) std::path::PathBuf);
+pub(crate) struct ConfigFilePlugin(
+    pub(crate) std::path::PathBuf,
+    /// Whose home the file is in, as the agent says it.
+    pub(crate) crate::persona::ProductIdentity,
+);
 
 #[async_trait]
 impl Plugin for ConfigFilePlugin {
@@ -1044,7 +1055,7 @@ impl Plugin for ConfigFilePlugin {
             ctx,
             "config-file",
             20,
-            crate::config::describe_config_file(&self.0),
+            crate::config::describe_config_file_for(&self.0, &self.1),
         );
         let catalog = atomcode_config::settings::describe_catalog(&self.0);
         describes_live(
@@ -2679,6 +2690,8 @@ pub(crate) struct WorklogPlugin {
     /// the process-wide i18n cache: a command is registered by a row, and a row
     /// decides from its own configuration which language it speaks.
     pub(crate) language: Option<atomcode_config::locale::Locale>,
+    /// Whose session records the recap is drawn from.
+    pub(crate) identity: crate::persona::ProductIdentity,
 }
 
 #[async_trait]
@@ -2700,6 +2713,7 @@ impl Plugin for WorklogPlugin {
             ctx,
             Arc::new(WorklogCommand {
                 language: self.language,
+                product: self.identity.name().to_string(),
                 sessions_root: SessionManager::sessions_root(
                     atomcode_harness::product_dirs(ctx)?.user(),
                 ),
@@ -2710,6 +2724,8 @@ impl Plugin for WorklogPlugin {
 
 struct WorklogCommand {
     language: Option<atomcode_config::locale::Locale>,
+    /// Whose session records the recap says it was drawn from.
+    product: String,
     /// Every project's buckets: `<user tree>/sessions`.
     sessions_root: std::path::PathBuf,
 }
@@ -2729,6 +2745,7 @@ fn worklog_prompt_at(
     today: chrono::NaiveDate,
     sessions_root: &std::path::Path,
     english: bool,
+    product: &str,
 ) -> WorklogPrompt {
     let Some(date) = atomcode_capabilities::session::resolve_worklog_date(arg, today) else {
         return WorklogPrompt::Unusable(if english {
@@ -2743,8 +2760,8 @@ fn worklog_prompt_at(
     // The label is the one a person would write themselves (`8/27`), and it goes
     // into the heading the model sees — not a machine date.
     let label = date.format("%-m/%-d").to_string();
-    WorklogPrompt::Prompt(atomcode_capabilities::session::build_worklog_prompt(
-        &label, &turns, english,
+    WorklogPrompt::Prompt(atomcode_capabilities::session::build_worklog_prompt_for(
+        product, &label, &turns, english,
     ))
 }
 
@@ -2777,6 +2794,7 @@ impl atomcode_harness::commands::CatalogCommand for WorklogCommand {
             chrono::Local::now().date_naive(),
             &self.sessions_root,
             english,
+            &self.product,
         ) {
             WorklogPrompt::Unusable(usage) => return Err(usage),
             WorklogPrompt::Prompt(prompt) => {
@@ -4006,7 +4024,8 @@ mod tests {
         }
         manager.append_events(&lease, &facts).expect("append");
 
-        let WorklogPrompt::Prompt(prompt) = worklog_prompt_at("8/27", day, dir.path(), false)
+        let WorklogPrompt::Prompt(prompt) =
+            worklog_prompt_at("8/27", day, dir.path(), false, "AtomCode")
         else {
             panic!("a usable date builds a prompt");
         };
@@ -4028,17 +4047,21 @@ mod tests {
         let day = chrono::NaiveDate::from_ymd_opt(2026, 8, 27).expect("a date");
         let root = tempfile::tempdir().expect("tempdir");
         for unparseable in ["last tuesday", "13/45", "2026"] {
-            let said = worklog_prompt_at(unparseable, day, root.path(), false);
+            let said = worklog_prompt_at(unparseable, day, root.path(), false, "AtomCode");
             assert!(
                 matches!(said, WorklogPrompt::Unusable(_)),
                 "`{unparseable}` is refused rather than recapped"
             );
         }
         // And the words are the person's language, like the template is.
-        let WorklogPrompt::Unusable(zh) = worklog_prompt_at("nope", day, root.path(), false) else {
+        let WorklogPrompt::Unusable(zh) =
+            worklog_prompt_at("nope", day, root.path(), false, "AtomCode")
+        else {
             panic!("usage");
         };
-        let WorklogPrompt::Unusable(en) = worklog_prompt_at("nope", day, root.path(), true) else {
+        let WorklogPrompt::Unusable(en) =
+            worklog_prompt_at("nope", day, root.path(), true, "AtomCode")
+        else {
             panic!("usage");
         };
         assert!(zh.contains("用法") && en.contains("Usage"), "{zh} / {en}");

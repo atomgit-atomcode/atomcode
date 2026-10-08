@@ -271,6 +271,7 @@ impl Env {
                 front_end: None,
                 review_delegate: None,
                 host_plugins: host,
+                identity: Default::default(),
             },
             provider_factory: Arc::new(Factory(recorder.clone())),
             plugin_hooks: Arc::new(StaticPluginHookSource::default()),

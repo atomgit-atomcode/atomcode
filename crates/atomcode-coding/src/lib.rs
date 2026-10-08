@@ -99,7 +99,7 @@ pub use parts::{
     subagent_enabled_from_env, CodingParts, HostPlugins, McpRowFacts, PrepareOptions,
     SessionBinding, SessionMode, SubagentPolicy,
 };
-pub use persona::coding_persona;
+pub use persona::{coding_persona, ProductIdentity};
 pub use plan_mode::PlanModeGate;
 pub use plugin_hooks::{PluginHookSource, StaticPluginHookSource};
 pub use provider_factory::{

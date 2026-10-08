@@ -152,6 +152,7 @@ async fn full_assembly_wire_prefix_is_cacheable_across_turns() {
         front_end: None,
         review_delegate: None,
         host_plugins: Default::default(),
+        identity: Default::default(),
     };
     let parts = prepare(&cfg, opts.clone()).await.unwrap();
 
@@ -250,6 +251,7 @@ async fn tool_block_and_system_are_deterministic_across_independent_assemblies()
         front_end: None,
         review_delegate: None,
         host_plugins: Default::default(),
+        identity: Default::default(),
     };
 
     async fn first_call(cfg: &CodingAgentConfig, opts: PrepareOptions) -> (String, String) {

@@ -195,5 +195,6 @@ pub fn quiet_options() -> PrepareOptions {
         front_end: None,
         review_delegate: None,
         host_plugins: Default::default(),
+        identity: Default::default(),
     }
 }

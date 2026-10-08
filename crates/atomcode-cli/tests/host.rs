@@ -316,6 +316,7 @@ async fn started(
             front_end: Some(front_end.clone()),
             review_delegate: None,
             host_plugins: Default::default(),
+            identity: Default::default(),
         },
         provider_factory: Arc::new(Factory(env.script.clone())),
         plugin_hooks: Arc::new(StaticPluginHookSource::default()),
@@ -568,6 +569,7 @@ async fn a_finished_turn_offers_what_might_be_said_next() {
             front_end: Some(front_end.clone()),
             review_delegate: None,
             host_plugins: Default::default(),
+            identity: Default::default(),
         },
         provider_factory: Arc::new(Factory(env.script.clone())),
         plugin_hooks: Arc::new(StaticPluginHookSource::default()),
@@ -3297,6 +3299,7 @@ async fn started_without_a_provider_on(
             front_end: Some(front_end.clone()),
             review_delegate: None,
             host_plugins: Default::default(),
+            identity: Default::default(),
         },
         provider_factory: Arc::new(GatewayGap {
             script: env.script.clone(),
