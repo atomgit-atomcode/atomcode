@@ -3059,6 +3059,20 @@ impl Host {
         true
     }
 
+    /// What an endpoint listed for the providers panel's picker — see
+    /// [`crate::providers::discovered`]. Answers what to tell the person when
+    /// there is nothing to pick.
+    pub fn providers_discovered(
+        &self,
+        account: &str,
+        listed: Result<Vec<crate::providers::Discovered>, String>,
+    ) -> Option<String> {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let view = m.providers.clone();
+        let panel = m.providers_panel.as_mut()?;
+        crate::providers::discovered(&view, panel, account, listed)
+    }
+
     /// Run one key against the providers panel: the panel it writes back, and
     /// the write to send over the seam when the key asked for one.
     ///

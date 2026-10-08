@@ -390,6 +390,33 @@ pub enum Msg<'a> {
     CmdAboutTools,
     CmdAboutShowInject,
     CmdAboutMouse,
+    /// `/provider`'s model picker: the listing had nothing the account lacks.
+    ProviderDiscoverNothingNew,
+    /// …this account's protocol (or this screen) lists no models.
+    ProviderDiscoverUnsupported,
+    /// …while the listing is on its way.
+    ProviderDiscovering,
+    /// …beside an empty model field: the key that opens it.
+    ProviderDiscoverHint,
+    /// …its keys.
+    ProviderPickKeys,
+    /// …its filter line.
+    ProviderPickFilter {
+        query: &'a str,
+    },
+    /// …the listing could not be had, and why.
+    ProviderDiscoverFailed {
+        why: &'a str,
+    },
+    DiscoverNotAListing,
+    DiscoverTimedOut,
+    DiscoverTooLarge,
+    /// `key`: a 401/403, which is the key's fault.
+    DiscoverStatus {
+        status: u16,
+        key: bool,
+    },
+    DiscoverUnreachable,
     /// The word a `※ recap:` line opens with.
     RecapLabel,
     /// Ctrl+Z where it cannot stop: no job control (Windows), or started with

@@ -241,6 +241,23 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdAboutShowInject => "环境注入:收起、只留标签、全文,循环;不带名字则全部".into(),
         Msg::CmdAboutMouse => "把鼠标交还终端,或收回来".into(),
         Msg::RecapLabel => "※ 回顾:".into(),
+        Msg::ProviderDiscoverNothingNew => "服务端列出的模型这个账号都已经加过了;要加别的就手动输入。".into(),
+        Msg::ProviderDiscoverUnsupported => "这个协议没有模型列表接口,请手动输入模型 ID。".into(),
+        Msg::ProviderDiscovering => "正在从服务端拉取模型列表…(Esc 取消)".into(),
+        Msg::ProviderDiscoverHint => "从服务端拉取".into(),
+        Msg::ProviderPickKeys => "↑↓ 选 · Enter 填入 · Esc 返回 · 打字筛选".into(),
+        Msg::ProviderPickFilter { query } => format!("筛选:{query}").into(),
+        Msg::DiscoverNotAListing => "服务端返回的不是模型列表".into(),
+        Msg::DiscoverTimedOut => "服务端没在 10 秒内回答".into(),
+        Msg::DiscoverTooLarge => "返回的列表超过 4 MiB".into(),
+        Msg::DiscoverStatus { status, key } => match key {
+            true => format!("服务端返回 HTTP {status},请检查 API key").into(),
+            false => format!("服务端返回 HTTP {status}").into(),
+        },
+        Msg::DiscoverUnreachable => "连不上服务端".into(),
+        Msg::ProviderDiscoverFailed { why } => {
+            format!("没拉到模型列表:{why}。可以手动输入模型 ID。").into()
+        }
         Msg::SuspendUnsupported => {
             "这里没法挂起(Ctrl+Z):Windows 没有,或启动方设成了不许挂起。单条命令可以用 !命令,或另开一个终端。".into()
         }

@@ -17,6 +17,7 @@
 
 mod anthropic;
 mod atomgit_sign;
+pub mod discovery;
 mod ollama;
 mod openai_compat;
 pub mod probe;

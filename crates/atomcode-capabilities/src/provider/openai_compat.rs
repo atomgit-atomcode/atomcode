@@ -465,7 +465,7 @@ fn build_http_client_inner(
 /// are warned and skipped — NEVER fatal (the webpki base guarantees a working
 /// client). Mirrors `core::provider::add_trusted_roots`; codex-style graceful
 /// `load_native_certs`. See issue #514.
-fn add_trusted_roots(mut builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+pub(crate) fn add_trusted_roots(mut builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
     // 1) OS native roots (corporate MITM CAs live here).
     let native = rustls_native_certs::load_native_certs();
     if !native.errors.is_empty() {

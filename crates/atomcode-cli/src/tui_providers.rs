@@ -291,6 +291,32 @@ fn label_for(config: &Config, id: &str) -> String {
     atomcode_config::provider_book::account_label(config, id)
 }
 
+/// Why an endpoint gave no listing, in the person's words.
+fn discovery_reason(error: &atomcode_capabilities::provider::discovery::DiscoveryError) -> String {
+    use atomcode_capabilities::provider::discovery::{DiscoveryError, DiscoveryRequestError};
+    match error {
+        DiscoveryError::Unsupported => tr(SMsg::ProviderDiscoverUnsupported).into_owned(),
+        DiscoveryError::BadUrl(why) => why.clone(),
+        DiscoveryError::NotAListing => tr(SMsg::DiscoverNotAListing).into_owned(),
+        DiscoveryError::Request(DiscoveryRequestError::Timeout) => {
+            tr(SMsg::DiscoverTimedOut).into_owned()
+        }
+        DiscoveryError::Request(DiscoveryRequestError::ResponseTooLarge) => {
+            tr(SMsg::DiscoverTooLarge).into_owned()
+        }
+        DiscoveryError::Request(DiscoveryRequestError::UpstreamStatus(status)) => {
+            tr(SMsg::DiscoverStatus {
+                status: *status,
+                key: matches!(status, 401 | 403),
+            })
+            .into_owned()
+        }
+        DiscoveryError::Request(DiscoveryRequestError::Transport) => {
+            tr(SMsg::DiscoverUnreachable).into_owned()
+        }
+    }
+}
+
 impl Providers for ConfigProviders {
     fn rows(&self) -> ProvidersView {
         self.read()
@@ -368,6 +394,46 @@ impl Providers for ConfigProviders {
 
     fn delete_model(&self, id: &str) -> Result<(), String> {
         self.book().delete_model(id).map_err(said)
+    }
+
+    /// The account's own listing, asked of its saved address and key — the
+    /// listing the web UI's `/providers/discover-models` reads, by the same
+    /// code (`atomcode_capabilities::provider::discovery`).
+    fn discover(&self, account: &str) -> Option<atomcode_tui::providers::DiscoverFuture> {
+        use atomcode_capabilities::provider::discovery::{
+            discover, discovery_protocol, DiscoveryTransport,
+        };
+        let config = self.load();
+        // The service's own models; nothing to pick from here.
+        if config.account_is_codingplan_managed(account) {
+            return None;
+        }
+        let endpoint = config.account_endpoint(account)?;
+        let base_url = endpoint.base_url.clone()?;
+        let wire = endpoint.provider_type.clone();
+        discovery_protocol(&wire)?;
+        let transport = DiscoveryTransport {
+            api_key: endpoint.api_key.clone(),
+            user_agent: endpoint.user_agent.clone(),
+            skip_tls_verify: endpoint.skip_tls_verify,
+        };
+        Some(Box::pin(async move {
+            discover(&base_url, &wire, &transport)
+                .await
+                .map(|models| {
+                    models
+                        .into_iter()
+                        .map(|model| atomcode_tui::providers::Discovered {
+                            id: model.id,
+                            window: model.context_window,
+                        })
+                        .collect()
+                })
+                .map_err(|error| {
+                    let why = discovery_reason(&error);
+                    tr(SMsg::ProviderDiscoverFailed { why: &why }).into_owned()
+                })
+        }))
     }
 
     /// One request to the endpoint just saved (`atomcode_capabilities::provider::probe`),

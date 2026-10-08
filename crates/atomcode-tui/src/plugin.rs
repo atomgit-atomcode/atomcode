@@ -3229,11 +3229,34 @@ impl Tui {
         let Some(port) = ctx.service::<crate::plugin::ProvidersSvc>() else {
             return Err(t(Msg::NoProviderPort).into_owned());
         };
+        // Listing an endpoint's models writes nothing, so it is not followed by
+        // a reload: the answer fills the picker the form put up, off the frame.
+        if let Step::Discover { account } = step {
+            let Some(listing) = port.discover(&account) else {
+                let said = self.host.providers_discovered(
+                    &account,
+                    Err(t(Msg::ProviderDiscoverUnsupported).into_owned()),
+                );
+                return said.map_or(Ok(None), Err);
+            };
+            let host = self.host.clone();
+            let keys = self.wake.lock().expect("wake poisoned").clone();
+            tokio::spawn(async move {
+                let listed = listing.await;
+                if let Some(said) = host.providers_discovered(&account, listed) {
+                    host.say(&said, true);
+                }
+                if let Some(keys) = keys {
+                    let _ = keys.send(Wake::Fact);
+                }
+            });
+            return Ok(None);
+        }
         // What to check once the write has landed: the account, and the model
         // when a model was saved (see `Providers::probe`).
         let mut check: Option<(String, Option<String>)> = None;
         let said = match step {
-            Step::Use { .. } | Step::Stay | Step::Close => None,
+            Step::Use { .. } | Step::Stay | Step::Close | Step::Discover { .. } => None,
             Step::SaveAccount {
                 id: Some(id),
                 draft,
