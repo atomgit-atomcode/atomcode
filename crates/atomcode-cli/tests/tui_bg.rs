@@ -205,6 +205,7 @@ fn start(
                 review_delegate: Some(review_home.delegate_for(&front_end)),
                 front_end: Some(front_end),
                 host_plugins: Default::default(),
+                identity: Default::default(),
             },
             provider_factory: Arc::new(script.clone()),
             plugin_hooks: Arc::new(StaticPluginHookSource::default()),

@@ -518,6 +518,7 @@ fn start(
             front_end: None,
             review_delegate: None,
             host_plugins: Default::default(),
+            identity: Default::default(),
         },
         provider_factory: Arc::new(RecordingFactory(recorder.clone())),
         plugin_hooks: Arc::new(StaticPluginHookSource::default()),

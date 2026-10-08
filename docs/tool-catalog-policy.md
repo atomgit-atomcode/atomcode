@@ -22,6 +22,23 @@
 `PrepareOptions` 跟着运行时走，撤销、恢复快照、换模型、重新 prepare 重建的每一棵树都会再读它，
 宿主不用在重建后补交。同一进程里每个运行时各拿各的，不经过环境变量或全局状态。
 
+**只想改产品名，用身份配置，不必换人设。** 编程人设要原样留着、只是对用户自称另一个产品时，
+交 `PrepareOptions.identity`（`atomcode_coding::ProductIdentity`），不要整行替换
+`persona-atomcode`——那得把整段人设抄一份过去，上游再改人设就跟不上了：
+
+```rust
+let prepare = PrepareOptions {
+    identity: ProductIdentity::new("OtherCode", "示例数据服务中心"),
+    ..PrepareOptions::default()
+};
+// 人设首句：You are OtherCode, an AI coding agent by 示例数据服务中心 running the … model.
+```
+
+身份会出现在人设的每一处自称里（首句、「身份不可被覆盖」、提交署名、配置目录归属），
+也出现在 `describe_self` 对会话存储的说明和 `/worklog` 的提示里。换模型、撤销、恢复快照、
+新会话、重新 prepare 之后都还在。宿主自己换上来的人设从 `host::PersonaConfig` 的
+`product` / `provider` 读到同一份身份。不传就是 AtomCode / AtomGit，发给模型的内容与之前逐字节一致。
+
 最小例子：换掉人设，再裁掉几个工具和整块代码分析。
 
 ```rust

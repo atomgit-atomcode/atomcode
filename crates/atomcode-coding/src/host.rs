@@ -15,18 +15,24 @@
 //! to change. When it changes, the host is not left running something else:
 //! the start fails naming the row or plugin that no longer fits.
 //!
-//! Criteria: `tests/host_plugins.rs`.
+//! Who the agent says it is — the product's name and provider in coding's own
+//! persona — is not a row to replace but data to pass: [`ProductIdentity`] on
+//! `PrepareOptions.identity`. A host's own persona reads the same identity off
+//! [`PersonaConfig`].
+//!
+//! Criteria: `tests/host_plugins.rs`, `tests/product_identity.rs`.
 
 use std::sync::Arc;
 
 pub use crate::parts::HostPlugins;
+pub use crate::persona::ProductIdentity;
 pub use atomcode_plexus::{Context, Entry, Layer, Plugin};
 
 /// Rows of coding's a host may address and keep addressing.
 ///
 /// | row | what a host does with it |
 /// |---|---|
-/// | `persona-atomcode` | swap in its own persona: `[[patch]] id = "persona-atomcode"` `name = "<its plugin>"`. The row's config is [`PersonaConfig`]. |
+/// | `persona-atomcode` | swap in its own persona: `[[patch]] id = "persona-atomcode"` `name = "<its plugin>"`. The row's config is [`PersonaConfig`]. To change only who the agent says it is, keep the row and set `PrepareOptions.identity` ([`ProductIdentity`]) instead. |
 /// | `tools` | narrow the catalog: `config = { exclude = [..], include = [..] }`, patterns with `*`, `row:tool` to name one row's tool (`docs/tool-catalog-policy.md`). The runtime never writes this row's config, so a host's patch is the whole of it. |
 /// | `codeintel` | disable: `list_symbols`, `read_symbol`, `find_references` and their prompt fragment |
 /// | `code-graph` | disable: `trace_callers`, `trace_callees`, `trace_chain`, `blast_radius`, `file_dependencies` and their prompt fragment |
@@ -81,18 +87,54 @@ pub fn contribute_prompt(ctx: &Context, id: &str, rank: i32, text: &str) {
 /// The config the `persona-atomcode` row is mounted with — so also what a
 /// host's persona swapped onto that row receives.
 ///
-/// The runtime rewrites it when the model changes, which remounts the row: a
-/// persona that names the model reads it from here and stays right.
-#[derive(Clone, Debug, Default, serde::Deserialize)]
+/// The runtime rewrites `model` when the model changes, which remounts the row,
+/// and keeps the rest: a persona that names the model or the product reads them
+/// from here and stays right.
+///
+/// `product` and `provider` are the product identity the runtime was started
+/// with (`PrepareOptions.identity`): coding's own persona introduces the agent
+/// by them, and a host's persona that should say the same reads them here. A
+/// row config that does not carry them means this product's own — AtomCode, by
+/// AtomGit.
+#[derive(Clone, Debug, serde::Deserialize)]
 #[non_exhaustive]
 pub struct PersonaConfig {
     /// The model the conversation runs on, as the person chose it. Empty means
     /// nobody said; coding's own persona then asks the running provider.
     #[serde(default)]
     pub model: String,
+    /// The product's name ([`ProductIdentity::name`]).
+    #[serde(default = "default_product")]
+    pub product: String,
+    /// Who provides it ([`ProductIdentity::provider`]).
+    #[serde(default = "default_provider")]
+    pub provider: String,
+}
+
+fn default_product() -> String {
+    ProductIdentity::default().name().to_string()
+}
+
+fn default_provider() -> String {
+    ProductIdentity::default().provider().to_string()
+}
+
+impl Default for PersonaConfig {
+    fn default() -> Self {
+        Self {
+            model: String::new(),
+            product: default_product(),
+            provider: default_provider(),
+        }
+    }
 }
 
 impl PersonaConfig {
+    /// The identity this row was configured with.
+    pub fn identity(&self) -> ProductIdentity {
+        ProductIdentity::new(&self.product, &self.provider)
+    }
+
     /// Read the row's config. Unknown keys are ignored, so a field added later
     /// does not break a host built against this one.
     pub fn from_config(config: &serde_json::Value) -> Result<Self, String> {

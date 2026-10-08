@@ -610,10 +610,11 @@ name = "tool-open-file"
 [[remove]]
 id = "persona-coding"
 
-# `{model}` is rewritten by a `/model` patch so this row remounts with it.
+# `{model}` is rewritten by a `/model` patch so this row remounts with it; the
+# patch keeps the rest of this config, so the product's identity stays.
 [[insert]]
 name = "persona-atomcode"
-config = { model = {model} }
+config = { model = {model}, product = {product}, provider = {provider} }
 
 # The self-correction loop: an in-workspace code edit the model walked away
 # from without checking gets one nudge. `force` follows presence, the same rule
@@ -656,10 +657,25 @@ name = "ui-handle"
 /// that the row had no way to be told which backend to use — the person's
 /// `[web_search] provider = "duckduckgo"` would have been read by the chain and
 /// silently dropped by the tree.
-/// The `persona-atomcode` row's config: the model its identity line names.
-#[derive(serde::Serialize)]
-struct PersonaPatch<'a> {
-    model: &'a str,
+/// The `persona-atomcode` row's config as it stands in `app`, with `model`
+/// changed and nothing else.
+///
+/// A patch replaces a row's config whole, and this row carries more than the
+/// model: the product's identity, and whatever a host's persona swapped onto it
+/// was configured with. Writing `{ model }` alone would hand the next mount the
+/// default identity — the agent would introduce itself as AtomCode again after
+/// the first `/model`. A tree with no such row gets `{ model }`, and the patch
+/// fails the way it always has.
+fn persona_patch(app: &App, model: &str) -> serde_json::Value {
+    let mut config = app
+        .tree()
+        .entries
+        .iter()
+        .find(|entry| entry.id == "persona-atomcode")
+        .and_then(|entry| entry.config.as_object().cloned())
+        .unwrap_or_default();
+    config.insert("model".into(), serde_json::Value::from(model));
+    serde_json::Value::Object(config)
 }
 
 /// Rows whose config follows the running model — patched at mount and again on
@@ -980,12 +996,31 @@ pub fn tools_host_row(
     }
 }
 
-/// The coding overlay with this working directory substituted in.
+/// The coding overlay with this working directory substituted in, for this
+/// product: AtomCode, by AtomGit. [`coding_overlay_for`] names another.
 pub fn coding_overlay(
     working_dir: &Path,
     artifacts: &Path,
     presence: Presence,
     model: &str,
+) -> String {
+    coding_overlay_for(
+        working_dir,
+        artifacts,
+        presence,
+        model,
+        &crate::persona::ProductIdentity::default(),
+    )
+}
+
+/// [`coding_overlay`] for a product that goes by `identity`: the persona row is
+/// configured with it, and introduces the agent by it.
+pub fn coding_overlay_for(
+    working_dir: &Path,
+    artifacts: &Path,
+    presence: Presence,
+    model: &str,
+    identity: &crate::persona::ProductIdentity,
 ) -> String {
     // Each placeholder stands **where its value goes**, not inside quotes of its
     // own — so what is substituted is [`toml_string`]'s whole output, quotes and
@@ -1013,6 +1048,14 @@ pub fn coding_overlay(
             &atomcode_harness::bundle::toml_string(&artifacts.to_string_lossy()),
         )
         .replace("{model}", &atomcode_harness::bundle::toml_string(model))
+        .replace(
+            "{product}",
+            &atomcode_harness::bundle::toml_string(identity.name()),
+        )
+        .replace(
+            "{provider}",
+            &atomcode_harness::bundle::toml_string(identity.provider()),
+        )
         .replace(
             "{force_verify}",
             // Same rule as the fence above, read the other way round: with
@@ -1248,7 +1291,8 @@ pub async fn swap_provider_for(
     //
     //   persona-atomcode  bakes the model into its identity line — a swap that
     //                     moved only `llm` leaves the model reading a first line
-    //                     that names the model it used to be.
+    //                     that names the model it used to be. Only the model
+    //                     changes; the identity it also carries stays.
     //   tool-code-review  holds the provider it hands the child reviewer — so
     //                     `/model` would move the conversation and leave the
     //                     reviewer on the old model, and `/logout` would leave
@@ -1262,7 +1306,7 @@ pub async fn swap_provider_for(
     };
     let mut layer = Layer::new()
         .patch("llm", LlmInjectedRow { provider_id: &id })
-        .and_then(|layer| layer.patch("persona-atomcode", PersonaPatch { model }))
+        .and_then(|layer| layer.patch("persona-atomcode", persona_patch(app, model)))
         .and_then(|layer| layer.patch("tool-code-review", CodeReviewModelPatch { model }))
         .map_err(|e| restore(e.to_string()))?;
     if let Some(config) = config {
@@ -1574,6 +1618,8 @@ pub struct HostState {
     pub rate_limit_source: Option<Arc<dyn crate::rate_limit::RateLimitWindowSource>>,
     /// The settings file this runtime was configured from, when it was.
     pub config_file: Option<std::path::PathBuf>,
+    /// Who the agent says it is. The default is this product's own.
+    pub identity: crate::persona::ProductIdentity,
     /// The language this runtime was configured to speak — `[language]`, as the
     /// host resolved it. A row that writes words the model reads (the `/worklog`
     /// template) asks for it here, so it never reaches for the process-wide i18n
@@ -1880,8 +1926,14 @@ fn compose_hosted(
     layers.push(Layer::from_toml(CODING_DEFAULTS).map_err(|e| e.to_string())?);
     layers.push(scoped);
     layers.push(
-        Layer::from_toml(&coding_overlay(working_dir, &artifacts, presence, &model))
-            .map_err(|e| e.to_string())?,
+        Layer::from_toml(&coding_overlay_for(
+            working_dir,
+            &artifacts,
+            presence,
+            &model,
+            &host.identity,
+        ))
+        .map_err(|e| e.to_string())?,
     );
     // The session is the runtime's: its id, and its log in the session store,
     // appended by `session-store` under the runtime's lease and replayed by
@@ -2006,12 +2058,14 @@ fn compose_hosted(
     // never looked at. Read before `host.session` moves below, and the same
     // condition `session-store` is mounted under, one line away.
     let keeps_sessions = host.session.stored.is_some();
-    registry.register(Arc::new(crate::host_rows::SessionNativePlugin(Arc::new(
-        host.session,
-    ))));
+    registry.register(Arc::new(crate::host_rows::SessionNativePlugin(
+        Arc::new(host.session),
+        host.identity.clone(),
+    )));
     if keeps_sessions {
         registry.register(Arc::new(crate::host_rows::WorklogPlugin {
             language: host.language,
+            identity: host.identity.clone(),
         }));
     }
     // Unconditional, unlike `/worklog`: writing the instruction file needs a
@@ -2070,7 +2124,10 @@ fn compose_hosted(
         )));
     }
     if let Some(file) = host.config_file {
-        registry.register(Arc::new(crate::host_rows::ConfigFilePlugin(file)));
+        registry.register(Arc::new(crate::host_rows::ConfigFilePlugin(
+            file,
+            host.identity.clone(),
+        )));
     }
     if let Some(key) = host.web_search_api_key {
         registry.register(Arc::new(
@@ -3055,6 +3112,7 @@ impl Plugin for CodingPersonaPlugin {
         // `coding_persona_rows`.
         let text = crate::persona::coding_persona_rows(
             &model,
+            &row.identity(),
             &has,
             &*atomcode_harness::product_dirs(ctx)?,
         );

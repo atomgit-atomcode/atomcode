@@ -193,7 +193,21 @@ fn fmt_duration(ms: i64) -> String {
 /// + the deterministic day data grouped by project, with pre-aggregated durations
 /// so the `时长` / duration column is accurate (an agent-active proxy). Rendered
 /// turns are capped to protect the model's context window. Pure ⇒ unit-testable.
+///
+/// Names the session records AtomCode's; [`build_worklog_prompt_for`] names
+/// another product's.
 pub fn build_worklog_prompt(date_label: &str, turns: &[WorklogTurn], english: bool) -> String {
+    build_worklog_prompt_for("AtomCode", date_label, turns, english)
+}
+
+/// [`build_worklog_prompt`] for the product called `product`: the records the
+/// prompt says it was drawn from are that product's.
+pub fn build_worklog_prompt_for(
+    product: &str,
+    date_label: &str,
+    turns: &[WorklogTurn],
+    english: bool,
+) -> String {
     let mut s = String::new();
     if english {
         s.push_str(&format!("# Work recap for {date_label}\n\n"));
@@ -201,18 +215,21 @@ pub fn build_worklog_prompt(date_label: &str, turns: &[WorklogTurn], english: bo
         s.push_str(&format!("# {date_label} 工作复盘\n\n"));
     }
     if turns.is_empty() {
-        s.push_str(if english {
-            "No completed AtomCode sessions on this day. Reply that there is no work to recap for this date.\n"
+        s.push_str(&if english {
+            format!("No completed {product} sessions on this day. Reply that there is no work to recap for this date.\n")
         } else {
-            "这一天在 AtomCode 上没有已完成的会话记录。请回复:该日期没有可复盘的工作记录。\n"
+            format!("这一天在 {product} 上没有已完成的会话记录。请回复:该日期没有可复盘的工作记录。\n")
         });
         return s;
     }
-    s.push_str(if english {
-        INSTRUCTION_EN
-    } else {
-        INSTRUCTION_ZH
-    });
+    s.push_str(
+        &if english {
+            INSTRUCTION_EN
+        } else {
+            INSTRUCTION_ZH
+        }
+        .replace("{product}", product),
+    );
     s.push_str(if english {
         "\n---\nRaw activity:\n"
     } else {
@@ -323,7 +340,7 @@ pub fn build_worklog_prompt(date_label: &str, turns: &[WorklogTurn], english: bo
 }
 
 const INSTRUCTION_ZH: &str = "\
-以下是这一天（跨所有项目）从 AtomCode 会话记录里确定性提取的工作痕迹。请据此生成一张 Markdown 表格,列为:\n\
+以下是这一天（跨所有项目）从 {product} 会话记录里确定性提取的工作痕迹。请据此生成一张 Markdown 表格,列为:\n\
 `序号` | `工作内容` | `时长` | `问题与评价`。要求:\n\
 - 序号:从 1 开始递增。\n\
 - 工作内容:按主题归并同类轮次(可跨项目/会话),用简洁的动宾短语,合并重复。\n\
@@ -333,7 +350,7 @@ const INSTRUCTION_ZH: &str = "\
 先用一句话概括这一天的整体工作(以「今日小结:」开头),空一行,再输出表格。除此之外不要多余解释。\n";
 
 const INSTRUCTION_EN: &str = "\
-Below is a deterministic extract of this day's activity (across all projects) from AtomCode's \
+Below is a deterministic extract of this day's activity (across all projects) from {product}'s \
 session records. Produce ONE Markdown table with columns: `#` | `Work item` | `Time` | `Issues & notes`. \
 Rules:\n\
 - #: sequential number starting at 1.\n\
@@ -489,6 +506,33 @@ mod tests {
     fn build_worklog_prompt_empty_day_asks_for_a_no_work_reply() {
         assert!(build_worklog_prompt("8/27", &[], false).contains("没有"));
         assert!(build_worklog_prompt("8/27", &[], true).contains("no work"));
+    }
+
+    /// The records the recap is drawn from are the product's: AtomCode's
+    /// unless told otherwise, in exactly the words they always were.
+    #[test]
+    fn build_worklog_prompt_names_the_product_whose_records_these_are() {
+        assert_eq!(
+            build_worklog_prompt("8/27", &[], true),
+            "# Work recap for 8/27\n\nNo completed AtomCode sessions on this day. Reply that \
+             there is no work to recap for this date.\n"
+        );
+        assert_eq!(
+            build_worklog_prompt("8/27", &[], false),
+            "# 8/27 工作复盘\n\n这一天在 AtomCode 上没有已完成的会话记录。请回复:该日期没有可复盘的工作记录。\n"
+        );
+        let turns = vec![turn("/w/p", "task", Some(60 * 1000), 0)];
+        for english in [true, false] {
+            assert_eq!(
+                build_worklog_prompt("8/27", &turns, english),
+                build_worklog_prompt_for("AtomCode", "8/27", &turns, english)
+            );
+            for turns in [&turns[..], &[]] {
+                let out = build_worklog_prompt_for("OtherCode", "8/27", turns, english);
+                assert!(out.contains("OtherCode"), "{out}");
+                assert!(!out.contains("AtomCode"), "{out}");
+            }
+        }
     }
 
     #[test]

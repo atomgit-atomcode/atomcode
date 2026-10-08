@@ -133,6 +133,7 @@ fn start(
                 front_end,
                 review_delegate: None,
                 host_plugins: Default::default(),
+                identity: Default::default(),
             },
             provider_factory: Arc::new(Factory(count.clone())),
             plugin_hooks: Arc::new(StaticPluginHookSource::default()),
