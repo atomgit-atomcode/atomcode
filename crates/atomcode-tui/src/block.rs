@@ -96,6 +96,8 @@ pub fn hash_of(parts: &[&str]) -> ContentHash {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ShapeCaps {
     pub unicode: bool,
+    /// See [`crate::caps::Caps::basic_glyphs`].
+    pub basic_glyphs: bool,
     pub colors: crate::caps::Colors,
     /// Whether a cell's background colour paints.
     ///
@@ -111,6 +113,7 @@ impl ShapeCaps {
     pub fn of(caps: &crate::caps::Caps) -> Self {
         Self {
             unicode: caps.unicode,
+            basic_glyphs: caps.basic_glyphs,
             colors: caps.colors,
             cell_background: caps.cell_background,
         }
@@ -123,7 +126,7 @@ impl ShapeCaps {
     /// spell it out — `gates/tui-layers.sh` counts literal ones above the
     /// shield layer.
     pub fn g(&self, glyph: crate::caps::Glyph) -> &'static str {
-        crate::caps::glyph(self.unicode, glyph)
+        crate::caps::glyph_for(self.unicode, self.basic_glyphs, glyph)
     }
 }
 
@@ -676,6 +679,7 @@ mod tests {
     fn shape(unicode: bool) -> ShapeCaps {
         ShapeCaps {
             unicode,
+            basic_glyphs: false,
             colors: crate::caps::Colors::Ansi256,
             cell_background: true,
         }

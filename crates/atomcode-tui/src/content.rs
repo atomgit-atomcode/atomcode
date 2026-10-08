@@ -397,8 +397,11 @@ impl Content for WelcomeBlock {
         }
         // Under them, dim and without a bullet: an aside about the screen, not
         // a fact about the session.
+        // One line each: the keys line and the release's news are two asides.
         if let Some(note) = self.note.as_deref().filter(|n| !n.trim().is_empty()) {
-            below.extend(wrapped(note, content_w as u16, muted(), ""));
+            for line in note.lines().filter(|line| !line.trim().is_empty()) {
+                below.extend(wrapped(line, content_w as u16, muted(), ""));
+            }
         }
 
         // ---- The right column: a heading and the tips ----
@@ -562,8 +565,10 @@ fn mascot(ctx: &RenderCtx, content_w: usize, art: Option<&Mascot>) -> Vec<Line> 
     let Some(art) = art else {
         return Vec::new();
     };
+    // `▀` and `▄` are all the art is made of, and a basic console font has
+    // both ([`crate::caps::console_safe`]).
     let drawable = ctx.caps.colors != crate::caps::Colors::None
-        && ctx.caps.unicode
+        && (ctx.caps.unicode || ctx.caps.basic_glyphs)
         && ctx.caps.cell_background;
     if !drawable {
         return Vec::new();
@@ -3424,6 +3429,7 @@ mod tests {
             width,
             caps: crate::block::ShapeCaps {
                 unicode: true,
+                basic_glyphs: false,
                 colors: crate::caps::Colors::Ansi256,
                 cell_background,
             },
@@ -3664,6 +3670,47 @@ mod tests {
             // The words are still there: only the art is withheld.
             assert!(all.contains("AtomCode") && all.contains("~/proj"), "{all}");
         }
+    }
+
+    #[test]
+    fn a_console_with_basic_glyphs_still_gets_the_mascot() {
+        // `▀` and `▄` are all the art is made of, and a basic console font
+        // draws both — a PowerShell window gets the cat Git Bash's mintty got.
+        let basic = RenderCtx {
+            width: 80,
+            caps: crate::block::ShapeCaps {
+                unicode: false,
+                basic_glyphs: true,
+                ..wctx(80, true).caps
+            },
+        };
+        let all = welcome()
+            .lines(&basic)
+            .iter()
+            .map(Line::plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all.contains('▀') || all.contains('▄'), "{all}");
+    }
+
+    /// The welcome's foot can carry two asides — the keys line and the
+    /// release's news — one per line.
+    #[test]
+    fn a_welcome_note_of_two_lines_is_two_lines_under_the_block() {
+        let mut block = welcome();
+        block.note = Some("按键提示:全部按键见 /keys\n已更新到 v5.2.2:全新架构".into());
+        let rows: Vec<String> = block
+            .lines(&crate::block::RenderCtx::bare(100))
+            .iter()
+            .map(|l| l.plain())
+            .collect();
+        let keys = rows.iter().position(|r| r.contains("/keys")).expect("keys");
+        let news = rows
+            .iter()
+            .position(|r| r.contains("已更新到"))
+            .expect("news");
+        assert_eq!(news, keys + 1, "{rows:#?}");
+        assert!(rows.iter().all(|r| !r.contains('\n')));
     }
 
     #[test]

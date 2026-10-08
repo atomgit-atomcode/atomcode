@@ -1019,6 +1019,53 @@ mod tests {
     /// use it, not step up to the louder slot 7 just because the dim one misses a
     /// contrast target: a status row and its prose in the same near-white is the
     /// exact "muted renders white" bug this guards.
+    /// PowerShell's classic console, as its colour table reports it (the
+    /// surface reads it through the console API): a navy ground and near-white
+    /// text, the Campbell slots otherwise. Muted balanced for an assumed black
+    /// ground fell to about 3.4:1 here; measured, it clears the floor.
+    #[test]
+    fn muted_reads_on_powershells_navy() {
+        let campbell = [
+            (12, 12, 12),
+            (197, 15, 31),
+            (19, 161, 14),
+            (193, 156, 0),
+            (0, 55, 218),
+            (1, 36, 86),
+            (58, 150, 221),
+            (204, 204, 204),
+            (118, 118, 118),
+            (231, 72, 86),
+            (22, 198, 12),
+            (249, 241, 165),
+            (59, 120, 255),
+            (180, 0, 158),
+            (97, 214, 214),
+            (242, 242, 242),
+        ];
+        let mut palette = Palette::assumed(Theme::Dark)
+            .with_background((1, 36, 86))
+            .with_foreground((238, 237, 240));
+        for (n, rgb) in campbell.iter().enumerate() {
+            palette = palette.with_slot(n as u8, *rgb);
+        }
+        let navy = Caps {
+            palette,
+            colors: Colors::Ansi256,
+            ..Caps::default()
+        };
+        let muted = seen(Role::Muted, navy).unwrap();
+        assert!(
+            contrast(muted, (1, 36, 86)) >= 4.5,
+            "{muted:?} on navy is {:.2}:1",
+            contrast(muted, (1, 36, 86))
+        );
+        assert!(
+            contrast(muted, (1, 36, 86)) < contrast((238, 237, 240), (1, 36, 86)),
+            "and quieter than the text"
+        );
+    }
+
     #[test]
     fn muted_uses_the_schemes_dim_grey_when_the_terminal_reports_one() {
         // A typical dark scheme: black ground, a mid grey in slot 8 (~5.3:1) and a

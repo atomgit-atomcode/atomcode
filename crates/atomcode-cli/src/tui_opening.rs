@@ -42,6 +42,11 @@ pub struct OpeningRow {
     /// The first-launch keys line ([`keys_note`]), for the foot of the first
     /// welcome block. `None` on every launch after the first.
     pub keys: Option<KeysNote>,
+    /// The first launch on a new release: its one line about what changed
+    /// (`crate::tui_changelog`), at the foot of the welcome too — under the
+    /// working directory and the model, an aside about this build, not news
+    /// standing over the screen. Recorded as told when the welcome is drawn.
+    pub news: Option<crate::tui_changelog::Launch>,
 }
 
 /// The first-launch keys line, and where to record that it was drawn.
@@ -51,14 +56,37 @@ pub struct KeysNote {
     pub marker: PathBuf,
 }
 
-/// Records the keys line as shown when the screen says it was drawn — not
-/// when the screen came up, which is before the welcome it rides on.
-struct RememberWhenSeen(PathBuf);
+/// Records what the welcome's foot said as shown when the screen says it was
+/// drawn — not when the screen came up, which is before the welcome it rides
+/// on, and not at all on a launch whose welcome stood down (a resumed session
+/// with history): the keys line and the release's news both come round again.
+struct RememberWhenSeen {
+    keys: Option<PathBuf>,
+    news: Option<crate::tui_changelog::Launch>,
+}
 
 impl WelcomeNoteSeen for RememberWhenSeen {
     fn seen(&self) {
-        remember_keys_notice(&self.0);
+        if let Some(marker) = &self.keys {
+            remember_keys_notice(marker);
+        }
+        if let Some(news) = &self.news {
+            news.told();
+        }
     }
+}
+
+/// The welcome's foot: the keys line, then the release's news, one per line.
+fn welcome_note(
+    keys: Option<&KeysNote>,
+    news: Option<&crate::tui_changelog::Launch>,
+) -> Option<String> {
+    let lines: Vec<&str> = keys
+        .map(|keys| keys.text.as_str())
+        .into_iter()
+        .chain(news.and_then(|news| news.notice.as_deref()))
+        .collect();
+    (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
 /// One notice per line.
@@ -154,13 +182,17 @@ impl Plugin for OpeningRow {
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
         let _ = ctx
             .provide::<OpeningNoticesSvc>(Arc::new(OpeningNotices {
-                welcome_note: self.keys.as_ref().map(|keys| keys.text.clone()),
+                welcome_note: welcome_note(self.keys.as_ref(), self.news.as_ref()),
                 ..notices(self.notice.as_deref())
             }))
             .map_err(|e| e.to_string())?;
-        if let Some(keys) = &self.keys {
+        let news = self.news.clone().filter(|news| news.notice.is_some());
+        if self.keys.is_some() || news.is_some() {
             let _ = ctx
-                .provide::<WelcomeNoteSeenSvc>(Arc::new(RememberWhenSeen(keys.marker.clone())))
+                .provide::<WelcomeNoteSeenSvc>(Arc::new(RememberWhenSeen {
+                    keys: self.keys.as_ref().map(|keys| keys.marker.clone()),
+                    news,
+                }))
                 .map_err(|e| e.to_string())?;
         }
         Ok(())
@@ -213,9 +245,10 @@ mod tests {
         let row = OpeningRow {
             notice: Some("config.toml did not parse".into()),
             keys: keys_note(&marker),
+            news: None,
         };
         let said = OpeningNotices {
-            welcome_note: row.keys.as_ref().map(|k| k.text.clone()),
+            welcome_note: welcome_note(row.keys.as_ref(), row.news.as_ref()),
             ..notices(row.notice.as_deref())
         };
         assert_eq!(said.notices, vec!["config.toml did not parse".to_string()]);
@@ -223,7 +256,11 @@ mod tests {
 
         assert!(!marker.exists(), "not spent by being handed to the screen");
         // Spent when the screen says it drew it.
-        RememberWhenSeen(marker.clone()).seen();
+        RememberWhenSeen {
+            keys: Some(marker.clone()),
+            news: None,
+        }
+        .seen();
         assert!(marker.exists(), "remembered once it was drawn");
         assert!(keys_note(&marker).is_none(), "never again");
         let _ = std::fs::remove_dir_all(&dir);

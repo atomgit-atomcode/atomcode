@@ -923,6 +923,41 @@ mod win_console {
     extern "system" {
         fn GetStdHandle(which: u32) -> Handle;
         fn GetConsoleMode(console: Handle, mode: *mut u32) -> i32;
+        fn GetConsoleScreenBufferInfoEx(console: Handle, info: *mut ScreenBufferInfoEx) -> i32;
+    }
+
+    /// `CONSOLE_SCREEN_BUFFER_INFOEX`.
+    #[repr(C)]
+    struct ScreenBufferInfoEx {
+        size: u32,
+        buffer_size: [i16; 2],
+        cursor: [i16; 2],
+        attributes: u16,
+        window: [i16; 4],
+        maximum_window: [i16; 2],
+        popup_attributes: u16,
+        fullscreen_supported: i32,
+        color_table: [u32; 16],
+    }
+
+    /// The standard output console's current attributes and colour table;
+    /// `None` when it is not a console.
+    pub(super) fn colours() -> Option<(u16, [u32; 16])> {
+        // SAFETY: the struct is the documented layout, zeroed, with its size
+        // field set as the API requires; the call writes into it and keeps no
+        // pointer. The handle is only passed on.
+        unsafe {
+            let handle = GetStdHandle(STD_OUTPUT_HANDLE);
+            if handle.is_null() || handle as isize == -1 {
+                return None;
+            }
+            let mut info: ScreenBufferInfoEx = std::mem::zeroed();
+            info.size = std::mem::size_of::<ScreenBufferInfoEx>() as u32;
+            if GetConsoleScreenBufferInfoEx(handle, &mut info) == 0 {
+                return None;
+            }
+            Some((info.attributes, info.color_table))
+        }
     }
 
     /// Whether the standard output's console executes VT sequences; `None`
@@ -977,6 +1012,7 @@ impl Terminal {
         };
         out.write_all(pointer.escape().as_bytes())?;
         out.flush()?;
+        console_mouse(pointer != ansi::Pointer::Terminal);
         let mut caps = crate::caps::Caps::detect_with(overrides);
         // Inside the alternate screen on purpose: a terminal that does not know
         // the queries may echo them, and here the first frame paints over it.
@@ -1043,6 +1079,7 @@ impl Terminal {
         let mut out = std::io::stdout();
         let _ = out.write_all(escape.as_bytes());
         let _ = out.flush();
+        console_mouse(want != ansi::Pointer::Terminal);
     }
 }
 
@@ -1093,6 +1130,43 @@ fn arm_panic_restore(#[allow(unused_variables)] original: Option<i32>) {
 
 /// Give the screen back, from anywhere, at most once.
 ///
+/// A classic Windows console window — not Windows Terminal (`WT_SESSION`), not
+/// a terminal that names itself (`TERM_PROGRAM`: mintty, VS Code). Only there
+/// are the console API's input modes and colour table the terminal's own: a
+/// pseudo-console behind another terminal has a default table, not the scheme
+/// on screen, and its mouse already arrives the terminal's way.
+#[cfg(windows)]
+fn classic_console() -> bool {
+    std::env::var_os("WT_SESSION").is_none() && std::env::var_os("TERM_PROGRAM").is_none()
+}
+
+/// The Win32 half of taking the pointer.
+///
+/// The escapes ([`ansi::MOUSE_ON`]) are how a terminal is asked for mouse
+/// reports, and Windows Terminal (a ConPTY) honours them. A classic console
+/// window does not: there the reports are console *input records*, which arrive
+/// only once the input mode says so — `ENABLE_MOUSE_INPUT`, with QuickEdit off —
+/// and an escape on the output side changes no input mode. So on Win10's
+/// conhost the screen never saw a click or a wheel: tool rows did not open,
+/// the wheel did not scroll, and a drag was QuickEdit's selection, which copies
+/// nothing until Enter. crossterm's mouse capture is exactly that mode switch on
+/// Windows (and nothing else — it writes no escape there); off puts back the
+/// mode it found. Only on a classic console ([`classic_console`]); elsewhere —
+/// Windows Terminal, mintty, any other platform — this does nothing.
+fn console_mouse(on: bool) {
+    #[cfg(windows)]
+    if classic_console() {
+        let mut out = std::io::stdout();
+        let _ = if on {
+            crossterm::execute!(out, crossterm::event::EnableMouseCapture)
+        } else {
+            crossterm::execute!(out, crossterm::event::DisableMouseCapture)
+        };
+    }
+    #[cfg(not(windows))]
+    let _ = on;
+}
+
 /// Both the panic hook and [`Terminal::restore`] call it; whichever gets there
 /// first wins the swap and the other does nothing. `MOUSE_OFF` goes out
 /// unconditionally — disabling reporting that was never enabled costs a few
@@ -1105,6 +1179,7 @@ fn emergency_restore() {
     }
     let mut out = std::io::stdout();
     let _ = out.write_all(ansi::MOUSE_OFF.as_bytes());
+    console_mouse(false);
     let _ = out.write_all(ansi::RESTORE_TITLE.as_bytes());
     let leave = if AWAY_FROM_SCREEN.swap(false, Ordering::SeqCst) {
         ansi::LEAVE
@@ -1741,8 +1816,44 @@ fn query_terminal() -> (Option<Rgb>, Option<Rgb>, Vec<(u8, Rgb)>) {
 
 #[cfg(not(unix))]
 fn query_terminal() -> (Option<Rgb>, Option<Rgb>, Vec<(u8, Rgb)>) {
-    // No tty descriptor to read a reply from. `COLORFGBG` and config remain.
+    // No tty descriptor to read a reply from. A classic Windows console
+    // answers through its own API instead (`win_console::colours`); Windows
+    // Terminal does not — what that API reports there is the pseudo-console's
+    // default table, not the scheme on screen — so it stays assumed.
+    #[cfg(windows)]
+    if classic_console() {
+        if let Some((attributes, table)) = win_console::colours() {
+            let (bg, fg, slots) = console_palette(attributes, &table);
+            return (Some(bg), Some(fg), slots);
+        }
+    }
     (None, None, Vec::new())
+}
+
+/// A console's colours as the palette takes them: its background and text
+/// colour (the current attributes' two indices), and its sixteen slots.
+///
+/// The console's colour table is in its own order — blue is index 1, red is 4 —
+/// and ANSI's swaps the two (`ESC[31m` is red), so each index has bits 0 and 2
+/// exchanged on the way. `table` entries are `COLORREF`s, `0x00BBGGRR`.
+///
+/// Why it matters: PowerShell's console is not black. Its background is a slot
+/// remapped to navy (`#012456`), and grey metadata balanced for black — the
+/// assumption when nothing is measured — fell to about 3.4:1 there.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn console_palette(attributes: u16, table: &[u32; 16]) -> (Rgb, Rgb, Vec<(u8, Rgb)>) {
+    let rgb = |c: u32| {
+        (
+            (c & 0xff) as u8,
+            ((c >> 8) & 0xff) as u8,
+            ((c >> 16) & 0xff) as u8,
+        )
+    };
+    let ansi = |i: usize| ((i & 0b1010) | ((i & 1) << 2) | ((i >> 2) & 1)) as u8;
+    let fg = rgb(table[(attributes & 0xf) as usize]);
+    let bg = rgb(table[((attributes >> 4) & 0xf) as usize]);
+    let slots = (0..16).map(|i| (ansi(i), rgb(table[i]))).collect();
+    (bg, fg, slots)
 }
 
 /// Wait until `fd` has something to read, or the timeout passes.
@@ -1972,6 +2083,7 @@ impl Surface for Terminal {
         let mut out = std::io::stdout();
         let _ = out.write_all(self.pointer_mode().escape().as_bytes());
         let _ = out.flush();
+        console_mouse(self.pointer_mode() != ansi::Pointer::Terminal);
     }
     fn forget(&self) {
         self.painted.forget();
@@ -1987,6 +2099,7 @@ impl Surface for Terminal {
         AWAY_FROM_SCREEN.store(true, Ordering::SeqCst);
         let mut out = std::io::stdout();
         let _ = out.write_all(ansi::MOUSE_OFF.as_bytes());
+        console_mouse(false);
         let _ = out.write_all(ansi::TRANSCRIPT_OUT.as_bytes());
         let _ = out.write_all(text.as_bytes());
         let _ = out.flush();
@@ -2017,6 +2130,7 @@ impl Surface for Terminal {
         }
         let _ = out.write_all(pointer.escape().as_bytes());
         let _ = out.flush();
+        console_mouse(pointer != ansi::Pointer::Terminal);
         self.painted.forget();
     }
     /// The screen given back the way `restore` gives it — pointer, keys,
@@ -2068,6 +2182,7 @@ impl Surface for Terminal {
         }
         let _ = out.write_all(pointer.escape().as_bytes());
         let _ = out.flush();
+        console_mouse(pointer != ansi::Pointer::Terminal);
         self.painted.forget();
         true
     }
@@ -2340,6 +2455,27 @@ pub fn from_crossterm(event: crossterm::event::Event) -> Option<Input> {
 
 #[cfg(test)]
 mod tests {
+    /// A console's table is in its own order and ANSI swaps red and blue; the
+    /// background and text colour are the attribute's two halves. PowerShell's
+    /// window is the case: navy ground (index 5, remapped), near-white text
+    /// (index 6, remapped).
+    #[test]
+    fn a_console_colour_table_becomes_the_palette() {
+        let mut table = [0u32; 16];
+        let colorref = |(r, g, b): (u32, u32, u32)| (b << 16) | (g << 8) | r;
+        table[1] = colorref((0, 55, 218)); // console blue
+        table[4] = colorref((197, 15, 31)); // console red
+        table[5] = colorref((1, 36, 86)); // PowerShell's background
+        table[6] = colorref((238, 237, 240)); // PowerShell's text
+        let (bg, fg, slots) = super::console_palette(0x56, &table);
+        assert_eq!(bg, (1, 36, 86));
+        assert_eq!(fg, (238, 237, 240));
+        let slot = |n: u8| slots.iter().find(|(i, _)| *i == n).map(|(_, rgb)| *rgb);
+        assert_eq!(slot(1), Some((197, 15, 31)), "ANSI 1 is red");
+        assert_eq!(slot(4), Some((0, 55, 218)), "ANSI 4 is blue");
+        assert_eq!(slot(5), Some((1, 36, 86)), "magenta stays");
+        assert_eq!(slots.len(), 16);
+    }
     use super::*;
 
     /// A console's own mode is the answer where there is a console: crossterm

@@ -188,6 +188,7 @@ fn picker(releases: &[Release], current: Version, seen: Seen) -> List {
 
 /// What an interactive launch has to say about the release it is, and the
 /// record to make once it has.
+#[derive(Clone)]
 pub struct Launch {
     /// The one line, when there is news and telling is on.
     pub notice: Option<String>,
@@ -195,6 +196,7 @@ pub struct Launch {
 }
 
 /// What [`Launch::told`] writes.
+#[derive(Clone)]
 enum Record {
     /// A release told about, or passed over in silence on an upgrade.
     Seen(PathBuf, Version),

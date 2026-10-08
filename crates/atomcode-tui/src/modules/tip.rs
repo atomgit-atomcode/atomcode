@@ -117,7 +117,17 @@ impl View for Tip {
                 ),
             },
         };
-        El::row(vec![El::Spacer, El::styled(text, theme::fg(role))]).lay(w)
+        // One cell short of the edge. A row written into its last column is one
+        // miscounted width away from the console wrapping its last character onto
+        // the next row — the composer's rule, which is not redrawn, so the stray
+        // character stayed after the tip was gone. That miscount is what a classic
+        // Windows console with a CJK font makes of an ambiguous-width `·`.
+        El::row(vec![
+            El::Spacer,
+            El::styled(text, theme::fg(role)),
+            El::styled(" ", crate::frame::Style::new()),
+        ])
+        .lay(w)
     }
 
     /// Always one row — the point of the module.
@@ -202,8 +212,15 @@ mod tests {
             here[0].plain()
         );
         assert!(
-            here[0].plain().ends_with("粘贴"),
+            here[0].plain().trim_end().ends_with("粘贴"),
             "against the right edge, above the box: {:?}",
+            here[0].plain()
+        );
+        // But never in the last column: one miscounted width there and the
+        // console wraps the last character onto the composer's rule.
+        assert!(
+            here[0].plain().ends_with(' '),
+            "the last column is left blank: {:?}",
             here[0].plain()
         );
 
@@ -250,8 +267,10 @@ mod tests {
             let out = draw_at(&moment, w, 1);
             let line = out.first().expect("one row");
             assert_eq!(width::str_width(&line.plain()), w as usize, "w={w}");
+            // Against the edge but one cell short of it: the last column is
+            // left blank (see `render`).
             assert!(
-                line.plain().ends_with("已复制"),
+                line.plain().ends_with("已复制 "),
                 "w={w}: a tip belongs at the right edge, not adrift: {:?}",
                 line.plain()
             );

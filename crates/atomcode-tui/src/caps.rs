@@ -114,6 +114,9 @@ impl Overrides {
     pub fn over(&self, caps: Caps) -> Caps {
         Caps {
             unicode: self.unicode.unwrap_or(caps.unicode),
+            // A stated answer either way is the whole answer: "the font has the
+            // glyphs" and "ASCII only" both leave no basic middle ground.
+            basic_glyphs: self.unicode.is_none() && caps.basic_glyphs,
             colors: self.colors.unwrap_or(caps.colors),
             cell_background: self.cell_background.unwrap_or(caps.cell_background),
             ..caps
@@ -125,6 +128,18 @@ impl Overrides {
 pub struct Caps {
     /// Decorative Unicode (box drawing, `✓`, `▸`) renders rather than tofu.
     pub unicode: bool,
+    /// With `unicode` off: the font still draws the line-drawing and the few
+    /// symbols every console font carries — box drawing, `•` `·` `○` `●` `◆`,
+    /// arrows, block elements — so those are kept, and only the rest
+    /// (`❯` `▸` `✓` `⚑` `⏸` braille…) goes to ASCII ([`console_safe`]).
+    ///
+    /// A classic Windows console window (conhost: no `WT_SESSION`, no
+    /// `TERM_PROGRAM`). Its fonts — the CJK raster and TrueType ones a Chinese
+    /// Windows ships, Consolas — have the box set but not the decorative one,
+    /// so with full Unicode the prompt, the notice flag and every mode icon
+    /// arrived as `□`; with plain ASCII the panels became `+--+`. This is the
+    /// third answer between the two.
+    pub basic_glyphs: bool,
     pub colors: Colors,
     /// The colours the terminal actually renders: its background, and its
     /// sixteen slots, as measured by the surface row.
@@ -183,6 +198,7 @@ impl Default for Caps {
     fn default() -> Self {
         Self {
             unicode: true,
+            basic_glyphs: false,
             colors: Colors::Ansi256,
             palette: crate::theme::Palette::assumed(crate::theme::Theme::Dark),
             // What a modern terminal does, which is the whole meaning of this
@@ -237,6 +253,7 @@ impl Caps {
     pub fn plain() -> Self {
         Self {
             unicode: false,
+            basic_glyphs: false,
             colors: Colors::None,
             palette: crate::theme::Palette::assumed(crate::theme::Theme::Dark),
             cell_background: false,
@@ -264,7 +281,8 @@ impl Caps {
         let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
         let term = env("TERM").unwrap_or_default();
 
-        let unicode = unicode_for(&env);
+        let basic_glyphs = basic_glyphs_for(&env, cfg!(windows));
+        let unicode = unicode_for(&env) && !basic_glyphs;
 
         let colors = colors_for(&env, cfg!(windows));
 
@@ -284,6 +302,7 @@ impl Caps {
 
         Self {
             unicode,
+            basic_glyphs,
             colors,
             // Assumed until the surface row measures it. Everything detected
             // here comes from the environment; asking the terminal what colour
@@ -294,7 +313,15 @@ impl Caps {
             // IDE terminal) paints cell backgrounds; a bare ssh client or a
             // legacy console does not, and art that assumes otherwise fragments.
             // See the field's docs.
-            cell_background: env("WT_SESSION").is_some()
+            //
+            // Windows is no longer in that list of doubts: this screen only runs
+            // there on a console that executes escapes
+            // ([`crate::surface::console_speaks_ansi`]), and a conhost with VT
+            // processing paints backgrounds — so a PowerShell window gets the
+            // mascot Git Bash's mintty always got (the same reasoning
+            // [`colors_for`] and [`unicode_for`] already apply).
+            cell_background: cfg!(windows)
+                || env("WT_SESSION").is_some()
                 || env("TERM_PROGRAM").is_some()
                 || env("TERM").is_some_and(|t| t.contains("jediterm")),
             graphics,
@@ -308,7 +335,7 @@ impl Caps {
 
     /// Rewrite text this terminal cannot render.
     pub fn text<'a>(&self, text: &'a str) -> Cow<'a, str> {
-        downgrade(text, self.unicode)
+        downgrade_keeping(text, self.unicode, self.basic_glyphs)
     }
 }
 
@@ -471,6 +498,77 @@ pub fn unicode_for(env: &dyn Fn(&str) -> Option<String>) -> bool {
     !(env("ATOMCODE_ASCII").is_some_and(|v| v != "0") || term == "dumb" || posix_locale)
 }
 
+/// Whether this is a console whose font has only the basic glyph set
+/// ([`Caps::basic_glyphs`]): Windows, no terminal that announces itself — not
+/// Windows Terminal (`WT_SESSION`), not mintty or VS Code (`TERM_PROGRAM`), not
+/// a JetBrains terminal — and nobody saying the font has them
+/// (`ATOMCODE_UNICODE`) or that it has none (`ATOMCODE_ASCII`, plain ASCII).
+pub fn basic_glyphs_for(env: &dyn Fn(&str) -> Option<String>, windows: bool) -> bool {
+    windows
+        && env("WT_SESSION").is_none()
+        && env("TERM_PROGRAM").is_none()
+        && !env("TERM").is_some_and(|t| t.contains("jediterm"))
+        && env("TERMINAL_EMULATOR").as_deref() != Some("JetBrains-JediTerm")
+        && !env("ATOMCODE_UNICODE").is_some_and(|v| v != "0")
+        && !env("ATOMCODE_ASCII").is_some_and(|v| v != "0")
+}
+
+/// The decorative characters a basic console font draws ([`Caps::basic_glyphs`]):
+/// box drawing, block elements, the arrows and the handful of bullets and shapes
+/// every CJK and Western console font carries. Everything else [`ascii_for`]
+/// knows is rewritten there.
+pub fn console_safe(ch: char) -> bool {
+    matches!(ch,
+        '\u{2500}'..='\u{257F}'          // box drawing
+        | '\u{2580}'..='\u{2593}'        // block elements (the QR code's halves)
+        | '\u{2190}'..='\u{2193}'        // ← ↑ → ↓
+        | '\u{2022}' | '\u{00B7}'         // • ·
+        | '\u{25CB}' | '\u{25CF}' | '\u{25C6}' | '\u{25C7}' | '\u{25CE}' // ○ ● ◆ ◇ ◎
+        | '\u{2026}'                      // …
+    )
+}
+
+/// A glyph for a terminal that is full Unicode, basic ([`Caps::basic_glyphs`])
+/// or ASCII: on a basic console the Unicode one when its font draws it, else
+/// the ASCII one — except the result gutter, whose `⎿` the font lacks and whose
+/// ASCII `` ` `` reads worse than the corner it is a cousin of.
+pub fn glyph_for(unicode: bool, basic: bool, which: Glyph) -> &'static str {
+    if unicode || !basic {
+        return glyph(unicode, which);
+    }
+    if which == Glyph::Gutter {
+        return "\u{2514}";
+    }
+    let rich = glyph(true, which);
+    if rich.chars().all(console_safe) {
+        rich
+    } else {
+        glyph(false, which)
+    }
+}
+
+/// [`downgrade`], keeping what a basic console font draws when `basic`.
+pub fn downgrade_keeping(text: &str, unicode: bool, basic: bool) -> Cow<'_, str> {
+    if !basic || unicode {
+        return downgrade(text, unicode);
+    }
+    if text.is_ascii()
+        || !text
+            .chars()
+            .any(|c| !console_safe(c) && ascii_for(c).is_some())
+    {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match ascii_for(c) {
+            Some(stand_in) if !console_safe(c) => out.push_str(stand_in),
+            _ => out.push(c),
+        }
+    }
+    Cow::Owned(out)
+}
+
 pub fn downgrade(text: &str, unicode: bool) -> Cow<'_, str> {
     if unicode || text.is_ascii() || !text.chars().any(|c| ascii_for(c).is_some()) {
         return Cow::Borrowed(text);
@@ -589,7 +687,7 @@ impl Caps {
     }
 
     pub fn g(&self, glyph: Glyph) -> &'static str {
-        self::glyph(self.unicode, glyph)
+        glyph_for(self.unicode, self.basic_glyphs, glyph)
     }
 }
 
@@ -667,6 +765,105 @@ pub fn glyph(unicode: bool, glyph: Glyph) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn env_of(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |k: &str| {
+            pairs
+                .iter()
+                .find(|(name, _)| *name == k)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    /// A classic Windows console window is the basic one; a terminal that
+    /// announces itself, a JetBrains terminal, a person's stated answer, and
+    /// anything not on Windows are not.
+    #[test]
+    fn only_a_classic_windows_console_is_basic() {
+        assert!(basic_glyphs_for(&env_of(&[]), true));
+        assert!(!basic_glyphs_for(&env_of(&[]), false), "not Windows");
+        assert!(!basic_glyphs_for(&env_of(&[("WT_SESSION", "x")]), true));
+        assert!(!basic_glyphs_for(
+            &env_of(&[("TERM_PROGRAM", "mintty")]),
+            true
+        ));
+        assert!(!basic_glyphs_for(
+            &env_of(&[("TERMINAL_EMULATOR", "JetBrains-JediTerm")]),
+            true
+        ));
+        assert!(!basic_glyphs_for(
+            &env_of(&[("ATOMCODE_UNICODE", "1")]),
+            true
+        ));
+        assert!(!basic_glyphs_for(&env_of(&[("ATOMCODE_ASCII", "1")]), true));
+    }
+
+    /// On a basic console: the box, the bullets and the arrows stay — no
+    /// `+--+` — and what the font lacks (`❯ ▸ ✓ ⚑ ⏸`) becomes ASCII, column for
+    /// column.
+    #[test]
+    fn a_basic_console_keeps_what_its_font_draws() {
+        assert_eq!(glyph_for(false, true, Glyph::Horizontal), "─");
+        assert_eq!(glyph_for(false, true, Glyph::TopLeft), "┌");
+        assert_eq!(glyph_for(false, true, Glyph::Bullet), "•");
+        assert_eq!(glyph_for(false, true, Glyph::ToolMark), "●");
+        assert_eq!(glyph_for(false, true, Glyph::Prompt), ">");
+        assert_eq!(glyph_for(false, true, Glyph::Pointer), ">");
+        assert_eq!(glyph_for(false, true, Glyph::Ok), "v");
+        assert_eq!(glyph_for(false, true, Glyph::Pause), "=");
+        assert_eq!(glyph_for(false, true, Glyph::Gutter), "└");
+        assert_eq!(
+            glyph_for(true, false, Glyph::Prompt),
+            "❯",
+            "full Unicode untouched"
+        );
+        assert_eq!(
+            glyph_for(false, false, Glyph::Horizontal),
+            "-",
+            "plain ASCII untouched"
+        );
+
+        let text = "⚑ 已更新 · ❯ ▸ ✓ ─┌┐ • ● ← ▀▄ ⏸";
+        let kept = downgrade_keeping(text, false, true);
+        assert_eq!(kept, "! 已更新 · > > v ─┌┐ • ● ← ▀▄ =");
+        assert_eq!(
+            crate::width::str_width(&kept),
+            crate::width::str_width(text),
+            "one column for one"
+        );
+        assert_eq!(
+            downgrade_keeping(text, true, true),
+            text,
+            "full Unicode untouched"
+        );
+        assert_eq!(
+            downgrade_keeping(text, false, false),
+            downgrade(text, false)
+        );
+    }
+
+    /// A stated answer about the font is the whole answer.
+    #[test]
+    fn an_override_leaves_no_basic_middle_ground() {
+        let basic = Caps {
+            unicode: false,
+            basic_glyphs: true,
+            ..Caps::default()
+        };
+        for unicode in [true, false] {
+            let over = Overrides {
+                unicode: Some(unicode),
+                ..Overrides::default()
+            }
+            .over(basic);
+            assert!(!over.basic_glyphs);
+            assert_eq!(over.unicode, unicode);
+        }
+        assert!(
+            Overrides::default().over(basic).basic_glyphs,
+            "nothing stated, kept"
+        );
+    }
 
     /// The keyboard protocol is asked for only where its keys can be read:
     /// not on Windows (`[27u` typed for esc in VS Code), not in JediTerm

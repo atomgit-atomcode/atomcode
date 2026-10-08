@@ -202,6 +202,7 @@ pub mod tui_front {
             telemetry,
             opening_notice,
             None,
+            None,
             spawn,
             review_home,
         )
@@ -222,6 +223,7 @@ pub mod tui_front {
         telemetry: Option<Arc<atomcode_telemetry::Telemetry>>,
         opening_notice: Option<String>,
         keys_note: Option<crate::tui_opening::KeysNote>,
+        news: Option<crate::tui_changelog::Launch>,
         spawn: Option<crate::background::Spawn>,
         review_home: Option<crate::background::ReviewHome>,
     ) -> Result<(launch::Mounted, Option<Arc<crate::background::Background>>), String> {
@@ -306,6 +308,7 @@ pub mod tui_front {
             Arc::new(crate::tui_opening::OpeningRow {
                 notice: opening_notice,
                 keys: keys_note,
+                news,
             }),
             Arc::new(crate::tui_upgrade::UpgradeRow),
             Arc::new(crate::tui_changelog::ChangelogRow {
@@ -931,6 +934,9 @@ model = "vendor-b"
         config_path: std::path::PathBuf,
         telemetry: Option<Arc<atomcode_telemetry::Telemetry>>,
         opening_notice: Option<String>,
+        // The release's one line, when this launch has one to tell
+        // (`crate::tui_changelog::Launch`); drawn at the welcome's foot.
+        news: Option<crate::tui_changelog::Launch>,
         spawn: Option<crate::background::Spawn>,
         review_home: Option<crate::background::ReviewHome>,
     ) -> Result<Option<Left>, String> {
@@ -959,6 +965,7 @@ model = "vendor-b"
             telemetry,
             opening_notice,
             keys_note,
+            news,
             spawn,
             review_home,
         )

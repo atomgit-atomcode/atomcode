@@ -2494,14 +2494,20 @@ async fn run() -> Result<i32> {
             &Config::config_dir(),
         )
     });
-    let startup_notice = match whats_new.as_ref().and_then(|w| w.notice.clone()) {
-        Some(news) => {
+    // Said at the welcome's foot and recorded when the welcome is drawn; with
+    // nothing to say (a fresh install, telling turned off) it is recorded now.
+    let whats_new = match whats_new {
+        Some(news) if news.notice.is_some() => {
             // It already says which release this is: the "upgraded vA → vB" line
             // a restart from `/upgrade` would add is the same news twice.
             std::env::remove_var(UPGRADED_FROM_ENV);
-            merge_startup_notices(startup_notice, Some(news))
+            Some(news)
         }
-        None => startup_notice,
+        Some(quiet) => {
+            quiet.told();
+            None
+        }
+        None => None,
     };
     let (mut native_headless_runtime, mut native_tui_runtime) = if is_headless {
         (Some(native_runtime), None)
@@ -2779,9 +2785,6 @@ async fn run() -> Result<i32> {
                             >
                     })
                 };
-                if let Some(whats_new) = &whats_new {
-                    whats_new.told();
-                }
                 let result = atomcode::tui_front::run(
                     runtime,
                     front_end,
@@ -2794,6 +2797,7 @@ async fn run() -> Result<i32> {
                     // takes it by value, and which arm runs is decided at
                     // `screen_for`, not here.
                     startup_notice.clone(),
+                    whats_new.clone(),
                     Some(spawn),
                     Some(review_home.clone()),
                 )
