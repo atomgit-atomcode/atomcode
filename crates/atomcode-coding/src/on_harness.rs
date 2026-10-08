@@ -1589,11 +1589,34 @@ pub struct HostState {
     /// here, out of the caller's reach. That was the whole of what kept this
     /// entry closed to a product outside this workspace.
     ///
-    /// A name already taken — by the harness's catalog, by [`plugins`], or by
-    /// the rows above — is refused rather than registered. Replacing one of
-    /// coding's rows is a patch pointing that row at a differently named plugin
-    /// (`[[patch]]` `id = "persona-atomcode"` `name = "my-persona"`), which keeps
-    /// the row's id, its place in the tree, and every patch aimed at it.
+    /// A name already taken — by the harness's catalog, by [`plugins`], by the
+    /// rows above, or by another of these — is refused rather than registered.
+    /// Replacing one of coding's rows is a patch pointing that row at a
+    /// differently named plugin (`[[patch]]` `id = "persona-atomcode"`
+    /// `name = "my-persona"`), which keeps the row's id, its place in the tree,
+    /// and every patch aimed at it.
+    ///
+    /// A host running [`crate::CodingRuntime`] rather than calling this itself
+    /// fills it through `PrepareOptions.host_plugins` ([`crate::HostPlugins`]):
+    /// the runtime puts those plugins here and their layers last in
+    /// `extra_layers`, on every tree it builds, so they survive undo, restore,
+    /// reprepare and `/model`. For example, a persona of the host's own and a
+    /// narrower catalog:
+    ///
+    /// ```ignore
+    /// let host = HostPlugins::new()
+    ///     .with_plugin(Arc::new(HostPersona)) // name() == "host-persona"
+    ///     .with_layer(
+    ///         Layer::new()
+    ///             .swap("persona-atomcode", "host-persona")
+    ///             .disable("code-graph")
+    ///             .patch("tools", json!({ "exclude": ["schedule_wakeup", "mcp__github__*"] }))?,
+    ///     );
+    /// let prepare = PrepareOptions { host_plugins: host, ..PrepareOptions::default() };
+    /// ```
+    ///
+    /// Which of coding's rows stay put for a host is [`crate::host`]'s to say;
+    /// `docs/tool-catalog-policy.md` has the whole of it.
     pub plugins: Vec<Arc<dyn atomcode_plexus::Plugin>>,
     /// `[web_search] api_key`. Handed to `tool-web` as a plugin instance, never
     /// as row config — a config tree is printed verbatim, a credential must not be.
@@ -1658,6 +1681,83 @@ pub async fn mount_hosted(
     host: HostState,
     extra_layers: &[Layer],
 ) -> Result<(AgentHandle, App, Arc<ProviderSlots>), String> {
+    let (registry, tree, providers) = compose_hosted(
+        working_dir,
+        dirs,
+        presence,
+        provider,
+        models,
+        host,
+        extra_layers,
+    )?;
+    let mut app = App::new(registry, tree);
+    app.start().await.map_err(|e| e.to_string())?;
+    let handle = app
+        .context()
+        .service::<atomcode_harness::seams::AgentHandleSvc>()
+        .ok_or("the `ui-handle` row must provide a handle")?
+        .take()
+        .ok_or("the handle, once")?;
+    Ok((handle, app, providers))
+}
+
+/// Whether the tree [`mount_hosted`] would build composes, without mounting a
+/// single row.
+///
+/// For a runtime that starts with no provider to mount on: the rows a host
+/// brought (`HostState.plugins`, `extra_layers`) are still checked when it
+/// starts, rather than the first time a provider arrives. The three refusals
+/// are the ones a mount would give, in its words — a name already taken, a row
+/// naming a plugin nobody registered, a patch aimed at a row nobody inserted —
+/// because they come from the same composition.
+pub(crate) fn check_hosted(
+    working_dir: &Path,
+    dirs: &atomcode_capabilities::ProductDirs,
+    presence: Presence,
+    models: Option<HostModels>,
+    host: HostState,
+    extra_layers: &[Layer],
+) -> Result<(), String> {
+    let (registry, tree, _) = compose_hosted(
+        working_dir,
+        dirs,
+        presence,
+        signed_out_provider(),
+        models,
+        host,
+        extra_layers,
+    )?;
+    // `App::start` asks the same question first, before it mounts anything.
+    for entry in tree.active() {
+        if registry.get(&entry.name).is_none() {
+            return Err(atomcode_plexus::PlexusError::UnknownPlugin {
+                entry: entry.id.clone(),
+                plugin: entry.name.clone(),
+            }
+            .to_string());
+        }
+    }
+    Ok(())
+}
+
+/// The registry and the tree [`mount_hosted`] starts: everything up to the
+/// mount itself, which is what [`check_hosted`] shares with it.
+fn compose_hosted(
+    working_dir: &Path,
+    dirs: &atomcode_capabilities::ProductDirs,
+    presence: Presence,
+    provider: Arc<dyn LlmProvider>,
+    models: Option<HostModels>,
+    host: HostState,
+    extra_layers: &[Layer],
+) -> Result<
+    (
+        atomcode_plexus::PluginRegistry,
+        ConfigTree,
+        Arc<ProviderSlots>,
+    ),
+    String,
+> {
     let model = host
         .model
         .clone()
@@ -2004,26 +2104,28 @@ pub async fn mount_hosted(
             slots: providers.clone(),
         }))));
     }
+    let mut brought: Vec<&'static str> = Vec::new();
     for plugin in host.plugins {
         let name = plugin.name();
-        if registry.get(name).is_some() {
+        // Refused rather than registered: the registry panics on a second
+        // `name`, and the list is the caller's input.
+        if brought.contains(&name) {
             return Err(format!(
-                "plugin `{name}` is already in the coding catalog; to replace that row, patch \
-                 it to a plugin with a different name rather than registering a second `{name}`"
+                "host plugin `{name}` is registered twice; each plugin name is registered once \
+                 and mounted on as many rows as the layers insert"
             ));
         }
+        if registry.get(name).is_some() {
+            return Err(format!(
+                "host plugin `{name}` is already in the coding catalog; to replace that row, \
+                 patch it to a plugin with a different name rather than registering a second \
+                 `{name}`"
+            ));
+        }
+        brought.push(name);
         registry.register(plugin);
     }
-
-    let mut app = App::new(registry, tree);
-    app.start().await.map_err(|e| e.to_string())?;
-    let handle = app
-        .context()
-        .service::<atomcode_harness::seams::AgentHandleSvc>()
-        .ok_or("the `ui-handle` row must provide a handle")?
-        .take()
-        .ok_or("the handle, once")?;
-    Ok((handle, app, providers))
+    Ok((registry, tree, providers))
 }
 
 // ---- the verify cadence, as a row ---------------------------------------
@@ -2897,15 +2999,11 @@ pub(crate) fn mount_cc_hooks(
 /// prompt is worse than either.
 pub struct CodingPersonaPlugin;
 
-#[derive(serde::Deserialize, Default)]
-struct PersonaRow {
-    /// The model the identity line names. Carried in config rather than read
-    /// from the `llm` seam so that a `/model` patch, which rewrites it, also
-    /// remounts this row — a persona still naming the old model would be a
-    /// quiet lie in the first line the model reads.
-    #[serde(default)]
-    model: String,
-}
+// The row's config is `crate::host::PersonaConfig`: published, because a
+// host's persona swapped onto this row receives the same config. The model is
+// carried there rather than read from the `llm` seam so that a `/model` patch,
+// which rewrites it, also remounts the row — a persona still naming the old
+// model would be a quiet lie in the first line the model reads.
 
 #[async_trait]
 impl Plugin for CodingPersonaPlugin {
@@ -2931,11 +3029,7 @@ impl Plugin for CodingPersonaPlugin {
         "coding's own persona, in place of the harness's generic one"
     }
     async fn apply(&self, ctx: &Context, config: &serde_json::Value) -> Result<(), String> {
-        let row: PersonaRow = if config.is_null() {
-            PersonaRow::default()
-        } else {
-            serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
-        };
+        let row = crate::host::PersonaConfig::from_config(config)?;
         let tools = ctx.service::<atomcode_harness::seams::ToolsSvc>();
         let has = |name: &str| tools.as_ref().is_some_and(|t| t.get(name).is_some());
         // Empty means "ask the running tree". A host whose provider is built by

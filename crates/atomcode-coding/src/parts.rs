@@ -150,6 +150,88 @@ pub struct PrepareOptions {
     /// running there (the terminal's background sessions). `None` reviews
     /// inline, in the turn that asked.
     pub review_delegate: Option<Arc<dyn atomcode_review::ReviewDelegate>>,
+    /// Rows a host outside this workspace brings to every tree this runtime
+    /// mounts. Empty mounts exactly the product.
+    ///
+    /// Here rather than on [`crate::CodingRuntimeStart`] because these options
+    /// stay with the runtime and are read again on every rebuild — undo, a
+    /// restored snapshot, a reprepare, a provider coming back — so what the host
+    /// asked for cannot fall out of the second tree.
+    pub host_plugins: HostPlugins,
+}
+
+/// A host's own rows, for [`crate::CodingRuntime`] to mount alongside the
+/// product's.
+///
+/// Plugins only make names available; layers decide what is mounted, in the
+/// same TOML or builder form as any other layer. The layers go last — after
+/// the product's own rows and after what the person wrote in `config.toml` — so
+/// a host can insert rows of its own and patch, swap or disable any of coding's:
+///
+/// ```toml
+/// # this host's persona in place of coding's: the row keeps its id and place
+/// [[patch]]
+/// id = "persona-atomcode"
+/// name = "host-persona"
+///
+/// # one tool at a time, from any row
+/// [[patch]]
+/// id = "tools"
+/// config = { exclude = ["schedule_wakeup", "mcp__github__*"] }
+///
+/// # a whole row: its tools and its prompt fragment together
+/// [[patch]]
+/// id = "code-graph"
+/// disabled = true
+/// ```
+///
+/// Any row may be addressed. The ones [`crate::host::PUBLISHED_ROWS`] lists
+/// are kept stable; any other is this crate's to rename. Either way a layer
+/// that no longer fits — a plugin name already taken, a row naming a plugin
+/// nobody registered, a patch aimed at a row nobody inserted — fails the start
+/// with that name in the error, rather than mounting something else.
+///
+/// The fields are private so the shape can grow without breaking a host.
+#[derive(Clone, Default)]
+pub struct HostPlugins {
+    pub(crate) plugins: Vec<Arc<dyn atomcode_plexus::Plugin>>,
+    pub(crate) layers: Vec<atomcode_plexus::Layer>,
+}
+
+impl HostPlugins {
+    /// Nothing: the product as it ships.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Make `plugin` available by its name. Mounting it is a layer's job.
+    pub fn with_plugin(mut self, plugin: Arc<dyn atomcode_plexus::Plugin>) -> Self {
+        self.plugins.push(plugin);
+        self
+    }
+
+    /// Apply `layer` after every layer before it, the host's own included.
+    pub fn with_layer(mut self, layer: atomcode_plexus::Layer) -> Self {
+        self.layers.push(layer);
+        self
+    }
+
+    /// Whether this brings nothing at all.
+    pub fn is_empty(&self) -> bool {
+        self.plugins.is_empty() && self.layers.is_empty()
+    }
+}
+
+impl std::fmt::Debug for HostPlugins {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostPlugins")
+            .field(
+                "plugins",
+                &self.plugins.iter().map(|p| p.name()).collect::<Vec<_>>(),
+            )
+            .field("layers", &self.layers)
+            .finish()
+    }
 }
 
 impl Default for PrepareOptions {
@@ -170,6 +252,7 @@ impl Default for PrepareOptions {
             rate_limit_source: None,
             front_end: None,
             review_delegate: None,
+            host_plugins: HostPlugins::default(),
         }
     }
 }
@@ -2265,6 +2348,7 @@ mod tests {
             rate_limit_source: None,
             front_end: None,
             review_delegate: None,
+            host_plugins: Default::default(),
         };
 
         let prepared =
@@ -2556,6 +2640,7 @@ mod tests {
             rate_limit_source: None,
             front_end: None,
             review_delegate: None,
+            host_plugins: Default::default(),
         }
     }
 

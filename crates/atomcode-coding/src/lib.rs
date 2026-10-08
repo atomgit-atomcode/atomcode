@@ -53,6 +53,7 @@ pub mod config;
 mod controllers;
 pub mod discipline;
 pub mod front_end;
+pub mod host;
 pub mod on_harness;
 pub mod parts;
 pub mod persona;
@@ -95,8 +96,8 @@ pub use controllers::{GoalPhase, GoalProgress, GoalTerminal, LoopProgress};
 pub use init_prompt::{build_init_prompt, INIT_PROMPT, INIT_PROMPT_ZH_CN};
 pub use parts::{
     prepare, prepare_from_config, prepare_with_plugin_hook_source, prepare_with_plugin_hooks,
-    subagent_enabled_from_env, CodingParts, McpRowFacts, PrepareOptions, SessionBinding,
-    SessionMode, SubagentPolicy,
+    subagent_enabled_from_env, CodingParts, HostPlugins, McpRowFacts, PrepareOptions,
+    SessionBinding, SessionMode, SubagentPolicy,
 };
 pub use persona::coding_persona;
 pub use plan_mode::PlanModeGate;
@@ -129,3 +130,10 @@ pub use vision::{run_vl_caption, should_skip, vl_model_display, PreprocessOutcom
 /// plugin-contributed hooks can name [`cc_hooks::HookConfig`] without a direct
 /// `atomcode-capabilities` dependency or its feature flag.
 pub use atomcode_capabilities::cc_hooks;
+
+/// The container a host's rows are written for, whole: [`plexus::Plugin`],
+/// [`plexus::Layer`], [`plexus::Entry`], [`plexus::Context`] and the rest.
+/// Re-exported because [`HostPlugins`] carries its types, so a host names the
+/// same crate this one was built against. What a host can count on about
+/// coding's own rows is in [`host`].
+pub use atomcode_plexus as plexus;

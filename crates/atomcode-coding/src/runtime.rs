@@ -2943,6 +2943,12 @@ impl CodingRuntime {
                     }
                 }
             };
+        // No provider, so nothing was mounted — but what the host brought is
+        // checked now, while the start that brought it can still say no.
+        if kernel_agent.is_none() {
+            check_mount(&parts, &agent, &prepare)
+                .map_err(|e| RuntimeStartError::Assemble(std::io::Error::other(e)))?;
+        }
         parts
             .publish_staged_session()
             .map_err(runtime_start_prepare_error)?;
@@ -9462,9 +9468,9 @@ fn harness_host_state(
         )),
     );
     Ok(crate::on_harness::HostState {
-        // None: this runtime mounts the product's own rows and nothing else.
-        // The field is for a host outside this workspace that brings its own.
-        plugins: Vec::new(),
+        // What a host outside this workspace brought. Registered only: the
+        // rows that mount them come in its layers, last (see `mount`).
+        plugins: prepare.host_plugins.plugins.clone(),
         session_context: Some(crate::on_harness::HostContext {
             hook: Arc::new(atomcode_capabilities::session::SessionContextHook::new(
                 &config.working_dir,
@@ -9555,6 +9561,68 @@ pub async fn mount(
     prepare: &PrepareOptions,
     provider: Arc<dyn atomcode_kernel::provider::LlmProvider>,
 ) -> Result<Mounted, String> {
+    // The capability graph's own sub-agents — the reviewer, `task`, `team` — run on
+    // this model, billed to the session and metered the way the chain's
+    // `assemble` wires them.
+    let _ = crate::parts::wire_side_providers(parts, config, &provider);
+    let tree = tree_inputs(parts, config, prepare)?;
+    // Turns on this tree are billed to the model it was built for. The chain
+    // stamps the same attribution inside `assemble`.
+    if let Some(snapshot) = parts.snapshot_hook() {
+        snapshot.set_model_attribution(&config.provider_name, &config.model);
+    }
+    let (handle, app, providers) = crate::on_harness::mount_hosted(
+        &config.working_dir,
+        &config.dirs,
+        tree.presence,
+        provider,
+        tree.models,
+        tree.host,
+        &tree.extra,
+    )
+    .await?;
+    Ok(Mounted {
+        handle,
+        app,
+        providers,
+    })
+}
+
+/// Whether [`mount`] would get past composing the tree, without a provider and
+/// without mounting a row.
+///
+/// What a start with no provider to mount on checks instead, so a host's rows
+/// that cannot mount (`PrepareOptions.host_plugins`) fail the start that brought
+/// them rather than the first provider that arrives afterwards.
+fn check_mount(
+    parts: &crate::CodingParts,
+    config: &CodingAgentConfig,
+    prepare: &PrepareOptions,
+) -> Result<(), String> {
+    let tree = tree_inputs(parts, config, prepare)?;
+    crate::on_harness::check_hosted(
+        &config.working_dir,
+        &config.dirs,
+        tree.presence,
+        tree.models,
+        tree.host,
+        &tree.extra,
+    )
+}
+
+/// What [`mount`] hands `mount_hosted` besides the provider.
+struct TreeInputs {
+    presence: crate::on_harness::Presence,
+    models: Option<crate::on_harness::HostModels>,
+    host: crate::on_harness::HostState,
+    extra: Vec<atomcode_plexus::Layer>,
+}
+
+fn tree_inputs(
+    parts: &crate::CodingParts,
+    config: &CodingAgentConfig,
+    prepare: &PrepareOptions,
+) -> Result<TreeInputs, String> {
     // Presence follows the same rule the overlay uses: a person who can answer
     // means asking, nobody means fencing.
     let presence = if config.is_attended() {
@@ -9562,8 +9630,11 @@ pub async fn mount(
     } else {
         crate::on_harness::Presence::Headless
     };
-    // What the person wrote in `config.toml`, as a layer of its own.
-    let extra = vec![crate::on_harness::config_rows(config)?];
+    // What the person wrote in `config.toml`, as a layer of its own; then what
+    // the host brought, in its order and after everything else, so a host's
+    // patch is the last word on any row — coding's own and the person's alike.
+    let mut extra = vec![crate::on_harness::config_rows(config)?];
+    extra.extend(prepare.host_plugins.layers.iter().cloned());
     // The model catalog, when this host has one. Both halves come from what
     // `install_subagent_tiers` already put on the config, so the tree and the
     // chain resolve a selection through the same resolver — including its reset
@@ -9577,30 +9648,12 @@ pub async fn mount(
             providers,
             current: config.provider_name.clone(),
         });
-    // The capability graph's own sub-agents — the reviewer, `task`, `team` — run on
-    // this model, billed to the session and metered the way the chain's
-    // `assemble` wires them.
-    let _ = crate::parts::wire_side_providers(parts, config, &provider);
     let host = harness_host_state(parts, config, prepare).map_err(|error| error.to_string())?;
-    // Turns on this tree are billed to the model it was built for. The chain
-    // stamps the same attribution inside `assemble`.
-    if let Some(snapshot) = parts.snapshot_hook() {
-        snapshot.set_model_attribution(&config.provider_name, &config.model);
-    }
-    let (handle, app, providers) = crate::on_harness::mount_hosted(
-        &config.working_dir,
-        &config.dirs,
+    Ok(TreeInputs {
         presence,
-        provider,
         models,
         host,
-        &extra,
-    )
-    .await?;
-    Ok(Mounted {
-        handle,
-        app,
-        providers,
+        extra,
     })
 }
 
@@ -11296,6 +11349,7 @@ pub mod testkit {
             rate_limit_source: None,
             front_end: None,
             review_delegate: None,
+            host_plugins: Default::default(),
         };
         let plugin_hooks = Arc::new(crate::plugin_hooks::StaticPluginHookSource::default());
         let parts = crate::parts::prepare_with_plugin_hook_source(
@@ -12428,6 +12482,7 @@ mod tests {
                 rate_limit_source: None,
                 front_end: None,
                 review_delegate: None,
+                host_plugins: Default::default(),
             },
             provider_factory: Arc::new(TestProviderFactory {
                 fail: fail_provider,
