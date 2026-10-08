@@ -1977,10 +1977,19 @@ pub(crate) async fn live_switch_session_endpoint(
     State(state): State<AppState>,
     Json(req): Json<LiveSwitchSessionReq>,
 ) -> impl IntoResponse {
-    match crate::native_live::resume_session(req.session_id).await {
-        Ok(changed) => {
-            crate::update_project_state(&mut *state.project.write().await, &changed.working_dir);
-            Json(serde_json::json!({ "ok": true }))
+    match crate::native_live::resume_or_fork_session(req.session_id).await {
+        Ok(resumed) => {
+            crate::update_project_state(
+                &mut *state.project.write().await,
+                &resumed.changed.working_dir,
+            );
+            // `session_id` is where the runtime is now — a copy's own id when
+            // the one asked for was held by another atomcode (`forked_from`).
+            Json(serde_json::json!({
+                "ok": true,
+                "session_id": resumed.changed.session_id,
+                "forked_from": resumed.forked_from,
+            }))
         }
         Err(error) => {
             let active_turn = matches!(error, crate::live_hub::HubError::ActiveTurn);

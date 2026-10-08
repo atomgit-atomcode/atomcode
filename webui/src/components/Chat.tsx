@@ -914,7 +914,15 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
       if (sync && sessionId) {
         postLiveSwitchSession(sessionId)
           .then((result) => {
-            if (result.ok || sessionGenerationRef.current !== switchGeneration) return;
+            if (sessionGenerationRef.current !== switchGeneration) return;
+            // Another atomcode held it, so the runtime opened a copy: follow it
+            // there and say so — the original is untouched where it is open.
+            if (result.ok && result.forkedFrom && result.sessionId) {
+              noticeAfterSwitchRef.current = t('sync.sessionForked');
+              onSessionId(result.sessionId);
+              return;
+            }
+            if (result.ok) return;
             if (result.activeTurn && prevId) {
               noticeAfterSwitchRef.current = t('cmd.session.busy');
               onSessionId(prevId);
@@ -1776,6 +1784,7 @@ export function Chat({ sessionId, onSessionId, cwd, onPermission, pendingPermiss
               if (!result.ok) {
                 throw new Error(result.error ?? 'live runtime rejected the session switch');
               }
+              if (result.forkedFrom) pushCommandNotice(t('sync.sessionForked'));
               startLiveStream();
             })
             .catch((error) => {

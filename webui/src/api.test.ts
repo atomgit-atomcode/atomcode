@@ -588,3 +588,21 @@ test('a chat refused with 409 says why, not only the status', async () => {
     },
   );
 });
+
+test('a live switch to a session held elsewhere says which copy it opened', async () => {
+  const api = await import('./api.ts');
+  await serving(
+    200,
+    '{"ok":true,"session_id":"copy-1","forked_from":"orig-1"}',
+    'application/json',
+    async () => {
+      assert.deepEqual(await api.postLiveSwitchSession('orig-1'), {
+        ok: true,
+        activeTurn: false,
+        error: undefined,
+        sessionId: 'copy-1',
+        forkedFrom: 'orig-1',
+      });
+    },
+  );
+});

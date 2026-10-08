@@ -297,27 +297,61 @@ pub fn provider_fingerprint(
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
+/// Where a switch landed, and whether it is the session asked for or a copy of it.
+pub struct Resumed {
+    pub changed: atomcode_coding::SessionChanged,
+    /// The session asked for, when another atomcode held it and a copy was
+    /// opened instead (`None` for the session itself).
+    pub forked_from: Option<String>,
+}
+
+/// Switch the bound runtime to exactly `session_id`; a session another atomcode
+/// holds is refused. For callers that go on to use the id they asked for — a
+/// directory change's paired switch, its rollback — and so must not be moved
+/// to a copy behind their back.
 pub async fn resume_session(
     session_id: String,
 ) -> Result<atomcode_coding::SessionChanged, HubError> {
+    resume(session_id, false)
+        .await
+        .map(|resumed| resumed.changed)
+}
+
+/// Switch the bound runtime to `session_id` — or, when another atomcode
+/// process holds it (a terminal window, VS Code), to a copy of it.
+///
+/// The copy is what the terminal's `/resume` has always done for a session in
+/// use: the conversation so far, in a session of its own, the original left to
+/// whoever has it. Refusing instead sent the person off to find which process
+/// that was, with nothing on screen to say where to look.
+pub async fn resume_or_fork_session(session_id: String) -> Result<Resumed, HubError> {
+    resume(session_id, true).await
+}
+
+async fn resume(session_id: String, fork_on_busy: bool) -> Result<Resumed, HubError> {
     let binding = hub().binding()?;
     if binding.session_id == session_id {
-        return Ok(atomcode_coding::SessionChanged {
-            generation: atomcode_coding::RuntimeGeneration(binding.generation),
-            session_id: Some(binding.session_id),
-            working_dir: binding.working_dir,
+        return Ok(Resumed {
+            changed: atomcode_coding::SessionChanged {
+                generation: atomcode_coding::RuntimeGeneration(binding.generation),
+                session_id: Some(binding.session_id),
+                working_dir: binding.working_dir,
+            },
+            forked_from: None,
         });
     }
     let project_bucket = atomcode_capabilities::session::SessionManager::project_hash(
         &binding.working_dir,
         &atomcode_coding::config::product_dirs_from_env(),
     );
-    let prepared = match crate::legacy_convert::prepare_catalog_session_resume_in_project(
-        &project_bucket,
-        &session_id,
-    ) {
+    let prepare = if fork_on_busy {
+        crate::legacy_convert::prepare_catalog_session_resume_or_fork_in_project
+    } else {
+        crate::legacy_convert::prepare_catalog_session_resume_in_project
+    };
+    let prepared = match prepare(&project_bucket, &session_id) {
         Ok(Some(prepared)) => prepared,
-        // Found here but not to be had (in use by another runtime, unreadable):
+        // Found here but not to be had (unreadable, or in use and not copyable):
         // that is the answer, not a reason to look in every other project and
         // report whatever the second search says instead.
         Err(error) => return Err(HubError::RuntimeRejected(error.to_string())),
@@ -328,9 +362,15 @@ pub async fn resume_session(
             })?,
     };
     let target_dir = PathBuf::from(&prepared.view.meta.working_dir);
-    hub()
-        .resume_session_with_lease(session_id, target_dir, prepared.lease)
-        .await
+    // A copy is resumed under its own id; the original stays where it is.
+    let resumed_id = prepared.view.meta.id.clone();
+    let changed = hub()
+        .resume_session_with_lease(resumed_id, target_dir, prepared.lease)
+        .await?;
+    Ok(Resumed {
+        changed,
+        forked_from: prepared.forked_from,
+    })
 }
 
 /// Move the bound runtime to a fresh staged session. This is the only safe way

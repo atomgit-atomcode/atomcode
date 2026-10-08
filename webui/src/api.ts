@@ -1121,18 +1121,34 @@ export async function postLiveCompact(): Promise<{ accepted: boolean }> {
 /** Ask the bound native runtime to resume an existing session. */
 export async function postLiveSwitchSession(
   sessionId: string,
-): Promise<{ ok: boolean; activeTurn: boolean; error?: string }> {
+): Promise<{
+  ok: boolean;
+  activeTurn: boolean;
+  error?: string;
+  /** Where the runtime is now: a copy's own id when `forkedFrom` is set. */
+  sessionId?: string;
+  /** The session asked for, when another atomcode held it and a copy was opened. */
+  forkedFrom?: string;
+}> {
   const resp = await fetch('/live/switch_session', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ session_id: sessionId }),
   });
   if (!resp.ok) throw new Error(`switch live session failed: ${resp.status}`);
-  const body = await resp.json() as { ok?: boolean; active_turn?: boolean; error?: string };
+  const body = await resp.json() as {
+    ok?: boolean;
+    active_turn?: boolean;
+    error?: string;
+    session_id?: string | null;
+    forked_from?: string | null;
+  };
   return {
     ok: body.ok === true,
     activeTurn: body.active_turn === true,
     error: body.error,
+    ...(body.session_id ? { sessionId: body.session_id } : {}),
+    ...(body.forked_from ? { forkedFrom: body.forked_from } : {}),
   };
 }
 
