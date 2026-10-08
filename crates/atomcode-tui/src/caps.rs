@@ -575,6 +575,10 @@ pub fn downgrade_keeping(text: &str, unicode: bool, basic: bool) -> Cow<'_, str>
     for c in text.chars() {
         match ascii_for(c) {
             _ if c == '\u{FE0F}' => {}
+            // The result gutter as [`glyph_for`] draws it here: the corner, not
+            // the `` ` `` the ASCII table has for it. A tool row is laid out in
+            // full Unicode and reaches this rewrite with its `⎿` still on it.
+            _ if c == '\u{23BF}' => out.push('\u{2514}'),
             Some(stand_in) if !console_safe(c) => out.push_str(stand_in),
             _ => out.push(c),
         }
@@ -851,6 +855,11 @@ mod tests {
             downgrade_keeping(text, true, true),
             text,
             "full Unicode untouched"
+        );
+        assert_eq!(
+            downgrade_keeping("⎿ Grep(x)", false, true),
+            "└ Grep(x)",
+            "the result gutter is the corner glyph_for draws, not a backtick"
         );
         assert_eq!(
             downgrade_keeping("晴 ☀\u{FE0F}", false, true),
