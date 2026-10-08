@@ -6492,8 +6492,13 @@ impl Tui {
                 // on. Nothing configured to step to is not an error — it is a
                 // key that has nothing to do, which `/model` says better than
                 // a silent no-op would.
+                // With `default` for the level: a key that steps through models
+                // is a quick switch, and stopping on the level picker after each
+                // press turned every F2 into two choices. The endpoint's default
+                // thinking level is taken; `/model` typed, or the panel, still
+                // offers the levels for whoever wants to choose.
                 if let Some(id) = next {
-                    self.run_command(&format!("/model {id}"));
+                    self.run_command(&format!("/model {id} default"));
                 }
                 return false;
             }

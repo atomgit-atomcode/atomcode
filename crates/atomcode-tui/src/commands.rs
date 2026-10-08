@@ -4039,6 +4039,14 @@ mod tests {
             other => panic!("{other:?}"),
         }
 
+        // 带着 default 来的(F2 一步步切模型发的就是这一句):直接换好,强度交给
+        // 接口默认,不再停在挑强度那一层 —— 快捷键是快切,每按一下都要再选一次
+        // 是两个选择。
+        match all.dispatch("/model glm default", &app.context()).await {
+            Outcome::Said(said) => assert!(said.contains("glm"), "{said}"),
+            other => panic!("F2's line stopped on the level picker: {other:?}"),
+        }
+
         // 没声明的:还是那一句,不进挑强度那一层。
         match all.dispatch("/model plain", &app.context()).await {
             Outcome::Said(said) => assert!(said.contains("plain"), "{said}"),
