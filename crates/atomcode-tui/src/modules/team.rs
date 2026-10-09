@@ -275,10 +275,12 @@ impl View for Team {
                 ..
             } => {
                 let name = from.rsplit('/').next().unwrap_or(from).to_string();
-                let said = text
-                    .strip_prefix(&format!("[{name}] "))
-                    .unwrap_or(text)
-                    .replace('\n', " ");
+                // Its first sentence, in plain words: the whole report flattened
+                // onto one row read `· 结论: **这套…** ## 1. importer…`, markdown
+                // and all, and the `[… finished turn 1: Stopped]` the team
+                // wraps a turn-end report in.
+                let said =
+                    crate::content::report_gist(crate::content::member_report_body(&name, text));
                 if let Some(m) = Self::find(state, &name) {
                     m.last = said;
                 }
@@ -303,6 +305,12 @@ impl View for Team {
         }
         let caps = vp.moment.caps;
         let muted = theme::fg(Role::Muted);
+        if all_resting(&rows, vp.moment) {
+            return vec![Line::styled(
+                width::take_width(&t(Msg::TeamHeaderAllIdle { count: rows.len() }), w as usize),
+                muted,
+            )];
+        }
 
         let switchable = targets(vp.moment);
         // Both of these are true while the panel has the keyboard, and one of
@@ -432,6 +440,12 @@ impl View for Team {
         for row in &rows {
             let selectable = switchable.iter().position(|s| *s == row.session);
             let (mark, ink) = mark_of(&row.session);
+            // An idle member's row recedes — it is waiting, not working — unless
+            // it is the one on screen, which keeps the mark of where you are.
+            let ink = match row.state {
+                Shown::Idle if !here(&row.session) => muted,
+                _ => ink,
+            };
             // Only idle says so. Working is what the running time at the edge
             // already shows; a turn count said `第 1 轮` for every subagent,
             // which only ever runs one.
@@ -492,8 +506,13 @@ impl View for Team {
         if !running(moment) {
             return Height::Hug(0);
         }
-        let rows = rows(state, moment).len();
-        Height::Hug(1 + u16::from(!targets(moment).is_empty()) + rows.min(u16::MAX as usize) as u16)
+        let rows = rows(state, moment);
+        if all_resting(&rows, moment) {
+            return Height::Hug(1);
+        }
+        Height::Hug(
+            1 + u16::from(!targets(moment).is_empty()) + rows.len().min(u16::MAX as usize) as u16,
+        )
     }
 
     /// The spinner needs frames. The same cadence as the status line, for the
@@ -501,6 +520,23 @@ impl View for Team {
     fn tick() -> Option<std::time::Duration> {
         Some(std::time::Duration::from_millis(110))
     }
+}
+
+/// The panel as one line: every member idle, the lead's turn over, and nobody
+/// pointing at the panel. Nothing is moving then, and three rows of `空闲` held
+/// the bottom of the screen after the work was done.
+///
+/// It opens again when a member starts work or the lead starts a turn, and when
+/// a person points at it — `↓` as the line says, or a press on the line: either
+/// sets `team_cursor`. Pointing, not the keyboard: a panel a person opened stays
+/// open while the pointer is on its rows without the keys having been handed
+/// over. The next turn the lead starts lets go of a pointing that was not the
+/// keyboard's, so a team idle again after it folds again.
+fn all_resting(rows: &[Row], moment: &Moment) -> bool {
+    !rows.is_empty()
+        && !moment.turn_open
+        && moment.team_cursor.is_none()
+        && rows.iter().all(|r| r.state == Shown::Idle)
 }
 
 /// What a member's mark says: whether it is running a turn right now.
@@ -1086,7 +1122,21 @@ mod tests {
                 ..MemberNow::default()
             },
         ]);
-        assert_eq!(Team::height(&state, &live, 60), Height::Hug(4));
+        // While the lead's turn runs the panel is open: a line each.
+        let mut working = live.clone();
+        working.turn_open = true;
+        assert_eq!(Team::height(&state, &working, 60), Height::Hug(4));
+        // Every member idle and the turn over: one line, until the keyboard
+        // takes the panel.
+        assert_eq!(Team::height(&state, &live, 60), Height::Hug(1));
+        let rows: Vec<String> = Team::render(&state, &Viewport::new(Rect::sized(60, 1), &live))
+            .iter()
+            .map(|l| l.plain())
+            .collect();
+        assert_eq!(rows, vec!["团队 · 2 名成员空闲 · ↓ 选择查看".to_string()]);
+        let mut focused = live.clone();
+        focused.team_cursor = Some(0);
+        assert_eq!(Team::height(&state, &focused, 60), Height::Hug(4));
         assert_eq!(
             Team::height(&State::default(), &Moment::default(), 60),
             Height::Hug(0),

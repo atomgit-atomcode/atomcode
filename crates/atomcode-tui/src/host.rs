@@ -232,6 +232,9 @@ impl Presentation {
             // conversation that started it answers right under it in its own
             // words, so the report itself is a click away, not said twice.
             ("injected:background", Showing::Folded),
+            // A team member's report, on the same terms: `● scout 汇报回来了`,
+            // the lead answers under it, and the report is a click away.
+            ("injected:peer", Showing::Folded),
             // An answered question — an approval most of all — folds to
             // `● bash … → 允许一次`: the command was read in full while it was
             // being asked (an unanswered one never folds, `ChoiceBlock::
@@ -601,11 +604,12 @@ impl Presentation {
 /// by default to `● 后台「…」的结果回来了  点击展开`, with the conversation that
 /// started the job answering under it — and, left out of this list, a row that
 /// promised a click and answered none.
-const CLICKABLE: [&str; 5] = [
+const CLICKABLE: [&str; 6] = [
     "tool_call",
     "reasoning",
     "vl_caption",
     "injected:background",
+    "injected:peer",
     "choice",
 ];
 
@@ -1815,6 +1819,17 @@ impl Host {
         }
         let m = self.moment.read().expect("moment poisoned");
         crate::modules::team::target_at_line(&m, (y - rect.y) as usize)
+    }
+
+    /// Whether `(x, y)` is on the team panel folded to its one line (every
+    /// member idle, `modules::team::all_resting`). One row tall is how it is
+    /// told: open, the panel is a header, the lead and at least one member.
+    pub fn team_folded_at(&self, x: u16, y: u16) -> bool {
+        self.hits
+            .lock()
+            .expect("hits poisoned")
+            .team
+            .is_some_and(|rect| rect.h == 1 && rect.contains(x, y))
     }
 
     /// Whether the team panel has the keyboard.
@@ -13412,7 +13427,12 @@ mod tests {
         assert!(
             kinds.iter().all(|k| matches!(
                 *k,
-                "tool_call" | "reasoning" | "vl_caption" | "injected:background" | "choice"
+                "tool_call"
+                    | "reasoning"
+                    | "vl_caption"
+                    | "injected:background"
+                    | "injected:peer"
+                    | "choice"
             )),
             "these answer a click too: {kinds:?}"
         );
@@ -14362,10 +14382,19 @@ mod tests {
             !screen.contains("system-reminder") && !screen.contains("[reminder]"),
             "the reminder is on screen:\n{screen}"
         );
+        // The report is on screen as its head — who came back — folded the way
+        // a background result is; the words are one click away, not gone.
         assert!(
-            screen.contains("sessions are made in agent.rs"),
+            screen.contains("scout 汇报回来了") && !screen.contains("[scout]"),
             "a teammate's report is an answer, and it is gone:\n{screen}"
         );
+        h.presentation.write().unwrap().toggle("injected:peer");
+        let open = h.compose((80, 40)).rows().join("\n");
+        assert!(
+            open.contains("sessions are made in agent.rs"),
+            "opened, the report is there in full:\n{open}"
+        );
+        h.presentation.write().unwrap().toggle("injected:peer");
 
         // And back, one step at a time — the hidable cycle, same as reasoning: a
         // lid naming the kind, then the text, then away again. The group gesture

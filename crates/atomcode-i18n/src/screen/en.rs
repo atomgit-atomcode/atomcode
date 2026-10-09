@@ -175,6 +175,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::TeamHeader { count, background } => {
             format!("{} · ↓ to pick one to view", team_en(count, background)).into()
         }
+        Msg::TeamHeaderAllIdle { count } => format!("team · {count} members idle · ↓ to pick one to view").into(),
+        Msg::MemberReportedBack { name } => format!("{name} reported back").into(),
+        Msg::MemberTurnCancelled { name } => format!("{name} was cancelled").into(),
+        Msg::MemberTurnEndedEarly { name, why } => format!("{name}'s turn ended early ({why})").into(),
         Msg::TeamLead => "main".into(),
         Msg::TeamBackgroundRole => "background".into(),
         Msg::TeamBackgroundWaiting => "needs you".into(),

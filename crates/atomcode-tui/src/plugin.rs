@@ -2241,6 +2241,15 @@ impl UserInterface for Tui {
                                     continue;
                                 }
                             }
+                            // A press on the team panel folded to one line opens
+                            // it, the way `↓` does — the line names the key, and
+                            // a pointer that cannot reach the rows behind it
+                            // would be a panel only the keyboard can open.
+                            if self.host.team_folded_at(x, y) {
+                                self.host.focus_team();
+                                stale = true;
+                                continue;
+                            }
                             // A press on a team row is a switch to that agent.
                             // The row is what the press took — not "whatever
                             // was focused" — so the pointer's own row is read
@@ -5787,6 +5796,13 @@ impl Tui {
             AgentEvent::TurnStarted { .. } => {
                 let mut m = self.host.moment.write().expect("moment poisoned");
                 m.turn_open = true;
+                // A row the pointer lit last turn is let go of, unless the keys
+                // are on the panel: it is what keeps a team panel open that a
+                // person opened, and once a new turn runs, a team that goes
+                // idle again should fold again (`modules::team::all_resting`).
+                if !m.team_keyboard {
+                    m.team_cursor = None;
+                }
                 // A guess about what follows the LAST turn. The composer's own
                 // submit clears it, but a turn can start without one — a
                 // background result coming home, a resend, `/init`, a loop

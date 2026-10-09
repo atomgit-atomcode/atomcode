@@ -152,6 +152,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::TeamHeader { count, background } => {
             format!("{} · ↓ 选择查看", team_zh(count, background)).into()
         }
+        Msg::TeamHeaderAllIdle { count } => format!("团队 · {count} 名成员空闲 · ↓ 选择查看").into(),
+        Msg::MemberReportedBack { name } => format!("{name} 汇报回来了").into(),
+        Msg::MemberTurnCancelled { name } => format!("{name} 被取消了").into(),
+        Msg::MemberTurnEndedEarly { name, why } => format!("{name} 这一轮异常结束({why})").into(),
         Msg::TeamLead => "main".into(),
         Msg::TeamBackgroundRole => "后台".into(),
         Msg::TeamBackgroundWaiting => "等你回答".into(),

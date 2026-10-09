@@ -526,15 +526,36 @@ impl Producer for Transcript {
             }
 
             SessionEvent::Injected { text, origin, .. } => {
+                // A member's report is drawn the way a background result is: a
+                // head that says who came back, and the report under it, folded
+                // until a click (`Presentation::default_folds`). Raw, it was the
+                // whole report — often a hundred lines with its own headings —
+                // standing open in the lead's conversation with no lid.
+                let (text, result) = match origin {
+                    InjectionOrigin::Peer { outside: true, .. } => (text.clone(), true),
+                    InjectionOrigin::Peer { from, .. } => {
+                        let name = from.rsplit('/').next().unwrap_or(from);
+                        let body = crate::content::member_report_body(name, text);
+                        // The head keeps what the team's own turn-end line said
+                        // that matters to a person: a member that was cancelled
+                        // or broke off did not report, and must not read as if
+                        // it had.
+                        let head = match crate::content::member_turn_end(name, text) {
+                            None | Some("Stopped") => t(Msg::MemberReportedBack { name }),
+                            Some("Cancelled") => t(Msg::MemberTurnCancelled { name }),
+                            Some(why) => t(Msg::MemberTurnEndedEarly { name, why }),
+                        };
+                        (format!("{head}\n{body}"), true)
+                    }
+                    _ => (text.clone(), false),
+                };
                 out.emit(
                     at,
                     Arc::new(InjectedBlock {
                         kind: origin_kind(origin),
                         origin: origin_label(origin),
-                        text: text.clone(),
-                        // What a background session sent home is the result it
-                        // was started for; the rest are asides.
-                        result: matches!(origin, InjectionOrigin::Peer { outside: true, .. }),
+                        text,
+                        result,
                     }),
                 );
             }

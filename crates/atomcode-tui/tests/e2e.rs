@@ -4802,8 +4802,9 @@ async fn a_member_s_own_conversation_stays_off_the_lead_s_screen() {
         !screen.contains("MEMBER-THINKING-OUT-LOUD") && !screen.contains("MEMBER-TRAILING-WORDS"),
         "the member's own conversation is not the lead's screen:\n{screen}"
     );
+    // As its folded head — who came back — the report a click away.
     assert!(
-        screen.contains("scout reporting in"),
+        screen.contains("scout 汇报回来了"),
         "what the member told the lead is on it:\n{screen}"
     );
 
@@ -4848,6 +4849,9 @@ async fn the_team_panel_says_who_is_on_the_team_and_what_each_last_said() {
     s.term.type_line("have someone look around");
     s.quiet().await;
 
+    // The member has reported and the lead's turn is over: the panel is one
+    // line until a person opens it.
+    open_folded_team(&s).await;
     let panel = s
         .term
         .last()
@@ -5583,7 +5587,9 @@ async fn cancel_all_stops_every_members_turn_and_keeps_the_team() {
 
     s.term.type_line("/cancel-all");
     until(&s, "1 个成员").await;
-    until(&s, "Cancelled").await;
+    // The member's turn-end report, folded to a head that says it was cancelled
+    // rather than that it reported.
+    until(&s, "scout 被取消了").await;
 
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
@@ -6325,13 +6331,15 @@ async fn the_keyboard_switches_the_screen_to_a_member_and_back() {
     let task = s.open().await;
 
     s.term.type_line("have someone look around");
-    until(&s, "scout reporting in").await;
+    until(&s, "scout 汇报回来了").await;
     s.quiet().await;
     assert!(!s.screen().contains("MEMBER-THINKING-OUT-LOUD"));
-    assert!(panel_text(&s).contains("main"), "{}", panel_text(&s));
+    // Idle and the lead done: folded to one line, which the keys open.
+    assert!(panel_text(&s).contains("空闲"), "{}", panel_text(&s));
 
     s.term.press(KeyPress::plain(Key::Tab));
     until(&s, "Enter 切换").await;
+    assert!(panel_text(&s).contains("main"), "{}", panel_text(&s));
     s.term.press(KeyPress::plain(Key::Down));
     s.term.press(KeyPress::plain(Key::Enter));
     until(&s, "MEMBER-THINKING-OUT-LOUD").await;
@@ -6384,6 +6392,42 @@ async fn the_keyboard_switches_the_screen_to_a_member_and_back() {
 
 /// A press on a member's row switches to it, and the row under the pointer is
 /// the row lit — the one a press would take.
+/// Open the team panel folded to its one line — every member idle and the
+/// lead's turn over — with a press on that line, the way a person reaches the
+/// rows behind it. Waits for the rows to be drawn.
+async fn open_folded_team(s: &Session) {
+    let part = s.term.last().unwrap().part("team").unwrap().clone();
+    assert!(
+        part.lines.len() == 1 && part.lines[0].plain().contains("空闲"),
+        "the idle team is folded to one line: {:?}",
+        part.lines.iter().map(|l| l.plain()).collect::<Vec<_>>()
+    );
+    s.term.pointer(
+        atomcode_tui::surface::Click::Press,
+        part.rect.x + 2,
+        part.rect.y,
+    );
+    s.term.pointer(
+        atomcode_tui::surface::Click::Release,
+        part.rect.x + 2,
+        part.rect.y,
+    );
+    for _ in 0..100 {
+        if s.term
+            .last()
+            .and_then(|frame| frame.part("team").cloned())
+            .is_some_and(|part| part.lines.len() > 1)
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!(
+        "a press on the folded line opens the panel:\n{}",
+        s.screen()
+    );
+}
+
 #[tokio::test]
 async fn a_press_on_a_team_row_switches_to_that_agent() {
     use atomcode_tui::surface::Click;
@@ -6393,8 +6437,9 @@ async fn a_press_on_a_team_row_switches_to_that_agent() {
     let s = start(tree(&dir, &script, &[&team])).await;
     let task = s.open().await;
     s.term.type_line("have someone look around");
-    until(&s, "scout reporting in").await;
+    until(&s, "scout 汇报回来了").await;
     s.quiet().await;
+    open_folded_team(&s).await;
 
     let part = s.term.last().unwrap().part("team").unwrap().clone();
     let scout_row = part
@@ -6455,8 +6500,19 @@ async fn hovering_the_team_panel_leaves_the_keyboard_where_it_was() {
     let s = start(tree(&dir, &script, &[&team])).await;
     let task = s.open().await;
     s.term.type_line("have someone look around");
-    until(&s, "scout reporting in").await;
+    until(&s, "scout 汇报回来了").await;
     s.quiet().await;
+    // Opened the way a person opens it once the team is idle, then the keys
+    // handed back: the panel stays open — the pointer is still on it — with no
+    // keyboard, which is the state under test.
+    open_folded_team(&s).await;
+    s.term.press(KeyPress::plain(Key::Esc));
+    for _ in 0..100 {
+        if !s.screen().contains("Enter 切换") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 
     let part = s.term.last().unwrap().part("team").unwrap().clone();
     let scout_row = part

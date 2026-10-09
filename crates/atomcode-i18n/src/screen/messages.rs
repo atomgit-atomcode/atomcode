@@ -248,6 +248,23 @@ pub enum Msg<'a> {
         count: usize,
         background: usize,
     },
+    /// Every member idle and the lead's turn over: the panel as one line.
+    TeamHeaderAllIdle {
+        count: usize,
+    },
+    /// A member's report in the conversation, folded to this head.
+    MemberReportedBack {
+        name: &'a str,
+    },
+    /// A member whose turn was cancelled, folded to this head.
+    MemberTurnCancelled {
+        name: &'a str,
+    },
+    /// A member whose turn ended any other way than finishing.
+    MemberTurnEndedEarly {
+        name: &'a str,
+        why: &'a str,
+    },
     /// The lead's own row, first in the list.
     TeamLead,
     /// The role column of a background session's row.

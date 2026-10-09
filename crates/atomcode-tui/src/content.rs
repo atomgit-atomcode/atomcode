@@ -2225,6 +2225,72 @@ impl InjectedBlock {
     }
 }
 
+/// A member's report without what the team wraps it in: the `[name] ` a
+/// `tell_parent` message starts with, or the `[name finished turn N: …]` line
+/// the team writes when a member ends its turn without one. That line is a
+/// record for the lead — `Stopped` is a debug name, not words for a person.
+pub fn member_report_body<'a>(name: &str, text: &'a str) -> &'a str {
+    let text = text.trim_start();
+    if let Some(rest) = text.strip_prefix(&format!("[{name}] ")) {
+        return rest;
+    }
+    let ended = format!("[{name} finished turn ");
+    if text.starts_with(&ended) {
+        return text
+            .split_once('\n')
+            .map_or("", |(_, body)| body.trim_start());
+    }
+    text
+}
+
+/// How a member's turn ended, when the report is the one the team writes at
+/// turn end (`[name finished turn N: Reason]`): `Some("Cancelled")`, and so on.
+/// `None` for a report the member sent itself with `tell_parent`.
+pub fn member_turn_end<'a>(name: &str, text: &'a str) -> Option<&'a str> {
+    let rest = text
+        .trim_start()
+        .strip_prefix(&format!("[{name} finished turn "))?;
+    let head = rest.split('\n').next()?;
+    let (_, reason) = head.split_once(": ")?;
+    Some(reason.trim_end_matches(']').trim())
+}
+
+/// A report's first sentence, as plain words on one line: what the team panel
+/// says after a member's name. Markdown marks go — `**`, a heading's `#`, a
+/// list's `-`, a quote's `>`, code ticks, a table's bars — because they are
+/// for rendering, and on one muted line they were noise in front of the words.
+#[allow(
+    clippy::string_slice,
+    reason = "cut at char_indices offsets plus that char's own length, which are char boundaries"
+)]
+pub fn report_gist(body: &str) -> String {
+    let line = body
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.chars().all(|c| matches!(c, '-' | '|' | ':' | ' ' | '=')))
+        .unwrap_or("");
+    let line = line.trim_start_matches(['#', '>', '-', '*', '+', '|', ' ']);
+    let plain: String = line
+        .replace("**", "")
+        .replace("__", "")
+        .replace('`', "")
+        .replace(" | ", " ")
+        .trim_end_matches(['|', ' '])
+        .to_string();
+    // The first sentence, when the line runs on into a second.
+    let cut = plain
+        .char_indices()
+        .find(|&(i, c)| {
+            matches!(c, '。' | '！' | '？')
+                || (matches!(c, '.' | '!' | '?') && plain[i + c.len_utf8()..].starts_with(' '))
+        })
+        .map(|(i, c)| i + c.len_utf8());
+    match cut {
+        Some(end) => plain[..end].to_string(),
+        None => plain,
+    }
+}
+
 /// Every injection there is, as *(the word a person types, the kind the screen
 /// files it under)*.
 ///
@@ -3086,6 +3152,46 @@ impl Content for TurnEndBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A member's report as the team sends it, both ways: a `tell_parent`
+    /// message, and the line the team writes when a turn ends without one —
+    /// the shape that reached a screen as `[small-crates-api finished turn 1:
+    /// Stopped] I could not reach …`.
+    #[test]
+    fn a_member_report_is_read_without_what_the_team_wraps_it_in() {
+        assert_eq!(member_report_body("scout", "[scout] found it"), "found it");
+        let ended = "[scout finished turn 1: Stopped]\n结论:**两处**都是死代码。\n## 细节";
+        assert_eq!(
+            member_report_body("scout", ended),
+            "结论:**两处**都是死代码。\n## 细节"
+        );
+        assert_eq!(member_turn_end("scout", ended), Some("Stopped"));
+        assert_eq!(
+            member_turn_end("scout", "[scout finished turn 3: Cancelled]\n"),
+            Some("Cancelled")
+        );
+        assert_eq!(member_turn_end("scout", "[scout] found it"), None);
+        // Someone else's name is not this member's wrapper.
+        assert_eq!(member_report_body("scout", "[other] x"), "[other] x");
+    }
+
+    /// One plain sentence for the panel: markdown marks gone, the first
+    /// sentence kept, a heading or a table rule never taken for the words.
+    #[test]
+    fn a_report_s_gist_is_its_first_sentence_in_plain_words() {
+        assert_eq!(
+            report_gist("结论:**这套是死代码**。其余都有消费者。\n## 1. importer"),
+            "结论:这套是死代码。"
+        );
+        assert_eq!(report_gist("## Method\n- found `x` here"), "Method");
+        assert_eq!(
+            report_gist("\n|---|---|\n| a | b |"),
+            "a b",
+            "a table's rule is not a sentence"
+        );
+        assert_eq!(report_gist("Done. Two items left."), "Done.");
+        assert_eq!(report_gist(""), "");
+    }
 
     /// A goal met is good news — a success-green `✓`, the words in the plain
     /// colour — and one that stopped undecided is a caution in the warning
