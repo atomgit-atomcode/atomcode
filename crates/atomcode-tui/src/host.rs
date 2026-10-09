@@ -681,6 +681,14 @@ fn blank_between(upper: &str, lower: &str, calls_apart: bool) -> bool {
     if upper == "user" || lower == "user" {
         return true;
     }
+    // The recap under a turn, and a result that came back from elsewhere — a
+    // background job, a member's report — are each their own paragraph: not
+    // the turn above them and not the reply that follows. Pressed together
+    // they read as one block of three different things (2026-10-09).
+    let apart = |kind: &str| matches!(kind, "recap" | "injected:background" | "injected:peer");
+    if apart(upper) || apart(lower) {
+        return true;
+    }
     // A `!` command's output hangs directly under the command, the way a tool's
     // result hangs under its call; the pair gets the user bar's air around it.
     if upper == "shell" && lower == "shell_output" {
@@ -7524,6 +7532,20 @@ mod tests {
         let h = host();
         assert!(!h.toggle_mcp());
         assert!(!h.mcp_open());
+    }
+
+    /// The recap and a result that came back from elsewhere stand apart from
+    /// each other and from the reply that follows — the screenshot had all three
+    /// pressed into one block.
+    #[test]
+    fn a_recap_and_a_returned_result_are_paragraphs_of_their_own() {
+        assert!(blank_between("recap", "injected:background", false));
+        assert!(blank_between("injected:background", "assistant", false));
+        assert!(blank_between("assistant", "injected:peer", false));
+        assert!(blank_between("turn_end", "recap", false));
+        // Not a gap between everything.
+        assert!(!blank_between("assistant", "assistant", false));
+        assert!(!blank_between("assistant", "injected:memory", false));
     }
 
     /// The question a person typed stands apart on BOTH sides — from what came
