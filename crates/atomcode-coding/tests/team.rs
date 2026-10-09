@@ -2445,3 +2445,43 @@ async fn the_products_roles_are_built_in() {
         );
     }
 }
+
+/// A full team is refused with a way out, not only the fact. Idle members hold
+/// their places until stopped, and a lead told only "full" said it would wait
+/// for a member to free one — which never happens on its own.
+#[tokio::test]
+async fn a_full_team_says_which_members_hold_the_places_and_how_to_free_one() {
+    let dir = scratch("full-team");
+    let app = start(tree(
+        &dir,
+        &format!(r#"{DELEGATE}, {{ text = "delegated" }}"#),
+        r#"{ text = "done" }, { text = "done" }, { text = "done" }, { text = "done" }, { text = "done" }, { text = "done" }"#,
+    ))
+    .await;
+    let lead = create_agent(&app).await.unwrap();
+    run_turn(&app, "go").await.unwrap();
+    // Up to the team's default size: `scout`, then five more.
+    for name in ["m1", "m2", "m3", "m4", "m5"] {
+        let made = as_lead(
+            &app,
+            &lead,
+            &format!(r#"{{"action":"delegate","name":"{name}","role":"explorer","task":"look"}}"#),
+        )
+        .await;
+        assert!(!made.is_error, "{}", made.content);
+    }
+    let refused = as_lead(
+        &app,
+        &lead,
+        r#"{"action":"delegate","name":"fourth","role":"explorer","task":"look"}"#,
+    )
+    .await;
+    assert!(refused.is_error);
+    assert!(
+        refused.content.contains("m1, m2, m3, m4, m5, scout")
+            && refused.content.contains("`stop`")
+            && refused.content.contains("status"),
+        "who holds the places, and how to free one: {}",
+        refused.content
+    );
+}

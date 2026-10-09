@@ -849,7 +849,23 @@ impl TeamTool {
                 ));
             }
             if mine.map(|m| m.len()).unwrap_or(0) >= self.max_members {
-                return Err(format!("the team is full ({} members)", self.max_members));
+                // How to make room, not only that there is none: an idle member
+                // holds its place until it is stopped, and a lead told only "full"
+                // said it would wait for a member to free one — which never
+                // happens on its own.
+                let names = mine
+                    .map(|m| {
+                        let mut names: Vec<&str> = m.keys().map(String::as_str).collect();
+                        names.sort_unstable();
+                        names.join(", ")
+                    })
+                    .unwrap_or_default();
+                return Err(format!(
+                    "the team is full ({} members: {names}). A member keeps its place until \
+                     stopped, idle or not — places never free up on their own. Use `status` to \
+                     see which are idle, `stop` one whose work is done, then delegate again.",
+                    self.max_members
+                ));
             }
         }
         // A stopped member's log is kept under its name, and ends saying it was
@@ -1503,6 +1519,12 @@ impl Tool for TeamTool {
          block on a member: `tell` sends it more instructions — it \
          keeps its context, so follow-ups are cheap. `status` lists members with their \
          state. `stop` ends one member, or all with no name.\n\
+         \n\
+         Lifecycle: a member that has finished stays on the team, idle, and keeps one of \
+         the team's places until you stop it — places never free up on their own. When a \
+         member's report covers its task and you have no follow-up for it, `stop` it. \
+         Before you give the user your final answer, stop the members you no longer need. \
+         Keep a member only while you still mean to `tell` it more.\n\
          \n\
          Rules: a member sees none of this conversation, so state the task completely, with \
          paths. Members never have a shell — do not delegate builds or test runs. Names are \
