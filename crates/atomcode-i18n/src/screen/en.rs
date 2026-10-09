@@ -922,7 +922,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::MouseUnreportedAtStart => "this terminal reports no mouse · drag to select · PageUp/PageDown to scroll · /raw select across screens · ctrl+p/n history · ctrl+t open · ctrl+o thinking".into(),
         Msg::MouseUnreported => "this terminal reports no mouse, so it keeps it · drag to select · PageUp/PageDown to scroll".into(),
         Msg::MouseHandedBackAtStart => "the terminal has the mouse · ctrl+g take it · /raw select across screens · wheel/↑↓ scroll · ctrl+p/n history · ctrl+t open · ctrl+o thinking".into(),
-        Msg::ReasoningHiddenHint => "this turn's reasoning is hidden · ctrl-o shows it (or /reasoning)".into(),
+        Msg::ReasoningHiddenHint => "reasoning is hidden · ctrl-o shows it (again for all of it) · tool output: ctrl-t".into(),
         Msg::NoProviderPanel => "this screen has no provider panel: the launcher provided no `tui-panel-providers`".into(),
         Msg::NoPluginPanel => "this screen has no plugin panel: the launcher provided no `tui-panel-plugins`".into(),
         Msg::NoToolPanel => "this screen has no tool panel: the launcher provided no `tui-panel-tools`".into(),
