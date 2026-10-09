@@ -1953,8 +1953,16 @@ fn query_terminal() -> (Option<Rgb>, Option<Rgb>, Vec<(u8, Rgb)>) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
     let mut seen: Vec<u8> = Vec::with_capacity(1024);
     let mut chunk = [0u8; 512];
+    let mut fence_seen = false;
+    let mut quiet_deadline = deadline;
     loop {
-        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let now = std::time::Instant::now();
+        let end = if fence_seen {
+            quiet_deadline.min(deadline)
+        } else {
+            deadline
+        };
+        let left = end.saturating_duration_since(now);
         if left.is_zero() || !readable(fd, left) {
             break;
         }
@@ -1965,8 +1973,14 @@ fn query_terminal() -> (Option<Rgb>, Option<Rgb>, Vec<(u8, Rgb)>) {
             break;
         }
         seen.extend_from_slice(&chunk[..n as usize]);
-        if answered_da1(&seen) {
-            break;
+        if !fence_seen && answered_da1(&seen) {
+            fence_seen = true;
+            // Some terminals answer the queued OSC colour queries after DA1.
+            // Keep reading until a short quiet period, so those replies never
+            // reach crossterm as ordinary input events.
+            quiet_deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
+        } else if fence_seen {
+            quiet_deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
         }
     }
     (parse_osc11(&seen), parse_osc10(&seen), parse_osc4(&seen))
@@ -3156,6 +3170,15 @@ mod tests {
             assert!(answers_in_order(Some(program)), "{program}");
         }
         assert!(answers_in_order(None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn colour_probe_keeps_reading_after_da1_for_late_slot_replies() {
+        let seen = b"\x1b]11;rgb:1c1c/1c1c/1c1c\x1b\\\x1b[c\x1b]4;15;rgb:a5a5/a5a5/a5a5\x1b\\";
+        assert!(answered_da1(seen));
+        assert_eq!(parse_osc11(seen), Some((0x1c, 0x1c, 0x1c)));
+        assert_eq!(parse_osc4(seen), vec![(15, (0xa5, 0xa5, 0xa5))]);
     }
 
     /// And the probe actually asks it.
