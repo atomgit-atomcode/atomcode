@@ -115,7 +115,12 @@ pub fn keys_notice_marker(config_dir: &Path) -> PathBuf {
 }
 
 /// A line of keys for the foot of the welcome block — on the first launch of
-/// this screen only.
+/// this screen only, except where the terminal reports no mouse (HarmonyOS).
+///
+/// There it is every launch: the mouse is the terminal's, the wheel does not
+/// scroll the conversation, and PageUp/PageDown and `/raw` are how to read back
+/// — keys nothing else on that screen names, and not ones a person keeps from
+/// a single first launch.
 ///
 /// Reasoning is hidden and tool output has its own key, and neither says so on
 /// screen. It is an aside about the screen, so it sits under the working
@@ -128,10 +133,14 @@ pub fn keys_notice_marker(config_dir: &Path) -> PathBuf {
 /// drew it — no welcome yet when it quit, a config that stopped the agent from
 /// describing itself — has not spent it.
 pub fn keys_note(marker: &Path) -> Option<KeysNote> {
-    (!marker.exists()).then(|| KeysNote {
+    keys_note_for(marker, atomcode_tui::caps::mouse_reported())
+}
+
+fn keys_note_for(marker: &Path, mouse_reported: bool) -> Option<KeysNote> {
+    (!mouse_reported || !marker.exists()).then(|| KeysNote {
         // Where the terminal reports no mouse (HarmonyOS) there is no ctrl-g to
         // name, and the conversation scrolls with PageUp/PageDown.
-        text: atomcode_config::i18n::t(if atomcode_tui::caps::mouse_reported() {
+        text: atomcode_config::i18n::t(if mouse_reported {
             atomcode_config::i18n::Msg::TuiKeysHint
         } else {
             atomcode_config::i18n::Msg::TuiKeysHintNoMouse
@@ -269,7 +278,17 @@ mod tests {
         }
         .seen();
         assert!(marker.exists(), "remembered once it was drawn");
-        assert!(keys_note(&marker).is_none(), "never again");
+        assert!(keys_note_for(&marker, true).is_none(), "never again");
+        // Where the terminal reports no mouse (HarmonyOS) the line is how to
+        // scroll and select at all, so it is there every launch — and names
+        // PageUp/PageDown rather than a ctrl-g that does nothing there.
+        let always = keys_note_for(&marker, false)
+            .expect("every launch there")
+            .text;
+        assert!(
+            always.contains("PageUp") && !always.contains("ctrl-g"),
+            "{always}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
