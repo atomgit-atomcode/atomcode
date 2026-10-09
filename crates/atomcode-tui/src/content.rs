@@ -684,25 +684,41 @@ impl Content for UserSaid {
     /// two blocks — see `host::blank_between`, which is the one place that
     /// decides it for both the painter and the scroll.
     fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
-        let w = ctx.width;
-        // Roles, not colours. This used to name `Theme::Dark` outright, which
-        // is how the whole transcript stayed dark on a light screen: a module
-        // that can resolve is a module that can resolve wrongly.
-        let bar = crate::theme::bg(crate::theme::Role::PanelBg)
-            .under(crate::theme::fg(crate::theme::Role::PanelFg));
-        wrapped(
+        input_bar(
             &self.0,
-            w,
-            user(),
+            ctx.width,
             &format!("{} ", Caps::default().g(Glyph::Prompt)),
+            None,
+            user(),
         )
+    }
+}
+
+/// A line the person typed, as a full-width bar: `mark` on the first row,
+/// `text` after it in `style`, the rest of the width filled with the bar.
+/// `mark_style` colours the mark; `None` leaves it as quiet as the indent.
+fn input_bar(text: &str, w: u16, mark: &str, mark_style: Option<Style>, style: Style) -> Vec<Line> {
+    // Roles, not colours. This used to name `Theme::Dark` outright, which
+    // is how the whole transcript stayed dark on a light screen: a module
+    // that can resolve is a module that can resolve wrongly.
+    let bar = crate::theme::bg(crate::theme::Role::PanelBg)
+        .under(crate::theme::fg(crate::theme::Role::PanelFg));
+    wrapped(text, w, style, mark)
         .into_iter()
-        .map(|line| {
+        .enumerate()
+        .map(|(row, line)| {
             let pad = (w as usize).saturating_sub(line.width());
             let mut spans: Vec<Span> = line
                 .spans
                 .into_iter()
-                .map(|sp| Span::styled(sp.text, sp.style.under(bar)))
+                .enumerate()
+                .map(|(i, sp)| {
+                    let own = match mark_style {
+                        Some(mark) if row == 0 && i == 0 => mark,
+                        _ => sp.style,
+                    };
+                    Span::styled(sp.text, own.under(bar))
+                })
                 .collect();
             if pad > 0 {
                 spans.push(Span::styled(" ".repeat(pad), bar));
@@ -710,6 +726,31 @@ impl Content for UserSaid {
             Line::from_spans(spans)
         })
         .collect()
+}
+
+/// A `!` command the person ran here, echoed as Claude Code echoes one: the
+/// same bar as anything typed, but opened by `!` in the product's colour — the
+/// colour the input box turned while it was being typed — instead of `❯`, and
+/// the command after it in the terminal's own ink. It is not something said to
+/// the agent, and the line says so before anyone reads the words.
+#[derive(Debug)]
+pub struct ShellSaid(pub String);
+
+impl Content for ShellSaid {
+    fn kind(&self) -> &'static str {
+        "shell"
+    }
+    fn content_hash(&self) -> ContentHash {
+        hash_of(&["shell", &self.0])
+    }
+    fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+        input_bar(
+            &self.0,
+            ctx.width,
+            "! ",
+            Some(Style::new().fg(Color::role(Role::Brand)).bold()),
+            Style::new(),
+        )
     }
 }
 
@@ -2651,15 +2692,27 @@ impl Content for ShellOutput {
             if self.failed { "failed" } else { "ok" },
         ])
     }
+    /// Hung on the `⎿` a tool's result hangs on, directly under the command:
+    /// the first row carries the gutter, every row after it the gutter's width
+    /// of indent — Claude Code's `⎿ (Bash completed with no output)`.
     fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
         let w = ctx.width;
+        let gutter = format!(
+            "{}{} ",
+            " ".repeat(GUTTER),
+            Caps::default().g(Glyph::Gutter)
+        );
+        let indent = " ".repeat(width::str_width(&gutter));
+        let tail_style = if self.failed { bad() } else { muted() };
+        let rows = self
+            .lines
+            .iter()
+            .map(|line| (line.as_str(), Style::new()))
+            .chain(self.tail.as_deref().map(|tail| (tail, tail_style)));
         let mut out = Vec::new();
-        for line in &self.lines {
-            out.extend(wrapped(line, w, Style::new(), "  "));
-        }
-        if let Some(tail) = &self.tail {
-            let style = if self.failed { bad() } else { muted() };
-            out.extend(wrapped(tail, w, style, "  "));
+        for (i, (text, style)) in rows.enumerate() {
+            let lead = if i == 0 { &gutter } else { &indent };
+            out.extend(wrapped(text, w, style, lead));
         }
         out
     }
@@ -3151,6 +3204,39 @@ impl Content for TurnEndBlock {
 
 #[cfg(test)]
 mod tests {
+
+    /// A `!` command is echoed `! cmd`, not `❯ !cmd`; what it printed hangs on
+    /// the `⎿` gutter, the rows after the first set in under it; and a command
+    /// that printed nothing says so in Claude Code's words, on the gutter.
+    #[test]
+    fn a_bang_command_reads_like_claude_code_s() {
+        let ctx = RenderCtx::bare(60);
+        let plain = |lines: Vec<Line>| lines.iter().map(|l| l.plain()).collect::<Vec<_>>();
+        let echo = plain(ShellSaid("rm -rf x.html".into()).lines(&ctx));
+        assert!(echo[0].starts_with("! rm -rf x.html"), "{echo:?}");
+
+        let out = plain(
+            ShellOutput {
+                lines: vec!["a".into(), "b".into()],
+                ..ShellOutput::default()
+            }
+            .lines(&ctx),
+        );
+        assert_eq!(out[0].trim_end(), "  ⎿ a");
+        assert_eq!(out[1].trim_end(), "    b");
+
+        let nothing = plain(
+            ShellOutput {
+                tail: Some(t(Msg::ShellSaidNothing).into_owned()),
+                ..ShellOutput::default()
+            }
+            .lines(&ctx),
+        );
+        assert_eq!(
+            nothing[0].trim_end(),
+            format!("  ⎿ {}", t(Msg::ShellSaidNothing))
+        );
+    }
     use super::*;
 
     /// A member's report as the team sends it, both ways: a `tell_parent`

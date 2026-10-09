@@ -4197,17 +4197,19 @@ impl Tui {
         command: String,
         shell: std::sync::Arc<dyn crate::shell::Shell>,
     ) {
-        use crate::content::{ShellOutput, UserSaid};
+        use crate::content::{ShellOutput, ShellSaid};
         let host = self.host.clone();
         let keys = self.wake.lock().expect("wake poisoned").clone();
-        // 人打的那一行,画成人说的话 —— 和上一代前端一样,也和斜杠命令的回显一样;
-        // 底下紧跟着一块会长的输出。一条跑了几秒的命令,期间屏上不该没有它的痕迹。
+        // 人打的那一行,画成一条和人说的话同样的横条,但用 `!` 开头、品牌色 ——
+        // 和输入框在 `!` 模式下的颜色一样,一眼看出这不是对模型说的话(Claude Code
+        // 也这样)。底下紧贴着一块会长的输出,挂在工具结果的 `⎿` 上。一条跑了几秒的
+        // 命令,期间屏上不该没有它的痕迹。
         let output = {
             let mut stream = host.stream.write().expect("stream poisoned");
             let mut w = stream.writer("commands");
             w.emit(
                 crate::block::Coord::default(),
-                Arc::new(UserSaid(line.clone())),
+                Arc::new(ShellSaid(command.clone())),
             );
             w.open(
                 crate::block::Coord::default(),

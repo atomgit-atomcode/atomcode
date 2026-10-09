@@ -7256,9 +7256,28 @@ async fn a_bang_runs_here_and_what_it_printed_goes_with_the_next_message() {
         "输出留在对话区里:\n{}",
         s.screen()
     );
-    // 画成人打的那一行,和上一代前端一样 —— 不是一条 `$ …` 提示。
-    assert!(seen.contains("!git status"), "回显的是打的那一行:\n{seen}");
+    // 画成 Claude Code 那样:`!` 代替 `❯` 打头,后面是命令 —— 不是一条
+    // `$ …` 提示,也不是一句发给模型的 `❯ !git status`。输出紧贴在它下面,
+    // 挂在工具结果的 `⎿` 上。
+    assert!(
+        seen.contains("! git status"),
+        "回显的是命令,`!` 打头:\n{seen}"
+    );
     assert!(!seen.contains("$ git status"), "不再是 `$ …`:\n{seen}");
+    assert!(
+        !seen.contains("❯ !git status"),
+        "不画成发给模型的话:\n{seen}"
+    );
+    let rows: Vec<&str> = seen.lines().collect();
+    let echo = rows
+        .iter()
+        .position(|r| r.contains("! git status"))
+        .expect("echo row");
+    assert!(
+        rows.get(echo + 1)
+            .is_some_and(|r| r.contains("⎿") && r.contains("OUT-OF[git status]")),
+        "输出紧贴在命令下面,挂在 ⎿ 上:\n{seen}"
+    );
 
     // 下一条消息带着它走。钉的是**发出去的那条命令**,不是屏上画了
     // 什么 —— 这一半的整个意义就在于模型收到了什么。

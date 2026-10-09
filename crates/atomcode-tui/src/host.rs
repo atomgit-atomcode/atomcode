@@ -680,6 +680,14 @@ fn blank_between(upper: &str, lower: &str, calls_apart: bool) -> bool {
     if upper == "user" || lower == "user" {
         return true;
     }
+    // A `!` command's output hangs directly under the command, the way a tool's
+    // result hangs under its call; the pair gets the user bar's air around it.
+    if upper == "shell" && lower == "shell_output" {
+        return false;
+    }
+    if upper == "shell" || lower == "shell" {
+        return true;
+    }
     match (upper == "tool_call", lower == "tool_call") {
         (true, true) => calls_apart,
         (a, b) => a != b,
@@ -7496,6 +7504,15 @@ mod tests {
         // Unrelated neighbours still butt together — the rule is the user bar,
         // not a blank between everything.
         assert!(!blank_between("assistant", "assistant", true));
+    }
+
+    /// A `!` command and its output are one piece, like a call and its result:
+    /// no blank between them, the user bar's air around the pair.
+    #[test]
+    fn a_bang_command_s_output_hangs_directly_under_it() {
+        assert!(!blank_between("shell", "shell_output", false));
+        assert!(blank_between("assistant", "shell", false), "air above");
+        assert!(blank_between("shell_output", "user", false), "and below");
     }
 
     /// Two turns, the second with something long enough to take several rows.

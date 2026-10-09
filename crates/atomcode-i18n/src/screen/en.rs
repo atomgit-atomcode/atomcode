@@ -636,9 +636,9 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CostUnattributed { tokens } => {
             format!("not attributable to any one model: {tokens}").into()
         }
-        Msg::ShellTimedOut { secs } => format!("[still going after {secs}s — stopped]").into(),
-        Msg::ShellFailed { code } => format!("[exit {code}]").into(),
-        Msg::ShellSaidNothing => "[no output]".into(),
+        Msg::ShellTimedOut { secs } => format!("(still going after {secs}s — stopped)").into(),
+        Msg::ShellFailed { code } => format!("(exit {code})").into(),
+        Msg::ShellSaidNothing => "(completed with no output)".into(),
         Msg::CompactionInterrupted => {
             "the compaction was interrupted — the context is as long as it was".into()
         }
