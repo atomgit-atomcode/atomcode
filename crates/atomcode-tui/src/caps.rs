@@ -279,7 +279,9 @@ pub fn cell_background_for(
 /// scrolling with the wheel — and `ctrl+g` (handing it back) was the only way
 /// to select a word. There the mouse stays the terminal's.
 ///
-/// `ATOMCODE_MOUSE=1` says otherwise, for a terminal there that learns to.
+/// `ATOMCODE_MOUSE=1` lifts this gate, for a terminal there that learns to — with
+/// `[ui] mouse = true` as well, since that defaults off on HarmonyOS
+/// (`atomcode_config::config::default_mouse`).
 pub fn mouse_reported() -> bool {
     mouse_reported_for(cfg!(target_env = "ohos"), |k| std::env::var(k).ok())
 }
