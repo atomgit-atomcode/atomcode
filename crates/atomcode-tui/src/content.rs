@@ -2607,6 +2607,37 @@ fn first_line(s: &str) -> &str {
     s.lines().next().unwrap_or("")
 }
 
+/// An approval the session's auto mode answered — nobody was asked
+/// ([`atomcode_harness::seams::ANSWERED_BY_MODE`]). The card it would have been,
+/// under a kind of its own that the screen hides by default
+/// (`Presentation::default_folds`): the way opencode, codex and oh-my-pi treat a
+/// call their auto mode let through — the tool's own row says what ran, and
+/// `→ 允许一次` under every one of them read as a choice the person had made.
+/// The record is the log's (`SessionEvent::Answered`); nothing on this screen
+/// shows the kind today, and the block keeps the card only so a way to show it
+/// would draw what was decided.
+#[derive(Debug)]
+pub struct AllowedByMode(pub ChoiceBlock);
+
+impl Content for AllowedByMode {
+    fn kind(&self) -> &'static str {
+        "choice:auto"
+    }
+    fn content_hash(&self) -> ContentHash {
+        hash_of(&[
+            "choice:auto",
+            &self.0.question,
+            self.0.answer.as_deref().unwrap_or(""),
+        ])
+    }
+    fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+        self.0.lines(ctx)
+    }
+    fn summary(&self, ctx: &RenderCtx) -> Line {
+        self.0.summary(ctx)
+    }
+}
+
 /// What a slash command said back.
 ///
 /// A block like any other, so a command's answer scrolls with the conversation

@@ -9559,6 +9559,7 @@ fn harness_host_state(
             modes: atomcode_harness::seams::Modes {
                 plan: Arc::clone(&parts.plan_mode),
                 accept_edits: Arc::clone(&parts.accept_edits),
+                auto: Arc::clone(&parts.bypass_mode),
             },
             plan_mcp_grants: Arc::clone(&parts.mcp_plan_grants),
             approval_grants: parts.approval.store(),

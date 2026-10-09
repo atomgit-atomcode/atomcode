@@ -798,6 +798,9 @@ pub struct Modes {
     pub plan: Arc<std::sync::atomic::AtomicBool>,
     /// Edits inside the workspace are applied without asking.
     pub accept_edits: Arc<std::sync::atomic::AtomicBool>,
+    /// Auto: nobody is asked before a tool runs. The approval is still written
+    /// down, as answered by [`ANSWERED_BY_MODE`] — see the handle's approval.
+    pub auto: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// One stored session, as a list would show it.
@@ -968,7 +971,8 @@ pub trait SessionTitle: Send + Sync {
 /// Questions put to a person, and their answers — session vocabulary, so the
 /// kernel's (`docs/adr/0024` §6). Re-exported where the seams have always named them.
 pub use atomcode_kernel::session::{
-    AboutCall, Answer, Question, ANSWER_ALLOW, ANSWER_ALWAYS, ANSWER_ALWAYS_ALL, ANSWER_DENY,
+    AboutCall, Answer, Question, ANSWERED_BY_MODE, ANSWER_ALLOW, ANSWER_ALWAYS, ANSWER_ALWAYS_ALL,
+    ANSWER_DENY,
 };
 
 /// Asking a human. `None` means "no answer" — every caller must treat that as a

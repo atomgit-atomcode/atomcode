@@ -807,6 +807,24 @@ impl ApprovalPolicy for Asker {
         // contract — the one every shipped front end already speaks — and the
         // question above is the record of it. A session a client can rejoin is
         // the point; a new wire shape for it would be a different change.
+        // Auto mode: nobody is asked, and the record says so — the question and
+        // `ANSWERED_BY_MODE`'s allow, written back to back, so a screen folds
+        // the pair as one and never draws a card that nobody will answer. Read
+        // here, from the mode itself, rather than from anything an answer
+        // carries: an answer's say-so about who gave it is a driver's to forge.
+        let auto = self
+            .ctx
+            .service::<crate::seams::ModesSvc>()
+            .is_some_and(|modes| modes.auto.load(std::sync::atomic::Ordering::Acquire));
+        if auto {
+            crate::agent::record_asked(&self.ctx, &question);
+            crate::agent::record_answered_by(
+                &self.ctx,
+                Some(crate::seams::ANSWER_ALLOW.to_string()),
+                true,
+            );
+            return Decision::Allow;
+        }
         crate::agent::record_asked(&self.ctx, &question);
         let request = ApprovalRequest {
             call_id: call.id.clone(),

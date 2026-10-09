@@ -576,7 +576,8 @@ impl Producer for Transcript {
             // And it was closed — with an answer or without one. Amended in
             // place, so the words the person was deciding between stay where
             // they were and only the answer is filled in.
-            SessionEvent::Answered { answer, .. } => {
+            SessionEvent::Answered { answer, by, .. } => {
+                let by_mode = by == atomcode_harness::seams::ANSWERED_BY_MODE;
                 let said = match (answer, &open.asked) {
                     // The label the asker gave the value it sent back, so the
                     // word on the card is the word the card offered.
@@ -603,10 +604,18 @@ impl Producer for Transcript {
                     }
                 };
                 match open.asked.take() {
+                    Some((id, asked)) if by_mode => {
+                        let card = card_for(&asked, Some(said));
+                        out.amend(id, Arc::new(crate::content::AllowedByMode(card)));
+                        out.settle(id);
+                    }
                     Some((id, asked)) => {
                         out.amend(id, Arc::new(card_for(&asked, Some(said))));
                         out.settle(id);
                     }
+                    // Nothing was asked on screen and nobody answered: nothing
+                    // to draw.
+                    None if by_mode => {}
                     // An answer with no question in front of it: the log is out
                     // of shape, but a person should still see what was decided.
                     None => {

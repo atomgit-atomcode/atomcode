@@ -1296,6 +1296,15 @@ pub const ANSWER_ALWAYS: &str = "allow_always";
 pub const ANSWER_ALWAYS_ALL: &str = "allow_always_all";
 pub const ANSWER_DENY: &str = "deny";
 
+/// The [`SessionEvent::Answered::by`] of an approval nobody was asked: the
+/// session's execution mode (auto) allowed it on the person's standing say-so.
+/// Written by the asking side from the mode itself, never taken from an answer —
+/// a driver's own policy (headless `-p` allowing a shell call) is a driver
+/// answering, and is recorded as one.
+/// Written down rather than dropped, so what auto allowed stays on the record;
+/// told apart from a person's answer, so no front end draws it as one.
+pub const ANSWERED_BY_MODE: &str = "auto mode";
+
 /// One answer: what comes back, and what a plain front end prints.
 ///
 /// Serialisable because an answered question is a fact of the session, and a

@@ -240,6 +240,9 @@ impl Presentation {
             // being asked (an unanswered one never folds, `ChoiceBlock::
             // always_open`), and afterwards it is a record, a click away.
             ("choice", Showing::Folded),
+            // An approval auto mode answered was nobody's choice to record on
+            // screen: the call's own row says what ran (`content::AllowedByMode`).
+            ("choice:auto", Showing::Hidden),
         ];
         by_kind.extend(
             crate::content::ENVIRONMENTAL_INJECTIONS
@@ -12151,6 +12154,47 @@ mod tests {
             h.moment.read().unwrap().history.last().map(String::as_str),
             Some("看看")
         );
+    }
+
+    /// An approval auto mode answered draws nothing: nobody was asked, and
+    /// `→ 允许一次` under every call read as a choice the person had made. The
+    /// same approval answered by a person is still drawn.
+    #[test]
+    fn an_approval_auto_mode_answered_is_not_drawn_as_a_persons_choice() {
+        let drawn = |by: &str| -> String {
+            let h = host();
+            h.absorb(&SessionEvent::TurnStart { turn: 1 });
+            h.absorb(&SessionEvent::Asked {
+                turn: 1,
+                question: atomcode_harness::seams::Question {
+                    prompt: "edit_file (outside the workspace) /x/y.rs".into(),
+                    options: vec![atomcode_harness::seams::Answer::labelled(
+                        atomcode_harness::seams::ANSWER_ALLOW,
+                        "allow once",
+                    )],
+                    asker: None,
+                    about: None,
+                },
+            });
+            h.absorb(&SessionEvent::Answered {
+                turn: 1,
+                answer: Some(atomcode_harness::seams::ANSWER_ALLOW.into()),
+                by: by.into(),
+            });
+            h.compose((100, 30))
+                .part("stream")
+                .expect("the conversation")
+                .lines
+                .iter()
+                .map(|l| l.plain())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let auto = drawn(atomcode_harness::seams::ANSWERED_BY_MODE);
+        assert!(!auto.contains("outside the workspace"), "{auto}");
+        let person = drawn("the person at the terminal");
+        assert!(person.contains("outside the workspace"), "{person}");
+        assert!(person.contains("→"), "{person}");
     }
 
     #[test]

@@ -151,16 +151,26 @@ pub fn record_asked(ctx: &Context, question: &crate::seams::Question) {
 /// vocabulary calls the decision: the log holds what the person chose, and the
 /// policy that asked is free to read it however it likes.
 pub fn record_answered(ctx: &Context, answer: Option<String>) {
+    record_answered_by(ctx, answer, false);
+}
+
+/// [`record_answered`], for an answer the session's execution mode gave in the
+/// person's place (`by_mode`): written as [`crate::seams::ANSWERED_BY_MODE`],
+/// so the record says nobody was asked.
+pub fn record_answered_by(ctx: &Context, answer: Option<String>, by_mode: bool) {
     let Some(log) = person_session(ctx) else {
         return;
     };
     // The front end's own name for itself. Read here rather than passed in,
     // because it is a property of whoever filled the seam, and a caller that
     // had to remember to thread it through is one that will eventually forget.
-    let by = ctx
-        .service::<crate::seams::UserQuestionsSvc>()
-        .map(|q| q.describe())
-        .unwrap_or_else(|| "nobody".to_string());
+    let by = if by_mode {
+        crate::seams::ANSWERED_BY_MODE.to_string()
+    } else {
+        ctx.service::<crate::seams::UserQuestionsSvc>()
+            .map(|q| q.describe())
+            .unwrap_or_else(|| "nobody".to_string())
+    };
     crate::session::commit(
         &scoped(ctx),
         &log,

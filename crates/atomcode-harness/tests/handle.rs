@@ -382,6 +382,76 @@ async fn a_risky_call_is_asked_about_with_the_bytes_that_will_run() {
     );
 }
 
+/// In auto mode nobody is asked: no approval goes out to the driver, the call
+/// runs, and the log still has the exchange — answered by
+/// [`ANSWERED_BY_MODE`], read from the mode itself, so a screen can tell it
+/// from a person's choice and no answer can claim it.
+///
+/// [`ANSWERED_BY_MODE`]: atomcode_harness::seams::ANSWERED_BY_MODE
+#[tokio::test]
+async fn in_auto_mode_nobody_is_asked_and_the_log_says_so() {
+    let dir = scratch("by-mode");
+    let script = replay(
+        r#"{ text = "Writing.", calls = [ { name = "write_file", args = { file_path = "out.txt", content = "written" } } ] },
+           { text = "Done." }"#,
+    );
+    let app = start(tree(&dir, &script, &[])).await;
+    let modes = atomcode_harness::seams::Modes {
+        plan: Default::default(),
+        accept_edits: Default::default(),
+        auto: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+    };
+    let _ = app
+        .context()
+        .provide::<atomcode_harness::seams::ModesSvc>(std::sync::Arc::new(modes));
+    let mut handle = handle_of(&app);
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "write it".into(),
+            images: Vec::new(),
+        })
+        .unwrap();
+    let seen = drain_turn(&mut handle).await;
+    assert!(
+        !seen.iter().any(|e| matches!(e, AgentEvent::Request { .. })),
+        "nobody was asked: {seen:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("out.txt")).unwrap(),
+        "written"
+    );
+    let logged: Vec<_> = app
+        .context()
+        .only_session()
+        .unwrap()
+        .events()
+        .into_iter()
+        .map(|e| e.event)
+        .collect();
+    let asked = logged
+        .iter()
+        .filter(|e| matches!(e, atomcode_harness::session::SessionEvent::Asked { .. }))
+        .count();
+    let answered: Vec<_> = logged
+        .iter()
+        .filter_map(|e| match e {
+            atomcode_harness::session::SessionEvent::Answered { answer, by, .. } => {
+                Some((answer.clone(), by.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(asked, 1, "{logged:?}");
+    assert_eq!(
+        answered,
+        vec![(
+            Some(atomcode_harness::seams::ANSWER_ALLOW.to_string()),
+            atomcode_harness::seams::ANSWERED_BY_MODE.to_string()
+        )]
+    );
+}
+
 #[tokio::test]
 async fn a_refused_call_does_not_run_and_the_model_is_told() {
     let dir = scratch("deny");
