@@ -147,6 +147,25 @@ struct Live {
     /// 交给它的那件事的第一行。日志里还没有它说的第一句话时(刚起、还没落盘),
     /// 面板那一列靠它认,而不是一串 id。
     task: Option<String>,
+    /// 上一次描述它时的样子,和那时日志有几条、它在什么状态。见 [`describe`]。
+    described: Arc<Mutex<Option<Described>>>,
+}
+
+/// 一个后台会话上一次被描述成的样子。
+///
+/// 列表在有会话在跑时每秒报一次,而描述一个会话要把它整份日志拷出来读 —— 一次审查
+/// 的日志带着工具输出,动辄几 MB,每秒乘以槽位数。日志条数和状态都没变,上次那份
+/// 就还是对的,只有在跑的那个用时要量到此刻。
+#[derive(Clone)]
+struct Described {
+    len: usize,
+    state: BackgroundState,
+    /// 在等的那个请求:换了一个问题而日志一条没多(不是每种问法都先记一条),
+    /// 那一行要说的话也换了。
+    pending: Option<u64>,
+    session: BackgroundSession,
+    /// 日志第一条的时刻:在跑的用时从它量起。
+    first_at: Option<u64>,
 }
 
 /// 一个替别的对话干活的后台会话,在盘上怎么记。
@@ -452,6 +471,7 @@ fn attach(
             mark: Arc::new(Mutex::new(Mark::Own)),
             name: None,
             task: None,
+            described: Arc::new(Mutex::new(None)),
         },
         Pumps {
             id,
@@ -512,6 +532,24 @@ fn in_turn(live: &Live) -> bool {
 /// 多久(它可能先空着,也可能中途在等一个回答)。
 fn log_of(live: &Live) -> Vec<LoggedEvent> {
     log_of_control(&live.control)
+}
+
+/// 它在等的那个请求的 id。
+fn pending_id(live: &Live) -> Option<u64> {
+    match live.track.lock().expect("track poisoned").pending.as_ref() {
+        Some(AgentEvent::Request { id, .. }) => Some(*id),
+        _ => None,
+    }
+}
+
+/// 这个会话的日志有几条 —— 不拷日志。
+fn log_len(live: &Live) -> usize {
+    let session = live.control.session_id();
+    live.control
+        .front_end()
+        .app()
+        .and_then(|app| Feed::find(&app, &session))
+        .map_or(0, |agent| agent.session().len())
 }
 
 fn log_of_control(control: &RuntimeControl) -> Vec<LoggedEvent> {
@@ -627,7 +665,48 @@ fn stats_of(log: &[LoggedEvent], running_at: Option<u64>) -> Option<BackgroundSt
 
 fn describe(live: &Live) -> BackgroundSession {
     let state = state_of(live);
+    let len = log_len(live);
+    let running = matches!(state, BackgroundState::Running | BackgroundState::Waiting);
+    let pending = pending_id(live);
+    let cached = live.described.lock().expect("described poisoned").clone();
+    if let Some(cached) =
+        cached.filter(|c| c.len == len && c.state == state && c.pending == pending)
+    {
+        let mut session = cached.session;
+        if let (true, Some(first)) = (running, cached.first_at) {
+            let elapsed_ms = now_ms().saturating_sub(first);
+            match session.stats.as_mut() {
+                Some(stats) => stats.elapsed_ms = elapsed_ms,
+                None if elapsed_ms > 0 => {
+                    session.stats = Some(BackgroundStats {
+                        elapsed_ms,
+                        ..BackgroundStats::default()
+                    })
+                }
+                None => {}
+            }
+        }
+        return session;
+    }
     let log = log_of(live);
+    let session = describe_from_log(live, state, &log);
+    *live.described.lock().expect("described poisoned") = Some(Described {
+        // What was read, not what `len` said a moment ago: a fact that landed in
+        // between is in this description, and the next tick must not skip it.
+        len: log.len(),
+        state,
+        pending,
+        session: session.clone(),
+        first_at: log.first().map(|first| first.at),
+    });
+    session
+}
+
+fn describe_from_log(
+    live: &Live,
+    state: BackgroundState,
+    log: &[LoggedEvent],
+) -> BackgroundSession {
     let title = log.iter().rev().find_map(|logged| match &logged.event {
         SessionEvent::Titled { title, .. } if !title.trim().is_empty() => Some(title.clone()),
         _ => None,
