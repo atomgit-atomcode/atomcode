@@ -1822,8 +1822,22 @@ impl Host {
     /// Not "is a row lit": the pointer lights a row by being over it, and a
     /// panel that takes the keyboard because a mouse crossed it would eat what
     /// the person is typing. Only `Tab` sets this.
+    ///
+    /// And only while the panel still has rows to point at. Its rows can go
+    /// out from under it — a member stopped, a background review finished while
+    /// the person was on its row — and a keyboard left with a panel nobody draws
+    /// swallowed every character typed after it, until an Esc nobody knew to
+    /// press. The panel's own legend already asks the same question. The hold
+    /// is given up rather than only ignored: a panel that comes back later —
+    /// the next background task — must not come back holding the keyboard
+    /// nobody handed it.
     pub fn team_focused(&self) -> bool {
-        self.moment.read().expect("moment poisoned").team_keyboard
+        let mut m = self.moment.write().expect("moment poisoned");
+        if m.team_keyboard && crate::modules::team::targets(&m).is_empty() {
+            m.team_keyboard = false;
+            m.team_cursor = None;
+        }
+        m.team_keyboard
     }
 
     /// Whether plain Tab cycles the execution mode
@@ -14842,6 +14856,37 @@ mod tests {
             stats: None,
             origin: None,
         }])
+    }
+
+    /// The keyboard does not stay with a team panel whose rows went: the
+    /// background review the person was pointing at finished. Typing goes back
+    /// to the composer, and the next panel to appear does not take it.
+    #[test]
+    fn the_keyboard_comes_back_when_the_panel_s_rows_go() {
+        let h = host();
+        let review = |state| {
+            crate::bg::BgView::from_host(vec![atomcode_host_api::BackgroundSession {
+                session: "review".into(),
+                title: Some("code-review".into()),
+                state,
+                created_at: 1,
+                last: None,
+                stats: None,
+                origin: Some("lead".into()),
+            }])
+        };
+        use atomcode_host_api::BackgroundState as S;
+        h.moment.write().unwrap().lead = "lead".into();
+        h.show_bg(review(S::Running));
+        assert!(h.focus_team());
+        assert!(h.team_focused());
+        h.show_bg(review(S::Done));
+        assert!(!h.team_focused(), "nothing left to point at");
+        h.show_bg(review(S::Running));
+        assert!(
+            !h.team_focused(),
+            "a panel that came back was not handed it"
+        );
     }
 
     /// A press on a background row of the team panel opens `/bg` with the
