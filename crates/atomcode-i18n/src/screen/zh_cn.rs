@@ -231,6 +231,9 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("请求失败:{reason} —— {seconds} 秒后重试({attempt}/{max})").into()
         }
         Msg::InjectedFromBackground => "来自后台".into(),
+        Msg::InjectedFromLead => "来自 main".into(),
+        Msg::GoalActiveBadge => "/goal 运行中".into(),
+        Msg::GoalPausedBadge => "/goal 已暂停".into(),
         Msg::TranscriptDropped { through } => {
             format!("到 #{through} 为止的工具结果没有再发给模型").into()
         }

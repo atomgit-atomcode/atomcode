@@ -405,6 +405,22 @@ impl View for Input {
             El::text(crate::el::captioned_rule(&keys, w as usize, muted, muted))
         } else {
             let history = history_caption(vp.moment);
+            // An active goal owns the right shoulder while it runs. Keep the
+            // label fixed and short: the condition is already the turn's input
+            // line, while this badge answers only whether `/goal` is still in
+            // control. When it goes away, the person's session name returns.
+            let goal = vp
+                .moment
+                .autonomy
+                .as_ref()
+                .filter(|running| running.kind == "goal")
+                .map(|running| {
+                    if running.paused.is_some() {
+                        ("/goal paused", theme::fg(Role::Warning))
+                    } else {
+                        ("/goal active", theme::fg(Role::Accent))
+                    }
+                });
             // Only a name the PERSON chose (`/rename`) earns the pill; an auto
             // first-prompt guess would otherwise pin a chip to the composer for a
             // name nobody asked for. The window title still carries any name.
@@ -413,20 +429,24 @@ impl View for Input {
                 .title
                 .as_deref()
                 .filter(|s| !s.is_empty() && vp.moment.title_user_set);
+            let right = goal.map(|(text, _)| text).or(name);
+            let right_style = goal
+                .map(|(_, style)| style)
+                .unwrap_or_else(|| theme::fg(Role::Border).reverse());
             // The clipboard's offer used to take this shoulder for the few
             // seconds it was up. It is the tip row's line now, one row above the
             // box (`modules::tip`): beside the field it read as chrome about the
             // box, and it pushed the session's name off to say it.
-            if history.is_none() && name.is_none() {
+            if history.is_none() && right.is_none() {
                 rule()
             } else {
                 El::text(crate::el::flanked_rule(
                     history.as_deref(),
-                    name,
+                    right,
                     w as usize,
                     edge,
                     muted,
-                    theme::fg(Role::Border).reverse(),
+                    right_style,
                 ))
             }
         };
@@ -659,6 +679,73 @@ mod tests {
             12,
             "still a full-width rule: {narrow:?}"
         );
+    }
+
+    /// A running goal needs one stable glanceable fact, not its condition and
+    /// internal round counter repeated in the footer. It temporarily owns the
+    /// upper-right shoulder, in the accent colour the slash commands use; when
+    /// the goal ends, the person's session name comes back.
+    #[test]
+    fn an_active_goal_is_a_cyan_badge_on_the_composers_right_shoulder() {
+        let mut m = Moment {
+            title: Some("修解析器".into()),
+            title_user_set: true,
+            autonomy: Some(atomcode_host_api::Running {
+                kind: "goal".into(),
+                what: "分析当前项目死代码".into(),
+                round: 0,
+                of: Some(240),
+                elapsed_secs: 14,
+                paused: None,
+            }),
+            ..Moment::default()
+        };
+        let rendered = Input::render(&State::default(), &Viewport::new(Rect::sized(60, 3), &m));
+        let top = &rendered[0];
+        let plain = top.plain();
+        assert!(plain.contains("/goal active"), "{plain:?}");
+        assert!(!plain.contains("分析当前项目死代码"), "{plain:?}");
+        assert!(!plain.contains("0/240"), "{plain:?}");
+        assert!(
+            !plain.contains("修解析器"),
+            "goal owns the shoulder: {plain:?}"
+        );
+        let badge = top
+            .spans
+            .iter()
+            .find(|span| span.text.contains("/goal active"))
+            .expect("goal badge");
+        assert_eq!(badge.style.fg, theme::fg(Role::Accent).fg, "{top:?}");
+
+        m.autonomy = None;
+        let after = draw(&State::default(), &m, 60, 3);
+        assert!(after[0].contains("修解析器"), "{after:?}");
+        assert!(!after[0].contains("/goal"), "{after:?}");
+    }
+
+    #[test]
+    fn a_paused_goal_never_claims_to_be_active() {
+        let m = Moment {
+            autonomy: Some(atomcode_host_api::Running {
+                kind: "goal".into(),
+                what: "ship it".into(),
+                round: 2,
+                of: Some(12),
+                elapsed_secs: 5,
+                paused: Some("waiting".into()),
+            }),
+            ..Moment::default()
+        };
+        let rendered = Input::render(&State::default(), &Viewport::new(Rect::sized(40, 3), &m));
+        let top = &rendered[0];
+        assert!(top.plain().contains("/goal paused"), "{top:?}");
+        assert!(!top.plain().contains("active"), "{top:?}");
+        let badge = top
+            .spans
+            .iter()
+            .find(|span| span.text.contains("/goal paused"))
+            .expect("paused badge");
+        assert_eq!(badge.style.fg, theme::fg(Role::Warning).fg, "{top:?}");
     }
 
     /// The clipboard's offer is the tip row's, one row above this one — a rule

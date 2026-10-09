@@ -392,6 +392,11 @@ pub enum Msg<'a> {
     /// The chip on an injected block: another session — one this tree has never
     /// held — reporting back (`modules/transcript.rs`).
     InjectedFromBackground,
+    /// Work or steering the lead sent into a member's conversation.
+    InjectedFromLead,
+    /// Compact autonomous-goal state on the composer's right shoulder.
+    GoalActiveBadge,
+    GoalPausedBadge,
     TranscriptDropped {
         through: u64,
     },

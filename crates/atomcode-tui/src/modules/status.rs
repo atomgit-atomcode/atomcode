@@ -209,17 +209,20 @@ impl View for Status {
         if let Some((text, _)) = &activity {
             reserved += width::str_width(text) + sep_w;
         }
-        // A session working towards something on its own says so for as long as
-        // it is. On this row rather than one of its own: a line that is empty
-        // whenever nothing is running costs a row of the conversation to say
-        // nothing, and what this is for is the glance — "it is still going, it
-        // is on round 4". `/autonomy` answers the same thing when asked; this
-        // is the part that does not have to be asked.
+        // A repeating `/loop` still reports here. `/goal` deliberately does
+        // not: its compact `/goal active` badge lives on the composer's upper
+        // right shoulder, where autonomous goal state is visible without
+        // squeezing model, cwd, context and cache out of this row.
         //
         // Reserved beside the activity indicator and for the same reason: it
         // sits outside the fitted group, so the group has to degrade to leave
         // room for it rather than shove it off the edge.
-        let autonomy = vp.moment.autonomy.as_ref().map(autonomy_badge);
+        let autonomy = vp
+            .moment
+            .autonomy
+            .as_ref()
+            .filter(|running| running.kind != "goal")
+            .map(autonomy_badge);
         if let Some(text) = &autonomy {
             reserved += width::str_width(text) + sep_w;
         }
@@ -1271,18 +1274,11 @@ mod tests {
         );
     }
 
-    /// A session running on its own says so without being asked.
-    ///
-    /// The gap this closes: the fact was already kept (`Moment::autonomy`, fed
-    /// by `HostEvent::Autonomy` every round) and **nothing drew it** — a person
-    /// could only find out by typing `/autonomy`, which is the one thing you
-    /// cannot do while wondering whether it is still going.
-    ///
-    /// Both halves are the criterion. It costs nothing when nothing is running:
-    /// a badge that took a slot on every idle screen would be a permanent
-    /// reminder of a thing that is not happening.
+    /// Goal state moved to the composer's upper-right badge; it must not keep
+    /// consuming footer room as a second, more verbose copy. `/loop` has no
+    /// composer badge and therefore keeps its existing footer report.
     #[test]
-    fn a_session_running_on_its_own_says_so_and_costs_nothing_when_it_is_not() {
+    fn goal_leaves_the_footer_while_loop_still_reports_there() {
         let st = State::default();
         let mut m = Moment::default();
 
@@ -1298,8 +1294,11 @@ mod tests {
             paused: None,
         });
         let running = draw::<Status>(&st, 80, &m);
-        assert!(running.contains("目标"), "which kind: {running:?}");
-        assert!(running.contains("4/12"), "and how far: {running:?}");
+        assert!(
+            !running.contains("目标"),
+            "goal leaked into footer: {running:?}"
+        );
+        assert!(!running.contains("4/12"), "goal rounds leaked: {running:?}");
 
         // Registered but not running is the state somebody would otherwise sit
         // and wait through, so it is said.

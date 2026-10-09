@@ -6655,7 +6655,7 @@ impl Tui {
                             count: images.len(),
                         }));
                     }
-                    self.spawn_command(&text, false, with_answer);
+                    self.spawn_command(&text, false, with_answer, false);
                     return false;
                 }
                 // One command. Whether it starts a turn or folds into the one
@@ -8385,7 +8385,7 @@ impl Tui {
     /// On its own task: a command may reconfigure the tree or call a model, and
     /// the loop must keep painting and keep accepting keys while it does.
     fn run_command(&self, line: &str) {
-        self.spawn_command(line, false, false);
+        self.spawn_command(line, false, false, false);
     }
 
     /// [`Tui::run_command`] for a command the person typed (or picked from the
@@ -8400,12 +8400,23 @@ impl Tui {
     /// else's words. Between turns nothing else writes, so it is echoed at
     /// once, and a slow command shows it was taken.
     fn run_typed_command(&self, line: &str) {
+        // A successful `/goal <condition>` immediately opens a real turn whose
+        // first UserMessage is that same condition. Echoing the slash command as
+        // well leaves two full-width input bars for one gesture. Hold this one
+        // echo until the command answers: on success the committed UserMessage
+        // is the durable, replayable copy; on refusal the command still has to
+        // be shown so the error has a visible question above it.
+        let goal_starts_turn = starts_goal_turn(line);
         if self.turn_running() {
-            self.spawn_command(line, false, true);
+            self.spawn_command(line, false, true, goal_starts_turn);
             return;
         }
-        self.host.echo_command(line);
-        self.run_command(line);
+        if goal_starts_turn {
+            self.spawn_command(line, false, true, true);
+        } else {
+            self.host.echo_command(line);
+            self.run_command(line);
+        }
     }
 
     /// Whether a turn is running on this screen right now.
@@ -8419,14 +8430,14 @@ impl Tui {
     /// news. A refusal still says itself: there the person would otherwise
     /// be left thinking the change had landed.
     fn run_command_quietly(&self, line: &str) {
-        self.spawn_command(line, true, false);
+        self.spawn_command(line, true, false, false);
     }
 
     /// The one spawn/dispatch/deliver body both callers share; `quiet_success`
     /// folds a success's `Said` into `Quiet` so the success stays off the
     /// screen while a refusal keeps talking. `echo` puts the line itself in the
     /// conversation just before what it said ([`Tui::run_typed_command`]).
-    fn spawn_command(&self, line: &str, quiet_success: bool, echo: bool) {
+    fn spawn_command(&self, line: &str, quiet_success: bool, echo: bool, goal_starts_turn: bool) {
         let (Some(ctx), Some(keys)) = (
             self.ctx.lock().expect("ctx poisoned").clone(),
             self.wake.lock().expect("wake poisoned").clone(),
@@ -8441,7 +8452,7 @@ impl Tui {
                 crate::command::Outcome::Said(_) if quiet_success => crate::command::Outcome::Quiet,
                 other => other,
             };
-            if echo {
+            if echo && !(goal_starts_turn && matches!(&outcome, crate::command::Outcome::Said(_))) {
                 host.echo_command(&line);
             }
             deliver(&host, &keys, outcome);
@@ -8589,6 +8600,42 @@ fn no_clipboard_picture(otherwise: Msg<'static>) -> Msg<'static> {
     } else {
         otherwise
     }
+}
+
+/// Whether a typed command will become `/goal`'s first real user turn.
+///
+/// Control and query forms answer in place and therefore keep their ordinary
+/// command echo. Only a condition opens the duplicate `UserMessage` bar.
+fn starts_goal_turn(line: &str) -> bool {
+    let line = line.trim();
+    let Some(body) = line.strip_prefix('/') else {
+        return false;
+    };
+    let (name, args) = body
+        .split_once(char::is_whitespace)
+        .map(|(name, args)| (name, args.trim()))
+        .unwrap_or((body, ""));
+    if name != "goal" || args.is_empty() {
+        return false;
+    }
+    !matches!(
+        args,
+        "stop"
+            | "off"
+            | "clear"
+            | "cancel"
+            | "reset"
+            | "none"
+            | "pause"
+            | "status"
+            | "state"
+            | "progress"
+            | "状态"
+            | "help"
+            | "?"
+            | "-h"
+            | "--help"
+    )
 }
 
 fn deliver(
@@ -11873,6 +11920,36 @@ mod midturn_command_tests {
         let before = kinds(&host).len();
         tui.run_typed_command("/no-such-command");
         assert_eq!(&kinds(&host)[before..], &["user"]);
+        answered(&mut woken).await;
+        assert_eq!(&kinds(&host)[before..], &["user", "command"]);
+    }
+
+    #[test]
+    fn only_a_new_goal_condition_opens_the_duplicate_turn() {
+        assert!(starts_goal_turn("/goal 分析当前项目死代码"));
+        assert!(starts_goal_turn("  /goal   ship it  "));
+        for command in [
+            "/goal",
+            "/goal status",
+            "/goal 状态",
+            "/goal pause",
+            "/goal stop",
+            "/goal help",
+            "/loop ship it",
+        ] {
+            assert!(!starts_goal_turn(command), "misclassified {command:?}");
+        }
+    }
+
+    /// Holding the echo must not make a failed goal command disappear. There
+    /// is no goal capability in this deliberately empty command tree, so the
+    /// refused answer must put both the command and its reason down together.
+    #[tokio::test]
+    async fn a_goal_that_did_not_start_keeps_its_command_echo() {
+        let (host, tui, mut woken) = screen();
+        let before = kinds(&host).len();
+        tui.run_typed_command("/goal ship it");
+        assert_eq!(kinds(&host).len(), before, "echo waits for the answer");
         answered(&mut woken).await;
         assert_eq!(&kinds(&host)[before..], &["user", "command"]);
     }
