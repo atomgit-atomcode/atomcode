@@ -1704,6 +1704,17 @@ async fn run() -> Result<i32> {
             match atomcode_tui::theme::forced(
                 screen_theme(cli.theme.as_deref(), ui_theme).as_deref(),
             ) {
+                // The question is written to stdout and the answer read from the
+                // terminal: redirected, the terminal never hears it, and the
+                // report would say "did not answer" about a terminal that would
+                // have. Say so instead of printing a wrong report.
+                Ok(None) if !std::io::IsTerminal::is_terminal(&std::io::stdout()) => {
+                    eprintln!(
+                        "--probe-terminal asks the terminal itself, so its output cannot be \
+                         redirected. Run it in the terminal and copy what it prints."
+                    );
+                    2
+                }
                 Ok(theme) => {
                     print!("{}", atomcode_tui::surface::probe_report(theme));
                     0

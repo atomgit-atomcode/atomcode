@@ -897,9 +897,50 @@ fn exact(rgb: Rgb, colors: Colors, p: &Palette) -> Color {
 ///    grey) lands here directly;
 /// 4. the index that reads best, where nothing can (a mid-tone ground).
 fn legible_index(target: Rgb, bg: Rgb, need: f32) -> Color {
+    // Every role is resolved per span, per frame (`ansi::sgr`), and a search
+    // over 240 indices is ~5µs where a slot pick is ~0.2µs. The answer is a
+    // pure function of three small values, and a screen asks the same handful
+    // over and over, so it is remembered.
+    thread_local! {
+        static SEEN: std::cell::RefCell<std::collections::HashMap<(Rgb, Rgb, u32), Color>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    let key = (target, bg, need.to_bits());
+    if let Some(hit) = SEEN.with(|seen| seen.borrow().get(&key).copied()) {
+        return hit;
+    }
+    let found = search_legible_index(target, bg, need);
+    SEEN.with(|seen| {
+        let mut seen = seen.borrow_mut();
+        // A palette change brings new keys; a few roles on a few grounds is
+        // all a session produces, so this bound is only a backstop.
+        if seen.len() > 1024 {
+            seen.clear();
+        }
+        seen.insert(key, found);
+    });
+    found
+}
+
+fn search_legible_index(target: Rgb, bg: Rgb, need: f32) -> Color {
+    // Luminance and hue come from a table rather than raising 240 colours to
+    // the 2.4th power on every miss.
+    let table = standard_indices();
+    let ground = luminance(bg);
+    let target_hue = hue(target);
     let near = |n: u8| distance(cube(n), target);
-    let reads = |n: u8| contrast(cube(n), bg);
-    let same_hue = |n: u8| match (hue(target), hue(cube(n))) {
+    let reads = |n: u8| {
+        let (hi, lo) = {
+            let x = table[n as usize].0;
+            if x > ground {
+                (x, ground)
+            } else {
+                (ground, x)
+            }
+        };
+        (hi + 0.05) / (lo + 0.05)
+    };
+    let same_hue = |n: u8| match (target_hue, table[n as usize].1) {
         (Some(a), Some(b)) => {
             let d = (a - b).abs();
             d.min(360.0 - d) <= HUE_KEPT
@@ -923,6 +964,13 @@ fn legible_index(target: Rgb, bg: Rgb, need: f32) -> Color {
         .or_else(|| all().max_by(|&a, &b| reads(a).total_cmp(&reads(b))))
         .unwrap_or(231);
     Color::Ansi(n)
+}
+
+/// Luminance and hue of each standard index, computed once: the indices are
+/// the standard's, not a scheme's, so they never change.
+fn standard_indices() -> &'static [(f32, Option<f32>); 256] {
+    static TABLE: std::sync::OnceLock<[(f32, Option<f32>); 256]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| std::array::from_fn(|n| (luminance(cube(n as u8)), hue(cube(n as u8)))))
 }
 
 /// WCAG AA for body text: the least a role may fall back to for its hue.
