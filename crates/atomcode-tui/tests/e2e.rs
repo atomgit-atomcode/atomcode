@@ -7203,6 +7203,40 @@ impl atomcode_tui::shell::Shell for Ran {
     }
 }
 
+/// 回合还在跑时跑一条 `!`:输出照常画,但不收 `✻ Done` 那一行 —— 回合结束行
+/// 的词里本来就有 `Done`,半路冒出一行会读成「这一轮答完了」,而模型还在说。
+#[tokio::test]
+async fn a_bang_run_mid_turn_does_not_close_like_a_turn() {
+    let dir = scratch("bang-mid-turn");
+    let shell = Arc::new(Ran::default());
+    let (s, _sent) = start_with_shell(
+        tree(&dir, &replay(r#"{ text = "ok" }"#), &[SLOW_PRE_STEP]),
+        shell.clone(),
+    )
+    .await;
+    let _task = s.open().await;
+
+    s.term.type_line("SLOW-b7q");
+    held_at_pre_step("SLOW-b7q").await;
+    s.term.type_line("!echo hi");
+    let mut seen = String::new();
+    for _ in 0..60 {
+        seen = transcript(&s);
+        if seen.contains("OUT-OF[echo hi]") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(seen.contains("OUT-OF[echo hi]"), "输出照常画:\n{seen}");
+    // 回合还被拦在 PreStep(两秒),它自己的结束行还没来。
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let seen = transcript(&s);
+    assert!(
+        !seen.contains("✻ Done"),
+        "回合没完,`!` 不收一行像回合结束的:\n{seen}"
+    );
+}
+
 /// `!cmd` 在本机跑,结果留在屏上,并跟**下一条**消息一起给模型。
 ///
 /// 三半都要钉,而第三半是最容易漏的:

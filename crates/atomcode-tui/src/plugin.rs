@@ -4299,17 +4299,31 @@ impl Tui {
                     }),
                 );
                 w.settle(output);
-                // 收尾一行,和回合结束那行同一个样子:`✻ Done 10:38 · 12.4s`。
+            }
+            // 收尾一行,和回合结束那行同一个样子:`✻ Done 10:38 · 12.4s`。
+            //
+            // 只在没有回合在跑时画。`!` 在模型回答到一半时也能跑,而回合结束行
+            // 的词里本来就有 `Done`:半路冒出一行 `✻ Done …`,读起来就是「这一轮
+            // 答完了」,而模型还在说。那时收尾的是那个回合自己的那一行。
+            let in_turn = {
+                let m = host.moment.read().expect("moment poisoned");
+                m.turn_open || m.activity != crate::moment::Activity::Idle
+            };
+            if !in_turn {
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_millis() as u64);
-                w.emit(
-                    crate::block::Coord::default(),
-                    Arc::new(crate::content::ShellDone {
-                        ended_at: crate::content::clock_of(now_ms),
-                        elapsed_ms: began.elapsed().as_millis() as u64,
-                    }),
-                );
+                host.stream
+                    .write()
+                    .expect("stream poisoned")
+                    .writer("commands")
+                    .emit(
+                        crate::block::Coord::default(),
+                        Arc::new(crate::content::ShellDone {
+                            ended_at: crate::content::clock_of(now_ms),
+                            elapsed_ms: began.elapsed().as_millis() as u64,
+                        }),
+                    );
             }
             // 模型那一份用原始输出,不带屏幕上那句评语。攒着,跟下一条
             // 消息一起过去。
