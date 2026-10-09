@@ -721,6 +721,27 @@ pub struct Allowance {
     pub spent: Option<crate::rate_limit::AccountUsage>,
     /// 问不到的时候,为什么。
     pub unavailable: Option<String>,
+    /// `spent` 没取到的时候,为什么——和 `unavailable` 分开,因为两者各自失败:
+    /// 窗口答上来了、统计超时,是常见的那一种。空且 `spent` 也空,才是来源本来
+    /// 就不报统计。
+    pub spent_unavailable: Option<String>,
+}
+
+/// 统计取回来了就是它;没取回来,说为什么。
+///
+/// `Ok(None)` 是来源本来就不报统计,那不是失败,两头都空。超时和请求失败
+/// 曾经一起折成 `None`,屏幕就把它们画成「这个宿主不记账」。
+fn spent_or_why(
+    asked: Result<
+        Result<Option<crate::rate_limit::AccountUsage>, String>,
+        tokio::time::error::Elapsed,
+    >,
+) -> (Option<crate::rate_limit::AccountUsage>, Option<String>) {
+    match asked {
+        Ok(Ok(spent)) => (spent, None),
+        Ok(Err(error)) => (None, Some(error)),
+        Err(elapsed) => (None, Some(elapsed.to_string())),
+    }
 }
 
 /// 问到了就是那些窗口;没问到是空的,而空由 [`why_not`] 解释。
@@ -5019,6 +5040,12 @@ fn spawn_runtime_owner_with_optional_agent(
                                 }));
                                 return;
                             }
+                            // One budget for the spend too, though it is the
+                            // heavy one: the three come back as one answer, so
+                            // a longer wait for the figures would hold the
+                            // allowance — which a person opens to see what is
+                            // left, and which does not draw them — behind it.
+                            // A spend that misses the budget says so instead.
                             let (windows, plan, spent) = tokio::join!(
                                 tokio::time::timeout(budget, source.fetch_windows()),
                                 tokio::time::timeout(budget, source.fetch_plan()),
@@ -5028,16 +5055,21 @@ fn spawn_runtime_owner_with_optional_agent(
                             // the service would not say is not a reason to draw
                             // no windows.
                             let plan = plan.ok().and_then(|fetched| fetched.ok()).flatten();
-                            let spent = spent.ok().and_then(|fetched| fetched.ok()).flatten();
+                            let (spent, spent_unavailable) = spent_or_why(spent);
+                            if let Some(why) = &spent_unavailable {
+                                tracing::warn!(%why, "account spend did not come back");
+                            }
                             let _ = done.send(Ok(Allowance {
                                 windows: windows_or_nothing(&windows),
                                 plan,
                                 spent,
                                 // The windows are the answer this question is
-                                // about. A plan or a spend that did not come
-                                // back leaves its own field empty and says
-                                // nothing more — those two are extra.
+                                // about; a plan that did not come back leaves
+                                // its field empty and says nothing more. A
+                                // spend that did not come back says why, or
+                                // the page reads it as a host that keeps none.
                                 unavailable: why_not(&windows),
+                                spent_unavailable,
                             }));
                         });
                     }
@@ -11816,6 +11848,41 @@ mod tests {
         let empty: Arc<dyn crate::rate_limit::RateLimitWindowSource> =
             Arc::new(FakeQuotaSource { result: Ok(vec![]) });
         assert_eq!(resolve_goal_round_cap(Some(&empty), 777).await, 777);
+    }
+
+    /// 统计没取到要说为什么,而「来源本来就不报统计」不是没取到。
+    ///
+    /// 现场(2026-10-09,Win10):超时和请求失败都被折成 `spent: None`,屏幕于是写
+    /// 「这个宿主不记账」——说的是事实的反面,也什么都没留下可查。
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn spend_that_did_not_come_back_says_why() {
+        let usage = crate::rate_limit::AccountUsage {
+            from: "2026-10-01".into(),
+            to: "2026-10-09".into(),
+            models: Vec::new(),
+            daily: Vec::new(),
+            series: Vec::new(),
+            total_tokens: 1,
+            total_requests: 1,
+        };
+        let (spent, why) = spent_or_why(Ok(Ok(Some(usage))));
+        assert!(spent.is_some() && why.is_none());
+
+        // A source that reports no spend at all: nothing failed, nothing to say.
+        assert_eq!(spent_or_why(Ok(Ok(None))).1, None);
+
+        let (spent, why) = spent_or_why(Ok(Err("GET usage failed".into())));
+        assert!(spent.is_none());
+        assert_eq!(why.as_deref(), Some("GET usage failed"));
+
+        let elapsed = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            std::future::pending::<Result<Option<crate::rate_limit::AccountUsage>, String>>(),
+        )
+        .await;
+        let (spent, why) = spent_or_why(elapsed);
+        assert!(spent.is_none());
+        assert!(why.is_some(), "a timeout is a reason too");
     }
 
     #[test]

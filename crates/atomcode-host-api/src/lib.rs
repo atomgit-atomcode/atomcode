@@ -557,6 +557,13 @@ pub enum HostReply {
         /// What went through, when the host meters it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stats: Option<UsageStats>,
+        /// Why `stats` is absent from a host that does meter it: the figures
+        /// were asked for and did not come back. `unavailable` is about the
+        /// windows only, and the two fail apart — a timed-out `stats` with no
+        /// reason reads as "this host keeps no account", the same lie in
+        /// another column.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stats_unavailable: Option<String>,
     },
     /// The files the session was configured from, in the host's own grouping.
     Sources {
@@ -1925,6 +1932,7 @@ mod tests {
                     total_tokens: 221_100_000,
                     total_requests: 1604,
                 }),
+                stats_unavailable: Some("deadline has elapsed".into()),
             },
             HostReply::Sources {
                 groups: vec![SourceGroup {

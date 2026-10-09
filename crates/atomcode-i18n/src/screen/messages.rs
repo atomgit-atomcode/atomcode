@@ -1287,6 +1287,11 @@ pub enum Msg<'a> {
         n: usize,
     },
     StatsNotKept,
+    /// The figures were asked for and did not come back. **Not** the same
+    /// sentence as [`Msg::StatsNotKept`], which is a host that keeps none.
+    StatsUnknown {
+        why: &'a str,
+    },
 
     // ── the account's figures (`modules/settings.rs`) ──
     StatsNoDaily,

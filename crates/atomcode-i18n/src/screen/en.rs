@@ -830,6 +830,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::McpTallyOff { n } => format!("{n} not connected").into(),
         Msg::McpTallyDisabled { n } => format!("{n} disabled").into(),
         Msg::StatsNotKept => "this host keeps no account".into(),
+        Msg::StatsUnknown { why } => format!("Could not fetch the figures: {why}").into(),
 
         // ── the account's figures (`modules/settings.rs`) ──
         Msg::StatsNoDaily => "there is no daily record".into(),

@@ -772,6 +772,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::McpTallyOff { n } => format!("{n} 个没连").into(),
         Msg::McpTallyDisabled { n } => format!("{n} 个已停用").into(),
         Msg::StatsNotKept => "这个宿主不记账".into(),
+        Msg::StatsUnknown { why } => format!("统计没取到：{why}").into(),
 
         // ── the account's figures (`modules/settings.rs`) ──
         Msg::StatsNoDaily => "没有按天的记录".into(),

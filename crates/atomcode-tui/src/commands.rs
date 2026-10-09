@@ -3589,6 +3589,7 @@ mod tests {
                 HostCommand::Usage { .. } => HostReply::Usage {
                     windows: Vec::new(),
                     unavailable: None,
+                    stats_unavailable: None,
                     plan: Some(atomcode_host_api::Entitlement {
                         plan: "CodingPlan Pro".into(),
                         active: true,

@@ -528,6 +528,9 @@ pub struct UsagePage {
     /// What went through — per model and per day. `None` when the host does not
     /// count it.
     pub stats: Option<atomcode_host_api::UsageStats>,
+    /// Why `stats` is `None` when the host does count it but did not answer this
+    /// time. Without it a timeout reads as "this host keeps no account".
+    pub stats_unavailable: Option<String>,
 }
 
 /// What the Status page draws: where this session came from and what it runs

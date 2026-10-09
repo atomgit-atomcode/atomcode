@@ -4990,7 +4990,7 @@ impl Tui {
                 }),
                 _ => None,
             };
-            let (windows, plan, stats, unavailable) = match control
+            let (windows, plan, stats, unavailable, stats_unavailable) = match control
                 .call(HostCommand::Usage {
                     session,
                     windows_only: false,
@@ -5002,12 +5002,19 @@ impl Tui {
                     plan,
                     stats,
                     unavailable,
-                }) => (windows, plan, stats, unavailable),
+                    stats_unavailable,
+                }) => (windows, plan, stats, unavailable, stats_unavailable),
                 // The host itself would not answer. That is not "nothing to
                 // count" either — the page says which it was rather than
-                // drawing an empty allowance over a live one.
-                Ok(other) => (Vec::new(), None, None, Some(format!("{other:?}"))),
-                Err(error) => (Vec::new(), None, None, Some(format!("{error:?}"))),
+                // drawing an empty allowance over a live one, on both tabs.
+                Ok(other) => {
+                    let why = Some(format!("{other:?}"));
+                    (Vec::new(), None, None, why.clone(), why)
+                }
+                Err(error) => {
+                    let why = Some(format!("{error:?}"));
+                    (Vec::new(), None, None, why.clone(), why)
+                }
             };
             host.moment.write().expect("moment poisoned").usage =
                 Some(crate::settings::UsagePage {
@@ -5016,6 +5023,7 @@ impl Tui {
                     plan,
                     stats,
                     unavailable,
+                    stats_unavailable,
                 });
             if let Some(repaint) = repaint {
                 repaint.now();

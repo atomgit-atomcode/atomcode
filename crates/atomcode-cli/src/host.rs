@@ -2644,9 +2644,11 @@ impl HostControl for RuntimeControl {
                     plan,
                     spent,
                     unavailable,
+                    spent_unavailable,
                 } = self.handle.usage(windows_only).await.map_err(refused)?;
                 Ok(HostReply::Usage {
                     unavailable,
+                    stats_unavailable: spent_unavailable,
                     plan: plan.map(|plan| atomcode_host_api::Entitlement {
                         plan: plan.plan,
                         active: plan.active,

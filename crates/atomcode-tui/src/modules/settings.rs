@@ -1082,11 +1082,15 @@ fn stats_lines(
     which: crate::settings::StatsPage,
 ) -> Vec<UsageLine> {
     use crate::settings::StatsPage;
+    // 「不记账」和「没取到」是两句话:后者画成前者,人就不知道该去查什么。
     let Some(stats) = page.and_then(|page| page.stats.as_ref()) else {
         return vec![UsageLine::Note(
             match page {
                 None => t(Msg::AskingHost),
-                Some(_) => t(Msg::StatsNotKept),
+                Some(page) => match page.stats_unavailable.as_deref() {
+                    Some(why) => t(Msg::StatsUnknown { why }),
+                    None => t(Msg::StatsNotKept),
+                },
             }
             .into_owned(),
         )];
@@ -2316,6 +2320,7 @@ mod tests {
     #[test]
     fn the_usage_page_draws_what_was_counted_and_no_bar_for_what_was_not() {
         let counted = usage_page(crate::settings::UsagePage {
+            stats_unavailable: None,
             context: None,
             unavailable: None,
             plan: None,
@@ -2338,6 +2343,7 @@ mod tests {
         // and this test. It lived on the per-model bars until those became a
         // table; the protection belongs wherever a bar still is.
         let pair = usage_page(crate::settings::UsagePage {
+            stats_unavailable: None,
             context: None,
             unavailable: None,
             plan: None,
@@ -2357,6 +2363,7 @@ mod tests {
         );
 
         let uncounted = usage_page(crate::settings::UsagePage {
+            stats_unavailable: None,
             context: None,
             unavailable: None,
             plan: None,
@@ -2379,6 +2386,7 @@ mod tests {
     #[test]
     fn a_meter_that_did_not_answer_does_not_read_as_a_host_with_no_meter() {
         let no_meter = usage_page(crate::settings::UsagePage {
+            stats_unavailable: None,
             context: None,
             unavailable: None,
             plan: None,
@@ -2386,6 +2394,7 @@ mod tests {
             stats: None,
         });
         let no_answer = usage_page(crate::settings::UsagePage {
+            stats_unavailable: None,
             context: None,
             unavailable: Some("timed out".into()),
             plan: None,
@@ -2405,6 +2414,31 @@ mod tests {
         );
     }
 
+    /// 统计没取到(超时、请求失败)和「这个宿主不记账」是两句话。
+    ///
+    /// 现场(2026-10-09,Win10 + PowerShell):CodingPlan 账号的 Stats 页写着
+    /// 「这个宿主不记账」——宿主记账,只是那一次没答上来,而失败被折成了「没有」。
+    /// 合并回去照样画得出一页,那一页说的是事实的反面,人也就无从知道该去查什么。
+    #[test]
+    fn stats_that_did_not_come_back_do_not_read_as_a_host_that_keeps_none() {
+        let not_kept = stats_page(crate::settings::UsagePage::default());
+        let not_answered = stats_page(crate::settings::UsagePage {
+            stats_unavailable: Some("deadline has elapsed".into()),
+            ..crate::settings::UsagePage::default()
+        });
+        let not_kept = drawn(&not_kept, 80, 20).join("\n");
+        let not_answered = drawn(&not_answered, 80, 20).join("\n");
+        assert!(not_kept.contains("不记账"), "{not_kept}");
+        assert!(
+            !not_answered.contains("不记账"),
+            "没取到不能说成不记账:{not_answered}"
+        );
+        assert!(
+            not_answered.contains("deadline has elapsed"),
+            "而且说得出为什么:{not_answered}"
+        );
+    }
+
     /// Per-model spend and the day series reach the page.
     ///
     /// These are the figures the classic front end's `/usage` showed and the
@@ -2415,6 +2449,7 @@ mod tests {
     fn the_models_page_shows_what_went_through_per_model_and_per_day() {
         use atomcode_host_api::{DayUse, ModelSeries, ModelUse, UsageStats};
         let page = models_page(crate::settings::UsagePage {
+            stats_unavailable: None,
             context: None,
             unavailable: None,
             plan: None,
@@ -2535,6 +2570,7 @@ mod tests {
     fn each_model_is_drawn_in_its_own_colour_and_its_row_carries_it() {
         use atomcode_host_api::{DayUse, ModelSeries, ModelUse, UsageStats};
         let page = models_page(crate::settings::UsagePage {
+            stats_unavailable: None,
             context: None,
             unavailable: None,
             plan: None,
@@ -2643,6 +2679,7 @@ mod tests {
         let first = daily[0].date.clone();
         let last = daily[89].date.clone();
         let page = models_page(crate::settings::UsagePage {
+            stats_unavailable: None,
             context: None,
             unavailable: None,
             plan: None,
@@ -2691,6 +2728,7 @@ mod tests {
         use atomcode_host_api::Entitlement;
         let page = |active: bool, left: i32| {
             usage_page(crate::settings::UsagePage {
+                stats_unavailable: None,
                 context: None,
                 unavailable: None,
                 plan: Some(Entitlement {
@@ -2751,6 +2789,7 @@ mod tests {
             })
             .collect();
         let page = stats_page(crate::settings::UsagePage {
+            stats_unavailable: None,
             context: None,
             unavailable: None,
             plan: None,
@@ -2845,6 +2884,7 @@ mod tests {
             })
             .collect();
         let page = stats_page(crate::settings::UsagePage {
+            stats_unavailable: None,
             context: None,
             unavailable: None,
             plan: None,
@@ -2942,6 +2982,7 @@ mod tests {
         spent.exhausted = true;
         spent.resets_in_seconds = 11;
         let page = usage_page(crate::settings::UsagePage {
+            stats_unavailable: None,
             context: None,
             unavailable: None,
             plan: None,
@@ -2991,6 +3032,7 @@ mod tests {
             })
             .collect();
         let page = crate::settings::UsagePage {
+            stats_unavailable: None,
             context: None,
             unavailable: None,
             plan: None,
@@ -3120,6 +3162,7 @@ mod tests {
     fn the_allowance_and_the_history_are_two_pages() {
         use atomcode_host_api::{DayUse, Entitlement, ModelUse, UsageStats};
         let page = crate::settings::UsagePage {
+            stats_unavailable: None,
             context: None,
             unavailable: None,
             plan: Some(Entitlement {
@@ -3223,6 +3266,7 @@ mod tests {
                 settings: two(),
                 settings_panel: Some(scrolled),
                 usage: Some(crate::settings::UsagePage {
+                    stats_unavailable: None,
                     context: None,
                     unavailable: None,
                     plan: None,
