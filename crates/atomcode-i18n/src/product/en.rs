@@ -661,6 +661,17 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::WelcomeTipInit => "scan the codebase into AGENTS.md".into(),
         Msg::WelcomeTipLanguage => "switch the UI language".into(),
         Msg::WelcomeTipUsage => "view token usage & quota".into(),
+        Msg::WelcomeTipCompact => "compact the conversation to free context".into(),
+        Msg::WelcomeTipEffort => "set how hard the model thinks".into(),
+        Msg::WelcomeTipAuto => "auto-approve every tool call".into(),
+        Msg::WelcomeTipOpenrouter => "use free OpenRouter models".into(),
+        Msg::WelcomeTipReview => "review the current changes".into(),
+        Msg::WelcomeTipBg => "run sessions in the background".into(),
+        Msg::WelcomeTipContext => "see what fills the context".into(),
+        Msg::WelcomeTipMemory => "see what is remembered".into(),
+        Msg::WelcomeTipRemember => "save a fact to memory".into(),
+        Msg::WelcomeTipRename => "rename this session".into(),
+        Msg::WelcomeTipHelp => "list every command".into(),
 
         // ── Slash commands ──
         Msg::CmdSwitchedPlanMode =>

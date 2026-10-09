@@ -770,6 +770,28 @@ pub enum Msg<'a> {
     WelcomeTipLanguage,
     /// Welcome tip: /usage command description.
     WelcomeTipUsage,
+    /// Welcome tip: /compact command description.
+    WelcomeTipCompact,
+    /// Welcome tip: /effort command description.
+    WelcomeTipEffort,
+    /// Welcome tip: /auto command description.
+    WelcomeTipAuto,
+    /// Welcome tip: /openrouter command description.
+    WelcomeTipOpenrouter,
+    /// Welcome tip: /review command description.
+    WelcomeTipReview,
+    /// Welcome tip: /bg command description.
+    WelcomeTipBg,
+    /// Welcome tip: /context command description.
+    WelcomeTipContext,
+    /// Welcome tip: /memory command description.
+    WelcomeTipMemory,
+    /// Welcome tip: /remember command description.
+    WelcomeTipRemember,
+    /// Welcome tip: /rename command description.
+    WelcomeTipRename,
+    /// Welcome tip: /help command description.
+    WelcomeTipHelp,
 
     // ── Slash-command high-frequency messages ──
     CmdSwitchedPlanMode,

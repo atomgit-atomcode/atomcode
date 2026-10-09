@@ -43,8 +43,33 @@ const PINNED: &str = "login";
 /// divergence is a tip that names a command the other screen pins, which
 /// `the_pool_matches_what_the_other_front_end_offers` guards against.
 const CANDIDATES: &[&str] = &[
-    "login", "provider", "model", "resume", "setup", "skills", "plugin", "webui", "mcp", "plan",
-    "session", "loop", "goal", "init", "language", "usage",
+    "login",
+    "provider",
+    "model",
+    "resume",
+    "setup",
+    "skills",
+    "plugin",
+    "webui",
+    "mcp",
+    "plan",
+    "session",
+    "loop",
+    "goal",
+    "init",
+    "language",
+    "usage",
+    "compact",
+    "effort",
+    "auto",
+    "openrouter",
+    "review",
+    "bg",
+    "context",
+    "memory",
+    "remember",
+    "rename",
+    "help",
 ];
 
 /// The words this build ships when no launcher provides any.
@@ -86,6 +111,17 @@ impl WelcomeWords for ShippedWords {
             "init" => Msg::WelcomeTipInit,
             "language" => Msg::WelcomeTipLanguage,
             "usage" => Msg::WelcomeTipUsage,
+            "compact" => Msg::WelcomeTipCompact,
+            "effort" => Msg::WelcomeTipEffort,
+            "auto" => Msg::WelcomeTipAuto,
+            "openrouter" => Msg::WelcomeTipOpenrouter,
+            "review" => Msg::WelcomeTipReview,
+            "bg" => Msg::WelcomeTipBg,
+            "context" => Msg::WelcomeTipContext,
+            "memory" => Msg::WelcomeTipMemory,
+            "remember" => Msg::WelcomeTipRemember,
+            "rename" => Msg::WelcomeTipRename,
+            "help" => Msg::WelcomeTipHelp,
             _ => return None,
         };
         Some(t(msg).into_owned())
@@ -108,27 +144,43 @@ pub(crate) fn choose_tips(
     words: &dyn WelcomeWords,
     seed: &str,
 ) -> Vec<(String, String)> {
-    let find = |name: &str| commands.iter().find(|command| command.name == name);
+    // By name or by alias: `/bg` is what people type, and on this screen it is an
+    // alias of `background`. The tip shows the candidate's own spelling — the one
+    // the usage counts say people reach for.
+    let find = |name: &str| {
+        commands
+            .iter()
+            .find(|command| command.name == name || command.aliases.contains(&name))
+    };
 
     // What one command is described by: the localisation when it has a line for
-    // it, and the command's own `about` otherwise. The fallback is what keeps a
-    // tip from being a command name with nothing beside it on a screen the
-    // launcher's table does not know about.
-    let describe = |command: &Command| -> String {
+    // the name the tip shows, and the command's own `about` otherwise. The
+    // fallback is what keeps a tip from being a command name with nothing beside
+    // it on a screen the launcher's table does not know about.
+    let describe = |name: &str, command: &Command| -> String {
         words
-            .about(&command.name)
+            .about(name)
             .unwrap_or_else(|| command.about.to_string())
     };
 
     let mut tips: Vec<(String, String)> = Vec::new();
     if let Some(pinned) = find(PINNED) {
-        tips.push((format!("/{}", pinned.name), describe(pinned)));
+        tips.push((format!("/{PINNED}"), describe(PINNED, pinned)));
     }
 
-    let mut rest: Vec<&Command> = CANDIDATES
+    // Two candidates that land on one command (a name and its alias) are one tip.
+    let mut seen: Vec<&str> = Vec::new();
+    let mut rest: Vec<(&str, &Command)> = CANDIDATES
         .iter()
         .filter(|name| **name != PINNED)
-        .filter_map(|name| find(name))
+        .filter_map(|name| find(name).map(|command| (*name, command)))
+        .filter(|(_, command)| {
+            let fresh = !seen.contains(&command.name.as_ref());
+            if fresh {
+                seen.push(command.name.as_ref());
+            }
+            fresh
+        })
         .collect();
 
     // A stable order for a stable seed: one directory picks the same tips every
@@ -138,8 +190,8 @@ pub(crate) fn choose_tips(
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed_of(seed));
     rest.shuffle(&mut rng);
 
-    for command in rest.into_iter().take(MAX_TIPS) {
-        tips.push((format!("/{}", command.name), describe(command)));
+    for (name, command) in rest.into_iter().take(MAX_TIPS) {
+        tips.push((format!("/{name}"), describe(name, command)));
     }
     tips
 }
@@ -244,6 +296,21 @@ mod tests {
         }
     }
 
+    /// `/bg` is what people type (1,305 uses in the 2026-10 counts) and an alias
+    /// of `background` on this screen. A pool that only matched names would never
+    /// offer it; one that showed the canonical name would teach a word nobody
+    /// uses.
+    #[test]
+    fn a_candidate_that_is_an_alias_is_offered_by_the_name_people_type() {
+        let background = Command::new("background", "说明").with_aliases(&["bg"]);
+        let tips = choose_tips(&[background], &words(), "~/proj");
+        assert_eq!(
+            tips.iter().map(|(c, _)| c.as_str()).collect::<Vec<_>>(),
+            vec!["/bg"],
+            "{tips:?}"
+        );
+    }
+
     #[test]
     fn the_pinned_slot_yields_when_the_screen_has_no_such_command() {
         let without = choose_tips(&commands(&["resume", "help"]), &words(), "~/proj");
@@ -324,8 +391,33 @@ mod tests {
         // `/login` this one lists too (there it is `PINNED`, here it is entry 0
         // of the same list).
         let tuix = [
-            "login", "provider", "model", "resume", "setup", "skills", "plugin", "webui", "mcp",
-            "plan", "session", "loop", "goal", "init", "language", "usage",
+            "login",
+            "provider",
+            "model",
+            "resume",
+            "setup",
+            "skills",
+            "plugin",
+            "webui",
+            "mcp",
+            "plan",
+            "session",
+            "loop",
+            "goal",
+            "init",
+            "language",
+            "usage",
+            "compact",
+            "effort",
+            "auto",
+            "openrouter",
+            "review",
+            "bg",
+            "context",
+            "memory",
+            "remember",
+            "rename",
+            "help",
         ];
         assert_eq!(
             CANDIDATES, tuix,

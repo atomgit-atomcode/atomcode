@@ -18,7 +18,7 @@ pub const PINNED: Tip = Tip {
     desc: Msg::WelcomeTipLogin,
 };
 
-/// Random pool (15). Filtered to onboarding-relevant commands; excludes
+/// Random pool (26). Filtered to onboarding-relevant commands; excludes
 /// exit/clear/destructive and pure-utility commands. Edit + recompile to refresh.
 pub const POOL: &[Tip] = &[
     Tip {
@@ -80,6 +80,50 @@ pub const POOL: &[Tip] = &[
     Tip {
         cmd: "/usage",
         desc: Msg::WelcomeTipUsage,
+    },
+    Tip {
+        cmd: "/compact",
+        desc: Msg::WelcomeTipCompact,
+    },
+    Tip {
+        cmd: "/effort",
+        desc: Msg::WelcomeTipEffort,
+    },
+    Tip {
+        cmd: "/auto",
+        desc: Msg::WelcomeTipAuto,
+    },
+    Tip {
+        cmd: "/openrouter",
+        desc: Msg::WelcomeTipOpenrouter,
+    },
+    Tip {
+        cmd: "/review",
+        desc: Msg::WelcomeTipReview,
+    },
+    Tip {
+        cmd: "/bg",
+        desc: Msg::WelcomeTipBg,
+    },
+    Tip {
+        cmd: "/context",
+        desc: Msg::WelcomeTipContext,
+    },
+    Tip {
+        cmd: "/memory",
+        desc: Msg::WelcomeTipMemory,
+    },
+    Tip {
+        cmd: "/remember",
+        desc: Msg::WelcomeTipRemember,
+    },
+    Tip {
+        cmd: "/rename",
+        desc: Msg::WelcomeTipRename,
+    },
+    Tip {
+        cmd: "/help",
+        desc: Msg::WelcomeTipHelp,
     },
 ];
 

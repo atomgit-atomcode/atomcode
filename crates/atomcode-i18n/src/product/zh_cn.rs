@@ -633,6 +633,17 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::WelcomeTipInit => "扫描代码库生成 AGENTS.md".into(),
         Msg::WelcomeTipLanguage => "切换界面语言".into(),
         Msg::WelcomeTipUsage => "查看用量与额度".into(),
+        Msg::WelcomeTipCompact => "压缩对话，腾出上下文".into(),
+        Msg::WelcomeTipEffort => "调整模型思考强度".into(),
+        Msg::WelcomeTipAuto => "工具调用全部自动批准".into(),
+        Msg::WelcomeTipOpenrouter => "接入 OpenRouter 免费模型".into(),
+        Msg::WelcomeTipReview => "审查当前代码改动".into(),
+        Msg::WelcomeTipBg => "把会话放到后台跑".into(),
+        Msg::WelcomeTipContext => "查看上下文用量明细".into(),
+        Msg::WelcomeTipMemory => "查看已保存的记忆".into(),
+        Msg::WelcomeTipRemember => "让它记住一件事".into(),
+        Msg::WelcomeTipRename => "给当前会话改名".into(),
+        Msg::WelcomeTipHelp => "查看所有命令".into(),
 
         // ── 斜杠命令 ──
         Msg::CmdSwitchedPlanMode =>
