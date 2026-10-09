@@ -104,6 +104,56 @@ pub const ALT_SCREEN_OFF: &str = "\x1b[?1049l";
 /// said by the surface, which knows which one is in force.
 pub const TRANSCRIPT_BACK: &str = "\x1b[?1049h\x1b[?7l\x1b[?25l\x1b[H\x1b[2J";
 
+/// [`ENTER`] as this launch writes it: without the modes `ATOMCODE_TERM_SKIP`
+/// names (see [`without_modes`]).
+pub fn enter() -> String {
+    without_modes(ENTER, skipped_modes())
+}
+
+/// [`TRANSCRIPT_BACK`] as this launch writes it — the same modes left out, or
+/// coming back from `/raw` would put back what the launch left off.
+pub fn transcript_back() -> String {
+    without_modes(TRANSCRIPT_BACK, skipped_modes())
+}
+
+/// The modes `ATOMCODE_TERM_SKIP` names, read once.
+///
+/// **A diagnostic, not a setting.** A terminal can change what it does with a
+/// key depending on the modes a program asked for — HarmonyOS PC's terminal
+/// pastes on Ctrl+V on its main screen and hands the program a bare `^V` on
+/// this one, while `/raw` (off the alternate screen, line wrap back on) gets
+/// the paste. Leaving one mode out at a time is how to tell which of them
+/// does it, on a machine nobody here can reach.
+fn skipped_modes() -> &'static [String] {
+    static SKIPPED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    SKIPPED.get_or_init(|| {
+        std::env::var("ATOMCODE_TERM_SKIP")
+            .unwrap_or_default()
+            .split(',')
+            .map(|mode| mode.trim().to_ascii_lowercase())
+            .filter(|mode| !mode.is_empty())
+            .collect()
+    })
+}
+
+/// `seq` with the named modes taken out: `alt` (the alternate screen), `wrap`
+/// (line wrap stays on), `focus` (no focus reports). Names it does not know are
+/// ignored. [`LEAVE`] needs no such care: undoing a mode that was never set
+/// changes nothing.
+pub fn without_modes(seq: &str, skip: &[String]) -> String {
+    let mut out = seq.to_string();
+    for mode in skip {
+        let sets = match mode.as_str() {
+            "alt" => "\x1b[?1049h",
+            "wrap" => "\x1b[?7l",
+            "focus" => "\x1b[?1004h",
+            _ => continue,
+        };
+        out = out.replace(sets, "");
+    }
+    out
+}
+
 /// Rows of the conversation as the terminal's own lines — styled, each ended
 /// with a reset and `\r\n` (raw mode does not turn `\n` into a return). For
 /// `/raw`, where they are printed rather than painted at a position.
@@ -656,6 +706,20 @@ pub fn encode(frame: &Frame) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// `ATOMCODE_TERM_SKIP` takes out exactly the modes it names, from the
+    /// opening and from the way back from `/raw`, and nothing else.
+    #[test]
+    fn a_named_mode_is_left_out_of_what_the_screen_asks_for() {
+        let skip = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert_eq!(without_modes(ENTER, &[]), ENTER);
+        let no_alt = without_modes(ENTER, &skip(&["alt"]));
+        assert!(!no_alt.contains("?1049h") && no_alt.contains("?7l") && no_alt.contains("?2004h"));
+        let no_wrap = without_modes(TRANSCRIPT_BACK, &skip(&["wrap"]));
+        assert!(!no_wrap.contains("?7l") && no_wrap.contains("?1049h"));
+        let no_focus = without_modes(ENTER, &skip(&["focus", "nonsense"]));
+        assert!(!no_focus.contains("?1004h") && no_focus.contains("?1049h"));
+    }
+
     /// 进屏时要了焦点报告,出去时原样退回去。
     ///
     /// “刚才有没有人在看”是回合结束通知唯一的依据:人看着它做完的那一次

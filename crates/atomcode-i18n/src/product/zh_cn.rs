@@ -1209,7 +1209,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             format!("安装 ask skill 失败: {}. 请手动运行 /plugin install atomcode@atomcode-skills", error).into(),
         Msg::CmdPasteNoImage => "剪贴板中没有图片。".into(),
         Msg::CmdPasteNoImageOhos => {
-            "鸿蒙暂不支持读取系统剪贴板图片。请把图片存成文件，然后粘贴/输入它的绝对路径（如 /storage/.../pic.png）来添加图片。".into()
+            "鸿蒙上读不到系统剪贴板（文字和图片都读不到）。粘贴文字：在输入框里右键或长按，选「粘贴」；添加图片：存成文件后粘贴/输入它的绝对路径（如 /storage/.../pic.png）。".into()
         }
 
         // ── reasoning effort ──

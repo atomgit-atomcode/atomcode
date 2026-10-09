@@ -2131,8 +2131,8 @@ pub enum Msg<'a> {
         wanted: &'a str,
         levels: &'a str,
     },
-    /// Reading the clipboard picture is not possible on this platform
-    /// (HarmonyOS): what to do instead.
+    /// The clipboard cannot be read on this platform (HarmonyOS) — text or
+    /// picture — so a Ctrl+V reaches here with nothing: what to do instead.
     ClipboardImageUnsupportedHere,
     /// `/changelog` in the command menu and the welcome tips.
     CmdAboutChangelog,

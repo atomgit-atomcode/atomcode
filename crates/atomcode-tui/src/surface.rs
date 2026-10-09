@@ -1088,7 +1088,7 @@ impl Terminal {
         }
         crossterm::terminal::enable_raw_mode()?;
         let mut out = std::io::stdout();
-        out.write_all(ansi::ENTER.as_bytes())?;
+        out.write_all(ansi::enter().as_bytes())?;
         if crate::caps::wants_keyboard_protocol() {
             out.write_all(ansi::KEYS_ON.as_bytes())?;
         }
@@ -2315,7 +2315,7 @@ impl Surface for Terminal {
             return;
         }
         let mut out = std::io::stdout();
-        let _ = out.write_all(ansi::TRANSCRIPT_BACK.as_bytes());
+        let _ = out.write_all(ansi::transcript_back().as_bytes());
         let _ = out.flush();
         console_wrap(false);
         AWAY_FROM_SCREEN.store(false, Ordering::SeqCst);
@@ -2372,7 +2372,7 @@ impl Surface for Terminal {
         let _ = crossterm::terminal::enable_raw_mode();
         SCREEN_HELD.store(true, Ordering::SeqCst);
         drop_typed_while_stopped();
-        let _ = out.write_all(ansi::ENTER.as_bytes());
+        let _ = out.write_all(ansi::enter().as_bytes());
         // Whatever the shell called the window meanwhile is put away again;
         // the next frame names it (the screen forgets what it last said).
         let _ = out.write_all(ansi::SAVE_TITLE.as_bytes());

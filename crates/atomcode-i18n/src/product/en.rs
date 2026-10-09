@@ -1240,7 +1240,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             format!("ask skill install failed: {}. Run /plugin install atomcode@atomcode-skills manually", error).into(),
         Msg::CmdPasteNoImage => "No image in clipboard.".into(),
         Msg::CmdPasteNoImageOhos => {
-            "HarmonyOS can't read images from the system clipboard yet. Save the image to a file, then paste/type its absolute path (e.g. /storage/.../pic.png) to attach it.".into()
+            "The system clipboard cannot be read on HarmonyOS (neither text nor images). To paste text, right-click or long-press in the input and choose Paste; to attach an image, save it to a file, then paste/type its absolute path (e.g. /storage/.../pic.png).".into()
         }
 
         // ── reasoning effort ──

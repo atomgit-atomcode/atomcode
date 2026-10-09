@@ -1410,7 +1410,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::EffortNotForThisModel { wanted, levels } => {
             format!("this model does not take {wanted}; it takes {levels}, default (or auto)").into()
         }
-        Msg::ClipboardImageUnsupportedHere => "Reading a picture from the clipboard is not supported on HarmonyOS yet. Save it to a file and add it with /paste <path>, or type its absolute path in the composer".into(),
+        Msg::ClipboardImageUnsupportedHere => "The system clipboard cannot be read on HarmonyOS (neither text nor pictures). To paste text, right-click or long-press in the composer and choose Paste; to add a picture, save it to a file and use /paste <path>, or type its absolute path in the composer".into(),
         Msg::CmdAboutChangelog => "What changed in each release".into(),
         Msg::ChangelogPickerTitle => "pick a release to read what changed".into(),
         Msg::ChangelogNewTag => "new".into(),
