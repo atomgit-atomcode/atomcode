@@ -248,6 +248,28 @@ fn keyboard_protocol_for(windows: bool, env: impl Fn(&str) -> Option<String>) ->
     !jediterm
 }
 
+/// Whether the terminal reports the mouse at all — whether asking it to
+/// (`ESC[?1002h ESC[?1006h`) gets anything back.
+///
+/// HarmonyOS's own Terminal does not: it sends nothing for a wheel, a drag or a
+/// click (measured on HarmonyOS PC 6.1, `cat -v` with both modes set), **and**
+/// it stops its own text selection the moment it is asked to report. So taking
+/// the mouse there bought nothing and cost everything — no selecting, no
+/// scrolling with the wheel — and `ctrl+g` (handing it back) was the only way
+/// to select a word. There the mouse stays the terminal's.
+///
+/// `ATOMCODE_MOUSE=1` says otherwise, for a terminal there that learns to.
+pub fn mouse_reported() -> bool {
+    mouse_reported_for(cfg!(target_env = "ohos"), |k| std::env::var(k).ok())
+}
+
+fn mouse_reported_for(ohos: bool, env: impl Fn(&str) -> Option<String>) -> bool {
+    match env("ATOMCODE_MOUSE").filter(|v| !v.is_empty()) {
+        Some(forced) => forced == "1" || forced.eq_ignore_ascii_case("true"),
+        None => !ohos,
+    }
+}
+
 impl Caps {
     /// The plainest terminal: ASCII, no colour. What CI and a pipe get.
     pub fn plain() -> Self {
@@ -790,6 +812,16 @@ mod tests {
                 .find(|(name, _)| *name == k)
                 .map(|(_, v)| v.to_string())
         }
+    }
+
+    /// HarmonyOS's terminal reports no mouse, so the mouse stays its own there
+    /// — unless told otherwise; everywhere else it is taken as before.
+    #[test]
+    fn harmonyos_keeps_the_mouse_unless_told_otherwise() {
+        assert!(!mouse_reported_for(true, |_| None));
+        assert!(mouse_reported_for(true, |k| (k == "ATOMCODE_MOUSE").then(|| "1".into())));
+        assert!(mouse_reported_for(false, |_| None));
+        assert!(!mouse_reported_for(false, |k| (k == "ATOMCODE_MOUSE").then(|| "0".into())));
     }
 
     /// A classic Windows console window is the basic one; a terminal that

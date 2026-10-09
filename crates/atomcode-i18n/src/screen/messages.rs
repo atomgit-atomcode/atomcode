@@ -1461,6 +1461,10 @@ pub enum Msg<'a> {
     /// Said once at start when `[ui] mouse = false` hands the pointer to the
     /// terminal from the first frame.
     MouseHandedBackAtStart,
+    /// The terminal reports no mouse (HarmonyOS): what works instead, at start.
+    MouseUnreportedAtStart,
+    /// ctrl-g on a terminal that reports no mouse.
+    MouseUnreported,
     /// Said once, after a turn whose reasoning is off the screen: the key that
     /// brings it back, since nothing on screen says there is any.
     ReasoningHiddenHint,

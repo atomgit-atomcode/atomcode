@@ -858,6 +858,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::RawTop => "── atomcode · 本会话全文 ──".into(),
         Msg::RawBottom => "── 以上是本会话全文:可用终端自己的拖选、滚动、搜索 · 按任意键回到 atomcode ──".into(),
         Msg::MouseHandedBack => "鼠标已交还终端 · ctrl+g 收回 · /raw 跨屏选 · 滚轮滚动 · ctrl+p/n 历史 · ctrl+t 展开 · ctrl+o 思考".into(),
+        Msg::MouseUnreportedAtStart => "这个终端不上报鼠标 · 直接拖选 · PageUp/PageDown 翻页 · /raw 跨屏选 · ctrl+p/n 历史 · ctrl+t 展开 · ctrl+o 思考".into(),
+        Msg::MouseUnreported => "这个终端不上报鼠标,鼠标留给终端 · 直接拖选 · PageUp/PageDown 翻页".into(),
         Msg::MouseHandedBackAtStart => "鼠标在终端手里 · ctrl+g 收回 · /raw 跨屏选 · 滚轮滚动 · ctrl+p/n 历史 · ctrl+t 展开 · ctrl+o 思考".into(),
         Msg::ReasoningHiddenHint => "这一轮的思考过程没有显示 · ctrl-o 查看(或 /reasoning)".into(),
         Msg::NoProviderPanel => "这个屏幕没有 provider 面板:启动器没有提供 `tui-panel-providers`".into(),

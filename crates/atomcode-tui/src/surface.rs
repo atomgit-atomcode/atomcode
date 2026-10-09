@@ -1082,7 +1082,9 @@ impl Terminal {
         // Before anything names the window, so leaving can put back whatever a
         // person had called it.
         out.write_all(ansi::SAVE_TITLE.as_bytes())?;
-        let pointer = if mouse {
+        // A terminal that reports no mouse keeps it from the first frame: asked
+        // to report, HarmonyOS's stops its own selection and sends nothing.
+        let pointer = if mouse && crate::caps::mouse_reported() {
             ansi::Pointer::Buttons
         } else {
             ansi::Pointer::Terminal

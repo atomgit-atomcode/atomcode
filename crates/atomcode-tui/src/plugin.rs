@@ -1508,11 +1508,16 @@ impl UserInterface for Tui {
         // frame, so ↑/↓ scroll and the history is on ctrl-p/ctrl-n — said once,
         // on the tip row, where nobody has to have pressed ctrl-g to learn it.
         if !self.surface.mouse() {
-            self.host.say_for(
-                t(Msg::MouseHandedBackAtStart).into_owned(),
-                false,
-                MOUSE_NOTICE_MS * 2,
-            );
+            // A terminal that reports no mouse is told what does work there —
+            // not about a ctrl-g that would take nothing, or a wheel that sends
+            // nothing.
+            let tip = if crate::caps::mouse_reported() {
+                Msg::MouseHandedBackAtStart
+            } else {
+                Msg::MouseUnreportedAtStart
+            };
+            self.host
+                .say_for(t(tip).into_owned(), false, MOUSE_NOTICE_MS * 2);
         }
 
         // Before anything is typed: would a turn be taken at all?
@@ -7151,6 +7156,13 @@ impl Tui {
             }
             Action::ToggleMouse => {
                 drop(m);
+                // Nothing to take on a terminal that reports no mouse: taking it
+                // would only stop the terminal's own selection.
+                if !self.surface.mouse() && !crate::caps::mouse_reported() {
+                    self.host
+                        .say_for(t(Msg::MouseUnreported).into_owned(), false, MOUSE_NOTICE_MS);
+                    return false;
+                }
                 let on = !self.surface.mouse();
                 self.surface.set_mouse(on);
                 let text = if on {
