@@ -825,6 +825,9 @@ pub struct Terminal {
     /// Where stderr was sent while we hold the screen, and the descriptor it
     /// came from. See [`Terminal::take_stderr`].
     stderr: Option<StderrHeld>,
+    /// Columns at the right edge never drawn into: one on a classic Windows
+    /// console, none anywhere else. See [`edge_margin`].
+    margin: u16,
 }
 
 /// The real stderr, set aside, and the file it was pointed at instead.
@@ -1091,8 +1094,15 @@ impl Terminal {
         let mut caps = crate::caps::Caps::detect_with(overrides);
         // A classic console with a CJK font draws ambiguous characters wide;
         // widths everywhere have to count them that way (`crate::width`).
+        // Measured, not guessed: the code page said so on paper and a Win10
+        // console still drew `○ · ↓` wider than they were counted — every team
+        // row three cells too long. What the console does with them is what
+        // its cursor does.
         #[cfg(windows)]
-        crate::width::set_ambiguous_wide(caps.basic_glyphs && win_console::cjk_codepage());
+        crate::width::set_ambiguous_wide(
+            caps.basic_glyphs && ambiguous_drawn_wide().unwrap_or_else(win_console::cjk_codepage),
+        );
+        let margin = edge_margin(caps);
         // Inside the alternate screen on purpose: a terminal that does not know
         // the queries may echo them, and here the first frame paints over it.
         //
@@ -1124,6 +1134,7 @@ impl Terminal {
             painted: LastPainted::default(),
             away: std::sync::atomic::AtomicBool::new(false),
             stderr,
+            margin,
         })
     }
 
@@ -1239,6 +1250,34 @@ fn classic_console() -> bool {
 /// wheel, past this screen into whatever the shell printed before it. Where
 /// standard input is no console at all (an old pipe-based mintty) the mode
 /// cannot be set and this does nothing. Not Windows: nothing.
+/// Columns at the right edge this screen leaves alone.
+///
+/// One on a classic Windows console ([`crate::caps::Caps::basic_glyphs`]):
+/// Win10's conhost wraps a row the moment its last column is written, `?7l` or
+/// not, and on the bottom row a wrap is the whole screen scrolling up a row —
+/// every frame, the status line and the team rows stacking up the screen and
+/// the composer pushed off it. With the last column never written there is
+/// nothing to wrap, whatever the console makes of the widths before it. None
+/// anywhere else: the terminals that honour `?7l` lose nothing.
+fn edge_margin(caps: crate::caps::Caps) -> u16 {
+    u16::from(cfg!(windows) && caps.basic_glyphs && !caps.unicode)
+}
+
+/// Whether this console draws East Asian ambiguous characters two cells wide,
+/// read off its cursor: `○·` written at the top-left, and the column the
+/// cursor stands at after them. `None` when the cursor cannot be read. Inside
+/// the alternate screen, before the first frame, which paints over it.
+#[cfg(windows)]
+fn ambiguous_drawn_wide() -> Option<bool> {
+    let mut out = std::io::stdout();
+    out.write_all("\x1b[H\u{25CB}\u{00B7}".as_bytes()).ok()?;
+    out.flush().ok()?;
+    let (col, _) = crossterm::cursor::position().ok()?;
+    let _ = out.write_all(b"\x1b[H\x1b[2K");
+    let _ = out.flush();
+    Some(col > 2)
+}
+
 /// The Win32 half of `?7l` / `?7h` ([`win_console::wrap_at_eol`]): off while
 /// this screen is up, back when the terminal's own text is.
 fn console_wrap(on: bool) {
@@ -2121,7 +2160,8 @@ impl Surface for Terminal {
         "the terminal, full screen".into()
     }
     fn size(&self) -> (u16, u16) {
-        crossterm::terminal::size().unwrap_or((80, 24))
+        let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
+        (w.saturating_sub(self.margin).max(1), h)
     }
     fn present(&self, frame: &Frame) {
         // The transcript is on the terminal's own screen; a frame drawn now
@@ -2994,6 +3034,24 @@ mod tests {
             from_crossterm(Event::Mouse(down)),
             Some(Input::Mouse(Click::Press, 3, 4))
         );
+    }
+
+    /// The last column is given up only on a classic Windows console, the one
+    /// that wraps on it; a terminal that honours `?7l` keeps its full width.
+    #[test]
+    fn only_a_classic_windows_console_gives_up_its_last_column() {
+        let full = crate::caps::Caps {
+            unicode: true,
+            basic_glyphs: false,
+            ..crate::caps::Caps::default()
+        };
+        assert_eq!(edge_margin(full), 0);
+        let basic = crate::caps::Caps {
+            unicode: false,
+            basic_glyphs: true,
+            ..crate::caps::Caps::default()
+        };
+        assert_eq!(edge_margin(basic), u16::from(cfg!(windows)));
     }
 
     #[test]
