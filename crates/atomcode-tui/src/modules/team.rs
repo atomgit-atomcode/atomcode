@@ -764,7 +764,7 @@ mod tests {
             "its last words, on one line, cut to fit: {row:?}"
         );
         assert!(
-            row.trim_end().ends_with("↓ 94.4k tok") && row.contains("1 分 26 秒"),
+            row.trim_end().ends_with("↓ 94.4K tok") && row.contains("1 分 26 秒"),
             "time and context at the edge: {row:?}"
         );
         assert!(
