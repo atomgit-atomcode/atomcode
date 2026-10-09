@@ -116,24 +116,60 @@ pub fn transcript_back() -> String {
     without_modes(TRANSCRIPT_BACK, skipped_modes())
 }
 
-/// The modes `ATOMCODE_TERM_SKIP` names, read once.
+/// The modes this launch leaves out, read once: what `ATOMCODE_TERM_SKIP`
+/// names when it is set (empty included — that is "leave nothing out"), and the
+/// platform's own default when it is not ([`default_skips`]).
 ///
-/// **A diagnostic, not a setting.** A terminal can change what it does with a
-/// key depending on the modes a program asked for — HarmonyOS PC's terminal
-/// pastes on Ctrl+V on its main screen and hands the program a bare `^V` on
-/// this one, while `/raw` (off the alternate screen, line wrap back on) gets
-/// the paste. Leaving one mode out at a time is how to tell which of them
-/// does it, on a machine nobody here can reach.
+/// A terminal can change what it does with a key depending on the modes a
+/// program asked for. HarmonyOS PC's terminal pastes on Ctrl+V on its main
+/// screen and hands the program a bare `^V` on the alternate one — and this
+/// process cannot read that clipboard itself — so there the screen stays off
+/// the alternate screen, as `atomcode-tuix` always did (checked on the device
+/// with `ATOMCODE_TERM_SKIP=alt`, 2026-10-09). The variable stays as the way to
+/// put a mode back, or to take one out somewhere else.
 fn skipped_modes() -> &'static [String] {
     static SKIPPED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    SKIPPED.get_or_init(|| {
-        std::env::var("ATOMCODE_TERM_SKIP")
-            .unwrap_or_default()
+    SKIPPED.get_or_init(|| match std::env::var_os("ATOMCODE_TERM_SKIP") {
+        Some(named) => named
+            .to_string_lossy()
             .split(',')
             .map(|mode| mode.trim().to_ascii_lowercase())
             .filter(|mode| !mode.is_empty())
-            .collect()
+            .collect(),
+        None => default_skips(cfg!(target_env = "ohos")),
     })
+}
+
+/// The modes left out when nobody said: the alternate screen on HarmonyOS (see
+/// [`skipped_modes`]), nothing anywhere else.
+pub fn default_skips(ohos: bool) -> Vec<String> {
+    if ohos {
+        vec!["alt".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Whether this launch draws on the alternate screen.
+pub fn on_alternate_screen() -> bool {
+    !skipped_modes().iter().any(|mode| mode == "alt")
+}
+
+/// [`LEAVE`] as this launch has to say it. Off the alternate screen there is no
+/// shell screen for the terminal to bring back, so the last frame would stay
+/// where it was drawn and whatever is printed next — the resume line, a shell
+/// prompt — would land on top of it: the screen is cleared first.
+pub fn leave() -> String {
+    leave_for(on_alternate_screen())
+}
+
+/// [`leave`], with where the screen was drawn said.
+pub fn leave_for(alternate: bool) -> String {
+    if alternate {
+        LEAVE.to_string()
+    } else {
+        format!("{CLEAR}{LEAVE}")
+    }
 }
 
 /// `seq` with the named modes taken out: `alt` (the alternate screen), `wrap`
@@ -718,6 +754,18 @@ mod tests {
         assert!(!no_wrap.contains("?7l") && no_wrap.contains("?1049h"));
         let no_focus = without_modes(ENTER, &skip(&["focus", "nonsense"]));
         assert!(!no_focus.contains("?1004h") && no_focus.contains("?1049h"));
+    }
+
+    /// HarmonyOS draws off the alternate screen by default (its terminal does
+    /// not paste on Ctrl+V there); everywhere else nothing is left out. Off it,
+    /// the way out clears what was drawn so nothing prints over the last frame.
+    #[test]
+    fn harmonyos_stays_off_the_alternate_screen_and_clears_on_the_way_out() {
+        assert_eq!(default_skips(true), vec!["alt".to_string()]);
+        assert!(default_skips(false).is_empty());
+        assert_eq!(leave_for(true), LEAVE);
+        let off = leave_for(false);
+        assert!(off.starts_with(CLEAR) && off.ends_with(LEAVE), "{off:?}");
     }
 
     /// 进屏时要了焦点报告,出去时原样退回去。

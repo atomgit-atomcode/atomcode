@@ -1332,12 +1332,15 @@ fn emergency_restore() {
     let _ = out.write_all(ansi::MOUSE_OFF.as_bytes());
     console_mouse(false);
     let _ = out.write_all(ansi::RESTORE_TITLE.as_bytes());
+    // In `/raw` the conversation is on the terminal's own screen and stays
+    // there; otherwise the way out the launch's screen needs.
     let leave = if AWAY_FROM_SCREEN.swap(false, Ordering::SeqCst) {
         ansi::LEAVE
             .strip_suffix(ansi::ALT_SCREEN_OFF)
             .unwrap_or(ansi::LEAVE)
+            .to_string()
     } else {
-        ansi::LEAVE
+        ansi::leave()
     };
     let _ = out.write_all(leave.as_bytes());
     let _ = out.flush();
@@ -2354,7 +2357,7 @@ impl Surface for Terminal {
         let mut out = std::io::stdout();
         let _ = out.write_all(ansi::MOUSE_OFF.as_bytes());
         let _ = out.write_all(ansi::RESTORE_TITLE.as_bytes());
-        let _ = out.write_all(ansi::LEAVE.as_bytes());
+        let _ = out.write_all(ansi::leave().as_bytes());
         let _ = out.flush();
         let _ = crossterm::terminal::disable_raw_mode();
         // The screen is the shell's while stopped: a kill or a hang-up that
