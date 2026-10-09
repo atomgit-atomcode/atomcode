@@ -82,11 +82,18 @@ pub(crate) fn figures(stats: Option<atomcode_host_api::BackgroundStats>) -> Stri
     let Some(stats) = stats else {
         return String::new();
     };
+    // The turn summary's own reckoning: what every request sent, summed. A host
+    // from before the sums carries only the last request's — said as it was.
+    let (prompt, cached) = if stats.sent > 0 {
+        (stats.sent, stats.sent_cached)
+    } else {
+        (stats.prompt, stats.cached)
+    };
     crate::content::TurnStats {
         steps: stats.steps,
-        prompt: stats.prompt,
+        prompt,
         completion: stats.completion,
-        cached: stats.cached,
+        cached,
         tools: stats.tools,
         elapsed_ms: stats.elapsed_ms,
     }
@@ -419,6 +426,32 @@ pub fn key(view: &BgView, panel: &mut Panel, press: KeyPress) -> Step {
 
 #[cfg(test)]
 mod tests {
+
+    /// The panel's figures are the turn summary's reckoning — summed over every
+    /// request — and fall back to the last request's from a host that does not
+    /// send the sums.
+    #[test]
+    fn figures_use_the_summed_cost_when_the_host_sends_it() {
+        let stats = |sent, sent_cached| atomcode_host_api::BackgroundStats {
+            steps: 2,
+            tools: 0,
+            prompt: 1200,
+            cached: 1100,
+            completion: 20,
+            elapsed_ms: 1000,
+            sent,
+            sent_cached,
+        };
+        // 1100 of 2200 summed: 50%, and 20 + 1100 missed = 1.12K.
+        let summed = figures(Some(stats(2200, 1100)));
+        assert!(
+            summed.contains("50%") && summed.contains("1.12K"),
+            "{summed}"
+        );
+        // An older host: the last request's 1100 of 1200.
+        let older = figures(Some(stats(0, 0)));
+        assert!(older.contains("91%"), "{older}");
+    }
     use super::*;
 
     fn session(id: &str, group: Group) -> Session {

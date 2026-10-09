@@ -722,17 +722,13 @@ impl Producer for Transcript {
 
             // A round's usage, merged by the loop into one figure per round.
             SessionEvent::Usage { usage, .. } => {
-                // `prompt` is the whole context this request sent — and the two
-                // obvious folds are both wrong. Summing counts the same opening
-                // prefix once per round; a running max cannot go down, so a turn
-                // whose context was compacted would keep reporting the size
-                // before the compaction. The last reading is the true one.
-                //
-                // `cached` is a part of that same request, so it is taken from
-                // the same reading rather than kept on its own: a hit rate is
-                // only meaningful against the request it came from.
-                open.stats.prompt = usage.prompt;
-                open.stats.cached = usage.cached;
+                // Summed, both: the line closing the turn says what it cost and
+                // how much of that the cache served, and every request is billed
+                // in full — the prefix it re-sends is cheap only when it hits.
+                // The last reading alone said `99% cached` for a turn that missed
+                // the cache outright twice (see `TurnStats`).
+                open.stats.prompt = open.stats.prompt.saturating_add(usage.prompt);
+                open.stats.cached = open.stats.cached.saturating_add(usage.cached);
                 // Output is the one figure that does add up: each round
                 // generated its own, and the loop has already folded whatever
                 // the provider re-sent within a round.
@@ -1403,6 +1399,69 @@ mod tests {
         // Turn 2 was a self-cancel: it draws no separator in the transcript now —
         // it closes on the composer instead.
         assert!(ends[1].is_empty(), "a cancel draws nothing: {:?}", ends[1]);
+    }
+
+    /// A turn's hit rate and cost are over every request it sent, not its last.
+    ///
+    /// The 14 requests of a real turn (session `ffd4eacc`): the 5th and 12th
+    /// missed the cache outright, and the last hit 99.6%. The line closed on
+    /// `13.11K tokens · 99% cached` — the last request's — while the footer,
+    /// summing the same requests, said 66%. Summed, the two agree.
+    #[test]
+    fn a_turn_s_cache_rate_is_over_every_request_not_its_last() {
+        use atomcode_kernel::stream::TokenUsage;
+        let readings: [(u32, u32, u32); 14] = [
+            (36338, 256, 16896),
+            (37353, 325, 35328),
+            (38064, 455, 36352),
+            (43694, 712, 43520),
+            (54473, 189, 0),
+            (54367, 58, 35200),
+            (54448, 717, 35200),
+            (88297, 215, 37376),
+            (88455, 363, 87552),
+            (89144, 886, 54272),
+            (104592, 778, 88576),
+            (138095, 716, 0),
+            (173341, 85, 137728),
+            (173171, 6732, 172544),
+        ];
+        let mut facts = vec![SessionEvent::TurnStart { turn: 1 }];
+        for (round, (prompt, completion, cached)) in readings.iter().enumerate() {
+            facts.push(SessionEvent::Usage {
+                turn: 1,
+                round: round as u32 + 1,
+                usage: TokenUsage {
+                    prompt: *prompt,
+                    completion: *completion,
+                    cached: *cached,
+                },
+            });
+        }
+        facts.push(SessionEvent::TurnEnd {
+            turn: 1,
+            stop: atomcode_harness::seams::StopReason::Stopped,
+            error: None,
+        });
+        let s = fold(&facts);
+        let said: String = s
+            .slots()
+            .iter()
+            .filter(|x| x.block().kind() == "turn_end")
+            .flat_map(|x| {
+                x.block()
+                    .content
+                    .lines(&crate::block::RenderCtx::bare(120))
+                    .into_iter()
+                    .map(|l| l.plain())
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        // 780,544 of 1,173,832 sent were cached: 66%. Billable: the 393,288
+        // that missed plus 12,487 generated.
+        assert!(said.contains("66%"), "the turn's own rate: {said}");
+        assert!(!said.contains("99%"), "not its last request's: {said}");
+        assert!(said.contains("405.77K tokens"), "what it cost: {said}");
     }
 
     /// A turn's cost belongs to that turn. The corpus ends turn 1 and then

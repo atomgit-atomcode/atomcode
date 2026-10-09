@@ -536,15 +536,18 @@ fn one_line(text: &str) -> Option<String> {
         .map(|line| line.chars().take(240).collect())
 }
 
-/// 这次活花掉的:从它自己的日志折出来,字段和本机那条回合汇总(`content::TurnStats`)
-/// 一一对应 —— 屏幕上两行用的是同一套口径,「入 / 缓存」指的是**最后一次请求**的上下文
-/// (整段每轮重发,所以最后那次读数就是现在这一次),而「出」是每轮新做的工作,累加。
+/// 这次活花掉的:从它自己的日志折出来,和本机那条回合汇总(`content::TurnStats`)同一
+/// 套口径 —— 花费与命中率按**每次请求累加**(`sent` / `sent_cached`,每次请求都整段计费,
+/// 前缀只在命中时便宜);`prompt` / `cached` 仍是最后一次请求,说的是上下文现在多大。
+/// 「出」是每轮新做的工作,累加。
 ///
 /// 一条请求都没发过就 `None`:没有可说的数,画出来只会是「0 轮  0 工具」。
 fn stats_of(log: &[LoggedEvent]) -> Option<BackgroundStats> {
     let mut steps = 0u32;
     let mut tools = 0u32;
     let mut completion = 0u32;
+    let mut sent = 0u32;
+    let mut sent_cached = 0u32;
     let mut last: Option<atomcode_kernel::stream::TokenUsage> = None;
     for logged in log {
         match &logged.event {
@@ -554,6 +557,8 @@ fn stats_of(log: &[LoggedEvent]) -> Option<BackgroundStats> {
             }
             SessionEvent::Usage { usage, .. } => {
                 completion = completion.saturating_add(usage.completion);
+                sent = sent.saturating_add(usage.prompt);
+                sent_cached = sent_cached.saturating_add(usage.cached);
                 last = Some(*usage);
             }
             _ => {}
@@ -571,6 +576,8 @@ fn stats_of(log: &[LoggedEvent]) -> Option<BackgroundStats> {
         cached: usage.cached,
         completion,
         elapsed_ms,
+        sent,
+        sent_cached,
     })
 }
 
@@ -1539,6 +1546,29 @@ mod tests {
             track.saw(&ended(reason.clone()));
             assert_eq!(track.ended, Some(BackgroundState::Failed), "{reason:?}");
         }
+    }
+
+    /// 后台会话的花费按每次请求累加(`sent` / `sent_cached`),`prompt` / `cached`
+    /// 仍是最后一次请求 —— 一个说花了多少,一个说上下文现在多大。
+    #[test]
+    fn background_cost_is_summed_over_requests_and_context_is_the_last() {
+        let usage = |prompt, cached| LoggedEvent {
+            seq: 0,
+            at: 0,
+            event: SessionEvent::Usage {
+                turn: 1,
+                round: 1,
+                usage: atomcode_kernel::stream::TokenUsage {
+                    prompt,
+                    completion: 10,
+                    cached,
+                },
+            },
+        };
+        let stats = stats_of(&[usage(1000, 0), usage(1200, 1100)]).expect("ran");
+        assert_eq!((stats.sent, stats.sent_cached), (2200, 1100));
+        assert_eq!((stats.prompt, stats.cached), (1200, 1100));
+        assert_eq!(stats.completion, 20);
     }
 
     /// 投回去的是最后一个回合的结论;最后一个回合没出字,就没有结论可投。

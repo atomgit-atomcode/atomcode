@@ -768,6 +768,8 @@ mod tests {
                 cached: 0,
                 completion: 800,
                 elapsed_ms: 86_000,
+                sent: 0,
+                sent_cached: 0,
             }),
         }
     }

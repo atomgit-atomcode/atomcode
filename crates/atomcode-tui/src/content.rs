@@ -2857,23 +2857,30 @@ pub fn clock_of(at_ms: u64) -> Option<String> {
 /// Folded by whoever owns those facts and handed here as a value: the block
 /// draws these numbers, it does not know where usage comes from.
 ///
-/// `prompt` is **not** a sum over the turn's rounds, and that is the whole trap
-/// in this type. It is the entire context one request sent, so a turn of four
-/// rounds sends the same opening prefix four times, growing; summing would
-/// count it four times and report a number with no meaning. `cached` is a part
-/// of that same request — read off the same reading, which is why the two are
-/// kept together instead of the ratio being folded on its own.
+/// `prompt` and `cached` are **sums over every request the turn sent**, the way
+/// `atomcode-tuix` tallies them and the way a provider bills them: each request
+/// is paid for in full, its cached part at the cached rate. They are not "how
+/// big the context is" — that is the last request's reading, and the live line
+/// keeps it.
+///
+/// This was the last reading once, on the argument that summing re-counts the
+/// same prefix. That holds for a context *size* and is wrong for a *cost*: the
+/// prefix really is re-sent and re-billed each round, and it is only cheap when
+/// it hits. A turn of 14 requests whose 5th and 12th missed the cache entirely
+/// (54K and 138K re-billed in full) closed on `13.11K tokens · 99% cached` —
+/// its last request's figures — while the same session's footer, summing,
+/// said 66%. Summed, the line says `405.77K tokens · 66% cached`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TurnStats {
     /// Model requests the turn ran. `step` and `round` are one counter in the
     /// turn loop, so this is both.
     pub steps: u32,
-    /// The context the turn's **last** request sent.
+    /// Input sent, summed over every request of the turn.
     pub prompt: u32,
     /// Tokens the model generated, summed over the turn's rounds. Unlike
     /// `prompt`, each round's output is new, so this one does add up.
     pub completion: u32,
-    /// The cached part of `prompt`, from that same last request.
+    /// The part of `prompt` served from cache, summed the same way.
     pub cached: u32,
     /// Tool calls the turn ran, summed over its steps.
     pub tools: u32,

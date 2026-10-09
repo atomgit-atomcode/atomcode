@@ -1361,6 +1361,14 @@ pub struct BackgroundStats {
     /// timing — a session cut before it opened, or one replayed from a log old
     /// enough not to have stamped one.
     pub elapsed_ms: u64,
+    /// Input sent, summed over every request — what the work cost, as opposed
+    /// to `prompt`, which is how big its context is now. `0` from a host that
+    /// predates it.
+    #[serde(default)]
+    pub sent: u32,
+    /// The part of `sent` served from cache, summed the same way.
+    #[serde(default)]
+    pub sent_cached: u32,
 }
 
 /// Where a background session stands.
