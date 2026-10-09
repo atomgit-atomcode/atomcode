@@ -72,6 +72,19 @@ impl Shell for Here {
         within: Duration,
         line: &(dyn Fn(String) + Send + Sync),
     ) -> Ran {
+        self.run_streaming_in(None, command, within, line).await
+    }
+
+    /// In the session's directory when the screen knows it — after a `/cd`
+    /// that is not where this row was set up — and in the launch directory
+    /// otherwise.
+    async fn run_streaming_in(
+        &self,
+        dir: Option<&std::path::Path>,
+        command: &str,
+        within: Duration,
+        line: &(dyn Fn(String) + Send + Sync),
+    ) -> Ran {
         use atomcode_capabilities::tools::{run_shell, ShellExit};
         // 一次一整行地交出去:块的边界是一次读了多少,不是一行,按块画会把一行
         // 劈成两截。stdout 和 stderr **各攒各的**:`run_shell` 把两路的块交给同
@@ -87,7 +100,7 @@ impl Shell for Here {
         let outcome = run_shell(
             &atomcode_capabilities::world::LocalShell,
             command,
-            &self.working_dir,
+            dir.unwrap_or(&self.working_dir),
             within.as_secs(),
             |chunk| {
                 let mut held = pending.lock().expect("pending poisoned");
@@ -140,6 +153,40 @@ impl Shell for Here {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// A `!` runs where the session works when the screen knows it — after a
+    /// `/cd`, not where this row was set up — and where it was set up otherwise.
+    #[tokio::test]
+    async fn a_command_runs_in_the_directory_it_is_given() {
+        let set_up = tempfile::tempdir().expect("dir");
+        let moved = tempfile::tempdir().expect("dir");
+        let here = Here {
+            working_dir: set_up.path().to_path_buf(),
+        };
+        let ran = here
+            .run_streaming_in(
+                Some(moved.path()),
+                "pwd -P",
+                Duration::from_secs(10),
+                &|_| {},
+            )
+            .await;
+        let moved_real = moved.path().canonicalize().expect("real");
+        assert_eq!(
+            ran.output.trim(),
+            moved_real.display().to_string(),
+            "{ran:?}"
+        );
+        let ran = here
+            .run_streaming_in(None, "pwd -P", Duration::from_secs(10), &|_| {})
+            .await;
+        let set_up_real = set_up.path().canonicalize().expect("real");
+        assert_eq!(
+            ran.output.trim(),
+            set_up_real.display().to_string(),
+            "{ran:?}"
+        );
+    }
 
     /// stdout and stderr are kept apart while they stream: a stdout line still
     /// being written when stderr speaks stays one line, and every stderr line —

@@ -793,6 +793,78 @@ async fn a_ctrl_c_is_disarmed_by_other_input() {
     task.abort();
 }
 
+/// The same welcome when the host is slow to say where the session works: the
+/// screen asks before it follows the session, so the history cannot fill the
+/// stream ahead of the welcome while the answer is on its way.
+#[tokio::test]
+async fn a_resumed_session_keeps_its_welcome_when_the_host_is_slow_to_say_where_it_is() {
+    let home = scratch("welcome-slow-home");
+    let root = scratch("welcome-slow-work");
+    let id = "welcomed-slowly";
+    {
+        let s = start(tree_resumable(
+            &root,
+            &home,
+            id,
+            false,
+            &replay(r#"{ text = "It is 42." }"#),
+            &[],
+        ))
+        .await;
+        let task = s.open().await;
+        s.term.type_line("remember the number 42");
+        s.quiet().await;
+        persisted(&home, id, 6).await;
+        s.term.press(KeyPress::ctrl('d'));
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    let here = root.display().to_string();
+    let s = start_with_host(
+        tree_resumable(
+            &root,
+            &home,
+            id,
+            true,
+            &replay(r#"{ text = "still 42." }"#),
+            &[],
+        ),
+        move |inner| {
+            Arc::new(SlowToSay {
+                inner: Arc::new(WorksIn { inner, here }),
+            })
+        },
+    )
+    .await;
+    let task = s.open().await;
+    until(&s, "remember the number 42").await;
+    for _ in 0..40 {
+        s.term
+            .pointer(atomcode_tui::surface::Click::WheelUp, 10, 10);
+    }
+    s.quiet().await;
+    let top = s.screen();
+    assert_eq!(top.matches("上手提示").count(), 1, "{top}");
+    let heading = top.find("上手提示").expect("the welcome heading");
+    let history = top.find("remember the number 42").expect("the history");
+    assert!(heading < history, "{top}");
+    // And it names where the session works, as the host said — not the
+    // directory this test process happens to run in.
+    let name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("a name");
+    // Read with the whitespace taken out: a long path wraps in the welcome.
+    let welcome: String = top[..history]
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert!(welcome.contains(name), "{top}");
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
 #[tokio::test]
 async fn a_resumed_session_opens_with_a_welcome_above_its_history() {
     // The welcome rides the top of a resumed conversation, not only a fresh one.
@@ -9776,6 +9848,88 @@ async fn view_picks_from_a_sheet_and_esc_comes_back_to_the_same_row() {
 
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+/// **The status row says where the session works, as its host answers.** The
+/// process stays where it was launched — `/cd` starts a session somewhere else
+/// and moves nothing in this one — so the row asks the host rather than
+/// reading its own directory.
+#[tokio::test]
+async fn the_status_row_shows_the_directory_the_host_says_the_session_is_in() {
+    let dir = scratch("session-dir");
+    let here = "/elsewhere/dir-from-the-host".to_string();
+    let s = start_with_host(
+        tree(&dir, &replay(r#"{ text = "hi" }"#), &[]),
+        // Slower than the session's description, which is what the welcome
+        // used to be drawn on alone — so a welcome that did not wait for the
+        // answer would name the directory the process was launched in.
+        move |inner| {
+            Arc::new(SlowToSay {
+                inner: Arc::new(WorksIn { inner, here }),
+            })
+        },
+    )
+    .await;
+    s.term.resize(160, 24);
+    let task = s.open().await;
+    until(&s, "dir-from-the-host").await;
+    let status = s
+        .term
+        .last()
+        .and_then(|frame| frame.part("status").cloned())
+        .map(|part| {
+            part.lines
+                .iter()
+                .map(|l| l.plain())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    assert!(
+        status.contains("dir-from-the-host"),
+        "{status}\n{}",
+        s.screen()
+    );
+    // The welcome names it too: it waits for the answer rather than drawing
+    // the directory the process happens to be in.
+    let stream = s
+        .term
+        .last()
+        .and_then(|frame| frame.part("stream").cloned())
+        .map(|part| {
+            part.lines
+                .iter()
+                .map(|l| l.plain())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    assert!(stream.contains("dir-from-the-host"), "{stream}");
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+/// A host that takes its time to say where the session works.
+struct SlowToSay {
+    inner: Arc<dyn atomcode_host_api::HostControl>,
+}
+
+#[async_trait]
+impl atomcode_host_api::HostControl for SlowToSay {
+    async fn call(
+        &self,
+        command: atomcode_host_api::HostCommand,
+    ) -> Result<atomcode_host_api::HostReply, atomcode_host_api::HostError> {
+        if matches!(command, atomcode_host_api::HostCommand::Context { .. }) {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
+        self.inner.call(command).await
+    }
+
+    fn subscribe(&self) -> tokio::sync::mpsc::UnboundedReceiver<atomcode_host_api::HostEvent> {
+        self.inner.subscribe()
+    }
 }
 
 /// A host that says where the session works, and otherwise is the fixture's.

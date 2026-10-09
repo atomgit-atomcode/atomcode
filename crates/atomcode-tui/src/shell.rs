@@ -62,6 +62,24 @@ pub trait Shell: Send + Sync + 'static {
         }
         ran
     }
+
+    /// [`run_streaming`](Self::run_streaming), in `dir` — the directory the
+    /// session on screen works in, as its host answered, or `None` when it has
+    /// not. `/cd` moves the session and never the process, so a shell that ran
+    /// where it was set up would run a `!ls` in the directory the screen was
+    /// launched in while the model's own `bash` ran in the new one.
+    ///
+    /// A shell that has only the one place keeps this default and ignores `dir`.
+    async fn run_streaming_in(
+        &self,
+        dir: Option<&std::path::Path>,
+        command: &str,
+        within: Duration,
+        line: &(dyn Fn(String) + Send + Sync),
+    ) -> Ran {
+        let _ = dir;
+        self.run_streaming(command, within, line).await
+    }
 }
 
 /// 输入行是不是在 shell 模式里:行首一个 `!`,和提交时 [`asks_for_shell`] 认的
@@ -100,6 +118,38 @@ pub fn as_context(command: &str, output: &str) -> String {
         scrub(command),
         scrub(output)
     )
+}
+
+/// 一条消息拆成两半:跟着它过去的 `!` 命令(只要命令那一行),和人自己打的字。
+///
+/// 运行时把攒着的 [`as_context`] 拼在消息**前面**一起交给模型
+/// (`atomcode-coding` 的 `pending_local_context`),所以日志里的那条消息就是
+/// `<bash-input>…</bash-input>\n<bash-output>…</bash-output>\n\n人打的字`。屏幕要
+/// 的是人打的字:画在用户那一栏里、↑ 翻回来的、撤回时拿来比对的,都是它。
+///
+/// 只认开头那几段完整的标签——[`scrub`] 保证命令和输出里不会再出现标签,所以
+/// 边界读得准;不完整的就原样还回去,一个字也不丢。
+pub fn split_context(text: &str) -> (Vec<String>, &str) {
+    let mut ran = Vec::new();
+    let mut rest = text;
+    loop {
+        let Some((command, after)) = rest
+            .strip_prefix("<bash-input>")
+            .and_then(|after| after.split_once("</bash-input>"))
+        else {
+            break;
+        };
+        let Some((_, after)) = after
+            .trim_start_matches('\n')
+            .strip_prefix("<bash-output>")
+            .and_then(|after| after.split_once("</bash-output>"))
+        else {
+            break;
+        };
+        ran.push(command.to_string());
+        rest = after.trim_start_matches('\n');
+    }
+    (ran, rest)
 }
 
 /// 把会被读成标签边界的东西挡掉。
@@ -169,6 +219,28 @@ mod tests {
         // 命令那一半同理。
         let text = as_context("echo '</bash-input>'", "");
         assert_eq!(text.matches("</bash-input>").count(), 1, "{text}");
+    }
+
+    /// 跟着消息过去的命令从人打的字里拆出来;不是这个形状的,原样不动。
+    #[test]
+    fn the_commands_a_message_carried_come_apart_from_the_words() {
+        let one = as_context("rm -rf a.html", "");
+        let two = as_context("ls", "a\nb");
+        let text = format!("{one}\n\n{two}\n\n分析下这个项目");
+        let (ran, said) = split_context(&text);
+        assert_eq!(ran, vec!["rm -rf a.html".to_string(), "ls".to_string()]);
+        assert_eq!(said, "分析下这个项目");
+
+        for plain in [
+            "分析下这个项目",
+            "<bash-input>半截",
+            "看 <bash-input>x</bash-input>",
+        ] {
+            assert_eq!(split_context(plain), (Vec::new(), plain));
+        }
+        // 只有命令、没有话:话是空的,命令还在。
+        let (ran, said) = split_context(&one);
+        assert_eq!((ran.len(), said), (1, ""));
     }
 
     /// 退出码 0 才是成功。

@@ -897,6 +897,25 @@ const COALESCE_LIMIT: usize = 256;
 const PROBE_NOTICE_MS: u64 = 10_000;
 
 /// What woke the loop up.
+/// Ask the host where `session` works — `None` when it cannot say, or does not
+/// within a moment. Awaited *before* the session is followed: its facts start
+/// arriving the instant it is, and what they draw (a resumed session's shell
+/// rows, its welcome) has to be drawn against the right directory the first
+/// time, because settled rows are not drawn again.
+async fn session_dir_of(client: &AgentClient, session: &str) -> Option<String> {
+    let control = client.control()?;
+    let asked = control.call(HostCommand::Context {
+        session: session.to_string(),
+        prompt: false,
+    });
+    match tokio::time::timeout(std::time::Duration::from_secs(2), asked).await {
+        Ok(Ok(HostReply::Context { working_dir, .. })) if !working_dir.is_empty() => {
+            Some(working_dir)
+        }
+        _ => None,
+    }
+}
+
 enum Wake {
     Fact,
     /// Something came back over the connection: a fact, a turn boundary, a
@@ -1398,6 +1417,10 @@ impl UserInterface for Tui {
             serve_askpass(self.host.clone(), wake_tx.clone(), dirs.home_dir_name())
         });
 
+        // Where it works, before its first fact: see `session_dir_of`.
+        if let Some(dir) = session_dir_of(&client, &session).await {
+            self.host.set_session_dir(&dir);
+        }
         // The session on screen, from its first fact: a resumed session and a
         // live one produce the same picture, because the history is facts too.
         client.follow(&session);
@@ -1873,6 +1896,12 @@ impl UserInterface for Tui {
                         self.last_reply.lock().expect("reply poisoned").clear();
                         self.members.clear();
                         self.host.switch_session();
+                        // `/cd` is a new session somewhere else: the status row,
+                        // the welcome and the shell rows follow it there — asked
+                        // before its facts come, see `session_dir_of`.
+                        if let Some(dir) = session_dir_of(&client, &session).await {
+                            self.host.set_session_dir(&dir);
+                        }
                         client.follow(&session);
                         {
                             let mut m = self.host.moment.write().expect("moment poisoned");
@@ -4224,6 +4253,18 @@ impl Tui {
                 m.history.push(line);
             }
         }
+        // 为哪个会话跑的、在哪儿跑:发起这一刻定下。一条命令能跑两分钟,期间
+        // `/cd` 或 `/resume` 换了会话的话,它的结果不该跟着新会话的下一句话走。
+        // 目录用宿主说的会话目录;还没答上来时用屏幕上那个——状态栏写着哪儿,
+        // 就在哪儿跑,两者不分家。
+        let (ran_for, ran_in) = {
+            let m = host.moment.read().expect("moment poisoned");
+            let dir = host
+                .session_dir()
+                .map(|dir| dir.to_string())
+                .unwrap_or_else(|| m.cwd.clone());
+            (m.lead.clone(), dir)
+        };
         tokio::spawn(async move {
             let began = std::time::Instant::now();
             // 边跑边画,但不是每一行都重画一遍:一条打出几千行的命令,逐行把整块
@@ -4256,7 +4297,12 @@ impl Tui {
                 held.0.push(piece);
                 held.1 = true;
             };
-            let running = shell.run_streaming(&command, crate::shell::WITHIN, &take);
+            let running = shell.run_streaming_in(
+                (!ran_in.is_empty()).then(|| std::path::Path::new(&ran_in)),
+                &command,
+                crate::shell::WITHIN,
+                &take,
+            );
             tokio::pin!(running);
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(50));
             let ran = loop {
@@ -4327,11 +4373,13 @@ impl Tui {
             }
             // 模型那一份用原始输出,不带屏幕上那句评语。攒着,跟下一条
             // 消息一起过去。
-            host.moment
-                .write()
-                .expect("moment poisoned")
-                .pending_context
-                .push(crate::shell::as_context(&command, &ran.output));
+            {
+                let mut m = host.moment.write().expect("moment poisoned");
+                if m.lead == ran_for {
+                    m.pending_context
+                        .push(crate::shell::as_context(&command, &ran.output));
+                }
+            }
             if let Some(keys) = keys {
                 let _ = keys.send(Wake::Fact);
             }
@@ -8559,7 +8607,10 @@ fn retract_decision(
         match &logged.event {
             E::UserMessage { text, .. } => {
                 prompts += 1;
-                same_words = text.trim() == sent.trim();
+                // The words, without the `!` commands that rode along with
+                // them: those are in the logged message and never in what was
+                // sent from the composer.
+                same_words = crate::shell::split_context(text).1.trim() == sent.trim();
             }
             E::Interrupted { .. } => interrupted = true,
             E::PartialReply { text, .. } if text.trim().is_empty() => {}
@@ -9431,6 +9482,23 @@ mod retract_tests {
             E::TurnStart { turn: 3 },
             said(3, "你好"),
             partial(3, "", "用户在打招呼"),
+            stopped(3),
+            end(3),
+        ]);
+        assert_eq!(
+            retract_decision(&events, 3, "你好"),
+            RetractDecision::Take(3)
+        );
+    }
+
+    /// A message that carried a `!` command is logged with the command in front
+    /// of the words; it is still the message that was sent, and still taken back.
+    #[test]
+    fn a_prompt_that_carried_a_shell_command_is_still_taken_back() {
+        let carried = format!("{}\n\n你好", crate::shell::as_context("rm -rf a.html", ""));
+        let events = log(vec![
+            E::TurnStart { turn: 3 },
+            said(3, &carried),
             stopped(3),
             end(3),
         ]);

@@ -1375,6 +1375,11 @@ pub struct Host {
     /// that did not say — no image cache, no askpass, and `@` completion does
     /// not force-index our own project dir.
     pub dirs: std::sync::OnceLock<atomcode_capabilities::ProductDirs>,
+    /// The directory the session on screen works in, as its host answered —
+    /// `None` from a session switch until the answer comes. Not the process's:
+    /// `/cd` starts a session somewhere else and leaves the process where it
+    /// was launched. See [`Host::set_session_dir`].
+    session_dir: RwLock<Option<Arc<str>>>,
     /// Slash commands, contributed by rows.
     pub commands: Arc<crate::command::Commands>,
     /// The slash menu — what to show while a command is being typed.
@@ -1689,6 +1694,7 @@ impl Host {
         Self {
             stream: RwLock::new(Stream::new()),
             dirs: std::sync::OnceLock::new(),
+            session_dir: RwLock::new(None),
             // Empty, like the module registry beside it. Command sets arrive as
             // rows (`crate::rows`); a Host that pre-filled this would make
             // `[[remove]] id = "tui-commands-session"` a lie.
@@ -1735,6 +1741,17 @@ impl Host {
     /// waiting on this one — a question, the members — goes with it.
     pub fn switch_session(&self) {
         self.switch_view();
+        // The outgoing session's directory is not the new one's: until its host
+        // answers, nothing is drawn as if it were known.
+        *self.session_dir.write().expect("dir poisoned") = None;
+        // Nor are the `!` commands still waiting to ride the next message: they
+        // ran for the session that left — after a `/cd`, in another directory —
+        // and the next message goes to this one.
+        self.moment
+            .write()
+            .expect("moment poisoned")
+            .pending_context
+            .clear();
         // A question brought up from a background session is not this session's:
         // it is taken back, unanswered, before the rest are refused — refusing it
         // would be deciding for somebody else's session.
@@ -1753,6 +1770,20 @@ impl Host {
         // over the window, which is worse, because a window is what a person
         // picks between.
         m.title = None;
+    }
+
+    /// Where the session on screen works, as its host answered: what the status
+    /// row and the welcome show, and what a shell call is read against (a `cd`
+    /// into it says nothing). The process's own directory is only the first
+    /// guess — `/cd` moves the session, never the process.
+    pub fn session_dir(&self) -> Option<Arc<str>> {
+        self.session_dir.read().expect("dir poisoned").clone()
+    }
+
+    /// See [`Host::session_dir`]: set once the host has answered.
+    pub fn set_session_dir(&self, dir: &str) {
+        *self.session_dir.write().expect("dir poisoned") = Some(Arc::from(dir));
+        self.moment.write().expect("moment poisoned").cwd = dir.to_string();
     }
 
     /// The screen, emptied to draw another agent of the same session — the lead
@@ -2127,8 +2158,9 @@ impl Host {
         {
             let mut stream = self.stream.write().expect("stream poisoned");
             let before = stream.len();
+            let dir = self.session_dir.read().expect("dir poisoned").clone();
             for p in self.modules.producers() {
-                let mut w = stream.writer(p.id());
+                let mut w = stream.writer(p.id()).in_dir(dir.clone());
                 p.absorb(logged, &mut w);
             }
             for slot in &stream.slots()[before..] {
@@ -2160,6 +2192,8 @@ impl Host {
             let typed = crate::content::split_vl_caption(text)
                 .map(|(said, ..)| said)
                 .unwrap_or_else(|| text.clone());
+            // Nor the `!` commands that rode along — they were run, not typed.
+            let typed = crate::shell::split_context(&typed).1.to_string();
             let mut m = self.moment.write().expect("moment poisoned");
             if !typed.trim().is_empty()
                 && m.history.last().map(String::as_str) != Some(typed.as_str())
@@ -11958,6 +11992,91 @@ mod tests {
         assert!(
             !rows.iter().any(|r| r.contains("ReadFile(c2.rs)")),
             "the last call is still drawn after the turn ended:\n{rows:#?}"
+        );
+    }
+
+    /// Where the session works is the host's answer, not the process's: once
+    /// it is in, the status row says it and a shell call's `cd` into it is left
+    /// out. A switch to another session forgets it until that one's answer
+    /// comes, so a `cd` is never hidden on the strength of the wrong directory.
+    #[test]
+    fn a_cd_into_the_sessions_own_directory_is_left_out_once_the_host_has_said_it() {
+        let h = host();
+        let bash = |id: &str| SessionEvent::AssistantMessage {
+            turn: 1,
+            round: 1,
+            text: String::new(),
+            reasoning: String::new(),
+            tool_calls: vec![atomcode_kernel::tool::ToolCall {
+                id: id.into(),
+                name: "bash".into(),
+                arguments: format!(r#"{{"command":"cd /work/b && make {id}"}}"#),
+            }],
+            reasoning_blocks: Vec::new(),
+            meta: None,
+        };
+        let rows = |h: &Host| -> String {
+            h.compose((100, 40))
+                .part("stream")
+                .expect("the conversation")
+                .lines
+                .iter()
+                .map(|l| l.plain())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        h.absorb(&SessionEvent::TurnStart { turn: 1 });
+        // Not yet said: the `cd` stays.
+        h.absorb(&bash("one"));
+        assert!(
+            rows(&h).contains("$ cd /work/b && make one"),
+            "{}",
+            rows(&h)
+        );
+
+        h.set_session_dir("/work/b");
+        assert_eq!(h.moment.read().unwrap().cwd, "/work/b");
+        h.absorb(&bash("two"));
+        let drawn = rows(&h);
+        assert!(drawn.contains("$ make two"), "{drawn}");
+        assert!(!drawn.contains("cd /work/b && make two"), "{drawn}");
+
+        // Another session: nothing is known about where it works yet.
+        h.switch_session();
+        h.absorb(&SessionEvent::TurnStart { turn: 1 });
+        h.absorb(&bash("three"));
+        assert!(
+            rows(&h).contains("$ cd /work/b && make three"),
+            "{}",
+            rows(&h)
+        );
+    }
+
+    /// A `!` command waiting to ride the next message ran for the session on
+    /// screen; when another session takes its place — a `/cd`, a resume — the
+    /// next message goes there, and the command does not go with it. And the
+    /// words the person typed, not the command that rode along, are what ↑
+    /// brings back.
+    #[test]
+    fn a_shell_command_does_not_ride_into_another_session() {
+        let h = host();
+        h.moment
+            .write()
+            .unwrap()
+            .pending_context
+            .push(crate::shell::as_context("rm -rf a.html", ""));
+        h.switch_session();
+        assert!(h.moment.read().unwrap().pending_context.is_empty());
+
+        h.absorb(&SessionEvent::TurnStart { turn: 1 });
+        h.absorb(&SessionEvent::UserMessage {
+            turn: 1,
+            text: format!("{}\n\n看看", crate::shell::as_context("ls", "a")),
+            images: Vec::new(),
+        });
+        assert_eq!(
+            h.moment.read().unwrap().history.last().map(String::as_str),
+            Some("看看")
         );
     }
 

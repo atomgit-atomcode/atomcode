@@ -523,6 +523,7 @@ impl Stream {
         StreamWriter {
             stream: self,
             producer,
+            dir: None,
         }
     }
 }
@@ -536,9 +537,27 @@ impl Stream {
 pub struct StreamWriter<'a> {
     stream: &'a mut Stream,
     producer: &'static str,
+    /// The directory the session works in, as the host answered it — `None`
+    /// until it has (see [`StreamWriter::dir`]).
+    dir: Option<Arc<str>>,
 }
 
 impl StreamWriter<'_> {
+    /// The same writer, for a session the host says works in `dir`.
+    pub fn in_dir(mut self, dir: Option<Arc<str>>) -> Self {
+        self.dir = dir;
+        self
+    }
+
+    /// Where the session this fact belongs to works, when the host has said.
+    ///
+    /// Data, like everything else a producer is given: the host's answer,
+    /// handed over, never looked up. `None` while the question is out — a
+    /// producer that wants it must draw something correct without it.
+    pub fn dir(&self) -> Option<&str> {
+        self.dir.as_deref()
+    }
+
     /// Append a new block, `Live`.
     pub fn open(&mut self, at: Coord, content: Arc<dyn Content>) -> BlockId {
         let id = BlockId(self.stream.next_id.fetch_add(1, Ordering::SeqCst) + 1);

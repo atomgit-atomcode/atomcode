@@ -375,7 +375,10 @@ impl Producer for Transcript {
                     None => {}
                 }
                 for call in tool_calls {
-                    let block = ToolCallBlock::pending(&call.id, &call.name, &call.arguments);
+                    let mut block = ToolCallBlock::pending(&call.id, &call.name, &call.arguments);
+                    if let Some(dir) = out.dir() {
+                        block = block.ran_in(dir);
+                    }
                     let id = out.open(at, Arc::new(block.with(Outcome::Pending)));
                     open.calls.insert(call.id.clone(), (id, block));
                 }

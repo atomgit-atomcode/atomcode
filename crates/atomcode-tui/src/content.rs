@@ -684,13 +684,29 @@ impl Content for UserSaid {
     /// two blocks — see `host::blank_between`, which is the one place that
     /// decides it for both the painter and the scroll.
     fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
-        input_bar(
-            &self.0,
+        // The `!` commands that rode along are the model's reading, not what
+        // was typed: the person's words lead the bar, and each command follows
+        // as one muted `! command` row — said, so a resumed session still shows
+        // that the message carried it, but not as the tags the model reads.
+        let (ran, said) = crate::shell::split_context(&self.0);
+        let mut rows = input_bar(
+            said,
             ctx.width,
             &format!("{} ", Caps::default().g(Glyph::Prompt)),
             None,
             user(),
-        )
+        );
+        let room = (ctx.width as usize).saturating_sub(4);
+        for command in ran {
+            rows.extend(input_bar(
+                &clip(&command, room),
+                ctx.width,
+                "  ! ",
+                None,
+                muted(),
+            ));
+        }
+        rows
     }
 }
 
@@ -996,6 +1012,11 @@ pub struct ToolCallBlock {
     pub name: String,
     pub args: String,
     pub outcome: Outcome,
+    /// Where the session worked when the call was made, as its host answered —
+    /// `None` when it had not yet. A shell row leaves out a `cd` into it (see
+    /// [`crate::text::without_cd_into`]); without it, nothing is left out.
+    /// Fixed at the call: a later `/cd` does not move where this one ran.
+    pub dir: Option<String>,
 }
 
 impl ToolCallBlock {
@@ -1122,7 +1143,13 @@ impl ToolCallBlock {
             name: name.into(),
             args: args.into(),
             outcome: Outcome::Pending,
+            dir: None,
         }
+    }
+    /// The same call, made in `dir`.
+    pub fn ran_in(mut self, dir: impl Into<String>) -> Self {
+        self.dir = Some(dir.into());
+        self
     }
     pub fn with(&self, outcome: Outcome) -> Self {
         Self {
@@ -1130,6 +1157,7 @@ impl ToolCallBlock {
             name: self.name.clone(),
             args: self.args.clone(),
             outcome,
+            dir: self.dir.clone(),
         }
     }
 
@@ -1156,7 +1184,14 @@ impl ToolCallBlock {
 
     /// What this call acted on, for display.
     fn subject(&self) -> String {
-        subject_of(&self.name, &self.args_without_reason())
+        let subject = subject_of(&self.name, &self.args_without_reason());
+        match (&self.dir, look(&self.name).verb) {
+            (Some(dir), Some(Verb::Shell)) => {
+                let folded = crate::text::collapse_home(dir);
+                crate::text::without_cd_into(&subject, &[dir, &folded]).to_string()
+            }
+            _ => subject,
+        }
     }
 
     /// The call as one phrase: `$ cargo test` for the shell — its own prompt,
@@ -1804,7 +1839,15 @@ impl Content for ToolCallBlock {
             Outcome::Failed(s) => format!("failed:{s}"),
             Outcome::Interrupted => "interrupted".into(),
         };
-        hash_of(&["tool_call", &self.call_id, &self.name, &self.args, &tag])
+        let dir = self.dir.as_deref().unwrap_or_default();
+        hash_of(&[
+            "tool_call",
+            &self.call_id,
+            &self.name,
+            &self.args,
+            &tag,
+            dir,
+        ])
     }
     /// The shape `atomcode-tuix` ships, because two front ends with two looks
     /// are two products:
@@ -4539,6 +4582,7 @@ mod tests {
                 name: "read_file".into(),
                 args: r#"{"file_path":"very/long/path/to/a/file.rs"}"#.into(),
                 outcome: Outcome::Failed("no such file or directory".into()),
+                dir: None,
             }),
             Box::new(NoticeBlock {
                 detail: "rate limited; waiting 30s".into(),
@@ -4616,6 +4660,7 @@ mod tests {
             outcome: Outcome::Ok(
                 "Edited a.rs (1 replacement)\n@@ -1,2 +1,2 @@\n keep\n-old\n+new".into(),
             ),
+            dir: None,
         };
         let lines = block.lines(&crate::block::RenderCtx::bare(80));
         // The `(+N -M)` count rides the naming line, right after the file — not a
@@ -4655,6 +4700,7 @@ mod tests {
             name: "write_file".into(),
             args: r#"{"file_path":"a.html","content":"<h1>hi</h1>\nbye"}"#.into(),
             outcome: Outcome::Ok("Wrote a.html".into()),
+            dir: None,
         };
         let lines = block.lines(&crate::block::RenderCtx::bare(80));
         let naming = lines
@@ -5382,24 +5428,61 @@ mod tests {
     }
 
     /// A shell call reads the way it was typed — `$ ls`, not `$(ls)`, which
-    /// reads as a substitution — folded or under a reason.
+    /// reads as a substitution — and a `cd` into the directory it ran in is
+    /// left out. A `cd` elsewhere stays, and so does every `cd` of a call whose
+    /// directory is not known.
     #[test]
-    fn a_shell_call_reads_as_typed() {
+    fn a_shell_call_reads_as_typed_without_a_cd_into_where_it_ran() {
         let ctx = crate::block::RenderCtx::bare(80);
-        let args = serde_json::json!({ "command": "cd /tmp && ls -la" }).to_string();
-        let line = ToolCallBlock::pending("c", "bash", args)
+        let call = |command: &str| {
+            let args = serde_json::json!({ "command": command }).to_string();
+            ToolCallBlock::pending("c", "bash", args)
+        };
+        let line = call("cd /work/proj && ls -la")
+            .ran_in("/work/proj")
             .summary(&ctx)
             .plain();
-        assert!(line.starts_with("● $ cd /tmp && ls -la"), "{line:?}");
+        assert!(line.starts_with("● $ ls -la"), "{line:?}");
+        let line = call("cd /tmp && ls")
+            .ran_in("/work/proj")
+            .summary(&ctx)
+            .plain();
+        assert!(line.starts_with("● $ cd /tmp && ls"), "{line:?}");
+        let line = call("cd /work/proj && ls").summary(&ctx).plain();
+        assert!(line.starts_with("● $ cd /work/proj && ls"), "{line:?}");
         assert!(!line.contains("$("), "{line:?}");
         // Under a reason, the `⎿` row is the same phrase.
-        let args = serde_json::json!({ "command": "make", "intent": "构建" });
+        let args = serde_json::json!({ "command": "cd /work/proj && make", "intent": "构建" });
         let rows: Vec<String> = ToolCallBlock::pending("c", "bash", args.to_string())
+            .ran_in("/work/proj")
             .summary_lines(&ctx)
             .iter()
             .map(Line::plain)
             .collect();
         assert!(rows[1].contains("⎿ $ make ·"), "{rows:?}");
+    }
+
+    /// The `!` commands a message carried are not drawn as the tags the model
+    /// reads: the person's words lead the bar, each command follows as a muted
+    /// `! command` row.
+    #[test]
+    fn a_message_that_carried_a_shell_command_shows_the_words_and_the_command() {
+        let text = format!(
+            "{}\n\n分析下这个项目",
+            crate::shell::as_context("rm -rf pelican-bike.html", "")
+        );
+        let rows: Vec<String> = UserSaid(text)
+            .lines(&crate::block::RenderCtx::bare(60))
+            .iter()
+            .map(Line::plain)
+            .collect();
+        assert!(!rows.iter().any(|r| r.contains("bash-")), "{rows:?}");
+        assert!(rows[0].contains("分析下这个项目"), "{rows:?}");
+        assert!(
+            rows[1].trim_end().ends_with("! rm -rf pelican-bike.html"),
+            "{rows:?}"
+        );
+        assert!(rows.iter().all(|r| width::str_width(r) <= 60), "{rows:?}");
     }
 
     /// A folded call whose command wraps says it was cut: the row it keeps ends

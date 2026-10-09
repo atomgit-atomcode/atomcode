@@ -370,6 +370,62 @@ pub fn collapse_home_in_command(command: &str) -> String {
     collapse_home_in_command_with(command, home_dir().as_deref())
 }
 
+/// `command` without a leading `cd <dir> && `, when `<dir>` is one of `here`.
+///
+/// A model that works in the session's own directory still opens most of its
+/// commands with `cd /that/directory && `, and on a one-row line that prefix is
+/// half the row before the command has said anything. It says nothing either:
+/// the call ran there anyway. A `cd` anywhere else is kept — that one is news.
+///
+/// Only `&&`: a `;` would run the rest even where the `cd` failed, and a reader
+/// should see that. `here` holds the spellings the directory can appear in (as
+/// is, and home-folded the way [`collapse_home_in_command`] writes it), compared
+/// without a trailing separator. Quoted targets are read whole.
+///
+/// Cosmetic only, like the home folding: what ran keeps its `cd`.
+pub fn without_cd_into<'a>(command: &'a str, here: &[&str]) -> &'a str {
+    let Some(rest) = command.trim_start().strip_prefix("cd") else {
+        return command;
+    };
+    if !rest.starts_with([' ', '\t']) {
+        return command;
+    }
+    let rest = rest.trim_start();
+    let (target, after) = match rest.chars().next() {
+        Some(quote @ ('"' | '\'')) => {
+            let Some((target, after)) = rest
+                .strip_prefix(quote)
+                .and_then(|inner| inner.split_once(quote))
+            else {
+                return command;
+            };
+            (target, after)
+        }
+        _ => rest.split_at(rest.find(char::is_whitespace).unwrap_or(rest.len())),
+    };
+    let Some(remainder) = after.trim_start().strip_prefix("&&") else {
+        return command;
+    };
+    let remainder = remainder.trim_start();
+    let bare = |path: &str| {
+        let trimmed = path.trim_end_matches(['/', '\\']);
+        if trimmed.is_empty() {
+            path.to_string()
+        } else {
+            trimmed.to_string()
+        }
+    };
+    let target = bare(target);
+    if remainder.is_empty()
+        || !here
+            .iter()
+            .any(|dir| !dir.is_empty() && bare(dir) == target)
+    {
+        return command;
+    }
+    remainder
+}
+
 /// The implementation, with home explicit. See [`collapse_home_in_command`].
 #[allow(
     clippy::string_slice,
@@ -565,6 +621,37 @@ fn eat_escape(chars: &mut Peekable<Chars<'_>>) {
 
 #[cfg(test)]
 mod tests {
+    /// A `cd` into the directory the call ran in says nothing and goes; one
+    /// anywhere else, or one chained with `;`, stays.
+    #[test]
+    fn a_cd_into_here_is_left_out_of_the_command() {
+        let here = ["/Users/me/proj", "~/proj"];
+        assert_eq!(
+            super::without_cd_into("cd /Users/me/proj && ls -la", &here),
+            "ls -la"
+        );
+        assert_eq!(
+            super::without_cd_into("cd ~/proj/ && git log", &here),
+            "git log"
+        );
+        assert_eq!(
+            super::without_cd_into("cd \"~/proj\" &&  make", &here),
+            "make"
+        );
+        for kept in [
+            "cd /tmp && ls",
+            "cd /Users/me/proj; ls",
+            "cd /Users/me/proj",
+            "cd /Users/me/proj && ",
+            "cdx /Users/me/proj && ls",
+            "ls && cd /Users/me/proj && ls",
+            "cd \"/Users/me/proj && ls",
+        ] {
+            assert_eq!(super::without_cd_into(kept, &here), kept);
+        }
+        assert_eq!(super::without_cd_into("cd / && ls", &["/"]), "ls");
+        assert_eq!(super::without_cd_into("cd  && ls", &[""]), "cd  && ls");
+    }
     /// The ghost is the rest of something this session already said — never
     /// something invented.
     #[test]
