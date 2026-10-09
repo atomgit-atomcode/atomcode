@@ -193,27 +193,6 @@ struct Link {
     control: Arc<dyn HostControl>,
 }
 
-/// A question this screen put up for one of its own agents.
-struct OpenAsk {
-    /// The panel's id in [`crate::ask::Asks`].
-    ask: u64,
-    /// The session that asked it, from the [`SessionEvent::Asked`] fact the
-    /// asking row wrote just before the request — `None` for a question asked
-    /// without one (the model's own `request_user_input`).
-    ///
-    /// [`SessionEvent::Asked`]: atomcode_kernel::session::SessionEvent::Asked
-    session: Option<String>,
-    /// Asked for a member of the team ([`Question::asker`]). Its `Asked` and
-    /// `Answered` are written into the lead's log, so the session alone cannot
-    /// tell it from the lead's own — and the lead's turn ending does not end it.
-    ///
-    /// [`Question::asker`]: atomcode_kernel::session::Question::asker
-    member: bool,
-    /// For a question with no `Asked` fact: the lead's tool call it was asked
-    /// from ([`crate::ask::call_asking`]), whose result says it is over.
-    call: Option<String>,
-}
-
 /// What this screen follows: one session, and the members of its team the
 /// person has looked at (`docs/adr/0023` §3).
 #[derive(Default)]
@@ -1229,12 +1208,9 @@ pub struct Tui {
     /// per screen, for the reason `allowance_nudged` is: it is news the first
     /// time, and after that it is one more line to read past.
     reasoning_hinted: AtomicBool,
-    /// The questions this screen put up for its own agents, with the call each
-    /// is about — see [`OpenAsk`].
-    open_asks: Mutex<Vec<OpenAsk>>,
-    /// Sessions whose `Asked` fact has arrived and whose request has not yet:
-    /// the next question put up is theirs, in this order.
-    asked_unshown: Mutex<std::collections::VecDeque<(String, bool)>>,
+    /// Which of the questions this screen put up have stopped waiting without
+    /// it — see [`crate::ask::Ledger`].
+    asks_ledger: Mutex<crate::ask::Ledger>,
     /// Whether this project's older sessions have been folded into the history
     /// yet. Once per screen.
     history_asked: Mutex<bool>,
@@ -5494,7 +5470,7 @@ impl Tui {
             let n = questions.len();
             let call = crate::ask::call_asking(kind, &payload, &self.client.root_events());
             let (ask, answer) = self.host.asks.push_batch_with_id(questions);
-            self.remember_ask(ask, call);
+            self.remember_ask(ask, &payload, call);
             let client = self.client.clone();
             tokio::spawn(async move {
                 // Taken down — answered elsewhere, or its turn is over: nothing
@@ -5516,7 +5492,7 @@ impl Tui {
         };
         let call = crate::ask::call_asking(kind, &payload, &self.client.root_events());
         let (ask, answer) = self.host.asks.push_with_id(asked);
-        self.remember_ask(ask, call);
+        self.remember_ask(ask, &payload, call);
         let client = self.client.clone();
         let kind = kind.to_string();
         tokio::spawn(async move {
@@ -5529,30 +5505,16 @@ impl Tui {
         });
     }
 
-    fn remember_ask(&self, ask: u64, call: Option<String>) {
-        // The session whose `Asked` came in ahead of this request. A question
-        // with one is closed by that session's `Answered`; only one without
-        // falls back to the call it was asked from.
-        let (session, member) = match self
-            .asked_unshown
+    fn remember_ask(&self, ask: u64, payload: &Value, call: Option<String>) {
+        // The words of the (first) question: what pairs it with its `Asked`.
+        let prompt = payload
+            .get("question")
+            .or_else(|| payload.pointer("/questions/0/question"))
+            .and_then(Value::as_str);
+        self.asks_ledger
             .lock()
             .expect("asks poisoned")
-            .pop_front()
-        {
-            Some((session, member)) => (Some(session), member),
-            None => (None, false),
-        };
-        let call = if session.is_some() { None } else { call };
-        let mut open = self.open_asks.lock().expect("asks poisoned");
-        // What was answered here or already taken down is no longer up: kept, it
-        // would only grow.
-        open.retain(|known| self.host.asks.is_up(known.ask));
-        open.push(OpenAsk {
-            ask,
-            session,
-            member,
-            call,
-        });
+            .shown(ask, prompt, call);
     }
 
     /// Take down the questions that stopped waiting without this screen
@@ -5575,58 +5537,22 @@ impl Tui {
     /// [`Answered`]: atomcode_kernel::session::SessionEvent::Answered
     fn settle_asks(&self, event: &AgentEvent) -> bool {
         use atomcode_kernel::session::SessionEvent;
-        let root = self.client.root();
-        let gone: Vec<u64> = {
-            let mut open = self.open_asks.lock().expect("asks poisoned");
-            let mut unshown = self.asked_unshown.lock().expect("asks poisoned");
-            let mut take = |pick: &dyn Fn(&OpenAsk) -> bool, first_only: bool| {
-                let mut gone = Vec::new();
-                open.retain(|known| {
-                    if (first_only && !gone.is_empty()) || !pick(known) {
-                        return true;
-                    }
-                    gone.push(known.ask);
-                    false
-                });
-                gone
-            };
+        let gone = {
+            let mut ledger = self.asks_ledger.lock().expect("asks poisoned");
             match event {
                 AgentEvent::Fact(committed) => match &committed.event {
                     SessionEvent::Asked { question, .. } => {
-                        unshown.push_back((committed.session.clone(), question.asker.is_some()));
+                        ledger.asked(&committed.session, question);
                         Vec::new()
                     }
-                    SessionEvent::Answered { .. } => {
-                        // Closed before it was ever put up here (an answer the
-                        // execution mode gave): nothing on screen is about it.
-                        if let Some(at) = unshown.iter().position(|(s, _)| *s == committed.session)
-                        {
-                            unshown.remove(at);
-                            Vec::new()
-                        } else {
-                            take(
-                                &|known| known.session.as_deref() == Some(&*committed.session),
-                                true,
-                            )
-                        }
+                    SessionEvent::Answered { by, .. } => {
+                        ledger.answered(&committed.session, by, |ask| self.host.asks.is_up(ask))
                     }
-                    SessionEvent::ToolResultLogged { call_id, .. } => take(
-                        &|known| {
-                            known.session.is_none() && known.call.as_deref() == Some(&**call_id)
-                        },
-                        false,
-                    ),
+                    SessionEvent::ToolResultLogged { call_id, .. } => ledger.call_settled(call_id),
                     _ => Vec::new(),
                 },
                 AgentEvent::TurnComplete { .. } | AgentEvent::Cancelled => {
-                    unshown.retain(|(s, member)| *s != root || *member);
-                    take(
-                        &|known| match &known.session {
-                            Some(session) => *session == root && !known.member,
-                            None => known.call.is_some(),
-                        },
-                        false,
-                    )
+                    ledger.turn_ended(&self.client.root())
                 }
                 _ => Vec::new(),
             }
@@ -9246,8 +9172,7 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
             allowance_checked: Mutex::new(None),
             allowance_nudged: Arc::new(AtomicBool::new(false)),
             reasoning_hinted: AtomicBool::new(false),
-            open_asks: Mutex::new(Vec::new()),
-            asked_unshown: Mutex::new(std::collections::VecDeque::new()),
+            asks_ledger: Mutex::new(crate::ask::Ledger::default()),
             history_asked: Mutex::new(false),
             files: Mutex::new(None),
             pressed_at: Mutex::new(None),
