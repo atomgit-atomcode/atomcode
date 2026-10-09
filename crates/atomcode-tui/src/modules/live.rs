@@ -1129,7 +1129,7 @@ mod tests {
     #[test]
     fn the_context_is_the_last_round_and_the_output_is_the_whole_turn() {
         let mut state = fold(&a_turn());
-        assert!(working(&state, 0)[0].contains("入 1.2k"));
+        assert!(working(&state, 0)[0].contains("入 1.2K"));
         assert!(working(&state, 0)[0].contains("缓存 33.33%"));
 
         Live::absorb(
@@ -1146,11 +1146,11 @@ mod tests {
         );
         let said = working(&state, 0)[0].clone();
         assert!(
-            said.contains("入 2.0k"),
-            "the latest context, not 1.2k + 2.0k: {said}"
+            said.contains("入 2.0K"),
+            "the latest context, not 1.2K + 2.0K: {said}"
         );
         assert!(
-            !said.contains("3.2k"),
+            !said.contains("3.2K"),
             "a sum of contexts counts the same tokens once per round: {said}"
         );
         assert!(said.contains("出 100"), "the output adds up: {said}");
@@ -1248,7 +1248,7 @@ mod tests {
         moment.turn_started = Some(Timestamp::millis(0));
 
         let roomy = line_at(&state, &moment, 60);
-        for want in ["耗时 12s", "入 1.2k", "出 80", "缓存 33.33%"] {
+        for want in ["耗时 12s", "入 1.2K", "出 80", "缓存 33.33%"] {
             assert!(roomy.contains(want), "{want} missing from {roomy}");
         }
 
@@ -1263,7 +1263,7 @@ mod tests {
             "and so does the clock: {narrow}"
         );
         assert!(!narrow.contains("入"), "the figure is dropped: {narrow}");
-        assert!(!narrow.contains("1.2k"), "whole, not halved: {narrow}");
+        assert!(!narrow.contains("1.2K"), "whole, not halved: {narrow}");
 
         // Narrower than the words alone: nothing to do but clip them.
         let nothing_fits = line_at(&state, &moment, 3);

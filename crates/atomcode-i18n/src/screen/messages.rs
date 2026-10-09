@@ -1524,6 +1524,15 @@ pub enum Msg<'a> {
     TurnTools {
         tools: u32,
     },
+    /// A turn's cache hit, on its closing line — the last request of this turn
+    /// only, so it is said apart from the session's figure on the status row.
+    TurnCached {
+        pct: u8,
+    },
+    /// The session's cache hit, on the status row.
+    SessionCached {
+        pct: u64,
+    },
     StopCancelled,
     StopMaxRounds,
     StopByPolicy,

@@ -112,7 +112,7 @@ impl View for Status {
     }
 
     /// The bottom line: what model, where, how full the context is, how much of
-    /// it was cached — `model │ cwd │ 49.0k/512k tok (10%) │ cache 96%`, with the
+    /// it was cached — `model │ cwd │ 49.0K/512K tok (10%) │ cache 96%`, with the
     /// home directory collapsed to `~`.
     ///
     /// Each part carries its own colour: the model in the theme accent, the cwd
@@ -442,31 +442,31 @@ fn path_basename(path: &str) -> &str {
 }
 
 /// A token count in the status row's units, `atomcode-tuix`'s `format_tok_count`:
-/// `k` below a million and `m` at/above it. `round_clean` keeps a round value
-/// clean (`512k`, `1m`) for the window; the used count keeps one decimal
+/// `K` below a million and `M` at/above it. `round_clean` keeps a round value
+/// clean (`512K`, `1M`) for the window; the used count keeps one decimal
 /// (`49.0k`) so it is visibly moving.
 fn format_tok_count(n: usize, round_clean: bool) -> String {
     if n >= 1_000_000 {
         if round_clean && n.is_multiple_of(1_000_000) {
-            format!("{}m", n / 1_000_000)
+            format!("{}M", n / 1_000_000)
         } else {
-            format!("{:.1}m", n as f64 / 1_000_000.0)
+            format!("{:.1}M", n as f64 / 1_000_000.0)
         }
     } else if n >= 1000 {
         if round_clean && n.is_multiple_of(1000) {
-            format!("{}k", n / 1000)
+            format!("{}K", n / 1000)
         } else if round_clean {
-            format!("{:.0}k", n as f64 / 1000.0)
+            format!("{:.0}K", n as f64 / 1000.0)
         } else {
-            format!("{:.1}k", n as f64 / 1000.0)
+            format!("{:.1}K", n as f64 / 1000.0)
         }
     } else {
         format!("{n}")
     }
 }
 
-/// Context usage as `49.0k/512k tok (10%)` when the window is known, or a bare
-/// `49.0k tok` when the provider has not reported one yet.
+/// Context usage as `49.0K/512K tok (10%)` when the window is known, or a bare
+/// `49.0K tok` when the provider has not reported one yet.
 fn format_ctx_usage(used: usize, window: usize) -> String {
     let used_label = format_tok_count(used, false);
     if window == 0 {
@@ -510,7 +510,7 @@ fn gauge_tokens(state: &State, moment: &Moment) -> u32 {
 fn cache_indicator(cached: u64, prompt: u64) -> Option<String> {
     (cached > 0 && prompt > 0).then(|| {
         let pct = (cached * 100 / prompt).min(100);
-        format!("cache {pct}%")
+        crate::i18n::t(crate::i18n::Msg::SessionCached { pct }).into_owned()
     })
 }
 
@@ -1402,7 +1402,7 @@ mod tests {
             ..Default::default()
         };
         let line = Status::render(&st, &Viewport::new(Rect::sized(120, 1), &m))[0].plain();
-        assert!(line.contains("cache 45%"), "{line:?}");
+        assert!(line.contains("缓存 45%"), "{line:?}");
     }
 
     /// A compaction is not a request, so the row cannot wait for one to report
@@ -1419,13 +1419,13 @@ mod tests {
             ..Default::default()
         };
         let line = Status::render(&st, &Viewport::new(Rect::sized(120, 1), &m))[0].plain();
-        assert!(line.contains("700.0k/1m tok (70%)"), "{line:?}");
+        assert!(line.contains("700.0K/1M tok (70%)"), "{line:?}");
 
         // The fold: the compaction measured the view shrinking to a fifth of its
         // bytes, and no request has reported since.
         m.note_fold(2_500_000, 500_000);
         let line = Status::render(&st, &Viewport::new(Rect::sized(120, 1), &m))[0].plain();
-        assert!(line.contains("140.0k/1m tok (14%)"), "{line:?}");
+        assert!(line.contains("140.0K/1M tok (14%)"), "{line:?}");
 
         // The next request is the authority on its own prompt, so it retires the
         // estimate rather than being blended with it — the clear `Host` makes on
@@ -1444,7 +1444,7 @@ mod tests {
         );
         m.ctx_shrunk_since_reading = None;
         let line = Status::render(&st, &Viewport::new(Rect::sized(120, 1), &m))[0].plain();
-        assert!(line.contains("150.0k/1m tok (15%)"), "{line:?}");
+        assert!(line.contains("150.0K/1M tok (15%)"), "{line:?}");
     }
 
     #[test]
@@ -1481,7 +1481,7 @@ mod tests {
 
     /// A small count is a count, not a rounding of itself to nothing. `14`
     /// tokens is what a one-line exchange costs, and the line used to render it
-    /// as `0k tok` — a zero it had just decided not to print.
+    /// as `0K tok` — a zero it had just decided not to print.
     #[test]
     fn a_small_count_is_not_rounded_away_to_zero() {
         let st = State {
@@ -1499,7 +1499,7 @@ mod tests {
         };
         let line =
             Status::render(&st, &Viewport::new(Rect::sized(70, 1), &Moment::default()))[0].plain();
-        assert!(line.contains("123.5k tok"), "{line:?}");
+        assert!(line.contains("123.5K tok"), "{line:?}");
     }
 
     #[test]
@@ -1830,7 +1830,7 @@ mod tests {
     }
 
     /// The reference footer: usage against the window and the cache ratio, in
-    /// tuix's `49.0k/512k tok (10%)` / `cache 96%` shape.
+    /// tuix's `49.0K/512K tok (10%)` / `cache 96%` shape.
     #[test]
     fn the_row_shows_usage_against_the_window_and_the_cache_ratio() {
         let st = State {
@@ -1850,8 +1850,8 @@ mod tests {
         assert!(line.contains("glm5.3-flash-pro"), "{line:?}");
         assert!(line.contains("~/Documents/workspace/atomcode"), "{line:?}");
         // 49000/512000 ≈ 9.57% → 10%.
-        assert!(line.contains("49.0k/512k tok (10%)"), "{line:?}");
-        assert!(line.contains("cache 96%"), "{line:?}");
+        assert!(line.contains("49.0K/512K tok (10%)"), "{line:?}");
+        assert!(line.contains("缓存 96%"), "{line:?}");
     }
 
     /// The footer collapses the home directory to `~`, the space-saving
@@ -1885,7 +1885,7 @@ mod tests {
         };
         let line =
             Status::render(&st, &Viewport::new(Rect::sized(120, 1), &Moment::default()))[0].plain();
-        assert!(line.contains("49.0k tok"), "{line:?}");
+        assert!(line.contains("49.0K tok"), "{line:?}");
         assert!(
             !line.contains('/'),
             "no window means no denominator: {line:?}"
@@ -1950,11 +1950,7 @@ mod tests {
         assert_eq!(colour("/w"), theme::fg(Role::Muted).fg, "cwd is muted grey");
         // 100/1000 = 10% < 70, so the usage is green.
         assert_eq!(colour("tok"), theme::fg(Role::Success).fg, "usage is green");
-        assert_eq!(
-            colour("cache"),
-            theme::fg(Role::Warning).fg,
-            "cache is gold"
-        );
+        assert_eq!(colour("缓存"), theme::fg(Role::Warning).fg, "cache is gold");
     }
 
     /// The usage is green, shifting to yellow then red as the window fills past

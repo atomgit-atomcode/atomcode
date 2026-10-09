@@ -682,12 +682,12 @@ impl AccountForm {
 pub const WINDOW_PRESETS: [usize; 6] = [1_000_000, 512_000, 256_000, 128_000, 64_000, 32_000];
 
 /// The smallest and largest window [`parse_window`] takes. Below a thousand
-/// tokens is a typo for a larger number (`1.4` meant `1.4m`), and above a
+/// tokens is a typo for a larger number (`1.4` meant `1.4M`), and above a
 /// hundred million no model exists — a held-down `0` key would otherwise
 /// reach the configuration file, which stores the window as a signed integer.
 pub const WINDOW_TYPED_RANGE: std::ops::RangeInclusive<usize> = 1_000..=100_000_000;
 
-/// A typed window, in tokens: `200000`, `200k`, `1.5m` (either case). `None`
+/// A typed window, in tokens: `200000`, `200K`, `1.5M` (either case). `None`
 /// for anything else, and for a size outside [`WINDOW_TYPED_RANGE`].
 pub fn parse_window(text: &str) -> Option<usize> {
     let text = text.trim().to_ascii_lowercase();
@@ -711,13 +711,13 @@ pub fn parse_window(text: &str) -> Option<usize> {
     Some(value.round() as usize).filter(|window| WINDOW_TYPED_RANGE.contains(window))
 }
 
-/// A window as it reads on the form: `1m`, `512k`, or the plain count when it
+/// A window as it reads on the form: `1M`, `512K`, or the plain count when it
 /// is neither a whole million nor a whole thousand.
 pub fn window_label(window: usize) -> String {
     if window >= 1_000_000 && window.is_multiple_of(1_000_000) {
-        format!("{}m", window / 1_000_000)
+        format!("{}M", window / 1_000_000)
     } else if window >= 1000 && window.is_multiple_of(1000) {
-        format!("{}k", window / 1000)
+        format!("{}K", window / 1000)
     } else {
         window.to_string()
     }
@@ -2746,8 +2746,8 @@ mod tests {
         };
         assert_eq!(draft.window, None);
 
-        assert_eq!(window_label(1_000_000), "1m");
-        assert_eq!(window_label(512_000), "512k");
+        assert_eq!(window_label(1_000_000), "1M");
+        assert_eq!(window_label(512_000), "512K");
         assert_eq!(window_label(131_072), "131072");
     }
 

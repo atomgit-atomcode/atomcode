@@ -2463,7 +2463,7 @@ mod tests {
         let shown = drawn(&page, 96, 60).join("\n");
         assert!(shown.contains("deepseek-flash"), "{shown}");
         assert!(
-            shown.contains("221.1m"),
+            shown.contains("221.1M"),
             "tokens as a person reads them: {shown}"
         );
         assert!(shown.contains("1604"), "and requests: {shown}");
@@ -2475,9 +2475,9 @@ mod tests {
         // blocks and put the peak in words beside it — that says "it spiked",
         // not "how much". The fractions are the classic front end's: the peak
         // at the top, then the row's share of the way down to zero.
-        assert!(shown.contains("216.6m"), "the top of the axis: {shown}");
+        assert!(shown.contains("216.6M"), "the top of the axis: {shown}");
         assert!(
-            shown.contains("130m") && shown.contains("43.3m"),
+            shown.contains("130M") && shown.contains("43.3M"),
             "and the heights between it and zero: {shown}"
         );
         // The bottom row is the floor *and* a row of the plot: the flat run
@@ -2513,8 +2513,8 @@ mod tests {
             line.find(needle).expect("just found it") + needle.len()
         };
         assert_eq!(
-            ends("221.1m"),
-            ends("59.7m"),
+            ends("221.1M"),
+            ends("59.7M"),
             "the token column lines up: {shown}"
         );
         assert_eq!(
@@ -2661,15 +2661,15 @@ mod tests {
         });
         let shown = drawn(&page, 96, 60).join("\n");
         assert!(
-            shown.contains("9m"),
+            shown.contains("9M"),
             "the peak is on the axis even though it is at the far left: {shown}"
         );
         let top = shown
             .lines()
-            .find(|line| line.contains("9m") && line.chars().any(is_plot_ink))
+            .find(|line| line.contains("9M") && line.chars().any(is_plot_ink))
             .unwrap_or_else(|| panic!("the top row of the plot has the line on it: {shown}"));
         let ink = top.chars().position(is_plot_ink).expect("just found it");
-        let axis = top.find("9m").expect("the label") + 2;
+        let axis = top.find("9M").expect("the label") + 2;
         assert!(
             ink - axis < CHART_CELLS / 4,
             "and it is drawn at the left, where those days are: {top:?}"

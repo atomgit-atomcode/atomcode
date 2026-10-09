@@ -406,6 +406,12 @@ impl Presentation {
         self.tool_output
     }
 
+    /// Whether two calls in a row get a blank row between them — the drawn-in-
+    /// full modes, where a call is a paragraph; see [`blank_between`].
+    pub fn calls_apart(&self) -> bool {
+        matches!(self.tool_output, ToolOutput::Full | ToolOutput::Head)
+    }
+
     /// Whether a run of consecutive calls merges into one lid.
     pub fn merges_tool_runs(&self) -> bool {
         self.tool_output == ToolOutput::Group
@@ -635,9 +641,14 @@ type RowOwner = Option<(BlockId, &'static str)>;
 /// `⎿ ok · 12 行` followed by the next sentence has the same problem the other
 /// way round — hence the two-sided test below.
 ///
-/// Nothing goes between two tool calls. A run of them is one thought, and a
-/// screen of six calls separated by five gaps is a screen that no longer shows
-/// what was done in one glance.
+/// Between two tool calls it depends on how the calls are drawn
+/// (`calls_apart`). Drawn in full — each a `●` reason over a `⎿` call, or a
+/// preview of what it printed — two calls pressed together read as one block
+/// of grey, and the eye cannot find where the next step starts; a blank row
+/// gives each its own paragraph, the way a reader sees it elsewhere
+/// (2026-10-09, the user's call). In the compact modes (`Each`, `Group`) a
+/// call is one row, a list of them reads as a list, and a gap under every row
+/// would double the screen they were chosen to save.
 ///
 /// The turn's closing summary is a separator — `✻ Done · 3 轮 · 2 工具` — and gets
 /// a row of air on both sides unconditionally. It is the one row that is *about*
@@ -654,7 +665,7 @@ type RowOwner = Option<(BlockId, &'static str)>;
 /// One definition, consulted by both the painter and the height the scroll is
 /// measured against — the two have to agree or the last rows of a long
 /// transcript become unreachable.
-fn blank_between(upper: &str, lower: &str) -> bool {
+fn blank_between(upper: &str, lower: &str, calls_apart: bool) -> bool {
     if upper == "turn_end" || lower == "turn_end" {
         return true;
     }
@@ -665,7 +676,10 @@ fn blank_between(upper: &str, lower: &str) -> bool {
     if upper == "user" || lower == "user" {
         return true;
     }
-    (upper == "tool_call") != (lower == "tool_call")
+    match (upper == "tool_call", lower == "tool_call") {
+        (true, true) => calls_apart,
+        (a, b) => a != b,
+    }
 }
 
 /// What a block of this kind opens with, if it opens with anything.
@@ -5486,6 +5500,7 @@ impl Host {
     ) -> (Vec<Line>, Vec<RowOwner>) {
         let stream = self.stream.read().expect("stream poisoned");
         let pres = self.presentation.read().expect("presentation poisoned");
+        let calls_apart = pres.calls_apart();
         let mut out: Vec<Line> = Vec::new();
         // Grown in lockstep with `out`, so a row and its owner cannot get out
         // of step — the alternative is two loops that agree until one changes.
@@ -5655,7 +5670,7 @@ impl Host {
                 // the guard proved both fit — counting only `n` let the seam
                 // push `skipped` one past `scroll`, and the window then started
                 // a row higher than the scroll said.
-                let seam = usize::from(below.is_some_and(|b| blank_between(kind, b)));
+                let seam = usize::from(below.is_some_and(|b| blank_between(kind, b, calls_apart)));
                 if n + seam <= scroll.saturating_sub(skipped) {
                     skipped += n + seam;
                     below = Some(kind);
@@ -5726,13 +5741,13 @@ impl Host {
             if out.len() >= want {
                 break;
             }
-            let seam = usize::from(below.is_some_and(|b| blank_between(kind, b)));
+            let seam = usize::from(below.is_some_and(|b| blank_between(kind, b, calls_apart)));
             if n + seam <= scroll.saturating_sub(skipped) {
                 skipped += n + seam;
                 below = Some(kind);
                 continue;
             }
-            let blank = below.is_some_and(|b| blank_between(kind, b));
+            let blank = below.is_some_and(|b| blank_between(kind, b, calls_apart));
             below = Some(kind);
             // The blank belongs to the seam between this block and the one
             // below it, so it goes into the buffer first: rows go in
@@ -6351,12 +6366,13 @@ impl Host {
         // seam the newest-first walk charges to this slot.
         let mut below: Option<&'static str> = None;
         let mut acc = 0usize;
+        let calls_apart = pres.calls_apart();
         idx.skip_from.clear();
         idx.skip_from.resize(slots.len() + 1, 0);
         for i in (0..slots.len()).rev() {
             if let Some(entry) = idx.rows.get(i).copied().flatten() {
                 if entry.rows > 0 {
-                    let seam = below.is_some_and(|b| blank_between(entry.kind, b));
+                    let seam = below.is_some_and(|b| blank_between(entry.kind, b, calls_apart));
                     acc += entry.rows + usize::from(seam);
                     below = Some(entry.kind);
                 }
@@ -7404,13 +7420,13 @@ mod tests {
     #[test]
     fn a_user_bar_gets_a_blank_row_above_and_below_it() {
         assert!(
-            blank_between("commands", "user"),
+            blank_between("commands", "user", false),
             "a blank above the user bar"
         );
-        assert!(blank_between("user", "tool_call"), "and below it");
+        assert!(blank_between("user", "tool_call", false), "and below it");
         // Unrelated neighbours still butt together — the rule is the user bar,
         // not a blank between everything.
-        assert!(!blank_between("assistant", "assistant"));
+        assert!(!blank_between("assistant", "assistant", true));
     }
 
     /// Two turns, the second with something long enough to take several rows.
@@ -11508,7 +11524,7 @@ mod tests {
             .expect("the model's words are on screen");
         let call = rows
             .iter()
-            .position(|r| r.contains("$("))
+            .position(|r| r.contains("$ "))
             .expect("the call it asked for");
         assert_eq!(
             call,
@@ -11520,6 +11536,46 @@ mod tests {
             rows[prose + 1].trim().is_empty(),
             "the one row between them is not blank: {:?}",
             &rows[prose..=call]
+        );
+    }
+
+    /// Drawn in full, two calls in a row are two paragraphs: a blank row between
+    /// them, so the next step's `●` is easy to find. In the compact modes a call
+    /// is one row and the list stays a list.
+    #[test]
+    fn two_calls_drawn_in_full_have_a_row_of_air_between_them() {
+        let rows = |mode: Option<crate::host::ToolOutput>| -> Vec<String> {
+            let h = fed();
+            if let Some(mode) = mode {
+                h.presentation.write().unwrap().set_tool_output(mode);
+            }
+            h.compose((80, 60))
+                .part("stream")
+                .expect("the conversation")
+                .lines
+                .iter()
+                .map(|l| l.plain())
+                .collect()
+        };
+        let full = rows(None);
+        let second = full
+            .iter()
+            .position(|r| r.contains("b.rs"))
+            .expect("the second call");
+        assert!(
+            full[second - 1].trim().is_empty() && full[second - 2].contains("a.rs"),
+            "no blank row between the two calls: {:?}",
+            &full[second.saturating_sub(3)..=second]
+        );
+        let each = rows(Some(crate::host::ToolOutput::Each));
+        let second = each
+            .iter()
+            .position(|r| r.contains("b.rs"))
+            .expect("the second call");
+        assert!(
+            each[second - 1].contains("a.rs"),
+            "a compact list grew a gap: {:?}",
+            &each[second.saturating_sub(3)..=second]
         );
     }
 

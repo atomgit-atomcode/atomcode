@@ -974,6 +974,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::AskRefuseChoice => "refuse".into(),
         Msg::TurnRounds { steps } => format!("{steps} rounds").into(),
         Msg::TurnTools { tools } => format!("{tools} tools").into(),
+        Msg::TurnCached { pct } => format!("{pct}% cached").into(),
+        Msg::SessionCached { pct } => format!("cache {pct}%").into(),
         Msg::StopCancelled => "stopped".into(),
         Msg::StopMaxRounds => "stopped · the rounds ran out".into(),
         Msg::StopByPolicy => "stopped · a stopping policy ended it (a deadline or a budget)".into(),

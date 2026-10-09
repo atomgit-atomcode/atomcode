@@ -629,7 +629,7 @@ mod tests {
             "not by its id:\n{screen}"
         );
         assert!(
-            row.trim_end().ends_with("↓ 61.6k tok") && row.contains("1 分 52 秒"),
+            row.trim_end().ends_with("↓ 61.6K tok") && row.contains("1 分 52 秒"),
             "time and context at the right edge: {row:?}"
         );
     }

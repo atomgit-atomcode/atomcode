@@ -505,7 +505,7 @@ fn listed_parts(
             let Some(row) = view.models().get(i) else {
                 return None;
             };
-            let mut about = vec![format!("{}k", row.window / 1000)];
+            let mut about = vec![crate::providers::window_label(row.window)];
             if panel.drill.is_none() {
                 about.insert(0, row.account.clone());
             }
@@ -1097,7 +1097,7 @@ mod tests {
         let screen = drawn(&m, 60, 24);
         assert!(screen.contains("筛选:qwen"), "{screen}");
         assert!(screen.contains("› qwen3-coder"), "{screen}");
-        assert!(screen.contains("256.0k"), "{screen}");
+        assert!(screen.contains("256.0K"), "{screen}");
         assert!(!screen.contains("glm-5"), "filtered out:\n{screen}");
         assert!(screen.contains("Enter 填入"), "{screen}");
         for w in [4u16, 20, 60] {
@@ -1220,7 +1220,7 @@ mod tests {
 
         let narrow = drawn(&m, 60, 24);
         assert!(
-            narrow.contains("openrouter · 128k"),
+            narrow.contains("openrouter · 128K"),
             "the description keeps its room when the ids cannot:\n{narrow}"
         );
         for line in lines(&m, 60, 24) {

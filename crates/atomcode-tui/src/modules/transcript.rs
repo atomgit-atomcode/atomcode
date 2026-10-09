@@ -1370,12 +1370,11 @@ mod tests {
             })
             .collect();
         assert_eq!(ends.len(), 2, "two turns end in the corpus: {ends:?}");
-        for want in ["1 轮", "2 工具", "880 tokens", "33% cached"] {
-            assert!(
-                ends[0][0].contains(want),
-                "{want} missing from {:?}",
-                ends[0]
-            );
+        // All of it, on whichever row: at this width the figures can take the
+        // row under the outcome.
+        let said = ends[0].join("\n");
+        for want in ["1 轮", "2 工具", "880 tokens", "本轮缓存 33%"] {
+            assert!(said.contains(want), "{want} missing from {:?}", ends[0]);
         }
         // Turn 2 was a self-cancel: it draws no separator in the transcript now —
         // it closes on the composer instead.
@@ -1414,7 +1413,7 @@ mod tests {
         // Turn 1 took `DONE_LABELS[0]` (`Done`); turn 2's Cancelled end did not
         // advance the rotation, so this clean turn-2 end is `DONE_LABELS[1]`.
         assert!(last.contains("Nailed it"), "{last:?}");
-        for leaked in ["1200", "880", "tokens", "轮", "cached"] {
+        for leaked in ["1200", "880", "tokens", "轮", "缓存"] {
             assert!(!last.contains(leaked), "{leaked} leaked into {last:?}");
         }
     }

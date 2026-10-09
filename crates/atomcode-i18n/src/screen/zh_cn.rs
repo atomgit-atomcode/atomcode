@@ -910,6 +910,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::AskRefuseChoice => "拒绝".into(),
         Msg::TurnRounds { steps } => format!("{steps} 轮").into(),
         Msg::TurnTools { tools } => format!("{tools} 工具").into(),
+        Msg::TurnCached { pct } => format!("本轮缓存 {pct}%").into(),
+        Msg::SessionCached { pct } => format!("缓存 {pct}%").into(),
         Msg::StopCancelled => "已中断".into(),
         Msg::StopMaxRounds => "已中断 · 轮数用完了".into(),
         Msg::StopByPolicy => "已中断 · 一条停止策略叫停(时限或预算)".into(),

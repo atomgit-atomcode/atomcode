@@ -1118,6 +1118,20 @@ impl ToolCallBlock {
         subject_of(&self.name, &self.args_without_reason())
     }
 
+    /// The call as one phrase: `$ cargo test` for the shell — its own prompt,
+    /// the way the command would be typed, not `$(…)`, which reads as a
+    /// substitution — and `ReadFile(a.rs)` for every other tool.
+    fn called(&self, subject: &str) -> String {
+        let name = self.display_name();
+        if subject.is_empty() {
+            name
+        } else if look(&self.name).verb == Some(Verb::Shell) {
+            format!("{name} {subject}")
+        } else {
+            format!("{name}({subject})")
+        }
+    }
+
     /// Why this call is being made, if the model said.
     ///
     /// `intent` rides in the call's own arguments — that is what makes a reason
@@ -1163,11 +1177,7 @@ impl ToolCallBlock {
         // a reason, this row is the only place the call's name appears, and a
         // block that said what the model meant but not which tool it used would
         // leave the failure under it unexplained.
-        let called = if subject.is_empty() {
-            self.display_name()
-        } else {
-            format!("{}({subject})", self.display_name())
-        };
+        let called = self.called(&subject);
         let caps = Caps::default();
         // Indented under the tool mark, with the gutter glyph on the first row
         // only — the shape a result takes, so the two read as the same kind of
@@ -1236,14 +1246,7 @@ impl ToolCallBlock {
     fn head(&self, w: u16, lead: &str, lead_style: Style, name_style: Style) -> Vec<Line> {
         let spans = match self.reason() {
             Some(reason) => vec![Span::styled(reason, name_style)],
-            None => {
-                let subject = self.subject();
-                let mut spans = vec![Span::styled(self.display_name(), name_style)];
-                if !subject.is_empty() {
-                    spans.push(Span::styled(format!("({subject})"), name_style));
-                }
-                spans
-            }
+            None => vec![Span::styled(self.called(&self.subject()), name_style)],
         };
         crate::markdown::wrap_spans(&spans, w, lead, lead_style)
     }
@@ -1725,6 +1728,22 @@ fn flatten(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// `line` with a `…` at its end, cut to make room for it inside `w` cells. The
+/// mark takes the style of the text it ends.
+fn ellipsized(line: &Line, w: usize) -> Line {
+    if w == 0 {
+        return line.clone();
+    }
+    let style = line.spans.last().map(|span| span.style).unwrap_or_default();
+    let mut out = if line.width() < w {
+        line.clone()
+    } else {
+        line.truncate(w - 1)
+    };
+    out.push(Span::styled("…", style));
+    out
+}
+
 fn clip(s: &str, cells: usize) -> String {
     let flat = flatten(s);
     if width::str_width(&flat) <= cells {
@@ -1913,17 +1932,23 @@ impl Content for ToolCallBlock {
         // grey left no order inside the block, and the longer, denser command
         // row was the one the eye landed on. A running call keeps its colour
         // either way (`folded_style`); done is the dot's to say.
-        let mut rows: Vec<Line> = self
-            .opening_rows(
-                w,
-                &lead,
-                self.mark().1,
-                self.folded_reason_style(),
-                self.folded_style(),
-            )
-            .into_iter()
-            .take(FOLDED_ROWS)
-            .collect();
+        let opening = self.opening_rows(
+            w,
+            &lead,
+            self.mark().1,
+            self.folded_reason_style(),
+            self.folded_style(),
+        );
+        let cut = opening.len() > FOLDED_ROWS;
+        let mut rows: Vec<Line> = opening.into_iter().take(FOLDED_ROWS).collect();
+        // Rows left out are said to be: a long command used to stop wherever
+        // its wrap happened to fall — mid-flag, mid-word — and read as if that
+        // were the whole of it.
+        if cut {
+            if let Some(last) = rows.last_mut() {
+                *last = ellipsized(last, w as usize);
+            }
+        }
         if matches!(self.outcome, Outcome::Ok(_)) {
             return rows;
         }
@@ -1998,7 +2023,13 @@ impl Content for ToolCallBlock {
         // be), the tool's name, the parentheses, and the ` · ` before the note.
         let fixed = 2
             + width::str_width(&name)
-            + if has_subject { 2 } else { 0 }
+            + if !has_subject {
+                0
+            } else if look(&self.name).verb == Some(Verb::Shell) {
+                1
+            } else {
+                2
+            }
             + if note.is_empty() {
                 0
             } else {
@@ -2025,10 +2056,7 @@ impl Content for ToolCallBlock {
             format!("{} ", Caps::default().g(Glyph::ToolMark)),
             self.mark().1,
         )];
-        spans.push(Span::styled(name, style));
-        if has_subject {
-            spans.push(Span::styled(format!("({subject})"), style));
-        }
+        spans.push(Span::styled(self.called(&subject), style));
         if !note.is_empty() {
             spans.push(Span::styled(format!(" · {note}"), note_style));
         }
@@ -2683,7 +2711,7 @@ impl TurnStats {
         ];
         if with_cached {
             if let Some(pct) = self.cache_pct() {
-                parts.push(format!("{pct}% cached"));
+                parts.push(t(Msg::TurnCached { pct }).into_owned());
             }
         }
         Some(parts.join(" · "))
@@ -2780,13 +2808,13 @@ pub fn cache_hit_rate(cached: u32, prompt: u32) -> Option<String> {
 /// quantity on the same screen, and two renderings of one number is a
 /// disagreement a person has to stop and resolve.
 pub fn token_count(n: u32) -> String {
-    // `k` from a thousand, with one decimal kept (`8.0k`, not `8k`): the live line
-    // shows `入` and `出` side by side, and a bare `8003` next to `78.2k` reads as
+    // `K` from a thousand, with one decimal kept (`8.0K`, not `8K`): the live line
+    // shows `入` and `出` side by side, and a bare `8003` next to `78.2K` reads as
     // two different units. One decimal, always, keeps the column consistent.
     if n < 1_000 {
         return n.to_string();
     }
-    format!("{:.1}k", n as f64 / 1000.0)
+    format!("{:.1}K", n as f64 / 1000.0)
 }
 
 /// The same, for a figure an account service reports.
@@ -2803,11 +2831,11 @@ pub fn token_count_u64(n: u64) -> String {
     let (scaled, suffix) = if f < 10_000.0 {
         return n.to_string();
     } else if f < M {
-        (f / K, "k")
+        (f / K, "K")
     } else if f < B {
-        (f / M, "m")
+        (f / M, "M")
     } else {
-        (f / B, "b")
+        (f / B, "B")
     };
     let text = format!("{scaled:.1}");
     let trimmed = text.strip_suffix(".0").unwrap_or(&text);
@@ -3243,7 +3271,10 @@ mod tests {
             line.contains(&format!("Nailed it 21:42 · 12.5s · {rounds} · {tools} · ")),
             "{line}"
         );
-        assert!(line.ends_with("% cached"), "{line}");
+        assert!(
+            line.contains(" · 本轮缓存 ") && line.ends_with('%'),
+            "{line}"
+        );
     }
 
     /// 其他收尾的"话"是一句句子 —— 一个原因、接下来该做什么 —— 所以时间不跟在它后
@@ -3265,12 +3296,12 @@ mod tests {
             "上面那句是为什么停:\n{line}"
         );
         assert!(
-            !rows[0].contains("tokens") && !rows[0].contains("cached"),
+            !rows[0].contains("tokens") && !rows[0].contains("缓存"),
             "账不在上面那句里:\n{line}"
         );
         let word = t(Msg::StopAt { at: "21:42" }).into_owned();
         assert!(
-            rows[1].contains('✻') && rows[1].contains(&word) && rows[1].contains("% cached"),
+            rows[1].contains('✻') && rows[1].contains(&word) && rows[1].contains("本轮缓存"),
             "下面那行是「✻ {word} · …」:钟点有词接着、缓存命中也在:\n{line}"
         );
     }
@@ -4085,7 +4116,7 @@ mod tests {
             "2 工具",
             "32.7s",
             "4.36K tokens",
-            "99% cached",
+            "本轮缓存 99%",
         ] {
             assert!(text.contains(want), "{want} missing from {text:?}");
         }
@@ -4117,7 +4148,7 @@ mod tests {
             ended_at: None,
         };
         let text = drawn(&block, 80);
-        assert!(!text.contains("cached"), "{text:?}");
+        assert!(!text.contains("缓存"), "{text:?}");
         // Billable with nothing cached is the whole request plus its output:
         // `28 + 6223 = 6251` → `6.25K`.
         assert!(
@@ -4145,7 +4176,7 @@ mod tests {
         assert_eq!(lines.len(), 1, "nothing to say means no extra row");
         let text = drawn(&block, 80);
         assert!(text.contains("已中断"), "{text:?}");
-        for absent in ["轮", "工具", "tokens", "cached"] {
+        for absent in ["轮", "工具", "tokens", "缓存"] {
             assert!(!text.contains(absent), "{absent} in {text:?}");
         }
     }
@@ -4181,7 +4212,7 @@ mod tests {
             // figures under itself, where they are wrapped mid-phrase — they
             // are all still said, which is the property.
             let flat: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-            for want in ["4轮", "2工具", "32.7s", "4.36Ktokens", "99%cached"] {
+            for want in ["4轮", "2工具", "32.7s", "4.36Ktokens", "本轮缓存99%"] {
                 assert!(flat.contains(want), "w={w}: {want} lost from {text:?}");
             }
             for line in block.lines(&crate::block::RenderCtx::bare(w)) {
@@ -4222,10 +4253,10 @@ mod tests {
         assert_eq!(token_count(28), "28");
         assert_eq!(token_count(999), "999");
         // From a thousand it is `k` with one decimal kept, so `入`/`出` share a unit.
-        assert_eq!(token_count(1_000), "1.0k");
-        assert_eq!(token_count(8_003), "8.0k");
-        assert_eq!(token_count(90_659), "90.7k");
-        assert_eq!(token_count(1_048_576), "1048.6k");
+        assert_eq!(token_count(1_000), "1.0K");
+        assert_eq!(token_count(8_003), "8.0K");
+        assert_eq!(token_count(90_659), "90.7K");
+        assert_eq!(token_count(1_048_576), "1048.6K");
     }
 
     /// Two decimals, because the integer part stops moving: at a context of tens
@@ -5061,8 +5092,8 @@ mod tests {
         );
         // Still the command, still readable at both ends, opened by the status
         // dot (muted while it runs).
-        assert!(lid.starts_with("● $(cd /tmp"), "{lid:?}");
-        assert!(lid.ends_with("PY) · 运行中"), "{lid:?}");
+        assert!(lid.starts_with("● $ cd /tmp"), "{lid:?}");
+        assert!(lid.ends_with("PY · 运行中"), "{lid:?}");
 
         // Expanded: over as many rows as it takes, and every one of them one row.
         let rows = c.lines(&crate::block::RenderCtx::bare(200));
@@ -5107,6 +5138,47 @@ mod tests {
         assert_eq!(a, 60, "the line does not use the width it was given");
     }
 
+    /// A shell call reads the way it was typed — `$ ls`, not `$(ls)`, which
+    /// reads as a substitution — folded or under a reason.
+    #[test]
+    fn a_shell_call_reads_as_typed() {
+        let ctx = crate::block::RenderCtx::bare(80);
+        let args = serde_json::json!({ "command": "cd /tmp && ls -la" }).to_string();
+        let line = ToolCallBlock::pending("c", "bash", args)
+            .summary(&ctx)
+            .plain();
+        assert!(line.starts_with("● $ cd /tmp && ls -la"), "{line:?}");
+        assert!(!line.contains("$("), "{line:?}");
+        // Under a reason, the `⎿` row is the same phrase.
+        let args = serde_json::json!({ "command": "make", "intent": "构建" });
+        let rows: Vec<String> = ToolCallBlock::pending("c", "bash", args.to_string())
+            .summary_lines(&ctx)
+            .iter()
+            .map(Line::plain)
+            .collect();
+        assert!(rows[1].contains("⎿ $ make ·"), "{rows:?}");
+    }
+
+    /// A folded call whose command wraps says it was cut: the row it keeps ends
+    /// in `…` rather than wherever the wrap fell.
+    #[test]
+    fn a_folded_command_cut_short_ends_in_an_ellipsis() {
+        let command = "find . -path ./node_modules -prune -o -path ./.git -prune -o -type f -print | sort | head -100";
+        let args = serde_json::json!({ "command": command, "intent": "列出全部文件" });
+        let call =
+            ToolCallBlock::pending("c", "bash", args.to_string()).with(Outcome::Ok("a".into()));
+        let rows = call.summary_lines(&crate::block::RenderCtx::bare(60));
+        assert_eq!(rows.len(), FOLDED_ROWS, "{rows:?}");
+        let last = rows.last().expect("the command row").plain();
+        assert!(last.ends_with('…'), "{last:?}");
+        assert!(width::str_width(&last) <= 60, "{last:?}");
+        // One that fits is not marked.
+        let args = serde_json::json!({ "command": "ls", "intent": "看看" });
+        let rows = ToolCallBlock::pending("c", "bash", args.to_string())
+            .summary_lines(&crate::block::RenderCtx::bare(60));
+        assert!(!rows.iter().any(|r| r.plain().contains('…')), "{rows:?}");
+    }
+
     #[test]
     fn the_folded_line_keeps_both_ends_of_the_command_and_its_result() {
         // 「摘要太短，看不清楚」. The folded line used to cut the subject to 44
@@ -5120,7 +5192,7 @@ mod tests {
         let line = c.summary(&crate::block::RenderCtx::bare(48)).plain();
         assert!(line.contains('…'), "nothing was abbreviated: {line:?}");
         assert!(
-            line.starts_with("● $(git log"),
+            line.starts_with("● $ git log"),
             "the head of the command is gone: {line:?}"
         );
         assert!(
