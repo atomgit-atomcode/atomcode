@@ -9106,18 +9106,7 @@ fn surface_row(
         cell_background: row.cell_background,
     };
     let mouse = row.mouse && !std::env::var("ATOMCODE_NO_MOUSE").is_ok_and(|v| v != "0");
-    // The env var wins: it is how a person overrides one session without
-    // editing the tree they share with everyone else.
-    let named = std::env::var("ATOMCODE_THEME")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .or(row.theme);
-    let theme = match named.as_deref() {
-        None | Some("auto") => None,
-        Some("dark") => Some(crate::theme::Theme::Dark),
-        Some("light") => Some(crate::theme::Theme::Light),
-        Some(other) => return Err(format!("theme `{other}` is not auto, dark or light")),
-    };
+    let theme = crate::theme::forced(row.theme.as_deref())?;
     Ok((theme, mouse, overrides))
 }
 

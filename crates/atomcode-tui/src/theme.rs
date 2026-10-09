@@ -373,6 +373,30 @@ fn lift(base: Rgb, bg: Rgb, need: f32) -> Rgb {
     winner.map(|(_, c)| c).unwrap_or(best)
 }
 
+/// The theme a person asked for, if they asked: `ATOMCODE_THEME`, else `named`
+/// (the surface row's `theme`, which the launcher fills from `--theme` or
+/// `[ui] theme`). `None` — and `auto` — mean measure the terminal.
+///
+/// One place for the order, so the screen and `--probe-terminal` cannot
+/// disagree about which palette is in force. The env var wins: it is how a
+/// person overrides one session without editing the tree they share with
+/// everyone else.
+pub fn forced(named: Option<&str>) -> Result<Option<Theme>, String> {
+    let env = std::env::var("ATOMCODE_THEME")
+        .ok()
+        .filter(|v| !v.is_empty());
+    named_theme(env.as_deref().or(named))
+}
+
+fn named_theme(named: Option<&str>) -> Result<Option<Theme>, String> {
+    match named {
+        None | Some("auto") => Ok(None),
+        Some("dark") => Ok(Some(Theme::Dark)),
+        Some("light") => Ok(Some(Theme::Light)),
+        Some(other) => Err(format!("theme `{other}` is not auto, dark or light")),
+    }
+}
+
 /// The contrast a role must clear against the background.
 ///
 /// The floors were raised in response to exactly the complaint "the palette is
@@ -626,7 +650,10 @@ pub fn resolve(role: Role, caps: Caps) -> Option<Color> {
                 p.background(),
                 floor(role),
             );
-            Some(exact(ink, caps.colors, p))
+            Some(match caps.colors {
+                Colors::Ansi256 => legible_index(ink, p.background(), floor(role)),
+                _ => exact(ink, caps.colors, p),
+            })
         }
         Role::Muted => {
             let need = floor(role);
@@ -683,11 +710,16 @@ pub fn resolve(role: Role, caps: Caps) -> Option<Color> {
             }
             // Otherwise the two measured ends: the terminal's own text colour,
             // moved toward its own background until the ink recedes. Truecolor
-            // keeps the ratio that was just computed; an indexed terminal gets
-            // the nearest slot, which is the honest answer when slots are the
-            // only vocabulary it has.
+            // keeps the ratio that was just computed; a 256-colour terminal
+            // gets the nearest standard index that still clears the floor (the
+            // nearest by distance alone landed a step under it on blue and
+            // green grounds); sixteen colours get the nearest slot, which is the
+            // honest answer when slots are the only vocabulary there is.
             if let Some(ink) = mixed {
-                return Some(exact(ink, caps.colors, p));
+                return Some(match caps.colors {
+                    Colors::Ansi256 => legible_index(ink, bg, need),
+                    _ => exact(ink, caps.colors, p),
+                });
             }
             // Nobody answered: synthesise from the standard candidate and stop
             // just above the floor. Taking an assumed slot here instead is what
@@ -742,8 +774,18 @@ fn synthesise(role: Role, caps: Caps) -> Option<Color> {
     if truecolor {
         return Some(Color::rgb(lift(base, bg, need)));
     }
-    // No truecolor to fall back on, so take the least bad slot rather than the
-    // most preferred one.
+    // 256 colours: the cube and ramp are the standard, rendered the same by
+    // every such terminal (see [`cube`]), so the lifted colour has an index
+    // nearby — the nearest one that still clears the floor. The sixteen alone
+    // were the bug: on white, xterm's yellow and green are the *best* of their
+    // candidates and still read at 1.7:1 and 2.2:1, so a warning and every
+    // added diff line were near-invisible on Terminal.app and on Windows
+    // Terminal, which both run at 256.
+    if caps.colors == Colors::Ansi256 {
+        return Some(legible_index(lift(base, bg, need), bg, need));
+    }
+    // Sixteen colours have no such vocabulary, so take the least bad slot
+    // rather than the most preferred one.
     let best = slots
         .iter()
         .copied()
@@ -836,6 +878,75 @@ fn exact(rgb: Rgb, colors: Colors, p: &Palette) -> Color {
         })
         .unwrap_or(7);
     Color::Ansi(best)
+}
+
+/// Ink at 256 colours, from the standard indices (16 and up), which every
+/// 256-colour terminal renders the same; the sixteen are a scheme's own and,
+/// unanswered, a guess. [`exact`] is the right door for a *surface*, which
+/// wants to be near a colour and has no floor; ink has one, and
+/// nearest-by-distance alone can land a step under it.
+///
+/// In order:
+///
+/// 1. the index nearest `target` that keeps its hue and clears `need`;
+/// 2. the same hue at the AA floor (4.5), the one that reads best — the cube
+///    has six levels a channel, and on white no yellow in it reaches 7:1
+///    (`#5f5f00` is 6.7:1). Without this step a warning came out `#3a3a3a`:
+///    legible, and no longer a warning;
+/// 3. whatever clears `need`, nearest — a target with no hue to keep (metadata
+///    grey) lands here directly;
+/// 4. the index that reads best, where nothing can (a mid-tone ground).
+fn legible_index(target: Rgb, bg: Rgb, need: f32) -> Color {
+    let near = |n: u8| distance(cube(n), target);
+    let reads = |n: u8| contrast(cube(n), bg);
+    let same_hue = |n: u8| match (hue(target), hue(cube(n))) {
+        (Some(a), Some(b)) => {
+            let d = (a - b).abs();
+            d.min(360.0 - d) <= HUE_KEPT
+        }
+        _ => false,
+    };
+    let all = || 16u8..=255;
+    let n = all()
+        .filter(|&n| same_hue(n) && reads(n) >= need)
+        .min_by(|&a, &b| near(a).total_cmp(&near(b)))
+        .or_else(|| {
+            all()
+                .filter(|&n| same_hue(n) && reads(n) >= need.min(AA))
+                .max_by(|&a, &b| reads(a).total_cmp(&reads(b)))
+        })
+        .or_else(|| {
+            all()
+                .filter(|&n| reads(n) >= need)
+                .min_by(|&a, &b| near(a).total_cmp(&near(b)))
+        })
+        .or_else(|| all().max_by(|&a, &b| reads(a).total_cmp(&reads(b))))
+        .unwrap_or(231);
+    Color::Ansi(n)
+}
+
+/// WCAG AA for body text: the least a role may fall back to for its hue.
+const AA: f32 = 4.5;
+/// How far a hue may turn and still be the same colour by name — yellow stays
+/// yellow, and does not become orange or green.
+const HUE_KEPT: f32 = 20.0;
+
+/// Hue in degrees, or `None` for a grey, which has none to keep.
+fn hue(c: Rgb) -> Option<f32> {
+    if chroma(c) < 12 {
+        return None;
+    }
+    let (r, g, b) = (c.0 as f32, c.1 as f32, c.2 as f32);
+    let max = r.max(g).max(b);
+    let d = max - r.min(g).min(b);
+    let h = if max == r {
+        ((g - b) / d).rem_euclid(6.0)
+    } else if max == g {
+        (b - r) / d + 2.0
+    } else {
+        (r - g) / d + 4.0
+    };
+    Some(h * 60.0)
 }
 
 /// How much colour there is in a colour, as opposed to lightness.
@@ -1149,8 +1260,53 @@ mod tests {
         );
     }
 
+    /// The names a person can give, and the one they cannot.
+    #[test]
+    fn a_named_theme_is_auto_dark_or_light() {
+        assert_eq!(named_theme(None), Ok(None));
+        assert_eq!(named_theme(Some("auto")), Ok(None));
+        assert_eq!(named_theme(Some("dark")), Ok(Some(Theme::Dark)));
+        assert_eq!(named_theme(Some("light")), Ok(Some(Theme::Light)));
+        assert!(named_theme(Some("chartreuse")).is_err());
+    }
+
     #[test]
     fn every_role_reads_against_any_background() {
+        every_role_reads_at(Colors::True);
+    }
+
+    /// The same sweep at 256 colours, which is what Terminal.app and Windows
+    /// Terminal run at (neither sets `COLORTERM`). Truecolor alone was checked,
+    /// and on white at 256 a warning read at 1.7:1 and an added diff line at
+    /// 2.2:1 — the synthesiser fell back to the sixteen slots instead of the
+    /// cube a 256-colour terminal is guaranteed to have.
+    #[test]
+    fn every_role_reads_against_any_background_at_256_colours() {
+        every_role_reads_at(Colors::Ansi256);
+    }
+
+    /// At 256 colours a role may trade the AAA target for its own hue, never
+    /// below AA: a warning on white stays a yellow (`#5f5f00`, 6.7:1) rather
+    /// than turning into a 7:1 grey nobody would read as a warning.
+    #[test]
+    fn a_warning_on_white_at_256_colours_is_still_yellow() {
+        let caps = Caps {
+            colors: Colors::Ansi256,
+            ..caps_on((255, 255, 255))
+        };
+        for role in [Role::Warning, Role::Success, Role::DiffAdd, Role::Error] {
+            let c = seen(role, caps).unwrap();
+            assert!(contrast(c, (255, 255, 255)) >= AA, "{role:?} {c:?}");
+            assert!(chroma(c) >= 12, "{role:?} lost its hue: {c:?}");
+        }
+        let warning = seen(Role::Warning, caps).unwrap();
+        assert!(
+            warning.0 == warning.1 && warning.2 < warning.0,
+            "yellow: {warning:?}"
+        );
+    }
+
+    fn every_role_reads_at(colors: Colors) {
         // The property the whole scheme exists for, checked over the colour
         // cube rather than over the two backgrounds someone happened to try.
         // Both shipped palettes failed this: the first was invisible on white,
@@ -1159,7 +1315,10 @@ mod tests {
         for r in (0..=255u8).step_by(51) {
             for g in (0..=255u8).step_by(51) {
                 for b in (0..=255u8).step_by(51) {
-                    let caps = caps_on((r, g, b));
+                    let caps = Caps {
+                        colors,
+                        ..caps_on((r, g, b))
+                    };
                     for role in ROLES {
                         if matches!(role, Role::PanelFg | Role::PanelBg | Role::PanelSelBg) {
                             continue; // surfaces and the ink on them, below
@@ -1170,7 +1329,13 @@ mod tests {
                         // the guarantee there is "the best there is".
                         let ceiling = contrast((255, 255, 255), (r, g, b))
                             .max(contrast((0, 0, 0), (r, g, b)));
-                        let need = floor(role).min(ceiling - 0.01);
+                        // At 256 colours a hue is kept down to AA (see
+                        // `legible_index`), so that is the floor held there.
+                        let floor = match colors {
+                            Colors::Ansi256 => floor(role).min(AA),
+                            _ => floor(role),
+                        };
+                        let need = floor.min(ceiling - 0.01);
                         if ratio < need {
                             worst.push(format!(
                                 "{role:?} on #{r:02x}{g:02x}{b:02x}: {ratio:.2} < {need:.2}"

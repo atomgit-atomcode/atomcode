@@ -1747,17 +1747,27 @@ fn local_clipboard(text: &str) -> bool {
 /// wrong, this says whether the terminal answered at all, what it said, and
 /// which roles are running below their contrast floor — instead of leaving
 /// "still can't read it" as the only available bug report.
-pub fn probe_report() -> String {
+///
+/// `theme` is what the screen would be told (see [`crate::theme::forced`]):
+/// with one, the screen never asks the terminal, so neither does the report —
+/// it shows the palette actually in force, not one the screen would not use.
+pub fn probe_report(theme: Option<Theme>) -> String {
     use std::fmt::Write as _;
 
-    // Same reason as `enter`: the palette probe writes OSC queries, which a
-    // legacy Windows console would echo as text without this.
-    enable_vt_output();
-    let raw = crossterm::terminal::enable_raw_mode().is_ok();
-    let palette = measure_palette();
-    if raw {
-        let _ = crossterm::terminal::disable_raw_mode();
-    }
+    let palette = match theme {
+        Some(theme) => Palette::assumed(theme),
+        None => {
+            // Same reason as `enter`: the palette probe writes OSC queries,
+            // which a legacy Windows console would echo as text without this.
+            enable_vt_output();
+            let raw = crossterm::terminal::enable_raw_mode().is_ok();
+            let palette = measure_palette();
+            if raw {
+                let _ = crossterm::terminal::disable_raw_mode();
+            }
+            palette
+        }
+    };
     let mut caps = crate::caps::Caps::detect();
     caps.palette = palette;
 
@@ -1785,6 +1795,8 @@ pub fn probe_report() -> String {
         hex(bg),
         if palette.background_measured() {
             "answered by the terminal"
+        } else if theme.is_some() {
+            "set by ATOMCODE_THEME, --theme or [ui] theme — the terminal was not asked"
         } else {
             "assumed — the terminal did not answer"
         },

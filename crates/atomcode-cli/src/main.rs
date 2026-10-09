@@ -121,6 +121,23 @@ fn headless_completion_notify_reason(
     }
 }
 
+/// The theme the row-assembled screen is told: `--theme` for this launch, else
+/// `[ui] theme` — which the settings panel and `/config ui.theme` write, and
+/// which this screen used to ignore, so a person who picked light there got
+/// no change and no way to make one stick. `auto` is `None`: ask the terminal.
+/// (`ATOMCODE_THEME` still beats both; see `atomcode_tui::theme::forced`.)
+fn screen_theme(
+    flag: Option<&str>,
+    configured: atomcode_config::config::UiTheme,
+) -> Option<String> {
+    use atomcode_config::config::UiTheme;
+    flag.map(str::to_string).or(match configured {
+        UiTheme::Auto => None,
+        UiTheme::Dark => Some("dark".into()),
+        UiTheme::Light => Some("light".into()),
+    })
+}
+
 fn restore_terminal_if_tui() {
     if HEADLESS_MODE.load(Ordering::Relaxed) {
         return;
@@ -875,8 +892,15 @@ struct Cli {
     pub mascot: bool,
 
     /// On the row-assembled screen: `auto` (ask the terminal), `dark` or `light`.
+    /// Without it, `[ui] theme` from the config file.
     #[arg(long, value_name = "THEME")]
     pub theme: Option<String>,
+
+    /// Print what the terminal says its colours are and what every colour role
+    /// of the row-assembled screen resolves to on it, then exit. For a screen
+    /// that is hard to read: it says whether the terminal answered at all.
+    #[arg(long)]
+    pub probe_terminal: bool,
 
     /// On the row-assembled screen: leave the mouse to the terminal (its own
     /// selection works).
@@ -1669,6 +1693,27 @@ async fn run() -> Result<i32> {
                 1
             }
         });
+    }
+
+    if cli.probe_terminal {
+        let config_path = cli.config.clone().unwrap_or_else(Config::default_path);
+        let ui_theme = Config::load(&config_path)
+            .map(|config| config.ui.theme)
+            .unwrap_or_default();
+        return Ok(
+            match atomcode_tui::theme::forced(
+                screen_theme(cli.theme.as_deref(), ui_theme).as_deref(),
+            ) {
+                Ok(theme) => {
+                    print!("{}", atomcode_tui::surface::probe_report(theme));
+                    0
+                }
+                Err(why) => {
+                    eprintln!("{why}");
+                    1
+                }
+            },
+        );
     }
 
     let is_admin = atomcode_capabilities::process_utils::is_running_as_admin();
@@ -2705,7 +2750,7 @@ async fn run() -> Result<i32> {
             if let Some(front_end) = tui_front_end {
                 let screen = atomcode_tui::launch::Screen {
                     mascot: cli.mascot,
-                    theme: cli.theme.clone(),
+                    theme: screen_theme(cli.theme.as_deref(), config.ui.theme),
                     // The `[ui] mouse` default, with `--no-mouse` as the one-launch
                     // override — so `/config ui.mouse false` persists it and the flag
                     // still forces it off on a single run.
@@ -5079,6 +5124,26 @@ fn install_panic_hook(telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>) 
 
 #[cfg(test)]
 mod tests {
+
+    /// `[ui] theme` reaches the row-assembled screen; `--theme` overrides it
+    /// for one launch, and `auto` leaves the terminal to be asked.
+    #[test]
+    fn the_configured_theme_reaches_the_screen_unless_the_flag_overrides_it() {
+        use atomcode_config::config::UiTheme;
+        assert_eq!(
+            super::screen_theme(None, UiTheme::Light).as_deref(),
+            Some("light")
+        );
+        assert_eq!(
+            super::screen_theme(None, UiTheme::Dark).as_deref(),
+            Some("dark")
+        );
+        assert_eq!(super::screen_theme(None, UiTheme::Auto), None);
+        assert_eq!(
+            super::screen_theme(Some("dark"), UiTheme::Light).as_deref(),
+            Some("dark")
+        );
+    }
 
     /// `hooks list/paths` shows what reading each file came to, not just whether it
     /// exists: a file that does not parse used to show ✓ beside "(No hooks loaded)".
