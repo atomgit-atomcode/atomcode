@@ -942,9 +942,16 @@ mod tests {
         // config AND the catalog renders the value on disk — the two ways the
         // dead-key version silently failed.
         let on: Config = toml::from_str("").unwrap();
-        assert!(on.ui.mouse, "mouse defaults on");
+        // On except where the terminal reports no mouse (HarmonyOS): the
+        // default is what is in effect there, and `/config` shows it.
+        assert_eq!(on.ui.mouse, !cfg!(target_env = "ohos"), "mouse default");
+        assert_eq!(
+            Config::default().ui.mouse,
+            on.ui.mouse,
+            "the empty file and the built-in default agree"
+        );
         let setting = SETTINGS.iter().find(|s| s.id == "ui.mouse").unwrap();
-        assert_eq!(setting.value(&on), "true");
+        assert_eq!(setting.value(&on), on.ui.mouse.to_string());
 
         let off: Config = toml::from_str("[ui]\nmouse = false\n").unwrap();
         assert!(!off.ui.mouse, "`mouse = false` is honoured, not discarded");

@@ -599,9 +599,10 @@ pub struct UiConfig {
     /// scrollback where the emulator keeps it, otherwise scroll with
     /// PageUp/PageDown). Most people are better off leaving this ON and holding
     /// Shift to drag-select natively when they want to. Read once at startup (like
-    /// `theme`); `--no-mouse` overrides it off for one launch, Ctrl+O toggles it
-    /// live. Default on.
-    #[serde(default = "default_true")]
+    /// `theme`); `--no-mouse` overrides it off for one launch, Ctrl+G toggles it
+    /// live. Default on — except on HarmonyOS, whose terminal reports no mouse at
+    /// all (see [`default_mouse`]).
+    #[serde(default = "default_mouse")]
     pub mouse: bool,
     /// Auto-copy a rendered code block's raw source to the clipboard when the
     /// AI finishes emitting it. OFF by default — it silently overwrote the
@@ -674,7 +675,7 @@ impl Default for UiConfig {
         Self {
             theme: UiTheme::default(),
             screen: Screen::default(),
-            mouse: true,
+            mouse: default_mouse(),
             auto_copy_code_blocks: default_auto_copy_code_blocks(),
             ai_session_naming: default_ai_session_naming(),
             terminal_status_glyph: default_terminal_status_glyph(),
@@ -704,6 +705,17 @@ impl Default for UiConfig {
 pub enum ModeSwitchKey {
     ShiftTab,
     Tab,
+}
+
+/// `[ui] mouse` when the file does not say.
+///
+/// Off on HarmonyOS (`target_env = "ohos"`): its terminal sends nothing for a
+/// wheel, a drag or a click, and stops its own selection when asked to report —
+/// so the screen keeps the mouse off there whatever this says
+/// (`atomcode_tui::caps::mouse_reported`). The default says the same, so
+/// `/config` shows what is in effect rather than `true` over a mouse that is off.
+pub fn default_mouse() -> bool {
+    !cfg!(target_env = "ohos")
 }
 
 impl Default for ModeSwitchKey {
