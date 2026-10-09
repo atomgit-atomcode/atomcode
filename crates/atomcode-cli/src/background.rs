@@ -107,7 +107,13 @@ impl atomcode_review::ReviewDelegate for ReviewElsewhere {
             .upgrade()?;
         let front_end = self.front_end.upgrade()?;
         match background
-            .start_for(&front_end, working_dir.to_path_buf(), task, scope)
+            .start_for(
+                &front_end,
+                working_dir.to_path_buf(),
+                task,
+                scope,
+                Some("code-review".to_string()),
+            )
             .await
         {
             Ok(None) => None,
@@ -135,6 +141,12 @@ struct Live {
     origin: String,
     /// 替别的对话干活的会话,在盘上标没标、标到了哪一步。见 [`Mark`]。
     mark: Arc<Mutex<Mark>>,
+    /// 发起它的那一方给它起的名字(审查就叫 `code-review`)。有就用它,不等它自己
+    /// 起名 —— 面板上那一行认的是「这是哪件活」。
+    name: Option<String>,
+    /// 交给它的那件事的第一行。日志里还没有它说的第一句话时(刚起、还没落盘),
+    /// 面板那一列靠它认,而不是一串 id。
+    task: Option<String>,
 }
 
 /// 一个替别的对话干活的后台会话,在盘上怎么记。
@@ -325,6 +337,26 @@ pub fn connect(
     });
     // 泵在 `Arc` 建好之后才起:起早了,第一条事件升级不了弱引用,泵就停了。
     parts.pump(Arc::downgrade(&background));
+    // 后台还有活在跑,就每秒把列表再报一次。事件只在「在等人 / 回合完了」时报,
+    // 而面板那一行要跟着走的 —— 它起的名字、说到哪了、用了多久、上下文多大 ——
+    // 全在两者之间变:不报,面板就一直停在刚放进后台那一刻(名字是一串 id、没有
+    // 用时、没有 token)。没人看(没有订阅者)或没有在跑的,就不报。
+    {
+        let weak = Arc::downgrade(&background);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let Some(background) = weak.upgrade() else {
+                    break;
+                };
+                if background.someone_running() {
+                    background.announce_list();
+                }
+            }
+        });
+    }
     crate::tui_share::remember(background.front_control());
 
     let routing = background.clone();
@@ -418,6 +450,8 @@ fn attach(
             since: now_ms(),
             origin: own,
             mark: Arc::new(Mutex::new(Mark::Own)),
+            name: None,
+            task: None,
         },
         Pumps {
             id,
@@ -541,8 +575,12 @@ fn one_line(text: &str) -> Option<String> {
 /// 前缀只在命中时便宜);`prompt` / `cached` 仍是最后一次请求,说的是上下文现在多大。
 /// 「出」是每轮新做的工作,累加。
 ///
-/// 一条请求都没发过就 `None`:没有可说的数,画出来只会是「0 轮  0 工具」。
-fn stats_of(log: &[LoggedEvent]) -> Option<BackgroundStats> {
+/// 一条请求都没发过、也没在跑,就 `None`:没有可说的数,画出来只会是「0 轮  0 工具」。
+/// 在跑的,先只有用时。
+///
+/// `running_at`:还在跑时的此刻(unix 毫秒)。那时用时量到此刻,而不是最后一条事实 ——
+/// 模型安静地想一分钟,面板上的用时不该停在一分钟前。
+fn stats_of(log: &[LoggedEvent], running_at: Option<u64>) -> Option<BackgroundStats> {
     let mut steps = 0u32;
     let mut tools = 0u32;
     let mut completion = 0u32;
@@ -564,10 +602,16 @@ fn stats_of(log: &[LoggedEvent]) -> Option<BackgroundStats> {
             _ => {}
         }
     }
-    let usage = last?;
-    let elapsed_ms = match (log.first(), log.last()) {
-        (Some(first), Some(last)) => last.at.saturating_sub(first.at),
+    let elapsed_ms = match (log.first(), running_at.or(log.last().map(|last| last.at))) {
+        (Some(first), Some(end)) => end.saturating_sub(first.at),
         _ => 0,
+    };
+    // 还在跑、第一个回答还没来(一次审查的第一个请求就可能要几十秒):没有可说的
+    // token,但用时是有的 —— 面板那一行不该在这几十秒里什么都不说。
+    let usage = match (last, running_at) {
+        (Some(usage), _) => usage,
+        (None, Some(_)) if elapsed_ms > 0 => atomcode_kernel::stream::TokenUsage::default(),
+        (None, _) => return None,
     };
     Some(BackgroundStats {
         steps,
@@ -635,12 +679,22 @@ fn describe(live: &Live) -> BackgroundSession {
     };
     BackgroundSession {
         session: live.control.session_id(),
-        // 还没起名的会话,用它的第一句话当名字——面板那一列总得有点什么可认。
-        title: title.or_else(first_words),
+        // 发起方起的名字优先;再是它自己起的;还没起名的,用它的第一句话 —— 日志里
+        // 还没有时,用交给它的那件事的第一行。面板那一列总得有点什么可认,而一串
+        // id 前缀认不出是哪件活。
+        title: live
+            .name
+            .clone()
+            .or(title)
+            .or_else(first_words)
+            .or_else(|| live.task.clone()),
         state,
         created_at: live.since,
         last,
-        stats: stats_of(&log),
+        stats: stats_of(
+            &log,
+            matches!(state, BackgroundState::Running | BackgroundState::Waiting).then(now_ms),
+        ),
         // 替谁干活:等于它自己(`/bg` 把那段对话挪过来的)就是没有别的读者。
         origin: (!live.origin.is_empty() && live.origin != live.control.session_id())
             .then(|| live.origin.clone()),
@@ -906,6 +960,15 @@ impl Background {
     fn list(&self) -> Vec<BackgroundSession> {
         let state = self.state.lock().expect("background poisoned");
         state.slots.iter().map(describe).collect()
+    }
+
+    /// 有人在看,而且后台有活在跑(在跑一个回合,或在等人回答)。
+    fn someone_running(&self) -> bool {
+        if self.watchers.lock().expect("watchers poisoned").is_empty() {
+            return false;
+        }
+        let state = self.state.lock().expect("background poisoned");
+        state.slots.iter().any(in_turn)
     }
 
     fn announce_list(&self) {
@@ -1233,7 +1296,7 @@ impl Background {
         }
         .working_dir_now()
         .await;
-        self.start_locked(working_dir, text, scope).await
+        self.start_locked(working_dir, text, scope, None).await
     }
 
     /// [`Self::start`],替 `front_end` 那个 runtime —— 只在它**此刻**就是前台那个时。
@@ -1252,6 +1315,7 @@ impl Background {
         working_dir: PathBuf,
         text: String,
         scope: Option<String>,
+        name: Option<String>,
     ) -> Result<Option<HostReply>, HostError> {
         let Ok(_op) = self.op.try_lock() else {
             return Ok(None);
@@ -1263,7 +1327,9 @@ impl Background {
         if !in_front {
             return Ok(None);
         }
-        self.start_locked(working_dir, text, scope).await.map(Some)
+        self.start_locked(working_dir, text, scope, name)
+            .await
+            .map(Some)
     }
 
     /// 起一个后台会话去做 `text`,替前台那个。调用方拿着 `op`。
@@ -1272,6 +1338,7 @@ impl Background {
         working_dir: PathBuf,
         text: String,
         scope: Option<String>,
+        name: Option<String>,
     ) -> Result<HostReply, HostError> {
         let control = {
             let state = self.state.lock().expect("background poisoned");
@@ -1289,6 +1356,8 @@ impl Background {
         live.origin = control.session_id();
         // 结果落进那段对话之后,盘上才标它不是人的一段对话(见 `Mark`)。
         live.mark = Arc::new(Mutex::new(Mark::Pending(working_dir)));
+        live.name = name;
+        live.task = one_line(&text);
         if let Err(error) = live.control.runtime().submit(UserInput::from(text)).await {
             // 没接下任务的会话不留槽:它只会是一行什么都不做的空会话。
             stop(live).await;
@@ -1565,7 +1634,7 @@ mod tests {
                 },
             },
         };
-        let stats = stats_of(&[usage(1000, 0), usage(1200, 1100)]).expect("ran");
+        let stats = stats_of(&[usage(1000, 0), usage(1200, 1100)], None).expect("ran");
         assert_eq!((stats.sent, stats.sent_cached), (2200, 1100));
         // A long-lived session's sums run past `u32::MAX` and keep counting.
         let long = stats_of(&[
@@ -1579,6 +1648,30 @@ mod tests {
         );
         assert_eq!((stats.prompt, stats.cached), (1200, 1100));
         assert_eq!(stats.completion, 20);
+    }
+
+    /// 还在跑的,用时量到此刻 —— 模型安静地想一分钟,面板上的用时不该停在它最后
+    /// 一条事实那里;跑完的,量到最后一条事实。
+    #[test]
+    fn a_running_background_session_s_time_runs_to_now() {
+        let at = |at, event| LoggedEvent { seq: 0, at, event };
+        let log = [
+            at(1_000, SessionEvent::TurnStart { turn: 1 }),
+            at(
+                2_000,
+                SessionEvent::Usage {
+                    turn: 1,
+                    round: 1,
+                    usage: atomcode_kernel::stream::TokenUsage {
+                        prompt: 100,
+                        completion: 1,
+                        cached: 0,
+                    },
+                },
+            ),
+        ];
+        assert_eq!(stats_of(&log, None).unwrap().elapsed_ms, 1_000);
+        assert_eq!(stats_of(&log, Some(61_000)).unwrap().elapsed_ms, 60_000);
     }
 
     /// 投回去的是最后一个回合的结论;最后一个回合没出字,就没有结论可投。

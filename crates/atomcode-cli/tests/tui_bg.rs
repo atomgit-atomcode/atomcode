@@ -630,6 +630,32 @@ async fn background_task_runs_without_changing_the_foreground() {
     rig.quit().await;
 }
 
+/// **A background row keeps up while its session works out of view.** Nothing
+/// happens in the session while the model is held — no question, no turn end,
+/// which were the only times the list used to be sent — and still the team
+/// panel's row names the task (not an id prefix) and its time runs.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(atomcode_home)]
+async fn a_background_row_keeps_up_while_its_session_works() {
+    let rig = Rig::new().await;
+    rig.term.type_line("/background slow job");
+    rig.until_screen(&t(Msg::BgStarted { slot: 1 })).await;
+    rig.until("the row names the task and its time runs", |rig| {
+        rig.term
+            .text()
+            .lines()
+            .any(|line| line.contains("slow job") && line.contains("秒"))
+    })
+    .await;
+    rig.release();
+    rig.until_background("the task finished", |list| {
+        list.first()
+            .is_some_and(|s| s.state == BackgroundState::Done)
+    })
+    .await;
+    rig.quit().await;
+}
+
 /// **`/review` runs in the background by default.** The command is
 /// `/background` with the task filled in: the person's conversation keeps its
 /// place, and the review's own session is handed the prompt that names the tool
@@ -748,6 +774,12 @@ async fn the_models_code_review_runs_in_a_background_session() {
     // started no session at all.
     rig.until_background("the review went to a background session", |list| {
         list.len() == 1 && list[0].origin.as_deref() == Some(first.as_str())
+    })
+    .await;
+    // Listed as what it is from the first announcement on — not as the first
+    // eight characters of an id while its log is still empty.
+    rig.until_background("the review is named code-review", |list| {
+        list.len() == 1 && list[0].title.as_deref() == Some("code-review")
     })
     .await;
     assert_eq!(rig.client.root(), first, "the foreground never moved");
