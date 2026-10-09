@@ -261,8 +261,6 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         }
         Msg::InjectedFromBackground => "from the background".into(),
         Msg::InjectedFromLead => "from main".into(),
-        Msg::GoalActiveBadge => "/goal active".into(),
-        Msg::GoalPausedBadge => "/goal paused".into(),
         Msg::TranscriptDropped { through } => {
             format!("tool results through #{through} are no longer sent to the model").into()
         }

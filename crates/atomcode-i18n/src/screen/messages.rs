@@ -394,9 +394,6 @@ pub enum Msg<'a> {
     InjectedFromBackground,
     /// Work or steering the lead sent into a member's conversation.
     InjectedFromLead,
-    /// Compact autonomous-goal state on the composer's right shoulder.
-    GoalActiveBadge,
-    GoalPausedBadge,
     TranscriptDropped {
         through: u64,
     },
