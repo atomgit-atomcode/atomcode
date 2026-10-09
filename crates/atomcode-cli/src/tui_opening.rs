@@ -129,7 +129,14 @@ pub fn keys_notice_marker(config_dir: &Path) -> PathBuf {
 /// describing itself — has not spent it.
 pub fn keys_note(marker: &Path) -> Option<KeysNote> {
     (!marker.exists()).then(|| KeysNote {
-        text: atomcode_config::i18n::t(atomcode_config::i18n::Msg::TuiKeysHint).into_owned(),
+        // Where the terminal reports no mouse (HarmonyOS) there is no ctrl-g to
+        // name, and the conversation scrolls with PageUp/PageDown.
+        text: atomcode_config::i18n::t(if atomcode_tui::caps::mouse_reported() {
+            atomcode_config::i18n::Msg::TuiKeysHint
+        } else {
+            atomcode_config::i18n::Msg::TuiKeysHintNoMouse
+        })
+        .into_owned(),
         marker: marker.to_path_buf(),
     })
 }

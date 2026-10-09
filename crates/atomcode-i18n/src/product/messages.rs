@@ -731,6 +731,9 @@ pub enum Msg<'a> {
     /// Said once, on the first launch of the row-assembled screen (`--tui`):
     /// the keys a person would not find on their own.
     TuiKeysHint,
+    /// The same line where the terminal reports no mouse (HarmonyOS): no
+    /// ctrl-g to name, and PageUp/PageDown is how the conversation scrolls.
+    TuiKeysHintNoMouse,
 
     // ── Welcome screen tips ──
     /// Heading above the tips list on the welcome screen.
