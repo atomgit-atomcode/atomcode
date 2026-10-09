@@ -193,6 +193,27 @@ struct Link {
     control: Arc<dyn HostControl>,
 }
 
+/// A question this screen put up for one of its own agents.
+struct OpenAsk {
+    /// The panel's id in [`crate::ask::Asks`].
+    ask: u64,
+    /// The session that asked it, from the [`SessionEvent::Asked`] fact the
+    /// asking row wrote just before the request — `None` for a question asked
+    /// without one (the model's own `request_user_input`).
+    ///
+    /// [`SessionEvent::Asked`]: atomcode_kernel::session::SessionEvent::Asked
+    session: Option<String>,
+    /// Asked for a member of the team ([`Question::asker`]). Its `Asked` and
+    /// `Answered` are written into the lead's log, so the session alone cannot
+    /// tell it from the lead's own — and the lead's turn ending does not end it.
+    ///
+    /// [`Question::asker`]: atomcode_kernel::session::Question::asker
+    member: bool,
+    /// For a question with no `Asked` fact: the lead's tool call it was asked
+    /// from ([`crate::ask::call_asking`]), whose result says it is over.
+    call: Option<String>,
+}
+
 /// What this screen follows: one session, and the members of its team the
 /// person has looked at (`docs/adr/0023` §3).
 #[derive(Default)]
@@ -301,6 +322,16 @@ impl AgentClient {
             .lock()
             .expect("client poisoned")
             .screen()
+            .map(|v| v.events.clone())
+            .unwrap_or_default()
+    }
+
+    /// The lead's log, whoever is on screen.
+    fn root_events(&self) -> Vec<LoggedEvent> {
+        let views = self.view.lock().expect("client poisoned");
+        views
+            .sessions
+            .get(&views.root)
             .map(|v| v.events.clone())
             .unwrap_or_default()
     }
@@ -1198,6 +1229,12 @@ pub struct Tui {
     /// per screen, for the reason `allowance_nudged` is: it is news the first
     /// time, and after that it is one more line to read past.
     reasoning_hinted: AtomicBool,
+    /// The questions this screen put up for its own agents, with the call each
+    /// is about — see [`OpenAsk`].
+    open_asks: Mutex<Vec<OpenAsk>>,
+    /// Sessions whose `Asked` fact has arrived and whose request has not yet:
+    /// the next question put up is theirs, in this order.
+    asked_unshown: Mutex<std::collections::VecDeque<(String, bool)>>,
     /// Whether this project's older sessions have been folded into the history
     /// yet. Once per screen.
     history_asked: Mutex<bool>,
@@ -5455,10 +5492,16 @@ impl Tui {
             // A question left unanswered — declined, or skipped on the way
             // to the review page — is that question declined, not the batch.
             let n = questions.len();
-            let answer = self.host.asks.push_batch(questions);
+            let call = crate::ask::call_asking(kind, &payload, &self.client.root_events());
+            let (ask, answer) = self.host.asks.push_batch_with_id(questions);
+            self.remember_ask(ask, call);
             let client = self.client.clone();
             tokio::spawn(async move {
-                let mut replies = answer.await.unwrap_or_default();
+                // Taken down — answered elsewhere, or its turn is over: nothing
+                // to send. Withdrawing is not answering.
+                let Ok(mut replies) = answer.await else {
+                    return;
+                };
                 replies.resize(n, None);
                 let answers: Vec<Value> = replies.into_iter().map(crate::ask::declinable).collect();
                 client.respond(id, serde_json::json!({ "responses": answers }));
@@ -5471,13 +5514,128 @@ impl Tui {
             self.client.respond(id, Value::Null);
             return;
         };
-        let answer = self.host.asks.push(asked);
+        let call = crate::ask::call_asking(kind, &payload, &self.client.root_events());
+        let (ask, answer) = self.host.asks.push_with_id(asked);
+        self.remember_ask(ask, call);
         let client = self.client.clone();
         let kind = kind.to_string();
         tokio::spawn(async move {
-            let chosen = answer.await.ok().flatten();
+            // Taken down — answered elsewhere, or its turn is over: nothing to
+            // send. Withdrawing is not answering.
+            let Ok(chosen) = answer.await else {
+                return;
+            };
             client.respond(id, crate::ask::response_for(&kind, chosen));
         });
+    }
+
+    fn remember_ask(&self, ask: u64, call: Option<String>) {
+        // The session whose `Asked` came in ahead of this request. A question
+        // with one is closed by that session's `Answered`; only one without
+        // falls back to the call it was asked from.
+        let (session, member) = match self
+            .asked_unshown
+            .lock()
+            .expect("asks poisoned")
+            .pop_front()
+        {
+            Some((session, member)) => (Some(session), member),
+            None => (None, false),
+        };
+        let call = if session.is_some() { None } else { call };
+        let mut open = self.open_asks.lock().expect("asks poisoned");
+        // What was answered here or already taken down is no longer up: kept, it
+        // would only grow.
+        open.retain(|known| self.host.asks.is_up(known.ask));
+        open.push(OpenAsk {
+            ask,
+            session,
+            member,
+            call,
+        });
+    }
+
+    /// Take down the questions that stopped waiting without this screen
+    /// answering them — `atomcode-tuix`'s `retract_stale_approval` and its
+    /// turn-end clear, for every question rather than approvals alone.
+    ///
+    /// * The asking session's [`Answered`] fact: the asking row writes it when
+    ///   the question closes, however it closed — answered here, answered on the
+    ///   web page in sync, refused by its timeout, refused on a stop. The one
+    ///   signal that comes from the owner of the question. Questions are asked
+    ///   one at a time per session, so it closes that session's oldest one.
+    /// * For a question asked with no `Asked` fact, the result of the call it
+    ///   was asked from.
+    /// * The lead's turn is over: none of its questions is waiting any more. A
+    ///   member's question is left alone — its turn is its own, and taking it
+    ///   down unanswered would leave the member waiting on nobody.
+    ///
+    /// `true` when a panel came down, which a frame has to show.
+    ///
+    /// [`Answered`]: atomcode_kernel::session::SessionEvent::Answered
+    fn settle_asks(&self, event: &AgentEvent) -> bool {
+        use atomcode_kernel::session::SessionEvent;
+        let root = self.client.root();
+        let gone: Vec<u64> = {
+            let mut open = self.open_asks.lock().expect("asks poisoned");
+            let mut unshown = self.asked_unshown.lock().expect("asks poisoned");
+            let mut take = |pick: &dyn Fn(&OpenAsk) -> bool, first_only: bool| {
+                let mut gone = Vec::new();
+                open.retain(|known| {
+                    if (first_only && !gone.is_empty()) || !pick(known) {
+                        return true;
+                    }
+                    gone.push(known.ask);
+                    false
+                });
+                gone
+            };
+            match event {
+                AgentEvent::Fact(committed) => match &committed.event {
+                    SessionEvent::Asked { question, .. } => {
+                        unshown.push_back((committed.session.clone(), question.asker.is_some()));
+                        Vec::new()
+                    }
+                    SessionEvent::Answered { .. } => {
+                        // Closed before it was ever put up here (an answer the
+                        // execution mode gave): nothing on screen is about it.
+                        if let Some(at) = unshown.iter().position(|(s, _)| *s == committed.session)
+                        {
+                            unshown.remove(at);
+                            Vec::new()
+                        } else {
+                            take(
+                                &|known| known.session.as_deref() == Some(&*committed.session),
+                                true,
+                            )
+                        }
+                    }
+                    SessionEvent::ToolResultLogged { call_id, .. } => take(
+                        &|known| {
+                            known.session.is_none() && known.call.as_deref() == Some(&**call_id)
+                        },
+                        false,
+                    ),
+                    _ => Vec::new(),
+                },
+                AgentEvent::TurnComplete { .. } | AgentEvent::Cancelled => {
+                    unshown.retain(|(s, member)| *s != root || *member);
+                    take(
+                        &|known| match &known.session {
+                            Some(session) => *session == root && !known.member,
+                            None => known.call.is_some(),
+                        },
+                        false,
+                    )
+                }
+                _ => Vec::new(),
+            }
+        };
+        let mut any = false;
+        for ask in gone {
+            any |= self.host.asks.withdraw(ask);
+        }
+        any
     }
 
     /// Put a policy intervention to the person, and act on what they pick.
@@ -5545,6 +5703,13 @@ impl Tui {
     /// is the same news in another shape, so a frame for it would recompose the
     /// picture that is already on the screen.
     fn on_event(&self, event: AgentEvent) -> bool {
+        // Before anything else, and whoever is on screen: the arms below drop
+        // the lead's turn events while a member is looked at.
+        let settled = self.settle_asks(&event);
+        self.on_event_drawn(event) || settled
+    }
+
+    fn on_event_drawn(&self, event: AgentEvent) -> bool {
         use crate::moment::Activity;
         match event {
             // Content: a fact of the session on screen, folded once.
@@ -9081,6 +9246,8 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
             allowance_checked: Mutex::new(None),
             allowance_nudged: Arc::new(AtomicBool::new(false)),
             reasoning_hinted: AtomicBool::new(false),
+            open_asks: Mutex::new(Vec::new()),
+            asked_unshown: Mutex::new(std::collections::VecDeque::new()),
             history_asked: Mutex::new(false),
             files: Mutex::new(None),
             pressed_at: Mutex::new(None),

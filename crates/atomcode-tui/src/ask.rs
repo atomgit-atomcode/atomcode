@@ -334,6 +334,15 @@ impl Asks {
     /// 丢掉 `Pending` 就丢掉了应答通道，等着的那个人看到的是一次取消 —— 既不是
     /// `finish(Vec::new())` 那个「拒绝」，更不是同意。给一条已经作废的问询用（它来自
     /// 的那个会话不在等了），见 `crate::host::Host::withdraw_bg_question`。
+    /// Whether the question `id` is still up, unanswered.
+    pub fn is_up(&self, id: u64) -> bool {
+        self.queue
+            .lock()
+            .expect("asks poisoned")
+            .iter()
+            .any(|pending| pending.id == id)
+    }
+
     pub fn withdraw(&self, id: u64) -> bool {
         let mut q = self.queue.lock().expect("asks poisoned");
         let before = q.len();
@@ -367,6 +376,7 @@ impl Asks {
 
     /// Post several questions to be answered together, and get the channel
     /// their answers arrive on — one per question, in order.
+    #[cfg(test)]
     pub(crate) fn push_batch(&self, asked: Vec<Asked>) -> oneshot::Receiver<Vec<Option<Reply>>> {
         let (reply, rx) = oneshot::channel();
         self.enqueue(asked, Replier::Many(reply));
@@ -421,6 +431,52 @@ impl Asks {
 /// twice. Otherwise the question is read off the request — and a model's own
 /// `request_user_input` read off the request keeps the request beside it, so
 /// the panel can ask for what the model asked for: several answers, or words.
+/// The tool call a request is asking on behalf of, read off `events` — the log
+/// of the session it would belong to — or `None` when that log has no such call
+/// waiting (a member's question, read against the lead's log).
+///
+/// The answer is what lets a question come down when it stops waiting without
+/// this screen having answered it — another front end did (the web page, in
+/// sync), or the turn ended: the call's result is logged then, and a question
+/// still up over a call that has its result is a panel asking nothing.
+///
+/// An approval names its call (`ApprovalRequest::call_id`) and is taken at its
+/// word when that call is open in `events`. `request_user_input` names none, but
+/// it is asked from inside its own call, so the newest such call with no result
+/// logged yet is the one.
+pub fn call_asking(kind: &str, payload: &Value, events: &[LoggedEvent]) -> Option<String> {
+    let open = |id: &str| {
+        let called = events.iter().any(|logged| match &logged.event {
+            SessionEvent::AssistantMessage { tool_calls, .. } => {
+                tool_calls.iter().any(|call| call.id == id)
+            }
+            _ => false,
+        });
+        let answered = events.iter().any(|logged| {
+            matches!(&logged.event, SessionEvent::ToolResultLogged { call_id, .. } if call_id == id)
+        });
+        called && !answered
+    };
+    if let Some(id) = payload
+        .get("call_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    {
+        return open(id).then(|| id.to_string());
+    }
+    if kind != REQUEST_USER_INPUT_KIND {
+        return None;
+    }
+    events.iter().rev().find_map(|logged| match &logged.event {
+        SessionEvent::AssistantMessage { tool_calls, .. } => tool_calls
+            .iter()
+            .rev()
+            .find(|call| call.name == "request_user_input" && open(&call.id))
+            .map(|call| call.id.clone()),
+        _ => None,
+    })
+}
+
 pub fn question_for(kind: &str, payload: &Value, events: &[LoggedEvent]) -> Option<Asked> {
     if kind == REQUEST_USER_INPUT_KIND {
         let request: UserInputRequest = serde_json::from_value(payload.clone()).ok()?;
@@ -1308,6 +1364,59 @@ mod tests {
             at: 0,
             event: SessionEvent::Asked { turn: 1, question },
         }
+    }
+
+    /// The model's own `request_user_input` writes no `Asked`, so the call it
+    /// was asked from is what says it is over: the newest such call still
+    /// without a result. Once the result is logged, nothing is waiting on it.
+    #[test]
+    fn a_question_without_an_asked_fact_is_tied_to_its_open_call() {
+        let at = |event| LoggedEvent {
+            seq: 1,
+            at: 0,
+            event,
+        };
+        let called = |id: &str, name: &str| {
+            at(SessionEvent::AssistantMessage {
+                turn: 1,
+                round: 1,
+                text: String::new(),
+                reasoning: String::new(),
+                tool_calls: vec![atomcode_kernel::tool::ToolCall {
+                    id: id.into(),
+                    name: name.into(),
+                    arguments: "{}".into(),
+                }],
+                reasoning_blocks: Vec::new(),
+                meta: None,
+            })
+        };
+        let result = |id: &str| {
+            at(SessionEvent::ToolResultLogged {
+                turn: 1,
+                round: 1,
+                call_id: id.into(),
+                content: String::new(),
+                is_error: false,
+                images: Vec::new(),
+            })
+        };
+        let payload = serde_json::json!({ "question": "Which?" });
+        let mut log = vec![
+            called("old", "request_user_input"),
+            result("old"),
+            called("read", "read_file"),
+            called("now", "request_user_input"),
+        ];
+        assert_eq!(
+            call_asking(REQUEST_USER_INPUT_KIND, &payload, &log).as_deref(),
+            Some("now")
+        );
+        log.push(result("now"));
+        assert_eq!(call_asking(REQUEST_USER_INPUT_KIND, &payload, &log), None);
+        // A call the lead's log does not have (a member's) is not claimed.
+        let named = serde_json::json!({ "call_id": "elsewhere" });
+        assert_eq!(call_asking("approval", &named, &log), None);
     }
 
     /// Several questions in one request are several questions on screen, and
