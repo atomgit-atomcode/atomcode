@@ -513,6 +513,14 @@ async fn what_this_launch_has_to_say_is_said_and_the_welcome_still_opens() {
         screen_text.contains("Tips for getting started"),
         "and the welcome still opened over them:\n{screen_text}"
     );
+    // Under the welcome, not over it: the screen's first line is the product's
+    // banner, not a note about how this launch went.
+    let welcome_at = screen_text.find("Tips for getting started").unwrap();
+    let notice_at = screen_text.find("this config did not parse").unwrap();
+    assert!(
+        welcome_at < notice_at,
+        "the launch's notices sit under the welcome:\n{screen_text}"
+    );
 
     term.press(atomcode_tui::surface::KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), running).await;

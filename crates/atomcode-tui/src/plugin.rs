@@ -776,6 +776,12 @@ const WHEEL_LINES: i32 = 1;
 /// How close two presses on the same cell must be to count as a double- (then
 /// triple-) click. 400ms is the common desktop default — long enough for a
 /// deliberate second tap, short enough that two separate clicks are not fused.
+/// How long this launch's notices wait for the welcome to be drawn before they
+/// are said without it (`OpeningNotices`). The welcome normally comes within
+/// a frame or two of the agent describing itself; this is for a launch where it
+/// does not come at all.
+const OPENING_NOTICE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 const MULTI_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
 
 /// The ways out of a policy intervention, as a person reads them.
@@ -1463,26 +1469,47 @@ impl UserInterface for Tui {
         let mut welcome_note = ctx
             .service::<OpeningNoticesSvc>()
             .and_then(|notices| notices.welcome_note.clone());
-        if let Some(notices) = ctx.service::<OpeningNoticesSvc>() {
+        //
+        // Held until the welcome has been drawn, and said right under it: drawn
+        // the moment the screen came up, they stood above the welcome — the
+        // first line of the screen a note about an untrusted plugin hook, over
+        // the product's own banner. The welcome waits on the agent describing
+        // itself, so the hold has a limit (`OPENING_NOTICE_WAIT`): a launch
+        // whose agent never does — the config that did not parse may be why —
+        // still gets its notices, where they always were.
+        let mut opening_notices: Vec<String> = ctx
+            .service::<OpeningNoticesSvc>()
+            .map(|notices| {
+                notices
+                    .notices
+                    .iter()
+                    .filter(|line| !line.trim().is_empty())
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let notices_held_since = std::time::Instant::now();
+        if !opening_notices.is_empty() {
+            let wake = wake_tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(OPENING_NOTICE_WAIT).await;
+                let _ = wake.send(Wake::Fact);
+            });
+        }
+        let say_opening_notices = |notices: &mut Vec<String>| {
+            if notices.is_empty() {
+                return false;
+            }
             let mut stream = self.host.stream.write().expect("stream poisoned");
             let mut writer = stream.writer("commands");
-            for detail in notices
-                .notices
-                .iter()
-                .filter(|line| !line.trim().is_empty())
-            {
+            for detail in notices.drain(..) {
                 writer.emit(
                     crate::block::Coord::default(),
-                    Arc::new(crate::content::NoticeBlock {
-                        detail: detail.clone(),
-                    }),
+                    Arc::new(crate::content::NoticeBlock { detail }),
                 );
             }
-            drop(stream);
-            // Nothing else is owed yet, so without this the first frame waits
-            // on whatever the agent says first.
-            let _ = wake_tx.send(Wake::Fact);
-        }
+            true
+        };
 
         // Whether the conversation still owes its first word. Answered in the
         // loop below rather than here, because the welcome names the session's
@@ -1755,6 +1782,10 @@ impl UserInterface for Tui {
                             }
                         }
                         stale |= opened;
+                        // This launch's notices, under the welcome just drawn —
+                        // or, where the history stood it down, after what is
+                        // there. Once: the list is drained.
+                        stale |= say_opening_notices(&mut opening_notices);
                         // Answered once per session, whatever the answer: a
                         // stream that was not empty will not become empty
                         // again, and one that opened is no longer empty. It is
@@ -1763,6 +1794,12 @@ impl UserInterface for Tui {
                         // one thing that can empty the stream under this loop.
                         owes_opening = false;
                     }
+                }
+                // No welcome in time: said anyway, where they always were.
+                if !opening_notices.is_empty()
+                    && notices_held_since.elapsed() >= OPENING_NOTICE_WAIT
+                {
+                    stale |= say_opening_notices(&mut opening_notices);
                 }
             }
             if stale && (coalesced >= COALESCE_LIMIT || wake.is_empty()) {
