@@ -919,7 +919,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::RawTop => "── atomcode · the whole conversation ──".into(),
         Msg::RawBottom => "── the whole conversation, above: select, scroll and search it with the terminal · any key returns to atomcode ──".into(),
         Msg::MouseHandedBack => "mouse handed back · ctrl+g take it · /raw select across screens · wheel/↑↓ scroll · ctrl+p/n history · ctrl+t open · ctrl+o thinking".into(),
-        Msg::MouseUnreportedAtStart => "this terminal reports no mouse · drag to select · PageUp/PageDown to scroll · /raw select across screens · ctrl+p/n history · ctrl+t open · ctrl+o thinking".into(),
+        Msg::MouseUnreportedAtStart => "this terminal reports no mouse · drag to select · PageUp/PageDown to scroll · /raw select across screens · ↑↓ history · ctrl+t open · ctrl+o thinking".into(),
         Msg::MouseUnreported => "this terminal reports no mouse, so it keeps it · drag to select · PageUp/PageDown to scroll".into(),
         Msg::MouseHandedBackAtStart => "the terminal has the mouse · ctrl+g take it · /raw select across screens · wheel/↑↓ scroll · ctrl+p/n history · ctrl+t open · ctrl+o thinking".into(),
         Msg::ReasoningHiddenHint => "reasoning is hidden · ctrl-o shows it (again for all of it) · tool output: ctrl-t".into(),

@@ -2155,10 +2155,12 @@ impl UserInterface for Tui {
                         stale = true;
                         continue;
                     }
-                    if !self.surface.mouse()
-                        && self.arrows_reach_the_composer()
-                        && !(n == 1 && self.caret_moves_within_draft(up))
-                    {
+                    if arrows_scroll(
+                        self.surface.mouse(),
+                        crate::caps::mouse_reported(),
+                        self.arrows_reach_the_composer()
+                            && !(n == 1 && self.caret_moves_within_draft(up)),
+                    ) {
                         let lines = n.min(i32::MAX as usize) as i32;
                         quit = self.act(Action::Scroll(if up { -lines } else { lines }), &client);
                     } else {
@@ -9049,6 +9051,19 @@ fn sanitize_paste(text: &str) -> String {
 /// unchanged when the run turns out not to be a paste. Rebuilding a key event
 /// from its character would be a second answer to what a keystroke is, sitting
 /// next to `from_crossterm` and free to disagree with it.
+/// Whether a run of ↑/↓ that reached the composer scrolls the conversation
+/// rather than walking the input history.
+///
+/// Only with the mouse handed back, where the wheel can arrive as arrow keys —
+/// and only on a terminal that reports the mouse at all. One that does not
+/// (HarmonyOS) sends the wheel nowhere: its arrows are keys a person pressed,
+/// and the history is what they are for, as they are with the mouse held.
+/// Scrolling there is PageUp/PageDown. Taking them for the wheel left the
+/// history with no key but ctrl-p/ctrl-n, which nothing on that screen named.
+fn arrows_scroll(mouse_held: bool, mouse_reported: bool, would_scroll: bool) -> bool {
+    !mouse_held && mouse_reported && would_scroll
+}
+
 async fn read_input(
     wake: mpsc::UnboundedSender<Wake>,
     handed_back: impl Fn() -> bool + Send + 'static,
@@ -9508,6 +9523,25 @@ mod surface_row_tests {
 
 #[cfg(test)]
 mod history_tests {
+    use super::arrows_scroll;
+
+    /// With the mouse handed back, arrows the wheel may have sent scroll; on a
+    /// terminal that reports no mouse (HarmonyOS) they are pressed keys and walk
+    /// the history; with the mouse held they always do.
+    #[test]
+    fn arrows_scroll_only_where_the_wheel_can_send_them() {
+        assert!(arrows_scroll(false, true, true), "mouse handed back");
+        assert!(
+            !arrows_scroll(false, false, true),
+            "a terminal with no mouse"
+        );
+        assert!(!arrows_scroll(true, true, true), "mouse held");
+        assert!(
+            !arrows_scroll(false, true, false),
+            "the caret had somewhere to go"
+        );
+    }
+
     use super::{accept_ghost, recall_back, recall_forward};
     use crate::moment::Moment;
 
