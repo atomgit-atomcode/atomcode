@@ -248,6 +248,27 @@ fn keyboard_protocol_for(windows: bool, env: impl Fn(&str) -> Option<String>) ->
     !jediterm
 }
 
+/// Whether the terminal paints a cell's background, from what the environment
+/// says — see [`Caps::cell_background`].
+///
+/// HarmonyOS is in for the reason Windows is: this screen runs there in the
+/// system's own Terminal, which paints backgrounds (checked on HarmonyOS PC 6.1
+/// with `48;5;236` / `48;5;254` blocks) and announces nothing — no
+/// `TERM_PROGRAM`, `TERM=xterm-256color` — so the "an emulator names itself"
+/// rule read it as a bare ssh client. That took the mascot, the user message
+/// bar and every panel's selection band off a terminal that draws all three.
+pub fn cell_background_for(
+    env: &dyn Fn(&str) -> Option<String>,
+    windows: bool,
+    ohos: bool,
+) -> bool {
+    windows
+        || ohos
+        || env("WT_SESSION").is_some()
+        || env("TERM_PROGRAM").is_some()
+        || env("TERM").is_some_and(|t| t.contains("jediterm"))
+}
+
 /// Whether the terminal reports the mouse at all — whether asking it to
 /// (`ESC[?1002h ESC[?1006h`) gets anything back.
 ///
@@ -342,10 +363,7 @@ impl Caps {
             // processing paints backgrounds — so a PowerShell window gets the
             // mascot Git Bash's mintty always got (the same reasoning
             // [`colors_for`] and [`unicode_for`] already apply).
-            cell_background: cfg!(windows)
-                || env("WT_SESSION").is_some()
-                || env("TERM_PROGRAM").is_some()
-                || env("TERM").is_some_and(|t| t.contains("jediterm")),
+            cell_background: cell_background_for(&env, cfg!(windows), cfg!(target_env = "ohos")),
             graphics,
             paste_image: if cfg!(windows) {
                 PasteImage::CtrlAltVOrCommand
@@ -812,6 +830,21 @@ mod tests {
                 .find(|(name, _)| *name == k)
                 .map(|(_, v)| v.to_string())
         }
+    }
+
+    /// HarmonyOS's own Terminal names itself nowhere and still paints
+    /// backgrounds — so the mascot and the bars are drawn there; a bare
+    /// `xterm-256color` elsewhere (an ssh client) still is not trusted to.
+    #[test]
+    fn harmonyos_paints_backgrounds_though_it_names_no_terminal() {
+        let bare = env_of(&[("TERM", "xterm-256color")]);
+        assert!(cell_background_for(&bare, false, true), "HarmonyOS");
+        assert!(
+            !cell_background_for(&bare, false, false),
+            "a bare ssh client"
+        );
+        let named = env_of(&[("TERM", "xterm-256color"), ("TERM_PROGRAM", "iTerm.app")]);
+        assert!(cell_background_for(&named, false, false));
     }
 
     /// HarmonyOS's terminal reports no mouse, so the mouse stays its own there
