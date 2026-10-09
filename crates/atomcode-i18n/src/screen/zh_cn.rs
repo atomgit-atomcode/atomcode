@@ -144,11 +144,17 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StatusRounds { kind, rounds } => format!("{kind} 第 {rounds} 轮").into(),
 
         // ── 团队面板 ──
-        Msg::TeamHeaderFocused { count } => {
-            format!("团队 · {count} 名成员 · ↑↓ 选 · Enter 切换 · Esc 返回").into()
+        Msg::TeamHeaderFocused { count, background } => format!(
+            "{} · ↑↓ 选 · Enter 切换 · Esc 返回",
+            team_zh(count, background)
+        )
+        .into(),
+        Msg::TeamHeader { count, background } => {
+            format!("{} · ↓ 选择查看", team_zh(count, background)).into()
         }
-        Msg::TeamHeader { count } => format!("团队 · {count} 名成员 · ↓ 选择查看").into(),
         Msg::TeamLead => "main".into(),
+        Msg::TeamBackgroundRole => "后台".into(),
+        Msg::TeamBackgroundWaiting => "等你回答".into(),
         Msg::TeamViewing => " 正在看".into(),
         Msg::TeamWorkingRound { round } => format!("第 {round} 轮").into(),
 
@@ -1322,4 +1328,16 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         )
         .into(),
     }
+}
+
+/// `团队 · 2 名成员 · 1 个后台任务`, leaving out a count that is zero.
+fn team_zh(count: usize, background: usize) -> String {
+    let mut parts = vec!["团队".to_string()];
+    if count > 0 {
+        parts.push(format!("{count} 名成员"));
+    }
+    if background > 0 {
+        parts.push(format!("{background} 个后台任务"));
+    }
+    parts.join(" · ")
 }

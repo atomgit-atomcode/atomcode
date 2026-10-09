@@ -167,11 +167,17 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StatusRounds { kind, rounds } => format!("{kind} round {rounds}").into(),
 
         // ── the team panel ──
-        Msg::TeamHeaderFocused { count } => {
-            format!("team · {count} members · ↑↓ to pick · Enter to switch · Esc to go back").into()
+        Msg::TeamHeaderFocused { count, background } => format!(
+            "{} · ↑↓ to pick · Enter to switch · Esc to go back",
+            team_en(count, background)
+        )
+        .into(),
+        Msg::TeamHeader { count, background } => {
+            format!("{} · ↓ to pick one to view", team_en(count, background)).into()
         }
-        Msg::TeamHeader { count } => format!("team · {count} members · ↓ to pick one to view").into(),
         Msg::TeamLead => "main".into(),
+        Msg::TeamBackgroundRole => "background".into(),
+        Msg::TeamBackgroundWaiting => "needs you".into(),
         Msg::TeamViewing => " viewing".into(),
         Msg::TeamWorkingRound { round } => format!("round {round}").into(),
 
@@ -1430,4 +1436,18 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         )
         .into(),
     }
+}
+
+/// `team · 2 members · 1 background task`, leaving out a count that is zero.
+fn team_en(count: usize, background: usize) -> String {
+    let mut parts = vec!["team".to_string()];
+    if count > 0 {
+        parts.push(format!("{count} members"));
+    }
+    match background {
+        0 => {}
+        1 => parts.push("1 background task".into()),
+        n => parts.push(format!("{n} background tasks")),
+    }
+    parts.join(" · ")
 }

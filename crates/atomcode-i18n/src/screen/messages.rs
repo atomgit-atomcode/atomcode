@@ -242,12 +242,18 @@ pub enum Msg<'a> {
     // ── the team panel (`modules/team.rs`) ──
     TeamHeaderFocused {
         count: usize,
+        background: usize,
     },
     TeamHeader {
         count: usize,
+        background: usize,
     },
     /// The lead's own row, first in the list.
     TeamLead,
+    /// The role column of a background session's row.
+    TeamBackgroundRole,
+    /// A background session stopped on a question for the person.
+    TeamBackgroundWaiting,
     /// Marks the member whose stream the screen is showing.
     TeamViewing,
     TeamWorkingRound {

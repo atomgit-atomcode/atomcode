@@ -113,7 +113,37 @@ pub struct Team;
 /// pointer ask the same question through `targets`: an empty answer is what
 /// keeps `Tab` from giving the keyboard to a panel nobody drew.
 fn running(moment: &Moment) -> bool {
-    moment.members.iter().any(|m| !m.gone)
+    moment.members.iter().any(|m| !m.gone) || !background(moment).is_empty()
+}
+
+/// Background sessions this conversation started and is still waiting on — a
+/// `code-review` run in the background, say: working, or stopped on a question.
+///
+/// They are listed here, beside the members, because to the person they are
+/// the same thing — work this agent handed off that is still out — and a line
+/// that only said `等待 1 个后台任务完成` gave no way to see which, or how far
+/// along. Claude Code lists its background agents in the same strip.
+///
+/// Done ones are not: their result has come home into this conversation, which
+/// is where it is read. The `/bg` panel keeps the full list.
+pub fn background(moment: &Moment) -> Vec<&crate::bg::Session> {
+    if moment.lead.is_empty() {
+        return Vec::new();
+    }
+    moment
+        .bg
+        .sessions()
+        .iter()
+        .filter(|s| {
+            s.group != crate::bg::Group::Completed && s.origin.as_deref() == Some(&*moment.lead)
+        })
+        .collect()
+}
+
+/// Whether a target is a background session rather than an agent the screen
+/// can switch to: a press on it opens the `/bg` panel at that session.
+pub fn is_background(moment: &Moment, session: &str) -> bool {
+    background(moment).iter().any(|s| s.id == session)
 }
 
 /// The sessions the panel's selectable rows switch to, in the order they are
@@ -137,6 +167,8 @@ pub fn targets(moment: &Moment) -> Vec<String> {
                 .filter(|m| !m.gone)
                 .map(|m| m.session.clone()),
         )
+        // After the members, in the order [`rows`] draws them.
+        .chain(background(moment).into_iter().map(|s| s.id.clone()))
         .collect()
 }
 
@@ -279,12 +311,20 @@ impl View for Team {
         // are no keys to list until `Tab` hands them over.
         let focused = vp.moment.team_keyboard && !switchable.is_empty();
         let pointing = vp.moment.team_cursor.is_some() && !switchable.is_empty();
+        let background = rows.iter().filter(|r| r.background).count();
+        let members = rows.len() - background;
         let mut out = vec![Line::styled(
             width::take_width(
                 &if focused {
-                    t(Msg::TeamHeaderFocused { count: rows.len() })
+                    t(Msg::TeamHeaderFocused {
+                        count: members,
+                        background,
+                    })
                 } else {
-                    t(Msg::TeamHeader { count: rows.len() })
+                    t(Msg::TeamHeader {
+                        count: members,
+                        background,
+                    })
                 },
                 w as usize,
             ),
@@ -398,6 +438,11 @@ impl View for Team {
             let said = match row.state {
                 Shown::Working => String::new(),
                 Shown::Idle => format!(" {}", pt(PMsg::BgStateIdle)),
+                Shown::Waiting => format!(" {}", t(Msg::TeamBackgroundWaiting)),
+            };
+            let said_ink = match row.state {
+                Shown::Waiting => theme::fg(Role::Warning),
+                _ => muted,
             };
             let mut line: Vec<El> = Vec::new();
             line.push(El::styled(format!("{mark} "), ink));
@@ -408,7 +453,7 @@ impl View for Team {
                     muted,
                 ));
             }
-            line.push(El::styled(said, muted));
+            line.push(El::styled(said, said_ink));
             if !row.member.last.is_empty() {
                 line.push(El::styled(
                     format!(" {} {}", caps.g(Glyph::Separator), row.member.last),
@@ -466,6 +511,8 @@ impl View for Team {
 enum Shown {
     Working,
     Idle,
+    /// A background session stopped on a question for the person.
+    Waiting,
 }
 
 struct Row {
@@ -477,6 +524,8 @@ struct Row {
     state: Shown,
     /// Empty for a member only this log knows of, which cannot be switched to.
     session: String,
+    /// A background session (see [`background`]), not a member.
+    background: bool,
 }
 
 /// The two sources, joined by name.
@@ -517,6 +566,33 @@ fn rows(state: &State, moment: &Moment) -> Vec<Row> {
                 _ => Shown::Working,
             },
             session: live.session.clone(),
+            background: false,
+        });
+    }
+    // Then the background sessions, still among the switchable rows: [`targets`]
+    // lists them in this place, and a drawn row must be the target it says.
+    for session in background(moment) {
+        let stats = session.stats.as_ref();
+        out.push(Row {
+            member: Member {
+                name: session.title.clone(),
+                role: t(Msg::TeamBackgroundRole).into_owned(),
+                last: session.last.clone().unwrap_or_default().replace('\n', " "),
+                stopped: false,
+            },
+            labelled: true,
+            // What the host folded from its log; nothing to show before it ran.
+            elapsed: stats
+                .filter(|s| s.elapsed_ms > 0)
+                .map(|s| std::time::Duration::from_millis(s.elapsed_ms)),
+            tokens: stats.map_or(0, |s| s.prompt),
+            state: if session.waiting {
+                Shown::Waiting
+            } else {
+                Shown::Working
+            },
+            session: session.id.clone(),
+            background: true,
         });
     }
     // Then what only this log remembers — a member stopped before this screen
@@ -532,6 +608,7 @@ fn rows(state: &State, moment: &Moment) -> Vec<Row> {
             tokens: 0,
             state: Shown::Working,
             session: String::new(),
+            background: false,
         });
     }
     out
@@ -631,6 +708,131 @@ mod tests {
         assert!(
             row.trim_end().ends_with("↓ 61.6K tok") && row.contains("1 分 52 秒"),
             "time and context at the right edge: {row:?}"
+        );
+    }
+
+    fn bg_session(
+        id: &str,
+        title: &str,
+        group: crate::bg::Group,
+        origin: &str,
+    ) -> crate::bg::Session {
+        crate::bg::Session {
+            id: id.into(),
+            title: title.into(),
+            group,
+            last: Some("Tracing ChangeDirectory\nand current_dir usage".into()),
+            waiting: group == crate::bg::Group::NeedsInput,
+            failed: false,
+            origin: Some(origin.into()),
+            stats: Some(atomcode_host_api::BackgroundStats {
+                steps: 3,
+                tools: 5,
+                prompt: 94_400,
+                cached: 0,
+                completion: 800,
+                elapsed_ms: 86_000,
+            }),
+        }
+    }
+
+    /// A background session this conversation started — `code-review` run in
+    /// the background — is a row under `main`, Claude Code's way: its name,
+    /// that it is background work, what it last said, and its time and
+    /// context at the edge. Someone else's, and finished ones, are not.
+    #[test]
+    fn our_background_work_is_listed_under_the_lead() {
+        use crate::bg::{BgView, Group};
+        let mut moment = Moment::default().with_lead("lead-1");
+        moment.viewing = "lead-1".into();
+        moment.bg = BgView::new(vec![
+            bg_session("bg-1", "code-review", Group::Working, "lead-1"),
+            bg_session("bg-2", "theirs", Group::Working, "other"),
+            bg_session("bg-3", "finished", Group::Completed, "lead-1"),
+        ]);
+        let state = State::default();
+        let screen = drew(&state, &moment);
+        assert!(screen.contains("● main"), "{screen}");
+        let row = screen
+            .lines()
+            .find(|l| l.contains("code-review"))
+            .unwrap_or_else(|| panic!("listed:\n{screen}"));
+        assert!(row.contains("○ code-review"), "a hollow ring: {row:?}");
+        assert!(row.contains(&*t(Msg::TeamBackgroundRole)), "{row:?}");
+        assert!(
+            row.contains("· Tracing") && !screen.contains("\nand current_dir"),
+            "its last words, on one line, cut to fit: {row:?}"
+        );
+        assert!(
+            row.trim_end().ends_with("↓ 94.4k tok") && row.contains("1 分 26 秒"),
+            "time and context at the edge: {row:?}"
+        );
+        assert!(
+            !screen.contains("theirs") && !screen.contains("finished"),
+            "{screen}"
+        );
+        assert!(
+            screen.lines().next().is_some_and(|h| h.contains("1")
+                && h.contains(&*t(Msg::TeamHeader {
+                    count: 0,
+                    background: 1
+                }))),
+            "the header counts it as background work: {screen}"
+        );
+        // The panel is up for it alone, and its row is a target in drawn order.
+        assert!(Team::height(&state, &moment, 60) != Height::Hug(0));
+        assert_eq!(
+            targets(&moment),
+            vec!["lead-1".to_string(), "bg-1".to_string()]
+        );
+        assert!(is_background(&moment, "bg-1") && !is_background(&moment, "lead-1"));
+        assert_eq!(target_at_line(&moment, 2), Some(1), "line 2 is the bg row");
+    }
+
+    /// One waiting on a question says so, in the warning colour's words.
+    #[test]
+    fn a_background_session_waiting_on_the_person_says_so() {
+        use crate::bg::{BgView, Group};
+        let mut moment = Moment::default().with_lead("lead-1");
+        moment.bg = BgView::new(vec![bg_session(
+            "bg-1",
+            "code-review",
+            Group::NeedsInput,
+            "lead-1",
+        )]);
+        let screen = drew(&State::default(), &moment);
+        assert!(screen.contains(&*t(Msg::TeamBackgroundWaiting)), "{screen}");
+    }
+
+    /// Members first, then background work: the order `targets` switches in.
+    #[test]
+    fn members_come_before_background_work() {
+        use crate::bg::{BgView, Group};
+        let mut moment = Moment::default()
+            .with_lead("lead-1")
+            .with_members(vec![MemberNow {
+                name: "scout".into(),
+                activity: Activity::Working,
+                turn: 1,
+                session: "lead-1/scout".into(),
+                ..MemberNow::default()
+            }]);
+        moment.bg = BgView::new(vec![bg_session(
+            "bg-1",
+            "code-review",
+            Group::Working,
+            "lead-1",
+        )]);
+        let screen = drew(&State::default(), &moment);
+        let at = |needle: &str| {
+            screen
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle}:\n{screen}"))
+        };
+        assert!(at("scout") < at("code-review"), "{screen}");
+        assert_eq!(
+            targets(&moment),
+            vec!["lead-1".to_string(), "lead-1/scout".into(), "bg-1".into()]
         );
     }
 

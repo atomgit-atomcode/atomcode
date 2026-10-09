@@ -2249,7 +2249,7 @@ impl UserInterface for Tui {
                             if let Some(row) = self.host.team_row_at(x, y) {
                                 let _ = self.host.point_team_at(row);
                                 if let Some(session) = self.host.team_target() {
-                                    self.switch_to(&session);
+                                    self.take_team_target(&session);
                                 }
                                 self.host.unfocus_team();
                                 stale = true;
@@ -2796,9 +2796,13 @@ impl UserInterface for Tui {
                     quit = self.team_key(press);
                     stale = true;
                 }
+                // Only for a team: background work alone lists rows here too,
+                // and a `code-review` left running must not take Tab from the
+                // suggestion and the mode switch — ↓ reaches it instead.
                 Wake::Input(Input::Key(press))
                     if matches!(press.key, crate::surface::Key::Tab)
                         && press.mods == crate::surface::Mods::NONE
+                        && self.host.team_has_members()
                         && self.host.focus_team() =>
                 {
                     stale = true;
@@ -2807,7 +2811,7 @@ impl UserInterface for Tui {
                 // no history being walked, the conversation at its bottom —
                 // steps down into the team panel, the way Claude Code's agent
                 // list is reached. Anywhere ↓ still means something, it keeps
-                // meaning it; Tab reaches the panel from anywhere.
+                // meaning it; Tab reaches the panel from anywhere when there is a team.
                 Wake::Input(Input::Key(press))
                     if matches!(press.key, crate::surface::Key::Down)
                         && press.mods == crate::surface::Mods::NONE
@@ -5213,7 +5217,7 @@ impl Tui {
             }
             (Key::Enter, _) => {
                 if let Some(session) = self.host.team_target() {
-                    self.switch_to(&session);
+                    self.take_team_target(&session);
                 }
                 self.host.unfocus_team();
             }
@@ -5280,6 +5284,17 @@ impl Tui {
         self.recaps.fetch_add(1, Ordering::SeqCst);
         if let Some(task) = self.recap_task.lock().expect("recap poisoned").take() {
             task.abort();
+        }
+    }
+
+    /// What a press on a team panel row does: an agent is switched to; a
+    /// background session — which is not this session's to draw — opens the
+    /// `/bg` panel at it, where it can be opened, answered or dropped.
+    fn take_team_target(&self, session: &str) {
+        if self.host.team_target_is_background(session) {
+            self.host.open_bg_at(session);
+        } else {
+            self.switch_to(session);
         }
     }
 

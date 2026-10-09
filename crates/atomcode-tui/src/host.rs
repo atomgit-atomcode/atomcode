@@ -4371,6 +4371,39 @@ impl Host {
         true
     }
 
+    /// Bring the background panel up with its cursor on `session` — a press on
+    /// a background row of the team panel. Esc just puts it away again: the
+    /// session was not moved there, so there is nothing to go back to.
+    pub fn open_bg_at(&self, session: &str) -> bool {
+        if !self.open_bg(None) {
+            return false;
+        }
+        let mut m = self.moment.write().expect("moment poisoned");
+        let view = m.bg.clone();
+        if let Some(panel) = m.bg_panel.as_mut() {
+            panel.aim = Some(session.to_string());
+            panel.settle(&view);
+        }
+        true
+    }
+
+    /// Whether the team panel lists any member — not only background work.
+    pub fn team_has_members(&self) -> bool {
+        self.moment
+            .read()
+            .expect("moment poisoned")
+            .members
+            .iter()
+            .any(|m| !m.gone)
+    }
+
+    /// Whether a team panel target is a background session rather than an
+    /// agent the screen can switch to.
+    pub fn team_target_is_background(&self, session: &str) -> bool {
+        let m = self.moment.read().expect("moment poisoned");
+        crate::modules::team::is_background(&m, session)
+    }
+
     /// Put the background panel away. True when it was up.
     pub fn close_bg(&self) -> bool {
         self.moment
@@ -14809,6 +14842,38 @@ mod tests {
             stats: None,
             origin: None,
         }])
+    }
+
+    /// A press on a background row of the team panel opens `/bg` with the
+    /// cursor on that session — not the first one — and nothing to go back to.
+    #[test]
+    fn a_background_row_opens_the_panel_at_its_session() {
+        let mods = Arc::new(Modules::new());
+        mods.add_view(Arc::new(Mounted::<crate::modules::bg::Bg>::new()))
+            .unwrap();
+        let h = Host::new(mods, default_layout());
+        let session = |id: &str, state| atomcode_host_api::BackgroundSession {
+            session: id.into(),
+            title: Some(id.into()),
+            state,
+            created_at: 1,
+            last: None,
+            stats: None,
+            origin: Some("lead".into()),
+        };
+        use atomcode_host_api::BackgroundState as S;
+        h.moment.write().unwrap().lead = "lead".into();
+        assert!(h.show_bg(crate::bg::BgView::from_host(vec![
+            session("first", S::Running),
+            session("review", S::Running),
+        ])));
+        assert!(h.team_target_is_background("review"));
+        assert!(!h.team_target_is_background("lead"));
+        assert!(h.open_bg_at("review"));
+        let m = h.moment.read().unwrap();
+        let panel = m.bg_panel.as_ref().expect("the panel is up");
+        assert_eq!(m.bg.at(panel.cursor).map(|s| s.id.as_str()), Some("review"));
+        assert_eq!(panel.moved, None, "Esc only puts it away");
     }
 
     /// 屏幕上有别的问题在等，后台的就先不提 —— 前台优先。
