@@ -1277,6 +1277,20 @@ impl BlockView {
     }
 }
 
+/// The cells a screen [`Selection`](crate::moment::Selection) can touch, as a
+/// rect: the bounding box of its two ends.
+///
+/// The conversation's menu keeps off this so it does not hide the words it is
+/// about; the projection that produces the selection is already recomputed
+/// every frame, so a menu placed off this rides the words as they scroll.
+fn selection_rect(sel: crate::moment::Selection) -> Rect {
+    let x0 = sel.anchor.0.min(sel.head.0);
+    let x1 = sel.anchor.0.max(sel.head.0);
+    let y0 = sel.anchor.1.min(sel.head.1);
+    let y1 = sel.anchor.1.max(sel.head.1);
+    Rect::new(x0, y0, x1 - x0 + 1, y1 - y0 + 1)
+}
+
 /// Which block each row of the stream came from, and where the stream was.
 ///
 /// Composing is where this is known and clicking is where it is needed, so the
@@ -5229,6 +5243,32 @@ impl Host {
         *self.context_menu.write().expect("menu poisoned") = crate::menu::Menu::new(at, items);
     }
 
+    /// Open the conversation's context menu: the one raised over the selected
+    /// words rather than over a box the pointer is in.
+    ///
+    /// A conversation selection is held by **what it covers**, and the view
+    /// keeps moving under it while the model is still talking; a menu anchored
+    /// to the screen cell the button went down on is left behind by the words it
+    /// offers to act on. This one is anchored to the selection instead: placed
+    /// beside it so it does not hide them, and re-derived from the live
+    /// selection every frame ([`Host::compose`]) so it rides the words as they
+    /// scroll. With nothing selected there is nothing to ride and it falls back
+    /// to the cell, the same as the composer's.
+    pub fn open_selection_menu(&self, at: (u16, u16), items: Vec<crate::menu::Item>) {
+        let hold = self
+            .moment
+            .read()
+            .expect("moment poisoned")
+            .selection
+            .filter(|s| !s.is_empty())
+            .map(selection_rect);
+        *self.context_menu.write().expect("menu poisoned") =
+            crate::menu::Menu::new(at, items).map(|menu| match hold {
+                Some(hold) => menu.holding(hold),
+                None => menu.following(),
+            });
+    }
+
     /// Close it, if it is open. Returns whether there was one, so a caller can
     /// tell "closed it" from "there was nothing to close".
     pub fn close_context_menu(&self) -> bool {
@@ -6253,7 +6293,18 @@ impl Host {
         // selection that runs under it — the menu's own rows came out striped
         // where a selection crossed them, which is what a menu covering what it
         // covers is not supposed to look like.
-        if let Some(menu) = self.context_menu.read().expect("menu poisoned").clone() {
+        if let Some(menu) = self.context_menu.write().expect("menu poisoned").as_mut() {
+            // A menu that was raised over a selection is about *those words*,
+            // which are held by what they cover: re-derive where they are now, so
+            // the panel is drawn beside them this frame rather than beside where
+            // they were when the button went down. A composer menu holds nothing
+            // and keeps the cell it was asked for.
+            if menu.follows {
+                menu.hold = moment
+                    .selection
+                    .filter(|s| !s.is_empty())
+                    .map(selection_rect);
+            }
             let rect = menu.rect(w, h);
             if !rect.is_empty() {
                 let vp = crate::moment::Viewport::new(rect, &moment);
@@ -14985,6 +15036,94 @@ mod tests {
             "the row under the pointer is the row that is chosen"
         );
         assert!(!h.context_menu_open());
+    }
+
+    #[test]
+    fn a_selection_menu_keeps_off_the_words_and_rides_them_when_they_scroll() {
+        // #1630 in one test. The panel raised over a selection is *about* those
+        // words: it must not cover them, and it must follow them as the view
+        // moves under them — the screen cell the button went down on is left
+        // behind the moment the conversation scrolls.
+        let h = fed();
+        let size = (80, 24);
+        // Long enough that the view has somewhere to move to.
+        for i in 0..40 {
+            h.absorb(&SessionEvent::AssistantMessage {
+                turn: 1,
+                round: i,
+                text: format!("row {i}"),
+                reasoning: String::new(),
+                tool_calls: Vec::new(),
+                reasoning_blocks: Vec::new(),
+                meta: None,
+            });
+        }
+        let (row, width) = {
+            let view = h
+                .block_view(size, &h.moment.read().expect("moment poisoned"))
+                .expect("a view onto the conversation");
+            // A row in the middle of the window, so scrolling keeps it on screen
+            // and there is room below it for the panel both before and after.
+            (view.top() + view.rect.h as usize / 2, view.rect.w)
+        };
+        {
+            let mut m = h.moment.write().expect("moment poisoned");
+            m.stream_selection = Some(crate::moment::StreamSelection {
+                anchor: (0, row),
+                head: (6.min(width.saturating_sub(1)), row),
+                extended: false,
+            });
+            m.scroll = crate::moment::ScrollPos::BOTTOM;
+        }
+        h.open_selection_menu(
+            (2, 4),
+            vec![
+                crate::menu::Item::new("copy-selected", "复制选中"),
+                crate::menu::Item::new("paste", "粘贴"),
+            ],
+        );
+
+        let words = |h: &Host| -> Rect {
+            let m = h.moment.read().expect("moment poisoned");
+            let sel = m.stream_selection.expect("a selection");
+            let view = h
+                .block_view(size, &m)
+                .expect("a view onto the conversation");
+            selection_rect(crate::moment::Selection {
+                anchor: view.screen_of(sel.anchor),
+                head: view.screen_of(sel.head),
+            })
+        };
+        let overlaps = |a: Rect, b: Rect| {
+            a.x < b.right() && b.x < a.right() && a.y < b.bottom() && b.y < a.bottom()
+        };
+
+        let before = words(&h);
+        let menu = h.compose(size).part("context-menu").expect("open").rect;
+        assert!(
+            !overlaps(menu, before),
+            "the menu covers the words it is about: {menu:?} vs {before:?}"
+        );
+        let gap = menu.y as i32 - before.y as i32;
+
+        // The view moves under the words, as streaming does while a person is
+        // reading. The words move up the screen.
+        h.moment.write().expect("moment poisoned").scroll = crate::moment::ScrollPos(3);
+        let after = words(&h);
+        assert_ne!(
+            before, after,
+            "the words did not move; nothing is under test"
+        );
+        let menu_after = h.compose(size).part("context-menu").expect("open").rect;
+        assert!(
+            !overlaps(menu_after, after),
+            "the menu covers the words after a scroll: {menu_after:?} vs {after:?}"
+        );
+        assert_eq!(
+            menu_after.y as i32 - after.y as i32,
+            gap,
+            "the menu did not move with the words — it was left at the old cell"
+        );
     }
 
     #[test]

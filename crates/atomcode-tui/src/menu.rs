@@ -86,9 +86,28 @@ pub struct Menu {
     /// row the pointer is on after that: hovering re-anchors it, because that is
     /// what keeps the panel from sliding out from under a moving pointer. See
     /// [`Menu::hover`].
+    ///
+    /// Unused when [`Menu::hold`] is set: a menu that is about selected words is
+    /// placed off those words rather than off a cell (see [`Menu::rect`]).
     pub at: (u16, u16),
     pub items: Vec<Item>,
     cursor: usize,
+    /// The words this menu is about, as a screen rect to keep off if it can —
+    /// the conversation's selection for the menu raised over it, `None` for the
+    /// composer's. When it is set the panel is placed beside it
+    /// ([`beside`]) so it never hides the text it offers to act on.
+    pub hold: Option<Rect>,
+    /// Whether this menu rides the conversation's selection: its [`hold`] is
+    /// re-derived from the live selection every frame (`Host::compose`), so the
+    /// panel stays beside the words as the view scrolls under them instead of
+    /// being left at the cell the button went down on.
+    ///
+    /// Separate from `hold` because a conversation menu can open with nothing
+    /// selected (it then offers to copy everything) and still must start riding
+    /// the moment a selection is projected — a menu is either the
+    /// conversation's or the composer's, whether or not there are words to keep
+    /// off this frame.
+    pub follows: bool,
 }
 
 /// Cells of runway to the right of the words, so the panel does not look
@@ -117,7 +136,26 @@ impl Menu {
             at,
             items,
             cursor: 0,
+            hold: None,
+            follows: false,
         })
+    }
+
+    /// The same menu, about the cells `hold`: placed beside them rather than
+    /// across them ([`Menu::rect`]), and riding the live selection as the view
+    /// scrolls ([`Menu::follows`]).
+    pub fn holding(mut self, hold: Rect) -> Self {
+        self.hold = Some(hold);
+        self.follows = true;
+        self
+    }
+
+    /// The conversation's menu with nothing selected yet: it rides the selection
+    /// as soon as one is projected, and until then sits at the cell it was asked
+    /// for.
+    pub fn following(mut self) -> Self {
+        self.follows = true;
+        self
     }
 
     pub fn item_count(&self) -> usize {
@@ -134,6 +172,11 @@ impl Menu {
     /// `at.y - cursor`, and the whole thing is slid back on screen rather than
     /// clipped, because a menu half off the edge is a menu whose last item
     /// cannot be reached.
+    ///
+    /// A menu that [`hold`](Menu::hold)s a rect is placed *beside* it instead
+    /// ([`beside`]), so it does not hide the words it is about; the pointer
+    /// anchor is the fallback for when every side of those words is off the
+    /// screen.
     pub fn rect(&self, screen_w: u16, screen_h: u16) -> Rect {
         // The items, and a frame of one cell round them (see `render`).
         let h = (self.items.len() as u16 + 2).min(screen_h);
@@ -156,7 +199,14 @@ impl Menu {
             .saturating_sub(self.cursor as u16 + 1)
             .min(screen_h.saturating_sub(h));
         let x = self.at.0.min(screen_w.saturating_sub(w));
-        Rect::new(x, y, w, h)
+        let natural = Rect::new(x, y, w, h);
+        match self
+            .hold
+            .and_then(|hold| beside(hold, w, h, screen_w, screen_h))
+        {
+            Some(rect) => rect,
+            None => natural,
+        }
     }
 
     /// How wide one item's row is, in cells.
@@ -322,6 +372,40 @@ impl Menu {
         ));
         out
     }
+}
+
+/// Where a `w`×`h` panel goes so it does not cover `hold`, or `None` when there
+/// is no room beside it on this screen.
+///
+/// Below the words first, then above them — the two places the eye follows a
+/// selection to — and only then the room to their right and left. The panel is
+/// slid back on screen where it lands, the same as [`Menu::rect`] does for the
+/// pointer anchor: a panel with its last row off the edge is a panel whose last
+/// item cannot be reached.
+///
+/// `None` is the honest answer when the words fill the screen in every
+/// direction: the caller falls back to the cell the button went down on, which
+/// is the one place left, and an unavoidable cover is better than a panel with
+/// nowhere to be.
+fn beside(hold: Rect, w: u16, h: u16, screen_w: u16, screen_h: u16) -> Option<Rect> {
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let x = hold.x.min(screen_w.saturating_sub(w));
+    if h <= screen_h.saturating_sub(hold.bottom()) {
+        return Some(Rect::new(x, hold.bottom(), w, h));
+    }
+    if h <= hold.y {
+        return Some(Rect::new(x, hold.y - h, w, h));
+    }
+    let y = hold.y.min(screen_h.saturating_sub(h));
+    if w <= screen_w.saturating_sub(hold.right()) {
+        return Some(Rect::new(hold.right(), y, w, h));
+    }
+    if w <= hold.x {
+        return Some(Rect::new(hold.x - w, y, w, h));
+    }
+    None
 }
 
 /// The slash menu: what a `/` is offering, and which of it is pointed at.
@@ -1059,6 +1143,73 @@ mod tests {
                 "  /quit    退出".to_string(),
             ]
         );
+    }
+
+    // ---- a menu that is about a selection --------------------------------
+
+    /// Whether two rects share a cell.
+    fn overlaps(a: Rect, b: Rect) -> bool {
+        a.x < b.right() && b.x < a.right() && a.y < b.bottom() && b.y < a.bottom()
+    }
+
+    #[test]
+    fn a_menu_about_a_selection_is_placed_below_it() {
+        // The bug the issue reports: opening across the words a person picked
+        // hides the thing the menu is about. Below them is the first place to
+        // look.
+        let hold = Rect::new(10, 5, 20, 1);
+        let menu = Menu::new((12, 6), items()).unwrap().holding(hold);
+        let rect = menu.rect(80, 24);
+        assert!(!overlaps(rect, hold), "the menu covers the words: {rect:?}");
+        assert_eq!(rect.y, hold.bottom(), "it sits directly under them");
+    }
+
+    #[test]
+    fn a_menu_about_a_selection_flips_above_when_the_bottom_is_crowded() {
+        let hold = Rect::new(10, 20, 20, 1);
+        let menu = Menu::new((12, 21), items()).unwrap().holding(hold);
+        let rect = menu.rect(80, 24);
+        assert!(!overlaps(rect, hold), "the menu covers the words: {rect:?}");
+        assert_eq!(rect.bottom(), hold.y, "it sits directly on top of them");
+    }
+
+    #[test]
+    fn a_menu_about_a_selection_goes_beside_when_there_is_no_room_above_or_below() {
+        // A selection taller than the screen leaves only the sides; the panel
+        // still keeps off the words it can.
+        let hold = Rect::new(30, 0, 10, 24);
+        let menu = Menu::new((32, 2), items()).unwrap().holding(hold);
+        let rect = menu.rect(80, 24);
+        assert!(!overlaps(rect, hold), "the menu covers the words: {rect:?}");
+    }
+
+    #[test]
+    fn a_menu_with_no_room_at_all_falls_back_to_the_pointer() {
+        // Words that fill the screen leave nowhere to stand: covering is the
+        // least bad of the places left, and it is still at the cell asked for.
+        let hold = Rect::new(0, 0, 80, 24);
+        let menu = Menu::new((10, 10), items()).unwrap().holding(hold);
+        let rect = menu.rect(80, 24);
+        assert_eq!(rect.y + 1, 10);
+        assert_eq!(rect.x, 10);
+    }
+
+    #[test]
+    fn a_menu_about_a_selection_does_not_slide_when_the_pointer_walks_it() {
+        // The panel is placed off the selection, not off the pointer, so a
+        // moving pointer changes the lit row and nothing else.
+        let hold = Rect::new(10, 5, 20, 1);
+        let mut menu = Menu::new((12, 6), items()).unwrap().holding(hold);
+        let rect = menu.rect(80, 24);
+        for (i, want) in ["copy", "paste", "clear", "send"].iter().enumerate() {
+            let y = rect.y + 1 + i as u16;
+            menu.hover(rect.x, y, 80, 24);
+            assert_eq!(menu.rect(80, 24), rect, "the menu moved at row {i}");
+            assert_eq!(
+                menu.click(rect.x, y, 80, 24),
+                Some(Step::Picked((*want).into())),
+            );
+        }
     }
 
     // ---- the slash menu --------------------------------------------------

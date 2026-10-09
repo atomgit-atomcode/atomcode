@@ -4510,11 +4510,11 @@ async fn a_right_click_outside_the_composer_offers_only_what_belongs_there() {
 }
 
 #[tokio::test]
-async fn the_menu_over_a_selection_keeps_its_own_colours() {
-    // The menu is a panel raised over the screen, so what it covers it covers.
-    // It did not: the selection was highlighted after the menu was drawn, so a
-    // menu opened on selected text came out striped with the selection running
-    // through its rows.
+async fn a_menu_over_a_selection_keeps_off_the_words_it_is_about() {
+    // #1630: right-clicking a selection popped the menu across the very words
+    // that were picked and hid them. The menu is *about* those words, so it is
+    // placed beside them instead — below when there is room, above when the
+    // bottom edge is crowded.
     let dir = scratch("menu-over-selection");
     let s = start(tree(&dir, &replay(r#"{ text = "the model spoke" }"#), &[])).await;
     let task = s.open().await;
@@ -4545,7 +4545,7 @@ async fn the_menu_over_a_selection_keeps_its_own_colours() {
     );
     s.quiet().await;
 
-    // Open the menu on the selected row, so the two have to share cells.
+    // Open the menu on the selected row; it has to move rather than cover it.
     right_click(&s, stream.x + 2, row);
     s.quiet().await;
 
@@ -4557,17 +4557,22 @@ async fn the_menu_over_a_selection_keeps_its_own_colours() {
         .expect("the menu opened")
         .clone();
     assert!(
-        part.rect.contains(stream.x + 2, row),
-        "the menu has to cover the row the selection is on, or this proves \
-         nothing: menu {:?}, selected row {row}",
+        !part.rect.contains(stream.x + 2, row),
+        "the menu is still covering the words it is about: menu {:?}, selected \
+         row {row}",
         part.rect
     );
-    for (i, line) in part.lines.iter().enumerate() {
-        assert!(
-            line.spans.iter().all(|s| !s.style.reverse),
-            "menu row {i} was recoloured by the selection under it: {line:?}"
-        );
-    }
+    assert_eq!(
+        part.rect.y,
+        row + 1,
+        "with room below, the menu sits under the selected row: {:?}",
+        part.rect
+    );
+    let drawn: Vec<String> = part.lines.iter().map(|l| l.plain()).collect();
+    assert!(
+        drawn.iter().any(|l| l.contains("复制选中")) && drawn.iter().any(|l| l.contains("粘贴")),
+        "the menu still offers what it is about: {drawn:?}"
+    );
 
     s.term.press(KeyPress::plain(Key::Esc));
     s.term.press(KeyPress::ctrl('d'));

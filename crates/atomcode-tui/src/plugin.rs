@@ -8093,7 +8093,14 @@ impl Tui {
                 crate::menu::Item::new("paste", t(Msg::MenuPaste)).about(t(Msg::MenuPasteAbout)),
             ]
         };
-        self.host.open_context_menu((x, y), items);
+        if in_composer {
+            self.host.open_context_menu((x, y), items);
+        } else {
+            // Over the conversation the menu is about the selection, so it is
+            // anchored to the words rather than to the cell: it is placed beside
+            // them and follows them as the view scrolls (`open_selection_menu`).
+            self.host.open_selection_menu((x, y), items);
+        }
     }
 
     /// Paste the clipboard's text into the composer: the menu's `粘贴`, the
