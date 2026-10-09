@@ -3083,7 +3083,14 @@ impl Host {
         if m.providers == view {
             return false;
         }
-        m.providers = view;
+        // The models list sorts around the one in use, so a list read while the
+        // panel is up can move every row; the cursor follows what it pointed at
+        // rather than staying on a row number now holding another model.
+        let before = std::mem::replace(&mut m.providers, view);
+        let moment = &mut *m;
+        if let Some(panel) = moment.providers_panel.as_mut() {
+            crate::providers::follow_cursor(&before, &moment.providers, panel);
+        }
         true
     }
 

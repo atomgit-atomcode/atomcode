@@ -326,15 +326,25 @@ impl ProvidersView {
                 // 平铺过的那版在多账号下读不出「这个模型是谁家的」——行里写着
                 // 账号,但十几行里找同一个账号要靠眼睛扫。下钻到某个账号时不画
                 // 标题:那时整张列表都是它的,再写一遍是废话。
+                //
+                // 正在用的那一个打头:它的账号整组排最前,组里它自己排第一,其余
+                // 照文件顺序。`/model` 打开时光标停在第一个能停的行上,于是落下
+                // 就在它身上;按文件顺序排时,用着后面账号的模型,每次都得先翻过
+                // 别人家整组才找得到自己。
+                let in_use = self.models.iter().position(|m| m.current);
+                let mut order: Vec<usize> = in_use.into_iter().collect();
+                order.extend((0..self.models.len()).filter(|i| Some(*i) != in_use));
                 let mut groups: Vec<&str> = Vec::new();
-                for m in self.models.iter() {
-                    if !groups.contains(&m.account.as_str()) {
-                        groups.push(&m.account);
+                for &i in &order {
+                    let account = self.models[i].account.as_str();
+                    if !groups.contains(&account) {
+                        groups.push(account);
                     }
                 }
                 for account in groups {
                     let mut under: Vec<usize> = Vec::new();
-                    for (i, m) in self.models.iter().enumerate() {
+                    for &i in &order {
+                        let m = &self.models[i];
                         if m.account != account {
                             continue;
                         }
@@ -375,6 +385,35 @@ impl ProvidersView {
         let listed = self.listed(panel);
         panel.cursor = settle(&listed, panel.cursor);
     }
+}
+
+/// 列表从 `before` 换成 `after` 时,把光标挪回它原来指着的那一行。
+///
+/// 光标存的是行号,而模型页按「正在用的那一个」排序——标记一变,整组就换了
+/// 位置。按行号不动,光标就指到了别的模型上,回车换过去的是一个人没挑的那个。
+/// 认的是行背后的东西(模型、账号按 id),找不到就落到最近的能停的行。
+pub fn follow_cursor(before: &ProvidersView, after: &ProvidersView, panel: &mut Panel) {
+    let id_of = |view: &ProvidersView, row: Listed| -> Option<(bool, String)> {
+        match row {
+            Listed::Model(i) => view.models().get(i).map(|m| (true, m.id.clone())),
+            Listed::Account(i) => view.accounts().get(i).map(|a| (false, a.id.clone())),
+            Listed::Effort(_) | Listed::Group(_) | Listed::Add => None,
+        }
+    };
+    let listed = after.listed(panel);
+    let pointed = before
+        .listed(panel)
+        .get(panel.cursor)
+        .and_then(|row| id_of(before, *row));
+    let found = pointed.and_then(|want| {
+        listed
+            .iter()
+            .position(|row| id_of(after, *row).as_ref() == Some(&want))
+    });
+    panel.cursor = match found {
+        Some(at) => at,
+        None => settle(&listed, panel.cursor),
+    };
 }
 
 /// One row of the list, as everything that walks the list sees it.
@@ -3169,6 +3208,80 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    /// 正在用的模型那一组排最前,组里它自己排第一:`/model` 一打开,光标落下的
+    /// 第一个能停的行就是它。按配置文件的顺序排时,用着排在后面账号的模型,
+    /// 每次打开都要先翻过别人家的整组才找得到自己在哪(2026-10-09 反馈)。
+    #[test]
+    fn the_model_in_use_and_its_account_come_first() {
+        let on_b = view().with_current(Some("local/b"));
+        let mut panel = Panel::new();
+        panel.tab = Tab::Models;
+        assert_eq!(
+            on_b.listed(&panel),
+            vec![
+                Listed::Group(2),
+                Listed::Model(2),
+                Listed::Model(1),
+                Listed::Group(0),
+                Listed::Model(0),
+                Listed::Add,
+            ],
+            "当前账号整组提前,组内当前模型打头,其余保持文件里的顺序"
+        );
+        on_b.settle_cursor(&mut panel);
+        assert_eq!(
+            on_b.listed(&panel)[panel.cursor],
+            Listed::Model(2),
+            "打开就停在正在用的那一个上"
+        );
+
+        // 没标当前的列表照文件顺序,不凭空挑一个提前。
+        assert_eq!(
+            view().listed(&panel),
+            vec![
+                Listed::Group(0),
+                Listed::Model(0),
+                Listed::Group(1),
+                Listed::Model(1),
+                Listed::Model(2),
+                Listed::Add,
+            ]
+        );
+    }
+
+    /// 面板开着时列表换了(agent 迟报了自己在用哪个、网页上切了模型),正在用的
+    /// 那组跳到最前——光标得跟着它指着的那个模型走,不能留在原来的行号上。
+    /// 留在行号上,回车换过去的就是一个人从没指过的模型。
+    #[test]
+    fn a_reordered_list_keeps_the_cursor_on_the_same_model() {
+        let before = view();
+        let mut panel = Panel::new();
+        panel.tab = Tab::Models;
+        // 文件顺序:[G0, M0, G1, M1, M2, Add],指着 local/a(第 3 行)。
+        panel.cursor = 3;
+        assert_eq!(before.listed(&panel)[panel.cursor], Listed::Model(1));
+
+        // 报上来:在用的是 local/b,local 那组提到最前。
+        let after = before.with_current(Some("local/b"));
+        follow_cursor(&before, &after, &mut panel);
+        assert_eq!(
+            after.listed(&panel)[panel.cursor],
+            Listed::Model(1),
+            "还指着 local/a:{:?}",
+            after.listed(&panel)
+        );
+
+        // 指着的那一个没了:落到能停的行上,不停在小标题上。
+        let gone = ProvidersView::new(
+            vec![account("deepseek", 1)],
+            vec![model("deepseek/chat", "deepseek")],
+            Vec::new(),
+            Vec::new(),
+        );
+        follow_cursor(&after, &gone, &mut panel);
+        assert!(gone.listed(&panel)[panel.cursor].selectable());
     }
 
     /// 小标题停不住:上下键从它上面走过去,回车不会落在一条分界线上。
