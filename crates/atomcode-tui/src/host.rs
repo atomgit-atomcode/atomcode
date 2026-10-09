@@ -670,7 +670,8 @@ type RowOwner = Option<(BlockId, &'static str)>;
 /// measured against — the two have to agree or the last rows of a long
 /// transcript become unreachable.
 fn blank_between(upper: &str, lower: &str, calls_apart: bool) -> bool {
-    if upper == "turn_end" || lower == "turn_end" {
+    // A `!` command's closing line is the same separator, with the same air.
+    if upper == "turn_end" || lower == "turn_end" || upper == "shell_end" || lower == "shell_end" {
         return true;
     }
     // A user bar gets air on BOTH sides: after it (its answer starts fresh) and
@@ -7513,6 +7514,10 @@ mod tests {
         assert!(!blank_between("shell", "shell_output", false));
         assert!(blank_between("assistant", "shell", false), "air above");
         assert!(blank_between("shell_output", "user", false), "and below");
+        assert!(
+            blank_between("shell_output", "shell_end", false),
+            "its `✻ Done` line stands apart, like a turn's"
+        );
     }
 
     /// Two turns, the second with something long enough to take several rows.

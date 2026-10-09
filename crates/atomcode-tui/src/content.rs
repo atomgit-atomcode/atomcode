@@ -2718,6 +2718,46 @@ impl Content for ShellOutput {
     }
 }
 
+/// The line that closes a `!` command: `✻ Done 10:38 · 12.4s`.
+///
+/// The turn-end line's shape — the same mark, the same dim, the clock beside
+/// the word and how long after it — because to a person reading back it is the
+/// same question: when did that finish, and how long did it take. Only those
+/// two: no rounds, tools or tokens, because no model was asked anything, and a
+/// row of zeros would claim one was. How it ended (an exit code, a timeout) is
+/// already said in red on the output's own last row.
+#[derive(Debug)]
+pub struct ShellDone {
+    /// The person's own clock when it finished (`10:38`), when there was one.
+    pub ended_at: Option<String>,
+    pub elapsed_ms: u64,
+}
+
+impl Content for ShellDone {
+    fn kind(&self) -> &'static str {
+        "shell_end"
+    }
+    fn content_hash(&self) -> ContentHash {
+        hash_of(&[
+            "shell_end",
+            self.ended_at.as_deref().unwrap_or(""),
+            &self.elapsed_ms.to_string(),
+        ])
+    }
+    fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+        let mark = Caps::default().g(Glyph::Sparkle);
+        let took = fmt_dur(self.elapsed_ms);
+        let caption = match &self.ended_at {
+            Some(at) => format!("{mark} Done {at} · {took}"),
+            None => format!("{mark} Done · {took}"),
+        };
+        vec![Line::styled(
+            width::take_width(&caption, ctx.width as usize),
+            muted(),
+        )]
+    }
+}
+
 /// How a turn ended.
 ///
 /// The reason is the *typed* one, not a rendering of it. A block that took a
@@ -3236,6 +3276,17 @@ mod tests {
             nothing[0].trim_end(),
             format!("  ⎿ {}", t(Msg::ShellSaidNothing))
         );
+
+        // And it closes the way a turn does: `✻ Done 10:38 · 12.4s`, nothing
+        // about rounds or tokens — no model was asked anything.
+        let done = plain(
+            ShellDone {
+                ended_at: Some("10:38".into()),
+                elapsed_ms: 12_400,
+            }
+            .lines(&ctx),
+        );
+        assert_eq!(done, vec!["✻ Done 10:38 · 12.4s".to_string()]);
     }
     use super::*;
 

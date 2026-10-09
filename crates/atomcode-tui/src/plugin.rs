@@ -4225,6 +4225,7 @@ impl Tui {
             }
         }
         tokio::spawn(async move {
+            let began = std::time::Instant::now();
             // 边跑边画,但不是每一行都重画一遍:一条打出几千行的命令,逐行把整块
             // 复制一次就是几千次复制。行先攒着,由一个 50ms 的钟去画 —— 而不是
             // 等下一行来了才画:一阵几行、然后安静下来的命令(`npm run dev` 的
@@ -4298,6 +4299,17 @@ impl Tui {
                     }),
                 );
                 w.settle(output);
+                // 收尾一行,和回合结束那行同一个样子:`✻ Done 10:38 · 12.4s`。
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis() as u64);
+                w.emit(
+                    crate::block::Coord::default(),
+                    Arc::new(crate::content::ShellDone {
+                        ended_at: crate::content::clock_of(now_ms),
+                        elapsed_ms: began.elapsed().as_millis() as u64,
+                    }),
+                );
             }
             // 模型那一份用原始输出,不带屏幕上那句评语。攒着,跟下一条
             // 消息一起过去。

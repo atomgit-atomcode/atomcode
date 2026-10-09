@@ -7278,6 +7278,23 @@ async fn a_bang_runs_here_and_what_it_printed_goes_with_the_next_message() {
             .is_some_and(|r| r.contains("⎿") && r.contains("OUT-OF[git status]")),
         "输出紧贴在命令下面,挂在 ⎿ 上:\n{seen}"
     );
+    // 收尾一行和回合结束同一个样子,只有钟点和用时 —— 没问过模型,不报轮数。
+    let mut closed = seen.clone();
+    for _ in 0..200 {
+        if closed.contains("✻ Done") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        closed = transcript(&s);
+    }
+    let done = closed
+        .lines()
+        .find(|r| r.contains("✻ Done"))
+        .unwrap_or_else(|| panic!("收尾一行 `✻ Done 钟点 · 用时`:\n{closed}"));
+    assert!(
+        done.contains(':') && !done.contains("tokens"),
+        "钟点和用时,没有轮数和 token:{done:?}"
+    );
 
     // 下一条消息带着它走。钉的是**发出去的那条命令**,不是屏上画了
     // 什么 —— 这一半的整个意义就在于模型收到了什么。
