@@ -87,12 +87,12 @@ pub(crate) fn figures(stats: Option<atomcode_host_api::BackgroundStats>) -> Stri
     let (prompt, cached) = if stats.sent > 0 {
         (stats.sent, stats.sent_cached)
     } else {
-        (stats.prompt, stats.cached)
+        (u64::from(stats.prompt), u64::from(stats.cached))
     };
     crate::content::TurnStats {
         steps: stats.steps,
         prompt,
-        completion: stats.completion,
+        completion: u64::from(stats.completion),
         cached,
         tools: stats.tools,
         elapsed_ms: stats.elapsed_ms,

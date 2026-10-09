@@ -546,8 +546,8 @@ fn stats_of(log: &[LoggedEvent]) -> Option<BackgroundStats> {
     let mut steps = 0u32;
     let mut tools = 0u32;
     let mut completion = 0u32;
-    let mut sent = 0u32;
-    let mut sent_cached = 0u32;
+    let mut sent = 0u64;
+    let mut sent_cached = 0u64;
     let mut last: Option<atomcode_kernel::stream::TokenUsage> = None;
     for logged in log {
         match &logged.event {
@@ -557,8 +557,8 @@ fn stats_of(log: &[LoggedEvent]) -> Option<BackgroundStats> {
             }
             SessionEvent::Usage { usage, .. } => {
                 completion = completion.saturating_add(usage.completion);
-                sent = sent.saturating_add(usage.prompt);
-                sent_cached = sent_cached.saturating_add(usage.cached);
+                sent += u64::from(usage.prompt);
+                sent_cached += u64::from(usage.cached);
                 last = Some(*usage);
             }
             _ => {}
@@ -1567,6 +1567,16 @@ mod tests {
         };
         let stats = stats_of(&[usage(1000, 0), usage(1200, 1100)]).expect("ran");
         assert_eq!((stats.sent, stats.sent_cached), (2200, 1100));
+        // A long-lived session's sums run past `u32::MAX` and keep counting.
+        let long = stats_of(&[
+            usage(3_000_000_000, 2_000_000_000),
+            usage(3_000_000_000, 2_000_000_000),
+        ])
+        .expect("ran");
+        assert_eq!(
+            (long.sent, long.sent_cached),
+            (6_000_000_000, 4_000_000_000)
+        );
         assert_eq!((stats.prompt, stats.cached), (1200, 1100));
         assert_eq!(stats.completion, 20);
     }

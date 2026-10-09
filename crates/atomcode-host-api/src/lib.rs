@@ -1364,11 +1364,15 @@ pub struct BackgroundStats {
     /// Input sent, summed over every request — what the work cost, as opposed
     /// to `prompt`, which is how big its context is now. `0` from a host that
     /// predates it.
+    ///
+    /// `u64`, unlike the per-request figures: it is a sum over a whole
+    /// session's requests, which a long-lived one can carry past `u32::MAX` —
+    /// where a saturating `u32` stopped counting and skewed the cache share.
     #[serde(default)]
-    pub sent: u32,
+    pub sent: u64,
     /// The part of `sent` served from cache, summed the same way.
     #[serde(default)]
-    pub sent_cached: u32,
+    pub sent_cached: u64,
 }
 
 /// Where a background session stands.

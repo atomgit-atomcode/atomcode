@@ -717,7 +717,7 @@ impl Producer for Transcript {
                 // Each step reports the calls it ran; the turn's tool count is
                 // their sum. Unlike `steps` (a running counter read verbatim),
                 // this one adds up across the turn.
-                open.stats.tools += *tool_calls;
+                open.stats.tools = open.stats.tools.saturating_add(*tool_calls);
             }
 
             // A round's usage, merged by the loop into one figure per round.
@@ -727,12 +727,12 @@ impl Producer for Transcript {
                 // in full — the prefix it re-sends is cheap only when it hits.
                 // The last reading alone said `99% cached` for a turn that missed
                 // the cache outright twice (see `TurnStats`).
-                open.stats.prompt = open.stats.prompt.saturating_add(usage.prompt);
-                open.stats.cached = open.stats.cached.saturating_add(usage.cached);
+                open.stats.prompt += u64::from(usage.prompt);
+                open.stats.cached += u64::from(usage.cached);
                 // Output is the one figure that does add up: each round
                 // generated its own, and the loop has already folded whatever
                 // the provider re-sent within a round.
-                open.stats.completion += usage.completion;
+                open.stats.completion += u64::from(usage.completion);
             }
 
             // Turn and step boundaries are coordinates, not blocks; request
@@ -1407,6 +1407,48 @@ mod tests {
     /// missed the cache outright, and the last hit 99.6%. The line closed on
     /// `13.11K tokens · 99% cached` — the last request's — while the footer,
     /// summing the same requests, said 66%. Summed, the two agree.
+    /// Summed past `u32::MAX`, the figures stay true. Two requests of three
+    /// billion each, two billion of each cached: 66% cached. A saturating `u32`
+    /// stopped the input at 4.29 billion while the cache went on to four, and
+    /// the line said 93%.
+    #[test]
+    fn a_turn_s_sums_do_not_stop_at_u32() {
+        use atomcode_kernel::stream::TokenUsage;
+        let reading = |round| SessionEvent::Usage {
+            turn: 1,
+            round,
+            usage: TokenUsage {
+                prompt: 3_000_000_000,
+                completion: 0,
+                cached: 2_000_000_000,
+            },
+        };
+        let s = fold(&[
+            SessionEvent::TurnStart { turn: 1 },
+            reading(1),
+            reading(2),
+            SessionEvent::TurnEnd {
+                turn: 1,
+                stop: atomcode_harness::seams::StopReason::Stopped,
+                error: None,
+            },
+        ]);
+        let said: String = s
+            .slots()
+            .iter()
+            .filter(|x| x.block().kind() == "turn_end")
+            .flat_map(|x| {
+                x.block()
+                    .content
+                    .lines(&crate::block::RenderCtx::bare(120))
+                    .into_iter()
+                    .map(|l| l.plain())
+            })
+            .collect();
+        assert!(said.contains("66%") && !said.contains("93%"), "{said}");
+        assert!(said.contains("2000.00M tokens"), "{said}");
+    }
+
     #[test]
     fn a_turn_s_cache_rate_is_over_every_request_not_its_last() {
         use atomcode_kernel::stream::TokenUsage;

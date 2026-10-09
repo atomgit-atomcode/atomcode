@@ -2876,12 +2876,16 @@ pub struct TurnStats {
     /// turn loop, so this is both.
     pub steps: u32,
     /// Input sent, summed over every request of the turn.
-    pub prompt: u32,
+    ///
+    /// The three sums are `u64`, as the session's own in the status line are:
+    /// a sum over requests is not bounded by one request's `u32`, and a
+    /// saturating `u32` stops counting and skews the cache share instead.
+    pub prompt: u64,
     /// Tokens the model generated, summed over the turn's rounds. Unlike
     /// `prompt`, each round's output is new, so this one does add up.
-    pub completion: u32,
+    pub completion: u64,
     /// The part of `prompt` served from cache, summed the same way.
-    pub cached: u32,
+    pub cached: u64,
     /// Tool calls the turn ran, summed over its steps.
     pub tools: u32,
     /// Wall-clock the turn took, in milliseconds. `0` when the log carried no
