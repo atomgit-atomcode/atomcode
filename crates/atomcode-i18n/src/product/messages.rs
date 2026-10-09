@@ -770,6 +770,12 @@ pub enum Msg<'a> {
     WelcomeTipLanguage,
     /// Welcome tip: /usage command description.
     WelcomeTipUsage,
+    /// Under a top-level error that a refused write caused: the product's data
+    /// directory can be moved to one the person can write to.
+    ErrorDataDirElsewhere {
+        /// The command that sets the data directory, in the platform's shell.
+        how: &'a str,
+    },
     /// Welcome tip: /compact command description.
     WelcomeTipCompact,
     /// Welcome tip: /effort command description.

@@ -633,6 +633,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::WelcomeTipInit => "扫描代码库生成 AGENTS.md".into(),
         Msg::WelcomeTipLanguage => "切换界面语言".into(),
         Msg::WelcomeTipUsage => "查看用量与额度".into(),
+        Msg::ErrorDataDirElsewhere { how } => format!("或者把数据目录换到你能写的地方：{how}").into(),
         Msg::WelcomeTipCompact => "压缩对话，腾出上下文".into(),
         Msg::WelcomeTipEffort => "调整模型思考强度".into(),
         Msg::WelcomeTipAuto => "工具调用全部自动批准".into(),

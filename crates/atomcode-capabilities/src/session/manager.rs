@@ -226,7 +226,17 @@ impl fmt::Display for SessionStoreError {
             Self::UnsafeFile { path, reason } => {
                 write!(f, "unsafe session file {}: {reason}", path.display())
             }
-            Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
+            Self::Io { path, source } => {
+                write!(f, "{}: {source}", path.display())?;
+                // A bare "Permission denied" names neither the layer that refused
+                // nor whose it is — and the fix is different for each.
+                if source.kind() == io::ErrorKind::PermissionDenied {
+                    if let Some(why) = denied_because(path) {
+                        write!(f, " — {why}")?;
+                    }
+                }
+                Ok(())
+            }
             Self::UncertainCommit {
                 id,
                 commit_error,
@@ -4643,6 +4653,90 @@ pub(crate) fn for_each_jsonl_line(
     Ok((total, lines))
 }
 
+/// Which layer of `path` refused, and what to do about it — read off the file
+/// system when the refusal is reported. `None` when there is nothing it can
+/// honestly say.
+///
+/// The layer is the nearest one that exists: a directory that could not be
+/// created was refused by its parent. The climb stops at a layer that exists
+/// but cannot be looked at — that one is the refusal, and climbing past it
+/// would name a layer that had nothing to do with it.
+#[cfg(unix)]
+fn denied_because(path: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let (at, meta) = path.ancestors().find_map(|at| match fs::metadata(at) {
+        Ok(meta) => Some(Some((at, meta))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(_) => Some(None),
+    })??;
+    // SAFETY: getters with no arguments and no failure mode.
+    let (me, group) = unsafe { (libc::geteuid(), libc::getegid()) };
+    let layer = Layer {
+        at,
+        dir: meta.is_dir(),
+        owner: meta.uid(),
+        mode: meta.mode(),
+    };
+    denied_text(&layer, me, group, dirs::home_dir().as_deref())
+}
+
+#[cfg(not(unix))]
+fn denied_because(_path: &Path) -> Option<String> {
+    None
+}
+
+/// What was read off the layer that refused.
+#[derive(Clone, Copy, Debug)]
+struct Layer<'a> {
+    at: &'a Path,
+    dir: bool,
+    owner: u32,
+    mode: u32,
+}
+
+/// What [`denied_because`] says, as a pure function of what it read.
+///
+/// Two problems behind one errno that it can tell apart: a layer someone else
+/// owns (the usual one — a run as root, then one as yourself, under the same
+/// `HOME`) and your own layer with its write bit off. Anything else — your
+/// own layer with the bits fine (an ACL, SELinux, an immutable flag), or a
+/// refusal to root — it cannot see, and says nothing rather than guess.
+///
+/// `sudo chown -R` is offered only for a layer strictly inside `home`. The
+/// nearest existing layer can be far above the data — `/root` itself, when the
+/// data directory was never made — and that command on it would hand somebody
+/// else's whole home away.
+fn denied_text(layer: &Layer<'_>, me: u32, group: u32, home: Option<&Path>) -> Option<String> {
+    let at = layer.at.display();
+    // Root is refused by none of the things this can see.
+    if me == 0 {
+        return None;
+    }
+    if layer.owner != me {
+        let inside_home = home.is_some_and(|home| layer.at != home && layer.at.starts_with(home));
+        return Some(if inside_home {
+            format!(
+                "{at} belongs to uid {}, not to uid {me} this runs as; \
+                 to take it back: sudo chown -R {me}:{group} {at}",
+                layer.owner
+            )
+        } else {
+            format!(
+                "{at} belongs to uid {}, not to uid {me} this runs as",
+                layer.owner
+            )
+        });
+    }
+    if layer.mode & 0o200 != 0 {
+        return None;
+    }
+    let bits = if layer.dir { "u+rwx" } else { "u+w" };
+    Some(format!(
+        "{at} is not writable (mode {:o}); to fix it: chmod {bits} {at}",
+        layer.mode & 0o7777
+    ))
+}
+
 pub(super) fn io_at(path: &Path, source: io::Error) -> SessionStoreError {
     if source.kind() == io::ErrorKind::NotFound {
         SessionStoreError::NotFound {
@@ -4814,6 +4908,106 @@ mod tests {
         assert_eq!(
             SessionManager::project_hash(p, &test_dirs()),
             format!("{:016x}", expected.finish())
+        );
+    }
+
+    /// 写不进会话目录时,报错说出是哪一层、归谁、怎么改回来。
+    ///
+    /// 现场(2026-10-09,AidLux 上的 Debian 13):uid 1000 的用户 `HOME=/root`,
+    /// `sessions/` 早先被 root 建过。报错只有三遍 `Permission denied`,人不知道
+    /// 是哪个目录、归谁,也就无从下手。
+    #[test]
+    fn a_directory_owned_by_someone_else_says_whose_it_is_and_how_to_take_it_back() {
+        let home = Path::new("/root");
+        let layer = Layer {
+            at: Path::new("/root/.x/sessions"),
+            dir: true,
+            owner: 0,
+            mode: 0o755,
+        };
+        let said = denied_text(&layer, 1000, 60000, Some(home)).unwrap();
+        assert!(
+            said.contains("uid 0") && said.contains("uid 1000"),
+            "{said}"
+        );
+        assert!(
+            said.contains("sudo chown -R 1000:60000 /root/.x/sessions"),
+            "{said}"
+        );
+    }
+
+    /// 拒绝的那一层是主目录本身或在主目录之外(数据目录还没建出来,最近的一层
+    /// 就是 `/root`):只说归谁,不给命令——`chown -R /root` 会把别人的整个主目录
+    /// 交出去(评审指出)。
+    #[test]
+    fn no_command_is_offered_for_a_directory_that_is_not_inside_the_home() {
+        let home = Path::new("/root");
+        for at in ["/root", "/", "/data/elsewhere"] {
+            let layer = Layer {
+                at: Path::new(at),
+                dir: true,
+                owner: 0,
+                mode: 0o700,
+            };
+            let said = denied_text(&layer, 1000, 60000, Some(home)).unwrap();
+            assert!(said.contains("uid 0"), "{said}");
+            assert!(!said.contains("chown"), "{at}: {said}");
+        }
+    }
+
+    /// 自己的东西:只有权限位真缺了写才这么说,目录给 `u+rwx`、文件给 `u+w`
+    /// (不把数据文件变成可执行)。权限位是好的就说不出原因(ACL、SELinux、
+    /// 不可变属性),那就什么也不补;root 被拒也一样。
+    #[test]
+    fn ones_own_layer_is_called_unwritable_only_when_its_mode_says_so() {
+        let home = Path::new("/home/u");
+        let dir = Layer {
+            at: Path::new("/home/u/.x/sessions"),
+            dir: true,
+            owner: 1000,
+            mode: 0o40500,
+        };
+        let said = denied_text(&dir, 1000, 1000, Some(home)).unwrap();
+        assert!(said.contains("chmod u+rwx /home/u/.x/sessions"), "{said}");
+        assert!(said.contains("mode 500"), "{said}");
+
+        let file = Layer {
+            at: Path::new("/home/u/.x/sessions/a.events"),
+            dir: false,
+            owner: 1000,
+            mode: 0o100444,
+        };
+        let said = denied_text(&file, 1000, 1000, Some(home)).unwrap();
+        assert!(said.contains("chmod u+w "), "{said}");
+
+        let fine = Layer {
+            mode: 0o40700,
+            ..dir
+        };
+        assert_eq!(denied_text(&fine, 1000, 1000, Some(home)), None);
+        let as_root = Layer { owner: 1000, ..dir };
+        assert_eq!(denied_text(&as_root, 0, 0, Some(home)), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_that_refuses_a_write_is_named_in_the_error() {
+        use std::os::unix::fs::PermissionsExt;
+        // Root writes through any mode, so there is nothing to refuse.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        std::fs::set_permissions(&sessions, fs::Permissions::from_mode(0o500)).unwrap();
+        let bucket = sessions.join("47acaa0a9d16febb");
+        let error = fs::create_dir_all(&bucket).unwrap_err();
+        let said = io_at(&bucket, error).to_string();
+        std::fs::set_permissions(&sessions, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            said.contains(&format!("{} is not writable", sessions.display())),
+            "names the layer that refused, not only the path asked for: {said}"
         );
     }
 

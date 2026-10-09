@@ -661,6 +661,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::WelcomeTipInit => "scan the codebase into AGENTS.md".into(),
         Msg::WelcomeTipLanguage => "switch the UI language".into(),
         Msg::WelcomeTipUsage => "view token usage & quota".into(),
+        Msg::ErrorDataDirElsewhere { how } => format!("Or keep the data somewhere you can write: {how}").into(),
         Msg::WelcomeTipCompact => "compact the conversation to free context".into(),
         Msg::WelcomeTipEffort => "set how hard the model thinks".into(),
         Msg::WelcomeTipAuto => "auto-approve every tool call".into(),
