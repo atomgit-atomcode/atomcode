@@ -1716,10 +1716,13 @@ mod tests {
         let stats = stats_of(&[usage(1000, 0), usage(1200, 1100)], None).expect("ran");
         assert_eq!((stats.sent, stats.sent_cached), (2200, 1100));
         // A long-lived session's sums run past `u32::MAX` and keep counting.
-        let long = stats_of(&[
-            usage(3_000_000_000, 2_000_000_000),
-            usage(3_000_000_000, 2_000_000_000),
-        ])
+        let long = stats_of(
+            &[
+                usage(3_000_000_000, 2_000_000_000),
+                usage(3_000_000_000, 2_000_000_000),
+            ],
+            None,
+        )
         .expect("ran");
         assert_eq!(
             (long.sent, long.sent_cached),
