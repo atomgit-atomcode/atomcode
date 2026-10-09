@@ -282,8 +282,13 @@ pub fn cell_background_for(
 /// `ATOMCODE_MOUSE=1` lifts this gate, for a terminal there that learns to — with
 /// `[ui] mouse = true` as well, since that defaults off on HarmonyOS
 /// (`atomcode_config::config::default_mouse`).
+///
+/// Read once and kept — a launch-time environment variable, and this is asked
+/// per arrow burst, not once per screen.
 pub fn mouse_reported() -> bool {
-    mouse_reported_for(cfg!(target_env = "ohos"), |k| std::env::var(k).ok())
+    static REPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REPORTED
+        .get_or_init(|| mouse_reported_for(cfg!(target_env = "ohos"), |k| std::env::var(k).ok()))
 }
 
 fn mouse_reported_for(ohos: bool, env: impl Fn(&str) -> Option<String>) -> bool {
