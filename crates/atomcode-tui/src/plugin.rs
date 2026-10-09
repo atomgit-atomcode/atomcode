@@ -2778,6 +2778,13 @@ impl UserInterface for Tui {
                 {
                     stale |= self.run_bg_key(press);
                 }
+                // A selected screen range is owned by copy, not by the question's
+                // decline gesture or the composer's cancel gesture. Keep this after
+                // the real panels above, so it cannot steal their Ctrl+C bindings.
+                Wake::Input(Input::Key(press)) if self.ctrl_c_copies_selection(press) => {
+                    quit = self.act(Action::CopySelection, &client);
+                    stale = true;
+                }
                 // Paging the conversation, past a question that is up: reading
                 // what it asks about is the reason to page back while it waits,
                 // and the question has no use for these keys itself.
@@ -2949,6 +2956,17 @@ impl UserInterface for Tui {
 }
 
 impl Tui {
+    fn ctrl_c_copies_selection(&self, press: crate::surface::KeyPress) -> bool {
+        if press != crate::surface::KeyPress::ctrl('c') {
+            return false;
+        }
+        let m = self.host.moment.read().expect("moment poisoned");
+        match m.stream_selection {
+            Some(sel) => sel.anchor != sel.head,
+            None => m.selection.is_some_and(|sel| !sel.is_empty()),
+        }
+    }
+
     /// Whether a single press at `(x, y)` carries the held conversation
     /// selection on to it instead of starting a new one.
     ///
@@ -11701,6 +11719,45 @@ mod paste_habit_tests {
 
     fn typed(host: &Host) -> String {
         host.moment.read().expect("moment poisoned").input.clone()
+    }
+
+    #[test]
+    fn ctrl_c_copies_only_a_nonempty_selection() {
+        let (host, tui) = screen();
+        let key = crate::surface::KeyPress::ctrl('c');
+        assert!(!tui.ctrl_c_copies_selection(key));
+        {
+            let mut m = host.moment.write().unwrap();
+            m.selection = Some(crate::moment::Selection::at(2, 3));
+        }
+        assert!(!tui.ctrl_c_copies_selection(key));
+        host.moment
+            .write()
+            .unwrap()
+            .selection
+            .as_mut()
+            .unwrap()
+            .head = (8, 3);
+        assert!(tui.ctrl_c_copies_selection(key));
+        assert!(!tui.ctrl_c_copies_selection(crate::surface::KeyPress::ch('c')));
+        assert!(!tui.ctrl_c_copies_selection(crate::surface::KeyPress::ctrl('d')));
+        {
+            let mut m = host.moment.write().unwrap();
+            m.turn_open = true;
+            m.asking = Some(crate::moment::Ask::one(
+                atomcode_harness::seams::Question::plain("approve?", &["yes", "no"]),
+            ));
+        }
+        assert!(
+            tui.ctrl_c_copies_selection(key),
+            "approval does not take copy"
+        );
+        assert!(!tui.act(Action::CopySelection, &tui.client));
+        let m = host.moment.read().unwrap();
+        assert!(m.turn_open);
+        assert!(!m.stopping);
+        assert!(!m.quit_armed);
+        assert!(m.asking.is_some());
     }
 
     /// What people who copy with a drag paste with: the middle button, the
