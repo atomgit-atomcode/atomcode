@@ -9031,6 +9031,19 @@ fn sanitize_paste(text: &str) -> String {
     crate::text::for_buffer(text)
 }
 
+/// Whether a run of ↑/↓ that reached the composer scrolls the conversation
+/// rather than walking the input history.
+///
+/// Only with the mouse handed back, where the wheel can arrive as arrow keys —
+/// and only on a terminal that reports the mouse at all. One that does not
+/// (HarmonyOS) sends the wheel nowhere: its arrows are keys a person pressed,
+/// and the history is what they are for, as they are with the mouse held.
+/// Scrolling there is PageUp/PageDown. Taking them for the wheel left the
+/// history with no key but ctrl-p/ctrl-n, which nothing on that screen named.
+fn arrows_scroll(mouse_held: bool, mouse_reported: bool, would_scroll: bool) -> bool {
+    !mouse_held && mouse_reported && would_scroll
+}
+
 /// Read the terminal, gathering keystroke bursts that are really a paste.
 ///
 /// **Why this is not just a loop over events.** A terminal without bracketed
@@ -9051,19 +9064,6 @@ fn sanitize_paste(text: &str) -> String {
 /// unchanged when the run turns out not to be a paste. Rebuilding a key event
 /// from its character would be a second answer to what a keystroke is, sitting
 /// next to `from_crossterm` and free to disagree with it.
-/// Whether a run of ↑/↓ that reached the composer scrolls the conversation
-/// rather than walking the input history.
-///
-/// Only with the mouse handed back, where the wheel can arrive as arrow keys —
-/// and only on a terminal that reports the mouse at all. One that does not
-/// (HarmonyOS) sends the wheel nowhere: its arrows are keys a person pressed,
-/// and the history is what they are for, as they are with the mouse held.
-/// Scrolling there is PageUp/PageDown. Taking them for the wheel left the
-/// history with no key but ctrl-p/ctrl-n, which nothing on that screen named.
-fn arrows_scroll(mouse_held: bool, mouse_reported: bool, would_scroll: bool) -> bool {
-    !mouse_held && mouse_reported && would_scroll
-}
-
 async fn read_input(
     wake: mpsc::UnboundedSender<Wake>,
     handed_back: impl Fn() -> bool + Send + 'static,
