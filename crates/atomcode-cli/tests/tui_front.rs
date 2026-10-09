@@ -1035,7 +1035,14 @@ async fn a_person_edits_the_plan_with_todo_add_and_clear() {
         text.contains("(no tasks)")
     })
     .await;
+    // The first enter takes the menu's lit row onto the line (`/todo `), so
+    // `add <task>` can follow it; the second runs the bare name, which prints
+    // the plan (184d5f2b4, and the e2e criterion
+    // `taking_todo_from_the_menu_waits_for_what_comes_after_it`).
     term.type_line("/todo");
+    term.press(atomcode_tui::surface::KeyPress::plain(
+        atomcode_tui::surface::Key::Enter,
+    ));
     until_text(&term, "and /todo says there is none", |text| {
         text.contains("这段对话里还没有计划清单")
     })
