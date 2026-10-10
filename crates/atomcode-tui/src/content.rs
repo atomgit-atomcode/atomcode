@@ -3292,7 +3292,7 @@ impl Content for TurnEndBlock {
     /// that line: it hangs directly under the outcome (`⎿`), before the figures.
     fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
         // A turn you stopped yourself closes at the foot of the conversation,
-        // not here: the dim `⎿ 已中断 · …` line the tail draws carries it
+        // not here: the dim `已中断 · …` line the tail draws carries it
         // (`live::stopped_note`, driven by `moment.interrupted`), so the
         // transcript drops the centered separator for a cancel rather than draw
         // a boundary that line already draws.

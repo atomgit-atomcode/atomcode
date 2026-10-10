@@ -169,17 +169,12 @@ impl View for Live {
             return Vec::new();
         }
         let Some(words) = showing(state, vp.moment) else {
-            // A turn the person stopped closes here, hanging under the last
-            // thing it did the way a tool's result hangs under its call —
-            // Claude Code's `⎿ Interrupted · What should Claude do instead?`.
+            // A stopped turn closes here as a standalone status, aligned with
+            // the conversation rather than nested under its last tool call.
             let mut out = Vec::new();
             let note = u16::from(stopped_note(vp.moment));
             if note > 0 {
-                let note = format!(
-                    "  {} {}",
-                    vp.moment.caps.g(Glyph::Gutter),
-                    t(Msg::ComposerInterrupted)
-                );
+                let note = t(Msg::ComposerInterrupted).into_owned();
                 out.extend(El::row(vec![El::styled(note, theme::fg(Role::Muted))]).lay(w));
             }
             out.extend(match waiting_on_background(state, vp.moment) {
@@ -366,7 +361,7 @@ fn showing(state: &State, moment: &Moment) -> Option<String> {
 }
 
 /// Whether the turn the person stopped is closed with the dim
-/// `⎿ 已中断 · 接下来做什么？` line: they stopped it themselves (Escape — not a
+/// `已中断 · 接下来做什么？` line: they stopped it themselves (Escape — not a
 /// cancel the runtime made, such as a model switch), and it is idle now, so the
 /// line does not sit under a turn still landing. It stays until the next
 /// prompt is sent (`moment.interrupted`, cleared in `Action::Submit`). Not
@@ -631,8 +626,8 @@ mod tests {
     }
 
     /// A stopped turn is closed at the foot of the conversation — this tail
-    /// row, under the last thing the turn did — hanging the way a result hangs
-    /// under its call, and the row is counted in the height it asks for.
+    /// row, aligned with the conversation rather than nested as a tool result,
+    /// and the row is counted in the height it asks for.
     #[test]
     fn a_stopped_turn_is_closed_under_the_conversation() {
         let mut m = Moment::default();
@@ -640,8 +635,8 @@ mod tests {
         let state = State::default();
         let drawn = line_at(&state, &m, 80);
         assert!(
-            drawn.trim_start().starts_with("⎿ 已中断"),
-            "hangs like a result: {drawn:?}"
+            drawn.starts_with(t(Msg::ComposerInterrupted).as_ref()),
+            "standalone status without a tool-result gutter: {drawn:?}"
         );
         assert_eq!(Live::height(&state, &m, 80), Height::Hug(1));
     }
