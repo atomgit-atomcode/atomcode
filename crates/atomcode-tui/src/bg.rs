@@ -219,6 +219,10 @@ pub struct Panel {
     /// 是被 `/bg` 移走的那个会话打开的:esc 回到它。`None` 是 `/bg list` 打开的,
     /// esc 就只是收起面板,回到原来那个会话。
     pub moved: Option<String>,
+    /// When this panel was opened from the team strip, the conversation that
+    /// owns that strip. Opening the selected background session carries this
+    /// breadcrumb across the ensuing `/resume`.
+    pub return_to: Option<String>,
     /// 光标要落在的会话——列表可能晚一步到,到了再落。
     pub aim: Option<String>,
     /// 刚才想就地回复一个在等你回答的会话:话不发,图例那一行换成「按 Enter 打开」。
@@ -234,6 +238,7 @@ impl Panel {
         Self {
             aim: moved.clone(),
             moved,
+            return_to: None,
             ..Self::default()
         }
     }

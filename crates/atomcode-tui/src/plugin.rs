@@ -1290,6 +1290,16 @@ pub struct Tui {
     /// How many provider checks have been started, so one that lands after a
     /// later save is dropped rather than said (see [`Tui::say_when_probed`]).
     probes: Arc<std::sync::atomic::AtomicU64>,
+    /// A `/resume` chosen through Team → background panel, until the host
+    /// confirms which session replaced the current one.
+    pending_team_resume: Mutex<Option<PendingTeamResume>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingTeamResume {
+    target: String,
+    return_to: String,
+    label: String,
 }
 
 #[async_trait]
@@ -1943,6 +1953,12 @@ impl UserInterface for Tui {
                 // one, from its first fact, in a stream of its own.
                 Wake::Host(HostEvent::SessionChanged { session, .. }) => {
                     if session != client.root() {
+                        let team_return = self
+                            .pending_team_resume
+                            .lock()
+                            .expect("team resume poisoned")
+                            .take()
+                            .filter(|pending| pending.target == session);
                         // What a recap would be about is the conversation that
                         // just left the screen.
                         self.drop_recap();
@@ -1962,6 +1978,10 @@ impl UserInterface for Tui {
                             let mut m = self.host.moment.write().expect("moment poisoned");
                             m.lead = session.clone();
                             m.viewing = session.clone();
+                            m.team_return = team_return.map(|pending| crate::moment::TeamReturn {
+                                session: pending.return_to,
+                                current_label: pending.label,
+                            });
                         }
                         // The session that arrives owes its own first word.
                         // `switch_session` empties the stream (`host.rs`
@@ -3825,7 +3845,22 @@ impl Tui {
         use crate::bg::Step;
         let line = match step {
             Step::Open { id } => {
+                let return_to = self.host.bg_return_to();
+                let label = self
+                    .host
+                    .bg_name(&id)
+                    .map(|(_, title)| title)
+                    .unwrap_or_else(|| id.clone());
                 self.host.close_bg();
+                *self
+                    .pending_team_resume
+                    .lock()
+                    .expect("team resume poisoned") =
+                    return_to.map(|return_to| PendingTeamResume {
+                        target: id.clone(),
+                        return_to,
+                        label,
+                    });
                 format!("/resume {id}")
             }
             Step::Start { task } => format!("/background {task}"),
@@ -5460,7 +5495,11 @@ impl Tui {
     /// background session — which is not this session's to draw — opens the
     /// `/bg` panel at it, where it can be opened, answered or dropped.
     fn take_team_target(&self, session: &str) {
-        if self.host.team_target_is_background(session) {
+        if self.host.team_target_is_return(session) {
+            if let Some(keys) = self.wake.lock().expect("wake poisoned").clone() {
+                let _ = keys.send(Wake::Chose(Some(format!("/resume {session}"))));
+            }
+        } else if self.host.team_target_is_background(session) {
             self.host.open_bg_at(session);
         } else {
             self.switch_to(session);
@@ -9302,6 +9341,7 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
             opener: Arc::new(atomcode_capabilities::tools::LocalOpener),
             presses: Arc::default(),
             probes: Arc::default(),
+            pending_team_resume: Mutex::new(None),
         },
     )
 }
@@ -12044,6 +12084,25 @@ mod midturn_command_tests {
         assert_eq!(kinds(&host).len(), before, "echo waits for the answer");
         answered(&mut woken).await;
         assert_eq!(&kinds(&host)[before..], &["user", "command"]);
+    }
+
+    /// `main` on a background breadcrumb is not an in-runtime member switch:
+    /// it asks the existing session command path to resume the origin.
+    #[test]
+    fn main_on_a_background_team_strip_resumes_the_origin() {
+        let (host, tui, mut woken) = screen();
+        host.moment.write().expect("moment poisoned").team_return =
+            Some(crate::moment::TeamReturn {
+                session: "lead-1".into(),
+                current_label: "code-review".into(),
+            });
+
+        tui.take_team_target("lead-1");
+
+        assert!(matches!(
+            woken.try_recv(),
+            Ok(Wake::Chose(Some(line))) if line == "/resume lead-1"
+        ));
     }
 }
 

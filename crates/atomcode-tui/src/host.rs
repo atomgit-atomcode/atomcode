@@ -1785,6 +1785,7 @@ impl Host {
         self.asks.refuse_all();
         let mut m = self.moment.write().expect("moment poisoned");
         m.members.clear();
+        m.team_return = None;
         m.team_cursor = None;
         // The keyboard went with the panel: the new session's team is not up
         // yet, and a leftover `true` here would route the first keys of the new
@@ -4484,11 +4485,24 @@ impl Host {
         }
         let mut m = self.moment.write().expect("moment poisoned");
         let view = m.bg.clone();
+        let return_to = (!m.lead.is_empty()).then(|| m.lead.clone());
         if let Some(panel) = m.bg_panel.as_mut() {
             panel.aim = Some(session.to_string());
+            panel.return_to = return_to;
             panel.settle(&view);
         }
         true
+    }
+
+    /// The source conversation carried by a background panel opened from the
+    /// team strip. An ordinary `/bg` panel has no such breadcrumb.
+    pub fn bg_return_to(&self) -> Option<String> {
+        self.moment
+            .read()
+            .expect("moment poisoned")
+            .bg_panel
+            .as_ref()
+            .and_then(|panel| panel.return_to.clone())
     }
 
     /// Whether the team panel lists any member — not only background work.
@@ -4506,6 +4520,17 @@ impl Host {
     pub fn team_target_is_background(&self, session: &str) -> bool {
         let m = self.moment.read().expect("moment poisoned");
         crate::modules::team::is_background(&m, session)
+    }
+
+    /// Whether this target is the `main` breadcrumb of a background session
+    /// opened from the team strip.
+    pub fn team_target_is_return(&self, session: &str) -> bool {
+        self.moment
+            .read()
+            .expect("moment poisoned")
+            .team_return
+            .as_ref()
+            .is_some_and(|back| back.session == session)
     }
 
     /// Put the background panel away. True when it was up.
@@ -15301,6 +15326,11 @@ mod tests {
         let panel = m.bg_panel.as_ref().expect("the panel is up");
         assert_eq!(m.bg.at(panel.cursor).map(|s| s.id.as_str()), Some("review"));
         assert_eq!(panel.moved, None, "Esc only puts it away");
+        assert_eq!(
+            panel.return_to.as_deref(),
+            Some("lead"),
+            "opening from the team strip carries its way back"
+        );
     }
 
     /// 屏幕上有别的问题在等，后台的就先不提 —— 前台优先。

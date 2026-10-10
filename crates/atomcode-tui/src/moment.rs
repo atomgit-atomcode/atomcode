@@ -426,6 +426,16 @@ pub struct Retract {
     pub ended: bool,
 }
 
+/// The one-hop breadcrumb kept while a background session opened from the
+/// team strip is on screen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TeamReturn {
+    /// The originating conversation to resume when `main` is chosen.
+    pub session: String,
+    /// The background row's human title (`code-review`, for example).
+    pub current_label: String,
+}
+
 /// The non-derivable half of what a module renders from.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Moment {
@@ -797,6 +807,11 @@ pub struct Moment {
     /// The session on screen — the lead, or one of its members the person
     /// switched to (`docs/adr/0023` §3). Everything drawn is this one's.
     pub viewing: String,
+    /// Navigation back to the conversation that opened this background
+    /// session through the team strip. This is deliberately presentation
+    /// state: both conversations remain ordinary top-level sessions and the
+    /// actual switch in either direction still goes through `/resume`.
+    pub team_return: Option<TeamReturn>,
     /// The turns an undo, a rewind or an interruption took back
     /// (`docs/adr/0024` §17). What they said stays on screen — the stream is not
     /// reversible — drawn as one dim line each.

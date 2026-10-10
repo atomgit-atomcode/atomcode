@@ -115,7 +115,20 @@ pub struct Team;
 fn running(moment: &Moment) -> bool {
     moment.members.iter().any(|m| !m.gone)
         || !background(moment).is_empty()
+        || moment.team_return.is_some()
         || (!moment.lead.is_empty() && !moment.viewing.is_empty() && moment.viewing != moment.lead)
+}
+
+/// The row called `main`. Ordinarily it is this runtime's lead; while looking
+/// at a background session opened from the strip it is the conversation that
+/// opened it, and choosing it performs another `/resume` rather than an
+/// in-runtime member switch.
+fn main_target(moment: &Moment) -> &str {
+    moment
+        .team_return
+        .as_ref()
+        .map(|back| back.session.as_str())
+        .unwrap_or(&moment.lead)
 }
 
 /// Background sessions this conversation started and is still waiting on — a
@@ -158,10 +171,11 @@ pub fn is_background(moment: &Moment, session: &str) -> bool {
 /// returns. [`rows`] makes exactly the same exception, and the two must agree
 /// or a press would land on the agent below the one it hit.
 pub fn targets(moment: &Moment) -> Vec<String> {
-    if moment.lead.is_empty() || !running(moment) {
+    let main = main_target(moment);
+    if main.is_empty() || !running(moment) {
         return Vec::new();
     }
-    let mut targets: Vec<String> = std::iter::once(moment.lead.clone())
+    let mut targets: Vec<String> = std::iter::once(main.to_string())
         .chain(
             moment
                 .members
@@ -173,7 +187,7 @@ pub fn targets(moment: &Moment) -> Vec<String> {
         .chain(background(moment).into_iter().map(|s| s.id.clone()))
         .collect();
     if !moment.viewing.is_empty()
-        && moment.viewing != moment.lead
+        && moment.viewing != main
         && !targets.iter().any(|s| s == &moment.viewing)
     {
         targets.push(moment.viewing.clone());
@@ -418,7 +432,7 @@ impl View for Team {
             }
         };
         if !switchable.is_empty() {
-            let (mark, ink) = mark_of(&vp.moment.lead);
+            let (mark, ink) = mark_of(main_target(vp.moment));
             out.extend(band(
                 lay(
                     vec![
@@ -543,7 +557,7 @@ impl View for Team {
 /// keyboard's, so a team idle again after it folds again.
 fn all_resting(rows: &[Row], moment: &Moment) -> bool {
     !rows.is_empty()
-        && (moment.viewing.is_empty() || moment.viewing == moment.lead)
+        && (moment.viewing.is_empty() || moment.viewing == main_target(moment))
         && !moment.turn_open
         && moment.team_cursor.is_none()
         && rows.iter().all(|r| r.state == Shown::Idle)
@@ -642,17 +656,23 @@ fn rows(state: &State, moment: &Moment) -> Vec<Row> {
         });
     }
     if !moment.viewing.is_empty()
-        && moment.viewing != moment.lead
+        && moment.viewing != main_target(moment)
         && !out.iter().any(|row| row.session == moment.viewing)
     {
         out.push(Row {
             member: Member {
                 name: moment
-                    .viewing
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(&moment.viewing)
-                    .to_string(),
+                    .team_return
+                    .as_ref()
+                    .map(|back| back.current_label.clone())
+                    .unwrap_or_else(|| {
+                        moment
+                            .viewing
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(&moment.viewing)
+                            .to_string()
+                    }),
                 ..Member::default()
             },
             labelled: false,
@@ -808,6 +828,37 @@ mod tests {
             Height::Hug(3),
             "member navigation never folds away while the member is viewed"
         );
+    }
+
+    /// A background session is a separate runtime, so it cannot use the
+    /// member switch path. The breadcrumb still draws the same two-row road
+    /// back; the TUI turns its `main` target into `/resume <origin>`.
+    #[test]
+    fn a_background_session_opened_from_team_keeps_main_on_the_strip() {
+        let moment = Moment {
+            lead: "review-7".into(),
+            viewing: "review-7".into(),
+            team_return: Some(crate::moment::TeamReturn {
+                session: "lead-1".into(),
+                current_label: "code-review".into(),
+            }),
+            ..Moment::default()
+        };
+        let state = State::default();
+        let screen = drew(&state, &moment);
+        assert!(
+            screen.contains("○ main"),
+            "the way back is drawn:\n{screen}"
+        );
+        assert!(
+            screen.contains("● code-review"),
+            "the background session keeps its human title:\n{screen}"
+        );
+        assert_eq!(
+            targets(&moment),
+            vec!["lead-1".to_string(), "review-7".to_string()]
+        );
+        assert_eq!(Team::height(&state, &moment, 60), Height::Hug(3));
     }
 
     fn bg_session(
