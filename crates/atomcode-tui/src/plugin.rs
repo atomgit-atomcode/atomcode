@@ -7969,7 +7969,8 @@ impl Tui {
     /// What has been typed after the slash, while a command is being named.
     ///
     /// `None` when the line is not a command being typed: no slash, or one with
-    /// a space after it (the name is settled and the argument has begun). One
+    /// a free-text argument after it. A command with a closed option set keeps
+    /// the menu while its argument is being filtered. One
     /// reader for the two questions that depend on it — what the menu should
     /// list, and whether the return key has been told anything yet — so those
     /// two cannot disagree about what is on the line.
@@ -7982,8 +7983,19 @@ impl Tui {
             .input
             .clone();
         let rest = typed.strip_prefix('/')?;
-        if rest.contains(char::is_whitespace) {
-            return None;
+        if let Some((name, args)) = rest.split_once(char::is_whitespace) {
+            let command = self.host.commands.find(name)?;
+            if command.options.is_empty() {
+                return None;
+            }
+            let first = args.split_whitespace().next().unwrap_or("");
+            if command
+                .options
+                .iter()
+                .any(|option| option.value.eq_ignore_ascii_case(first))
+            {
+                return None;
+            }
         }
         Some(rest.to_string())
     }
@@ -8011,7 +8023,13 @@ impl Tui {
         let prefix = if searching { None } else { self.slash_prefix() };
         let menu = match prefix {
             Some(rest) => {
-                let matches = self.host.commands.matching(&rest);
+                let (matches, option_filter) = match rest.split_once(char::is_whitespace) {
+                    Some((name, args)) => (
+                        self.host.commands.find(name).into_iter().collect(),
+                        Some(args),
+                    ),
+                    None => (self.host.commands.matching(&rest), None),
+                };
                 // The agent's description, for a command that expands its closed
                 // set (below): the effort in force marks the ✓ row, and the
                 // model's OWN levels are the rows offered. Read only when
@@ -8031,9 +8049,11 @@ impl Tui {
                 for c in matches {
                     // A command with a closed set of values, once fully named, is
                     // not one row but one row per value: the menu's own way to
-                    // pick an argument, in place of a modal. `{name} {value}`
-                    // dispatches the command the row stands for.
-                    if !c.options.is_empty() && c.answers_to(&rest) {
+                    // pick an argument, in place of a modal. Most choices
+                    // dispatch `{name} {value}`; `/skills` deliberately
+                    // completes it with a trailing space so the person can add
+                    // the task before sending.
+                    if !c.options.is_empty() && (c.answers_to(&rest) || option_filter.is_some()) {
                         // `/effort`'s values are the MODEL's, not a fixed set: a
                         // model with no reasoning control offers only `default`,
                         // a restricted one offers exactly its declared levels.
@@ -8047,7 +8067,15 @@ impl Tui {
                         } else {
                             c.options.clone()
                         };
-                        for opt in &opts {
+                        let fragments: Vec<String> = option_filter
+                            .unwrap_or_default()
+                            .split_whitespace()
+                            .map(str::to_lowercase)
+                            .collect();
+                        for opt in opts.iter().filter(|opt| {
+                            let haystack = format!("{} {}", opt.value, opt.about).to_lowercase();
+                            fragments.iter().all(|fragment| haystack.contains(fragment))
+                        }) {
                             // Effort's `default` is "leave it to the endpoint",
                             // i.e. no level set — so `default` is the marked row
                             // exactly when nothing is in force.
@@ -8184,11 +8212,12 @@ impl Tui {
         // argument is required and has no bare form completes onto the line for
         // the argument to be typed (`/rename `). Both are `complete`, not a bare
         // dispatch that could only answer "needs an argument".
-        if self
-            .host
-            .commands
-            .find(name)
-            .is_some_and(|c| !c.options.is_empty() || c.require_arg)
+        let command = self.host.commands.find(name);
+        let option_owner = name
+            .split_once(char::is_whitespace)
+            .and_then(|(base, _)| self.host.commands.find(base));
+        if command.is_some_and(|c| !c.options.is_empty() || c.require_arg)
+            || option_owner.is_some_and(|c| c.require_arg)
         {
             self.complete_command(name);
             return false;
@@ -8219,11 +8248,12 @@ impl Tui {
             self.complete_path(name);
             return;
         }
-        let takes = self
-            .host
-            .commands
-            .find(name)
-            .is_some_and(|c| c.takes.is_some());
+        let command = self.host.commands.find(name);
+        let option_owner = name
+            .split_once(char::is_whitespace)
+            .and_then(|(base, _)| self.host.commands.find(base));
+        let takes = command.as_ref().is_some_and(|c| c.takes.is_some())
+            || option_owner.as_ref().is_some_and(|c| c.require_arg);
         let text = if takes {
             format!("/{name} ")
         } else {
@@ -12263,5 +12293,89 @@ mod paste_habit_tests {
             None,
             "the composer is not what a press over the conversation copies"
         );
+    }
+}
+
+#[cfg(test)]
+mod skills_menu_tests {
+    use super::*;
+
+    fn screen() -> (Arc<Host>, Tui) {
+        let (host, tui) = assemble(Headless::new(80, 24));
+        let _locale = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::ZhCn);
+        let skill_usage =
+            crate::i18n::product::t(crate::i18n::product::Msg::CmdCatalogSkillUsage).into_owned();
+        tui.client.follow("lead");
+        tui.client.describe(&AgentDescription {
+            session: "lead".into(),
+            commands: vec![
+                atomcode_kernel::agent::CommandDescription {
+                    name: "skills".into(),
+                    usage: Some("[名字… [给它们的话]]".into()),
+                    summary: "浏览技能".into(),
+                    target: atomcode_kernel::agent::CommandTarget::Session,
+                },
+                atomcode_kernel::agent::CommandDescription {
+                    name: "brainstorming".into(),
+                    usage: Some(skill_usage.clone()),
+                    summary: "先梳理需求".into(),
+                    target: atomcode_kernel::agent::CommandTarget::Session,
+                },
+                atomcode_kernel::agent::CommandDescription {
+                    name: "code".into(),
+                    usage: Some(skill_usage),
+                    summary: "实现代码".into(),
+                    target: atomcode_kernel::agent::CommandTarget::Session,
+                },
+            ],
+            ..Default::default()
+        });
+        host.commands
+            .add(Arc::new(crate::commands::AgentCatalogCommands {
+                client: tui.client.clone(),
+            }))
+            .unwrap();
+        (host, tui)
+    }
+
+    fn type_line(host: &Host, line: &str) {
+        let mut m = host.moment.write().expect("moment poisoned");
+        m.input = line.into();
+        m.caret = line.len();
+    }
+
+    #[test]
+    fn skills_filters_in_a_second_level_menu() {
+        let (host, tui) = screen();
+        type_line(&host, "/skills ");
+        tui.refresh_menu();
+        assert_eq!(
+            host.menu_selected().as_deref(),
+            Some("skills brainstorming")
+        );
+
+        type_line(&host, "/skills co");
+        tui.refresh_menu();
+        assert_eq!(host.menu_selected().as_deref(), Some("skills code"));
+
+        type_line(&host, "/skills od");
+        tui.refresh_menu();
+        assert_eq!(
+            host.menu_selected().as_deref(),
+            Some("skills code"),
+            "the option filter is a substring search, not only a prefix search"
+        );
+    }
+
+    #[test]
+    fn taking_a_skill_completes_the_task_instead_of_sending_it() {
+        let (host, tui) = screen();
+        assert!(!tui.take_command("skills code", &tui.client));
+        let m = host.moment.read().expect("moment poisoned");
+        assert_eq!(m.input, "/skills code ");
+        assert_eq!(m.caret, m.input.len());
+        drop(m);
+        assert!(!host.menu_open(), "the next words are the skill's task");
     }
 }

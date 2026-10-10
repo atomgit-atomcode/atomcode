@@ -61,8 +61,9 @@ pub struct Command {
 ///
 /// A command with a closed argument set — `/effort`'s levels — lists them here
 /// rather than answering with a modal. The menu expands the command into a row
-/// per option once it is fully named; a pick is dispatched as `{name} {value}`,
-/// so the menu and a typed `/effort high` reach one implementation.
+/// per option once it is fully named. Most picks dispatch as `{name} {value}`;
+/// a command whose pick still needs free text can complete that value onto the
+/// line instead.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommandOption {
     /// The argument this row stands for, dispatched after the command name.
@@ -502,7 +503,8 @@ impl Commands {
     /// 1. the command the typed word *is* (its name or an alias);
     /// 2. the commands in [`MOST_USED`], most used first;
     /// 3. the rest of this build's own commands, alphabetically;
-    /// 4. the agent's catalog — one row per skill — alphabetically.
+    /// 4. the rest of the agent's catalog, alphabetically (skills live under
+    ///    the `/skills` gateway).
     ///
     /// Sorted by name alone, `/q` + Enter ran a skill called `quantify-agent`,
     /// `/m` opened `/mcp`, and the skills a person installed sat between the

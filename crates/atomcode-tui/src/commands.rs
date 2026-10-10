@@ -3027,34 +3027,86 @@ pub struct AgentCatalogCommands {
     pub client: Arc<crate::plugin::AgentClient>,
 }
 
+fn described_command_is_skill(command: &atomcode_kernel::agent::CommandDescription) -> bool {
+    // Skill rows all carry the harness's one shared usage shape. Check both
+    // translations because a description can have arrived just before
+    // `/language` changed the screen's current locale.
+    [crate::i18n::Locale::En, crate::i18n::Locale::ZhCn]
+        .into_iter()
+        .any(|locale| {
+            command.usage.as_deref()
+                == Some(
+                    crate::i18n::product::t_with(
+                        locale,
+                        crate::i18n::product::Msg::CmdCatalogSkillUsage,
+                    )
+                    .as_ref(),
+                )
+        })
+}
+
 #[async_trait]
 impl CommandSet for AgentCatalogCommands {
     fn id(&self) -> &'static str {
         "cmd-agent-catalog"
     }
-    /// The agent's rows are the menu's, not `/help`'s: one row per
-    /// user-invocable skill, and `/help` is this build's own table.
+    /// The agent's rows belong to the menu, not `/help`; user-invocable
+    /// skills are grouped behind `/skills`, while `/help` stays build-local.
     fn in_help(&self) -> bool {
         false
     }
     fn commands(&self) -> Vec<Command> {
+        let described = self
+            .client
+            .described()
+            .map(|d| d.commands)
+            .unwrap_or_default();
+        let skill_options: Vec<crate::command::CommandOption> = described
+            .iter()
+            .filter(|c| described_command_is_skill(c))
+            .map(|c| crate::command::CommandOption::new(c.name.clone(), c.summary.clone()))
+            .collect();
+        described
+            .into_iter()
+            .filter(|c| !described_command_is_skill(c))
+            .map(|c| {
+                let is_skills = c.name == "skills";
+                Command {
+                    name: c.name.into(),
+                    about: c.summary.into(),
+                    takes: c.usage.map(Into::into),
+                    // The agent's own commands carry no aliases.
+                    aliases: &[],
+                    // `/skills` owns the skill rows as its closed second level;
+                    // other agent commands keep their ordinary free-text shape.
+                    options: if is_skills {
+                        skill_options.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    // Picking `/skills` enters that second level. With no skills
+                    // installed it remains a bare command and can say so itself.
+                    require_arg: is_skills && !skill_options.is_empty(),
+                    // The agent's commands are described, not typed with keys.
+                    secret_args: false,
+                }
+            })
+            .collect()
+    }
+    fn hidden(&self) -> Vec<Command> {
         self.client
             .described()
             .map(|d| d.commands)
             .unwrap_or_default()
             .into_iter()
+            .filter(|c| described_command_is_skill(c))
             .map(|c| Command {
                 name: c.name.into(),
                 about: c.summary.into(),
                 takes: c.usage.map(Into::into),
-                // The agent's own commands carry no aliases.
                 aliases: &[],
-                // Nor a closed set of values to pick from inline.
                 options: Vec::new(),
-                // The agent owns what its own command does with no argument, so
-                // this screen dispatches it bare rather than deciding for it.
                 require_arg: false,
-                // The agent's commands are described, not typed with keys.
                 secret_args: false,
             })
             .collect()
@@ -3488,6 +3540,91 @@ mod tests {
                 .iter()
                 .any(|x| x.name == "playwright-best-practices"),
             "菜单仍然给得出技能"
+        );
+    }
+
+    #[test]
+    fn skills_are_a_second_level_menu_and_stay_dispatchable() {
+        let _locale = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::ZhCn);
+        let client = Arc::new(crate::plugin::AgentClient::default());
+        client.follow("lead");
+        let skill_usage =
+            crate::i18n::product::t(crate::i18n::product::Msg::CmdCatalogSkillUsage).into_owned();
+        client.describe(&atomcode_kernel::agent::AgentDescription {
+            session: "lead".into(),
+            commands: vec![
+                atomcode_kernel::agent::CommandDescription {
+                    name: "skills".into(),
+                    usage: Some("[名字… [给它们的话]]".into()),
+                    summary: "浏览技能".into(),
+                    target: atomcode_kernel::agent::CommandTarget::Session,
+                },
+                atomcode_kernel::agent::CommandDescription {
+                    name: "brainstorming".into(),
+                    usage: Some(skill_usage.clone()),
+                    summary: "先梳理需求".into(),
+                    target: atomcode_kernel::agent::CommandTarget::Session,
+                },
+                atomcode_kernel::agent::CommandDescription {
+                    name: "code".into(),
+                    usage: Some(skill_usage),
+                    summary: "实现代码".into(),
+                    target: atomcode_kernel::agent::CommandTarget::Session,
+                },
+                atomcode_kernel::agent::CommandDescription {
+                    name: "stop-member".into(),
+                    usage: Some("<name>".into()),
+                    summary: "停止成员".into(),
+                    target: atomcode_kernel::agent::CommandTarget::Session,
+                },
+            ],
+            ..Default::default()
+        });
+
+        let set = AgentCatalogCommands { client };
+        let shown = set.commands();
+        assert!(shown.iter().any(|c| c.name == "stop-member"));
+        assert!(!shown.iter().any(|c| c.name == "brainstorming"));
+        let skills = shown
+            .iter()
+            .find(|c| c.name == "skills")
+            .expect("the gateway stays visible");
+        assert!(skills.require_arg, "a pick completes instead of sending");
+        assert_eq!(
+            skills
+                .options
+                .iter()
+                .map(|o| o.value.as_ref())
+                .collect::<Vec<_>>(),
+            ["brainstorming", "code"]
+        );
+        assert_eq!(
+            set.hidden()
+                .iter()
+                .map(|c| c.name.as_ref())
+                .collect::<Vec<_>>(),
+            ["brainstorming", "code"],
+            "direct /skill dispatch remains compatible even though the top menu is clean"
+        );
+
+        set.client
+            .describe(&atomcode_kernel::agent::AgentDescription {
+                session: "lead".into(),
+                commands: vec![atomcode_kernel::agent::CommandDescription {
+                    name: "skills".into(),
+                    usage: Some("[名字… [给它们的话]]".into()),
+                    summary: "浏览技能".into(),
+                    target: atomcode_kernel::agent::CommandTarget::Session,
+                }],
+                ..Default::default()
+            });
+        let empty = set.commands();
+        let skills = empty.iter().find(|c| c.name == "skills").unwrap();
+        assert!(skills.options.is_empty());
+        assert!(
+            !skills.require_arg,
+            "with nothing to pick, bare /skills must still report the empty catalog"
         );
     }
 
