@@ -741,6 +741,37 @@ async fn the_guard_warns_then_ends_a_turn_that_is_not_progressing() {
 }
 
 #[tokio::test]
+async fn the_guard_tells_a_repeating_todo_update_that_the_same_status_will_not_change_again() {
+    let dir = scratch("guard-todo");
+    let script = always_calls(
+        "todowrite",
+        r#"{ action = "update", id = 4, status = "completed" }"#,
+    );
+    let rows = "[[patch]]\nid = \"round-cap\"\nconfig = { max_rounds = 20 }\n\n\
+                [[remove]]\nid = \"repeat-fuse\"\n\n\
+                [[patch]]\nid = \"tool-loop-guard\"\nconfig = { warn_after = 3, stop_after = 5 }";
+    let app = start(tree(&dir, &script, &[rows])).await;
+    let outcome = run_turn(&app, "go").await.unwrap();
+
+    assert_eq!(outcome.stop, StopReason::ToolLoopDetected);
+    let text = app
+        .context()
+        .only_session()
+        .unwrap()
+        .derive_messages()
+        .iter()
+        .map(|message| message.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains("reported Todo #4 as `completed`"),
+        "the soft correction must name the status the repeated result reported: {text}"
+    );
+    assert!(text.contains("no logical state change"), "{text}");
+    assert!(text.contains("Do NOT call `todowrite`"), "{text}");
+}
+
+#[tokio::test]
 async fn the_guard_does_not_fire_when_results_differ() {
     let dir = scratch("guard-progress");
     // Each call appends, so the result differs every time — that is progress,
