@@ -2213,7 +2213,13 @@ impl SessionManager {
             base_turn_count: source.meta.turn_count,
         });
         if self.is_event_session(source_id) {
-            self.fork_event_session(source_id, &destination_lease, &meta, now_ms)?;
+            self.fork_event_session(
+                source_id,
+                &destination_lease,
+                &meta,
+                &source.presentation,
+                now_ms,
+            )?;
             let forked = self.load_native_session(destination_id)?;
             return Ok((forked, destination_lease));
         }

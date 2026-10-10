@@ -286,6 +286,7 @@ impl SessionManager {
         source_id: &str,
         destination: &SessionLease,
         meta: &SessionMeta,
+        presentation: &super::presentation::PresentationFile,
         now_ms: i64,
     ) -> SessionResult<()> {
         let source_header = self.read_event_header(source_id)?;
@@ -296,7 +297,15 @@ impl SessionManager {
         header.inherited = events.len();
         header.created_at = u64::try_from(now_ms).unwrap_or(0);
         self.create_event_session(destination, &header, meta)?;
-        self.append_events(destination, &events)
+        let copied = self
+            .append_events(destination, &events)
+            .and_then(|()| self.write_presentation(destination.id(), presentation));
+        if copied.is_err() {
+            // Only remove a destination we created, never an existing session
+            // rejected by create_event_session. A failed copy is not offered.
+            self.delete(destination)?;
+        }
+        copied
     }
 
     /// Turn timestamps of an event session: when each turn started and ended.
@@ -2127,12 +2136,26 @@ mod tests {
     /// the source as its parent and all of them counted as inherited.
     #[test]
     fn forking_an_event_session_copies_its_log() {
+        use crate::session::presentation::{
+            DisplayAnchor, PresentationEntry, PresentationFile, PresentationRole,
+        };
         let (_dir, manager) = store();
         let lease = created(&manager, "s1");
         manager.append_events(&lease, &a_turn()).unwrap();
+        let presentation = PresentationFile {
+            entries: vec![PresentationEntry {
+                anchor: DisplayAnchor::AtStart,
+                role: PresentationRole::Assistant,
+                text: "local command output".into(),
+            }],
+            ..Default::default()
+        };
+        manager.write_presentation("s1", &presentation).unwrap();
 
         let (forked, _fork_lease) = manager.fork_native_session("s1", "s2", 2_000).unwrap();
         assert_eq!(forked.meta.id, "s2");
+        assert_eq!(forked.presentation, presentation);
+        assert_eq!(manager.read_presentation("s1").unwrap(), presentation);
         assert_eq!(
             forked.meta.fork_info.as_ref().map(|f| f.parent_id.as_str()),
             Some("s1")
@@ -2145,5 +2168,22 @@ mod tests {
         let header = manager.read_event_header("s2").unwrap();
         assert_eq!(header.parent.as_deref(), Some("s1"));
         assert_eq!(header.inherited, 4);
+    }
+
+    #[test]
+    fn a_failed_event_fork_does_not_publish_a_partial_copy() {
+        let (_dir, manager) = store();
+        let _source = created(&manager, "s1");
+        let destination = manager.acquire_lease("s2").unwrap();
+        let invalid = super::super::presentation::PresentationFile {
+            v: u32::MAX,
+            ..Default::default()
+        };
+        assert!(manager
+            .fork_event_session("s1", &destination, &meta("s2"), &invalid, 2_000)
+            .is_err());
+        assert!(!manager.index_path("s2").unwrap().exists());
+        assert!(!manager.events_path("s2").unwrap().exists());
+        assert!(manager.load_native_session("s1").is_ok());
     }
 }
