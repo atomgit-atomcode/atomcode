@@ -2302,7 +2302,7 @@ impl Surface for Terminal {
         let mut out = std::io::stdout();
         let _ = out.write_all(ansi::MOUSE_OFF.as_bytes());
         console_mouse(false);
-        let _ = out.write_all(ansi::TRANSCRIPT_OUT.as_bytes());
+        let _ = out.write_all(ansi::transcript_out().as_bytes());
         let _ = out.flush();
         console_wrap(true);
         let _ = out.write_all(text.as_bytes());

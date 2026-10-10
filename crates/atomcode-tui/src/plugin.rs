@@ -2158,6 +2158,7 @@ impl UserInterface for Tui {
                     if arrows_scroll(
                         self.surface.mouse(),
                         crate::caps::mouse_reported(),
+                        crate::ansi::alternate_scroll_enabled() && n > 1,
                         self.arrows_reach_the_composer()
                             && !(n == 1 && self.caret_moves_within_draft(up)),
                     ) {
@@ -9081,14 +9082,18 @@ fn sanitize_paste(text: &str) -> String {
 /// Whether a run of ↑/↓ that reached the composer scrolls the conversation
 /// rather than walking the input history.
 ///
-/// Only with the mouse handed back, where the wheel can arrive as arrow keys —
-/// and only on a terminal that reports the mouse at all. One that does not
-/// (HarmonyOS) sends the wheel nowhere: its arrows are keys a person pressed,
-/// and the history is what they are for, as they are with the mouse held.
-/// Scrolling there is PageUp/PageDown. Taking them for the wheel left the
-/// history with no key but ctrl-p/ctrl-n, which nothing on that screen named.
-fn arrows_scroll(mouse_held: bool, mouse_reported: bool, would_scroll: bool) -> bool {
-    !mouse_held && mouse_reported && would_scroll
+/// With the mouse handed back, the wheel can arrive as arrow keys. Ordinarily
+/// that is useful only on a terminal that reports a mouse; HarmonyOS is the
+/// exception: DECSET 1007 turns its wheel into a multi-arrow burst, while a
+/// lone Up/Down remains an input-history key. Fn+Up/Down arrives as
+/// PageUp/PageDown and always pages the conversation.
+fn arrows_scroll(
+    mouse_held: bool,
+    mouse_reported: bool,
+    alternate_scroll_burst: bool,
+    would_scroll: bool,
+) -> bool {
+    !mouse_held && (mouse_reported || alternate_scroll_burst) && would_scroll
 }
 
 /// Read the terminal, gathering keystroke bursts that are really a paste.
@@ -9572,19 +9577,23 @@ mod surface_row_tests {
 mod history_tests {
     use super::arrows_scroll;
 
-    /// With the mouse handed back, arrows the wheel may have sent scroll; on a
-    /// terminal that reports no mouse (HarmonyOS) they are pressed keys and walk
-    /// the history; with the mouse held they always do.
+    /// With the mouse handed back, arrows the wheel may have sent scroll.
+    /// HarmonyOS contributes only grouped alternate-scroll bursts; a lone arrow
+    /// still walks input history. With the mouse held arrows always remain keys.
     #[test]
     fn arrows_scroll_only_where_the_wheel_can_send_them() {
-        assert!(arrows_scroll(false, true, true), "mouse handed back");
+        assert!(arrows_scroll(false, true, false, true), "mouse handed back");
         assert!(
-            !arrows_scroll(false, false, true),
-            "a terminal with no mouse"
+            arrows_scroll(false, false, true, true),
+            "HarmonyOS alternate-scroll burst"
         );
-        assert!(!arrows_scroll(true, true, true), "mouse held");
         assert!(
-            !arrows_scroll(false, true, false),
+            !arrows_scroll(false, false, false, true),
+            "no mouse and no alternate-scroll"
+        );
+        assert!(!arrows_scroll(true, true, false, true), "mouse held");
+        assert!(
+            !arrows_scroll(false, true, false, false),
             "the caret had somewhere to go"
         );
     }

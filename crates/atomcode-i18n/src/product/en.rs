@@ -310,7 +310,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
 
   ── Browse output ──
     Shift+Up / Shift+Down            Scroll up / down one line
-    PageUp / PageDown                Scroll up / down 10 lines
+    PageUp / PageDown                Scroll up / down 10 lines (HarmonyOS: Fn+Up / Fn+Down)
     Alt+Up / Alt+Down                Jump to previous / next message
     Ctrl+Up / Ctrl+Down              Jump to previous / next user message
     Home / End                       With empty input, jump to top / bottom
@@ -642,7 +642,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "/webui  open a synced session in the browser".into(),
 
         // ── Welcome screen tips ──
-        Msg::TuiKeysHintNoMouse => "keys: reasoning ctrl-o · tool output ctrl-t · PageUp/PageDown to scroll · /raw select across screens · every key: /keys".into(),
+        Msg::TuiKeysHintNoMouse => "keys: reasoning ctrl-o · tool output ctrl-t · wheel or Fn+Up/Down to scroll · Up/Down history · /raw select across screens · every key: /keys".into(),
         Msg::TuiKeysHint => "keys: reasoning ctrl-o · tool output ctrl-t · ctrl-g hands the mouse to the terminal and back · every key: /keys".into(),
         Msg::WelcomeTipsHeading => "Tips for getting started".into(),
         Msg::WelcomeTipLogin => "claim a free token quota".into(),

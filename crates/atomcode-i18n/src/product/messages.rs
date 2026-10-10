@@ -732,7 +732,8 @@ pub enum Msg<'a> {
     /// the keys a person would not find on their own.
     TuiKeysHint,
     /// The same line where the terminal reports no mouse (HarmonyOS): no
-    /// ctrl-g to name, and PageUp/PageDown is how the conversation scrolls.
+    /// ctrl-g to name; wheel/Fn+Up/Down scrolls the conversation and Up/Down
+    /// remains available for input history.
     TuiKeysHintNoMouse,
 
     // ── Welcome screen tips ──

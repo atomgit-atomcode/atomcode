@@ -117,10 +117,11 @@ pub fn keys_notice_marker(config_dir: &Path) -> PathBuf {
 /// A line of keys for the foot of the welcome block — on the first launch of
 /// this screen only, except on HarmonyOS PC.
 ///
-/// There it is every launch: the mouse is the terminal's, the wheel does not
-/// scroll the conversation, and PageUp/PageDown and `/raw` are how to read back
-/// — keys nothing else on that screen names, and not ones a person keeps from
-/// a single first launch.
+/// There it is every launch: the mouse is the terminal's, alternate-scroll
+/// turns its wheel into conversation movement, and Fn+Up/Down
+/// (PageUp/PageDown) plus `/raw` are the explicit ways to read back — controls
+/// nothing else on that screen names, and not ones a person keeps from a single
+/// first launch.
 ///
 /// Reasoning is hidden and tool output has its own key, and neither says so on
 /// screen. It is an aside about the screen, so it sits under the working
@@ -146,7 +147,8 @@ pub fn keys_note(marker: &Path) -> Option<KeysNote> {
 fn keys_note_for(marker: &Path, every_launch: bool, mouse_reported: bool) -> Option<KeysNote> {
     (every_launch || !marker.exists()).then(|| KeysNote {
         // Where the terminal reports no mouse (HarmonyOS) there is no ctrl-g to
-        // name, and the conversation scrolls with PageUp/PageDown.
+        // name, and the conversation scrolls with PageUp/PageDown (Fn+Up/Down
+        // on that keyboard).
         text: atomcode_config::i18n::t(if mouse_reported {
             atomcode_config::i18n::Msg::TuiKeysHint
         } else {
@@ -298,7 +300,7 @@ mod tests {
             .expect("every launch on HarmonyOS PC")
             .text;
         assert!(
-            always.contains("PageUp") && !always.contains("ctrl-g"),
+            always.contains("滚轮") && always.contains("Fn+↑/↓") && !always.contains("ctrl-g"),
             "{always}"
         );
         let _ = std::fs::remove_dir_all(&dir);
