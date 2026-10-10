@@ -248,6 +248,56 @@ fn keyboard_protocol_for(windows: bool, env: impl Fn(&str) -> Option<String>) ->
     !jediterm
 }
 
+/// Whether the terminal paints a cell's background, from what the environment
+/// says — see [`Caps::cell_background`].
+///
+/// HarmonyOS is in for the reason Windows is: this screen runs there in the
+/// system's own Terminal, which paints backgrounds (checked on HarmonyOS PC 6.1
+/// with `48;5;236` / `48;5;254` blocks) and announces nothing — no
+/// `TERM_PROGRAM`, `TERM=xterm-256color` — so the "an emulator names itself"
+/// rule read it as a bare ssh client. That took the mascot, the user message
+/// bar and every panel's selection band off a terminal that draws all three.
+pub fn cell_background_for(
+    env: &dyn Fn(&str) -> Option<String>,
+    windows: bool,
+    ohos: bool,
+) -> bool {
+    windows
+        || ohos
+        || env("WT_SESSION").is_some()
+        || env("TERM_PROGRAM").is_some()
+        || env("TERM").is_some_and(|t| t.contains("jediterm"))
+}
+
+/// Whether the terminal reports the mouse at all — whether asking it to
+/// (`ESC[?1002h ESC[?1006h`) gets anything back.
+///
+/// HarmonyOS's own Terminal does not: it sends nothing for a wheel, a drag or a
+/// click (measured on HarmonyOS PC 6.1, `cat -v` with both modes set), **and**
+/// it stops its own text selection the moment it is asked to report. So taking
+/// the mouse there bought nothing and cost everything — no selecting, no
+/// scrolling with the wheel — and `ctrl+g` (handing it back) was the only way
+/// to select a word. There the mouse stays the terminal's.
+///
+/// `ATOMCODE_MOUSE=1` lifts this gate, for a terminal there that learns to — with
+/// `[ui] mouse = true` as well, since that defaults off on HarmonyOS
+/// (`atomcode_config::config::default_mouse`).
+///
+/// Read once and kept — a launch-time environment variable, and this is asked
+/// per arrow burst, not once per screen.
+pub fn mouse_reported() -> bool {
+    static REPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REPORTED
+        .get_or_init(|| mouse_reported_for(cfg!(target_env = "ohos"), |k| std::env::var(k).ok()))
+}
+
+fn mouse_reported_for(ohos: bool, env: impl Fn(&str) -> Option<String>) -> bool {
+    match env("ATOMCODE_MOUSE").filter(|v| !v.is_empty()) {
+        Some(forced) => forced == "1" || forced.eq_ignore_ascii_case("true"),
+        None => !ohos,
+    }
+}
+
 impl Caps {
     /// The plainest terminal: ASCII, no colour. What CI and a pipe get.
     pub fn plain() -> Self {
@@ -320,10 +370,7 @@ impl Caps {
             // processing paints backgrounds — so a PowerShell window gets the
             // mascot Git Bash's mintty always got (the same reasoning
             // [`colors_for`] and [`unicode_for`] already apply).
-            cell_background: cfg!(windows)
-                || env("WT_SESSION").is_some()
-                || env("TERM_PROGRAM").is_some()
-                || env("TERM").is_some_and(|t| t.contains("jediterm")),
+            cell_background: cell_background_for(&env, cfg!(windows), cfg!(target_env = "ohos")),
             graphics,
             paste_image: if cfg!(windows) {
                 PasteImage::CtrlAltVOrCommand
@@ -790,6 +837,31 @@ mod tests {
                 .find(|(name, _)| *name == k)
                 .map(|(_, v)| v.to_string())
         }
+    }
+
+    /// HarmonyOS's own Terminal names itself nowhere and still paints
+    /// backgrounds — so the mascot and the bars are drawn there; a bare
+    /// `xterm-256color` elsewhere (an ssh client) still is not trusted to.
+    #[test]
+    fn harmonyos_paints_backgrounds_though_it_names_no_terminal() {
+        let bare = env_of(&[("TERM", "xterm-256color")]);
+        assert!(cell_background_for(&bare, false, true), "HarmonyOS");
+        assert!(
+            !cell_background_for(&bare, false, false),
+            "a bare ssh client"
+        );
+        let named = env_of(&[("TERM", "xterm-256color"), ("TERM_PROGRAM", "iTerm.app")]);
+        assert!(cell_background_for(&named, false, false));
+    }
+
+    /// HarmonyOS's terminal reports no mouse, so the mouse stays its own there
+    /// — unless told otherwise; everywhere else it is taken as before.
+    #[test]
+    fn harmonyos_keeps_the_mouse_unless_told_otherwise() {
+        assert!(!mouse_reported_for(true, |_| None));
+        assert!(mouse_reported_for(true, |k| (k == "ATOMCODE_MOUSE").then(|| "1".into())));
+        assert!(mouse_reported_for(false, |_| None));
+        assert!(!mouse_reported_for(false, |k| (k == "ATOMCODE_MOUSE").then(|| "0".into())));
     }
 
     /// A classic Windows console window is the basic one; a terminal that

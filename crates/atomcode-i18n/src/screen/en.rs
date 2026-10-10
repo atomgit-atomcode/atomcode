@@ -260,6 +260,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             format!("request failed: {reason} — retrying in {seconds}s ({attempt}/{max})").into()
         }
         Msg::InjectedFromBackground => "from the background".into(),
+        Msg::InjectedFromLead => "from main".into(),
         Msg::TranscriptDropped { through } => {
             format!("tool results through #{through} are no longer sent to the model").into()
         }
@@ -919,8 +920,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::RawTop => "── atomcode · the whole conversation ──".into(),
         Msg::RawBottom => "── the whole conversation, above: select, scroll and search it with the terminal · any key returns to atomcode ──".into(),
         Msg::MouseHandedBack => "mouse handed back · ctrl+g take it · /raw select across screens · wheel/↑↓ scroll · ctrl+p/n history · ctrl+t open · ctrl+o thinking".into(),
+        Msg::MouseUnreportedAtStart => "this terminal reports no mouse · drag to select · wheel or Fn+Up/Down scroll · /raw select across screens · Up/Down history · ctrl+t open · ctrl+o thinking".into(),
+        Msg::MouseUnreported => "this terminal reports no mouse, so it keeps it · drag to select · wheel or Fn+Up/Down scroll".into(),
         Msg::MouseHandedBackAtStart => "the terminal has the mouse · ctrl+g take it · /raw select across screens · wheel/↑↓ scroll · ctrl+p/n history · ctrl+t open · ctrl+o thinking".into(),
-        Msg::ReasoningHiddenHint => "this turn's reasoning is hidden · ctrl-o shows it (or /reasoning)".into(),
+        Msg::ReasoningHiddenHint => "reasoning is hidden · ctrl-o shows it (again for all of it) · tool output: ctrl-t".into(),
         Msg::NoProviderPanel => "this screen has no provider panel: the launcher provided no `tui-panel-providers`".into(),
         Msg::NoPluginPanel => "this screen has no plugin panel: the launcher provided no `tui-panel-plugins`".into(),
         Msg::NoToolPanel => "this screen has no tool panel: the launcher provided no `tui-panel-tools`".into(),
@@ -1408,7 +1411,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::EffortNotForThisModel { wanted, levels } => {
             format!("this model does not take {wanted}; it takes {levels}, default (or auto)").into()
         }
-        Msg::ClipboardImageUnsupportedHere => "Reading a picture from the clipboard is not supported on HarmonyOS yet. Save it to a file and add it with /paste <path>, or type its absolute path in the composer".into(),
+        Msg::ClipboardImageUnsupportedHere => "The system clipboard cannot be read on HarmonyOS (neither text nor pictures). To paste text, right-click or long-press in the composer and choose Paste; to add a picture, save it to a file and use /paste <path>, or type its absolute path in the composer".into(),
         Msg::CmdAboutChangelog => "What changed in each release".into(),
         Msg::ChangelogPickerTitle => "pick a release to read what changed".into(),
         Msg::ChangelogNewTag => "new".into(),

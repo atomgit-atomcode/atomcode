@@ -231,6 +231,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             format!("请求失败:{reason} —— {seconds} 秒后重试({attempt}/{max})").into()
         }
         Msg::InjectedFromBackground => "来自后台".into(),
+        Msg::InjectedFromLead => "来自 main".into(),
         Msg::TranscriptDropped { through } => {
             format!("到 #{through} 为止的工具结果没有再发给模型").into()
         }
@@ -858,8 +859,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::RawTop => "── atomcode · 本会话全文 ──".into(),
         Msg::RawBottom => "── 以上是本会话全文:可用终端自己的拖选、滚动、搜索 · 按任意键回到 atomcode ──".into(),
         Msg::MouseHandedBack => "鼠标已交还终端 · ctrl+g 收回 · /raw 跨屏选 · 滚轮滚动 · ctrl+p/n 历史 · ctrl+t 展开 · ctrl+o 思考".into(),
+        Msg::MouseUnreportedAtStart => "这个终端不上报鼠标 · 直接拖选 · 滚轮或 Fn+↑/↓ 翻页 · /raw 跨屏选 · ↑↓ 历史 · ctrl+t 展开 · ctrl+o 思考".into(),
+        Msg::MouseUnreported => "这个终端不上报鼠标,鼠标留给终端 · 直接拖选 · 滚轮或 Fn+↑/↓ 翻页".into(),
         Msg::MouseHandedBackAtStart => "鼠标在终端手里 · ctrl+g 收回 · /raw 跨屏选 · 滚轮滚动 · ctrl+p/n 历史 · ctrl+t 展开 · ctrl+o 思考".into(),
-        Msg::ReasoningHiddenHint => "这一轮的思考过程没有显示 · ctrl-o 查看(或 /reasoning)".into(),
+        Msg::ReasoningHiddenHint => "思考过程已收起 · ctrl-o 展开(再按看全文) · 工具输出用 ctrl-t".into(),
         Msg::NoProviderPanel => "这个屏幕没有 provider 面板:启动器没有提供 `tui-panel-providers`".into(),
         Msg::NoPluginPanel => "这个屏幕没有插件面板:启动器没有提供 `tui-panel-plugins`".into(),
         Msg::NoToolPanel => "这个屏幕没有工具面板:启动器没有提供 `tui-panel-tools`".into(),
@@ -1300,7 +1303,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::EffortNotForThisModel { wanted, levels } => {
             format!("当前模型不支持 {wanted};它支持:{levels}, default(或 auto)").into()
         }
-        Msg::ClipboardImageUnsupportedHere => "鸿蒙暂不支持读取系统剪贴板里的图片。把图片存成文件，用 /paste <图片路径> 添加，或直接在输入框里写图片的绝对路径".into(),
+        Msg::ClipboardImageUnsupportedHere => "鸿蒙上读不到系统剪贴板（文字和图片都读不到）。粘贴文字：在输入框里右键或长按，选「粘贴」；添加图片：存成文件后用 /paste <图片路径>，或直接在输入框里写它的绝对路径".into(),
         Msg::CmdAboutChangelog => "查看各版本的更新内容".into(),
         Msg::ChangelogPickerTitle => "选一个版本查看更新内容".into(),
         Msg::ChangelogNewTag => "新".into(),

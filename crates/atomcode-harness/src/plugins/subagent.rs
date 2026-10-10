@@ -209,6 +209,7 @@ struct InProcessSubagents {
     /// name at spawn time so a tool unmounted since is simply not offered.
     allowed_tools: Vec<String>,
     max_rounds: u32,
+    permits: Arc<tokio::sync::Semaphore>,
 }
 
 #[async_trait]
@@ -234,6 +235,11 @@ impl Subagents for InProcessSubagents {
     }
 
     async fn spawn(&self, work: crate::seams::Delegation<'_>) -> SubagentOutcome {
+        let _permit = self
+            .permits
+            .acquire()
+            .await
+            .expect("subagent concurrency semaphore stays open");
         // Both resolved before the child exists: a bad id, or a level this model
         // will not honour, must fail the tool call — not leave a half-created
         // agent behind, and certainly not run anyway at a level nobody asked for.
@@ -650,6 +656,8 @@ struct SubagentRow {
     allowed_tools: Vec<String>,
     #[serde(default = "default_rounds")]
     max_rounds: u32,
+    #[serde(default = "default_concurrent")]
+    max_concurrent: usize,
 }
 
 impl Default for SubagentRow {
@@ -657,6 +665,7 @@ impl Default for SubagentRow {
         Self {
             allowed_tools: default_tools(),
             max_rounds: default_rounds(),
+            max_concurrent: default_concurrent(),
         }
     }
 }
@@ -670,6 +679,10 @@ fn default_tools() -> Vec<String> {
 
 fn default_rounds() -> u32 {
     12
+}
+
+fn default_concurrent() -> usize {
+    3
 }
 
 pub struct SubagentPlugin;
@@ -703,6 +716,7 @@ impl Plugin for SubagentPlugin {
                 ctx: ctx.clone(),
                 allowed_tools: row.allowed_tools.clone(),
                 max_rounds: row.max_rounds,
+                permits: Arc::new(tokio::sync::Semaphore::new(row.max_concurrent.max(1))),
             }))
             .map_err(|e| e.to_string())?;
         mount(

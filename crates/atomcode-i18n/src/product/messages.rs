@@ -731,6 +731,10 @@ pub enum Msg<'a> {
     /// Said once, on the first launch of the row-assembled screen (`--tui`):
     /// the keys a person would not find on their own.
     TuiKeysHint,
+    /// The same line where the terminal reports no mouse (HarmonyOS): no
+    /// ctrl-g to name; wheel/Fn+Up/Down scrolls the conversation and Up/Down
+    /// remains available for input history.
+    TuiKeysHintNoMouse,
 
     // ── Welcome screen tips ──
     /// Heading above the tips list on the welcome screen.
@@ -767,6 +771,34 @@ pub enum Msg<'a> {
     WelcomeTipLanguage,
     /// Welcome tip: /usage command description.
     WelcomeTipUsage,
+    /// Under a top-level error that a refused write caused: the product's data
+    /// directory can be moved to one the person can write to.
+    ErrorDataDirElsewhere {
+        /// The command that sets the data directory, in the platform's shell.
+        how: &'a str,
+    },
+    /// Welcome tip: /compact command description.
+    WelcomeTipCompact,
+    /// Welcome tip: /effort command description.
+    WelcomeTipEffort,
+    /// Welcome tip: /auto command description.
+    WelcomeTipAuto,
+    /// Welcome tip: /openrouter command description.
+    WelcomeTipOpenrouter,
+    /// Welcome tip: /review command description.
+    WelcomeTipReview,
+    /// Welcome tip: /bg command description.
+    WelcomeTipBg,
+    /// Welcome tip: /context command description.
+    WelcomeTipContext,
+    /// Welcome tip: /memory command description.
+    WelcomeTipMemory,
+    /// Welcome tip: /remember command description.
+    WelcomeTipRemember,
+    /// Welcome tip: /rename command description.
+    WelcomeTipRename,
+    /// Welcome tip: /help command description.
+    WelcomeTipHelp,
 
     // ── Slash-command high-frequency messages ──
     CmdSwitchedPlanMode,

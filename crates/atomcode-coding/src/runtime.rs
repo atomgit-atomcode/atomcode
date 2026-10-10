@@ -9732,6 +9732,7 @@ struct OutputArtifactPatch {
 
 #[derive(serde::Serialize)]
 struct SubagentRowPatch {
+    max_concurrent: usize,
     max_rounds: u32,
 }
 
@@ -9812,17 +9813,29 @@ fn harness_option_rows(
             )
             .map_err(|e| e.to_string())?;
     }
-    // `[subagent]`: how long a delegated agent may run, and how many members a
-    // team may hold; roles come from this project and the person's home.
+    // `[subagent]`: how long a delegated agent may run. `[team]`: how many
+    // persistent members a lead may retain. Roles come from this project and
+    // the person's home.
     if let Some((max_concurrent, max_rounds)) = parts.subagent_knobs() {
+        let max_members = config
+            .subagent_config
+            .as_deref()
+            .map(|config| config.team.max_members.max(1))
+            .unwrap_or_else(|| atomcode_config::config::TeamConfig::default().max_members);
         rows = rows
-            .patch("subagent-in-process", SubagentRowPatch { max_rounds })
+            .patch(
+                "subagent-in-process",
+                SubagentRowPatch {
+                    max_concurrent,
+                    max_rounds,
+                },
+            )
             .map_err(|e| e.to_string())?
             .patch(
                 "team-in-process",
                 TeamRowPatch {
                     project_root: wd,
-                    max_members: max_concurrent,
+                    max_members,
                     max_rounds,
                 },
             )

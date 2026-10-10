@@ -310,7 +310,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
 
   ── Browse output ──
     Shift+Up / Shift+Down            Scroll up / down one line
-    PageUp / PageDown                Scroll up / down 10 lines
+    PageUp / PageDown                Scroll up / down 10 lines (HarmonyOS: Fn+Up / Fn+Down)
     Alt+Up / Alt+Down                Jump to previous / next message
     Ctrl+Up / Ctrl+Down              Jump to previous / next user message
     Home / End                       With empty input, jump to top / bottom
@@ -642,6 +642,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "/webui  open a synced session in the browser".into(),
 
         // ── Welcome screen tips ──
+        Msg::TuiKeysHintNoMouse => "keys: reasoning ctrl-o · tool output ctrl-t · wheel or Fn+Up/Down to scroll · Up/Down history · /raw select across screens · every key: /keys".into(),
         Msg::TuiKeysHint => "keys: reasoning ctrl-o · tool output ctrl-t · ctrl-g hands the mouse to the terminal and back · every key: /keys".into(),
         Msg::WelcomeTipsHeading => "Tips for getting started".into(),
         Msg::WelcomeTipLogin => "claim a free token quota".into(),
@@ -660,6 +661,18 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::WelcomeTipInit => "scan the codebase into AGENTS.md".into(),
         Msg::WelcomeTipLanguage => "switch the UI language".into(),
         Msg::WelcomeTipUsage => "view token usage & quota".into(),
+        Msg::ErrorDataDirElsewhere { how } => format!("Or keep the data somewhere you can write: {how}").into(),
+        Msg::WelcomeTipCompact => "compact the conversation to free context".into(),
+        Msg::WelcomeTipEffort => "set how hard the model thinks".into(),
+        Msg::WelcomeTipAuto => "auto-approve every tool call".into(),
+        Msg::WelcomeTipOpenrouter => "use free OpenRouter models".into(),
+        Msg::WelcomeTipReview => "review the current changes".into(),
+        Msg::WelcomeTipBg => "run sessions in the background".into(),
+        Msg::WelcomeTipContext => "see what fills the context".into(),
+        Msg::WelcomeTipMemory => "see what is remembered".into(),
+        Msg::WelcomeTipRemember => "save a fact to memory".into(),
+        Msg::WelcomeTipRename => "rename this session".into(),
+        Msg::WelcomeTipHelp => "list every command".into(),
 
         // ── Slash commands ──
         Msg::CmdSwitchedPlanMode =>
@@ -1239,7 +1252,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             format!("ask skill install failed: {}. Run /plugin install atomcode@atomcode-skills manually", error).into(),
         Msg::CmdPasteNoImage => "No image in clipboard.".into(),
         Msg::CmdPasteNoImageOhos => {
-            "HarmonyOS can't read images from the system clipboard yet. Save the image to a file, then paste/type its absolute path (e.g. /storage/.../pic.png) to attach it.".into()
+            "The system clipboard cannot be read on HarmonyOS (neither text nor images). To paste text, right-click or long-press in the input and choose Paste; to attach an image, save it to a file, then paste/type its absolute path (e.g. /storage/.../pic.png).".into()
         }
 
         // ── reasoning effort ──

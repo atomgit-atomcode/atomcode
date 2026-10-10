@@ -36,16 +36,12 @@ pub const ERASE_LINE: &str = "\x1b[K";
 /// rather than argued about: with wrap off, an over-wide row is truncated by
 /// the terminal and the screen stays put.
 ///
-/// Alternate scroll (DECSET 1007) is deliberately NOT set. It was, once, on the
-/// theory that having the terminal translate the wheel into arrow keys let the
-/// wheel scroll the stream while the pointer was the terminal's. But the arrows
-/// this UI binds are [`CaretUp`]/[`CaretDown`] — caret motion, and then
-/// input-history recall at the top of the composer — not scroll (that is
-/// PageUp/PageDown). So with the mouse handed back, 1007 turned every wheel notch
-/// into a history recall; staying off is how that bug is avoided. With mouse
-/// reporting on (the default) the wheel arrives as a button event and scrolls
-/// normally; with it off, the wheel is the terminal's own (native scrollback on
-/// emulators that keep it for the alternate screen, otherwise PageUp/PageDown).
+/// Alternate scroll (DECSET 1007) is deliberately not part of this universal
+/// sequence. It is enabled separately only on HarmonyOS, whose terminal keeps
+/// the mouse but does not report wheel events. There the input pump separates a
+/// multi-arrow wheel burst from a lone Up/Down history key. Other platforms use
+/// reported mouse events (the default), or the terminal's native scrollback
+/// when the mouse is handed back.
 ///
 /// [`CaretUp`]: crate::keymap::Action::CaretUp
 /// [`CaretDown`]: crate::keymap::Action::CaretDown
@@ -103,6 +99,123 @@ pub const ALT_SCREEN_OFF: &str = "\x1b[?1049l";
 /// the half of [`ENTER`] that [`TRANSCRIPT_OUT`] undid. The pointer mode is
 /// said by the surface, which knows which one is in force.
 pub const TRANSCRIPT_BACK: &str = "\x1b[?1049h\x1b[?7l\x1b[?25l\x1b[H\x1b[2J";
+/// Ask a terminal on the alternate screen to translate wheel motion into
+/// cursor keys. HarmonyOS HiShell does not report mouse events, so this is the
+/// only path by which its wheel can reach the application.
+pub const ALT_SCROLL_ON: &str = "\x1b[?1007h";
+pub const ALT_SCROLL_OFF: &str = "\x1b[?1007l";
+
+/// [`ENTER`] as this launch writes it: without the modes `ATOMCODE_TERM_SKIP`
+/// names (see [`without_modes`]).
+pub fn enter() -> String {
+    with_alternate_scroll(
+        without_modes(ENTER, skipped_modes()),
+        alternate_scroll_enabled(),
+    )
+}
+
+/// [`TRANSCRIPT_BACK`] as this launch writes it — the same modes left out, or
+/// coming back from `/raw` would put back what the launch left off.
+pub fn transcript_back() -> String {
+    with_alternate_scroll(
+        without_modes(TRANSCRIPT_BACK, skipped_modes()),
+        alternate_scroll_enabled(),
+    )
+}
+
+/// Leave the retained screen for `/raw`. Turn alternate-scroll off first or a
+/// terminal that applies mode 1007 globally can leak wheel-as-arrow behaviour
+/// into the transcript and the shell.
+pub fn transcript_out() -> String {
+    format!("{ALT_SCROLL_OFF}{TRANSCRIPT_OUT}")
+}
+
+/// The modes this launch leaves out, read once: the ones `ATOMCODE_TERM_SKIP`
+/// names, and none when nobody said a thing (see [`skipped_modes_for`]).
+fn skipped_modes() -> &'static [String] {
+    static SKIPPED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    SKIPPED.get_or_init(|| skipped_modes_for(std::env::var_os("ATOMCODE_TERM_SKIP")))
+}
+
+/// `ATOMCODE_TERM_SKIP` as the modes to leave out: the ones it names, or none
+/// when nobody said. Names are trimmed and lowercased and empty ones dropped.
+///
+/// HarmonyOS needs the alternate screen too: off it, HiShell consumes
+/// PageUp/PageDown for its own incomplete scrollback, so no key can reach the
+/// retained conversation. On it, Fn+Up/Down pages the whole conversation. The
+/// trade-off is that Ctrl+V cannot read the HarmonyOS clipboard there; the
+/// terminal's right-click/long-press paste still works. `ATOMCODE_TERM_SKIP=alt`
+/// remains the explicit way to trade paging for the terminal's Ctrl+V paste.
+fn skipped_modes_for(named: Option<std::ffi::OsString>) -> Vec<String> {
+    let Some(named) = named else {
+        return Vec::new();
+    };
+    named
+        .to_string_lossy()
+        .split(',')
+        .map(|mode| mode.trim().to_ascii_lowercase())
+        .filter(|mode| !mode.is_empty())
+        .collect()
+}
+
+/// Whether this launch draws on the alternate screen.
+pub fn on_alternate_screen() -> bool {
+    !skipped_modes().iter().any(|mode| mode == "alt")
+}
+
+/// HarmonyOS HiShell keeps the mouse but does not report it. On its alternate
+/// screen DECSET 1007 converts the wheel to arrows, which the TUI routes to its
+/// retained conversation. Other terminals keep the existing mouse path.
+pub fn alternate_scroll_enabled() -> bool {
+    cfg!(target_env = "ohos") && on_alternate_screen()
+}
+
+fn with_alternate_scroll(mut seq: String, enabled: bool) -> String {
+    if enabled {
+        seq.push_str(ALT_SCROLL_ON);
+    }
+    seq
+}
+
+/// [`LEAVE`] as this launch has to say it. Off the alternate screen there is no
+/// shell screen for the terminal to bring back, so the last frame would stay
+/// where it was drawn and whatever is printed next — the resume line, a shell
+/// prompt — would land on top of it: the screen is cleared first.
+pub fn leave() -> String {
+    leave_for_with_scroll(on_alternate_screen(), alternate_scroll_enabled())
+}
+
+/// [`leave`], with where the screen was drawn said.
+pub fn leave_for(alternate: bool) -> String {
+    leave_for_with_scroll(alternate, false)
+}
+
+fn leave_for_with_scroll(alternate: bool, alternate_scroll: bool) -> String {
+    let prefix = if alternate_scroll { ALT_SCROLL_OFF } else { "" };
+    if alternate {
+        format!("{prefix}{LEAVE}")
+    } else {
+        format!("{prefix}{CLEAR}{LEAVE}")
+    }
+}
+
+/// `seq` with the named modes taken out: `alt` (the alternate screen), `wrap`
+/// (line wrap stays on), `focus` (no focus reports). Names it does not know are
+/// ignored. [`LEAVE`] needs no such care: undoing a mode that was never set
+/// changes nothing.
+pub fn without_modes(seq: &str, skip: &[String]) -> String {
+    let mut out = seq.to_string();
+    for mode in skip {
+        let sets = match mode.as_str() {
+            "alt" => "\x1b[?1049h",
+            "wrap" => "\x1b[?7l",
+            "focus" => "\x1b[?1004h",
+            _ => continue,
+        };
+        out = out.replace(sets, "");
+    }
+    out
+}
 
 /// Rows of the conversation as the terminal's own lines — styled, each ended
 /// with a reset and `\r\n` (raw mode does not turn `\n` into a return). For
@@ -656,6 +769,46 @@ pub fn encode(frame: &Frame) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// `ATOMCODE_TERM_SKIP` takes out exactly the modes it names, from the
+    /// opening and from the way back from `/raw`, and nothing else.
+    #[test]
+    fn a_named_mode_is_left_out_of_what_the_screen_asks_for() {
+        let skip = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert_eq!(without_modes(ENTER, &[]), ENTER);
+        let no_alt = without_modes(ENTER, &skip(&["alt"]));
+        assert!(!no_alt.contains("?1049h") && no_alt.contains("?7l") && no_alt.contains("?2004h"));
+        let no_wrap = without_modes(TRANSCRIPT_BACK, &skip(&["wrap"]));
+        assert!(!no_wrap.contains("?7l") && no_wrap.contains("?1049h"));
+        let no_focus = without_modes(ENTER, &skip(&["focus", "nonsense"]));
+        assert!(!no_focus.contains("?1004h") && no_focus.contains("?1049h"));
+    }
+
+    /// Nothing is left out unless it is explicitly named. Off the alternate
+    /// screen, the way out clears what was drawn so nothing prints over it.
+    #[test]
+    fn nothing_is_left_out_unless_named_and_off_screen_clears_on_exit() {
+        assert!(skipped_modes_for(None).is_empty());
+        for named in ["", ",", " , "] {
+            assert!(skipped_modes_for(Some(named.into())).is_empty());
+        }
+        assert_eq!(
+            skipped_modes_for(Some(" ALT , wrap ".into())),
+            vec!["alt".to_string(), "wrap".to_string()]
+        );
+        assert_eq!(leave_for(true), LEAVE);
+        let off = leave_for(false);
+        assert!(off.starts_with(CLEAR) && off.ends_with(LEAVE), "{off:?}");
+    }
+
+    #[test]
+    fn harmonyos_alternate_screen_turns_wheel_translation_on_and_cleans_it_up() {
+        let entered = with_alternate_scroll(ENTER.to_string(), true);
+        assert!(entered.ends_with(ALT_SCROLL_ON));
+        let left = leave_for_with_scroll(true, true);
+        assert!(left.starts_with(ALT_SCROLL_OFF) && left.ends_with(LEAVE));
+        assert!(transcript_out().starts_with(ALT_SCROLL_OFF));
+    }
+
     /// 进屏时要了焦点报告,出去时原样退回去。
     ///
     /// “刚才有没有人在看”是回合结束通知唯一的依据:人看着它做完的那一次
@@ -1029,9 +1182,9 @@ mod tests {
         // back. Leaving a shell with wrap off is as rude as leaving it in raw
         // mode — every long command line would overwrite its own last column.
         assert!(ENTER.contains("?7l") && LEAVE.contains("?7h"));
-        // Alternate scroll (1007) is deliberately NOT set — with the mouse handed
-        // back it turned the wheel into arrow keys, which recall input history
-        // rather than scroll. Neither side touches it, so there is nothing to undo.
+        // Alternate scroll (1007) is platform-specific and therefore stays out
+        // of the universal constants. HarmonyOS adds/removes it through the
+        // helpers tested separately above.
         assert!(!ENTER.contains("1007") && !LEAVE.contains("1007"));
         // Bracketed paste, likewise — and leaving it on would make every
         // subsequent shell paste arrive wrapped in markers it does not expect.

@@ -1057,6 +1057,19 @@ mod win_console {
     }
 }
 
+/// The pointer a screen starts with, and whether it holds the mouse — one
+/// answer, so what the terminal is told and what later re-statements start
+/// from cannot disagree (see [`Terminal::enter`]).
+fn starting_pointer(asked: bool, reported: bool) -> (ansi::Pointer, bool) {
+    let mouse = asked && reported;
+    let pointer = if mouse {
+        ansi::Pointer::Buttons
+    } else {
+        ansi::Pointer::Terminal
+    };
+    (pointer, mouse)
+}
+
 impl Terminal {
     /// Take the screen. `theme` forces a palette; `None` means ask the terminal
     /// what colour it is and follow the answer. `overrides` is what this build
@@ -1075,18 +1088,22 @@ impl Terminal {
         }
         crossterm::terminal::enable_raw_mode()?;
         let mut out = std::io::stdout();
-        out.write_all(ansi::ENTER.as_bytes())?;
+        out.write_all(ansi::enter().as_bytes())?;
         if crate::caps::wants_keyboard_protocol() {
             out.write_all(ansi::KEYS_ON.as_bytes())?;
         }
         // Before anything names the window, so leaving can put back whatever a
         // person had called it.
         out.write_all(ansi::SAVE_TITLE.as_bytes())?;
-        let pointer = if mouse {
-            ansi::Pointer::Buttons
-        } else {
-            ansi::Pointer::Terminal
-        };
+        // A terminal that reports no mouse keeps it from the first frame: asked
+        // to report, HarmonyOS's stops its own selection and sends nothing.
+        //
+        // Decided once, here, and kept as `grab` below as well as written out:
+        // `grab` is what every later re-statement of the pointer starts from
+        // (`refresh_pointer`, e.g. hover turning on under `/webui`'s link). It
+        // used to keep the *asked-for* value while the terminal was told off,
+        // so the first re-statement took the mouse back and selection died.
+        let (pointer, mouse) = starting_pointer(mouse, crate::caps::mouse_reported());
         out.write_all(pointer.escape().as_bytes())?;
         out.flush()?;
         console_wrap(false);
@@ -1315,12 +1332,15 @@ fn emergency_restore() {
     let _ = out.write_all(ansi::MOUSE_OFF.as_bytes());
     console_mouse(false);
     let _ = out.write_all(ansi::RESTORE_TITLE.as_bytes());
+    // In `/raw` the conversation is on the terminal's own screen and stays
+    // there; otherwise the way out the launch's screen needs.
     let leave = if AWAY_FROM_SCREEN.swap(false, Ordering::SeqCst) {
         ansi::LEAVE
             .strip_suffix(ansi::ALT_SCREEN_OFF)
             .unwrap_or(ansi::LEAVE)
+            .to_string()
     } else {
-        ansi::LEAVE
+        ansi::leave()
     };
     let _ = out.write_all(leave.as_bytes());
     let _ = out.flush();
@@ -2282,7 +2302,7 @@ impl Surface for Terminal {
         let mut out = std::io::stdout();
         let _ = out.write_all(ansi::MOUSE_OFF.as_bytes());
         console_mouse(false);
-        let _ = out.write_all(ansi::TRANSCRIPT_OUT.as_bytes());
+        let _ = out.write_all(ansi::transcript_out().as_bytes());
         let _ = out.flush();
         console_wrap(true);
         let _ = out.write_all(text.as_bytes());
@@ -2298,7 +2318,7 @@ impl Surface for Terminal {
             return;
         }
         let mut out = std::io::stdout();
-        let _ = out.write_all(ansi::TRANSCRIPT_BACK.as_bytes());
+        let _ = out.write_all(ansi::transcript_back().as_bytes());
         let _ = out.flush();
         console_wrap(false);
         AWAY_FROM_SCREEN.store(false, Ordering::SeqCst);
@@ -2337,7 +2357,7 @@ impl Surface for Terminal {
         let mut out = std::io::stdout();
         let _ = out.write_all(ansi::MOUSE_OFF.as_bytes());
         let _ = out.write_all(ansi::RESTORE_TITLE.as_bytes());
-        let _ = out.write_all(ansi::LEAVE.as_bytes());
+        let _ = out.write_all(ansi::leave().as_bytes());
         let _ = out.flush();
         let _ = crossterm::terminal::disable_raw_mode();
         // The screen is the shell's while stopped: a kill or a hang-up that
@@ -2355,7 +2375,7 @@ impl Surface for Terminal {
         let _ = crossterm::terminal::enable_raw_mode();
         SCREEN_HELD.store(true, Ordering::SeqCst);
         drop_typed_while_stopped();
-        let _ = out.write_all(ansi::ENTER.as_bytes());
+        let _ = out.write_all(ansi::enter().as_bytes());
         // Whatever the shell called the window meanwhile is put away again;
         // the next frame names it (the screen forgets what it last said).
         let _ = out.write_all(ansi::SAVE_TITLE.as_bytes());
@@ -3190,6 +3210,23 @@ mod tests {
     /// anything calls it — which is exactly the shape of bug that keeps
     /// turning up here: the judgement pinned, the wiring not.
     #[cfg(unix)]
+    #[test]
+    fn a_terminal_that_reports_no_mouse_starts_without_it_on_both_counts() {
+        // HarmonyOS: asked for the mouse, the terminal reports none. The
+        // terminal is told off AND the screen holds it off — the hold is what a
+        // later re-statement (hover under `/webui`) starts from, and holding it
+        // on there took the mouse back and killed selection.
+        assert_eq!(
+            starting_pointer(true, false),
+            (ansi::Pointer::Terminal, false)
+        );
+        assert_eq!(starting_pointer(true, true), (ansi::Pointer::Buttons, true));
+        assert_eq!(
+            starting_pointer(false, true),
+            (ansi::Pointer::Terminal, false)
+        );
+    }
+
     #[test]
     fn the_colour_probe_asks_before_it_writes_anything() {
         let source = include_str!("surface.rs");

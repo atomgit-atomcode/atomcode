@@ -220,6 +220,15 @@ pub static SETTINGS: &[SettingSpec] = &[
         apply: ApplyPolicy::CapabilityReprepare,
     },
     SettingSpec {
+        id: "team.max_members",
+        path: &["team", "max_members"],
+        label_en: "Team members",
+        label_zh: "团队成员数",
+        aliases: &["team", "agent"],
+        kind: SettingKind::Integer { min: 1, max: 64 },
+        apply: ApplyPolicy::CapabilityReprepare,
+    },
+    SettingSpec {
         id: "ui.screen",
         path: &["ui", "screen"],
         label_en: "Screen",
@@ -452,6 +461,7 @@ impl SettingSpec {
                 .unwrap_or_default(),
             "subagent.max_concurrent" => config.subagent.max_concurrent.to_string(),
             "subagent.max_rounds" => config.subagent.max_rounds.to_string(),
+            "team.max_members" => config.team.max_members.to_string(),
             "subagent.codex" => config.subagent.codex.clone(),
             "subagent.claude" => config.subagent.claude.clone(),
             "ui.screen" => format!("{:?}", config.ui.screen).to_lowercase(),
@@ -942,9 +952,16 @@ mod tests {
         // config AND the catalog renders the value on disk — the two ways the
         // dead-key version silently failed.
         let on: Config = toml::from_str("").unwrap();
-        assert!(on.ui.mouse, "mouse defaults on");
+        // On except where the terminal reports no mouse (HarmonyOS): the
+        // default is what is in effect there, and `/config` shows it.
+        assert_eq!(on.ui.mouse, !cfg!(target_env = "ohos"), "mouse default");
+        assert_eq!(
+            Config::default().ui.mouse,
+            on.ui.mouse,
+            "the empty file and the built-in default agree"
+        );
         let setting = SETTINGS.iter().find(|s| s.id == "ui.mouse").unwrap();
-        assert_eq!(setting.value(&on), "true");
+        assert_eq!(setting.value(&on), on.ui.mouse.to_string());
 
         let off: Config = toml::from_str("[ui]\nmouse = false\n").unwrap();
         assert!(!off.ui.mouse, "`mouse = false` is honoured, not discarded");
@@ -1091,6 +1108,7 @@ model = "model-a"
             "coding.shell_guard_policy",
             "subagent.max_concurrent",
             "subagent.max_rounds",
+            "team.max_members",
             "ui.ai_session_naming",
             "datalog.enabled",
             "lsp.enabled",
@@ -1102,6 +1120,7 @@ model = "model-a"
                 | "tools.atomgit.enabled"
                 | "subagent.max_concurrent"
                 | "subagent.max_rounds"
+                | "team.max_members"
                 | "datalog.enabled"
                 | "lsp.enabled"
                 | "lsp.auto_detect"

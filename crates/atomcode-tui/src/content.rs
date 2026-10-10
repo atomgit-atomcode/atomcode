@@ -205,7 +205,8 @@ pub trait WelcomeWords: Send + Sync + 'static {
 /// process started.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct OpeningNotices {
-    /// One block each, above the welcome.
+    /// One block each, under the welcome — said once it is drawn, or without
+    /// it when it does not come in time (`plugin::OPENING_NOTICE_WAIT`).
     pub notices: Vec<String>,
     /// One line at the foot of this launch's first welcome block, under the
     /// working directory and the model — a quiet aside that belongs with the

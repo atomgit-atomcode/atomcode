@@ -160,7 +160,10 @@ fn origin_label(origin: &InjectionOrigin) -> String {
         // member, and the person reading the block has no way to tell the two
         // apart — the log has always been able to say which it was.
         InjectionOrigin::Peer { outside: true, .. } => t(Msg::InjectedFromBackground).into_owned(),
-        InjectionOrigin::Peer { .. } => "peer".into(),
+        // On a member's screen this is its lead assigning or steering the work.
+        // Reports in the other direction use the result presentation below,
+        // whose heading already names the member.
+        InjectionOrigin::Peer { .. } => t(Msg::InjectedFromLead).into_owned(),
         InjectionOrigin::Memory => "memory".into(),
         InjectionOrigin::Reminder => "reminder".into(),
         InjectionOrigin::Continuation => "continuation".into(),
@@ -855,6 +858,19 @@ fn wait_left(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn work_sent_to_a_member_is_labelled_as_coming_from_main() {
+        let label = origin_label(&InjectionOrigin::Peer {
+            from: "lead-1".into(),
+            outside: false,
+        });
+        assert_eq!(label, t(Msg::InjectedFromLead));
+        assert_ne!(
+            label, "peer",
+            "an implementation term is not an input label"
+        );
+    }
 
     /// The runtime's English wait sentence is said in the person's language;
     /// any other wording is left alone rather than guessed at.

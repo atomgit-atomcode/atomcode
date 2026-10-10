@@ -294,7 +294,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
 
   ── 翻看输出 ──
     Shift+Up / Shift+Down            向上 / 向下滚动一行
-    PageUp / PageDown                向上 / 向下滚动 10 行
+    PageUp / PageDown                向上 / 向下滚动 10 行（鸿蒙：Fn+↑ / Fn+↓）
     Alt+Up / Alt+Down                跳到上一条 / 下一条消息
     Ctrl+Up / Ctrl+Down              跳到上一条 / 下一条用户消息
     Home / End                       空输入时跳到对话顶部 / 底部
@@ -614,6 +614,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "使用 /webui 在浏览器中同步会话".into(),
 
         // ── 欢迎屏幕提示 ──
+        Msg::TuiKeysHintNoMouse => "按键提示:思考过程 ctrl-o · 工具输出 ctrl-t · 滚轮或 Fn+↑/↓ 翻页 · ↑↓ 历史 · /raw 跨屏选 · 全部按键见 /keys".into(),
         Msg::TuiKeysHint => "按键提示:思考过程 ctrl-o · 工具输出 ctrl-t · ctrl-g 交还/收回鼠标 · 全部按键见 /keys".into(),
         Msg::WelcomeTipsHeading => "上手提示".into(),
         Msg::WelcomeTipLogin => "领取免费额度".into(),
@@ -632,6 +633,18 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::WelcomeTipInit => "扫描代码库生成 AGENTS.md".into(),
         Msg::WelcomeTipLanguage => "切换界面语言".into(),
         Msg::WelcomeTipUsage => "查看用量与额度".into(),
+        Msg::ErrorDataDirElsewhere { how } => format!("或者把数据目录换到你能写的地方：{how}").into(),
+        Msg::WelcomeTipCompact => "压缩对话，腾出上下文".into(),
+        Msg::WelcomeTipEffort => "调整模型思考强度".into(),
+        Msg::WelcomeTipAuto => "工具调用全部自动批准".into(),
+        Msg::WelcomeTipOpenrouter => "接入 OpenRouter 免费模型".into(),
+        Msg::WelcomeTipReview => "审查当前代码改动".into(),
+        Msg::WelcomeTipBg => "把会话放到后台跑".into(),
+        Msg::WelcomeTipContext => "查看上下文用量明细".into(),
+        Msg::WelcomeTipMemory => "查看已保存的记忆".into(),
+        Msg::WelcomeTipRemember => "让它记住一件事".into(),
+        Msg::WelcomeTipRename => "给当前会话改名".into(),
+        Msg::WelcomeTipHelp => "查看所有命令".into(),
 
         // ── 斜杠命令 ──
         Msg::CmdSwitchedPlanMode =>
@@ -1208,7 +1221,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             format!("安装 ask skill 失败: {}. 请手动运行 /plugin install atomcode@atomcode-skills", error).into(),
         Msg::CmdPasteNoImage => "剪贴板中没有图片。".into(),
         Msg::CmdPasteNoImageOhos => {
-            "鸿蒙暂不支持读取系统剪贴板图片。请把图片存成文件，然后粘贴/输入它的绝对路径（如 /storage/.../pic.png）来添加图片。".into()
+            "鸿蒙上读不到系统剪贴板（文字和图片都读不到）。粘贴文字：在输入框里右键或长按，选「粘贴」；添加图片：存成文件后粘贴/输入它的绝对路径（如 /storage/.../pic.png）。".into()
         }
 
         // ── reasoning effort ──

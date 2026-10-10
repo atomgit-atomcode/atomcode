@@ -305,6 +305,16 @@ impl AgentClient {
             .unwrap_or_default()
     }
 
+    /// The lead's log, whoever is on screen.
+    fn root_events(&self) -> Vec<LoggedEvent> {
+        let views = self.view.lock().expect("client poisoned");
+        views
+            .sessions
+            .get(&views.root)
+            .map(|v| v.events.clone())
+            .unwrap_or_default()
+    }
+
     /// What the agent on screen was last described as.
     pub fn described(&self) -> Option<AgentDescription> {
         self.view
@@ -766,6 +776,12 @@ const WHEEL_LINES: i32 = 1;
 /// How close two presses on the same cell must be to count as a double- (then
 /// triple-) click. 400ms is the common desktop default — long enough for a
 /// deliberate second tap, short enough that two separate clicks are not fused.
+/// How long this launch's notices wait for the welcome to be drawn before they
+/// are said without it (`OpeningNotices`). The welcome normally comes within
+/// a frame or two of the agent describing itself; this is for a launch where it
+/// does not come at all.
+const OPENING_NOTICE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 const MULTI_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
 
 /// The ways out of a policy intervention, as a person reads them.
@@ -1198,6 +1214,9 @@ pub struct Tui {
     /// per screen, for the reason `allowance_nudged` is: it is news the first
     /// time, and after that it is one more line to read past.
     reasoning_hinted: AtomicBool,
+    /// Which of the questions this screen put up have stopped waiting without
+    /// it — see [`crate::ask::Ledger`].
+    asks_ledger: Mutex<crate::ask::Ledger>,
     /// Whether this project's older sessions have been folded into the history
     /// yet. Once per screen.
     history_asked: Mutex<bool>,
@@ -1450,26 +1469,47 @@ impl UserInterface for Tui {
         let mut welcome_note = ctx
             .service::<OpeningNoticesSvc>()
             .and_then(|notices| notices.welcome_note.clone());
-        if let Some(notices) = ctx.service::<OpeningNoticesSvc>() {
+        //
+        // Held until the welcome has been drawn, and said right under it: drawn
+        // the moment the screen came up, they stood above the welcome — the
+        // first line of the screen a note about an untrusted plugin hook, over
+        // the product's own banner. The welcome waits on the agent describing
+        // itself, so the hold has a limit (`OPENING_NOTICE_WAIT`): a launch
+        // whose agent never does — the config that did not parse may be why —
+        // still gets its notices, where they always were.
+        let mut opening_notices: Vec<String> = ctx
+            .service::<OpeningNoticesSvc>()
+            .map(|notices| {
+                notices
+                    .notices
+                    .iter()
+                    .filter(|line| !line.trim().is_empty())
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let notices_held_since = std::time::Instant::now();
+        if !opening_notices.is_empty() {
+            let wake = wake_tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(OPENING_NOTICE_WAIT).await;
+                let _ = wake.send(Wake::Fact);
+            });
+        }
+        let say_opening_notices = |notices: &mut Vec<String>| {
+            if notices.is_empty() {
+                return false;
+            }
             let mut stream = self.host.stream.write().expect("stream poisoned");
             let mut writer = stream.writer("commands");
-            for detail in notices
-                .notices
-                .iter()
-                .filter(|line| !line.trim().is_empty())
-            {
+            for detail in notices.drain(..) {
                 writer.emit(
                     crate::block::Coord::default(),
-                    Arc::new(crate::content::NoticeBlock {
-                        detail: detail.clone(),
-                    }),
+                    Arc::new(crate::content::NoticeBlock { detail }),
                 );
             }
-            drop(stream);
-            // Nothing else is owed yet, so without this the first frame waits
-            // on whatever the agent says first.
-            let _ = wake_tx.send(Wake::Fact);
-        }
+            true
+        };
 
         // Whether the conversation still owes its first word. Answered in the
         // loop below rather than here, because the welcome names the session's
@@ -1508,11 +1548,16 @@ impl UserInterface for Tui {
         // frame, so ↑/↓ scroll and the history is on ctrl-p/ctrl-n — said once,
         // on the tip row, where nobody has to have pressed ctrl-g to learn it.
         if !self.surface.mouse() {
-            self.host.say_for(
-                t(Msg::MouseHandedBackAtStart).into_owned(),
-                false,
-                MOUSE_NOTICE_MS * 2,
-            );
+            // A terminal that reports no mouse is told what does work there —
+            // not about a ctrl-g that would take nothing, or a wheel that sends
+            // nothing.
+            let tip = if crate::caps::mouse_reported() {
+                Msg::MouseHandedBackAtStart
+            } else {
+                Msg::MouseUnreportedAtStart
+            };
+            self.host
+                .say_for(t(tip).into_owned(), false, MOUSE_NOTICE_MS * 2);
         }
 
         // Before anything is typed: would a turn be taken at all?
@@ -1737,6 +1782,10 @@ impl UserInterface for Tui {
                             }
                         }
                         stale |= opened;
+                        // This launch's notices, under the welcome just drawn —
+                        // or, where the history stood it down, after what is
+                        // there. Once: the list is drained.
+                        stale |= say_opening_notices(&mut opening_notices);
                         // Answered once per session, whatever the answer: a
                         // stream that was not empty will not become empty
                         // again, and one that opened is no longer empty. It is
@@ -1745,6 +1794,12 @@ impl UserInterface for Tui {
                         // one thing that can empty the stream under this loop.
                         owes_opening = false;
                     }
+                }
+                // No welcome in time: said anyway, where they always were.
+                if !opening_notices.is_empty()
+                    && notices_held_since.elapsed() >= OPENING_NOTICE_WAIT
+                {
+                    stale |= say_opening_notices(&mut opening_notices);
                 }
             }
             if stale && (coalesced >= COALESCE_LIMIT || wake.is_empty()) {
@@ -2100,10 +2155,13 @@ impl UserInterface for Tui {
                         stale = true;
                         continue;
                     }
-                    if !self.surface.mouse()
-                        && self.arrows_reach_the_composer()
-                        && !(n == 1 && self.caret_moves_within_draft(up))
-                    {
+                    if arrows_scroll(
+                        self.surface.mouse(),
+                        crate::caps::mouse_reported(),
+                        crate::ansi::alternate_scroll_enabled() && n > 1,
+                        self.arrows_reach_the_composer()
+                            && !(n == 1 && self.caret_moves_within_draft(up)),
+                    ) {
                         let lines = n.min(i32::MAX as usize) as i32;
                         quit = self.act(Action::Scroll(if up { -lines } else { lines }), &client);
                     } else {
@@ -5450,10 +5508,16 @@ impl Tui {
             // A question left unanswered — declined, or skipped on the way
             // to the review page — is that question declined, not the batch.
             let n = questions.len();
-            let answer = self.host.asks.push_batch(questions);
+            let call = crate::ask::call_asking(kind, &payload, &self.client.root_events());
+            let (ask, answer) = self.host.asks.push_batch_with_id(questions);
+            self.remember_ask(ask, &payload, call);
             let client = self.client.clone();
             tokio::spawn(async move {
-                let mut replies = answer.await.unwrap_or_default();
+                // Taken down — answered elsewhere, or its turn is over: nothing
+                // to send. Withdrawing is not answering.
+                let Ok(mut replies) = answer.await else {
+                    return;
+                };
                 replies.resize(n, None);
                 let answers: Vec<Value> = replies.into_iter().map(crate::ask::declinable).collect();
                 client.respond(id, serde_json::json!({ "responses": answers }));
@@ -5466,13 +5530,78 @@ impl Tui {
             self.client.respond(id, Value::Null);
             return;
         };
-        let answer = self.host.asks.push(asked);
+        let call = crate::ask::call_asking(kind, &payload, &self.client.root_events());
+        let (ask, answer) = self.host.asks.push_with_id(asked);
+        self.remember_ask(ask, &payload, call);
         let client = self.client.clone();
         let kind = kind.to_string();
         tokio::spawn(async move {
-            let chosen = answer.await.ok().flatten();
+            // Taken down — answered elsewhere, or its turn is over: nothing to
+            // send. Withdrawing is not answering.
+            let Ok(chosen) = answer.await else {
+                return;
+            };
             client.respond(id, crate::ask::response_for(&kind, chosen));
         });
+    }
+
+    fn remember_ask(&self, ask: u64, payload: &Value, call: Option<String>) {
+        // The words of the (first) question: what pairs it with its `Asked`.
+        let prompt = payload
+            .get("question")
+            .or_else(|| payload.pointer("/questions/0/question"))
+            .and_then(Value::as_str);
+        self.asks_ledger
+            .lock()
+            .expect("asks poisoned")
+            .shown(ask, prompt, call);
+    }
+
+    /// Take down the questions that stopped waiting without this screen
+    /// answering them — `atomcode-tuix`'s `retract_stale_approval` and its
+    /// turn-end clear, for every question rather than approvals alone.
+    ///
+    /// * The asking session's [`Answered`] fact: the asking row writes it when
+    ///   the question closes, however it closed — answered here, answered on the
+    ///   web page in sync, refused by its timeout, refused on a stop. The one
+    ///   signal that comes from the owner of the question. Questions are asked
+    ///   one at a time per session, so it closes that session's oldest one.
+    /// * For a question asked with no `Asked` fact, the result of the call it
+    ///   was asked from.
+    /// * The lead's turn is over: none of its questions is waiting any more. A
+    ///   member's question is left alone — its turn is its own, and taking it
+    ///   down unanswered would leave the member waiting on nobody.
+    ///
+    /// `true` when a panel came down, which a frame has to show.
+    ///
+    /// [`Answered`]: atomcode_kernel::session::SessionEvent::Answered
+    fn settle_asks(&self, event: &AgentEvent) -> bool {
+        use atomcode_kernel::session::SessionEvent;
+        let gone = {
+            let mut ledger = self.asks_ledger.lock().expect("asks poisoned");
+            match event {
+                AgentEvent::Fact(committed) => match &committed.event {
+                    SessionEvent::Asked { question, .. } => {
+                        ledger.asked(&committed.session, question);
+                        Vec::new()
+                    }
+                    SessionEvent::Answered { by, .. } => {
+                        ledger.answered(&committed.session, by, |ask| self.host.asks.is_up(ask))
+                    }
+                    SessionEvent::ToolResultLogged { call_id, .. } => ledger.call_settled(call_id),
+                    _ => Vec::new(),
+                },
+                AgentEvent::TurnComplete { .. } | AgentEvent::Cancelled => {
+                    ledger.turn_ended(&self.client.root())
+                }
+                _ => Vec::new(),
+            }
+        };
+        let mut any = false;
+        for ask in gone {
+            any |= self.host.asks.withdraw(ask);
+        }
+        any
     }
 
     /// Put a policy intervention to the person, and act on what they pick.
@@ -5540,6 +5669,13 @@ impl Tui {
     /// is the same news in another shape, so a frame for it would recompose the
     /// picture that is already on the screen.
     fn on_event(&self, event: AgentEvent) -> bool {
+        // Before anything else, and whoever is on screen: the arms below drop
+        // the lead's turn events while a member is looked at.
+        let settled = self.settle_asks(&event);
+        self.on_event_drawn(event) || settled
+    }
+
+    fn on_event_drawn(&self, event: AgentEvent) -> bool {
         use crate::moment::Activity;
         match event {
             // Content: a fact of the session on screen, folded once.
@@ -6520,7 +6656,7 @@ impl Tui {
                             count: images.len(),
                         }));
                     }
-                    self.spawn_command(&text, false, with_answer);
+                    self.spawn_command(&text, false, with_answer, false);
                     return false;
                 }
                 // One command. Whether it starts a turn or folds into the one
@@ -7151,6 +7287,13 @@ impl Tui {
             }
             Action::ToggleMouse => {
                 drop(m);
+                // Nothing to take on a terminal that reports no mouse: taking it
+                // would only stop the terminal's own selection.
+                if !self.surface.mouse() && !crate::caps::mouse_reported() {
+                    self.host
+                        .say_for(t(Msg::MouseUnreported).into_owned(), false, MOUSE_NOTICE_MS);
+                    return false;
+                }
                 let on = !self.surface.mouse();
                 self.surface.set_mouse(on);
                 let text = if on {
@@ -8243,7 +8386,7 @@ impl Tui {
     /// On its own task: a command may reconfigure the tree or call a model, and
     /// the loop must keep painting and keep accepting keys while it does.
     fn run_command(&self, line: &str) {
-        self.spawn_command(line, false, false);
+        self.spawn_command(line, false, false, false);
     }
 
     /// [`Tui::run_command`] for a command the person typed (or picked from the
@@ -8258,12 +8401,23 @@ impl Tui {
     /// else's words. Between turns nothing else writes, so it is echoed at
     /// once, and a slow command shows it was taken.
     fn run_typed_command(&self, line: &str) {
+        // A successful `/goal <condition>` immediately opens a real turn whose
+        // first UserMessage is that same condition. Echoing the slash command as
+        // well leaves two full-width input bars for one gesture. Hold this one
+        // echo until the command answers: on success the committed UserMessage
+        // is the durable, replayable copy; on refusal the command still has to
+        // be shown so the error has a visible question above it.
+        let goal_starts_turn = starts_goal_turn(line);
         if self.turn_running() {
-            self.spawn_command(line, false, true);
+            self.spawn_command(line, false, true, goal_starts_turn);
             return;
         }
-        self.host.echo_command(line);
-        self.run_command(line);
+        if goal_starts_turn {
+            self.spawn_command(line, false, true, true);
+        } else {
+            self.host.echo_command(line);
+            self.run_command(line);
+        }
     }
 
     /// Whether a turn is running on this screen right now.
@@ -8277,14 +8431,14 @@ impl Tui {
     /// news. A refusal still says itself: there the person would otherwise
     /// be left thinking the change had landed.
     fn run_command_quietly(&self, line: &str) {
-        self.spawn_command(line, true, false);
+        self.spawn_command(line, true, false, false);
     }
 
     /// The one spawn/dispatch/deliver body both callers share; `quiet_success`
     /// folds a success's `Said` into `Quiet` so the success stays off the
     /// screen while a refusal keeps talking. `echo` puts the line itself in the
     /// conversation just before what it said ([`Tui::run_typed_command`]).
-    fn spawn_command(&self, line: &str, quiet_success: bool, echo: bool) {
+    fn spawn_command(&self, line: &str, quiet_success: bool, echo: bool, goal_starts_turn: bool) {
         let (Some(ctx), Some(keys)) = (
             self.ctx.lock().expect("ctx poisoned").clone(),
             self.wake.lock().expect("wake poisoned").clone(),
@@ -8299,7 +8453,7 @@ impl Tui {
                 crate::command::Outcome::Said(_) if quiet_success => crate::command::Outcome::Quiet,
                 other => other,
             };
-            if echo {
+            if echo && !(goal_starts_turn && matches!(&outcome, crate::command::Outcome::Said(_))) {
                 host.echo_command(&line);
             }
             deliver(&host, &keys, outcome);
@@ -8447,6 +8601,42 @@ fn no_clipboard_picture(otherwise: Msg<'static>) -> Msg<'static> {
     } else {
         otherwise
     }
+}
+
+/// Whether a typed command will become `/goal`'s first real user turn.
+///
+/// Control and query forms answer in place and therefore keep their ordinary
+/// command echo. Only a condition opens the duplicate `UserMessage` bar.
+fn starts_goal_turn(line: &str) -> bool {
+    let line = line.trim();
+    let Some(body) = line.strip_prefix('/') else {
+        return false;
+    };
+    let (name, args) = body
+        .split_once(char::is_whitespace)
+        .map(|(name, args)| (name, args.trim()))
+        .unwrap_or((body, ""));
+    if name != "goal" || args.is_empty() {
+        return false;
+    }
+    !matches!(
+        args,
+        "stop"
+            | "off"
+            | "clear"
+            | "cancel"
+            | "reset"
+            | "none"
+            | "pause"
+            | "status"
+            | "state"
+            | "progress"
+            | "状态"
+            | "help"
+            | "?"
+            | "-h"
+            | "--help"
+    )
 }
 
 fn deliver(
@@ -8889,6 +9079,23 @@ fn sanitize_paste(text: &str) -> String {
     crate::text::for_buffer(text)
 }
 
+/// Whether a run of ↑/↓ that reached the composer scrolls the conversation
+/// rather than walking the input history.
+///
+/// With the mouse handed back, the wheel can arrive as arrow keys. Ordinarily
+/// that is useful only on a terminal that reports a mouse; HarmonyOS is the
+/// exception: DECSET 1007 turns its wheel into a multi-arrow burst, while a
+/// lone Up/Down remains an input-history key. Fn+Up/Down arrives as
+/// PageUp/PageDown and always pages the conversation.
+fn arrows_scroll(
+    mouse_held: bool,
+    mouse_reported: bool,
+    alternate_scroll_burst: bool,
+    would_scroll: bool,
+) -> bool {
+    !mouse_held && (mouse_reported || alternate_scroll_burst) && would_scroll
+}
+
 /// Read the terminal, gathering keystroke bursts that are really a paste.
 ///
 /// **Why this is not just a loop over events.** A terminal without bracketed
@@ -9076,6 +9283,7 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
             allowance_checked: Mutex::new(None),
             allowance_nudged: Arc::new(AtomicBool::new(false)),
             reasoning_hinted: AtomicBool::new(false),
+            asks_ledger: Mutex::new(crate::ask::Ledger::default()),
             history_asked: Mutex::new(false),
             files: Mutex::new(None),
             pressed_at: Mutex::new(None),
@@ -9374,6 +9582,29 @@ mod surface_row_tests {
 
 #[cfg(test)]
 mod history_tests {
+    use super::arrows_scroll;
+
+    /// With the mouse handed back, arrows the wheel may have sent scroll.
+    /// HarmonyOS contributes only grouped alternate-scroll bursts; a lone arrow
+    /// still walks input history. With the mouse held arrows always remain keys.
+    #[test]
+    fn arrows_scroll_only_where_the_wheel_can_send_them() {
+        assert!(arrows_scroll(false, true, false, true), "mouse handed back");
+        assert!(
+            arrows_scroll(false, false, true, true),
+            "HarmonyOS alternate-scroll burst"
+        );
+        assert!(
+            !arrows_scroll(false, false, false, true),
+            "no mouse and no alternate-scroll"
+        );
+        assert!(!arrows_scroll(true, true, false, true), "mouse held");
+        assert!(
+            !arrows_scroll(false, true, false, false),
+            "the caret had somewhere to go"
+        );
+    }
+
     use super::{accept_ghost, recall_back, recall_forward};
     use crate::moment::Moment;
 
@@ -11781,6 +12012,36 @@ mod midturn_command_tests {
         let before = kinds(&host).len();
         tui.run_typed_command("/no-such-command");
         assert_eq!(&kinds(&host)[before..], &["user"]);
+        answered(&mut woken).await;
+        assert_eq!(&kinds(&host)[before..], &["user", "command"]);
+    }
+
+    #[test]
+    fn only_a_new_goal_condition_opens_the_duplicate_turn() {
+        assert!(starts_goal_turn("/goal 分析当前项目死代码"));
+        assert!(starts_goal_turn("  /goal   ship it  "));
+        for command in [
+            "/goal",
+            "/goal status",
+            "/goal 状态",
+            "/goal pause",
+            "/goal stop",
+            "/goal help",
+            "/loop ship it",
+        ] {
+            assert!(!starts_goal_turn(command), "misclassified {command:?}");
+        }
+    }
+
+    /// Holding the echo must not make a failed goal command disappear. There
+    /// is no goal capability in this deliberately empty command tree, so the
+    /// refused answer must put both the command and its reason down together.
+    #[tokio::test]
+    async fn a_goal_that_did_not_start_keeps_its_command_echo() {
+        let (host, tui, mut woken) = screen();
+        let before = kinds(&host).len();
+        tui.run_typed_command("/goal ship it");
+        assert_eq!(kinds(&host).len(), before, "echo waits for the answer");
         answered(&mut woken).await;
         assert_eq!(&kinds(&host)[before..], &["user", "command"]);
     }

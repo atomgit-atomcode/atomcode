@@ -2753,6 +2753,58 @@ async fn the_live_line_says_what_the_turn_is_doing_while_it_runs() {
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
 
+/// A question that stops waiting without this screen answering it comes down.
+///
+/// Here it is refused by its own timeout — the shape of every way it can end
+/// elsewhere: the web page answering it in sync, a stop, a refusal on the way
+/// out. The call's result is logged and the turn goes on, and the panel used to
+/// stay up over a finished conversation, asking about a call that had already
+/// been decided (`atomcode-tuix` takes it down; this screen did not).
+#[tokio::test]
+async fn a_question_that_ended_elsewhere_comes_down_on_its_own() {
+    let dir = scratch("approve-elsewhere");
+    // The turn goes on after the question for a few seconds, so what takes the
+    // panel down is the question ending — not the turn ending behind it.
+    let script = replay(
+        r#"{ text = "Writing.", calls = [ { name = "write_file", args = { file_path = "out.txt", content = "written" } } ] },
+           { text = "Waiting.", calls = [ { name = "bash", args = { command = "sleep 3" } } ] },
+           { text = "Moved on." }"#,
+    );
+    // `asking`, with the question given a second to wait instead of forever.
+    let s = start(tree(
+        &dir,
+        &script,
+        &[
+            "[[patch]]\nid = \"approval\"\ndisabled = true\n",
+            "[[patch]]\nid = \"approval-interactive\"\ndisabled = false\n",
+            "[[patch]]\nid = \"ui\"\nconfig = { ask_timeout_secs = 1 }\n",
+        ],
+    ))
+    .await;
+    let task = s.open().await;
+
+    s.term.type_line("write it");
+    until(&s, "esc 拒绝").await;
+    // Nobody here answers. The question ends on its own and comes down while
+    // the turn is still going…
+    until_gone(&s, "esc 拒绝").await;
+    assert!(
+        !s.screen().contains("Moved on."),
+        "down when the question ended, not when the turn did:\n{}",
+        s.screen()
+    );
+    // …and does not come back when the turn ends.
+    until(&s, "Moved on.").await;
+    assert!(!s.screen().contains("esc 拒绝"), "{}", s.screen());
+    assert!(
+        !dir.join("out.txt").exists(),
+        "unanswered is refused, never allowed"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
 #[tokio::test]
 async fn a_risky_call_is_asked_about_on_screen_and_an_allow_lets_it_run() {
     let dir = scratch("approve");

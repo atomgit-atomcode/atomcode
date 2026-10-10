@@ -897,6 +897,57 @@ struct ToolLoopGuard {
     stop_after: u32,
 }
 
+/// The exact-repeat guard has stronger evidence than a generic "you repeated
+/// yourself" reminder: this call already completed successfully with this same
+/// model-visible result. Say that explicitly for state-update tools, otherwise a
+/// weak model can read the unchanged result as a reason to submit the update yet
+/// again. `todowrite` stays stateless and the session log stays authoritative;
+/// this only explains what the successful repeated calls have already proved.
+fn exact_repeat_warning(exec: &ToolExec, result: &ToolResult, count: u32) -> String {
+    if exec.call.name == "todowrite" && !result.is_error {
+        let correction = serde_json::from_str::<Value>(&exec.call.arguments)
+            .ok()
+            .and_then(|args| {
+                match args.get("action").and_then(Value::as_str) {
+                    Some("update") => {
+                        let id = args.get("id")?.as_u64()?;
+                        let status = args.get("status")?.as_str()?.trim();
+                        (!status.is_empty()).then(|| {
+                            format!(
+                                "The unchanged result above has already reported Todo #{id} as \
+                                 `{status}`. Because this update only sets that status, this \
+                                 repeat made no logical state change."
+                            )
+                        })
+                    }
+                    // Replacing a list with the identical list is idempotent. `add` is
+                    // deliberately excluded: repeating it really can append another item.
+                    None if args.get("todos").is_some() => Some(
+                        "The unchanged result above has already reported this full todo list. \
+                         Replacing it with the identical list again made no logical state change."
+                            .to_string(),
+                    ),
+                    Some("add") | Some(_) | None => None,
+                }
+            });
+        if let Some(correction) = correction {
+            return format!(
+                "\n\n[tool-loop guard] This is identical successful `todowrite` call {count}. \
+                 {correction} Do NOT call `todowrite` with these arguments again this turn. \
+                 Continue with the next action, or finish without another tool call."
+            );
+        }
+    }
+
+    format!(
+        "\n\n[tool-loop guard] This is call {count} with the same arguments and the same \
+         result. The result above is unchanged, so another identical call will not make \
+         progress. Do NOT call `{}` with these arguments again this turn. Change approach, \
+         use different arguments, or finish without another tool call.",
+        exec.call.name
+    )
+}
+
 #[async_trait]
 impl Waterfall<ToolsExecute> for ToolLoopGuard {
     async fn handle(&self, exec: &mut ToolExec, next: Next<'_, ToolsExecute>) -> ToolResult {
@@ -920,10 +971,8 @@ impl Waterfall<ToolsExecute> for ToolLoopGuard {
                 exec.call.name
             );
         } else if count >= self.warn_after {
-            result.content.push_str(&format!(
-                "\n\n[tool-loop guard] This is call {count} with the same arguments and the same \
-                 result. Change approach rather than repeating it."
-            ));
+            let warning = exact_repeat_warning(exec, &result, count);
+            result.content.push_str(&warning);
         }
         result
     }
@@ -1204,8 +1253,10 @@ impl Plugin for ToolLoopGuardPlugin {
 }
 
 #[cfg(test)]
-mod retry_backoff_tests {
-    use super::retry_backoff;
+mod focused_policy_tests {
+    use super::{exact_repeat_warning, retry_backoff};
+    use crate::events::{Authorization, ToolExec};
+    use atomcode_kernel::tool::{ToolCall, ToolResult};
     use std::time::Duration;
 
     const BASE: Duration = Duration::from_secs(3);
@@ -1242,10 +1293,88 @@ mod retry_backoff_tests {
             Duration::from_secs(60)
         );
     }
+
+    fn exec(name: &str, arguments: &str) -> ToolExec {
+        ToolExec {
+            call: ToolCall {
+                id: "call-1".to_string(),
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+            },
+            turn: 1,
+            round: 3,
+            authorization: Authorization::default(),
+            working_dir: std::path::PathBuf::from("."),
+        }
+    }
+
+    #[test]
+    fn repeated_todo_update_says_the_same_status_will_not_change_state_again() {
+        let exec = exec(
+            "todowrite",
+            r#"{"action":"update","id":4,"status":"completed"}"#,
+        );
+        let warning = exact_repeat_warning(
+            &exec,
+            &ToolResult {
+                call_id: "call-1".to_string(),
+                content: "#4 → completed".to_string(),
+                is_error: false,
+                images: Vec::new(),
+            },
+            3,
+        );
+
+        assert!(
+            warning.contains("reported Todo #4 as `completed`"),
+            "{warning}"
+        );
+        assert!(warning.contains("no logical state change"), "{warning}");
+        assert!(warning.contains("Do NOT call `todowrite`"), "{warning}");
+    }
+
+    #[test]
+    fn a_failed_todo_call_does_not_claim_that_the_state_was_applied() {
+        let exec = exec(
+            "todowrite",
+            r#"{"action":"update","id":99,"status":"completed"}"#,
+        );
+        let warning = exact_repeat_warning(
+            &exec,
+            &ToolResult {
+                call_id: "call-1".to_string(),
+                content: "unknown task".to_string(),
+                is_error: true,
+                images: Vec::new(),
+            },
+            3,
+        );
+
+        assert!(!warning.contains("already `completed`"), "{warning}");
+        assert!(warning.contains("Change approach"), "{warning}");
+    }
+
+    #[test]
+    fn repeated_todo_add_is_not_described_as_a_no_op() {
+        let exec = exec("todowrite", r#"{"action":"add","content":"run tests"}"#);
+        let warning = exact_repeat_warning(
+            &exec,
+            &ToolResult {
+                call_id: "call-1".to_string(),
+                content: "Added task: run tests".to_string(),
+                is_error: false,
+                images: Vec::new(),
+            },
+            3,
+        );
+
+        assert!(!warning.contains("no logical state change"), "{warning}");
+        assert!(warning.contains("Change approach"), "{warning}");
+    }
 }
 
-/// 轮次预算的语义。单独一个模块，因为 `retry_backoff_tests` 只 import 了它自己
-/// 那一件东西，而这个判据要 `RoundCap` 与 `TurnProgress`。
+/// 轮次预算的语义。单独一个模块，因为上面的判据只需要纯函数与数据，
+/// 而这个判据要 `RoundCap` 与 `TurnProgress`。
 #[cfg(test)]
 mod round_budget_tests {
     use super::{RoundCap, TurnProgress};

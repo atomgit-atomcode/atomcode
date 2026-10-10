@@ -1573,9 +1573,66 @@ async fn async_main() {
         Ok(code) => std::process::exit(code),
         Err(e) => {
             restore_terminal_if_tui();
-            eprintln!("\nAtomCode error: {:#}", e);
+            eprintln!("\nAtomCode error: {}", error_report(&e));
             std::process::exit(1);
         }
+    }
+}
+
+/// The error chain as one line, each cause said once — and, when something
+/// refused a write, where the data could live instead.
+///
+/// Not `{:#}`: an error that writes its cause into its own message and also
+/// hands it on as `source()` (`SessionStoreError::Io`, `RuntimeStartError`)
+/// comes out once per layer, and a person read the same "Permission denied"
+/// three times without being told what to do about it.
+fn error_report(error: &anyhow::Error) -> String {
+    let mut said = String::new();
+    for cause in error.chain() {
+        let text = cause.to_string();
+        if said.contains(&text) {
+            continue;
+        }
+        if !said.is_empty() {
+            said.push_str(": ");
+        }
+        said.push_str(&text);
+    }
+    // The library says which directory refused and whose it is; where else the
+    // data may go is this host's to say, since the variable is its name. Only
+    // for a refusal from the session store: a project file or a socket that was
+    // refused is not fixed by moving the data.
+    let store_denied = error.chain().any(|cause| {
+        use atomcode_capabilities::session::SessionStoreError;
+        let store = cause.downcast_ref::<SessionStoreError>().or_else(|| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .and_then(|io| io.get_ref())
+                .and_then(|inner| inner.downcast_ref::<SessionStoreError>())
+        });
+        matches!(
+            store,
+            Some(SessionStoreError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::PermissionDenied
+        )
+    });
+    if store_denied {
+        use atomcode_config::i18n::{t, Msg};
+        said.push('\n');
+        said.push_str(&t(Msg::ErrorDataDirElsewhere {
+            how: &set_env_command(atomcode_config::distribution::HOME_ENV),
+        }));
+    }
+    said
+}
+
+/// How to set `env` in the shell a person on this platform has open — the
+/// default one, PowerShell, on Windows.
+fn set_env_command(env: &str) -> String {
+    if cfg!(windows) {
+        format!("$env:{env}=\"<dir>\"")
+    } else {
+        format!("export {env}=<dir>")
     }
 }
 
@@ -5135,6 +5192,50 @@ fn install_panic_hook(telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>) 
 
 #[cfg(test)]
 mod tests {
+
+    /// 现场(2026-10-09):`{:#}` 把同一句 Permission denied 打了三遍——每一层
+    /// 既把下一层写进自己的话里,又把它交给 `source()`。说过的不再说;是会话
+    /// 存储写不进去时,再告诉人数据目录可以换到哪儿。
+    #[test]
+    fn a_failure_is_reported_once_with_where_the_data_could_live_instead() {
+        use atomcode_capabilities::session::SessionStoreError;
+        let denied = SessionStoreError::Io {
+            path: "/root/.x/sessions/47acaa0a9d16febb".into(),
+            source: std::io::Error::from_raw_os_error(13),
+        };
+        let middle = std::io::Error::new(std::io::ErrorKind::PermissionDenied, denied);
+        let error = anyhow::Error::new(middle).context("coding runtime prepare failed");
+        let said = super::error_report(&error);
+        assert_eq!(said.matches("os error 13").count(), 1, "said once: {said}");
+        assert!(
+            said.contains(&super::set_env_command(
+                atomcode_config::distribution::HOME_ENV
+            )),
+            "{said}"
+        );
+
+        // A refusal that has nothing to do with the data directory is not met
+        // with advice to move it (评审指出).
+        let elsewhere = anyhow::Error::new(std::io::Error::from_raw_os_error(13))
+            .context("reading ./src/main.rs");
+        let said = super::error_report(&elsewhere);
+        assert!(
+            !said.contains(atomcode_config::distribution::HOME_ENV),
+            "{said}"
+        );
+    }
+
+    /// The command is one the person's shell can run: `export` is not a
+    /// PowerShell word (评审指出).
+    #[test]
+    fn the_command_to_move_the_data_is_the_platforms_own() {
+        let said = super::set_env_command("ATOMCODE_HOME");
+        if cfg!(windows) {
+            assert!(said.starts_with("$env:ATOMCODE_HOME"), "{said}");
+        } else {
+            assert!(said.starts_with("export ATOMCODE_HOME="), "{said}");
+        }
+    }
 
     /// `[ui] theme` reaches the row-assembled screen; `--theme` overrides it
     /// for one launch, and `auto` leaves the terminal to be asked.

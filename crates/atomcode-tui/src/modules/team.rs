@@ -22,12 +22,12 @@
 //! The answer is not a filtered copy of someone else's screen — it is a
 //! summary of what the lead knows, which is what a lead has.
 //!
-//! Nor does it show a member that has stopped. A stopped member is not on the
-//! team any more — it does not come back, it takes no room in the next
-//! delegation, and a row for it would be a line that says nothing and does
-//! nothing. The panel is what this agent is *running*; the way to read what a
-//! stopped member said is `/agents`, which lists every member the registry has
-//! announced, stopped ones included, and switches to any of them
+//! Nor does it ordinarily show a member that has stopped. A stopped member is
+//! not on the team any more — it does not come back or take room in the next
+//! delegation. The exception is one already on screen through `/agents`: its
+//! row and the lead remain until the person returns, because removing the
+//! navigation while it is being used would strand that screen. `/agents`
+//! lists every member the registry has announced, stopped ones included
 //! (`docs/adr/0023` §5).
 //!
 //! # A way in
@@ -113,7 +113,9 @@ pub struct Team;
 /// pointer ask the same question through `targets`: an empty answer is what
 /// keeps `Tab` from giving the keyboard to a panel nobody drew.
 fn running(moment: &Moment) -> bool {
-    moment.members.iter().any(|m| !m.gone) || !background(moment).is_empty()
+    moment.members.iter().any(|m| !m.gone)
+        || !background(moment).is_empty()
+        || (!moment.lead.is_empty() && !moment.viewing.is_empty() && moment.viewing != moment.lead)
 }
 
 /// Background sessions this conversation started and is still waiting on — a
@@ -151,25 +153,32 @@ pub fn is_background(moment: &Moment, session: &str) -> bool {
 /// on screen — there is nothing to switch between, and nothing for the arrows
 /// to point at.
 ///
-/// A stopped member is not one of them: it is not on the panel, so a target for
-/// it would be a row nothing drew. [`rows`] drops exactly the same members, and
-/// the two must agree or a press would land on the agent below the one it hit.
-/// Reading a stopped member is `/agents`.
+/// A stopped member is not one of them unless it is the member currently being
+/// read through `/agents`; that one stays beside the lead until the person
+/// returns. [`rows`] makes exactly the same exception, and the two must agree
+/// or a press would land on the agent below the one it hit.
 pub fn targets(moment: &Moment) -> Vec<String> {
     if moment.lead.is_empty() || !running(moment) {
         return Vec::new();
     }
-    std::iter::once(moment.lead.clone())
+    let mut targets: Vec<String> = std::iter::once(moment.lead.clone())
         .chain(
             moment
                 .members
                 .iter()
-                .filter(|m| !m.gone)
+                .filter(|m| !m.gone || m.session == moment.viewing)
                 .map(|m| m.session.clone()),
         )
         // After the members, in the order [`rows`] draws them.
         .chain(background(moment).into_iter().map(|s| s.id.clone()))
-        .collect()
+        .collect();
+    if !moment.viewing.is_empty()
+        && moment.viewing != moment.lead
+        && !targets.iter().any(|s| s == &moment.viewing)
+    {
+        targets.push(moment.viewing.clone());
+    }
+    targets
 }
 
 /// Which selectable row a line of the drawn panel is, when it is one: the
@@ -534,6 +543,7 @@ impl View for Team {
 /// keyboard's, so a team idle again after it folds again.
 fn all_resting(rows: &[Row], moment: &Moment) -> bool {
     !rows.is_empty()
+        && (moment.viewing.is_empty() || moment.viewing == moment.lead)
         && !moment.turn_open
         && moment.team_cursor.is_none()
         && rows.iter().all(|r| r.state == Shown::Idle)
@@ -583,7 +593,7 @@ fn rows(state: &State, moment: &Moment) -> Vec<Row> {
     let mut out: Vec<Row> = Vec::new();
     for live in &moment.members {
         let logged = state.members.iter().find(|m| m.name == live.name);
-        if live.gone || logged.is_some_and(|m| m.stopped) {
+        if (live.gone || logged.is_some_and(|m| m.stopped)) && live.session != moment.viewing {
             continue;
         }
         // One this log never delegated — a subagent the `task` tool made — is
@@ -629,6 +639,28 @@ fn rows(state: &State, moment: &Moment) -> Vec<Row> {
             },
             session: session.id.clone(),
             background: true,
+        });
+    }
+    if !moment.viewing.is_empty()
+        && moment.viewing != moment.lead
+        && !out.iter().any(|row| row.session == moment.viewing)
+    {
+        out.push(Row {
+            member: Member {
+                name: moment
+                    .viewing
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&moment.viewing)
+                    .to_string(),
+                ..Member::default()
+            },
+            labelled: false,
+            elapsed: None,
+            tokens: 0,
+            state: Shown::Idle,
+            session: moment.viewing.clone(),
+            background: false,
         });
     }
     // Then what only this log remembers — a member stopped before this screen
@@ -744,6 +776,37 @@ mod tests {
         assert!(
             row.trim_end().ends_with("↓ 61.6K tok") && row.contains("1 分 52 秒"),
             "time and context at the right edge: {row:?}"
+        );
+    }
+
+    /// A member log outlives its registry row. While that log is on screen the
+    /// team strip is navigation, not merely live-status chrome: it must retain
+    /// both the current member and the way back to `main`.
+    #[test]
+    fn a_member_view_keeps_the_road_back_after_its_live_row_is_gone() {
+        let moment = Moment {
+            lead: "lead-1".into(),
+            viewing: "lead-1/code-review".into(),
+            ..Moment::default()
+        };
+        let state = State::default();
+        let screen = drew(&state, &moment);
+        assert!(
+            screen.contains("○ main"),
+            "the lead stays reachable:\n{screen}"
+        );
+        assert!(
+            screen.contains("● code-review"),
+            "the historical member is still the current row:\n{screen}"
+        );
+        assert_eq!(
+            targets(&moment),
+            vec!["lead-1".to_string(), "lead-1/code-review".to_string()]
+        );
+        assert_eq!(
+            Team::height(&state, &moment, 60),
+            Height::Hug(3),
+            "member navigation never folds away while the member is viewed"
         );
     }
 

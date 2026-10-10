@@ -115,7 +115,13 @@ pub fn keys_notice_marker(config_dir: &Path) -> PathBuf {
 }
 
 /// A line of keys for the foot of the welcome block — on the first launch of
-/// this screen only.
+/// this screen only, except on HarmonyOS PC.
+///
+/// There it is every launch: the mouse is the terminal's, alternate-scroll
+/// turns its wheel into conversation movement, and Fn+Up/Down
+/// (PageUp/PageDown) plus `/raw` are the explicit ways to read back — controls
+/// nothing else on that screen names, and not ones a person keeps from a single
+/// first launch.
 ///
 /// Reasoning is hidden and tool output has its own key, and neither says so on
 /// screen. It is an aside about the screen, so it sits under the working
@@ -128,8 +134,27 @@ pub fn keys_notice_marker(config_dir: &Path) -> PathBuf {
 /// drew it — no welcome yet when it quit, a config that stopped the agent from
 /// describing itself — has not spent it.
 pub fn keys_note(marker: &Path) -> Option<KeysNote> {
-    (!marker.exists()).then(|| KeysNote {
-        text: atomcode_config::i18n::t(atomcode_config::i18n::Msg::TuiKeysHint).into_owned(),
+    keys_note_for(
+        marker,
+        cfg!(target_env = "ohos"),
+        atomcode_tui::caps::mouse_reported(),
+    )
+}
+
+/// `every_launch` is the platform (HarmonyOS PC) and only that: anywhere else
+/// the line is said once, whatever the mouse is doing. `mouse_reported` picks
+/// the words.
+fn keys_note_for(marker: &Path, every_launch: bool, mouse_reported: bool) -> Option<KeysNote> {
+    (every_launch || !marker.exists()).then(|| KeysNote {
+        // Where the terminal reports no mouse (HarmonyOS) there is no ctrl-g to
+        // name, and the conversation scrolls with PageUp/PageDown (Fn+Up/Down
+        // on that keyboard).
+        text: atomcode_config::i18n::t(if mouse_reported {
+            atomcode_config::i18n::Msg::TuiKeysHint
+        } else {
+            atomcode_config::i18n::Msg::TuiKeysHintNoMouse
+        })
+        .into_owned(),
         marker: marker.to_path_buf(),
     })
 }
@@ -262,7 +287,22 @@ mod tests {
         }
         .seen();
         assert!(marker.exists(), "remembered once it was drawn");
-        assert!(keys_note(&marker).is_none(), "never again");
+        assert!(keys_note_for(&marker, false, true).is_none(), "never again");
+        // Elsewhere a terminal with the mouse turned off still says it once.
+        assert!(
+            keys_note_for(&marker, false, false).is_none(),
+            "once, off HarmonyOS"
+        );
+        // On HarmonyOS PC the line is how to scroll and select at all, so it
+        // is there every launch — and names PageUp/PageDown rather than a
+        // ctrl-g that does nothing there.
+        let always = keys_note_for(&marker, true, false)
+            .expect("every launch on HarmonyOS PC")
+            .text;
+        assert!(
+            always.contains("滚轮") && always.contains("Fn+↑/↓") && !always.contains("ctrl-g"),
+            "{always}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

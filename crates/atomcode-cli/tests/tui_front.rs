@@ -513,6 +513,14 @@ async fn what_this_launch_has_to_say_is_said_and_the_welcome_still_opens() {
         screen_text.contains("Tips for getting started"),
         "and the welcome still opened over them:\n{screen_text}"
     );
+    // Under the welcome, not over it: the screen's first line is the product's
+    // banner, not a note about how this launch went.
+    let welcome_at = screen_text.find("Tips for getting started").unwrap();
+    let notice_at = screen_text.find("this config did not parse").unwrap();
+    assert!(
+        welcome_at < notice_at,
+        "the launch's notices sit under the welcome:\n{screen_text}"
+    );
 
     term.press(atomcode_tui::surface::KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), running).await;
@@ -1027,7 +1035,14 @@ async fn a_person_edits_the_plan_with_todo_add_and_clear() {
         text.contains("(no tasks)")
     })
     .await;
+    // The first enter takes the menu's lit row onto the line (`/todo `), so
+    // `add <task>` can follow it; the second runs the bare name, which prints
+    // the plan (184d5f2b4, and the e2e criterion
+    // `taking_todo_from_the_menu_waits_for_what_comes_after_it`).
     term.type_line("/todo");
+    term.press(atomcode_tui::surface::KeyPress::plain(
+        atomcode_tui::surface::Key::Enter,
+    ));
     until_text(&term, "and /todo says there is none", |text| {
         text.contains("这段对话里还没有计划清单")
     })

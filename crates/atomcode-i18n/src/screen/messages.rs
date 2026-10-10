@@ -392,6 +392,8 @@ pub enum Msg<'a> {
     /// The chip on an injected block: another session — one this tree has never
     /// held — reporting back (`modules/transcript.rs`).
     InjectedFromBackground,
+    /// Work or steering the lead sent into a member's conversation.
+    InjectedFromLead,
     TranscriptDropped {
         through: u64,
     },
@@ -1461,6 +1463,10 @@ pub enum Msg<'a> {
     /// Said once at start when `[ui] mouse = false` hands the pointer to the
     /// terminal from the first frame.
     MouseHandedBackAtStart,
+    /// The terminal reports no mouse (HarmonyOS): what works instead, at start.
+    MouseUnreportedAtStart,
+    /// ctrl-g on a terminal that reports no mouse.
+    MouseUnreported,
     /// Said once, after a turn whose reasoning is off the screen: the key that
     /// brings it back, since nothing on screen says there is any.
     ReasoningHiddenHint,
@@ -2127,8 +2133,8 @@ pub enum Msg<'a> {
         wanted: &'a str,
         levels: &'a str,
     },
-    /// Reading the clipboard picture is not possible on this platform
-    /// (HarmonyOS): what to do instead.
+    /// The clipboard cannot be read on this platform (HarmonyOS) — text or
+    /// picture — so a Ctrl+V reaches here with nothing: what to do instead.
     ClipboardImageUnsupportedHere,
     /// `/changelog` in the command menu and the welcome tips.
     CmdAboutChangelog,

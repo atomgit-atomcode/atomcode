@@ -334,6 +334,15 @@ impl Asks {
     /// 丢掉 `Pending` 就丢掉了应答通道，等着的那个人看到的是一次取消 —— 既不是
     /// `finish(Vec::new())` 那个「拒绝」，更不是同意。给一条已经作废的问询用（它来自
     /// 的那个会话不在等了），见 `crate::host::Host::withdraw_bg_question`。
+    /// Whether the question `id` is still up, unanswered.
+    pub fn is_up(&self, id: u64) -> bool {
+        self.queue
+            .lock()
+            .expect("asks poisoned")
+            .iter()
+            .any(|pending| pending.id == id)
+    }
+
     pub fn withdraw(&self, id: u64) -> bool {
         let mut q = self.queue.lock().expect("asks poisoned");
         let before = q.len();
@@ -367,6 +376,7 @@ impl Asks {
 
     /// Post several questions to be answered together, and get the channel
     /// their answers arrive on — one per question, in order.
+    #[cfg(test)]
     pub(crate) fn push_batch(&self, asked: Vec<Asked>) -> oneshot::Receiver<Vec<Option<Reply>>> {
         let (reply, rx) = oneshot::channel();
         self.enqueue(asked, Replier::Many(reply));
@@ -421,6 +431,198 @@ impl Asks {
 /// twice. Otherwise the question is read off the request — and a model's own
 /// `request_user_input` read off the request keeps the request beside it, so
 /// the panel can ask for what the model asked for: several answers, or words.
+/// Which of this screen's questions have stopped waiting without it — the
+/// bookkeeping behind taking a question down when it was answered elsewhere
+/// (the web page, in sync), refused by its timeout, or its turn ended.
+///
+/// Fed from the log, where the asking row writes the authoritative pair: an
+/// [`SessionEvent::Asked`] before the request and an
+/// [`SessionEvent::Answered`] when it closes, however it closes. Both carry no
+/// id, and a member's questions are written into the lead's log beside the
+/// lead's own, so two can be waiting in one session at once. The rules are
+/// chosen so that a question still waiting is never taken down by mistake — a
+/// member left asking nobody — at the cost of, when it cannot be told which
+/// of two closed, leaving one up until something certain says so.
+#[derive(Debug, Default)]
+pub(crate) struct Ledger {
+    /// `Asked` facts whose request has not been put up yet.
+    unshown: Vec<Recorded>,
+    open: Vec<OpenAsk>,
+}
+
+#[derive(Debug)]
+struct Recorded {
+    session: String,
+    member: bool,
+    prompt: String,
+}
+
+/// A question put up on screen.
+#[derive(Debug)]
+struct OpenAsk {
+    ask: u64,
+    /// The session its `Asked` was written into; `None` when it had none (the
+    /// model's own `request_user_input`), which only its `call` closes.
+    session: Option<String>,
+    /// Asked for a member of the team ([`Question::asker`]): its facts are in
+    /// the lead's log, and the lead's turn ending does not end it.
+    member: bool,
+    call: Option<String>,
+}
+
+impl Ledger {
+    /// An `Asked` fact, written into `session`'s log.
+    pub(crate) fn asked(&mut self, session: &str, question: &Question) {
+        self.unshown.push(Recorded {
+            session: session.to_string(),
+            member: question.asker.is_some(),
+            prompt: question.prompt.clone(),
+        });
+    }
+
+    /// A request put up as panel `ask`. `prompt` is its (first) question's
+    /// words, which is what pairs it with its `Asked` — by words, not by order:
+    /// a lead and a member asking at once interleave. With no `Asked` to pair,
+    /// `call` (see [`call_asking`]) is what will say it is over.
+    pub(crate) fn shown(&mut self, ask: u64, prompt: Option<&str>, call: Option<String>) {
+        let recorded = prompt
+            .and_then(|prompt| self.unshown.iter().position(|r| r.prompt == prompt))
+            .map(|at| self.unshown.remove(at));
+        self.open.push(match recorded {
+            Some(r) => OpenAsk {
+                ask,
+                session: Some(r.session),
+                member: r.member,
+                call: None,
+            },
+            None => OpenAsk {
+                ask,
+                session: None,
+                member: false,
+                call,
+            },
+        });
+    }
+
+    /// An `Answered` fact in `session`'s log. Returns the panels to take down.
+    ///
+    /// * By the execution mode: nobody was asked — it closes an `Asked` that
+    ///   never reached this screen.
+    /// * Otherwise, first a question this screen answered itself (no longer
+    ///   `is_up`): that is the one closing, and nothing comes down.
+    /// * Otherwise it was answered elsewhere, and only a session with exactly
+    ///   one question up says which. With two, guessing could take down the one
+    ///   still waiting; neither comes down here.
+    pub(crate) fn answered(
+        &mut self,
+        session: &str,
+        by: &str,
+        is_up: impl Fn(u64) -> bool,
+    ) -> Vec<u64> {
+        if by == atomcode_kernel::session::ANSWERED_BY_MODE {
+            if let Some(at) = self.unshown.iter().position(|r| r.session == session) {
+                self.unshown.remove(at);
+            }
+            return Vec::new();
+        }
+        let ours = |o: &OpenAsk| o.session.as_deref() == Some(session);
+        if let Some(at) = self.open.iter().position(|o| ours(o) && !is_up(o.ask)) {
+            self.open.remove(at);
+            return Vec::new();
+        }
+        let up: Vec<usize> = (0..self.open.len())
+            .filter(|&at| ours(&self.open[at]))
+            .collect();
+        match up.as_slice() {
+            [only] => vec![self.open.remove(*only).ask],
+            // None up: it closed before it was put up (refused on the way, or
+            // never drawable) — its `Asked` is not waiting for a request any more.
+            [] => {
+                if let Some(at) = self.unshown.iter().position(|r| r.session == session) {
+                    self.unshown.remove(at);
+                }
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// A tool call's result is in the log: a question asked from it with no
+    /// `Asked` of its own is over.
+    pub(crate) fn call_settled(&mut self, call_id: &str) -> Vec<u64> {
+        self.take(|o| o.session.is_none() && o.call.as_deref() == Some(call_id))
+    }
+
+    /// The lead's turn is over: the lead's own questions are, and so is any
+    /// question tied to one of its calls. A member's are not.
+    pub(crate) fn turn_ended(&mut self, lead: &str) -> Vec<u64> {
+        self.unshown.retain(|r| r.session != lead || r.member);
+        self.take(|o| match &o.session {
+            Some(session) => session == lead && !o.member,
+            None => o.call.is_some(),
+        })
+    }
+
+    fn take(&mut self, pick: impl Fn(&OpenAsk) -> bool) -> Vec<u64> {
+        let mut gone = Vec::new();
+        self.open.retain(|o| {
+            if pick(o) {
+                gone.push(o.ask);
+                false
+            } else {
+                true
+            }
+        });
+        gone
+    }
+}
+
+/// The tool call a request is asking on behalf of, read off `events` — the log
+/// of the session it would belong to — or `None` when that log has no such call
+/// waiting (a member's question, read against the lead's log).
+///
+/// The answer is what lets a question come down when it stops waiting without
+/// this screen having answered it — another front end did (the web page, in
+/// sync), or the turn ended: the call's result is logged then, and a question
+/// still up over a call that has its result is a panel asking nothing.
+///
+/// An approval names its call (`ApprovalRequest::call_id`) and is taken at its
+/// word when that call is open in `events`. `request_user_input` names none, but
+/// it is asked from inside its own call, so the newest such call with no result
+/// logged yet is the one.
+pub fn call_asking(kind: &str, payload: &Value, events: &[LoggedEvent]) -> Option<String> {
+    let open = |id: &str| {
+        let called = events.iter().any(|logged| match &logged.event {
+            SessionEvent::AssistantMessage { tool_calls, .. } => {
+                tool_calls.iter().any(|call| call.id == id)
+            }
+            _ => false,
+        });
+        let answered = events.iter().any(|logged| {
+            matches!(&logged.event, SessionEvent::ToolResultLogged { call_id, .. } if call_id == id)
+        });
+        called && !answered
+    };
+    if let Some(id) = payload
+        .get("call_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    {
+        return open(id).then(|| id.to_string());
+    }
+    if kind != REQUEST_USER_INPUT_KIND {
+        return None;
+    }
+    events.iter().rev().find_map(|logged| match &logged.event {
+        SessionEvent::AssistantMessage { tool_calls, .. } => tool_calls
+            .iter()
+            .rev()
+            .find(|call| call.name == "request_user_input" && open(&call.id))
+            .map(|call| call.id.clone()),
+        _ => None,
+    })
+}
+
 pub fn question_for(kind: &str, payload: &Value, events: &[LoggedEvent]) -> Option<Asked> {
     if kind == REQUEST_USER_INPUT_KIND {
         let request: UserInputRequest = serde_json::from_value(payload.clone()).ok()?;
@@ -1308,6 +1510,151 @@ mod tests {
             at: 0,
             event: SessionEvent::Asked { turn: 1, question },
         }
+    }
+
+    fn asked_q(prompt: &str, member: Option<&str>) -> Question {
+        Question {
+            prompt: prompt.into(),
+            options: Vec::new(),
+            asker: member.map(Into::into),
+            about: None,
+        }
+    }
+
+    /// Answered on the web page: the one question up in that session comes
+    /// down. Answered here: nothing does — the panel is already gone, and the
+    /// fact is the screen's own answer coming back.
+    #[test]
+    fn a_ledger_takes_down_what_closed_elsewhere_and_nothing_it_answered() {
+        let mut l = Ledger::default();
+        l.asked("lead", &asked_q("Allow `write_file`?", None));
+        l.shown(1, Some("Allow `write_file`?"), None);
+        assert_eq!(
+            l.answered("lead", "the connected driver", |_| true),
+            vec![1]
+        );
+
+        l.asked("lead", &asked_q("Allow `bash`?", None));
+        l.shown(2, Some("Allow `bash`?"), None);
+        // Answered here: no longer up when its fact arrives.
+        assert!(l
+            .answered("lead", "the person at the terminal", |_| false)
+            .is_empty());
+        assert!(l.open.is_empty(), "and it is spent, not kept");
+    }
+
+    /// The case the rules are for: the lead and a member each have a question
+    /// up, both written into the lead's log. An answer from elsewhere cannot
+    /// say which closed, so neither is guessed at — taking down the member's
+    /// would leave it waiting on nobody. The lead's turn ending takes the
+    /// lead's down and leaves the member's; the member's own answer, now the
+    /// only one up, takes it down.
+    #[test]
+    fn a_ledger_never_guesses_between_two_waiting_questions() {
+        let mut l = Ledger::default();
+        // Interleaved: the member's `Asked` lands between the lead's and its
+        // request — paired by words, not by order.
+        l.asked("lead", &asked_q("Lead asks?", None));
+        l.asked("lead", &asked_q("Member asks?", Some("scribe")));
+        l.shown(2, Some("Member asks?"), None);
+        l.shown(1, Some("Lead asks?"), None);
+
+        assert!(
+            l.answered("lead", "the connected driver", |_| true)
+                .is_empty(),
+            "two up: not a guess"
+        );
+        assert_eq!(
+            l.turn_ended("lead"),
+            vec![1],
+            "the lead's, not the member's"
+        );
+        assert_eq!(
+            l.answered("lead", "the connected driver", |_| true),
+            vec![2],
+            "now the only one up"
+        );
+    }
+
+    /// An answer the execution mode gave asked nobody: it closes an `Asked`
+    /// that never reached the screen, and leaves the panel that is up alone.
+    #[test]
+    fn a_ledger_lets_an_auto_answer_close_what_was_never_shown() {
+        let mut l = Ledger::default();
+        l.asked("lead", &asked_q("Up?", None));
+        l.shown(1, Some("Up?"), None);
+        l.asked("lead", &asked_q("Auto?", None));
+        assert!(l
+            .answered("lead", atomcode_kernel::session::ANSWERED_BY_MODE, |_| true)
+            .is_empty());
+        assert!(l.unshown.is_empty());
+        assert_eq!(
+            l.answered("lead", "the connected driver", |_| true),
+            vec![1]
+        );
+    }
+
+    /// No `Asked` (the model's own `request_user_input`): its call's result is
+    /// what says it is over.
+    #[test]
+    fn a_ledger_closes_an_unrecorded_question_by_its_call() {
+        let mut l = Ledger::default();
+        l.shown(1, Some("Which?"), Some("call-7".into()));
+        assert!(l.call_settled("call-6").is_empty());
+        assert_eq!(l.call_settled("call-7"), vec![1]);
+    }
+
+    /// The model's own `request_user_input` writes no `Asked`, so the call it
+    /// was asked from is what says it is over: the newest such call still
+    /// without a result. Once the result is logged, nothing is waiting on it.
+    #[test]
+    fn a_question_without_an_asked_fact_is_tied_to_its_open_call() {
+        let at = |event| LoggedEvent {
+            seq: 1,
+            at: 0,
+            event,
+        };
+        let called = |id: &str, name: &str| {
+            at(SessionEvent::AssistantMessage {
+                turn: 1,
+                round: 1,
+                text: String::new(),
+                reasoning: String::new(),
+                tool_calls: vec![atomcode_kernel::tool::ToolCall {
+                    id: id.into(),
+                    name: name.into(),
+                    arguments: "{}".into(),
+                }],
+                reasoning_blocks: Vec::new(),
+                meta: None,
+            })
+        };
+        let result = |id: &str| {
+            at(SessionEvent::ToolResultLogged {
+                turn: 1,
+                round: 1,
+                call_id: id.into(),
+                content: String::new(),
+                is_error: false,
+                images: Vec::new(),
+            })
+        };
+        let payload = serde_json::json!({ "question": "Which?" });
+        let mut log = vec![
+            called("old", "request_user_input"),
+            result("old"),
+            called("read", "read_file"),
+            called("now", "request_user_input"),
+        ];
+        assert_eq!(
+            call_asking(REQUEST_USER_INPUT_KIND, &payload, &log).as_deref(),
+            Some("now")
+        );
+        log.push(result("now"));
+        assert_eq!(call_asking(REQUEST_USER_INPUT_KIND, &payload, &log), None);
+        // A call the lead's log does not have (a member's) is not claimed.
+        let named = serde_json::json!({ "call_id": "elsewhere" });
+        assert_eq!(call_asking("approval", &named, &log), None);
     }
 
     /// Several questions in one request are several questions on screen, and
