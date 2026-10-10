@@ -6795,14 +6795,6 @@ impl Tui {
                 // is NOT a command: it reaches the model untouched instead of
                 // erroring with "没有 /Users/… 这条命令".
                 if crate::command::looks_like_command(&text) {
-                    // Echoed before anything is said about it, so what follows
-                    // (the refusal below, the command's answer) reads under it —
-                    // with the answer instead while a turn runs, for the reason
-                    // `run_typed_command` gives.
-                    let with_answer = self.turn_running();
-                    if !with_answer {
-                        self.host.echo_command(&text);
-                    }
                     // A command carries no pictures — no command takes them —
                     // and `take_shown` above has already drained them off the
                     // composer. Until one does, **say so**: a screenshot
@@ -6815,7 +6807,7 @@ impl Tui {
                             count: images.len(),
                         }));
                     }
-                    self.spawn_command(&text, false, with_answer, false);
+                    self.run_typed_command(&text);
                     return false;
                 }
                 // One command. Whether it starts a turn or folds into the one
@@ -8701,8 +8693,18 @@ impl Tui {
         let host = self.host.clone();
         let line = line.to_string();
         tokio::spawn(async move {
+            // A skill's acknowledgement is projected from its durable
+            // `Injected` + `UserMessage` facts, between the compact invocation
+            // and the folded body. Delivering the command's transient answer
+            // as well races ahead of both and leaves "按 … 开始" above the
+            // command. Other turn-starting commands (notably `/goal`) still
+            // deliver their own answer here.
+            let result_in_transcript = commands.starts_turn(&line);
             let outcome = match commands.dispatch(&line, &ctx).await {
                 crate::command::Outcome::Said(_) if quiet_success => crate::command::Outcome::Quiet,
+                crate::command::Outcome::Said(_) if result_in_transcript => {
+                    crate::command::Outcome::Quiet
+                }
                 other => other,
             };
             if echo

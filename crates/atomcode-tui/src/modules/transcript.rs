@@ -15,8 +15,8 @@ use atomcode_harness::session::{InjectionOrigin, SessionEvent};
 
 use crate::block::{BlockId, Coord, StreamWriter};
 use crate::content::{
-    ChoiceBlock, InjectedBlock, ModelSaid, ModelThought, NoticeBlock, Outcome, SkillBlock,
-    ToolCallBlock, TurnEndBlock, TurnStats, UserSaid,
+    ChoiceBlock, CommandSaid, InjectedBlock, ModelSaid, ModelThought, NoticeBlock, Outcome,
+    SkillBlock, ToolCallBlock, TurnEndBlock, TurnStats, UserSaid,
 };
 use crate::module::Producer;
 
@@ -301,6 +301,21 @@ impl Producer for Transcript {
                     );
                 } else {
                     out.emit(at, Arc::new(UserSaid(text.clone())));
+                }
+                if !open.skills.is_empty() {
+                    let names = open
+                        .skills
+                        .iter()
+                        .map(|(name, _)| name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" · ");
+                    out.emit(
+                        at,
+                        Arc::new(CommandSaid {
+                            text: format!("按 {names} 开始"),
+                            refused: false,
+                        }),
+                    );
                 }
                 for (name, text) in open.skills.drain(..) {
                     out.emit(at, Arc::new(SkillBlock { name, text }));
@@ -1164,8 +1179,9 @@ mod tests {
         let shown = said(&stream);
         assert!(shown.contains("/review this patch"), "{shown}");
         assert!(shown.contains("⎿ Skill: review"), "{shown}");
-        assert_eq!(kinds(&stream), vec!["user", "skill"]);
-        let skill = stream.slots()[1].block();
+        assert_eq!(kinds(&stream), vec!["user", "command", "skill"]);
+        assert!(shown.contains("按 review 开始"), "{shown}");
+        let skill = stream.slots()[2].block();
         let folded = skill
             .content
             .summary(&crate::block::RenderCtx::bare(80))
