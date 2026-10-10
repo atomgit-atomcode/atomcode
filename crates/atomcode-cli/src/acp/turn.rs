@@ -326,14 +326,18 @@ pub(crate) async fn run_turn<W: TurnWire>(
             // what it left behind: one that only answered is done here; one
             // that queued a message has a turn starting, and that turn's facts
             // belong to this request rather than to the next one.
-            Some(AgentEvent::Invoked { id, output, queued })
-                if invoke_id.as_deref() == Some(id.as_ref()) =>
-            {
+            Some(AgentEvent::Invoked {
+                id,
+                output,
+                queued,
+                failed,
+            }) if invoke_id.as_deref() == Some(id.as_ref()) => {
                 if let Some(update) = wire.translate(
                     &AgentEvent::Invoked {
                         id: id.clone(),
                         output,
                         queued,
+                        failed,
                     },
                     &msg_id,
                 ) {

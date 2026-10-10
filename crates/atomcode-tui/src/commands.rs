@@ -3048,6 +3048,27 @@ pub(crate) fn described_command_is_skill(
         })
 }
 
+pub(crate) fn catalog_command_starts_turn(
+    commands: &[atomcode_kernel::agent::CommandDescription],
+    name: &str,
+    args: &str,
+) -> bool {
+    let is_skill = |candidate: &str| {
+        commands.iter().any(|command| {
+            command.name.eq_ignore_ascii_case(candidate) && described_command_is_skill(command)
+        })
+    };
+    if name.eq_ignore_ascii_case("init") || name.eq_ignore_ascii_case("worklog") {
+        commands
+            .iter()
+            .any(|command| command.name.eq_ignore_ascii_case(name))
+    } else if name.eq_ignore_ascii_case("skills") {
+        args.split_whitespace().next().is_some_and(is_skill)
+    } else {
+        is_skill(name)
+    }
+}
+
 #[async_trait]
 impl CommandSet for AgentCatalogCommands {
     fn id(&self) -> &'static str {
@@ -3115,25 +3136,17 @@ impl CommandSet for AgentCatalogCommands {
             .collect()
     }
     fn starts_turn(&self, name: &str, args: &str) -> bool {
-        let commands = self
-            .client
-            .described()
-            .map(|d| d.commands)
-            .unwrap_or_default();
-        let is_skill = |candidate: &str| {
-            commands.iter().any(|command| {
-                command.name.eq_ignore_ascii_case(candidate) && described_command_is_skill(command)
-            })
-        };
-
-        if name.eq_ignore_ascii_case("init") || name.eq_ignore_ascii_case("worklog") {
-            true
-        } else if name.eq_ignore_ascii_case("skills") {
-            args.split_whitespace().next().is_some_and(is_skill)
-        } else {
-            is_skill(name)
-        }
+        catalog_command_starts_turn(
+            &self
+                .client
+                .described()
+                .map(|d| d.commands)
+                .unwrap_or_default(),
+            name,
+            args,
+        )
     }
+
     async fn run(&self, name: &str, args: &str, _ctx: &Context) -> Outcome {
         self.client.invoke(name, args);
         Outcome::Quiet

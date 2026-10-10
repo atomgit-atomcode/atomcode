@@ -393,6 +393,10 @@ pub enum AgentEvent {
     Invoked {
         id: CommandId,
         output: String,
+        /// Whether the catalog command returned an error. Independent of inbox state.
+        /// Older receipts did not report this; None must not be treated as success.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failed: Option<bool>,
         /// Whether the command also left the model something to do.
         ///
         /// Some catalog commands only answer (`policy`, `queue`); some answer
@@ -697,6 +701,29 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn invocation_failure_crosses_the_wire_and_older_receipts_still_read() {
+        let failed = AgentEvent::Invoked {
+            id: "invoke".into(),
+            output: "invalid date".into(),
+            queued: true,
+            failed: Some(true),
+        };
+        let mut wire = serde_json::to_value(&failed).unwrap();
+        assert!(matches!(
+            serde_json::from_value::<AgentEvent>(wire.clone()).unwrap(),
+            AgentEvent::Invoked {
+                failed: Some(true),
+                ..
+            }
+        ));
+        wire["Invoked"].as_object_mut().unwrap().remove("failed");
+        assert!(matches!(
+            serde_json::from_value::<AgentEvent>(wire).unwrap(),
+            AgentEvent::Invoked { failed: None, .. }
+        ));
+    }
+
     /// What a subscriber is told about an agent crosses the wire whole, and a
     /// description written before a field existed still reads.
     #[test]
@@ -742,6 +769,7 @@ mod tests {
             AgentEvent::Invoked {
                 id: "i-1".into(),
                 output: "stopped: scout".into(),
+                failed: Some(false),
                 queued: false,
             },
         ] {

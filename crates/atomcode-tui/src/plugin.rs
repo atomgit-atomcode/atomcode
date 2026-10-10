@@ -209,6 +209,9 @@ struct Views {
     /// A `/model` moved the lead's selection id since the providers list was
     /// last marked ([`AgentClient::take_remark`]).
     remark: bool,
+    /// Invocations whose successful acknowledgement is drawn from session facts.
+    /// Retain the compact line until the reply, so failures can still echo it.
+    turn_invocations: std::collections::HashMap<CommandId, String>,
 }
 
 /// One followed session, as its facts and events have described it.
@@ -482,6 +485,27 @@ impl AgentClient {
     pub fn invoke(&self, name: &str, args: &str) {
         let id = format!("tui-{}", self.receipts.fetch_add(1, Ordering::SeqCst));
         let session = self.session();
+        if crate::commands::catalog_command_starts_turn(
+            &self.described().map(|d| d.commands).unwrap_or_default(),
+            name,
+            args,
+        ) {
+            self.view
+                .lock()
+                .expect("client poisoned")
+                .turn_invocations
+                .insert(
+                    id.clone(),
+                    format!(
+                        "/{name}{}",
+                        if args.trim().is_empty() {
+                            String::new()
+                        } else {
+                            format!(" {}", args.trim())
+                        }
+                    ),
+                );
+        }
         self.command(AgentCommand::Invoke {
             id,
             session,
@@ -5985,6 +6009,16 @@ impl Tui {
                 self.host.claimed(&command)
             }
             AgentEvent::Rejected { command, error } => {
+                if let Some(line) = self
+                    .client
+                    .view
+                    .lock()
+                    .expect("client poisoned")
+                    .turn_invocations
+                    .remove(&command)
+                {
+                    self.host.echo_command(&line);
+                }
                 self.client.answered(&command);
                 // A queued line already handed back when its view was left
                 // mid-stop (`Host::take_stopped`): this is the refusal that was
@@ -6057,9 +6091,28 @@ impl Tui {
                 self.ask_about_policy(intervention);
                 true
             }
-            AgentEvent::Invoked { output, .. } => {
+            AgentEvent::Invoked {
+                id, output, failed, ..
+            } => {
+                let invocation = self
+                    .client
+                    .view
+                    .lock()
+                    .expect("client poisoned")
+                    .turn_invocations
+                    .remove(&id);
+                if let Some(line) = invocation {
+                    if failed == Some(false) {
+                        return false;
+                    }
+                    self.host.echo_command(&line);
+                }
                 if !output.is_empty() {
-                    self.say(&output);
+                    if failed == Some(true) {
+                        self.say_refused(&output);
+                    } else {
+                        self.say(&output);
+                    }
                 }
                 true
             }
@@ -8693,18 +8746,11 @@ impl Tui {
         let host = self.host.clone();
         let line = line.to_string();
         tokio::spawn(async move {
-            // A skill's acknowledgement is projected from its durable
-            // `Injected` + `UserMessage` facts, between the compact invocation
-            // and the folded body. Delivering the command's transient answer
-            // as well races ahead of both and leaves "按 … 开始" above the
-            // command. Other turn-starting commands (notably `/goal`) still
-            // deliver their own answer here.
-            let result_in_transcript = commands.starts_turn(&line);
+            // Catalog dispatch only queues Invoke and returns Quiet. Its
+            // asynchronous answer is handled by on_event; successful turn
+            // acknowledgements belong to the transcript's durable facts.
             let outcome = match commands.dispatch(&line, &ctx).await {
                 crate::command::Outcome::Said(_) if quiet_success => crate::command::Outcome::Quiet,
-                crate::command::Outcome::Said(_) if result_in_transcript => {
-                    crate::command::Outcome::Quiet
-                }
                 other => other,
             };
             if echo
@@ -12238,6 +12284,78 @@ mod midturn_command_tests {
     async fn answered(woken: &mut mpsc::UnboundedReceiver<Wake>) {
         let woke = tokio::time::timeout(std::time::Duration::from_secs(5), woken.recv()).await;
         assert!(matches!(woke, Ok(Some(Wake::Fact))), "the command answered");
+    }
+
+    #[test]
+    fn asynchronous_turn_command_success_does_not_race_the_transcript() {
+        for line in ["/init", "/worklog yesterday", "/review patch"] {
+            for queued in [true, false] {
+                let (host, tui, _) = screen();
+                tui.client
+                    .view
+                    .lock()
+                    .unwrap()
+                    .turn_invocations
+                    .insert("invoke".into(), line.into());
+                let before = kinds(&host);
+                tui.on_event(AgentEvent::Invoked {
+                    id: "invoke".into(),
+                    output: "starting".into(),
+                    queued,
+                    failed: Some(false),
+                });
+                assert_eq!(kinds(&host), before, "{line}, queued={queued}");
+            }
+        }
+    }
+
+    #[test]
+    fn asynchronous_turn_command_failure_keeps_the_invocation_and_error() {
+        let (host, tui, _) = screen();
+        tui.client
+            .view
+            .lock()
+            .unwrap()
+            .turn_invocations
+            .insert("invoke".into(), "/worklog invalid".into());
+        let before = kinds(&host).len();
+        tui.on_event(AgentEvent::Invoked {
+            id: "invoke".into(),
+            output: "invalid date".into(),
+            queued: true,
+            failed: Some(true),
+        });
+        assert_eq!(&kinds(&host)[before..], &["user", "command"]);
+        let stream = host.stream.read().unwrap();
+        let shown = stream
+            .slots()
+            .last()
+            .unwrap()
+            .block()
+            .content
+            .lines(&crate::block::RenderCtx::bare(100));
+        assert!(shown
+            .iter()
+            .any(|line| line.plain().contains("invalid date")));
+    }
+
+    #[test]
+    fn an_older_receipt_cannot_silently_hide_a_command_error() {
+        let (host, tui, _) = screen();
+        tui.client
+            .view
+            .lock()
+            .unwrap()
+            .turn_invocations
+            .insert("invoke".into(), "/worklog invalid".into());
+        let before = kinds(&host).len();
+        tui.on_event(AgentEvent::Invoked {
+            id: "invoke".into(),
+            output: "invalid date".into(),
+            queued: false,
+            failed: None,
+        });
+        assert_eq!(&kinds(&host)[before..], &["user", "command"]);
     }
 
     /// `/status` typed while a reply was still arriving had its echo put in at

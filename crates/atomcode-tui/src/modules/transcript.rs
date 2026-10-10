@@ -302,6 +302,32 @@ impl Producer for Transcript {
                 } else {
                     out.emit(at, Arc::new(UserSaid(text.clone())));
                 }
+                let command = text.split_whitespace().next().unwrap_or("");
+                let english = crate::i18n::current_locale() == crate::i18n::Locale::En;
+                let acknowledgement = if command.eq_ignore_ascii_case("/init") {
+                    Some(if english {
+                        "Reading the repository to write its instruction file."
+                    } else {
+                        "正在读这个仓库,准备写它的说明文件。"
+                    })
+                } else if command.eq_ignore_ascii_case("/worklog") {
+                    Some(if english {
+                        "Put the recap of that day in the conversation."
+                    } else {
+                        "把那天的工作复盘放进对话了。"
+                    })
+                } else {
+                    None
+                };
+                if let Some(text) = acknowledgement {
+                    out.emit(
+                        at,
+                        Arc::new(CommandSaid {
+                            text: text.into(),
+                            refused: false,
+                        }),
+                    );
+                }
                 if !open.skills.is_empty() {
                     let names = open
                         .skills
@@ -1189,6 +1215,31 @@ mod tests {
         assert!(folded.contains("⎿ Skill: review"), "{folded}");
         assert!(!folded.contains("SKILL.md body"), "{folded}");
         assert!(shown.contains("SKILL.md body"), "{shown}");
+    }
+
+    #[test]
+    fn built_in_command_acknowledgements_follow_the_invocation_before_the_reply() {
+        for invocation in ["/init", "/worklog", "/worklog yesterday"] {
+            let stream = fold(&[
+                SessionEvent::TurnStart { turn: 1 },
+                SessionEvent::UserMessage {
+                    turn: 1,
+                    text: invocation.into(),
+                    images: Vec::new(),
+                },
+                SessionEvent::AssistantChunk {
+                    turn: 1,
+                    round: 1,
+                    delta: "answer".into(),
+                    reasoning: false,
+                },
+            ]);
+            assert_eq!(
+                kinds(&stream),
+                vec!["user", "command", "assistant"],
+                "{invocation}"
+            );
+        }
     }
 
     /// Esc before the model said anything takes the turn back, and the undo that

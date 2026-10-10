@@ -1187,13 +1187,20 @@ pub fn run_catalog_command(
 ) {
     tokio::spawn(async move {
         let agent = target.clone();
-        let output = command.run(target, &args).await.unwrap_or_else(|e| e);
+        let result = command.run(target, &args).await;
+        let failed = result.is_err();
+        let output = result.unwrap_or_else(|e| e);
         // Asked here because here is where it can be answered: the command has
         // run, and whatever it queued is in this agent's inbox now. A caller
         // deciding "is a turn coming" cannot see that — the field's own doc
         // says what goes wrong when it guesses.
         let queued = agent.inbox().has_waking_input();
-        let _ = events.send(AgentEvent::Invoked { id, output, queued });
+        let _ = events.send(AgentEvent::Invoked {
+            id,
+            output,
+            queued,
+            failed: Some(failed),
+        });
     });
 }
 

@@ -317,7 +317,16 @@ async fn skills_with_names_on_it_runs_them_together_rather_than_listing() {
             .waiting_from(atomcode_harness::agent::MessageOrigin::User),
         "and it is waiting as the person's own message, not a listing"
     );
-    let queued = agent.inbox().claim().message.expect("a message was queued");
+    let claimed = agent.inbox().claim();
+    assert_eq!(
+        claimed.message.as_deref(),
+        Some("/skills plan review fix the auth bug")
+    );
+    assert_eq!(claimed.injections.len(), 1);
+    let (queued, origin) = &claimed.injections[0];
+    assert!(
+        matches!(origin, atomcode_harness::session::InjectionOrigin::Skill { name } if name == "plan · review")
+    );
     assert!(
         queued.contains("Lay it out first.") && queued.contains("Then read it back."),
         "both skills are in it: {queued}"
