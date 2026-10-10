@@ -174,7 +174,11 @@ impl View for Live {
             let mut out = Vec::new();
             let note = u16::from(stopped_note(vp.moment));
             if note > 0 {
-                let note = t(Msg::ComposerInterrupted).into_owned();
+                let note = format!(
+                    "{} {}",
+                    vp.moment.caps.g(Glyph::Sparkle),
+                    t(Msg::ComposerInterrupted)
+                );
                 out.extend(El::row(vec![El::styled(note, theme::fg(Role::Muted))]).lay(w));
             }
             out.extend(match waiting_on_background(state, vp.moment) {
@@ -361,7 +365,7 @@ fn showing(state: &State, moment: &Moment) -> Option<String> {
 }
 
 /// Whether the turn the person stopped is closed with the dim
-/// `已中断 · 接下来做什么？` line: they stopped it themselves (Escape — not a
+/// `✻ 已中断 · 接下来做什么？` line: they stopped it themselves (Escape — not a
 /// cancel the runtime made, such as a model switch), and it is idle now, so the
 /// line does not sit under a turn still landing. It stays until the next
 /// prompt is sent (`moment.interrupted`, cleared in `Action::Submit`). Not
@@ -635,7 +639,11 @@ mod tests {
         let state = State::default();
         let drawn = line_at(&state, &m, 80);
         assert!(
-            drawn.starts_with(t(Msg::ComposerInterrupted).as_ref()),
+            drawn.starts_with(&format!(
+                "{} {}",
+                m.caps.g(Glyph::Sparkle),
+                t(Msg::ComposerInterrupted)
+            )),
             "standalone status without a tool-result gutter: {drawn:?}"
         );
         assert_eq!(Live::height(&state, &m, 80), Height::Hug(1));
