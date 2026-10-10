@@ -3111,6 +3111,16 @@ impl CommandSet for AgentCatalogCommands {
             })
             .collect()
     }
+    fn starts_turn(&self, name: &str) -> bool {
+        self.client
+            .described()
+            .map(|d| d.commands)
+            .unwrap_or_default()
+            .iter()
+            .any(|command| {
+                command.name.eq_ignore_ascii_case(name) && described_command_is_skill(command)
+            })
+    }
     async fn run(&self, name: &str, args: &str, _ctx: &Context) -> Outcome {
         self.client.invoke(name, args);
         Outcome::Quiet

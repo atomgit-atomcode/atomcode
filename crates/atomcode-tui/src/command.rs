@@ -278,6 +278,12 @@ pub trait CommandSet: Send + Sync {
     fn hidden(&self) -> Vec<Command> {
         Vec::new()
     }
+    /// Whether running this command starts a durable user turn of its own.
+    /// Front ends defer their transient command echo for these, so the
+    /// committed `UserMessage` is the one visible copy.
+    fn starts_turn(&self, _name: &str) -> bool {
+        false
+    }
     /// Whether this set's rows belong in `/help`.
     ///
     /// Yes for the sets that make up this build's own command surface. No for
@@ -563,6 +569,18 @@ impl Commands {
                     .any(|c| c.answers_to(name))
             })
             .cloned()
+    }
+
+    /// Whether a whole typed line names a command that commits its own user
+    /// message. Arguments do not affect ownership.
+    pub fn starts_turn(&self, line: &str) -> bool {
+        let name = line
+            .trim()
+            .trim_start_matches('/')
+            .split_whitespace()
+            .next()
+            .unwrap_or("");
+        self.owner(name).is_some_and(|set| set.starts_turn(name))
     }
 
     /// Dispatch a whole typed line, slash and all.

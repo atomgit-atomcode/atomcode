@@ -2224,6 +2224,49 @@ impl Content for NoticeBlock {
     }
 }
 
+/// Instructions loaded by a slash-invoked skill.
+///
+/// The invocation itself remains the user's visible message. The expanded
+/// SKILL.md is still inspectable, but starts behind a one-line lid so running a
+/// skill does not replace the conversation with its implementation document.
+#[derive(Debug)]
+pub struct SkillBlock {
+    pub name: String,
+    pub text: String,
+}
+
+impl SkillBlock {
+    fn lid(&self, ctx: &RenderCtx, hint: PMsg) -> Line {
+        let w = ctx.width as usize;
+        let gutter = format!("{} ", ctx.caps.g(Glyph::Gutter));
+        let mut line = Line::styled(format!("  {gutter}Skill: {}", self.name), muted());
+        let hint = format!("  {}", pt(hint));
+        let room = w.saturating_sub(line.width());
+        line.push(Span::styled(width::take_width(&hint, room), tail_ink()));
+        line.truncate(w)
+    }
+}
+
+impl Content for SkillBlock {
+    fn kind(&self) -> &'static str {
+        "skill"
+    }
+
+    fn content_hash(&self) -> ContentHash {
+        hash_of(&["skill", &self.name, &self.text])
+    }
+
+    fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+        let mut out = vec![self.lid(ctx, PMsg::LidCollapseHint)];
+        out.extend(wrapped(&self.text, ctx.width, Style::new(), "     "));
+        out
+    }
+
+    fn summary(&self, ctx: &RenderCtx) -> Line {
+        self.lid(ctx, PMsg::LidExpandHint)
+    }
+}
+
 /// Model-visible context the harness added on its own initiative.
 #[derive(Debug)]
 pub struct InjectedBlock {

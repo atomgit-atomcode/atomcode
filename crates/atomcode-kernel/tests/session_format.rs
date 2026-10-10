@@ -14,6 +14,19 @@
 
 use atomcode_kernel::session::InjectionOrigin;
 
+#[test]
+fn a_skill_injection_names_what_supplied_the_hidden_context() {
+    let origin = InjectionOrigin::Skill {
+        name: "review".into(),
+    };
+    let json = serde_json::to_string(&origin).unwrap();
+    assert_eq!(json, r#"{"skill":{"name":"review"}}"#);
+    assert_eq!(
+        serde_json::from_str::<InjectionOrigin>(&json).unwrap(),
+        origin
+    );
+}
+
 /// Read off a build that predates the field: nothing outside, and it could not
 /// have been anything else — only a peer of this tree could be reported then.
 #[test]

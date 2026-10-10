@@ -8529,12 +8529,12 @@ impl Tui {
         // echo until the command answers: on success the committed UserMessage
         // is the durable, replayable copy; on refusal the command still has to
         // be shown so the error has a visible question above it.
-        let goal_starts_turn = starts_goal_turn(line);
+        let command_starts_turn = starts_goal_turn(line) || self.host.commands.starts_turn(line);
         if self.turn_running() {
-            self.spawn_command(line, false, true, goal_starts_turn);
+            self.spawn_command(line, false, true, command_starts_turn);
             return;
         }
-        if goal_starts_turn {
+        if command_starts_turn {
             self.spawn_command(line, false, true, true);
         } else {
             self.host.echo_command(line);
@@ -8560,7 +8560,13 @@ impl Tui {
     /// folds a success's `Said` into `Quiet` so the success stays off the
     /// screen while a refusal keeps talking. `echo` puts the line itself in the
     /// conversation just before what it said ([`Tui::run_typed_command`]).
-    fn spawn_command(&self, line: &str, quiet_success: bool, echo: bool, goal_starts_turn: bool) {
+    fn spawn_command(
+        &self,
+        line: &str,
+        quiet_success: bool,
+        echo: bool,
+        command_starts_turn: bool,
+    ) {
         let (Some(ctx), Some(keys)) = (
             self.ctx.lock().expect("ctx poisoned").clone(),
             self.wake.lock().expect("wake poisoned").clone(),
@@ -8575,7 +8581,13 @@ impl Tui {
                 crate::command::Outcome::Said(_) if quiet_success => crate::command::Outcome::Quiet,
                 other => other,
             };
-            if echo && !(goal_starts_turn && matches!(&outcome, crate::command::Outcome::Said(_))) {
+            if echo
+                && !(command_starts_turn
+                    && matches!(
+                        &outcome,
+                        crate::command::Outcome::Said(_) | crate::command::Outcome::Quiet
+                    ))
+            {
                 host.echo_command(&line);
             }
             deliver(&host, &keys, outcome);
@@ -12377,5 +12389,13 @@ mod skills_menu_tests {
         assert_eq!(m.caret, m.input.len());
         drop(m);
         assert!(!host.menu_open(), "the next words are the skill's task");
+    }
+
+    #[test]
+    fn a_direct_skill_command_defers_to_its_committed_user_message() {
+        let (host, _) = screen();
+        assert!(host.commands.starts_turn("/code fix the test"));
+        assert!(host.commands.starts_turn("/brainstorming"));
+        assert!(!host.commands.starts_turn("/skills code fix the test"));
     }
 }

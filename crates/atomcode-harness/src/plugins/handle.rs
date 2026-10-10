@@ -506,6 +506,11 @@ impl Projector {
             // and the model's request and stopped, so a team member's report was
             // invisible to the person it was being reported to.
             SessionEvent::Injected { text, origin, .. } => {
+                // The person's compact `/skill …` message is the presentation;
+                // the expanded body remains in the log for the model and resume.
+                if matches!(origin, crate::session::InjectionOrigin::Skill { .. }) {
+                    return Vec::new();
+                }
                 self.answering_a_nudge =
                     matches!(origin, crate::session::InjectionOrigin::InternalNudge);
                 use crate::session::InjectionOrigin as In;
@@ -516,6 +521,7 @@ impl Projector {
                         In::Peer { from, .. } => Out::Peer { from: from.clone() },
                         In::Memory => Out::Memory,
                         In::Reminder => Out::Reminder,
+                        In::Skill { .. } => unreachable!("handled above"),
                         In::Continuation => Out::Continuation,
                         In::InternalNudge => Out::Continuation,
                         In::CompactionSummary => Out::CompactionSummary,

@@ -61,6 +61,10 @@ pub enum InjectionOrigin {
     Memory,
     /// A `<system-reminder>` style runtime note.
     Reminder,
+    /// Expanded instructions loaded by a person-invoked skill. The invocation
+    /// itself is the user message; this body is model-visible implementation
+    /// context and front ends must not present it as words the person typed.
+    Skill { name: String },
     /// A continuation the harness itself asked for.
     Continuation,
     /// A nudge the harness asked for, whose talking-only answer is not shown.
@@ -549,10 +553,13 @@ impl SessionEvent {
 /// **12** — added [`NoticeKind::MemberNotRestored`]: a team member a resume
 /// could not bring back, told the same way.
 ///
+/// **13** — added [`InjectionOrigin::Skill`]: expanded skill instructions are
+/// logged for replay without being presented as the person's typed message.
+///
 /// A file's header records the version that created it; a later build may
 /// append facts of a kind added since. A reader that meets a kind it does not
 /// know treats the file as newer than itself, the same refusal.
-pub const SESSION_FORMAT_VERSION: u32 = 12;
+pub const SESSION_FORMAT_VERSION: u32 = 13;
 
 /// One replacement a [`SessionEvent::MessagesRewritten`] makes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1190,6 +1197,7 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<TracedMessage> {
                     // user run (`merge_consecutive_user`, which names this very
                     // case), OpenAI/Ollama tolerate the adjacency.
                     InjectionOrigin::Reminder => Message::user(text),
+                    InjectionOrigin::Skill { .. } => Message::user(text),
                     // The person's own words, but to a member rather than to
                     // this agent: something the member now acts on, which the
                     // lead coordinates around rather than overrides.

@@ -15,8 +15,8 @@ use atomcode_harness::session::{InjectionOrigin, SessionEvent};
 
 use crate::block::{BlockId, Coord, StreamWriter};
 use crate::content::{
-    ChoiceBlock, InjectedBlock, ModelSaid, ModelThought, NoticeBlock, Outcome, ToolCallBlock,
-    TurnEndBlock, TurnStats, UserSaid,
+    ChoiceBlock, InjectedBlock, ModelSaid, ModelThought, NoticeBlock, Outcome, SkillBlock,
+    ToolCallBlock, TurnEndBlock, TurnStats, UserSaid,
 };
 use crate::module::Producer;
 
@@ -57,6 +57,10 @@ struct Open {
     /// The last thing the turn in flight said, for whether it stopped on a
     /// question to the person.
     last_reply: String,
+    /// Expanded slash-invoked skills arrive before their compact user message
+    /// in the authoritative log. Hold them long enough to draw them under that
+    /// invocation, where a tool result would appear.
+    skills: Vec<(String, String)>,
 }
 
 /// Turns session facts into what a person reads.
@@ -166,6 +170,7 @@ fn origin_label(origin: &InjectionOrigin) -> String {
         InjectionOrigin::Peer { .. } => t(Msg::InjectedFromLead).into_owned(),
         InjectionOrigin::Memory => "memory".into(),
         InjectionOrigin::Reminder => "reminder".into(),
+        InjectionOrigin::Skill { name } => format!("skill:{name}"),
         InjectionOrigin::Continuation => "continuation".into(),
         InjectionOrigin::InternalNudge => "nudge".into(),
         InjectionOrigin::CompactionSummary => "compaction summary".into(),
@@ -191,6 +196,7 @@ pub(crate) fn origin_kind(origin: &InjectionOrigin) -> &'static str {
         InjectionOrigin::Peer { .. } => "injected:peer",
         InjectionOrigin::Memory => "injected:memory",
         InjectionOrigin::Reminder => "injected:reminder",
+        InjectionOrigin::Skill { .. } => "injected:skill",
         InjectionOrigin::Continuation => "injected:continuation",
         InjectionOrigin::InternalNudge => "injected:nudge",
         InjectionOrigin::CompactionSummary => "injected:compaction",
@@ -295,6 +301,9 @@ impl Producer for Transcript {
                     );
                 } else {
                     out.emit(at, Arc::new(UserSaid(text.clone())));
+                }
+                for (name, text) in open.skills.drain(..) {
+                    out.emit(at, Arc::new(SkillBlock { name, text }));
                 }
             }
 
@@ -532,6 +541,13 @@ impl Producer for Transcript {
             }
 
             SessionEvent::Injected { text, origin, .. } => {
+                // The log commits model context before the user message it
+                // accompanies. Keep that authority and only reorder its visual
+                // projection: `/name args`, then a folded, inspectable body.
+                if let InjectionOrigin::Skill { name } = origin {
+                    open.skills.push((name.clone(), text.clone()));
+                    return;
+                }
                 // A member's report is drawn the way a background result is: a
                 // head that says who came back, and the report under it, folded
                 // until a click (`Presentation::default_folds`). Raw, it was the
@@ -1126,6 +1142,37 @@ mod tests {
 
     fn kinds(s: &Stream) -> Vec<&'static str> {
         s.slots().iter().map(|x| x.block().kind()).collect()
+    }
+
+    #[test]
+    fn a_skill_body_is_inspectable_but_not_a_second_user_block() {
+        let stream = fold(&[
+            SessionEvent::TurnStart { turn: 1 },
+            SessionEvent::Injected {
+                turn: 1,
+                text: "# very long SKILL.md body".into(),
+                origin: InjectionOrigin::Skill {
+                    name: "review".into(),
+                },
+            },
+            SessionEvent::UserMessage {
+                turn: 1,
+                text: "/review this patch".into(),
+                images: Vec::new(),
+            },
+        ]);
+        let shown = said(&stream);
+        assert!(shown.contains("/review this patch"), "{shown}");
+        assert!(shown.contains("⎿ Skill: review"), "{shown}");
+        assert_eq!(kinds(&stream), vec!["user", "skill"]);
+        let skill = stream.slots()[1].block();
+        let folded = skill
+            .content
+            .summary(&crate::block::RenderCtx::bare(80))
+            .plain();
+        assert!(folded.contains("⎿ Skill: review"), "{folded}");
+        assert!(!folded.contains("SKILL.md body"), "{folded}");
+        assert!(shown.contains("SKILL.md body"), "{shown}");
     }
 
     /// Esc before the model said anything takes the turn back, and the undo that

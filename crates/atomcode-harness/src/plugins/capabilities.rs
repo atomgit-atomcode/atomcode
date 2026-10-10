@@ -535,9 +535,9 @@ fn catalog_has(ctx: &Context, name: &str) -> bool {
 
 /// One skill, as a command a person runs.
 ///
-/// Running it queues the expanded skill as **the person's own message**: a
-/// skill is a prompt someone wrote to send, and sending it is a turn like any
-/// other — logged as theirs, answerable, undoable.
+/// Running it queues the person's compact invocation as their message and the
+/// expanded skill as model-visible context. Both are logged, answerable and
+/// undoable, while a front end never has to pretend the whole SKILL.md was typed.
 struct RunSkill(Arc<atomcode_capabilities::skills::Skill>);
 
 #[async_trait]
@@ -556,8 +556,10 @@ impl crate::commands::CatalogCommand for RunSkill {
         if text.trim().is_empty() {
             return Err(format!("`{}` 展开之后是空的", bare_name(&self.0.name)));
         }
-        agent.send(text);
-        Ok(format!("按 `{}` 开始", bare_name(&self.0.name)))
+        let name = bare_name(&self.0.name);
+        agent.inject(text, InjectionOrigin::Skill { name: name.clone() });
+        agent.send(skill_invocation(&name, args));
+        Ok(format!("按 `{name}` 开始"))
     }
 
     // Generated from a SKILL.md on disk: it yields its name to any built-in of
@@ -681,7 +683,17 @@ impl ListSkills {
         }
         // One turn, with a rule between them: sent as several the first would
         // be answered before the second was read.
-        agent.send(blocks.join("\n\n---\n\n"));
+        agent.inject(
+            blocks.join("\n\n---\n\n"),
+            InjectionOrigin::Skill {
+                name: names
+                    .iter()
+                    .map(|name| bare_name(name))
+                    .collect::<Vec<_>>()
+                    .join(" · "),
+            },
+        );
+        agent.send(skill_invocation("skills", args));
         // Named back, because a misspelled second name is not an error — it
         // quietly became the first word of the task, and this line is where
         // that becomes visible.
@@ -693,6 +705,15 @@ impl ListSkills {
                 .collect::<Vec<_>>()
                 .join(" · ")
         ))
+    }
+}
+
+fn skill_invocation(name: &str, args: &str) -> String {
+    let args = args.trim();
+    if args.is_empty() {
+        format!("/{name}")
+    } else {
+        format!("/{name} {args}")
     }
 }
 

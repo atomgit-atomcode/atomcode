@@ -188,13 +188,18 @@ async fn a_skill_a_person_can_invoke_is_a_command_the_agent_can_run() {
         .into_iter()
         .find(|a| a.parent().is_none())
         .expect("the conversation's own agent");
-    let offered: Vec<String> = ctx
-        .service::<CommandsSvc>()
-        .expect("the command catalog")
+    let commands = ctx.service::<CommandsSvc>().expect("the command catalog");
+    let offered: Vec<String> = commands
         .offered_for(&agent)
         .into_iter()
         .map(|c| c.name)
         .collect();
+    let command = commands.find("demo-skill", &agent).expect("skill command");
+    command
+        .run(agent.clone(), "tidy this")
+        .await
+        .expect("skill runs");
+    let claimed = agent.inbox().claim();
     mounted.shutdown().await;
 
     assert!(
@@ -202,4 +207,10 @@ async fn a_skill_a_person_can_invoke_is_a_command_the_agent_can_run() {
         "a skill a person may invoke must be a command the agent can run — \
          `/demo-skill` is how they run it, and the classic front end offered it: {offered:?}"
     );
+    assert_eq!(claimed.message.as_deref(), Some("/demo-skill tidy this"));
+    assert!(matches!(
+        claimed.injections.as_slice(),
+        [(text, atomcode_harness::session::InjectionOrigin::Skill { name })]
+            if text.contains("Do the thing.") && name == "demo-skill"
+    ));
 }

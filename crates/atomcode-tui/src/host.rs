@@ -228,6 +228,9 @@ impl Presentation {
             // recognition is the model's crutch for a picture it cannot see, not
             // the conversation, so it stays out of the way until a click asks.
             ("vl_caption", Showing::Folded),
+            // A slash invocation is the visible request; its expanded SKILL.md
+            // remains available under a compact `⎿ Skill: name` lid.
+            ("skill", Showing::Folded),
             // A background job's report folds to `● 后台「…」的结果回来了`: the
             // conversation that started it answers right under it in its own
             // words, so the report itself is a click away, not said twice.
@@ -607,10 +610,11 @@ impl Presentation {
 /// by default to `● 后台「…」的结果回来了  点击展开`, with the conversation that
 /// started the job answering under it — and, left out of this list, a row that
 /// promised a click and answered none.
-const CLICKABLE: [&str; 6] = [
+const CLICKABLE: [&str; 7] = [
     "tool_call",
     "reasoning",
     "vl_caption",
+    "skill",
     "injected:background",
     "injected:peer",
     "choice",
@@ -682,6 +686,11 @@ fn blank_between(upper: &str, lower: &str, calls_apart: bool) -> bool {
     // should not butt up against the previous turn's last line or a compaction
     // notice — one blank row sets the question apart from what came before).
     if upper == "user" || lower == "user" {
+        // A skill body belongs directly under the slash invocation, like a
+        // tool result under its call; the `⎿` gutter already supplies the seam.
+        if upper == "user" && lower == "skill" {
+            return false;
+        }
         return true;
     }
     // The recap under a turn, and a result that came back from elsewhere — a
@@ -13823,6 +13832,44 @@ mod tests {
             folded,
             "clicking it again is the inverse"
         );
+    }
+
+    #[test]
+    fn clicking_a_slash_skill_opens_and_closes_its_instructions() {
+        let h = host();
+        h.absorb(&SessionEvent::TurnStart { turn: 1 });
+        h.absorb(&SessionEvent::Injected {
+            turn: 1,
+            text: "# THE-SKILL-BODY\n\nFollow these instructions.".into(),
+            origin: atomcode_kernel::session::InjectionOrigin::Skill {
+                name: "review".into(),
+            },
+        });
+        h.absorb(&SessionEvent::UserMessage {
+            turn: 1,
+            text: "/review this patch".into(),
+            images: Vec::new(),
+        });
+
+        let size = (80, 40);
+        let folded = h.compose(size).rows().join("\n");
+        assert!(folded.contains("/review this patch"), "{folded}");
+        assert!(folded.contains("⎿ Skill: review"), "{folded}");
+        assert!(folded.contains("点击展开"), "{folded}");
+        assert!(!folded.contains("THE-SKILL-BODY"), "{folded}");
+
+        let rect = h.compose(size).part("stream").unwrap().rect;
+        let (id, kind) = (rect.y..rect.bottom())
+            .filter_map(|y| h.block_at(2, y))
+            .find(|(_, kind)| *kind == "skill")
+            .expect("the folded skill answers a click");
+        h.toggle_block(id, kind);
+        let open = h.compose(size).rows().join("\n");
+        assert!(open.contains("THE-SKILL-BODY"), "{open}");
+        assert!(open.contains("点击收起"), "{open}");
+
+        h.toggle_block(id, kind);
+        assert_eq!(h.compose(size).rows().join("\n"), folded);
     }
 
     /// A background job's report is folded to its one line, which says
