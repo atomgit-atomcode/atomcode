@@ -21,8 +21,7 @@ use crate::modules::chrome::{
 };
 use crate::moment::{Moment, Viewport};
 use crate::plugins::{
-    AddMarketForm, Form, Listed, MarketForm, Panel, PluginAction, PluginForm, PluginsView, Scope,
-    ScopeForm, Tab,
+    AddMarketForm, Form, Listed, MarketForm, Panel, PluginForm, PluginsView, Scope, ScopeForm, Tab,
 };
 use crate::theme::{self, Role};
 use crate::width;
@@ -153,7 +152,10 @@ fn layout(view: &PluginsView, panel: &Panel, h: usize) -> Vec<Row> {
                     }
                 }
                 Form::Plugin(_) => {
-                    for at in 0..PluginAction::ALL.len() {
+                    let Form::Plugin(form) = form else {
+                        unreachable!()
+                    };
+                    for at in 0..form.actions().len() {
                         rows.push(Row::Choice(at));
                     }
                 }
@@ -345,6 +347,16 @@ fn listed_line(
             if let Some(scope) = row.installed {
                 about.push(scope.short().to_string());
             }
+            if let Some(trusted) = row.hook_trusted {
+                about.push(
+                    t(if trusted {
+                        Msg::PluginHookTrustedShort
+                    } else {
+                        Msg::PluginHookUntrustedShort
+                    })
+                    .into_owned(),
+                );
+            }
             if !row.description.is_empty() {
                 about.push(row.description.clone());
             }
@@ -452,8 +464,9 @@ fn choice_line(panel: &Panel, at: usize, w: usize, caps: crate::caps::Caps) -> L
                 at == *cursor,
             )
         }
-        Form::Plugin(PluginForm { at: cursor, .. }) => {
-            let Some(action) = PluginAction::ALL.get(at).copied() else {
+        Form::Plugin(form @ PluginForm { at: cursor, .. }) => {
+            let actions = form.actions();
+            let Some(action) = actions.get(at).copied() else {
                 return Line::empty();
             };
             (
@@ -630,6 +643,7 @@ mod tests {
             marketplace: market.into(),
             description: about.into(),
             installed,
+            hook_trusted: None,
         }
     }
 
@@ -768,6 +782,22 @@ mod tests {
         assert!(
             !text.contains("看一眼改了什么"),
             "and none of what it says either:\n{text}"
+        );
+    }
+
+    #[test]
+    fn an_installed_plugin_shows_its_hook_trust_state() {
+        let mut row = plugin("hooks", "official", "does work", Some(Scope::User));
+        row.hook_trusted = Some(false);
+        let m = Moment {
+            plugins: PluginsView::new(vec![row], vec![]),
+            plugins_panel: Some(Panel::new()),
+            ..Moment::default()
+        };
+        let screen = drawn(&m, 100, 20);
+        assert!(
+            screen.contains(t(Msg::PluginHookUntrustedShort).as_ref()),
+            "{screen}"
         );
     }
 

@@ -4845,6 +4845,20 @@ impl Tui {
                 .into_owned(),
                 format!("{plugin}@{marketplace}"),
             ),
+            Step::Trust {
+                plugin,
+                marketplace,
+            } => (
+                format!("{} {plugin}@{marketplace}…", t(Msg::PluginActionTrust)),
+                format!("trust:{plugin}@{marketplace}"),
+            ),
+            Step::Untrust {
+                plugin,
+                marketplace,
+            } => (
+                format!("{} {plugin}@{marketplace}…", t(Msg::PluginActionUntrust)),
+                format!("untrust:{plugin}@{marketplace}"),
+            ),
             Step::AddMarket { url } => (
                 t(Msg::MarketFetching { what: url }).into_owned(),
                 format!("market:{url}"),
@@ -4882,6 +4896,14 @@ impl Tui {
                     marketplace,
                     scope,
                 } => port.uninstall(&plugin, &marketplace, scope).await,
+                Step::Trust {
+                    plugin,
+                    marketplace,
+                } => port.trust(&plugin, &marketplace).await,
+                Step::Untrust {
+                    plugin,
+                    marketplace,
+                } => port.untrust(&plugin, &marketplace).await,
                 Step::AddMarket { url } => port.add_market(&url).await,
                 Step::UpdateMarket { name } => port.update_market(&name).await,
                 Step::RemoveMarket { name } => port.remove_market(&name).await,

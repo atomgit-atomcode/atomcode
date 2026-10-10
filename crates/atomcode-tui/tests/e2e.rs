@@ -8441,7 +8441,19 @@ impl Recorded {
             .lock()
             .expect("recording poisoned")
             .iter()
-            .any(|line| line == "install tidy@official user");
+            .any(|line| line.starts_with("install tidy@official "));
+        let trusted = self
+            .did
+            .lock()
+            .expect("recording poisoned")
+            .iter()
+            .rev()
+            .find_map(|line| match line.as_str() {
+                "trust tidy@official" => Some(true),
+                "untrust tidy@official" => Some(false),
+                _ => None,
+            })
+            .unwrap_or(false);
         atomcode_tui::plugins::PluginsView::new(
             vec![
                 PluginRow {
@@ -8449,12 +8461,14 @@ impl Recorded {
                     marketplace: "official".into(),
                     description: "把代码排整齐".into(),
                     installed: installed.then_some(Scope::User),
+                    hook_trusted: installed.then_some(trusted),
                 },
                 PluginRow {
                     name: "lens".into(),
                     marketplace: "official".into(),
                     description: "看一眼改了什么".into(),
                     installed: None,
+                    hook_trusted: None,
                 },
             ],
             vec![MarketRow {
@@ -8507,6 +8521,14 @@ impl atomcode_tui::plugins::Plugins for Recorded {
     ) -> Result<String, String> {
         self.note(format!("uninstall {plugin}@{market}"));
         Ok(format!("卸掉了 {plugin}@{market}"))
+    }
+    async fn trust(&self, plugin: &str, market: &str) -> Result<String, String> {
+        self.note(format!("trust {plugin}@{market}"));
+        Ok(format!("已信任 {plugin}@{market}"))
+    }
+    async fn untrust(&self, plugin: &str, market: &str) -> Result<String, String> {
+        self.note(format!("untrust {plugin}@{market}"));
+        Ok(format!("已取消信任 {plugin}@{market}"))
     }
     async fn add_market(&self, url: &str) -> Result<String, String> {
         self.note(format!("add {url}"));
@@ -8646,6 +8668,18 @@ async fn plugin_subcommands_do_the_same_jobs_from_the_line() {
 
     s.term.type_line("/plugin list");
     until(&s, "tidy@official").await;
+
+    s.term.type_line("/plugin trust tidy");
+    until(&s, "已信任 tidy@official").await;
+    s.term.type_line("/plugin untrust tidy@official");
+    until(&s, "已取消信任 tidy@official").await;
+    assert!(
+        port.did.lock().expect("recording poisoned").ends_with(&[
+            "trust tidy@official".to_string(),
+            "untrust tidy@official".to_string()
+        ]),
+        "typed trust operations reach the same port"
+    );
 
     s.term.type_line("/plugin install nothing-by-that-name");
     until(&s, "没有叫 nothing-by-that-name 的插件").await;
