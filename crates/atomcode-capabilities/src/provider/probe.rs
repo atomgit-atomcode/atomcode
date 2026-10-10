@@ -135,6 +135,7 @@ fn classify(status: u16, content_type: &str, body: &str, asked_model: bool) -> S
         .and_then(provider_error_code);
     let missing_model = names_a_missing_model(&detail, code.as_deref());
     let model_access_refusal = names_a_model_access_refusal(&detail, code.as_deref());
+    let probe_validation_refusal = names_a_probe_validation_refusal(&detail);
     let trimmed = body.trim_start();
     let is_page = content_type.to_ascii_lowercase().contains("html") || trimmed.starts_with('<');
     let speaks_json =
@@ -183,6 +184,11 @@ fn classify(status: u16, content_type: &str, body: &str, asked_model: bool) -> S
                 Seen::Endpoint
             }
         }
+        // Some OpenAI-compatible gateways incorrectly wrap request validation
+        // in HTTP 500. The probe deliberately sends no messages so it cannot
+        // generate or bill; a complaint about that exact field still proves
+        // that the selected model reached the chat/completions handler.
+        _ if speaks_json && probe_validation_refusal => Seen::Endpoint,
         404 | 405 => Seen::NotHere(format!("HTTP {status}")),
         // A web page where an API answer should be. Only a success status says the
         // address is wrong: a 5xx or 429 page is an outage or a challenge in front
@@ -252,6 +258,20 @@ fn names_a_model_access_refusal(detail: &str, code: Option<&str>) -> bool {
         && ["not allowed", "not authorized", "no access", "permission"]
             .iter()
             .any(|needle| detail.contains(needle))
+}
+
+fn names_a_probe_validation_refusal(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    detail.contains("messages")
+        && [
+            "is required",
+            "are required",
+            "must not be empty",
+            "cannot be empty",
+            "at least one",
+        ]
+        .iter()
+        .any(|needle| detail.contains(needle))
 }
 
 /// Ask `base_url` once. `Err` is a transport failure, with its reason.
@@ -378,6 +398,20 @@ mod tests {
             classify(422, "application/json", body, true),
             Seen::Endpoint
         );
+        let mislabeled_500 = r#"{"error":{"message":"litellm.InternalServerError: Exception - field messages is required. Received Model Group=myth-2","type":null,"param":null,"code":"500"}}"#;
+        assert_eq!(
+            classify(500, "application/json", mislabeled_500, true),
+            Seen::Endpoint
+        );
+        assert!(matches!(
+            classify(
+                500,
+                "application/json",
+                r#"{"error":{"message":"upstream unavailable"}}"#,
+                true
+            ),
+            Seen::Other(500, _, true)
+        ));
     }
 
     #[test]
