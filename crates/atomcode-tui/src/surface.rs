@@ -5,6 +5,9 @@
 //! it. Two implementations ship — a real terminal and a headless recorder —
 //! and every test above this line runs against the second one, with no tty.
 
+#[path = "link_pointer.rs"]
+mod link_pointer;
+
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
@@ -183,6 +186,9 @@ pub trait Surface: Send + Sync {
         None
     }
 
+    /// Observe input without requiring a repaint, for terminal-owned link feedback.
+    fn observe_input(&self, _input: &Input) {}
+
     /// What the terminal on the other end can render.
     ///
     /// Detected once, here, because this is the only layer allowed to touch the
@@ -217,7 +223,9 @@ pub trait Surface: Send + Sync {
     /// motion is worth taking only for as long as something on screen follows
     /// the pointer. The composer's context menu does — it lights the row the
     /// pointer is over — so it turns this on while it is open and off again
-    /// when it closes. Asking for what is already the case does nothing.
+    /// when it closes. Supported terminal surfaces also keep motion enabled
+    /// for link hover while they own the mouse. Asking for what is already the
+    /// case does nothing.
     fn set_motion(&self, _on: bool) {}
 
     /// Whether free motion is currently requested.
@@ -819,6 +827,7 @@ pub struct Terminal {
     hover: std::sync::atomic::AtomicBool,
     caps: crate::caps::Caps,
     painted: LastPainted,
+    link_hover: Mutex<link_pointer::LinkHover>,
     /// Whether `/raw` has stepped out onto the terminal's own screen
     /// ([`Surface::show_transcript`]): while it has, nothing is written.
     away: std::sync::atomic::AtomicBool,
@@ -1103,7 +1112,12 @@ impl Terminal {
         // (`refresh_pointer`, e.g. hover turning on under `/webui`'s link). It
         // used to keep the *asked-for* value while the terminal was told off,
         // so the first re-statement took the mouse back and selection died.
-        let (pointer, mouse) = starting_pointer(mouse, crate::caps::mouse_reported());
+        let link_terminal = link_pointer::detect();
+        let (_, mouse) = starting_pointer(mouse, crate::caps::mouse_reported());
+        let pointer = ansi::Pointer::from_intents(
+            mouse,
+            link_terminal != link_pointer::TerminalKind::Unsupported,
+        );
         out.write_all(pointer.escape().as_bytes())?;
         out.flush()?;
         console_wrap(false);
@@ -1142,6 +1156,7 @@ impl Terminal {
         // `Drop` runs at all.
         #[cfg(unix)]
         arm_signal_restore();
+        link_pointer::POINTER.configure(link_terminal);
         Ok(Self {
             raw: true,
             state: std::sync::atomic::AtomicU8::new(pointer_state(pointer)),
@@ -1149,6 +1164,7 @@ impl Terminal {
             hover: std::sync::atomic::AtomicBool::new(false),
             caps,
             painted: LastPainted::default(),
+            link_hover: Mutex::new(link_pointer::LinkHover::default()),
             away: std::sync::atomic::AtomicBool::new(false),
             stderr,
             margin,
@@ -1171,7 +1187,7 @@ impl Terminal {
         use std::sync::atomic::Ordering;
         let want = ansi::Pointer::from_intents(
             self.grab.load(Ordering::SeqCst),
-            self.hover.load(Ordering::SeqCst),
+            self.hover.load(Ordering::SeqCst) || link_pointer::POINTER.enabled(),
         );
         let had = self.pointer_mode();
         let Some(escape) = want.escape_from(had) else {
@@ -1329,6 +1345,7 @@ fn emergency_restore() {
         return;
     }
     let mut out = std::io::stdout();
+    let _ = link_pointer::POINTER.restore(&mut out);
     let _ = out.write_all(ansi::MOUSE_OFF.as_bytes());
     console_mouse(false);
     let _ = out.write_all(ansi::RESTORE_TITLE.as_bytes());
@@ -1417,6 +1434,7 @@ extern "C" fn on_fatal_signal(sig: libc::c_int) {
         // allocates, locks or unwinds.
         unsafe {
             for bytes in [
+                link_pointer::POINTER.restore_bytes(),
                 ansi::MOUSE_OFF.as_bytes(),
                 ansi::RESTORE_TITLE.as_bytes(),
                 ansi::LEAVE.as_bytes(),
@@ -2117,19 +2135,39 @@ impl Surface for Terminal {
         (w.saturating_sub(self.margin).max(1), h)
     }
     fn present(&self, frame: &Frame) {
-        // The transcript is on the terminal's own screen; a frame drawn now
-        // would be drawn over it.
         if self.showing_transcript() {
             return;
         }
-        // Only the rows that moved, and silence for a screen that did not.
         let patch = self.patch(frame);
-        if patch.is_empty() {
+        let mut out = std::io::stdout();
+        if !patch.is_empty() {
+            let _ = out.write_all(patch.as_bytes());
+            let _ = out.flush();
+        }
+        if link_pointer::POINTER.enabled() && self.mouse() {
+            let mut hover = self.link_hover.lock().expect("link hover poisoned");
+            hover.paint(frame);
+            let _ = link_pointer::POINTER.update(&mut out, hover.over_link());
+        }
+    }
+    fn observe_input(&self, input: &Input) {
+        if !link_pointer::POINTER.enabled() || !self.mouse() || self.showing_transcript() {
             return;
         }
+        if !matches!(
+            input,
+            Input::Mouse(..) | Input::Focus(false) | Input::Resize(..)
+        ) {
+            return;
+        }
+        let mut hover = self.link_hover.lock().expect("link hover poisoned");
+        hover.observe(input);
         let mut out = std::io::stdout();
-        let _ = out.write_all(patch.as_bytes());
-        let _ = out.flush();
+        if matches!(input, Input::Focus(false) | Input::Resize(..)) {
+            let _ = link_pointer::POINTER.restore(&mut out);
+        } else {
+            let _ = link_pointer::POINTER.update(&mut out, hover.over_link());
+        }
     }
     fn caps(&self) -> crate::caps::Caps {
         self.caps
@@ -2145,6 +2183,8 @@ impl Surface for Terminal {
         // state derived from it.
         if !on {
             self.hover.store(false, Ordering::SeqCst);
+            self.link_hover.lock().expect("link hover poisoned").clear();
+            let _ = link_pointer::POINTER.restore(&mut std::io::stdout());
         }
         self.refresh_pointer();
     }
@@ -2196,6 +2236,8 @@ impl Surface for Terminal {
     }
     fn forget(&self) {
         self.painted.forget();
+        self.link_hover.lock().expect("link hover poisoned").clear();
+        let _ = link_pointer::POINTER.restore(&mut std::io::stdout());
     }
     /// Off the alternate screen, with the pointer and line wrap the
     /// terminal's again, and the text printed where the shell left off — so it
@@ -2206,7 +2248,9 @@ impl Surface for Terminal {
             return true;
         }
         AWAY_FROM_SCREEN.store(true, Ordering::SeqCst);
+        self.link_hover.lock().expect("link hover poisoned").clear();
         let mut out = std::io::stdout();
+        let _ = link_pointer::POINTER.restore(&mut out);
         let _ = out.write_all(ansi::MOUSE_OFF.as_bytes());
         console_mouse(false);
         let _ = out.write_all(ansi::transcript_out().as_bytes());
@@ -2261,7 +2305,9 @@ impl Surface for Terminal {
         let Some(signal) = stop_signal() else {
             return false;
         };
+        self.link_hover.lock().expect("link hover poisoned").clear();
         let mut out = std::io::stdout();
+        let _ = link_pointer::POINTER.restore(&mut out);
         let _ = out.write_all(ansi::MOUSE_OFF.as_bytes());
         let _ = out.write_all(ansi::RESTORE_TITLE.as_bytes());
         let _ = out.write_all(ansi::leave().as_bytes());

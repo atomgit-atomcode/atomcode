@@ -1989,6 +1989,9 @@ impl UserInterface for Tui {
                     _ => {}
                 }
             }
+            if let Wake::Input(input) = &woke {
+                self.surface.observe_input(input);
+            }
             // The pointer's own vocabulary, needed in the patterns below rather
             // than only inside an arm body.
             use crate::surface::Click;
@@ -2272,7 +2275,8 @@ impl UserInterface for Tui {
                 // unrequested hover there is the terminal working as it always
                 // does, and the notice fired on every move.
                 Wake::Input(Input::Mouse(Click::Hover, ..))
-                    if !self.surface.reports_every_move()
+                    if !self.surface.motion()
+                        && !self.surface.reports_every_move()
                         && !self.host.context_menu_open()
                         && !self.host.menu_open()
                         && !self.host.asks.is_waiting()
