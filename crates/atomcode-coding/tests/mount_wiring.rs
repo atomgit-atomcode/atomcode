@@ -25,6 +25,41 @@ fn _isolate_atomcode_home() {
 /// decorator to fold a `TokenUsage` and emit one `LlmChat`.
 struct CannedProvider;
 
+#[tokio::test]
+#[serial_test::serial(atomcode_home)]
+async fn team_capacity_is_not_the_task_concurrency_limit() {
+    let project = tempfile::tempdir().unwrap();
+    let mut file = atomcode_config::config::Config::default();
+    file.subagent.max_concurrent = 1;
+    file.team.max_members = 6;
+    let mut cfg = atomcode_coding::CodingRuntimeConfig::from_config(
+        &file,
+        project.path(),
+        atomcode_coding::config::product_dirs_from_env(),
+        None,
+        None,
+        false,
+        false,
+    )
+    .agent_config();
+    cfg.subagent_config = Some(Arc::new(file));
+    let mut opts = quiet_options();
+    opts.subagents = atomcode_coding::SubagentPolicy::Enabled;
+
+    let dump = support::mount(&cfg, opts, Arc::new(CannedProvider))
+        .await
+        .dump();
+
+    assert!(
+        dump.contains("team-in-process") && dump.contains("\"max_members\": 6"),
+        "the team row must receive its own capacity:\n{dump}"
+    );
+    assert!(
+        dump.contains("subagent-in-process") && dump.contains("\"max_concurrent\": 1"),
+        "the task row must receive the execution limit:\n{dump}"
+    );
+}
+
 #[async_trait::async_trait]
 impl LlmProvider for CannedProvider {
     fn model_name(&self) -> &str {

@@ -4603,6 +4603,7 @@ async fn a_runtime_configured_from_a_file_describes_the_file() {
     for section in [
         "[permissions]",
         "[subagent]",
+        "[team]",
         "[web_search]",
         "default_model",
     ] {

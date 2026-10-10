@@ -267,10 +267,10 @@ impl Default for LoopConfig {
     }
 }
 
-/// `[subagent]` execution policy for the `task` and `team` tools.
+/// `[subagent]` execution policy for delegated agents.
 ///
-/// `max_concurrent` and `max_rounds` are the live knobs: `coding::parts` reads them
-/// and wires them into `TaskTool` and the team manager. Whether the tools are
+/// `max_concurrent` bounds execution while `max_rounds` bounds each delegated
+/// conversation. Persistent team roster capacity lives in [`TeamConfig`]. Whether the tools are
 /// mounted at all is the driver's `SubagentPolicy` first, then the env gate
 /// `ATOMCODE_SUBAGENT` (`0`/`false`/`off` turns them off) — there is no config key
 /// for it. The old `enabled`, `initial_turns`, `max_turns` and `timeout_secs` keys
@@ -315,6 +315,20 @@ impl Default for SubAgentConfig {
             claude: default_subagent_level(),
             external: Vec::new(),
         }
+    }
+}
+
+/// `[team]` policy for persistent named agents.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TeamConfig {
+    /// Maximum members retained by one lead, including idle members. Default 6.
+    pub max_members: usize,
+}
+
+impl Default for TeamConfig {
+    fn default() -> Self {
+        Self { max_members: 6 }
     }
 }
 
@@ -413,6 +427,10 @@ pub struct Config {
     /// [`SubAgentConfig`], including a configurable 200-round high-water mark.
     #[serde(default)]
     pub subagent: SubAgentConfig,
+    /// Persistent team roster policy. This is independent of task execution
+    /// concurrency because idle members remain on a team until explicitly stopped.
+    #[serde(default)]
+    pub team: TeamConfig,
     /// /loop command policy. Missing from older configs → max_rounds=100.
     /// TOML section is `[loop_config]` (bare `loop` is a Rust keyword).
     #[serde(default)]
@@ -872,6 +890,7 @@ impl Default for Config {
             telemetry: Default::default(),
             lsp: Default::default(),
             subagent: Default::default(),
+            team: Default::default(),
             loop_config: Default::default(),
             coding: CodingConfig::default(),
             tools: ToolsConfig::default(),
@@ -3553,6 +3572,7 @@ model = "missing-type"
             telemetry: Default::default(),
             lsp: Default::default(),
             subagent: Default::default(),
+            team: Default::default(),
             loop_config: Default::default(),
             coding: CodingConfig::default(),
             tools: ToolsConfig {
@@ -4118,6 +4138,20 @@ max_rounds = 42
         let cfg: Config = toml::from_str(toml_text).expect("dead keys are ignored");
         assert_eq!(cfg.subagent.max_concurrent, 5);
         assert_eq!(cfg.subagent.max_rounds, 42);
+    }
+
+    #[test]
+    fn team_capacity_is_independent_of_subagent_concurrency() {
+        let cfg: Config = toml::from_str(
+            r#"
+[subagent]
+max_concurrent = 1
+"#,
+        )
+        .expect("config parses");
+
+        assert_eq!(cfg.subagent.max_concurrent, 1);
+        assert_eq!(cfg.team.max_members, 6);
     }
 
     #[test]

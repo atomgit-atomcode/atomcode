@@ -220,6 +220,15 @@ pub static SETTINGS: &[SettingSpec] = &[
         apply: ApplyPolicy::CapabilityReprepare,
     },
     SettingSpec {
+        id: "team.max_members",
+        path: &["team", "max_members"],
+        label_en: "Team members",
+        label_zh: "团队成员数",
+        aliases: &["team", "agent"],
+        kind: SettingKind::Integer { min: 1, max: 64 },
+        apply: ApplyPolicy::CapabilityReprepare,
+    },
+    SettingSpec {
         id: "ui.screen",
         path: &["ui", "screen"],
         label_en: "Screen",
@@ -452,6 +461,7 @@ impl SettingSpec {
                 .unwrap_or_default(),
             "subagent.max_concurrent" => config.subagent.max_concurrent.to_string(),
             "subagent.max_rounds" => config.subagent.max_rounds.to_string(),
+            "team.max_members" => config.team.max_members.to_string(),
             "subagent.codex" => config.subagent.codex.clone(),
             "subagent.claude" => config.subagent.claude.clone(),
             "ui.screen" => format!("{:?}", config.ui.screen).to_lowercase(),
@@ -1098,6 +1108,7 @@ model = "model-a"
             "coding.shell_guard_policy",
             "subagent.max_concurrent",
             "subagent.max_rounds",
+            "team.max_members",
             "ui.ai_session_naming",
             "datalog.enabled",
             "lsp.enabled",
@@ -1109,6 +1120,7 @@ model = "model-a"
                 | "tools.atomgit.enabled"
                 | "subagent.max_concurrent"
                 | "subagent.max_rounds"
+                | "team.max_members"
                 | "datalog.enabled"
                 | "lsp.enabled"
                 | "lsp.auto_detect"
