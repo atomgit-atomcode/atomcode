@@ -4686,6 +4686,7 @@ fn denied_because(_path: &Path) -> Option<String> {
 }
 
 /// What was read off the layer that refused.
+#[cfg(any(unix, test))]
 #[derive(Clone, Copy, Debug)]
 struct Layer<'a> {
     at: &'a Path,
@@ -4706,6 +4707,7 @@ struct Layer<'a> {
 /// nearest existing layer can be far above the data — `/root` itself, when the
 /// data directory was never made — and that command on it would hand somebody
 /// else's whole home away.
+#[cfg(any(unix, test))]
 fn denied_text(layer: &Layer<'_>, me: u32, group: u32, home: Option<&Path>) -> Option<String> {
     let at = layer.at.display();
     // Root is refused by none of the things this can see.
