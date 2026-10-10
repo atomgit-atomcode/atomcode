@@ -571,6 +571,26 @@ impl CommandSet for TakeAwayCommands {
 /// The conversation: what is in it, what to do with it, and which one it is.
 pub struct SessionCommands;
 
+/// The UI languages `/language` offers inline in the slash menu. A picked row
+/// dispatches the same `/language <value>` form as hand-written input, so the
+/// host remains the only owner of persistence and immediate locale application.
+fn language_options() -> Vec<CommandOption> {
+    [
+        (
+            "auto",
+            crate::i18n::product::Msg::OnboardingLanguageOptionAuto,
+        ),
+        ("en", crate::i18n::product::Msg::OnboardingLanguageOptionEn),
+        (
+            "zh_CN",
+            crate::i18n::product::Msg::OnboardingLanguageOptionZhCn,
+        ),
+    ]
+    .into_iter()
+    .map(|(value, message)| CommandOption::new(value, crate::i18n::product::t(message)))
+    .collect()
+}
+
 /// The reasoning-effort levels the slash menu offers inline, in place of a
 /// modal: the closed set from the one place that defines it, plus `default`
 /// (leave it to the endpoint). A pick dispatches `/effort <value>`, so this and
@@ -910,11 +930,7 @@ fn session_catalogue() -> Vec<Command> {
         Command::said("cost", t(Msg::CmdAboutCost)),
         Command::said("usage", t(Msg::CmdAboutUsage)),
         Command::said_taking("mcp", t(Msg::CmdTakesMcp), t(Msg::CmdAboutMcp)),
-        Command::said_taking(
-            "language",
-            t(Msg::CmdTakesLanguage),
-            t(Msg::CmdAboutLanguage),
-        ),
+        Command::said("language", t(Msg::CmdAboutLanguage)).selecting(language_options()),
         Command::said("reload", t(Msg::CmdAboutReload)),
         Command::said("logout", t(Msg::CmdAboutLogout)),
         Command::said("login", t(Msg::CmdAboutLogin)),
@@ -6281,6 +6297,22 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted.len(), names.len(), "no duplicates: {names:?}");
+    }
+
+    #[test]
+    fn language_offers_its_values_inline_not_as_free_text() {
+        let c = builtin_for_test();
+        let language = c.find("language").expect("language is a command");
+        assert!(
+            language.takes.is_none(),
+            "the closed set is shown in the slash menu"
+        );
+        let values: Vec<&str> = language.options.iter().map(|o| o.value.as_ref()).collect();
+        assert_eq!(values, ["auto", "en", "zh_CN"]);
+        assert!(language
+            .options
+            .iter()
+            .all(|option| !option.about.trim().is_empty()));
     }
 
     #[test]
