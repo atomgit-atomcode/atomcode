@@ -8925,14 +8925,21 @@ async fn read_input(
 /// stream needs a tty, and what is worth judging here is not that crossterm
 /// reads — it is the timing decision, and a judgement that cannot supply the
 /// timing judges nothing. Everything above is one line of plumbing.
-async fn pump_input<S>(
-    mut events: S,
-    wake: mpsc::UnboundedSender<Wake>,
-    handed_back: impl Fn() -> bool,
-) where
+async fn pump_input<S>(events: S, wake: mpsc::UnboundedSender<Wake>, handed_back: impl Fn() -> bool)
+where
     S: futures::Stream<Item = crossterm::event::Event> + Unpin,
 {
     use futures::StreamExt;
+    // Windows sends releases between presses. They carry no input, but letting
+    // them reach the gatherer ends each burst before its newline can join it.
+    // Filter inside the stream so releases neither split nor extend the timeout.
+    let events = events.filter(|event| {
+        futures::future::ready(!matches!(event,
+            crossterm::event::Event::Key(key)
+                if key.kind == crossterm::event::KeyEventKind::Release
+        ))
+    });
+    futures::pin_mut!(events);
     let forward = |event| -> bool {
         match crate::surface::from_crossterm(event) {
             Some(input) => wake.send(Wake::Input(input)).is_ok(),
@@ -10737,6 +10744,82 @@ mod paste_burst_tests {
             vec![Input::Paste(text.into())],
             "one paste, not thirteen keystrokes — and not three submits"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn windows_paste_releases_do_not_split_lines_into_submits() {
+        use crossterm::event::KeyEventKind;
+        let text =
+            "因此从代码看，不需要额外修复。标记里的 #xxx\n不是剪贴板内容编号，而是本次粘贴的编号。";
+        let script = text
+            .chars()
+            .flat_map(|c| {
+                let Event::Key(key) = (if c == '\n' { enter() } else { press(c) }) else {
+                    unreachable!()
+                };
+                let mut release = key;
+                release.kind = KeyEventKind::Release;
+                [(0, Event::Key(key)), (0, Event::Key(release))]
+            })
+            .collect();
+        let seen = pumped(script).await;
+        assert_eq!(seen, vec![Input::Paste(text.into())]);
+        let (host, tui) = assemble(Headless::new(80, 24));
+        for input in seen {
+            let Input::Paste(text) = input else {
+                panic!("paste leaked a key")
+            };
+            tui.act(Action::Paste(text), &tui.client);
+        }
+        let m = host.moment.read().unwrap();
+        assert_eq!(m.input, text);
+        assert!(!m.turn_open);
+        assert!(!m.pending_working);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn windows_releases_preserve_typed_enter_and_fold_large_pastes() {
+        use crossterm::event::KeyEventKind;
+        let with_releases = |script: Vec<(u64, Event)>| {
+            script
+                .into_iter()
+                .flat_map(|(gap, event)| {
+                    let Event::Key(key) = event else {
+                        unreachable!()
+                    };
+                    let mut release = key;
+                    release.kind = KeyEventKind::Release;
+                    [(gap, Event::Key(key)), (0, Event::Key(release))]
+                })
+                .collect()
+        };
+        assert_eq!(
+            pumped(with_releases(vec![
+                (0, press('h')),
+                (60, press('i')),
+                (60, enter())
+            ]))
+            .await,
+            vec![
+                Input::Key(KeyPress::ch('h')),
+                Input::Key(KeyPress::ch('i')),
+                Input::Key(KeyPress::plain(Key::Enter))
+            ]
+        );
+        let text = "第一行内容\n第二行内容\n第三行内容\n第四行内容\n第五行内容";
+        let seen = pumped(with_releases(
+            text.chars()
+                .map(|c| (0, if c == '\n' { enter() } else { press(c) }))
+                .collect(),
+        ))
+        .await;
+        assert_eq!(seen, vec![Input::Paste(text.into())]);
+        let (host, tui) = assemble(Headless::new(80, 24));
+        tui.act(Action::Paste(text.into()), &tui.client);
+        let m = host.moment.read().unwrap();
+        assert_eq!(m.input, "[Pasted #1 +5 lines]");
+        assert_eq!(crate::moment::expand_pastes(&m.input, &m.pastes), text);
+        assert!(!m.pending_working);
     }
 
     /// And the failure that would be worse: typing `hi` then Enter has to stay
