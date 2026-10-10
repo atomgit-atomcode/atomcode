@@ -3114,15 +3114,23 @@ impl CommandSet for AgentCatalogCommands {
             })
             .collect()
     }
-    fn starts_turn(&self, name: &str) -> bool {
-        self.client
+    fn starts_turn(&self, name: &str, args: &str) -> bool {
+        let commands = self
+            .client
             .described()
             .map(|d| d.commands)
-            .unwrap_or_default()
-            .iter()
-            .any(|command| {
-                command.name.eq_ignore_ascii_case(name) && described_command_is_skill(command)
+            .unwrap_or_default();
+        let is_skill = |candidate: &str| {
+            commands.iter().any(|command| {
+                command.name.eq_ignore_ascii_case(candidate) && described_command_is_skill(command)
             })
+        };
+
+        if name.eq_ignore_ascii_case("skills") {
+            args.split_whitespace().next().is_some_and(is_skill)
+        } else {
+            is_skill(name)
+        }
     }
     async fn run(&self, name: &str, args: &str, _ctx: &Context) -> Outcome {
         self.client.invoke(name, args);

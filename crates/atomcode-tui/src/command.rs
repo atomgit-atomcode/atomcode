@@ -281,7 +281,7 @@ pub trait CommandSet: Send + Sync {
     /// Whether running this command starts a durable user turn of its own.
     /// Front ends defer their transient command echo for these, so the
     /// committed `UserMessage` is the one visible copy.
-    fn starts_turn(&self, _name: &str) -> bool {
+    fn starts_turn(&self, _name: &str, _args: &str) -> bool {
         false
     }
     /// Whether this set's rows belong in `/help`.
@@ -575,15 +575,16 @@ impl Commands {
     }
 
     /// Whether a whole typed line names a command that commits its own user
-    /// message. Arguments do not affect ownership.
+    /// message. The owning set also sees the arguments because a gateway can
+    /// list on its own but start a turn when it names one of its children.
     pub fn starts_turn(&self, line: &str) -> bool {
-        let name = line
-            .trim()
-            .trim_start_matches('/')
-            .split_whitespace()
-            .next()
-            .unwrap_or("");
-        self.owner(name).is_some_and(|set| set.starts_turn(name))
+        let body = line.trim().trim_start_matches('/');
+        let (name, args) = match body.split_once(char::is_whitespace) {
+            Some((n, a)) => (n, a.trim()),
+            None => (body, ""),
+        };
+        self.owner(name)
+            .is_some_and(|set| set.starts_turn(name, args))
     }
 
     /// Dispatch a whole typed line, slash and all.
@@ -932,7 +933,7 @@ mod tests {
                     Command::new("only-skill", "skill"),
                 ]
             }
-            fn starts_turn(&self, _name: &str) -> bool {
+            fn starts_turn(&self, _name: &str, _args: &str) -> bool {
                 true
             }
             async fn run(&self, name: &str, _args: &str, _ctx: &Context) -> Outcome {

@@ -12570,10 +12570,12 @@ mod skills_menu_tests {
     }
 
     #[test]
-    fn a_direct_skill_command_defers_to_its_committed_user_message() {
+    fn a_skill_command_defers_to_its_committed_user_message() {
         let (host, _) = screen();
         assert!(host.commands.starts_turn("/code fix the test"));
         assert!(host.commands.starts_turn("/brainstorming"));
-        assert!(!host.commands.starts_turn("/skills code fix the test"));
+        assert!(host.commands.starts_turn("/skills code fix the test"));
+        assert!(!host.commands.starts_turn("/skills"));
+        assert!(!host.commands.starts_turn("/skills unknown fix the test"));
     }
 }
