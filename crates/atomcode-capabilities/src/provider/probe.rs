@@ -134,10 +134,13 @@ fn classify(status: u16, content_type: &str, body: &str, asked_model: bool) -> S
         .as_ref()
         .and_then(provider_error_code);
     let missing_model = names_a_missing_model(&detail, code.as_deref());
+    let model_access_refusal = names_a_model_access_refusal(&detail, code.as_deref());
+    let probe_validation_refusal = names_a_probe_validation_refusal(&detail);
     let trimmed = body.trim_start();
     let is_page = content_type.to_ascii_lowercase().contains("html") || trimmed.starts_with('<');
     let speaks_json =
         trimmed.starts_with('{') || trimmed.starts_with('[') || trimmed.starts_with("data:");
+    let auth_refusal = names_an_auth_refusal(&detail, code.as_deref());
     let kind = || {
         if content_type.is_empty() {
             if is_page {
@@ -159,7 +162,20 @@ fn classify(status: u16, content_type: &str, body: &str, asked_model: bool) -> S
         // and the like), not the API refusing the key: the same reason a 429 or
         // 5xx page below is not taken as a wrong address.
         403 if is_page => Seen::Other(status, kind(), false),
-        401 | 403 => Seen::Key(status),
+        401 => Seen::Key(status),
+        // An account-only probe uses a deliberately nonexistent placeholder
+        // model. A gateway saying that the authenticated key may only use other
+        // models proves both the endpoint and the key; it does not reject the
+        // key. When the person did choose this model, keep the refusal visible.
+        403 if model_access_refusal && !asked_model => Seen::Endpoint,
+        403 if model_access_refusal => Seen::Other(status, detail, speaks_json),
+        // Unlike 401, 403 does not establish why access was forbidden. Gateways
+        // use it for route policy, IP allowlists, missing signatures and other
+        // permission checks as well as bad API keys. Only blame the key when the
+        // answer itself names authentication; otherwise preserve the detail as
+        // an inconclusive answer.
+        403 if auth_refusal => Seen::Key(status),
+        403 => Seen::Other(status, detail, speaks_json),
         // The model is the complaint: the path is there.
         _ if missing_model => {
             if asked_model {
@@ -168,6 +184,11 @@ fn classify(status: u16, content_type: &str, body: &str, asked_model: bool) -> S
                 Seen::Endpoint
             }
         }
+        // Some OpenAI-compatible gateways incorrectly wrap request validation
+        // in HTTP 500. The probe deliberately sends no messages so it cannot
+        // generate or bill; a complaint about that exact field still proves
+        // that the selected model reached the chat/completions handler.
+        _ if speaks_json && probe_validation_refusal => Seen::Endpoint,
         404 | 405 => Seen::NotHere(format!("HTTP {status}")),
         // A web page where an API answer should be. Only a success status says the
         // address is wrong: a 5xx or 429 page is an outage or a challenge in front
@@ -182,6 +203,75 @@ fn classify(status: u16, content_type: &str, body: &str, asked_model: bool) -> S
         _ if speaks_json && !asked_model => Seen::Endpoint,
         _ => Seen::Other(status, detail, speaks_json),
     }
+}
+
+fn names_an_auth_refusal(detail: &str, code: Option<&str>) -> bool {
+    let code = code.unwrap_or_default().to_ascii_lowercase();
+    if [
+        "invalid_api_key",
+        "invalid_token",
+        "authentication_error",
+        "auth_error",
+        "unauthorized",
+        "unauthenticated",
+    ]
+    .contains(&code.as_str())
+    {
+        return true;
+    }
+    let detail = detail.to_ascii_lowercase();
+    if detail.contains("unauthorized") || detail.contains("unauthenticated") {
+        return true;
+    }
+    let names_credential = [
+        "api key",
+        "api_key",
+        "apikey",
+        "access token",
+        "access_token",
+    ]
+    .iter()
+    .any(|needle| detail.contains(needle));
+    let rejects_credential = [
+        "invalid",
+        "incorrect",
+        "expired",
+        "revoked",
+        "rejected",
+        "not valid",
+    ]
+    .iter()
+    .any(|needle| detail.contains(needle));
+    names_credential && rejects_credential
+}
+
+fn names_a_model_access_refusal(detail: &str, code: Option<&str>) -> bool {
+    let code = code.unwrap_or_default().to_ascii_lowercase();
+    if matches!(
+        code.as_str(),
+        "key_model_access_denied" | "model_access_denied"
+    ) {
+        return true;
+    }
+    let detail = detail.to_ascii_lowercase();
+    detail.contains("model")
+        && ["not allowed", "not authorized", "no access", "permission"]
+            .iter()
+            .any(|needle| detail.contains(needle))
+}
+
+fn names_a_probe_validation_refusal(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    detail.contains("messages")
+        && [
+            "is required",
+            "are required",
+            "must not be empty",
+            "cannot be empty",
+            "at least one",
+        ]
+        .iter()
+        .any(|needle| detail.contains(needle))
 }
 
 /// Ask `base_url` once. `Err` is a transport failure, with its reason.
@@ -308,6 +398,20 @@ mod tests {
             classify(422, "application/json", body, true),
             Seen::Endpoint
         );
+        let mislabeled_500 = r#"{"error":{"message":"litellm.InternalServerError: Exception - field messages is required. Received Model Group=myth-2","type":null,"param":null,"code":"500"}}"#;
+        assert_eq!(
+            classify(500, "application/json", mislabeled_500, true),
+            Seen::Endpoint
+        );
+        assert!(matches!(
+            classify(
+                500,
+                "application/json",
+                r#"{"error":{"message":"upstream unavailable"}}"#,
+                true
+            ),
+            Seen::Other(500, _, true)
+        ));
     }
 
     #[test]
@@ -415,16 +519,49 @@ mod tests {
             ),
             Seen::Other(403, _, false)
         ));
-        // The API's own 403 still names the key.
+        // A 403 only names the key when its payload says that authentication
+        // failed. A generic JSON "forbidden" is still ambiguous.
         assert_eq!(
             classify(
                 403,
                 "application/json",
-                r#"{"error":{"message":"forbidden"}}"#,
+                r#"{"error":{"message":"invalid API key"}}"#,
                 false
             ),
             Seen::Key(403)
         );
+        let ambiguous = classify(
+            403,
+            "application/json",
+            r#"{"error":{"message":"forbidden"}}"#,
+            false,
+        );
+        assert!(matches!(
+            ambiguous,
+            Seen::Other(403, detail, true) if detail == "forbidden"
+        ));
+        assert!(matches!(
+            classify(
+                403,
+                "application/json",
+                r#"{"error":{"message":"API key has insufficient quota"}}"#,
+                false
+            ),
+            Seen::Other(403, detail, true) if detail.contains("insufficient quota")
+        ));
+    }
+
+    #[test]
+    fn a_placeholder_model_permission_refusal_proves_the_account() {
+        let denied = r#"{"error":{"message":"key not allowed to access model; tried atomcode-probe","type":"key_model_access_denied","param":"model","code":"403"}}"#;
+        assert_eq!(
+            classify(403, "application/json", denied, false),
+            Seen::Endpoint
+        );
+        assert!(matches!(
+            classify(403, "application/json", denied, true),
+            Seen::Other(403, detail, true) if detail.contains("not allowed to access model")
+        ));
     }
 
     /// A base_url may carry a credential — a `?key=` or a `user:password@`. When

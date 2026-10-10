@@ -771,6 +771,38 @@ async fn the_guard_tells_a_repeating_todo_update_that_the_same_status_will_not_c
     assert!(text.contains("Do NOT call `todowrite`"), "{text}");
 }
 
+/// A stop leaves the guard clean: the turn a person sends to get unstuck is
+/// judged on its own — it runs the same rounds again, warns at its own pace,
+/// and is not stopped on arrival by the previous turn's count. Issue #1633 saw
+/// the opposite loop: after a stop the model re-entered the same state and the
+/// next message hit the fuse again with nothing new said.
+#[tokio::test]
+async fn a_turn_after_a_stop_is_judged_fresh_by_the_guard() {
+    let dir = scratch("guard-fresh-turn");
+    let script = always_calls(
+        "todowrite",
+        r#"{ action = "update", id = 4, status = "completed" }"#,
+    );
+    let rows = "[[patch]]\nid = \"round-cap\"\nconfig = { max_rounds = 20 }\n\n\
+                [[remove]]\nid = \"repeat-fuse\"\n\n\
+                [[patch]]\nid = \"tool-loop-guard\"\nconfig = { warn_after = 3, stop_after = 5 }";
+    let app = start(tree(&dir, &script, &[rows])).await;
+
+    let first = run_turn(&app, "go").await.unwrap();
+    assert_eq!(first.stop, StopReason::ToolLoopDetected);
+    assert_eq!(
+        first.rounds, 5,
+        "warned at 3, stopped at 5: one stop per turn's own count"
+    );
+
+    // The next turn on the same session starts from zero: had the count or the
+    // tripped flag leaked across turns, this message would have been stopped
+    // on the first call instead of running the full sequence again.
+    let second = run_turn(&app, "again").await.unwrap();
+    assert_eq!(second.stop, StopReason::ToolLoopDetected);
+    assert_eq!(second.rounds, 5, "the second turn counts from zero");
+}
+
 #[tokio::test]
 async fn the_guard_does_not_fire_when_results_differ() {
     let dir = scratch("guard-progress");
