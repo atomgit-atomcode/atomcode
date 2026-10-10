@@ -138,7 +138,7 @@ fn release_doc(release: &Release, current: Version) -> Doc {
             parts.issues.clone(),
         ));
     }
-    let mut title = vec![Piece::new(release.version.to_string(), Tone::Plain)];
+    let mut title = vec![Piece::new(release_label(release), Tone::Plain)];
     if let Some(date) = &release.date {
         title.push(Piece::new(format!("  {date}"), Tone::Muted));
     }
@@ -166,7 +166,7 @@ fn picker(releases: &[Release], current: Version, seen: Seen) -> List {
             }
             let mut row = Row::new(
                 format!("/changelog {}", release.version),
-                release.version.to_string(),
+                release_label(release),
             )
             .about(about)
             .preview(
@@ -184,6 +184,13 @@ fn picker(releases: &[Release], current: Version, seen: Seen) -> List {
         })
         .collect();
     List::new("changelog", tr(SMsg::ChangelogPickerTitle), rows)
+}
+
+fn release_label(release: &Release) -> String {
+    match release.same_source {
+        Some(same_source) => format!("{}（{same_source}）", release.version),
+        None => release.version.to_string(),
+    }
 }
 
 /// What an interactive launch has to say about the release it is, and the
@@ -301,6 +308,20 @@ mod tests {
             last: last.map(v),
             before: before.map(v),
         }
+    }
+
+    #[test]
+    fn a_same_source_release_is_marked_beside_its_primary_number() {
+        let release = Release {
+            version: v("5.2.2"),
+            same_source: Some(v("5.2.0")),
+            date: Some("2026-10-10".into()),
+            body: String::new(),
+        };
+        assert_eq!(release_label(&release), "v5.2.2（v5.2.0）");
+        let doc = release_doc(&release, v("5.2.2"));
+        assert!(doc.title[0].text.contains("v5.2.2（v5.2.0）"));
+        assert!(doc.title[1].text.contains("2026-10-10"));
     }
 
     /// 不带参数:像 `/resume` 那样升起一张版本单子,最新的在最上,光标在它上面;

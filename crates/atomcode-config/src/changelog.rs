@@ -53,6 +53,9 @@ pub fn localized(zh: &str, en: &str, locale: crate::locale::Locale) -> Vec<Relea
         let Some(twin) = chinese.iter().find(|r| r.version == release.version) else {
             continue;
         };
+        if release.same_source.is_none() {
+            release.same_source = twin.same_source;
+        }
         let issues = twin.parts().issues;
         if release.parts().issues.is_empty() && !issues.is_empty() {
             release.body = format!("{}\n\n### Issues\n\n{issues}", release.body.trim_end());
@@ -109,8 +112,11 @@ impl fmt::Display for Version {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Release {
     pub version: Version,
-    /// What follows the number on the heading line, brackets taken off:
-    /// `## v5.2.1 (2026-10-08)` → `2026-10-08`.
+    /// Another release number built from the same source line, when the notes
+    /// mark one: `## v5.2.2（v5.2.0） (2026-10-10)`.
+    pub same_source: Option<Version>,
+    /// The date on the heading line, brackets taken off:
+    /// `## v5.2.2（v5.2.0） (2026-10-10)` → `2026-10-10`.
     pub date: Option<String>,
     /// The section below its heading, as written.
     pub body: String,
@@ -223,12 +229,14 @@ fn plain(text: &str) -> String {
 /// release written twice keeps its first section.
 pub fn releases(document: &str) -> Vec<Release> {
     let mut out: Vec<Release> = Vec::new();
-    let mut open: Option<(Version, Option<String>, Vec<&str>)> = None;
-    let close = |open: Option<(Version, Option<String>, Vec<&str>)>, out: &mut Vec<Release>| {
-        if let Some((version, date, body)) = open {
+    let mut open: Option<(Version, Option<Version>, Option<String>, Vec<&str>)> = None;
+    let close = |open: Option<(Version, Option<Version>, Option<String>, Vec<&str>)>,
+                 out: &mut Vec<Release>| {
+        if let Some((version, same_source, date, body)) = open {
             if !out.iter().any(|r| r.version == version) {
                 out.push(Release {
                     version,
+                    same_source,
                     date,
                     body: body.join("\n").trim().to_string(),
                 });
@@ -238,8 +246,8 @@ pub fn releases(document: &str) -> Vec<Release> {
     for line in document.lines() {
         if let Some(heading) = release_heading(line) {
             close(open.take(), &mut out);
-            open = Some((heading.0, heading.1, Vec::new()));
-        } else if let Some((_, _, body)) = open.as_mut() {
+            open = Some((heading.0, heading.1, heading.2, Vec::new()));
+        } else if let Some((_, _, _, body)) = open.as_mut() {
             body.push(line);
         }
     }
@@ -248,9 +256,10 @@ pub fn releases(document: &str) -> Vec<Release> {
     out
 }
 
-/// `## v5.2.1 (2026-10-08)` → the number and the date. Only a level-two
-/// heading whose first word is a release number opens a release.
-fn release_heading(line: &str) -> Option<(Version, Option<String>)> {
+/// `## v5.2.2（v5.2.0） (2026-10-10)` → the release number, its optional
+/// same-source number, and the date. Only a level-two heading whose first word
+/// is a release number opens a release.
+fn release_heading(line: &str) -> Option<(Version, Option<Version>, Option<String>)> {
     let rest = line.strip_prefix("## ")?.trim();
     // The number ends at a space or at a bracket written straight after it
     // (`## v5.2.0（2026-09-30）`, as Chinese text is often typed).
@@ -259,12 +268,38 @@ fn release_heading(line: &str) -> Option<(Version, Option<String>)> {
         .unwrap_or(rest.len());
     let (number, after) = rest.split_at(end);
     let version = Version::parse(number)?;
+    let mut after = after.trim();
+    let mut same_source = None;
+    if let Some((inside, tail)) = parenthesized_prefix(after) {
+        if let Some(version) = Version::parse(inside) {
+            same_source = Some(version);
+            after = tail.trim();
+        }
+    }
     let date = after
         .trim()
         .trim_start_matches(['(', '（', '-', '—', '·'])
         .trim_end_matches([')', '）'])
         .trim();
-    Some((version, (!date.is_empty()).then(|| date.to_string())))
+    Some((
+        version,
+        same_source,
+        (!date.is_empty()).then(|| date.to_string()),
+    ))
+}
+
+/// The text and tail of an ASCII or full-width parenthesized prefix.
+fn parenthesized_prefix(text: &str) -> Option<(&str, &str)> {
+    let (open, close) = if text.starts_with('(') {
+        ('(', ')')
+    } else if text.starts_with('（') {
+        ('（', '）')
+    } else {
+        return None;
+    };
+    let body = text.strip_prefix(open)?;
+    let end = body.find(close)?;
+    Some((&body[..end], &body[end + close.len_utf8()..]))
 }
 
 /// What a person has been told about, read from [`seen_path`].
@@ -440,6 +475,20 @@ mod tests {
         assert_eq!(Version::parse("all"), None);
         assert!(v("5.10.0") > v("5.9.9"), "by number, not by text");
         assert_eq!(v("5.2.1").to_string(), "v5.2.1");
+    }
+
+    #[test]
+    fn a_same_source_version_is_not_mistaken_for_the_release_date() {
+        let all = releases(
+            "## v5.2.2（v5.2.0） (2026-10-10)\nnew\n\n\
+             ## v5.1.0（v5.2.1） (2026-09-18)\nold\n",
+        );
+        assert_eq!(all[0].version, v("5.2.2"));
+        assert_eq!(all[0].same_source, Some(v("5.2.0")));
+        assert_eq!(all[0].date.as_deref(), Some("2026-10-10"));
+        assert_eq!(all[1].version, v("5.1.0"));
+        assert_eq!(all[1].same_source, Some(v("5.2.1")));
+        assert_eq!(all[1].date.as_deref(), Some("2026-09-18"));
     }
 
     #[test]

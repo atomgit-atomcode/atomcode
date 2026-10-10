@@ -6,8 +6,9 @@ For whoever edits this file; this block is never shown.
 - The English twin of `CHANGELOG.md`: one section per release, same version
   numbers. The English UI reads this file; a release with no section here is
   shown from the Chinese file instead.
-- Each section starts `## vX.Y.Z`, optionally followed by a date:
-  `## v5.2.2 (2026-10-08)`. Newest first (order is by version number anyway).
+- Each section starts `## vX.Y.Z`, optionally followed by a same-source version
+  and a date: `## v5.2.2（v5.2.0） (2026-10-10)`. Newest first (order is by
+  version number anyway).
 - A section has three parts under these subheadings (tabs in `/changelog`):
   - `### Overview`: a paragraph or two on what the release is about, shown at
     the top of the Overview tab.
@@ -23,7 +24,7 @@ For whoever edits this file; this block is never shown.
 - Compiled into the binary; rebuild to see a change.
 -->
 
-## v5.2.2
+## v5.2.2（v5.2.0） (2026-10-10)
 
 ### Overview
 
@@ -42,7 +43,7 @@ This release is about **rebuilding the architecture and the terminal UI**: the r
 - **Smoother interaction**: paste screenshots and image paths into the composer, with long pastes folded; file writes and edits show their diff inline; Ctrl+R searches this project's input history; Ctrl+X interrupts the turn and sends queued messages at once; sudo and ssh in tools ask for the password in the composer instead of hanging.
 - **Security, stability, Windows, and fixes**: reading credentials, keys or .env files asks for approval first; delegated subagents have clear limits; the repeated-call fuse is gentler and tunable with [coding] repeat_stop_rounds; images per request are capped and compressed so requests are no longer too large; legacy Windows consoles, colors, keys and box drawing work, and a console that cannot draw the new UI falls back to the classic one and says why; /upgrade on Windows no longer fails with "access denied" while an old version holds the slot; background processes in bash keep their output and stop reliably; switching to a strict provider no longer fails every request with 400.
 
-## v5.1.0 (2026-09-18)
+## v5.1.0（v5.2.1） (2026-09-18)
 
 ### Overview
 
