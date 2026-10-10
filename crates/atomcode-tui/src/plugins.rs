@@ -81,6 +81,8 @@ pub struct PluginRow {
     pub description: String,
     /// 已经装上了就是它装在哪个范围;`None` 是还没装。
     pub installed: Option<Scope>,
+    /// 只有装着且带 hook 的插件有值；值是当前 hook 集合是否已获信任。
+    pub hook_trusted: Option<bool>,
 }
 
 impl PluginRow {
@@ -276,19 +278,21 @@ pub struct ScopeForm {
     pub at: usize,
 }
 
-/// 一个已经装上的插件能做的两件事。
+/// 一个已经装上的插件能做的事。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PluginAction {
+    Trust,
+    Untrust,
     /// 重新装一遍:先卸干净再装,这样市场那边改了什么都能跟上。
     Update,
     Uninstall,
 }
 
 impl PluginAction {
-    pub const ALL: [PluginAction; 2] = [PluginAction::Update, PluginAction::Uninstall];
-
     pub fn label(self) -> String {
         match self {
+            PluginAction::Trust => t(Msg::PluginActionTrust),
+            PluginAction::Untrust => t(Msg::PluginActionUntrust),
             PluginAction::Update => pt(PMsg::PluginActionUpdate),
             PluginAction::Uninstall => pt(PMsg::PluginActionUninstall),
         }
@@ -297,6 +301,8 @@ impl PluginAction {
 
     pub fn about(self) -> String {
         match self {
+            PluginAction::Trust => t(Msg::PluginActionTrustAbout),
+            PluginAction::Untrust => t(Msg::PluginActionUntrustAbout),
             PluginAction::Update => t(Msg::PluginActionUpdateAbout),
             PluginAction::Uninstall => t(Msg::PluginActionUninstallAbout),
         }
@@ -310,7 +316,21 @@ pub struct PluginForm {
     pub plugin: String,
     pub marketplace: String,
     pub scope: Scope,
+    pub hook_trusted: Option<bool>,
     pub at: usize,
+}
+
+impl PluginForm {
+    pub fn actions(&self) -> Vec<PluginAction> {
+        let mut actions = Vec::new();
+        match self.hook_trusted {
+            Some(false) => actions.push(PluginAction::Trust),
+            Some(true) => actions.push(PluginAction::Untrust),
+            None => {}
+        }
+        actions.extend([PluginAction::Update, PluginAction::Uninstall]);
+        actions
+    }
 }
 
 /// 一个市场能做的三件事。
@@ -475,6 +495,14 @@ pub enum Step {
         plugin: String,
         marketplace: String,
         scope: Scope,
+    },
+    Trust {
+        plugin: String,
+        marketplace: String,
+    },
+    Untrust {
+        plugin: String,
+        marketplace: String,
     },
     AddMarket {
         url: String,
@@ -660,6 +688,7 @@ fn enter(view: &PluginsView, panel: &mut Panel, at: Option<Listed>) -> Step {
                     plugin: row.name.clone(),
                     marketplace: row.marketplace.clone(),
                     scope,
+                    hook_trusted: row.hook_trusted,
                     at: 0,
                 }),
                 // 还没装的:先问装到哪儿去。
@@ -752,6 +781,7 @@ fn scope_key(panel: &mut Panel, form: ScopeForm, press: KeyPress) -> Step {
 }
 
 fn plugin_key(panel: &mut Panel, form: PluginForm, press: KeyPress) -> Step {
+    let actions = form.actions();
     match (press.key, press.mods) {
         (Key::Esc, _) | (Key::Char('c'), Mods::CTRL) => {
             panel.form = None;
@@ -763,14 +793,22 @@ fn plugin_key(panel: &mut Panel, form: PluginForm, press: KeyPress) -> Step {
             Step::Stay
         }
         (Key::Down, _) => {
-            let at = (form.at + 1).min(PluginAction::ALL.len() - 1);
+            let at = (form.at + 1).min(actions.len() - 1);
             panel.form = Some(Form::Plugin(PluginForm { at, ..form }));
             Step::Stay
         }
         (Key::Enter, _) => {
-            let action = PluginAction::ALL[form.at.min(PluginAction::ALL.len() - 1)];
+            let action = actions[form.at.min(actions.len() - 1)];
             panel.form = None;
             match action {
+                PluginAction::Trust => Step::Trust {
+                    plugin: form.plugin,
+                    marketplace: form.marketplace,
+                },
+                PluginAction::Untrust => Step::Untrust {
+                    plugin: form.plugin,
+                    marketplace: form.marketplace,
+                },
                 PluginAction::Update => Step::Update {
                     plugin: form.plugin,
                     marketplace: form.marketplace,
@@ -962,6 +1000,10 @@ pub trait Plugins: Send + Sync {
         scope: Scope,
     ) -> Result<String, String>;
 
+    async fn trust(&self, plugin: &str, marketplace: &str) -> Result<String, String>;
+
+    async fn untrust(&self, plugin: &str, marketplace: &str) -> Result<String, String>;
+
     async fn add_market(&self, url: &str) -> Result<String, String>;
 
     async fn update_market(&self, name: &str) -> Result<String, String>;
@@ -997,6 +1039,7 @@ mod tests {
             marketplace: market.into(),
             description: about.into(),
             installed,
+            hook_trusted: None,
         }
     }
 
@@ -1150,6 +1193,35 @@ mod tests {
                 plugin: "lens".into(),
                 marketplace: "official".into(),
                 scope: Scope::User,
+            }
+        );
+    }
+
+    #[test]
+    fn an_installed_plugin_offers_the_action_for_its_current_hook_trust() {
+        let mut untrusted = plugin("hooks", "official", "", Some(Scope::User));
+        untrusted.hook_trusted = Some(false);
+        let view = PluginsView::new(vec![untrusted], vec![]);
+        let mut panel = Panel::new();
+        run(&view, &mut panel, &[press(Key::Enter)]);
+        assert_eq!(
+            run(&view, &mut panel, &[press(Key::Enter)]),
+            Step::Trust {
+                plugin: "hooks".into(),
+                marketplace: "official".into(),
+            }
+        );
+
+        let mut trusted = plugin("hooks", "official", "", Some(Scope::User));
+        trusted.hook_trusted = Some(true);
+        let view = PluginsView::new(vec![trusted], vec![]);
+        let mut panel = Panel::new();
+        run(&view, &mut panel, &[press(Key::Enter)]);
+        assert_eq!(
+            run(&view, &mut panel, &[press(Key::Enter)]),
+            Step::Untrust {
+                plugin: "hooks".into(),
+                marketplace: "official".into(),
             }
         );
     }

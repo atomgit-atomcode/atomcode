@@ -353,7 +353,13 @@ impl Plugins for DiskPlugins {
                 .or_else(|| described.get(market).and_then(|d| d.get(plugin)).cloned())
                 .unwrap_or_default()
         };
-        let plugins = merge(&markets, &installed, &about);
+        let trust = atomcode_capabilities::plugin::installed_plugin_hook_trust_status(
+            &atomcode_coding::config::product_dirs_from_env(),
+        );
+        let mut plugins = merge(&markets, &installed, &about);
+        for row in &mut plugins {
+            row.hook_trusted = hook_status(&trust, &row.name, &row.marketplace).map(|s| s.trusted);
+        }
         let markets = markets
             .into_iter()
             .map(|m| MarketRow {
@@ -429,6 +435,38 @@ impl Plugins for DiskPlugins {
             .into_owned()
         })?;
         Ok(tr(SMsg::Uninstalled { id: &id }).into_owned())
+    }
+
+    async fn trust(&self, plugin: &str, market: &str) -> Result<String, String> {
+        let dirs = atomcode_coding::config::product_dirs_from_env();
+        let status = atomcode_capabilities::plugin::installed_plugin_hook_trust_status(&dirs);
+        let id = format!("{plugin}@{market}");
+        let Some(status) = hook_status(&status, plugin, market) else {
+            return Err(tr(SMsg::PluginHasNoHooks { id: &id }).into_owned());
+        };
+        atomcode_capabilities::plugin::hook_trust::trust(
+            dirs.user(),
+            &status.plugin_id,
+            &status.hash,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(tr(SMsg::PluginHooksTrusted {
+            id: &id,
+            count: status.hook_count,
+        })
+        .into_owned())
+    }
+
+    async fn untrust(&self, plugin: &str, market: &str) -> Result<String, String> {
+        let dirs = atomcode_coding::config::product_dirs_from_env();
+        let status = atomcode_capabilities::plugin::installed_plugin_hook_trust_status(&dirs);
+        let id = format!("{plugin}@{market}");
+        let Some(status) = hook_status(&status, plugin, market) else {
+            return Err(tr(SMsg::PluginHasNoHooks { id: &id }).into_owned());
+        };
+        atomcode_capabilities::plugin::hook_trust::untrust(dirs.user(), &status.plugin_id)
+            .map_err(|e| e.to_string())?;
+        Ok(tr(SMsg::PluginHooksUntrustedNow { id: &id }).into_owned())
     }
 
     async fn add_market(&self, url: &str) -> Result<String, String> {
@@ -722,6 +760,7 @@ fn merge(
                 marketplace: market.name.clone(),
                 description: about(&market.name, name, here),
                 installed: here.map(|i| scope_out(&i.scope)),
+                hook_trusted: None,
             });
         }
     }
@@ -741,9 +780,22 @@ fn merge(
             marketplace: info.marketplace.clone(),
             description: about(&info.marketplace, &info.plugin, Some(info)),
             installed: Some(scope_out(&info.scope)),
+            hook_trusted: None,
         });
     }
     rows
+}
+
+fn hook_status<'a>(
+    statuses: &'a [atomcode_capabilities::plugin::PluginHookTrust],
+    plugin: &str,
+    marketplace: &str,
+) -> Option<&'a atomcode_capabilities::plugin::PluginHookTrust> {
+    let key = marketplace::sanitize_name(plugin);
+    statuses.iter().find(|status| {
+        status.marketplace == marketplace
+            && (status.plugin == plugin || marketplace::sanitize_name(&status.plugin) == key)
+    })
 }
 
 #[cfg(test)]

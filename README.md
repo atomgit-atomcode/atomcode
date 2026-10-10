@@ -545,7 +545,7 @@ Type `/` in the TUI to browse the full list with live completion; `/help` shows 
 | Command   | Action                                                                |
 | --------- | --------------------------------------------------------------------- |
 | `/mcp`    | MCP server status (subcommands: `reload`, `tools`, `login`, `logout`) |
-| `/plugin` | Plugin marketplace (`marketplace` / `install` / `uninstall` / `list`) |
+| `/plugin` | Plugin marketplace (`marketplace` / `install` / `uninstall` / `trust` / `untrust` / `list`) |
 | `/skills` | Browse loaded skills                                                  |
 
 **Project & system**

@@ -43,8 +43,11 @@
 
 ### Issues
 
+- [#1352 [共创大赛][Bug] diff预览有丢失问题](https://atomgit.com/atomgit_atomcode/atomcode/issues/1352)
+- [#1479 [共创大赛][Bug] Ver5.0.7在使用 /upgrade 更新到5.0.8时会出现拒绝访问](https://atomgit.com/atomgit_atomcode/atomcode/issues/1479)
 - [#1564 Windows Terminal 下 Ctrl+V 无法粘贴剪贴板图片（Cline CLI 同环境正常）](https://atomgit.com/atomgit_atomcode/atomcode/issues/1564)
 - [#1565 刚上的deepseek-flash模型报错了](https://atomgit.com/atomgit_atomcode/atomcode/issues/1565)
+- [#1568 [共创大赛]-[Feature] 希望在添加Provider的时候根据Provider的地址拉取模型列表进行选择](https://atomgit.com/atomgit_atomcode/atomcode/issues/1568)
 - [#1570 bug：读取图片后，服务连接失败且当前会话中无法恢复](https://atomgit.com/atomgit_atomcode/atomcode/issues/1570)
 - [#1573 [共创大赛][Bug] V5.1.0更新说明中修复ESC逻辑，实测未修复，反倒更糟糕](https://atomgit.com/atomgit_atomcode/atomcode/issues/1573)
 - [#1574 [共创大赛][Bug] 表格渲染不完整](https://atomgit.com/atomgit_atomcode/atomcode/issues/1574)
@@ -80,6 +83,21 @@
 - [#1611 [Bug] fresh 会话启动竞态：首轮事实提交先于 publish_staged_session，撞 NotFound(index) 后 session-store 判死并 cancel，日志永久丢写](https://atomgit.com/atomgit_atomcode/atomcode/issues/1611)
 - [#1612 [Docs][TUI] 中断并发快捷键已改绑 Ctrl+X：物料按 e1f32e135 标题引用会带上旧键名 Ctrl+B](https://atomgit.com/atomgit_atomcode/atomcode/issues/1612)
 - [#1614 [Bug] 新 TUI：Ctrl+O 思考过程文本颜色由终端实测调色板计算而非固定灰，macOS iTerm2 下不是灰色](https://atomgit.com/atomgit_atomcode/atomcode/issues/1614)
+- [#1618 TUI 应能解析   CSI-u 键报（vs code 1.140.0, atomcode 5.2）](https://atomgit.com/atomgit_atomcode/atomcode/issues/1618)
+- [#1619 5.2.x 会话存储迁移后部分旧会话从 TUI 消失（无 .index，daemon 报 Corrupt）](https://atomgit.com/atomgit_atomcode/atomcode/issues/1619)
+- [#1620 [5.2.1] 自动升级后 5.2.0 写入的 v2 会话（.index/.events）全部从 /resume 消失；5.2.1 疑为比 5.2.0 更旧的构建（缺 review 子命令，附二进制指纹与 rollback 验证）](https://atomgit.com/atomgit_atomcode/atomcode/issues/1620)
+- [#1621 workspace 全量测试下 session::snapshot 两条稳定失败：store 路径取自其它测试临时改写的 $ATOMCODE_HOME，随后该目录被删除](https://atomgit.com/atomgit_atomcode/atomcode/issues/1621)
+- [#1622 webui 在旧内核浏览器（华为浏览器 Chromium 99）中无法正常显示：前端 CSS 使用 105+/108+/111+/117+ 特性，且缺最低浏览器版本说明与无 token 引导页](https://atomgit.com/atomgit_atomcode/atomcode/issues/1622)
+- [#1623 webui「登录账号」在 PWA 应用窗口中静默失败：window.open 弹出的 OAuth 授权页无提示、轮询 10 分钟无反馈，需先在浏览器登录 gitcode.com 才能绕过](https://atomgit.com/atomgit_atomcode/atomcode/issues/1623)
+- [#1624 team 角色缺 permission 字段时每轮对话重复告警刷屏，且 agents/*.md 角色文件 frontmatter（含 permission）完全无文档、无迁移引导](https://atomgit.com/atomgit_atomcode/atomcode/issues/1624)
+- [#1625 webui 服务随 TUI 进程退出而静默停止，桌面客户端只提示"服务没有启动"且无启动引导——建议支持独立守护模式](https://atomgit.com/atomgit_atomcode/atomcode/issues/1625)
+- [#1626 会话 bucket 内的备份子目录（bak_*）被扫描器计入，导致同一会话 ID 重复、聊天连接报 HTTP 409 Conflict](https://atomgit.com/atomgit_atomcode/atomcode/issues/1626)
+- [#1627 客户端关闭后重启：webui 进程反复短命退出且不绑定端口 16 分钟，登录按钮无服务可连（附完整监控+daemon 日志时间线）](https://atomgit.com/atomgit_atomcode/atomcode/issues/1627)
+- [#1629 [共创大赛][Bug] v5.2.1 版本新TUI，windows 平台，对话过程中 control + c 复制，会导致对话终止。](https://atomgit.com/atomgit_atomcode/atomcode/issues/1629)
+- [#1630 [共创大赛][Bug] v5.2.1 新TUI，选择右击会出现 “copy the selection put the selected text” 一个类似的按钮提示，会遮挡你选择服务的内容。](https://atomgit.com/atomgit_atomcode/atomcode/issues/1630)
+- [#1632 [共创大赛][Bug] atomcode 无法正常授权](https://atomgit.com/atomgit_atomcode/atomcode/issues/1632)
+- [#1633 长会话多次 compact 后模型重发相同 todowrite，连续触发 tool loop detected 熔断（附日志证据与改进建议）](https://atomgit.com/atomgit_atomcode/atomcode/issues/1633)
+- [#1634 [TUI] 执行 skill 时 SKILL.md 全文原样刷入 transcript 对话区，应折叠为摘要展示](https://atomgit.com/atomgit_atomcode/atomcode/issues/1634)
 
 ## v5.1.0（v5.2.1） (2026-09-18)
 

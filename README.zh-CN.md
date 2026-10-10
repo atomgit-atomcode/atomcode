@@ -524,7 +524,7 @@ atomcode --prompt-file task.md
 | 命令      | 动作                                                         |
 | --------- | ------------------------------------------------------------ |
 | `/mcp`    | MCP 服务状态（子命令：`reload`、`tools`、`login`、`logout`） |
-| `/plugin` | 插件市场（`marketplace` / `install` / `uninstall` / `list`） |
+| `/plugin` | 插件市场（`marketplace` / `install` / `uninstall` / `trust` / `untrust` / `list`） |
 | `/skills` | 浏览已加载的 skills                                          |
 
 **项目与系统**

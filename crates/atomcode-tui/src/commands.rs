@@ -7166,6 +7166,37 @@ impl CommandSet for PluginCommands {
                     Err(why) => Outcome::Refused(why),
                 }
             }
+            "trust" | "untrust" => {
+                let Some(typed) = rest.split_whitespace().next() else {
+                    return Outcome::Refused(
+                        t(if verb == "trust" {
+                            Msg::PluginTrustWhich
+                        } else {
+                            Msg::PluginUntrustWhich
+                        })
+                        .into_owned(),
+                    );
+                };
+                let installed: Vec<crate::plugins::PluginRow> = view
+                    .plugins()
+                    .iter()
+                    .filter(|row| row.installed.is_some())
+                    .cloned()
+                    .collect();
+                let row = match pick(&installed, typed, verb) {
+                    Ok(row) => row.clone(),
+                    Err(why) => return Outcome::Refused(why),
+                };
+                let done = if verb == "trust" {
+                    port.trust(&row.name, &row.marketplace).await
+                } else {
+                    port.untrust(&row.name, &row.marketplace).await
+                };
+                match done {
+                    Ok(said) => reload_then(ctx, said).await,
+                    Err(why) => Outcome::Refused(why),
+                }
+            }
             "update" => {
                 let Some(typed) = rest.split_whitespace().next() else {
                     return Outcome::Refused(t(Msg::PluginUpdateWhich).into_owned());
@@ -7312,6 +7343,7 @@ mod plugin_tests {
             marketplace: market.into(),
             description: String::new(),
             installed: None,
+            hook_trusted: None,
         }
     }
 
