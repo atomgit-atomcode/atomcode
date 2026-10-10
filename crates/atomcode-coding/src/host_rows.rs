@@ -57,6 +57,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
 use atomcode_capabilities::session::SessionManager;
+use atomcode_config::i18n::{t, Msg};
 use atomcode_harness::agent::{Agent, MessageOrigin};
 use atomcode_harness::events::{
     AgentRequest, ModelRequest, ModelResponse, PreStep, RequestError, StepDecision, TurnFinishing,
@@ -2124,8 +2125,8 @@ impl atomcode_harness::commands::CatalogCommand for WorktreeCommand {
     fn describe(&self) -> CommandDescription {
         on_the_session(
             "worktree",
-            Some("[create] <名字> [基准] | list | done | cleanup <名字> [--force]"),
-            "开一个自己的分支与 checkout 并进去干活;`list` 看有哪些,`done` 回主检出,`cleanup` 清掉",
+            Some(&t(Msg::CmdCatalogWorktreeUsage)),
+            &t(Msg::CmdCatalogWorktree),
         )
     }
     fn offered_for(&self, agent: &atomcode_harness::agent::Agent) -> bool {
@@ -2657,11 +2658,7 @@ fn init_prompt_from(
 #[async_trait]
 impl atomcode_harness::commands::CatalogCommand for InitCommand {
     fn describe(&self) -> CommandDescription {
-        on_the_session(
-            "init",
-            None,
-            "让模型读一遍这个仓库,把 AGENTS.md 写出来或改好",
-        )
+        on_the_session("init", None, &t(Msg::CmdCatalogInit))
     }
     fn offered_for(&self, agent: &atomcode_harness::agent::Agent) -> bool {
         the_conversation_itself(agent)
@@ -2770,8 +2767,8 @@ impl atomcode_harness::commands::CatalogCommand for WorklogCommand {
     fn describe(&self) -> CommandDescription {
         on_the_session(
             "worklog",
-            Some("[今天|昨天|8/27]"),
-            "跨所有项目翻一天的会话记录,做成一份工作日报",
+            Some(&t(Msg::CmdCatalogWorklogUsage)),
+            &t(Msg::CmdCatalogWorklog),
         )
     }
     fn offered_for(&self, agent: &atomcode_harness::agent::Agent) -> bool {
@@ -2851,8 +2848,8 @@ impl atomcode_harness::commands::CatalogCommand for GoalCommand {
     fn describe(&self) -> CommandDescription {
         on_the_session(
             "goal",
-            Some("<要达成的条件> | stop | pause"),
-            "自己干到条件成立为止;`stop` 收工,`pause` 先搁着。",
+            Some(&t(Msg::CmdCatalogGoalUsage)),
+            &t(Msg::CmdCatalogGoal),
         )
     }
     fn offered_for(&self, agent: &atomcode_harness::agent::Agent) -> bool {
@@ -2914,8 +2911,8 @@ impl atomcode_harness::commands::CatalogCommand for LoopCommand {
     fn describe(&self) -> CommandDescription {
         on_the_session(
             "loop",
-            Some("<每轮要做的事> | stop"),
-            "一遍遍地做同一件事,直到 `stop`。",
+            Some(&t(Msg::CmdCatalogLoopUsage)),
+            &t(Msg::CmdCatalogLoop),
         )
     }
     fn offered_for(&self, agent: &atomcode_harness::agent::Agent) -> bool {
@@ -3025,8 +3022,8 @@ impl atomcode_harness::commands::CatalogCommand for QueueCommand {
     fn describe(&self) -> CommandDescription {
         on_the_session(
             "queue",
-            Some("<要先说的话>"),
-            "排在下一轮前面的话 —— 现在不打断,下一轮模型先看到它。",
+            Some(&t(Msg::CmdCatalogQueueUsage)),
+            &t(Msg::CmdCatalogQueue),
         )
     }
     fn offered_for(&self, agent: &atomcode_harness::agent::Agent) -> bool {
@@ -3078,10 +3075,12 @@ impl PolicyCommand {
 #[async_trait]
 impl atomcode_harness::commands::CatalogCommand for PolicyCommand {
     fn describe(&self) -> CommandDescription {
+        // `done | skip | how | end` are subcommands, not words: the same four
+        // in either language, so the hint is not in the table.
         on_the_session(
             "policy",
             Some("done | skip | how | end"),
-            "卡在策略边界上时,说怎么往下走;不带参数就是问有哪些走法。",
+            &t(Msg::CmdCatalogPolicy),
         )
     }
     fn offered_for(&self, agent: &atomcode_harness::agent::Agent) -> bool {

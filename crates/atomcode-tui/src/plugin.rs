@@ -489,6 +489,35 @@ impl AgentClient {
             args: args.to_string(),
         });
     }
+    /// Ask every followed session to describe itself again.
+    ///
+    /// For a change that moves no fact, only what a row *says* — the language.
+    /// Host control re-describes the sessions it serves when it applies the
+    /// language itself; the settings panel writes through the port, which the
+    /// host never sees, so the screen asks for the same refresh here.
+    ///
+    /// A re-subscribe from the next fact, not the first: this refreshes the
+    /// description, and replaying the log to learn it again would redraw the
+    /// conversation to say the same thing in another language.
+    pub(crate) fn refresh_descriptions(&self) {
+        let from: Vec<(String, SeqNo)> = {
+            let views = self.view.lock().expect("client poisoned");
+            views
+                .sessions
+                .iter()
+                .map(|(session, view)| {
+                    (
+                        session.clone(),
+                        view.high.map_or(0, |high| high.saturating_add(1)),
+                    )
+                })
+                .collect()
+        };
+        for (session, from) in from {
+            self.command(AgentCommand::Subscribe { session, from });
+        }
+    }
+
     /// Compact the conversation of the agent on screen.
     pub fn compact(&self, focus: Option<String>) {
         let command = self
@@ -5223,6 +5252,13 @@ impl Tui {
     /// swallowed — "the file changed but the session did not" is exactly the
     /// state a person must not be left in silently.
     fn reload_if_a_change_needs_it(&self, id: &str) -> Result<(), String> {
+        // The language row is `ImmediateUi`: there is nothing for the graph to
+        // do, but the catalog rows' glosses live in a description this screen
+        // already holds, so it is asked for again. Host control does the same
+        // for its own writers (`crate::host`, `RuntimeControl::redescribe`).
+        if id == "language" {
+            self.client.refresh_descriptions();
+        }
         let needs = {
             let m = self.host.moment.read().expect("moment poisoned");
             m.settings

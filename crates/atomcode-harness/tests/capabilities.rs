@@ -783,3 +783,51 @@ async fn a_session_that_never_planned_is_left_alone() {
         task_list_notes(&app)
     );
 }
+
+/// **What a command says it is for is read at describe time, not frozen at
+/// mount.** The glosses a row puts in the catalog come from the product's
+/// language table (`crates/atomcode-i18n`), so `/language` is enough to change
+/// them — the same app, described once more, speaks the language in force.
+///
+/// A row that copied its glosses into a struct field when it mounted would
+/// answer the same in both languages here, and on screen would keep the old
+/// menu until the next start. That is the whole of what this asks: a
+/// `remember` gloss that carries Chinese under `zh`, and none under `en`.
+#[tokio::test]
+async fn what_a_catalog_row_says_follows_the_language_in_force() {
+    let dir = scratch("row-language");
+    let app = start(tree(&dir, STOP, &[])).await;
+    let catalog = app
+        .context()
+        .service::<atomcode_harness::seams::CommandsSvc>()
+        .expect("the catalog is a core row");
+    let agent = atomcode_harness::create_agent(&app)
+        .await
+        .expect("an agent to run commands against");
+
+    let _locale = atomcode_config::i18n::test_lock();
+    for (locale, chinese) in [
+        (atomcode_config::i18n::Locale::En, false),
+        (atomcode_config::i18n::Locale::ZhCn, true),
+    ] {
+        atomcode_config::i18n::set_locale(locale);
+        for name in ["skills", "memory", "remember", "forget"] {
+            let said = catalog
+                .find(name, &agent)
+                .unwrap_or_else(|| panic!("`/{name}` is on offer"))
+                .describe();
+            assert_eq!(
+                has_cjk(&said.summary),
+                chinese,
+                "`/{name}` under {locale:?} says: {}",
+                said.summary
+            );
+        }
+    }
+}
+
+/// Whether `text` carries a CJK character — which it does not when it is in
+/// English, so the two languages are told apart by what a person would see.
+fn has_cjk(text: &str) -> bool {
+    text.chars().any(|c| matches!(c, '\u{4e00}'..='\u{9fff}'))
+}

@@ -359,11 +359,7 @@ pub(crate) fn attach(
                     }
                 }
                 CodingRuntimeEvent::ProviderChanged { .. }
-                | CodingRuntimeEvent::ReasoningEffortChanged { .. } => {
-                    if let Some(app) = watched.front_end.app() {
-                        watched.front_end.feed().redescribe(&app);
-                    }
-                }
+                | CodingRuntimeEvent::ReasoningEffortChanged { .. } => watched.redescribe(),
                 // How much the session may do without asking is session state,
                 // not a fact in the log — so a screen draws it from here or not
                 // at all. Pushed rather than polled, like the two above: the
@@ -1396,6 +1392,18 @@ impl RuntimeControl {
             .lock()
             .expect("unavailable_said poisoned") = None;
     }
+
+    /// Tell every subscriber what its agent is, again, without touching the log.
+    ///
+    /// For a change that alters what a row *says* rather than what happened —
+    /// the language, a provider, the thinking level. It moves no fact, so the
+    /// front end hears `Described` once more instead of waiting for its next
+    /// subscribe to notice.
+    pub(crate) fn redescribe(&self) {
+        if let Some(app) = self.front_end.app() {
+            self.front_end.feed().redescribe(&app);
+        }
+    }
     /// The runtime this controls — for a host holding several
     /// (`crate::background`), which cancels and stops them itself.
     pub(crate) fn runtime(&self) -> &CodingRuntimeHandle {
@@ -2321,6 +2329,10 @@ impl HostControl for RuntimeControl {
                     .map_err(|message| HostError::Failed { message })?;
                 if id == "language" {
                     crate::tui_settings::apply_language(&value);
+                    // The screen's own table follows the locale on its next
+                    // draw; the rows' glosses are in the description it
+                    // already holds, so they have to be pushed again.
+                    self.redescribe();
                 }
                 Ok(HostReply::Done)
             }
@@ -2334,6 +2346,7 @@ impl HostControl for RuntimeControl {
                     .map_err(|message| HostError::Failed { message })?;
                 if id == "language" {
                     crate::tui_settings::apply_language("auto");
+                    self.redescribe();
                 }
                 Ok(HostReply::Done)
             }

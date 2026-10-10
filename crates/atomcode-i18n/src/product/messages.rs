@@ -2236,4 +2236,35 @@ pub enum Msg<'a> {
     ResumeHintBackground {
         cmd: &'a str,
     },
+
+    // ── the agent catalog's own commands, as a front end draws them ──
+    //
+    // The rows a runtime capability mounts
+    // (`crates/atomcode-coding/src/host_rows.rs`,
+    // `crates/atomcode-harness/src/plugins/capabilities.rs`) build their
+    // `CommandDescription` at `describe()` time by reading these, so a slash
+    // menu's gloss follows `/language` without a restart. The `…Usage` sibling
+    // is the argument hint a menu draws beside the name.
+    CmdCatalogWorktree,
+    CmdCatalogWorktreeUsage,
+    CmdCatalogInit,
+    CmdCatalogWorklog,
+    CmdCatalogWorklogUsage,
+    CmdCatalogGoal,
+    CmdCatalogGoalUsage,
+    CmdCatalogLoop,
+    CmdCatalogLoopUsage,
+    CmdCatalogQueue,
+    CmdCatalogQueueUsage,
+    CmdCatalogPolicy,
+    CmdCatalogReview,
+    CmdCatalogSkills,
+    CmdCatalogSkillsUsage,
+    /// The hint on a user-invoked skill's own row; its gloss is the skill's.
+    CmdCatalogSkillUsage,
+    CmdCatalogMemory,
+    CmdCatalogRemember,
+    CmdCatalogRememberUsage,
+    CmdCatalogForget,
+    CmdCatalogForgetUsage,
 }

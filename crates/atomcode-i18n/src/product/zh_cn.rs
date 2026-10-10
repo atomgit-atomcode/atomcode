@@ -1367,6 +1367,40 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             "  （提示：重启 / 恢复会话后该 loop 不会保留）".into(),
         Msg::CmdDescLoop =>
             "按固定间隔重复执行提示/命令，或让模型自主决定节奏".into(),
+
+        // ── 能力行自己挂的命令，菜单怎么画 ──
+        Msg::CmdCatalogWorktree =>
+            "开一个自己的分支与 checkout 并进去干活;`list` 看有哪些,`done` 回主检出,`cleanup` 清掉".into(),
+        Msg::CmdCatalogWorktreeUsage =>
+            "[create] <名字> [基准] | list | done | cleanup <名字> [--force]".into(),
+        Msg::CmdCatalogInit =>
+            "让模型读一遍这个仓库,把 AGENTS.md 写出来或改好".into(),
+        Msg::CmdCatalogWorklog =>
+            "跨所有项目翻一天的会话记录,做成一份工作日报".into(),
+        Msg::CmdCatalogWorklogUsage => "[今天|昨天|8/27]".into(),
+        Msg::CmdCatalogGoal =>
+            "自己干到条件成立为止;`stop` 收工,`pause` 先搁着。".into(),
+        Msg::CmdCatalogGoalUsage => "<要达成的条件> | stop | pause".into(),
+        Msg::CmdCatalogLoop =>
+            "一遍遍地做同一件事,直到 `stop`。".into(),
+        Msg::CmdCatalogLoopUsage => "<每轮要做的事> | stop".into(),
+        Msg::CmdCatalogQueue =>
+            "排在下一轮前面的话 —— 现在不打断,下一轮模型先看到它。".into(),
+        Msg::CmdCatalogQueueUsage => "<要先说的话>".into(),
+        Msg::CmdCatalogPolicy =>
+            "卡在策略边界上时,说怎么往下走;不带参数就是问有哪些走法。".into(),
+        Msg::CmdCatalogReview =>
+            "让评审员看一遍现在的改动;只读,不改".into(),
+        Msg::CmdCatalogSkills =>
+            "装了哪些 skill;给名字就把它们一起用上".into(),
+        Msg::CmdCatalogSkillsUsage => "[名字… [给它们的话]]".into(),
+        Msg::CmdCatalogSkillUsage => "[给它的话]".into(),
+        Msg::CmdCatalogMemory => "存下来的那些话".into(),
+        Msg::CmdCatalogRemember =>
+            "记住一句话,以后每个会话都带着".into(),
+        Msg::CmdCatalogRememberUsage => "<要记住的话>".into(),
+        Msg::CmdCatalogForget => "把记住的某句话删掉".into(),
+        Msg::CmdCatalogForgetUsage => "<要忘掉的话>".into(),
         Msg::ModelNoImageSupport { model } => format!(
             "当前模型 \"{}\" 不支持图片输入，且未配置 vision_preprocessor_provider。\
              请用 /model 切换到支持视觉的模型，或在配置中设置 vision_preprocessor_provider。",

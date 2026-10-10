@@ -13,6 +13,7 @@ use atomcode_coding::{
     CodingRuntimeStart, PrepareOptions, ProviderBuildError, SessionMode, StaticPluginHookSource,
     SubagentPolicy, UserInput,
 };
+use atomcode_host_api::HostCommand;
 use atomcode_kernel::message::Message;
 use atomcode_kernel::provider::{ChatOptions, LlmProvider};
 use atomcode_kernel::stream::{ProviderError, StreamEvent, TokenUsage};
@@ -1117,6 +1118,153 @@ async fn the_launchers_own_commands_are_in_the_menu() {
             "`/{name}` is mounted: {offered:?}"
         );
     }
+}
+
+/// `/language` reaches the menu: the glosses the runtime's rows put on their
+/// commands are read from the product's language table each time the agent is
+/// described, so a switch redraws the menu in the new language without a
+/// restart.
+///
+/// The run this pins is the whole one: the row reads the table when it is asked
+/// (`crates/atomcode-coding/src/host_rows.rs`), the answer travels in a
+/// `Described` event, and `AgentCatalogCommands` reads the last one when the
+/// menu is drawn (`crates/atomcode-tui/src/commands.rs`). `/language` itself is
+/// the host writing the setting and pushing a fresh description — which is the
+/// middle of the run, and the part a build could get wrong while both ends look
+/// right.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_menu_is_described_in_the_language_language_is_set_to() {
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("ATOMCODE_HOME", home.path());
+    let project = tempfile::tempdir().unwrap();
+    let count = Arc::new(Count::default());
+    let config_path = home.path().join("config.toml");
+    // Start from a language that is not the machine's, and ask for the other by
+    // name below, so the criterion reads the same wherever it runs.
+    let _locale = atomcode_config::i18n::test_lock();
+    atomcode_config::i18n::set_locale(atomcode_config::locale::Locale::En);
+
+    let front_end = FrontEnd::new();
+    let (start, config) = start(
+        project.path(),
+        &count,
+        SessionMode::Fresh,
+        Some(front_end.clone()),
+    );
+    let runtime = CodingRuntime::start(start).await.expect("starts");
+    let session = runtime.session.clone().expect("a stored session").id;
+    let screen = Screen {
+        headless: Some((140, 40)),
+        ..Screen::default()
+    };
+    // A host whose configuration a screen may edit: `/language` writes through
+    // it. Everything else keeps the trait's default.
+    let mounted = tui_front::mount(
+        runtime,
+        front_end,
+        config,
+        Some(Arc::new(Writable)),
+        &screen,
+        config_path,
+        None,
+        None,
+    )
+    .await
+    .expect("the screen mounts");
+
+    // The menu's catalog half arrives with the agent's first description, on
+    // the screen's event loop — so the loop has to be running before the menu
+    // has anything of the agent's to read.
+    let commands = mounted
+        .app
+        .context()
+        .service::<atomcode_tui::plugin::CommandsSvc>()
+        .expect("the command registry");
+    let ui = mounted.ui.clone();
+    let ctx = mounted.app.context();
+    let _running = tokio::spawn(async move {
+        let _ = ui.run(&ctx, None).await;
+    });
+
+    let about = |name: &str| commands.find(name).map(|c| c.about.into_owned());
+    let catalog = ["goal", "loop", "queue", "policy", "worktree"];
+    for _ in 0..200 {
+        if about("goal").is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    for name in catalog {
+        let said = about(name).unwrap_or_else(|| panic!("`/{name}` is in the menu"));
+        assert!(
+            !has_cjk(&said),
+            "`/{name}` is drawn in English before any switch: {said}"
+        );
+    }
+
+    // `/language zh`, as the screen runs it: the host writes the setting and
+    // describes the agent again.
+    let client = mounted
+        .app
+        .context()
+        .service::<atomcode_tui::plugin::AgentClientSvc>()
+        .expect("the screen's end of the connection");
+    client
+        .control()
+        .expect("a host to ask")
+        .call(HostCommand::SetSetting {
+            session,
+            id: "language".into(),
+            value: "zh".into(),
+        })
+        .await
+        .expect("the host takes the new language");
+
+    for name in catalog {
+        for _ in 0..200 {
+            if about(name).map(|said| has_cjk(&said)).unwrap_or(false) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let said = about(name).unwrap_or_else(|| panic!("`/{name}` is in the menu"));
+        assert!(
+            has_cjk(&said),
+            "`/{name}` never followed `/language zh`: {said}"
+        );
+    }
+}
+
+/// A host a screen may edit, for the one setting this test moves.
+struct Writable;
+
+impl atomcode::host::HostConfig for Writable {
+    fn for_model(&self, model: &str) -> Result<CodingAgentConfig, String> {
+        let mut config = CodingAgentConfig::new(
+            "key",
+            "https://example.test/v1",
+            model,
+            std::env::temp_dir(),
+            atomcode_coding::config::product_dirs_from_env(),
+        );
+        config.interactive = true;
+        Ok(config)
+    }
+    fn current(&self) -> Result<CodingAgentConfig, String> {
+        self.for_model("scripted")
+    }
+    fn set_setting(&self, id: &str, value: &str) -> Result<(), String> {
+        match (id, value) {
+            ("language", "en" | "zh") => Ok(()),
+            _ => Err(format!("this test's host does not edit `{id}`")),
+        }
+    }
+}
+
+/// Whether `text` carries a CJK character — which it does not when it is in
+/// English, so the two languages are told apart by what a person would see.
+fn has_cjk(text: &str) -> bool {
+    text.chars().any(|c| matches!(c, '\u{4e00}'..='\u{9fff}'))
 }
 
 /// `/changelog` is picked the way `/resume` is: the releases rise from the

@@ -1407,6 +1407,41 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             "  (note: the loop won't survive a restart / resume)".into(),
         Msg::CmdDescLoop =>
             "Repeat a prompt/command on an interval, or let the model self-pace".into(),
+
+        // ── the agent catalog's own commands, as a front end draws them ──
+        Msg::CmdCatalogWorktree =>
+            "Work on a branch and checkout of your own; `list` shows them, `done` returns to the main checkout, `cleanup` removes one".into(),
+        Msg::CmdCatalogWorktreeUsage =>
+            "[create] <name> [base] | list | done | cleanup <name> [--force]".into(),
+        Msg::CmdCatalogInit =>
+            "Have the model read this repository and write or fix AGENTS.md".into(),
+        Msg::CmdCatalogWorklog =>
+            "Go through one day's sessions across all projects and turn them into a work report".into(),
+        Msg::CmdCatalogWorklogUsage => "[today|yesterday|M/D]".into(),
+        Msg::CmdCatalogGoal =>
+            "Keep working until the condition holds; `stop` finishes, `pause` sets it aside.".into(),
+        Msg::CmdCatalogGoalUsage => "<condition to meet> | stop | pause".into(),
+        Msg::CmdCatalogLoop =>
+            "Do the same thing over and over, until `stop`.".into(),
+        Msg::CmdCatalogLoopUsage => "<what to do each round> | stop".into(),
+        Msg::CmdCatalogQueue =>
+            "A word ahead of the next round — it does not interrupt now; the model sees it first next turn.".into(),
+        Msg::CmdCatalogQueueUsage => "<what to say first>".into(),
+        Msg::CmdCatalogPolicy =>
+            "When you are stuck at a policy boundary, say how to go on; with no argument it asks which ways there are.".into(),
+        Msg::CmdCatalogReview =>
+            "Have the reviewer look over the current changes; read-only, changes nothing"
+                .into(),
+        Msg::CmdCatalogSkills =>
+            "Which skills are installed; give names and they are used together".into(),
+        Msg::CmdCatalogSkillsUsage => "[name… [what to tell them]]".into(),
+        Msg::CmdCatalogSkillUsage => "[what to tell it]".into(),
+        Msg::CmdCatalogMemory => "The things you remembered".into(),
+        Msg::CmdCatalogRemember =>
+            "Remember one line, carried into every session from now on".into(),
+        Msg::CmdCatalogRememberUsage => "<what to remember>".into(),
+        Msg::CmdCatalogForget => "Delete one of the lines you remembered".into(),
+        Msg::CmdCatalogForgetUsage => "<what to forget>".into(),
         Msg::ModelNoImageSupport { model } => format!(
             "Current model \"{}\" does not support image input and no \
              vision_preprocessor_provider is configured. Use /model to \

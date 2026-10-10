@@ -19,6 +19,7 @@ use atomcode_capabilities::skills::{
     standard_skill_dirs, ListSkillsTool, SkillRegistry, SkillRoots, UseSkillTool,
 };
 use atomcode_capabilities::tools::{WebFetchTool, WebSearchTool};
+use atomcode_config::i18n::{t, Msg};
 use atomcode_kernel::tool::Tool;
 use atomcode_plexus::{Context, Plugin};
 use serde::Deserialize;
@@ -396,8 +397,10 @@ impl crate::commands::CatalogCommand for ReviewCommand {
     fn describe(&self) -> atomcode_kernel::agent::CommandDescription {
         atomcode_kernel::agent::CommandDescription {
             name: "review".into(),
+            // `[staged | <base>]` is a syntax, not a sentence: the same in
+            // either language, so it is not in the table.
             usage: Some("[staged | <base>]".into()),
-            summary: "让评审员看一遍现在的改动;只读,不改".into(),
+            summary: t(Msg::CmdCatalogReview).into_owned(),
             target: atomcode_kernel::agent::CommandTarget::Session,
         }
     }
@@ -542,7 +545,7 @@ impl crate::commands::CatalogCommand for RunSkill {
     fn describe(&self) -> atomcode_kernel::agent::CommandDescription {
         atomcode_kernel::agent::CommandDescription {
             name: bare_name(&self.0.name),
-            usage: Some("[给它的话]".into()),
+            usage: Some(t(Msg::CmdCatalogSkillUsage).into_owned()),
             summary: self.0.description.clone(),
             target: atomcode_kernel::agent::CommandTarget::Session,
         }
@@ -628,8 +631,8 @@ impl crate::commands::CatalogCommand for ListSkills {
     fn describe(&self) -> atomcode_kernel::agent::CommandDescription {
         atomcode_kernel::agent::CommandDescription {
             name: "skills".into(),
-            usage: Some("[名字… [给它们的话]]".into()),
-            summary: "装了哪些 skill;给名字就把它们一起用上".into(),
+            usage: Some(t(Msg::CmdCatalogSkillsUsage).into_owned()),
+            summary: t(Msg::CmdCatalogSkills).into_owned(),
             target: atomcode_kernel::agent::CommandTarget::Session,
         }
     }
@@ -701,8 +704,10 @@ impl ListSkills {
 /// of the two changed.
 struct MemoryCommand {
     name: &'static str,
-    usage: Option<&'static str>,
-    summary: &'static str,
+    /// The table entries, not their words: `describe()` is read whenever a
+    /// front end asks, and the language in force is the one at that moment.
+    usage: Option<Msg<'static>>,
+    summary: Msg<'static>,
     action: &'static str,
     project: PathBuf,
     /// Where the project tiers live (`<project dir>/memory.md`, `…/local/…`).
@@ -722,8 +727,8 @@ impl crate::commands::CatalogCommand for MemoryCommand {
     fn describe(&self) -> atomcode_kernel::agent::CommandDescription {
         atomcode_kernel::agent::CommandDescription {
             name: self.name.into(),
-            usage: self.usage.map(str::to_string),
-            summary: self.summary.into(),
+            usage: self.usage.map(|msg| t(msg).into_owned()),
+            summary: t(self.summary).into_owned(),
             target: atomcode_kernel::agent::CommandTarget::Session,
         }
     }
@@ -750,7 +755,7 @@ impl crate::commands::CatalogCommand for MemoryCommand {
             rest => (None, rest),
         };
         if self.action != "list" && content.is_empty() {
-            return Err(format!("要有话可{}", self.summary));
+            return Err(t(Msg::CmdCustomArgRequired { name: self.name }).into_owned());
         }
         let mut call = serde_json::json!({ "action": self.action });
         if let Some(scope) = scope {
@@ -859,7 +864,7 @@ impl Plugin for MemoryPlugin {
             Arc::new(MemoryCommand {
                 name: "memory",
                 usage: None,
-                summary: "存下来的那些话",
+                summary: Msg::CmdCatalogMemory,
                 action: "list",
                 project: project.clone(),
                 dirs: dirs.clone(),
@@ -867,8 +872,8 @@ impl Plugin for MemoryPlugin {
             }) as Arc<dyn crate::commands::CatalogCommand>,
             Arc::new(MemoryCommand {
                 name: "remember",
-                usage: Some("<要记住的话>"),
-                summary: "记住一句话,以后每个会话都带着",
+                usage: Some(Msg::CmdCatalogRememberUsage),
+                summary: Msg::CmdCatalogRemember,
                 action: "remember",
                 project: project.clone(),
                 dirs: dirs.clone(),
@@ -876,8 +881,8 @@ impl Plugin for MemoryPlugin {
             }),
             Arc::new(MemoryCommand {
                 name: "forget",
-                usage: Some("<要忘掉的话>"),
-                summary: "把记住的某句话删掉",
+                usage: Some(Msg::CmdCatalogForgetUsage),
+                summary: Msg::CmdCatalogForget,
                 action: "forget",
                 project: project.clone(),
                 dirs: dirs.clone(),
