@@ -716,6 +716,59 @@ rank = 2
         assert!(port.probe("nobody", None).is_none());
     }
 
+    /// CodingPlan accounts are `/login`'s, not typed: there is nothing to fetch
+    /// a listing from, and the Ctrl+F flow answers by not offering one.
+    #[test]
+    fn a_codingplan_account_is_not_discovered() {
+        let (port, path) = port("discover-codingplan");
+        std::fs::write(
+            &path,
+            "[provider_accounts.AtomGit]\nprovider = \"openai-compatible\"\nbase_url = \"https://gateway.example.com/v1\"\n",
+        )
+        .unwrap();
+        assert!(port.discover("AtomGit").is_none());
+    }
+
+    /// A wire this build has no listing for keeps the picker closed — the
+    /// model is typed, as it was before discovery existed.
+    #[test]
+    fn an_unsupported_wire_is_not_discovered() {
+        let (port, path) = port("discover-unsupported");
+        std::fs::write(
+            &path,
+            "[providers.odd]\ntype = \"custom\"\nbase_url = \"https://example.com/v1\"\napi_key = \"sk\"\n",
+        )
+        .unwrap();
+        assert!(port.discover("odd").is_none());
+    }
+
+    /// No address, no listing to ask for — and an account the file does not
+    /// have is answered the same way.
+    #[test]
+    fn an_account_without_a_base_url_is_not_discovered() {
+        let (port, path) = port("discover-no-url");
+        std::fs::write(
+            &path,
+            "[providers.bare]\ntype = \"openai\"\napi_key = \"sk\"\n",
+        )
+        .unwrap();
+        assert!(port.discover("bare").is_none());
+        assert!(port.discover("nobody").is_none());
+    }
+
+    /// A typed OpenAI-compatible account does offer its listing — the future
+    /// exists and is bound to that account's own address and key.
+    #[test]
+    fn a_discoverable_account_offers_a_listing() {
+        let (port, path) = port("discover-offered");
+        std::fs::write(
+            &path,
+            "[provider_accounts.mine]\nprovider = \"openai-compatible\"\nbase_url = \"https://one.example.com/v1\"\napi_key = \"sk-one\"\n",
+        )
+        .unwrap();
+        assert!(port.discover("mine").is_some());
+    }
+
     /// Nothing that crosses the seam carries a key, however the row is printed.
     #[test]
     fn a_credential_never_leaves_the_port() {
