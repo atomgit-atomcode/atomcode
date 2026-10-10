@@ -1304,6 +1304,12 @@ const UPGRADED_FROM_ENV: &str = atomcode::tui_opening::UPGRADED_FROM_ENV;
 const INTERNAL_PREPARE_UPGRADE_ENV: &str = "ATOMCODE_INTERNAL_PREPARE_UPGRADE";
 
 fn main() {
+    // `NSPasteboard` is not safe on the Tokio/blocking workers where the TUI
+    // asks for clipboard images. A re-exec'd helper stops here, on the actual
+    // OS main thread, and writes only its clipboard result to stdout.
+    if atomcode_tui::surface::run_clipboard_helper_if_requested() {
+        return;
+    }
     // Completion generation must be a pure, fast CLI operation: no helper
     // thread, Tokio runtime, log file, config read, telemetry, or updater.
     // Shells may invoke completion helpers frequently, so even best-effort

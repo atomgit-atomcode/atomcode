@@ -1603,7 +1603,7 @@ fn pixel_fingerprint(width: usize, height: usize, bytes: &[u8]) -> u64 {
 /// (`Win+Shift+S`) and Qt screenshot tools leave a V5 header with bitfield
 /// masks that `arboard` rejects, so without it a screenshot read as "no image"
 /// — to the paste and to the hint that offers one alike.
-fn clipboard_rgba() -> Option<(usize, usize, Vec<u8>)> {
+fn clipboard_rgba_direct() -> Option<(usize, usize, Vec<u8>)> {
     let from_arboard = arboard::Clipboard::new()
         .ok()
         .and_then(|mut clipboard| clipboard.get_image().ok())
@@ -1620,6 +1620,82 @@ fn clipboard_rgba() -> Option<(usize, usize, Vec<u8>)> {
     {
         from_arboard
     }
+}
+
+/// macOS AppKit clipboard calls have crashed inside `NSPasteboard` when made
+/// from Tokio/blocking workers (EXC_BAD_ACCESS, before Rust can unwind). Keep
+/// them in a tiny re-exec child: its `main` is the real OS main thread, and a
+/// native crash makes this read return `None` instead of taking down the TUI.
+#[cfg(target_os = "macos")]
+const CLIPBOARD_HELPER_ENV: &str = "ATOMCODE_INTERNAL_CLIPBOARD_HELPER";
+
+#[cfg(target_os = "macos")]
+fn macos_clipboard_helper(kind: &str) -> Option<Vec<u8>> {
+    let output = std::process::Command::new(std::env::current_exe().ok()?)
+        .env(CLIPBOARD_HELPER_ENV, kind)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    output.status.success().then_some(output.stdout)
+}
+
+#[cfg(target_os = "macos")]
+fn decode_clipboard_rgba(bytes: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
+    const HEADER: usize = 16;
+    let width = usize::try_from(u64::from_le_bytes(bytes.get(..8)?.try_into().ok()?)).ok()?;
+    let height =
+        usize::try_from(u64::from_le_bytes(bytes.get(8..HEADER)?.try_into().ok()?)).ok()?;
+    let pixels = width.checked_mul(height)?.checked_mul(4)?;
+    (pixels == bytes.len().checked_sub(HEADER)?).then(|| (width, height, bytes[HEADER..].to_vec()))
+}
+
+fn clipboard_rgba() -> Option<(usize, usize, Vec<u8>)> {
+    #[cfg(target_os = "macos")]
+    {
+        return decode_clipboard_rgba(&macos_clipboard_helper("image")?);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        clipboard_rgba_direct()
+    }
+}
+
+/// Run the private macOS clipboard child before the CLI creates its helper
+/// thread or Tokio runtime. Returns `true` when this process was the helper and
+/// the normal product startup must stop.
+#[cfg(target_os = "macos")]
+pub fn run_clipboard_helper_if_requested() -> bool {
+    use std::io::Write as _;
+
+    let Ok(kind) = std::env::var(CLIPBOARD_HELPER_ENV) else {
+        return false;
+    };
+    let result = match kind.as_str() {
+        "image" => clipboard_rgba_direct().and_then(|(width, height, rgba)| {
+            let width = u64::try_from(width).ok()?;
+            let height = u64::try_from(height).ok()?;
+            let mut out = std::io::stdout().lock();
+            out.write_all(&width.to_le_bytes()).ok()?;
+            out.write_all(&height.to_le_bytes()).ok()?;
+            out.write_all(&rgba).ok()?;
+            Some(())
+        }),
+        "text" => arboard::Clipboard::new()
+            .ok()
+            .and_then(|mut clipboard| clipboard.get_text().ok())
+            .and_then(|text| std::io::stdout().lock().write_all(text.as_bytes()).ok()),
+        _ => None,
+    };
+    if result.is_none() {
+        std::process::exit(1);
+    }
+    true
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn run_clipboard_helper_if_requested() -> bool {
+    false
 }
 
 /// The raw `CF_DIB` bytes on the Windows clipboard, when there is any bitmap.
@@ -1694,9 +1770,18 @@ fn encode_rgba_png(width: usize, height: usize, rgba: &[u8]) -> Option<Vec<u8>> 
 /// line, and collapsing them here means no caller has to decide what to say
 /// about a paste of nothing.
 fn read_clipboard_text() -> Option<String> {
-    let mut clipboard = arboard::Clipboard::new().ok()?;
-    let text = clipboard.get_text().ok()?;
-    (!text.is_empty()).then_some(text)
+    #[cfg(target_os = "macos")]
+    {
+        let bytes = macos_clipboard_helper("text")?;
+        let text = String::from_utf8(bytes).ok()?;
+        return (!text.is_empty()).then_some(text);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut clipboard = arboard::Clipboard::new().ok()?;
+        let text = clipboard.get_text().ok()?;
+        (!text.is_empty()).then_some(text)
+    }
 }
 
 /// Hand the text to whatever this machine uses for a clipboard. `true` when one
@@ -3045,5 +3130,30 @@ mod tests {
             body.contains("probes_colours("),
             "the probe writes to the terminal without asking whether this one              can be asked"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_clipboard_helper_payload_is_bounded_by_its_dimensions() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&2_u64.to_le_bytes());
+        payload.extend_from_slice(&1_u64.to_le_bytes());
+        payload.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(
+            decode_clipboard_rgba(&payload),
+            Some((2, 1, vec![1, 2, 3, 4, 5, 6, 7, 8]))
+        );
+
+        payload.pop();
+        assert_eq!(
+            decode_clipboard_rgba(&payload),
+            None,
+            "a truncated or crashed helper cannot become an image"
+        );
+
+        let mut impossible = Vec::new();
+        impossible.extend_from_slice(&u64::MAX.to_le_bytes());
+        impossible.extend_from_slice(&u64::MAX.to_le_bytes());
+        assert_eq!(decode_clipboard_rgba(&impossible), None);
     }
 }
