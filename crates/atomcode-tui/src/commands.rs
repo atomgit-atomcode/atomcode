@@ -1407,6 +1407,7 @@ impl CommandSet for SessionCommands {
                     })
                     .await
                 {
+                    Ok(HostReply::DoneWithNote { note }) => Outcome::Said(note),
                     Ok(_) => Outcome::Quiet,
                     Err(error) => Outcome::Refused(refusal(error)),
                 }
@@ -3708,6 +3709,25 @@ mod tests {
             "asked: {:?}",
             host.asked.lock().unwrap()
         );
+    }
+
+    /// A successful busy resume carries the source/fork notice. It belongs on
+    /// screen rather than being swallowed with ordinary silent successes.
+    #[tokio::test]
+    async fn a_busy_resume_fork_is_said() {
+        let host = Arc::new(Recording::default());
+        let (app, _client, all) = following(&host);
+        host.replies
+            .lock()
+            .unwrap()
+            .push_back(Ok(HostReply::DoneWithNote {
+                note: "source 正在运行，已创建 forked".into(),
+            }));
+
+        match all.dispatch("/resume source", &app.context()).await {
+            Outcome::Said(said) => assert_eq!(said, "source 正在运行，已创建 forked"),
+            other => panic!("{other:?}"),
+        }
     }
 
     /// `/compact` during a turn waits behind it — and says so, instead of

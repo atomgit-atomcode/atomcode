@@ -2009,25 +2009,63 @@ impl HostControl for RuntimeControl {
                 // otherwise-fine resume, so this never uses `?`. The runtime's own
                 // working dir, not the process's: `/cd` moves where sessions
                 // resolve, and the resume follows it.
-                if let Ok(stats) = self.handle.context_stats().await {
-                    let here = stats.working_dir;
+                let here = self
+                    .handle
+                    .context_stats()
+                    .await
+                    .ok()
+                    .map(|stats| stats.working_dir);
+                if let Some(here) = here.as_ref() {
                     if let Some(bucket) = bucket_to_pin_on_resume(
                         &scan.entries,
                         &target,
                         &SessionManager::project_hash(
-                            &here,
+                            here,
                             &atomcode_coding::config::product_dirs_from_env(),
                         ),
                     ) {
                         SessionManager::pin_project_bucket(
-                            &here,
+                            here,
                             &atomcode_coding::config::product_dirs_from_env(),
                             &bucket,
                         );
                     }
                 }
-                let changed = self.handle.resume_session(target).await.map_err(refused)?;
-                self.changed(changed.session_id)
+                // Interactive resume has the same busy-session semantics as
+                // `atomcode-tuix`: the original runtime keeps its lease and we
+                // continue from its last committed state in a native fork. The
+                // prepared lease is handed straight to the runtime, so there is
+                // no acquire/drop race between deciding and switching.
+                let prepared = atomcode_daemon::legacy_convert::prepare_catalog_session_resume_or_fork_in_project(
+                    &entry.project_bucket,
+                    &target,
+                )
+                .map_err(|error| HostError::Failed {
+                    message: error.to_string(),
+                })?
+                .ok_or(HostError::NotFound)?;
+                let resumed_id = prepared.view.meta.id.clone();
+                let working_dir =
+                    here.unwrap_or_else(|| prepared.view.meta.working_dir.clone().into());
+                let forked_from = prepared.forked_from;
+                let changed = self
+                    .handle
+                    .resume_session_with_lease(resumed_id.clone(), working_dir, prepared.lease)
+                    .await
+                    .map_err(refused)?;
+                let reply = self.changed(changed.session_id)?;
+                match forked_from {
+                    Some(source_id) => Ok(HostReply::DoneWithNote {
+                        note: atomcode_config::i18n::t(
+                            atomcode_config::i18n::Msg::SessionBusyForked {
+                                source_id: &source_id,
+                                fork_id: &resumed_id,
+                            },
+                        )
+                        .into_owned(),
+                    }),
+                    None => Ok(reply),
+                }
             }
             HostCommand::SetReasoningEffort { session, level } => {
                 self.addressed(&session)?;

@@ -764,6 +764,65 @@ async fn a_stored_session_is_listed_and_resumed_with_its_history() {
     );
 }
 
+/// Interactive `/resume` must not strand a person merely because another
+/// window owns the selected conversation. Keep that owner's lease intact and
+/// switch this runtime to a committed native fork, matching atomcode-tuix and
+/// CLI `--continue`.
+#[tokio::test]
+async fn a_busy_session_is_resumed_as_an_announced_fork() {
+    let env = env();
+    let mut owner = connected(&env).await;
+    let source = owner.session.clone();
+    owner.commands.send(message("remember pineapple")).unwrap();
+    through_turn(&mut owner).await;
+
+    let second = connected(&env).await;
+    let previous = second.session.clone();
+    let mut watching = second.control.subscribe();
+    let Ok(HostReply::DoneWithNote { note }) = second
+        .control
+        .call(HostCommand::Resume {
+            session: previous.clone(),
+            target: source.clone(),
+        })
+        .await
+    else {
+        panic!("a busy resume creates an announced fork");
+    };
+    let changed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match watching.recv().await {
+                Some(HostEvent::SessionChanged {
+                    session,
+                    previous: Some(was),
+                }) if was == previous => return session,
+                Some(_) => continue,
+                None => panic!("the host stopped talking"),
+            }
+        }
+    })
+    .await
+    .expect("the fork switch is announced");
+
+    assert_ne!(changed, source);
+    assert!(note.contains(&source), "{note}");
+    assert!(note.contains(&changed), "{note}");
+
+    let scan = atomcode_capabilities::session::SessionManager::scan_all(
+        atomcode_coding::config::product_dirs_from_env().user(),
+    );
+    let fork = scan
+        .entries
+        .iter()
+        .find(|entry| entry.id == changed)
+        .expect("the fork is in the catalog");
+    assert_eq!(fork.fork_root_id.as_deref(), Some(source.as_str()));
+
+    // The first connection still owns and can use the original session.
+    owner.commands.send(message("still here")).unwrap();
+    through_turn(&mut owner).await;
+}
+
 /// A resumed session holds every fact it committed, in order and under the same
 /// numbers — a question the person answered, the title, a compaction asked
 /// for, the turns around them — chunks aside, which are not kept
