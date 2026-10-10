@@ -725,6 +725,27 @@ fn put_path(m: &mut crate::moment::Moment, picked: &str) -> bool {
     true
 }
 
+/// What follows a leading `$` or `¥` while a skill is being named.
+///
+/// Only the first character has this meaning. Once whitespace appears the
+/// skill has been named and the rest is its task, so the discovery menu closes.
+fn skill_prefix(input: &str) -> Option<&str> {
+    let rest = input
+        .strip_prefix('$')
+        .or_else(|| input.strip_prefix('¥'))?;
+    (!rest.chars().any(char::is_whitespace)).then_some(rest)
+}
+
+/// Turn the composer spelling into the existing `/skills` gateway command.
+fn skill_command(input: &str, known: impl FnOnce(&str) -> bool) -> Option<String> {
+    let rest = input
+        .strip_prefix('$')
+        .or_else(|| input.strip_prefix('¥'))?;
+    let rest = rest.trim();
+    let name = rest.split_whitespace().next()?;
+    known(name).then(|| format!("/skills {rest}"))
+}
+
 /// What is on disk under `cwd` matching `prefix`, for the `@` menu.
 ///
 /// IO, and deliberately here rather than in a module: a module may not touch
@@ -6744,6 +6765,30 @@ impl Tui {
                         return false;
                     }
                 }
+                // `$name [task]` is the compact spelling of `/skills name
+                // [task]`. `¥` is accepted only as a keyboard/input alias; a
+                // menu pick has already normalised it to `$`, while a fully
+                // typed `¥name` reaches the same gateway here. The marker must
+                // be the first character (see `skill_prefix`), so currency and
+                // shell variables in ordinary prose remain ordinary prose.
+                let described = self.client.described();
+                let command = skill_command(&text, |name| {
+                    described.as_ref().is_some_and(|description| {
+                        description.commands.iter().any(|command| {
+                            crate::commands::described_command_is_skill(command)
+                                && command.name.eq_ignore_ascii_case(name)
+                        })
+                    })
+                });
+                if let Some(command) = command {
+                    if !images.is_empty() {
+                        self.say_refused(&t(Msg::CommandCarriesNoPictures {
+                            count: images.len(),
+                        }));
+                    }
+                    self.run_typed_command(&command);
+                    return false;
+                }
                 // A slash *command* goes to the command surface, everything else
                 // to the model. The one place the two are told apart — and a
                 // filesystem path that merely begins with `/` (`/Users/me/x.png`)
@@ -8043,6 +8088,18 @@ impl Tui {
             .search
             .is_some();
         let prefix = if searching { None } else { self.slash_prefix() };
+        let skill = if searching || prefix.is_some() {
+            None
+        } else {
+            let input = self
+                .host
+                .moment
+                .read()
+                .expect("moment poisoned")
+                .input
+                .clone();
+            skill_prefix(&input).map(str::to_string)
+        };
         let menu = match prefix {
             Some(rest) => {
                 let (matches, option_filter) = match rest.split_once(char::is_whitespace) {
@@ -8125,6 +8182,29 @@ impl Tui {
             // after `@` — the same discovery surface the slash menu is, for the
             // other thing people type by name and get wrong. Taking a row puts
             // the path on the line (`complete_path`).
+            None if skill.is_some() => {
+                let query = skill.as_deref().unwrap_or_default().to_lowercase();
+                self.client
+                    .described()
+                    .map(|description| {
+                        description
+                            .commands
+                            .into_iter()
+                            .filter(crate::commands::described_command_is_skill)
+                            .filter(|command| {
+                                let haystack =
+                                    format!("{} {}", command.name, command.summary).to_lowercase();
+                                haystack.contains(&query)
+                            })
+                            .map(|command| {
+                                crate::menu::Item::new(format!("${}", command.name), command.name)
+                                    .about(command.summary)
+                                    .sigil("$")
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }
             None => {
                 let (typed, caret, cwd) = {
                     let m = self.host.moment.read().expect("moment poisoned");
@@ -8230,6 +8310,10 @@ impl Tui {
             self.complete_path(name);
             return false;
         }
+        if name.starts_with('$') {
+            self.complete_skill(name);
+            return false;
+        }
         // A command with a closed set opens that set; one whose free-text
         // argument is required and has no bare form completes onto the line for
         // the argument to be typed (`/rename `). Both are `complete`, not a bare
@@ -8270,6 +8354,10 @@ impl Tui {
             self.complete_path(name);
             return;
         }
+        if name.starts_with('$') {
+            self.complete_skill(name);
+            return;
+        }
         let command = self.host.commands.find(name);
         let option_owner = name
             .split_once(char::is_whitespace)
@@ -8304,6 +8392,20 @@ impl Tui {
             &mut self.host.moment.write().expect("moment poisoned"),
             picked,
         );
+        self.refresh_menu();
+    }
+
+    /// Replace either leading skill-picker spelling with the canonical `$name`
+    /// form and leave room for the task. Selection never preserves `¥`: it is
+    /// an input alias for keyboards that produce it, not a second wire syntax.
+    fn complete_skill(&self, picked: &str) {
+        let name = picked.trim_start_matches('$');
+        let text = format!("${name} ");
+        let mut m = self.host.moment.write().expect("moment poisoned");
+        m.input = text;
+        m.caret = m.input.len();
+        m.history_at = None;
+        drop(m);
         self.refresh_menu();
     }
 
@@ -12399,6 +12501,60 @@ mod skills_menu_tests {
             host.menu_selected().as_deref(),
             Some("skills code"),
             "the option filter is a substring search, not only a prefix search"
+        );
+    }
+
+    #[test]
+    fn a_leading_dollar_or_yen_opens_the_same_fuzzy_skill_menu() {
+        let (host, tui) = screen();
+        for typed in ["$od", "¥od"] {
+            type_line(&host, typed);
+            tui.refresh_menu();
+            assert_eq!(
+                host.menu_selected().as_deref(),
+                Some("$code"),
+                "{typed:?} should find code"
+            );
+        }
+
+        for typed in ["use $od", "use ¥od", "$code task", "¥code task"] {
+            type_line(&host, typed);
+            tui.refresh_menu();
+            assert!(
+                !host.menu_open(),
+                "{typed:?} must not keep the skill picker open"
+            );
+        }
+    }
+
+    #[test]
+    fn taking_a_yen_skill_match_normalises_it_to_dollar() {
+        let (host, tui) = screen();
+        type_line(&host, "¥od");
+        tui.refresh_menu();
+        assert!(!tui.take_command("$code", &tui.client));
+        let m = host.moment.read().expect("moment poisoned");
+        assert_eq!(m.input, "$code ");
+        assert_eq!(m.caret, m.input.len());
+        drop(m);
+        assert!(!host.menu_open(), "the following words are the skill task");
+    }
+
+    #[test]
+    fn a_committed_skill_prefix_uses_the_skills_gateway() {
+        let known = |name: &str| name == "code";
+        assert_eq!(skill_command("$code", known), Some("/skills code".into()));
+        assert_eq!(
+            skill_command("¥code fix the test", known),
+            Some("/skills code fix the test".into())
+        );
+        assert_eq!(skill_command("use $code", known), None);
+        assert_eq!(skill_command("$", known), None);
+        assert_eq!(skill_command("¥", known), None);
+        assert_eq!(
+            skill_command("$unknown", known),
+            None,
+            "an unknown dollar word remains an ordinary message"
         );
     }
 

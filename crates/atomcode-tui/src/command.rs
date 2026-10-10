@@ -558,15 +558,18 @@ impl Commands {
     }
 
     fn owner(&self, name: &str) -> Option<Arc<dyn CommandSet>> {
-        self.sets
-            .read()
-            .expect("commands poisoned")
-            .iter()
-            .find(|s| {
-                s.commands()
-                    .iter()
-                    .chain(s.hidden().iter())
-                    .any(|c| c.answers_to(name))
+        let sets = self.sets.read().expect("commands poisoned");
+        // A hidden command is a compatibility route, not a claim on the public
+        // command namespace. In particular, direct `/skill-name` invocation is
+        // kept for skills that do not collide, while a skill named `changelog`
+        // must yield `/changelog` to the product command and remain reachable
+        // through `/skills changelog`. Do this in two passes so mount order can
+        // never let a hidden skill shadow a visible command.
+        sets.iter()
+            .find(|s| s.commands().iter().any(|c| c.answers_to(name)))
+            .or_else(|| {
+                sets.iter()
+                    .find(|s| s.hidden().iter().any(|c| c.answers_to(name)))
             })
             .cloned()
     }
@@ -906,6 +909,82 @@ mod tests {
         let err = c.add(Arc::new(Fake("rival", CLASH))).unwrap_err();
         assert!(err.contains("/alpha"), "{err}");
         assert!(err.contains("row-a") && err.contains("rival"), "{err}");
+    }
+
+    /// Hidden commands are compatibility routes, so they cannot take a name
+    /// from a visible command even when their set mounted first. Skills use
+    /// this road for legacy `/skill-name`; a collision stays reachable through
+    /// `/skills name`, whose dispatch is owned by the visible `/skills` command.
+    #[tokio::test]
+    async fn a_visible_command_owns_its_name_over_a_hidden_skill() {
+        struct HiddenSkills;
+        #[async_trait]
+        impl CommandSet for HiddenSkills {
+            fn id(&self) -> &'static str {
+                "hidden-skills"
+            }
+            fn commands(&self) -> Vec<Command> {
+                Vec::new()
+            }
+            fn hidden(&self) -> Vec<Command> {
+                vec![
+                    Command::new("changelog", "skill"),
+                    Command::new("only-skill", "skill"),
+                ]
+            }
+            fn starts_turn(&self, _name: &str) -> bool {
+                true
+            }
+            async fn run(&self, name: &str, _args: &str, _ctx: &Context) -> Outcome {
+                Outcome::Said(format!("skill:{name}"))
+            }
+        }
+
+        struct Builtins;
+        #[async_trait]
+        impl CommandSet for Builtins {
+            fn id(&self) -> &'static str {
+                "builtins"
+            }
+            fn commands(&self) -> Vec<Command> {
+                vec![
+                    Command::new("changelog", "product changelog"),
+                    Command::new("skills", "run a skill"),
+                ]
+            }
+            async fn run(&self, name: &str, args: &str, _ctx: &Context) -> Outcome {
+                Outcome::Said(format!("builtin:{name}({args})"))
+            }
+        }
+
+        let commands = Commands::new();
+        commands.add(Arc::new(HiddenSkills)).unwrap();
+        commands.add(Arc::new(Builtins)).unwrap();
+        let app = atomcode_plexus::App::new(
+            atomcode_plexus::PluginRegistry::new(),
+            atomcode_plexus::ConfigTree::default(),
+        );
+        let ctx = app.context();
+
+        assert_eq!(
+            commands.dispatch("/changelog", &ctx).await,
+            Outcome::Said("builtin:changelog()".into())
+        );
+        assert!(
+            !commands.starts_turn("/changelog"),
+            "the hidden skill must not lend its turn semantics to the builtin"
+        );
+        assert_eq!(
+            commands.dispatch("/only-skill", &ctx).await,
+            Outcome::Said("skill:only-skill".into()),
+            "a non-conflicting legacy skill route remains available"
+        );
+        assert!(commands.starts_turn("/only-skill"));
+        assert_eq!(
+            commands.dispatch("/skills changelog", &ctx).await,
+            Outcome::Said("builtin:skills(changelog)".into()),
+            "the colliding skill name remains an argument to the skills gateway"
+        );
     }
 
     /// A downstream build can put its own `/alpha` in place of the shipped one

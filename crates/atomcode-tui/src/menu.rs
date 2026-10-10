@@ -44,6 +44,10 @@ pub struct Item {
     /// can run long, or be cut by the panel's right edge, without moving
     /// anything: the two columns people read down are the name and the gloss.
     pub hint: String,
+    /// Marker drawn before the label. Slash-command rows use `/`; another
+    /// discovery surface sharing this list can name its own syntax (`$` for a
+    /// skill mention) without baking that syntax into the renderer.
+    pub sigil: String,
 }
 
 impl Item {
@@ -53,6 +57,7 @@ impl Item {
             label: label.into(),
             about: String::new(),
             hint: String::new(),
+            sigil: "/".into(),
         }
     }
     pub fn about(mut self, about: impl Into<String>) -> Self {
@@ -61,6 +66,11 @@ impl Item {
     }
     pub fn hint(mut self, hint: impl Into<String>) -> Self {
         self.hint = hint.into();
+        self
+    }
+
+    pub fn sigil(mut self, sigil: impl Into<String>) -> Self {
+        self.sigil = sigil.into();
         self
     }
 }
@@ -595,7 +605,7 @@ impl Slash {
                         panel
                     };
                     let mut spans = vec![
-                        Span::styled("  /".to_string(), base),
+                        Span::styled(format!("  {}", item.sigil), base),
                         Span::styled(
                             widen(&item.label, column),
                             if here {
@@ -1232,6 +1242,17 @@ mod tests {
         let list = Slash::new(commands(3));
         assert_eq!(list.cursor(), 0);
         assert_eq!(list.selected().map(|i| i.value.as_str()), Some("cmd0"));
+    }
+
+    #[test]
+    fn a_list_item_draws_the_syntax_that_named_it() {
+        let slash = Slash::new(vec![Item::new("help", "help")]);
+        assert!(slash_rows(&slash, 20, 1)[0].contains("/help"));
+
+        let skill = Slash::new(vec![Item::new("$code", "code").sigil("$")]);
+        let row = &slash_rows(&skill, 20, 1)[0];
+        assert!(row.contains("$code"), "{row:?}");
+        assert!(!row.contains("/$code"), "{row:?}");
     }
 
     #[test]

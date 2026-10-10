@@ -3028,7 +3028,9 @@ pub struct AgentCatalogCommands {
     pub client: Arc<crate::plugin::AgentClient>,
 }
 
-fn described_command_is_skill(command: &atomcode_kernel::agent::CommandDescription) -> bool {
+pub(crate) fn described_command_is_skill(
+    command: &atomcode_kernel::agent::CommandDescription,
+) -> bool {
     // Skill rows all carry the harness's one shared usage shape. Check both
     // translations because a description can have arrived just before
     // `/language` changed the screen's current locale.
