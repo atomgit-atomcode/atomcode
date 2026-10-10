@@ -4,8 +4,8 @@
 //! 和 `/resume`、`/rewind` 是同一家的面板:从底下升起来,开着的时候键归它。住在这儿
 //! 的是**数据和按键**;列表由宿主推来(`HostEvent::BackgroundChanged`,或 `/bg` 那一趟
 //! 往返的回答),经 [`crate::host::Host::show_bg`] 落到 [`crate::moment::Moment::bg`];
-//! 面板要做的事都说成一条命令(`/resume <id>`、`/background <任务>`、`/bg tell`、
-//! `/bg drop`),由 [`Step`] 交出去——面板和敲命令走的是同一条路。
+//! 打开现有会话由 [`Step::Open`] 请求宿主 `Foreground`,无需停下运行中的回合。
+//! 其他操作由 [`Step`] 交给 `/background <任务>`、`/bg tell`、`/bg drop`。
 
 use crate::surface::{Key, KeyPress, Mods};
 

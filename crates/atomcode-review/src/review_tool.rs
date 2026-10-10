@@ -767,8 +767,15 @@ fn delegated_task(args: &str) -> String {
         "" => "{}",
         args => args,
     };
+    let options = serde_json::from_str::<serde_json::Value>(args).unwrap_or_default();
+    let depth = options["depth"].as_str().unwrap_or("默认");
+    let scope = match options["scope"]["kind"].as_str() {
+        Some("staged") => "暂存区",
+        Some("range") => options["scope"]["base"].as_str().unwrap_or("提交范围"),
+        _ => "工作区改动",
+    };
     format!(
-        "Review the requested changes: call the `code_review` tool with {args}, then give me a \
+        "代码审查 · {scope} · {depth}\nReview the requested changes: call the `code_review` tool with {args}, then give me a \
          concise summary of its findings."
     )
 }

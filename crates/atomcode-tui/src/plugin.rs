@@ -1008,6 +1008,16 @@ async fn session_dir_of(client: &AgentClient, session: &str) -> Option<String> {
 
 enum Wake {
     Fact,
+    Foreground {
+        request: u64,
+        session: String,
+        target: String,
+    },
+    ForegroundFailed {
+        request: u64,
+        target: String,
+        error: atomcode_host_api::HostError,
+    },
     /// Something came back over the connection: a fact, a turn boundary, a
     /// question, what the agents are.
     Event(AgentEvent),
@@ -1364,13 +1374,15 @@ pub struct Tui {
     /// How many provider checks have been started, so one that lands after a
     /// later save is dropped rather than said (see [`Tui::say_when_probed`]).
     probes: Arc<std::sync::atomic::AtomicU64>,
-    /// A `/resume` chosen through Team → background panel, until the host
+    /// A foreground switch chosen through Team → background panel, until the host
     /// confirms which session replaced the current one.
-    pending_team_resume: Mutex<Option<PendingTeamResume>>,
+    pending_background_switch: Mutex<Option<PendingBackgroundSwitch>>,
+    background_switching: AtomicU64,
+    background_switch_requests: AtomicU64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct PendingTeamResume {
+struct PendingBackgroundSwitch {
     target: String,
     return_to: String,
     label: String,
@@ -2035,10 +2047,11 @@ impl UserInterface for Tui {
                 // one, from its first fact, in a stream of its own.
                 Wake::Host(HostEvent::SessionChanged { session, .. }) => {
                     if session != client.root() {
+                        self.background_switching.store(0, Ordering::SeqCst);
                         let team_return = self
-                            .pending_team_resume
+                            .pending_background_switch
                             .lock()
-                            .expect("team resume poisoned")
+                            .expect("background switch poisoned")
                             .take()
                             .filter(|pending| pending.target == session);
                         // What a recap would be about is the conversation that
@@ -2154,6 +2167,52 @@ impl UserInterface for Tui {
                 Wake::Remote(line) => {
                     self.run_remotely(&line);
                     stale = true;
+                }
+                Wake::Foreground {
+                    request,
+                    session,
+                    target,
+                } => {
+                    let control = client.control();
+                    if let Some(keys) = self.wake.lock().expect("wake poisoned").clone() {
+                        tokio::spawn(async move {
+                            let result = match control {
+                                Some(control) => {
+                                    control
+                                        .call(atomcode_host_api::HostCommand::Foreground {
+                                            session,
+                                            target: target.clone(),
+                                        })
+                                        .await
+                                }
+                                None => Err(atomcode_host_api::HostError::Unavailable),
+                            };
+                            let error = match result {
+                                Ok(atomcode_host_api::HostReply::SessionChanged { .. }) => None,
+                                Ok(reply) => Some(atomcode_host_api::HostError::Failed {
+                                    message: format!("{reply:?}"),
+                                }),
+                                Err(error) => Some(error),
+                            };
+                            if let Some(error) = error {
+                                let _ = keys.send(Wake::ForegroundFailed {
+                                    request,
+                                    target,
+                                    error,
+                                });
+                            }
+                        });
+                    }
+                }
+                Wake::ForegroundFailed {
+                    request,
+                    target,
+                    error,
+                } => {
+                    if self.finish_background_switch(request, &target) {
+                        self.host.say(crate::commands::refusal(error), true);
+                        stale = true;
+                    }
                 }
                 Wake::Chose(chosen) => {
                     self.chose(chosen);
@@ -3927,6 +3986,9 @@ impl Tui {
         use crate::bg::Step;
         let line = match step {
             Step::Open { id } => {
+                if self.background_switching.load(Ordering::SeqCst) != 0 {
+                    return;
+                }
                 let return_to = self.host.bg_return_to();
                 let label = self
                     .host
@@ -3935,15 +3997,16 @@ impl Tui {
                     .unwrap_or_else(|| id.clone());
                 self.host.close_bg();
                 *self
-                    .pending_team_resume
+                    .pending_background_switch
                     .lock()
-                    .expect("team resume poisoned") =
-                    return_to.map(|return_to| PendingTeamResume {
+                    .expect("background switch poisoned") =
+                    return_to.map(|return_to| PendingBackgroundSwitch {
                         target: id.clone(),
                         return_to,
                         label,
                     });
-                format!("/resume {id}")
+                self.foreground_background(&id);
+                return;
             }
             Step::Start { task } => format!("/background {task}"),
             Step::Tell { id, text } => format!("/bg tell {id} {text}"),
@@ -5607,13 +5670,54 @@ impl Tui {
     /// `/bg` panel at it, where it can be opened, answered or dropped.
     fn take_team_target(&self, session: &str) {
         if self.host.team_target_is_return(session) {
-            if let Some(keys) = self.wake.lock().expect("wake poisoned").clone() {
-                let _ = keys.send(Wake::Chose(Some(format!("/resume {session}"))));
-            }
+            self.foreground_background(session);
         } else if self.host.team_target_is_background(session) {
             self.host.open_bg_at(session);
         } else {
             self.switch_to(session);
+        }
+    }
+
+    /// A late refusal must not clear a newer switch or its breadcrumb.
+    fn finish_background_switch(&self, request: u64, target: &str) -> bool {
+        if self
+            .background_switching
+            .compare_exchange(request, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return false;
+        }
+        let mut pending = self
+            .pending_background_switch
+            .lock()
+            .expect("background switch poisoned");
+        if pending.as_ref().is_some_and(|p| p.target == target) {
+            *pending = None;
+        }
+        true
+    }
+
+    /// Select an existing live runtime without replacing or cancelling its turn.
+    fn foreground_background(&self, target: &str) {
+        let request = self
+            .background_switch_requests
+            .fetch_add(1, Ordering::SeqCst)
+            + 1;
+        if self
+            .background_switching
+            .compare_exchange(0, request, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        if let Some(keys) = self.wake.lock().expect("wake poisoned").clone() {
+            let _ = keys.send(Wake::Foreground {
+                request,
+                session: self.client.root(),
+                target: target.to_owned(),
+            });
+        } else {
+            self.background_switching.store(0, Ordering::SeqCst);
         }
     }
 
@@ -9608,7 +9712,9 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
             opener: Arc::new(atomcode_capabilities::tools::LocalOpener),
             presses: Arc::default(),
             probes: Arc::default(),
-            pending_team_resume: Mutex::new(None),
+            pending_background_switch: Mutex::new(None),
+            background_switching: AtomicU64::new(0),
+            background_switch_requests: AtomicU64::new(0),
         },
     )
 }
@@ -12425,10 +12531,47 @@ mod midturn_command_tests {
         assert_eq!(&kinds(&host)[before..], &["user", "command"]);
     }
 
-    /// `main` on a background breadcrumb is not an in-runtime member switch:
-    /// it asks the existing session command path to resume the origin.
     #[test]
-    fn main_on_a_background_team_strip_resumes_the_origin() {
+    fn opening_a_background_panel_requests_a_foreground_switch() {
+        let (_, tui, mut woken) = screen();
+        let source = tui.client.root();
+        tui.run_bg_step(crate::bg::Step::Open {
+            id: "running-review".into(),
+        });
+        assert!(
+            matches!(woken.try_recv(), Ok(Wake::Foreground { session, target, .. })
+            if session == source && target == "running-review")
+        );
+        tui.run_bg_step(crate::bg::Step::Open {
+            id: "running-review".into(),
+        });
+        assert!(
+            woken.try_recv().is_err(),
+            "duplicate clicks, resume and cancel are not queued"
+        );
+    }
+
+    #[test]
+    fn an_old_background_switch_refusal_cannot_clear_a_new_switch() {
+        let (_, tui, _) = screen();
+        tui.background_switching.store(2, Ordering::SeqCst);
+        *tui.pending_background_switch.lock().unwrap() = Some(PendingBackgroundSwitch {
+            target: "review".into(),
+            return_to: "main".into(),
+            label: "code-review".into(),
+        });
+        assert!(!tui.finish_background_switch(1, "review"));
+        assert_eq!(tui.background_switching.load(Ordering::SeqCst), 2);
+        assert!(tui.pending_background_switch.lock().unwrap().is_some());
+        assert!(tui.finish_background_switch(2, "review"));
+        assert_eq!(tui.background_switching.load(Ordering::SeqCst), 0);
+        assert!(tui.pending_background_switch.lock().unwrap().is_none());
+    }
+
+    /// `main` on a background breadcrumb is not an in-runtime member switch:
+    /// it asks the host to foreground the origin without cancelling the turn.
+    #[test]
+    fn main_on_a_background_team_strip_foregrounds_the_origin() {
         let (host, tui, mut woken) = screen();
         host.moment.write().expect("moment poisoned").team_return =
             Some(crate::moment::TeamReturn {
@@ -12440,7 +12583,7 @@ mod midturn_command_tests {
 
         assert!(matches!(
             woken.try_recv(),
-            Ok(Wake::Chose(Some(line))) if line == "/resume lead-1"
+            Ok(Wake::Foreground { target, .. }) if target == "lead-1"
         ));
     }
 }

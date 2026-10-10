@@ -870,7 +870,7 @@ fn review_prompt(arg: &str) -> String {
         None => format!(r#"{{"scope":{scope_json}}}"#),
     };
     let ask = format!(
-        "Review the requested changes: call the `code_review` tool with {args}, then give me a \
+        "/review {arg}\nReview the requested changes: call the `code_review` tool with {args}, then give me a \
          concise summary of its findings."
     );
     // 关注点是人的原话,不是参数:交给评审自己去读,而不是塞进工具的 schema。
@@ -6323,6 +6323,7 @@ mod tests {
 
         // Depth is a keyword before the scope, alone or with one.
         let deep = review_prompt("deep");
+        assert_eq!(deep.lines().next(), Some("/review deep"));
         assert!(
             deep.contains(r#""depth":"deep""#) && deep.contains(r#""kind":"working_tree""#),
             "{deep}"

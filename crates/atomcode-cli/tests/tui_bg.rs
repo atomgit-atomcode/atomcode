@@ -630,6 +630,84 @@ async fn background_task_runs_without_changing_the_foreground() {
     rig.quit().await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(atomcode_home)]
+async fn escape_returns_to_a_moved_turn_while_it_is_still_running() {
+    let rig = Rig::new().await;
+    let main = rig.client.root();
+    rig.term.type_line("slow task");
+    rig.until("the turn is held", |rig| {
+        rig.script.started.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    rig.term.type_line("/bg");
+    rig.until_screen(&t(Msg::BgPanelMoved)).await;
+    rig.until("the screen follows a fresh session", |rig| {
+        rig.client.root() != main
+    })
+    .await;
+    rig.term.press(KeyPress::plain(Key::Esc));
+    rig.until("escape returns to the running turn", |rig| {
+        rig.client.root() == main
+    })
+    .await;
+    assert_eq!(rig.script.finished.load(Ordering::SeqCst), 0);
+    rig.release();
+    rig.until_screen("slow done").await;
+    rig.quit().await;
+}
+
+/// A held turn can be inspected and left through the panel without cancelling it.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(atomcode_home)]
+async fn a_running_background_task_can_be_opened_and_left_again() {
+    let rig = Rig::new().await;
+    rig.term.type_line("main conversation");
+    rig.until_screen("answer 1").await;
+    let main = rig.client.root();
+    rig.term.type_line("/background slow job");
+    rig.until("the task is held in the model", |rig| {
+        rig.script.started.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    let task = rig.background().await[0].session.clone();
+    rig.term.type_line("/bg 1");
+    rig.until("the task is foreground", |rig| rig.client.root() == task)
+        .await;
+    for (session, target) in [
+        (task.clone(), "missing".into()),
+        ("stale".into(), main.clone()),
+    ] {
+        assert!(matches!(
+            rig.control()
+                .call(HostCommand::Foreground { session, target })
+                .await,
+            Err(HostError::NotFound)
+        ));
+        assert_eq!(rig.client.root(), task);
+    }
+    // Open the panel while the task is still running, then open the main row.
+    rig.term.type_line("/bg list");
+    rig.until_screen(&t(Msg::BgGroupCompleted)).await;
+    rig.term.press(KeyPress::plain(Key::Enter));
+    rig.until("main is foreground again", |rig| rig.client.root() == main)
+        .await;
+    assert_eq!(rig.script.finished.load(Ordering::SeqCst), 0);
+    assert!(rig
+        .background()
+        .await
+        .iter()
+        .any(|entry| entry.session == task && entry.state == BackgroundState::Running));
+    rig.term.type_line("/bg 1");
+    rig.until("the held task is foreground again", |rig| {
+        rig.client.root() == task
+    })
+    .await;
+    rig.release();
+    rig.until_screen("slow done").await;
+    rig.quit().await;
+}
+
 /// **A background row keeps up while its session works out of view.** Nothing
 /// happens in the session while the model is held — no question, no turn end,
 /// which were the only times the list used to be sent — and still the team
@@ -685,12 +763,11 @@ async fn a_review_runs_in_a_background_session_by_default() {
             .is_some_and(|s| s.state == BackgroundState::Done)
     })
     .await;
-    // The task that session was given names the tool and the scope the person
-    // asked for. Read after the turn: the log is written as it goes, and before
-    // the turn there is nothing to read yet.
+    // The preview names the actual command, rather than an internal tool instruction.
+    // The command unit tests separately verify the model's scope arguments.
     let log = rig.stored(&review).await;
-    assert!(log.contains("code_review"), "{log}");
-    assert!(log.contains(r#"{"scope":{"kind":"staged"}}"#), "{log}");
+    assert!(log.contains("/review staged"), "{log}");
+    assert!(!log.contains("Review the requested changes"), "{log}");
 
     rig.term.type_line("/bg 1");
     rig.until("the review comes forward", |rig| {
@@ -783,8 +860,11 @@ async fn the_models_code_review_runs_in_a_background_session() {
     })
     .await;
     assert_eq!(rig.client.root(), first, "the foreground never moved");
+    let review = rig.background().await[0].session.clone();
     // And the review's own answer comes home, folded to its one line.
     rig.until_screen("结果回来了").await;
+    let preview = rig.stored(&review).await;
+    assert!(preview.contains("review it"), "{preview}");
     rig.quit().await;
 }
 
@@ -1232,6 +1312,33 @@ async fn bg_is_refused_while_a_question_waits() {
     );
     assert_eq!(rig.client.root(), first);
     assert!(rig.background().await.is_empty());
+    rig.quit().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(atomcode_home)]
+async fn foreground_is_refused_while_the_current_session_waits_for_an_answer() {
+    let rig = Rig::new().await;
+    let main = rig.client.root();
+    rig.term.type_line("/background slow job");
+    rig.until("the job is running", |rig| {
+        rig.script.started.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    let target = rig.background().await[0].session.clone();
+    rig.term.type_line("ask me");
+    rig.until_screen("Which one?").await;
+    let result = rig
+        .control()
+        .call(HostCommand::Foreground {
+            session: main.clone(),
+            target: target.clone(),
+        })
+        .await;
+    assert!(matches!(result, Err(HostError::Busy { .. })), "{result:?}");
+    assert_eq!(rig.client.root(), main);
+    assert_eq!(rig.background().await[0].session, target);
+    rig.release();
     rig.quit().await;
 }
 

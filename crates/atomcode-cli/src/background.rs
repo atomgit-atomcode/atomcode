@@ -562,6 +562,21 @@ fn log_of_control(control: &RuntimeControl) -> Vec<LoggedEvent> {
         .unwrap_or_default()
 }
 
+fn current_request(log: &[LoggedEvent]) -> Option<String> {
+    let turn = log.iter().rev().find_map(|logged| match logged.event {
+        SessionEvent::TurnStart { turn } => Some(turn),
+        _ => None,
+    })?;
+    log.iter().rev().find_map(|logged| match &logged.event {
+        SessionEvent::UserMessage {
+            turn: said_turn,
+            text,
+            ..
+        } if *said_turn == turn => Some(text.clone()),
+        _ => None,
+    })
+}
+
 /// 画一个问询要看的日志尾巴有多长。
 ///
 /// `question_for` 取的是**最新的那条**匹配(`crates/atomcode-tui/src/ask.rs`),
@@ -1406,6 +1421,21 @@ impl Background {
         if !in_front {
             return Ok(None);
         }
+        // Only the input of the turn that delegated this job is its request.
+        // An automatic turn must not borrow an unrelated earlier user message.
+        let request = {
+            let state = self.state.lock().expect("background poisoned");
+            let log = log_of(&state.front);
+            current_request(&log)
+        };
+        let text = match request {
+            Some(request) => format!(
+                "{request}\n\n{}",
+                text.split_once('\n')
+                    .map_or(text.as_str(), |(_, instructions)| instructions)
+            ),
+            None => text,
+        };
         self.start_locked(working_dir, text, scope, name)
             .await
             .map(Some)
@@ -1810,6 +1840,36 @@ mod tests {
             reason: StopReason::Stopped,
         });
         assert!(track.pending.is_none());
+    }
+
+    #[test]
+    fn a_delegated_review_uses_only_its_current_turn_request() {
+        let logged = |event| LoggedEvent {
+            seq: 0,
+            at: 0,
+            event,
+        };
+        let mut log = vec![
+            logged(SessionEvent::TurnStart { turn: 1 }),
+            logged(SessionEvent::UserMessage {
+                turn: 1,
+                text: "审查 v5.2.2".into(),
+                images: vec![],
+            }),
+        ];
+        assert_eq!(current_request(&log).as_deref(), Some("审查 v5.2.2"));
+        log.push(logged(SessionEvent::TurnStart { turn: 2 }));
+        assert_eq!(
+            current_request(&log),
+            None,
+            "an automatic turn has no user input to borrow"
+        );
+        log.push(logged(SessionEvent::UserMessage {
+            turn: 2,
+            text: "只看鉴权".into(),
+            images: vec![],
+        }));
+        assert_eq!(current_request(&log).as_deref(), Some("只看鉴权"));
     }
 
     #[test]
