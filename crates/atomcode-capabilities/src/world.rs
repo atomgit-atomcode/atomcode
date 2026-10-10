@@ -978,7 +978,7 @@ impl FileSystem for LocalFs {
     }
 
     async fn canonicalize(&self, path: &Path) -> Result<PathBuf, FsError> {
-        self.resolve(path)
+        Self::real_path(&self.resolve(path)?)
     }
 
     /// The walker `glob` and `grep` always used, verbatim — gitignore-aware

@@ -121,6 +121,72 @@ impl SensitivePaths {
             .is_some_and(|value| self.decoded_json_references(&value))
     }
 
+    /// Check file targets in the same world and directory the tool uses. Only
+    /// path arguments are resolved: search patterns, URLs and query text are
+    /// not filesystem paths. The raw check still covers shell commands.
+    pub async fn references_in(
+        &self,
+        args: &str,
+        working_dir: &Path,
+        world: &dyn crate::world::FileSystem,
+    ) -> bool {
+        if self.references(args) {
+            return true;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(args) else {
+            return false;
+        };
+        let mut real_user: Option<Option<PathBuf>> = None;
+        for key in ["file_path", "path"] {
+            let Some(raw) = value.get(key).and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let path = super::resolve_path(raw, working_dir);
+            let named = serde_json::json!({ "path": path }).to_string();
+            if self.references(&named) {
+                return true;
+            }
+            // A world that refuses resolution also refuses the tool's access.
+            // Missing targets still received the lexical check above.
+            if let Ok(real) = world.canonicalize(&path).await {
+                if self.references(&serde_json::json!({ "path": real }).to_string()) {
+                    return true;
+                }
+                let user = match &real_user {
+                    Some(user) => user,
+                    None => real_user.insert(world.canonicalize(&self.user_dir).await.ok()),
+                };
+                if user
+                    .as_ref()
+                    .is_some_and(|user| is_credential_path(&real, user))
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// File grants follow the resolved target rather than a relative spelling
+    /// that can name another secret after changing directory or a symlink.
+    pub async fn file_target_scope(
+        &self,
+        args: &str,
+        working_dir: &Path,
+        world: &dyn crate::world::FileSystem,
+    ) -> Option<String> {
+        let value: serde_json::Value = serde_json::from_str(args).ok()?;
+        let mut targets = Vec::new();
+        for key in ["file_path", "path"] {
+            if let Some(raw) = value.get(key).and_then(|v| v.as_str()) {
+                let path = super::resolve_path(raw, working_dir);
+                let real = world.canonicalize(&path).await.unwrap_or(path);
+                targets.push(crate::pathnorm::to_display(&real));
+            }
+        }
+        (!targets.is_empty()).then(|| targets.join("\u{1f}"))
+    }
+
     /// [`SENSITIVE_MARKERS`] plus the credential stores of the user tree.
     fn matches_a_marker(&self, lowercased: &str) -> bool {
         SENSITIVE_MARKERS.iter().any(|m| lowercased.contains(m))
@@ -464,6 +530,84 @@ mod grant_scope_tests {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn relative_file_targets_use_the_execution_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let user = temp.path().join("user");
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(user.join("config.toml"), "FAKE_KEY").unwrap();
+        std::fs::write(project.join("config.toml"), "ordinary").unwrap();
+        let guard = super::SensitivePaths::new(&user, ".ours");
+        let world = crate::world::LocalFs::unfenced();
+        let args = r#"{"file_path":"config.toml"}"#;
+        assert!(guard.references_in(args, &user, &world).await);
+        assert!(
+            guard
+                .references_in(r#"{"path":"../user/config.toml"}"#, &project, &world)
+                .await
+        );
+        assert!(!guard.references_in(args, &project, &world).await);
+        assert!(
+            !guard
+                .references_in(r#"{"pattern":"config.toml"}"#, &user, &world)
+                .await
+        );
+        assert!(
+            !guard
+                .references_in(r#"{"file_path":".env.example"}"#, &project, &world)
+                .await
+        );
+        assert_ne!(
+            guard.file_target_scope(args, &user, &world).await,
+            guard.file_target_scope(args, &project, &world).await
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_targets_and_a_symlinked_user_tree_are_guarded() {
+        let temp = tempfile::tempdir().unwrap();
+        let real_user = temp.path().join("user");
+        std::fs::create_dir_all(&real_user).unwrap();
+        std::fs::write(real_user.join("config.toml"), "FAKE_KEY").unwrap();
+        let user = temp.path().join("user-alias");
+        std::os::unix::fs::symlink(&real_user, &user).unwrap();
+        std::os::unix::fs::symlink(
+            real_user.join("config.toml"),
+            temp.path().join("settings.txt"),
+        )
+        .unwrap();
+        std::fs::write(temp.path().join(".env.production"), "FAKE_ENV").unwrap();
+        std::os::unix::fs::symlink(
+            temp.path().join(".env.production"),
+            temp.path().join(".env.example"),
+        )
+        .unwrap();
+        let guard = super::SensitivePaths::new(&user, ".ours");
+        // This is the world's production mode: reads unfenced, writes fenced.
+        let world = crate::world::LocalFs::writes_fenced(temp.path());
+        assert!(
+            guard
+                .references_in(r#"{"file_path":"settings.txt"}"#, temp.path(), &world)
+                .await
+        );
+        assert!(
+            guard
+                .references_in(r#"{"file_path":".env.example"}"#, temp.path(), &world)
+                .await
+        );
+        let args = serde_json::json!({"file_path": real_user.join("config.toml")}).to_string();
+        assert!(guard.references_in(&args, temp.path(), &world).await);
+        assert_eq!(
+            guard
+                .file_target_scope(r#"{"file_path":"settings.txt"}"#, temp.path(), &world)
+                .await,
+            guard.file_target_scope(&args, temp.path(), &world).await
+        );
+    }
+
     use super::*;
     use std::time::Duration;
     use tokio::sync::mpsc::unbounded_channel;

@@ -638,6 +638,71 @@ config = { script = [
     assert!(seen.contains("Refused"), "and was told why: {seen}");
 }
 
+#[tokio::test]
+async fn relative_credential_reads_are_gated_for_the_lead_and_its_children() {
+    use atomcode_harness::events::ToolResultEvent;
+
+    for delegated in [false, true] {
+        let dir = scratch(if delegated {
+            "relative-child"
+        } else {
+            "relative-lead"
+        });
+        std::fs::write(dir.join("config.toml"), "api_key = 'REVIEW_FAKE_KEY'").unwrap();
+        let dirs = format!(
+            "[[patch]]\nid = \"product-dirs\"\nconfig = {{ user = {:?}, project_dir_name = \".ours\" }}",
+            dir.to_string_lossy()
+        );
+        let script = r#"
+[[patch]]
+id = "llm"
+name = "llm-replay"
+config = { script = [
+  { text = "Reading.", calls = [ { name = "read_file", args = { file_path = "config.toml" } } ] },
+  { text = "Done." },
+] }
+"#;
+        let approval = if delegated {
+            YOLO
+        } else {
+            "[[patch]]\nid = \"approval\"\nconfig = { mode = \"deny-risky\" }"
+        };
+        let app = start(tree(&dir, script, &[approval, &dirs])).await;
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let spy = seen.clone();
+        let _listening = app.context().on_emit::<ToolResultEvent>(
+            move |result: &atomcode_kernel::tool::ToolResult| {
+                spy.lock().unwrap().push(result.content.clone());
+            },
+        );
+        if delegated {
+            let outcome = app
+                .context()
+                .service::<SubagentsSvc>()
+                .unwrap()
+                .spawn(atomcode_harness::seams::Delegation {
+                    task: "read config.toml",
+                    instructions: "do the task",
+                    ..Default::default()
+                })
+                .await;
+            assert!(
+                outcome.error.is_none(),
+                "delegation failed: {:?}",
+                outcome.error
+            );
+        } else {
+            run_turn(&app, "read config.toml").await.unwrap();
+        }
+        let seen = seen.lock().unwrap().join("\n");
+        assert!(
+            !seen.contains("REVIEW_FAKE_KEY"),
+            "credentials leaked: {seen}"
+        );
+        assert!(seen.contains("Refused"), "read was not gated: {seen}");
+    }
+}
+
 /// A child budget of zero rounds is no budget of its own, the way the product's
 /// `[subagent] max_rounds` has always read it — not a budget of nothing.
 #[tokio::test]

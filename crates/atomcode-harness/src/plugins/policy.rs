@@ -385,13 +385,27 @@ impl Waterfall<ToolsExecute> for SensitivePathGate {
         if tool.risk(&exec.call.arguments) != RiskLevel::Safe {
             return next.run(exec).await;
         }
-        if !self.sensitive.references(&exec.call.arguments) {
+        let scoped = crate::agent::scoped(&self.ctx);
+        // `tool-fs` without an fs seam uses local disk; `tool-fs-world`
+        // uses the caller's scoped world. Check the same one in either case.
+        let world = scoped
+            .service::<crate::seams::FsSvc>()
+            .unwrap_or_else(|| Arc::new(atomcode_capabilities::world::LocalFs::unfenced()));
+        if !self
+            .sensitive
+            .references_in(&exec.call.arguments, &exec.working_dir, &*world)
+            .await
+        {
             return next.run(exec).await;
         }
+        let scope = self
+            .sensitive
+            .file_target_scope(&exec.call.arguments, &exec.working_dir, &*world)
+            .await;
         let as_risky: Arc<dyn Tool> = Arc::new(AsRisky {
             name: format!("{} (sensitive path)", tool.name()),
             inner: tool,
-            scope: None,
+            scope,
             grantable: true,
         });
         match policy.decide(&exec.call, &as_risky).await {
@@ -456,7 +470,14 @@ impl Waterfall<ToolsExecute> for DelegationBounds {
         if NEVER_DELEGATED.contains(&name) {
             return refuse(format!("a delegated agent never runs `{name}`"));
         }
-        if self.sensitive.references(&exec.call.arguments) {
+        let world = scoped
+            .service::<crate::seams::FsSvc>()
+            .unwrap_or_else(|| Arc::new(atomcode_capabilities::world::LocalFs::unfenced()));
+        if self
+            .sensitive
+            .references_in(&exec.call.arguments, &exec.working_dir, &*world)
+            .await
+        {
             return refuse(format!(
                 "a delegated agent may not touch sensitive paths (credentials, keys, `.env`): `{name}`"
             ));
@@ -487,7 +508,7 @@ impl Plugin for DelegationBoundsPlugin {
         &["product-dirs", "tools"]
     }
     fn uses(&self) -> &'static [&'static str] {
-        &["agents"]
+        &["agents", "fs"]
     }
     fn description(&self) -> &'static str {
         "refuse outright what a delegated agent may never do: a shell, delegating, sensitive paths, writes outside its lane"
@@ -517,7 +538,7 @@ impl Plugin for SensitivePathsPlugin {
         &["product-dirs", "tools"]
     }
     fn uses(&self) -> &'static [&'static str] {
-        &["approval"]
+        &["approval", "fs"]
     }
     fn description(&self) -> &'static str {
         "ask before a read-only tool touches credentials, keys or `.env` — through the approval seam"
