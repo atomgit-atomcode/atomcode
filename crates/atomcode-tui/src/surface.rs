@@ -1861,28 +1861,16 @@ pub fn probe_report(theme: Option<Theme>) -> String {
     out
 }
 
-/// Whether this terminal can be asked about its colours at all.
-///
-/// The exchange below ends on a DA1 fence, which every terminal answers and
-/// answers **last**. Orca (observed at 1.4.180) delivers its OSC 11 reply
-/// *after* that DA1 — so the drain stops, the screen starts reading keys, and
-/// the colour reply arrives as a burst of what looks like typing. A wrong
-/// palette costs contrast; this costs a line of `rgb:1c1c/…` in the composer
-/// and a person wondering what they pressed.
-///
-/// So this one is not asked, and the assumed dark palette stands. An explicit
-/// `[ui] theme` is unaffected — it never reaches here.
-///
-/// A pure function of the variable, not a read of it, so the list of terminals
-/// can be judged without owning this machine's environment.
+/// Keep the existing conservative opt-out for Orca's colour probing.
+/// An explicit theme bypasses probing regardless of the terminal program.
 #[cfg(any(unix, test))]
-fn answers_in_order(term_program: Option<&str>) -> bool {
+fn probes_colours(term_program: Option<&str>) -> bool {
     !term_program.is_some_and(|program| program.eq_ignore_ascii_case("orca"))
 }
 
 /// Ask the terminal what colours it actually renders.
 ///
-/// Two questions in one exchange: OSC 11 for the background, OSC 4 for each of
+/// OSC 11 supplies the background, OSC 10 the foreground, and OSC 4 each of
 /// the sixteen slots. What comes back is what the resolver measures against, so
 /// a terminal that answers fully gets a palette chosen for *its* colours rather
 /// than for a guess about which of two families it belongs to.
@@ -1894,6 +1882,15 @@ fn answers_in_order(term_program: Option<&str>) -> bool {
 /// a wrong assumption costs contrast, not correctness.
 fn measure_palette() -> Palette {
     let (bg, fg, slots) = query_terminal();
+    palette_from_colours(bg, fg, slots, colorfgbg_theme)
+}
+
+fn palette_from_colours(
+    bg: Option<Rgb>,
+    fg: Option<Rgb>,
+    slots: Vec<(u8, Rgb)>,
+    fallback: impl FnOnce() -> Option<Theme>,
+) -> Palette {
     let theme = bg
         .map(|rgb| {
             if crate::theme::luminance(rgb) > 0.18 {
@@ -1902,7 +1899,7 @@ fn measure_palette() -> Palette {
                 Theme::Dark
             }
         })
-        .or_else(colorfgbg_theme)
+        .or_else(fallback)
         .unwrap_or(Theme::Dark);
     let mut p = Palette::assumed(theme);
     if let Some(rgb) = bg {
@@ -1933,77 +1930,36 @@ fn theme_from_colorfgbg(raw: &str) -> Option<Theme> {
     })
 }
 
-/// One exchange: the background, the foreground and all sixteen slots, then a
-/// fence.
-///
-/// Unix only — it needs the tty as a file descriptor, with a timeout, which is
-/// not something crossterm exposes. Elsewhere the palette is assumed and
-/// `COLORFGBG` and config still apply.
+/// Ask crossterm's shared input reader for background, foreground and slots.
+/// Replies are parsed by that reader, including those arriving after timeout;
+/// this layer never reads OSC bytes directly or relies on DA1 reply ordering.
 #[cfg(unix)]
 fn query_terminal() -> (Option<Rgb>, Option<Rgb>, Vec<(u8, Rgb)>) {
-    use std::os::fd::AsRawFd;
-
-    // One terminal is not asked at all. See [`answers_in_order`].
-    if !answers_in_order(std::env::var("TERM_PROGRAM").ok().as_deref()) {
+    if !probes_colours(std::env::var("TERM_PROGRAM").ok().as_deref()) {
         return (None, None, Vec::new());
     }
+    let colors = crossterm::event::query_terminal_colors(std::time::Duration::from_millis(200))
+        .unwrap_or_default();
+    terminal_colours(colors)
+}
 
-    let mut query: Vec<u8> = Vec::with_capacity(256);
-    query.extend_from_slice(b"\x1b]11;?\x1b\\");
-    // OSC 10 as well: body text is drawn in the terminal's own foreground, and
-    // so is metadata (`theme::muted_ink`) — it is the one colour that is
-    // legible by construction, and a slot is not a substitute for it.
-    query.extend_from_slice(b"\x1b]10;?\x1b\\");
-    for n in 0..16u8 {
-        query.extend_from_slice(format!("\x1b]4;{n};?\x1b\\").as_bytes());
-    }
-    // DA1 last, as a fence. Every terminal answers it, and answers in order, so
-    // a terminal that ignores the colour queries ends the wait immediately
-    // instead of costing the whole timeout — and one that honours them has
-    // already replied by the time this answer arrives.
-    query.extend_from_slice(b"\x1b[c");
-
-    let mut out = std::io::stdout();
-    if out.write_all(&query).is_err() || out.flush().is_err() {
-        return (None, None, Vec::new());
-    }
-
-    let stdin = std::io::stdin();
-    let fd = stdin.as_raw_fd();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
-    let mut seen: Vec<u8> = Vec::with_capacity(1024);
-    let mut chunk = [0u8; 512];
-    let mut fence_seen = false;
-    let mut quiet_deadline = deadline;
-    loop {
-        let now = std::time::Instant::now();
-        let end = if fence_seen {
-            quiet_deadline.min(deadline)
-        } else {
-            deadline
-        };
-        let left = end.saturating_duration_since(now);
-        if left.is_zero() || !readable(fd, left) {
-            break;
-        }
-        // SAFETY: `fd` is stdin, borrowed for the length of this call, and the
-        // buffer is a live local of exactly `chunk.len()` bytes.
-        let n = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
-        if n <= 0 {
-            break;
-        }
-        seen.extend_from_slice(&chunk[..n as usize]);
-        if !fence_seen && answered_da1(&seen) {
-            fence_seen = true;
-            // Some terminals answer the queued OSC colour queries after DA1.
-            // Keep reading until a short quiet period, so those replies never
-            // reach crossterm as ordinary input events.
-            quiet_deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
-        } else if fence_seen {
-            quiet_deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
+/// Map parsed OSC kinds to palette inputs; unanswered colours stay absent.
+#[cfg(any(unix, test))]
+fn terminal_colours(
+    colors: impl IntoIterator<Item = (u8, Option<u8>, Rgb)>,
+) -> (Option<Rgb>, Option<Rgb>, Vec<(u8, Rgb)>) {
+    let mut bg = None;
+    let mut fg = None;
+    let mut slots = Vec::new();
+    for (kind, slot, rgb) in colors {
+        match (kind, slot) {
+            (11, None) => bg = Some(rgb),
+            (10, None) => fg = Some(rgb),
+            (4, Some(n)) if n < 16 => slots.push((n, rgb)),
+            _ => {}
         }
     }
-    (parse_osc11(&seen), parse_osc10(&seen), parse_osc4(&seen))
+    (bg, fg, slots)
 }
 
 #[cfg(not(unix))]
@@ -2046,140 +2002,6 @@ pub(crate) fn console_palette(attributes: u16, table: &[u32; 16]) -> (Rgb, Rgb, 
     let bg = rgb(table[((attributes >> 4) & 0xf) as usize]);
     let slots = (0..16).map(|i| (ansi(i), rgb(table[i]))).collect();
     (bg, fg, slots)
-}
-
-/// Wait until `fd` has something to read, or the timeout passes.
-#[cfg(unix)]
-fn readable(fd: std::os::fd::RawFd, within: std::time::Duration) -> bool {
-    let mut poll = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let ms = within.as_millis().min(i32::MAX as u128) as i32;
-    // SAFETY: one initialised `pollfd`, and the count says so.
-    unsafe { libc::poll(&mut poll, 1, ms) > 0 }
-}
-
-/// Has a Device Attributes reply (`ESC [ ... c`) arrived?
-///
-/// Checked structurally rather than by looking for a `c`, because `c` is also a
-/// hex digit and the colour reply is full of them.
-#[cfg(any(unix, test))]
-fn answered_da1(seen: &[u8]) -> bool {
-    let mut from = 0;
-    while let Some(at) = seen[from..].iter().position(|&b| b == 0x1b) {
-        let esc = from + at;
-        if seen.get(esc + 1) == Some(&b'[') {
-            let mut i = esc + 2;
-            while let Some(&b) = seen.get(i) {
-                if b.is_ascii_digit() || b == b';' || b == b'?' {
-                    i += 1;
-                    continue;
-                }
-                return b == b'c';
-            }
-            return false;
-        }
-        from = esc + 1;
-    }
-    false
-}
-
-/// The payloads of every OSC reply in the stream — what sits between `ESC ]`
-/// and its terminator (BEL, or `ESC \\`).
-///
-/// Scanned rather than pattern-matched on the whole buffer because seventeen
-/// answers arrive interleaved with a device-attributes reply, in an order the
-/// terminal chooses.
-#[cfg(any(unix, test))]
-fn osc_payloads(seen: &[u8]) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    while i + 1 < seen.len() {
-        if seen[i] != 0x1b || seen[i + 1] != b']' {
-            i += 1;
-            continue;
-        }
-        let body = i + 2;
-        let mut j = body;
-        while j < seen.len() {
-            if seen[j] == 0x07 || (seen[j] == 0x1b && seen.get(j + 1) == Some(&b'\\')) {
-                break;
-            }
-            j += 1;
-        }
-        if j < seen.len() {
-            out.push(String::from_utf8_lossy(&seen[body..j]).into_owned());
-        }
-        i = j + 1;
-    }
-    out
-}
-
-/// `rgb:RRRR/GGGG/BBBB` — or `#RRGGBB`, the older form.
-///
-/// Components are one to four hex digits: xterm answers in sixteen bits per
-/// channel, others in eight. Both scale to the top byte.
-#[cfg(any(unix, test))]
-fn parse_colour(spec: &str) -> Option<Rgb> {
-    let spec = spec.trim();
-    let hex = match spec.strip_prefix("rgb:") {
-        Some(rest) => rest,
-        None => spec.strip_prefix('#').filter(|h| h.len() == 6)?,
-    };
-    let parts: Vec<&str> = if hex.contains('/') {
-        hex.split('/').collect()
-    } else {
-        vec![hex.get(0..2)?, hex.get(2..4)?, hex.get(4..6)?]
-    };
-    if parts.len() < 3 {
-        return None;
-    }
-    let scale = |p: &str| -> Option<u8> {
-        let p = p.trim();
-        if p.is_empty() || p.len() > 4 || !p.chars().all(|c| c.is_ascii_hexdigit()) {
-            return None;
-        }
-        let v = u32::from_str_radix(p, 16).ok()?;
-        // One hex digit is four bits, four are sixteen; normalise to the top
-        // eight so every width lands on the same scale.
-        Some((v << (4 * (4 - p.len())) >> 8) as u8)
-    };
-    Some((scale(parts[0])?, scale(parts[1])?, scale(parts[2])?))
-}
-
-/// The background, from an OSC 11 reply.
-#[cfg(any(unix, test))]
-fn parse_osc11(seen: &[u8]) -> Option<Rgb> {
-    osc_payloads(seen)
-        .iter()
-        .find_map(|p| parse_colour(p.strip_prefix("11;")?))
-}
-
-/// The terminal's own text colour, from an OSC 10 reply. Absent on terminals
-/// that do not implement the query — `Secondary` and `ToolName` need no number
-/// at all, so only metadata feels it.
-#[cfg(any(unix, test))]
-fn parse_osc10(seen: &[u8]) -> Option<Rgb> {
-    osc_payloads(seen)
-        .iter()
-        .find_map(|p| parse_colour(p.strip_prefix("10;")?))
-}
-
-/// The slots, from the OSC 4 replies. Slots the terminal did not answer for are
-/// simply absent — the palette falls back to xterm's value for each.
-#[cfg(any(unix, test))]
-fn parse_osc4(seen: &[u8]) -> Vec<(u8, Rgb)> {
-    osc_payloads(seen)
-        .iter()
-        .filter_map(|p| {
-            let rest = p.strip_prefix("4;")?;
-            let (n, spec) = rest.split_once(';')?;
-            Some((n.trim().parse::<u8>().ok()?, parse_colour(spec)?))
-        })
-        .filter(|(n, _)| *n < 16)
-        .collect()
 }
 
 /// The last frame that reached the terminal, so an unchanged screen is not
@@ -2859,39 +2681,55 @@ mod tests {
     }
 
     #[test]
-    fn the_terminals_own_background_decides_the_palette() {
-        // The exchange this parses is the whole of theme detection: get it
-        // wrong and a light terminal is painted in a dark palette, which is
-        // unreadable rather than merely ugly.
-        let dark = b"\x1b]11;rgb:1c1c/1c1c/1c1c\x1b\\";
-        assert_eq!(parse_osc11(dark), Some((0x1c, 0x1c, 0x1c)));
-
-        // Eight bits per channel, BEL-terminated — the other common shape.
-        let light = b"\x1b]11;rgb:ff/ff/f8\x07";
-        assert_eq!(parse_osc11(light), Some((0xff, 0xff, 0xf8)));
-
-        // And the older `#RRGGBB`.
-        assert_eq!(parse_osc11(b"\x1b]11;#ffffff\x07"), Some((255, 255, 255)));
-
-        // A terminal that answered only the fence has said nothing about colour.
-        assert_eq!(parse_osc11(b"\x1b[?62;1;2;6;9;15;22c"), None);
-        assert_eq!(parse_osc11(b""), None);
-        assert_eq!(parse_osc11(b"\x1b]11;not-a-colour\x07"), None);
+    fn parsed_terminal_colours_map_background_foreground_and_slots() {
+        let bg = (28, 29, 30);
+        let fg = (240, 241, 242);
+        let slot = (10, 20, 30);
+        assert_eq!(
+            terminal_colours([
+                (4, Some(15), slot),
+                (10, None, fg),
+                (11, None, bg),
+                (4, Some(16), slot),
+                (4, None, slot),
+                (10, Some(1), slot),
+                (11, Some(1), slot),
+                (12, None, slot),
+            ]),
+            (Some(bg), Some(fg), vec![(15, slot)])
+        );
     }
 
     #[test]
-    fn the_fence_is_recognised_by_shape_not_by_the_letter_c() {
-        // `c` is also a hex digit, and the colour reply is full of them. A
-        // substring check would end the wait on `rgb:1c1c/...` and throw the
-        // answer away — the bug this shape check exists to prevent.
-        assert!(answered_da1(b"\x1b[?62;1;2c"));
-        assert!(answered_da1(b"\x1b]11;rgb:1c1c/1c1c/1c1c\x07\x1b[?6c"));
-        assert!(
-            !answered_da1(b"\x1b]11;rgb:1c1c/1c1c/1c1c\x07"),
-            "the colour reply alone is not the fence"
-        );
-        assert!(!answered_da1(b"\x1b[?62;1"), "still arriving");
-        assert!(!answered_da1(b""));
+    fn missing_terminal_colours_keep_palette_fallbacks() {
+        for fallback in [None, Some(Theme::Light)] {
+            let (bg, fg, slots) = terminal_colours([]);
+            assert_eq!((bg, fg, slots.clone()), (None, None, Vec::new()));
+            let palette = palette_from_colours(bg, fg, slots, || fallback);
+            let assumed = Palette::assumed(fallback.unwrap_or(Theme::Dark));
+            assert_eq!(palette.theme(), assumed.theme());
+            assert_eq!(palette.background(), assumed.background());
+            assert!(!palette.background_measured());
+            assert_eq!(palette.foreground(), None);
+            assert_eq!(palette.measured(), 0);
+            for n in 0..16 {
+                assert_eq!(palette.slot(n), assumed.slot(n));
+            }
+        }
+
+        let bg = (255, 255, 255);
+        let fg = (10, 20, 30);
+        let slot = (40, 50, 60);
+        let (bg, fg, slots) =
+            terminal_colours([(11, None, bg), (10, None, fg), (4, Some(2), slot)]);
+        let palette = palette_from_colours(bg, fg, slots, || panic!("background was answered"));
+        assert_eq!(palette.theme(), Theme::Light);
+        assert_eq!(palette.background(), bg.unwrap());
+        assert!(palette.background_measured());
+        assert_eq!(palette.foreground(), fg);
+        assert_eq!(palette.measured(), 1);
+        assert_eq!(palette.slot(2), slot);
+        assert_eq!(palette.slot(3), Palette::assumed(Theme::Light).slot(3));
     }
 
     #[test]
@@ -3167,48 +3005,16 @@ mod tests {
         assert!(!SCREEN_HELD.load(Ordering::SeqCst));
     }
 
-    /// One terminal is not asked about its colours.
-    ///
-    /// The colour exchange ends on a DA1 fence because every terminal answers
-    /// it last. Orca (1.4.180) answers OSC 11 **after** it — so the drain
-    /// stops, the screen starts reading keys, and the colour reply arrives as
-    /// a burst of what looks like typing. A wrong palette costs contrast; that
-    /// costs a line of `rgb:…` in the composer and a person wondering what
-    /// they pressed.
-    ///
-    /// The list is written out here rather than read from the function, for
-    /// the reason the signal gate's is: reading it back would make removing a
-    /// name from the list a shorter loop and still green.
     #[test]
-    fn the_terminal_that_answers_out_of_order_is_not_asked() {
-        assert!(!answers_in_order(Some("orca")));
-        assert!(!answers_in_order(Some("Orca")), "however it is cased");
-        // And everything else is, including a terminal that says nothing about
-        // itself — assuming the worst of every terminal would turn one
-        // observed bug into a palette nobody gets.
+    fn orca_keeps_the_conservative_colour_probe_opt_out() {
+        assert!(!probes_colours(Some("orca")));
+        assert!(!probes_colours(Some("Orca")));
         for program in ["iTerm.app", "Apple_Terminal", "WezTerm", "ghostty", ""] {
-            assert!(answers_in_order(Some(program)), "{program}");
+            assert!(probes_colours(Some(program)), "{program}");
         }
-        assert!(answers_in_order(None));
+        assert!(probes_colours(None));
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn colour_probe_keeps_reading_after_da1_for_late_slot_replies() {
-        let seen = b"\x1b]11;rgb:1c1c/1c1c/1c1c\x1b\\\x1b[c\x1b]4;15;rgb:a5a5/a5a5/a5a5\x1b\\";
-        assert!(answered_da1(seen));
-        assert_eq!(parse_osc11(seen), Some((0x1c, 0x1c, 0x1c)));
-        assert_eq!(parse_osc4(seen), vec![(15, (0xa5, 0xa5, 0xa5))]);
-    }
-
-    /// And the probe actually asks it.
-    ///
-    /// Judged by reading this file, because the thing that would prove it at
-    /// run time needs a terminal: `query_terminal` writes to a real tty and
-    /// waits on a real reply, so there is no version of it a test can drive.
-    /// The rule above is a pure function and stays green whether or not
-    /// anything calls it — which is exactly the shape of bug that keeps
-    /// turning up here: the judgement pinned, the wiring not.
     #[cfg(unix)]
     #[test]
     fn a_terminal_that_reports_no_mouse_starts_without_it_on_both_counts() {
@@ -3236,7 +3042,7 @@ mod tests {
             .expect("this file defines it");
         let body = body.split("\n}\n").next().expect("and it ends");
         assert!(
-            body.contains("answers_in_order("),
+            body.contains("probes_colours("),
             "the probe writes to the terminal without asking whether this one              can be asked"
         );
     }

@@ -63,9 +63,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 
-# Reading the terminal's answer to an OSC 11 query needs the tty as a file
-# descriptor with a timeout — `poll` and `read`, which crossterm does not
-# expose. Unix only; elsewhere the theme comes from config or `COLORFGBG`.
+# Unix terminal restoration, signal/job control and stderr descriptor handling.
+# Colour queries use crossterm's shared input reader instead of direct tty reads.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

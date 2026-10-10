@@ -5,6 +5,7 @@ resolver = "2"
 # `crates/atomcode-codingplan-crypto/`). Adding any future crate is also
 # a no-toml-edit operation.
 members = ["crates/*"]
+exclude = ["vendor/crossterm"]
 # `atomcode-codingplan-crypto` is intentionally absent from default-members:
 # the stub is wired into atomcode-auth via an optional dep behind the
 # final binary's `codingplan-crypto` feature, so a default `cargo build`
@@ -51,6 +52,9 @@ edition = "2021"
 license = "MIT"
 repository = "https://atomgit.com/atomgit_atomcode/atomcode"
 description = "Open-source terminal AI coding agent"
+
+[patch.crates-io]
+crossterm = { path = "vendor/crossterm" }
 
 [workspace.dependencies]
 agent-client-protocol = "=2.0.0"
