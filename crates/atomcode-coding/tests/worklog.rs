@@ -111,15 +111,14 @@ async fn the_command_recaps_the_day_this_session_actually_worked() {
         "it says what it did: {said}"
     );
 
-    // It queued the recap as the person's own message — the same door everything
-    // they type goes through, so the turn it starts is theirs to undo. Not yet in
-    // the log: a queued message is committed by the turn that claims it, which is
-    // exactly the behaviour a command handing work to the model should have.
+    // It queued the compact invocation as the person's own message — the same
+    // door everything they type goes through, so the turn it starts is theirs
+    // to undo. The generated recap prompt travels with it as runtime context.
     assert!(
         agent
             .inbox()
             .waiting_from(atomcode_harness::agent::MessageOrigin::User),
-        "the recap is waiting as the person's own message"
+        "the invocation is waiting as the person's own message"
     );
 
     // Drive that turn, so the recap the model actually worked from is in the log.
@@ -128,16 +127,27 @@ async fn the_command_recaps_the_day_this_session_actually_worked() {
         .drive(&agent)
         .await;
 
-    let recap = agent
-        .session()
-        .events()
-        .into_iter()
-        .filter_map(|logged| match logged.event {
-            atomcode_kernel::session::SessionEvent::UserMessage { text, .. } => Some(text),
+    let events = agent.session().events();
+    let invocation = events.iter().find_map(|logged| match &logged.event {
+        atomcode_kernel::session::SessionEvent::UserMessage { text, .. } if text == "/worklog" => {
+            Some(text.as_str())
+        }
+        _ => None,
+    });
+    assert_eq!(invocation, Some("/worklog"));
+    let recap = events
+        .iter()
+        .find_map(|logged| match &logged.event {
+            atomcode_kernel::session::SessionEvent::Injected {
+                text,
+                origin: atomcode_harness::session::InjectionOrigin::Reminder,
+                ..
+            } if text.contains("工作复盘") || text.contains("Work recap") => {
+                Some(text.as_str())
+            }
             _ => None,
         })
-        .find(|text| text.contains("工作复盘") || text.contains("Work recap"))
-        .expect("the recap is in the log as a user turn");
+        .expect("the recap is in the log as runtime context");
     assert!(
         recap.contains("port the quantizer to the NPU"),
         "the day's own work is in it: {recap}"

@@ -12466,6 +12466,18 @@ mod skills_menu_tests {
                     summary: "实现代码".into(),
                     target: atomcode_kernel::agent::CommandTarget::Session,
                 },
+                atomcode_kernel::agent::CommandDescription {
+                    name: "init".into(),
+                    usage: None,
+                    summary: "生成项目说明".into(),
+                    target: atomcode_kernel::agent::CommandTarget::Session,
+                },
+                atomcode_kernel::agent::CommandDescription {
+                    name: "worklog".into(),
+                    usage: Some("[日期]".into()),
+                    summary: "生成工作复盘".into(),
+                    target: atomcode_kernel::agent::CommandTarget::Session,
+                },
             ],
             ..Default::default()
         });
@@ -12579,5 +12591,8 @@ mod skills_menu_tests {
         assert!(host.commands.starts_turn("/skills code fix the test"));
         assert!(!host.commands.starts_turn("/skills"));
         assert!(!host.commands.starts_turn("/skills unknown fix the test"));
+        assert!(host.commands.starts_turn("/init"));
+        assert!(host.commands.starts_turn("/worklog"));
+        assert!(host.commands.starts_turn("/worklog yesterday"));
     }
 }

@@ -98,8 +98,9 @@ async fn the_command_hands_the_model_the_prompt_this_machine_is_configured_with(
         .await
         .expect("running it");
 
-    // Queued as the person's own message — the same door everything they type
-    // goes through, so the turn it starts is theirs to undo.
+    // The compact invocation is the person's message. The generated prompt is
+    // logged separately as runtime context, so a front end does not claim the
+    // whole built-in template was typed into the composer.
     assert!(
         agent
             .inbox()
@@ -112,19 +113,23 @@ async fn the_command_hands_the_model_the_prompt_this_machine_is_configured_with(
         .drive(&agent)
         .await;
 
-    let sent = agent
-        .session()
-        .events()
-        .into_iter()
-        .filter_map(|logged| match logged.event {
-            atomcode_kernel::session::SessionEvent::UserMessage { text, .. } => Some(text),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let events = agent.session().events();
+    let sent = events.iter().find_map(|logged| match &logged.event {
+        atomcode_kernel::session::SessionEvent::UserMessage { text, .. } => Some(text.as_str()),
+        _ => None,
+    });
+    assert_eq!(sent, Some("/init"));
+    let prompt = events.iter().find_map(|logged| match &logged.event {
+        atomcode_kernel::session::SessionEvent::Injected {
+            text,
+            origin: atomcode_harness::session::InjectionOrigin::Reminder,
+            ..
+        } => Some(text.as_str()),
+        _ => None,
+    });
     assert!(
-        sent.contains("AGENTS.md"),
-        "the built-in prompt went to the model:\n{sent}"
+        prompt.is_some_and(|text| text.contains("AGENTS.md")),
+        "the built-in prompt went to the model as runtime context: {prompt:?}"
     );
     // What a person's own `init_prompt_file` adds is `init_prompt_from`'s to
     // answer, and it is judged where it can be: the path this row reads comes

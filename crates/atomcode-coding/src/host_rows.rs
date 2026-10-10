@@ -2673,7 +2673,11 @@ impl atomcode_harness::commands::CatalogCommand for InitCommand {
             self.language,
             Some(atomcode_config::locale::Locale::En) | None
         );
-        agent.send(prompt);
+        // Keep the implementation prompt in the authoritative log without
+        // presenting it as words the person typed. The compact invocation is
+        // the user turn; the prompt is runtime context, like other reminders.
+        agent.inject(prompt, atomcode_harness::session::InjectionOrigin::Reminder);
+        agent.send("/init");
         Ok(if english {
             "Reading the repository to write its instruction file.".to_string()
         } else {
@@ -2795,7 +2799,13 @@ impl atomcode_harness::commands::CatalogCommand for WorklogCommand {
         ) {
             WorklogPrompt::Unusable(usage) => return Err(usage),
             WorklogPrompt::Prompt(prompt) => {
-                agent.send(prompt);
+                agent.inject(prompt, atomcode_harness::session::InjectionOrigin::Reminder);
+                let args = args.trim();
+                agent.send(if args.is_empty() {
+                    "/worklog".to_string()
+                } else {
+                    format!("/worklog {args}")
+                });
                 Ok(if english {
                     "Put the recap of that day in the conversation.".to_string()
                 } else {

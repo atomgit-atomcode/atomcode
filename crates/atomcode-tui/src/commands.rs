@@ -3126,7 +3126,9 @@ impl CommandSet for AgentCatalogCommands {
             })
         };
 
-        if name.eq_ignore_ascii_case("skills") {
+        if name.eq_ignore_ascii_case("init") || name.eq_ignore_ascii_case("worklog") {
+            true
+        } else if name.eq_ignore_ascii_case("skills") {
             args.split_whitespace().next().is_some_and(is_skill)
         } else {
             is_skill(name)
