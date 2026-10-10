@@ -24,6 +24,8 @@
 
 use qrcode::{Color as QrColor, QrCode};
 
+use crate::block::{hash_of, Content, ContentHash, RenderCtx};
+use crate::frame::{Color, Line, Span, Style};
 use crate::raster::{Cell, Raster};
 
 /// The light margin a scanner needs around the code, in modules.
@@ -46,18 +48,6 @@ const WHITE: crate::theme::Rgb = (255, 255, 255);
 /// it here. The first draft did check both, and the criterion for it stayed
 /// green when this file's check was deleted — which is what a rule with two
 /// implementations looks like from the outside.
-pub fn text_code(data: &str) -> Option<String> {
-    use qrcode::render::unicode::Dense1x2;
-    let code = QrCode::new(data.as_bytes()).ok()?;
-    Some(
-        code.render::<Dense1x2>()
-            .dark_color(Dense1x2::Dark)
-            .light_color(Dense1x2::Light)
-            .quiet_zone(true)
-            .build(),
-    )
-}
-
 pub fn code(data: &str) -> Option<Raster> {
     let code = QrCode::new(data.as_bytes()).ok()?;
     let side = code.width() + QUIET_ZONE * 2;
@@ -89,6 +79,72 @@ pub fn code(data: &str) -> Option<Raster> {
         }
     }
     Raster::from_cells(columns, rows, cells).ok()
+}
+
+/// A QR code kept semantic until the terminal's capabilities are known.
+#[derive(Debug)]
+pub struct CodeBlock {
+    data: String,
+    raster: Raster,
+}
+
+impl CodeBlock {
+    pub fn new(data: &str) -> Option<Self> {
+        Some(Self {
+            data: data.to_string(),
+            raster: code(data)?,
+        })
+    }
+}
+
+impl Content for CodeBlock {
+    fn kind(&self) -> &'static str {
+        "qr"
+    }
+
+    fn content_hash(&self) -> ContentHash {
+        hash_of(&["qr", &self.data])
+    }
+
+    fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+        let drawable = ctx.caps.colors != crate::caps::Colors::None
+            && ctx.caps.cell_background
+            && (ctx.caps.unicode || ctx.caps.basic_glyphs)
+            && ctx.width >= self.raster.columns;
+        if !drawable {
+            return Vec::new();
+        }
+
+        let lower_only = ctx.caps.basic_glyphs && !ctx.caps.unicode;
+        (0..self.raster.rows)
+            .map(|row| {
+                let spans = (0..self.raster.columns)
+                    .map(|column| {
+                        let cell = self.raster.cell(column, row).expect("inside QR raster");
+                        let colour = |rgb| match rgb {
+                            Some(BLACK) => Color::picture(16),
+                            Some(WHITE) => Color::picture(231),
+                            _ => unreachable!("QR raster is black and white"),
+                        };
+                        let (glyph, top, bottom) = if lower_only {
+                            ('▄', cell.bg, cell.fg)
+                        } else {
+                            ('▀', cell.fg, cell.bg)
+                        };
+                        Span::styled(
+                            glyph.to_string(),
+                            Style::new().fg(colour(top)).bg(colour(bottom)),
+                        )
+                    })
+                    .collect();
+                Line::from_spans(spans)
+            })
+            .collect()
+    }
+
+    fn always_open(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -194,5 +250,37 @@ mod tests {
             code(&encodes_but_will_not_fit).is_none(),
             "a raster has a size, and this is past it"
         );
+    }
+
+    #[test]
+    fn a_windows_basic_console_gets_lower_blocks_not_text_fallback_hashes() {
+        let block = CodeBlock::new("https://example.com/login?code=abc").expect("QR");
+        let ctx = RenderCtx {
+            width: 80,
+            caps: crate::block::ShapeCaps {
+                unicode: false,
+                basic_glyphs: true,
+                colors: crate::caps::Colors::Ansi16,
+                cell_background: true,
+            },
+        };
+        let drawn = block
+            .lines(&ctx)
+            .iter()
+            .map(Line::plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(drawn.contains('▄'), "{drawn}");
+        assert!(!drawn.contains(['▀', '#']), "{drawn}");
+    }
+
+    #[test]
+    fn an_incapable_or_narrow_terminal_gets_no_broken_code() {
+        let block = CodeBlock::new("https://example.com/login?code=abc").expect("QR");
+        let mut ctx = RenderCtx::bare(1);
+        assert!(block.lines(&ctx).is_empty(), "a cropped QR cannot scan");
+        ctx.width = 80;
+        ctx.caps.cell_background = false;
+        assert!(block.lines(&ctx).is_empty(), "half a QR cannot scan");
     }
 }

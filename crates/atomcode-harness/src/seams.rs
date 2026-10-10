@@ -957,6 +957,14 @@ pub trait UserInterface: Send + Sync {
     /// login shows a QR code, a URL and each step it is on, and a modal would
     /// make that a frame the person has to read before it goes away.
     fn say(&self, _text: &str) {}
+
+    /// Put a scannable code into the front end's scrollback.
+    ///
+    /// This is presentation rather than pre-rendered text: a terminal front end
+    /// must choose glyphs and colours from its measured capabilities. Default:
+    /// nothing. Callers must also say the underlying URL, so a front end that
+    /// cannot draw the code still leaves the operation possible.
+    fn show_qr(&self, _data: &str) {}
 }
 
 /// Naming a session. A seam because the cheap answer (the first prompt) and the

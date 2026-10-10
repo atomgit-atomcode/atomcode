@@ -1364,6 +1364,14 @@ impl UserInterface for Tui {
         }
     }
 
+    fn show_qr(&self, data: &str) {
+        Tui::show_qr(self, data);
+        let sender = self.wake.lock().expect("wake poisoned").clone();
+        if let Some(sender) = sender {
+            let _ = sender.send(Wake::Fact);
+        }
+    }
+
     async fn run(&self, ctx: &Context, initial: Option<String>) -> Result<(), String> {
         let HostConnection {
             session,
@@ -5733,6 +5741,15 @@ impl Tui {
                 refused: false,
             }),
         );
+    }
+
+    fn show_qr(&self, data: &str) {
+        let Some(code) = crate::qr::CodeBlock::new(data) else {
+            return;
+        };
+        let mut stream = self.host.stream.write().expect("stream poisoned");
+        let mut w = stream.writer("commands");
+        w.emit(crate::block::Coord::default(), Arc::new(code));
     }
 
     /// The agent's own events: they move the status line and answer the

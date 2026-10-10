@@ -184,6 +184,7 @@ struct World {
 /// it is not assertable through a screen.
 trait Say: Send + Sync {
     fn say(&self, text: &str);
+    fn show_qr(&self, data: &str);
 }
 
 /// The screen's front end, seen as somewhere lines go.
@@ -192,6 +193,10 @@ struct ScreenSay(Arc<dyn UserInterface>);
 impl Say for ScreenSay {
     fn say(&self, text: &str) {
         self.0.say(text);
+    }
+
+    fn show_qr(&self, data: &str) {
+        self.0.show_qr(data);
     }
 }
 
@@ -395,7 +400,7 @@ fn run_oauth(
         })
         .into_owned()
     })?;
-    say.say(&login_chrome(session.url()));
+    show_login_chrome(say, session.url());
 
     let ticks = session.spawn_poller(Duration::from_secs(2));
     loop {
@@ -446,18 +451,11 @@ fn keep_credentials(auth: &atomcode_auth::AuthInfo) -> Result<(), String> {
     })
 }
 
-/// What the person reads while they reach for their phone: the code, then the
-/// URL — as lines in the conversation, since that is where they will be looking.
-fn login_chrome(url: &str) -> String {
-    let mut chrome = String::new();
-    if let Some(qr) = atomcode_tui::qr::text_code(url) {
-        chrome.push_str(&qr);
-        chrome.push('\n');
-    }
-    chrome.push_str(&tr(SMsg::ScanOrOpen));
-    chrome.push('\n');
-    chrome.push_str(url);
-    chrome
+/// What the person reads while they reach for their phone: a semantic picture,
+/// then the URL as the fallback every front end can show.
+fn show_login_chrome(say: &dyn Say, url: &str) {
+    say.show_qr(url);
+    say.say(&format!("{}\n{url}", tr(SMsg::ScanOrOpen)));
 }
 
 #[cfg(test)]
@@ -472,6 +470,7 @@ mod tests {
     #[derive(Default)]
     struct Recording {
         said: std::sync::Mutex<Vec<String>>,
+        qr: std::sync::Mutex<Vec<String>>,
     }
 
     impl Say for Recording {
@@ -481,11 +480,22 @@ mod tests {
                 .expect("recording poisoned")
                 .push(text.to_string());
         }
+
+        fn show_qr(&self, data: &str) {
+            self.qr
+                .lock()
+                .expect("recording poisoned")
+                .push(data.to_string());
+        }
     }
 
     impl Recording {
         fn all(&self) -> String {
             self.said.lock().expect("recording poisoned").join("\n")
+        }
+
+        fn qrs(&self) -> Vec<String> {
+            self.qr.lock().expect("recording poisoned").clone()
         }
     }
 
@@ -680,6 +690,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn login_qr_is_a_picture_and_the_url_remains_text() {
+        let recorder = Recording::default();
+        let url = "https://acs.atomgit.com/s/example";
+
+        show_login_chrome(&recorder, url);
+
+        assert_eq!(recorder.qrs(), [url]);
+        let said = recorder.all();
+        assert!(
+            said.contains(url),
+            "the fallback URL remains readable: {said}"
+        );
+        assert!(
+            !said.contains(['▀', '▄', '█', '#']),
+            "QR modules must not pass through ordinary text glyph fallback: {said}"
+        );
+    }
+
     /// A sink that records, wearing the front end the flow asks for.
     fn sink_with(recorder: Arc<Recording>) -> Arc<dyn UserInterface> {
         Arc::new(RecorderFront(recorder))
@@ -697,6 +726,9 @@ mod tests {
         }
         fn say(&self, text: &str) {
             self.0.say(text);
+        }
+        fn show_qr(&self, data: &str) {
+            self.0.show_qr(data);
         }
     }
 
