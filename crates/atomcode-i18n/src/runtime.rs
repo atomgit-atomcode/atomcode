@@ -152,16 +152,32 @@ pub fn fmt_tokens(n: usize) -> String {
 
 /// Determine the initial locale from (in priority order):
 /// CLI `--lang` flag, config file `language` field, environment
-/// variables `LC_ALL` / `LC_MESSAGES` / `LANG`.
+/// variables `LC_ALL` / `LC_MESSAGES` / `LANG`, then the system's preferred locale.
+/// Non-Chinese locales and failed detection fall back to English.
 pub fn resolve_initial_locale(cli_lang: Option<&str>, config_lang: Option<Locale>) -> Locale {
-    resolve_initial_locale_with_env(cli_lang, config_lang, &|k| std::env::var(k).ok())
+    resolve_locale(
+        cli_lang,
+        config_lang,
+        &|k| std::env::var(k).ok(),
+        &sys_locale::get_locale,
+    )
 }
 
+/// Deterministic environment-only resolver; does not query the host system.
 #[doc(hidden)]
 pub fn resolve_initial_locale_with_env(
     cli_lang: Option<&str>,
     config_lang: Option<Locale>,
     env: &dyn Fn(&str) -> Option<String>,
+) -> Locale {
+    resolve_locale(cli_lang, config_lang, env, &|| None)
+}
+
+fn resolve_locale(
+    cli_lang: Option<&str>,
+    config_lang: Option<Locale>,
+    env: &dyn Fn(&str) -> Option<String>,
+    system_locale: &dyn Fn() -> Option<String>,
 ) -> Locale {
     if let Some(s) = cli_lang {
         if let Ok(loc) = s.parse::<Locale>() {
@@ -173,12 +189,23 @@ pub fn resolve_initial_locale_with_env(
     }
     for key in ["LC_ALL", "LC_MESSAGES", "LANG"] {
         if let Some(val) = env(key) {
+            let val = val.trim();
             if !val.is_empty() {
-                return classify_env_locale(&val);
+                // C/POSIX select encoding and formatting, not a human language.
+                // Preserve environment precedence: a generic winning value falls
+                // through to the system, not to a lower-priority variable.
+                let base = val.split(['.', '@']).next().unwrap_or_default();
+                if base.eq_ignore_ascii_case("C") || base.eq_ignore_ascii_case("POSIX") {
+                    break;
+                }
+                return classify_env_locale(val);
             }
         }
     }
-    Locale::En
+    system_locale()
+        .as_deref()
+        .map(classify_env_locale)
+        .unwrap_or(Locale::En)
 }
 
 fn classify_env_locale(value: &str) -> Locale {
@@ -256,6 +283,84 @@ impl Drop for LocaleTestGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_language_is_the_last_fallback() {
+        for (system, expected) in [
+            (Some("zh-CN"), Locale::ZhCn),
+            (Some("zh-Hant-TW"), Locale::ZhCn),
+            (Some("ZH-HK"), Locale::ZhCn),
+            (Some("en-US"), Locale::En),
+            (Some("ja-JP"), Locale::En),
+            (Some("fr-FR"), Locale::En),
+            (Some(""), Locale::En),
+            (None, Locale::En),
+        ] {
+            let system = || system.map(str::to_owned);
+            assert_eq!(resolve_locale(None, None, &|_| None, &system), expected);
+            assert_eq!(
+                resolve_locale(None, None, &|_| Some(String::new()), &system),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn generic_locales_follow_the_system_language() {
+        for key in ["LC_ALL", "LC_MESSAGES", "LANG"] {
+            for value in ["C", "POSIX", "C.UTF-8", "C.utf8", "POSIX.UTF-8"] {
+                let env = |k: &str| (k == key).then(|| value.to_owned());
+                for (system, expected) in [
+                    (Some("zh-Hans-CN"), Locale::ZhCn),
+                    (Some("zh-Hant-TW"), Locale::ZhCn),
+                    (Some("en-US"), Locale::En),
+                    (Some("ja-JP"), Locale::En),
+                    (None, Locale::En),
+                ] {
+                    assert_eq!(
+                        resolve_locale(None, None, &env, &|| system.map(str::to_owned)),
+                        expected,
+                        "{key}={value}, system={system:?}"
+                    );
+                }
+            }
+        }
+        let env = |k: &str| match k {
+            "LC_ALL" => Some("C.UTF-8".into()),
+            "LANG" => Some("en_US.UTF-8".into()),
+            _ => None,
+        };
+        assert_eq!(
+            resolve_locale(None, None, &env, &|| Some("zh-Hans-CN".into())),
+            Locale::ZhCn
+        );
+    }
+
+    #[test]
+    fn explicit_language_never_queries_the_system() {
+        let system = || panic!("system language must not override an explicit setting");
+        assert_eq!(
+            resolve_locale(Some("en"), Some(Locale::ZhCn), &|_| None, &system),
+            Locale::En
+        );
+        assert_eq!(
+            resolve_locale(None, Some(Locale::ZhCn), &|_| None, &system),
+            Locale::ZhCn
+        );
+        for key in ["LC_ALL", "LC_MESSAGES", "LANG"] {
+            for value in ["en_US.UTF-8", "ja_JP.UTF-8"] {
+                let env = |k: &str| (k == key).then(|| value.to_owned());
+                assert_eq!(resolve_locale(None, None, &env, &system), Locale::En);
+            }
+        }
+        let env = |k: &str| match k {
+            "LC_ALL" => Some(String::new()),
+            "LC_MESSAGES" => Some("zh_CN.UTF-8".into()),
+            "LANG" => Some("en_US.UTF-8".into()),
+            _ => None,
+        };
+        assert_eq!(resolve_locale(None, None, &env, &system), Locale::ZhCn);
+    }
 
     #[test]
     fn fmt_tokens_scales_with_magnitude() {
