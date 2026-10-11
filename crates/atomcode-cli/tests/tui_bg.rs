@@ -708,6 +708,119 @@ async fn a_running_background_task_can_be_opened_and_left_again() {
     rig.quit().await;
 }
 
+async fn a_restored_history() -> (Rig, String) {
+    let rig = Rig::new().await;
+    changed_repo(rig.project.path());
+    let history = rig.client.root();
+    rig.term.type_line("main conversation");
+    rig.until_screen("answer 1").await;
+    rig.until("the historical turn finished", |rig| {
+        rig.client.root_settled()
+    })
+    .await;
+    rig.term.type_line("/new");
+    rig.until("a fresh conversation opened", |rig| {
+        rig.client.root() != history
+    })
+    .await;
+    rig.term.type_line(&format!("/resume {history}"));
+    rig.until("the historical conversation is restored", |rig| {
+        rig.client.root() == history
+    })
+    .await;
+    rig.until("the restored catalog offers all runtime commands", |rig| {
+        rig.client.described().is_some_and(|description| {
+            ["goal", "loop", "queue", "policy", "worktree"]
+                .iter()
+                .all(|name| {
+                    description
+                        .commands
+                        .iter()
+                        .any(|command| command.name == *name)
+                })
+        })
+    })
+    .await;
+    (rig, history)
+}
+
+/// Session reconstruction must keep the command port to the same runtime owner.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(atomcode_home)]
+async fn goal_can_start_after_a_history_session_is_resumed() {
+    let (rig, history) = a_restored_history().await;
+    rig.term.type_line("/goal slow goal");
+    rig.until(
+        "the resumed conversation's goal actually reaches the model",
+        |rig| rig.script.started.load(Ordering::SeqCst) == 1,
+    )
+    .await;
+    assert_eq!(rig.client.root(), history);
+    rig.term.type_line("/goal stop");
+    rig.release();
+    rig.quit().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(atomcode_home)]
+async fn the_other_runtime_commands_work_after_a_history_session_is_resumed() {
+    let (rig, history) = a_restored_history().await;
+    rig.term.type_line("/policy how");
+    rig.until_screen("现在没有卡住的策略边界要你决定").await;
+    rig.term.type_line("/worktree list");
+    rig.until_screen("← 当前").await;
+    let project = rig.project.path().canonicalize().unwrap();
+    assert!(rig.term.text().contains(project.to_str().unwrap()));
+
+    rig.term.type_line("/queue slow queued context");
+    rig.until_screen("排好了").await;
+    // The typed request has no 'slow': only a delivered queue can hold it.
+    rig.term.type_line("inspect the queued context");
+    rig.until("the queued context reached the model", |rig| {
+        rig.script.started.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    rig.client.cancel();
+    rig.until("the queued turn was cancelled", |rig| {
+        rig.client.root_settled()
+    })
+    .await;
+    assert_eq!(rig.script.finished.load(Ordering::SeqCst), 0);
+
+    rig.term.type_line("/loop 1h slow loop");
+    rig.until("the resumed session's loop reached the model", |rig| {
+        rig.script.started.load(Ordering::SeqCst) == 2
+    })
+    .await;
+    assert!(
+        matches!(rig.control().call(HostCommand::Autonomy { session: history.clone() }).await,
+        Ok(HostReply::Autonomy { running: Some(running) }) if running.kind == "loop")
+    );
+    rig.term.type_line("/loop stop");
+    rig.until_screen("循环停了").await;
+    rig.until("stopping the loop cancelled its turn", |rig| {
+        rig.client.root_settled()
+    })
+    .await;
+    assert_eq!(rig.client.root(), history);
+    assert_eq!(rig.script.finished.load(Ordering::SeqCst), 0);
+    // A further project switch must remount these commands with its own cwd.
+    let other = tempfile::tempdir().unwrap();
+    changed_repo(other.path());
+    rig.term
+        .type_line(&format!("/cd {}", other.path().display()));
+    rig.until("the other project is foreground", |rig| {
+        rig.client.root() != history
+    })
+    .await;
+    rig.term.type_line("/worktree list");
+    let other_path = other.path().canonicalize().unwrap();
+    rig.until_screen(other_path.to_str().unwrap()).await;
+    rig.until_screen("← 当前").await;
+    rig.release();
+    rig.quit().await;
+}
+
 /// **A background row keeps up while its session works out of view.** Nothing
 /// happens in the session while the model is held — no question, no turn end,
 /// which were the only times the list used to be sent — and still the team

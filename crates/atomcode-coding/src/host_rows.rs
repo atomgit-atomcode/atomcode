@@ -2055,7 +2055,10 @@ impl Plugin for CompactionCodingPlugin {
 // person typed is one of its choices, are this row's judgements.
 
 /// `capability-commands`: goal, loop, queue and policy, in the catalog.
-pub(crate) struct CapabilityCommandsPlugin(pub(crate) Arc<dyn crate::runtime::RuntimeCommands>);
+pub(crate) struct CapabilityCommandsPlugin(
+    pub(crate) Arc<dyn crate::runtime::RuntimeCommands>,
+    pub(crate) std::path::PathBuf,
+);
 
 #[async_trait]
 impl Plugin for CapabilityCommandsPlugin {
@@ -2075,7 +2078,7 @@ impl Plugin for CapabilityCommandsPlugin {
             Arc::new(LoopCommand(self.0.clone())),
             Arc::new(QueueCommand(self.0.clone())),
             Arc::new(PolicyCommand(self.0.clone())),
-            Arc::new(WorktreeCommand(self.0.clone())),
+            Arc::new(WorktreeCommand(self.0.clone(), self.1.clone())),
         ] {
             atomcode_harness::commands::register(ctx, command)?;
         }
@@ -2118,7 +2121,7 @@ fn the_conversation_itself(agent: &atomcode_harness::agent::Agent) -> bool {
 /// so `done` is not a remembered path either, it is the repository's own main
 /// checkout, which survives restarts where a slot in a front end's memory does
 /// not.
-struct WorktreeCommand(Arc<dyn crate::runtime::RuntimeCommands>);
+struct WorktreeCommand(Arc<dyn crate::runtime::RuntimeCommands>, std::path::PathBuf);
 
 #[async_trait]
 impl atomcode_harness::commands::CatalogCommand for WorktreeCommand {
@@ -2137,12 +2140,10 @@ impl atomcode_harness::commands::CatalogCommand for WorktreeCommand {
         agent: Arc<atomcode_harness::agent::Agent>,
         args: &str,
     ) -> Result<String, String> {
-        let root = agent
-            .ctx()
-            .service::<atomcode_harness::seams::FsSvc>()
-            .map(|fs| fs.root())
-            .ok_or_else(|| "这个会话没有工作区".to_string())?;
-        run_worktree(&root, args, &self.0).await
+        // The filesystem's access root is not the conversation's working
+        // directory: an unfenced local world reports the process startup cwd.
+        let root = agent.cwd().unwrap_or(&self.1);
+        run_worktree(root, args, &self.0).await
     }
 }
 
@@ -2392,8 +2393,8 @@ fn worktree(
             "`{name}` 不能当 worktree 的名字:要一个不带路径分隔符的名字"
         ));
     }
-    // `FsSvc::root()` is the working directory when the world is unfenced, so
-    // this can be a subdirectory: `git -C` finds the repository from it, but
+    // The conversation's working directory can be a subdirectory: `git -C`
+    // finds the repository from it, but
     // `.worktrees` has to hang off the *repository*, or `/worktree x` means
     // something different depending on where in the tree the person is.
     let root = match git_out(root, &["rev-parse", "--show-toplevel"]) {
@@ -2549,7 +2550,7 @@ fn exclude_worktrees_dir(root: &std::path::Path) -> Result<(), String> {
 
 /// Run one git command in `root` and hand back its stdout, or git's own words
 /// on failure. `-C` rather than a directory on the child: the same call works
-/// for the repository root and for the subdirectory `FsSvc::root()` may be.
+/// for the repository root and for a conversation working in a subdirectory.
 fn git_out(root: &std::path::Path, args: &[&str]) -> Result<String, String> {
     let mut git = std::process::Command::new("git");
     git.arg("-C")

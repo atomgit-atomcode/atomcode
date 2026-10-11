@@ -6822,6 +6822,10 @@ fn spawn_runtime_owner_with_optional_agent(
                                 // tree's: a reprepare must not put back what they
                                 // turned off (`CodingParts::tool_switches`).
                                 parts.adopt_tool_switches(runtime.parts.tool_switches());
+                                // These commands address this owner, not the old session.
+                                // Keep their stable port on every rebuilt capability graph,
+                                // including historical-session resume and fresh/project switches.
+                                parts.runtime_commands = runtime.parts.runtime_commands.clone();
                                 RuntimeResources {
                                 config: input.config,
                                 prepare: input.prepare,

@@ -2121,6 +2121,7 @@ fn compose_hosted(
     if let Some(commands) = host.runtime_commands {
         registry.register(Arc::new(crate::host_rows::CapabilityCommandsPlugin(
             commands,
+            working_dir.to_path_buf(),
         )));
     }
     if let Some(file) = host.config_file {
