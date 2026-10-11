@@ -555,10 +555,8 @@ const PAD: usize = 2;
 /// A version of this that "coped" by filling both pixels with the upper colour
 /// drew a solid orange rectangle for weeks and looked like a loading placeholder.
 ///
-/// My equivalents: `colors != None` for `colors`, `unicode` for
-/// `unicode_symbols`, and the measured `cell_background` for
-/// `modern_emulator || jediterm` — the same three facts, one of them measured
-/// rather than guessed from an environment variable.
+/// This screen uses `colors != None`, Unicode/basic glyph support, and the
+/// `cell_background` capability, including xterm declarations over SSH.
 ///
 /// Cut to `content_w`, like every other row: art wider than the rect it was given
 /// is a row running into its neighbour.
@@ -2220,7 +2218,10 @@ impl Content for NoticeBlock {
     }
     fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
         let w = ctx.width;
-        wrapped(&self.detail, w, muted(), "⚑ ")
+        // Launcher banners may carry SGR. Strip it before layout and selection
+        // split the text into spans, which could otherwise leave escape tails.
+        let detail = crate::text::for_buffer(&self.detail);
+        wrapped(&detail, w, muted(), "⚑ ")
     }
 }
 
@@ -3857,6 +3858,68 @@ mod tests {
                 cell_background,
             },
         }
+    }
+
+    #[test]
+    fn coloured_notices_are_plain_before_wrapping_and_drag_selection() {
+        let plain = "Warning: Running with Administrator privileges.\nThe model may have access to system files.\nConsider running without elevation, inside a scoped working directory.";
+        let notice = NoticeBlock {
+            detail: format!("\x1b[33m{plain}\x1b[39m\n"),
+        };
+        let expected = NoticeBlock {
+            detail: format!("{plain}\n"),
+        };
+        for width in 4..=100 {
+            let ctx = wctx(width, true);
+            let actual_lines = notice.lines(&ctx);
+            let expected_lines = expected.lines(&ctx);
+            assert_eq!(
+                actual_lines.iter().map(Line::plain).collect::<Vec<_>>(),
+                expected_lines.iter().map(Line::plain).collect::<Vec<_>>(),
+                "width={width}"
+            );
+            let height = actual_lines.len() as u16;
+            for head in [0, width / 2, width - 1] {
+                let selection = crate::moment::Selection {
+                    anchor: (0, 0),
+                    head: (head, height - 1),
+                };
+                let rect = crate::frame::Rect::new(0, 0, width, height);
+                let mut actual = crate::frame::Frame::new(width, height);
+                actual.place("notice", rect, actual_lines.clone());
+                actual.highlight(&selection);
+                let mut expected = crate::frame::Frame::new(width, height);
+                expected.place("notice", rect, expected_lines.clone());
+                expected.highlight(&selection);
+                assert_eq!(crate::ansi::encode(&actual), crate::ansi::encode(&expected));
+                assert_eq!(
+                    actual.selected_text(&selection),
+                    expected.selected_text(&selection)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ssh_xterm_capabilities_show_the_welcome_mascot() {
+        let env = |key: &str| (key == "TERM").then(|| "xterm-256color".to_string());
+        let caps = crate::caps::Caps::plain();
+        let ctx = RenderCtx {
+            width: 100,
+            caps: crate::block::ShapeCaps {
+                colors: crate::caps::colors_for(&env, false),
+                unicode: crate::caps::unicode_for(&env),
+                basic_glyphs: caps.basic_glyphs,
+                cell_background: crate::caps::cell_background_for(&env, false, false),
+            },
+        };
+        let text = welcome()
+            .lines(&ctx)
+            .iter()
+            .map(Line::plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains('▀') || text.contains('▄'), "{text}");
     }
 
     fn lines_of(block: &WelcomeBlock, width: u16, cell_background: bool) -> Vec<String> {

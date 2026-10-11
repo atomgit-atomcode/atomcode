@@ -157,10 +157,9 @@ pub struct Caps {
     /// Not the same question as [`colors`](Self::colors): a terminal can have 256
     /// of them and still drop the background, and when it does, anything drawn
     /// with one comes apart. Tuix learned this the hard way — its mascot packs two
-    /// vertical pixels per cell (`▀` with fg above, bg below), and on a bare ssh
-    /// client the glyphs arrived but the backgrounds did not, so the art
-    /// fragmented into its top half. It gates on `modern_emulator`/`jediterm` for
-    /// that reason; those two variables are what a shield can honestly read.
+    /// vertical pixels per cell (`▀` with fg above, bg below). Accept an xterm
+    /// declaration as well as a named emulator: SSH normally forwards TERM,
+    /// but not the local emulator's identifying environment variables.
     ///
     /// False by default, like everything a terminal has not said. A caller that
     /// needs it can encode its own gate (a plain foreground glyph always works);
@@ -257,6 +256,8 @@ fn keyboard_protocol_for(windows: bool, env: impl Fn(&str) -> Option<String>) ->
 /// `TERM_PROGRAM`, `TERM=xterm-256color` — so the "an emulator names itself"
 /// rule read it as a bare ssh client. That took the mascot, the user message
 /// bar and every panel's selection band off a terminal that draws all three.
+/// An xterm TERM also declares background colours; this is the capability
+/// declaration that survives SSH when local emulator names do not.
 pub fn cell_background_for(
     env: &dyn Fn(&str) -> Option<String>,
     windows: bool,
@@ -267,7 +268,10 @@ pub fn cell_background_for(
         || env("WT_SESSION").is_some()
         || env("TERM_PROGRAM").is_some()
         || env("VTE_VERSION").is_some()
-        || env("TERM").is_some_and(|t| t.contains("jediterm"))
+        || env("TERM").is_some_and(|t| {
+            matches!(t.as_str(), "xterm" | "xterm-color" | "xterm-256color")
+                || t.contains("jediterm")
+        })
 }
 
 /// Whether the terminal reports the mouse at all — whether asking it to
@@ -359,10 +363,9 @@ impl Caps {
             // here comes from the environment; asking the terminal what colour
             // it is is I/O, and belongs to the row that owns the tty.
             palette: crate::theme::Palette::assumed(crate::theme::Theme::Dark),
-            // The one bit the environment *can* answer, and tuix's answer is kept
-            // verbatim: an emulator that announces itself (or JediTerm, a local
-            // IDE terminal) paints cell backgrounds; a bare ssh client or a
-            // legacy console does not, and art that assumes otherwise fragments.
+            // Named emulators and xterm TERM declarations paint backgrounds.
+            // SSH normally preserves only TERM, so a missing local emulator
+            // name must not override that declaration.
             // See the field's docs.
             //
             // Windows is no longer in that list of doubts: this screen only runs
@@ -841,11 +844,10 @@ mod tests {
     }
 
     /// HarmonyOS's own Terminal names itself nowhere and still paints
-    /// backgrounds — so the mascot and the bars are drawn there; a bare
-    /// `xterm-256color` elsewhere (an ssh client) still is not trusted to.
+    /// backgrounds — so the mascot and the bars are drawn there.
     #[test]
     fn harmonyos_paints_backgrounds_though_it_names_no_terminal() {
-        let bare = env_of(&[("TERM", "xterm-256color")]);
+        let bare = env_of(&[]);
         assert!(cell_background_for(&bare, false, true), "HarmonyOS");
         assert!(
             !cell_background_for(&bare, false, false),
@@ -859,8 +861,20 @@ mod tests {
     fn ubuntu_vte_paints_backgrounds_without_term_program() {
         let ubuntu = env_of(&[("TERM", "xterm-256color"), ("VTE_VERSION", "7600")]);
         assert!(cell_background_for(&ubuntu, false, false));
-        let bare = env_of(&[("TERM", "xterm-256color")]);
+        let bare = env_of(&[]);
         assert!(!cell_background_for(&bare, false, false));
+    }
+
+    #[test]
+    fn ssh_xterm_declares_backgrounds_without_local_emulator_variables() {
+        for term in ["xterm", "xterm-color", "xterm-256color"] {
+            let env = |key: &str| (key == "TERM").then(|| term.to_string());
+            assert!(cell_background_for(&env, false, false), "{term}");
+        }
+        for term in ["dumb", "unknown", ""] {
+            let env = |key: &str| (key == "TERM").then(|| term.to_string());
+            assert!(!cell_background_for(&env, false, false), "{term}");
+        }
     }
 
     /// HarmonyOS's terminal reports no mouse, so the mouse stays its own there
