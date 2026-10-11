@@ -24,6 +24,17 @@ For whoever edits this file; this block is never shown.
 - Compiled into the binary; rebuild to see a change.
 -->
 
+## v5.2.3 (2026-10-11)
+
+### Overview
+
+Fix runtime commands becoming unavailable after restoring a historical session, and keep worktree operations in the current session's project directory.
+
+### Changes
+
+- **Commands in restored sessions**: `/goal`, `/loop`, `/queue`, `/policy` and `/worktree` remain available after restoring history. New sessions, project switches and runtime rebuilds also retain the same command entry point.
+- **Worktrees use the current project**: `/worktree` operates on the current session's Git repository, avoiding operations on the startup repository after restoring a session or using `/cd`.
+
 ## v5.2.2（v5.2.0） (2026-10-10)
 
 ### Overview
