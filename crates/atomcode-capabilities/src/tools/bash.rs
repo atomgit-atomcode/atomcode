@@ -428,6 +428,9 @@ fn shell_tool_description(
              PATHS: bash treats `\\` as an escape, so a Windows path like `C:\\Windows` is \
              mangled — use forward slashes (`C:/Windows`) or POSIX form (`/c/Windows`). \
              Relative paths work (the working directory is already set).\n\
+             GNU tools in /usr/bin and /bin take priority over Windows names such as \
+             find/sort. To run a Windows version, use its explicit path \
+             (e.g. C:/Windows/System32/find.exe).\n\
              Windows-native tools (where, reg, tasklist, sc) are still callable by name. Do \
              NOT emit cmd.exe builtins (`dir`, `type`, `copy`, `%VAR%`) — use their bash \
              equivalents (`ls`, `cat`, `cp`, `$VAR`) or the dedicated file tools above.\n\
@@ -1063,13 +1066,21 @@ fn rewrite_nul_redirect(command: &str) -> Cow<'_, str> {
     Cow::Owned(result)
 }
 
+/// Set lookup order inside MSYS bash, after it has converted the inherited
+/// Windows PATH. Keep native tools reachable behind the POSIX tools, without
+/// mixing Windows semicolon paths with MSYS colon paths in the parent process.
+#[cfg(any(windows, test))]
+fn windows_bash_script(command: &str) -> String {
+    format!("export PATH=\"/usr/bin:/bin${{PATH:+:$PATH}}\";\n{command}")
+}
+
 /// Windows shell selection. Returns `Ok(Command)` ready to spawn, or `Err(reason)` when
 /// the command contains bash constructs that neither bash (absent) nor cmd.exe can handle
 /// safely — the caller surfaces that as a clear tool error so the model can rewrite.
 #[cfg(windows)]
 fn build_command(command: &str) -> Result<tokio::process::Command, String> {
     if let Some(bash) = detect_windows_bash() {
-        // Bash available (Git Bash / WSL / MSYS2) — route through it, unifying with
+        // Bash available (Git Bash / MSYS2) — route through it, unifying with
         // the Unix path. `bash -c "<script>"` honors bash quoting exactly as the model
         // expects; no silent corruption of `$()`, inline Python, or multi-line strings.
         // Rewrite the cmd.exe idiom `> nul` → `> /dev/null` first: under Git Bash `nul`
@@ -1077,7 +1088,7 @@ fn build_command(command: &str) -> Result<tokio::process::Command, String> {
         // the cwd (see `rewrite_nul_redirect`).
         let command = rewrite_nul_redirect(command);
         let mut cmd = tokio::process::Command::new(bash);
-        cmd.arg("-c").arg(command.as_ref());
+        cmd.arg("-c").arg(windows_bash_script(command.as_ref()));
         return Ok(cmd);
     }
     // No bash — cmd.exe fallback. Guard against constructs cmd.exe will silently corrupt
@@ -3897,6 +3908,85 @@ mod tests {
             !r.content.contains('\x1b'),
             "escape leaked into result: {:?}",
             r.content
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn windows_bash_setup_prefers_posix_tools_and_keeps_inherited_tools() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["find", "sort", "atomcode-native-tool"] {
+            let file = dir.path().join(name);
+            std::fs::write(&file, format!("#!/bin/sh\nprintf 'INHERITED-{name}\\n'\n")).unwrap();
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(dir.path().join("data.txt"), "2\n10\n1\n").unwrap();
+        let script = "printf 'SORT\n'; sort -rn data.txt; find . -name data.txt -exec echo FOUND {} \\;; atomcode-native-tool";
+        let output = std::process::Command::new("/bin/bash")
+            .args(["-c", &windows_bash_script(script)])
+            .env("PATH", dir.path())
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(
+            stdout,
+            "SORT\n10\n2\n1\nFOUND ./data.txt\nINHERITED-atomcode-native-tool\n"
+        );
+        let quoted_script = "cat <<'END'\n$PATH and \"quotes\"\nEND\nprintf '%s' \"$(echo done)\"";
+        let output = std::process::Command::new("/bin/bash")
+            .args(["-c", &windows_bash_script(quoted_script)])
+            .env("PATH", dir.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "$PATH and \"quotes\"\ndone"
+        );
+        for inherited in [Some(""), None] {
+            let mut cmd = std::process::Command::new("/bin/bash");
+            cmd.args(["-c", &windows_bash_script("printf '%s' \"$PATH\"")]);
+            if let Some(path) = inherited {
+                cmd.env("PATH", path);
+            } else {
+                cmd.env_remove("PATH");
+            }
+            let output = cmd.output().unwrap();
+            assert!(output.status.success());
+            let path = String::from_utf8(output.stdout).unwrap();
+            assert!(path.starts_with("/usr/bin:/bin"));
+            assert!(!path.ends_with(':'));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn git_bash_prefers_gnu_find_and_sort_over_system32() {
+        if detect_windows_bash().is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("data.txt"), "2\n10\n1\n").unwrap();
+        std::fs::write(dir.path().join("x.txt"), "x").unwrap();
+        let windows = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+        let mut cmd = build_command(
+            "sort -rn data.txt && find . -maxdepth 1 -name x.txt -exec echo FOUND {} \\;",
+        )
+        .unwrap();
+        cmd.env("PATH", std::path::PathBuf::from(windows).join("System32"));
+        cmd.current_dir(dir.path());
+        let output = cmd.as_std_mut().output().unwrap();
+        assert!(output.status.success(), "{}", decode_output(&output.stderr));
+        assert_eq!(
+            decode_output(&output.stdout).replace("\r\n", "\n"),
+            "10\n2\n1\nFOUND ./x.txt\n"
         );
     }
 
