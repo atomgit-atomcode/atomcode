@@ -10039,6 +10039,8 @@ fn reload_skills_live(runtime: &RuntimeResources) -> Result<usize, ()> {
         }
     };
     registry.reload_dirs(&dirs, &runtime.prepare.plugin_skill_dirs);
+    atomcode_harness::plugins::capabilities::register_skill_commands(&ctx, &registry)
+        .map_err(|_| ())?;
     // The catalog is ranked against the project's own instruction files, as at
     // mount — a reload that dropped the ranking would quietly reorder the
     // prompt prefix.

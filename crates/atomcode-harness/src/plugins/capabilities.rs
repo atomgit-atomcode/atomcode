@@ -499,8 +499,21 @@ fn yes() -> bool {
 /// 两件事都在这里：`/skills`（人能看装了什么，不必让模型替他调工具）和
 /// **每个 `user_invocable` 的 skill 一条**——`/init`、`/setup` 和任何人自己写的
 /// 那条，都不必由这一行或屏幕知道它们的名字。
+/// 同名的扁平 command 保留直接 `/name`，skill 保留限定名的菜单条目，
+/// `/skills name` 和模型调用仍从 skill 索引取内容。重载时只刷新磁盘生成的
+/// 条目，内建命令不受影响。
 pub fn register_skill_commands(ctx: &Context, registry: &Arc<SkillRegistry>) -> Result<(), String> {
-    crate::commands::register(ctx, Arc::new(ListSkills(registry.clone())))?;
+    let catalog = ctx
+        .require::<crate::seams::CommandsSvc>()
+        .map_err(|e| e.to_string())?;
+    catalog.remove_skill_commands(registry);
+    if !catalog.has("skills") {
+        crate::commands::register(ctx, Arc::new(ListSkills(registry.clone())))?;
+        let owned = catalog.clone();
+        let registry = registry.clone();
+        let _ = ctx.effect(move || owned.remove_skill_commands(&registry));
+    }
+    let commands = registry.slash_commands();
     for skill in registry.user_invocable() {
         // A cheap early skip when the name is already taken — a skill called
         // `compact` must not take the host's `/compact`. The catalog is the
@@ -511,10 +524,49 @@ pub fn register_skill_commands(ctx: &Context, registry: &Arc<SkillRegistry>) -> 
         // the memory row — is still evicted rather than crashing the tree. This
         // skip only saves registering-then-yielding when the built-in got there
         // first.
-        if catalog_has(ctx, &bare_name(&skill.name)) {
+        let collision = commands
+            .iter()
+            .any(|command| command.name == skill.name && command.source_path != skill.source_path);
+        // Keep a qualified alias for the skill in the frontend's skill menu;
+        // the bare name belongs to its separate command even when hidden.
+        let name = if collision {
+            if skill.name.contains(':') {
+                skill.name.clone()
+            } else {
+                format!("skills:{}", skill.name)
+            }
+        } else {
+            bare_name(&skill.name)
+        };
+        if catalog_has(ctx, &name) {
             continue;
         }
-        crate::commands::register(ctx, Arc::new(RunSkill(skill)))?;
+        catalog.register(Arc::new(RunSkill {
+            skill,
+            name,
+            command: false,
+            registry: registry.clone(),
+        }))?;
+    }
+    for command in commands
+        .into_iter()
+        .filter(|command| command.user_invocable)
+    {
+        let collision = registry
+            .get(&command.name)
+            .is_some_and(|skill| skill.source_path != command.source_path);
+        if !collision {
+            continue;
+        }
+        let name = bare_name(&command.name);
+        if !catalog_has(ctx, &name) {
+            catalog.register(Arc::new(RunSkill {
+                skill: command,
+                name,
+                command: true,
+                registry: registry.clone(),
+            }))?;
+        }
     }
     Ok(())
 }
@@ -522,7 +574,8 @@ pub fn register_skill_commands(ctx: &Context, registry: &Arc<SkillRegistry>) -> 
 /// The name a person types for a skill: `skills:init` is typed `/init`.
 ///
 /// The namespace is how the registry keeps two skills of the same name apart;
-/// it is not something anyone wants to type.
+/// it only needs to be typed when a skill's bare slash name belongs to a
+/// separate command; `/skills` can still resolve the skill's bare name.
 fn bare_name(name: &str) -> String {
     name.rsplit(':').next().unwrap_or(name).to_string()
 }
@@ -533,30 +586,42 @@ fn catalog_has(ctx: &Context, name: &str) -> bool {
         .is_some_and(|catalog| catalog.has(name))
 }
 
-/// One skill, as a command a person runs.
+/// One disk template, as a command a person runs.
 ///
 /// Running it queues the person's compact invocation as their message and the
 /// expanded skill as model-visible context. Both are logged, answerable and
 /// undoable, while a front end never has to pretend the whole SKILL.md was typed.
-struct RunSkill(Arc<atomcode_capabilities::skills::Skill>);
+struct RunSkill {
+    skill: Arc<atomcode_capabilities::skills::Skill>,
+    name: String,
+    command: bool,
+    registry: Arc<SkillRegistry>,
+}
 
 #[async_trait]
 impl crate::commands::CatalogCommand for RunSkill {
     fn describe(&self) -> atomcode_kernel::agent::CommandDescription {
         atomcode_kernel::agent::CommandDescription {
-            name: bare_name(&self.0.name),
-            usage: Some(t(Msg::CmdCatalogSkillUsage).into_owned()),
-            summary: self.0.description.clone(),
+            name: self.name.clone(),
+            usage: Some(
+                t(if self.command {
+                    Msg::CmdCatalogPromptCommandUsage
+                } else {
+                    Msg::CmdCatalogSkillUsage
+                })
+                .into_owned(),
+            ),
+            summary: self.skill.description.clone(),
             target: atomcode_kernel::agent::CommandTarget::Session,
         }
     }
 
     async fn run(&self, agent: Arc<crate::agent::Agent>, args: &str) -> Result<String, String> {
-        let text = self.0.expand(args.trim(), agent.session_id());
+        let text = self.skill.expand(args.trim(), agent.session_id());
         if text.trim().is_empty() {
-            return Err(format!("`{}` 展开之后是空的", bare_name(&self.0.name)));
+            return Err(format!("`{}` 展开之后是空的", self.name));
         }
-        let name = bare_name(&self.0.name);
+        let name = self.name.clone();
         agent.inject(text, InjectionOrigin::Skill { name: name.clone() });
         agent.send(skill_invocation(&name, args));
         Ok(format!("按 `{name}` 开始"))
@@ -567,6 +632,10 @@ impl crate::commands::CatalogCommand for RunSkill {
     // the assembly. Still reachable through `use_skill`.
     fn is_skill(&self) -> bool {
         true
+    }
+
+    fn skill_registry(&self) -> Option<&Arc<SkillRegistry>> {
+        Some(&self.registry)
     }
 }
 
@@ -622,6 +691,8 @@ fn skills_and_task<'a>(
 /// way to run one: two skills that are meant to apply to the same task have to
 /// arrive together, because sent as two turns the first has already been
 /// answered before the second is read.
+/// When a separate flat command shares the name, `/name` runs that command;
+/// this gateway always loads the skill.
 ///
 /// **It used to throw the argument away.** `/skills review my patch` listed
 /// every skill and did nothing else — which reads, to the person who typed

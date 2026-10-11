@@ -39,6 +39,12 @@ pub trait CatalogCommand: Send + Sync {
     fn is_skill(&self) -> bool {
         false
     }
+
+    /// Source ownership for commands generated from a live skill registry.
+    /// Name priority (`is_skill`) alone does not identify their lifecycle owner.
+    fn skill_registry(&self) -> Option<&Arc<atomcode_capabilities::skills::SkillRegistry>> {
+        None
+    }
 }
 
 /// Every command registered, by name. Two **built-in** rows claiming one name
@@ -100,6 +106,21 @@ impl CommandCatalog {
             .write()
             .expect("commands poisoned")
             .retain(|c| c.describe().name != name);
+    }
+
+    /// Remove only templates owned by the registry being reloaded or unmounted.
+    pub fn remove_skill_commands(
+        &self,
+        registry: &Arc<atomcode_capabilities::skills::SkillRegistry>,
+    ) {
+        self.commands
+            .write()
+            .expect("commands poisoned")
+            .retain(|command| {
+                command
+                    .skill_registry()
+                    .is_none_or(|owner| !Arc::ptr_eq(owner, registry))
+            });
     }
 
     /// Remove exactly the command that was registered, by identity — not by
@@ -206,6 +227,53 @@ mod tests {
         }
         fn is_skill(&self) -> bool {
             true
+        }
+    }
+
+    struct OwnedSkill {
+        name: &'static str,
+        registry: Arc<atomcode_capabilities::skills::SkillRegistry>,
+    }
+
+    #[async_trait]
+    impl CatalogCommand for OwnedSkill {
+        fn describe(&self) -> CommandDescription {
+            Named(self.name).describe()
+        }
+        async fn run(&self, _agent: Arc<Agent>, _args: &str) -> Result<String, String> {
+            Ok(String::new())
+        }
+        fn is_skill(&self) -> bool {
+            true
+        }
+        fn skill_registry(&self) -> Option<&Arc<atomcode_capabilities::skills::SkillRegistry>> {
+            Some(&self.registry)
+        }
+    }
+
+    #[test]
+    fn refreshing_one_registry_keeps_other_sources_and_builtins() {
+        let catalog = CommandCatalog::new();
+        let ours = Arc::new(atomcode_capabilities::skills::SkillRegistry::new());
+        let other = Arc::new(atomcode_capabilities::skills::SkillRegistry::new());
+        catalog
+            .register(Arc::new(OwnedSkill {
+                name: "ours",
+                registry: ours.clone(),
+            }))
+            .unwrap();
+        catalog
+            .register(Arc::new(OwnedSkill {
+                name: "other",
+                registry: other,
+            }))
+            .unwrap();
+        catalog.register(Arc::new(Skilled("unowned"))).unwrap();
+        catalog.register(Arc::new(Named("builtin"))).unwrap();
+        catalog.remove_skill_commands(&ours);
+        assert!(!catalog.has("ours"));
+        for kept in ["other", "unowned", "builtin"] {
+            assert!(catalog.has(kept), "refresh removed another source: {kept}");
         }
     }
 

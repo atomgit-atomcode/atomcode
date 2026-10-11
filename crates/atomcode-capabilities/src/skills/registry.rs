@@ -8,6 +8,25 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+#[derive(Default)]
+struct SkillIndex {
+    skills: BTreeMap<String, Arc<Skill>>,
+    commands: BTreeMap<String, Arc<Skill>>,
+}
+
+impl std::ops::Deref for SkillIndex {
+    type Target = BTreeMap<String, Arc<Skill>>;
+    fn deref(&self) -> &Self::Target {
+        &self.skills
+    }
+}
+
+impl std::ops::DerefMut for SkillIndex {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.skills
+    }
+}
+
 /// Skills indexed by name. `BTreeMap` for deterministic (sorted) order — the skill list
 /// is injected into the system prompt, so a stable order keeps the prompt prefix
 /// byte-identical (prompt-prefix caching), same rationale as the kernel ToolRegistry.
@@ -19,7 +38,7 @@ pub struct SkillRegistry {
     /// fragment — so re-reading in place is what lets a reload reach all of
     /// them without rebuilding the tree they are mounted in (`docs/adr/0022`
     /// §2).
-    skills: RwLock<BTreeMap<String, Arc<Skill>>>,
+    skills: RwLock<SkillIndex>,
     /// Our own trees: a skill under one of them ranks first in the catalog
     /// ([`super::render::source_rank`]). Handed in by whoever knows where they
     /// are — [`Self::reload`] takes them from its [`SkillRoots`].
@@ -29,7 +48,7 @@ pub struct SkillRegistry {
 impl SkillRegistry {
     pub fn new() -> Self {
         Self {
-            skills: RwLock::new(BTreeMap::new()),
+            skills: RwLock::new(SkillIndex::default()),
             native_roots: RwLock::new(Vec::new()),
         }
     }
@@ -43,11 +62,11 @@ impl SkillRegistry {
     /// The map, for a reader. A poisoned lock is taken over rather than
     /// propagated: a panic in a catalog render must not take every later skill
     /// lookup down with it.
-    fn read(&self) -> std::sync::RwLockReadGuard<'_, BTreeMap<String, Arc<Skill>>> {
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, SkillIndex> {
         self.skills.read().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn write(&self) -> std::sync::RwLockWriteGuard<'_, BTreeMap<String, Arc<Skill>>> {
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, SkillIndex> {
         self.skills.write().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -68,7 +87,9 @@ impl SkillRegistry {
         *self.write() = next;
     }
 
-    /// Load from `dirs` in LOW→HIGH priority order (a later dir's same-named skill wins).
+    /// Load from `dirs` in LOW→HIGH priority order within each template kind.
+    /// Directory skills win over same-named flat commands in the skill index;
+    /// direct slash invocation retains the flat command separately.
     /// Each dir is scanned for flat `*.md` files AND `*/SKILL.md` subdirectories; parse
     /// failures are skipped.
     pub fn load(dirs: &[PathBuf]) -> Self {
@@ -104,7 +125,21 @@ impl SkillRegistry {
             if p.is_file() {
                 if depth == 0 && p.extension().and_then(|e| e.to_str()) == Some("md") {
                     if let Ok(s) = parse_skill_file(&p, namespace) {
-                        self.write().insert(s.name.clone(), Arc::new(s));
+                        let mut index = self.write();
+                        let s = Arc::new(s);
+                        // Flat markdown is a slash command. Keep it for direct
+                        // invocation, but never replace a directory SKILL.md in
+                        // the index used by /skills and the model tools.
+                        let replaces_command = index.get(&s.name).is_none_or(|old| {
+                            index
+                                .commands
+                                .get(&s.name)
+                                .is_some_and(|c| Arc::ptr_eq(c, old))
+                        });
+                        if replaces_command {
+                            index.insert(s.name.clone(), s.clone());
+                        }
+                        index.commands.insert(s.name.clone(), s);
                     }
                 }
             } else if p.is_dir() {
@@ -143,6 +178,13 @@ impl SkillRegistry {
         let skills = self.read();
         if let Some(skill) = skills.get(name) {
             return Some(skill.clone());
+        }
+        // A standard, unnamespaced skill gets a qualified menu alias when its
+        // bare slash name belongs to a separate flat command.
+        if let Some(bare) = name.strip_prefix("skills:") {
+            if let Some(skill) = skills.get(bare) {
+                return Some(skill.clone());
+            }
         }
         if name.contains(':') {
             return None;
@@ -195,7 +237,7 @@ impl SkillRegistry {
     /// silently skips unparseable skills — the SAME behavior the runtime skill path
     /// uses — so no parse warnings are collected.
     pub fn reload(&self, roots: SkillRoots<'_>) -> Vec<String> {
-        self.write().clear();
+        *self.write() = SkillIndex::default();
         self.set_native_roots(roots.native());
         for dir in standard_skill_dirs(roots) {
             self.load_dir(&dir, Some("skills"));
@@ -211,6 +253,12 @@ impl SkillRegistry {
             .filter(|s| s.user_invocable)
             .cloned()
             .collect()
+    }
+
+    /// Direct slash-command templates, including hidden commands so their
+    /// visibility cannot accidentally expose a same-named skill as /name.
+    pub fn slash_commands(&self) -> Vec<Arc<Skill>> {
+        self.read().commands.values().cloned().collect()
     }
 
     /// Insert a skill programmatically (same-name replaces). Mirrors core
@@ -409,6 +457,66 @@ mod tests {
                     || dir.starts_with(project.join(".agents")),
                 "{dir:?} is neither ours (handed in) nor another product's"
             );
+        }
+    }
+
+    #[test]
+    fn a_flat_command_never_replaces_a_same_named_directory_skill() {
+        for command_first in [false, true] {
+            for hidden in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let skills = root.path().join("skills");
+                let commands = root.path().join("commands");
+                std::fs::create_dir_all(skills.join("changelog")).unwrap();
+                std::fs::create_dir_all(&commands).unwrap();
+                std::fs::write(
+                    skills.join("changelog/SKILL.md"),
+                    "---\ndescription: skill description\n---\nSKILL BODY",
+                )
+                .unwrap();
+                // Identity is the frontmatter name, not the file's basename.
+                std::fs::write(commands.join("other.md"), format!(
+                    "---\nname: changelog\ndescription: command description\nuser-invocable: {}\n---\nCOMMAND BODY", !hidden)).unwrap();
+                let registry = SkillRegistry::new();
+                let paths = if command_first {
+                    [&commands, &skills]
+                } else {
+                    [&skills, &commands]
+                };
+                for path in paths {
+                    registry.load_dir(path, Some("plugin"));
+                }
+                for name in ["changelog", "plugin:changelog"] {
+                    let skill = registry.get(name).unwrap();
+                    assert_eq!(skill.template, "SKILL BODY");
+                    assert_eq!(skill.description, "skill description");
+                    assert!(skill.user_invocable);
+                }
+                assert_eq!(registry.len(), 1);
+                assert_eq!(registry.user_invocable().len(), 1);
+                let command = registry.slash_commands().pop().unwrap();
+                assert_eq!(command.template, "COMMAND BODY");
+                assert_eq!(command.user_invocable, !hidden);
+                let catalog = registry.render_catalog().unwrap();
+                assert!(catalog.contains("skill description"));
+                assert!(!catalog.contains("command description"));
+
+                // Both maps are replaced together; removing a skill leaves the
+                // command-only behavior intact, and removing that leaves nothing.
+                let dirs = vec![
+                    (skills.clone(), "plugin".into()),
+                    (commands.clone(), "plugin".into()),
+                ];
+                registry.reload_dirs(&[], &dirs);
+                assert_eq!(registry.get("changelog").unwrap().template, "SKILL BODY");
+                std::fs::remove_file(skills.join("changelog/SKILL.md")).unwrap();
+                registry.reload_dirs(&[], &dirs);
+                assert_eq!(registry.get("changelog").unwrap().template, "COMMAND BODY");
+                std::fs::remove_file(commands.join("other.md")).unwrap();
+                registry.reload_dirs(&[], &dirs);
+                assert!(registry.is_empty());
+                assert!(registry.slash_commands().is_empty());
+            }
         }
     }
 

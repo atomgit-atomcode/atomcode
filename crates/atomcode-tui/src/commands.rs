@@ -3054,9 +3054,28 @@ pub(crate) fn catalog_command_starts_turn(
     args: &str,
 ) -> bool {
     let is_skill = |candidate: &str| {
-        commands.iter().any(|command| {
-            command.name.eq_ignore_ascii_case(candidate) && described_command_is_skill(command)
-        })
+        let skills = commands
+            .iter()
+            .filter(|command| described_command_is_skill(command));
+        if skills
+            .clone()
+            .any(|command| command.name.eq_ignore_ascii_case(candidate))
+        {
+            return true;
+        }
+        // A colliding skill retains its qualified identity in the catalog,
+        // while /skills accepts its unambiguous bare name just like use_skill.
+        !candidate.contains(':')
+            && skills
+                .filter(|command| {
+                    command
+                        .name
+                        .rsplit(':')
+                        .next()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(candidate))
+                })
+                .count()
+                == 1
     };
     if name.eq_ignore_ascii_case("init") || name.eq_ignore_ascii_case("worklog") {
         commands
@@ -3066,6 +3085,21 @@ pub(crate) fn catalog_command_starts_turn(
         args.split_whitespace().next().is_some_and(is_skill)
     } else {
         is_skill(name)
+            || commands.iter().any(|command| {
+                command.name.eq_ignore_ascii_case(name)
+                    && [crate::i18n::Locale::En, crate::i18n::Locale::ZhCn]
+                        .into_iter()
+                        .any(|locale| {
+                            command.usage.as_deref()
+                                == Some(
+                                    crate::i18n::product::t_with(
+                                        locale,
+                                        crate::i18n::product::Msg::CmdCatalogPromptCommandUsage,
+                                    )
+                                    .as_ref(),
+                                )
+                        })
+            })
     }
 }
 
@@ -3577,6 +3611,54 @@ mod tests {
                 .any(|x| x.name == "playwright-best-practices"),
             "菜单仍然给得出技能"
         );
+    }
+
+    #[test]
+    fn a_colliding_command_and_skill_have_separate_menu_entries() {
+        let _locale = crate::i18n::test_lock();
+        let client = Arc::new(crate::plugin::AgentClient::default());
+        client.follow("lead");
+        let described =
+            |name: &str, summary: &str, usage| atomcode_kernel::agent::CommandDescription {
+                name: name.into(),
+                summary: summary.into(),
+                usage: Some(crate::i18n::product::t(usage).into_owned()),
+                target: atomcode_kernel::agent::CommandTarget::Session,
+            };
+        client.describe(&atomcode_kernel::agent::AgentDescription {
+            session: "lead".into(),
+            commands: vec![
+                described(
+                    "skills",
+                    "skill gateway",
+                    crate::i18n::product::Msg::CmdCatalogSkillsUsage,
+                ),
+                described(
+                    "plugin:changelog",
+                    "SKILL",
+                    crate::i18n::product::Msg::CmdCatalogSkillUsage,
+                ),
+                described(
+                    "changelog",
+                    "COMMAND",
+                    crate::i18n::product::Msg::CmdCatalogPromptCommandUsage,
+                ),
+            ],
+            ..Default::default()
+        });
+        let set = AgentCatalogCommands { client };
+        let shown = set.commands();
+        assert_eq!(
+            shown.iter().find(|c| c.name == "changelog").unwrap().about,
+            "COMMAND"
+        );
+        let skills = shown.iter().find(|c| c.name == "skills").unwrap();
+        assert_eq!(skills.options.len(), 1);
+        assert_eq!(skills.options[0].value, "plugin:changelog");
+        assert!(set.starts_turn("skills", "changelog task"));
+        assert!(set.starts_turn("skills", "plugin:changelog task"));
+        assert!(set.starts_turn("changelog", "task"));
+        assert!(!set.starts_turn("skills", "unknown task"));
     }
 
     #[test]

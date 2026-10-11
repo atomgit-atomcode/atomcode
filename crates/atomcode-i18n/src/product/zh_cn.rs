@@ -1395,6 +1395,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             "装了哪些 skill;给名字就把它们一起用上".into(),
         Msg::CmdCatalogSkillsUsage => "[名字… [给它们的话]]".into(),
         Msg::CmdCatalogSkillUsage => "[给它的话]".into(),
+        Msg::CmdCatalogPromptCommandUsage => "[命令参数]".into(),
         Msg::CmdCatalogMemory => "存下来的那些话".into(),
         Msg::CmdCatalogRemember =>
             "记住一句话,以后每个会话都带着".into(),

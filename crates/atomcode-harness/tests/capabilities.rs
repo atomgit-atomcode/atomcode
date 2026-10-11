@@ -68,6 +68,103 @@ name = "llm-replay"
 config = { script = [ { text = "ok" } ] }
 "#;
 
+#[tokio::test]
+async fn same_named_commands_and_skills_keep_their_own_content_and_visibility() {
+    use atomcode_kernel::tool::{Tool, ToolContext};
+    use std::sync::Arc;
+    for namespace in [None, Some("plugin")] {
+        for hidden_command in [false, true] {
+            for hidden_skill in [false, true] {
+                let dir = scratch("command-skill-collision");
+                let skills = dir.join("skills");
+                let commands = dir.join("commands");
+                std::fs::create_dir_all(skills.join("changelog")).unwrap();
+                std::fs::create_dir_all(&commands).unwrap();
+                let skill_path = skills.join("changelog/SKILL.md");
+                let command_path = commands.join("changelog.md");
+                std::fs::write(&skill_path, format!(
+                    "---\ndescription: skill workflow\nuser-invocable: {}\n---\nSKILL $ARGUMENTS", !hidden_skill)).unwrap();
+                std::fs::write(&command_path, format!(
+                    "---\ndescription: command workflow\nuser-invocable: {}\n---\nCOMMAND $ARGUMENTS", !hidden_command)).unwrap();
+                let app = start(tree(&dir, STOP, &[])).await;
+                let ctx = app.context();
+                let registry = ctx.service::<SkillsSvc>().unwrap();
+                registry.load_dir(&skills, namespace);
+                registry.load_dir(&commands, namespace);
+                plugins::capabilities::register_skill_commands(&ctx, &registry).unwrap();
+                let catalog = ctx
+                    .service::<atomcode_harness::seams::CommandsSvc>()
+                    .unwrap();
+                let agent = atomcode_harness::create_agent(&app).await.unwrap();
+                let alias = if namespace.is_some() {
+                    "plugin:changelog"
+                } else {
+                    "skills:changelog"
+                };
+                assert_eq!(catalog.find(alias, &agent).is_some(), !hidden_skill);
+                assert_eq!(catalog.find("changelog", &agent).is_some(), !hidden_command);
+                if !hidden_command {
+                    catalog
+                        .find("changelog", &agent)
+                        .unwrap()
+                        .run(agent.clone(), "task")
+                        .await
+                        .unwrap();
+                    assert_eq!(agent.claim_injections()[0].0, "COMMAND task");
+                }
+                let skills_command = catalog.find("skills", &agent).unwrap();
+                let result = skills_command.run(agent.clone(), "changelog task").await;
+                assert_eq!(result.is_ok(), !hidden_skill);
+                if !hidden_skill {
+                    assert_eq!(agent.claim_injections()[0].0, "SKILL task");
+                    let described = catalog.find(alias, &agent).unwrap().describe();
+                    assert_eq!(described.summary, "skill workflow");
+                }
+                let tool = atomcode_capabilities::skills::UseSkillTool::new(Arc::clone(&registry));
+                let tool_ctx = ToolContext {
+                    working_dir: dir.clone(),
+                    cancel: tokio_util::sync::CancellationToken::new(),
+                    progress: atomcode_kernel::tool::ProgressSink::noop(),
+                    requester: None,
+                };
+                let result = tool
+                    .execute(r#"{"name":"changelog","arguments":"task"}"#, &tool_ctx)
+                    .await;
+                assert!(!result.is_error, "{}", result.content);
+                assert!(result.content.contains("SKILL task"));
+                assert!(!result.content.contains("COMMAND task"));
+
+                // Reload must update direct commands as well as model lookup,
+                // remove deleted files, and leave built-in commands intact.
+                std::fs::write(&command_path, "NEW COMMAND $ARGUMENTS").unwrap();
+                std::fs::write(&skill_path, "NEW SKILL $ARGUMENTS").unwrap();
+                let ns = namespace.unwrap_or("skills").to_string();
+                registry.reload_dirs(&[], &[(skills.clone(), ns.clone()), (commands.clone(), ns)]);
+                plugins::capabilities::register_skill_commands(&ctx, &registry).unwrap();
+                catalog
+                    .find("changelog", &agent)
+                    .unwrap()
+                    .run(agent.clone(), "task")
+                    .await
+                    .unwrap();
+                assert_eq!(agent.claim_injections()[0].0, "NEW COMMAND task");
+                catalog
+                    .find("skills", &agent)
+                    .unwrap()
+                    .run(agent.clone(), "changelog task")
+                    .await
+                    .unwrap();
+                assert_eq!(agent.claim_injections()[0].0, "NEW SKILL task");
+                assert!(catalog.find("memory", &agent).is_some());
+                registry.reload_dirs(&[], &[]);
+                plugins::capabilities::register_skill_commands(&ctx, &registry).unwrap();
+                assert!(catalog.find("changelog", &agent).is_none());
+                assert!(catalog.find("memory", &agent).is_some());
+            }
+        }
+    }
+}
+
 fn script_one(tool: &str, args: &str) -> String {
     format!(
         r#"

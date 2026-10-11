@@ -1436,6 +1436,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             "Which skills are installed; give names and they are used together".into(),
         Msg::CmdCatalogSkillsUsage => "[name… [what to tell them]]".into(),
         Msg::CmdCatalogSkillUsage => "[what to tell it]".into(),
+        Msg::CmdCatalogPromptCommandUsage => "[command arguments]".into(),
         Msg::CmdCatalogMemory => "The things you remembered".into(),
         Msg::CmdCatalogRemember =>
             "Remember one line, carried into every session from now on".into(),

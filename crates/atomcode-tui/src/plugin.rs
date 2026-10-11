@@ -6900,10 +6900,11 @@ impl Tui {
                 let described = self.client.described();
                 let command = skill_command(&text, |name| {
                     described.as_ref().is_some_and(|description| {
-                        description.commands.iter().any(|command| {
-                            crate::commands::described_command_is_skill(command)
-                                && command.name.eq_ignore_ascii_case(name)
-                        })
+                        crate::commands::catalog_command_starts_turn(
+                            &description.commands,
+                            "skills",
+                            name,
+                        )
                     })
                 });
                 if let Some(command) = command {

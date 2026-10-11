@@ -335,13 +335,15 @@ pub fn iter_installed_plugin_assets_for(
 /// namespace used by [`crate::skills::SkillRegistry::load_dir`].
 ///
 /// **`commands/` as well as `skills/`.** A plugin's `commands/*.md` are the
-/// same thing under another name — that is already how this build reads
+/// also prompt templates — that is already how this build reads
 /// `~/.claude/commands` and `<project dir>/commands`
 /// ([`crate::skills::SkillRegistry`]'s standard directories), and how the
 /// plugins were written for the front end that came before. Reading only
 /// `skills/` meant a plugin whose whole contribution was a `commands/` folder
 /// installed cleanly, reported its files, and contributed nothing that could
 /// be run.
+/// A same-named SKILL.md is retained for /skills and model invocation; the
+/// flat command is kept separately for direct /name invocation.
 pub fn installed_plugin_skill_dirs(
     dirs: &ProductDirs,
     working_dir: &Path,
@@ -878,7 +880,7 @@ mod tests {
 
     /// A plugin's `commands/` counts, the same as its `skills/`.
     ///
-    /// The two words are one thing in this build: `~/.claude/commands` and
+    /// Both contribute templates in this build: `~/.claude/commands` and
     /// `<project>/.atomcode/commands` are already standard skill directories,
     /// and plugins were written for a front end that read theirs. Only the
     /// plugin path was left out — so a plugin whose whole contribution is a
@@ -899,6 +901,12 @@ mod tests {
             )
             .unwrap();
         }
+        std::fs::create_dir_all(plugin_dir.join("skills/tidy")).unwrap();
+        std::fs::write(
+            plugin_dir.join("skills/tidy/SKILL.md"),
+            "---\ndescription: tidy skill\n---\nSKILL BODY",
+        )
+        .unwrap();
         // A second plugin that points `skills` **at** its commands folder — a
         // legal manifest, and the one shape where the two lists overlap.
         let twice_dir = plugins_root.join("installed/mp/twice");
@@ -930,6 +938,13 @@ mod tests {
         let state_path = paths::installed_plugins_file(dirs.user()).unwrap();
         super::super::state::save_installed_plugins_file(&state_path, &state).unwrap();
 
+        let mut registry = crate::skills::SkillRegistry::new();
+        reload_skill_registry(&mut registry, &dirs, &_home.path().join("projects/any"));
+        assert_eq!(registry.get("pair:tidy").unwrap().template, "SKILL BODY");
+        assert_eq!(registry.get("pair:tidy").unwrap().description, "tidy skill");
+        assert!(registry.slash_commands().iter().any(|command| {
+            command.name == "pair:tidy" && command.description == "the tidy one"
+        }));
         let dirs = installed_plugin_skill_dirs(&dirs, &_home.path().join("projects/any"));
         let of = |plugin: &str| -> Vec<String> {
             dirs.iter()
