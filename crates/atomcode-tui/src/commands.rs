@@ -3108,10 +3108,9 @@ impl CommandSet for AgentCatalogCommands {
     fn id(&self) -> &'static str {
         "cmd-agent-catalog"
     }
-    /// The agent's rows belong to the menu, not `/help`; user-invocable
-    /// skills are grouped behind `/skills`, while `/help` stays build-local.
+    /// Commands are visible in help; individual skills remain behind `/skills`.
     fn in_help(&self) -> bool {
-        false
+        true
     }
     fn commands(&self) -> Vec<Command> {
         let described = self
@@ -3569,15 +3568,14 @@ mod tests {
         );
     }
 
-    /// `/help` is this build's own table: the agent's catalog — one row per
-    /// user-invocable skill — rides in the menu and stays out of `/help`.
+    /// Dynamic commands may enter help while individual skills stay out.
     #[tokio::test]
     async fn help_leaves_the_agents_catalog_to_the_menu() {
-        // 真实那一组自己声明不进 /help。
+        // The real catalog now opts dynamic commands into help.
         let real = AgentCatalogCommands {
             client: Arc::new(crate::plugin::AgentClient::default()),
         };
-        assert!(!real.in_help(), "agent 的命令目录不进 /help");
+        assert!(real.in_help(), "动态 command 进入 /help");
 
         // ……/help 端到端不列技能,菜单照旧给得出。
         struct Catalog;
@@ -3611,6 +3609,39 @@ mod tests {
                 .any(|x| x.name == "playwright-best-practices"),
             "菜单仍然给得出技能"
         );
+    }
+
+    #[test]
+    fn a_standalone_plugin_command_is_in_the_menu_and_help() {
+        let _locale = crate::i18n::test_lock();
+        let client = Arc::new(crate::plugin::AgentClient::default());
+        client.follow("lead");
+        client.describe(&atomcode_kernel::agent::AgentDescription {
+            session: "lead".into(),
+            commands: vec![atomcode_kernel::agent::CommandDescription {
+                name: "tidy".into(),
+                summary: "plugin tidy command".into(),
+                usage: Some(
+                    crate::i18n::product::t(
+                        crate::i18n::product::Msg::CmdCatalogPromptCommandUsage,
+                    )
+                    .into_owned(),
+                ),
+                target: atomcode_kernel::agent::CommandTarget::Session,
+            }],
+            ..Default::default()
+        });
+        let set = Arc::new(AgentCatalogCommands { client });
+        assert!(set.starts_turn("tidy", "task"));
+        assert!(!set.starts_turn("skills", "tidy task"));
+        assert!(set.hidden().is_empty());
+        let commands = Commands::new();
+        commands.add(set).unwrap();
+        assert!(commands.matching("tidy").iter().any(|c| c.name == "tidy"));
+        assert!(commands
+            .help_listed()
+            .iter()
+            .any(|c| c.name == "tidy" && c.about == "plugin tidy command"));
     }
 
     #[test]

@@ -552,12 +552,6 @@ pub fn register_skill_commands(ctx: &Context, registry: &Arc<SkillRegistry>) -> 
         .into_iter()
         .filter(|command| command.user_invocable)
     {
-        let collision = registry
-            .get(&command.name)
-            .is_some_and(|skill| skill.source_path != command.source_path);
-        if !collision {
-            continue;
-        }
         let name = bare_name(&command.name);
         if !catalog_has(ctx, &name) {
             catalog.register(Arc::new(RunSkill {

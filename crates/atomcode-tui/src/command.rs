@@ -286,12 +286,8 @@ pub trait CommandSet: Send + Sync {
     }
     /// Whether this set's rows belong in `/help`.
     ///
-    /// Yes for the sets that make up this build's own command surface. No for
-    /// the agent's catalog (`cmd-agent-catalog`): one row per user-invocable
-    /// skill, plus whatever the tree registered — typeable, listed in the slash
-    /// menu, and not in `/help`. The classic screen drew the line in the same
-    /// place: its `/help` was its own table, and skills were reached through
-    /// `/skills`.
+    /// Built-ins and dynamic commands belong here. Individual skills are
+    /// exposed through `/skills` rather than as separate help rows.
     fn in_help(&self) -> bool {
         true
     }
@@ -481,7 +477,7 @@ impl Commands {
     ///
     /// The menu and `/help` are not the same list. A skill is one command per
     /// skill — typeable, in the menu, and how `/init` or anyone's own
-    /// `.atomcode/skills/…` gets run — while `/help` is this build's own table.
+    /// `.atomcode/skills/…` gets run — while `/help` lists built-ins and dynamic commands, excluding individual skills.
     pub fn help_listed(&self) -> Vec<Command> {
         let mut out: Vec<Command> = Vec::new();
         for command in self

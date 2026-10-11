@@ -88,8 +88,8 @@ impl SkillRegistry {
     }
 
     /// Load from `dirs` in LOW→HIGH priority order within each template kind.
-    /// Directory skills win over same-named flat commands in the skill index;
-    /// direct slash invocation retains the flat command separately.
+    /// Directory skills and flat commands have separate indexes;
+    /// only directory skills are available to /skills and model tools.
     /// Each dir is scanned for flat `*.md` files AND `*/SKILL.md` subdirectories; parse
     /// failures are skipped.
     pub fn load(dirs: &[PathBuf]) -> Self {
@@ -130,15 +130,6 @@ impl SkillRegistry {
                         // Flat markdown is a slash command. Keep it for direct
                         // invocation, but never replace a directory SKILL.md in
                         // the index used by /skills and the model tools.
-                        let replaces_command = index.get(&s.name).is_none_or(|old| {
-                            index
-                                .commands
-                                .get(&s.name)
-                                .is_some_and(|c| Arc::ptr_eq(c, old))
-                        });
-                        if replaces_command {
-                            index.insert(s.name.clone(), s.clone());
-                        }
                         index.commands.insert(s.name.clone(), s);
                     }
                 }
@@ -511,7 +502,8 @@ mod tests {
                 assert_eq!(registry.get("changelog").unwrap().template, "SKILL BODY");
                 std::fs::remove_file(skills.join("changelog/SKILL.md")).unwrap();
                 registry.reload_dirs(&[], &dirs);
-                assert_eq!(registry.get("changelog").unwrap().template, "COMMAND BODY");
+                assert!(registry.get("changelog").is_none());
+                assert_eq!(registry.slash_commands()[0].template, "COMMAND BODY");
                 std::fs::remove_file(commands.join("other.md")).unwrap();
                 registry.reload_dirs(&[], &dirs);
                 assert!(registry.is_empty());
@@ -534,8 +526,9 @@ mod tests {
         .unwrap();
 
         let reg = SkillRegistry::load(&[d.path().to_path_buf()]);
-        assert_eq!(reg.len(), 2);
-        assert!(reg.get("greet").is_some());
+        assert_eq!(reg.len(), 1);
+        assert!(reg.get("greet").is_none());
+        assert_eq!(reg.slash_commands()[0].name, "greet");
         let review = reg.get("review").unwrap();
         assert_eq!(review.description, "review code");
     }
@@ -638,7 +631,7 @@ mod tests {
         std::fs::write(b.path().join("x.md"), "from B\n").unwrap();
         let reg = SkillRegistry::load(&[a.path().to_path_buf(), b.path().to_path_buf()]);
         assert!(
-            reg.get("x").unwrap().template.contains("from B"),
+            reg.slash_commands()[0].template.contains("from B"),
             "later dir wins"
         );
     }

@@ -69,6 +69,65 @@ config = { script = [ { text = "ok" } ] }
 "#;
 
 #[tokio::test]
+async fn a_command_without_a_skill_is_only_a_direct_command() {
+    use atomcode_kernel::tool::{Tool, ToolContext};
+    use std::sync::Arc;
+    let dir = scratch("command-only");
+    let commands = dir.join("commands");
+    std::fs::create_dir_all(&commands).unwrap();
+    let path = commands.join("tidy.md");
+    std::fs::write(
+        &path,
+        "---\ndescription: tidy command\n---\nCOMMAND $ARGUMENTS",
+    )
+    .unwrap();
+    let app = start(tree(&dir, STOP, &[])).await;
+    let ctx = app.context();
+    let registry = ctx.service::<SkillsSvc>().unwrap();
+    registry.load_dir(&commands, Some("plugin"));
+    plugins::capabilities::register_skill_commands(&ctx, &registry).unwrap();
+    let catalog = ctx
+        .service::<atomcode_harness::seams::CommandsSvc>()
+        .unwrap();
+    let agent = atomcode_harness::create_agent(&app).await.unwrap();
+    catalog
+        .find("tidy", &agent)
+        .unwrap()
+        .run(agent.clone(), "task")
+        .await
+        .unwrap();
+    assert_eq!(agent.claim_injections()[0].0, "COMMAND task");
+    assert!(catalog
+        .find("skills", &agent)
+        .unwrap()
+        .run(agent.clone(), "tidy task")
+        .await
+        .is_err());
+    let tool = atomcode_capabilities::skills::UseSkillTool::new(Arc::clone(&registry));
+    let result = tool
+        .execute(
+            r#"{"name":"tidy"}"#,
+            &ToolContext {
+                working_dir: dir.clone(),
+                cancel: tokio_util::sync::CancellationToken::new(),
+                progress: atomcode_kernel::tool::ProgressSink::noop(),
+                requester: None,
+            },
+        )
+        .await;
+    assert!(result.is_error);
+    assert!(registry.render_catalog().is_none());
+    std::fs::write(&path, "---\nuser-invocable: false\n---\nHIDDEN").unwrap();
+    registry.reload_dirs(&[], &[(commands.clone(), "plugin".into())]);
+    plugins::capabilities::register_skill_commands(&ctx, &registry).unwrap();
+    assert!(catalog.find("tidy", &agent).is_none());
+    std::fs::remove_file(path).unwrap();
+    registry.reload_dirs(&[], &[(commands, "plugin".into())]);
+    plugins::capabilities::register_skill_commands(&ctx, &registry).unwrap();
+    assert!(catalog.find("tidy", &agent).is_none());
+}
+
+#[tokio::test]
 async fn same_named_commands_and_skills_keep_their_own_content_and_visibility() {
     use atomcode_kernel::tool::{Tool, ToolContext};
     use std::sync::Arc;

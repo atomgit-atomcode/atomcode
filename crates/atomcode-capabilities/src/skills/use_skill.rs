@@ -144,7 +144,8 @@ mod tests {
     fn registry_with(skills: &[(&str, &str)]) -> Arc<SkillRegistry> {
         let d = Box::leak(Box::new(tempfile::tempdir().unwrap())); // keep alive for the test
         for (name, body) in skills {
-            std::fs::write(d.path().join(format!("{name}.md")), body).unwrap();
+            std::fs::create_dir_all(d.path().join(name)).unwrap();
+            std::fs::write(d.path().join(name).join("SKILL.md"), body).unwrap();
         }
         Arc::new(SkillRegistry::load(&[d.path().to_path_buf()]))
     }
@@ -156,7 +157,8 @@ mod tests {
             .execute(r#"{"name":"greet","arguments":"world"}"#, &ctx())
             .await;
         assert!(!r.is_error, "{}", r.content);
-        assert_eq!(r.content, "Hello world!");
+        assert!(r.content.ends_with("Hello world!"), "{}", r.content);
+        assert!(!r.content.contains("$ARGUMENTS"));
     }
 
     #[tokio::test]
@@ -194,18 +196,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn use_skill_single_file_skill_omits_install_path_reminder() {
-        // Single-file `.md` skills share a skills folder, so the install-path note would
-        // point at the wrong (shared) dir — it must stay omitted. Guards the fix from
-        // over-applying to loose skills.
-        let tool = UseSkillTool::new(registry_with(&[("loose", "just a body")]));
+    async fn use_skill_rejects_a_flat_command() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("loose.md"), "COMMAND BODY").unwrap();
+        let tool = UseSkillTool::new(Arc::new(SkillRegistry::load(&[d.path().to_path_buf()])));
         let r = tool.execute(r#"{"name":"loose"}"#, &ctx()).await;
-        assert!(!r.is_error, "{}", r.content);
-        assert!(
-            !r.content.contains("installed at:"),
-            "single-file skill must not get the install-path note: {}",
-            r.content
-        );
+        assert!(r.is_error);
+        assert!(!r.content.contains("COMMAND BODY"));
     }
 
     #[tokio::test]
@@ -264,7 +261,8 @@ mod tests {
     #[tokio::test]
     async fn use_skill_finds_plugin_namespaced_skill() {
         let base = Box::leak(Box::new(tempfile::tempdir().unwrap())); // loose user skill
-        std::fs::write(base.path().join("setup.md"), "built-in setup body\n").unwrap();
+        std::fs::create_dir_all(base.path().join("setup")).unwrap();
+        std::fs::write(base.path().join("setup/SKILL.md"), "built-in setup body\n").unwrap();
 
         let plugin_ns = "plugin-total-design";
         let plugin = Box::leak(Box::new(tempfile::tempdir().unwrap())); // plugin install dir
