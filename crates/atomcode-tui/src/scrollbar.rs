@@ -83,6 +83,11 @@ impl Drag {
             .saturating_sub(self.bar.track.y)
             .saturating_sub(self.offset)
             .min(travel);
+        // Several offsets can share an endpoint cell. Grabbing that cell
+        // without moving must preserve the offset rather than snap to the end.
+        if self.on_thumb && start == self.bar.start {
+            return self.bar.scroll;
+        }
         if start == 0 {
             return self.bar.max;
         }
@@ -111,6 +116,19 @@ mod tests {
         assert_eq!(bar.grab(y).position(y), 500);
         assert_eq!(bar.grab(y).position(0), 1000);
         assert_eq!(bar.grab(y).position(u16::MAX), 0);
+    }
+    #[test]
+    fn grabbing_a_quantized_endpoint_preserves_the_offset_until_movement() {
+        let track = Rect::new(79, 3, 1, 20);
+        for scroll in [0, 1, 5000, 95000, 99999, 100000] {
+            let bar = Bar::new(track, 100000, scroll, 20).unwrap();
+            let y = track.y + bar.start;
+            assert_eq!(bar.grab(y).position(y), scroll);
+        }
+        let bar = Bar::new(track, 100000, 95000, 20).unwrap();
+        let drag = bar.grab(track.y);
+        assert!(drag.position(track.y + 1) < 95000);
+        assert_eq!(drag.position(track.bottom()), 0);
     }
     #[test]
     fn short_conversations_and_single_row_tracks_have_no_scrollbar() {
