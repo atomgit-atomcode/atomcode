@@ -2122,6 +2122,8 @@ pub enum Msg<'a> {
     CopyHandedOver,
     /// Local Linux clipboard backends failed, with an actionable fallback.
     CopyLocalUnavailable,
+    /// A background copy could not be queued.
+    CopyCouldNotStart,
     /// `/paste <file>` on something too big to put in the composer. **Not**
     /// [`Msg::FileUnreadable`]: it reads fine, it just must not go there.
     FileTooBigToPaste {

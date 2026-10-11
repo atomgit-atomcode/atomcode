@@ -1316,6 +1316,7 @@ pub struct Hits {
     rows: Vec<Option<(crate::block::BlockId, &'static str)>>,
     /// Where the "back to the bottom" badge was, when it was up.
     jump: Option<Rect>,
+    scrollbar: Option<crate::scrollbar::Bar>,
     /// Where the composer was drawn, so a click in it can find a caret.
     field: Option<Rect>,
     /// Where the question panel was drawn, so a click on it can find an answer.
@@ -6003,6 +6004,7 @@ impl Host {
     pub fn compose(&self, size: (u16, u16)) -> Frame {
         let (w, h) = size;
         let mut frame = Frame::new(w, h);
+        self.hits.lock().expect("hits poisoned").scrollbar = None;
         let mut moment = self.moment.read().expect("moment poisoned").clone();
         // This frame's bitmaps, as a snapshot. Here because `View::render` cannot
         // reach a service — the module reads `viewport.moment.rasters`, the same
@@ -6033,6 +6035,7 @@ impl Host {
             }
             match region {
                 Region::Stream { tail } => {
+                    let rect = crate::scrollbar::content_rect(rect);
                     // The pane is split before anything is drawn: the modules
                     // riding the tail take their rows off the bottom, and what
                     // is left is the conversation's. With no tail declared this
@@ -6065,6 +6068,7 @@ impl Host {
                         rect: pane.block_rect,
                         rows: owners,
                         jump: None,
+                        scrollbar: None,
                         field: None,
                         ask: None,
                         team: None,
@@ -6088,6 +6092,19 @@ impl Host {
                     // is *not* looking at.
                     stream_rect = Some(pane.block_rect);
                     frame.place("stream", pane.block_rect, lines);
+                    if let Some(bar) = crate::scrollbar::Bar::new(
+                        Rect::new(rect.right(), pane.block_rect.y, 1, pane.block_rect.h),
+                        if rect.right() < w {
+                            self.scroll_limit(size, &moment)
+                        } else {
+                            0
+                        },
+                        moment.scroll.0,
+                        rect.h,
+                    ) {
+                        frame.place("conversation-scrollbar", bar.track, bar.lines(&moment.caps));
+                        self.hits.lock().expect("hits poisoned").scrollbar = Some(bar);
+                    }
                     // A tail module is placed under **its own id**, not a
                     // path: `named_twice` already refuses a tree that names one
                     // both as a tail id and as a leaf, so an id is unique in a
@@ -6321,7 +6338,7 @@ impl Host {
         // Last, over everything, including a modal: the selection is a
         // rectangle on the screen, and the screen is what was pointed at.
         if let Some(sel) = moment.selection {
-            frame.highlight(&sel);
+            frame.highlight_with_colors(&sel, moment.caps.colors != crate::caps::Colors::None);
         }
 
         // Last of all, and after the selection on purpose: the context menu is
@@ -6388,7 +6405,10 @@ impl Host {
         pruned
             .layout_with(Rect::sized(w, h), &asked)
             .into_iter()
-            .find_map(|(region, rect)| matches!(region, Region::Stream { .. }).then_some(rect))
+            .find_map(|(region, rect)| {
+                matches!(region, Region::Stream { .. })
+                    .then_some(crate::scrollbar::content_rect(rect))
+            })
             .unwrap_or_else(|| Rect::sized(w, h))
     }
 
@@ -6615,7 +6635,7 @@ impl Host {
             .layout_with(Rect::sized(w, h), &asked)
             .into_iter()
             .find_map(|(region, rect)| match region {
-                Region::Stream { tail } => Some((rect, tail)),
+                Region::Stream { tail } => Some((crate::scrollbar::content_rect(rect), tail)),
                 _ => None,
             })?;
         let heights = self.tail_heights_of(&tail, rect.w, moment);
@@ -6950,6 +6970,35 @@ impl Host {
         for block in run {
             pres.set_block(block, !folded);
         }
+    }
+
+    /// Resolve against the scrollbar actually painted, with overlays taking priority.
+    pub(crate) fn scrollbar_at(&self, x: u16, y: u16) -> Option<crate::scrollbar::Bar> {
+        if self.overlays.current().is_some() {
+            return None;
+        }
+        let hits = self.hits.lock().expect("hits poisoned");
+        if [
+            hits.menu,
+            hits.ask,
+            hits.team,
+            hits.settings,
+            hits.providers,
+            hits.plugins,
+            hits.tools,
+            hits.mcp,
+            hits.rewind,
+            hits.resume,
+            hits.sheet,
+            hits.bg,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|r| r.contains(x, y))
+        {
+            return None;
+        }
+        hits.scrollbar.filter(|bar| bar.track.contains(x, y))
     }
 
     /// Whether a point is on the "back to the bottom" badge.

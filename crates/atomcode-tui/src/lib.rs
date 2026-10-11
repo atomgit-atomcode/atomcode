@@ -81,6 +81,7 @@ pub mod remote;
 pub mod resume;
 pub mod rewind;
 pub mod rows;
+mod scrollbar;
 pub mod search;
 pub mod secret;
 pub mod settings;

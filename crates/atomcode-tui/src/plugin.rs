@@ -1007,6 +1007,10 @@ async fn session_dir_of(client: &AgentClient, session: &str) -> Option<String> {
 }
 
 enum Wake {
+    Copied {
+        session: String,
+        message: String,
+    },
     Fact,
     Foreground {
         request: u64,
@@ -1321,6 +1325,8 @@ pub struct Tui {
     files: Mutex<Option<(std::path::PathBuf, FileIndex)>>,
     /// Where the button went down, so a release can tell a click from a drag.
     pressed_at: Mutex<Option<(u16, u16)>>,
+    scroll_drag: Mutex<Option<crate::scrollbar::Drag>>,
+    copy_worker: Mutex<Option<std::sync::mpsc::SyncSender<(String, String, String)>>>,
     /// The newest turn a message this screen sent was taken by
     /// (`AgentEvent::Accepted`): a report folded into that turn is not what
     /// opened it — see [`opens_a_turn_on_screen`].
@@ -1990,6 +1996,12 @@ impl UserInterface for Tui {
                 }
             }
             if let Wake::Input(input) = &woke {
+                if matches!(
+                    input,
+                    Input::Resize(..) | Input::Key(_) | Input::Focus(false)
+                ) {
+                    *self.scroll_drag.lock().expect("scroll drag poisoned") = None;
+                }
                 self.surface.observe_input(input);
             }
             // The pointer's own vocabulary, needed in the patterns below rather
@@ -2049,6 +2061,7 @@ impl UserInterface for Tui {
                 // The host put another session in place of this one: draw that
                 // one, from its first fact, in a stream of its own.
                 Wake::Host(HostEvent::SessionChanged { session, .. }) => {
+                    *self.scroll_drag.lock().expect("scroll drag poisoned") = None;
                     if session != client.root() {
                         self.background_switching.store(0, Ordering::SeqCst);
                         let team_return = self
@@ -2416,6 +2429,10 @@ impl UserInterface for Tui {
                             stale = true;
                             continue;
                         }
+                    }
+                    if self.scrollbar_input(click, x, y) {
+                        stale = true;
+                        continue;
                     }
                     let action = match click {
                         Click::WheelUp => Some(Action::Scroll(-WHEEL_LINES)),
@@ -2939,6 +2956,12 @@ impl UserInterface for Tui {
                 // in this panel can press Esc without it reaching the
                 // double-tap in `act`: the panel owns the key while it is up,
                 // and Esc in there means "back a step", then "put it away".
+                Wake::Copied { session, message } => {
+                    if self.host.moment.read().expect("moment poisoned").viewing == session {
+                        self.host.say(message, false);
+                        stale = true;
+                    }
+                }
                 Wake::Input(Input::Key(press)) if self.host.rewind_open() => {
                     stale |= self.run_rewind_key(press);
                 }
@@ -3183,6 +3206,89 @@ impl Tui {
         shift || (!sel.extended && (!on_screen(sel.anchor.1) || !on_screen(sel.head.1)))
     }
 
+    /// Serialize clipboard writes away from the UI event loop.
+    fn copy_text(&self, text: String, label: String) {
+        let Some(wake) = self.wake.lock().expect("wake poisoned").clone() else {
+            // Before the event loop exists (scripted surfaces), complete inline.
+            let how = self.surface.copy(&text);
+            self.host.say(how.words(label), false);
+            return;
+        };
+        let session = self
+            .host
+            .moment
+            .read()
+            .expect("moment poisoned")
+            .viewing
+            .clone();
+        let mut worker = self.copy_worker.lock().expect("copy worker poisoned");
+        if worker.is_none() {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<(String, String, String)>(8);
+            let surface = self.surface.clone();
+            if std::thread::Builder::new()
+                .name("clipboard-copy".into())
+                .spawn(move || {
+                    for (text, label, session) in rx {
+                        let message = surface.copy(&text).words(label);
+                        if wake.send(Wake::Copied { session, message }).is_err() {
+                            break;
+                        }
+                    }
+                })
+                .is_err()
+            {
+                self.host.say(t(Msg::CopyCouldNotStart).into_owned(), true);
+                return;
+            }
+            *worker = Some(tx);
+        }
+        if worker
+            .as_ref()
+            .unwrap()
+            .try_send((text, label, session))
+            .is_err()
+        {
+            self.host.say(t(Msg::CopyCouldNotStart).into_owned(), true);
+        }
+    }
+
+    fn scrollbar_input(&self, click: crate::surface::Click, x: u16, y: u16) -> bool {
+        use crate::surface::Click;
+        let mut held = self.scroll_drag.lock().expect("scroll drag poisoned");
+        match click {
+            Click::Press => {
+                let Some(bar) = self.host.scrollbar_at(x, y) else {
+                    *held = None;
+                    return false;
+                };
+                let drag = bar.grab(y);
+                *held = Some(drag);
+                *self.pressed_at.lock().expect("press poisoned") = None;
+                *self.extend_on_release.lock().expect("extend poisoned") = None;
+                let mut m = self.host.moment.write().expect("moment poisoned");
+                m.selection = None;
+                m.stream_selection = None;
+                m.edge_scroll = None;
+                let max = self.host.scroll_limit(self.surface.size(), &m);
+                m.scroll = crate::moment::ScrollPos(drag.position(y).min(max));
+                true
+            }
+            Click::Drag | Click::Release => {
+                let Some(drag) = *held else {
+                    return false;
+                };
+                let mut m = self.host.moment.write().expect("moment poisoned");
+                let max = self.host.scroll_limit(self.surface.size(), &m);
+                m.scroll = crate::moment::ScrollPos(drag.position(y).min(max));
+                if click == Click::Release {
+                    *held = None;
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Carry a conversation selection's head to the pointer, scrolling the
     /// view when the pointer is at the conversation's top or bottom row and
     /// there is more that way — the drag that runs past the edge of a screen.
@@ -3209,8 +3315,13 @@ impl Tui {
             m.scroll = crate::moment::ScrollPos(m.scroll.0 - 1);
         }
         m.edge_scroll = (up || down).then_some((x, y));
-        let Some(view) = self.host.block_view(size, m) else {
-            return;
+        let view = if up || down {
+            let Some(view) = self.host.block_view(size, m) else {
+                return;
+            };
+            view
+        } else {
+            view
         };
         let y = y.clamp(top_edge, bottom_edge.max(top_edge));
         let row = view
@@ -7842,7 +7953,7 @@ impl Tui {
                     let text = frame.selected_text(&sel);
                     self.host.moment.write().expect("moment poisoned").selection = Some(sel);
                     if !text.is_empty() {
-                        self.surface.copy(&text);
+                        self.copy_text(text, t(Msg::CopiedSelection).into_owned());
                     }
                 }
                 return false;
@@ -7856,7 +7967,7 @@ impl Tui {
                     let text = frame.selected_text(&sel);
                     self.host.moment.write().expect("moment poisoned").selection = Some(sel);
                     if !text.is_empty() {
-                        self.surface.copy(&text);
+                        self.copy_text(text, t(Msg::CopiedSelection).into_owned());
                     }
                 }
                 return false;
@@ -7899,8 +8010,7 @@ impl Tui {
                     // and it must say so on the gesture itself rather than leave
                     // the person to copy a second time to learn it worked. And it
                     // says WHICH kind of "copied" it was — see `Copied`.
-                    let how = self.surface.copy(&text);
-                    self.host.say(how.words(t(Msg::CopiedSelection)), false);
+                    self.copy_text(text, t(Msg::CopiedSelection).into_owned());
                 }
                 return false;
             }
@@ -8697,12 +8807,11 @@ impl Tui {
                         None => self.host.compose(size).selected_text(&sel),
                     };
                     if !text.is_empty() {
-                        let how = self.surface.copy(&text);
                         // The reserved row above the field, not the stream: this
                         // is true of *now*, and a block for it would push the
                         // conversation up a row for a sentence nobody reads
                         // twice.
-                        self.host.say(how.words(t(Msg::CopiedSelection)), false);
+                        self.copy_text(text, t(Msg::CopiedSelection).into_owned());
                         return false;
                     }
                 }
@@ -8729,13 +8838,9 @@ impl Tui {
                     );
                     return false;
                 }
-                let how = self.surface.copy(&text);
-                // The other front end's usage panel already says this.
-                self.host.say(
-                    how.words(crate::i18n::product::t(
-                        crate::i18n::product::Msg::UsageCopied,
-                    )),
-                    false,
+                self.copy_text(
+                    text,
+                    crate::i18n::product::t(crate::i18n::product::Msg::UsageCopied).into_owned(),
                 );
                 false
             }
@@ -9667,6 +9772,8 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
             history_asked: Mutex::new(false),
             files: Mutex::new(None),
             pressed_at: Mutex::new(None),
+            scroll_drag: Mutex::new(None),
+            copy_worker: Mutex::new(None),
             person_turn: Mutex::new(None),
             turn_began: Mutex::new(None),
             away_this_turn: std::sync::atomic::AtomicBool::new(false),
@@ -12825,5 +12932,93 @@ mod skills_menu_tests {
         assert!(host.commands.starts_turn("/init"));
         assert!(host.commands.starts_turn("/worklog"));
         assert!(host.commands.starts_turn("/worklog yesterday"));
+    }
+}
+
+#[cfg(test)]
+mod conversation_mouse_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+    struct HeldCopy {
+        entered: std::sync::mpsc::Sender<String>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl Surface for HeldCopy {
+        fn describe(&self) -> String {
+            "held copy".into()
+        }
+        fn size(&self) -> (u16, u16) {
+            (80, 24)
+        }
+        fn present(&self, _: &crate::frame::Frame) {}
+        fn copy(&self, text: &str) -> crate::surface::Copied {
+            self.entered.send(text.into()).unwrap();
+            let _ = self
+                .release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(2));
+            crate::surface::Copied::Here
+        }
+    }
+    #[test]
+    fn clipboard_waits_do_not_block_the_ui_and_copies_finish_in_order() {
+        let (entered, entries) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let (host, tui) = assemble(Arc::new(HeldCopy {
+            entered,
+            release: Mutex::new(held),
+        }));
+        let (wake, mut events) = mpsc::unbounded_channel();
+        *tui.wake.lock().unwrap() = Some(wake);
+        let started = Instant::now();
+        tui.copy_text("first".into(), "first copied".into());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            entries.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "first"
+        );
+        tui.copy_text("second".into(), "second copied".into());
+        assert!(entries.try_recv().is_err(), "copies must be serialized");
+        tui.act(Action::Insert('x'), &tui.client);
+        assert_eq!(host.moment.read().unwrap().input, "x");
+        release.send(()).unwrap();
+        assert_eq!(
+            entries.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "second"
+        );
+        release.send(()).unwrap();
+        let one = events.blocking_recv().unwrap();
+        let two = events.blocking_recv().unwrap();
+        assert!(matches!(one,Wake::Copied {message,..} if message=="first copied"));
+        assert!(matches!(two,Wake::Copied {message,..} if message=="second copied"));
+    }
+    #[test]
+    fn scrollbar_click_and_drag_move_history_without_starting_a_selection() {
+        let (host, tui) = assemble(crate::surface::Headless::new(80, 24));
+        host.modules
+            .add_producer(crate::modules::transcript::Transcript::new())
+            .unwrap();
+        host.absorb(&atomcode_kernel::session::SessionEvent::AssistantMessage {
+            turn: 1,
+            round: 0,
+            text: (0..200)
+                .map(|i| format!("line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            reasoning: String::new(),
+            tool_calls: Vec::new(),
+            reasoning_blocks: Vec::new(),
+            meta: None,
+        });
+        let frame = host.compose((80, 24));
+        let track = frame.part("conversation-scrollbar").unwrap().rect;
+        assert!(tui.scrollbar_input(crate::surface::Click::Press, track.x, track.y));
+        assert!(host.moment.read().unwrap().scroll.0 > 0);
+        assert!(host.moment.read().unwrap().selection.is_none());
+        assert!(tui.scrollbar_input(crate::surface::Click::Drag, track.x - 3, track.bottom()));
+        assert_eq!(host.moment.read().unwrap().scroll.0, 0);
+        assert!(tui.scrollbar_input(crate::surface::Click::Release, track.x, track.bottom()));
+        assert!(tui.scroll_drag.lock().unwrap().is_none());
     }
 }

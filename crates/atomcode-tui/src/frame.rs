@@ -483,6 +483,10 @@ impl Frame {
     /// asked to highlight its own share would have to know where it sits and
     /// what its neighbours did.
     pub fn highlight(&mut self, sel: &crate::moment::Selection) {
+        self.highlight_with_colors(sel, true);
+    }
+
+    pub(crate) fn highlight_with_colors(&mut self, sel: &crate::moment::Selection, colors: bool) {
         if sel.is_empty() {
             return;
         }
@@ -520,8 +524,8 @@ impl Frame {
                     // ground under the whole range and keep each span's foreground, so
                     // the selection reads as a single readable band.
                     *line = line.restyle(a, b, |st| Style {
-                        bg: Some(Color::role(crate::theme::Role::PanelSelBg)),
-                        reverse: false,
+                        bg: colors.then(|| Color::role(crate::theme::Role::PanelSelBg)),
+                        reverse: !colors,
                         ..st
                     });
                 }
@@ -773,6 +777,30 @@ mod tests {
         // One for the line count, one for each over-wide line.
         assert_eq!(v.len(), 3, "{v:?}");
         assert!(v.iter().all(|m| m.contains("greedy")));
+    }
+
+    #[test]
+    fn monochrome_selections_still_have_visible_feedback() {
+        let mut frame = Frame::new(10, 1);
+        frame.place(
+            "text",
+            Rect::new(0, 0, 10, 1),
+            vec![Line::raw("abcdefghij")],
+        );
+        frame.highlight_with_colors(
+            &crate::moment::Selection {
+                anchor: (2, 0),
+                head: (4, 0),
+            },
+            false,
+        );
+        let marked: String = frame.parts[0].lines[0]
+            .spans
+            .iter()
+            .filter(|span| span.style.reverse)
+            .map(|span| span.text.as_str())
+            .collect();
+        assert_eq!(marked, "cde");
     }
 
     #[test]
