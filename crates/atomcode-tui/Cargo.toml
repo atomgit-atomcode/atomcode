@@ -44,6 +44,8 @@ crossterm = { version = "0.29", features = ["event-stream"] }
 # behind `Surface::clipboard_image`, and everything above it sees an
 # `ImageContent` and nothing else.
 arboard = "3"
+# Anonymous input files keep clipboard helpers from blocking on a full pipe.
+tempfile = "3"
 # arboard hands back raw RGBA; every provider wants an encoded image, so the
 # encode happens once at this boundary rather than in each provider adapter.
 png = "0.18"
@@ -84,7 +86,3 @@ tokio = { version = "1", features = ["test-util"] }
 atomcode-tree-host = { path = "../atomcode-tree-host" }
 atomcode-kernel = { path = "../atomcode-kernel", features = ["test-support"] }
 ctor = "0.2"
-# A real directory for the one criterion that writes a file (`/save`). The
-# session's working root is a path, and a criterion that faked it would be
-# testing the fake.
-tempfile = "3"

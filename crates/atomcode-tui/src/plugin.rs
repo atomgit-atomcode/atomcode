@@ -2239,41 +2239,9 @@ impl UserInterface for Tui {
                     }
                     stale = true;
                 }
-                // A move is the one event the tracker sends for a reason we did
-                // not ask for: `Moved` arrives only while free motion is
-                // reporting, and free motion is asked for exactly while the
-                // menu is up. Seeing one with the menu down is the one piece of
-                // evidence available that the terminal's tracker is not where
-                // this side left it — which is what a session restore, a tab
-                // switch or a stray reset from anything else holding the tty
-                // does to it. Say the mode again, and say so, because the
-                // pointer was in the terminal's hands until the next click
-                // brought it back.
-                //
-                // Not a query: see `Surface::heal_mouse` for why asking is not
-                // an option here.
-                // A hover-arrival is proof the mode is *on* only for the one case
-                // this arm was written for: free motion was not requested, so the
-                // terminal must be reporting it on its own.
-                //
-                // With a question on screen we have just asked for it (see
-                // `set_motion` below, and that is what starts this arm's one
-                // firing), so an arriving hover is exactly what was requested —
-                // treating it as a terminal that took the mouse back would say so
-                // on the tip row and, worse, hand the pointer back the next time
-                // the question is answered. The question's own hover is a
-                // request, same as the menu's.
-                //
-                // Every thing that asked for motion has to be listed here, or the
-                // hover it asked for is read as a terminal taking the mouse back:
-                // the slash menu is the fourth such thing, and it is the one that
-                // is up while a person is typing — the moment a spurious "the
-                // terminal took your mouse" notice would be most visible.
-                //
-                // And none of it holds where every move is reported whatever was
-                // asked (`Surface::reports_every_move`, a Windows console): an
-                // unrequested hover there is the terminal working as it always
-                // does, and the notice fired on every move.
+                // A late motion packet can outlive the menu that requested it.
+                // Reassert the intended mode, but motion alone does not prove
+                // that the terminal reclaimed the mouse. Do not announce that.
                 Wake::Input(Input::Mouse(Click::Hover, ..))
                     if !self.surface.motion()
                         && !self.surface.reports_every_move()
@@ -2283,9 +2251,6 @@ impl UserInterface for Tui {
                         && !self.team_on_screen() =>
                 {
                     self.surface.heal_mouse();
-                    self.host
-                        .say(t(Msg::MouseTakenBackAuto).into_owned(), false);
-                    stale = true;
                 }
                 // Acted on above; a change of focus draws nothing by itself.
                 // Looking away during a turn is one of the reasons it gets a

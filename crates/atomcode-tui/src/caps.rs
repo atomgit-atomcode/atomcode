@@ -266,6 +266,7 @@ pub fn cell_background_for(
         || ohos
         || env("WT_SESSION").is_some()
         || env("TERM_PROGRAM").is_some()
+        || env("VTE_VERSION").is_some()
         || env("TERM").is_some_and(|t| t.contains("jediterm"))
 }
 
@@ -852,6 +853,14 @@ mod tests {
         );
         let named = env_of(&[("TERM", "xterm-256color"), ("TERM_PROGRAM", "iTerm.app")]);
         assert!(cell_background_for(&named, false, false));
+    }
+
+    #[test]
+    fn ubuntu_vte_paints_backgrounds_without_term_program() {
+        let ubuntu = env_of(&[("TERM", "xterm-256color"), ("VTE_VERSION", "7600")]);
+        assert!(cell_background_for(&ubuntu, false, false));
+        let bare = env_of(&[("TERM", "xterm-256color")]);
+        assert!(!cell_background_for(&bare, false, false));
     }
 
     /// HarmonyOS's terminal reports no mouse, so the mouse stays its own there

@@ -1303,7 +1303,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::RemoteRan { command } => format!("（另一端执行了 {command}）").into(),
         Msg::RemoteDesktopOnly => "这条得在这台机器上敲。另一端能用的是：".into(),
         Msg::UsageUnknown { why } => format!("问不到还剩多少：{why}").into(),
-        Msg::CopyHandedOver => "（交给了终端；它要是不让复制，这次就没有）".into(),
+        Msg::CopyHandedOver => "无法确认复制成功：已请求终端复制，但终端可能不允许访问剪贴板。".into(),
+        Msg::CopyLocalUnavailable => "无法确认复制成功。Ubuntu Wayland 下请安装 wl-clipboard（sudo apt install wl-clipboard）后重试；也可按 Ctrl+G 释放鼠标，使用终端复制。".into(),
         Msg::ContextNoPrompt => "这个宿主没有系统提示词可说。".into(),
         Msg::ComposerSuggested { text } => text.to_string().into(),
         Msg::WaitsForTheTurn { command } => {

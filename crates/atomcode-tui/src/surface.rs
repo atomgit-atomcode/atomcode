@@ -828,6 +828,10 @@ pub struct Terminal {
     caps: crate::caps::Caps,
     painted: LastPainted,
     link_hover: Mutex<link_pointer::LinkHover>,
+    // X11 owns clipboard data in the writing process. Keep its event loop alive
+    // until this terminal is dropped rather than losing the selection on return.
+    #[cfg(target_os = "linux")]
+    clipboard: Mutex<Option<arboard::Clipboard>>,
     /// Whether `/raw` has stepped out onto the terminal's own screen
     /// ([`Surface::show_transcript`]): while it has, nothing is written.
     away: std::sync::atomic::AtomicBool,
@@ -1165,6 +1169,8 @@ impl Terminal {
             caps,
             painted: LastPainted::default(),
             link_hover: Mutex::new(link_pointer::LinkHover::default()),
+            #[cfg(target_os = "linux")]
+            clipboard: Mutex::new(None),
             away: std::sync::atomic::AtomicBool::new(false),
             stderr,
             margin,
@@ -1809,8 +1815,6 @@ fn read_clipboard_text() -> Option<String> {
 /// is not the one anybody is looking at. There OSC 52 is the only thing that
 /// can work, and it is already on its way — and nothing can be confirmed.
 fn local_clipboard(text: &str) -> bool {
-    use std::process::{Command, Stdio};
-
     if std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some() {
         return false;
     }
@@ -1830,35 +1834,73 @@ fn local_clipboard(text: &str) -> bool {
         &[("clip", &[])]
     } else {
         &[
-            ("wl-copy", &[]),
+            ("wl-copy", &["--type", "text/plain;charset=utf-8"]),
             ("xclip", &["-selection", "clipboard"]),
             ("xsel", &["--clipboard", "--input"]),
         ]
     };
     for (bin, args) in helpers {
-        let Ok(mut child) = Command::new(bin)
-            .args(*args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        else {
-            continue; // not installed; try the next one
-        };
-        if let Some(mut stdin) = child.stdin.take() {
-            // Best effort, and deliberately not `?`: a helper that exits before
-            // reading gives EPIPE, and losing the copy — or hanging the UI —
-            // over a broken pipe would be worse than a copy that half worked.
-            let _ = stdin.write_all(text.as_bytes());
-        }
-        // `stdin` is dropped here, so the child sees EOF and can exit. A
-        // helper that ran and exited 0 took it; one that failed is no better
-        // than not being installed, so the next one gets a turn.
-        if child.wait().map(|done| done.success()).unwrap_or(false) {
+        if clipboard_helper(bin, args, text) {
             return true;
         }
     }
     false
+}
+
+fn clipboard_helper(bin: &str, args: &[&str], text: &str) -> bool {
+    clipboard_helper_with_timeout(bin, args, text, std::time::Duration::from_secs(2))
+}
+
+fn clipboard_helper_with_timeout(
+    bin: &str,
+    args: &[&str],
+    text: &str,
+    timeout: std::time::Duration,
+) -> bool {
+    use std::io::{Seek, SeekFrom};
+    use std::process::{Command, Stdio};
+    // A helper may never read its input. A file avoids a blocking pipe write
+    // before we can enforce the process deadline. tempfile unlinks it on Unix.
+    let Ok(mut input) = tempfile::tempfile() else {
+        return false;
+    };
+    if input.write_all(text.as_bytes()).is_err() || input.seek(SeekFrom::Start(0)).is_err() {
+        return false;
+    }
+    let mut command = Command::new(bin);
+    command
+        .args(args)
+        .stdin(Stdio::from(input))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            _ => {
+                // Also stop a Unix helper's MIME probe or popup child, so a
+                // timed-out attempt cannot overwrite a later clipboard copy.
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
 }
 
 // ---- what colour is the terminal? ---------------------------------------
@@ -2364,6 +2406,32 @@ impl Surface for Terminal {
         let mut out = std::io::stdout();
         let _ = out.write_all(ansi::set_clipboard(text).as_bytes());
         let _ = out.flush();
+        #[cfg(target_os = "linux")]
+        if std::env::var_os("SSH_CONNECTION").is_none() && std::env::var_os("SSH_TTY").is_none() {
+            // GNOME does not expose the data-control protocol used by native
+            // Wayland clipboard libraries. wl-copy also supports its regular
+            // data-device protocol; prefer it over the XWayland bridge.
+            if std::env::var_os("WAYLAND_DISPLAY").is_some()
+                && clipboard_helper("wl-copy", &["--type", "text/plain;charset=utf-8"], text)
+            {
+                return Copied::Here;
+            }
+            let mut owner = self.clipboard.lock().expect("clipboard poisoned");
+            if owner.is_none() {
+                *owner = arboard::Clipboard::new().ok();
+            }
+            if owner
+                .as_mut()
+                .is_some_and(|board| board.set_text(text.to_owned()).is_ok())
+            {
+                return Copied::Here;
+            }
+            return if local_clipboard(text) {
+                Copied::Here
+            } else {
+                Copied::LocalUnavailable
+            };
+        }
         // 这一句是唯一能确认的那一半 —— OSC 52 写出去了不等于终端收下了。
         match local_clipboard(text) {
             true => Copied::Here,
@@ -2419,6 +2487,8 @@ pub enum Copied {
     Here,
     /// 只交给了终端。成没成只有终端知道,而它不说。
     HandedOver,
+    /// Local clipboard access failed; the terminal request remains unconfirmed.
+    LocalUnavailable,
 }
 
 impl Copied {
@@ -2427,8 +2497,9 @@ impl Copied {
         let said = said.into();
         match self {
             Copied::Here => said,
-            Copied::HandedOver => {
-                format!("{said}{}", crate::i18n::t(crate::i18n::Msg::CopyHandedOver))
+            Copied::HandedOver => crate::i18n::t(crate::i18n::Msg::CopyHandedOver).into_owned(),
+            Copied::LocalUnavailable => {
+                crate::i18n::t(crate::i18n::Msg::CopyLocalUnavailable).into_owned()
             }
         }
     }
@@ -2655,6 +2726,47 @@ mod tests {
     }
     use crate::frame::{Line, Rect};
 
+    #[cfg(unix)]
+    #[test]
+    fn clipboard_helpers_must_accept_the_text_and_exit_successfully() {
+        assert!(clipboard_helper(
+            "sh",
+            &["-c", "test \"$(cat)\" = '中文 clipboard'"],
+            "中文 clipboard"
+        ));
+        assert!(!clipboard_helper(
+            "sh",
+            &["-c", "cat >/dev/null; exit 1"],
+            "text"
+        ));
+        assert!(!clipboard_helper(
+            "/nonexistent/atomcode-clipboard",
+            &[],
+            "text"
+        ));
+    }
+
+    #[test]
+    fn unavailable_local_copy_explains_how_to_retry() {
+        let message = Copied::LocalUnavailable.words("已复制");
+        assert!(!message.starts_with("已复制"));
+        assert!(message.contains("wl-clipboard"));
+        assert!(message.contains("Ctrl+G"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_clipboard_helper_that_never_reads_or_exits_is_bounded() {
+        let started = std::time::Instant::now();
+        assert!(!clipboard_helper_with_timeout(
+            "sh",
+            &["-c", "exec sleep 30"],
+            &"x".repeat(1024 * 1024),
+            std::time::Duration::from_millis(50),
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    }
+
     /// 一次不能确认的复制,不许说成一次复制好了的。
     ///
     /// OSC 52 是写出去就没有下文的:终端不回话,而它可能悄悄拒掉(iTerm2
@@ -2669,7 +2781,7 @@ mod tests {
         let maybe = Copied::HandedOver.words("已复制");
         assert_eq!(done, "已复制", "确认了的那一句原样");
         assert_ne!(maybe, done, "没确认的不能是同一句话:{maybe}");
-        assert!(maybe.starts_with("已复制"), "但也不是换一句话说:{maybe}");
+        assert!(!maybe.starts_with("已复制"), "不能用成功提示开头:{maybe}");
 
         // 而一块答不上来的屏幕默认是「不能确认」,不是「成了」—— 这是安全的
         // 那一侧,也是每个自己不实现 `copy` 的 surface 得到的答案。

@@ -2118,9 +2118,10 @@ pub enum Msg<'a> {
     UsageUnknown {
         why: &'a str,
     },
-    /// Tacked onto a "copied" line when nothing could confirm it: the text
-    /// went out as OSC 52 and the terminal does not answer.
+    /// Copy cannot be confirmed: OSC 52 has no acknowledgement.
     CopyHandedOver,
+    /// Local Linux clipboard backends failed, with an actionable fallback.
+    CopyLocalUnavailable,
     /// `/paste <file>` on something too big to put in the composer. **Not**
     /// [`Msg::FileUnreadable`]: it reads fine, it just must not go there.
     FileTooBigToPaste {
