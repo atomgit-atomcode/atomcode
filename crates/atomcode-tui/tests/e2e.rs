@@ -10209,7 +10209,14 @@ async fn a_click_after_scrolling_away_extends_the_selection() {
     let first = s
         .screen()
         .lines()
-        .filter_map(|l| l.trim().strip_prefix("LINE-").map(|n| format!("LINE-{n}")))
+        .filter_map(|l| {
+            l.trim().strip_prefix("LINE-").map(|n| {
+                // The rendered row also contains scrollbar chrome; only the
+                // answer belongs in the copied selection.
+                let number: String = n.chars().take_while(char::is_ascii_digit).collect();
+                format!("LINE-{number}")
+            })
+        })
         .nth(1)
         .expect("a line of the answer on screen");
     let from = row_of(&s, &first);
@@ -10291,7 +10298,14 @@ async fn shift_click_extends_each_time_and_a_plain_click_after_puts_it_away() {
     let first = s
         .screen()
         .lines()
-        .filter_map(|l| l.trim().strip_prefix("LINE-").map(|n| format!("LINE-{n}")))
+        .filter_map(|l| {
+            l.trim().strip_prefix("LINE-").map(|n| {
+                // The rendered row also contains scrollbar chrome; only the
+                // answer belongs in the copied selection.
+                let number: String = n.chars().take_while(char::is_ascii_digit).collect();
+                format!("LINE-{number}")
+            })
+        })
         .nth(1)
         .expect("a line of the answer on screen");
     let from = row_of(&s, &first);
@@ -10425,7 +10439,14 @@ async fn a_drag_after_scrolling_away_starts_a_new_selection() {
     let line = s
         .screen()
         .lines()
-        .filter_map(|l| l.trim().strip_prefix("LINE-").map(|n| format!("LINE-{n}")))
+        .filter_map(|l| {
+            l.trim().strip_prefix("LINE-").map(|n| {
+                // The rendered row also contains scrollbar chrome; only the
+                // answer belongs in the copied selection.
+                let number: String = n.chars().take_while(char::is_ascii_digit).collect();
+                format!("LINE-{number}")
+            })
+        })
         .nth(3)
         .expect("a line of the answer on screen");
     let at = row_of(&s, &line);
