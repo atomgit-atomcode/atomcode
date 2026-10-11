@@ -84,7 +84,11 @@ async fn a_command_without_a_skill_is_only_a_direct_command() {
     let app = start(tree(&dir, STOP, &[])).await;
     let ctx = app.context();
     let registry = ctx.service::<SkillsSvc>().unwrap();
-    registry.load_dir(&commands, Some("plugin"));
+    registry.load_template_dir(
+        &commands,
+        Some("plugin"),
+        atomcode_capabilities::skills::TemplateKind::Command,
+    );
     plugins::capabilities::register_skill_commands(&ctx, &registry).unwrap();
     let catalog = ctx
         .service::<atomcode_harness::seams::CommandsSvc>()
@@ -118,13 +122,87 @@ async fn a_command_without_a_skill_is_only_a_direct_command() {
     assert!(result.is_error);
     assert!(registry.render_catalog().is_none());
     std::fs::write(&path, "---\nuser-invocable: false\n---\nHIDDEN").unwrap();
-    registry.reload_dirs(&[], &[(commands.clone(), "plugin".into())]);
+    registry.reload_dirs(
+        &[],
+        &[(
+            commands.clone(),
+            "plugin".into(),
+            atomcode_capabilities::skills::TemplateKind::Command,
+        )],
+    );
     plugins::capabilities::register_skill_commands(&ctx, &registry).unwrap();
     assert!(catalog.find("tidy", &agent).is_none());
     std::fs::remove_file(path).unwrap();
-    registry.reload_dirs(&[], &[(commands, "plugin".into())]);
+    registry.reload_dirs(
+        &[],
+        &[(
+            commands,
+            "plugin".into(),
+            atomcode_capabilities::skills::TemplateKind::Command,
+        )],
+    );
     plugins::capabilities::register_skill_commands(&ctx, &registry).unwrap();
     assert!(catalog.find("tidy", &agent).is_none());
+}
+
+#[tokio::test]
+async fn a_plugin_command_keeps_the_bare_name_over_a_local_single_file_skill() {
+    let dir = scratch("cross-source-collision");
+    let skills = dir.join("skills");
+    let commands = dir.join("custom-actions");
+    std::fs::create_dir_all(&skills).unwrap();
+    std::fs::create_dir_all(&commands).unwrap();
+    std::fs::write(skills.join("tidy.md"), "LOCAL SKILL $ARGUMENTS").unwrap();
+    std::fs::write(commands.join("tidy.md"), "PLUGIN COMMAND $ARGUMENTS").unwrap();
+    let app = start(tree(&dir, STOP, &[])).await;
+    let ctx = app.context();
+    let registry = ctx.service::<SkillsSvc>().unwrap();
+    let sources = vec![
+        (
+            skills,
+            "local".into(),
+            atomcode_capabilities::skills::TemplateKind::Skill,
+        ),
+        (
+            commands,
+            "plugin".into(),
+            atomcode_capabilities::skills::TemplateKind::Command,
+        ),
+    ];
+    for _ in 0..2 {
+        registry.reload_dirs(&[], &sources);
+        plugins::capabilities::register_skill_commands(&ctx, &registry).unwrap();
+        let catalog = ctx
+            .service::<atomcode_harness::seams::CommandsSvc>()
+            .unwrap();
+        let agent = atomcode_harness::create_agent(&app).await.unwrap();
+        catalog
+            .find("tidy", &agent)
+            .unwrap()
+            .run(agent.clone(), "task")
+            .await
+            .unwrap();
+        assert_eq!(agent.claim_injections()[0].0, "PLUGIN COMMAND task");
+        catalog
+            .find("local:tidy", &agent)
+            .unwrap()
+            .run(agent.clone(), "task")
+            .await
+            .unwrap();
+        assert_eq!(agent.claim_injections()[0].0, "LOCAL SKILL task");
+        catalog
+            .find("skills", &agent)
+            .unwrap()
+            .run(agent.clone(), "tidy task")
+            .await
+            .unwrap();
+        assert_eq!(agent.claim_injections()[0].0, "LOCAL SKILL task");
+        assert_eq!(
+            registry.get("tidy").unwrap().template,
+            "LOCAL SKILL $ARGUMENTS"
+        );
+        assert!(registry.get("plugin:tidy").is_none());
+    }
 }
 
 #[tokio::test]
@@ -149,7 +227,11 @@ async fn same_named_commands_and_skills_keep_their_own_content_and_visibility() 
                 let ctx = app.context();
                 let registry = ctx.service::<SkillsSvc>().unwrap();
                 registry.load_dir(&skills, namespace);
-                registry.load_dir(&commands, namespace);
+                registry.load_template_dir(
+                    &commands,
+                    namespace,
+                    atomcode_capabilities::skills::TemplateKind::Command,
+                );
                 plugins::capabilities::register_skill_commands(&ctx, &registry).unwrap();
                 let catalog = ctx
                     .service::<atomcode_harness::seams::CommandsSvc>()
@@ -198,7 +280,21 @@ async fn same_named_commands_and_skills_keep_their_own_content_and_visibility() 
                 std::fs::write(&command_path, "NEW COMMAND $ARGUMENTS").unwrap();
                 std::fs::write(&skill_path, "NEW SKILL $ARGUMENTS").unwrap();
                 let ns = namespace.unwrap_or("skills").to_string();
-                registry.reload_dirs(&[], &[(skills.clone(), ns.clone()), (commands.clone(), ns)]);
+                registry.reload_dirs(
+                    &[],
+                    &[
+                        (
+                            skills.clone(),
+                            ns.clone(),
+                            atomcode_capabilities::skills::TemplateKind::Skill,
+                        ),
+                        (
+                            commands.clone(),
+                            ns,
+                            atomcode_capabilities::skills::TemplateKind::Command,
+                        ),
+                    ],
+                );
                 plugins::capabilities::register_skill_commands(&ctx, &registry).unwrap();
                 catalog
                     .find("changelog", &agent)

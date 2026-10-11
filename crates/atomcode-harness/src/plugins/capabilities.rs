@@ -524,9 +524,10 @@ pub fn register_skill_commands(ctx: &Context, registry: &Arc<SkillRegistry>) -> 
         // the memory row — is still evicted rather than crashing the tree. This
         // skip only saves registering-then-yielding when the built-in got there
         // first.
-        let collision = commands
-            .iter()
-            .any(|command| command.name == skill.name && command.source_path != skill.source_path);
+        let collision = commands.iter().any(|command| {
+            bare_name(&command.name) == bare_name(&skill.name)
+                && command.source_path != skill.source_path
+        });
         // Keep a qualified alias for the skill in the frontend's skill menu;
         // the bare name belongs to its separate command even when hidden.
         let name = if collision {

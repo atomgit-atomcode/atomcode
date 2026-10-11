@@ -2481,7 +2481,7 @@ enum ReadyRuntimeRequest {
         event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
     },
     ReloadCapabilities {
-        plugin_skill_dirs: Vec<(PathBuf, String)>,
+        plugin_skill_dirs: Vec<atomcode_capabilities::skills::TemplateDirectory>,
         runtime_id: bg_runtime::RuntimeId,
         event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
     },
@@ -3341,7 +3341,7 @@ impl RuntimeControl {
 
     pub fn reload_capabilities(
         &self,
-        plugin_skill_dirs: Vec<(PathBuf, String)>,
+        plugin_skill_dirs: Vec<atomcode_capabilities::skills::TemplateDirectory>,
         runtime_id: bg_runtime::RuntimeId,
         event_tx: mpsc::UnboundedSender<bg_runtime::RuntimeEvent>,
     ) -> Result<(), atomcode_coding::RuntimeUnavailable> {

@@ -144,8 +144,7 @@ mod tests {
     fn registry_with(skills: &[(&str, &str)]) -> Arc<SkillRegistry> {
         let d = Box::leak(Box::new(tempfile::tempdir().unwrap())); // keep alive for the test
         for (name, body) in skills {
-            std::fs::create_dir_all(d.path().join(name)).unwrap();
-            std::fs::write(d.path().join(name).join("SKILL.md"), body).unwrap();
+            std::fs::write(d.path().join(format!("{name}.md")), body).unwrap();
         }
         Arc::new(SkillRegistry::load(&[d.path().to_path_buf()]))
     }
@@ -157,8 +156,7 @@ mod tests {
             .execute(r#"{"name":"greet","arguments":"world"}"#, &ctx())
             .await;
         assert!(!r.is_error, "{}", r.content);
-        assert!(r.content.ends_with("Hello world!"), "{}", r.content);
-        assert!(!r.content.contains("$ARGUMENTS"));
+        assert_eq!(r.content, "Hello world!");
     }
 
     #[tokio::test]
@@ -199,10 +197,20 @@ mod tests {
     async fn use_skill_rejects_a_flat_command() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("loose.md"), "COMMAND BODY").unwrap();
-        let tool = UseSkillTool::new(Arc::new(SkillRegistry::load(&[d.path().to_path_buf()])));
+        let registry = SkillRegistry::new();
+        registry.load_template_dir(d.path(), None, super::super::TemplateKind::Command);
+        let tool = UseSkillTool::new(Arc::new(registry));
         let r = tool.execute(r#"{"name":"loose"}"#, &ctx()).await;
         assert!(r.is_error);
         assert!(!r.content.contains("COMMAND BODY"));
+    }
+
+    #[tokio::test]
+    async fn use_skill_still_accepts_a_single_file_skill() {
+        let tool = UseSkillTool::new(registry_with(&[("loose", "SKILL BODY")]));
+        let r = tool.execute(r#"{"name":"loose"}"#, &ctx()).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert_eq!(r.content, "SKILL BODY");
     }
 
     #[tokio::test]

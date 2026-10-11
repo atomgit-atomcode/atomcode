@@ -2371,7 +2371,7 @@ impl CodingRuntimeHandle {
     /// disk state rather than the stale startup snapshot.
     pub async fn reload_capabilities_with_plugin_skills(
         &self,
-        plugin_skill_dirs: Option<Vec<(std::path::PathBuf, String)>>,
+        plugin_skill_dirs: Option<Vec<atomcode_capabilities::skills::TemplateDirectory>>,
     ) -> Result<SessionChanged, RuntimeError> {
         self.send_withdraw_mcp_tools(false).await?;
         self.reprepare_target(ReprepareTarget::Reload { plugin_skill_dirs })
@@ -3475,7 +3475,7 @@ pub enum RewindFinalization {
 #[derive(Clone)]
 pub enum ReprepareTarget {
     Reload {
-        plugin_skill_dirs: Option<Vec<(std::path::PathBuf, String)>>,
+        plugin_skill_dirs: Option<Vec<atomcode_capabilities::skills::TemplateDirectory>>,
     },
     ReloadConfig(CodingAgentConfig),
     Fresh,

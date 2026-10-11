@@ -8,6 +8,15 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+/// The caller identifies the role of a directory, including custom plugin paths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TemplateKind {
+    Skill,
+    Command,
+}
+
+pub type TemplateDirectory = (PathBuf, String, TemplateKind);
+
 #[derive(Default)]
 struct SkillIndex {
     skills: BTreeMap<String, Arc<Skill>>,
@@ -75,34 +84,47 @@ impl SkillRegistry {
     /// The swap is one write: a reader either sees every skill from before or
     /// every skill from after, never a half-scanned catalog — which is what a
     /// model would otherwise be told about mid-reload.
-    pub fn reload_dirs(&self, dirs: &[PathBuf], namespaced: &[(PathBuf, String)]) {
+    pub fn reload_dirs(&self, dirs: &[PathBuf], namespaced: &[TemplateDirectory]) {
         let fresh = Self::new();
         for dir in dirs {
-            fresh.load_dir(dir, None);
+            fresh.load_standard_dir(dir, None);
         }
-        for (dir, namespace) in namespaced {
-            fresh.load_dir(dir, Some(namespace));
+        for (dir, namespace, kind) in namespaced {
+            fresh.load_template_dir(dir, Some(namespace), *kind);
         }
         let next = std::mem::take(&mut *fresh.write());
         *self.write() = next;
     }
 
     /// Load from `dirs` in LOW→HIGH priority order within each template kind.
-    /// Directory skills and flat commands have separate indexes;
-    /// only directory skills are available to /skills and model tools.
+    /// Skill sources support both single files and directories. Standard
+    /// command roots are loaded into the separate command index.
     /// Each dir is scanned for flat `*.md` files AND `*/SKILL.md` subdirectories; parse
     /// failures are skipped.
     pub fn load(dirs: &[PathBuf]) -> Self {
         let reg = Self::new();
         for dir in dirs {
-            reg.load_dir(dir, None);
+            reg.load_standard_dir(dir, None);
         }
         reg
     }
 
     /// Load one directory, optionally namespacing the skill names (`{ns}:{name}`).
     pub fn load_dir(&self, dir: &Path, namespace: Option<&str>) {
-        self.scan_skill_dir(dir, namespace, 0);
+        self.load_template_dir(dir, namespace, TemplateKind::Skill);
+    }
+
+    fn load_standard_dir(&self, dir: &Path, namespace: Option<&str>) {
+        let kind = if dir.file_name().is_some_and(|name| name == "commands") {
+            TemplateKind::Command
+        } else {
+            TemplateKind::Skill
+        };
+        self.load_template_dir(dir, namespace, kind);
+    }
+
+    pub fn load_template_dir(&self, dir: &Path, namespace: Option<&str>, kind: TemplateKind) {
+        self.scan_skill_dir(dir, namespace, 0, kind);
     }
 
     /// Scan `dir` for skills, recursing into grouping subdirectories. A subdir holding a
@@ -111,7 +133,13 @@ impl SkillRegistry {
     /// recursively, so `skills/GROUP/SUB/SKILL.md` is still found. Flat `*.md`
     /// slash-commands are TOP-LEVEL only (depth 0) — a skill's own `*.md` are resources,
     /// not separate commands. `depth` is bounded to guard against symlink cycles.
-    fn scan_skill_dir(&self, dir: &Path, namespace: Option<&str>, depth: usize) {
+    fn scan_skill_dir(
+        &self,
+        dir: &Path,
+        namespace: Option<&str>,
+        depth: usize,
+        kind: TemplateKind,
+    ) {
         const MAX_DEPTH: usize = 8;
         if depth > MAX_DEPTH {
             return;
@@ -127,10 +155,16 @@ impl SkillRegistry {
                     if let Ok(s) = parse_skill_file(&p, namespace) {
                         let mut index = self.write();
                         let s = Arc::new(s);
-                        // Flat markdown is a slash command. Keep it for direct
-                        // invocation, but never replace a directory SKILL.md in
-                        // the index used by /skills and the model tools.
-                        index.commands.insert(s.name.clone(), s);
+                        // The source role, not markdown layout, determines
+                        // whether the template is a command or a skill.
+                        match kind {
+                            TemplateKind::Command => {
+                                index.commands.insert(s.name.clone(), s);
+                            }
+                            TemplateKind::Skill => {
+                                index.insert(s.name.clone(), s);
+                            }
+                        }
                     }
                 }
             } else if p.is_dir() {
@@ -140,7 +174,7 @@ impl SkillRegistry {
                         self.write().insert(s.name.clone(), Arc::new(s));
                     }
                 } else {
-                    self.scan_skill_dir(&p, namespace, depth + 1);
+                    self.scan_skill_dir(&p, namespace, depth + 1, kind);
                 }
             }
         }
@@ -231,7 +265,7 @@ impl SkillRegistry {
         *self.write() = SkillIndex::default();
         self.set_native_roots(roots.native());
         for dir in standard_skill_dirs(roots) {
-            self.load_dir(&dir, Some("skills"));
+            self.load_standard_dir(&dir, Some("skills"));
         }
         Vec::new()
     }
@@ -475,7 +509,15 @@ mod tests {
                     [&skills, &commands]
                 };
                 for path in paths {
-                    registry.load_dir(path, Some("plugin"));
+                    registry.load_template_dir(
+                        path,
+                        Some("plugin"),
+                        if path == &commands {
+                            TemplateKind::Command
+                        } else {
+                            TemplateKind::Skill
+                        },
+                    );
                 }
                 for name in ["changelog", "plugin:changelog"] {
                     let skill = registry.get(name).unwrap();
@@ -495,8 +537,8 @@ mod tests {
                 // Both maps are replaced together; removing a skill leaves the
                 // command-only behavior intact, and removing that leaves nothing.
                 let dirs = vec![
-                    (skills.clone(), "plugin".into()),
-                    (commands.clone(), "plugin".into()),
+                    (skills.clone(), "plugin".into(), TemplateKind::Skill),
+                    (commands.clone(), "plugin".into(), TemplateKind::Command),
                 ];
                 registry.reload_dirs(&[], &dirs);
                 assert_eq!(registry.get("changelog").unwrap().template, "SKILL BODY");
@@ -526,9 +568,8 @@ mod tests {
         .unwrap();
 
         let reg = SkillRegistry::load(&[d.path().to_path_buf()]);
-        assert_eq!(reg.len(), 1);
-        assert!(reg.get("greet").is_none());
-        assert_eq!(reg.slash_commands()[0].name, "greet");
+        assert_eq!(reg.len(), 2);
+        assert!(reg.get("greet").is_some());
         let review = reg.get("review").unwrap();
         assert_eq!(review.description, "review code");
     }
@@ -631,7 +672,7 @@ mod tests {
         std::fs::write(b.path().join("x.md"), "from B\n").unwrap();
         let reg = SkillRegistry::load(&[a.path().to_path_buf(), b.path().to_path_buf()]);
         assert!(
-            reg.slash_commands()[0].template.contains("from B"),
+            reg.get("x").unwrap().template.contains("from B"),
             "later dir wins"
         );
     }

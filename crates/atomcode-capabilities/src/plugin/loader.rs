@@ -347,19 +347,26 @@ pub fn iter_installed_plugin_assets_for(
 pub fn installed_plugin_skill_dirs(
     dirs: &ProductDirs,
     working_dir: &Path,
-) -> Vec<(PathBuf, String)> {
+) -> Vec<crate::skills::TemplateDirectory> {
     let mut out = Vec::new();
     for assets in iter_installed_plugin_assets_for(dirs, working_dir) {
-        for dir in assets
-            .skills_dirs()
-            .into_iter()
-            .chain(std::iter::once(assets.commands_dir()))
+        for (dir, kind) in
+            std::iter::once((assets.commands_dir(), crate::skills::TemplateKind::Command)).chain(
+                assets
+                    .skills_dirs()
+                    .into_iter()
+                    .map(|dir| (dir, crate::skills::TemplateKind::Skill)),
+            )
         {
             // A plugin may name the same folder twice (`skills = "commands"`),
             // and loading it twice would make every skill in it ambiguous
             // against itself.
-            if dir.exists() && !out.iter().any(|(had, _): &(PathBuf, String)| had == &dir) {
-                out.push((dir, assets.plugin.clone()));
+            if dir.exists()
+                && !out
+                    .iter()
+                    .any(|(had, _, _): &crate::skills::TemplateDirectory| had == &dir)
+            {
+                out.push((dir, assets.plugin.clone(), kind));
             }
         }
     }
@@ -381,8 +388,8 @@ pub fn reload_skill_registry(
         project: working_dir,
         dirs,
     });
-    for (dir, namespace) in installed_plugin_skill_dirs(dirs, working_dir) {
-        registry.load_dir(&dir, Some(&namespace));
+    for (dir, namespace, kind) in installed_plugin_skill_dirs(dirs, working_dir) {
+        registry.load_template_dir(&dir, Some(&namespace), kind);
     }
     warnings
 }
@@ -814,7 +821,11 @@ mod tests {
         let skill_dirs = installed_plugin_skill_dirs(&dirs, project.path());
         assert_eq!(
             skill_dirs,
-            vec![(plugin_dir.join("skills"), "probe".into())]
+            vec![(
+                plugin_dir.join("skills"),
+                "probe".into(),
+                crate::skills::TemplateKind::Skill
+            )]
         );
         let mut registry = crate::skills::SkillRegistry::new();
         assert!(reload_skill_registry(&mut registry, &dirs, project.path()).is_empty());
@@ -893,7 +904,7 @@ mod tests {
         let dirs = _home.dirs();
         let plugins_root = paths::plugins_root(dirs.user()).unwrap();
         let plugin_dir = plugins_root.join("installed/mp/pair");
-        for (folder, name) in [("skills", "check"), ("commands", "tidy")] {
+        for (folder, name) in [("skills", "check"), ("actions", "tidy")] {
             std::fs::create_dir_all(plugin_dir.join(folder)).unwrap();
             std::fs::write(
                 plugin_dir.join(folder).join(format!("{name}.md")),
@@ -905,6 +916,11 @@ mod tests {
         std::fs::write(
             plugin_dir.join("skills/tidy/SKILL.md"),
             "---\ndescription: tidy skill\n---\nSKILL BODY",
+        )
+        .unwrap();
+        std::fs::write(
+            plugin_dir.join("plugin.json"),
+            r#"{"name":"pair","commands":"actions"}"#,
         )
         .unwrap();
         // A second plugin that points `skills` **at** its commands folder — a
@@ -940,6 +956,15 @@ mod tests {
 
         let mut registry = crate::skills::SkillRegistry::new();
         reload_skill_registry(&mut registry, &dirs, &_home.path().join("projects/any"));
+        assert_eq!(
+            registry.get("pair:check").unwrap().description,
+            "the check one"
+        );
+        assert!(registry.get("twice:only").is_none());
+        assert!(registry
+            .slash_commands()
+            .iter()
+            .any(|command| command.name == "twice:only"));
         assert_eq!(registry.get("pair:tidy").unwrap().template, "SKILL BODY");
         assert_eq!(registry.get("pair:tidy").unwrap().description, "tidy skill");
         assert!(registry.slash_commands().iter().any(|command| {
@@ -948,15 +973,15 @@ mod tests {
         let dirs = installed_plugin_skill_dirs(&dirs, &_home.path().join("projects/any"));
         let of = |plugin: &str| -> Vec<String> {
             dirs.iter()
-                .filter(|(_, ns)| ns == plugin)
-                .map(|(dir, _)| dir.file_name().unwrap().to_string_lossy().into_owned())
+                .filter(|(_, ns, _)| ns == plugin)
+                .map(|(dir, _, _)| dir.file_name().unwrap().to_string_lossy().into_owned())
                 .collect()
         };
         let pair = of("pair");
         assert!(pair.contains(&"skills".to_string()), "{pair:?}");
         assert!(
-            pair.contains(&"commands".to_string()),
-            "the commands folder is contributed too: {pair:?}"
+            pair.contains(&"actions".to_string()),
+            "a custom commands folder keeps its command role: {pair:?}"
         );
         // A folder named twice is listed once: loading it twice would make
         // every skill in it ambiguous against itself.

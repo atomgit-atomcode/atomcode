@@ -38,14 +38,14 @@ pub fn installed_plugin_hook_source() -> Arc<dyn PluginHookSource> {
     Arc::new(InstalledPluginHookSource)
 }
 
-pub fn gather_plugin_skill_dirs() -> Vec<(std::path::PathBuf, String)> {
+pub fn gather_plugin_skill_dirs() -> Vec<atomcode_capabilities::skills::TemplateDirectory> {
     let working_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     gather_plugin_skill_dirs_for(&working_dir)
 }
 
 pub fn gather_plugin_skill_dirs_for(
     working_dir: &std::path::Path,
-) -> Vec<(std::path::PathBuf, String)> {
+) -> Vec<atomcode_capabilities::skills::TemplateDirectory> {
     atomcode_capabilities::plugin::loader::installed_plugin_skill_dirs(
         &atomcode_coding::config::product_dirs_from_env(),
         working_dir,

@@ -1920,7 +1920,11 @@ async fn the_catalog_is_the_skills_the_driver_named() {
     let recorder = Arc::new(Recorder::default());
     let mut start = start(env.project.path(), &recorder, SessionMode::Fresh);
     start.prepare.skill_dirs = Some(vec![skills.path().to_path_buf()]);
-    start.prepare.plugin_skill_dirs = vec![(plugin.path().to_path_buf(), "myplugin".into())];
+    start.prepare.plugin_skill_dirs = vec![(
+        plugin.path().to_path_buf(),
+        "myplugin".into(),
+        atomcode_capabilities::skills::TemplateKind::Skill,
+    )];
     let mut runtime = CodingRuntime::start(start).await.unwrap();
 
     turn(&mut runtime, "hello").await;
@@ -4482,7 +4486,11 @@ async fn a_capability_the_runtime_mounts_itself_still_describes_itself() {
     let recorder = Arc::new(Recorder::default());
     let mut start = start(env.project.path(), &recorder, SessionMode::Fresh);
     start.prepare.skill_dirs = Some(vec![skills.path().to_path_buf()]);
-    start.prepare.plugin_skill_dirs = vec![(plugin.path().to_path_buf(), "myplugin".into())];
+    start.prepare.plugin_skill_dirs = vec![(
+        plugin.path().to_path_buf(),
+        "myplugin".into(),
+        atomcode_capabilities::skills::TemplateKind::Skill,
+    )];
     start.prepare.mcp = true;
     start.prepare.extra_mcp_servers = vec![atomcode_capabilities::mcp::McpServerConfig {
         name: "t".into(),

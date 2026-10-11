@@ -104,10 +104,11 @@ pub struct PrepareOptions {
     /// Plugin-contributed skill directories, each paired with its namespace
     /// (the plugin manifest's `name`). Loaded AFTER `skill_dirs` so plugin
     /// skills are registered as `<namespace>:<skill-name>` — same convention
-    /// the slash menu uses. Empty = no plugin skills. The registry remains
+    /// the slash menu uses. Each source carries its skill/command role, including
+    /// custom manifest paths. Empty = no plugin templates. The registry remains
     /// source-neutral; the driver discovers installed-plugin directories and
     /// feeds them in.
-    pub plugin_skill_dirs: Vec<(PathBuf, String)>,
+    pub plugin_skill_dirs: Vec<atomcode_capabilities::skills::TemplateDirectory>,
     /// Connect MCP servers from `<working_dir>/.mcp.json` (+ global config).
     pub mcp: bool,
     /// Driver-supplied MCP servers connected alongside config servers — e.g.
@@ -873,8 +874,8 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         cfg.dirs.project(&cfg.working_dir),
     ]);
     if opts.tools {
-        for (dir, ns) in &opts.plugin_skill_dirs {
-            skills.load_dir(dir, Some(ns));
+        for (dir, ns, kind) in &opts.plugin_skill_dirs {
+            skills.load_template_dir(dir, Some(ns), *kind);
         }
     }
     let skills = Arc::new(skills);
@@ -900,7 +901,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         plugins: opts
             .plugin_skill_dirs
             .iter()
-            .map(|(_, plugin)| plugin.clone())
+            .map(|(_, plugin, _)| plugin.clone())
             .collect(),
     });
     if opts.tools {
