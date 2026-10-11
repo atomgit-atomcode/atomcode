@@ -6916,14 +6916,10 @@ async fn the_effort_command_changes_what_requests_ask_for_while_the_screen_runs(
 }
 
 #[tokio::test]
-async fn a_hover_with_nothing_following_the_pointer_says_the_mode_again_and_says_so() {
-    // The terminal can put its own tracker back without telling us — a session
-    // restore, a tab switch, a reset from anything else holding the tty. There
-    // is no way to ask (see `Surface::heal_mouse`: the `$y` reply never drains
-    // out of crossterm's parser), so the signal is behavioural: a plain move
-    // arrives *only* while free motion is reporting, and free motion is asked
-    // for exactly while the menu is up. A move with no menu is the one piece of
-    // evidence available that the tracker is not where this side left it.
+async fn a_late_hover_reasserts_the_mode_without_claiming_the_terminal_took_the_mouse() {
+    // A motion packet requested by a menu can arrive after the menu closes.
+    // Reasserting button reporting is safe and also heals a dropped mode, but
+    // that packet alone does not prove the terminal reclaimed the pointer.
     let dir = scratch("heal-hover");
     let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
     let task = s.open().await;
@@ -6948,9 +6944,8 @@ async fn a_hover_with_nothing_following_the_pointer_says_the_mode_again_and_says
         .pointer(atomcode_tui::surface::Click::Hover, field.x + 2, field.y);
     s.quiet().await;
 
-    // Said again, as the whole mode — so a terminal that dropped the grab is
-    // back in button reporting. The state does not change (this side never
-    // thought it had changed), which is exactly why the tip is owed.
+    // Say the whole mode again. The intended state stays in button reporting;
+    // this is a reassertion, not a change of pointer ownership.
     let sent = s.term.escapes();
     assert!(sent.len() > before, "the mode was not said again: {sent:?}");
     assert_eq!(
@@ -6964,11 +6959,12 @@ async fn a_hover_with_nothing_following_the_pointer_says_the_mode_again_and_says
         "still in button reporting — healing is not a state change"
     );
 
-    // And the person is told, on the reserved row, because the click they were
-    // about to make would have gone to the terminal instead.
+    // A late motion packet can arrive after a menu closes. Reasserting the
+    // mode does not prove that the terminal reclaimed the pointer, so no
+    // misleading notice should be raised for the person.
     assert!(
-        s.screen().contains("鼠标被终端收回"),
-        "the person was not told:\n{}",
+        !s.screen().contains("鼠标被终端收回"),
+        "a late hover was mistaken for the terminal reclaiming the mouse:\n{}",
         s.screen()
     );
 
