@@ -175,12 +175,17 @@ impl Tool for MemoryTool {
                 let g = self.global();
                 let p = self.store("project", &ctx.working_dir);
                 let l = self.store("local", &ctx.working_dir);
-                let name = ctx
-                    .working_dir
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "project".into());
-                let merged = MemoryStore::merged_for_prompt(&g, &p, &l, &name);
+                let stores = match a.scope.as_deref() {
+                    Some("global") => vec![("Global", &g)],
+                    Some("project") => vec![("Project", &p)],
+                    Some("local") => vec![("Local", &l)],
+                    Some(other) => return err(format!("memory: unknown scope '{other}'")),
+                    None => vec![("Global", &g), ("Project", &p), ("Local", &l)],
+                };
+                let merged = match MemoryStore::for_display(&stores) {
+                    Ok(text) => text,
+                    Err(error) => return err(format!("memory: {error}")),
+                };
                 if merged.trim().is_empty() {
                     ok("(memory is empty)".to_string())
                 } else {

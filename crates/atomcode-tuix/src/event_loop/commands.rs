@@ -2304,12 +2304,18 @@ fn execute_slash_command_impl(
             let local = MemoryStore::local(
                 &atomcode_coding::config::product_dirs_from_env().project(&ctx.working_dir),
             );
-            let name = ctx
-                .working_dir
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "project".into());
-            let merged = MemoryStore::merged_for_prompt(&global, &project, &local, &name);
+            let merged = match MemoryStore::for_display(&[
+                ("Global", &global),
+                ("Project", &project),
+                ("Local", &local),
+            ]) {
+                Ok(text) => text,
+                Err(error) => {
+                    renderer.render(UiLine::CommandOutput(format!("memory: {error}")));
+                    renderer.flush();
+                    return Ok(());
+                }
+            };
             let out = if merged.trim().is_empty() {
                 "(memory is empty)".to_string()
             } else {

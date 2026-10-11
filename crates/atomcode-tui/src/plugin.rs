@@ -212,6 +212,7 @@ struct Views {
     /// Invocations whose successful acknowledgement is drawn from session facts.
     /// Retain the compact line until the reply, so failures can still echo it.
     turn_invocations: std::collections::HashMap<CommandId, String>,
+    memory_invocations: std::collections::HashMap<CommandId, String>,
 }
 
 /// One followed session, as its facts and events have described it.
@@ -505,6 +506,13 @@ impl AgentClient {
                         }
                     ),
                 );
+        }
+        if name == "memory" {
+            self.view
+                .lock()
+                .expect("client poisoned")
+                .memory_invocations
+                .insert(id.clone(), session.clone());
         }
         self.command(AgentCommand::Invoke {
             id,
@@ -6278,6 +6286,30 @@ impl Tui {
             AgentEvent::Invoked {
                 id, output, failed, ..
             } => {
+                let memory_session = self
+                    .client
+                    .view
+                    .lock()
+                    .expect("client poisoned")
+                    .memory_invocations
+                    .remove(&id);
+                if memory_session
+                    .as_ref()
+                    .is_some_and(|session| *session != self.client.session())
+                {
+                    // A late read belongs to the session that requested it.
+                    return false;
+                }
+                if memory_session.is_some() && failed == Some(false) {
+                    let sheet = crate::sheet::Sheet::doc(crate::sheet::Doc::new(
+                        "memory",
+                        Vec::new(),
+                        vec![crate::sheet::DocTab::new("memory", output.clone())],
+                    ));
+                    if self.host.open_sheet(sheet) {
+                        return true;
+                    }
+                }
                 let invocation = self
                     .client
                     .view
@@ -12467,6 +12499,62 @@ mod midturn_command_tests {
     async fn answered(woken: &mut mpsc::UnboundedReceiver<Wake>) {
         let woke = tokio::time::timeout(std::time::Duration::from_secs(5), woken.recv()).await;
         assert!(matches!(woke, Ok(Some(Wake::Fact))), "the command answered");
+    }
+
+    #[test]
+    fn memory_reply_opens_a_scrollable_document_with_the_complete_workflow() {
+        let (host, tui, _) = screen();
+        host.modules
+            .add_view(Arc::new(crate::module::Mounted::<
+                crate::modules::sheet::SheetView,
+            >::new()))
+            .unwrap();
+        let session = tui.client.session();
+        tui.client
+            .view
+            .lock()
+            .unwrap()
+            .memory_invocations
+            .insert("memory".into(), session);
+        let workflow = format!(
+            "# Project\n{}\nLAST-WORKFLOW-STEP",
+            "- step\n".repeat(1_000)
+        );
+        tui.on_event(AgentEvent::Invoked {
+            id: "memory".into(),
+            output: workflow.clone(),
+            queued: false,
+            failed: Some(false),
+        });
+        let moment = host.moment.read().unwrap();
+        let crate::sheet::Page::Doc(doc) = &moment.sheet.as_ref().unwrap().page else {
+            panic!("memory document");
+        };
+        assert_eq!(doc.tabs[0].markdown, workflow);
+        assert!(doc
+            .lines(40)
+            .iter()
+            .any(|line| line.plain().contains("LAST-WORKFLOW-STEP")));
+    }
+
+    #[test]
+    fn a_late_memory_reply_does_not_enter_the_replacement_session() {
+        let (host, tui, _) = screen();
+        tui.client
+            .view
+            .lock()
+            .unwrap()
+            .memory_invocations
+            .insert("old-memory".into(), "a-session-no-longer-on-screen".into());
+        let before = kinds(&host);
+        assert!(!tui.on_event(AgentEvent::Invoked {
+            id: "old-memory".into(),
+            output: "old project's memory".into(),
+            queued: false,
+            failed: Some(false),
+        }));
+        assert_eq!(kinds(&host), before);
+        assert!(host.moment.read().unwrap().sheet.is_none());
     }
 
     #[test]

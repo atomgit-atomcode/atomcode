@@ -99,6 +99,31 @@ impl MemoryStore {
         &self.path
     }
 
+    /// Full source for a person reviewing memory, independent of prompt budgets.
+    pub fn full_text(&self) -> io::Result<String> {
+        match fs::read_to_string(&self.path) {
+            Ok(text) => Ok(text),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(String::new()),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn for_display(stores: &[(&str, &MemoryStore)]) -> io::Result<String> {
+        let mut sections = Vec::new();
+        for (label, store) in stores {
+            let text = store.full_text().map_err(|error| {
+                io::Error::new(error.kind(), format!("{}: {error}", store.path().display()))
+            })?;
+            if !text.trim().is_empty() {
+                sections.push(format!(
+                    "## {}\n\n[{label}]\n{text}",
+                    store.path().display()
+                ));
+            }
+        }
+        Ok(sections.join("\n\n"))
+    }
+
     pub fn load(&self) -> Vec<String> {
         let content = match fs::metadata(&self.path) {
             Ok(meta) => {
@@ -282,6 +307,30 @@ impl MemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_review_keeps_workflows_beyond_prompt_and_file_budgets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = MemoryStore::new(tmp.path().join("memory.md"));
+        let workflow = format!(
+            "- BEGIN-WORKFLOW {} END-WORKFLOW\n  continuation\n",
+            "流程".repeat(20_000)
+        );
+        fs::write(store.path(), &workflow).unwrap();
+        let review = MemoryStore::for_display(&[("Project", &store)]).unwrap();
+        assert!(review.contains(&workflow));
+        assert!(review.contains(&store.path().display().to_string()));
+        let empty = MemoryStore::new(tmp.path().join("missing.md"));
+        assert!(empty.full_text().unwrap().is_empty());
+        fs::write(store.path(), "- ".to_string() + &"x".repeat(1_000)).unwrap();
+        let prompt = MemoryStore::merged_for_prompt(&empty, &store, &empty, "project");
+        assert!(
+            !prompt.contains(&"x".repeat(501)),
+            "injection still caps long entries"
+        );
+        let directory = MemoryStore::new(tmp.path().to_path_buf());
+        assert!(MemoryStore::for_display(&[("Project", &directory)]).is_err());
+    }
 
     #[test]
     fn test_append_creates_file() {
