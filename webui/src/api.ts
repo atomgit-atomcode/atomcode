@@ -894,6 +894,7 @@ export async function openWorkspaceFile(path: string, sessionId?: string): Promi
 // --- Change working directory ---
 
 export interface CdResponse {
+  session_id?: string;
   success: boolean;
   message: string;
   current_dir: string;

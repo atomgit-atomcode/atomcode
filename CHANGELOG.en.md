@@ -34,6 +34,7 @@ Fix runtime commands becoming unavailable after restoring a historical session, 
 
 - **Commands in restored sessions**: `/goal`, `/loop`, `/queue`, `/policy` and `/worktree` remain available after restoring history. New sessions, project switches and runtime rebuilds also retain the same command entry point.
 - **Worktrees use the current project**: `/worktree` operates on the current session's Git repository, avoiding operations on the startup repository after restoring a session or using `/cd`.
+- **Consistent web session counts**: project counts use the same visibility rules as expanded session lists, excluding unused empty sessions and counting fork lineages once. Adding a workspace reuses the session already opened by the runtime instead of creating a duplicate empty record.
 
 ## v5.2.2（v5.2.0） (2026-10-10)
 

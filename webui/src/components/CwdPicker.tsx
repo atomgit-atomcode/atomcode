@@ -6,7 +6,7 @@ import { useT } from '../settings';
 
 interface CwdPickerProps {
   current: string;
-  onPick: (path: string) => void;
+  onPick: (path: string, sessionId?: string) => void;
   onClose: () => void;
 }
 
@@ -140,7 +140,7 @@ export function CwdPicker({ current, onPick, onClose }: CwdPickerProps) {
         setConfirmError(res.message);
         return;
       }
-      onPick(res.current_dir || finalPath);
+      onPick(res.current_dir || finalPath, res.session_id);
       onClose();
     } catch (error) {
       setConfirmError(String(error instanceof Error ? error.message : error));

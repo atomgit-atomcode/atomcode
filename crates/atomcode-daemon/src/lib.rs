@@ -370,6 +370,9 @@ pub struct ChangeDirRequest {
 /// Response after changing directory
 #[derive(Debug, Serialize)]
 pub struct ChangeDirResponse {
+    /// The runtime already opened this session; callers must reuse it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     pub success: bool,
     pub message: String,
     pub current_dir: PathBuf,
@@ -1498,13 +1501,24 @@ fn is_system_temp_dir(path: &std::path::Path) -> bool {
 
 /// List all projects (scans sessions directory)
 fn list_projects() -> std::io::Result<Vec<ProjectInfo>> {
-    let scan = catalog_scan_in_root(&NativeSessionManager::sessions_root(
+    let root = NativeSessionManager::sessions_root(
         atomcode_coding::config::product_dirs_from_env().user(),
-    ))?;
+    );
+    let scan = catalog_scan_in_root(&root)?;
+    let active = active_catalog_location(&scan.entries);
+    Ok(projects_from_catalog(&root, scan.entries, active.as_ref()))
+}
+
+fn projects_from_catalog(
+    root: &std::path::Path,
+    entries: Vec<atomcode_capabilities::session::CatalogEntry>,
+    active: Option<&atomcode_capabilities::session::CatalogLocation>,
+) -> Vec<ProjectInfo> {
+    let entries = visible_catalog_entries(root, entries, active);
     let mut by_project = std::collections::BTreeMap::<String, ProjectInfo>::new();
-    for entry in scan.entries {
+    for entry in entries {
         // A project is counted by what its session list shows.
-        if is_system_temp_dir(&entry.working_dir) || entry.delegated() {
+        if is_system_temp_dir(&entry.working_dir) {
             continue;
         }
         let created_at = u64::try_from(entry.created_at_ms.max(0)).unwrap_or(0) / 1_000;
@@ -1530,7 +1544,7 @@ fn list_projects() -> std::io::Result<Vec<ProjectInfo>> {
     }
     let mut projects: Vec<_> = by_project.into_values().collect();
     projects.sort_by(|a, b| b.last_updated.cmp(&a.last_updated));
-    Ok(projects)
+    projects
 }
 
 /// Session metadata with project hash for cross-project listing
@@ -1738,6 +1752,17 @@ fn catalog_entry_is_visible(
         .has_valid_inflight_snapshot(&entry.id)
 }
 
+/// Every list and its project count use the same visibility and fork identity.
+fn visible_catalog_entries(
+    root: &std::path::Path,
+    mut entries: Vec<atomcode_capabilities::session::CatalogEntry>,
+    active: Option<&atomcode_capabilities::session::CatalogLocation>,
+) -> Vec<atomcode_capabilities::session::CatalogEntry> {
+    entries.retain(|entry| catalog_entry_is_visible(root, entry, active));
+    NativeSessionManager::collapse_fork_lineages(&mut entries);
+    entries
+}
+
 static SESSION_CATALOG_IO: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
 /// Run bulk catalog scans off the async runtime and serialize them so queued
@@ -1779,15 +1804,12 @@ fn list_sessions_in_root(
     project_hash: &str,
     active: Option<&atomcode_capabilities::session::CatalogLocation>,
 ) -> std::io::Result<Vec<SessionSummary>> {
-    let mut entries: Vec<_> = catalog_scan_in_root(sessions_root)?
+    let entries = catalog_scan_in_root(sessions_root)?
         .entries
         .into_iter()
-        .filter(|entry| {
-            entry.project_bucket == project_hash
-                && catalog_entry_is_visible(sessions_root, entry, active)
-        })
+        .filter(|entry| entry.project_bucket == project_hash)
         .collect();
-    NativeSessionManager::collapse_fork_lineages(&mut entries);
+    let mut entries = visible_catalog_entries(sessions_root, entries, active);
     crate::legacy_convert::repair_catalog_names_for_display_in_root(sessions_root, &mut entries);
     Ok(entries
         .iter()
@@ -1813,12 +1835,11 @@ fn list_all_sessions_in_root(
     sessions_root: &std::path::Path,
     active: Option<&atomcode_capabilities::session::CatalogLocation>,
 ) -> std::io::Result<Vec<SessionMetaWithProject>> {
-    let mut entries: Vec<_> = catalog_scan_in_root(sessions_root)?
-        .entries
-        .into_iter()
-        .filter(|entry| catalog_entry_is_visible(sessions_root, entry, active))
-        .collect();
-    NativeSessionManager::collapse_fork_lineages(&mut entries);
+    let mut entries = visible_catalog_entries(
+        sessions_root,
+        catalog_scan_in_root(sessions_root)?.entries,
+        active,
+    );
     // Bound snapshot hydration to the same newest-50 surface the API returns.
     entries.truncate(50);
     crate::legacy_convert::repair_catalog_names_for_display_in_root(sessions_root, &mut entries);
@@ -2043,6 +2064,7 @@ async fn change_dir(
                 Some(prev) => prev.clone(),
                 None => {
                     return Json(ChangeDirResponse {
+                        session_id: None,
                         success: false,
                         message: "No previous directory to go back to".to_string(),
                         current_dir: project.working_dir.clone(),
@@ -2076,6 +2098,7 @@ async fn change_dir(
             // Check if directory exists
             if !resolved.exists() {
                 return Json(ChangeDirResponse {
+                    session_id: None,
                     success: false,
                     message: format!("Directory does not exist: {}", resolved.display()),
                     current_dir: project.working_dir.clone(),
@@ -2085,6 +2108,7 @@ async fn change_dir(
 
             if !resolved.is_dir() {
                 return Json(ChangeDirResponse {
+                    session_id: None,
                     success: false,
                     message: format!("Not a directory: {}", resolved.display()),
                     current_dir: project.working_dir.clone(),
@@ -2106,14 +2130,19 @@ async fn change_dir(
         // When a native live runtime is attached, it is the working-directory
         // owner. Reject the HTTP mutation if the runtime cannot accept the same
         // transition; otherwise the UI state and the executing runtime diverge.
+        let mut opened_session = None;
         if let Ok(previous_binding) = crate::native_live::binding() {
-            if let Err(error) = crate::native_live::change_directory(new_path.clone()).await {
-                return Json(ChangeDirResponse {
-                    success: false,
-                    message: format!("Runtime rejected directory change: {error:?}"),
-                    current_dir: project.working_dir.clone(),
-                    project_hash: hash_path(&project.working_dir),
-                });
+            match crate::native_live::change_directory(new_path.clone()).await {
+                Ok(changed) => opened_session = changed.session_id,
+                Err(error) => {
+                    return Json(ChangeDirResponse {
+                        session_id: None,
+                        success: false,
+                        message: format!("Runtime rejected directory change: {error:?}"),
+                        current_dir: project.working_dir.clone(),
+                        project_hash: hash_path(&project.working_dir),
+                    });
+                }
             }
             if let Some(session_id) = req
                 .session_id
@@ -2138,6 +2167,7 @@ async fn change_dir(
                         Err(error) => Some(format!("directory restore failed: {error:?}")),
                     };
                     return Json(ChangeDirResponse {
+                        session_id: None,
                         success: false,
                         message: match rollback_error {
                             Some(rollback) => format!(
@@ -2149,6 +2179,7 @@ async fn change_dir(
                         project_hash: hash_path(&project.working_dir),
                     });
                 }
+                opened_session = Some(session_id.to_string());
             }
         }
 
@@ -2178,6 +2209,7 @@ async fn change_dir(
         // MCP registry is loaded per-request based on working_dir, no need to reload here.
 
         Json(ChangeDirResponse {
+            session_id: opened_session,
             success: true,
             message: format!("Changed to {}", new_path.display()),
             current_dir: new_path,
@@ -8565,6 +8597,69 @@ mod tests {
             sessions[0].message_count, 0,
             "catalog meta remains canonical until turn completion"
         );
+        let projects = projects_from_catalog(
+            tmp.path(),
+            catalog_scan_in_root(tmp.path()).unwrap().entries,
+            None,
+        );
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].session_count, sessions.len());
+    }
+
+    #[test]
+    fn project_counts_match_visible_sessions_with_empty_and_fork_records() {
+        use atomcode_capabilities::session::{
+            CatalogLocation, ForkInfo, SessionManager, SessionMeta, StorageOwner,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let bucket = "0123456789abcdef";
+        let manager = SessionManager::with_root(tmp.path().join(bucket));
+        for (id, messages, fork) in [
+            ("unused-empty", 0, false),
+            ("active-empty", 0, false),
+            ("conversation", 1, false),
+            ("fork", 1, true),
+        ] {
+            let mut meta = SessionMeta::new(id, "/project", 1);
+            meta.owner = StorageOwner::Native;
+            meta.message_count = messages;
+            if fork {
+                meta.updated_at = 2;
+                meta.fork_info = Some(ForkInfo {
+                    root_id: "conversation".into(),
+                    parent_id: "conversation".into(),
+                    forked_at_ms: 2,
+                    base_message_count: 1,
+                    base_turn_count: 0,
+                });
+            }
+            manager.write_meta(&meta).unwrap();
+        }
+        let active = CatalogLocation {
+            id: "active-empty".into(),
+            project_bucket: bucket.into(),
+        };
+        for (active, expected) in [(Some(&active), 2), (None, 1)] {
+            let projects = projects_from_catalog(
+                tmp.path(),
+                catalog_scan_in_root(tmp.path()).unwrap().entries,
+                active,
+            );
+            let sessions = list_sessions_in_root(tmp.path(), bucket, active).unwrap();
+            assert_eq!(projects.len(), 1);
+            assert_eq!(projects[0].session_count, expected);
+            assert_eq!(projects[0].session_count, sessions.len());
+        }
+        let empty_bucket = "fedcba9876543210";
+        SessionManager::with_root(tmp.path().join(empty_bucket))
+            .write_meta(&SessionMeta::new("empty", "/empty-project", 1))
+            .unwrap();
+        let projects = projects_from_catalog(
+            tmp.path(),
+            catalog_scan_in_root(tmp.path()).unwrap().entries,
+            None,
+        );
+        assert!(projects.iter().all(|project| project.hash != empty_bucket));
     }
 
     #[test]

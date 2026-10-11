@@ -289,16 +289,24 @@ export function App() {
     setSidebarOpen(false);
   }
 
-  // 切换工作目录：侧栏按新目录过滤会话，并在该目录下新建一个会话（落地、侧栏可见）。
+  // 切换工作目录：复用运行时已打开的会话；独立网页服务才另外创建会话。
   // 也是「切换项目」下拉选中另一个项目时的入口（真正切进去，而非只浏览）。
-  function handlePickCwd(path: string) {
+  function handlePickCwd(path: string, openedSessionId?: string) {
     setSidebarOpen(false);
     setCwd(path);
-    // We don't know the new dir's bucket hash until the daemon creates a session
-    // there; clear it so the sidebar falls back to filtering by `cwd` in the
-    // meantime, then openNewSession's response re-pins projectHash.
-    setProjectHash('');
-    openNewSession(path || undefined);
+    // A same-directory /cd can retain the current session. Keep its metadata
+    // and physical bucket: the sessionId effect does not rerun for the same ID.
+    if (!openedSessionId || openedSessionId !== sessionId) setProjectHash('');
+    if (openedSessionId) {
+      // /cd already created (or retained) the runtime's session. The metadata
+      // effect resolves its physical bucket; do not create a second session.
+      setOptimisticSession(null);
+      setActiveSession((current) => current?.id === openedSessionId ? current : null);
+      setSessionId(openedSessionId);
+      setSessionListVersion((v) => v + 1);
+    } else {
+      openNewSession(path || undefined);
+    }
   }
 
   // The per-project "+" in the workspace tree: open a new session in that
