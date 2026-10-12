@@ -1,6 +1,7 @@
 import { marked } from 'marked';
 import DOMPurify from 'dompurify';
 import { useMemo } from 'preact/hooks';
+import { createMathExtensions } from '../lib/markdownMath';
 
 marked.setOptions({ gfm: true, breaks: false });
 
@@ -9,6 +10,11 @@ marked.setOptions({ gfm: true, breaks: false });
 // `1<del>3 …4</del>7`，吃掉波浪号且整段加删除线，与 TUI 显示不一致（issue #825）。
 // 覆盖 del tokenizer 返回 undefined → 波浪号回退为普通文本。
 marked.use({ tokenizer: { del: () => undefined } });
+
+// 数学渲染：解析期分词（$...$、$$...$$、\(...\)、\[...\]），详见 lib/markdownMath.ts。
+// 与上面 del 覆盖同理——在 marked 解析期处理，代码 span/围栏先于数学扩展的
+// tokenizer 保证原文不被吞（对比渲染后扫 DOM 的方案，见 markdownMath.ts 头注）。
+marked.use({ extensions: createMathExtensions() });
 
 // Custom code-block renderer → matches the ported .code-block-wrapper CSS.
 const renderer = new marked.Renderer();
@@ -43,7 +49,11 @@ function highlightHtml(html: string, search: string): string {
     
     const parent = textNode.parentNode;
     if (!parent) continue;
-    
+
+    // 数学子树不参与搜索高亮：往 KaTeX 的 MathML/排版 span 里插 <mark>
+    // 会破坏渲染结构，且 annotation 里的 TeX 原文高亮无意义。
+    if ((parent as HTMLElement).closest?.('.katex')) continue;
+
     const parentTag = (parent as HTMLElement).tagName?.toLowerCase();
     if (parentTag === 'script' || parentTag === 'style') continue;
 
@@ -73,7 +83,12 @@ export function Markdown({ content, search }: { content: string; search?: string
   const html = useMemo(() => {
     const raw = marked.parse(content ?? '', { renderer }) as string;
     // SECURITY: model output is untrusted — sanitize before injecting as HTML.
-    const sanitized = DOMPurify.sanitize(raw, { ADD_ATTR: ['data-copy'] });
+    // KaTeX 输出携带 MathML <semantics><annotation encoding="..."> 原 TeX
+    // （供无障碍/复制），DOMPurify 默认不放行这三个面，需显式 ADD。
+    const sanitized = DOMPurify.sanitize(raw, {
+      ADD_ATTR: ['data-copy', 'encoding'],
+      ADD_TAGS: ['semantics', 'annotation', 'maction'],
+    });
     if (search && search.trim()) {
       return highlightHtml(sanitized, search);
     }
