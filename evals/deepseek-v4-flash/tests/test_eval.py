@@ -30,6 +30,22 @@ class EvalTests(unittest.TestCase):
         self.assertNotIn("secret", value)
         self.assertNotIn("xyz", value)
 
+    def test_scrub_removes_secrets_in_json(self):
+        # events.jsonl is JSON Lines: both the key and the value are quoted there.
+        value = ev.scrub(
+            '{"token":"abc123","api_key": "secret456",'
+            ' "authorization": "Bearer xyz789",'
+            ' "url":"https://example.test/x?token=qrs012"}'
+        )
+        for secret in ("abc123", "secret456", "xyz789", "qrs012"):
+            self.assertNotIn(secret, value)
+        self.assertIn('"token":"[REDACTED]"', value)
+        self.assertIn('"api_key": "[REDACTED]"', value)
+        self.assertIn('"authorization": "Bearer [REDACTED]"', value)
+
+    def test_scrub_leaves_lookalike_keys_alone(self):
+        self.assertEqual(ev.scrub("token_count=5 tokens=42"), "token_count=5 tokens=42")
+
     def test_percentile_interpolates(self):
         self.assertEqual(ev.percentile([1, 2, 3, 4], .5), 2.5)
         self.assertIsNone(ev.percentile([], .95))
