@@ -20,10 +20,11 @@ use atomcode_kernel::agent::Agent;
 use atomcode_kernel::event::{AgentCommand, AgentEvent};
 use atomcode_kernel::stream::StreamEvent;
 use atomcode_kernel::testkit::{
-    ApprovalMiddleware, CountingTool, EchoTool, MockProvider, PartialStallThenProvider,
-    RecorderHook, RiskyWriteTool, ScriptedProvider, StallThenProvider,
+    ApprovalMiddleware, CountingTool, DeferredSteerProvider, EchoTool, MockProvider,
+    PartialStallThenProvider, RecorderHook, RecordingProvider, RiskyWriteTool, ScriptedProvider,
+    StallThenProvider,
 };
-use atomcode_kernel::tool::{ToolCall, ToolRegistry};
+use atomcode_kernel::tool::{Tool, ToolCall, ToolContext, ToolRegistry, ToolResult};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1026,5 +1027,435 @@ async fn transport_continuation_and_idle_timeout_share_one_recovery_budget() {
     assert_eq!(recoveries, 1);
     assert_eq!(provider.calls(), 2);
     assert_eq!(reason, atomcode_kernel::event::StopReason::Timeout);
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+}
+
+// Confirmed tool recovery uses a fresh request with paired, committed results.
+async fn confirmed_tool_case(
+    scripts: Vec<Vec<StreamEvent>>,
+) -> (Arc<RecordingProvider>, Vec<AgentEvent>, usize) {
+    let count = Arc::new(AtomicUsize::new(0));
+    let (provider, events) =
+        confirmed_tool_case_with(scripts, Arc::new(CountingTool::new(count.clone())), None).await;
+    (provider, events, count.load(Ordering::SeqCst))
+}
+
+async fn confirmed_tool_case_with(
+    scripts: Vec<Vec<StreamEvent>>,
+    tool: Arc<dyn Tool>,
+    cwd: Option<Arc<std::sync::RwLock<std::path::PathBuf>>>,
+) -> (Arc<RecordingProvider>, Vec<AgentEvent>) {
+    let provider = Arc::new(RecordingProvider::new(scripts));
+    let mut reg = ToolRegistry::new();
+    reg.register(tool);
+    let mut builder = Agent::builder()
+        .provider(provider.clone())
+        .tools(reg.mount(&["count"]));
+    if let Some(cwd) = cwd {
+        builder = builder.working_dir_shared(cwd);
+    }
+    let mut handle = builder.build().spawn();
+    handle.commands.send(send("go")).unwrap();
+    let events = tokio::time::timeout(OUTER_GUARD, async {
+        let mut events = Vec::new();
+        while let Some(event) = handle.events.recv().await {
+            let terminal = matches!(event, AgentEvent::TurnComplete { .. });
+            events.push(event);
+            if terminal {
+                break;
+            }
+        }
+        events
+    })
+    .await
+    .unwrap();
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    (provider, events)
+}
+
+fn count_round(id: &str, args: &str) -> Vec<StreamEvent> {
+    vec![
+        StreamEvent::ToolCall(tool_call(id, "count", args)),
+        StreamEvent::Done { truncated: false },
+    ]
+}
+
+fn interrupted_reasoning() -> Vec<StreamEvent> {
+    vec![
+        StreamEvent::Reasoning("considering the confirmed result".into()),
+        transport_interrupted(),
+    ]
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn confirmed_tool_result_allows_reasoning_transport_continuation() {
+    let (provider, events, count) = confirmed_tool_case(vec![
+        count_round("first", "{}"),
+        interrupted_reasoning(),
+        vec![
+            StreamEvent::TextDelta("finished".into()),
+            StreamEvent::Done { truncated: false },
+        ],
+    ])
+    .await;
+    assert_eq!(count, 1);
+    let requests = provider.recorded();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[2]
+        .0
+        .iter()
+        .any(|m| m.tool_call_id.as_deref() == Some("first") && m.text.contains("count#1")));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::StreamRecovery {
+            recovered: true,
+            ..
+        }
+    )));
+    assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })));
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn recovered_mutation_reuses_confirmed_receipt_with_new_call_id() {
+    let (provider, events, count) = confirmed_tool_case(vec![
+        count_round("first", r#"{"k":"v","extra":1}"#),
+        interrupted_reasoning(),
+        count_round("repeat", r#"{"extra":1,"k":"v"}"#),
+        vec![
+            StreamEvent::TextDelta("finished".into()),
+            StreamEvent::Done { truncated: false },
+        ],
+    ])
+    .await;
+    assert_eq!(
+        count, 1,
+        "canonical argument ordering must not repeat the mutation"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ToolStarted { .. }))
+            .count(),
+        1
+    );
+    let requests = provider.recorded();
+    assert_eq!(requests.len(), 4);
+    assert!(requests[3]
+        .0
+        .iter()
+        .any(|m| m.tool_call_id.as_deref() == Some("repeat")
+            && m.text.contains("tool not executed again")
+            && m.text.contains("count#1")));
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn confirmed_recovery_does_not_suppress_new_arguments_or_ordinary_repeats() {
+    for (interruption, second_args) in [(true, r#"{"k":"new"}"#), (false, "{}")] {
+        let mut scripts = vec![count_round("first", "{}")];
+        if interruption {
+            scripts.push(interrupted_reasoning());
+        }
+        scripts.push(count_round("second", second_args));
+        scripts.push(vec![
+            StreamEvent::TextDelta("finished".into()),
+            StreamEvent::Done { truncated: false },
+        ]);
+        let (_, _, count) = confirmed_tool_case(scripts).await;
+        assert_eq!(count, 2);
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn synthetic_or_mixed_tool_batch_cannot_authorize_reasoning_recovery() {
+    for calls in [
+        vec![
+            StreamEvent::ToolCall(tool_call("unknown", "missing", "{}")),
+            StreamEvent::Done { truncated: false },
+        ],
+        vec![
+            StreamEvent::ToolCall(tool_call("first", "count", "{}")),
+            StreamEvent::ToolCall(tool_call("unknown", "missing", "{}")),
+            StreamEvent::Done { truncated: false },
+        ],
+    ] {
+        let (provider, events, _) = confirmed_tool_case(vec![
+            calls,
+            interrupted_reasoning(),
+            vec![StreamEvent::Done { truncated: false }],
+        ])
+        .await;
+        assert_eq!(provider.recorded().len(), 2);
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::StreamRecovery { .. })));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::TurnComplete {
+                reason: atomcode_kernel::event::StopReason::ProviderError,
+                ..
+            }
+        )));
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn confirmed_results_do_not_authorize_unexecuted_calls_in_broken_stream() {
+    for pending in [
+        StreamEvent::ToolCall(tool_call("new", "count", "{}")),
+        StreamEvent::ToolCallDelta {
+            index: 0,
+            id: Some("new".into()),
+            name: Some("count".into()),
+            arguments: "{".into(),
+        },
+    ] {
+        let (provider, events, count) = confirmed_tool_case(vec![
+            count_round("first", "{}"),
+            vec![
+                StreamEvent::Reasoning("thinking".into()),
+                pending,
+                transport_interrupted(),
+            ],
+            vec![StreamEvent::Done { truncated: false }],
+        ])
+        .await;
+        assert_eq!(count, 1);
+        assert_eq!(provider.recorded().len(), 2);
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::StreamRecovery { .. })));
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn confirmed_tool_transport_continuation_is_still_bounded_once() {
+    let (provider, events, count) = confirmed_tool_case(vec![
+        count_round("first", "{}"),
+        interrupted_reasoning(),
+        interrupted_reasoning(),
+        vec![StreamEvent::Done { truncated: false }],
+    ])
+    .await;
+    assert_eq!(count, 1);
+    assert_eq!(provider.recorded().len(), 3);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(
+                e,
+                AgentEvent::StreamRecovery {
+                    recovered: false,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::TurnComplete {
+            reason: atomcode_kernel::event::StopReason::ProviderError,
+            ..
+        }
+    )));
+}
+
+struct RecoveryProbe {
+    count: Arc<AtomicUsize>,
+    failed: bool,
+    read_only: bool,
+    cwd: Option<Arc<std::sync::RwLock<std::path::PathBuf>>>,
+}
+
+#[async_trait::async_trait]
+impl Tool for RecoveryProbe {
+    fn name(&self) -> &str {
+        "count"
+    }
+    fn description(&self) -> &str {
+        "Recovery boundary probe"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type":"object"})
+    }
+    fn read_only_hint(&self) -> bool {
+        self.read_only
+    }
+    async fn execute(&self, _args: &str, ctx: &ToolContext) -> ToolResult {
+        let n = self.count.fetch_add(1, Ordering::SeqCst) + 1;
+        if n == 1 {
+            if let Some(cwd) = &self.cwd {
+                *cwd.write().unwrap() = std::path::PathBuf::from("/second-project");
+            }
+        }
+        ToolResult {
+            call_id: String::new(),
+            content: format!("count#{n} cwd={}", ctx.working_dir.display()),
+            is_error: self.failed,
+            images: vec![],
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn failed_actual_tool_result_cannot_authorize_reasoning_recovery() {
+    let count = Arc::new(AtomicUsize::new(0));
+    let (provider, events) = confirmed_tool_case_with(
+        vec![count_round("first", "{}"), interrupted_reasoning()],
+        Arc::new(RecoveryProbe {
+            count: count.clone(),
+            failed: true,
+            read_only: false,
+            cwd: None,
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.recorded().len(), 2);
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::StreamRecovery { .. })));
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn recovery_receipts_do_not_mask_fresh_reads_or_a_different_working_directory() {
+    for read_only in [true, false] {
+        let count = Arc::new(AtomicUsize::new(0));
+        let cwd = (!read_only).then(|| {
+            Arc::new(std::sync::RwLock::new(std::path::PathBuf::from(
+                "/first-project",
+            )))
+        });
+        let (_, events) = confirmed_tool_case_with(
+            vec![
+                count_round("first", "{}"),
+                interrupted_reasoning(),
+                count_round("second", "{}"),
+                vec![
+                    StreamEvent::TextDelta("finished".into()),
+                    StreamEvent::Done { truncated: false },
+                ],
+            ],
+            Arc::new(RecoveryProbe {
+                count: count.clone(),
+                failed: false,
+                read_only,
+                cwd: cwd.clone(),
+            }),
+            cwd,
+        )
+        .await;
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, AgentEvent::ToolStarted { .. }))
+                .count(),
+            2
+        );
+        if !read_only {
+            assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolResult { result } if result.call_id == "second" && result.content.contains("/second-project"))));
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn real_user_steer_clears_confirmed_recovery_receipts() {
+    let commands = Arc::new(std::sync::Mutex::new(None));
+    let provider = Arc::new(DeferredSteerProvider::new(
+        vec![
+            count_round("first", "{}"),
+            interrupted_reasoning(),
+            count_round("recovered", "{}"),
+            count_round("user_requested_repeat", "{}"),
+            vec![
+                StreamEvent::TextDelta("finished".into()),
+                StreamEvent::Done { truncated: false },
+            ],
+        ],
+        3,
+        "Run the operation again",
+        commands.clone(),
+    ));
+    let count = Arc::new(AtomicUsize::new(0));
+    let mut reg = ToolRegistry::new();
+    reg.register(Arc::new(CountingTool::new(count.clone())));
+    let mut handle = Agent::builder()
+        .provider(provider)
+        .tools(reg.mount(&["count"]))
+        .build()
+        .spawn();
+    *commands.lock().unwrap() = Some(handle.commands.clone());
+    handle.commands.send(send("go")).unwrap();
+    tokio::time::timeout(OUTER_GUARD, async {
+        while let Some(event) = handle.events.recv().await {
+            if matches!(event, AgentEvent::TurnComplete { .. }) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        2,
+        "a new user instruction must permit a real repeat"
+    );
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+}
+
+struct ReceiptAfterObserver(Arc<AtomicUsize>);
+#[async_trait::async_trait]
+impl atomcode_kernel::middleware::ToolMiddleware for ReceiptAfterObserver {
+    async fn after(
+        &self,
+        result: &mut ToolResult,
+        _tool: Option<&Arc<dyn Tool>>,
+    ) -> atomcode_kernel::middleware::AfterOutcome {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        result.content.push_str(" [observed]");
+        atomcode_kernel::middleware::AfterOutcome::Proceed
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn recovered_receipt_does_not_repeat_result_middleware_side_effects() {
+    let provider = Arc::new(RecordingProvider::new(vec![
+        count_round("first", "{}"),
+        interrupted_reasoning(),
+        count_round("recovered", "{}"),
+        vec![
+            StreamEvent::TextDelta("finished".into()),
+            StreamEvent::Done { truncated: false },
+        ],
+    ]));
+    let executions = Arc::new(AtomicUsize::new(0));
+    let observations = Arc::new(AtomicUsize::new(0));
+    let mut reg = ToolRegistry::new();
+    reg.register(Arc::new(CountingTool::new(executions.clone())));
+    let mut handle = Agent::builder()
+        .provider(provider.clone())
+        .tools(reg.mount(&["count"]))
+        .middleware(Arc::new(ReceiptAfterObserver(observations.clone())))
+        .build()
+        .spawn();
+    handle.commands.send(send("go")).unwrap();
+    tokio::time::timeout(OUTER_GUARD, async {
+        while let Some(event) = handle.events.recv().await {
+            if matches!(event, AgentEvent::TurnComplete { .. }) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(executions.load(Ordering::SeqCst), 1);
+    assert_eq!(observations.load(Ordering::SeqCst), 1);
+    assert!(provider.recorded()[3]
+        .0
+        .iter()
+        .any(|m| m.tool_call_id.as_deref() == Some("recovered")
+            && m.text.matches("[observed]").count() == 1));
     handle.commands.send(AgentCommand::Shutdown).unwrap();
 }

@@ -51,6 +51,8 @@ pub trait ToolMiddleware: Send + Sync {
     /// After a tool executes (or is blocked). Transform / observe the result in place
     /// (truncate / redact — CC's `updatedToolOutput`) and return an [`AfterOutcome`]
     /// CONTINUATION decision. Runs for every middleware in registration order.
+    /// A confirmed result reused during automatic recovery has already passed
+    /// this chain and is paired with the new call without invoking it again.
     ///
     /// `tool` is the resolved tool that produced the result, or `None` for results with
     /// no execution context (a blocked / stubbed / unknown-tool result). A transformer

@@ -84,6 +84,8 @@ pub struct RequestError {
     /// already describe work worth keeping, and discarding them means the retry
     /// starts from nothing. Carried here so a recovery policy can preserve it.
     pub partial: Option<Box<ModelResponse>>,
+    /// Any tool call or argument fragment in the failed stream is unexecuted.
+    pub unexecuted_tool_output: bool,
 }
 
 impl RequestError {
@@ -98,6 +100,7 @@ impl RequestError {
             empty_response: false,
             rate_limit_pause: None,
             partial: None,
+            unexecuted_tool_output: false,
         }
     }
 
@@ -113,11 +116,13 @@ impl RequestError {
             empty_response: false,
             rate_limit_pause: None,
             partial: None,
+            unexecuted_tool_output: false,
         }
     }
 
     /// Attach what the stream had produced before it broke.
     pub fn with_partial(mut self, partial: ModelResponse) -> Self {
+        self.unexecuted_tool_output |= !partial.tool_calls.is_empty();
         if !partial.text.is_empty()
             || !partial.tool_calls.is_empty()
             || !partial.reasoning.is_empty()

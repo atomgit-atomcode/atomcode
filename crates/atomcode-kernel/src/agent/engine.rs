@@ -136,7 +136,9 @@ const DEFAULT_MAX_PROVIDER_RETRIES: u32 = 3;
 /// `max_provider_retries` (which covers failures at OPEN, before any token).
 const MAX_STREAM_RETRIES: u32 = 5;
 const MAX_PARTIAL_STREAM_RECOVERIES: u32 = 1;
-const PARTIAL_STREAM_RESUME_NUDGE: &str = "[The previous assistant stream was interrupted after partial output. The preserved assistant message and any interrupted tool results above are authoritative. Continue from that saved progress. Do not repeat completed tool calls or restart the task.]";
+const MAX_RECOVERY_TOOL_RECEIPTS: usize = 128;
+const MAX_RECOVERY_RECEIPT_BYTES: usize = 8 * 1024 * 1024;
+const PARTIAL_STREAM_RESUME_NUDGE: &str = "[The previous assistant stream was interrupted. The preserved assistant messages and paired tool results above are authoritative. Continue from that saved progress. Do not repeat completed tool calls or restart the task.]";
 
 /// Safety fuse: maximum consecutive `WaitAndRetry` rate-limit sleeps within a
 /// single turn before the kernel forces a `Pause` stop (RateLimited), regardless
@@ -688,9 +690,20 @@ enum CallPlan {
 /// `CallPlan::Result` values have no execution context and therefore can never be
 /// candidates for exact-loop detection.
 struct ExecutedCallResult {
+    // A confirmed receipt has already passed the after-chain; do not run it twice.
+    reused: bool,
     result: ToolResult,
     effective_cwd: Option<std::path::PathBuf>,
     policy_intervention: Option<PolicyIntervention>,
+}
+
+// Per accepted turn only: never a persistence source or a replay queue.
+// The exact tool instance prevents receipts surviving a live catalog replacement.
+struct ConfirmedToolResult {
+    tool: std::sync::Arc<dyn crate::tool::Tool>,
+    arguments: String,
+    cwd: std::path::PathBuf,
+    result: ToolResult,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -2147,6 +2160,9 @@ impl RunningAgent {
         // Replaying that request can duplicate output or side effects, so recover at
         // most once by preserving it and opening a NEW continuation in this turn.
         let mut partial_stream_recoveries: u32 = 0;
+        let mut confirmed_tools: Vec<std::sync::Arc<ConfirmedToolResult>> = Vec::new();
+        let mut last_batch_confirmed = false;
+        let mut protect_recovered_tools = false;
         // One-shot marker consumed immediately after breaking out of the stalled
         // stream. Keep it separate from the turn-wide recovery counter: later 429
         // retries must retain their normal same-round accounting.
@@ -2272,6 +2288,9 @@ impl RunningAgent {
                 b.drain(..).collect()
             };
             if !steered.is_empty() {
+                confirmed_tools.clear();
+                last_batch_confirmed = false;
+                protect_recovered_tools = false;
                 // A real user steer changes the intent of the currently-running
                 // turn. Evidence collected before that intervention must not be
                 // compared with calls made in response to the new instruction.
@@ -2804,6 +2823,7 @@ impl RunningAgent {
                             if preserved_progress
                                 && partial_stream_recoveries < MAX_PARTIAL_STREAM_RECOVERIES
                             {
+                                protect_recovered_tools = last_batch_confirmed;
                                 partial_stream_recoveries += 1;
                                 self.rt.emit(AgentEvent::StreamRecovery {
                                     attempt: partial_stream_recoveries,
@@ -3089,12 +3109,12 @@ impl RunningAgent {
                     }
                     StreamEvent::Error(e) => {
                         // Transport recovery is a new continuation from saved
-                        // text, sharing the idle-timeout budget. A call delta
+                        // progress, sharing the idle-timeout budget. A call delta
                         // counts as tool output even before a complete call exists.
-                        let continue_text = e.code.as_deref()
+                        let continue_progress = e.code.as_deref()
                             == Some(crate::stream::STREAM_TRANSPORT_INTERRUPTED_CODE)
                             && e.http_status.is_none()
-                            && !assistant_text.trim().is_empty()
+                            && (!assistant_text.trim().is_empty() || last_batch_confirmed)
                             && !saw_tool_stream
                             && partial_stream_recoveries < MAX_PARTIAL_STREAM_RECOVERIES;
                         if saw_stream_content {
@@ -3107,7 +3127,8 @@ impl RunningAgent {
                                 suppress_internal_stream,
                             );
                         }
-                        if continue_text {
+                        if continue_progress {
+                            protect_recovered_tools = last_batch_confirmed;
                             partial_stream_recoveries += 1;
                             self.rt.emit(AgentEvent::StreamRecovery {
                                 attempt: partial_stream_recoveries,
@@ -3872,6 +3893,7 @@ impl RunningAgent {
             for (i, plan) in plans.iter().enumerate() {
                 if let CallPlan::Result { result: r, .. } = plan {
                     results[i] = Some(ExecutedCallResult {
+                        reused: false,
                         result: r.clone(),
                         effective_cwd: None,
                         policy_intervention: None,
@@ -3879,6 +3901,12 @@ impl RunningAgent {
                 }
             }
 
+            // One shared snapshot per batch; do not clone large receipts per call.
+            let recovery_receipts = std::sync::Arc::new(if protect_recovered_tools {
+                confirmed_tools.clone()
+            } else {
+                Vec::new()
+            });
             let mut ordered: FuturesOrdered<_> = FuturesOrdered::new();
             // Independent from user cancellation: a hard policy result stops
             // Execute plans that have not crossed their execution lock yet,
@@ -3910,6 +3938,7 @@ impl RunningAgent {
                 let parallel_safe = *parallel_safe;
                 let tool = tool.clone();
                 let call = call.clone();
+                let confirmed = recovery_receipts.clone();
                 ordered.push_back(async move {
                     let _permit = sem.acquire().await.expect("semaphore not closed");
                     // Read-lock ⇒ concurrent; write-lock ⇒ exclusive barrier.
@@ -3934,6 +3963,7 @@ impl RunningAgent {
                         return (
                             idx,
                             Some(ExecutedCallResult {
+                                reused: false,
                                 result: ToolResult {
                                     call_id: call.id.clone(),
                                     content: "blocked: another call in this batch terminated the turn by policy"
@@ -3955,6 +3985,31 @@ impl RunningAgent {
                             .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default()),
                         None => std::env::current_dir().unwrap_or_default(),
                     };
+                    // Match middleware-final arguments and execution-time cwd,
+                    // under the same barrier as execute. A known mutation in a
+                    // recovery is paired with its confirmed result, never rerun.
+                    if let Some(previous) = confirmed.iter().rev().find(|previous| {
+                        !parallel_safe
+                            && std::sync::Arc::ptr_eq(&previous.tool, &tool)
+                            && previous.arguments == canonicalize_tool_args(&call.arguments)
+                            && previous.cwd == effective_cwd
+                    }) {
+                        let mut result = previous.result.clone();
+                        result.call_id = call.id.clone();
+                        result.content = format!(
+                            "[Recovery: confirmed result reused; tool not executed again]\n{}",
+                            result.content,
+                        );
+                        return (
+                            idx,
+                            Some(ExecutedCallResult {
+                                reused: true,
+                                result,
+                                effective_cwd: Some(effective_cwd),
+                                policy_intervention: None,
+                            }),
+                        );
+                    }
                     let ctx = ToolContext {
                         working_dir: effective_cwd.clone(),
                         cancel: cancel.clone(),
@@ -4008,6 +4063,7 @@ impl RunningAgent {
                     (
                         idx,
                         Some(ExecutedCallResult {
+                            reused: false,
                             result: r,
                             effective_cwd: Some(effective_cwd),
                             policy_intervention,
@@ -4054,13 +4110,17 @@ impl RunningAgent {
                     }));
             let mut loop_calls = Vec::with_capacity(plans.len());
             let mut policy_denied = false;
+            let mut batch_confirmed = true;
+            let mut batch_evidence = Vec::new();
             for (plan, result_slot) in plans.iter().zip(results.iter_mut()) {
                 let Some(ExecutedCallResult {
+                    reused,
                     mut result,
                     effective_cwd,
                     policy_intervention: result_policy_intervention,
                 }) = result_slot.take()
                 else {
+                    batch_confirmed = false;
                     continue; // Skip plan (no result to apply)
                 };
                 if let Some(intervention) = result_policy_intervention {
@@ -4070,6 +4130,7 @@ impl RunningAgent {
                 // ToolMiddleware after-chain: transform / observe the result and
                 // collect any CONTINUATION decision. Middleware sees the RAW
                 // (uncapped) result. The first `Block` reason wins.
+                let execution_succeeded = !result.is_error;
                 let mut post_block: Option<String> = None;
                 // The resolved tool travels on the Execute plan; ready results (blocked /
                 // stub / unknown) have no tool. A result transformer keyed on tool
@@ -4079,9 +4140,13 @@ impl RunningAgent {
                     CallPlan::Execute { tool, .. } => Some(tool),
                     _ => None,
                 };
-                for mw in &self.middlewares {
-                    if let AfterOutcome::Block { reason } = mw.after(&mut result, plan_tool).await {
-                        post_block.get_or_insert(reason);
+                if !reused {
+                    for mw in &self.middlewares {
+                        if let AfterOutcome::Block { reason } =
+                            mw.after(&mut result, plan_tool).await
+                        {
+                            post_block.get_or_insert(reason);
+                        }
                     }
                 }
                 // KERNEL TOOL-RESULT SIZE CAP — the kernel's only built-in safety
@@ -4092,13 +4157,35 @@ impl RunningAgent {
                 // (deterministic → prefix-cache safe). The tiny `(cancelled)`/error
                 // stubs never reach the cap, so they pass through untouched.
                 cap_tool_result(&mut result, self.max_tool_result_bytes);
+                if !reused
+                    && execution_succeeded
+                    && !result.is_error
+                    && result.images.is_empty()
+                    && post_block.is_none()
+                    && !policy_denied
+                {
+                    if let (CallPlan::Execute { tool, call, .. }, Some(cwd)) =
+                        (plan, effective_cwd.as_ref())
+                    {
+                        batch_evidence.push(std::sync::Arc::new(ConfirmedToolResult {
+                            tool: tool.clone(),
+                            arguments: canonicalize_tool_args(&call.arguments),
+                            cwd: cwd.clone(),
+                            result: result.clone(),
+                        }));
+                    } else {
+                        batch_confirmed = false;
+                    }
+                } else {
+                    batch_confirmed = false;
+                }
 
                 // Build the fingerprint from what ACTUALLY executed and what the
                 // model will ACTUALLY see: middleware-final args, execution-time
                 // cwd, and the post-middleware, size-capped result. Success/failure
                 // is part of the identity: the same failed Bash call is also no
                 // progress. Image and post-blocked calls remain excluded.
-                if loop_candidate && result.images.is_empty() && post_block.is_none() {
+                if !reused && loop_candidate && result.images.is_empty() && post_block.is_none() {
                     if let (CallPlan::Execute { tool, call, .. }, Some(effective_cwd)) =
                         (plan, effective_cwd)
                     {
@@ -4165,6 +4252,24 @@ impl RunningAgent {
                 // every call is classified before ANY apply runs — so both keys are
                 // now inserted during classification. The record semantics are
                 // identical, just moved earlier; nothing to record here.
+            }
+            // Publish receipts only after the whole batch has been applied to
+            // authoritative conversation history. Errors, synthetic results,
+            // cancellation and policy stops never authorize tool recovery. Bound
+            // the additional per-turn cache; exceeding it fails closed.
+            last_batch_confirmed = batch_confirmed
+                && !batch_evidence.is_empty()
+                && !policy_denied
+                && !cancel.is_cancelled()
+                && confirmed_tools.len() + batch_evidence.len() <= MAX_RECOVERY_TOOL_RECEIPTS
+                && confirmed_tools
+                    .iter()
+                    .chain(batch_evidence.iter())
+                    .map(|r| r.arguments.len() + r.result.content.len())
+                    .sum::<usize>()
+                    <= MAX_RECOVERY_RECEIPT_BYTES;
+            if last_batch_confirmed {
+                confirmed_tools.extend(batch_evidence);
             }
             let loop_fingerprint = loop_candidate.then(|| {
                 loop_calls.sort();

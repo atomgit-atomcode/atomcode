@@ -263,6 +263,7 @@ async fn stream_once(
         .await
         .map_err(|e| RequestError::from_provider(&e))?;
     let mut out = ModelResponse::default();
+    let mut saw_tool_stream = false;
     loop {
         let next = match idle {
             Some(bound) => match tokio::time::timeout(bound, stream.next()).await {
@@ -271,7 +272,8 @@ async fn stream_once(
                 // streamed, so recovery can keep it.
                 Err(_) => {
                     return Err(RequestError {
-                        retryable: true,
+                        retryable: !saw_tool_stream,
+                        unexecuted_tool_output: saw_tool_stream,
                         code: Some(STREAM_IDLE_CODE.to_string()),
                         ..RequestError::message(format!(
                             "stream idle timeout: no event for {}ms",
@@ -323,13 +325,22 @@ async fn stream_once(
                 });
                 out.reasoning.push_str(&text);
             }
-            StreamEvent::ToolCall(call) => out.tool_calls.push(call),
+            StreamEvent::ToolCall(call) => {
+                saw_tool_stream = true;
+                out.tool_calls.push(call);
+            }
+            StreamEvent::ToolCallDelta { .. } => saw_tool_stream = true,
             StreamEvent::Usage(usage) => out.usage = Some(usage),
             // Hand back what was already produced: the tokens were paid for,
             // and a retry that starts from nothing repeats work the model has
             // already done.
             StreamEvent::Error(err) => {
-                return Err(RequestError::from_provider(&err).with_partial(out))
+                let mut error = RequestError::from_provider(&err).with_partial(out);
+                error.unexecuted_tool_output |= saw_tool_stream;
+                if saw_tool_stream {
+                    error.retryable = false;
+                }
+                return Err(error);
             }
             StreamEvent::Done { truncated } => out.truncated = truncated,
             _ => {}
@@ -1034,7 +1045,12 @@ impl Plugin for AgentLoopPlugin {
         // Resolved per round, and the turn runs without them: no system message
         // when there is no registry, no folded state when nothing projects, no
         // progress line or question for a tool when no front end drives it.
-        &["system-prompt", "session-projections", "tool-driver"]
+        &[
+            "system-prompt",
+            "session-projections",
+            "tool-driver",
+            "stream-recovery-progress",
+        ]
     }
     fn provides(&self) -> &'static [&'static str] {
         &["agent-loop"]

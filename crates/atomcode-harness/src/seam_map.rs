@@ -97,6 +97,7 @@ seam_catalog!(
     ModesSvc,
     GrantsSvc,
     ToolDriverSvc,
+    crate::plugins::recovery::Progress,
 );
 
 /// Slots the host fills itself.

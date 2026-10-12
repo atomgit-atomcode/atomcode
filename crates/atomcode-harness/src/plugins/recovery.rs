@@ -15,6 +15,9 @@
 //! over-window prompt unchanged is guaranteed to fail the same way.
 
 use std::sync::Arc;
+
+mod progress;
+pub(crate) use progress::Progress;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -540,7 +543,7 @@ repeat tool calls that already completed, and do not restart the task.";
 struct StreamRecovery {
     ctx: Context,
     max_recoveries: u32,
-    used: std::sync::atomic::AtomicU32,
+    progress: Arc<Progress>,
 }
 
 #[async_trait]
@@ -553,39 +556,48 @@ impl Waterfall<AgentRequest> for StreamRecovery {
         match next.run(req).await {
             Ok(response) => Ok(response),
             Err(error) => {
-                let Some(partial) = error.partial.clone() else {
-                    return Err(error);
-                };
-                let used = self.used.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                if used > self.max_recoveries {
-                    return Err(error);
-                }
                 let Some(session) = crate::agent::scoped(&self.ctx).service::<SessionSvc>() else {
                     return Err(error);
                 };
-
+                let confirmed = self.progress.confirmed(&session);
+                let transport = error.code.as_deref()
+                    == Some(atomcode_kernel::stream::STREAM_TRANSPORT_INTERRUPTED_CODE);
+                let idle = error.code.as_deref() == Some(super::agent_loop::STREAM_IDLE_CODE);
+                let has_text = error
+                    .partial
+                    .as_ref()
+                    .is_some_and(|p| !p.text.trim().is_empty());
+                let eligible = error.http_status.is_none()
+                    && (transport || idle)
+                    && !error.unexecuted_tool_output
+                    && (has_text || confirmed);
                 let turn = session.current_turn();
-                // Committed, not appended: a preserved message that never
-                // reaches the store would be missing from a resumed session
-                // while the model still believed it had said it.
-                crate::session::commit(
-                    &self.ctx,
-                    &session,
-                    SessionEvent::AssistantMessage {
-                        turn,
-                        round: req.round,
-                        text: partial.text.clone(),
-                        reasoning: partial.reasoning.clone(),
-                        // Tool calls are deliberately dropped: a call that was
-                        // still streaming has partial arguments, and one that
-                        // finished has no result recorded — either way the
-                        // model must re-issue it rather than have the harness
-                        // guess. The nudge says so.
-                        tool_calls: Vec::new(),
-                        reasoning_blocks: Vec::new(),
-                        meta: None,
-                    },
-                );
+                // Preserve safe text even when the budget is exhausted or tools
+                // were incomplete. Never commit unexecuted calls as real work.
+                if let Some(partial) = &error.partial {
+                    if !partial.text.is_empty() || !partial.reasoning.is_empty() {
+                        crate::session::commit(
+                            &self.ctx,
+                            &session,
+                            SessionEvent::AssistantMessage {
+                                turn,
+                                round: req.round,
+                                text: partial.text.clone(),
+                                reasoning: partial.reasoning.clone(),
+                                tool_calls: Vec::new(),
+                                reasoning_blocks: Vec::new(),
+                                meta: None,
+                            },
+                        );
+                    }
+                }
+                if !eligible
+                    || !self
+                        .progress
+                        .recover(&session, self.max_recoveries, confirmed)
+                {
+                    return Err(error);
+                }
                 crate::session::commit(
                     &self.ctx,
                     &session,
@@ -597,10 +609,10 @@ impl Waterfall<AgentRequest> for StreamRecovery {
                 );
                 notice(
                     &self.ctx,
-                    NoticeKind::StreamRecovered,
+                    NoticeKind::ProviderRetry,
                     format!(
                         "stream broke after partial output; preserved it and continuing \
-                         ({used}/{})",
+                         (bounded continuation; max {})",
                         self.max_recoveries
                     ),
                 );
@@ -616,7 +628,34 @@ impl Waterfall<AgentRequest> for StreamRecovery {
                     .collect();
                 messages.extend(session.derive_messages());
                 req.messages = messages;
-                next.run(req).await
+                let result = next.run(req).await;
+                match &result {
+                    Ok(_) => notice(
+                        &self.ctx,
+                        NoticeKind::StreamRecovered,
+                        "continued from saved progress".into(),
+                    ),
+                    Err(failure) => {
+                        if let Some(partial) = &failure.partial {
+                            if !partial.text.is_empty() || !partial.reasoning.is_empty() {
+                                crate::session::commit(
+                                    &self.ctx,
+                                    &session,
+                                    SessionEvent::AssistantMessage {
+                                        turn,
+                                        round: req.round,
+                                        text: partial.text.clone(),
+                                        reasoning: partial.reasoning.clone(),
+                                        tool_calls: Vec::new(),
+                                        reasoning_blocks: Vec::new(),
+                                        meta: None,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+                result
             }
         }
     }
@@ -629,16 +668,35 @@ impl Plugin for StreamRecoveryPlugin {
     fn name(&self) -> &'static str {
         "llm-stream-recovery"
     }
+    fn provides(&self) -> &'static [&'static str] {
+        &["stream-recovery-progress"]
+    }
     fn description(&self) -> &'static str {
         "keep what a broken stream produced and continue from it"
     }
     async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
         let row: StreamRow = parse(config)?;
+        let progress = Arc::new(Progress::default());
+        let _ = ctx
+            .provide::<Progress>(progress.clone())
+            .map_err(|e| e.to_string())?;
+        let observed = progress.clone();
+        let _ = ctx.on_emit::<crate::events::SessionEventCommitted>(
+            move |committed: &crate::session::Committed| match &committed.event {
+                SessionEvent::TurnStart { turn } | SessionEvent::UserMessage { turn, .. } => {
+                    observed.reset(&committed.session, *turn, false)
+                }
+                SessionEvent::TurnEnd { turn, .. } => {
+                    observed.reset(&committed.session, *turn, true)
+                }
+                _ => {}
+            },
+        );
         let _ = ctx.on_waterfall::<AgentRequest>(
             Arc::new(StreamRecovery {
                 ctx: ctx.clone(),
                 max_recoveries: row.max_recoveries,
-                used: std::sync::atomic::AtomicU32::new(0),
+                progress,
             }),
             false,
         );

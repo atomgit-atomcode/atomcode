@@ -135,6 +135,9 @@ impl Plugin for ParallelToolsPlugin {
     fn inject(&self) -> &'static [&'static str] {
         &["tools"]
     }
+    fn uses(&self) -> &'static [&'static str] {
+        &["stream-recovery-progress"]
+    }
     fn description(&self) -> &'static str {
         "overlap the tool calls that declare themselves safe to overlap"
     }

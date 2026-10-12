@@ -45,7 +45,8 @@ pub const STREAM_TRANSPORT_INTERRUPTED_CODE: &str = "stream_transport_interrupte
 /// A streaming failure surfaced by the provider. `retryable=true` =
 /// 429/5xx/timeout (the loop MAY retry later); `false` = terminal
 /// (auth/400/bad-request). A partial request is never replayed; the kernel may
-/// start one bounded continuation from saved text for the transport code above.
+/// start one bounded continuation from saved text or confirmed tool results for
+/// the transport code above. Incomplete/unexecuted tool output never authorizes it.
 #[derive(Clone, Debug, Default)]
 pub struct ProviderError {
     pub retryable: bool,

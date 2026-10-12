@@ -28,9 +28,32 @@ pub async fn execute_one(
     mut exec: ToolExec,
 ) -> ToolResult {
     let ctx = agent_ctx.clone();
-    agent_ctx
+    let session = crate::agent::scoped(agent_ctx).service::<crate::seams::SessionSvc>();
+    let recovery = agent_ctx.service::<crate::plugins::recovery::Progress>();
+    if cancel.is_cancelled() {
+        return error_result(&exec.call.id, "(cancelled before it started)");
+    }
+    if let (Some(progress), Some(log), Some(tool)) = (
+        &recovery,
+        &session,
+        agent_ctx
+            .service::<ToolsSvc>()
+            .and_then(|t| t.get(&exec.call.name)),
+    ) {
+        if let Some(receipt) = progress.reuse(log, &tool, &exec.call, &working_dir) {
+            // No execution: the committed receipt already passed gates and transforms.
+            return receipt;
+        }
+    }
+    // Only the execution terminal can certify success. A policy's synthetic
+    // result must never become proof that an operation actually ran.
+    let proof = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let executed = proof.clone();
+    let round = exec.round;
+    let result = agent_ctx
         .waterfall::<ToolsExecute, _>(&mut exec, move |exec| {
             let ctx = ctx.clone();
+            let executed = executed.clone();
             let cancel = cancel.clone();
             let working_dir = working_dir.clone();
             // The call as it stands AFTER the gates, arguments and all.
@@ -50,6 +73,23 @@ pub async fn execute_one(
                         ),
                     );
                 };
+                if let (Some(progress), Some(log)) = (
+                    ctx.service::<crate::plugins::recovery::Progress>(),
+                    crate::agent::scoped(&ctx).service::<crate::seams::SessionSvc>(),
+                ) {
+                    if let Some(receipt) = progress.reuse(&log, &tool, &call, &working_dir) {
+                        // A gate repaired the arguments into a completed mutation.
+                        // Fail closed here; outer result hooks must not observe a
+                        // fabricated second successful execution.
+                        return error_result(
+                            &call.id,
+                            &format!(
+                                "already completed during this turn; do not execute again. {}",
+                                receipt.content
+                            ),
+                        );
+                    }
+                }
                 // The agent's own token, not a fresh one: a long-running tool
                 // that polls `ctx.cancel` has to actually see a stop, or a
                 // cancel only takes effect after it finishes.
@@ -66,7 +106,7 @@ pub async fn execute_one(
                         _ => (ProgressSink::noop(), None),
                     };
                 let tool_ctx = ToolContext {
-                    working_dir,
+                    working_dir: working_dir.clone(),
                     cancel,
                     progress,
                     requester,
@@ -94,10 +134,24 @@ pub async fn execute_one(
                 let mut result = tool.execute(&call.arguments, &tool_ctx).await;
                 // Tools mint their own id-less results; pairing is the caller's.
                 result.call_id = call.id.clone();
+                if !result.is_error && result.images.is_empty() {
+                    *executed.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some((tool, call, working_dir));
+                }
                 result
             }) as BoxFuture<'_, ToolResult>
         })
-        .await
+        .await;
+    if !result.is_error && result.images.is_empty() {
+        if let (Some(progress), Some(log), Some((tool, call, cwd))) = (
+            recovery,
+            session,
+            proof.lock().unwrap_or_else(|e| e.into_inner()).take(),
+        ) {
+            progress.record(&log, round, tool, call, cwd, result.clone());
+        }
+    }
+    result
 }
 
 pub fn error_result(call_id: &str, message: &str) -> ToolResult {

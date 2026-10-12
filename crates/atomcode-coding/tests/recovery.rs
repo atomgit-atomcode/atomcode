@@ -769,6 +769,7 @@ impl Waterfall<AgentRequest> for BreaksMidStream {
         if n < self.break_times {
             return Err(RequestError {
                 retryable: true,
+                code: Some(atomcode_kernel::stream::STREAM_TRANSPORT_INTERRUPTED_CODE.into()),
                 ..RequestError::message("connection reset mid-stream")
             }
             .with_partial(ModelResponse {
@@ -872,5 +873,378 @@ async fn an_open_failure_has_nothing_to_preserve() {
     assert_eq!(
         injected, 0,
         "no resume nudge for a stream that never started"
+    );
+}
+
+// The shipping row assembly, using a real provider stream and tool terminal.
+struct StreamScript(Arc<atomcode_kernel::testkit::RecordingProvider>);
+#[async_trait]
+impl atomcode_plexus::Plugin for StreamScript {
+    fn name(&self) -> &'static str {
+        "recovery-stream-script"
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["llm"]
+    }
+    async fn apply(
+        &self,
+        ctx: &atomcode_plexus::Context,
+        _: &serde_json::Value,
+    ) -> Result<(), String> {
+        let _ = ctx
+            .provide::<atomcode_harness::seams::LlmSvc>(self.0.clone())
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+fn transport() -> atomcode_kernel::stream::StreamEvent {
+    atomcode_kernel::stream::StreamEvent::Error(atomcode_kernel::stream::ProviderError {
+        code: Some(atomcode_kernel::stream::STREAM_TRANSPORT_INTERRUPTED_CODE.into()),
+        message: "connection reset".into(),
+        ..Default::default()
+    })
+}
+fn completed_call(id: &str, name: &str) -> Vec<atomcode_kernel::stream::StreamEvent> {
+    use atomcode_kernel::{stream::StreamEvent, tool::ToolCall};
+    vec![
+        StreamEvent::ToolCall(ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: "{}".into(),
+        }),
+        StreamEvent::Done { truncated: false },
+    ]
+}
+fn finished() -> Vec<atomcode_kernel::stream::StreamEvent> {
+    use atomcode_kernel::stream::StreamEvent;
+    vec![
+        StreamEvent::TextDelta("finished".into()),
+        StreamEvent::Done { truncated: false },
+    ]
+}
+async fn streamed_app(
+    scripts: Vec<Vec<atomcode_kernel::stream::StreamEvent>>,
+    extra: &[&str],
+) -> (
+    App,
+    Arc<atomcode_kernel::testkit::RecordingProvider>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let dir = scratch("confirmed-stream");
+    let provider = Arc::new(atomcode_kernel::testkit::RecordingProvider::new(scripts));
+    let mut registry = atomcode_coding::on_harness::catalog();
+    registry.register(Arc::new(StreamScript(provider.clone())));
+    let mut layers =
+        vec!["[[patch]]\nid = \"llm\"\nname = \"recovery-stream-script\"\nconfig = {}"];
+    layers.extend_from_slice(extra);
+    let mut app = App::new(registry, tree(&dir, &layers));
+    app.start().await.unwrap();
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    app.context()
+        .require::<atomcode_harness::seams::ToolsSvc>()
+        .unwrap()
+        .register(Arc::new(atomcode_kernel::testkit::CountingTool::new(
+            count.clone(),
+        )))
+        .unwrap();
+    (app, provider, count)
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn shipping_rows_continue_after_confirmed_tools_without_repeating_mutations() {
+    use atomcode_kernel::stream::StreamEvent;
+    let (app, provider, count) = streamed_app(
+        vec![
+            completed_call("first", "count"),
+            vec![
+                StreamEvent::Reasoning("thinking after results".into()),
+                transport(),
+            ],
+            completed_call("repeat", "count"),
+            finished(),
+        ],
+        &[],
+    )
+    .await;
+    let outcome = run_turn(&app, "go").await.unwrap();
+    assert_eq!(outcome.stop, StopReason::Stopped);
+    assert_eq!(provider.recorded().len(), 4);
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    assert!(provider.recorded()[3]
+        .0
+        .iter()
+        .any(|m| m.tool_call_id.as_deref() == Some("repeat")
+            && m.text.contains("tool not executed again")));
+    let log = app.context().only_session().unwrap();
+    assert_eq!(
+        log.events()
+            .iter()
+            .filter(|e| matches!(e.event, SessionEvent::ToolStarted { .. }))
+            .count(),
+        1
+    );
+    atomcode_harness::session::assert_model_visible_is_logged(&log, &provider.recorded()[3].0)
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn shipping_rows_refuse_unexecuted_calls_and_preserve_safe_text() {
+    use atomcode_kernel::{stream::StreamEvent, tool::ToolCall};
+    for pending in [
+        StreamEvent::ToolCall(ToolCall {
+            id: "new".into(),
+            name: "count".into(),
+            arguments: "{}".into(),
+        }),
+        StreamEvent::ToolCallDelta {
+            index: 0,
+            id: Some("new".into()),
+            name: Some("count".into()),
+            arguments: "{".into(),
+        },
+    ] {
+        let (app, provider, count) = streamed_app(
+            vec![
+                completed_call("first", "count"),
+                vec![
+                    StreamEvent::TextDelta("safe partial".into()),
+                    pending,
+                    transport(),
+                ],
+                finished(),
+            ],
+            &[],
+        )
+        .await;
+        assert_eq!(
+            run_turn(&app, "go").await.unwrap().stop,
+            StopReason::ProviderError
+        );
+        assert_eq!(provider.recorded().len(), 2);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert!(app
+            .context()
+            .only_session()
+            .unwrap()
+            .derive_messages()
+            .iter()
+            .any(|m| m.text == "safe partial"));
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn shipping_rows_need_actual_results_and_a_typed_transport_error() {
+    use atomcode_kernel::stream::{ProviderError, StreamEvent};
+    for (name, code) in [("missing", true), ("count", false)] {
+        let error = if code {
+            transport()
+        } else {
+            StreamEvent::Error(ProviderError {
+                message: "logical failure".into(),
+                ..Default::default()
+            })
+        };
+        let (app, provider, _) = streamed_app(
+            vec![
+                completed_call("first", name),
+                vec![StreamEvent::Reasoning("thinking".into()), error],
+                finished(),
+            ],
+            &[],
+        )
+        .await;
+        assert_eq!(
+            run_turn(&app, "go").await.unwrap().stop,
+            StopReason::ProviderError
+        );
+        assert_eq!(provider.recorded().len(), 2);
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn shipping_rows_bound_recovery_and_keep_both_partial_replies() {
+    use atomcode_kernel::stream::StreamEvent;
+    let (app, provider, _) = streamed_app(
+        vec![
+            vec![StreamEvent::TextDelta("first partial".into()), transport()],
+            vec![StreamEvent::TextDelta("second partial".into()), transport()],
+            finished(),
+        ],
+        &[],
+    )
+    .await;
+    assert_eq!(
+        run_turn(&app, "go").await.unwrap().stop,
+        StopReason::ProviderError
+    );
+    assert_eq!(provider.recorded().len(), 2);
+    let messages = app.context().only_session().unwrap().derive_messages();
+    assert!(messages.iter().any(|m| m.text == "first partial"));
+    assert!(messages.iter().any(|m| m.text == "second partial"));
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn shipping_recovery_budget_resets_for_each_accepted_turn() {
+    use atomcode_kernel::stream::StreamEvent;
+    let (app, provider, _) = streamed_app(
+        vec![
+            vec![StreamEvent::TextDelta("first".into()), transport()],
+            finished(),
+            vec![StreamEvent::TextDelta("second".into()), transport()],
+            finished(),
+        ],
+        &[],
+    )
+    .await;
+    assert_eq!(
+        run_turn(&app, "one").await.unwrap().stop,
+        StopReason::Stopped
+    );
+    assert_eq!(
+        run_turn(&app, "two").await.unwrap().stop,
+        StopReason::Stopped
+    );
+    assert_eq!(provider.recorded().len(), 4);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn removing_shipping_recovery_row_removes_tool_continuation() {
+    use atomcode_kernel::stream::StreamEvent;
+    let (app, provider, count) = streamed_app(
+        vec![
+            completed_call("first", "count"),
+            vec![StreamEvent::Reasoning("thinking".into()), transport()],
+            finished(),
+        ],
+        &["[[remove]]\nid = \"llm-stream-recovery\""],
+    )
+    .await;
+    assert_eq!(
+        run_turn(&app, "go").await.unwrap().stop,
+        StopReason::ProviderError
+    );
+    assert_eq!(provider.recorded().len(), 2);
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
+struct BatchRedaction;
+#[async_trait]
+impl Waterfall<atomcode_harness::events::ToolsExecuteBatch> for BatchRedaction {
+    async fn handle(
+        &self,
+        batch: &mut atomcode_harness::events::ToolBatch,
+        next: Next<'_, atomcode_harness::events::ToolsExecuteBatch>,
+    ) -> Vec<atomcode_kernel::tool::ToolResult> {
+        let mut results = next.run(batch).await;
+        for result in &mut results {
+            result.content = result.content.replace("count#1", "[redacted]");
+        }
+        results
+    }
+}
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn shipping_reuse_preserves_committed_batch_redaction() {
+    use atomcode_kernel::stream::StreamEvent;
+    let (app, provider, count) = streamed_app(
+        vec![
+            completed_call("first", "count"),
+            vec![StreamEvent::Reasoning("thinking".into()), transport()],
+            completed_call("repeat", "count"),
+            finished(),
+        ],
+        &[],
+    )
+    .await;
+    let _guard = app
+        .context()
+        .on_waterfall::<atomcode_harness::events::ToolsExecuteBatch>(
+            Arc::new(BatchRedaction),
+            false,
+        );
+    assert_eq!(
+        run_turn(&app, "go").await.unwrap().stop,
+        StopReason::Stopped
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    let calls = provider.recorded();
+    let receipt = calls[3]
+        .0
+        .iter()
+        .find(|m| m.tool_call_id.as_deref() == Some("repeat"))
+        .unwrap();
+    assert!(receipt.text.contains("[redacted]"));
+    assert!(!receipt.text.contains("count#1"));
+}
+
+struct SyntheticToolSuccess;
+#[async_trait]
+impl Waterfall<atomcode_harness::events::ToolsExecute> for SyntheticToolSuccess {
+    async fn handle(
+        &self,
+        exec: &mut atomcode_harness::events::ToolExec,
+        _: Next<'_, atomcode_harness::events::ToolsExecute>,
+    ) -> atomcode_kernel::tool::ToolResult {
+        atomcode_kernel::tool::ToolResult {
+            call_id: exec.call.id.clone(),
+            content: "synthetic success".into(),
+            is_error: false,
+            images: vec![],
+        }
+    }
+}
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_synthetic_success_is_not_confirmed_execution() {
+    use atomcode_kernel::stream::StreamEvent;
+    let (app, provider, count) = streamed_app(
+        vec![
+            completed_call("first", "count"),
+            vec![StreamEvent::Reasoning("thinking".into()), transport()],
+            finished(),
+        ],
+        &[],
+    )
+    .await;
+    let _guard = app
+        .context()
+        .on_waterfall::<atomcode_harness::events::ToolsExecute>(
+            Arc::new(SyntheticToolSuccess),
+            false,
+        );
+    assert_eq!(
+        run_turn(&app, "go").await.unwrap().stop,
+        StopReason::ProviderError
+    );
+    assert_eq!(provider.recorded().len(), 2);
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn shipping_transport_and_idle_failures_share_one_continuation_budget() {
+    use atomcode_kernel::stream::{ProviderError, StreamEvent};
+    let (app, provider, _) = streamed_app(
+        vec![
+            vec![StreamEvent::TextDelta("first".into()), transport()],
+            vec![
+                StreamEvent::TextDelta("second".into()),
+                StreamEvent::Error(ProviderError {
+                    code: Some(atomcode_harness::plugins::agent_loop::STREAM_IDLE_CODE.into()),
+                    message: "idle timeout".into(),
+                    retryable: true,
+                    ..Default::default()
+                }),
+            ],
+            finished(),
+        ],
+        &[],
+    )
+    .await;
+    assert_eq!(
+        run_turn(&app, "go").await.unwrap().stop,
+        StopReason::Timeout
+    );
+    assert_eq!(
+        provider.recorded().len(),
+        2,
+        "the plain retry must not replay partial work"
     );
 }

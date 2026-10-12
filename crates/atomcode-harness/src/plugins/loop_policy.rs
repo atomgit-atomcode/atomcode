@@ -319,6 +319,8 @@ impl Waterfall<AgentRequest> for Retry {
                     let nothing_to_add = error.empty_response && req.answering_a_nudge;
                     let worth_retrying = !error.is_fatal()
                         && !nothing_to_add
+                        && error.partial.is_none()
+                        && !error.unexecuted_tool_output
                         && (error.retryable || error.empty_response)
                         // A rate limit and an overflow each have a dedicated
                         // handler that knows how to make the next attempt
