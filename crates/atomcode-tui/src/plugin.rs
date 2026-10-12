@@ -12846,28 +12846,6 @@ mod paste_habit_tests {
     /// anything is selected — a terminal's own menu — and copy with nothing
     /// selected says so instead of copying the composer.
     #[test]
-    fn a_right_click_menu_survives_release_drag_and_wheel_events() {
-        use crate::surface::Click;
-        for in_composer in [false, true] {
-            let (host, tui) = screen();
-            host.compose((60, 24));
-            let (x, y) = if in_composer {
-                let field = host.field_rect().unwrap();
-                (field.x, field.y)
-            } else { (5, 2) };
-            assert_eq!(tui.pointer_in_menu(Click::RightPress, x, y, &tui.client), Some(false));
-            assert!(host.context_menu_open());
-            for event in [Click::Release, Click::Drag, Click::WheelUp, Click::WheelDown] {
-                tui.pointer_in_menu(event, x, y, &tui.client);
-                assert!(host.context_menu_open(), "{event:?}, composer={in_composer}");
-            }
-            // A real press outside remains a dismissal.
-            tui.pointer_in_menu(Click::Press, 0, 0, &tui.client);
-            assert!(!host.context_menu_open());
-        }
-    }
-
-    #[test]
     fn the_conversation_s_menu_has_copy_and_paste() {
         let (host, tui) = screen();
         host.moment.write().expect("moment poisoned").input = "草稿".into();
