@@ -84,6 +84,14 @@ test('escaped \\$ is not a delimiter', () => {
   assert.equal(matchInlineMath('$a\\$b$')?.tex, 'a\\$b');
 });
 
+test('closing dollar uses backslash parity, including a final TeX row break', () => {
+  assert.equal(matchInlineMath(String.raw`$x\\$`)?.tex, String.raw`x\\`);
+  assert.equal(matchInlineMath(String.raw`$x\\\$`), null);
+  const html = render(String.raw`$x\\$`);
+  assert.ok(html.includes('class="katex"'), html);
+  assert.ok(!html.includes('katex-error'), html);
+});
+
 // ---------- matchBlockMath：块级 ----------
 
 test('matches a multi-line $$...$$ block', () => {
@@ -140,6 +148,33 @@ test('code fences and code spans are immune (claude.ai bug regression)', () => {
   const spans = render('运行 `${FOO}` 与 `${BAR}` 两个变量');
   assert.ok(!spans.includes('katex'), spans);
   assert.ok(spans.includes('<code>'));
+});
+
+test('raw HTML code and keyboard text stay literal, with math resuming afterwards', () => {
+  for (const tag of ['code', 'kbd']) {
+    const raw = `<${tag}>$x$ and $$y$$</${tag}>`;
+    const html = render(raw + ' 后面的公式 $z$');
+    assert.ok(html.includes(raw), html);
+    assert.equal((html.match(/class="katex"/g) ?? []).length, 1, html);
+  }
+});
+
+test('invalid TeX falls back to the complete escaped source for all delimiters', () => {
+  for (const raw of [
+    String.raw`$\frac{1}{$`,
+    String.raw`$$ \frac{1}{ $$`,
+    String.raw`\( \frac{1}{ \)`,
+    String.raw`\[ \frac{1}{ \]`,
+  ]) {
+    const html = render(raw);
+    assert.ok(html.includes(`<code class="math-fallback">${raw}</code>`), html);
+    assert.ok(!html.includes('katex-error'), html);
+  }
+  const raw = String.raw`$\frac{<img src=x onerror=alert(1)> &}{$`;
+  const html = render(raw);
+  assert.ok(html.includes('math-fallback'), html);
+  assert.ok(html.includes('&lt;img src=x onerror=alert(1)&gt; &amp;'), html);
+  assert.ok(!html.includes('<img'), html);
 });
 
 test('currency prose renders without math', () => {

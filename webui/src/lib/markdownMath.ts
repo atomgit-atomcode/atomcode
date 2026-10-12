@@ -22,6 +22,12 @@ export interface MathMatch {
   display: boolean;
 }
 
+function isEscaped(src: string, at: number): boolean {
+  let backslashes = 0;
+  for (let i = at - 1; i >= 0 && src[i] === '\\'; i--) backslashes++;
+  return backslashes % 2 === 1;
+}
+
 /** 行内数学：$...$、$$...$$、\(...\)、\[...\]，必须匹配在 src 起点处。 */
 export function matchInlineMath(src: string): MathMatch | null {
   if (!src) return null;
@@ -60,7 +66,7 @@ export function matchInlineMath(src: string): MathMatch | null {
     // 单 $ 公式不跨行；遇反引号立即放弃（代码保护）。
     if (c === '\n' || c === '`') return null;
     if (c !== '$') continue;
-    if (src[i - 1] === '\\') continue; // \$ 转义不是闭定界符
+    if (isEscaped(src, i)) continue; // 奇数个反斜杠才转义 $，\\ 是 TeX 换行
     if (/\s/.test(src[i - 1])) continue; // 闭定界符前不能是空白
     const after = src[i + 1];
     if (after !== undefined && /[\d$]/.test(after)) continue; // 后不能是数字或 $
@@ -87,16 +93,16 @@ export function matchBlockMath(src: string): MathMatch | null {
 }
 
 /** KaTeX 渲染；失败时降级为转义后的原文，绝不吞内容。 */
-function renderKatex(tex: string, display: boolean): string {
+function renderKatex(tex: string, display: boolean, raw: string): string {
   try {
     return katex.renderToString(tex, {
       displayMode: display,
-      throwOnError: false,
+      throwOnError: true,
       strict: 'ignore',
       trust: false,
     });
   } catch {
-    const esc = tex.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const esc = raw.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     return `<code class="math-fallback">${esc}</code>`;
   }
 }
@@ -105,9 +111,7 @@ function renderKatex(tex: string, display: boolean): string {
 function firstUnescapedDollar(src: string): number {
   let i = -1;
   while ((i = src.indexOf('$', i + 1)) >= 0) {
-    let backslashes = 0;
-    for (let j = i - 1; j >= 0 && src[j] === '\\'; j--) backslashes++;
-    if (backslashes % 2 === 1) continue; // \$ 转义
+    if (isEscaped(src, i)) continue; // \$ 转义
     return i;
   }
   return -1;
@@ -146,7 +150,7 @@ export function createMathExtensions(): (TokenizerExtension & RendererExtension)
     },
     renderer(token: Tokens.Generic) {
       const t = token as MathToken;
-      return renderKatex(t.math, t.display);
+      return renderKatex(t.math, t.display, t.raw);
     },
   };
 
@@ -157,6 +161,8 @@ export function createMathExtensions(): (TokenizerExtension & RendererExtension)
       return minIndex(firstUnescapedDollar(src), src.indexOf('\\('), src.indexOf('\\['));
     },
     tokenizer(src: string) {
+      // 扩展先于内置 tokenizer 执行；HTML code/kbd 等原文区必须主动跳过。
+      if (this.lexer.state.inRawBlock) return undefined;
       const hit = matchInlineMath(src);
       if (!hit) return undefined;
       const token: MathToken = {
@@ -170,7 +176,7 @@ export function createMathExtensions(): (TokenizerExtension & RendererExtension)
     },
     renderer(token: Tokens.Generic) {
       const t = token as MathToken;
-      return renderKatex(t.math, t.display);
+      return renderKatex(t.math, t.display, t.raw);
     },
   };
 

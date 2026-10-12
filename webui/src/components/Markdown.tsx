@@ -12,8 +12,8 @@ marked.setOptions({ gfm: true, breaks: false });
 marked.use({ tokenizer: { del: () => undefined } });
 
 // 数学渲染：解析期分词（$...$、$$...$$、\(...\)、\[...\]），详见 lib/markdownMath.ts。
-// 与上面 del 覆盖同理——在 marked 解析期处理，代码 span/围栏先于数学扩展的
-// tokenizer 保证原文不被吞（对比渲染后扫 DOM 的方案，见 markdownMath.ts 头注）。
+// 扩展先于内置 tokenizer 执行；它只消费数学起点，并跳过 HTML 原文区，
+// 让代码 span/围栏由内置 tokenizer 消费（见 markdownMath.ts）。
 marked.use({ extensions: createMathExtensions() });
 
 // Custom code-block renderer → matches the ported .code-block-wrapper CSS.
