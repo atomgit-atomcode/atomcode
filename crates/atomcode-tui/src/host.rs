@@ -2536,7 +2536,15 @@ impl Host {
         }
         let row = (first - room.y) as i64;
         let short = row + 1 + grew - room.h as i64;
-        let down = short.clamp(0, row);
+        let mut down = short.clamp(0, row);
+        // Opening a large block can make its prompt leave the viewport and
+        // activate the header. Keep the opened lid below that reserved row.
+        let mut projected = self.moment.read().expect("moment poisoned").clone();
+        projected.scroll.0 = (projected.scroll.0 as i64 - down).max(0) as usize;
+        let heights = self.tail_heights(room.w, &projected);
+        let pane = Self::pane_geometry(room, projected.scroll.0, &heights);
+        let reserved = i64::from(self.prompt_header(&pane, &projected).is_some());
+        down = down.min((row - reserved).max(0));
         if down > 0 {
             let mut m = self.moment.write().expect("moment poisoned");
             m.scroll = crate::moment::ScrollPos((m.scroll.0 as i64 - down).max(0) as usize);
@@ -5728,6 +5736,60 @@ impl Host {
         }
     }
 
+    /// Find the prompt belonging to the first visible block, not necessarily
+    /// the newest turn. The header is chrome: it never enters the event log,
+    /// row index, transcript export or selectable block coordinates.
+    fn prompt_header(&self, pane: &Pane, moment: &Moment) -> Option<Line> {
+        let rect = pane.block_rect;
+        if rect.h < 4 || rect.w < 16 {
+            return None;
+        }
+        let stream = self.stream.read().expect("stream poisoned");
+        let pres = self.presentation.read().expect("presentation poisoned");
+        let ctx = crate::block::RenderCtx {
+            width: rect.w,
+            caps: crate::block::ShapeCaps::of(&moment.caps),
+        };
+        let index = self.row_index(&ctx, stream.slots(), &pres, moment.activity);
+        let distance = pane
+            .block_scroll
+            .saturating_add(rect.h as usize)
+            .min(index.total);
+        // The suffix table is sorted: jump to the viewport rather than scanning
+        // every block on every token in a long session.
+        let first = index.skip_from[1..].partition_point(|passed| *passed >= distance);
+        let first =
+            (first..index.rows.len()).find(|i| index.rows[*i].is_some_and(|row| row.rows > 0))?;
+        if stream.slots()[first].block().kind() == "user" {
+            return None;
+        }
+        // A reserved row must not push the reading position into the next
+        // prompt while still labeling it with the preceding turn.
+        let reduced =
+            index.skip_from[1..].partition_point(|passed| *passed >= distance.saturating_sub(1));
+        if (reduced..index.rows.len())
+            .find(|i| index.rows[*i].is_some_and(|row| row.rows > 0))
+            .is_some_and(|i| stream.slots()[i].block().kind() == "user")
+        {
+            return None;
+        }
+        (0..first).rev().find_map(|i| {
+            let block = stream.slots()[i].block();
+            (block.kind() == "user" && index.rows[i].is_some_and(|row| row.rows > 0))
+                .then(|| block.content.prompt_header(rect.w))
+                .flatten()
+        })
+    }
+
+    fn reserve_prompt_header(&self, pane: &mut Pane, moment: &Moment) -> Option<Line> {
+        let header = self.prompt_header(pane, moment)?;
+        pane.block_rect.y += 1;
+        pane.block_rect.h -= 1;
+        pane.scroll_rect.y += 1;
+        pane.scroll_rect.h = pane.scroll_rect.h.saturating_sub(1);
+        Some(header)
+    }
+
     /// Render the stream's tail into `rect`.
     ///
     /// Blocks are rendered newest-first until the rect is full, then reversed —
@@ -6108,7 +6170,12 @@ impl Host {
                     // is why every layout in this build still composes the same
                     // frame it did before the split existed.
                     let heights = self.tail_heights_of(&tail, rect.w, &moment);
-                    let pane = Self::pane_geometry(rect, moment.scroll.0, &heights);
+                    let mut pane = Self::pane_geometry(rect, moment.scroll.0, &heights);
+                    let header_rect =
+                        Rect::new(pane.block_rect.x, pane.block_rect.y, pane.block_rect.w, 1);
+                    if let Some(header) = self.reserve_prompt_header(&mut pane, &moment) {
+                        frame.place("stream.prompt", header_rect, vec![header]);
+                    }
                     // A selection held by what it covers is drawn where that is
                     // now — this frame's window onto it.
                     if let Some(sel) = moment.stream_selection {
@@ -6453,7 +6520,11 @@ impl Host {
     /// term the stream scrolls off its own top and the region goes blank, which
     /// reads as the conversation having been lost.
     pub fn stream_rows(&self, size: (u16, u16), moment: &Moment) -> u16 {
-        self.stream_room(size, moment).h
+        let room = self.stream_room(size, moment);
+        let heights = self.tail_heights(room.w, moment);
+        let pane = Self::pane_geometry(room, moment.scroll.0, &heights);
+        room.h
+            .saturating_sub(u16::from(self.prompt_header(&pane, moment).is_some()))
     }
 
     /// The box the conversation gets on a screen of `size`.
@@ -6710,7 +6781,8 @@ impl Host {
                 _ => None,
             })?;
         let heights = self.tail_heights_of(&tail, rect.w, moment);
-        let pane = Self::pane_geometry(rect, moment.scroll.0, &heights);
+        let mut pane = Self::pane_geometry(rect, moment.scroll.0, &heights);
+        self.reserve_prompt_header(&mut pane, moment);
         Some(BlockView {
             rect: pane.block_rect,
             scroll: pane.block_scroll,
@@ -13041,6 +13113,60 @@ mod tests {
         h.presentation.write().unwrap().set_block(id, false);
         let shown = stream_rows(&h, (120, 40)).join("\n");
         assert!(shown.contains("CURRENT FILE DETAIL"), "{shown}");
+    }
+
+    #[test]
+    fn prompt_header_follows_the_visible_turn_and_is_not_transcript_content() {
+        let h = host();
+        let say = |turn, text: &str| {
+            h.absorb(&SessionEvent::UserMessage {
+                turn,
+                text: text.into(),
+                images: Vec::new(),
+            })
+        };
+        let answer = |turn| {
+            h.absorb(&SessionEvent::AssistantMessage {
+                turn,
+                round: 1,
+                text: (0..40).map(|n| format!("answer {n}\n")).collect(),
+                reasoning: String::new(),
+                tool_calls: Vec::new(),
+                reasoning_blocks: Vec::new(),
+                meta: None,
+            })
+        };
+        say(1, "First question");
+        answer(1);
+        say(2, "Second question\nwith long details");
+        answer(2);
+        let frame = h.compose((40, 15));
+        let header = frame
+            .part("stream.prompt")
+            .expect("long turn pins its prompt");
+        assert_eq!(header.lines.len(), 1);
+        assert!(header.lines[0].plain().contains("Second question"));
+        assert!(h.compose((15, 15)).part("stream.prompt").is_none());
+        assert!(h.compose((40, 3)).part("stream.prompt").is_none());
+        let moment = h.moment.read().unwrap().clone();
+        let view = h.block_view((40, 15), &moment).unwrap();
+        assert_eq!(frame.part("stream").unwrap().rect, view.rect);
+        let exported = h
+            .transcript_lines(40, &moment)
+            .iter()
+            .map(Line::plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(exported.matches("Second question").count(), 1);
+        // Scroll through the second prompt to the preceding answer.
+        h.moment.write().unwrap().scroll.0 = 55;
+        let frame = h.compose((40, 15));
+        assert!(frame.part("stream.prompt").unwrap().lines[0]
+            .plain()
+            .contains("First question"));
+        let limit = h.scroll_limit((40, 15), &h.moment.read().unwrap());
+        h.moment.write().unwrap().scroll.0 = limit;
+        assert!(h.compose((40, 15)).part("stream.prompt").is_none());
     }
 
     /// A host holding exactly one finished tool call, folded, with the given

@@ -664,6 +664,31 @@ impl Content for UserSaid {
     fn kind(&self) -> &'static str {
         "user"
     }
+    fn prompt_header(&self, width: u16) -> Option<Line> {
+        let mut chars = self.0.chars();
+        let prefix: String = chars.by_ref().take(512).collect();
+        let omitted = chars.next().is_some();
+        let clean = crate::text::for_buffer(&prefix);
+        let mut text = clean.split_whitespace().collect::<Vec<_>>().join(" ");
+        if text.is_empty() {
+            return None;
+        }
+        if omitted {
+            text.push('…');
+        }
+        let room = (width as usize).saturating_sub(2);
+        let text = clip(&text, room);
+        input_bar(
+            &text,
+            width,
+            &format!("{} ", Caps::default().g(Glyph::Prompt)),
+            None,
+            user(),
+        )
+        .into_iter()
+        .next()
+    }
+
     fn content_hash(&self) -> ContentHash {
         hash_of(&["user", &self.0])
     }
@@ -6171,5 +6196,21 @@ mod edit_mismatch_display_tests {
             };
             assert!(block.always_open());
         }
+    }
+}
+
+#[cfg(test)]
+mod prompt_header_tests {
+    use super::*;
+    #[test]
+    fn prompt_summary_is_one_sanitized_row_with_width_aware_elision() {
+        let prompt = UserSaid("\x1b[31m中文问题\r\n后续内容 ".repeat(100));
+        let hash = prompt.content_hash();
+        let header = prompt.prompt_header(20).unwrap();
+        assert!(header.width() <= 20);
+        assert!(header.plain().contains('…'));
+        assert!(!header.plain().contains('\x1b'));
+        assert!(!header.plain().contains('\n'));
+        assert_eq!(prompt.content_hash(), hash);
     }
 }

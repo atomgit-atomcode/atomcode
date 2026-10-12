@@ -180,6 +180,11 @@ pub trait Content: Send + Sync + std::fmt::Debug {
     /// See `docs/adr/0025`.
     fn lines(&self, ctx: &RenderCtx) -> Vec<Line>;
 
+    /// Presentation-only context for a user prompt that has scrolled above the view.
+    fn prompt_header(&self, _width: u16) -> Option<Line> {
+        None
+    }
+
     /// The text this block is growing, when it can only ever grow.
     ///
     /// A streaming answer is one block whose text is appended to and never
