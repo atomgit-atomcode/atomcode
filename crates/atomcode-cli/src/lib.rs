@@ -412,7 +412,7 @@ pub mod tui_front {
             value: toml_edit::Item,
         ) -> Result<(), String> {
             atomcode_config::store::ConfigStore::new(&self.path)
-                .update_document(|document| {
+                .update_document_with_snapshot(|document, snapshot| {
                     let section = if document
                         .get("models")
                         .and_then(|models| models.get(selection))
@@ -428,6 +428,17 @@ pub mod tui_front {
                     } else {
                         anyhow::bail!("no persistent configuration entry for model `{selection}`");
                     };
+                    if key == "reasoning_effort" {
+                        let effort = value.as_str().expect("effort is stored as a string");
+                        let provider = snapshot
+                            .and_then(|snapshot| snapshot.config.provider_config_for_selection(selection))
+                            .ok_or_else(|| anyhow::anyhow!("cannot resolve persistent model `{selection}`"))?;
+                        if atomcode_config::config::clamp_effort_to_levels(
+                            Some(effort), provider.reasoning_effort_levels.as_deref(),
+                        ).is_none() {
+                            anyhow::bail!("reasoning effort `{effort}` is no longer allowed for model `{selection}`");
+                        }
+                    }
                     document[section][selection][key] = value;
                     Ok(())
                 })
@@ -787,6 +798,35 @@ model = "vendor-b"
                 if selection == "p" {
                     assert!(before.contains("reasoning_effort = \"low\""), "other provider is unchanged");
                 }
+            }
+        }
+
+        #[test]
+        fn effort_save_checks_the_latest_disk_levels() {
+            use atomcode_kernel::provider::ReasoningEffort;
+            for (selection, source, section) in [
+                ("p", "default_provider = \"p\"\n[providers.p]\ntype = \"openai\"\nmodel = \"custom\"\nbase_url = \"http://localhost/v1\"\n", "providers"),
+                ("custom/a", CONFIG, "models"),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("config.toml");
+                std::fs::write(&path, source).unwrap();
+                let file = ConfigFile { path: path.clone(), working_dir: dir.path().into(), telemetry: None, skip_permissions: false, provider_override: None };
+                file.set_reasoning_effort(selection, Some(ReasoningEffort::High)).unwrap();
+                atomcode_config::store::ConfigStore::new(&path).update_document(|document| {
+                    let mut levels = toml_edit::Array::new();
+                    levels.push("low");
+                    document[section][selection]["reasoning_effort_levels"] = toml_edit::value(levels);
+                    Ok(())
+                }).unwrap();
+                let before = std::fs::read_to_string(&path).unwrap();
+                let error = file.set_reasoning_effort(selection, Some(ReasoningEffort::High)).unwrap_err();
+                assert!(error.contains("no longer allowed"), "{error}");
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+                file.set_reasoning_effort(selection, Some(ReasoningEffort::Low)).unwrap();
+                assert_eq!(file.for_model(selection).unwrap().chat_options.reasoning_effort, Some(ReasoningEffort::Low));
+                file.set_reasoning_effort(selection, None).unwrap();
+                assert_eq!(file.for_model(selection).unwrap().chat_options.reasoning_effort, None);
             }
         }
 

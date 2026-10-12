@@ -133,6 +133,15 @@ impl ConfigStore {
     where
         F: FnOnce(&mut DocumentMut) -> Result<()>,
     {
+        self.update_document_with_snapshot(|document, _| mutate(document))
+    }
+
+    /// Patch a document using the latest typed snapshot under the same lock.
+    /// Validation failures leave the file untouched. An absent file has no snapshot.
+    pub fn update_document_with_snapshot<F>(&self, mutate: F) -> Result<ConfigCommit>
+    where
+        F: FnOnce(&mut DocumentMut, Option<&ConfigSnapshot>) -> Result<()>,
+    {
         self.with_lock(false, |disk| {
             let source = match std::fs::read_to_string(&self.path) {
                 Ok(source) => source,
@@ -146,7 +155,7 @@ impl ConfigStore {
             let mut document = source.parse::<DocumentMut>().with_context(|| {
                 format!("Failed to parse config document: {}", self.path.display())
             })?;
-            mutate(&mut document)?;
+            mutate(&mut document, disk.as_ref())?;
             let content = document.to_string();
             let snapshot = self.persist_document_locked(&content)?;
 
