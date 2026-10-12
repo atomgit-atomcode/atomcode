@@ -1557,6 +1557,7 @@ pub enum Msg<'a> {
     AskAttachedImages {
         count: usize,
     },
+    EditTextMismatch,
     OutcomeInterrupted,
     OutcomeFailedWith {
         first: &'a str,

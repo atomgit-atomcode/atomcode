@@ -79,7 +79,11 @@ impl Tool for EditFileTool {
          (including whitespace and indentation) and, unless `replace_all` is true, must \
          be UNIQUE in the file — include enough surrounding context to make it unique. \
          On no-match or an ambiguous match the file is left UNCHANGED. Relative paths \
-         resolve against the working directory."
+         resolve against the working directory. Use the latest read_file output, omit \
+         its line-number prefixes, and choose a short unique fragment. Do not build \
+         old_string from memory or reuse text from before another edit. After a no-match, \
+         rebuild old_string from the returned CURRENT text or re-read the file; never \
+         repeat the same failed arguments."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({

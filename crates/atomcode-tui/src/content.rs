@@ -1042,6 +1042,15 @@ pub struct ToolCallBlock {
 }
 
 impl ToolCallBlock {
+    /// Only the editor's explicit no-match result is recoverable here. Permission,
+    /// encoding, IO and ambiguous-match failures retain their ordinary display.
+    pub(crate) fn edit_text_mismatch(&self) -> bool {
+        self.name == "edit_file"
+            && matches!(&self.outcome, Outcome::Failed(text)
+                if text.starts_with("edit_file: old_string not found in ")
+                    && text.contains("The file was NOT modified."))
+    }
+
     fn mark(&self) -> (&'static str, Style) {
         match &self.outcome {
             Outcome::Pending => ("⋯", tool()),
@@ -2005,6 +2014,24 @@ impl Content for ToolCallBlock {
     /// you scan past, and a lid that grew a row per wrapped command would cost the
     /// whole run it hides.
     fn summary_lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+        if self.edit_text_mismatch() {
+            let w = ctx.width;
+            if w == 0 {
+                return Vec::new();
+            }
+            let caps = Caps::default();
+            let lead = format!("{} ", caps.g(Glyph::ToolMark));
+            let mut rows = self.opening_rows(
+                w,
+                &lead,
+                self.mark().1,
+                self.folded_reason_style(),
+                self.folded_style(),
+            );
+            let gutter = format!("{}{} ", " ".repeat(GUTTER), caps.g(Glyph::Gutter));
+            rows.extend(wrapped(&t(Msg::EditTextMismatch), w, muted(), &gutter));
+            return rows;
+        }
         if self.reason().is_none() {
             return vec![self.summary(ctx)];
         }
@@ -2175,7 +2202,7 @@ impl Content for ToolCallBlock {
     /// the rest of the turn, and a summary would hide the most consequential
     /// thing on the screen.
     fn always_open(&self) -> bool {
-        look(&self.name).always_open
+        look(&self.name).always_open && !self.edit_text_mismatch()
     }
 
     /// It is one, which is how the host gets at the call behind the lid.
@@ -6096,5 +6123,53 @@ mod recap_block_tests {
             .filter(|s| !s.text.trim().is_empty())
             .all(|s| s.style.fg == muted().fg));
         assert!(block.always_open());
+    }
+}
+
+#[cfg(test)]
+mod edit_mismatch_display_tests {
+    use super::*;
+    #[test]
+    fn edit_no_match_folds_but_keeps_the_full_result() {
+        let detail = "edit_file: old_string not found in a.md. The file was NOT modified.\n--- current lines 1-2 ---\nCURRENT CONTENT\n--- end current lines ---";
+        let block = ToolCallBlock {
+            call_id: "edit-1".into(),
+            name: "edit_file".into(),
+            args: r#"{"file_path":"a.md"}"#.into(),
+            outcome: Outcome::Failed(detail.into()),
+            dir: None,
+        };
+        assert!(!block.always_open());
+        let hash = block.content_hash();
+        let folded = block.summary_lines(&RenderCtx::bare(100));
+        assert!(!folded
+            .iter()
+            .any(|line| line.plain().contains("CURRENT CONTENT")));
+        assert!(folded
+            .iter()
+            .any(|line| line.plain().contains(&*t(Msg::EditTextMismatch))));
+        assert!(block
+            .lines(&RenderCtx::bare(100))
+            .iter()
+            .any(|line| line.plain().contains("CURRENT CONTENT")));
+        assert_eq!(block.content_hash(), hash);
+        assert!(matches!(&block.outcome, Outcome::Failed(text) if text == detail));
+    }
+    #[test]
+    fn other_edit_errors_and_success_remain_open() {
+        for outcome in [
+            Outcome::Failed("edit_file: cannot read a.md: permission denied".into()),
+            Outcome::Failed("edit_file: old_string appears 2 times".into()),
+            Outcome::Ok("Edited a.md".into()),
+        ] {
+            let block = ToolCallBlock {
+                call_id: "edit-2".into(),
+                name: "edit_file".into(),
+                args: r#"{"file_path":"a.md"}"#.into(),
+                outcome,
+                dir: None,
+            };
+            assert!(block.always_open());
+        }
     }
 }

@@ -874,7 +874,11 @@ fn window_into(
 /// the skill is named on the summary row, and what recedes is a document the
 /// agent fetched, not a change it made — see `Look::always_open`.
 fn behind_a_lid(block: &crate::block::Block) -> bool {
-    block.kind() == "tool_call" && !block.content.always_open()
+    block.kind() == "tool_call"
+        && !block.content.always_open()
+        // A refused edit remains its own visible row, so its recovery hint is
+        // not swallowed by the neighbouring calls' group count.
+        && !block.content.as_tool_call().is_some_and(|call| call.edit_text_mismatch())
 }
 
 /// Whether this slot is a call the screen actually draws, and so a member of a
@@ -12998,6 +13002,45 @@ mod tests {
                 .any(|r| r.contains("3 个工具") || r.contains("4 个工具")),
             "a lid swallowed the question:\n{rows:#?}"
         );
+    }
+
+    #[test]
+    fn an_edit_mismatch_is_short_by_default_and_opens_without_losing_detail() {
+        let h = host();
+        h.absorb(&SessionEvent::AssistantMessage {
+            turn: 1,
+            round: 1,
+            text: String::new(),
+            reasoning: String::new(),
+            tool_calls: vec![atomcode_kernel::tool::ToolCall {
+                id: "edit-mismatch".into(),
+                name: "edit_file".into(),
+                arguments: r#"{"file_path":"a.md"}"#.into(),
+            }],
+            reasoning_blocks: Vec::new(),
+            meta: None,
+        });
+        h.absorb(&SessionEvent::ToolResultLogged {
+            turn: 1, round: 1, call_id: "edit-mismatch".into(),
+            content: "edit_file: old_string not found in a.md. The file was NOT modified.\nCURRENT FILE DETAIL".into(),
+            is_error: true, images: Vec::new(),
+        });
+        let shown = stream_rows(&h, (120, 40)).join("\n");
+        assert!(shown.contains("原文未匹配"), "{shown}");
+        assert!(!shown.contains("CURRENT FILE DETAIL"), "{shown}");
+        let id = h
+            .stream
+            .read()
+            .unwrap()
+            .slots()
+            .iter()
+            .find(|slot| slot.block().content.as_tool_call().is_some())
+            .unwrap()
+            .block()
+            .id;
+        h.presentation.write().unwrap().set_block(id, false);
+        let shown = stream_rows(&h, (120, 40)).join("\n");
+        assert!(shown.contains("CURRENT FILE DETAIL"), "{shown}");
     }
 
     /// A host holding exactly one finished tool call, folded, with the given

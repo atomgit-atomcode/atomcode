@@ -927,6 +927,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::VerbMemory => "记忆".into(),
         Msg::VerbAsk => "提问".into(),
         Msg::AskAttachedImages { count } => format!("附 {count} 张图").into(),
+        Msg::EditTextMismatch => "原文未匹配，文件未修改；需按当前内容重试 · 点击查看详情".into(),
         Msg::OutcomeInterrupted => "已中断".into(),
         Msg::OutcomeFailedWith { first } => format!("失败 · {first}").into(),
         Msg::OutcomeLines { lines } => format!("{lines} 行").into(),

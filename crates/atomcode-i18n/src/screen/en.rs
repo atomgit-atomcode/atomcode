@@ -991,6 +991,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             1 => "1 image attached".into(),
             n => format!("{n} images attached").into(),
         },
+        Msg::EditTextMismatch => "Original text did not match; file unchanged. Retry with current text · click for details".into(),
         Msg::OutcomeInterrupted => "stopped".into(),
         Msg::OutcomeFailedWith { first } => format!("failed · {first}").into(),
         Msg::OutcomeLines { lines } => format!("{lines} lines").into(),
