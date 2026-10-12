@@ -630,13 +630,13 @@ impl Rows {
 /// An unchanged row here is neither encoded nor written; its previous payload
 /// is carried over verbatim.
 ///
-/// `lines[i]` is the whole row as drawn, which is what the comparison is on: a
-/// part covering a cell later than another part is what wins, exactly as the
-/// encoder resolves it. `rows` is the result — row payloads the terminal can be
+/// `lines[i]` keeps every part drawing into the row, with its column and width,
+/// in paint order. Comparing all contributions is conservative even when a
+/// later part covers an earlier one. `rows` is the result — row payloads that can be
 /// given one at a time, plus the trailing cursor sequence.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Lines {
-    lines: Vec<Line>,
+    lines: Vec<Vec<(u16, u16, Line)>>,
     rows: Rows,
 }
 
@@ -649,17 +649,18 @@ impl Lines {
     pub fn of(frame: &Frame, caps: crate::caps::Caps, prev: Option<&Lines>) -> Lines {
         let w = frame.size.w;
         let h = frame.size.h as usize;
-        // What each row is drawn as, later parts over earlier — the same
-        // resolution `encode_rows` performs, kept as values rather than bytes so
-        // the comparison below costs no formatting.
-        let mut lines: Vec<Line> = vec![Line::empty(); h];
+        // Retain every positioned contribution in paint order. A scrollbar or
+        // overlay may share a row with the body: comparing only the last part
+        // hides changes in the rest of the row. Include columns and clipping
+        // widths so moving an unchanged part also invalidates its payload.
+        let mut lines: Vec<Vec<(u16, u16, Line)>> = vec![Vec::new(); h];
         for part in &frame.parts {
             for (dy, line) in part.lines.iter().enumerate() {
                 if dy >= part.rect.h as usize {
                     break;
                 }
                 if let Some(slot) = lines.get_mut(part.rect.y as usize + dy) {
-                    *slot = line.clone();
+                    slot.push((part.rect.x, part.rect.w, line.clone()));
                 }
             }
         }
@@ -998,6 +999,33 @@ mod tests {
             "an identical frame re-encoded a row"
         );
         assert!(again.patch_from(Some(&first)).is_empty());
+    }
+
+    #[test]
+    fn a_stationary_scrollbar_does_not_hide_changed_body_rows() {
+        let caps = crate::caps::Caps::default();
+        let frame = |text: &str, x: u16| {
+            let mut f = Frame::new(20, 2);
+            f.place("body", Rect::new(x, 0, 18 - x, 1), vec![Line::raw(text)]);
+            f.place(
+                "scrollbar",
+                Rect::new(19, 0, 1, 2),
+                vec![Line::raw("│"), Line::raw("█")],
+            );
+            f
+        };
+        let first = Lines::of(&frame("old paragraph", 0), caps, None);
+        let moved_frame = frame("new paragraph", 0);
+        let next = Lines::of(&moved_frame, caps, Some(&first));
+        assert_eq!(next.full(), encode_rows(&moved_frame, caps).full());
+        assert!(next.patch_from(Some(&first)).contains("new paragraph"));
+        let shifted_frame = frame("new paragraph", 1);
+        let shifted = Lines::of(&shifted_frame, caps, Some(&next));
+        assert_eq!(shifted.full(), encode_rows(&shifted_frame, caps).full());
+        assert!(!shifted.patch_from(Some(&next)).is_empty());
+        assert!(Lines::of(&shifted_frame, caps, Some(&shifted))
+            .patch_from(Some(&shifted))
+            .is_empty());
     }
 
     #[test]

@@ -1408,9 +1408,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "That one has to be typed on this machine. From there you can use:".into()
         }
         Msg::UsageUnknown { why } => format!("Could not find out what is left: {why}").into(),
-        Msg::CopyHandedOver => {
-            "Could not confirm copying. The terminal was asked to copy; it may not allow clipboard access.".into()
-        }
+        Msg::CopyHandedOver => "Copy request sent. Paste to confirm.".into(),
         Msg::CopyCouldNotStart => "Copy could not start. Please retry after the current copy finishes.".into(),
         Msg::CopyLocalUnavailable => "Could not confirm copying. On Ubuntu Wayland, install wl-clipboard (sudo apt install wl-clipboard), then retry; or use Ctrl+G to release the mouse and copy through the terminal.".into(),
         Msg::ContextNoPrompt => "This host assembles no system prompt.".into(),
