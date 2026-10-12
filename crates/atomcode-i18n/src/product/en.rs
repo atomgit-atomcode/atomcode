@@ -1061,7 +1061,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::OfflineModeActive =>
             "Offline mode: web tools, telemetry, and auto-update are disabled.".into(),
         Msg::PluginHooksUntrusted { count, names } => format!(
-            "{count} plugin(s) ship untrusted hooks ({names}) — they won't run. Trust: atomcode plugin trust <name>"
+            "Hooks from {count} plugin(s) are not trusted ({names}) and will not run. Enter /plugin trust <name> to authorize them."
         ).into(),
         Msg::PluginInstalling { plugin, marketplace } =>
             format!("installing `{plugin}@{marketplace}`…").into(),

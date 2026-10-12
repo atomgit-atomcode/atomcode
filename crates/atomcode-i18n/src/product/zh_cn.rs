@@ -1032,7 +1032,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::OfflineModeActive =>
             "离线模式：已停用联网工具、遥测与自动更新。".into(),
         Msg::PluginHooksUntrusted { count, names } => format!(
-            "{count} 个插件带未信任的 hook（{names}）—— 不会运行。运行 atomcode plugin trust <name> 授权。"
+            "{count} 个插件的 hook 尚未获信任（{names}），这些 hook 不会运行。输入 /plugin trust <插件名> 授权。"
         ).into(),
         Msg::PluginInstalling { plugin, marketplace } =>
             format!("正在安装 `{plugin}@{marketplace}`…").into(),

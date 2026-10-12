@@ -8937,6 +8937,7 @@ impl Tui {
     /// else's words. Between turns nothing else writes, so it is echoed at
     /// once, and a slow command shows it was taken.
     fn run_typed_command(&self, line: &str) {
+        self.host.remember_command(line);
         // A successful `/goal <condition>` immediately opens a real turn whose
         // first UserMessage is that same condition. Echoing the slash command as
         // well leaves two full-width input bars for one gesture. Hold this one
@@ -12701,6 +12702,15 @@ mod midturn_command_tests {
         let before = kinds(&host).len();
         tui.run_typed_command("/no-such-command");
         assert_eq!(
+            host.moment
+                .read()
+                .unwrap()
+                .history
+                .last()
+                .map(String::as_str),
+            Some("/no-such-command")
+        );
+        assert_eq!(
             kinds(&host).len(),
             before,
             "nothing in the conversation before the answer: {:?}",
@@ -12722,6 +12732,15 @@ mod midturn_command_tests {
         let (host, tui, mut woken) = screen();
         let before = kinds(&host).len();
         tui.run_typed_command("/no-such-command");
+        assert_eq!(
+            host.moment
+                .read()
+                .unwrap()
+                .history
+                .last()
+                .map(String::as_str),
+            Some("/no-such-command")
+        );
         assert_eq!(&kinds(&host)[before..], &["user"]);
         answered(&mut woken).await;
         assert_eq!(&kinds(&host)[before..], &["user", "command"]);

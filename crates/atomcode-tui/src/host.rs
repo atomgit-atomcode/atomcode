@@ -5391,6 +5391,31 @@ impl Host {
         );
     }
 
+    /// Recall a submitted command without retaining credential arguments.
+    pub(crate) fn remember_command(&self, line: &str) {
+        let line = line.trim();
+        if line.is_empty() {
+            return;
+        }
+        let recalled = match line.split_once(char::is_whitespace) {
+            Some((name, _))
+                if self
+                    .commands
+                    .find(name.trim_start_matches('/'))
+                    .is_some_and(|command| command.secret_args) =>
+            {
+                name
+            }
+            _ => line,
+        };
+        let mut moment = self.moment.write().expect("moment poisoned");
+        if moment.history.last().map(String::as_str) != Some(recalled) {
+            moment.history.push(recalled.to_owned());
+        }
+        moment.history_at = None;
+        moment.draft.clear();
+    }
+
     /// Put a command the person typed in the conversation, as the bar a sent
     /// message gets — the way `atomcode-tuix` echoes it. Without it the answer
     /// (`正在接 OpenRouter…`) stands under a question nobody can see.
@@ -7378,6 +7403,12 @@ mod tests {
         }
         let h = host();
         h.commands.add(Arc::new(Keyed)).unwrap();
+        h.remember_command("/connect sk-or-v1-SECRET");
+        h.remember_command("/rename my session");
+        assert_eq!(
+            h.moment.read().unwrap().history,
+            ["/connect", "/rename my session"]
+        );
         h.echo_command("/connect sk-or-v1-SECRET");
         h.echo_command("/rename my session");
         use crate::block::Content as _;
