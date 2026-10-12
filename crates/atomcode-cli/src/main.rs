@@ -54,7 +54,7 @@ use atomcode_telemetry::{
     notice, CliOverride, CurrentContext, Event, Telemetry,
 };
 
-/// Set to `true` at the start of `run_headless` so the panic hook and the
+/// Set during CLI parsing for headless requests so startup errors, the panic hook and the
 /// top-level error handler can skip TUI cleanup. In headless mode raw mode
 /// was never enabled, so calling `disable_raw_mode` would be a wasted ioctl
 /// and on Windows can panic if the console handle isn't a real TTY.
@@ -1585,6 +1585,55 @@ async fn async_main() {
     }
 }
 
+/// Apply an optional first-run seed, then validate only explicitly selected paths.
+/// Default paths may remain absent for onboarding; metadata failures retain their cause.
+fn prepare_config_file(
+    config_path: &std::path::Path,
+    explicit: bool,
+    seed_source: Option<&std::path::Path>,
+) -> Result<()> {
+    match atomcode_config::config::Config::seed_user_config(config_path, seed_source) {
+        atomcode_config::config::SeedOutcome::Seeded => {
+            if let Some(src) = seed_source {
+                eprintln!(
+                    "[seed] initialized {} from {}",
+                    config_path.display(),
+                    src.display()
+                );
+            }
+        }
+        atomcode_config::config::SeedOutcome::Invalid(e) => {
+            eprintln!("Warning: --seed-config ignored (not a valid config): {e}");
+        }
+        atomcode_config::config::SeedOutcome::IoError(e) => {
+            eprintln!("Warning: --seed-config could not be applied: {e}");
+        }
+        // AlreadyConfigured / NoSource → nothing to do, stay quiet.
+        _ => {}
+    }
+
+    if explicit {
+        let exists = config_path.try_exists().map_err(|error| {
+            anyhow::Error::new(error).context(format!(
+                "failed to inspect config file: {}",
+                config_path.display()
+            ))
+        })?;
+        if !exists {
+            anyhow::bail!("config file not found: {}", config_path.display());
+        }
+    }
+    Ok(())
+}
+
+fn config_seed_source(seed: Option<&std::path::Path>) -> Option<PathBuf> {
+    seed.map(std::path::Path::to_path_buf).or_else(|| {
+        std::env::var_os("ATOMCODE_SEED_CONFIG")
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+    })
+}
+
 /// The error chain as one line, each cause said once — and, when something
 /// refused a write, where the data could live instead.
 ///
@@ -1679,6 +1728,12 @@ async fn run() -> Result<i32> {
 
     // No --help was passed. Parse normally to get the Cli struct.
     let cli = Cli::parse();
+    // Configuration errors happen before run_headless; keep its stdout free
+    // of terminal restore escapes even when startup fails early.
+    HEADLESS_MODE.store(
+        cli.prompt.is_some() || cli.prompt_file.is_some(),
+        Ordering::Relaxed,
+    );
 
     // ── Askpass early exit ────────────────────────────────────────────────────
     // Handle `atomcode __askpass <prompt>` before ANY TUI/telemetry setup.
@@ -2091,6 +2146,8 @@ async fn run() -> Result<i32> {
                 // Load config the same way the TUI path does so provider/model resolution
                 // is identical (honors --provider, --model, and config.toml).
                 let config_path = cli.config.clone().unwrap_or_else(Config::default_path);
+                let seed_source = config_seed_source(cli.seed_config.as_deref());
+                prepare_config_file(&config_path, cli.config.is_some(), seed_source.as_deref())?;
                 let mut config = if config_path.exists() {
                     Config::load(&config_path).unwrap_or_default()
                 } else {
@@ -2281,41 +2338,8 @@ async fn run() -> Result<i32> {
     // `--seed-config <path>` (or `ATOMCODE_SEED_CONFIG` env) source is given, copy
     // it into place once. No-op when a config already exists, so it's safe for the
     // launcher to always pass. Any failure is non-fatal → normal onboarding.
-    let seed_source = cli.seed_config.clone().or_else(|| {
-        std::env::var_os("ATOMCODE_SEED_CONFIG")
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-    });
-    match atomcode_config::config::Config::seed_user_config(&config_path, seed_source.as_deref()) {
-        atomcode_config::config::SeedOutcome::Seeded => {
-            if let Some(src) = seed_source.as_deref() {
-                eprintln!(
-                    "[seed] initialized {} from {}",
-                    config_path.display(),
-                    src.display()
-                );
-            }
-        }
-        atomcode_config::config::SeedOutcome::Invalid(e) => {
-            eprintln!("Warning: --seed-config ignored (not a valid config): {e}");
-        }
-        atomcode_config::config::SeedOutcome::IoError(e) => {
-            eprintln!("Warning: --seed-config could not be applied: {e}");
-        }
-        // AlreadyConfigured / NoSource → nothing to do, stay quiet.
-        _ => {}
-    }
-
-    // An explicitly named `--config` that still does not exist after seeding is a
-    // user error, not a first run. Falling through to defaults would silently drop
-    // the instruction, and the failure only resurfaces later as an unrelated
-    // provider error: the default config carries no base_url, so the first request
-    // reports `relative URL without a base` — which names neither the file nor the
-    // cause. The default path keeps its existing meaning: no config there is the
-    // documented first-run state the welcome screen handles.
-    if cli.config.is_some() && !config_path.exists() {
-        anyhow::bail!("config file not found: {}", config_path.display());
-    }
+    let seed_source = config_seed_source(cli.seed_config.as_deref());
+    prepare_config_file(&config_path, cli.config.is_some(), seed_source.as_deref())?;
 
     let config_load_start = std::time::Instant::now();
     let (mut config, config_startup_notice) = if config_path.exists() {
@@ -5209,6 +5233,55 @@ fn install_panic_hook(telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>) 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn explicit_missing_config_is_rejected_but_a_missing_default_is_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.toml");
+        let error = super::prepare_config_file(&path, true, None).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("config file not found: {}", path.display())
+        );
+        super::prepare_config_file(&path, false, None).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn an_explicit_config_can_be_seeded_before_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = dir.path().join("seed.toml");
+        let source = "default_provider = \"test\"\n[providers.test]\ntype = \"openai\"\nbase_url = \"http://localhost/v1\"\nmodel = \"test\"\n";
+        std::fs::write(&seed, source).unwrap();
+        let target = dir.path().join("nested/config.toml");
+        super::prepare_config_file(&target, true, Some(&seed)).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), source);
+        assert_eq!(
+            super::Config::load(&target).unwrap().default_provider,
+            "test"
+        );
+        std::fs::write(&target, "broken = [").unwrap();
+        super::prepare_config_file(&target, true, Some(&seed)).unwrap();
+        assert!(super::Config::load_with_diagnostics(&target).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "broken = [");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_inspection_failure_keeps_the_path_and_os_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("loop");
+        std::os::unix::fs::symlink("loop", &path).unwrap();
+        let error = super::prepare_config_file(&path, true, None).unwrap_err();
+        assert!(error.to_string().contains(&path.display().to_string()));
+        assert!(error.to_string().contains("failed to inspect"));
+        assert!(error
+            .chain()
+            .last()
+            .unwrap()
+            .downcast_ref::<std::io::Error>()
+            .is_some());
+        assert!(!error.to_string().contains("not found"));
+    }
 
     /// 现场(2026-10-09):`{:#}` 把同一句 Permission denied 打了三遍——每一层
     /// 既把下一层写进自己的话里,又把它交给 `source()`。说过的不再说;是会话
