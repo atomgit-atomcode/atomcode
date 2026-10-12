@@ -839,6 +839,7 @@ impl LlmProvider for OpenAiCompatProvider {
                             }
                             yield StreamEvent::Error(ProviderError {
                                 retryable: false,
+                                code: retry::stream_read_error_code(&e),
                                 message: retry::stream_read_error_message(
                                     &e,
                                     if emitted_replay_sensitive {
@@ -5524,8 +5525,10 @@ mod tests {
             "the one delivered delta must appear exactly once: {events:?}"
         );
         assert!(
-            events.iter().any(|e| matches!(e, StreamEvent::Error(_))),
-            "a post-emit mid-stream EOF must surface an error: {events:?}"
+            events.iter().any(|e| matches!(e, StreamEvent::Error(error)
+                if error.code.as_deref() == Some(atomcode_kernel::stream::STREAM_TRANSPORT_INTERRUPTED_CODE)
+                    && !error.retryable)),
+            "a post-emit EOF must be typed for continuation, never replay: {events:?}"
         );
 
         let _ = handle.join();

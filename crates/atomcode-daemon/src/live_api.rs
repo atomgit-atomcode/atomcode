@@ -976,7 +976,7 @@ impl NativeLiveWireProjector {
                         "recovered from the interrupted stream".to_string()
                     } else {
                         format!(
-                            "stream timed out; safely continuing from saved progress ({attempt}/{max_attempts})"
+                            "stream interrupted; safely continuing from saved progress ({attempt}/{max_attempts})"
                         )
                     },
                 },

@@ -853,6 +853,7 @@ impl LlmProvider for ResponsesProvider {
                             }
                             yield StreamEvent::Error(ProviderError {
                                 retryable: false,
+                                code: retry::stream_read_error_code(&e),
                                 message: retry::stream_read_error_message(
                                     &e,
                                     if emitted_replay_sensitive {

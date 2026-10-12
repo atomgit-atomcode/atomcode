@@ -1640,7 +1640,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             ).into(),
         Msg::StreamStalled => "esc to cancel".into(),
         Msg::StreamRecoveryRunning { attempt, max_attempts } => format!(
-            "stream timed out; safely continuing from saved progress ({attempt}/{max_attempts})…"
+            "stream interrupted; safely continuing from saved progress ({attempt}/{max_attempts})…"
         )
         .into(),
         Msg::StreamRecoverySucceeded => "✓ recovered from the interrupted stream".into(),

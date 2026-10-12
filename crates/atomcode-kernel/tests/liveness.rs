@@ -743,3 +743,288 @@ async fn no_timeout_by_default_unchanged() {
         "the default path is unchanged — full text delivered"
     );
 }
+
+fn transport_interrupted() -> StreamEvent {
+    StreamEvent::Error(atomcode_kernel::stream::ProviderError {
+        code: Some(atomcode_kernel::stream::STREAM_TRANSPORT_INTERRUPTED_CODE.into()),
+        message: "connection reset".into(),
+        ..Default::default()
+    })
+}
+
+async fn transport_case(
+    prefix: Vec<StreamEvent>,
+    recovered: Vec<StreamEvent>,
+) -> (Arc<PartialStallThenProvider>, Vec<AgentEvent>) {
+    let provider = Arc::new(PartialStallThenProvider::new(prefix, recovered));
+    let reg = ToolRegistry::new();
+    let mut handle = Agent::builder()
+        .provider(provider.clone())
+        .tools(reg.mount(&[] as &[&str]))
+        .build()
+        .spawn();
+    handle.commands.send(send("go")).unwrap();
+    let events = tokio::time::timeout(OUTER_GUARD, async {
+        let mut events = Vec::new();
+        while let Some(event) = handle.events.recv().await {
+            let done = matches!(event, AgentEvent::TurnComplete { .. });
+            events.push(event);
+            if done {
+                break;
+            }
+        }
+        events
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::TurnComplete { .. })
+    ));
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    (provider, events)
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn partial_text_transport_drop_continues_from_saved_progress_once() {
+    let (provider, events) = transport_case(
+        vec![
+            StreamEvent::TextDelta("saved prefix".into()),
+            transport_interrupted(),
+        ],
+        vec![
+            StreamEvent::TextDelta("continued tail".into()),
+            StreamEvent::Done { truncated: false },
+        ],
+    )
+    .await;
+    assert_eq!(provider.calls(), 2);
+    let requests = provider.requests();
+    assert!(requests[1].iter().any(|m| m.text == "saved prefix"));
+    assert!(requests[1]
+        .iter()
+        .any(|m| m.text.contains("Do not repeat completed tool calls")));
+    let text: String = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TextDelta(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text, "saved prefixcontinued tail");
+    assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::StreamRecovery {
+            recovered: true,
+            ..
+        }
+    )));
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn partial_text_transport_drop_does_not_replay_tool_arguments_or_logical_errors() {
+    let unsafe_outputs = vec![
+        StreamEvent::ToolCallDelta {
+            index: 0,
+            id: None,
+            name: Some("bash".into()),
+            arguments: "{\"command\":".into(),
+        },
+        StreamEvent::ToolCall(atomcode_kernel::tool::ToolCall {
+            id: "call".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        }),
+    ];
+    for tool in unsafe_outputs {
+        let (provider, events) = transport_case(
+            vec![
+                StreamEvent::TextDelta("saved".into()),
+                tool,
+                transport_interrupted(),
+            ],
+            vec![],
+        )
+        .await;
+        assert_eq!(provider.calls(), 1);
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            AgentEvent::StreamRecovery { .. } | AgentEvent::ToolStarted { .. }
+        )));
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::Error { .. })));
+    }
+    let (provider, _) = transport_case(
+        vec![
+            StreamEvent::TextDelta("saved".into()),
+            StreamEvent::Error(atomcode_kernel::stream::ProviderError {
+                message: "Connection reset".into(),
+                ..Default::default()
+            }),
+        ],
+        vec![],
+    )
+    .await;
+    assert_eq!(
+        provider.calls(),
+        1,
+        "untyped errors never authorize continuation"
+    );
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn repeated_partial_text_transport_drop_exhausts_the_shared_budget() {
+    let (provider, events) = transport_case(
+        vec![
+            StreamEvent::TextDelta("first".into()),
+            transport_interrupted(),
+        ],
+        vec![
+            StreamEvent::TextDelta("second".into()),
+            transport_interrupted(),
+        ],
+    )
+    .await;
+    assert_eq!(provider.calls(), 2);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(
+                e,
+                AgentEvent::StreamRecovery {
+                    recovered: false,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::TurnComplete {
+            reason: atomcode_kernel::event::StopReason::ProviderError,
+            ..
+        }
+    )));
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn partial_text_transport_continuation_remains_cancellable() {
+    let provider = Arc::new(
+        PartialStallThenProvider::new(
+            vec![
+                StreamEvent::TextDelta("saved".into()),
+                transport_interrupted(),
+            ],
+            vec![],
+        )
+        .with_recovered_stall(),
+    );
+    let reg = ToolRegistry::new();
+    let mut handle = Agent::builder()
+        .provider(provider.clone())
+        .tools(reg.mount(&[] as &[&str]))
+        .build()
+        .spawn();
+    handle.commands.send(send("go")).unwrap();
+    while let Some(event) = handle.events.recv().await {
+        if matches!(
+            event,
+            AgentEvent::StreamRecovery {
+                recovered: false,
+                ..
+            }
+        ) {
+            break;
+        }
+    }
+    handle.commands.send(AgentCommand::Cancel).unwrap();
+    let reason = tokio::time::timeout(OUTER_GUARD, async {
+        loop {
+            match handle.events.recv().await {
+                Some(AgentEvent::TurnComplete { reason, .. }) => break reason,
+                Some(_) => {}
+                None => panic!("closed before cancellation terminal"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(reason, atomcode_kernel::event::StopReason::Cancelled);
+    assert!(provider.calls() <= 2);
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn partial_transport_recovery_requires_text_and_no_http_rejection() {
+    let (provider, events) = transport_case(
+        vec![
+            StreamEvent::Reasoning("thinking only".into()),
+            transport_interrupted(),
+        ],
+        vec![],
+    )
+    .await;
+    assert_eq!(provider.calls(), 1);
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::StreamRecovery { .. })));
+    let (provider, events) = transport_case(
+        vec![
+            StreamEvent::TextDelta("partial".into()),
+            StreamEvent::Error(atomcode_kernel::stream::ProviderError {
+                code: Some(atomcode_kernel::stream::STREAM_TRANSPORT_INTERRUPTED_CODE.into()),
+                http_status: Some(400),
+                message: "bad request".into(),
+                ..Default::default()
+            }),
+        ],
+        vec![],
+    )
+    .await;
+    assert_eq!(provider.calls(), 1);
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::StreamRecovery { .. })));
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn transport_continuation_and_idle_timeout_share_one_recovery_budget() {
+    let provider = Arc::new(
+        PartialStallThenProvider::new(
+            vec![
+                StreamEvent::TextDelta("first".into()),
+                transport_interrupted(),
+            ],
+            vec![StreamEvent::TextDelta("second".into())],
+        )
+        .with_recovered_stall(),
+    );
+    let reg = ToolRegistry::new();
+    let mut handle = Agent::builder()
+        .provider(provider.clone())
+        .tools(reg.mount(&[] as &[&str]))
+        .stream_timeout(LIVENESS)
+        .build()
+        .spawn();
+    handle.commands.send(send("go")).unwrap();
+    let (recoveries, reason) = tokio::time::timeout(OUTER_GUARD, async {
+        let mut recoveries = 0;
+        loop {
+            match handle.events.recv().await {
+                Some(AgentEvent::StreamRecovery {
+                    recovered: false, ..
+                }) => recoveries += 1,
+                Some(AgentEvent::TurnComplete { reason, .. }) => break (recoveries, reason),
+                Some(_) => {}
+                None => panic!("closed before terminal"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(recoveries, 1);
+    assert_eq!(provider.calls(), 2);
+    assert_eq!(reason, atomcode_kernel::event::StopReason::Timeout);
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+}

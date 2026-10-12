@@ -136,7 +136,7 @@ const DEFAULT_MAX_PROVIDER_RETRIES: u32 = 3;
 /// `max_provider_retries` (which covers failures at OPEN, before any token).
 const MAX_STREAM_RETRIES: u32 = 5;
 const MAX_PARTIAL_STREAM_RECOVERIES: u32 = 1;
-const PARTIAL_STREAM_RESUME_NUDGE: &str = "[The previous assistant stream timed out after partial output. The preserved assistant message and any interrupted tool results above are authoritative. Continue from that saved progress. Do not repeat completed tool calls or restart the task.]";
+const PARTIAL_STREAM_RESUME_NUDGE: &str = "[The previous assistant stream was interrupted after partial output. The preserved assistant message and any interrupted tool results above are authoritative. Continue from that saved progress. Do not repeat completed tool calls or restart the task.]";
 
 /// Safety fuse: maximum consecutive `WaitAndRetry` rate-limit sleeps within a
 /// single turn before the kernel forces a `Pause` stop (RateLimited), regardless
@@ -2676,6 +2676,7 @@ impl RunningAgent {
             // empty 200), so it must NOT be retried as empty. Set true on the raw
             // arrival in each content arm below.
             let mut saw_stream_content = false;
+            let mut saw_tool_stream = false;
             let mut saw_suppressed_reasoning_filler = false;
             // Did the adapter report dropping an UNPARSEABLE chunk this round (a
             // `StreamEvent::Malformed`)? Only used to flavor the empty-response retry
@@ -2932,6 +2933,7 @@ impl RunningAgent {
                         });
                     }
                     StreamEvent::ToolCall(c) => {
+                        saw_tool_stream = true;
                         saw_stream_content = true;
                         pending_calls.push(c);
                     }
@@ -2944,6 +2946,7 @@ impl RunningAgent {
                         name,
                         arguments,
                     } => {
+                        saw_tool_stream = true;
                         saw_stream_content = true;
                         self.rt.emit(AgentEvent::ToolCallStreaming {
                             index,
@@ -3085,6 +3088,15 @@ impl RunningAgent {
                         }
                     }
                     StreamEvent::Error(e) => {
+                        // Transport recovery is a new continuation from saved
+                        // text, sharing the idle-timeout budget. A call delta
+                        // counts as tool output even before a complete call exists.
+                        let continue_text = e.code.as_deref()
+                            == Some(crate::stream::STREAM_TRANSPORT_INTERRUPTED_CODE)
+                            && e.http_status.is_none()
+                            && !assistant_text.trim().is_empty()
+                            && !saw_tool_stream
+                            && partial_stream_recoveries < MAX_PARTIAL_STREAM_RECOVERIES;
                         if saw_stream_content {
                             Self::persist_partial_assistant(
                                 convo,
@@ -3094,6 +3106,21 @@ impl RunningAgent {
                                 &pending_calls,
                                 suppress_internal_stream,
                             );
+                        }
+                        if continue_text {
+                            partial_stream_recoveries += 1;
+                            self.rt.emit(AgentEvent::StreamRecovery {
+                                attempt: partial_stream_recoveries,
+                                max_attempts: MAX_PARTIAL_STREAM_RECOVERIES,
+                                recovered: false,
+                            });
+                            convo.push(Message::synthetic_user(
+                                PARTIAL_STREAM_RESUME_NUDGE.to_string(),
+                            ));
+                            stream_retry = 0;
+                            retry_this_round = true;
+                            retry_is_partial_continuation = true;
+                            break;
                         }
                         self.hooks.on_error(&e.message).await;
                         self.rt.emit(AgentEvent::Error {

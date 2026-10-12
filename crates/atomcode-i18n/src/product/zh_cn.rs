@@ -1594,7 +1594,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             ).into(),
         Msg::StreamStalled => "按 esc 可取消".into(),
         Msg::StreamRecoveryRunning { attempt, max_attempts } => format!(
-            "流响应超时，正在从已保存进度安全续接（{attempt}/{max_attempts}）…"
+            "流响应中断，正在从已保存进度安全续接（{attempt}/{max_attempts}）…"
         )
         .into(),
         Msg::StreamRecoverySucceeded => "✓ 已从流中断处恢复".into(),

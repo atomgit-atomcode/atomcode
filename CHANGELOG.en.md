@@ -36,6 +36,7 @@ Fix runtime commands becoming unavailable after restoring a historical session, 
 - **Worktrees use the current project**: `/worktree` operates on the current session's Git repository, avoiding operations on the startup repository after restoring a session or using `/cd`.
 - **Consistent web session counts**: project counts use the same visibility rules as expanded session lists, excluding unused empty sessions and counting fork lineages once. Adding a workspace reuses the session already opened by the runtime instead of creating a duplicate empty record.
 - **Read complete memories**: `/memory` shows full global, project and local memory in a reader with wrapping, scrolling and paging. Long workflows are no longer truncated by prompt budgets; model injection keeps its existing limits.
+- **Continue interrupted text replies**: after a connection reset or premature close, a request with partial text and no tool calls or argument fragments can continue once from saved progress. Recovery shares the timeout budget, remains cancellable, and reports progress in the terminal and web UI.
 
 ## v5.2.2（v5.2.0） (2026-10-10)
 

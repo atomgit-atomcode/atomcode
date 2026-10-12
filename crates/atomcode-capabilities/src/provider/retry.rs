@@ -300,6 +300,11 @@ fn url_without_credentials(url: &reqwest::Url) -> String {
     safe.to_string()
 }
 
+pub(crate) fn stream_read_error_code(err: &(dyn std::error::Error + 'static)) -> Option<String> {
+    (chain_has_transient_io(err) || chain_has_incomplete_message(err))
+        .then(|| atomcode_kernel::stream::STREAM_TRANSPORT_INTERRUPTED_CODE.to_string())
+}
+
 /// Human-readable message for a mid-stream response-body read failure.
 ///
 /// The raw reqwest chain for a dropped connection ("error decoding response
@@ -510,6 +515,17 @@ fn random_jitter_fraction() -> f64 {
 mod tests {
     use super::*;
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+
+    #[test]
+    fn only_transport_causes_authorize_partial_text_continuation() {
+        let reset = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset");
+        assert_eq!(
+            stream_read_error_code(&reset).as_deref(),
+            Some(atomcode_kernel::stream::STREAM_TRANSPORT_INTERRUPTED_CODE)
+        );
+        let invalid = std::io::Error::new(std::io::ErrorKind::InvalidData, "connection reset");
+        assert!(stream_read_error_code(&invalid).is_none());
+    }
 
     #[test]
     fn retryable_status_table() {

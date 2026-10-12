@@ -6287,6 +6287,24 @@ impl Tui {
                 self.ask_about_policy(intervention);
                 true
             }
+            AgentEvent::StreamRecovery {
+                attempt,
+                max_attempts,
+                recovered,
+            } => {
+                use crate::i18n::product::{t as product_t, Msg as ProductMsg};
+                let message = product_t(if recovered {
+                    ProductMsg::StreamRecoverySucceeded
+                } else {
+                    ProductMsg::StreamRecoveryRunning {
+                        attempt,
+                        max_attempts,
+                    }
+                })
+                .into_owned();
+                self.host.say_for(message, false, 6_000);
+                true
+            }
             AgentEvent::Invoked {
                 id, output, failed, ..
             } => {
@@ -12579,6 +12597,25 @@ mod midturn_command_tests {
         }));
         assert_eq!(kinds(&host), before);
         assert!(host.moment.read().unwrap().sheet.is_none());
+    }
+
+    #[test]
+    fn stream_continuation_progress_is_visible_on_the_tip_row() {
+        let (host, tui, _) = screen();
+        assert!(tui.on_event(AgentEvent::StreamRecovery {
+            attempt: 1,
+            max_attempts: 1,
+            recovered: false,
+        }));
+        assert!(host
+            .moment
+            .read()
+            .unwrap()
+            .notice
+            .as_ref()
+            .unwrap()
+            .text
+            .contains("1/1"));
     }
 
     #[test]

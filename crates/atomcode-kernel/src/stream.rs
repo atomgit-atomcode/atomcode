@@ -37,9 +37,15 @@ impl TokenUsage {
 /// in `等待首字节超过 90s` and called a silent gateway a failed connection.
 pub const OPEN_TIMEOUT_CODE: &str = "open_timeout";
 
+/// A response body ended because its transport reset/closed, rather than an
+/// HTTP rejection or invalid payload. Consumers may continue saved text; this
+/// code never authorizes replaying a request or executing incomplete calls.
+pub const STREAM_TRANSPORT_INTERRUPTED_CODE: &str = "stream_transport_interrupted";
+
 /// A streaming failure surfaced by the provider. `retryable=true` =
 /// 429/5xx/timeout (the loop MAY retry later); `false` = terminal
-/// (auth/400/bad-request). The kernel does not retry here — it only surfaces.
+/// (auth/400/bad-request). A partial request is never replayed; the kernel may
+/// start one bounded continuation from saved text for the transport code above.
 #[derive(Clone, Debug, Default)]
 pub struct ProviderError {
     pub retryable: bool,
