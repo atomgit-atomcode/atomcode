@@ -127,7 +127,7 @@ impl AnthropicConfig {
 
 pub struct AnthropicProvider {
     cfg: AnthropicConfig,
-    client: reqwest::Client,
+    client: std::sync::Arc<super::openai_compat::SwappableClient>,
     url: String,
     /// Stable per-conversation id bound ONCE by the kernel; see the field on
     /// `OpenAiCompatProvider`. `OnceLock` — constant for the provider's life.
@@ -137,24 +137,29 @@ pub struct AnthropicProvider {
 
 impl AnthropicProvider {
     pub fn new(cfg: AnthropicConfig) -> Result<Self, ProviderError> {
-        let mut builder = crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
-            .connect_timeout(cfg.connect_timeout)
-            // Reap idle keep-alives before the server does (see POOL_IDLE_TIMEOUT).
-            .pool_idle_timeout(retry::POOL_IDLE_TIMEOUT)
-            // Product UA for gateway attribution (parity with core's build_http_client).
-            .user_agent(
-                cfg.user_agent
-                    .as_deref()
-                    .unwrap_or(super::DEFAULT_USER_AGENT),
-            );
-        if cfg.skip_tls_verify {
-            builder = builder.danger_accept_invalid_certs(true);
-        }
-        let client = builder.build().map_err(|e| ProviderError {
-            retryable: false,
-            message: format!("http client build failed: {e}"),
-            ..Default::default()
-        })?;
+        let connect_timeout = cfg.connect_timeout;
+        let user_agent = cfg.user_agent.clone();
+        let skip_tls_verify = cfg.skip_tls_verify;
+        let client = std::sync::Arc::new(super::openai_compat::SwappableClient::new(
+            false,
+            move |_| {
+                let mut builder =
+                    crate::proxy::apply_async_proxy_policy(reqwest::Client::builder())
+                        .connect_timeout(connect_timeout)
+                        // Reap idle keep-alives before the server does (see POOL_IDLE_TIMEOUT).
+                        .pool_idle_timeout(retry::POOL_IDLE_TIMEOUT)
+                        // Product UA for gateway attribution (parity with core's build_http_client).
+                        .user_agent(user_agent.as_deref().unwrap_or(super::DEFAULT_USER_AGENT));
+                if skip_tls_verify {
+                    builder = builder.danger_accept_invalid_certs(true);
+                }
+                builder.build().map_err(|e| ProviderError {
+                    retryable: false,
+                    message: format!("http client build failed: {e}"),
+                    ..Default::default()
+                })
+            },
+        )?);
         let url = format!("{}/v1/messages", cfg.base_url.trim_end_matches('/'));
         Ok(Self {
             cfg,
@@ -381,7 +386,35 @@ fn with_session_headers(
 /// transport) per `policy`. Shared by the initial open and the mid-stream
 /// re-open so both paths behave identically.
 async fn open_stream(
-    client: &reqwest::Client,
+    client: &super::openai_compat::SwappableClient,
+    url: &str,
+    body: &Value,
+    api_key: &str,
+    anthropic_version: &str,
+    session_id: &str,
+    policy: &RetryPolicy,
+    rate_limit_retry_owner: atomcode_kernel::provider::RateLimitRetryOwner,
+    open_timeout: Duration,
+) -> Result<reqwest::Response, ProviderError> {
+    retry::bounded_open(
+        open_timeout,
+        open_stream_attempts(
+            client,
+            url,
+            body,
+            api_key,
+            anthropic_version,
+            session_id,
+            policy,
+            rate_limit_retry_owner,
+            open_timeout,
+        ),
+    )
+    .await
+}
+
+async fn open_stream_attempts(
+    client: &super::openai_compat::SwappableClient,
     url: &str,
     body: &Value,
     api_key: &str,
@@ -392,8 +425,10 @@ async fn open_stream(
     open_timeout: Duration,
 ) -> Result<reqwest::Response, ProviderError> {
     let mut attempt = 1u32;
+    let mut timeout_pool_refreshed = false;
     loop {
-        let mut req = client
+        let http = client.get();
+        let mut req = http
             .post(url)
             .header("x-api-key", api_key)
             .header("anthropic-version", anthropic_version)
@@ -404,7 +439,24 @@ async fn open_stream(
         let send = match tokio::time::timeout(open_timeout, req.send()).await {
             Ok(r) => r,
             Err(_elapsed) => {
+                tracing::warn!(
+                    phase = "response_headers",
+                    attempt,
+                    timeout_ms = open_timeout.as_millis() as u64,
+                    pool_refreshed = timeout_pool_refreshed,
+                    "provider response headers timed out"
+                );
                 if attempt < policy.max_attempts {
+                    if !timeout_pool_refreshed {
+                        client.rebuild(false)?;
+                        timeout_pool_refreshed = true;
+                        tracing::info!(
+                            phase = "response_headers",
+                            attempt,
+                            reason = "silent_timeout",
+                            "provider connection pool rebuilt"
+                        );
+                    }
                     tokio::time::sleep(retry::compute_backoff(attempt, policy)).await;
                     attempt += 1;
                     continue;
@@ -422,6 +474,13 @@ async fn open_stream(
         };
         match send {
             Ok(resp) => {
+                tracing::info!(
+                    phase = "response_headers",
+                    attempt,
+                    pool_refreshed = timeout_pool_refreshed,
+                    status = resp.status().as_u16(),
+                    "provider response headers received"
+                );
                 let code = resp.status().as_u16();
                 if !resp.status().is_success() {
                     if retry::should_retry_open_status(code, rate_limit_retry_owner)

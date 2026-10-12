@@ -1216,3 +1216,76 @@ mod tests {
         );
     }
 }
+
+/// Bound all OPEN attempts and backoffs together; an exhausted budget must not
+/// be retried again by a runtime row. Streaming bodies are outside this scope.
+pub(crate) async fn bounded_open<T>(
+    per_attempt: Duration,
+    open: impl std::future::Future<Output = Result<T, atomcode_kernel::stream::ProviderError>>,
+) -> Result<T, atomcode_kernel::stream::ProviderError> {
+    let budget = per_attempt.saturating_mul(2);
+    match tokio::time::timeout(budget, open).await {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::warn!(
+                phase = "response_headers",
+                budget_ms = budget.as_millis() as u64,
+                "provider open retry budget exhausted"
+            );
+            Err(atomcode_kernel::stream::ProviderError {
+                retryable: false,
+                message: format!(
+                    "等待响应头超时：连接恢复与重试总等待已达到 {}s，请稍后重试",
+                    budget.as_secs()
+                ),
+                code: Some(atomcode_kernel::stream::OPEN_TIMEOUT_CODE.into()),
+                ..Default::default()
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod open_budget_tests {
+    use super::*;
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn open_budget_preserves_original_errors_and_success() {
+        let error = bounded_open::<()>(Duration::from_secs(90), async {
+            Err(atomcode_kernel::stream::ProviderError {
+                retryable: false,
+                http_status: Some(401),
+                message: "unauthorized".into(),
+                ..Default::default()
+            })
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.http_status, Some(401));
+        assert_eq!(error.message, "unauthorized");
+        assert_eq!(
+            bounded_open(Duration::from_secs(90), async { Ok(42) })
+                .await
+                .unwrap(),
+            42
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn open_budget_bounds_attempts_and_backoff_and_is_terminal() {
+        let started = tokio::time::Instant::now();
+        let error = bounded_open::<()>(Duration::from_secs(90), async {
+            tokio::time::sleep(Duration::from_secs(90)).await;
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            tokio::time::sleep(Duration::from_secs(90)).await;
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(started.elapsed(), Duration::from_secs(180));
+        assert!(!error.retryable);
+        assert_eq!(
+            error.code.as_deref(),
+            Some(atomcode_kernel::stream::OPEN_TIMEOUT_CODE)
+        );
+    }
+}

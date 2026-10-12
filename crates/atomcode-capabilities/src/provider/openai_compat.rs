@@ -995,7 +995,36 @@ pub(crate) async fn open_stream(
     rate_limit_retry_owner: atomcode_kernel::provider::RateLimitRetryOwner,
     open_timeout: Duration,
 ) -> Result<reqwest::Response, ProviderError> {
+    retry::bounded_open(
+        open_timeout,
+        open_stream_attempts(
+            client,
+            url,
+            body_bytes,
+            signer,
+            api_key,
+            session_id,
+            policy,
+            rate_limit_retry_owner,
+            open_timeout,
+        ),
+    )
+    .await
+}
+
+async fn open_stream_attempts(
+    client: &SwappableClient,
+    url: &str,
+    body_bytes: &[u8],
+    signer: &Option<std::sync::Arc<dyn RequestSigner>>,
+    api_key: &str,
+    session_id: &str,
+    policy: &RetryPolicy,
+    rate_limit_retry_owner: atomcode_kernel::provider::RateLimitRetryOwner,
+    open_timeout: Duration,
+) -> Result<reqwest::Response, ProviderError> {
     let mut attempt = 1u32;
+    let mut timeout_pool_refreshed = false;
     let mut tls12_probe = false;
     let mut auth_recovery_attempted = false;
     loop {
@@ -1042,7 +1071,24 @@ pub(crate) async fn open_stream(
             Err(_elapsed) => {
                 // A TTFB timeout is the same class as a transient transport failure:
                 // spend one attempt and retry.
+                tracing::warn!(
+                    phase = "response_headers",
+                    attempt,
+                    timeout_ms = open_timeout.as_millis() as u64,
+                    pool_refreshed = timeout_pool_refreshed,
+                    "provider response headers timed out"
+                );
                 if attempt < policy.max_attempts {
+                    if !timeout_pool_refreshed {
+                        client.rebuild(was_capped)?;
+                        timeout_pool_refreshed = true;
+                        tracing::info!(
+                            phase = "response_headers",
+                            attempt,
+                            reason = "silent_timeout",
+                            "provider connection pool rebuilt"
+                        );
+                    }
                     tokio::time::sleep(retry::compute_backoff(attempt, policy)).await;
                     attempt += 1;
                     continue;
@@ -1060,6 +1106,13 @@ pub(crate) async fn open_stream(
         };
         match sent {
             Ok(resp) => {
+                tracing::info!(
+                    phase = "response_headers",
+                    attempt,
+                    pool_refreshed = timeout_pool_refreshed,
+                    status = resp.status().as_u16(),
+                    "provider response headers received"
+                );
                 if tls12_probe {
                     atomcode_config::tls::latch_managed_tls12();
                     tls12_probe = false;
@@ -2947,6 +3000,55 @@ mod tests {
 
     fn line(v: Value) -> String {
         format!("data: {}\n", v)
+    }
+
+    #[tokio::test]
+    async fn silent_header_timeout_rebuilds_pool_and_recovers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/chat/completions", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let mut data = [0; 4096];
+            first.read(&mut data).await.unwrap();
+            // Keep the first socket alive but silent, as a blackholed gateway does.
+            let (mut second, _) = listener.accept().await.unwrap();
+            second.read(&mut data).await.unwrap();
+            second
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            drop(first);
+        });
+        let builds = std::sync::Arc::new(AtomicUsize::new(0));
+        let counted = builds.clone();
+        let client = SwappableClient::new(false, move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Ok(reqwest::Client::builder().no_proxy().build().unwrap())
+        })
+        .unwrap();
+        let policy = RetryPolicy {
+            max_attempts: 3,
+            base_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+        };
+        let response = open_stream(
+            &client,
+            &url,
+            b"{}",
+            &None,
+            "test",
+            "",
+            &policy,
+            atomcode_kernel::provider::RateLimitRetryOwner::Provider,
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+        server.await.unwrap();
     }
 
     // ---- SwappableClient (auto-rebuild on poisoned pool) ----
