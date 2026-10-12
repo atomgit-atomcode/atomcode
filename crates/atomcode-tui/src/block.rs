@@ -927,6 +927,22 @@ mod tests {
     }
 
     #[test]
+    fn blank_streamed_messages_take_no_rows_then_grow_without_outer_padding() {
+        let _alone = live_alone();
+        let mut stream = Stream::new();
+        let id = stream.writer("model").open(Coord::new(1, 1), grew("\n\n"));
+        let ctx = RenderCtx::bare(80);
+        assert_eq!(stream.get(id).unwrap().rows_at(&ctx).0, 0);
+        for text in ["\n\nhello", "\n\nhello\n\n", "\n\nhello\n\nworld\n"] {
+            stream.writer("model").amend(id, grew(text));
+            let (rows, lines) = stream.get(id).unwrap().rows_at(&ctx);
+            let expected = ModelSaid(text.into()).lines(&ctx);
+            assert_eq!(rows, expected.len());
+            assert_eq!(*lines.unwrap(), expected);
+        }
+    }
+
+    #[test]
     fn a_growing_block_renders_only_the_new_tail() {
         let _alone = live_alone();
         let mut s = Stream::new();
@@ -944,7 +960,7 @@ mod tests {
         assert_eq!(resumes(), 0, "nothing was rendered to resume from");
         assert_eq!(
             *l1.unwrap(),
-            crate::markdown::render("first line\n\n", 30, Style::new())
+            crate::markdown::render("first line", 30, Style::new())
         );
 
         // A word appended: the second render resumes, and still describes the
@@ -962,7 +978,7 @@ mod tests {
         assert_eq!(
             *l2.unwrap(),
             crate::markdown::render(
-                "first line\n\nsecond paragraph, still going\n",
+                "first line\n\nsecond paragraph, still going",
                 30,
                 Style::new()
             )
@@ -998,7 +1014,7 @@ mod tests {
         assert_eq!(resumes(), 0, "an edit is not an append");
         assert_eq!(
             *lines.unwrap(),
-            crate::markdown::render("a completely different answer\n", 30, Style::new())
+            crate::markdown::render("a completely different answer", 30, Style::new())
         );
     }
 
@@ -1073,7 +1089,7 @@ mod tests {
         assert_eq!(resumes(), 0, "another width is another render");
         assert_eq!(
             *lines.unwrap(),
-            crate::markdown::render("a line long enough to wrap differently\n", 12, Style::new())
+            crate::markdown::render("a line long enough to wrap differently", 12, Style::new())
         );
     }
 }

@@ -876,6 +876,23 @@ pub fn split_vl_caption(text: &str) -> Option<(String, String, String)> {
 #[derive(Debug, Default)]
 pub struct ModelSaid(pub String);
 
+impl ModelSaid {
+    /// Remove only outer blank lines, preserving indentation and Markdown spaces.
+    fn display_text(&self) -> &str {
+        let mut offset = 0;
+        let mut start = None;
+        let mut end = 0;
+        for line in self.0.split_inclusive('\n') {
+            if !line.trim().is_empty() {
+                start.get_or_insert(offset);
+                end = offset + line.trim_end_matches(['\r', '\n']).len();
+            }
+            offset += line.len();
+        }
+        start.map(|start| &self.0[start..end]).unwrap_or("")
+    }
+}
+
 impl Content for ModelSaid {
     fn kind(&self) -> &'static str {
         "assistant"
@@ -887,10 +904,16 @@ impl Content for ModelSaid {
     }
     fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
         let w = ctx.width;
-        crate::markdown::render(&self.0, w, Style::new())
+        let text = self.display_text();
+        if text.is_empty() {
+            Vec::new()
+        } else {
+            crate::markdown::render(text, w, Style::new())
+        }
     }
     fn growing_text(&self) -> Option<&str> {
-        Some(&self.0)
+        let text = self.display_text();
+        (!text.is_empty()).then_some(text)
     }
     fn summary(&self, ctx: &RenderCtx) -> Line {
         let w = ctx.width;
@@ -4878,6 +4901,22 @@ mod tests {
                 .any(|s| s.style.fg == green),
             "an added row is green"
         );
+    }
+
+    #[test]
+    fn assistant_display_drops_only_outer_blank_lines() {
+        let body =
+            "    indented code  \n\nparagraph  \nnext line\n\n```rust\n    let x = 1;\n\n```";
+        let padded = ModelSaid(format!("\n \r\n{body}\n\n \t\n"));
+        assert_eq!(padded.growing_text(), Some(body));
+        let ctx = crate::block::RenderCtx::bare(80);
+        assert_eq!(padded.lines(&ctx), ModelSaid(body.into()).lines(&ctx));
+        assert_ne!(padded.content_hash(), ModelSaid(body.into()).content_hash());
+        for blank in ["", "\n\n", " \t\r\n "] {
+            let said = ModelSaid(blank.into());
+            assert!(said.lines(&ctx).is_empty(), "{blank:?}");
+            assert_eq!(said.growing_text(), None);
+        }
     }
 
     #[test]
