@@ -1489,9 +1489,36 @@ fn format_output(stdout: &str, stderr: &str, code: Option<i32>) -> ToolResult {
             s.push_str("[process terminated by signal]");
         }
     }
+    // A non-zero exit where git could not get credentials non-interactively
+    // (GIT_TERMINAL_PROMPT=0, set in [`non_interactive_env_vars`]) leaves a bare
+    // `fatal: could not read Username …` that the model cannot diagnose — it retries
+    // blindly, wasting turns and quota (issue #1645). Append a one-line hint so the
+    // model can surface the cause and suggest a fix instead of looping.
+    if code != Some(0) && is_git_auth_failure(&stderr) {
+        if !s.is_empty() && !s.ends_with('\n') {
+            s.push('\n');
+        }
+        s.push_str(
+            "[hint] git could not obtain credentials non-interactively \
+             (GIT_TERMINAL_PROMPT=0). A credential helper, PAT, or the session's \
+             token may be missing or expired; configure one or refresh credentials \
+             before retrying.",
+        );
+    }
     // The bash invocation itself ran; a non-zero exit is reported in-band (the model
     // reads the exit code) rather than as a tool error.
     ok(s)
+}
+
+/// True when `git`'s stderr indicates it failed because it needed interactive
+/// credentials we deliberately suppressed (`GIT_TERMINAL_PROMPT=0`). Mirrors the
+/// check in `plugin::marketplace` so the bash tool's general path can surface the
+/// same diagnosis without depending on the plugin module.
+fn is_git_auth_failure(stderr: &str) -> bool {
+    stderr.contains("terminal prompts disabled")
+        || stderr.contains("could not read Username")
+        || stderr.contains("could not read Password")
+        || stderr.contains("Authentication failed")
 }
 
 /// Whether a `git checkout` operand is (heuristically) a FILE pathspec rather than a
@@ -3898,6 +3925,53 @@ mod tests {
             "escape leaked into result: {:?}",
             r.content
         );
+    }
+
+    /// A git auth failure on a non-zero exit gets the explanatory hint, so the
+    /// model can diagnose `could not read Username` instead of retrying blindly
+    /// (issue #1645).
+    #[test]
+    fn format_output_appends_hint_on_git_auth_failure() {
+        let stderr = "fatal: could not read Username for 'https://atomgit.com': terminal prompts disabled\n";
+        let r = format_output("", stderr, Some(128));
+        assert!(!r.is_error);
+        assert!(r.content.contains("could not read Username"), "{:?}", r.content);
+        assert!(r.content.contains("[hint]"), "{:?}", r.content);
+        assert!(
+            r.content.contains("GIT_TERMINAL_PROMPT=0"),
+            "{:?}",
+            r.content
+        );
+    }
+
+    /// The hint fires for every auth-failure signature git emits, not just the
+    /// `Username` variant.
+    #[test]
+    fn format_output_appends_hint_for_each_git_auth_signature() {
+        for stderr in [
+            "fatal: could not read Password for 'https://example.com': terminal prompts disabled\n",
+            "fatal: Authentication failed for 'https://example.com/repo.git'\n",
+        ] {
+            let r = format_output("", stderr, Some(1));
+            assert!(r.content.contains("[hint]"), "stderr={stderr:?}, content={:?}", r.content);
+        }
+    }
+
+    /// A successful command (exit 0) never gets the hint even if stderr mentions
+    /// an auth-failure phrase — git sometimes writes warnings to stderr on success.
+    #[test]
+    fn format_output_never_hints_on_exit_zero() {
+        let r = format_output("ok\n", "could not read Username", Some(0));
+        assert!(!r.content.contains("[hint]"), "{:?}", r.content);
+    }
+
+    /// A non-zero exit that is NOT an auth failure (e.g. a merge conflict) stays
+    /// untouched — the hint is specific to credential problems.
+    #[test]
+    fn format_output_leaves_unrelated_git_failures_alone() {
+        let stderr = "error: Your local changes would be overwritten by merge.\n";
+        let r = format_output("", stderr, Some(1));
+        assert!(!r.content.contains("[hint]"), "{:?}", r.content);
     }
 
     #[test]
