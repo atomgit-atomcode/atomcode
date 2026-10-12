@@ -2306,6 +2306,17 @@ async fn run() -> Result<i32> {
         _ => {}
     }
 
+    // An explicitly named `--config` that still does not exist after seeding is a
+    // user error, not a first run. Falling through to defaults would silently drop
+    // the instruction, and the failure only resurfaces later as an unrelated
+    // provider error: the default config carries no base_url, so the first request
+    // reports `relative URL without a base` — which names neither the file nor the
+    // cause. The default path keeps its existing meaning: no config there is the
+    // documented first-run state the welcome screen handles.
+    if cli.config.is_some() && !config_path.exists() {
+        anyhow::bail!("config file not found: {}", config_path.display());
+    }
+
     let config_load_start = std::time::Instant::now();
     let (mut config, config_startup_notice) = if config_path.exists() {
         match Config::load_with_diagnostics(&config_path) {
