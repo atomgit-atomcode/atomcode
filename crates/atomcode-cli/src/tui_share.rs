@@ -585,18 +585,21 @@ impl atomcode_tui::command::CommandSet for ShareCommands {
                 Outcome::Said(said)
             }
             "webui" => {
+                let options = match webui_options(args) {
+                    Ok(options) => options,
+                    Err(why) => return Outcome::Refused(why),
+                };
                 // 挂上再开浏览器:反过来的话,网页先连上一个还没绑定的 hub,
                 // 第一眼是空的。
                 if let Err(why) = attach(&self.config_path).await {
                     return Outcome::Refused(why);
                 }
-                let host = bind_host(args);
                 Outcome::Said(
                     atomcode_daemon::ensure_server_and_open(
-                        &host,
-                        atomcode_daemon::WEBUI_DEFAULT_PORT,
+                        &options.host,
+                        options.port,
                         true, // sync
-                        true, // open_browser: /webui keeps opening the page
+                        options.open_browser,
                     )
                     .await,
                 )
@@ -611,25 +614,51 @@ impl atomcode_tui::command::CommandSet for ShareCommands {
 
 /// `/webui` 绑哪个地址。默认只听本机;`lan`(或直接写地址)才暴露出去——把一台
 /// 能改你代码的机器暴露到网上是一个决定,不是默认值。
-pub(crate) fn bind_host(args: &str) -> String {
-    let args = args.trim();
-    if args == "lan" || args == "0.0.0.0" {
-        return "0.0.0.0".to_string();
-    }
-    let tokens: Vec<&str> = args.split_whitespace().collect();
-    for (at, token) in tokens.iter().enumerate() {
-        if let Some(host) = token.strip_prefix("--host=") {
-            if !host.is_empty() {
-                return host.to_string();
+#[derive(Debug, PartialEq, Eq)]
+struct WebuiOptions {
+    host: String,
+    port: u16,
+    open_browser: bool,
+}
+
+fn webui_options(args: &str) -> Result<WebuiOptions, String> {
+    let mut host = None;
+    let mut port = None;
+    let mut open_browser = true;
+    let mut tokens = args.split_whitespace();
+    let invalid = |argument: &str| tr(SMsg::WebuiInvalidArguments { argument }).into_owned();
+    while let Some(token) = tokens.next() {
+        match token {
+            "lan" | "0.0.0.0" if host.is_none() => host = Some("0.0.0.0".to_string()),
+            "--no-open" => open_browser = false,
+            _ if token == "--host" || token.starts_with("--host=") => {
+                let value = token
+                    .strip_prefix("--host=")
+                    .or_else(|| tokens.next())
+                    .filter(|value| !value.is_empty() && !value.starts_with('-'))
+                    .ok_or_else(|| invalid(token))?;
+                if host.replace(value.to_string()).is_some() {
+                    return Err(invalid(token));
+                }
             }
-        }
-        if *token == "--host" {
-            if let Some(host) = tokens.get(at + 1) {
-                return (*host).to_string();
+            _ if token == "--port" || token.starts_with("--port=") => {
+                let value = token
+                    .strip_prefix("--port=")
+                    .or_else(|| tokens.next())
+                    .ok_or_else(|| invalid(token))?;
+                let value = value.parse::<u16>().map_err(|_| invalid(token))?;
+                if port.replace(value).is_some() {
+                    return Err(invalid(token));
+                }
             }
+            _ => return Err(invalid(token)),
         }
     }
-    "127.0.0.1".to_string()
+    Ok(WebuiOptions {
+        host: host.unwrap_or_else(|| "127.0.0.1".to_string()),
+        port: port.unwrap_or(atomcode_daemon::WEBUI_DEFAULT_PORT),
+        open_browser,
+    })
 }
 
 /// 打开桌面端,或说它没装、去哪儿下载。
@@ -744,15 +773,62 @@ mod tests {
     /// 默认只听本机。把一台能改你代码的机器暴露到网上是一个决定,不是默认值。
     #[test]
     fn sharing_stays_on_this_machine_unless_asked_otherwise() {
-        assert_eq!(bind_host(""), "127.0.0.1");
-        assert_eq!(bind_host("lan"), "0.0.0.0");
-        assert_eq!(bind_host("0.0.0.0"), "0.0.0.0");
-        assert_eq!(bind_host("--host 192.168.1.9"), "192.168.1.9");
-        assert_eq!(bind_host("--host=192.168.1.9"), "192.168.1.9");
-        // 写了 --host 却没给地址:当没说,回到只听本机——而不是把它当成
-        // 「随便绑哪儿」。
-        assert_eq!(bind_host("--host"), "127.0.0.1");
-        assert_eq!(bind_host("--host="), "127.0.0.1");
+        assert_eq!(webui_options("").unwrap().host, "127.0.0.1");
+        assert_eq!(webui_options("lan").unwrap().host, "0.0.0.0");
+        assert_eq!(webui_options("0.0.0.0").unwrap().host, "0.0.0.0");
+        assert_eq!(
+            webui_options("--host 192.168.1.9").unwrap().host,
+            "192.168.1.9"
+        );
+        assert_eq!(
+            webui_options("--host=192.168.1.9").unwrap().host,
+            "192.168.1.9"
+        );
+    }
+
+    #[test]
+    fn webui_passes_explicit_ports_and_browser_options() {
+        assert_eq!(
+            webui_options("").unwrap().port,
+            atomcode_daemon::WEBUI_DEFAULT_PORT
+        );
+        for args in [
+            "--port 20001 --host 127.0.0.1 --no-open",
+            "--no-open --host=127.0.0.1 --port=20001",
+        ] {
+            assert_eq!(
+                webui_options(args).unwrap(),
+                WebuiOptions {
+                    host: "127.0.0.1".to_string(),
+                    port: 20001,
+                    open_browser: false,
+                }
+            );
+        }
+        assert_eq!(webui_options("lan --port 20001").unwrap().host, "0.0.0.0");
+        assert_eq!(webui_options("--port=0").unwrap().port, 0);
+        assert_eq!(webui_options("--port 65535").unwrap().port, 65535);
+    }
+
+    #[test]
+    fn webui_rejects_unknown_missing_invalid_and_duplicate_arguments() {
+        for args in [
+            "--host",
+            "--host=",
+            "--host --port 20001",
+            "--port",
+            "--port=",
+            "--port nope",
+            "--port -1",
+            "--port 65536",
+            "--ports 20001",
+            "20001",
+            "stop --port 20001",
+            "--port 1 --port 2",
+            "lan --host 127.0.0.1",
+        ] {
+            assert!(webui_options(args).is_err(), "{args}");
+        }
     }
 
     /// **配对屏关掉时交回来的那行,派发那边必须认得**。向导的落点是命令名,不是

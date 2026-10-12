@@ -123,6 +123,7 @@ AtomCode 是一款住在你终端里的 AI 编码助手。用自然语言给它�
 - **`/webui`**（TUI 内）或 **`atomcode webui`**（命令行）会在浏览器里打开一个本地 Web 界面，作为终端界面之外的另一种选择——同一个 agent、同一份会话，渲染在浏览器中
 - **仅本地回环** —— server 绑定 `127.0.0.1` 并使用一次性 token，不对网络暴露
 - **`/webui stop`** 停止进程内 server（之后再次 `/webui` 会重新启动）
+- **`/webui --port 20001`** 指定起始端口，也支持 `--host <地址>` 和 `--no-open`。端口被占用或被 Windows 保留（错误 10013）时会顺延，最多尝试 100 个端口，以打印的链接为准；修改已运行服务的端口前，先执行 `/webui stop`。
 
 ### App 远程访问
 
@@ -472,7 +473,7 @@ atomcode --prompt-file task.md
 | `/background <task>` | 兼容入口：在 `/bg` 槽位中启动一次性后台任务                                   |
 | `/cd`                | 切换工作目录并开启新建对话                                                    |
 | `/worktree`          | Git worktree 隔离（`create` / `list` / `done` / `cleanup`）                   |
-| `/webui`             | 启动浏览器 webui（子命令：`stop`、`lan`、`--host <地址>`）                    |
+| `/webui`             | 启动浏览器 webui（`stop`、`lan`、`--host <地址>`、`--port <端口>`、`--no-open`） |
 | `/sync`              | 连接到实时 webui 会话（`/sync off` 断开）                                     |
 
 **模式、自主与审查**

@@ -5705,8 +5705,7 @@ pub fn webui_port() -> Option<u16> {
 /// What to try when a port cannot be bound for a reason other than being in
 /// use. On Windows that is usually WSAEACCES (10013): the port sits in a range
 /// reserved for Hyper-V / WSL / Docker (WinNAT), which moves on a reboot or a
-/// network service restart — a port that worked yesterday refuses today, and
-/// trying the next one up rarely helps because the ranges are blocks.
+/// network service restart. Retained when the bounded port scan is exhausted.
 fn bind_failure_hint(error: &anyhow::Error) -> &'static str {
     let denied = error.downcast_ref::<std::io::Error>().is_some_and(|e| {
         e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(10013)
@@ -5719,7 +5718,7 @@ fn bind_failure_hint(error: &anyhow::Error) -> &'static str {
      并用 `--port` 换一个不在范围内的端口。"
 }
 
-/// 从 `start_port` 起尝试绑定 `host`，遇 `AddrInUse` 递增端口，直到成功或试满
+/// 从 `start_port` 起尝试绑定 `host`，遇端口占用或 Windows 10013 递增，直到成功或试满
 /// `max_tries` 个端口。返回已绑定的监听器与其真实端口（取自 `local_addr`，
 /// 故 `start_port == 0` 时也会回填 OS 分配的端口）。其他绑定错误立即返回。
 async fn bind_scanning(
@@ -5727,31 +5726,51 @@ async fn bind_scanning(
     start_port: u16,
     max_tries: u16,
 ) -> anyhow::Result<(tokio::net::TcpListener, u16)> {
+    bind_scanning_with(host, start_port, max_tries, cfg!(windows), |addr| {
+        tokio::net::TcpListener::bind(addr)
+    })
+    .await
+}
+
+async fn bind_scanning_with<B, F>(
+    host: &str,
+    start_port: u16,
+    max_tries: u16,
+    windows: bool,
+    mut bind: B,
+) -> anyhow::Result<(tokio::net::TcpListener, u16)>
+where
+    B: FnMut(String) -> F,
+    F: std::future::Future<Output = std::io::Result<tokio::net::TcpListener>>,
+{
     let mut last_err: Option<std::io::Error> = None;
     for offset in 0..max_tries {
         let Some(port) = start_port.checked_add(offset) else {
             break; // 触及 u16 上限
         };
         let addr = format!("{host}:{port}");
-        match tokio::net::TcpListener::bind(&addr).await {
+        match bind(addr).await {
             Ok(listener) => {
                 let actual = listener.local_addr()?.port();
                 return Ok((listener, actual));
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::AddrInUse
+                    || (windows && e.raw_os_error() == Some(10013)) =>
+            {
                 last_err = Some(e);
                 continue;
             }
-            // 非"端口占用"错误（权限、地址非法等）无法靠换端口解决，立即返回。
+            // 其他权限、地址等错误不当作端口不可用，立即返回。
             Err(e) => return Err(e.into()),
         }
     }
-    Err(anyhow::anyhow!(
-        "no free port in [{}, {}){}",
-        start_port,
-        start_port.saturating_add(max_tries),
-        last_err.map(|e| format!(": {e}")).unwrap_or_default()
-    ))
+    let error = last_err
+        .map(anyhow::Error::from)
+        .unwrap_or_else(|| anyhow::anyhow!("no ports attempted"));
+    Err(error.context(format!(
+        "no free port after at most {max_tries} attempts from {host}:{start_port}"
+    )))
 }
 
 /// 探测本机主用的非回环 IPv4（用 UDP connect 选路，不实际发包）。绑定非回环地址
@@ -5818,9 +5837,9 @@ pub async fn ensure_server_and_open(
                 // Into the log as well as the answer: `atomcode webui` run from a
                 // script prints the answer where nobody reads it, and a failed
                 // start used to leave nothing in `atomcode.log` at all.
-                tracing::error!(target: "atomcode::webui", %host, port, error = %e, "webui failed to bind");
+                tracing::error!(target: "atomcode::webui", %host, port, error = %format!("{e:#}"), "webui failed to bind");
                 return format!(
-                    "webui 启动失败：{host}:{port} 起的端口绑定失败（{e}）{}",
+                    "webui 启动失败：{host}:{port} 起的端口绑定失败（{e:#}）{}",
                     bind_failure_hint(&e)
                 );
             }
@@ -5828,7 +5847,7 @@ pub async fn ensure_server_and_open(
         if actual_port != port {
             // An installed app (PWA) is tied to the port it was installed from;
             // on another one it finds nothing. Said where it can be found later.
-            tracing::warn!(target: "atomcode::webui", requested = port, actual = actual_port, "webui port was in use; bound the next free one");
+            tracing::warn!(target: "atomcode::webui", requested = port, actual = actual_port, "webui port was unavailable; bound the next free one");
         }
         tracing::info!(target: "atomcode::webui", %host, port = actual_port, "webui listening");
         let tokens = auth_token::WebuiTokenStore::new();
@@ -6001,7 +6020,7 @@ pub async fn ensure_app_server(
 
     let (listener, actual_port) = bind_scanning(host, port, 100)
         .await
-        .map_err(|e| format!("绑定 {host}:{port} 失败（{e}）"))?;
+        .map_err(|e| format!("绑定 {host}:{port} 失败（{e:#}）"))?;
     let opts = ServerOpts {
         host: host.to_string(),
         port: actual_port,
@@ -9611,6 +9630,77 @@ done
         let (listener, port) = bind_scanning("127.0.0.1", 0, 1).await.unwrap();
         assert_ne!(port, 0);
         assert_eq!(listener.local_addr().unwrap().port(), port);
+    }
+
+    #[tokio::test]
+    async fn bind_scanning_skips_an_entire_windows_reserved_range() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let actual_port = listener.local_addr().unwrap().port();
+        let mut available = Some(listener);
+        let mut attempts = Vec::new();
+        let (_, port) = bind_scanning_with("127.0.0.1", 13457, 100, true, |addr| {
+            attempts.push(addr.clone());
+            std::future::ready(if addr == "127.0.0.1:13517" {
+                Ok(available.take().unwrap())
+            } else {
+                Err(std::io::Error::from_raw_os_error(10013))
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(port, actual_port);
+        assert_eq!(
+            attempts,
+            (13457..=13517)
+                .map(|port| format!("127.0.0.1:{port}"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn bind_scanning_keeps_the_reserved_port_hint_when_attempts_run_out() {
+        for (start, limit, expected) in [(13457, 3, 3), (65534, 100, 2)] {
+            let mut attempts = 0;
+            let error = bind_scanning_with("127.0.0.1", start, limit, true, |_| {
+                attempts += 1;
+                std::future::ready(Err(std::io::Error::from_raw_os_error(10013)))
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(attempts, expected);
+            assert!(bind_failure_hint(&error).contains("excludedportrange"));
+            assert!(format!("{error:#}").contains("10013"));
+        }
+    }
+
+    #[tokio::test]
+    async fn bind_scanning_does_not_retry_unrelated_bind_errors() {
+        for (windows, error) in [
+            (false, std::io::Error::from_raw_os_error(10013)),
+            (
+                true,
+                std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            ),
+            (
+                true,
+                std::io::Error::from(std::io::ErrorKind::AddrNotAvailable),
+            ),
+        ] {
+            let kind = error.kind();
+            let mut error = Some(error);
+            let mut attempts = 0;
+            let result = bind_scanning_with("127.0.0.1", 13457, 100, windows, |_| {
+                attempts += 1;
+                std::future::ready(Err(error.take().unwrap()))
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(attempts, 1);
+            assert_eq!(
+                result.downcast_ref::<std::io::Error>().unwrap().kind(),
+                kind
+            );
+        }
     }
 
     /// A port refused rather than taken — Windows' reserved ranges answer

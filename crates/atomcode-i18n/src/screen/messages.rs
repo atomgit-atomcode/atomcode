@@ -1975,6 +1975,9 @@ pub enum Msg<'a> {
     ShareNoModel,
     CmdAboutWebui,
     WebuiTakes,
+    WebuiInvalidArguments {
+        argument: &'a str,
+    },
     CmdAboutSync,
     SyncTakes,
     CmdAboutDesktop,

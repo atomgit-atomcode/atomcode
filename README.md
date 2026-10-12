@@ -123,6 +123,7 @@ Connect to any LLM that supports OpenAI's function-calling API:
 - **`/webui`** (in the TUI) or **`atomcode webui`** (CLI) launches a local browser UI as an alternative to the terminal interface — same agent, same sessions, rendered in your browser
 - **Loopback only** — the server binds to `127.0.0.1` and uses a one-time token; nothing is exposed to the network
 - **`/webui stop`** stops the in-process server (a later `/webui` restarts it)
+- **`/webui --port 20001`** chooses a starting port; `--host <addr>` and `--no-open` are also supported. Occupied ports and Windows reserved ports (error 10013) are skipped, up to 100 attempts. Use the printed URL; to change an already running server's port, stop it first.
 
 ### App Remote Access
 
@@ -493,7 +494,7 @@ Type `/` in the TUI to browse the full list with live completion; `/help` shows 
 | `/background <task>` | Compatibility alias: start a one-shot task in a `/bg` slot                                 |
 | `/cd`                | Change working directory and start a new session                                           |
 | `/worktree`          | Git worktree isolation (`create` / `list` / `done` / `cleanup`)                            |
-| `/webui`             | Launch the browser webui (subcommands: `stop`, `lan`, `--host <addr>`)                     |
+| `/webui`             | Launch the browser webui (`stop`, `lan`, `--host <addr>`, `--port <port>`, `--no-open`)     |
 | `/sync`              | Attach to the live webui session (`/sync off` to detach)                                   |
 
 **Modes, autonomy & review**
