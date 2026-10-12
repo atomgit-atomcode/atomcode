@@ -6149,8 +6149,14 @@ impl Host {
                         moment.scroll.0,
                         rect.h,
                     ) {
-                        frame.place("conversation-scrollbar", bar.track, bar.lines(&moment.caps));
-                        self.hits.lock().expect("hits poisoned").scrollbar = Some(bar);
+                        if crate::scrollbar::visible(&moment, tokio::time::Instant::now()) {
+                            frame.place(
+                                "conversation-scrollbar",
+                                bar.track,
+                                bar.lines(&moment.caps),
+                            );
+                            self.hits.lock().expect("hits poisoned").scrollbar = Some(bar);
+                        }
                     }
                     // A tail module is placed under **its own id**, not a
                     // path: `named_twice` already refuses a tree that names one

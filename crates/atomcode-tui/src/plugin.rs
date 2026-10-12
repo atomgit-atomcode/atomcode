@@ -1058,12 +1058,15 @@ enum Wake {
     Closed,
 }
 
-/// This row has no config left. The one knob it had — `mascot = true` — is now
+/// The scrollbar is screen policy. The old knob — `mascot = true` — is now
 /// `[[insert]] name = "tui-panel-mascot"`, which is the point: a panel is a row,
 /// not a boolean on somebody else's row.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Row {}
+struct Row {
+    #[serde(default)]
+    scrollbar: crate::moment::ScrollbarMode,
+}
 
 /// Whether a fact is the line a turn opens with on screen — what the working
 /// line, armed at `TurnStarted`, waits for so it never draws above it.
@@ -1964,10 +1967,20 @@ impl UserInterface for Tui {
             edge_due = held.then(|| edge_due.unwrap_or(now + EDGE_SCROLL_EVERY));
             let edge = edge_due.map(|due| due.saturating_duration_since(now));
             let tick = self.host.modules.tick();
-            let timer = match (tick, edge) {
+            let mut timer = match (tick, edge) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
             };
+            if let Some(until) = self
+                .host
+                .moment
+                .read()
+                .expect("moment poisoned")
+                .scrollbar_until
+            {
+                let left = until.saturating_duration_since(now);
+                timer = Some(timer.map_or(left, |t| t.min(left)));
+            }
             let woke = match replay.pop_front() {
                 Some(again) => again,
                 // Due already: the queue kept the loop busy past the beat.
@@ -2249,6 +2262,11 @@ impl UserInterface for Tui {
                 Wake::PullBgQuestion => self.pour_bg_question(),
                 Wake::Tick => {
                     let mut m = self.host.moment.write().expect("moment poisoned");
+                    if m.scrollbar_until
+                        .is_some_and(|t| t <= tokio::time::Instant::now())
+                    {
+                        m.scrollbar_until = None;
+                    }
                     m.tick = m.tick.wrapping_add(1);
                     stale = true;
                 }
@@ -3271,6 +3289,11 @@ impl Tui {
             Click::Press => {
                 let Some(bar) = self.host.scrollbar_at(x, y) else {
                     *held = None;
+                    self.host
+                        .moment
+                        .write()
+                        .expect("moment poisoned")
+                        .scrollbar_dragging = false;
                     return false;
                 };
                 let drag = bar.grab(y);
@@ -3282,6 +3305,8 @@ impl Tui {
                 m.stream_selection = None;
                 m.edge_scroll = None;
                 let max = self.host.scroll_limit(self.surface.size(), &m);
+                m.scrollbar_dragging = click != Click::Release;
+                crate::scrollbar::touch(&mut m);
                 m.scroll = crate::moment::ScrollPos(drag.position(y).min(max));
                 true
             }
@@ -3291,6 +3316,8 @@ impl Tui {
                 };
                 let mut m = self.host.moment.write().expect("moment poisoned");
                 let max = self.host.scroll_limit(self.surface.size(), &m);
+                m.scrollbar_dragging = click != Click::Release;
+                crate::scrollbar::touch(&mut m);
                 m.scroll = crate::moment::ScrollPos(drag.position(y).min(max));
                 if click == Click::Release {
                     *held = None;
@@ -7573,6 +7600,7 @@ impl Tui {
                 return m.cancel_idle();
             }
             Action::Scroll(by) => {
+                crate::scrollbar::touch(&mut m);
                 // Bounded by what is left to read, not by how much there is:
                 // scrolling past the oldest line would empty the region rather
                 // than show more of it.
@@ -7580,7 +7608,10 @@ impl Tui {
                 let next = m.scroll.0 as i64 - by as i64;
                 m.scroll = crate::moment::ScrollPos(next.clamp(0, max as i64) as usize);
             }
-            Action::ScrollToBottom => m.scroll = crate::moment::ScrollPos::BOTTOM,
+            Action::ScrollToBottom => {
+                crate::scrollbar::touch(&mut m);
+                m.scroll = crate::moment::ScrollPos::BOTTOM;
+            }
             // A click on a block, resolved against the frame that was actually
             // painted. Anywhere else — the prompt, the status line, a gap — is
             // not an error, it is simply not a fold.
@@ -9898,10 +9929,8 @@ impl Plugin for TuiUiPlugin {
         "a full-screen terminal UI assembled from module rows"
     }
     async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
-        // Parsed only to reject a stale `config = { mascot = true }` loudly:
-        // silently ignoring it would leave someone staring at a screen with no
-        // cat and no explanation.
-        let _row: Row = if config.is_null() {
+        // Validate screen policy and reject stale panel knobs such as mascot.
+        let row: Row = if config.is_null() {
             Row::default()
         } else {
             serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
@@ -9912,6 +9941,7 @@ impl Plugin for TuiUiPlugin {
         // tty and fail on a machine with no terminal at all.
         let surface = ctx.require::<SurfaceSvc>().map_err(|e| e.to_string())?;
         let (host, tui) = assemble(surface);
+        host.moment.write().expect("moment poisoned").scrollbar_mode = row.scrollbar;
         let _ = ctx
             .provide::<ModulesSvc>(host.modules.clone())
             .map_err(|e| e.to_string())?;
@@ -13214,7 +13244,21 @@ mod conversation_mouse_tests {
             reasoning_blocks: Vec::new(),
             meta: None,
         });
+        let idle = host.compose((80, 24));
+        assert!(
+            idle.part("conversation-scrollbar").is_none(),
+            "auto hides the idle bottom scrollbar"
+        );
+        host.moment.write().unwrap().scrollbar_mode = crate::moment::ScrollbarMode::Always;
         let frame = host.compose((80, 24));
+        assert_eq!(
+            idle.part("stream").unwrap().rect,
+            frame.part("stream").unwrap().rect
+        );
+        assert_eq!(
+            idle.part("stream").unwrap().lines,
+            frame.part("stream").unwrap().lines
+        );
         let track = frame.part("conversation-scrollbar").unwrap().rect;
         assert!(tui.scrollbar_input(crate::surface::Click::Press, track.x, track.y));
         assert!(host.moment.read().unwrap().scroll.0 > 0);
@@ -13223,6 +13267,16 @@ mod conversation_mouse_tests {
         assert_eq!(host.moment.read().unwrap().scroll.0, 0);
         assert!(tui.scrollbar_input(crate::surface::Click::Release, track.x, track.bottom()));
         assert!(tui.scroll_drag.lock().unwrap().is_none());
+        assert!(!host.moment.read().unwrap().scrollbar_dragging);
+        host.moment.write().unwrap().scrollbar_mode = crate::moment::ScrollbarMode::Hidden;
+        assert!(host
+            .compose((80, 24))
+            .part("conversation-scrollbar")
+            .is_none());
+        assert!(host.scrollbar_at(track.x, track.y).is_none());
+        host.moment.write().unwrap().scrollbar_dragging = true;
+        assert!(!tui.scrollbar_input(crate::surface::Click::Press, track.x, track.y));
+        assert!(!host.moment.read().unwrap().scrollbar_dragging);
     }
 }
 

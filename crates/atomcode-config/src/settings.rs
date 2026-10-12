@@ -102,6 +102,7 @@ const LANGUAGES: &[&str] = &["auto", "en", "zh_CN"];
 const SHELL_GUARD_POLICIES: &[&str] = &["prompt", "strict", "off"];
 const SUBAGENT_LEVELS: &[&str] = &["off", "read-only", "accept-edits", "auto"];
 const MODE_SWITCH_KEYS: &[&str] = &["shift_tab", "tab"];
+const SCROLLBARS: &[&str] = &["auto", "always", "hidden"];
 /// `default` is this build's, which is what a person gets back by unsetting it.
 const SCREENS: &[&str] = &["default", "rows", "classic"];
 
@@ -235,6 +236,15 @@ pub static SETTINGS: &[SettingSpec] = &[
         label_zh: "界面",
         aliases: &["tui", "classic", "rows", "界面", "屏幕"],
         kind: SettingKind::Choice(SCREENS),
+        apply: ApplyPolicy::NextStartup,
+    },
+    SettingSpec {
+        id: "ui.scrollbar",
+        path: &["ui", "scrollbar"],
+        label_en: "Conversation scrollbar",
+        label_zh: "会话滚动条",
+        aliases: &["scrollbar", "滚动条"],
+        kind: SettingKind::Choice(SCROLLBARS),
         apply: ApplyPolicy::NextStartup,
     },
     // `false` hands the pointer to the terminal, so PLAIN click-drag does the
@@ -465,6 +475,7 @@ impl SettingSpec {
             "subagent.codex" => config.subagent.codex.clone(),
             "subagent.claude" => config.subagent.claude.clone(),
             "ui.screen" => format!("{:?}", config.ui.screen).to_lowercase(),
+            "ui.scrollbar" => format!("{:?}", config.ui.scrollbar).to_lowercase(),
             "ui.mouse" => config.ui.mouse.to_string(),
             "ui.theme" => format!("{:?}", config.ui.theme).to_lowercase(),
             "ui.mode_switch_key" => match config.ui.mode_switch_key {
@@ -1129,5 +1140,24 @@ model = "model-a"
             };
             assert_eq!(setting.apply, expected, "{id}");
         }
+    }
+}
+
+#[cfg(test)]
+mod scrollbar_setting_tests {
+    #[test]
+    fn scrollbar_modes_round_trip_and_invalid_values_are_rejected() {
+        let spec = super::SETTINGS
+            .iter()
+            .find(|s| s.id == "ui.scrollbar")
+            .unwrap();
+        let mut doc = toml_edit::DocumentMut::new();
+        for mode in ["auto", "always", "hidden"] {
+            spec.patch(&mut doc, mode).unwrap();
+            let config: crate::config::Config = toml::from_str(&doc.to_string()).unwrap();
+            assert_eq!(spec.value(&config), mode);
+        }
+        assert!(spec.patch(&mut doc, "sometimes").is_err());
+        assert_eq!(spec.value(&crate::config::Config::default()), "auto");
     }
 }

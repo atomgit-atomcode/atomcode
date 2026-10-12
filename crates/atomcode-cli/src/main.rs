@@ -2864,6 +2864,7 @@ async fn run() -> Result<i32> {
                     // override — so `/config ui.mouse false` persists it and the flag
                     // still forces it off on a single run.
                     mouse: config.ui.mouse && !cli.no_mouse,
+                    scrollbar: format!("{:?}", config.ui.scrollbar).to_lowercase(),
                     ..Default::default()
                 };
                 tracing::info!(

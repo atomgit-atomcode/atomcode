@@ -2,6 +2,24 @@
 //! shared with wheel scrolling; a drag only maps screen cells to that offset.
 use crate::frame::{Line, Rect};
 
+pub(crate) fn visible(moment: &crate::moment::Moment, now: tokio::time::Instant) -> bool {
+    use crate::moment::ScrollbarMode;
+    match moment.scrollbar_mode {
+        ScrollbarMode::Always => true,
+        ScrollbarMode::Hidden => false,
+        ScrollbarMode::Auto => {
+            moment.scroll.0 > 0
+                || moment.scrollbar_dragging
+                || moment.scrollbar_until.is_some_and(|until| now < until)
+        }
+    }
+}
+
+pub(crate) fn touch(moment: &mut crate::moment::Moment) {
+    moment.scrollbar_until =
+        Some(tokio::time::Instant::now() + std::time::Duration::from_millis(800));
+}
+
 pub(crate) fn content_rect(mut rect: Rect) -> Rect {
     if rect.w > 2 {
         rect.w -= 1;
@@ -65,9 +83,13 @@ impl Bar {
                     crate::caps::Glyph::Track
                 };
                 Line::styled(
-                    caps.g(glyph),
+                    if selected && caps.unicode {
+                        "▏"
+                    } else {
+                        caps.g(glyph)
+                    },
                     crate::theme::fg(if selected {
-                        crate::theme::Role::Accent
+                        crate::theme::Role::Muted
                     } else {
                         crate::theme::Role::Border
                     }),
@@ -107,6 +129,47 @@ impl Drag {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn auto_visibility_tracks_history_drag_and_recent_input() {
+        use crate::moment::{Moment, ScrollPos, ScrollbarMode};
+        let now = tokio::time::Instant::now();
+        let mut m = Moment::default();
+        assert!(!visible(&m, now));
+        m.scroll = ScrollPos(10);
+        assert!(visible(&m, now));
+        m.scroll = ScrollPos::BOTTOM;
+        m.scrollbar_until = Some(now + std::time::Duration::from_millis(800));
+        assert!(visible(&m, now));
+        assert!(!visible(&m, now + std::time::Duration::from_secs(1)));
+        m.scrollbar_dragging = true;
+        assert!(visible(&m, now + std::time::Duration::from_secs(1)));
+        m.scrollbar_mode = ScrollbarMode::Hidden;
+        assert!(!visible(&m, now));
+        m.scrollbar_mode = ScrollbarMode::Always;
+        m.scrollbar_dragging = false;
+        m.scrollbar_until = None;
+        assert!(visible(&m, now));
+    }
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn flash_expires_on_the_event_loop_clock() {
+        let mut m = crate::moment::Moment::default();
+        touch(&mut m);
+        assert!(visible(&m, tokio::time::Instant::now()));
+        tokio::time::sleep(std::time::Duration::from_millis(801)).await;
+        assert!(!visible(&m, tokio::time::Instant::now()));
+    }
+    #[test]
+    fn monochrome_ascii_keeps_the_thumb_distinct_from_the_track() {
+        let caps = crate::caps::Caps {
+            unicode: false,
+            colors: crate::caps::Colors::None,
+            ..Default::default()
+        };
+        let bar = Bar::new(Rect::new(79, 0, 1, 20), 100, 0, 20).unwrap();
+        let lines = bar.lines(&caps);
+        assert!(lines.iter().any(|l| l.plain() == "#"));
+        assert!(lines.iter().any(|l| l.plain() == "|"));
+    }
     #[test]
     fn clicks_reach_both_ends_and_drag_keeps_the_grabbed_thumb_cell() {
         let bar = Bar::new(Rect::new(79, 3, 1, 20), 1000, 500, 20).unwrap();

@@ -436,6 +436,16 @@ pub struct TeamReturn {
     pub current_label: String,
 }
 
+/// Visibility policy for the conversation scrollbar.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScrollbarMode {
+    #[default]
+    Auto,
+    Always,
+    Hidden,
+}
+
 /// The non-derivable half of what a module renders from.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Moment {
@@ -470,6 +480,9 @@ pub struct Moment {
     /// 过去的那个回合的建议,比没有建议更坏。
     pub suggestion: Option<String>,
     pub scroll: ScrollPos,
+    pub scrollbar_mode: ScrollbarMode,
+    pub scrollbar_until: Option<tokio::time::Instant>,
+    pub scrollbar_dragging: bool,
     /// What the pointer has selected, if anything. Screen state, not a fact —
     /// which is exactly what this struct is for.
     pub selection: Option<Selection>,

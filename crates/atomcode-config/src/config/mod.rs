@@ -593,8 +593,17 @@ fn default_terminal_status_glyph() -> bool {
     true
 }
 
-/// UI section of the config — currently just the theme switch driving
-/// the TUIX colour palette. Persisted as a top-level `[ui]` table.
+/// Visibility of the full-screen conversation's scrollbar.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScrollbarMode {
+    #[default]
+    Auto,
+    Always,
+    Hidden,
+}
+
+/// Terminal UI preferences, persisted as a top-level `[ui]` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiConfig {
     /// Colour palette to use for markdown / code-block / chrome
@@ -622,6 +631,9 @@ pub struct UiConfig {
     /// all (see [`default_mouse`]).
     #[serde(default = "default_mouse")]
     pub mouse: bool,
+    /// Conversation scrollbar visibility in the full-screen UI; read at startup.
+    #[serde(default)]
+    pub scrollbar: ScrollbarMode,
     /// Auto-copy a rendered code block's raw source to the clipboard when the
     /// AI finishes emitting it. OFF by default — it silently overwrote the
     /// user's clipboard on every code-block reply (issue #699 feedback). Env
@@ -694,6 +706,7 @@ impl Default for UiConfig {
             theme: UiTheme::default(),
             screen: Screen::default(),
             mouse: default_mouse(),
+            scrollbar: ScrollbarMode::default(),
             auto_copy_code_blocks: default_auto_copy_code_blocks(),
             ai_session_naming: default_ai_session_naming(),
             terminal_status_glyph: default_terminal_status_glyph(),
