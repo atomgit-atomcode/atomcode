@@ -361,7 +361,9 @@ impl Line {
                 (tail, span.style),
             ] {
                 if !text.is_empty() {
-                    out.push(Span::styled(text, style));
+                    let mut piece = Span::styled(text, style);
+                    piece.link = span.link.clone();
+                    out.push(piece);
                 }
             }
         }

@@ -2207,6 +2207,8 @@ impl Surface for Terminal {
         let mut out = std::io::stdout();
         if matches!(input, Input::Focus(false) | Input::Resize(..)) {
             let _ = link_pointer::POINTER.restore(&mut out);
+        } else if matches!(input, Input::Mouse(Click::Hover, ..)) {
+            let _ = link_pointer::POINTER.update_after_motion(&mut out, hover.over_link());
         } else {
             let _ = link_pointer::POINTER.update(&mut out, hover.over_link());
         }

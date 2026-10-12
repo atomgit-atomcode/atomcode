@@ -10,6 +10,7 @@ pub(super) enum TerminalKind {
     Unsupported = 0,
     Kitty = 1,
     Ghostty = 2,
+    Cmux = 3,
 }
 
 pub(super) fn supported(program: &str, term: &str, kitty: bool, multiplexed: bool) -> TerminalKind {
@@ -25,14 +26,23 @@ pub(super) fn supported(program: &str, term: &str, kitty: bool, multiplexed: boo
 }
 
 pub(super) fn detect() -> TerminalKind {
-    supported(
+    let terminal = supported(
         &std::env::var("TERM_PROGRAM").unwrap_or_default(),
         &std::env::var("TERM").unwrap_or_default(),
         std::env::var_os("KITTY_WINDOW_ID").is_some(),
         ["TMUX", "STY", "ZELLIJ"]
             .iter()
             .any(|key| std::env::var_os(key).is_some()),
-    )
+    );
+    embedded_kind(terminal, std::env::var_os("CMUX_WORKSPACE_ID").is_some())
+}
+
+fn embedded_kind(terminal: TerminalKind, cmux: bool) -> TerminalKind {
+    if terminal == TerminalKind::Ghostty && cmux {
+        TerminalKind::Cmux
+    } else {
+        terminal
+    }
 }
 
 // Shared with panic and signal cleanup, which must not lock the hover state.
@@ -83,8 +93,30 @@ impl LinkPointer {
         }
         match self.terminal.load(Ordering::Relaxed) {
             1 => b"\x1b]22;\x1b\\",
-            2 => b"\x1b]22;text\x1b\\",
+            2 | 3 => b"\x1b]22;text\x1b\\",
             _ => b"",
+        }
+    }
+
+    /// cmux's AppKit cursor can be reset while its last shape remains cached.
+    /// A default/pointer pair re-arms that cache on motion within a link. Emit
+    /// both in one write so this does not require a text repaint or a timer.
+    pub(super) fn update_after_motion(
+        &self,
+        writer: &mut impl Write,
+        over_link: bool,
+    ) -> io::Result<()> {
+        if self.terminal.load(Ordering::Relaxed) == TerminalKind::Cmux as u8
+            && over_link
+            && self.state.load(Ordering::Relaxed) == 2
+        {
+            self.state.store(3, Ordering::Relaxed);
+            writer.write_all(b"\x1b]22;default\x1b\\\x1b]22;pointer\x1b\\")?;
+            writer.flush()?;
+            self.state.store(2, Ordering::Relaxed);
+            Ok(())
+        } else {
+            self.update(writer, over_link)
         }
     }
     pub(super) fn restore(&self, writer: &mut impl Write) -> io::Result<()> {
@@ -178,6 +210,69 @@ mod tests {
             TerminalKind::Unsupported
         );
     }
+
+    #[test]
+    fn cmux_requires_ghostty_detection_and_does_not_bypass_multiplexers() {
+        assert_eq!(
+            embedded_kind(TerminalKind::Ghostty, true),
+            TerminalKind::Cmux
+        );
+        assert_eq!(
+            embedded_kind(TerminalKind::Ghostty, false),
+            TerminalKind::Ghostty
+        );
+        assert_eq!(
+            embedded_kind(TerminalKind::Unsupported, true),
+            TerminalKind::Unsupported
+        );
+        assert_eq!(
+            embedded_kind(supported("ghostty", "tmux-256color", false, true), true),
+            TerminalKind::Unsupported
+        );
+    }
+
+    #[test]
+    fn cmux_motion_rearms_a_native_cursor_that_was_reset_without_a_shape_change() {
+        #[derive(Default)]
+        struct NativeCursor {
+            applied_hand: bool,
+            visible_hand: bool,
+            bytes: Vec<u8>,
+        }
+        impl Write for NativeCursor {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                let text = String::from_utf8_lossy(bytes);
+                if text.contains("22;default") {
+                    self.applied_hand = false;
+                    self.visible_hand = false;
+                }
+                if text.contains("22;pointer") && !self.applied_hand {
+                    self.applied_hand = true;
+                    self.visible_hand = true;
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let p = LinkPointer::new();
+        p.configure(TerminalKind::Cmux);
+        let mut native = NativeCursor::default();
+        for _ in 0..3 {
+            native.visible_hand = false;
+            p.update_after_motion(&mut native, true).unwrap();
+            assert!(native.visible_hand);
+            let len = native.bytes.len();
+            p.update(&mut native, true).unwrap();
+            assert_eq!(native.bytes.len(), len, "repaints do not re-arm the cursor");
+        }
+        p.update_after_motion(&mut native, false).unwrap();
+        assert!(!native.visible_hand);
+        p.restore(&mut native).unwrap();
+        assert!(native.bytes.ends_with(b"\x1b]22;text\x1b\\"));
+    }
     #[test]
     fn shapes_change_once_and_cleanup_releases_each_terminal() {
         for (kind, restore) in [
@@ -219,6 +314,52 @@ mod tests {
             hover.observe(&event);
             assert!(!hover.over_link());
         }
+    }
+
+    #[test]
+    fn a_selected_link_keeps_hover_feedback_across_repaints() {
+        let mut painted = frame(true);
+        let mut hover = LinkHover::default();
+        hover.observe(&Input::Mouse(Click::Hover, 1, 0));
+        hover.paint(&painted);
+        assert!(hover.over_link());
+        painted.highlight(&crate::moment::Selection {
+            anchor: (1, 0),
+            head: (2, 0),
+        });
+        hover.paint(&painted);
+        for x in 0..4 {
+            hover.observe(&Input::Mouse(Click::Hover, x, 0));
+            assert!(
+                hover.over_link(),
+                "link metadata survives each split at x={x}"
+            );
+        }
+        hover.observe(&Input::Mouse(Click::Hover, 4, 0));
+        assert!(!hover.over_link());
+    }
+
+    #[test]
+    fn failed_cmux_rearming_keeps_cleanup_armed() {
+        struct NoFlush;
+        impl Write for NoFlush {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::other("flush failed"))
+            }
+        }
+        let p = LinkPointer::new();
+        p.configure(TerminalKind::Cmux);
+        p.update(&mut Vec::new(), true).unwrap();
+        assert!(p.update_after_motion(&mut NoFlush, true).is_err());
+        assert_eq!(p.restore_bytes(), b"\x1b]22;text\x1b\\");
+        let mut out = Vec::new();
+        p.update_after_motion(&mut out, true).unwrap();
+        assert_eq!(out, b"\x1b]22;pointer\x1b\\");
+        p.restore(&mut out).unwrap();
+        assert!(p.restore_bytes().is_empty());
     }
     #[test]
     fn unsupported_terminals_emit_nothing() {
