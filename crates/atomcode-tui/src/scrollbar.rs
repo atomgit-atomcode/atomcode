@@ -84,12 +84,12 @@ impl Bar {
                 };
                 Line::styled(
                     if selected && caps.unicode {
-                        "▏"
+                        "┃"
                     } else {
                         caps.g(glyph)
                     },
                     crate::theme::fg(if selected {
-                        crate::theme::Role::Muted
+                        crate::theme::Role::Accent
                     } else {
                         crate::theme::Role::Border
                     }),

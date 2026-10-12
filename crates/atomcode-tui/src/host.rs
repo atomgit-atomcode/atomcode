@@ -1215,6 +1215,8 @@ fn run_around(
 /// rect is what is left once they have taken their rows. See
 /// [`Host::pane_geometry`].
 struct Pane {
+    /// Scrollable viewport, including rolling tails but excluding held panels.
+    scroll_rect: Rect,
     /// What the blocks are drawn into — the pane minus whatever tail rows the
     /// window still covers.
     block_rect: Rect,
@@ -5715,6 +5717,7 @@ impl Host {
         tail.reverse();
 
         Pane {
+            scroll_rect: pane,
             block_rect: Rect::new(pane.x, pane.y, pane.w, pane.h.saturating_sub(visible_tail)),
             block_scroll: scroll.saturating_sub(tail_full),
             tail,
@@ -6151,14 +6154,14 @@ impl Host {
                     stream_rect = Some(pane.block_rect);
                     frame.place("stream", pane.block_rect, lines);
                     if let Some(bar) = crate::scrollbar::Bar::new(
-                        Rect::new(rect.right(), pane.block_rect.y, 1, pane.block_rect.h),
+                        Rect::new(rect.right(), pane.scroll_rect.y, 1, pane.scroll_rect.h),
                         if rect.right() < w {
                             self.scroll_limit(size, &moment)
                         } else {
                             0
                         },
                         moment.scroll.0,
-                        rect.h,
+                        pane.scroll_rect.h,
                     ) {
                         if crate::scrollbar::visible(&moment, tokio::time::Instant::now()) {
                             frame.place(
@@ -11489,6 +11492,11 @@ mod tests {
                 (live > 0).then_some(live),
                 "{scroll}"
             );
+            assert_eq!(
+                p.scroll_rect,
+                Rect::new(0, 0, 80, 13),
+                "held panels are outside the track"
+            );
             assert_eq!(p.block_rect.h, 13 - live, "{scroll}");
             assert_eq!(p.block_scroll, scroll.saturating_sub(2), "{scroll}");
         }
@@ -11679,6 +11687,10 @@ mod tests {
         let pane = Rect::sized(80, 21);
         for scroll in 0..=6usize {
             let p = Host::pane_geometry(pane, scroll, &pane_heights());
+            assert_eq!(
+                p.scroll_rect, pane,
+                "rolling tails must not resize the track"
+            );
             assert_eq!(p.block_scroll, 0, "scroll {scroll} moved the conversation");
             assert_eq!(
                 p.block_rect.h,
