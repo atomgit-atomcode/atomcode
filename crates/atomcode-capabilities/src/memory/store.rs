@@ -14,6 +14,14 @@ const DEFAULT_CHAR_LIMIT: usize = 4000;
 /// whole [`DEFAULT_CHAR_LIMIT`] budget and starve every other fact.
 const MAX_MEMORY_ENTRY_CHARS: usize = 500;
 
+/// Full memory source for a driver, without prompt truncation or presentation parsing.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct MemorySection {
+    pub scope: String,
+    pub path: PathBuf,
+    pub text: String,
+}
+
 pub struct MemoryStore {
     path: PathBuf,
     /// Marks the machine-local store: `append` drops a wildcard-only `.gitignore`

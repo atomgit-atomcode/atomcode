@@ -822,6 +822,13 @@ impl crate::commands::CatalogCommand for MemoryCommand {
 
     async fn run(&self, _agent: Arc<crate::agent::Agent>, args: &str) -> Result<String, String> {
         use atomcode_kernel::tool::ToolContext;
+        let (sections, args) = if self.action == "list" {
+            args.strip_prefix("--json")
+                .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+                .map_or((false, args), |rest| (true, rest.trim()))
+        } else {
+            (false, args)
+        };
         // 哪一层。写在前面的 `--global` / `--local` 是人会打的写法,而不认
         // 它的后果是**把那两个字当成要记住的话写进项目那一层** ——
         // 记下了、记错了地方、而且记进去的是一句没人写的话。
@@ -843,6 +850,30 @@ impl crate::commands::CatalogCommand for MemoryCommand {
         };
         if self.action != "list" && content.is_empty() {
             return Err(t(Msg::CmdCustomArgRequired { name: self.name }).into_owned());
+        }
+        if sections {
+            use atomcode_capabilities::memory::store::MemorySection;
+            let project_dir = self.dirs.project(&self.project);
+            let stores = [
+                ("project", MemoryStore::project(&project_dir)),
+                ("global", MemoryStore::new(self.global.clone())),
+                ("local", MemoryStore::local(&project_dir)),
+            ];
+            let sections = stores
+                .iter()
+                .filter(|(name, _)| scope.is_none_or(|scope| scope == *name))
+                .map(|(name, store)| {
+                    store
+                        .full_text()
+                        .map(|text| MemorySection {
+                            scope: (*name).into(),
+                            path: store.path().into(),
+                            text,
+                        })
+                        .map_err(|error| format!("{}: {error}", store.path().display()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            return serde_json::to_string(&sections).map_err(|error| error.to_string());
         }
         let mut call = serde_json::json!({ "action": self.action });
         if let Some(scope) = scope {

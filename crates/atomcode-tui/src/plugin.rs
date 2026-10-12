@@ -518,7 +518,11 @@ impl AgentClient {
             id,
             session,
             name: name.to_string(),
-            args: args.to_string(),
+            args: if name == "memory" && !args.trim_start().starts_with("--json") {
+                format!("--json {}", args.trim())
+            } else {
+                args.to_string()
+            },
         });
     }
     /// Ask every followed session to describe itself again.
@@ -6304,7 +6308,9 @@ impl Tui {
                     let sheet = crate::sheet::Sheet::doc(crate::sheet::Doc::new(
                         "memory",
                         Vec::new(),
-                        vec![crate::sheet::DocTab::new("memory", output.clone())],
+                        memory_tabs(&output).unwrap_or_else(|| {
+                            vec![crate::sheet::DocTab::new("memory", output.clone())]
+                        }),
                     ));
                     if self.host.open_sheet(sheet) {
                         return true;
@@ -12522,7 +12528,12 @@ mod midturn_command_tests {
         );
         tui.on_event(AgentEvent::Invoked {
             id: "memory".into(),
-            output: workflow.clone(),
+            output: serde_json::json!([
+                {"scope":"project", "path":"/project/memory.md", "text":workflow},
+                {"scope":"global", "path":"/global/memory.md", "text":"GLOBAL MEMORY"},
+                {"scope":"local", "path":"/local/memory.md", "text":""}
+            ])
+            .to_string(),
             queued: false,
             failed: Some(false),
         });
@@ -12530,7 +12541,10 @@ mod midturn_command_tests {
         let crate::sheet::Page::Doc(doc) = &moment.sheet.as_ref().unwrap().page else {
             panic!("memory document");
         };
-        assert_eq!(doc.tabs[0].markdown, workflow);
+        assert_eq!(doc.tabs.len(), 3);
+        assert!(doc.tabs[0].markdown.contains(&workflow));
+        assert!(doc.tabs[1].markdown.contains("GLOBAL MEMORY"));
+        assert!(!doc.tabs[0].markdown.contains("GLOBAL MEMORY"));
         assert!(doc
             .lines(40)
             .iter()
@@ -12832,6 +12846,28 @@ mod paste_habit_tests {
     /// anything is selected — a terminal's own menu — and copy with nothing
     /// selected says so instead of copying the composer.
     #[test]
+    fn a_right_click_menu_survives_release_drag_and_wheel_events() {
+        use crate::surface::Click;
+        for in_composer in [false, true] {
+            let (host, tui) = screen();
+            host.compose((60, 24));
+            let (x, y) = if in_composer {
+                let field = host.field_rect().unwrap();
+                (field.x, field.y)
+            } else { (5, 2) };
+            assert_eq!(tui.pointer_in_menu(Click::RightPress, x, y, &tui.client), Some(false));
+            assert!(host.context_menu_open());
+            for event in [Click::Release, Click::Drag, Click::WheelUp, Click::WheelDown] {
+                tui.pointer_in_menu(event, x, y, &tui.client);
+                assert!(host.context_menu_open(), "{event:?}, composer={in_composer}");
+            }
+            // A real press outside remains a dismissal.
+            tui.pointer_in_menu(Click::Press, 0, 0, &tui.client);
+            assert!(!host.context_menu_open());
+        }
+    }
+
+    #[test]
     fn the_conversation_s_menu_has_copy_and_paste() {
         let (host, tui) = screen();
         host.moment.write().expect("moment poisoned").input = "草稿".into();
@@ -13108,5 +13144,55 @@ mod conversation_mouse_tests {
         assert_eq!(host.moment.read().unwrap().scroll.0, 0);
         assert!(tui.scrollbar_input(crate::surface::Click::Release, track.x, track.bottom()));
         assert!(tui.scroll_drag.lock().unwrap().is_none());
+    }
+}
+
+fn memory_tabs(output: &str) -> Option<Vec<crate::sheet::DocTab>> {
+    use crate::i18n::product::{t, Msg};
+    use atomcode_capabilities::memory::store::MemorySection;
+    let sections: Vec<MemorySection> = serde_json::from_str(output).ok()?;
+    sections
+        .into_iter()
+        .map(|section| {
+            let label = match section.scope.as_str() {
+                "project" => Msg::StatusMemoryScopeProject,
+                "global" => Msg::StatusMemoryScopeGlobal,
+                "local" => Msg::StatusMemoryScopeLocal,
+                _ => return None,
+            };
+            let body = if section.text.trim().is_empty() {
+                crate::i18n::t(crate::i18n::Msg::MemoryEmpty).into_owned()
+            } else {
+                section.text
+            };
+            Some(crate::sheet::DocTab::new(
+                t(label),
+                format!("## {}\n\n{body}", section.path.display()),
+            ))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod memory_tab_tests {
+    use super::*;
+    #[test]
+    fn memory_sources_have_separate_tabs_even_when_empty() {
+        let _locale = crate::i18n::test_lock();
+        let tabs = memory_tabs(r#"[{"scope":"project","path":"/project/memory.md","text":"PROJECT\n[Global]\n## heading"},{"scope":"global","path":"/global/memory.md","text":"GLOBAL"},{"scope":"local","path":"/local/memory.md","text":""}]"#).unwrap();
+        assert_eq!(tabs.len(), 3);
+        assert!(tabs[0].markdown.contains("PROJECT\n[Global]\n## heading"));
+        assert!(!tabs[0].markdown.contains("GLOBAL"));
+        assert!(tabs[1].markdown.contains("GLOBAL"));
+        assert!(tabs[2].markdown.contains("/local/memory.md"));
+        let mut doc = crate::sheet::Doc::new("memory", Vec::new(), tabs);
+        doc.top = 20;
+        assert!(doc.show(1));
+        assert_eq!(doc.top, 0);
+        doc.top = 5;
+        assert!(doc.show(0));
+        assert_eq!(doc.top, 20);
+        assert!(doc.show(1));
+        assert_eq!(doc.top, 5);
     }
 }

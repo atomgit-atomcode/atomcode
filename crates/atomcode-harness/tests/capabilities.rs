@@ -69,6 +69,47 @@ config = { script = [ { text = "ok" } ] }
 "#;
 
 #[tokio::test]
+async fn memory_json_keeps_all_scopes_separate_and_complete() {
+    let dir = scratch("memory-sections");
+    let app = start(tree(&dir, STOP, &[])).await;
+    let ctx = app.context();
+    let agent = atomcode_harness::create_agent(&app).await.unwrap();
+    let catalog = ctx
+        .service::<atomcode_harness::seams::CommandsSvc>()
+        .unwrap();
+    let command = catalog.find("memory", &agent).unwrap();
+    let text = "PROJECT CONTENT ".repeat(1000);
+    catalog
+        .find("remember", &agent)
+        .unwrap()
+        .run(agent.clone(), &text)
+        .await
+        .unwrap();
+    let output = command.run(agent.clone(), "--json").await.unwrap();
+    let sections: Vec<atomcode_capabilities::memory::store::MemorySection> =
+        serde_json::from_str(&output).unwrap();
+    assert_eq!(
+        sections
+            .iter()
+            .map(|section| section.scope.as_str())
+            .collect::<Vec<_>>(),
+        ["project", "global", "local"]
+    );
+    assert!(
+        sections[0].text.contains(text.trim()),
+        "{}",
+        sections[0].text
+    );
+    assert!(sections[1].text.is_empty());
+    assert!(sections[2].text.is_empty());
+    let output = command.run(agent, "--json --project").await.unwrap();
+    let sections: Vec<atomcode_capabilities::memory::store::MemorySection> =
+        serde_json::from_str(&output).unwrap();
+    assert_eq!(sections.len(), 1);
+    assert_eq!(sections[0].scope, "project");
+}
+
+#[tokio::test]
 async fn a_command_without_a_skill_is_only_a_direct_command() {
     use atomcode_kernel::tool::{Tool, ToolContext};
     use std::sync::Arc;

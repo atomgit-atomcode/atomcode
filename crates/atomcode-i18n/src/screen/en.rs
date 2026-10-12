@@ -21,6 +21,8 @@ use std::borrow::Cow;
 
 pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
     match msg {
+        Msg::MemoryEmpty => Cow::Borrowed("No memory in this scope yet."),
+
         // ── the command dispatcher ──
         Msg::CmdNoSuch { name } => {
             format!("no /{name} — type /help to see what there is").into()

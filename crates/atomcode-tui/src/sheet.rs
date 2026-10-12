@@ -383,6 +383,7 @@ pub struct Doc {
     pub tab: usize,
     /// 视野从画出来的第几行开始。
     pub top: usize,
+    tab_tops: Vec<usize>,
 }
 
 /// 文档的一页。
@@ -407,6 +408,7 @@ impl Doc {
         Self {
             id,
             title,
+            tab_tops: vec![0; tabs.len()],
             tabs: Arc::new(tabs),
             tab: 0,
             top: 0,
@@ -437,14 +439,13 @@ impl Doc {
             .min(self.last_top(room, width));
     }
 
-    /// 换到前一页 / 后一页,绕回;换了页从头读。只有一页时什么都不做。
+    /// 换到前一页 / 后一页,绕回;每页保留滚动位置。只有一页时什么都不做。
     fn switch(&mut self, by: isize) {
         let n = self.tabs.len();
         if n <= 1 {
             return;
         }
-        self.tab = (self.tab as isize + by).rem_euclid(n as isize) as usize;
-        self.top = 0;
+        self.show((self.tab as isize + by).rem_euclid(n as isize) as usize);
     }
 
     /// 正在看的那一页有没有可点的链接 —— 提示里才说「点击标题打开链接」。
@@ -459,8 +460,9 @@ impl Doc {
         if tab >= self.tabs.len() || tab == self.tab {
             return false;
         }
+        self.tab_tops[self.tab] = self.top;
         self.tab = tab;
-        self.top = 0;
+        self.top = self.tab_tops[tab];
         true
     }
 }

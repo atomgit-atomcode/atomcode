@@ -9,6 +9,8 @@ use std::borrow::Cow;
 
 pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
     match msg {
+        Msg::MemoryEmpty => Cow::Borrowed("这一范围暂无记忆。"),
+
         // ── 命令分发 ──
         Msg::CmdNoSuch { name } => {
             format!("没有 /{name} 这条命令,输入 /help 看有哪些").into()

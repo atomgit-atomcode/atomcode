@@ -7,6 +7,8 @@
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Msg<'a> {
+    MemoryEmpty,
+
     // ── the command dispatcher (`command.rs`) ──
     /// Typed `/xyz` and there is no such command, with nothing close either.
     CmdNoSuch {
