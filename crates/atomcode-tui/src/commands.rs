@@ -1505,9 +1505,13 @@ impl CommandSet for SessionCommands {
                     })
                     .await
                 {
-                    Ok(_) => {
+                    Ok(reply) => {
                         client.chose_effort(level);
-                        Outcome::Said(t(Msg::EffortSet { wanted }).into_owned())
+                        let mut message = t(Msg::EffortSet { wanted }).into_owned();
+                        if let HostReply::DoneWithNote { note } = reply {
+                            message.push_str(&format!("\n{note}"));
+                        }
+                        Outcome::Said(message)
                     }
                     Err(error) => Outcome::Refused(refusal(error)),
                 }
@@ -2413,12 +2417,16 @@ impl CommandSet for SessionCommands {
                     })
                     .await
                 {
-                    Ok(_) => Outcome::Said(
-                        t(Msg::ThinkingSet {
+                    Ok(reply) => {
+                        let mut message = t(Msg::ThinkingSet {
                             value: if on { "on" } else { "off" },
                         })
-                        .into_owned(),
-                    ),
+                        .into_owned();
+                        if let HostReply::DoneWithNote { note } = reply {
+                            message.push_str(&format!("\n{note}"));
+                        }
+                        Outcome::Said(message)
+                    }
                     Err(error) => Outcome::Refused(refusal(error)),
                 }
             }
@@ -4160,6 +4168,24 @@ mod tests {
     ///
     /// 两句都要说:只说第二句会读成「没换成」,只说第一句就是
     /// 今天这个样子。
+    #[tokio::test]
+    async fn reasoning_save_failures_are_visible_for_effort_and_thinking() {
+        for command in ["/effort high", "/think on"] {
+            let host = Arc::new(Recording::default());
+            let (app, _client, all) = following(&host);
+            host.replies
+                .lock()
+                .unwrap()
+                .push_back(Ok(HostReply::DoneWithNote {
+                    note: "SAVE-FAILED".into(),
+                }));
+            let Outcome::Said(said) = all.dispatch(command, &app.context()).await else {
+                panic!("setting should take effect");
+            };
+            assert!(said.contains("SAVE-FAILED"), "{said}");
+        }
+    }
+
     #[tokio::test]
     async fn a_model_switch_that_was_not_written_down_says_both_halves() {
         let host = Arc::new(Recording::default());

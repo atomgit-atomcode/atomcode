@@ -622,6 +622,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::RuntimeStopped { how } => {
             format!("the runtime stopped: {how}. nothing more will arrive in this session.").into()
         }
+        Msg::ReasoningNotKept { error } => format!("Applied for this session, but could not save the preference; it will revert after restart: {error}").into(),
         Msg::ModelNotKept { error } => {
             format!("but it was not written down; the next start will use the old one: {error}").into()
         }

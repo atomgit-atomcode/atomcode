@@ -1021,6 +1021,97 @@ async fn a_question_reaches_the_front_end_and_its_answer_goes_back() {
     );
 }
 
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn reasoning_changes_reach_the_config_owner_and_report_write_failures() {
+    struct Source {
+        fail: bool,
+        efforts: Mutex<Vec<Option<ReasoningEffort>>>,
+        thinking: Mutex<Vec<bool>>,
+    }
+    impl HostConfig for Source {
+        fn for_model(&self, _: &str) -> Result<CodingAgentConfig, String> {
+            Err("unused".into())
+        }
+        fn current(&self) -> Result<CodingAgentConfig, String> {
+            Err("unused".into())
+        }
+        fn set_reasoning_effort(
+            &self,
+            selection: &str,
+            effort: Option<ReasoningEffort>,
+        ) -> Result<(), String> {
+            assert_eq!(selection, "scripted");
+            self.efforts.lock().unwrap().push(effort);
+            if self.fail {
+                Err("WRITE-FAILED".into())
+            } else {
+                Ok(())
+            }
+        }
+        fn set_thinking_enabled(&self, selection: &str, on: bool) -> Result<(), String> {
+            assert_eq!(selection, "scripted");
+            self.thinking.lock().unwrap().push(on);
+            if self.fail {
+                Err("WRITE-FAILED".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+    for fail in [false, true] {
+        let env = env();
+        let source = Arc::new(Source {
+            fail,
+            efforts: Mutex::new(Vec::new()),
+            thinking: Mutex::new(Vec::new()),
+        });
+        let (mut connection, _) = started(
+            &env,
+            SubagentPolicy::default(),
+            Some(source.clone()),
+            Vec::new(),
+            false,
+        )
+        .await;
+        let session = connection.session.clone();
+        for level in [Some(ReasoningEffort::High), None] {
+            let reply = connection
+                .control
+                .call(HostCommand::SetReasoningEffort {
+                    session: session.clone(),
+                    level,
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                matches!(reply, HostReply::DoneWithNote { ref note } if note.contains("WRITE-FAILED")),
+                fail
+            );
+        }
+        for on in [true, false] {
+            let reply = connection
+                .control
+                .call(HostCommand::SetThinking {
+                    session: session.clone(),
+                    on,
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                matches!(reply, HostReply::DoneWithNote { ref note } if note.contains("WRITE-FAILED")),
+                fail
+            );
+        }
+        assert_eq!(
+            *source.efforts.lock().unwrap(),
+            [Some(ReasoningEffort::High), None]
+        );
+        assert_eq!(*source.thinking.lock().unwrap(), [true, false]);
+        connection.commands.send(message("still works")).unwrap();
+        through_turn(&mut connection).await;
+    }
+}
+
 #[tokio::test]
 async fn the_thinking_level_set_through_host_control_reaches_requests_and_is_described() {
     let env = env();

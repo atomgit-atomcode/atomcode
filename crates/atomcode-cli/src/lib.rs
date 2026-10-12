@@ -405,6 +405,36 @@ pub mod tui_front {
     }
 
     impl ConfigFile {
+        fn persist_reasoning(
+            &self,
+            selection: &str,
+            key: &str,
+            value: toml_edit::Item,
+        ) -> Result<(), String> {
+            atomcode_config::store::ConfigStore::new(&self.path)
+                .update_document(|document| {
+                    let section = if document
+                        .get("models")
+                        .and_then(|models| models.get(selection))
+                        .is_some_and(|entry| entry.as_table_like().is_some())
+                    {
+                        "models"
+                    } else if document
+                        .get("providers")
+                        .and_then(|providers| providers.get(selection))
+                        .is_some_and(|entry| entry.as_table_like().is_some())
+                    {
+                        "providers"
+                    } else {
+                        anyhow::bail!("no persistent configuration entry for model `{selection}`");
+                    };
+                    document[section][selection][key] = value;
+                    Ok(())
+                })
+                .map(|_| ())
+                .map_err(|error| format!("{error:#}"))
+        }
+
         fn resolve(&self, model: Option<&str>) -> Result<CodingAgentConfig, String> {
             use atomcode_config::config::Config;
             let config = if self.path.exists() {
@@ -542,6 +572,22 @@ pub mod tui_front {
                 })?;
             spec.reset(&mut document);
             std::fs::write(&self.path, document.to_string()).map_err(|e| e.to_string())
+        }
+
+        fn set_reasoning_effort(
+            &self,
+            selection: &str,
+            effort: Option<atomcode_kernel::provider::ReasoningEffort>,
+        ) -> Result<(), String> {
+            self.persist_reasoning(
+                selection,
+                "reasoning_effort",
+                toml_edit::value(effort.map(|effort| effort.as_str()).unwrap_or("auto")),
+            )
+        }
+
+        fn set_thinking_enabled(&self, selection: &str, on: bool) -> Result<(), String> {
+            self.persist_reasoning(selection, "thinking_enabled", toml_edit::value(on))
         }
 
         /// Persist `model` as `default_model`, in place, so a `/model` switch
@@ -706,6 +752,44 @@ model = "vendor-b"
         /// Rewriting the file from a serialized config would pass this if it
         /// only checked the value; the comment is what proves it was edited in
         /// place, which is what a person's config file deserves.
+        #[test]
+        fn reasoning_preferences_survive_fresh_loads_for_models_and_legacy_providers() {
+            use atomcode_kernel::provider::ReasoningEffort;
+            for (selection, source) in [
+                ("p", "default_provider = \"p\"\n[providers.p]\ntype = \"openai\"\nmodel = \"custom\"\nbase_url = \"http://localhost/v1\"\nreasoning_effort_levels = [\"low\", \"high\"]\n[providers.other]\ntype = \"openai\"\nmodel = \"other\"\nreasoning_effort = \"low\"\n"),
+                ("custom/a", CONFIG),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("config.toml");
+                std::fs::write(&path, format!("# keep this comment\n{source}")).unwrap();
+                let file = ConfigFile { path: path.clone(), working_dir: dir.path().into(), telemetry: None, skip_permissions: false, provider_override: None };
+                file.set_reasoning_effort(selection, Some(ReasoningEffort::High)).unwrap();
+                atomcode_config::store::ConfigStore::new(&path).update_document(|document| {
+                    document["ui"]["theme"] = toml_edit::value("light");
+                    Ok(())
+                }).unwrap();
+                file.set_thinking_enabled(selection, true).unwrap();
+                let fresh = file.for_model(selection).unwrap();
+                assert_eq!(fresh.chat_options.reasoning_effort, Some(ReasoningEffort::High));
+                assert_eq!(fresh.thinking_enabled, Some(true));
+                assert!(std::fs::read_to_string(&path).unwrap().contains("# keep this comment"));
+                file.set_reasoning_effort(selection, None).unwrap();
+                file.set_thinking_enabled(selection, false).unwrap();
+                let fresh = file.for_model(selection).unwrap();
+                assert_eq!(fresh.chat_options.reasoning_effort, None);
+                assert_eq!(fresh.thinking_enabled, Some(false));
+                assert!(fresh.supports_reasoning_effort, "default must keep the capability");
+                let before = std::fs::read_to_string(&path).unwrap();
+                assert!(before.contains("theme = \"light\""), "concurrent edits must survive");
+                assert!(before.contains("reasoning_effort = \"auto\""));
+                assert!(file.set_thinking_enabled("runtime-only/missing", true).is_err());
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+                if selection == "p" {
+                    assert!(before.contains("reasoning_effort = \"low\""), "other provider is unchanged");
+                }
+            }
+        }
+
         #[test]
         fn a_setting_is_read_from_the_file_and_written_back_into_it() {
             use crate::host::HostConfig;

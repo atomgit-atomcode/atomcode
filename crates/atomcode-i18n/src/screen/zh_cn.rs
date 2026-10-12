@@ -571,6 +571,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StatusWhereLine { where_ } => format!("在 {where_}").into(),
         Msg::StatusAutonomyLine { what, round, took } => format!("在自己干:{what} · 第 {round} 轮 · 已跑 {took}").into(),
         Msg::VisionFailedBecause { reason } => format!("图片没认出来:{reason}").into(),
+        Msg::ReasoningNotKept { error } => format!("本次会话已生效，但未能保存设置，重启后会恢复旧值：{error}").into(),
         Msg::ModelNotKept { error } => format!("但没存下来,重启后还是旧的那个:{error}").into(),
         Msg::RefusedStaleQuestion => "那个问题已经不等回答了".into(),
         Msg::RefusedNotRunning => "没有正在跑的回合可停".into(),

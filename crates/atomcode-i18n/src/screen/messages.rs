@@ -949,6 +949,9 @@ pub enum Msg<'a> {
     RefusedNotRunning,
     RefusedUnavailable,
     RefusedUnsupported,
+    ReasoningNotKept {
+        error: &'a str,
+    },
     ModelNotKept {
         error: &'a str,
     },

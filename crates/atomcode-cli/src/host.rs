@@ -106,6 +106,22 @@ pub trait HostConfig: Send + Sync {
         Ok(())
     }
 
+    /// Persist a model's reasoning preference after its live change succeeds.
+    /// Hosts without a configuration source keep these session-local.
+    fn set_reasoning_effort(
+        &self,
+        selection: &str,
+        effort: Option<atomcode_kernel::provider::ReasoningEffort>,
+    ) -> Result<(), String> {
+        let _ = (selection, effort);
+        Ok(())
+    }
+
+    fn set_thinking_enabled(&self, selection: &str, on: bool) -> Result<(), String> {
+        let _ = (selection, on);
+        Ok(())
+    }
+
     /// Who is signed in, when anybody is.
     ///
     /// `None` is the ordinary answer for a host that runs on a key in a file:
@@ -1964,6 +1980,15 @@ fn source_groups(working_dir: &std::path::Path) -> Vec<atomcode_host_api::Source
     ]
 }
 
+fn reasoning_persistence_reply(saved: Result<(), String>) -> HostReply {
+    match saved {
+        Ok(()) => HostReply::Done,
+        Err(error) => HostReply::DoneWithNote {
+            note: tr(SMsg::ReasoningNotKept { error: &error }).into_owned(),
+        },
+    }
+}
+
 #[async_trait]
 impl HostControl for RuntimeControl {
     async fn call(&self, command: HostCommand) -> Result<HostReply, HostError> {
@@ -2075,8 +2100,13 @@ impl HostControl for RuntimeControl {
                     .reassemble_provider(next.clone())
                     .await
                     .map_err(refused)?;
+                let selection = next.provider_name.clone();
                 *self.config.lock().expect("config poisoned") = next;
-                Ok(HostReply::Done)
+                Ok(reasoning_persistence_reply(
+                    self.host_config.as_ref().map_or(Ok(()), |source| {
+                        source.set_reasoning_effort(&selection, level)
+                    }),
+                ))
             }
             HostCommand::Sources { session } => {
                 self.addressed(&session)?;
@@ -2871,8 +2901,13 @@ impl HostControl for RuntimeControl {
                     .reassemble_provider(next.clone())
                     .await
                     .map_err(refused)?;
+                let selection = next.provider_name.clone();
                 *self.config.lock().expect("config poisoned") = next;
-                Ok(HostReply::Done)
+                Ok(reasoning_persistence_reply(
+                    self.host_config
+                        .as_ref()
+                        .map_or(Ok(()), |source| source.set_thinking_enabled(&selection, on)),
+                ))
             }
             HostCommand::Readiness { session } => {
                 self.addressed(&session)?;
