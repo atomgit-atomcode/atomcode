@@ -102,6 +102,7 @@ pub struct State {
     cached: u32,
     /// Which request of the turn is in flight.
     step: u32,
+    retry: Option<atomcode_harness::session::RetryAttempt>,
 }
 
 pub struct Live;
@@ -127,8 +128,20 @@ impl View for Live {
             SessionEvent::TurnEnd { .. } => state.turn = None,
 
             SessionEvent::StepStart { step, .. } => state.step = *step,
-            SessionEvent::RequestHeader { .. } => state.phase = Phase::Waiting,
+            SessionEvent::RequestHeader { .. } => {
+                state.phase = Phase::Waiting;
+                state.retry = None;
+            }
+            SessionEvent::Notice {
+                notice: atomcode_harness::session::NoticeKind::ProviderRetry,
+                retry,
+                ..
+            } => {
+                state.phase = Phase::Waiting;
+                state.retry = *retry;
+            }
             SessionEvent::AssistantChunk { reasoning, .. } => {
+                state.retry = None;
                 state.phase = if *reasoning {
                     Phase::Thinking
                 } else {
@@ -447,9 +460,33 @@ fn doing(state: &State, moment: &Moment) -> Option<String> {
         Activity::Idle => None,
         Activity::Stopping => Some(t(Msg::LiveStopping).into_owned()),
         Activity::Working => {
+            if let Some(retry) = state.retry {
+                let elapsed = moment
+                    .provider_retry_started
+                    .map(|since| moment.now.as_millis().saturating_sub(since.as_millis()))
+                    .unwrap_or(0);
+                let delay = retry.backoff_secs.saturating_mul(1000);
+                return Some(if elapsed < delay {
+                    t(Msg::LiveRetryWait {
+                        secs: (delay - elapsed).div_ceil(1000),
+                        attempt: retry.attempt,
+                        max: retry.max_attempts,
+                    })
+                    .into_owned()
+                } else {
+                    let requesting = t(Msg::LiveRetryRequest {
+                        attempt: retry.attempt,
+                        max: retry.max_attempts,
+                    });
+                    match quiet_for(state, moment) {
+                        Some(secs) => format!("{requesting} · {}", t(Msg::LiveSilentFor { secs })),
+                        None => requesting.into_owned(),
+                    }
+                });
+            }
             let verb = match state.phase {
                 Phase::Waiting => t(Msg::LiveWaiting),
-                Phase::Thinking => t(Msg::LiveThinking),
+                Phase::Thinking => t(Msg::LiveThinkingReceiving),
                 Phase::Writing => t(Msg::LiveWriting),
                 // `max(1)`: `Tools` is only set with calls outstanding, so a
                 // zero here would be a fold that lost one — and "running 0
@@ -465,7 +502,11 @@ fn doing(state: &State, moment: &Moment) -> Option<String> {
             // minutes a person spent watching a row that said only "waiting".
             // Tools are left out: a build that takes two minutes is not silence.
             Some(match quiet_for(state, moment) {
-                Some(secs) => format!("{verb} · {}", t(Msg::LiveSilentFor { secs })),
+                Some(secs) => format!(
+                    "{} · {}",
+                    t(Msg::LiveWaiting),
+                    t(Msg::LiveSilentFor { secs })
+                ),
                 None => verb,
             })
         }
@@ -934,6 +975,71 @@ mod tests {
     /// anything is arriving — so against a stream that opened and stalled it
     /// reads exactly like a model that is working. A person watched five minutes
     /// of that (2026-09-23) before the inter-token budget recovered the stream.
+    #[test]
+    fn streaming_reasoning_and_a_quiet_stream_have_distinct_statuses() {
+        let state = fold(&a_turn()[..4]);
+        let mut moment = Moment::default().working().at_tick(0);
+        moment.now = Timestamp::millis(10_000);
+        moment.quiet_since = Some(Timestamp::millis(9_000));
+        let receiving = doing(&state, &moment).unwrap();
+        assert!(
+            receiving.contains("接收中") && receiving.contains("Ctrl+O"),
+            "{receiving}"
+        );
+        moment.now = Timestamp::millis(40_000);
+        let quiet = doing(&state, &moment).unwrap();
+        assert!(
+            quiet.contains("正在等待模型") && quiet.contains("31 秒"),
+            "{quiet}"
+        );
+        assert!(!quiet.contains("接收中"));
+    }
+
+    #[test]
+    fn retry_status_counts_down_and_is_replaced_by_streaming_output() {
+        use atomcode_harness::session::{NoticeKind, RetryAttempt};
+        let mut state = fold(&a_turn()[..4]);
+        let notice = |attempt, backoff_secs| SessionEvent::Notice {
+            turn: 1,
+            notice: NoticeKind::ProviderRetry,
+            detail: "timeout".into(),
+            retry: Some(RetryAttempt {
+                attempt,
+                max_attempts: 2,
+                backoff_secs,
+            }),
+        };
+        Live::absorb(&mut state, &notice(1, 3));
+        let mut moment = Moment::default().working().at_tick(0);
+        moment.provider_retry_started = Some(Timestamp::millis(10_000));
+        moment.now = Timestamp::millis(10_500);
+        assert!(doing(&state, &moment).unwrap().contains("3s 后重试（1/2）"));
+        moment.now = Timestamp::millis(12_001);
+        assert!(doing(&state, &moment).unwrap().contains("1s 后重试"));
+        moment.now = Timestamp::millis(13_000);
+        assert!(doing(&state, &moment)
+            .unwrap()
+            .contains("正在重新请求模型（1/2）"));
+        moment.quiet_since = moment.provider_retry_started;
+        moment.now = Timestamp::millis(50_000);
+        assert!(doing(&state, &moment).unwrap().contains("40 秒没有新内容"));
+        moment.now = Timestamp::millis(13_000);
+        Live::absorb(&mut state, &notice(2, 6));
+        moment.provider_retry_started = Some(moment.now);
+        assert!(doing(&state, &moment).unwrap().contains("6s 后重试（2/2）"));
+        Live::absorb(&mut state, &a_turn()[3]);
+        assert!(doing(&state, &moment).unwrap().contains("接收中"));
+        Live::absorb(
+            &mut state,
+            &SessionEvent::TurnEnd {
+                turn: 1,
+                stop: StopReason::Stopped,
+                error: None,
+            },
+        );
+        assert!(doing(&state, &moment).is_none());
+    }
+
     #[test]
     fn a_turn_that_has_gone_quiet_says_how_long_it_has_been() {
         let state = fold(&[

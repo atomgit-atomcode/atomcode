@@ -1854,6 +1854,7 @@ impl Host {
         m.edge_scroll = None;
         m.turn_started = None;
         m.quiet_since = None;
+        m.provider_retry_started = None;
         m.steering.clear();
         // What a stop withdrew was taken off before this (`Host::take_stopped`);
         // the rest of the queue belongs to the view being left.
@@ -2124,6 +2125,7 @@ impl Host {
             SessionEvent::TurnStart { .. } => {
                 let mut m = self.moment.write().expect("moment poisoned");
                 let now = m.now;
+                m.provider_retry_started = None;
                 m.turn_started = Some(now);
                 m.quiet_since = Some(now);
             }
@@ -2131,6 +2133,15 @@ impl Host {
                 let mut m = self.moment.write().expect("moment poisoned");
                 m.turn_started = None;
                 m.quiet_since = None;
+                m.provider_retry_started = None;
+            }
+            SessionEvent::Notice {
+                notice: atomcode_harness::session::NoticeKind::ProviderRetry,
+                ..
+            } => {
+                let mut m = self.moment.write().expect("moment poisoned");
+                m.provider_retry_started = Some(m.now);
+                m.quiet_since = Some(m.now);
             }
             // The newest wins, which is the whole rule the fact carries. The window
             // title takes any name; the composer pill reads `user_set` to show only
@@ -13811,6 +13822,30 @@ mod tests {
             images: Vec::new(),
         });
         assert_eq!(h.moment.read().unwrap().history, history, "{history:?}");
+    }
+
+    #[test]
+    fn retry_clock_is_reset_on_a_new_turn() {
+        use atomcode_harness::session::{NoticeKind, RetryAttempt};
+        let h = host();
+        h.absorb(&SessionEvent::TurnStart { turn: 1 });
+        h.moment.write().unwrap().now = crate::moment::Timestamp::millis(1000);
+        h.absorb(&SessionEvent::Notice {
+            turn: 1,
+            notice: NoticeKind::ProviderRetry,
+            detail: "timeout".into(),
+            retry: Some(RetryAttempt {
+                attempt: 1,
+                max_attempts: 2,
+                backoff_secs: 3,
+            }),
+        });
+        assert_eq!(
+            h.moment.read().unwrap().provider_retry_started,
+            Some(crate::moment::Timestamp::millis(1000))
+        );
+        h.absorb(&SessionEvent::TurnStart { turn: 2 });
+        assert_eq!(h.moment.read().unwrap().provider_retry_started, None);
     }
 
     #[test]

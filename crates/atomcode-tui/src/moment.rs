@@ -563,6 +563,8 @@ pub struct Moment {
     /// minutes long and a stalled stream is recovered from silently, so without
     /// this the screen has nothing to distinguish the two.
     pub quiet_since: Option<Timestamp>,
+    /// UI clock reading when the latest provider retry was announced.
+    pub provider_retry_started: Option<Timestamp>,
     /// Where the agent is working. Not derivable from the log, which is
     /// exactly what this struct is for.
     pub cwd: String,

@@ -1624,6 +1624,16 @@ pub enum Msg<'a> {
     },
     LiveWaiting,
     LiveThinking,
+    LiveThinkingReceiving,
+    LiveRetryWait {
+        secs: u64,
+        attempt: u32,
+        max: u32,
+    },
+    LiveRetryRequest {
+        attempt: u32,
+        max: u32,
+    },
     LiveWriting,
     /// How long the turn in flight has had nothing new, once that is long
     /// enough to be worth saying. A slow model and a stalled one look identical
