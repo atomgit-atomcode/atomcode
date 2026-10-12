@@ -2484,6 +2484,28 @@ impl Host {
     /// opened fits under it; past that the view follows the opening down until
     /// it fits or that row reaches the top, and it never goes past the top.
     pub fn held_open_while<F: FnOnce()>(&self, x: u16, y: u16, id: BlockId, change: F) {
+        // Opening the thought being generated is watching live output, not
+        // moving into history. Keep bottom-following only if the person was
+        // already there; settled thoughts and a scrolled reader still pin.
+        let at_bottom = self
+            .moment
+            .read()
+            .expect("moment poisoned")
+            .scroll
+            .is_at_bottom();
+        let follow_live = at_bottom && {
+            let stream = self.stream.read().expect("stream poisoned");
+            let pres = self.presentation.read().expect("presentation poisoned");
+            stream.get(id).is_some_and(|slot| {
+                slot.is_live()
+                    && slot.block().kind() == "reasoning"
+                    && pres.is_block_folded(id, "reasoning")
+            })
+        };
+        if follow_live {
+            change();
+            return;
+        }
         let room = *self.last_room.lock().expect("room poisoned");
         // Where the block starts on screen: the click may have landed on any of
         // its rows, and it is the first one that must stay in view.
@@ -9783,6 +9805,39 @@ mod tests {
             y_before,
             "the row that was clicked moved, so the pin did not hold it"
         );
+    }
+
+    #[test]
+    fn opening_live_reasoning_at_bottom_keeps_following_new_thoughts() {
+        let h = host();
+        let size = (80, 24);
+        h.presentation.write().unwrap().toggle("reasoning");
+        let id = h.stream.write().unwrap().writer("model").open(
+            crate::block::Coord::new(1, 1),
+            Arc::new(crate::content::ModelThought("old thought\n\n".repeat(60))),
+        );
+        let frame = h.compose(size);
+        let rect = frame.part("stream").unwrap().rect;
+        let y = (rect.y..rect.bottom())
+            .find(|y| h.block_at(2, *y).is_some_and(|(at, _)| at == id))
+            .unwrap();
+        h.held_open_while(2, y, id, || h.toggle_block(id, "reasoning"));
+        assert!(h.moment.read().unwrap().scroll.is_at_bottom());
+        h.stream.write().unwrap().writer("model").amend(
+            id,
+            Arc::new(crate::content::ModelThought(format!(
+                "{}LATEST-THOUGHT",
+                "old thought\n\n".repeat(80)
+            ))),
+        );
+        assert!(h.compose(size).rows().join("\n").contains("LATEST-THOUGHT"));
+        assert!(h.moment.read().unwrap().scroll.is_at_bottom());
+
+        // A person deliberately reading above the bottom stays in reading mode.
+        h.toggle_block(id, "reasoning");
+        h.moment.write().unwrap().scroll = crate::moment::ScrollPos(1);
+        h.held_open_while(2, y, id, || h.toggle_block(id, "reasoning"));
+        assert!(!h.moment.read().unwrap().scroll.is_at_bottom());
     }
 
     /// Opened at the bottom, what opened is on the screen.
