@@ -8706,6 +8706,16 @@ impl Tui {
             self.open_composer_menu(x, y);
             return Some(false);
         }
+        // Only a button press can choose or dismiss. A terminal may deliver
+        // a release after the right press; treating it as another click makes
+        // the menu vanish before the person can use it. Keep drags and wheel
+        // packets in the open menu too, rather than acting on the text behind.
+        if matches!(
+            click,
+            Click::Release | Click::Drag | Click::WheelUp | Click::WheelDown
+        ) {
+            return self.host.context_menu_open().then_some(false);
+        }
         let size = self.surface.size();
         match self.host.context_menu_click(x, y, size) {
             ContextClick::NotOpen => None,
@@ -12839,6 +12849,41 @@ mod paste_habit_tests {
                 _ => tui.act(Action::AttachImage, &tui.client),
             };
             assert_eq!(typed(&host), "复制来的一句", "{gesture}");
+        }
+    }
+
+    #[test]
+    fn a_right_click_menu_survives_release_drag_and_wheel_events() {
+        use crate::surface::Click;
+        for in_composer in [false, true] {
+            let (host, tui) = screen();
+            host.compose((60, 24));
+            let (x, y) = if in_composer {
+                let field = host.field_rect().unwrap();
+                (field.x, field.y)
+            } else {
+                (5, 2)
+            };
+            assert_eq!(
+                tui.pointer_in_menu(Click::RightPress, x, y, &tui.client),
+                Some(false)
+            );
+            assert!(host.context_menu_open());
+            for event in [
+                Click::Release,
+                Click::Drag,
+                Click::WheelUp,
+                Click::WheelDown,
+            ] {
+                tui.pointer_in_menu(event, x, y, &tui.client);
+                assert!(
+                    host.context_menu_open(),
+                    "{event:?}, composer={in_composer}"
+                );
+            }
+            // A real press outside remains a dismissal.
+            tui.pointer_in_menu(Click::Press, 0, 0, &tui.client);
+            assert!(!host.context_menu_open());
         }
     }
 
