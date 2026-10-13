@@ -247,6 +247,11 @@ impl PluginAgentLoop {
 /// Chunks are logged verbatim, not re-rendered from the finished message: a
 /// replay or a live UI has to be able to reproduce what actually streamed.
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(
+    name = "llm_call",
+    skip_all,
+    fields(purpose = "main_reply", turn, round)
+)]
 async fn stream_once(
     provider: &dyn LlmProvider,
     ctx: &Context,

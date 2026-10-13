@@ -33,6 +33,7 @@ use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::time::Duration;
+use tracing::Instrument;
 
 // ---------------------------------------------------------------------------
 // OpenRouter app attribution
@@ -655,6 +656,15 @@ impl LlmProvider for OpenAiCompatProvider {
             }
         };
 
+        let mut timing = super::latency::Latency::new();
+        timing.mark("request_start");
+        timing.span().in_scope(|| tracing::info!(request_id = timing.id, model = %self.cfg.model,
+            reasoning_effort = body.get("reasoning_effort").and_then(serde_json::Value::as_str).unwrap_or("omitted"),
+            thinking_type = body.pointer("/thinking/type").and_then(serde_json::Value::as_str).unwrap_or("omitted"),
+            enable_thinking = ?body.get("enable_thinking").and_then(serde_json::Value::as_bool),
+            request_bytes = body_bytes.len(), messages = messages.len(), tools = tools.len(),
+            "provider request parameters"));
+
         // Open the stream. A hard failure here returns `Err` (not a stream of one
         // Error event) so the kernel's agent-layer open retry — which keys off the
         // returned `ProviderError` — still applies.
@@ -682,9 +692,13 @@ impl LlmProvider for OpenAiCompatProvider {
             rate_limit_retry_owner,
             open_timeout,
         )
+        .instrument(timing.span())
         .await
         {
-            Ok(r) => r,
+            Ok(r) => {
+                timing.mark("response_headers");
+                r
+            }
             // Gateway rejected `reasoning_effort`. Remember it for the session
             // (next send strips the field up front → succeeds) and surface one
             // actionable error instead of the raw `field ReasoningEffort invalid`.
@@ -693,11 +707,18 @@ impl LlmProvider for OpenAiCompatProvider {
             Err(e) if !effort_known_unsupported && is_reasoning_effort_rejection(&e) => {
                 self.effort_unsupported
                     .store(true, std::sync::atomic::Ordering::Relaxed);
+                timing.open_failed();
                 return Err(effort_unsupported_error());
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                timing.open_failed();
+                return Err(e);
+            }
         };
 
+        let request_id = timing.id;
+        let request_started = timing.started();
+        let request_span = timing.span();
         let s = async_stream::stream! {
             // v1 parity (core/openai.rs ~676): a chunked body that dies BEFORE any
             // replay-sensitive event has reached the consumer is safe to redo
@@ -737,6 +758,7 @@ impl LlmProvider for OpenAiCompatProvider {
                 // gets the full first-token budget, matching the kernel first_token_timeout.
                 // Reset per (re)open: a transparent reconnect restarts prefill on the server.
                 let mut first_byte_seen = false;
+                let mut logged_first_byte = false;
                 loop {
                     match retry::next_chunk_phased(
                         &mut byte_stream,
@@ -824,7 +846,7 @@ impl LlmProvider for OpenAiCompatProvider {
                                     }
                                 }
                                 if let Ok(fresh) =
-                                    open_stream(&client, &url, &body_bytes, &signer, &api_key, &session_id, &policy, rate_limit_retry_owner, open_timeout).await
+                                    open_stream(&client, &url, &body_bytes, &signer, &api_key, &session_id, &policy, rate_limit_retry_owner, open_timeout).instrument(request_span.clone()).await
                                 {
                                     stream_attempt += 1;
                                     resp = fresh;
@@ -851,6 +873,10 @@ impl LlmProvider for OpenAiCompatProvider {
                             return;
                         }
                         Ok(Some(Ok(chunk))) => {
+                            if !logged_first_byte && !chunk.is_empty() {
+                                request_span.in_scope(|| tracing::info!(request_id, phase = "first_body_chunk", stream_attempt, elapsed_ms = request_started.elapsed().as_millis() as u64, "provider request timing"));
+                                logged_first_byte = true;
+                            }
                             let mut saw_done = false;
                             for ev in dec.feed(chunk.as_ref()) {
                                 if !emitted_replay_sensitive && retry::is_attempt_metadata_event(&ev) {
@@ -875,7 +901,7 @@ impl LlmProvider for OpenAiCompatProvider {
             }
         };
 
-        Ok(s.boxed())
+        Ok(s.inspect(move |event| timing.observe(event)).boxed())
     }
 }
 

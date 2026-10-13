@@ -574,6 +574,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml",
+ "tracing",
 ]
 
 [[package]]
