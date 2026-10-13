@@ -1,6 +1,6 @@
 {
   "name": "@atomgit.com/atomcode",
-  "version": "0.0.0-dev",
+  "version": "5.2.3",
   "description": "Open-source terminal AI coding agent — connect any LLM, edit code, run commands, verify autonomously",
   "keywords": ["ai", "coding", "cli", "agent", "terminal", "llm"],
   "homepage": "https://atomgit.com/atomgit_atomcode/atomcode",
