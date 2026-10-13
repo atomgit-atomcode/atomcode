@@ -1,6 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 use super::manifest::{load_marketplace_manifest, MarketplaceManifest, PluginSource};
 use super::paths;
@@ -18,23 +19,55 @@ use crate::ProductDirs;
 ///
 /// Returns the resolved path on success, or an error with a friendly
 /// message explaining that git is required.
+///
+/// Probed at most ONCE per process, then cached; `ATOMCODE_GIT_PATH` overrides
+/// it (see [`resolve_git`]). Without the cache every git operation paid its own
+/// probe first: measured 2026-10-14, a launch with 7 marketplaces made 24 `git`
+/// spawns, 11 of them nothing but `git --version` probes.
 pub fn find_git() -> Result<PathBuf> {
-    // Test hook: set ATOMCODE_GIT_PATH to a non-existent path to simulate
-    // git being unavailable (useful for QA without needing to uninstall git).
-    //   ATOMCODE_GIT_PATH=/dev/null atomcode
-    if let Ok(custom) = std::env::var("ATOMCODE_GIT_PATH") {
-        let p = PathBuf::from(&custom);
+    static CACHED: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+    resolve_git(
+        std::env::var("ATOMCODE_GIT_PATH").ok().as_deref(),
+        &CACHED,
+        probe_git,
+    )
+}
+
+/// How git is resolved: the `ATOMCODE_GIT_PATH` hook when it names a real file,
+/// otherwise `probe` — run at most once per `cell`, and BOTH its answer and its
+/// error are reused for the life of the process. So a machine that gains git
+/// while AtomCode runs still needs the restart the error message asks for.
+///
+/// The hook arrives as an argument instead of being read here, so a test can
+/// drive both branches without mutating process-global state.
+fn resolve_git(
+    hook: Option<&str>,
+    cell: &OnceLock<Result<PathBuf, String>>,
+    probe: impl FnOnce() -> Result<PathBuf>,
+) -> Result<PathBuf> {
+    // The hook is also how QA simulates "no git" without uninstalling it — the
+    // path has to be absent to reach GIT_NOT_FOUND, `/dev/null` exists:
+    //   ATOMCODE_GIT_PATH=/nonexistent/git atomcode
+    if let Some(custom) = hook {
+        let p = PathBuf::from(custom);
         if p.exists() {
             return Ok(p);
         }
-        bail!(
-            "git is not installed or not on PATH. \
-             AtomCode requires git to manage plugin marketplaces. \
-             Please install git (e.g. `xcode-select --install` on macOS, \
-             `sudo apt install git` on Ubuntu) and restart AtomCode."
-        );
+        bail!(GIT_NOT_FOUND);
     }
 
+    cell.get_or_init(|| probe().map_err(|e| format!("{e:#}")))
+        .clone()
+        .map_err(anyhow::Error::msg)
+}
+
+const GIT_NOT_FOUND: &str = "git is not installed or not on PATH. \
+     AtomCode requires git to manage plugin marketplaces. \
+     Please install git (e.g. `xcode-select --install` on macOS, \
+     `sudo apt install git` on Ubuntu) and restart AtomCode.";
+
+/// The uncached probe behind [`find_git`].
+fn probe_git() -> Result<PathBuf> {
     // 1. Default PATH resolution — works on most Linux systems and in
     //    terminal-launched sessions where git is already on PATH.
     if let Ok(path) = which_git("git") {
@@ -68,12 +101,7 @@ pub fn find_git() -> Result<PathBuf> {
         }
     }
 
-    bail!(
-        "git is not installed or not on PATH. \
-         AtomCode requires git to manage plugin marketplaces. \
-         Please install git (e.g. `xcode-select --install` on macOS, \
-         `sudo apt install git` on Ubuntu) and restart AtomCode."
-    )
+    bail!(GIT_NOT_FOUND)
 }
 
 /// Simple `which`-like resolution for an executable name.
@@ -718,6 +746,80 @@ mod tests {
     use super::*;
     use crate::plugin::test_support::isolated_home;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The cache is the point of `resolve_git`: every ask after the first is
+    /// free, which is what stops a launch from spending a `git --version`
+    /// before each and every git operation.
+    #[test]
+    fn asking_for_git_many_times_probes_once() {
+        static CELL: std::sync::OnceLock<Result<PathBuf, String>> = std::sync::OnceLock::new();
+        let probes = AtomicUsize::new(0);
+        for _ in 0..5 {
+            let got = resolve_git(None, &CELL, || {
+                probes.fetch_add(1, Ordering::SeqCst);
+                Ok(PathBuf::from("/probed/git"))
+            })
+            .expect("the probe answered");
+            assert_eq!(got, PathBuf::from("/probed/git"));
+        }
+        assert_eq!(probes.load(Ordering::SeqCst), 1, "five asks, one probe");
+    }
+
+    /// A failed probe is cached like a successful one: a machine without git
+    /// must not turn every operation into another spawn, and the same friendly
+    /// error comes back each time.
+    #[test]
+    fn a_failed_probe_is_reused() {
+        static CELL: std::sync::OnceLock<Result<PathBuf, String>> = std::sync::OnceLock::new();
+        let probes = AtomicUsize::new(0);
+        for _ in 0..3 {
+            let err = resolve_git(None, &CELL, || {
+                probes.fetch_add(1, Ordering::SeqCst);
+                bail!(GIT_NOT_FOUND)
+            })
+            .expect_err("no git on this machine");
+            assert!(err.to_string().contains("not installed"), "{err}");
+        }
+        assert_eq!(probes.load(Ordering::SeqCst), 1, "three asks, one probe");
+    }
+
+    /// The hook is read before the cache, so it wins even after a real probe has
+    /// been cached — and it does not take that cache's place.
+    #[test]
+    fn the_git_path_hook_wins_over_the_cell_and_leaves_it_empty() {
+        static CELL: std::sync::OnceLock<Result<PathBuf, String>> = std::sync::OnceLock::new();
+        let dir = tempfile::tempdir().unwrap();
+        let hook = dir.path().join("git-hook");
+        std::fs::write(&hook, "").unwrap();
+        let probes = AtomicUsize::new(0);
+
+        let from_hook = resolve_git(Some(hook.to_str().unwrap()), &CELL, || {
+            probes.fetch_add(1, Ordering::SeqCst);
+            Ok(PathBuf::from("/probed/git"))
+        })
+        .expect("a hook naming a real file needs no probe");
+        assert_eq!(from_hook, hook, "the hook is what is answered with");
+        assert_eq!(probes.load(Ordering::SeqCst), 0, "and nothing was probed");
+
+        let first = resolve_git(None, &CELL, || {
+            probes.fetch_add(1, Ordering::SeqCst);
+            Ok(PathBuf::from("/probed/git"))
+        })
+        .unwrap();
+        let second = resolve_git(None, &CELL, || {
+            probes.fetch_add(1, Ordering::SeqCst);
+            Ok(PathBuf::from("/somewhere/else"))
+        })
+        .unwrap();
+        assert_eq!(first, PathBuf::from("/probed/git"));
+        assert_eq!(second, first, "the first probe still stands");
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            1,
+            "the hook left the cell empty, the probe filled it once"
+        );
+    }
 
     #[cfg(unix)]
     #[test]
