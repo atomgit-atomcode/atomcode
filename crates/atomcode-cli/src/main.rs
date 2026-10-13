@@ -174,6 +174,15 @@ fn resume_hint_line(session_id: &str, headless: bool, zh: bool) -> String {
     atomcode::resume_hint_line(BIN_NAME, session_id, headless, zh)
 }
 
+fn print_exit_resume_hints(lines: &[String]) -> io::Result<()> {
+    use std::io::IsTerminal;
+    let stdout = io::stdout();
+    let output = atomcode::exit_resume_output(lines, stdout.is_terminal());
+    let mut out = stdout.lock();
+    out.write_all(output.as_bytes())?;
+    out.flush()
+}
+
 /// What session to resume at launch, unified across `--continue`, `--resume`,
 /// and the `resume` subcommand so one code path (see the launch flow) drives it.
 enum ResumeSelector {
@@ -2965,14 +2974,12 @@ async fn run() -> Result<i32> {
                     Ok(Some(left)) => (left.foreground.clone(), left.background.clone()),
                     _ => (active_session_id.clone(), Vec::new()),
                 };
-                for line in atomcode::exit_resume_hints(
+                let _ = print_exit_resume_hints(&atomcode::exit_resume_hints(
                     BIN_NAME,
                     foreground.as_deref(),
                     &background,
                     hint_zh,
-                ) {
-                    println!("\n{line}");
-                }
+                ));
                 let result = result.map(|_| 0);
                 // The same flush every other exit path gets below.
                 telemetry
@@ -3053,7 +3060,7 @@ async fn run() -> Result<i32> {
             // Codex-style resume hint to STDOUT, after the TUI restored the
             // terminal, so `atomcode resume <id>` is discoverable on exit.
             if let Some(id) = &active_session_id {
-                println!("\n{}", resume_hint_line(id, false, hint_zh));
+                let _ = print_exit_resume_hints(&[resume_hint_line(id, false, hint_zh)]);
             }
             tui_result
         };

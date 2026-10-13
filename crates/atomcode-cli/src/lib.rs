@@ -121,6 +121,17 @@ pub fn exit_resume_hints(
         .collect()
 }
 
+/// Exit text for the terminal's scrollback. A TTY may have newline
+/// translation disabled, so explicitly return to column zero on every line.
+/// Redirected output keeps ordinary LF and contains no terminal controls.
+pub fn exit_resume_output(lines: &[String], terminal: bool) -> String {
+    if lines.is_empty() {
+        return String::new();
+    }
+    let newline = if terminal { "\r\n" } else { "\n" };
+    format!("{newline}{}{newline}", lines.join(newline))
+}
+
 /// 后台会话:一个屏幕背后的多个 runtime(`docs/plans/2026-09-25-bg-design.md`)。
 pub mod background;
 
@@ -1120,5 +1131,66 @@ model = "vendor-b"
     pub struct Left {
         pub foreground: Option<String>,
         pub background: Vec<String>,
+    }
+}
+
+#[cfg(test)]
+mod exit_output_tests {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn exit_hints_work_on_a_pty_without_newline_translation() {
+        use std::io::{Read, Write};
+        use std::os::fd::FromRawFd;
+        let mut master = -1;
+        let mut slave = -1;
+        // Private pseudo-terminal: never change the user's real terminal.
+        // SAFETY: openpty writes two descriptor slots; optional name/mode/size are null.
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        // SAFETY: openpty succeeded; each fresh descriptor gets one owning File.
+        let mut master = unsafe { std::fs::File::from_raw_fd(master) };
+        let mut slave_file = unsafe { std::fs::File::from_raw_fd(slave) };
+        let mut modes = std::mem::MaybeUninit::<libc::termios>::uninit();
+        assert_eq!(unsafe { libc::tcgetattr(slave, modes.as_mut_ptr()) }, 0);
+        let mut modes = unsafe { modes.assume_init() };
+        modes.c_oflag &= !libc::OPOST;
+        assert_eq!(unsafe { libc::tcsetattr(slave, libc::TCSANOW, &modes) }, 0);
+        let lines = super::exit_resume_hints("atomcode", Some("front"), &["back".into()], true);
+        let output = super::exit_resume_output(&lines, true);
+        slave_file.write_all(output.as_bytes()).unwrap();
+        slave_file.flush().unwrap();
+        let mut received = vec![0; output.len()];
+        master.read_exact(&mut received).unwrap();
+        assert_eq!(
+            received,
+            format!("\r\n{}\r\n{}\r\n", lines[0], lines[1]).as_bytes()
+        );
+    }
+    #[test]
+    fn tty_hints_reset_each_line_and_finish_at_column_zero() {
+        let hints = super::exit_resume_hints(
+            "atomcode",
+            Some("front"),
+            &["back".into(), "front".into()],
+            false,
+        );
+        assert_eq!(hints.len(), 2);
+        let output = super::exit_resume_output(&hints, true);
+        assert_eq!(output, format!("\r\n{}\r\n{}\r\n", hints[0], hints[1]));
+        assert!(!output.replace("\r\n", "").contains('\n'));
+        let redirected = super::exit_resume_output(&hints, false);
+        assert!(!redirected.contains('\r'));
+        assert!(redirected.ends_with('\n'));
+        assert!(super::exit_resume_output(&[], true).is_empty());
     }
 }
