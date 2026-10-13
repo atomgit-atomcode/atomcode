@@ -353,6 +353,11 @@ pub trait Surface: Send + Sync {
         None
     }
 
+    /// A remote process cannot read the client terminal’s system clipboard.
+    fn remote_clipboard(&self) -> bool {
+        false
+    }
+
     /// Take an image off the system clipboard, as the value the model sees.
     ///
     /// The same seam as [`Surface::copy`], for the same reason and in the other
@@ -2443,20 +2448,35 @@ impl Surface for Terminal {
                 Copied::LocalUnavailable
             };
         }
+        if self.remote_clipboard() {
+            return Copied::RemoteHandedOver;
+        }
         // 这一句是唯一能确认的那一半 —— OSC 52 写出去了不等于终端收下了。
         match local_clipboard(text) {
             true => Copied::Here,
             false => Copied::HandedOver,
         }
     }
+    fn remote_clipboard(&self) -> bool {
+        std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some()
+    }
     fn clipboard_image(&self) -> Option<atomcode_kernel::message::ImageContent> {
+        if self.remote_clipboard() {
+            return None;
+        }
         read_clipboard_image()
     }
     fn clipboard_image_mark(&self) -> Option<u64> {
+        if self.remote_clipboard() {
+            return None;
+        }
         let (width, height, rgba) = clipboard_rgba()?;
         Some(pixel_fingerprint(width, height, &rgba))
     }
     fn clipboard_text(&self) -> Option<String> {
+        if self.remote_clipboard() {
+            return None;
+        }
         read_clipboard_text()
     }
     fn restore(&self) {
@@ -2498,6 +2518,8 @@ pub enum Copied {
     Here,
     /// 只交给了终端。成没成只有终端知道,而它不说。
     HandedOver,
+    /// OSC 52 was sent over SSH, without acknowledging clipboard access.
+    RemoteHandedOver,
     /// Local clipboard access failed; the terminal request remains unconfirmed.
     LocalUnavailable,
 }
@@ -2509,6 +2531,9 @@ impl Copied {
         match self {
             Copied::Here => said,
             Copied::HandedOver => crate::i18n::t(crate::i18n::Msg::CopyHandedOver).into_owned(),
+            Copied::RemoteHandedOver => {
+                crate::i18n::t(crate::i18n::Msg::CopyRemoteHandedOver).into_owned()
+            }
             Copied::LocalUnavailable => {
                 crate::i18n::t(crate::i18n::Msg::CopyLocalUnavailable).into_owned()
             }
@@ -2786,6 +2811,15 @@ mod tests {
     ///
     /// 反面才是理由,所以这条钉的是**两句话不一样**:把不能确认的那半也
     /// 原样返回,这条就红 —— 而屏幕上一切照旧。
+    #[test]
+    fn remote_copy_explains_the_native_selection_fallback() {
+        let message = Copied::RemoteHandedOver.words("已复制");
+        assert!(!message.starts_with("已复制"));
+        assert!(message.contains("SSH"));
+        assert!(message.contains("Ctrl+G"));
+        assert!(message.contains("Cmd+C"));
+    }
+
     #[test]
     fn a_copy_that_cannot_be_confirmed_does_not_say_it_was_copied() {
         let done = Copied::Here.words("已复制");

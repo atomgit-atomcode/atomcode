@@ -2139,6 +2139,9 @@ pub enum Msg<'a> {
     },
     /// Copy cannot be confirmed: OSC 52 has no acknowledgement.
     CopyHandedOver,
+    CopyRemoteHandedOver,
+    ClipboardRemoteText,
+    ClipboardRemoteImage,
     /// Local Linux clipboard backends failed, with an actionable fallback.
     CopyLocalUnavailable,
     /// A background copy could not be queued.
