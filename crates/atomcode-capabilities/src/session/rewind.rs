@@ -942,7 +942,115 @@ impl WorkspaceCheckpoint {
         Ok(())
     }
 
+    /// Seed only ordinary indexes. The copied index is a disposable stat cache,
+    /// never a published checkpoint; capture reconciles filters before write-tree.
+    fn seed_index(&self) -> Result<(), WorkspaceCheckpointError> {
+        let target = self.git_dir.join("index");
+        let source = self.worktree.join(".git/index");
+        if target.exists()
+            || !self.worktree.join(".git").is_dir()
+            || !fs::symlink_metadata(&source).is_ok_and(|metadata| metadata.file_type().is_file())
+        {
+            return Ok(());
+        }
+        let query = |args: &[&str]| {
+            git_command()
+                .arg("-C")
+                .arg(&self.worktree)
+                .args(args)
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+        };
+        let Some(shared) = query(&["rev-parse", "--shared-index-path"]) else {
+            return Ok(());
+        };
+        if !shared.stdout.iter().all(u8::is_ascii_whitespace) {
+            return Ok(());
+        }
+        let Some(unmerged) = query(&["ls-files", "--unmerged", "-z"]) else {
+            return Ok(());
+        };
+        if !unmerged.stdout.is_empty() {
+            return Ok(());
+        }
+        if query(&["config", "--bool", "core.sparseCheckout"])
+            .is_some_and(|output| String::from_utf8_lossy(&output.stdout).trim() == "true")
+        {
+            return Ok(());
+        }
+        // Source assume-unchanged/skip-worktree flags could hide local edits.
+        // Keep such repositories on the existing full capture path.
+        let Some(flags) = query(&["ls-files", "-v", "-z"]) else {
+            return Ok(());
+        };
+        if flags
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+            .any(|entry| entry.first() != Some(&b'H'))
+        {
+            return Ok(());
+        }
+        // Open the source once: Git publishes indexes by rename, so this reads
+        // one version even if another process stages files concurrently.
+        let temporary = self.git_dir.join("index.seed");
+        let seeded = (|| -> std::io::Result<()> {
+            let mut reader = fs::File::open(&source)?;
+            let metadata = reader.metadata()?;
+            let modified = metadata.modified()?;
+            let mut writer = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            std::io::copy(&mut reader, &mut writer)?;
+            writer.set_times(fs::FileTimes::new().set_modified(modified))?;
+            drop(writer);
+            Ok(())
+        })();
+        if seeded.is_err() {
+            let _ = fs::remove_file(&temporary);
+            tracing::debug!(
+                phase = "seed_index",
+                "workspace index seed unavailable; using full capture"
+            );
+            return Ok(());
+        }
+        // Validate that Git can read the copied index in the shadow repository.
+        let valid = git_command()
+            .arg("--git-dir")
+            .arg(&self.git_dir)
+            .arg("--work-tree")
+            .arg(&self.worktree)
+            .env("GIT_INDEX_FILE", &temporary)
+            .args(["ls-files", "-v", "-z"])
+            .output()
+            .is_ok_and(|output| {
+                output.status.success()
+                    && output
+                        .stdout
+                        .split(|byte| *byte == 0)
+                        .filter(|entry| !entry.is_empty())
+                        .all(|entry| entry.first() == Some(&b'H'))
+            });
+        if valid && fs::rename(&temporary, &target).is_ok() {
+            tracing::info!(
+                phase = "seed_index",
+                process_id = std::process::id(),
+                "workspace checkpoint seeded from repository index"
+            );
+        } else {
+            let _ = fs::remove_file(&temporary);
+            tracing::debug!(
+                phase = "seed_index",
+                "workspace index seed rejected; using full capture"
+            );
+        }
+        Ok(())
+    }
+
     fn capture_locked(&self) -> Result<String, WorkspaceCheckpointError> {
+        checkpoint_phase("seed_index", || self.seed_index())?;
         let tracked = checkpoint_phase("list_tracked", || {
             self.list_user_files(["ls-files", "--cached", "-z"])
         })?;
@@ -1552,6 +1660,65 @@ mod tests {
         assert_eq!(
             fs::read_to_string(worktree.path().join("new.txt")).unwrap(),
             "new\n"
+        );
+    }
+
+    #[test]
+    fn seeded_capture_reconciles_staged_and_unstaged_changes_and_filters() {
+        let (worktree, _store, checkpoint) = fixture();
+        fs::write(worktree.path().join("tracked.txt"), "staged\n").unwrap();
+        fs::write(worktree.path().join(".env"), "secret\n").unwrap();
+        git(worktree.path(), &["add", "tracked.txt", ".env"]);
+        let user_index = fs::read(worktree.path().join(".git/index")).unwrap();
+        fs::write(worktree.path().join("tracked.txt"), "working\n").unwrap();
+        let tree = checkpoint.capture().unwrap().unwrap();
+        assert_eq!(
+            checkpoint
+                .run(["show", &format!("{tree}:tracked.txt")])
+                .unwrap()
+                .stdout,
+            b"working\n"
+        );
+        assert_eq!(
+            checkpoint
+                .run(["ls-tree", "--name-only", &tree])
+                .unwrap()
+                .stdout,
+            b"tracked.txt\n"
+        );
+        assert_eq!(
+            fs::read(worktree.path().join(".git/index")).unwrap(),
+            user_index
+        );
+    }
+
+    #[test]
+    fn seed_preserves_index_timestamp_and_split_indexes_use_full_capture() {
+        let (worktree, _store, checkpoint) = fixture();
+        checkpoint.seed_index().unwrap();
+        assert_eq!(
+            fs::metadata(checkpoint.git_dir.join("index"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            fs::metadata(worktree.path().join(".git/index"))
+                .unwrap()
+                .modified()
+                .unwrap()
+        );
+        let (_, store, _) = fixture();
+        git(worktree.path(), &["update-index", "--split-index"]);
+        let split =
+            WorkspaceCheckpoint::with_store(worktree.path(), store.path().join("split")).unwrap();
+        split.seed_index().unwrap();
+        assert!(!split.git_dir.join("index").exists());
+        let tree = split.capture().unwrap().unwrap();
+        assert_eq!(
+            split
+                .run(["show", &format!("{tree}:tracked.txt")])
+                .unwrap()
+                .stdout,
+            b"one\n"
         );
     }
 
