@@ -712,8 +712,8 @@ pub struct Moment {
     /// message** — the receipt id it was sent under, and the text as sent
     /// (`[Image #N]` markers included).
     ///
-    /// `steering` is what the panel draws, joined by newlines, where a message
-    /// with a newline of its own cannot be told from two. The id is what ties a
+    /// The panel draws `queued` to preserve message boundaries; `steering` is
+    /// the joined text used to track display changes. The id is what ties a
     /// line to the runtime's answer about it: a stop withdraws what is still
     /// waiting and answers each withdrawn send `Rejected { NotRunning }`, and
     /// only a line named by such an answer is one the model will never get. The
