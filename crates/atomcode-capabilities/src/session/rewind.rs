@@ -23,7 +23,7 @@ fn checkpoint_phase<T>(phase: &'static str, action: impl FnOnce() -> T) -> T {
     let result = action();
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let process_id = std::process::id();
-    if elapsed_ms >= 100 {
+    if elapsed_ms >= 1_000 {
         tracing::info!(
             phase,
             elapsed_ms,
@@ -540,7 +540,7 @@ impl WorkspaceCheckpoint {
         let process_lock_started = std::time::Instant::now();
         let tree = self.with_process_lock(|| {
             let lock_ms = process_lock_started.elapsed().as_millis() as u64;
-            if lock_ms >= 100 {
+            if lock_ms >= 1_000 {
                 tracing::info!(
                     phase = "process_lock",
                     elapsed_ms = lock_ms,
@@ -1085,7 +1085,7 @@ impl WorkspaceCheckpoint {
                 paths.push(path);
             }
         }
-        tracing::info!(
+        tracing::debug!(
             phase = "filter_paths",
             elapsed_ms = filter_started.elapsed().as_millis() as u64,
             process_id = std::process::id(),
@@ -1111,7 +1111,7 @@ impl WorkspaceCheckpoint {
             .filter(|path| !indexed.contains(*path) || changed.contains(*path))
             .cloned()
             .collect();
-        tracing::info!(
+        tracing::debug!(
             phase = "index_changes",
             process_id = std::process::id(),
             updated_count = updated.len(),
