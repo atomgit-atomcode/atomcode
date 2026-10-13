@@ -163,7 +163,10 @@ fn origin_label(origin: &InjectionOrigin) -> String {
         // back. Calling it `peer` would put it in the same breath as a team
         // member, and the person reading the block has no way to tell the two
         // apart — the log has always been able to say which it was.
-        InjectionOrigin::Peer { outside: true, .. } => t(Msg::InjectedFromBackground).into_owned(),
+        InjectionOrigin::Peer {
+            outside: true,
+            from,
+        } => t(Msg::InjectedFromSession { from }).into_owned(),
         // On a member's screen this is its lead assigning or steering the work.
         // Reports in the other direction use the result presentation below,
         // whose heading already names the member.
@@ -915,6 +918,21 @@ fn wait_left(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_outside_peer_is_labelled_with_its_session_identity() {
+        let label = origin_label(&InjectionOrigin::Peer {
+            from: "other-instance:session".into(),
+            outside: true,
+        });
+        assert!(label.contains("other-instance:session"));
+        assert_eq!(
+            label,
+            t(Msg::InjectedFromSession {
+                from: "other-instance:session"
+            })
+        );
+    }
 
     #[test]
     fn work_sent_to_a_member_is_labelled_as_coming_from_main() {

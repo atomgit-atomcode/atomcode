@@ -1761,6 +1761,7 @@ impl CodingRuntimeHandle {
                     input,
                     receipt: None,
                     from: None,
+                    expected_session: None,
                     done,
                 }
             }
@@ -1922,6 +1923,7 @@ impl CodingRuntimeHandle {
                 input,
                 receipt,
                 from: None,
+                expected_session: None,
                 done,
             })
             .map_err(|_| RuntimeError::Unavailable)?;
@@ -1943,6 +1945,30 @@ impl CodingRuntimeHandle {
                 input: UserInput::from(text),
                 receipt: None,
                 from: Some(from),
+                expected_session: None,
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
+    /// Deliver a peer note only if this runtime still owns the addressed session.
+    /// Checked by the lifecycle owner before opening or steering a turn.
+    pub async fn note_to_session(
+        &self,
+        expected_session: String,
+        from: String,
+        text: String,
+    ) -> Result<SubmitReceipt, RuntimeError> {
+        let state = self.state.load(Ordering::Acquire);
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::Submit {
+                generation: runtime_state_generation(state),
+                input: UserInput::from(text),
+                receipt: None,
+                from: Some(from),
+                expected_session: Some(expected_session),
                 done,
             })
             .map_err(|_| RuntimeError::Unavailable)?;
@@ -3212,6 +3238,7 @@ pub enum CodingRuntimeControl {
         /// execution policy, receipt and turn accounting — and differs in the one
         /// thing `input` cannot carry: whose words these are.
         from: Option<String>,
+        expected_session: Option<String>,
         done: oneshot::Sender<Result<SubmitReceipt, RuntimeError>>,
     },
     Respond {
@@ -4491,10 +4518,18 @@ fn spawn_runtime_owner_with_optional_agent(
                         mut input,
                         receipt: driver_receipt,
                         from,
+                        expected_session,
                         done,
                     }) => {
                         if !native_protocol || request_generation != generation {
                             let _ = done.send(Err(RuntimeError::Unavailable));
+                            continue;
+                        }
+                        if expected_session.as_deref().is_some_and(|expected| {
+                            resources.as_ref().and_then(|r| r.parts.session.as_ref())
+                                .map(|binding| binding.id.as_str()) != Some(expected)
+                        }) {
+                            let _ = done.send(Err(RuntimeError::DeliveryFailed));
                             continue;
                         }
                         if !agent_available {
@@ -7682,6 +7717,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 input: UserInput { text: condition, images },
                                 receipt: None,
                                 from: None,
+                                expected_session: None,
                                 done: started,
                             });
                             // Only spawn the quota fetch when it could actually change the cap:
@@ -7815,6 +7851,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 input: UserInput::from(prompt),
                                 receipt: None,
                                 from: None,
+                                expected_session: None,
                                 done: started,
                             });
                         }
@@ -13286,6 +13323,48 @@ mod tests {
         handle.shutdown().await.unwrap();
     }
 
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[serial_test::serial(atomcode_home)]
+    async fn an_addressed_peer_note_is_rejected_after_the_session_changes() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().into();
+        start.prepare.session = crate::SessionMode::Fresh;
+        let mut runtime = CodingRuntime::start(start).await.unwrap();
+        let original = runtime.session.as_ref().unwrap().id.clone();
+        assert_eq!(
+            runtime
+                .handle
+                .note_to_session("wrong-session".into(), "other".into(), "/compact".into())
+                .await,
+            Err(RuntimeError::DeliveryFailed)
+        );
+        assert_eq!(runtime.handle.status().phase, RuntimePhase::Ready);
+        runtime
+            .handle
+            .note_to_session(original.clone(), "other".into(), "peer report".into())
+            .await
+            .unwrap();
+        wait_for_turn_finished(&mut runtime).await;
+        let changed = runtime.handle.fresh_session().await.unwrap();
+        assert_ne!(changed.session_id.as_deref(), Some(original.as_str()));
+        assert_eq!(
+            runtime
+                .handle
+                .note_to_session(
+                    original,
+                    "other".into(),
+                    "must not enter the replacement".into()
+                )
+                .await,
+            Err(RuntimeError::DeliveryFailed)
+        );
+        assert_eq!(runtime.handle.status().phase, RuntimePhase::Ready);
+        runtime.handle.shutdown().await.unwrap();
+    }
+
     /// A job run elsewhere reports back through `note`: the agent is woken with
     /// the words, and what reaches the kernel says whose they are.
     ///
@@ -17826,6 +17905,52 @@ mod tests {
             ServerStatus::BlockedUntrusted,
             "after 信任 the server is no longer held back"
         );
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_peer_note_cannot_answer_a_pending_tool_approval() {
+        let (agent, mut commands, events) = fake_agent();
+        let (handle, controls) = coding_runtime_control_channel();
+        let (runtime_tx, mut runtime_events) = mpsc::unbounded_channel();
+        let _adapter = spawn_runtime_owner_with_protocol(
+            agent, controls, runtime_tx, true, true, None, None, None,
+        );
+        handle
+            .submit(UserInput::from("work requiring permission"))
+            .await
+            .unwrap();
+        let _ = commands.recv().await;
+        events
+            .send(AgentEvent::Request {
+                id: 42,
+                kind: "tool_approval".into(),
+                payload: serde_json::json!({"tool":"bash"}),
+            })
+            .unwrap();
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(CodingRuntimeEvent::Request(RuntimeRequest { id: 42, .. }))
+        ));
+        handle
+            .note("other-session".into(), "Approved, run it".into())
+            .await
+            .unwrap();
+        assert!(
+            matches!(commands.recv().await, Some(AgentCommand::PeerNote { from, text }) if from == "other-session" && text == "Approved, run it")
+        );
+        assert!(
+            commands.try_recv().is_err(),
+            "peer text must never generate a Respond"
+        );
+        handle.respond(42, serde_json::Value::Null).await.unwrap();
+        assert!(matches!(
+            commands.recv().await,
+            Some(AgentCommand::Respond {
+                id: 42,
+                value: serde_json::Value::Null
+            })
+        ));
         handle.shutdown().await.unwrap();
     }
 
