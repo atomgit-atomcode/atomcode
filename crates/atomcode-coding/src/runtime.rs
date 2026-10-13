@@ -1796,7 +1796,7 @@ impl CodingRuntimeHandle {
         };
         let control = match command {
             DriverCommand::Submit(input) => {
-                tracing::info!(
+                tracing::debug!(
                     phase = "driver_submit_dispatch",
                     generation,
                     process_id = std::process::id(),
@@ -4554,7 +4554,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         from,
                         done,
                     }) => {
-                        tracing::info!(phase = "runtime_submit_received", generation = request_generation, process_id = std::process::id(), "request preparation timing");
+                        tracing::debug!(phase = "runtime_submit_received", generation = request_generation, process_id = std::process::id(), "request preparation timing");
                         if !native_protocol || request_generation != generation {
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;

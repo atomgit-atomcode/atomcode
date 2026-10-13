@@ -45,12 +45,22 @@ impl Latency {
 
     pub fn mark(&self, phase: &'static str) {
         self.span.in_scope(|| {
-            tracing::info!(
-                request_id = self.id,
-                phase,
-                elapsed_ms = self.started.elapsed().as_millis() as u64,
-                "provider request timing"
-            )
+            let elapsed_ms = self.started.elapsed().as_millis() as u64;
+            if matches!(phase, "response_headers" | "first_reasoning" | "first_text") {
+                tracing::info!(
+                    request_id = self.id,
+                    phase,
+                    elapsed_ms,
+                    "provider request timing"
+                );
+            } else {
+                tracing::debug!(
+                    request_id = self.id,
+                    phase,
+                    elapsed_ms,
+                    "provider request timing"
+                );
+            }
         });
     }
     pub fn observe(&mut self, event: &StreamEvent) {

@@ -874,7 +874,7 @@ impl LlmProvider for OpenAiCompatProvider {
                         }
                         Ok(Some(Ok(chunk))) => {
                             if !logged_first_byte && !chunk.is_empty() {
-                                request_span.in_scope(|| tracing::info!(request_id, phase = "first_body_chunk", stream_attempt, elapsed_ms = request_started.elapsed().as_millis() as u64, "provider request timing"));
+                                request_span.in_scope(|| tracing::debug!(request_id, phase = "first_body_chunk", stream_attempt, elapsed_ms = request_started.elapsed().as_millis() as u64, "provider request timing"));
                                 logged_first_byte = true;
                             }
                             let mut saw_done = false;

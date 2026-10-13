@@ -433,7 +433,7 @@ impl Bridge {
 
 #[async_trait]
 impl Waterfall<PreStep> for Bridge {
-    #[tracing::instrument(name = "lifecycle_hook", skip_all, fields(hook = %self.hook_name))]
+    #[tracing::instrument(name = "lifecycle_hook", level = "debug", skip_all, fields(hook = %self.hook_name))]
     async fn handle(&self, decision: &mut StepDecision, next: Next<'_, PreStep>) -> StepDecision {
         let Some(agent) = self.root_agent() else {
             return next.run(decision).await;
@@ -509,7 +509,7 @@ fn with_logged_meta(messages: &[Message], logged: &[Message]) -> Vec<Message> {
 
 #[async_trait]
 impl Waterfall<AgentRequest> for Bridge {
-    #[tracing::instrument(name = "lifecycle_hook", skip_all, fields(hook = %self.hook_name))]
+    #[tracing::instrument(name = "lifecycle_hook", level = "debug", skip_all, fields(hook = %self.hook_name))]
     async fn handle(
         &self,
         req: &mut ModelRequest,
@@ -611,6 +611,9 @@ impl Waterfall<AgentRequest> for Bridge {
                     ..MessageMeta::default()
                 });
                 self.hook.on_model_response(&mut message).await;
+                if let Some(id) = self.hook.checkpoint_taken() {
+                    commit_checkpoint_once(agent.ctx(), &agent.session(), req.turn, id);
+                }
 
                 if response.tool_calls.is_empty() && !response.truncated {
                     let mut messages = req.messages.clone();
@@ -1934,10 +1937,17 @@ impl Plugin for NativeCompactionCheckpointPlugin {
         &["agents", "system-prompt"]
     }
     fn description(&self) -> &'static str {
-        "write a committed compaction to the coding runtime's native session store"
+        "keep native session checkpoints and wait for workspace capture before local tools"
     }
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
         let hook = self.0.clone();
+        let barrier = Arc::new(WorkspaceCaptureBarrier {
+            ctx: ctx.clone(),
+            hook: hook.clone(),
+        });
+        let _ =
+            ctx.on_waterfall::<atomcode_harness::events::ToolsExecuteBatch>(barrier.clone(), true);
+        let _ = ctx.on_parallel::<TurnFinishing>(barrier);
         let listener_ctx = ctx.clone();
         let _ = ctx.on_emit::<atomcode_harness::events::SessionEventCommitted>(
             move |committed: &atomcode_harness::session::Committed| {
@@ -1968,6 +1978,61 @@ impl Plugin for NativeCompactionCheckpointPlugin {
             },
         );
         Ok(())
+    }
+}
+
+/// Append the completed baseline once, whether tools or turn completion joined it.
+fn commit_checkpoint_once(ctx: &Context, log: &SessionLog, turn: u64, id: String) {
+    if log.events().iter().any(|item| matches!(&item.event, SessionEvent::Checkpointed { turn: existing, id: existing_id } if *existing == turn && existing_id == &id)) {
+        return;
+    }
+    atomcode_harness::session::commit(ctx, log, SessionEvent::Checkpointed { turn, id });
+}
+
+struct WorkspaceCaptureBarrier {
+    ctx: Context,
+    hook: Arc<atomcode_capabilities::session::SnapshotHook>,
+}
+
+impl WorkspaceCaptureBarrier {
+    async fn join(&self, turn: u64) {
+        if let Some(id) = self.hook.wait_for_checkpoint().await {
+            let scoped = atomcode_harness::agent::scoped(&self.ctx);
+            if let Some(agent) = scoped
+                .service::<SessionSvc>()
+                .and_then(|log| self.ctx.service::<AgentsSvc>()?.by_session(log.id()))
+            {
+                if agent.parent().is_none() {
+                    commit_checkpoint_once(agent.ctx(), &agent.session(), turn, id);
+                }
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl Waterfall<atomcode_harness::events::ToolsExecuteBatch> for WorkspaceCaptureBarrier {
+    async fn handle(
+        &self,
+        batch: &mut atomcode_harness::events::ToolBatch,
+        next: Next<'_, atomcode_harness::events::ToolsExecuteBatch>,
+    ) -> Vec<atomcode_kernel::tool::ToolResult> {
+        self.join(batch.turn).await;
+        next.run(batch).await
+    }
+}
+
+#[async_trait]
+impl Listener<TurnFinishing> for WorkspaceCaptureBarrier {
+    async fn call(&self, outcome: &TurnOutcome) -> Option<()> {
+        let scoped = atomcode_harness::agent::scoped(&self.ctx);
+        let agent = scoped
+            .service::<SessionSvc>()
+            .and_then(|log| self.ctx.service::<AgentsSvc>()?.by_session(log.id()))?;
+        if agent.parent().is_none() && outcome.steps > 0 {
+            self.join(outcome.turn).await;
+        }
+        None
     }
 }
 

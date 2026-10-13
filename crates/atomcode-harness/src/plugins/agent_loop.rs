@@ -163,7 +163,7 @@ impl PluginAgentLoop {
         let mut timing = crate::diagnostics::PhaseTiming::start("request_pipeline");
         let result = agent_ctx
             .waterfall::<AgentRequest, _>(&mut req, move |req| {
-                tracing::info!(
+                tracing::debug!(
                     phase = "before_provider",
                     turn,
                     round,
@@ -396,7 +396,7 @@ impl AgentLoop for PluginAgentLoop {
 }
 
 impl PluginAgentLoop {
-    #[tracing::instrument(name = "turn_pipeline", skip_all, fields(session_id = agent.session().id()))]
+    #[tracing::instrument(name = "turn_pipeline", level = "debug", skip_all, fields(session_id = agent.session().id()))]
     async fn drive_as(&self, agent: &Agent) -> TurnOutcome {
         // The agent's own context, so anything scoped to this agent — an
         // overridden tool catalog, an agent-local policy — is what resolves.
@@ -427,7 +427,7 @@ impl PluginAgentLoop {
                 ..Default::default()
             };
         }
-        tracing::info!(
+        tracing::debug!(
             phase = "turn_begin",
             process_id = std::process::id(),
             "request preparation timing"

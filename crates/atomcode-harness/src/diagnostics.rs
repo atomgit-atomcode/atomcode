@@ -19,7 +19,7 @@ impl PhaseTiming {
             outcome: "dropped_before_return",
         };
         timing.span.in_scope(|| {
-            tracing::info!(
+            tracing::debug!(
                 phase,
                 state = "start",
                 process_id = std::process::id(),
@@ -37,7 +37,7 @@ impl PhaseTiming {
 impl Drop for PhaseTiming {
     fn drop(&mut self) {
         self.span.in_scope(|| {
-            tracing::info!(
+            tracing::debug!(
                 phase = self.phase,
                 state = "end",
                 process_id = std::process::id(),
