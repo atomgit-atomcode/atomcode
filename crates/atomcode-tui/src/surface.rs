@@ -2189,7 +2189,12 @@ impl Surface for Terminal {
         if link_pointer::POINTER.enabled() && self.mouse() {
             let mut hover = self.link_hover.lock().expect("link hover poisoned");
             hover.paint(frame);
-            let _ = link_pointer::POINTER.update(&mut out, hover.over_link());
+            if !patch.is_empty() {
+                let _ =
+                    link_pointer::POINTER.update_after_terminal_write(&mut out, hover.over_link());
+            } else {
+                let _ = link_pointer::POINTER.update(&mut out, hover.over_link());
+            }
         }
     }
     fn observe_input(&self, input: &Input) {
@@ -2277,6 +2282,10 @@ impl Surface for Terminal {
         let _ = out.write_all(self.pointer_mode().escape().as_bytes());
         let _ = out.flush();
         console_mouse(self.pointer_mode() != ansi::Pointer::Terminal);
+        if link_pointer::POINTER.enabled() {
+            let hover = self.link_hover.lock().expect("link hover poisoned");
+            let _ = link_pointer::POINTER.update_after_terminal_write(&mut out, hover.over_link());
+        }
     }
     fn forget(&self) {
         self.painted.forget();

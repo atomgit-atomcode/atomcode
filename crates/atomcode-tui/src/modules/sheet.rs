@@ -606,6 +606,33 @@ mod tests {
         )
     }
 
+    #[test]
+    fn changelog_chinese_item_titles_keep_bold_through_the_document_panel() {
+        let doc = Doc::new(
+            "changelog",
+            vec![],
+            vec![crate::sheet::DocTab::new(
+                "概览",
+                "- **静默超时连接恢复**：等待响应头超时后重试。",
+            )],
+        );
+        let sheet = Sheet::doc(doc);
+        let Page::Doc(doc) = &sheet.page else {
+            unreachable!()
+        };
+        let lines = doc_lines(&sheet, doc, 24, 100, Caps::default());
+        let title = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.text.contains("静默超时连接恢复"))
+            .unwrap();
+        assert!(
+            title.style.bold,
+            "the document panel must preserve strong emphasis"
+        );
+        assert!(!title.text.contains("**"));
+    }
+
     fn doc_text(sheet: &Sheet, w: usize) -> Vec<String> {
         let Page::Doc(doc) = &sheet.page else {
             panic!("a document");
