@@ -41,6 +41,29 @@ fn checkpoint_phase<T>(phase: &'static str, action: impl FnOnce() -> T) -> T {
     result
 }
 
+fn nul_paths(output: &[u8]) -> Result<BTreeSet<String>, WorkspaceCheckpointError> {
+    output
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            let path = std::str::from_utf8(path).map_err(|_| {
+                WorkspaceCheckpointError::InvalidPath("non-UTF-8 index path".into())
+            })?;
+            validate_relative_path(path)?;
+            Ok(path.to_string())
+        })
+        .collect()
+}
+
+fn nul_input(paths: &[String]) -> Vec<u8> {
+    let mut input = Vec::new();
+    for path in paths {
+        input.extend_from_slice(path.as_bytes());
+        input.push(0);
+    }
+    input
+}
+
 const STORE_VERSION: &str = "atomcode-rewind-v1";
 /// Bumped to 2 in v5.0.5: `before_tree`/`after_tree` became optional (a
 /// conversation-only point omits them), a shape an older binary's required-`String`
@@ -963,17 +986,43 @@ impl WorkspaceCheckpoint {
             selected_count = paths.len(),
             "workspace checkpoint file counts"
         );
-        checkpoint_phase("read_tree_empty", || self.run(["read-tree", "--empty"]))?;
-        if !paths.is_empty() {
-            let mut input = Vec::new();
-            for path in paths {
-                input.extend_from_slice(path.as_bytes());
-                input.push(0);
-            }
+        // Keep Git's stat cache across captures. Listing changes against the
+        // shadow index preserves Git's racily-clean checks; hand-written mtime
+        // caches would miss same-size edits within the timestamp granularity.
+        let indexed =
+            checkpoint_phase("list_indexed", || self.run(["ls-files", "--cached", "-z"]))?;
+        let indexed = nul_paths(&indexed.stdout)?;
+        let changed = checkpoint_phase("list_changed", || {
+            self.run(["diff-files", "--no-ext-diff", "--name-only", "-z"])
+        })?;
+        let changed = nul_paths(&changed.stdout)?;
+        let selected: BTreeSet<_> = paths.into_iter().collect();
+        let removed: Vec<_> = indexed.difference(&selected).cloned().collect();
+        let updated: Vec<_> = selected
+            .iter()
+            .filter(|path| !indexed.contains(*path) || changed.contains(*path))
+            .cloned()
+            .collect();
+        tracing::info!(
+            phase = "index_changes",
+            process_id = std::process::id(),
+            updated_count = updated.len(),
+            removed_count = removed.len(),
+            "workspace checkpoint index changes"
+        );
+        if !removed.is_empty() {
+            checkpoint_phase("remove_index_paths", || {
+                self.run_with_input(
+                    ["update-index", "--force-remove", "-z", "--stdin"],
+                    &nul_input(&removed),
+                )
+            })?;
+        }
+        if !updated.is_empty() {
             checkpoint_phase("update_index", || {
                 self.run_with_input(
                     ["update-index", "--add", "--remove", "-z", "--stdin"],
-                    &input,
+                    &nul_input(&updated),
                 )
             })?;
         }
@@ -1504,6 +1553,46 @@ mod tests {
             fs::read_to_string(worktree.path().join("new.txt")).unwrap(),
             "new\n"
         );
+    }
+
+    #[test]
+    fn incremental_capture_tracks_same_size_edits_deletions_and_recreation() {
+        let (worktree, _store, checkpoint) = fixture();
+        let user_index = fs::read(worktree.path().join(".git/index")).unwrap();
+        let before = checkpoint.capture().unwrap().unwrap();
+        assert_eq!(checkpoint.capture().unwrap().unwrap(), before);
+        fs::write(worktree.path().join("tracked.txt"), "two\n").unwrap();
+        let edited = checkpoint.capture().unwrap().unwrap();
+        assert_ne!(edited, before);
+        fs::remove_file(worktree.path().join("tracked.txt")).unwrap();
+        let deleted = checkpoint.capture().unwrap().unwrap();
+        assert_ne!(deleted, edited);
+        assert!(checkpoint
+            .run(["ls-tree", "--name-only", &deleted])
+            .unwrap()
+            .stdout
+            .is_empty());
+        fs::write(worktree.path().join("tracked.txt"), "one\n").unwrap();
+        assert_eq!(checkpoint.capture().unwrap().unwrap(), before);
+        assert_eq!(
+            fs::read(worktree.path().join(".git/index")).unwrap(),
+            user_index
+        );
+    }
+
+    #[test]
+    fn incremental_capture_removes_paths_newly_ignored_and_adds_them_back() {
+        let (worktree, _store, checkpoint) = fixture();
+        fs::write(worktree.path().join("untracked.txt"), "keep\n").unwrap();
+        let before = checkpoint.capture().unwrap().unwrap();
+        fs::write(worktree.path().join(".gitignore"), "untracked.txt\n").unwrap();
+        let after = checkpoint.capture().unwrap().unwrap();
+        let diff = checkpoint.diff(&before, &after).unwrap();
+        assert!(diff
+            .iter()
+            .any(|entry| entry.path == "untracked.txt" && entry.deletions == 1));
+        fs::remove_file(worktree.path().join(".gitignore")).unwrap();
+        assert_eq!(checkpoint.capture().unwrap().unwrap(), before);
     }
 
     #[test]
