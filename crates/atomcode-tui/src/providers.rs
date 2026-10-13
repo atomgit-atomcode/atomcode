@@ -99,20 +99,21 @@ pub struct ModelRow {
 }
 
 impl ModelRow {
-    /// 换到这个模型时递上来挑的思考强度,`default` 收尾;`None` 是不问。
-    ///
-    /// 面板回车和手打 `/model` 都按这一处判:`levels` 为空是「没截短,全部都
-    /// 行」,`effort` 有值才说明这个模型真的吃这套;两头都没有的,端点默认
-    /// 就够。两处各判一遍的话,面板不问、命令却问,面板就会关上又弹回来。
+    /// Only explicitly declared, known levels are offered when switching models.
+    /// A stored default or a single configured value is not a level catalog.
     pub fn effort_pick(&self) -> Option<Vec<String>> {
-        let mut levels = match (self.levels.is_empty(), self.effort.is_some()) {
-            (false, _) => self.levels.clone(),
-            (true, true) => atomcode_harness::REASONING_EFFORT_LEVELS
-                .iter()
-                .map(|level| level.to_string())
-                .collect(),
-            (true, false) => return None,
-        };
+        let mut levels: Vec<String> = atomcode_harness::REASONING_EFFORT_LEVELS
+            .iter()
+            .filter(|level| {
+                self.levels
+                    .iter()
+                    .any(|value| value.trim().eq_ignore_ascii_case(level))
+            })
+            .map(|level| level.to_string())
+            .collect();
+        if levels.is_empty() {
+            return None;
+        }
         levels.push("default".to_string());
         Some(levels)
     }
@@ -2083,6 +2084,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn defaults_and_fixed_values_do_not_invent_a_level_catalog() {
+        for effort in [None, Some("auto"), Some("default"), Some("high")] {
+            let mut row = model("custom", "a");
+            row.effort = effort.map(str::to_string);
+            assert!(row.effort_pick().is_none(), "{effort:?}");
+        }
+        let mut row = model("custom", "a");
+        row.effort = Some("auto".into());
+        row.levels = vec!["HIGH".into(), "unknown".into(), "low".into()];
+        assert_eq!(row.effort_pick().unwrap(), ["low", "high", "default"]);
+        row.levels = vec!["unknown".into()];
+        assert!(row.effort_pick().is_none());
+    }
+
     /// Stepping between models with one key, in both directions, wrapping.
     ///
     /// Judged on the list rather than through the key, because "which model is
@@ -2511,7 +2527,7 @@ mod tests {
     }
 
     #[test]
-    fn a_model_that_takes_effort_without_narrowing_it_offers_every_level() {
+    fn a_fixed_effort_does_not_open_the_level_picker() {
         // 面板和 `/model` 对「要不要问强度」必须一个判法:这里不问而命令问,
         // 面板就会先关、再被 `PickEffort` 弹回来。
         let view = ProvidersView::new(
@@ -2533,14 +2549,12 @@ mod tests {
                 &mut secret,
                 &[press(Key::Right), press(Key::Enter)]
             ),
-            Step::Stay
+            Step::Use {
+                id: "deepseek/reasoner".into(),
+                effort: None
+            }
         );
-        let mut want: Vec<String> = atomcode_harness::REASONING_EFFORT_LEVELS
-            .iter()
-            .map(|level| level.to_string())
-            .collect();
-        want.push("default".into());
-        assert_eq!(panel.efforts.map(|pick| pick.levels), Some(want));
+        assert!(panel.efforts.is_none());
     }
 
     #[test]

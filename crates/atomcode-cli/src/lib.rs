@@ -444,6 +444,10 @@ pub mod tui_front {
                         let provider = snapshot
                             .and_then(|snapshot| snapshot.config.provider_config_for_selection(selection))
                             .ok_or_else(|| anyhow::anyhow!("cannot resolve persistent model `{selection}`"))?;
+                        // Resetting an unconfigured endpoint must not create a capability flag.
+                        if effort == "auto" && provider.reasoning_effort.is_none() {
+                            return Ok(());
+                        }
                         if atomcode_config::config::clamp_effort_to_levels(
                             Some(effort), provider.reasoning_effort_levels.as_deref(),
                         ).is_none() {
@@ -767,6 +771,28 @@ account = "custom"
 model = "vendor-b"
 "#;
 
+        #[test]
+        fn resetting_an_unconfigured_effort_does_not_declare_capability() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            std::fs::write(&path, CONFIG).unwrap();
+            let file = ConfigFile {
+                path: path.clone(),
+                working_dir: dir.path().into(),
+                telemetry: None,
+                skip_permissions: false,
+                provider_override: None,
+            };
+            file.set_reasoning_effort("custom/a", None).unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), CONFIG);
+            assert!(
+                !file
+                    .for_model("custom/a")
+                    .unwrap()
+                    .supports_reasoning_effort
+            );
+        }
+
         /// The settings a person may change are read from the file and written
         /// back into it — keeping their comments and their ordering
         /// (`docs/plans/2026-09-18-tui-panels-and-commands-inventory.md` A3).
@@ -800,7 +826,7 @@ model = "vendor-b"
                 let fresh = file.for_model(selection).unwrap();
                 assert_eq!(fresh.chat_options.reasoning_effort, None);
                 assert_eq!(fresh.thinking_enabled, Some(false));
-                assert!(fresh.supports_reasoning_effort, "default must keep the capability");
+                assert_eq!(fresh.supports_reasoning_effort, selection == "p", "only the declared level catalog keeps the capability after resetting");
                 let before = std::fs::read_to_string(&path).unwrap();
                 assert!(before.contains("theme = \"light\""), "concurrent edits must survive");
                 assert!(before.contains("reasoning_effort = \"auto\""));

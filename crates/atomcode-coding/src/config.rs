@@ -635,13 +635,11 @@ impl CodingRuntimeConfig {
     }
 }
 
-/// The reasoning-effort levels to advertise for an endpoint: the config's
-/// allowed set when it has an effort control, else empty (no reasoning-effort
-/// control — a front end offers only "leave it to the endpoint"). One place, so
-/// every `CodingAgentConfig` builder agrees, and the set matches the webui's.
+/// Advertise only explicitly declared levels. Wire support for a fixed value
+/// does not establish which other values a selector may offer.
 pub(crate) fn effort_levels_for(supports: bool, declared_levels: Option<&[String]>) -> Vec<String> {
     if supports {
-        atomcode_config::config::allowed_effort_levels(declared_levels)
+        atomcode_config::config::declared_effort_levels(declared_levels)
             .into_iter()
             .map(str::to_string)
             .collect()

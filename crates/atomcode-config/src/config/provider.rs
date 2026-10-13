@@ -48,19 +48,19 @@ pub struct ProviderConfig {
     /// Lets users work around new provider quirks without a code change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_history: Option<String>,
-    /// Reasoning effort control. `"auto"` declares that this concrete endpoint
-    /// supports effort switching while leaving the API default in effect;
-    /// `"low" | "medium" | "high" | "xhigh" | "max"` also set the model default.
+    /// Reasoning effort value. `"auto"` leaves the API default in effect;
+    /// `"low" | "medium" | "high" | "xhigh" | "max"` set the model default.
+    /// Switchable levels must be declared in `reasoning_effort_levels`.
     /// Sent as top-level `reasoning_effort` in the request body.
     /// None = endpoint capability is unknown/disabled; don't send the field.
-    /// For OpenAI-compatible endpoints, a configured value explicitly enables
-    /// the field for this model profile; unconfigured custom endpoints omit it.
+    /// A concrete configured value enables sending that value; `auto` alone
+    /// does not declare support. Unconfigured custom endpoints omit the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
-    /// Optional per-endpoint restriction of which reasoning-effort LEVELS this
-    /// model exposes (a subset of `["low","medium","high","xhigh","max"]`). `None`/empty
-    /// ⇒ all levels. See [`super::allowed_effort_levels`]. Constrains only what the
-    /// UI offers and what `/effort` accepts; the wire still sends a single value.
+    /// Explicit switchable levels for this endpoint, drawn from
+    /// `["low","medium","high","xhigh","max"]`. `None`/empty offers no levels.
+    /// See [`super::declared_effort_levels`]. A concrete configured effort can
+    /// still be sent even when no switchable list is declared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort_levels: Option<Vec<String>>,
     /// Whether extended thinking is enabled for this provider.

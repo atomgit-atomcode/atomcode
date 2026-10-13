@@ -1551,7 +1551,7 @@ pub fn codingplan_group_account_id(provider_type: &str) -> &'static str {
 /// The canonical reasoning-effort levels, in the order UIs cycle through them.
 /// The single source of truth for the level SET, so the TUI cycle, the
 /// `/provider` panel, `/effort`, the daemon, and the webui can never disagree
-/// about which levels exist. (`"auto"`/`None` are capability states handled
+/// about which levels exist. (`"auto"`/`None` are default values handled
 /// separately, not levels.)
 pub const REASONING_EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
@@ -1588,20 +1588,39 @@ pub fn effective_reasoning_effort_levels(
     None
 }
 
-/// Whether an endpoint exposes a reasoning-effort control, derived purely from CONFIG:
-/// an explicitly configured `reasoning_effort`, OR a non-empty `reasoning_effort_levels`
-/// (server-advertised via `models-v2`, or the CodingPlan builtin already folded into it).
-/// The SINGLE source of truth for every "does this model support effort" gate — the webui
-/// selector, the TUI `/effort`, and the wire capability — so none can disagree, and no
-/// hardcoded model name (`deepseek-v4-flash`) is needed anywhere.
+/// Whether the wire may send a reasoning-effort value: a concrete configured
+/// value or an explicit list of known levels. `auto`/default alone do not
+/// establish capability. Selectors use `declared_effort_levels` instead.
 pub fn endpoint_supports_reasoning_effort(
     reasoning_effort: Option<&str>,
     reasoning_effort_levels: Option<&[String]>,
 ) -> bool {
-    reasoning_effort.is_some() || reasoning_effort_levels.is_some_and(|levels| !levels.is_empty())
+    reasoning_effort.is_some_and(|value| {
+        REASONING_EFFORT_LEVELS
+            .iter()
+            .any(|level| value.trim().eq_ignore_ascii_case(level))
+    }) || !declared_effort_levels(reasoning_effort_levels).is_empty()
 }
 
-/// The ordered subset of reasoning-effort levels an endpoint exposes.
+/// Switchable levels require an explicit declaration; a default or one fixed value
+/// cannot tell us which other levels the endpoint accepts.
+pub fn declared_effort_levels(declared: Option<&[String]>) -> Vec<&'static str> {
+    let Some(list) = declared else {
+        return Vec::new();
+    };
+    REASONING_EFFORT_LEVELS
+        .iter()
+        .copied()
+        .filter(|level| {
+            list.iter()
+                .any(|value| value.trim().eq_ignore_ascii_case(level))
+        })
+        .collect()
+}
+
+/// Validation set for concrete configured reasoning-effort values.
+/// Selectors must use [`declared_effort_levels`] and never infer support from
+/// this function's fallback vocabulary.
 ///
 /// `declared` is the per-endpoint `reasoning_effort_levels` list (from config).
 /// `None` or an EMPTY list means "unrestricted" ⇒ every [`REASONING_EFFORT_LEVELS`]
@@ -1633,7 +1652,7 @@ pub fn allowed_effort_levels(declared: Option<&[String]>) -> Vec<&'static str> {
 /// the wire (and every display) can never carry a level the endpoint declares
 /// unsupported. A concrete level (`low`/`medium`/`high`/`xhigh`/`max`) outside
 /// [`allowed_effort_levels`] becomes `None` (the API default); `"auto"` and
-/// `None` are capability states, not levels, and pass through unchanged. A valid
+/// `None` are default values, not levels, and pass through unchanged. A valid
 /// value is returned verbatim (no normalization).
 pub fn clamp_effort_to_levels(effort: Option<&str>, declared: Option<&[String]>) -> Option<String> {
     let value = effort?;
@@ -2679,7 +2698,7 @@ kind = "claude-code"
             clamp_effort_to_levels(Some(" High "), Some(&low_high)).as_deref(),
             Some(" High ")
         );
-        // `auto` and None are capability states, not levels — always pass through.
+        // `auto` and None are default values, not levels — always pass through.
         assert_eq!(
             clamp_effort_to_levels(Some("auto"), Some(&low_high)).as_deref(),
             Some("auto")
@@ -2808,6 +2827,18 @@ kind = "claude-code"
         // Neither → not supported. Empty levels → not supported (no switching).
         assert!(!endpoint_supports_reasoning_effort(None, None));
         assert!(!endpoint_supports_reasoning_effort(None, Some(&[])));
+        assert!(!endpoint_supports_reasoning_effort(Some("auto"), None));
+        assert!(!endpoint_supports_reasoning_effort(Some("default"), None));
+        assert!(endpoint_supports_reasoning_effort(
+            Some("auto"),
+            Some(&levels)
+        ));
+        assert!(declared_effort_levels(None).is_empty());
+        assert!(declared_effort_levels(Some(&["unknown".into()])).is_empty());
+        assert_eq!(
+            declared_effort_levels(Some(&["HIGH".into(), "low".into()])),
+            ["low", "high"]
+        );
     }
 
     #[test]
