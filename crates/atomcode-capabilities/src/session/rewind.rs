@@ -17,6 +17,30 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Mutex, MutexGuard};
 
+/// Metadata-only phase timing; slow phases remain visible at the default log level.
+fn checkpoint_phase<T>(phase: &'static str, action: impl FnOnce() -> T) -> T {
+    let started = std::time::Instant::now();
+    let result = action();
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let process_id = std::process::id();
+    if elapsed_ms >= 100 {
+        tracing::info!(
+            phase,
+            elapsed_ms,
+            process_id,
+            "workspace checkpoint phase finished"
+        );
+    } else {
+        tracing::debug!(
+            phase,
+            elapsed_ms,
+            process_id,
+            "workspace checkpoint phase finished"
+        );
+    }
+    result
+}
+
 const STORE_VERSION: &str = "atomcode-rewind-v1";
 /// Bumped to 2 in v5.0.5: `before_tree`/`after_tree` became optional (a
 /// conversation-only point omits them), a shape an older binary's required-`String`
@@ -480,19 +504,33 @@ impl WorkspaceCheckpoint {
     ) -> Result<Option<String>, WorkspaceCheckpointError> {
         // Invariant A: physical disk floor. Unknown free space → skip.
         // This check is read-only and safe to perform outside the lock.
-        if !disk_floor_ok(available_disk_bytes(&self.git_dir), floor) {
+        if !checkpoint_phase("disk_floor", || {
+            disk_floor_ok(available_disk_bytes(&self.git_dir), floor)
+        }) {
             return Ok(None);
         }
         // Invariant B: store must not exceed budget. The size check AND any gc
         // that evicts loose objects MUST run inside the process lock, at parity
         // with retain_points — an unlocked gc could prune loose objects written
         // by a concurrent capture_locked that has not yet pinned them with a ref.
-        let _guard = self.guard();
+        let _guard = checkpoint_phase("thread_lock", || self.guard());
+        let process_lock_started = std::time::Instant::now();
         let tree = self.with_process_lock(|| {
-            let store_bytes = dir_size_bytes(&self.git_dir);
+            let lock_ms = process_lock_started.elapsed().as_millis() as u64;
+            if lock_ms >= 100 {
+                tracing::info!(
+                    phase = "process_lock",
+                    elapsed_ms = lock_ms,
+                    process_id = std::process::id(),
+                    "workspace checkpoint phase finished"
+                );
+            }
+            let store_bytes = checkpoint_phase("store_size", || dir_size_bytes(&self.git_dir));
             if store_bytes > budget {
-                let _ = self.gc_prune_now();
-                if dir_size_bytes(&self.git_dir) > budget {
+                let _ = checkpoint_phase("gc", || self.gc_prune_now());
+                if checkpoint_phase("store_size_after_gc", || dir_size_bytes(&self.git_dir))
+                    > budget
+                {
                     tracing::warn!(
                         git_dir = %self.git_dir.display(),
                         "code rewind capture skipped: store still over budget after gc"
@@ -882,9 +920,15 @@ impl WorkspaceCheckpoint {
     }
 
     fn capture_locked(&self) -> Result<String, WorkspaceCheckpointError> {
-        let tracked = self.list_user_files(["ls-files", "--cached", "-z"])?;
-        let untracked =
-            self.list_user_files(["ls-files", "--others", "--exclude-standard", "-z"])?;
+        let tracked = checkpoint_phase("list_tracked", || {
+            self.list_user_files(["ls-files", "--cached", "-z"])
+        })?;
+        let untracked = checkpoint_phase("list_untracked", || {
+            self.list_user_files(["ls-files", "--others", "--exclude-standard", "-z"])
+        })?;
+        let filter_started = std::time::Instant::now();
+        let tracked_count = tracked.len();
+        let untracked_count = untracked.len();
         let mut paths = Vec::new();
         // Tracked files: keep ALL of them (minus sensitive paths). Their blobs
         // are shared with the real repo via alternates, so retaining them costs
@@ -910,19 +954,30 @@ impl WorkspaceCheckpoint {
                 paths.push(path);
             }
         }
-        self.run(["read-tree", "--empty"])?;
+        tracing::info!(
+            phase = "filter_paths",
+            elapsed_ms = filter_started.elapsed().as_millis() as u64,
+            process_id = std::process::id(),
+            tracked_count,
+            untracked_count,
+            selected_count = paths.len(),
+            "workspace checkpoint file counts"
+        );
+        checkpoint_phase("read_tree_empty", || self.run(["read-tree", "--empty"]))?;
         if !paths.is_empty() {
             let mut input = Vec::new();
             for path in paths {
                 input.extend_from_slice(path.as_bytes());
                 input.push(0);
             }
-            self.run_with_input(
-                ["update-index", "--add", "--remove", "-z", "--stdin"],
-                &input,
-            )?;
+            checkpoint_phase("update_index", || {
+                self.run_with_input(
+                    ["update-index", "--add", "--remove", "-z", "--stdin"],
+                    &input,
+                )
+            })?;
         }
-        let output = self.run(["write-tree"])?;
+        let output = checkpoint_phase("write_tree", || self.run(["write-tree"]))?;
         let tree = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if tree.is_empty() {
             return Err(WorkspaceCheckpointError::Git {
