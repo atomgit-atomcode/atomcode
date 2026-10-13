@@ -1727,6 +1727,7 @@ pub async fn mount_hosted(
     host: HostState,
     extra_layers: &[Layer],
 ) -> Result<(AgentHandle, App, Arc<ProviderSlots>), String> {
+    let compose_started = std::time::Instant::now();
     let (registry, tree, providers) = compose_hosted(
         working_dir,
         dirs,
@@ -1736,8 +1737,16 @@ pub async fn mount_hosted(
         host,
         extra_layers,
     )?;
+    crate::runtime::record_startup_phase("compose", compose_started.elapsed(), None);
     let mut app = App::new(registry, tree);
-    app.start().await.map_err(|e| e.to_string())?;
+    let mount_started = std::time::Instant::now();
+    let mounted = app.start().await;
+    crate::runtime::record_startup_phase(
+        "app_start",
+        mount_started.elapsed(),
+        Some(mounted.is_ok()),
+    );
+    mounted.map_err(|e| e.to_string())?;
     let handle = app
         .context()
         .service::<atomcode_harness::seams::AgentHandleSvc>()

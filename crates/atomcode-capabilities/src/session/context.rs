@@ -175,7 +175,13 @@ impl SessionContextHook {
         // No console-window flash for the session-start git snapshot when run from a
         // console-less daemon (mirrors core's ctx/env); no-op off Windows.
         crate::process_utils::suppress_console_window_sync(&mut cmd);
-        let out = cmd.output().ok()?;
+        let started = std::time::Instant::now();
+        let result = cmd.output();
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        if elapsed_ms >= 100 {
+            tracing::info!(target: "atomcode_capabilities::startup", phase = "git_snapshot", operation = args.first().copied().unwrap_or(""), elapsed_ms, success = result.as_ref().is_ok_and(|out| out.status.success()), "slow session context probe");
+        }
+        let out = result.ok()?;
         if !out.status.success() {
             return None;
         }
