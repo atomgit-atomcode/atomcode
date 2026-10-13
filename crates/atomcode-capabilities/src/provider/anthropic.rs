@@ -605,7 +605,62 @@ fn build_request_body(
             .collect();
         body.insert("tools".into(), json!(t));
     }
-    Value::Object(body)
+    let mut body = Value::Object(body);
+    apply_prompt_cache(&mut body);
+    body
+}
+
+/// Place markers only after wire messages have been merged. Tools and system
+/// reserve two stable prefixes; up to two recent message boundaries cover the
+/// rolling conversation. Never mark signed/generated thinking blocks.
+fn apply_prompt_cache(body: &mut Value) {
+    let marker = json!({"type": "ephemeral"});
+    let mut remaining = 4usize;
+    if let Some(tool) = body
+        .get_mut("tools")
+        .and_then(Value::as_array_mut)
+        .and_then(|t| t.last_mut())
+    {
+        tool["cache_control"] = marker.clone();
+        remaining -= 1;
+    }
+    if let Some(system) = body.get_mut("system") {
+        if let Some(text) = system.as_str().filter(|s| !s.is_empty()) {
+            *system = json!([{"type": "text", "text": text, "cache_control": marker.clone()}]);
+            remaining -= 1;
+        }
+    }
+    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
+        let mut marked = 0;
+        for message in messages.iter_mut().rev() {
+            if remaining == 0 {
+                break;
+            }
+            let Some(content) = message.get_mut("content") else {
+                continue;
+            };
+            if let Some(text) = content.as_str().filter(|s| !s.is_empty()) {
+                *content = json!([{"type": "text", "text": text}]);
+            }
+            let Some(blocks) = content.as_array_mut() else {
+                continue;
+            };
+            if let Some(block) = blocks.iter_mut().rev().find(|block| {
+                matches!(
+                    block.get("type").and_then(Value::as_str),
+                    Some("text" | "image" | "tool_use" | "tool_result")
+                ) && !(block["type"] == "text" && block["text"].as_str().is_none_or(str::is_empty))
+            }) {
+                block["cache_control"] = marker.clone();
+                remaining -= 1;
+                // Keep the strategy small: at most two rolling messages.
+                marked += 1;
+                if marked == 2 {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 /// Split kernel messages into the Anthropic top-level `system` string (joined leading
@@ -1163,9 +1218,17 @@ impl AnthropicSseDecoder {
                     }
                 }
                 if let Some(u) = v.get("usage") {
-                    let o = u32_at(u, "output_tokens");
-                    if o > 0 {
-                        self.output_tokens = o;
+                    // Delta usage is cumulative. Missing fields preserve start
+                    // values; explicit zero is authoritative too.
+                    for (key, target) in [
+                        ("input_tokens", &mut self.input_tokens),
+                        ("output_tokens", &mut self.output_tokens),
+                        ("cache_read_input_tokens", &mut self.cache_read),
+                        ("cache_creation_input_tokens", &mut self.cache_creation),
+                    ] {
+                        if let Some(value) = u.get(key).and_then(Value::as_u64) {
+                            *target = value.min(u32::MAX as u64) as u32;
+                        }
                     }
                 }
             }
@@ -1211,6 +1274,55 @@ fn usize_at(v: &Value, key: &str) -> usize {
 mod tests {
     use super::*;
     use atomcode_kernel::message::{ImageContent, ReasoningBlock};
+
+    #[test]
+    fn cache_markers_preserve_thinking_and_cover_four_boundaries() {
+        let mut body = json!({"system":"stable", "tools":[{"name":"read"}], "messages":[
+            {"role":"user", "content":"old question"},
+            {"role":"assistant", "content":[{"type":"thinking","thinking":"private","signature":"sig"}, {"type":"text","text":"answer"}]},
+            {"role":"user", "content":[{"type":"tool_result","tool_use_id":"id","content":"result"}]}]});
+        apply_prompt_cache(&mut body);
+        assert_eq!(body.to_string().matches("cache_control").count(), 4);
+        assert!(body["messages"][0]["content"].is_string());
+        assert!(body["messages"][1]["content"][0]
+            .get("cache_control")
+            .is_none());
+        assert_eq!(body["messages"][1]["content"][0]["signature"], "sig");
+        assert!(body["messages"][1]["content"][1]
+            .get("cache_control")
+            .is_some());
+        assert!(body["messages"][2]["content"][0]
+            .get("cache_control")
+            .is_some());
+    }
+
+    #[test]
+    fn cache_markers_skip_thinking_only_messages_and_trailing_thinking_blocks() {
+        let thinking = json!({"role":"assistant", "content":[{"type":"thinking", "thinking":"private", "signature":"signed"}, {"type":"redacted_thinking", "data":"opaque"}]});
+        let mut body = json!({"messages":[
+            {"role":"user", "content":"question"},
+            {"role":"assistant", "content":[{"type":"text", "text":"answer"}, {"type":"thinking", "thinking":"private", "signature":"signed"}]},
+            thinking.clone()]});
+        apply_prompt_cache(&mut body);
+        assert_eq!(body["messages"][2], thinking);
+        assert!(body["messages"][1]["content"][0]
+            .get("cache_control")
+            .is_some());
+        assert!(body["messages"][1]["content"][1]
+            .get("cache_control")
+            .is_none());
+        assert_eq!(body.to_string().matches("cache_control").count(), 2);
+    }
+
+    #[test]
+    fn delta_usage_overrides_present_fields_without_double_counting() {
+        let mut decoder = AnthropicSseDecoder::new();
+        decoder.feed(line("message_start", json!({"type":"message_start","message":{"usage":{"input_tokens":10,"cache_read_input_tokens":20,"cache_creation_input_tokens":30}}})).as_bytes());
+        decoder.feed(line("message_delta", json!({"type":"message_delta","usage":{"input_tokens":5,"cache_read_input_tokens":0,"output_tokens":7}})).as_bytes());
+        assert_eq!(decoder.usage().prompt, 35);
+        assert_eq!(decoder.usage().cached, 0);
+        assert_eq!(decoder.usage().completion, 7);
+    }
 
     fn cfg() -> AnthropicConfig {
         AnthropicConfig::new("k", "https://api.anthropic.test", "claude-opus-4-8")
@@ -1589,7 +1701,7 @@ mod tests {
             "max_tokens from cfg when options has none"
         );
         assert_eq!(body["stream"], true);
-        assert_eq!(body["system"], "s");
+        assert_eq!(body["system"][0]["text"], "s");
         assert!(body.get("tools").is_none(), "empty tools omitted");
         assert!(body.get("tool_choice").is_none(), "Auto omits tool_choice");
         assert!(body.get("thinking").is_none(), "thinking off by default");
@@ -1630,7 +1742,7 @@ mod tests {
         // tools use input_schema, NOT function.parameters.
         assert_eq!(
             body["tools"][0],
-            json!({"name":"read","description":"d","input_schema":{"type":"object"}})
+            json!({"name":"read","description":"d","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral"}})
         );
     }
 

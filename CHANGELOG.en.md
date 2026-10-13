@@ -32,6 +32,7 @@ This release improves network recovery and terminal interaction: continue replie
 
 ### Changes
 
+- **Native Anthropic prompt caching**: add up to four cache breakpoints across tools, system and conversation history while preserving thinking blocks and signatures. Update cumulative streaming input and cache usage without double counting, retaining prior values when fields are absent.
 - **Recover silent connections**: when response headers time out and retries are allowed, refresh the connection pool at most once. OPEN attempts and backoff share a total budget, 180 seconds by default, with no automatic retry after exhaustion. Covers OpenAI-compatible, Responses and Anthropic requests, with local diagnostics for timeouts and recovery.
 - **Smoother terminal interaction**: click or drag the conversation scrollbar to navigate; fix jumps when grabbing an endpoint thumb and unstable geometry around changing task panels. Clipboard waits run off the UI thread; fix Linux copying, stale selection highlights and context menus closing on mouse release.
 - **Math on the web**: render inline and block TeX formulas while preserving code and currency text. Unrenderable formulas retain their source text, and search highlighting leaves formula structures intact.
