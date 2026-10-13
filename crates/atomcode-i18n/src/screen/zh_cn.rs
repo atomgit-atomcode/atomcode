@@ -1311,6 +1311,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::RemoteRan { command } => format!("（另一端执行了 {command}）").into(),
         Msg::RemoteDesktopOnly => "这条得在这台机器上敲。另一端能用的是：".into(),
         Msg::UsageUnknown { why } => format!("问不到还剩多少：{why}").into(),
+        Msg::BackgroundPolls { job, count } => format!("等待后台任务 {job} · 已检查 {count} 次 · 点击展开").into(),
         Msg::CopySendFailed => "复制请求发送失败；可按 Ctrl+G 后重新拖选，用终端复制。".into(),
         Msg::CopyTooLarge => "选区超过终端复制限制（100,000 字节），未发送；请缩小选区或按 Ctrl+G 使用终端复制。".into(),
         Msg::CopyRemoteHandedOver => "SSH 复制请求未确认；若粘贴无效，按 Ctrl+G 后重新拖选，用终端复制（Mac：Cmd+C）。".into(),

@@ -878,13 +878,27 @@ fn behind_a_lid(block: &crate::block::Block) -> bool {
         && !block.content.always_open()
         // A refused edit remains its own visible row, so its recovery hint is
         // not swallowed by the neighbouring calls' group count.
-        && !block.content.as_tool_call().is_some_and(|call| call.edit_text_mismatch())
+        && !block.content.as_tool_call().is_some_and(|call| {
+            call.edit_text_mismatch()
+                || (call.name == "bash_poll" && call.idle_poll_job().is_none())
+        })
 }
 
 /// Whether this slot is a call the screen actually draws, and so a member of a
 /// run.
 fn drawn_call(slots: &[crate::block::Slot], i: usize, pres: &Presentation) -> bool {
     !pres.is_hidden(slots[i].block().kind()) && behind_a_lid(slots[i].block())
+}
+
+fn same_poll_run(a: &crate::block::Block, b: &crate::block::Block) -> bool {
+    let Some(first) = a.content.as_tool_call() else {
+        return false;
+    };
+    let Some(next) = b.content.as_tool_call() else {
+        return false;
+    };
+    let job = first.idle_poll_job();
+    job.is_some() && job == next.idle_poll_job() && a.at.turn == b.at.turn && first.dir == next.dir
 }
 
 /// The run of drawn calls starting at `start`, and the slot the scan stopped on.
@@ -908,6 +922,11 @@ fn run_from(
     pres: &Presentation,
 ) -> (Vec<usize>, usize) {
     let mut members = vec![start];
+    let poll = slots[start]
+        .block()
+        .content
+        .as_tool_call()
+        .is_some_and(|c| c.idle_poll_job().is_some());
     let mut j = start + 1;
     while j < slots.len() {
         if pres.is_hidden(slots[j].block().kind()) {
@@ -915,6 +934,15 @@ fn run_from(
             continue;
         }
         if !behind_a_lid(slots[j].block()) {
+            break;
+        }
+        let next_poll = slots[j]
+            .block()
+            .content
+            .as_tool_call()
+            .is_some_and(|c| c.idle_poll_job().is_some());
+        if (poll && !same_poll_run(slots[start].block(), slots[j].block())) || (!poll && next_poll)
+        {
             break;
         }
         members.push(j);
@@ -953,10 +981,10 @@ struct Run {
 /// how many round trips it took. So a run of consecutive folded calls is drawn
 /// as one lid: how many there were, the last command, and its result.
 ///
-/// Only *folded* runs merge. A call the reader has opened is the one thing they
-/// are looking at, and burying it back inside a lid would answer a click by
-/// taking the answer away. It also makes the merged form a pure consequence of
-/// the fold state: nothing else has to be kept in step.
+/// Ordinary runs merge only when folded. Unchanged background polls merge by
+/// default in every mode, but both forms respect a call opened by the reader.
+/// Membership and hand choices determine the drawing; no second history or
+/// task state is kept in step.
 struct Lids {
     /// Per slot: the run it belongs to, when it is in one that merges. One
     /// vector rather than a map and a set, because this is asked once per slot
@@ -996,13 +1024,22 @@ fn lids(
             continue;
         }
         let (members, next) = run_from(slots, i, pres);
-        let all_folded = members
-            .iter()
-            .all(|m| pres.is_block_folded(slots[*m].block().id, "tool_call"));
-        // Merging is asked of the mode, not inferred from the fold state: the
-        // two were one condition while `Folded` meant both, and a person who
-        // wanted one row per call got a lid for the run instead.
-        if members.len() > 1 && all_folded && pres.merges_tool_runs() {
+        let poll = slots[i]
+            .block()
+            .content
+            .as_tool_call()
+            .is_some_and(|c| c.idle_poll_job().is_some());
+        let all_folded = members.iter().all(|m| {
+            let id = slots[*m].block().id;
+            if poll {
+                pres.by_block.get(&id) != Some(&false) && !pres.full_open.contains(&id)
+            } else {
+                pres.is_block_folded(id, "tool_call")
+            }
+        });
+        // Ordinary tool runs follow the selected mode. Unchanged background
+        // checks merge by default in every mode, until the reader opens them.
+        if members.len() > 1 && all_folded && (poll || pres.merges_tool_runs()) {
             let failed = members
                 .iter()
                 .filter(|m| {
@@ -1195,6 +1232,11 @@ fn run_around(
     }
     // Back to the run's first call: over the members, and over the hidden slots
     // between them, stopping at the first thing that is neither.
+    let poll = slots[at]
+        .block()
+        .content
+        .as_tool_call()
+        .is_some_and(|c| c.idle_poll_job().is_some());
     let mut start = at;
     let mut j = at;
     while j > 0 {
@@ -1203,6 +1245,15 @@ fn run_around(
             continue;
         }
         if !behind_a_lid(slots[j].block()) {
+            break;
+        }
+        let previous_poll = slots[j]
+            .block()
+            .content
+            .as_tool_call()
+            .is_some_and(|c| c.idle_poll_job().is_some());
+        if (poll && !same_poll_run(slots[at].block(), slots[j].block())) || (!poll && previous_poll)
+        {
             break;
         }
         start = j;
@@ -7077,6 +7128,32 @@ impl Host {
         // is drawn on its own row, and opening all of them because one was
         // clicked buried the one asked for among the rest — the person scrolled
         // through every call's output to reach it.
+        if let Some(at) = slots.iter().position(|s| s.block().id == id) {
+            if slots[at]
+                .block()
+                .content
+                .as_tool_call()
+                .is_some_and(|c| c.idle_poll_job().is_some())
+            {
+                let mut pres = self.presentation.write().expect("presentation poisoned");
+                let run = run_around(slots, &pres, id);
+                if run.len() > 1 {
+                    let expanded = run.iter().any(|id| {
+                        pres.by_block.get(id) == Some(&false) || pres.full_open.contains(id)
+                    });
+                    for id in run {
+                        pres.by_block.insert(id, expanded);
+                        if !expanded && pres.tool_output == ToolOutput::Head {
+                            pres.full_open.insert(id);
+                        } else {
+                            pres.full_open.remove(&id);
+                        }
+                    }
+                    pres.bump();
+                    return;
+                }
+            }
+        }
         let (run, show) = {
             let pres = self.presentation.read().expect("presentation poisoned");
             let run = if pres.merges_tool_runs() {
@@ -16011,6 +16088,207 @@ mod tests {
         assert!(h.withdraw_bg_question("b"));
         assert!(!h.settle_bg_question());
         assert!(!h.bg_question_answered("b", 7));
+    }
+    fn emit_poll(
+        h: &Host,
+        id: &str,
+        job: &str,
+        outcome: crate::content::Outcome,
+        turn: u64,
+        dir: &str,
+    ) {
+        let mut call = crate::content::ToolCallBlock::pending(
+            id,
+            "bash_poll",
+            serde_json::json!({"job_id": job, "intent": format!("waiting-{id}")}).to_string(),
+        )
+        .with(outcome);
+        call.dir = Some(dir.into());
+        h.stream.write().unwrap().writer("poll-test").emit(
+            crate::block::Coord {
+                turn,
+                ..Default::default()
+            },
+            Arc::new(call),
+        );
+    }
+
+    #[test]
+    fn unchanged_polls_merge_and_expand_without_losing_records_in_every_mode() {
+        for mode in [
+            ToolOutput::Full,
+            ToolOutput::Head,
+            ToolOutput::Each,
+            ToolOutput::Group,
+        ] {
+            let h = host();
+            h.presentation.write().unwrap().set_tool_output(mode);
+            for id in ["p1", "p2", "p3"] {
+                emit_poll(
+                    &h,
+                    id,
+                    "bg-1",
+                    crate::content::Outcome::Ok("status: running".into()),
+                    1,
+                    "/project",
+                );
+            }
+            let rows = h.compose((110, 40)).rows().join("\n");
+            assert_eq!(rows.matches("已检查 3 次").count(), 1, "{mode:?}: {rows}");
+            assert!(!rows.contains("waiting-p1"), "repeated intents are hidden");
+            let stream = h.stream.read().unwrap();
+            assert_eq!(
+                stream.slots().len(),
+                3,
+                "presentation must retain every record"
+            );
+            let id = stream.slots().last().unwrap().block().id;
+            drop(stream);
+            h.toggle_block(id, "tool_call");
+            let rows = h.compose((110, 40)).rows().join("\n");
+            assert!(
+                !rows.contains("已检查 3 次"),
+                "the lid must open: {mode:?}: {rows}"
+            );
+            for intent in ["waiting-p1", "waiting-p2", "waiting-p3"] {
+                assert!(
+                    rows.contains(intent),
+                    "all calls must open: {mode:?}: {rows}"
+                );
+            }
+            h.toggle_block(id, "tool_call");
+            assert!(h
+                .compose((110, 40))
+                .rows()
+                .join("\n")
+                .contains("已检查 3 次"));
+        }
+    }
+
+    #[test]
+    fn polls_do_not_merge_across_jobs_turns_directories_or_other_work() {
+        for (job, turn, dir) in [
+            ("bg-2", 1, "/project"),
+            ("bg-1", 2, "/project"),
+            ("bg-1", 1, "/elsewhere"),
+        ] {
+            let h = host();
+            emit_poll(
+                &h,
+                "p1",
+                "bg-1",
+                crate::content::Outcome::Ok("status: running".into()),
+                1,
+                "/project",
+            );
+            emit_poll(
+                &h,
+                "p2",
+                job,
+                crate::content::Outcome::Ok("status: running".into()),
+                turn,
+                dir,
+            );
+            assert!(!h
+                .compose((110, 40))
+                .rows()
+                .join("\n")
+                .contains("已检查 2 次"));
+        }
+        let h = host();
+        emit_poll(
+            &h,
+            "p1",
+            "bg-1",
+            crate::content::Outcome::Ok("status: running".into()),
+            1,
+            "/project",
+        );
+        emit_call(
+            &h,
+            Some(crate::content::Outcome::Ok("important output".into())),
+        );
+        emit_poll(
+            &h,
+            "p2",
+            "bg-1",
+            crate::content::Outcome::Ok("status: running".into()),
+            1,
+            "/project",
+        );
+        let rows = h.compose((110, 40)).rows().join("\n");
+        assert!(!rows.contains("已检查 2 次"));
+        assert!(
+            rows.contains("important output"),
+            "intervening work remains visible: {rows}"
+        );
+    }
+
+    #[test]
+    fn a_new_unchanged_poll_moves_the_count_without_leaving_a_stale_lid() {
+        let h = host();
+        for id in ["p1", "p2"] {
+            emit_poll(
+                &h,
+                id,
+                "bg-1",
+                crate::content::Outcome::Ok("status: running".into()),
+                1,
+                "/project",
+            );
+        }
+        assert!(h
+            .compose((110, 40))
+            .rows()
+            .join("\n")
+            .contains("已检查 2 次"));
+        emit_poll(
+            &h,
+            "p3",
+            "bg-1",
+            crate::content::Outcome::Ok("status: running".into()),
+            1,
+            "/project",
+        );
+        let rows = h.compose((110, 40)).rows().join("\n");
+        assert_eq!(rows.matches("已检查 3 次").count(), 1);
+        assert!(
+            !rows.contains("已检查 2 次"),
+            "cached earlier lid must disappear: {rows}"
+        );
+    }
+
+    #[test]
+    fn meaningful_poll_results_remain_independent_even_in_group_mode() {
+        for outcome in [
+            crate::content::Outcome::Ok("new output\nstatus: running".into()),
+            crate::content::Outcome::Ok("status: exited (code 0)".into()),
+            crate::content::Outcome::Failed("job missing".into()),
+            crate::content::Outcome::Pending,
+        ] {
+            let h = host();
+            h.presentation
+                .write()
+                .unwrap()
+                .set_tool_output(ToolOutput::Group);
+            for id in ["p1", "p2"] {
+                emit_poll(
+                    &h,
+                    id,
+                    "bg-1",
+                    crate::content::Outcome::Ok("status: running".into()),
+                    1,
+                    "/project",
+                );
+            }
+            emit_poll(&h, "changed", "bg-1", outcome, 1, "/project");
+            let rows = h.compose((110, 40)).rows().join("\n");
+            assert!(rows.contains("已检查 2 次"), "{rows}");
+            assert!(
+                rows.contains("waiting-changed"),
+                "new state cannot disappear into the lid: {rows}"
+            );
+        }
     }
 }
 

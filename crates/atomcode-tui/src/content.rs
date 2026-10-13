@@ -1067,6 +1067,19 @@ pub struct ToolCallBlock {
 }
 
 impl ToolCallBlock {
+    /// Only the exact no-output/running result emitted by bash_poll is noise.
+    /// New output, terminal states, errors and pending calls remain independent.
+    pub(crate) fn idle_poll_job(&self) -> Option<String> {
+        if self.name != "bash_poll"
+            || !matches!(&self.outcome, Outcome::Ok(text) if text == "status: running")
+        {
+            return None;
+        }
+        let args: serde_json::Value = serde_json::from_str(&self.args).ok()?;
+        let job = args.get("job_id")?.as_str()?;
+        (!job.is_empty()).then(|| job.to_owned())
+    }
+
     /// Only the editor's explicit no-match result is recoverable here. Permission,
     /// encoding, IO and ambiguous-match failures retain their ordinary display.
     pub(crate) fn edit_text_mismatch(&self) -> bool {
@@ -1479,6 +1492,17 @@ impl ToolCallBlock {
         live: bool,
         w: u16,
     ) -> Vec<Line> {
+        if let Some(job) = last.idle_poll_job() {
+            let caps = Caps::default();
+            return vec![Line::from_spans(vec![
+                Span::styled(format!("{} ", caps.g(Glyph::ToolMark)), fold()),
+                Span::styled(
+                    t(Msg::BackgroundPolls { job: &job, count }).into_owned(),
+                    muted(),
+                ),
+            ])
+            .truncate(w as usize)];
+        }
         if live {
             let caps = Caps::default();
             let lead = format!("{}{} ", " ".repeat(GUTTER), caps.g(Glyph::Gutter));

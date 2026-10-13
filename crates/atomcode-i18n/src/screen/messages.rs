@@ -2141,6 +2141,10 @@ pub enum Msg<'a> {
     CopyHandedOver,
     CopyRemoteHandedOver,
     CopySendFailed,
+    BackgroundPolls {
+        job: &'a str,
+        count: usize,
+    },
     CopyTooLarge,
     ClipboardRemoteText,
     ClipboardRemoteImage,
