@@ -1796,6 +1796,12 @@ impl CodingRuntimeHandle {
         };
         let control = match command {
             DriverCommand::Submit(input) => {
+                tracing::info!(
+                    phase = "driver_submit_dispatch",
+                    generation,
+                    process_id = std::process::id(),
+                    "request preparation timing"
+                );
                 let (done, _result) = oneshot::channel();
                 CodingRuntimeControl::Submit {
                     generation,
@@ -1955,6 +1961,7 @@ impl CodingRuntimeHandle {
         receipt: Option<atomcode_kernel::event::CommandId>,
         input: UserInput,
     ) -> Result<SubmitReceipt, RuntimeError> {
+        let mut timing = atomcode_harness::diagnostics::PhaseTiming::start("runtime_deliver");
         let state = self.state.load(Ordering::Acquire);
         let (done, result) = oneshot::channel();
         self.tx
@@ -1966,7 +1973,9 @@ impl CodingRuntimeHandle {
                 done,
             })
             .map_err(|_| RuntimeError::Unavailable)?;
-        result.await.map_err(|_| RuntimeError::Unavailable)?
+        let result = result.await.map_err(|_| RuntimeError::Unavailable)?;
+        timing.returned();
+        result
     }
 
     /// Tell this runtime something a session it does not hold said: a job this
@@ -4545,6 +4554,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         from,
                         done,
                     }) => {
+                        tracing::info!(phase = "runtime_submit_received", generation = request_generation, process_id = std::process::id(), "request preparation timing");
                         if !native_protocol || request_generation != generation {
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;

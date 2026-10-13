@@ -106,6 +106,11 @@ impl PluginAgentLoop {
     /// The single write path. A plugin that wants to react to session state
     /// listens to `session/event`; it never has to be called by the loop.
     fn commit(&self, session: &SessionLog, event: SessionEvent) -> SeqNo {
+        let mut timing = crate::diagnostics::PhaseTiming::start(match &event {
+            SessionEvent::UserMessage { .. } => "user_message_commit",
+            SessionEvent::RequestHeader { .. } => "request_header_commit",
+            _ => "session_commit",
+        });
         let (seq, at) = session.record(event.clone());
         self.ctx.emit::<SessionEventCommitted>(&Committed {
             session: session.id().to_string(),
@@ -116,12 +121,14 @@ impl PluginAgentLoop {
         if let Some(projections) = self.ctx.service::<SessionProjectionsSvc>() {
             projections.advance(session);
         }
+        timing.returned();
         seq
     }
 
     /// Assemble what the model sees this round: the system prompt from the
     /// fragment registry, the conversation from the log.
     fn assemble(&self, session: &SessionLog, ctx: &Context) -> (Vec<Message>, Vec<ToolDef>) {
+        let mut timing = crate::diagnostics::PhaseTiming::start("request_assemble");
         let mut messages = Vec::new();
         if let Some(prompts) = ctx.service::<SystemPromptSvc>() {
             let system = prompts.render();
@@ -135,6 +142,7 @@ impl PluginAgentLoop {
             .map(|t| t.defs())
             .unwrap_or_default();
         dump_request(session, &messages, &tools);
+        timing.returned();
         (messages, tools)
     }
 
@@ -151,8 +159,18 @@ impl PluginAgentLoop {
         mut req: ModelRequest,
     ) -> Result<ModelResponse, RequestError> {
         let ctx = agent_ctx.clone();
-        agent_ctx
+        let request_started = std::time::Instant::now();
+        let mut timing = crate::diagnostics::PhaseTiming::start("request_pipeline");
+        let result = agent_ctx
             .waterfall::<AgentRequest, _>(&mut req, move |req| {
+                tracing::info!(
+                    phase = "before_provider",
+                    turn,
+                    round,
+                    elapsed_ms = request_started.elapsed().as_millis() as u64,
+                    process_id = std::process::id(),
+                    "request preparation timing"
+                );
                 let provider = provider.clone();
                 let ctx = ctx.clone();
                 let session = session.clone();
@@ -167,7 +185,9 @@ impl PluginAgentLoop {
                     .await
                 }) as BoxFuture<'_, Result<ModelResponse, RequestError>>
             })
-            .await
+            .await;
+        timing.returned();
+        result
     }
 
     /// One round's tool calls, wrapped in the `tools/execute-batch` waterfall.
@@ -376,6 +396,7 @@ impl AgentLoop for PluginAgentLoop {
 }
 
 impl PluginAgentLoop {
+    #[tracing::instrument(name = "turn_pipeline", skip_all, fields(session_id = agent.session().id()))]
     async fn drive_as(&self, agent: &Agent) -> TurnOutcome {
         // The agent's own context, so anything scoped to this agent — an
         // overridden tool catalog, an agent-local policy — is what resolves.
@@ -406,6 +427,11 @@ impl PluginAgentLoop {
                 ..Default::default()
             };
         }
+        tracing::info!(
+            phase = "turn_begin",
+            process_id = std::process::id(),
+            "request preparation timing"
+        );
         let turn = session.next_turn();
         self.commit(&session, SessionEvent::TurnStart { turn });
         let mut outcome = TurnOutcome {
@@ -448,6 +474,7 @@ impl PluginAgentLoop {
             };
 
             if !decision.is_empty() || step == 0 {
+                let mut timing = crate::diagnostics::PhaseTiming::start("pre_step");
                 decision = self
                     .ctx
                     .waterfall::<PreStep, _>(&mut decision, |d| {
@@ -455,6 +482,7 @@ impl PluginAgentLoop {
                         Box::pin(async move { d })
                     })
                     .await;
+                timing.returned();
             }
 
             // A fold the person's stop overtook. `stand_down` withdrew what was

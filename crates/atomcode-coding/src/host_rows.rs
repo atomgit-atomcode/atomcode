@@ -360,6 +360,7 @@ impl Plugin for KernelHooksPlugin {
         let bridge = Arc::new(Bridge {
             ctx: ctx.clone(),
             hook,
+            hook_name: row.hook,
             host: self.0.clone(),
             session_started: AtomicBool::new(false),
             turn_started: Mutex::new(None),
@@ -374,6 +375,7 @@ impl Plugin for KernelHooksPlugin {
 struct Bridge {
     ctx: Context,
     hook: Arc<dyn LifecycleHooks>,
+    hook_name: String,
     /// The table the hook came from, which keeps the request's log view.
     host: Arc<HostHooks>,
     session_started: AtomicBool,
@@ -431,6 +433,7 @@ impl Bridge {
 
 #[async_trait]
 impl Waterfall<PreStep> for Bridge {
+    #[tracing::instrument(name = "lifecycle_hook", skip_all, fields(hook = %self.hook_name))]
     async fn handle(&self, decision: &mut StepDecision, next: Next<'_, PreStep>) -> StepDecision {
         let Some(agent) = self.root_agent() else {
             return next.run(decision).await;
@@ -438,9 +441,13 @@ impl Waterfall<PreStep> for Bridge {
         if !self.session_started.swap(true, Ordering::SeqCst) {
             let mut convo = self.conversation(&agent);
             let before = convo.messages.len();
+            let mut timing =
+                atomcode_harness::diagnostics::PhaseTiming::start("native_session_start");
             self.hook
                 .session_start(&mut convo, agent.seed_len() > 0)
                 .await;
+            timing.returned();
+            drop(timing);
             for message in convo.messages.drain(before..) {
                 decision
                     .injections
@@ -449,7 +456,12 @@ impl Waterfall<PreStep> for Bridge {
         }
         if decision.step == 1 {
             if let Some(text) = &mut decision.message {
-                if let Err(reason) = self.hook.user_prompt_submit(text).await {
+                let mut timing =
+                    atomcode_harness::diagnostics::PhaseTiming::start("native_user_prompt_submit");
+                let submitted = self.hook.user_prompt_submit(text).await;
+                timing.returned();
+                drop(timing);
+                if let Err(reason) = submitted {
                     decision.rejected = Some(reason);
                     return decision.clone();
                 }
@@ -497,6 +509,7 @@ fn with_logged_meta(messages: &[Message], logged: &[Message]) -> Vec<Message> {
 
 #[async_trait]
 impl Waterfall<AgentRequest> for Bridge {
+    #[tracing::instrument(name = "lifecycle_hook", skip_all, fields(hook = %self.hook_name))]
     async fn handle(
         &self,
         req: &mut ModelRequest,
@@ -513,7 +526,10 @@ impl Waterfall<AgentRequest> for Bridge {
         };
         if first {
             let mut convo = self.conversation(&agent);
+            let mut timing = atomcode_harness::diagnostics::PhaseTiming::start("hook_turn_start");
             self.hook.turn_start(&mut convo).await;
+            timing.returned();
+            drop(timing);
             // Which checkpoint this turn started from, in the log beside it:
             // what a rewind of the workspace to before it restores.
             if let Some(id) = self.hook.checkpoint_taken() {
@@ -534,16 +550,26 @@ impl Waterfall<AgentRequest> for Bridge {
         let mut proposed = with_logged_meta(&req.messages, &logged);
         let handed = proposed.clone();
         let before = proposed.len();
+        let mut timing = atomcode_harness::diagnostics::PhaseTiming::start("hook_pre_request");
         self.hook.pre_request(&mut proposed, &ctx).await;
+        timing.returned();
+        drop(timing);
         if proposed.len() > before && proposed[..before] == handed[..] {
             req.messages.extend(proposed.drain(before..));
         }
+        let mut timing =
+            atomcode_harness::diagnostics::PhaseTiming::start("hook_pre_request_options");
         self.hook
             .pre_request_options(&req.messages, &mut req.options, &ctx)
             .await;
+        timing.returned();
+        drop(timing);
+        let mut timing = atomcode_harness::diagnostics::PhaseTiming::start("hook_on_request");
         self.hook
             .on_request(&req.messages, &req.tools, &req.options, &ctx)
             .await;
+        timing.returned();
+        drop(timing);
 
         // The span a `MessageMeta` calls `elapsed_ms`: the request, from handing
         // it on to getting an answer back. The same one `agent_loop`'s
