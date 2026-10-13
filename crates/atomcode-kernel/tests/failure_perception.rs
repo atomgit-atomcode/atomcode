@@ -874,3 +874,82 @@ async fn prompt_rejected_reason() {
         outcome.error
     );
 }
+
+struct PanickingTurnHook;
+#[async_trait]
+impl LifecycleHooks for PanickingTurnHook {
+    async fn turn_start(&self, _conversation: &mut Conversation) {
+        panic!("one-shot hook panic regression");
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn run_to_completion_reports_agent_panic_as_internal_error() {
+    let registry = ToolRegistry::new();
+    let agent = Agent::builder()
+        .provider(Arc::new(AlwaysStopProvider::new("ok")))
+        .tools(registry.mount(&[] as &[&str]))
+        .hooks(Arc::new(PanickingTurnHook))
+        .build();
+    let outcome = tokio::time::timeout(
+        OUTER_GUARD,
+        agent.run_to_completion("go", AutoRespond::AllowAll),
+    )
+    .await
+    .expect("panic must not hang the receiver");
+    assert_eq!(outcome.stop, StopReason::InternalError);
+    assert!(outcome
+        .error
+        .unwrap()
+        .contains("one-shot hook panic regression"));
+    assert_eq!(outcome.error_code.as_deref(), Some("internal_error"));
+    assert_eq!(outcome.http_status, None);
+    assert_eq!(outcome.provider_retryable, None);
+}
+
+struct RetainedSenderPanic(std::sync::Mutex<Option<RequestCtx>>);
+#[async_trait]
+impl ToolMiddleware for RetainedSenderPanic {
+    async fn before(
+        &self,
+        _call: &mut ToolCall,
+        _tool: &Arc<dyn Tool>,
+        rt: &RequestCtx,
+    ) -> BeforeOutcome {
+        *self.0.lock().unwrap() = Some(rt.clone());
+        panic!("middleware panic with retained sender");
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_panicked_agent_does_not_wait_for_a_retained_event_sender() {
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(EchoTool));
+    let middleware = Arc::new(RetainedSenderPanic(std::sync::Mutex::new(None)));
+    let provider = Arc::new(ScriptedProvider::events(vec![
+        StreamEvent::TextDelta("partial before panic".into()),
+        StreamEvent::ToolCall(tool_call("panic-call", "echo", "{}")),
+        StreamEvent::Done { truncated: false },
+    ]));
+    let agent = Agent::builder()
+        .provider(provider)
+        .tools(registry.mount(&["echo"]))
+        .middleware(middleware.clone())
+        .build();
+    let outcome = tokio::time::timeout(
+        OUTER_GUARD,
+        agent.run_to_completion("go", AutoRespond::AllowAll),
+    )
+    .await
+    .expect("task failure must not wait for channel closure");
+    assert_eq!(outcome.stop, StopReason::InternalError);
+    assert_eq!(outcome.text, "partial before panic");
+    assert!(outcome
+        .error
+        .unwrap()
+        .contains("middleware panic with retained sender"));
+    assert!(
+        middleware.0.lock().unwrap().is_some(),
+        "the event sender really remains alive"
+    );
+}

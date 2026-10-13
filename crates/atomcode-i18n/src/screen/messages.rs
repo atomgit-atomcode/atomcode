@@ -1602,6 +1602,7 @@ pub enum Msg<'a> {
     StopRateLimited,
     StopTimeout,
     StopInvariantViolated,
+    StopInternalError,
     StopMaxContinuations,
     /// A turn the model ended on its own while the task list it kept still had
     /// open items: not a failure, and not a finish either.

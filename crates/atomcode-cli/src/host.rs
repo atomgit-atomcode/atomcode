@@ -1236,7 +1236,9 @@ pub fn notify_stop_reason(
         T::Cancelled => N::Cancelled,
         T::MaxRounds | T::MaxContinuations => N::TurnLimit,
         T::RepeatLoop | T::ToolLoopDetected => N::StepLimit,
-        T::ProviderError | T::Timeout | T::PromptRejected | T::RateLimited => N::Error,
+        T::ProviderError | T::InternalError | T::Timeout | T::PromptRejected | T::RateLimited => {
+            N::Error
+        }
         _ => N::Error,
     }
 }

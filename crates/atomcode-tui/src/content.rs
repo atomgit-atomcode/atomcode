@@ -3326,6 +3326,7 @@ fn turn_end_note(stop: StopReason, done_index: usize, open_items: usize) -> (Gly
         Timeout => (Glyph::Fail, t(Msg::StopTimeout).into_owned(), bad()),
         // A failure, with the provider's own sentence folded in below.
         ProviderError => (Glyph::Fail, t(Msg::StopCancelled).into_owned(), bad()),
+        InternalError => (Glyph::Fail, t(Msg::StopInternalError).into_owned(), bad()),
         // Not a failed request: the log cannot explain what reached the model,
         // and from here resume, fork and compaction are unsound. A person is
         // owed that in words rather than sharing a sentence with a dead
@@ -4568,6 +4569,8 @@ mod tests {
             "three reasons, three sentences: {said:?}"
         );
 
+        let internal = drawn(StopReason::InternalError);
+        assert!(internal.contains("内部错误"), "{internal}");
         let unsound = drawn(StopReason::InvariantViolated);
         assert!(
             unsound.contains("不宜再续"),

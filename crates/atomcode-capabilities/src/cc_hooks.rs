@@ -670,7 +670,10 @@ impl CCExternalHooks {
 /// terminal reason instead), so a failed tool call must not light the failure
 /// lamp for a turn that then completes normally.
 fn stop_is_failure(reason: &StopReason) -> bool {
-    matches!(reason, StopReason::ProviderError | StopReason::Timeout)
+    matches!(
+        reason,
+        StopReason::ProviderError | StopReason::InternalError | StopReason::Timeout
+    )
 }
 
 /// PostToolUse matcher resolution: when we know the tool name (the usual case — `before`
@@ -1216,6 +1219,7 @@ mod tests {
     fn stop_vs_stop_failure_terminal_mapping() {
         // API/provider failure terminals → StopFailure ("API 出错" lamp).
         assert!(stop_is_failure(&StopReason::ProviderError));
+        assert!(stop_is_failure(&StopReason::InternalError));
         assert!(stop_is_failure(&StopReason::Timeout));
         // Every other terminal → plain Stop.
         for reason in [
