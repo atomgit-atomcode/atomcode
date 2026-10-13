@@ -1416,6 +1416,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "That one has to be typed on this machine. From there you can use:".into()
         }
         Msg::UsageUnknown { why } => format!("Could not find out what is left: {why}").into(),
+        Msg::CopySendFailed => "Copy request could not be sent. Press Ctrl+G, select again, and copy through the terminal.".into(),
+        Msg::CopyTooLarge => "Selection exceeds the terminal copy limit (100,000 bytes); nothing sent. Select less text or use Ctrl+G to copy through the terminal.".into(),
         Msg::CopyRemoteHandedOver => "SSH copy is unconfirmed. If paste fails, press Ctrl+G, select again, and copy in the terminal (Mac: Cmd+C).".into(),
         Msg::ClipboardRemoteText => "SSH cannot read your local clipboard. Paste through the terminal (Mac: Cmd+V).".into(),
         Msg::ClipboardRemoteImage => "SSH cannot read your local image clipboard. Upload the image and use /paste <path>.".into(),

@@ -2140,6 +2140,8 @@ pub enum Msg<'a> {
     /// Copy cannot be confirmed: OSC 52 has no acknowledgement.
     CopyHandedOver,
     CopyRemoteHandedOver,
+    CopySendFailed,
+    CopyTooLarge,
     ClipboardRemoteText,
     ClipboardRemoteImage,
     /// Local Linux clipboard backends failed, with an actionable fallback.
