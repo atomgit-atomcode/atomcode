@@ -256,7 +256,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── what each command is for (`commands.rs`) ──
         Msg::CmdAboutQuit => "退出".into(),
-        Msg::CmdAboutReasoning => "思考:一行、全文、收起,循环".into(),
+        Msg::CmdAboutReasoning => "思考:展开或隐藏已收到的内容".into(),
         Msg::CmdAboutTools => "工具输出:全部、单个摘要、成组摘要;不带参数则循环".into(),
         Msg::CmdAboutShowInject => "环境注入:收起、只留标签、全文,循环;不带名字则全部".into(),
         Msg::CmdAboutMouse => "把鼠标交还终端,或收回来".into(),
@@ -394,7 +394,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
     拖动选中                        选中并复制
     Esc                             取消选中
     点击折叠行                      展开或收起思考 / 工具调用那一条
-    Ctrl+O / Alt+R                  思考：一行 / 全文 / 收起，循环
+    Ctrl+O / Alt+R                  思考：直接展开 / 隐藏，支持实时内容
     Ctrl+T                          工具输出：全部 / 单个摘要 / 成组摘要，循环（展开那一档连同答完的审批）
     Ctrl+L                          重画屏幕
     Ctrl+G / /mouse                 把鼠标交还终端（改用终端自己的框选；这时滚轮/↑↓ 滚动对话）
@@ -865,7 +865,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::MouseUnreportedAtStart => "这个终端不上报鼠标 · 直接拖选 · 滚轮或 Fn+↑/↓ 翻页 · /raw 跨屏选 · ↑↓ 历史 · ctrl+t 展开 · ctrl+o 思考".into(),
         Msg::MouseUnreported => "这个终端不上报鼠标,鼠标留给终端 · 直接拖选 · 滚轮或 Fn+↑/↓ 翻页".into(),
         Msg::MouseHandedBackAtStart => "鼠标在终端手里 · ctrl+g 收回 · /raw 跨屏选 · 滚轮滚动 · ctrl+p/n 历史 · ctrl+t 展开 · ctrl+o 思考".into(),
-        Msg::ReasoningHiddenHint => "思考过程已收起 · ctrl-o 展开(再按看全文) · 工具输出用 ctrl-t".into(),
+        Msg::ReasoningNotReceived => "尚未收到思考内容；收到后会实时展示。".into(),
+        Msg::ReasoningHiddenHint => "思考过程已收起 · ctrl-o 展开/隐藏 · 工具输出用 ctrl-t".into(),
         Msg::NoProviderPanel => "这个屏幕没有 provider 面板:启动器没有提供 `tui-panel-providers`".into(),
         Msg::NoPluginPanel => "这个屏幕没有插件面板:启动器没有提供 `tui-panel-plugins`".into(),
         Msg::NoToolPanel => "这个屏幕没有工具面板:启动器没有提供 `tui-panel-tools`".into(),

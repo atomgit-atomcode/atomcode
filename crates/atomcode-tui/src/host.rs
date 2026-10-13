@@ -2104,6 +2104,33 @@ impl Host {
                 .any(|s| s.block().at.turn == last && s.block().kind() == "reasoning")
     }
 
+    /// Show received thinking immediately, including live chunks. The return
+    /// value asks the caller to explain an empty view while keeping it enabled
+    /// for future chunks. Read presentation and stream without nested locks.
+    pub fn toggle_reasoning(&self) -> bool {
+        let opening = {
+            let mut pres = self.presentation.write().expect("presentation poisoned");
+            let opening = pres.showing("reasoning") != Showing::Open;
+            pres.show_as(
+                "reasoning",
+                if opening {
+                    Showing::Open
+                } else {
+                    Showing::Hidden
+                },
+            );
+            opening
+        };
+        opening
+            && !self
+                .stream
+                .read()
+                .expect("stream poisoned")
+                .slots()
+                .iter()
+                .any(|s| s.block().kind() == "reasoning")
+    }
+
     /// Deliver one committed fact to every module, with no sequence number of
     /// its own — for a caller that has only the event. A producer that needs
     /// the number (an undo naming the turn it went back to) sees zero, which
@@ -10009,6 +10036,48 @@ mod tests {
             y_before,
             "the row that was clicked moved, so the pin did not hold it"
         );
+    }
+
+    #[test]
+    fn reasoning_can_be_enabled_before_any_output_and_streams_on_the_first_press() {
+        let h = host();
+        assert!(h.toggle_reasoning(), "empty view needs an explanation");
+        assert_eq!(
+            h.presentation.read().unwrap().showing("reasoning"),
+            Showing::Open
+        );
+        for delta in ["LIVE-THOUGHT-ONE", " LIVE-THOUGHT-TWO"] {
+            h.absorb(&SessionEvent::AssistantChunk {
+                turn: 1,
+                round: 1,
+                delta: delta.into(),
+                reasoning: true,
+            });
+        }
+        let rows = h.compose((90, 24)).rows().join("\n");
+        assert!(
+            rows.contains("LIVE-THOUGHT-ONE LIVE-THOUGHT-TWO"),
+            "live chunks need no final message: {rows}"
+        );
+        assert!(h.moment.read().unwrap().scroll.is_at_bottom());
+        assert!(
+            !h.toggle_reasoning(),
+            "hiding has no missing-content notice"
+        );
+        assert!(!h
+            .compose((90, 24))
+            .rows()
+            .join("\n")
+            .contains("LIVE-THOUGHT-ONE"));
+        assert!(
+            !h.toggle_reasoning(),
+            "received thinking opens without an empty notice"
+        );
+        assert!(h
+            .compose((90, 24))
+            .rows()
+            .join("\n")
+            .contains("LIVE-THOUGHT-TWO"));
     }
 
     #[test]

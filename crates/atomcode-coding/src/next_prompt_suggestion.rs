@@ -107,6 +107,7 @@ pub(crate) struct SideSample {
 /// they hold one policy: low effort asked for, no output cap (see
 /// [`generate_next_prompt_suggestion`] for why), a timeout instead. `None` on
 /// any failure or the timeout; `what` names it in the debug log.
+#[tracing::instrument(name = "llm_call", skip_all, fields(purpose = what))]
 pub(crate) async fn sample_side_call(
     provider: Arc<dyn LlmProvider>,
     prompt: String,

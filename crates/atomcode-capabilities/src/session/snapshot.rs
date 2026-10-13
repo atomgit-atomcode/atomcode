@@ -16,6 +16,8 @@ use atomcode_kernel::checkpoint::{CompactionCheckpoint, CompactionCheckpointErro
 use atomcode_kernel::event::StopReason;
 use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
 use atomcode_kernel::message::{Conversation, Message, SessionSnapshot};
+use futures::future::{BoxFuture, Shared};
+use futures::FutureExt;
 
 use super::rewind::{
     FileChangeSummary, RewindLedger, RewindPoint, RewindTransactionJournal, WorkspaceRestorePlan,
@@ -109,12 +111,17 @@ pub struct SnapshotHook {
     rewind: Mutex<RewindState>,
 }
 
+type PendingCapture = Arc<Shared<BoxFuture<'static, Result<Option<String>, String>>>>;
+
 #[derive(Default)]
 struct RewindState {
     checkpoint: Option<Arc<WorkspaceCheckpoint>>,
     unavailable: Option<CodeRewindUnavailable>,
     transaction_unavailable: Option<String>,
     pending: Option<PendingRewindPoint>,
+    /// Retain the same job through finalization so parallel terminal listeners
+    /// can still publish the baseline after the pending point is consumed.
+    capture_job: Option<PendingCapture>,
     points: Vec<RewindPoint>,
 }
 
@@ -122,6 +129,7 @@ struct PendingRewindPoint {
     prompt_number: usize,
     prompt_preview: String,
     before_tree: Option<String>,
+    capture: Option<PendingCapture>,
 }
 
 /// Why the workspace half of a rewind is not on offer.
@@ -319,6 +327,58 @@ impl SnapshotHook {
         checkpoint
             .diff_text(&first, &now, path)
             .map_err(|e| e.to_string())
+    }
+
+    /// Join the owned capture without consuming its handle. A canceled waiter
+    /// leaves it available to the tool barrier or turn completion.
+    pub async fn wait_for_checkpoint(&self) -> Option<String> {
+        let capture = {
+            let rewind = self
+                .rewind
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            match rewind.pending.as_ref() {
+                Some(pending) => match &pending.capture {
+                    Some(capture) => capture.clone(),
+                    None => return pending.before_tree.clone(),
+                },
+                None => rewind.capture_job.clone()?,
+            }
+        };
+        let result = (*capture).clone().await;
+        let captured = result.clone().ok().flatten();
+        let mut rewind = self
+            .rewind
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(pending) = rewind.pending.as_mut() else {
+            return captured;
+        };
+        // A late result must never populate another turn's pending point.
+        if !pending
+            .capture
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &capture))
+        {
+            return (pending.capture.is_none() && pending.before_tree == captured)
+                .then_some(captured)
+                .flatten();
+        }
+        pending.capture = None;
+        pending.before_tree = result.ok().flatten();
+        let before_tree = pending.before_tree.clone();
+        drop(rewind);
+        if before_tree.is_none() {
+            tracing::warn!(
+                phase = "workspace_capture",
+                process_id = std::process::id(),
+                "workspace checkpoint unavailable for this turn"
+            );
+            self.persistence_status.report_auxiliary_warning(
+                "this turn has no workspace checkpoint; code rewind is unavailable for it",
+            );
+        }
+        before_tree
     }
 
     /// The checkpoint and the tree this session started from.
@@ -916,6 +976,8 @@ impl LifecycleHooks for SnapshotHook {
     /// requested tools execute, so persisting them could restore dangling tool
     /// calls without their results.
     async fn turn_start(&self, convo: &mut Conversation) {
+        // Drain any prior job before replacing its pending point.
+        self.wait_for_checkpoint().await;
         let prompt_number = convo
             .messages
             .iter()
@@ -938,23 +1000,55 @@ impl LifecycleHooks for SnapshotHook {
             .unwrap_or_else(|error| error.into_inner())
             .checkpoint
             .clone();
-        let before_tree = match checkpoint {
-            Some(checkpoint) => tokio::task::spawn_blocking(move || checkpoint.capture())
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .flatten(),
-            None => None,
-        };
+        let capture = checkpoint.map(|checkpoint| {
+            let span = tracing::Span::current();
+            let job = tokio::task::spawn_blocking(move || {
+                let started = std::time::Instant::now();
+                let result = checkpoint
+                    .capture()
+                    .map_err(|_| "capture_failed".to_string());
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                span.in_scope(|| {
+                    if result.is_err() {
+                        tracing::warn!(
+                            phase = "workspace_capture",
+                            elapsed_ms,
+                            "workspace checkpoint failed"
+                        );
+                    } else if elapsed_ms >= 1000 {
+                        tracing::info!(
+                            phase = "workspace_capture",
+                            elapsed_ms,
+                            captured = result.as_ref().is_ok_and(Option::is_some),
+                            "slow workspace checkpoint"
+                        );
+                    } else {
+                        tracing::debug!(
+                            phase = "workspace_capture",
+                            elapsed_ms,
+                            "workspace checkpoint finished"
+                        );
+                    }
+                });
+                result
+            });
+            Arc::new(
+                async move { job.await.map_err(|_| "capture_task_failed".to_string())? }
+                    .boxed()
+                    .shared(),
+            )
+        });
         {
             let mut rewind = self
                 .rewind
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
+            rewind.capture_job = capture.clone();
             rewind.pending = Some(PendingRewindPoint {
                 prompt_number,
                 prompt_preview,
-                before_tree,
+                before_tree: None,
+                capture,
             });
         }
         let snapshot = SessionSnapshot::from_conversation(convo);
@@ -979,6 +1073,8 @@ impl LifecycleHooks for SnapshotHook {
 
     /// Count this model round and retain the final request's usage/context figures.
     async fn on_model_response(&self, response: &mut Message) {
+        // Deltas already reached the UI; local tools and turn completion have not.
+        self.wait_for_checkpoint().await;
         let mut a = self.lock();
         a.round_count = a.round_count.saturating_add(1);
         a.tool_calls = a
@@ -1019,6 +1115,7 @@ impl LifecycleHooks for SnapshotHook {
     /// session meta (bump turn/message counts, append this turn's stat, stamp updated_at).
     /// Both are best-effort — an IO failure must never panic or break the turn.
     async fn turn_complete(&self, convo: &Conversation, reason: &StopReason, ctx: &TurnCtx) {
+        self.wait_for_checkpoint().await;
         let (pending, checkpoint) = {
             let mut rewind = self
                 .rewind
@@ -1221,6 +1318,145 @@ mod tests {
             mgr,
             dir,
         )
+    }
+
+    fn pending_capture(hook: &SnapshotHook, capture: PendingCapture) {
+        let mut rewind = hook.rewind.lock().unwrap();
+        rewind.capture_job = Some(capture.clone());
+        rewind.pending = Some(PendingRewindPoint {
+            prompt_number: 1,
+            prompt_preview: "hi".into(),
+            before_tree: None,
+            capture: Some(capture),
+        });
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn cancelling_a_capture_waiter_keeps_the_baseline_for_other_waiters() {
+        let (hook, _manager, _dir) = hook("shared-capture");
+        let hook = Arc::new(hook);
+        let (send, receive) = tokio::sync::oneshot::channel::<String>();
+        pending_capture(
+            &hook,
+            Arc::new(
+                async move { Ok(Some(receive.await.unwrap())) }
+                    .boxed()
+                    .shared(),
+            ),
+        );
+        let first = {
+            let hook = hook.clone();
+            tokio::spawn(async move { hook.wait_for_checkpoint().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!first.is_finished());
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        let a = {
+            let hook = hook.clone();
+            tokio::spawn(async move { hook.wait_for_checkpoint().await })
+        };
+        let b = {
+            let hook = hook.clone();
+            tokio::spawn(async move { hook.wait_for_checkpoint().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!a.is_finished() && !b.is_finished());
+        send.send("baseline".into()).unwrap();
+        assert_eq!(a.await.unwrap().as_deref(), Some("baseline"));
+        assert_eq!(b.await.unwrap().as_deref(), Some("baseline"));
+        assert_eq!(hook.checkpoint_taken().as_deref(), Some("baseline"));
+        // A parallel terminal listener can still obtain the same baseline.
+        hook.rewind.lock().unwrap().pending.take();
+        assert_eq!(
+            hook.wait_for_checkpoint().await.as_deref(),
+            Some("baseline")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_late_capture_does_not_fill_a_replacement_pending_point() {
+        let (hook, _manager, _dir) = hook("replacement-capture");
+        let hook = Arc::new(hook);
+        let (send, receive) = tokio::sync::oneshot::channel::<String>();
+        pending_capture(
+            &hook,
+            Arc::new(
+                async move { Ok(Some(receive.await.unwrap())) }
+                    .boxed()
+                    .shared(),
+            ),
+        );
+        let old = {
+            let hook = hook.clone();
+            tokio::spawn(async move { hook.wait_for_checkpoint().await })
+        };
+        tokio::task::yield_now().await;
+        let replacement = Arc::new(
+            async { Ok(Some("replacement".to_string())) }
+                .boxed()
+                .shared(),
+        );
+        pending_capture(&hook, replacement);
+        send.send("old".into()).unwrap();
+        assert_eq!(old.await.unwrap(), None);
+        assert_eq!(hook.checkpoint_taken(), None);
+        assert_eq!(
+            hook.wait_for_checkpoint().await.as_deref(),
+            Some("replacement")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn model_response_waits_for_the_baseline_before_tools_can_run() {
+        let (hook, _manager, _dir) = hook("response-barrier");
+        let hook = Arc::new(hook);
+        let (send, receive) = tokio::sync::oneshot::channel::<String>();
+        pending_capture(
+            &hook,
+            Arc::new(
+                async move { Ok(Some(receive.await.unwrap())) }
+                    .boxed()
+                    .shared(),
+            ),
+        );
+        let response = {
+            let hook = hook.clone();
+            tokio::spawn(async move {
+                let mut response = Message::assistant("already streamed", Vec::new());
+                hook.on_model_response(&mut response).await;
+                response
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !response.is_finished(),
+            "a tool batch cannot follow before the baseline"
+        );
+        send.send("before-tools".into()).unwrap();
+        assert_eq!(response.await.unwrap().text, "already streamed");
+        assert_eq!(hook.checkpoint_taken().as_deref(), Some("before-tools"));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn failed_capture_reports_no_code_baseline_without_losing_the_prompt() {
+        let (hook, manager, _dir) = hook("failed-capture");
+        let mut conversation = convo_with(1);
+        hook.turn_start(&mut conversation).await;
+        pending_capture(
+            &hook,
+            Arc::new(async { Err("failed".to_string()) }.boxed().shared()),
+        );
+        assert_eq!(hook.wait_for_checkpoint().await, None);
+        assert_eq!(hook.checkpoint_taken(), None);
+        assert!(hook
+            .persistence_status
+            .take_auxiliary_warning()
+            .unwrap()
+            .contains("no workspace checkpoint"));
+        assert_eq!(hook.wait_for_checkpoint().await, None);
+        assert!(hook.persistence_status.take_auxiliary_warning().is_none());
+        assert!(manager.has_inflight_snapshot("failed-capture"));
     }
 
     fn convo_with(n_user: usize) -> Conversation {

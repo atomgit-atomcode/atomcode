@@ -6,6 +6,7 @@ description = "Spike: AtomCode's coding agent reassembled as a plugin tree on at
 publish = false
 
 [dependencies]
+tracing = "0.1"
 atomcode-plexus = { path = "../atomcode-plexus" }
 # Value types only (Message/ToolCall/ToolDef/LlmProvider/Tool). The kernel's own
 # agent loop is deliberately NOT used: the loop is a plugin here, which is the

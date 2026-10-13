@@ -1,0 +1,9 @@
+# Request preparation timing
+
+The Windows diagnostic records session naming at 19:45:25.511 and main Provider entry at 19:45:51.221. Naming is already spawned in the background, so these timestamps do not prove naming blocked the main reply. The main request finishes in 3.183 seconds. Capture the upstream preparation stages before changing lifecycle behavior.
+
+Use monotonic phase guards with start and end records around runtime delivery, pre-step, CC SessionStart/UserPromptSubmit, native lifecycle turn_start/pre_request/pre_request_options/on_request (including checkpoint work), synchronous session commits, request assembly and datalog request recording. Record runtime control receipt and turn start. At the terminal of the AgentRequest waterfall, record time since waterfall entry (`before_provider`), separating preceding middleware from model streaming. `request_pipeline` ends after the whole model request returns and is not middleware-only duration. A session-scoped span correlates turn records; existing Provider request/process IDs remain unchanged.
+
+Guards retain their tracing span across await points without holding span enter guards. Normal returns are `returned`, including explicit errors/rejections; dropped futures are `dropped_before_return`, not asserted to be cancellation. Logs never carry prompt text, hook commands/outputs, credentials or paths. No retries, ordering, timeout, cancellation, persistence or runtime ownership are changed. The clocks cover library receipt onward, not physical keyboard input or final screen paint.
+
+Validate harness unit tests, coding runtime delivery tests and hook regressions, macOS mock streaming and compile/format gates. macOS differs in model, config and plugin execution; there is no established Windows-only cause yet. Only a slow Windows reproduction with these phases can identify the correct optimization.

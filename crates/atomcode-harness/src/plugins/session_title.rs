@@ -191,6 +191,7 @@ impl ModelTitle {
         models.provider(&current).await.ok()
     }
 
+    #[tracing::instrument(name = "llm_call", skip_all, fields(purpose = "session_title"))]
     async fn ask(&self, first: &str) -> Option<String> {
         let prompt = vec![
             Message::system(TITLE_SYSTEM),

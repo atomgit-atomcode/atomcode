@@ -2649,9 +2649,13 @@ impl atomcode_plexus::Waterfall<atomcode_harness::events::AgentRequest> for Data
             request_id: req.round as u64,
             ..Default::default()
         };
+        let mut timing =
+            atomcode_harness::diagnostics::PhaseTiming::start("datalog_record_request");
         self.sink
             .record_request(&req.messages, &req.tools, &req.options, &ctx)
             .await;
+        timing.returned();
+        drop(timing);
         let answered = next.run(req).await;
         match &answered {
             Ok(response) => {
@@ -2857,7 +2861,11 @@ impl atomcode_plexus::Waterfall<atomcode_harness::events::PreStep> for CcHooks {
         use atomcode_kernel::hook::LifecycleHooks;
         if !self.started.swap(true, std::sync::atomic::Ordering::SeqCst) {
             let mut convo = atomcode_kernel::message::Conversation::new();
+            let mut timing =
+                atomcode_harness::diagnostics::PhaseTiming::start("hook_session_start");
             self.engine.session_start(&mut convo, false).await;
+            timing.returned();
+            drop(timing);
             for message in convo.messages {
                 decision.injections.push((
                     message.text,
@@ -2866,7 +2874,12 @@ impl atomcode_plexus::Waterfall<atomcode_harness::events::PreStep> for CcHooks {
             }
         }
         if let Some(text) = &mut decision.message {
-            if let Err(reason) = self.engine.user_prompt_submit(text).await {
+            let mut timing =
+                atomcode_harness::diagnostics::PhaseTiming::start("hook_user_prompt_submit");
+            let submitted = self.engine.user_prompt_submit(text).await;
+            timing.returned();
+            drop(timing);
+            if let Err(reason) = submitted {
                 // The person's hook said no. `rejected` ends the turn without a
                 // step, which is what "block this prompt" means here.
                 decision.rejected = Some(reason);

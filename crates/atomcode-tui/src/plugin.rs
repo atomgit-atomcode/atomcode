@@ -8222,6 +8222,14 @@ impl Tui {
                 self.surface.forget();
                 return false;
             }
+            Action::ToggleFold("reasoning") => {
+                drop(m);
+                if self.host.toggle_reasoning() {
+                    self.host
+                        .say_for(t(Msg::ReasoningNotReceived).into_owned(), false, 5_000);
+                }
+                return false;
+            }
             Action::ToggleFold(kind) => {
                 drop(m);
                 self.host
