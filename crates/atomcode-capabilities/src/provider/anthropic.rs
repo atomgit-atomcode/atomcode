@@ -259,11 +259,7 @@ impl LlmProvider for AnthropicProvider {
                     .await
                     {
                         Err(_elapsed) => {
-                            yield StreamEvent::Error(ProviderError {
-                                retryable: false,
-                                message: "stream idle timeout".to_string(),
-                                ..Default::default()
-                            });
+                            yield StreamEvent::Error(retry::stream_idle_error());
                             return;
                         }
                         Ok(None) => {

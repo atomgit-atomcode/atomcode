@@ -79,7 +79,7 @@ impl Default for LoopRow {
 
 /// The code a stalled stream's error carries, so the loop can tell a turn that
 /// timed out from one the provider failed.
-pub const STREAM_IDLE_CODE: &str = "stream_idle_timeout";
+pub use atomcode_kernel::stream::STREAM_IDLE_TIMEOUT_CODE as STREAM_IDLE_CODE;
 
 fn default_max_rounds() -> u32 {
     100

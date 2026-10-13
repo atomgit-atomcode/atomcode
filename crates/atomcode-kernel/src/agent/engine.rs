@@ -3111,9 +3111,11 @@ impl RunningAgent {
                         // Transport recovery is a new continuation from saved
                         // progress, sharing the idle-timeout budget. A call delta
                         // counts as tool output even before a complete call exists.
-                        let continue_progress = e.code.as_deref()
-                            == Some(crate::stream::STREAM_TRANSPORT_INTERRUPTED_CODE)
-                            && e.http_status.is_none()
+                        let continue_progress = matches!(
+                            e.code.as_deref(),
+                            Some(crate::stream::STREAM_TRANSPORT_INTERRUPTED_CODE)
+                                | Some(crate::stream::STREAM_IDLE_TIMEOUT_CODE)
+                        ) && e.http_status.is_none()
                             && (!assistant_text.trim().is_empty() || last_batch_confirmed)
                             && !saw_tool_stream
                             && partial_stream_recoveries < MAX_PARTIAL_STREAM_RECOVERIES;
@@ -3143,17 +3145,22 @@ impl RunningAgent {
                             retry_is_partial_continuation = true;
                             break;
                         }
+                        let stop =
+                            if e.code.as_deref() == Some(crate::stream::STREAM_IDLE_TIMEOUT_CODE) {
+                                StopReason::Timeout
+                            } else {
+                                StopReason::ProviderError
+                            };
                         self.hooks.on_error(&e.message).await;
                         self.rt.emit(AgentEvent::Error {
                             message: e.message,
                             http_status: e.http_status,
                             code: e.code,
                             retryable: Some(e.retryable),
-                            // 同上:紧接着 finish_turn(ProviderError)。
+                            // The error terminates this turn with the classified stop reason.
                             ends_turn: true,
                         });
-                        self.finish_turn(convo, StopReason::ProviderError, &turn_ctx)
-                            .await;
+                        self.finish_turn(convo, stop, &turn_ctx).await;
                         return;
                     }
                     // The adapter dropped an unparseable chunk. Note it (to flavor the

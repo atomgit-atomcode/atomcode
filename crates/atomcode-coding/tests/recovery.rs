@@ -1248,3 +1248,126 @@ async fn shipping_transport_and_idle_failures_share_one_continuation_budget() {
         "the plain retry must not replay partial work"
     );
 }
+
+fn provider_idle() -> atomcode_kernel::stream::StreamEvent {
+    atomcode_kernel::stream::StreamEvent::Error(atomcode_kernel::stream::ProviderError {
+        code: Some(atomcode_kernel::stream::STREAM_IDLE_TIMEOUT_CODE.into()),
+        message: "stream idle timeout".into(),
+        retryable: false,
+        ..Default::default()
+    })
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn shipping_provider_idle_continues_saved_text_and_confirmed_tools() {
+    use atomcode_kernel::stream::StreamEvent;
+    let (app, provider, _) = streamed_app(
+        vec![
+            vec![
+                StreamEvent::TextDelta("saved prefix".into()),
+                provider_idle(),
+            ],
+            finished(),
+        ],
+        &[],
+    )
+    .await;
+    assert_eq!(
+        run_turn(&app, "go").await.unwrap().stop,
+        StopReason::Stopped
+    );
+    assert_eq!(provider.recorded().len(), 2);
+    assert!(provider.recorded()[1]
+        .0
+        .iter()
+        .any(|m| m.text == "saved prefix"));
+
+    let (app, provider, count) = streamed_app(
+        vec![
+            completed_call("first", "count"),
+            vec![
+                StreamEvent::Reasoning("thinking after results".into()),
+                provider_idle(),
+            ],
+            completed_call("repeat", "count"),
+            finished(),
+        ],
+        &[],
+    )
+    .await;
+    assert_eq!(
+        run_turn(&app, "go").await.unwrap().stop,
+        StopReason::Stopped
+    );
+    assert_eq!(provider.recorded().len(), 4);
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        1,
+        "the completed mutation must not run twice"
+    );
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn shipping_provider_idle_refuses_pending_tools_and_bounds_continuation() {
+    use atomcode_kernel::stream::StreamEvent;
+    let (app, provider, count) = streamed_app(
+        vec![
+            completed_call("first", "count"),
+            vec![
+                StreamEvent::TextDelta("safe partial".into()),
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("new".into()),
+                    name: Some("count".into()),
+                    arguments: "{".into(),
+                },
+                provider_idle(),
+            ],
+            finished(),
+        ],
+        &[],
+    )
+    .await;
+    assert_eq!(
+        run_turn(&app, "go").await.unwrap().stop,
+        StopReason::Timeout
+    );
+    assert_eq!(provider.recorded().len(), 2);
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    assert!(app
+        .context()
+        .only_session()
+        .unwrap()
+        .derive_messages()
+        .iter()
+        .any(|m| m.text == "safe partial"));
+
+    let (app, provider, _) = streamed_app(
+        vec![
+            vec![
+                StreamEvent::TextDelta("first partial".into()),
+                provider_idle(),
+            ],
+            vec![
+                StreamEvent::TextDelta("second partial".into()),
+                provider_idle(),
+            ],
+            finished(),
+        ],
+        &[],
+    )
+    .await;
+    assert_eq!(
+        run_turn(&app, "go").await.unwrap().stop,
+        StopReason::Timeout
+    );
+    assert_eq!(
+        provider.recorded().len(),
+        2,
+        "only one continuation is allowed"
+    );
+    let messages = app.context().only_session().unwrap().derive_messages();
+    for text in ["first partial", "second partial"] {
+        assert!(messages.iter().any(|m| m.text == text));
+    }
+}

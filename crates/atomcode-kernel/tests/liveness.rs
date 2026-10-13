@@ -1459,3 +1459,34 @@ async fn recovered_receipt_does_not_repeat_result_middleware_side_effects() {
             && m.text.matches("[observed]").count() == 1));
     handle.commands.send(AgentCommand::Shutdown).unwrap();
 }
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn provider_idle_error_continues_saved_text_without_replaying_the_prefix() {
+    let idle = StreamEvent::Error(atomcode_kernel::stream::ProviderError {
+        code: Some(atomcode_kernel::stream::STREAM_IDLE_TIMEOUT_CODE.into()),
+        message: "stream idle timeout".into(),
+        retryable: false,
+        ..Default::default()
+    });
+    let (provider, events) = transport_case(
+        vec![StreamEvent::TextDelta("saved prefix".into()), idle],
+        vec![
+            StreamEvent::TextDelta("continued tail".into()),
+            StreamEvent::Done { truncated: false },
+        ],
+    )
+    .await;
+    assert_eq!(provider.calls(), 2);
+    assert!(provider.requests()[1]
+        .iter()
+        .any(|m| m.text == "saved prefix"));
+    assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error { .. })));
+    let text: String = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TextDelta(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text, "saved prefixcontinued tail");
+}

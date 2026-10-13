@@ -747,13 +747,9 @@ impl LlmProvider for OpenAiCompatProvider {
                     .await
                     {
                         Err(_elapsed) => {
-                            // Mid-stream idle: non-recoverable (partial deltas may already
-                            // have reached the consumer), so not retryable.
-                            yield StreamEvent::Error(ProviderError {
-                                retryable: false,
-                                message: "stream idle timeout".to_string(),
-                                ..Default::default()
-                            });
+                            // Do not replay here: partial deltas may already be visible.
+                            // The owner can continue from preserved safe progress.
+                            yield StreamEvent::Error(retry::stream_idle_error());
                             return;
                         }
                         Ok(None) => {
@@ -5634,6 +5630,50 @@ mod tests {
         );
 
         let _ = handle.join();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn partial_byte_idle_is_typed_without_reopening_the_request() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        // Opening real sockets needs wall-clock I/O. Pause only after the first
+        // delta; the idle deadline itself is then tested with virtual time.
+        tokio::time::resume();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            read_http_request(&mut socket);
+            let payload = "data: {\"choices\":[{\"delta\":{\"content\":\"saved\"}}]}\n\n";
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").unwrap();
+            socket
+                .write_all(format!("{:x}\r\n{payload}\r\n", payload.len()).as_bytes())
+                .unwrap();
+            socket.flush().unwrap();
+            let _ = held.recv(); // Keep the connection alive: this is idle, not EOF.
+        });
+        let mut cfg = OpenAiCompatConfig::new("k", format!("http://127.0.0.1:{port}"), "test");
+        cfg.idle_timeout = std::time::Duration::from_secs(1);
+        let provider = OpenAiCompatProvider::new(cfg).unwrap();
+        let mut stream = provider
+            .chat_stream(&[Message::user("hi")], &[], &ChatOptions::default())
+            .await
+            .unwrap();
+        assert!(
+            matches!(stream.next().await, Some(StreamEvent::TextDelta(text)) if text == "saved")
+        );
+        tokio::time::pause();
+        let event = stream.next().await;
+        assert!(matches!(event, Some(StreamEvent::Error(error))
+            if error.code.as_deref() == Some(atomcode_kernel::stream::STREAM_IDLE_TIMEOUT_CODE)
+                && !error.retryable));
+        assert!(
+            stream.next().await.is_none(),
+            "the provider must not replay partial output"
+        );
+        drop(release);
+        handle.join().unwrap();
     }
 
     // ---- gateway identity headers (session affinity + product UA) ----
