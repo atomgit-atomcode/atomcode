@@ -3031,12 +3031,10 @@ pub(crate) fn mount_cc_hooks(
     let _ = ctx.on_emit::<atomcode_harness::events::TurnEnd>(
         move |outcome: &atomcode_harness::seams::TurnOutcome| {
             use atomcode_harness::seams::StopReason as Harness;
-            // The one branch CC actually reads off this value is Stop vs
-            // StopFailure, and `stop_is_failure` keys on a provider/stream
-            // failure — so that is the distinction worth carrying across two
-            // enums neither crate owns.
+            // CC observes Stop versus StopFailure. Preserve provider and task
+            // failures instead of reducing them to a successful completion.
             let reason = match outcome.stop {
-                Harness::ProviderError => atomcode_kernel::event::StopReason::ProviderError,
+                Harness::ProviderError | Harness::InternalError => outcome.stop,
                 _ => atomcode_kernel::event::StopReason::Stopped,
             };
             let engine = ended.engine.clone();

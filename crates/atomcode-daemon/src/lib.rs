@@ -3737,6 +3737,7 @@ pub(crate) fn stop_reason_wire(reason: atomcode_kernel::event::StopReason) -> &'
         StopReason::ToolLoopDetected => "tool_loop_detected",
         StopReason::MaxContinuations => "max_continuations",
         StopReason::ProviderError => "provider_error",
+        StopReason::InternalError => "internal_error",
         StopReason::Timeout => "timeout",
         StopReason::Cancelled => "cancelled",
         StopReason::PromptRejected => "prompt_rejected",
@@ -3748,6 +3749,13 @@ pub(crate) fn stop_reason_wire(reason: atomcode_kernel::event::StopReason) -> &'
 
 #[cfg(test)]
 mod chat_event_type_tests {
+    #[test]
+    fn internal_agent_failure_has_a_distinct_wire_reason() {
+        assert_eq!(
+            super::stop_reason_wire(atomcode_kernel::event::StopReason::InternalError),
+            "internal_error"
+        );
+    }
     use super::{ChatEvent, ChatRuntimeProjector};
 
     #[test]

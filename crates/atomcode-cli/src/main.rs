@@ -5779,6 +5779,23 @@ mod tests {
     }
 
     #[test]
+    fn internal_agent_errors_are_headless_failures() {
+        let completion = atomcode_coding::TurnCompletion::Completed {
+            turn_id: 1,
+            reason: atomcode_kernel::event::StopReason::InternalError,
+            snapshot: std::sync::Arc::new(atomcode_kernel::message::SessionSnapshot::new(
+                Vec::new(),
+            )),
+            stats: Default::default(),
+        };
+        assert_eq!(headless_completion_exit_code(&completion, 0), 1);
+        assert_eq!(
+            headless_completion_notify_reason(&completion),
+            atomcode_capabilities::notify::NotifyStopReason::Error
+        );
+    }
+
+    #[test]
     fn snapshot_unavailable_is_headless_failure_even_when_reason_is_stopped() {
         let completion = atomcode_coding::TurnCompletion::SnapshotUnavailable {
             turn_id: 1,

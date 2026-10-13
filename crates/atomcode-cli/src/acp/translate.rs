@@ -124,6 +124,7 @@ pub fn stop_reason(r: KStop) -> Result<AcpStop, &'static str> {
         KStop::Cancelled => Ok(AcpStop::Cancelled),
         KStop::PromptRejected | KStop::PolicyDenied => Ok(AcpStop::Refusal),
         KStop::ProviderError => Err("provider error"),
+        KStop::InternalError => Err("internal agent error"),
         KStop::Timeout => Err("turn timed out"),
         _ => Err("turn ended abnormally"),
     }
@@ -256,6 +257,7 @@ mod tests {
         use agent_client_protocol::schema::v1::StopReason as Acp;
         use atomcode_kernel::event::StopReason as K;
         assert_eq!(stop_reason(K::Stopped).unwrap(), Acp::EndTurn);
+        assert_eq!(stop_reason(K::InternalError), Err("internal agent error"));
         assert_eq!(stop_reason(K::MaxRounds).unwrap(), Acp::MaxTurnRequests);
         assert_eq!(
             stop_reason(K::MaxContinuations).unwrap(),

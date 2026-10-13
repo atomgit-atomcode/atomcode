@@ -17,6 +17,53 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Mutex, MutexGuard};
 
+/// Metadata-only phase timing; slow phases remain visible at the default log level.
+fn checkpoint_phase<T>(phase: &'static str, action: impl FnOnce() -> T) -> T {
+    let started = std::time::Instant::now();
+    let result = action();
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let process_id = std::process::id();
+    if elapsed_ms >= 1_000 {
+        tracing::info!(
+            phase,
+            elapsed_ms,
+            process_id,
+            "workspace checkpoint phase finished"
+        );
+    } else {
+        tracing::debug!(
+            phase,
+            elapsed_ms,
+            process_id,
+            "workspace checkpoint phase finished"
+        );
+    }
+    result
+}
+
+fn nul_paths(output: &[u8]) -> Result<BTreeSet<String>, WorkspaceCheckpointError> {
+    output
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            let path = std::str::from_utf8(path).map_err(|_| {
+                WorkspaceCheckpointError::InvalidPath("non-UTF-8 index path".into())
+            })?;
+            validate_relative_path(path)?;
+            Ok(path.to_string())
+        })
+        .collect()
+}
+
+fn nul_input(paths: &[String]) -> Vec<u8> {
+    let mut input = Vec::new();
+    for path in paths {
+        input.extend_from_slice(path.as_bytes());
+        input.push(0);
+    }
+    input
+}
+
 const STORE_VERSION: &str = "atomcode-rewind-v1";
 /// Bumped to 2 in v5.0.5: `before_tree`/`after_tree` became optional (a
 /// conversation-only point omits them), a shape an older binary's required-`String`
@@ -480,19 +527,33 @@ impl WorkspaceCheckpoint {
     ) -> Result<Option<String>, WorkspaceCheckpointError> {
         // Invariant A: physical disk floor. Unknown free space → skip.
         // This check is read-only and safe to perform outside the lock.
-        if !disk_floor_ok(available_disk_bytes(&self.git_dir), floor) {
+        if !checkpoint_phase("disk_floor", || {
+            disk_floor_ok(available_disk_bytes(&self.git_dir), floor)
+        }) {
             return Ok(None);
         }
         // Invariant B: store must not exceed budget. The size check AND any gc
         // that evicts loose objects MUST run inside the process lock, at parity
         // with retain_points — an unlocked gc could prune loose objects written
         // by a concurrent capture_locked that has not yet pinned them with a ref.
-        let _guard = self.guard();
+        let _guard = checkpoint_phase("thread_lock", || self.guard());
+        let process_lock_started = std::time::Instant::now();
         let tree = self.with_process_lock(|| {
-            let store_bytes = dir_size_bytes(&self.git_dir);
+            let lock_ms = process_lock_started.elapsed().as_millis() as u64;
+            if lock_ms >= 1_000 {
+                tracing::info!(
+                    phase = "process_lock",
+                    elapsed_ms = lock_ms,
+                    process_id = std::process::id(),
+                    "workspace checkpoint phase finished"
+                );
+            }
+            let store_bytes = checkpoint_phase("store_size", || dir_size_bytes(&self.git_dir));
             if store_bytes > budget {
-                let _ = self.gc_prune_now();
-                if dir_size_bytes(&self.git_dir) > budget {
+                let _ = checkpoint_phase("gc", || self.gc_prune_now());
+                if checkpoint_phase("store_size_after_gc", || dir_size_bytes(&self.git_dir))
+                    > budget
+                {
                     tracing::warn!(
                         git_dir = %self.git_dir.display(),
                         "code rewind capture skipped: store still over budget after gc"
@@ -881,10 +942,124 @@ impl WorkspaceCheckpoint {
         Ok(())
     }
 
+    /// Seed only ordinary indexes. The copied index is a disposable stat cache,
+    /// never a published checkpoint; capture reconciles filters before write-tree.
+    fn seed_index(&self) -> Result<(), WorkspaceCheckpointError> {
+        let target = self.git_dir.join("index");
+        let source = self.worktree.join(".git/index");
+        if target.exists()
+            || !self.worktree.join(".git").is_dir()
+            || !fs::symlink_metadata(&source).is_ok_and(|metadata| metadata.file_type().is_file())
+        {
+            return Ok(());
+        }
+        let query = |args: &[&str]| {
+            git_command()
+                .arg("-C")
+                .arg(&self.worktree)
+                .args(args)
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+        };
+        let Some(shared) = query(&["rev-parse", "--shared-index-path"]) else {
+            return Ok(());
+        };
+        if !shared.stdout.iter().all(u8::is_ascii_whitespace) {
+            return Ok(());
+        }
+        let Some(unmerged) = query(&["ls-files", "--unmerged", "-z"]) else {
+            return Ok(());
+        };
+        if !unmerged.stdout.is_empty() {
+            return Ok(());
+        }
+        if query(&["config", "--bool", "core.sparseCheckout"])
+            .is_some_and(|output| String::from_utf8_lossy(&output.stdout).trim() == "true")
+        {
+            return Ok(());
+        }
+        // Source assume-unchanged/skip-worktree flags could hide local edits.
+        // Keep such repositories on the existing full capture path.
+        let Some(flags) = query(&["ls-files", "-v", "-z"]) else {
+            return Ok(());
+        };
+        if flags
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+            .any(|entry| entry.first() != Some(&b'H'))
+        {
+            return Ok(());
+        }
+        // Open the source once: Git publishes indexes by rename, so this reads
+        // one version even if another process stages files concurrently.
+        let temporary = self.git_dir.join("index.seed");
+        let seeded = (|| -> std::io::Result<()> {
+            let mut reader = fs::File::open(&source)?;
+            let metadata = reader.metadata()?;
+            let modified = metadata.modified()?;
+            let mut writer = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            std::io::copy(&mut reader, &mut writer)?;
+            writer.set_times(fs::FileTimes::new().set_modified(modified))?;
+            drop(writer);
+            Ok(())
+        })();
+        if seeded.is_err() {
+            let _ = fs::remove_file(&temporary);
+            tracing::debug!(
+                phase = "seed_index",
+                "workspace index seed unavailable; using full capture"
+            );
+            return Ok(());
+        }
+        // Validate that Git can read the copied index in the shadow repository.
+        let valid = git_command()
+            .arg("--git-dir")
+            .arg(&self.git_dir)
+            .arg("--work-tree")
+            .arg(&self.worktree)
+            .env("GIT_INDEX_FILE", &temporary)
+            .args(["ls-files", "-v", "-z"])
+            .output()
+            .is_ok_and(|output| {
+                output.status.success()
+                    && output
+                        .stdout
+                        .split(|byte| *byte == 0)
+                        .filter(|entry| !entry.is_empty())
+                        .all(|entry| entry.first() == Some(&b'H'))
+            });
+        if valid && fs::rename(&temporary, &target).is_ok() {
+            tracing::info!(
+                phase = "seed_index",
+                process_id = std::process::id(),
+                "workspace checkpoint seeded from repository index"
+            );
+        } else {
+            let _ = fs::remove_file(&temporary);
+            tracing::debug!(
+                phase = "seed_index",
+                "workspace index seed rejected; using full capture"
+            );
+        }
+        Ok(())
+    }
+
     fn capture_locked(&self) -> Result<String, WorkspaceCheckpointError> {
-        let tracked = self.list_user_files(["ls-files", "--cached", "-z"])?;
-        let untracked =
-            self.list_user_files(["ls-files", "--others", "--exclude-standard", "-z"])?;
+        checkpoint_phase("seed_index", || self.seed_index())?;
+        let tracked = checkpoint_phase("list_tracked", || {
+            self.list_user_files(["ls-files", "--cached", "-z"])
+        })?;
+        let untracked = checkpoint_phase("list_untracked", || {
+            self.list_user_files(["ls-files", "--others", "--exclude-standard", "-z"])
+        })?;
+        let filter_started = std::time::Instant::now();
+        let tracked_count = tracked.len();
+        let untracked_count = untracked.len();
         let mut paths = Vec::new();
         // Tracked files: keep ALL of them (minus sensitive paths). Their blobs
         // are shared with the real repo via alternates, so retaining them costs
@@ -910,19 +1085,56 @@ impl WorkspaceCheckpoint {
                 paths.push(path);
             }
         }
-        self.run(["read-tree", "--empty"])?;
-        if !paths.is_empty() {
-            let mut input = Vec::new();
-            for path in paths {
-                input.extend_from_slice(path.as_bytes());
-                input.push(0);
-            }
-            self.run_with_input(
-                ["update-index", "--add", "--remove", "-z", "--stdin"],
-                &input,
-            )?;
+        tracing::debug!(
+            phase = "filter_paths",
+            elapsed_ms = filter_started.elapsed().as_millis() as u64,
+            process_id = std::process::id(),
+            tracked_count,
+            untracked_count,
+            selected_count = paths.len(),
+            "workspace checkpoint file counts"
+        );
+        // Keep Git's stat cache across captures. Listing changes against the
+        // shadow index preserves Git's racily-clean checks; hand-written mtime
+        // caches would miss same-size edits within the timestamp granularity.
+        let indexed =
+            checkpoint_phase("list_indexed", || self.run(["ls-files", "--cached", "-z"]))?;
+        let indexed = nul_paths(&indexed.stdout)?;
+        let changed = checkpoint_phase("list_changed", || {
+            self.run(["diff-files", "--no-ext-diff", "--name-only", "-z"])
+        })?;
+        let changed = nul_paths(&changed.stdout)?;
+        let selected: BTreeSet<_> = paths.into_iter().collect();
+        let removed: Vec<_> = indexed.difference(&selected).cloned().collect();
+        let updated: Vec<_> = selected
+            .iter()
+            .filter(|path| !indexed.contains(*path) || changed.contains(*path))
+            .cloned()
+            .collect();
+        tracing::debug!(
+            phase = "index_changes",
+            process_id = std::process::id(),
+            updated_count = updated.len(),
+            removed_count = removed.len(),
+            "workspace checkpoint index changes"
+        );
+        if !removed.is_empty() {
+            checkpoint_phase("remove_index_paths", || {
+                self.run_with_input(
+                    ["update-index", "--force-remove", "-z", "--stdin"],
+                    &nul_input(&removed),
+                )
+            })?;
         }
-        let output = self.run(["write-tree"])?;
+        if !updated.is_empty() {
+            checkpoint_phase("update_index", || {
+                self.run_with_input(
+                    ["update-index", "--add", "--remove", "-z", "--stdin"],
+                    &nul_input(&updated),
+                )
+            })?;
+        }
+        let output = checkpoint_phase("write_tree", || self.run(["write-tree"]))?;
         let tree = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if tree.is_empty() {
             return Err(WorkspaceCheckpointError::Git {
@@ -1449,6 +1661,105 @@ mod tests {
             fs::read_to_string(worktree.path().join("new.txt")).unwrap(),
             "new\n"
         );
+    }
+
+    #[test]
+    fn seeded_capture_reconciles_staged_and_unstaged_changes_and_filters() {
+        let (worktree, _store, checkpoint) = fixture();
+        fs::write(worktree.path().join("tracked.txt"), "staged\n").unwrap();
+        fs::write(worktree.path().join(".env"), "secret\n").unwrap();
+        git(worktree.path(), &["add", "tracked.txt", ".env"]);
+        let user_index = fs::read(worktree.path().join(".git/index")).unwrap();
+        fs::write(worktree.path().join("tracked.txt"), "working\n").unwrap();
+        let tree = checkpoint.capture().unwrap().unwrap();
+        assert_eq!(
+            checkpoint
+                .run(["show", &format!("{tree}:tracked.txt")])
+                .unwrap()
+                .stdout,
+            b"working\n"
+        );
+        assert_eq!(
+            checkpoint
+                .run(["ls-tree", "--name-only", &tree])
+                .unwrap()
+                .stdout,
+            b"tracked.txt\n"
+        );
+        assert_eq!(
+            fs::read(worktree.path().join(".git/index")).unwrap(),
+            user_index
+        );
+    }
+
+    #[test]
+    fn seed_preserves_index_timestamp_and_split_indexes_use_full_capture() {
+        let (worktree, _store, checkpoint) = fixture();
+        checkpoint.seed_index().unwrap();
+        assert_eq!(
+            fs::metadata(checkpoint.git_dir.join("index"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            fs::metadata(worktree.path().join(".git/index"))
+                .unwrap()
+                .modified()
+                .unwrap()
+        );
+        let (_, store, _) = fixture();
+        git(worktree.path(), &["update-index", "--split-index"]);
+        let split =
+            WorkspaceCheckpoint::with_store(worktree.path(), store.path().join("split")).unwrap();
+        split.seed_index().unwrap();
+        assert!(!split.git_dir.join("index").exists());
+        let tree = split.capture().unwrap().unwrap();
+        assert_eq!(
+            split
+                .run(["show", &format!("{tree}:tracked.txt")])
+                .unwrap()
+                .stdout,
+            b"one\n"
+        );
+    }
+
+    #[test]
+    fn incremental_capture_tracks_same_size_edits_deletions_and_recreation() {
+        let (worktree, _store, checkpoint) = fixture();
+        let user_index = fs::read(worktree.path().join(".git/index")).unwrap();
+        let before = checkpoint.capture().unwrap().unwrap();
+        assert_eq!(checkpoint.capture().unwrap().unwrap(), before);
+        fs::write(worktree.path().join("tracked.txt"), "two\n").unwrap();
+        let edited = checkpoint.capture().unwrap().unwrap();
+        assert_ne!(edited, before);
+        fs::remove_file(worktree.path().join("tracked.txt")).unwrap();
+        let deleted = checkpoint.capture().unwrap().unwrap();
+        assert_ne!(deleted, edited);
+        assert!(checkpoint
+            .run(["ls-tree", "--name-only", &deleted])
+            .unwrap()
+            .stdout
+            .is_empty());
+        fs::write(worktree.path().join("tracked.txt"), "one\n").unwrap();
+        assert_eq!(checkpoint.capture().unwrap().unwrap(), before);
+        assert_eq!(
+            fs::read(worktree.path().join(".git/index")).unwrap(),
+            user_index
+        );
+    }
+
+    #[test]
+    fn incremental_capture_removes_paths_newly_ignored_and_adds_them_back() {
+        let (worktree, _store, checkpoint) = fixture();
+        fs::write(worktree.path().join("untracked.txt"), "keep\n").unwrap();
+        let before = checkpoint.capture().unwrap().unwrap();
+        fs::write(worktree.path().join(".gitignore"), "untracked.txt\n").unwrap();
+        let after = checkpoint.capture().unwrap().unwrap();
+        let diff = checkpoint.diff(&before, &after).unwrap();
+        assert!(diff
+            .iter()
+            .any(|entry| entry.path == "untracked.txt" && entry.deletions == 1));
+        fs::remove_file(worktree.path().join(".gitignore")).unwrap();
+        assert_eq!(checkpoint.capture().unwrap().unwrap(), before);
     }
 
     #[test]

@@ -1019,6 +1019,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StopPolicyDenied => "stopped · a security policy blocked this step".into(),
         Msg::StopRateLimited => "paused · rate limited".into(),
         Msg::StopTimeout => "stopped · the model did not answer for a long time".into(),
+        Msg::StopInternalError => "Internal error".into(),
         Msg::StopInvariantViolated => "stopped · an internal invariant was broken; this session should not be carried on".into(),
         Msg::StopMaxContinuations => "stopped · the automatic continuations ran out".into(),
         Msg::StopWithOpenItems { count } => format!(

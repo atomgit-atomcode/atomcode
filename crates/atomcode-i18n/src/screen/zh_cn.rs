@@ -953,6 +953,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StopPolicyDenied => "已中断 · 安全策略拦下了这一步".into(),
         Msg::StopRateLimited => "已暂停 · 触发限流".into(),
         Msg::StopTimeout => "已中断 · 模型长时间没有回应".into(),
+        Msg::StopInternalError => "内部错误".into(),
         Msg::StopInvariantViolated => "已中断 · 内部不变量被破坏,这条会话不宜再续".into(),
         Msg::StopMaxContinuations => "已中断 · 自动续跑次数用完了".into(),
         Msg::StopWithOpenItems { count } => {
