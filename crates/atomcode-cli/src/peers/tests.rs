@@ -750,3 +750,73 @@ async fn an_uncertain_runtime_receipt_is_never_reported_as_refusal_or_retried() 
     ));
     assert_eq!(target.calls.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn a_replacement_session_has_room_without_opening_the_pending_list() {
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let (a, _at, _ga, b, bt, _gb) = endpoints(dir.path());
+    let address = b.info().await.unwrap().address;
+    let mut old_ids = Vec::new();
+    for _ in 0..QUEUE_LIMIT {
+        // Isolate queue capacity from the independent per-minute admission limit.
+        b.state.lock().unwrap().arrivals.clear();
+        let Receipt::Held { id } = a.send(&address, "old work".into()).await.unwrap() else {
+            panic!("expected held")
+        };
+        old_ids.push(id);
+    }
+    *bt.session.lock().unwrap() = "replacement".into();
+    b.state.lock().unwrap().arrivals.clear();
+    let address = b.info().await.unwrap().address;
+    let Receipt::Held { id } = a.send(&address, "new work".into()).await.unwrap() else {
+        panic!("old held messages must not fill the replacement queue")
+    };
+    let pending = b.pending().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].message.id, id);
+    let state = b.state.lock().unwrap();
+    for old_id in old_ids {
+        let receipt = &state.seen.iter().find(|entry| entry.0 == old_id).unwrap().2;
+        assert!(
+            matches!(receipt, Receipt::Refused { reason } if reason.contains("session changed"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn dead_socket_files_do_not_count_towards_online_discovery_capacity() {
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let (a, _at, _ga, b, _bt, _gb) = endpoints(dir.path());
+    let mut stale_paths = Vec::new();
+    for _ in 0..160 {
+        let path = a
+            .directory
+            .join(format!("{}.sock", uuid::Uuid::new_v4().simple()));
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        stale_paths.push(path);
+    }
+    let peers = a.list().await.unwrap();
+    assert_eq!(peers.len(), 1);
+    assert_eq!(peers[0].address, b.info().await.unwrap().address);
+    // Discovery has no filesystem deletion race with a restarting peer.
+    assert!(stale_paths.iter().all(|path| path.exists()));
+}
+
+#[tokio::test]
+async fn opening_pending_after_a_session_switch_updates_discarded_receipts() {
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let (a, _at, _ga, b, bt, _gb) = endpoints(dir.path());
+    let Receipt::Held { id } = a
+        .send(&b.info().await.unwrap().address, "old work".into())
+        .await
+        .unwrap()
+    else {
+        panic!("expected held")
+    };
+    *bt.session.lock().unwrap() = "replacement".into();
+    assert!(b.pending().unwrap().is_empty());
+    assert!(
+        matches!(&b.state.lock().unwrap().seen.iter().find(|entry| entry.0 == id).unwrap().2,
+        Receipt::Refused { reason } if reason.contains("session changed"))
+    );
+}

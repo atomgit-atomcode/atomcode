@@ -36,3 +36,10 @@ Validation:
 - Cargo.lock unchanged and checked for private dependency contamination.
 
 Not verified on a Linux host or through manual two-terminal UI use; macOS subprocess/socket integration and real host runtime tests cover the implementation. Windows/classic/ACP/headless remain outside this first version. No release merge or push.
+
+## Audit fixes (2026-10-13)
+
+- Old held messages are discarded before new admission and when viewing pending; their cached receipts become refused. Recheck the current session after reverse verification, before reserving the message.
+- Discovery counts only valid online responses towards the 128-endpoint cap. Dead socket files are skipped without unlinking; the existing eight-second scan deadline remains.
+- Three regressions cover a full old queue across session switching, discarded receipt updates, and discovery with 160 dead sockets plus an online peer.
+- Validation: 20 peer tests passed; full CLI crate 581 passed, 1 skipped; compile gate, fmt check and diff check passed. Cargo.lock unchanged. Changes remain on the feature branch, without release merge or push.

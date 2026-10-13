@@ -191,6 +191,26 @@ struct Admission {
     // Bounded per-instance replay protection. No retry or offline delivery promise.
     seen: VecDeque<(String, Vec<u8>, Receipt)>,
 }
+impl Admission {
+    fn discard_other_sessions(&mut self, session: &str) {
+        let mut discarded = Vec::new();
+        self.pending.retain(|entry| {
+            if entry.session == session {
+                true
+            } else {
+                discarded.push(entry.message.id.clone());
+                false
+            }
+        });
+        for (id, _, receipt) in &mut self.seen {
+            if discarded.contains(id) {
+                *receipt = Receipt::Refused {
+                    reason: "target session changed; message was discarded".into(),
+                };
+            }
+        }
+    }
+}
 pub struct Hub {
     directory: PathBuf,
     instance: String,
@@ -256,7 +276,7 @@ impl Hub {
     pub fn pending(&self) -> Result<Vec<Pending>, String> {
         let session = self.target()?.session();
         let mut state = self.state.lock().expect("peer state poisoned");
-        state.pending.retain(|entry| entry.session == session);
+        state.discard_other_sessions(&session);
         Ok(state.pending.iter().cloned().collect())
     }
     pub fn set_mode(&self, mode: Inbound) {
@@ -358,7 +378,6 @@ impl Hub {
         let mut entries = tokio::fs::read_dir(&self.directory)
             .await
             .map_err(|e| e.to_string())?;
-        let mut candidates = 0;
         while let Some(entry) = entries.next_entry().await.map_err(|e| e.to_string())? {
             let name = entry.file_name().to_string_lossy().into_owned();
             let Some(instance) = name.strip_suffix(".sock").filter(|id| valid_instance(id)) else {
@@ -367,10 +386,6 @@ impl Hub {
             if instance == self.instance {
                 continue;
             }
-            candidates += 1;
-            if candidates > 128 {
-                return Err("peer directory contains too many endpoints".into());
-            }
             if let Ok(Response::Info(info)) = rpc(&self.directory, instance, &Request::Info).await {
                 if info
                     .address
@@ -378,6 +393,9 @@ impl Hub {
                     .is_some_and(|(id, _)| id == instance)
                 {
                     peers.push(info);
+                    if peers.len() > 128 {
+                        return Err("peer directory contains too many online endpoints".into());
+                    }
                 }
             }
         }
@@ -462,6 +480,11 @@ impl Hub {
         let target = self.target()?;
         let receipt = {
             let mut state = self.state.lock().expect("peer state poisoned");
+            let session = target.session();
+            state.discard_other_sessions(&session);
+            if session != me.session {
+                return Err("target session changed or address is stale".into());
+            }
             if let Some((_, original, receipt)) = state
                 .seen
                 .iter()
