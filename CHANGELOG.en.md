@@ -49,7 +49,7 @@ This release improves network recovery and terminal interaction: continue replie
 - **SSH and links**: restore the mascot on Linux and SSH, strip terminal control sequences from notices, and fix unstable link pointers in cmux and links losing metadata during selection.
 - **Commands and skills**: resolve commands and same-named skills through their own entry points while retaining built-in command priority. Plugin commands appear in the slash menu, and input history recalls slash commands.
 - **Windows Bash compatibility**: prefer Git Bash POSIX tools so Windows programs with the same names do not intercept `find` and `sort`.
-- **Configuration and credential safety**: report missing explicitly selected configuration files across interactive, headless and ACP entry points; redact quoted secrets as well.
+- **Configuration and credential safety**: report missing explicitly selected configuration files across interactive, headless and ACP entry points; redact quoted secrets as well. Source builds without official gateway signing support reject requests explicitly instead of crashing.
 
 ## v5.2.2（v5.2.0） (2026-10-10)
 
