@@ -287,7 +287,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
 
         // ── what each command is for (`commands.rs`) ──
         Msg::CmdAboutQuit => "quit".into(),
-        Msg::CmdAboutReasoning => "reasoning: one line, in full, folded — cycles".into(),
+        Msg::CmdAboutReasoning => "reasoning: show or hide received content".into(),
         Msg::CmdAboutTools => "tool output: all of it, one summary each, summarised in groups; cycles with no argument".into(),
         Msg::CmdAboutShowInject => "injected context: folded, label only, in full — cycles; all of them with no name".into(),
         Msg::CmdAboutMouse => "hand the mouse back to the terminal, or take it back".into(),
@@ -431,7 +431,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
     drag                            select and copy
     Esc                             drop the selection
     click a fold                    open or fold that thought / tool call
-    Ctrl+O / Alt+R                  reasoning: one line / in full / folded, cycles
+    Ctrl+O / Alt+R                  reasoning: show / hide received content, including live updates
     Ctrl+T                          tool output: all / one summary each / summarised in groups, cycles (the opening step opens answered approvals too)
     Ctrl+L                          redraw the screen
     Ctrl+G / /mouse                 hand the mouse back to the terminal (use its own selection; wheel/↑↓ then scroll)
@@ -926,7 +926,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::MouseUnreportedAtStart => "this terminal reports no mouse · drag to select · wheel or Fn+Up/Down scroll · /raw select across screens · Up/Down history · ctrl+t open · ctrl+o thinking".into(),
         Msg::MouseUnreported => "this terminal reports no mouse, so it keeps it · drag to select · wheel or Fn+Up/Down scroll".into(),
         Msg::MouseHandedBackAtStart => "the terminal has the mouse · ctrl+g take it · /raw select across screens · wheel/↑↓ scroll · ctrl+p/n history · ctrl+t open · ctrl+o thinking".into(),
-        Msg::ReasoningHiddenHint => "reasoning is hidden · ctrl-o shows it (again for all of it) · tool output: ctrl-t".into(),
+        Msg::ReasoningNotReceived => "No reasoning received yet; incoming content will appear live.".into(),
+        Msg::ReasoningHiddenHint => "reasoning is hidden · ctrl-o shows/hides it · tool output: ctrl-t".into(),
         Msg::NoProviderPanel => "this screen has no provider panel: the launcher provided no `tui-panel-providers`".into(),
         Msg::NoPluginPanel => "this screen has no plugin panel: the launcher provided no `tui-panel-plugins`".into(),
         Msg::NoToolPanel => "this screen has no tool panel: the launcher provided no `tui-panel-tools`".into(),
