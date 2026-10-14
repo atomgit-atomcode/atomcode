@@ -735,6 +735,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::McpActionUntrust => "Untrust".into(),
         Msg::McpActionLogin => "Authenticate".into(),
         Msg::McpActionLogout => "Sign out".into(),
+        Msg::McpActionReconnect => "Reconnect".into(),
         Msg::McpActionEnable => "Enable".into(),
         Msg::McpActionDisable => "Disable".into(),
         Msg::McpLegendList => "↑/↓ move · Enter details · Esc close".into(),

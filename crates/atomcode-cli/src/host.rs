@@ -1102,6 +1102,8 @@ fn to_mcp_action(
     use atomcode_coding::parts::McpAction as Runtime;
     use atomcode_host_api::McpAction;
     match action {
+        McpAction::Reconnect => Some(Runtime::Reconnect),
+        McpAction::CancelReconnect => Some(Runtime::CancelReconnect),
         McpAction::Trust => Some(Runtime::Trust),
         McpAction::Untrust => Some(Runtime::Untrust),
         McpAction::Logout => Some(Runtime::Logout),

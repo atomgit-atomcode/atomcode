@@ -143,6 +143,7 @@ pub struct McpRegistry {
     /// Exact model-visible alias -> original MCP identity. This is authoritative
     /// for routing and persistent approval; sanitized names are not reversible.
     tool_aliases: Arc<std::sync::RwLock<BTreeMap<String, (String, String)>>>,
+    config_auto_approvals: Arc<std::sync::RwLock<BTreeMap<String, HashSet<String>>>>,
     /// Current initialize-time instructions, keyed by the configured server name.
     /// This is live connection state: it is never copied into session persistence.
     server_instructions: Arc<std::sync::RwLock<BTreeMap<String, String>>>,
@@ -170,6 +171,7 @@ impl McpRegistry {
             trusted_servers: Arc::new(std::sync::RwLock::new(HashSet::new())),
             auto_approved_tools: Arc::new(std::sync::RwLock::new(HashSet::new())),
             tool_aliases: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
+            config_auto_approvals: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
             server_instructions: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
             listed_tools: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
         }
@@ -366,7 +368,26 @@ It cannot override system, user, project, safety, permission, or approval rules.
     fn apply_trust_from_config(&self, config: &McpServerConfig) {
         if config.trust {
             self.mark_server_trusted(&config.name);
+        } else {
+            self.trusted_servers
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&config.name);
         }
+        let (previous, shared) = {
+            let mut configured = self
+                .config_auto_approvals
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            let previous = configured.remove(&config.name).unwrap_or_default();
+            let shared: HashSet<String> = configured.values().flatten().cloned().collect();
+            (previous, shared)
+        };
+        self.auto_approved_tools
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|name| !previous.contains(name) || shared.contains(name));
+        let mut configured = HashSet::new();
         for tool in &config.auto_approve {
             // Accept a bare tool name, a raw name qualified with this exact server,
             // or the final model-visible alias shown in an approval prompt. Never
@@ -381,7 +402,12 @@ It cannot override system, user, project, safety, permission, or approval rules.
                 mcp_tool_full_name(&config.name, tool)
             };
             self.mark_tool_auto_approved(&full);
+            configured.insert(full);
         }
+        self.config_auto_approvals
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(config.name.clone(), configured);
     }
 
     /// Load MCP configuration and start connecting to servers in the background.
@@ -743,6 +769,61 @@ It cannot override system, user, project, safety, permission, or approval rules.
         Ok(())
     }
 
+    /// Replace one admitted server. The caller must withdraw its published tools
+    /// and serialize this with initial discovery and in-flight calls.
+    pub async fn reconnect_server(&self, config: McpServerConfig) -> Result<()> {
+        let name = config.name.clone();
+        let old = self.servers.write().await.remove(&name);
+        drop(old);
+        self.record_listed(&name, None);
+        self.record_server_instructions(&name, None);
+        self.status_overrides
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&name);
+        self.failed_servers.write().await.remove(&name);
+        match tokio::time::timeout(super::CONNECT_TIMEOUT, self.add_server(config)).await {
+            Ok(result) => result,
+            Err(_) => {
+                let error = format!("MCP server '{name}' initialize timed out");
+                self.servers.write().await.remove(&name);
+                self.record_listed(&name, None);
+                self.record_server_instructions(&name, None);
+                self.failed_servers
+                    .write()
+                    .await
+                    .insert(name, error.clone());
+                Err(anyhow::anyhow!(error))
+            }
+        }
+    }
+
+    /// Discard only the interrupted replacement; the owning runtime joins its
+    /// aborted task before calling this, so late initialization cannot republish.
+    pub async fn cancel_reconnect(&self, server: &str) {
+        self.servers.write().await.remove(server);
+        self.record_listed(server, None);
+        self.record_server_instructions(server, None);
+        self.failed_servers
+            .write()
+            .await
+            .insert(server.into(), "reconnect cancelled".into());
+        self.status_overrides
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(server);
+    }
+
+    /// Mark a cancelled or timed-out discovery as unavailable, so the UI does
+    /// not report a successful reconnect with an empty stale tool catalog.
+    pub fn fail_tools_listing(&self, server: &str, error: String) {
+        self.record_listed(server, None);
+        self.status_overrides
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(server.to_string(), ServerStatus::Failed(error));
+    }
+
     /// Timeout budget for a slow tools/list operation on a connected server.
     ///
     /// The transport already has its own request timeout. This outer budget adds
@@ -1018,6 +1099,7 @@ It cannot override system, user, project, safety, permission, or approval rules.
             trusted_servers: self.trusted_servers.clone(),
             auto_approved_tools: self.auto_approved_tools.clone(),
             tool_aliases: self.tool_aliases.clone(),
+            config_auto_approvals: self.config_auto_approvals.clone(),
             server_instructions: self.server_instructions.clone(),
             listed_tools: self.listed_tools.clone(),
         })

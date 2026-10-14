@@ -4975,6 +4975,19 @@ impl Tui {
                             }
                         }
                         Err(why) => {
+                            // Reconnect withdraws the old tools before dialing.
+                            // Even failure changes live state; do not leave the
+                            // previous Connected page and tool count on screen.
+                            if action == crate::mcp::Action::Reconnect {
+                                if let Ok(view) = port.list().await {
+                                    host.show_mcp(view);
+                                    if host.mcp_awaiting_detail(&server) {
+                                        if let Ok(detail) = port.detail(&server).await {
+                                            host.mcp_detail(detail);
+                                        }
+                                    }
+                                }
+                            }
                             host.mcp_note(Some(why));
                         }
                     }
@@ -11214,6 +11227,55 @@ mod mcp_panel_tests {
     fn note(host: &Arc<Host>) -> Option<String> {
         let m = host.moment.read().expect("moment poisoned");
         m.mcp_panel.as_ref().and_then(|panel| panel.note.clone())
+    }
+
+    struct FailedReconnect;
+    #[async_trait]
+    impl crate::mcp::Mcp for FailedReconnect {
+        async fn list(&self) -> Result<crate::mcp::McpView, String> {
+            Ok(crate::mcp::McpView::new(vec![named(
+                "figma",
+                crate::mcp::McpState::Failed("dial failed".into()),
+            )]))
+        }
+        async fn detail(&self, name: &str) -> Result<crate::mcp::McpDetail, String> {
+            let mut page = page_of(name);
+            page.state = crate::mcp::McpState::Failed("dial failed".into());
+            page.tool_count = 0;
+            Ok(page)
+        }
+        async fn act(
+            &self,
+            _: &str,
+            action: crate::mcp::Action,
+        ) -> Result<crate::mcp::McpView, String> {
+            assert_eq!(action, crate::mcp::Action::Reconnect);
+            Err("dial failed".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_reconnect_refreshes_the_detail_and_preserves_the_error() {
+        let (host, tui, mut woken) = screen();
+        with_port_of(&tui, Arc::new(FailedReconnect));
+        tui.act(Action::ToggleMcp, &tui.client);
+        landed(&mut woken).await;
+        tui.run_mcp_key(KeyPress::plain(Key::Enter));
+        landed(&mut woken).await;
+        // Model the previously connected page; Reconnect is its first action.
+        let mut page = page_of("figma");
+        page.state = crate::mcp::McpState::Connected;
+        host.mcp_detail(page);
+        tui.run_mcp_key(KeyPress::plain(Key::Enter));
+        landed(&mut woken).await;
+        let moment = host.moment.read().unwrap();
+        let detail = moment.mcp.detail_for(Some("figma")).unwrap();
+        assert!(matches!(detail.state, crate::mcp::McpState::Failed(_)));
+        assert_eq!(detail.tool_count, 0);
+        assert_eq!(
+            moment.mcp_panel.as_ref().unwrap().note.as_deref(),
+            Some("dial failed")
+        );
     }
 
     /// A port whose sign-in waits until it is cancelled, and counts the cancels.

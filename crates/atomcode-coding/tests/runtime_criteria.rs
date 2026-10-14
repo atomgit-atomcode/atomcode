@@ -2655,6 +2655,242 @@ async fn an_mcp_servers_tools_are_offered_and_run() {
     );
 }
 
+/// A local reconnect updates one catalog without replacing the session or its
+/// other MCP connections. Failure removes its old tools; retry restores them.
+async fn reconnecting_one_mcp_keeps_its_neighbor_and_session() {
+    let env = env();
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let a_spawns = a.path().join("spawns");
+    let b_spawns = b.path().join("spawns");
+    let script_a = write_mcp_server(a.path(), &a_spawns);
+    let script_b = write_mcp_server(b.path(), &b_spawns);
+    let recorder = Arc::new(Recorder::default());
+    let mut start = start_with_mcp_server(env.project.path(), &recorder, &script_a, true);
+    let mut neighbor = start.prepare.extra_mcp_servers[0].clone();
+    neighbor.name = "neighbor".into();
+    if let atomcode_capabilities::mcp::McpTransportConfig::Stdio { args, .. } = &mut neighbor.config
+    {
+        *args = vec![script_b.display().to_string()];
+    }
+    start.prepare.extra_mcp_servers.push(neighbor);
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+    runtime
+        .handle
+        .wait_mcp_ready(std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
+    let session = runtime.session.as_ref().unwrap().id.clone();
+    turn(&mut runtime, "hello").await;
+    assert!(last_offered(&recorder).contains(&"mcp__t__echo".into()));
+    let original = std::fs::read_to_string(&script_a).unwrap();
+    let replacement = original.replace("\"name\":\"echo\"", "\"name\":\"fresh\"");
+    assert_ne!(original, replacement);
+    std::fs::write(&script_a, &replacement).unwrap();
+    runtime
+        .handle
+        .mcp_act("t".into(), atomcode_coding::parts::McpAction::Reconnect)
+        .await
+        .unwrap();
+    turn(&mut runtime, "hello after reconnect").await;
+    let offered = last_offered(&recorder);
+    assert!(offered.contains(&"mcp__t__fresh".into()), "{offered:?}");
+    assert!(!offered.contains(&"mcp__t__echo".into()), "{offered:?}");
+    assert!(
+        offered.contains(&"mcp__neighbor__echo".into()),
+        "{offered:?}"
+    );
+    assert_eq!(runtime.session.as_ref().unwrap().id, session);
+    assert_eq!(
+        std::fs::read_to_string(&b_spawns).unwrap().lines().count(),
+        1
+    );
+    std::fs::write(&script_a, "exit 1\n").unwrap();
+    assert!(runtime
+        .handle
+        .mcp_act("t".into(), atomcode_coding::parts::McpAction::Reconnect)
+        .await
+        .is_err());
+    turn(&mut runtime, "hello after failed reconnect").await;
+    let offered = last_offered(&recorder);
+    assert!(!offered.iter().any(|tool| tool.starts_with("mcp__t__")));
+    assert!(offered.contains(&"mcp__neighbor__echo".into()));
+    std::fs::write(&script_a, replacement).unwrap();
+    runtime
+        .handle
+        .mcp_act("t".into(), atomcode_coding::parts::McpAction::Reconnect)
+        .await
+        .unwrap();
+    turn(&mut runtime, "hello after retry").await;
+    assert!(last_offered(&recorder).contains(&"mcp__t__fresh".into()));
+    assert_eq!(
+        std::fs::read_to_string(&b_spawns).unwrap().lines().count(),
+        1
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
+// These use real clocks: readiness is signalled by an actual stdio child. The
+// one-second bounds verify the owner stays responsive while transport is stuck.
+async fn slow_mcp_reconnect_is_responsive(stage_tools: bool, shutdown: bool, scoped: bool) {
+    use atomcode_coding::parts::McpAction;
+    let env = env();
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let marker = a.path().join("blocked");
+    let script = write_mcp_server(a.path(), &a.path().join("spawns"));
+    let neighbor_script = write_mcp_server(b.path(), &b.path().join("spawns"));
+    let original = std::fs::read_to_string(&script).unwrap();
+    let recorder = Arc::new(Recorder::default());
+    let mut start = start_with_mcp_server(env.project.path(), &recorder, &script, true);
+    let mut neighbor = start.prepare.extra_mcp_servers[0].clone();
+    neighbor.name = "neighbor".into();
+    if let atomcode_capabilities::mcp::McpTransportConfig::Stdio { args, .. } = &mut neighbor.config
+    {
+        *args = vec![neighbor_script.display().to_string()];
+    }
+    start.prepare.extra_mcp_servers.push(neighbor);
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+    runtime
+        .handle
+        .wait_mcp_ready(std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
+    let slow = if stage_tools {
+        let old = "    *'\"method\":\"tools/list\"'*)";
+        let new = format!(
+            "{old}\necho blocked > \"{}\"\nwhile IFS= read -r rest; do :; done\n",
+            marker.display()
+        );
+        let changed = original.replace(old, &new);
+        assert_ne!(changed, original);
+        changed
+    } else {
+        format!(
+            "IFS= read -r line\necho blocked > \"{}\"\nwhile IFS= read -r rest; do :; done\n",
+            marker.display()
+        )
+    };
+    std::fs::write(&script, slow).unwrap();
+    let handle = runtime.handle.clone();
+    let pending =
+        tokio::spawn(async move { handle.mcp_act("t".into(), McpAction::Reconnect).await });
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !marker.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("server entered slow phase");
+    let limit = std::time::Duration::from_secs(1);
+    assert_eq!(
+        runtime.handle.status().phase,
+        atomcode_coding::runtime::RuntimePhase::Reconfiguring
+    );
+    assert!(!runtime
+        .handle
+        .accepts(&atomcode_coding::DriverCommand::Submit("not now".into())));
+    assert!(runtime
+        .handle
+        .dispatch(atomcode_coding::DriverCommand::Submit(
+            "must not disappear".into()
+        ))
+        .is_err());
+    assert!(runtime
+        .handle
+        .accepts(&atomcode_coding::DriverCommand::Cancel));
+    tokio::time::timeout(limit, runtime.handle.mcp_status())
+        .await
+        .expect("status must remain responsive")
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(limit, runtime.handle.submit("not now".into()))
+            .await
+            .unwrap(),
+        Err(atomcode_coding::RuntimeError::Busy)
+    );
+    assert_eq!(
+        tokio::time::timeout(limit, runtime.handle.fresh_session())
+            .await
+            .unwrap()
+            .unwrap_err(),
+        atomcode_coding::RuntimeError::Busy
+    );
+    if shutdown {
+        tokio::time::timeout(limit, runtime.handle.shutdown())
+            .await
+            .expect("shutdown must interrupt reconnect")
+            .unwrap();
+    } else {
+        if scoped {
+            // A different server's cancel must not touch the pending operation.
+            runtime
+                .handle
+                .mcp_act("neighbor".into(), McpAction::CancelReconnect)
+                .await
+                .unwrap();
+            assert!(!pending.is_finished());
+            tokio::time::timeout(
+                limit,
+                runtime
+                    .handle
+                    .mcp_act("t".into(), McpAction::CancelReconnect),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        } else {
+            tokio::time::timeout(limit, runtime.handle.cancel())
+                .await
+                .expect("cancel must interrupt reconnect")
+                .unwrap();
+        }
+        let status = runtime.handle.mcp_status().await.unwrap();
+        assert!(status.servers.iter().any(|(name, state)| name == "t" && matches!(state, atomcode_capabilities::mcp::ServerStatus::Failed(error) if error.contains("cancelled"))));
+        assert!(status.servers.iter().any(|(name, state)| name == "neighbor"
+            && matches!(state, atomcode_capabilities::mcp::ServerStatus::Connected)));
+        assert_eq!(
+            std::fs::read_to_string(b.path().join("spawns"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        turn(&mut runtime, "hello after cancelled reconnect").await;
+        let offered = last_offered(&recorder);
+        assert!(!offered.iter().any(|name| name.starts_with("mcp__t__")));
+        assert!(offered.contains(&"mcp__neighbor__echo".into()));
+        std::fs::write(&script, original).unwrap();
+        runtime
+            .handle
+            .mcp_act("t".into(), McpAction::Reconnect)
+            .await
+            .unwrap();
+        // A late scoped cancel after completion must not cancel a new user turn.
+        runtime
+            .handle
+            .mcp_act("t".into(), McpAction::CancelReconnect)
+            .await
+            .unwrap();
+        turn(&mut runtime, "hello after retry").await;
+        assert!(last_offered(&recorder).contains(&"mcp__t__echo".into()));
+        runtime.handle.shutdown().await.unwrap();
+    }
+    assert_eq!(
+        pending.await.unwrap(),
+        Err(atomcode_coding::RuntimeError::Cancelled)
+    );
+}
+async fn a_slow_mcp_initialize_can_be_cancelled_without_blocking_queries() {
+    slow_mcp_reconnect_is_responsive(false, false, false).await;
+}
+async fn a_slow_mcp_tool_discovery_can_be_cancelled_from_its_panel() {
+    slow_mcp_reconnect_is_responsive(true, false, true).await;
+}
+async fn shutdown_interrupts_a_slow_mcp_reconnect() {
+    slow_mcp_reconnect_is_responsive(false, true, false).await;
+}
+
 /// The retry budget follows the model, because it is the model's provider that
 /// declared it.
 ///
@@ -5964,6 +6200,10 @@ mod criteria {
         a_round_budget_ends_the_turn,
         what_the_model_is_told_about_mcp_only_names_ways_this_build_has,
         an_mcp_servers_tools_are_offered_and_run,
+        reconnecting_one_mcp_keeps_its_neighbor_and_session,
+        a_slow_mcp_initialize_can_be_cancelled_without_blocking_queries,
+        a_slow_mcp_tool_discovery_can_be_cancelled_from_its_panel,
+        shutdown_interrupts_a_slow_mcp_reconnect,
         withdrawing_mcp_takes_the_tools_off_the_model,
         a_servers_instructions_are_in_the_system_prompt,
         a_switched_session_keeps_the_mcp_tools,

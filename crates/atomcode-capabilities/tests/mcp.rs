@@ -451,3 +451,82 @@ async fn background_registry_reads_project_mcp_json() {
         "the connected server should appear in server_statuses"
     );
 }
+
+/// Real stdio processes: replacing one server must not restart its neighbor.
+#[tokio::test]
+async fn manual_reconnect_replaces_only_the_selected_server() {
+    let temp = tempfile::tempdir().unwrap();
+    let a_spawns = temp.path().join("a-spawns");
+    let b_spawns = temp.path().join("b-spawns");
+    let config = |name: &str, path: &std::path::Path| {
+        test_server_config_with_env(
+            name,
+            BTreeMap::from([("MCP_TEST_SPAWN_COUNTER".into(), path.display().to_string())]),
+        )
+    };
+    let registry = McpRegistry::new(NO_TREE);
+    let a = config("a", &a_spawns);
+    registry.add_server(a.clone()).await.unwrap();
+    registry.add_server(config("b", &b_spawns)).await.unwrap();
+    registry.list_all_tools().await;
+    registry.reconnect_server(a).await.unwrap();
+    let tools = registry.list_tools_for_server("a").await;
+    assert_eq!(tools.len(), 1);
+    assert_eq!(spawn_count(&a_spawns), 2);
+    assert_eq!(spawn_count(&b_spawns), 1);
+    let result = registry
+        .call_tool("b", "echo", serde_json::json!({"message":"still here"}))
+        .await
+        .unwrap();
+    assert!(result.contains("still here"));
+}
+
+#[tokio::test]
+async fn failed_manual_reconnect_discards_old_tools_and_can_be_retried() {
+    let registry = McpRegistry::new(NO_TREE);
+    let good = test_server_config("chosen");
+    registry.add_server(good.clone()).await.unwrap();
+    assert_eq!(registry.list_all_tools().await.len(), 1);
+    let mut bad = good.clone();
+    if let McpTransportConfig::Stdio { command, .. } = &mut bad.config {
+        *command = "/nonexistent/mcp-reconnect-test".into();
+    }
+    assert!(registry.reconnect_server(bad).await.is_err());
+    assert!(registry.listed_tools().is_empty());
+    assert!(matches!(
+        &registry.server_statuses().await[0].1,
+        ServerStatus::Failed(_)
+    ));
+    assert!(registry
+        .call_tool("chosen", "echo", serde_json::json!({}))
+        .await
+        .is_err());
+    registry.reconnect_server(good).await.unwrap();
+    assert_eq!(registry.list_tools_for_server("chosen").await.len(), 1);
+    assert!(matches!(
+        &registry.server_statuses().await[0].1,
+        ServerStatus::Connected
+    ));
+}
+
+#[tokio::test]
+async fn manual_reconnect_reloads_the_selected_servers_approval_config() {
+    let registry = McpRegistry::new(NO_TREE);
+    let mut config = test_server_config("selected");
+    config.trust = true;
+    config.auto_approve = vec!["echo".into(), "mcp__neighbor__echo".into()];
+    registry.add_server(config.clone()).await.unwrap();
+    let mut neighbor = test_server_config("neighbor");
+    neighbor.trust = true;
+    neighbor.auto_approve = vec!["echo".into()];
+    registry.add_server(neighbor).await.unwrap();
+    assert!(registry.is_server_trusted("selected"));
+    assert!(registry.is_tool_auto_approved("mcp__selected__echo"));
+    config.trust = false;
+    config.auto_approve.clear();
+    registry.reconnect_server(config).await.unwrap();
+    assert!(!registry.is_server_trusted("selected"));
+    assert!(!registry.is_tool_auto_approved("mcp__selected__echo"));
+    assert!(registry.is_server_trusted("neighbor"));
+    assert!(registry.is_tool_auto_approved("mcp__neighbor__echo"));
+}

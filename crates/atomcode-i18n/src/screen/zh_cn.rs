@@ -677,6 +677,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::McpActionUntrust => "取消信任".into(),
         Msg::McpActionLogin => "认证".into(),
         Msg::McpActionLogout => "登出".into(),
+        Msg::McpActionReconnect => "重连".into(),
         Msg::McpActionEnable => "启用".into(),
         Msg::McpActionDisable => "停用".into(),
         Msg::McpLegendList => "↑/↓ 移动 · Enter 详情 · Esc 关闭".into(),
