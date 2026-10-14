@@ -1597,6 +1597,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             "流响应中断，正在从已保存进度安全续接（{attempt}/{max_attempts}）…"
         )
         .into(),
+        Msg::StreamRecoveryPreserved { max_recoveries } => format!("模型响应中断，已保留收到的内容，正在尝试继续（本轮最多自动恢复 {max_recoveries} 次）。").into(),
         Msg::StreamRecoverySucceeded => "✓ 已从流中断处恢复".into(),
         Msg::ContextFromPeer => "对 agent 说".into(),
         Msg::ContextFromMemory => "来自记忆".into(),

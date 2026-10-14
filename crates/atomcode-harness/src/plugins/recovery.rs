@@ -610,11 +610,10 @@ impl Waterfall<AgentRequest> for StreamRecovery {
                 notice(
                     &self.ctx,
                     NoticeKind::ProviderRetry,
-                    format!(
-                        "stream broke after partial output; preserved it and continuing \
-                         (bounded continuation; max {})",
-                        self.max_recoveries
-                    ),
+                    atomcode_config::i18n::t(atomcode_config::i18n::Msg::StreamRecoveryPreserved {
+                        max_recoveries: self.max_recoveries,
+                    })
+                    .into_owned(),
                 );
 
                 // Re-project so the retry carries the preserved message.

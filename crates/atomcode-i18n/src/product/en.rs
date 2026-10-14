@@ -1643,6 +1643,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
             "stream interrupted; safely continuing from saved progress ({attempt}/{max_attempts})…"
         )
         .into(),
+        Msg::StreamRecoveryPreserved { max_recoveries } => format!("Model response interrupted. Received content was preserved; attempting to continue (up to {max_recoveries} automatic recoveries per turn).").into(),
         Msg::StreamRecoverySucceeded => "✓ recovered from the interrupted stream".into(),
         Msg::ContextFromPeer => "said to the agent by".into(),
         Msg::ContextFromMemory => "from memory".into(),

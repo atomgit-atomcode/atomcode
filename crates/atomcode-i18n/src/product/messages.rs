@@ -2165,6 +2165,10 @@ pub enum Msg<'a> {
         max_attempts: u32,
     },
     StreamRecoverySucceeded,
+    /// Notice when received output is preserved and bounded continuation begins.
+    StreamRecoveryPreserved {
+        max_recoveries: u32,
+    },
     /// Labels for model-visible context the person did not type. The line they
     /// prefix is drawn muted, because the one thing it must never look like is
     /// the person speaking.
