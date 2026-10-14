@@ -834,9 +834,15 @@ fn code_block(lines: &[String], lang: &str, w: u16) -> Vec<Line> {
         );
     }
     for line in lines {
-        let mut spans = vec![bar()];
-        spans.extend(highlight(line, lang));
-        out.push(Line::from_spans(spans).truncate(w as usize));
+        let rows = wrap_spans(&highlight(line, lang), w, GUTTER_BAR, fence());
+        for mut row in rows {
+            // Soft wraps are still part of the fenced block. Keep the gutter
+            // on continuation rows as well as the first row.
+            if let Some(gutter) = row.spans.first_mut() {
+                *gutter = bar();
+            }
+            out.push(row.truncate(w as usize));
+        }
     }
     out
 }
@@ -1025,6 +1031,7 @@ mod tests {
         "- a\n- b\n  - c\n",
         "> quoted\n> more\n",
         "before\n```rust\nfn main() {}\n```\nafter\n",
+        "before\n```bash\npsql \"$DATABASE_URL\" -c \"SELECT asin, data->>'sameFamilySummary' AS family FROM listings;\"\n```\nafter\n",
         // An open fence: the rule above it gains `rust` only when it closes.
         "before\n```rust\nfn main() {\n",
         // Streaming in: nothing is complete yet.
@@ -1581,6 +1588,44 @@ mod tests {
         let spans = spans_of("open file:///a/b.html", 200);
         let links: Vec<&str> = spans.iter().filter_map(|s| s.link.as_deref()).collect();
         assert_eq!(links, ["file:///a/b.html"], "{spans:?}");
+    }
+
+    #[test]
+    fn fenced_code_is_bounded_even_without_room_for_a_gutter() {
+        for width in 0..=4 {
+            let rows = render("```bash\necho 中文tail\n```", width, Style::new());
+            for row in rows {
+                assert!(row.width() <= width as usize);
+            }
+        }
+    }
+
+    #[test]
+    fn long_fenced_commands_keep_their_entire_source_when_wrapped() {
+        let command = "cd /www/wwwroot/amazon-listing-create/server && psql \"$DATABASE_URL\" -c \"SELECT asin, data->>'sameFamilySummary' AS family FROM listings WHERE asin='B012345678';\"";
+        for width in [12, 30, 80, 200] {
+            let rows = render(&format!("```bash\n{command}\n```"), width, Style::new());
+            let body = &rows[1..];
+            let reconstructed: String = body
+                .iter()
+                .map(|row| row.plain().strip_prefix(GUTTER_BAR).unwrap().to_string())
+                .collect();
+            assert_eq!(reconstructed, command, "width {width}");
+            for row in body {
+                assert!(width::str_width(&row.plain()) <= width as usize);
+                assert_eq!(row.spans[0].style, fence());
+            }
+            let strings: String = body
+                .iter()
+                .flat_map(|row| &row.spans[1..])
+                .filter(|span| span.style.fg == Some(Color::role(Role::Success)))
+                .map(|span| span.text.as_str())
+                .collect();
+            assert!(
+                strings.contains("SELECT asin"),
+                "highlight survives wrapping"
+            );
+        }
     }
 
     #[test]
