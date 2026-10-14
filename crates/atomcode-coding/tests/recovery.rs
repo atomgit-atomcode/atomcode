@@ -877,7 +877,7 @@ async fn an_open_failure_has_nothing_to_preserve() {
 }
 
 // The shipping row assembly, using a real provider stream and tool terminal.
-struct StreamScript(Arc<atomcode_kernel::testkit::RecordingProvider>);
+struct StreamScript(Arc<dyn atomcode_kernel::provider::LlmProvider>);
 #[async_trait]
 impl atomcode_plexus::Plugin for StreamScript {
     fn name(&self) -> &'static str {
@@ -1370,4 +1370,102 @@ async fn shipping_provider_idle_refuses_pending_tools_and_bounds_continuation() 
     for text in ["first partial", "second partial"] {
         assert!(messages.iter().any(|m| m.text == text));
     }
+}
+
+/// Exercises the real stream consumer and the shipping recovery stack together.
+struct LongStream(Vec<(u64, atomcode_kernel::stream::StreamEvent)>);
+#[async_trait]
+impl atomcode_kernel::provider::LlmProvider for LongStream {
+    fn model_name(&self) -> &str {
+        "long-stream"
+    }
+    async fn chat_stream(
+        &self,
+        _: &[atomcode_kernel::message::Message],
+        _: &[atomcode_kernel::tool::ToolDef],
+        _: &atomcode_kernel::provider::ChatOptions,
+    ) -> Result<
+        futures::stream::BoxStream<'static, atomcode_kernel::stream::StreamEvent>,
+        atomcode_kernel::stream::ProviderError,
+    > {
+        Ok(Box::pin(futures::stream::unfold(
+            self.0.clone().into_iter(),
+            |mut events| async move {
+                let (seconds, event) = events.next()?;
+                tokio::time::sleep(Duration::from_secs(seconds)).await;
+                Some((event, events))
+            },
+        )))
+    }
+}
+
+async fn long_stream_app(events: Vec<(u64, atomcode_kernel::stream::StreamEvent)>) -> App {
+    let dir = scratch("long-stream");
+    let mut registry = atomcode_coding::on_harness::catalog();
+    registry.register(Arc::new(StreamScript(Arc::new(LongStream(events)))));
+    let options = format!(
+        "[[patch]]\nid = \"llm\"\nname = \"recovery-stream-script\"\nconfig = {{}}\n\n\
+         [[patch]]\nid = \"agent-loop\"\nconfig = {{ max_rounds = 6, working_dir = {root:?}, stream_idle_ms = 300000, stream_first_content_ms = 600000 }}\n\n\
+         [[remove]]\nid = \"llm-retry\"\n\n\
+         [[patch]]\nid = \"llm-stream-recovery\"\nconfig = {{ max_recoveries = 0 }}",
+        root = dir.to_string_lossy()
+    );
+    let mut app = App::new(registry, tree(&dir, &[&options]));
+    app.start().await.unwrap();
+    app
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_progressing_stream_can_finish_after_ten_minutes() {
+    use atomcode_kernel::stream::StreamEvent;
+    let app = long_stream_app(vec![
+        (200, StreamEvent::Reasoning("thinking".into())),
+        (200, StreamEvent::TextDelta("long ".into())),
+        (200, StreamEvent::TextDelta("answer".into())),
+        (200, StreamEvent::Done { truncated: false }),
+    ])
+    .await;
+    let started = Instant::now();
+    let outcome = run_turn(&app, "go").await.unwrap();
+    assert_eq!(outcome.stop, StopReason::Stopped);
+    assert_eq!(outcome.text, "long answer");
+    assert_eq!(started.elapsed(), Duration::from_secs(800));
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn metadata_cannot_extend_the_five_minute_content_idle_budget() {
+    use atomcode_kernel::stream::StreamEvent;
+    let app = long_stream_app(vec![
+        (1, StreamEvent::TextDelta("saved".into())),
+        (200, StreamEvent::Usage(Default::default())),
+        (200, StreamEvent::TextDelta("too late".into())),
+    ])
+    .await;
+    let started = Instant::now();
+    let outcome = run_turn(&app, "go").await.unwrap();
+    assert_eq!(outcome.stop, StopReason::Timeout);
+    assert!(outcome.error.unwrap().contains("300000ms"));
+    assert_eq!(started.elapsed(), Duration::from_secs(301));
+    assert!(app
+        .context()
+        .only_session()
+        .unwrap()
+        .derive_messages()
+        .iter()
+        .any(|message| message.text == "saved"));
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_long_stream_without_a_total_deadline_remains_cancellable() {
+    use atomcode_kernel::stream::StreamEvent;
+    let app = long_stream_app(vec![(200, StreamEvent::TextDelta("late".into()))]).await;
+    let agent = atomcode_harness::create_agent(&app).await.unwrap();
+    agent.send("go");
+    let started = Instant::now();
+    let (outcome, ()) = tokio::join!(atomcode_harness::drive(&app, &agent), async {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        agent.interrupt();
+    });
+    assert_eq!(outcome.unwrap().stop, StopReason::Cancelled);
+    assert_eq!(started.elapsed(), Duration::from_secs(1));
 }

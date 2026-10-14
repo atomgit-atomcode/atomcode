@@ -126,11 +126,12 @@ config = { max_rounds = 24, max_seconds = 0 }
 name = "llm-retry"
 config = { attempts = 3, backoff_ms = 3000, cap_ms = 30000 }
 
-# Recovery, outermost first: a bound that each retry resets is not a bound,
-# and waiting out a limit has to happen outside everything that would burn it.
+# Recovery, outermost first: an explicitly configured total budget covers all
+# retries. By default content-idle watchdogs bound stalls, while a response that
+# keeps making progress has no whole-request deadline. request_secs = 0 disables it.
 [[insert]]
 name = "llm-request-timeout"
-config = { request_secs = 600 }
+config = { request_secs = 0 }
 
 [[insert]]
 name = "llm-rate-limit"

@@ -367,7 +367,7 @@ impl Plugin for OverflowPlugin {
 
 #[derive(Debug, Deserialize)]
 struct TimeoutRow {
-    /// A whole request that takes longer than this is treated as hung.
+    /// Optional whole-request ceiling in seconds; `0` disables it.
     #[serde(default = "default_request_secs")]
     request_secs: u64,
 }
@@ -381,15 +381,12 @@ impl Default for TimeoutRow {
 }
 
 fn default_request_secs() -> u64 {
-    600
+    0
 }
 
-/// A ceiling on one model request.
-///
-/// The provider adapter has its own byte-idle watchdog, which catches a stream
-/// that stops producing. This catches the other shape: a stream that keeps
-/// producing forever. Without it a turn can hang with no way back except
-/// killing the process.
+/// An opt-in ceiling on one model request, including retries. The default is
+/// disabled: content-idle watchdogs detect stalls without killing a long stream
+/// that keeps making progress. Cancellation remains owned by the agent loop.
 struct RequestTimeout {
     limit: Duration,
 }
@@ -422,10 +419,13 @@ impl Plugin for RequestTimeoutPlugin {
         "llm-request-timeout"
     }
     fn description(&self) -> &'static str {
-        "bound one model request so a turn cannot hang forever"
+        "optionally bound the total duration of one model request"
     }
     async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
         let row: TimeoutRow = parse(config)?;
+        if row.request_secs == 0 {
+            return Ok(());
+        }
         // Outermost, so the ceiling covers the waits and retries below it too —
         // a bound that each retry resets is not a bound.
         let _ = ctx.on_waterfall::<AgentRequest>(
