@@ -352,3 +352,6 @@ mod wire_dump_tests {
         );
     }
 }
+
+mod watchdog;
+pub use watchdog::StreamWatchdog;

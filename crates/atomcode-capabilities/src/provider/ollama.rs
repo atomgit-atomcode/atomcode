@@ -68,10 +68,10 @@ pub struct OllamaConfig {
     /// Enable thinking (`think: true`) for thinking-capable models. A per-call
     /// `reasoning_effort` overrides this with a level string (`think: "high"`).
     pub think: bool,
-    /// Inter-token stream-idle watchdog (after the first byte of a stream).
+    /// Inter-token stream-idle watchdog (after the first content of a stream).
     pub idle_timeout: Duration,
-    /// FIRST-byte (prefill / TTFB) idle watchdog: no bytes for this long BEFORE the
-    /// first byte of a (re)opened stream ⇒ terminal error. Separate from (and ≥)
+    /// FIRST-content (prefill) watchdog: no content for this long BEFORE the
+    /// first content of a (re)opened stream ⇒ terminal error. Separate from (and ≥)
     /// `idle_timeout`; wired from the coding-layer `first_token_timeout`.
     pub first_token_timeout: Duration,
     pub connect_timeout: Duration,
@@ -225,17 +225,14 @@ impl LlmProvider for OllamaProvider {
                 let mut pending_metadata = Vec::new();
                 let byte_stream = resp.bytes_stream();
                 futures::pin_mut!(byte_stream);
-                // PHASE-AWARE byte-idle watchdog: prefill (before the first byte of this
-                // (re)opened stream) waits up to `first_token`; after the first byte we
-                // tighten to the inter-token `idle`. See openai_compat for the rationale.
-                // Reset per (re)open — a transparent reconnect restarts prefill.
-                let mut first_byte_seen = false;
+                // Heartbeats and metadata do not end prefill or extend the
+                // content deadline. Every decoded content event resets idle.
+                // A transparent reopen gets a fresh first-content budget.
+                let mut watchdog = super::StreamWatchdog::new(Some(first_token), Some(idle));
                 loop {
                     match retry::next_chunk_phased(
                         &mut byte_stream,
-                        first_token,
-                        idle,
-                        &mut first_byte_seen,
+                        &watchdog,
                     )
                     .await
                     {
@@ -254,6 +251,7 @@ impl LlmProvider for OllamaProvider {
                                 {
                                     for metadata in pending_metadata.drain(..) { yield metadata; }
                                 }
+                                watchdog.observe(&ev);
                                 emitted_replay_sensitive |= retry::is_replay_sensitive_event(&ev);
                                 yield ev;
                             }
@@ -300,6 +298,7 @@ impl LlmProvider for OllamaProvider {
                                 {
                                     for metadata in pending_metadata.drain(..) { yield metadata; }
                                 }
+                                watchdog.observe(&ev);
                                 emitted_replay_sensitive |= retry::is_replay_sensitive_event(&ev);
                                 if matches!(ev, StreamEvent::Done { .. }) {
                                     saw_done = true;

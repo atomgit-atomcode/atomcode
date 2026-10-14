@@ -21,7 +21,6 @@ use atomcode_kernel::stream::StreamEvent;
 use atomcode_kernel::tool::{ToolCall, ToolDef, ToolResult};
 use atomcode_plexus::{Context, Plugin};
 use futures::future::BoxFuture;
-use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -57,12 +56,16 @@ struct LoopRow {
     /// them, with a cancelled result for any call that never ran.
     #[serde(default)]
     undo_cancelled: bool,
-    /// How long a stream may go without an event — first token included —
+    /// How long a stream may go without content progress — first content included
+    /// when stream_first_content_ms is omitted —
     /// before the request is abandoned as stalled. `0` waits as long as the
     /// provider does. A stall is retryable: what happens next is the retry
     /// policy's, and a turn that runs out of retries ends as timed out.
     #[serde(default)]
     stream_idle_ms: u64,
+    /// First content budget; omitted keeps the old single-budget behavior.
+    #[serde(default)]
+    stream_first_content_ms: Option<u64>,
 }
 
 impl Default for LoopRow {
@@ -73,6 +76,7 @@ impl Default for LoopRow {
             verify_log_invariant: true,
             undo_cancelled: false,
             stream_idle_ms: 0,
+            stream_first_content_ms: None,
         }
     }
 }
@@ -98,6 +102,7 @@ struct PluginAgentLoop {
     verify_log_invariant: bool,
     undo_cancelled: bool,
     stream_idle: Option<std::time::Duration>,
+    stream_first_content: Option<std::time::Duration>,
 }
 
 impl PluginAgentLoop {
@@ -178,9 +183,19 @@ impl PluginAgentLoop {
                 let tools = req.tools.clone();
                 let options = req.options.clone();
                 let idle = self.stream_idle;
+                let first_content = self.stream_first_content;
                 Box::pin(async move {
                     stream_once(
-                        &*provider, &ctx, &session, turn, round, messages, tools, options, idle,
+                        &*provider,
+                        &ctx,
+                        &session,
+                        turn,
+                        round,
+                        messages,
+                        tools,
+                        options,
+                        idle,
+                        first_content,
                     )
                     .await
                 }) as BoxFuture<'_, Result<ModelResponse, RequestError>>
@@ -282,6 +297,7 @@ async fn stream_once(
     tools: Vec<ToolDef>,
     options: ChatOptions,
     idle: Option<std::time::Duration>,
+    first_content: Option<std::time::Duration>,
 ) -> Result<ModelResponse, RequestError> {
     let mut stream = provider
         .chat_stream(&messages, &tools, &options)
@@ -289,28 +305,40 @@ async fn stream_once(
         .map_err(|e| RequestError::from_provider(&e))?;
     let mut out = ModelResponse::default();
     let mut saw_tool_stream = false;
+    let mut watchdog = atomcode_capabilities::provider::StreamWatchdog::new(first_content, idle);
     loop {
-        let next = match idle {
-            Some(bound) => match tokio::time::timeout(bound, stream.next()).await {
-                Ok(next) => next,
-                // Silence is not an answer. Retryable, and carrying what already
-                // streamed, so recovery can keep it.
-                Err(_) => {
-                    return Err(RequestError {
-                        retryable: !saw_tool_stream,
-                        unexecuted_tool_output: saw_tool_stream,
-                        code: Some(STREAM_IDLE_CODE.to_string()),
-                        ..RequestError::message(format!(
-                            "stream idle timeout: no event for {}ms",
-                            bound.as_millis()
-                        ))
-                    }
-                    .with_partial(out))
+        let next = match watchdog.next(&mut stream).await {
+            Ok(next) => next,
+            // Silence is not an answer. Retryable, and carrying what already
+            // streamed, so recovery can keep it.
+            Err(_) => {
+                let budget_ms = watchdog.budget().unwrap().as_millis();
+                tracing::warn!(
+                    phase = watchdog.phase(),
+                    budget_ms = budget_ms as u64,
+                    silent_ms = watchdog.silent_for().as_millis() as u64,
+                    turn,
+                    round,
+                    saw_tool_stream,
+                    text_chars = out.text.chars().count(),
+                    reasoning_chars = out.reasoning.chars().count(),
+                    "harness content deadline exceeded"
+                );
+                return Err(RequestError {
+                    retryable: !saw_tool_stream,
+                    unexecuted_tool_output: saw_tool_stream,
+                    code: Some(STREAM_IDLE_CODE.to_string()),
+                    ..RequestError::message(format!(
+                        "stream idle timeout ({}): no content for {}ms",
+                        watchdog.phase(),
+                        budget_ms
+                    ))
                 }
-            },
-            None => stream.next().await,
+                .with_partial(out));
+            }
         };
         let Some(event) = next else { break };
+        watchdog.observe(&event);
         match event {
             StreamEvent::TextDelta(text) => {
                 // Through the one write path like every other fact. A chunk
@@ -1108,6 +1136,11 @@ impl Plugin for AgentLoopPlugin {
             max_rounds: row.max_rounds,
             verify_log_invariant: row.verify_log_invariant,
             undo_cancelled: row.undo_cancelled,
+            stream_first_content: row
+                .stream_first_content_ms
+                .or(Some(row.stream_idle_ms))
+                .filter(|ms| *ms > 0)
+                .map(std::time::Duration::from_millis),
             stream_idle: (row.stream_idle_ms > 0)
                 .then(|| std::time::Duration::from_millis(row.stream_idle_ms)),
         };
@@ -1115,5 +1148,129 @@ impl Plugin for AgentLoopPlugin {
             .provide::<AgentLoopSvc>(Arc::new(driver))
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod content_deadline_tests {
+    use super::*;
+    use std::time::Duration;
+
+    struct TimedProvider(Vec<(u64, StreamEvent)>);
+    #[async_trait]
+    impl LlmProvider for TimedProvider {
+        fn model_name(&self) -> &str {
+            "timed"
+        }
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[ToolDef],
+            _: &ChatOptions,
+        ) -> Result<
+            futures::stream::BoxStream<'static, StreamEvent>,
+            atomcode_kernel::stream::ProviderError,
+        > {
+            let events = self.0.clone().into_iter();
+            Ok(Box::pin(futures::stream::unfold(
+                events,
+                |mut events| async move {
+                    let (seconds, event) = events.next()?;
+                    tokio::time::sleep(Duration::from_secs(seconds)).await;
+                    Some((event, events))
+                },
+            )))
+        }
+    }
+    async fn run(provider: &TimedProvider) -> Result<ModelResponse, RequestError> {
+        let app = atomcode_plexus::App::new(
+            atomcode_plexus::PluginRegistry::new(),
+            atomcode_plexus::ConfigTree::from_layers(Vec::new()).unwrap(),
+        );
+        let ctx = app.context();
+        let log = SessionLog::new("deadline-test");
+        stream_once(
+            provider,
+            &ctx,
+            &log,
+            1,
+            0,
+            Vec::new(),
+            Vec::new(),
+            ChatOptions::default(),
+            Some(Duration::from_secs(120)),
+            Some(Duration::from_secs(600)),
+        )
+        .await
+    }
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn first_content_after_two_minutes_is_not_abandoned() {
+        let out = run(&TimedProvider(vec![(
+            200,
+            StreamEvent::TextDelta("late answer".into()),
+        )]))
+        .await
+        .unwrap();
+        assert_eq!(out.text, "late answer");
+    }
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn metadata_cannot_extend_first_content_forever() {
+        let started = tokio::time::Instant::now();
+        let error = run(&TimedProvider(vec![
+            (
+                100,
+                StreamEvent::Usage(Default::default())
+            );
+            10
+        ]))
+        .await
+        .unwrap_err();
+        assert_eq!(error.code.as_deref(), Some(STREAM_IDLE_CODE));
+        assert_eq!(started.elapsed(), Duration::from_secs(600));
+    }
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn idle_silence_is_bounded_and_partial_output_is_kept() {
+        let started = tokio::time::Instant::now();
+        let error = run(&TimedProvider(vec![
+            (1, StreamEvent::TextDelta("saved".into())),
+            (100, StreamEvent::Usage(Default::default())),
+            (100, StreamEvent::TextDelta("too late".into())),
+        ]))
+        .await
+        .unwrap_err();
+        assert_eq!(started.elapsed(), Duration::from_secs(121));
+        assert_eq!(error.partial.unwrap().text, "saved");
+    }
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_stalled_tool_fragment_is_not_marked_safe_to_replay() {
+        let error = run(&TimedProvider(vec![
+            (
+                1,
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call".into()),
+                    name: Some("write_file".into()),
+                    arguments: "{".into(),
+                },
+            ),
+            (200, StreamEvent::TextDelta("too late".into())),
+        ]))
+        .await
+        .unwrap_err();
+        assert!(error.unexecuted_tool_output);
+        assert!(!error.retryable);
+        assert!(
+            error.partial.is_none(),
+            "an incomplete fragment is not a completed response"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn cancelling_a_first_content_wait_does_not_wait_for_its_deadline() {
+        let provider = TimedProvider(vec![(500, StreamEvent::TextDelta("late".into()))]);
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(10)) => {},
+            _ = run(&provider) => panic!("the response must still be pending"),
+        }
     }
 }

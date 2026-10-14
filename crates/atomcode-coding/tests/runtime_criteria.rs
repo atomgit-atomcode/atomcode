@@ -4535,6 +4535,7 @@ async fn a_silent_stream_times_the_turn_out() {
     let recorder = Arc::new(Recorder::default());
     let mut config = start(env.project.path(), &recorder, SessionMode::Fresh);
     config.agent.stream_timeout = std::time::Duration::from_millis(100);
+    config.agent.first_token_timeout = std::time::Duration::from_millis(50);
     // No provider-level retries, so what is measured is the liveness bound.
     config.agent.retry_max_attempts = Some(0);
     let mut runtime = CodingRuntime::start(config).await.unwrap();
@@ -6157,6 +6158,11 @@ macro_rules! criteria {
 }
 
 mod criteria {
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[serial_test::serial(engine)]
+    async fn a_silent_stream_times_the_turn_out() {
+        super::a_silent_stream_times_the_turn_out().await;
+    }
     criteria!(
         the_turn_is_stored_before_it_is_reported_finished,
         a_resumed_session_continues_the_stored_conversation,
@@ -6235,7 +6241,6 @@ mod criteria {
         the_round_budget_asks_before_it_cuts_a_turn_off,
         a_turn_left_cut_off_says_so,
         a_cut_off_turn_asks_before_giving_up,
-        a_silent_stream_times_the_turn_out,
         a_requested_compaction_is_summarized_by_the_model_about_the_focus,
         under_pressure_old_tool_output_is_folded_in_place_and_the_words_kept,
         past_most_of_the_window_older_turns_are_summarized_and_the_summary_kept_up,

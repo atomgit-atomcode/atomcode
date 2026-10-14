@@ -74,7 +74,7 @@ pub struct CodingAgentConfig {
     /// than between subsequent tokens, so this budget is separate from — and usually
     /// larger than — `stream_timeout`. Env `ATOMCODE_FIRST_TOKEN_TIMEOUT_SECS` (explicit
     /// value wins), else `max(600s, stream_timeout)` so it never drops below the
-    /// inter-token budget. Once the first byte arrives, `stream_timeout` takes over.
+    /// inter-token budget. Once the first content arrives, `stream_timeout` takes over.
     /// Reconnecting on a slow-but-progressing prefill just restarts it, so we wait longer.
     pub first_token_timeout: Duration,
     /// Liveness: max wait for a driver approval response before it degrades to deny.
@@ -904,7 +904,7 @@ fn env_duration_secs(var: &str) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 /// The default byte-idle stream timeout: `ATOMCODE_STREAM_TIMEOUT_SECS` if set to a valid
-/// positive integer, else 300s. Ported from core's env-configurable liveness knob.
+/// positive integer, else 120s. Ported from core's env-configurable liveness knob.
 fn default_stream_timeout() -> Duration {
     // Two minutes, not five. A gateway that opens a stream and then goes quiet
     // is recovered from without loss — the partial output is preserved and the

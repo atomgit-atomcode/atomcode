@@ -596,8 +596,23 @@ impl Waterfall<AgentRequest> for StreamRecovery {
                         .progress
                         .recover(&session, self.max_recoveries, confirmed)
                 {
+                    if idle || transport {
+                        tracing::warn!(
+                            turn,
+                            max_recoveries = self.max_recoveries,
+                            eligible,
+                            unexecuted_tool_output = error.unexecuted_tool_output,
+                            "stream continuation not available or budget exhausted"
+                        );
+                    }
                     return Err(error);
                 }
+                tracing::info!(
+                    turn,
+                    max_recoveries = self.max_recoveries,
+                    confirmed,
+                    "continuing stream from preserved progress"
+                );
                 crate::session::commit(
                     &self.ctx,
                     &session,
@@ -628,6 +643,11 @@ impl Waterfall<AgentRequest> for StreamRecovery {
                 messages.extend(session.derive_messages());
                 req.messages = messages;
                 let result = next.run(req).await;
+                tracing::info!(
+                    turn,
+                    recovered = result.is_ok(),
+                    "stream continuation finished"
+                );
                 match &result {
                     Ok(_) => notice(
                         &self.ctx,

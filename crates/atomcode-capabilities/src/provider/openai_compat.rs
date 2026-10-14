@@ -199,10 +199,10 @@ pub struct OpenAiCompatConfig {
     /// Kimi K2.6 preserved thinking: `thinking.keep` in the request body.
     pub thinking_keep: Option<String>,
     /// Per-chunk stream-idle watchdog: no bytes for this long ⇒ terminal error.
-    /// Governs the INTER-token phase (after the first byte of a stream).
+    /// Governs the INTER-token phase (after the first content of a stream).
     pub idle_timeout: Duration,
-    /// FIRST-byte (prefill / TTFB) idle watchdog: no bytes for this long BEFORE the
-    /// first byte of a (re)opened stream ⇒ terminal error. Separate from (and ≥)
+    /// FIRST-content (prefill) watchdog: no content for this long BEFORE the
+    /// first content of a (re)opened stream ⇒ terminal error. Separate from (and ≥)
     /// `idle_timeout` because prefill on a slow local model can be silent far longer
     /// than inter-token gaps. Wired from the coding-layer `first_token_timeout`.
     pub first_token_timeout: Duration,
@@ -750,21 +750,15 @@ impl LlmProvider for OpenAiCompatProvider {
                 let mut pending_metadata = Vec::new();
                 let byte_stream = resp.bytes_stream();
                 futures::pin_mut!(byte_stream);
-                // PHASE-AWARE byte-idle watchdog: before the first byte of THIS (re)opened
-                // stream we are in prefill (TTFB) — a slow local model can be silent for
-                // minutes — so allow up to `first_token`; once any byte has arrived, tighten
-                // to the inter-token `idle`. Keep-alive bytes flip us early but also keep
-                // resetting the watchdog, so it won't fire spuriously; a fully-silent prefill
-                // gets the full first-token budget, matching the kernel first_token_timeout.
-                // Reset per (re)open: a transparent reconnect restarts prefill on the server.
-                let mut first_byte_seen = false;
+                // Heartbeats and metadata do not end prefill or extend the
+                // content deadline. Every decoded content event resets idle.
+                // A transparent reopen gets a fresh first-content budget.
+                let mut watchdog = super::StreamWatchdog::new(Some(first_token), Some(idle));
                 let mut logged_first_byte = false;
                 loop {
                     match retry::next_chunk_phased(
                         &mut byte_stream,
-                        first_token,
-                        idle,
-                        &mut first_byte_seen,
+                        &watchdog,
                     )
                     .await
                     {
@@ -785,6 +779,7 @@ impl LlmProvider for OpenAiCompatProvider {
                                 {
                                     for metadata in pending_metadata.drain(..) { yield metadata; }
                                 }
+                                watchdog.observe(&ev);
                                 emitted_replay_sensitive |= retry::is_replay_sensitive_event(&ev);
                                 yield ev;
                             }
@@ -812,7 +807,8 @@ impl LlmProvider for OpenAiCompatProvider {
                                     {
                                         for metadata in pending_metadata.drain(..) { yield metadata; }
                                     }
-                                    emitted_replay_sensitive |= retry::is_replay_sensitive_event(&ev);
+                                    watchdog.observe(&ev);
+                                emitted_replay_sensitive |= retry::is_replay_sensitive_event(&ev);
                                     yield ev;
                                 }
                                 return;
@@ -888,6 +884,7 @@ impl LlmProvider for OpenAiCompatProvider {
                                 {
                                     for metadata in pending_metadata.drain(..) { yield metadata; }
                                 }
+                                watchdog.observe(&ev);
                                 emitted_replay_sensitive |= retry::is_replay_sensitive_event(&ev);
                                 if matches!(ev, StreamEvent::Done { .. }) {
                                     saw_done = true;

@@ -21,6 +21,28 @@ fn _isolate_atomcode_home() {
     atomcode_kernel::test_support::isolate_home();
 }
 
+#[tokio::test]
+async fn the_runtime_mounts_distinct_first_content_and_idle_budgets() {
+    let project = tempfile::tempdir().unwrap();
+    let mut cfg = atomcode_coding::CodingAgentConfig::new(
+        "placeholder",
+        "http://localhost",
+        "timed",
+        project.path(),
+        atomcode_coding::config::product_dirs_from_env(),
+    );
+    cfg.first_token_timeout = std::time::Duration::from_secs(600);
+    cfg.stream_timeout = std::time::Duration::from_secs(120);
+    let dump = support::mount(&cfg, quiet_options(), Arc::new(CannedProvider))
+        .await
+        .dump();
+    assert!(
+        dump.contains("\"stream_first_content_ms\": 600000"),
+        "{dump}"
+    );
+    assert!(dump.contains("\"stream_idle_ms\": 120000"), "{dump}");
+}
+
 /// Answers with a little text and a usage report — enough for a metering
 /// decorator to fold a `TokenUsage` and emit one `LlmChat`.
 struct CannedProvider;

@@ -9999,6 +9999,7 @@ struct AgentLoopOptionsPatch<'a> {
     working_dir: &'a std::path::Path,
     undo_cancelled: bool,
     stream_idle_ms: u128,
+    stream_first_content_ms: u128,
     /// Carried, not left to the row's default: this patch is the last word on
     /// `agent-loop` in this host, so omitting it would *be* the fuse value — the
     /// serde default in `harness/plugins/agent_loop.rs`. See
@@ -10100,6 +10101,7 @@ fn harness_option_rows(
             working_dir: wd,
             undo_cancelled: !config.keep_interrupted_context,
             stream_idle_ms: config.stream_timeout.as_millis(),
+            stream_first_content_ms: config.first_token_timeout.as_millis(),
             max_rounds: crate::on_harness::RUNAWAY_FUSE_ROUNDS,
         },
     )
