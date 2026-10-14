@@ -49,7 +49,7 @@ fn ok() -> Style {
 }
 /// A call that has receded behind a fold.
 ///
-/// The muted grey, so a folded line reads as scaffolding over the answer rather
+/// A light grey (#A8A8A8), so a folded line reads as scaffolding over the answer rather
 /// than as one more thing being said: an expanded call is a fact the reader is
 /// looking at, a folded one is a fact they have chosen not to, so it recedes
 /// like the rest of the chrome. The whole summary takes it — name, subject and
@@ -62,7 +62,7 @@ fn ok() -> Style {
 /// has already told the reader it exists, and the live line below is where "in
 /// flight" is stated.
 fn fold() -> Style {
-    muted()
+    Style::new().fg(Color::rgb((0xa8, 0xa8, 0xa8)))
 }
 
 /// The ink a click is announced in — the tail a lid ends with (`点击展开` on a
@@ -5227,7 +5227,7 @@ mod tests {
     /// rather than the summary, and a fold must not swallow that.
     #[test]
     fn a_folded_call_recedes_to_the_muted_grey_once_done_and_keeps_its_failure_note() {
-        let receded = Some(crate::frame::Color::role(Role::Muted));
+        let receded = Some(crate::frame::Color::rgb((0xa8, 0xa8, 0xa8)));
         let pending = ToolCallBlock::pending(
             "c",
             "read_file",
