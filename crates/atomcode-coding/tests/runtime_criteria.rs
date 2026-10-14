@@ -2490,6 +2490,81 @@ async fn an_mcp_servers_tools_are_offered_and_run() {
     );
 }
 
+/// A local reconnect updates one catalog without replacing the session or its
+/// other MCP connections. Failure removes its old tools; retry restores them.
+async fn reconnecting_one_mcp_keeps_its_neighbor_and_session() {
+    let env = env();
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let a_spawns = a.path().join("spawns");
+    let b_spawns = b.path().join("spawns");
+    let script_a = write_mcp_server(a.path(), &a_spawns);
+    let script_b = write_mcp_server(b.path(), &b_spawns);
+    let recorder = Arc::new(Recorder::default());
+    let mut start = start_with_mcp_server(env.project.path(), &recorder, &script_a, true);
+    let mut neighbor = start.prepare.extra_mcp_servers[0].clone();
+    neighbor.name = "neighbor".into();
+    if let atomcode_capabilities::mcp::McpTransportConfig::Stdio { args, .. } = &mut neighbor.config
+    {
+        *args = vec![script_b.display().to_string()];
+    }
+    start.prepare.extra_mcp_servers.push(neighbor);
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+    runtime
+        .handle
+        .wait_mcp_ready(std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
+    let session = runtime.session.as_ref().unwrap().id.clone();
+    turn(&mut runtime, "hello").await;
+    assert!(last_offered(&recorder).contains(&"mcp__t__echo".into()));
+    let original = std::fs::read_to_string(&script_a).unwrap();
+    let replacement = original.replace("\"name\":\"echo\"", "\"name\":\"fresh\"");
+    assert_ne!(original, replacement);
+    std::fs::write(&script_a, &replacement).unwrap();
+    runtime
+        .handle
+        .mcp_act("t".into(), atomcode_coding::parts::McpAction::Reconnect)
+        .await
+        .unwrap();
+    turn(&mut runtime, "hello after reconnect").await;
+    let offered = last_offered(&recorder);
+    assert!(offered.contains(&"mcp__t__fresh".into()), "{offered:?}");
+    assert!(!offered.contains(&"mcp__t__echo".into()), "{offered:?}");
+    assert!(
+        offered.contains(&"mcp__neighbor__echo".into()),
+        "{offered:?}"
+    );
+    assert_eq!(runtime.session.as_ref().unwrap().id, session);
+    assert_eq!(
+        std::fs::read_to_string(&b_spawns).unwrap().lines().count(),
+        1
+    );
+    std::fs::write(&script_a, "exit 1\n").unwrap();
+    assert!(runtime
+        .handle
+        .mcp_act("t".into(), atomcode_coding::parts::McpAction::Reconnect)
+        .await
+        .is_err());
+    turn(&mut runtime, "hello after failed reconnect").await;
+    let offered = last_offered(&recorder);
+    assert!(!offered.iter().any(|tool| tool.starts_with("mcp__t__")));
+    assert!(offered.contains(&"mcp__neighbor__echo".into()));
+    std::fs::write(&script_a, replacement).unwrap();
+    runtime
+        .handle
+        .mcp_act("t".into(), atomcode_coding::parts::McpAction::Reconnect)
+        .await
+        .unwrap();
+    turn(&mut runtime, "hello after retry").await;
+    assert!(last_offered(&recorder).contains(&"mcp__t__fresh".into()));
+    assert_eq!(
+        std::fs::read_to_string(&b_spawns).unwrap().lines().count(),
+        1
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
 /// The retry budget follows the model, because it is the model's provider that
 /// declared it.
 ///
@@ -5799,6 +5874,7 @@ mod criteria {
         a_round_budget_ends_the_turn,
         what_the_model_is_told_about_mcp_only_names_ways_this_build_has,
         an_mcp_servers_tools_are_offered_and_run,
+        reconnecting_one_mcp_keeps_its_neighbor_and_session,
         withdrawing_mcp_takes_the_tools_off_the_model,
         a_servers_instructions_are_in_the_system_prompt,
         a_switched_session_keeps_the_mcp_tools,

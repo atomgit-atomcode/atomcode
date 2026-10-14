@@ -1073,6 +1073,7 @@ pub enum Msg<'a> {
     McpActionUntrust,
     McpActionLogin,
     McpActionLogout,
+    McpActionReconnect,
     McpActionEnable,
     McpActionDisable,
     /// The key legend: on the list, on the detail page, and while a round trip

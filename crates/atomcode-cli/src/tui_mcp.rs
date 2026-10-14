@@ -360,6 +360,7 @@ fn unexpected(reply: &HostReply) -> String {
 /// `None` 是「认证」:它不是宿主命令,在这一侧跑([`sign_in`])。
 fn wire_action(action: Action) -> Option<McpAction> {
     match action {
+        Action::Reconnect => Some(McpAction::Reconnect),
         Action::Trust => Some(McpAction::Trust),
         Action::Untrust => Some(McpAction::Untrust),
         Action::Login => None,
@@ -529,6 +530,7 @@ mod tests {
     fn each_screen_action_translates_to_the_wire_action_of_the_same_name() {
         use atomcode_tui::mcp::Action as A;
         let cases = [
+            (A::Reconnect, Some(McpAction::Reconnect)),
             (A::Trust, Some(McpAction::Trust)),
             (A::Untrust, Some(McpAction::Untrust)),
             // Signed in on this side, never sent as a host command.

@@ -1420,6 +1420,7 @@ pub(crate) struct McpPublication {
     pub(crate) tool_names: Arc<RwLock<Vec<String>>>,
     pub(crate) publish_lock: Arc<tokio::sync::Mutex<()>>,
     pub(crate) publication_enabled: Arc<AtomicBool>,
+    pub(crate) discovery_jobs: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) catalog_ready: tokio::sync::watch::Sender<bool>,
     /// Where this row hands the mounted catalog back, so `withdraw_mcp_tools`
     /// can take the published tools off it. Nothing else writes it.
@@ -1561,6 +1562,92 @@ async fn publish_mcp(
     }
 }
 
+/// An idle runtime replaces exactly one server through the same publication
+/// seam as startup. Initial discovery must be complete and runtime admission
+/// idle, so no startup publisher or tool caller can race this replacement.
+pub(crate) async fn reconnect_mcp_server(
+    publication: McpPublication,
+    config: atomcode_capabilities::mcp::McpServerConfig,
+) -> Result<(), String> {
+    let registry = publication.registry;
+    let toolbox = publication
+        .toolbox_slot
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .ok_or("MCP tool catalog is not mounted")?;
+    let shared = McpShared {
+        tool_names: publication.tool_names,
+        publish_lock: publication.publish_lock,
+        publication_enabled: publication.publication_enabled,
+        prompts: publication
+            .prompts_slot
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone(),
+    };
+    let server = config.name.clone();
+    {
+        let _guard = shared.publish_lock.lock().await;
+        if !shared.publication_enabled.load(Ordering::Acquire) {
+            return Err("MCP tools have been withdrawn; reload capabilities first".into());
+        }
+        let aliases = registry.tool_aliases_for_server(&server);
+        let mut names = shared.tool_names.write().unwrap_or_else(|e| e.into_inner());
+        names.retain(|name| {
+            if aliases.contains(name) {
+                toolbox.unregister(name);
+                false
+            } else {
+                true
+            }
+        });
+        if let Some(prompts) = &shared.prompts {
+            crate::mcp_instructions::project(prompts, &registry, &names);
+        }
+    }
+    // Initial publication is already complete and runtime admission is idle;
+    // there is no active caller or startup publisher to race this replacement.
+    registry
+        .reconnect_server(config)
+        .await
+        .map_err(|e| format!("MCP server '{server}' reconnect failed: {e:#}"))?;
+    let budget = registry.list_tools_timeout(&server).await;
+    let tools = match tokio::time::timeout(budget, registry.list_tools_for_server(&server)).await {
+        Ok(tools) => tools,
+        Err(_) => {
+            let error = format!("MCP server '{server}' tools/list timed out");
+            registry.fail_tools_listing(&server, error.clone());
+            return Err(error);
+        }
+    };
+    if let Some((_, atomcode_capabilities::mcp::ServerStatus::Failed(error))) = registry
+        .server_statuses()
+        .await
+        .into_iter()
+        .find(|(name, _)| name == &server)
+    {
+        return Err(format!("MCP server '{server}' reconnect failed: {error}"));
+    }
+    publish_mcp(&toolbox, &registry, tools, &shared, false).await;
+    Ok(())
+}
+
+/// Tracks a mounted row's discovery pass, including cancellation before its
+/// task first polls. Reconnect cannot race a remount's cached catalog refresh.
+struct McpDiscoveryJob(Arc<std::sync::atomic::AtomicUsize>);
+impl McpDiscoveryJob {
+    fn new(jobs: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        jobs.fetch_add(1, Ordering::AcqRel);
+        Self(jobs)
+    }
+}
+impl Drop for McpDiscoveryJob {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// The publication state a publishing task shares with the runtime.
 #[derive(Clone)]
 struct McpShared {
@@ -1620,7 +1707,9 @@ impl Plugin for McpHostPlugin {
                  `--global` the user file). Two things only the person can do, and both \
                  are on the MCP screen that `/mcp` opens, one server to a row: trusting \
                  the project, without which its own `.mcp.json` servers never connect, \
-                 and signing in to an OAuth server. After a file changes, `/reload` reads \
+                 and signing in to an OAuth server. The server's detail page also offers \
+                 Reconnect, which replaces only that server while the session is idle. \
+                 After a file changes, `/reload` reads \
                  the servers again and reconnects. Each server's tools join the catalog \
                  as `mcp__<server>__<tool>` and go through the same approval as \
                  everything else.",
@@ -1636,6 +1725,7 @@ impl Plugin for McpHostPlugin {
             tool_names,
             publish_lock,
             publication_enabled,
+            discovery_jobs,
             catalog_ready,
             toolbox_slot,
             prompts_slot,
@@ -1666,10 +1756,12 @@ impl Plugin for McpHostPlugin {
         publish_mcp(&toolbox, &registry, registry.listed_tools(), &shared, true).await;
 
         let task = {
+            let discovery_job = McpDiscoveryJob::new(discovery_jobs);
             let toolbox = toolbox.clone();
             let registry = Arc::clone(&registry);
             let shared = shared.clone();
             tokio::spawn(async move {
+                let _discovery_job = discovery_job;
                 // A tree mounted after the servers came up (a rebuild) starts from
                 // what is already connected.
                 let now = registry.list_all_tools().await;
@@ -3220,6 +3312,20 @@ impl atomcode_harness::commands::CatalogCommand for PolicyCommand {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_cancelled_mcp_discovery_releases_the_reconnect_guard() {
+        let jobs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let guard = super::McpDiscoveryJob::new(jobs.clone());
+        assert_eq!(jobs.load(std::sync::atomic::Ordering::Acquire), 1);
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(jobs.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+
     use async_trait::async_trait;
     use std::sync::Arc;
 

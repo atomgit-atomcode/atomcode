@@ -523,6 +523,7 @@ pub struct CodingParts {
         std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<McpConnectEvent>>>,
     mcp_publish_lock: Arc<tokio::sync::Mutex<()>>,
     mcp_publication_enabled: Arc<std::sync::atomic::AtomicBool>,
+    mcp_discovery_jobs: Arc<std::sync::atomic::AtomicUsize>,
     /// The mounted catalog the `mcp-host` row publishes into, once it is up.
     ///
     /// Withdrawal has to reach the SAME catalog the model is offered, not just
@@ -1178,6 +1179,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         mcp_telemetry_rx: std::sync::Mutex::new(mcp_telemetry_rx),
         mcp_publish_lock: Arc::new(tokio::sync::Mutex::new(())),
         mcp_publication_enabled,
+        mcp_discovery_jobs: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         mcp_toolbox: Arc::new(std::sync::RwLock::new(None)),
         mcp_prompts: Arc::new(std::sync::RwLock::new(None)),
         mcp_catalog_ready: tokio::sync::watch::channel(mcp_registry.is_none()).0,
@@ -1368,6 +1370,7 @@ impl CodingParts {
             tool_names: Arc::clone(&self.mcp_tool_names),
             publish_lock: Arc::clone(&self.mcp_publish_lock),
             publication_enabled: Arc::clone(&self.mcp_publication_enabled),
+            discovery_jobs: self.mcp_discovery_jobs.clone(),
             catalog_ready: self.mcp_catalog_ready.clone(),
             toolbox_slot: Arc::clone(&self.mcp_toolbox),
             prompts_slot: Arc::clone(&self.mcp_prompts),
@@ -1560,6 +1563,38 @@ impl CodingParts {
         }
     }
 
+    pub(crate) async fn reconnect_mcp_server(
+        &self,
+        config: atomcode_capabilities::mcp::McpServerConfig,
+    ) -> Result<(), String> {
+        if !*self.mcp_catalog_ready.borrow()
+            || self
+                .mcp_discovery_jobs
+                .load(std::sync::atomic::Ordering::Acquire)
+                != 0
+        {
+            return Err(
+                "MCP tool discovery is still running; try reconnect after it finishes".into(),
+            );
+        }
+        let registry = self.mcp_registry.clone().ok_or("MCP is not enabled")?;
+        crate::host_rows::reconnect_mcp_server(
+            crate::host_rows::McpPublication {
+                registry,
+                connect_rx: None,
+                tool_names: self.mcp_tool_names.clone(),
+                publish_lock: self.mcp_publish_lock.clone(),
+                publication_enabled: self.mcp_publication_enabled.clone(),
+                discovery_jobs: self.mcp_discovery_jobs.clone(),
+                catalog_ready: self.mcp_catalog_ready.clone(),
+                toolbox_slot: self.mcp_toolbox.clone(),
+                prompts_slot: self.mcp_prompts.clone(),
+            },
+            config,
+        )
+        .await
+    }
+
     pub(crate) async fn mcp_statuses(
         &self,
     ) -> Vec<(String, atomcode_capabilities::mcp::ServerStatus)> {
@@ -1736,6 +1771,8 @@ pub async fn mcp_row_facts_in(
 /// waits on a browser and writes only a token (`cli/tui_mcp.rs`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum McpAction {
+    /// Reconnect only this server, keeping the current session.
+    Reconnect,
     Trust,
     Untrust,
     Logout,
@@ -1752,10 +1789,10 @@ impl McpAction {
     /// prepared, so writing them changes nothing until it is prepared again —
     /// and withdrawing (untrust, sign out) takes every MCP tool off, which only
     /// a rebuild puts back for the servers that are still allowed. `Disable` is
-    /// the one that acts in place: it holds this server's tools back through the
-    /// person's switches, so it needs neither an idle session nor a rebuild.
+    /// in-place switch: it holds this server's tools back through the person's
+    /// switches. Reconnect also acts in place, but requires an idle session.
     pub fn rebuilds(self) -> bool {
-        !matches!(self, Self::Disable)
+        !matches!(self, Self::Disable | Self::Reconnect)
     }
 }
 

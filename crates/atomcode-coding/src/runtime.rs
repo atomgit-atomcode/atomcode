@@ -1298,7 +1298,7 @@ async fn mcp_rows_of(runtime: &RuntimeResources) -> Result<Vec<crate::parts::Mcp
 /// refused config write must arrive with the guard's own words rather than a
 /// generic failure (§6). The caller wraps it in `RuntimeError::ReconfigureFailed`.
 ///
-/// This writes the state; it does not reconnect. Every action but `Disable` is
+/// Except for `Reconnect`, this writes state. Every action but `Disable` and `Reconnect` is
 /// followed by a capability reload from [`CodingRuntimeHandle::mcp_act`], which is
 /// what makes a trust or an enabled entry reach the session.
 ///
@@ -1318,6 +1318,33 @@ async fn apply_mcp_action(
     use crate::parts::McpAction;
 
     match action {
+        McpAction::Reconnect => {
+            use atomcode_capabilities::mcp::McpConfigSource;
+            let storage = crate::parts::mcp_storage(&runtime.config, &runtime.prepare);
+            let mut configs = storage
+                .load_including_disabled()
+                .map_err(|e| format!("{e:#}"))?;
+            configs.extend(runtime.prepare.extra_mcp_servers.clone());
+            let config = configs
+                .into_iter()
+                .rev()
+                .find(|config| config.name == server)
+                .ok_or_else(|| format!("MCP server '{server}' is not configured"))?;
+            if config.disabled {
+                return Err(format!(
+                    "MCP server '{server}' is disabled; enable it first"
+                ));
+            }
+            if config.source == McpConfigSource::Project
+                && !atomcode_capabilities::mcp::trust::is_project_trusted(
+                    &runtime.config.working_dir,
+                    runtime.config.dirs.user(),
+                )
+            {
+                return Err(atomcode_capabilities::mcp::trust::PROJECT_NOT_TRUSTED.to_string());
+            }
+            runtime.parts.reconnect_mcp_server(config).await
+        }
         McpAction::Trust => atomcode_capabilities::mcp::trust::trust_project(
             &runtime.config.working_dir,
             runtime.config.dirs.user(),
@@ -2235,12 +2262,13 @@ impl CodingRuntimeHandle {
     /// left behind.
     ///
     /// Trust and an enabled entry are read when the graph is prepared, and
-    /// untrust and sign-out take every MCP tool off; so every action but `Disable`
+    /// untrust and sign-out take every MCP tool off; so every action but `Disable` and `Reconnect`
     /// is followed by the same capability reload `/mcp reload` runs. Without it the
     /// panel would show the server exactly as it was — untrusted after 信任,
     /// disconnected after 启用 — and the person would take the action for a no-op.
     ///
-    /// Those four answer [`RuntimeError::Busy`] while a turn is running (both the
+    /// Reconnect updates one connection in place. It and rebuilding actions answer
+    /// [`RuntimeError::Busy`] while a turn is running (both the
     /// withdrawal and the rebuild wait for an idle session); `Disable` runs mid-turn.
     pub async fn mcp_act(
         &self,
@@ -5917,7 +5945,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         // the change and then failing to apply it. `Disable` holds
                         // tools back in place and runs mid-turn (design §5.4).
                         if request_generation != generation
-                            || (action.rebuilds()
+                            || ((action.rebuilds() || action == crate::parts::McpAction::Reconnect)
                                 && (compaction_suspended || active_turn.is_some()))
                         {
                             let _ = done.send(Err(RuntimeError::Busy));
@@ -17811,11 +17839,11 @@ mod tests {
         let logout = handle.mcp_act("srv".into(), McpAction::Logout).await;
         assert_eq!(logout, Err(RuntimeError::Busy));
         // And the two that only a rebuild can apply.
-        for action in [McpAction::Trust, McpAction::Enable] {
+        for action in [McpAction::Trust, McpAction::Enable, McpAction::Reconnect] {
             assert_eq!(
                 handle.mcp_act("srv".into(), action).await,
                 Err(RuntimeError::Busy),
-                "{action:?} is applied by a rebuild, which a running turn refuses"
+                "{action:?} requires an idle session"
             );
         }
         assert!(
@@ -17837,6 +17865,53 @@ mod tests {
         );
 
         handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[serial_test::serial(atomcode_home)]
+    async fn reconnect_cannot_enable_a_disabled_server_or_trust_a_project() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::env::set_var("ATOMCODE_HOME", home.path());
+        let path = project.path().join(".mcp.json");
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"chosen":{"command":"no-such-server","disabled":true}}}"#,
+        )
+        .unwrap();
+        let mut start = native_start(false);
+        start.agent.working_dir = project.path().into();
+        start.prepare.session = crate::SessionMode::Fresh;
+        let runtime = CodingRuntime::start(start).await.unwrap();
+        let error = runtime
+            .handle
+            .mcp_act("chosen".into(), crate::parts::McpAction::Reconnect)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("disabled"), "{error}");
+        assert!(std::fs::read_to_string(&path).unwrap().contains("true"));
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"chosen":{"command":"no-such-server"}}}"#,
+        )
+        .unwrap();
+        let error = runtime
+            .handle
+            .mcp_act("chosen".into(), crate::parts::McpAction::Reconnect)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(atomcode_capabilities::mcp::trust::PROJECT_NOT_TRUSTED),
+            "{error}"
+        );
+        assert!(!atomcode_capabilities::mcp::trust::is_project_trusted(
+            project.path(),
+            home.path()
+        ));
+        assert_eq!(runtime.handle.status().phase, RuntimePhase::Ready);
+        runtime.handle.shutdown().await.unwrap();
     }
 
     /// Trusting a project from the panel connects its servers.

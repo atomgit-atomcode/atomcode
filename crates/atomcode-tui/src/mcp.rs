@@ -103,6 +103,7 @@ pub struct McpDetail {
 /// 一次动作。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
+    Reconnect,
     Trust,
     Untrust,
     Login,
@@ -114,6 +115,7 @@ pub enum Action {
 impl Action {
     pub fn about(self) -> String {
         match self {
+            Self::Reconnect => t(Msg::McpActionReconnect),
             Self::Trust => t(Msg::McpActionTrust),
             Self::Untrust => t(Msg::McpActionUntrust),
             Self::Login => t(Msg::McpActionLogin),
@@ -283,6 +285,7 @@ impl Panel {
                 out.push(Action::Disable);
             }
             _ => {
+                out.push(Action::Reconnect);
                 if let Auth::OAuth {
                     authenticated: true,
                 } = detail.auth
@@ -587,7 +590,7 @@ mod tests {
         );
         assert_eq!(
             panel.actions(&connected),
-            vec![Action::Logout, Action::Disable]
+            vec![Action::Reconnect, Action::Logout, Action::Disable]
         );
 
         // Waiting for a person: authenticate it, or switch it off.
@@ -626,7 +629,12 @@ mod tests {
         assert!(actions.contains(&Action::Untrust), "{actions:?}");
         assert_eq!(
             actions,
-            vec![Action::Logout, Action::Untrust, Action::Disable]
+            vec![
+                Action::Reconnect,
+                Action::Logout,
+                Action::Untrust,
+                Action::Disable
+            ]
         );
 
         // 项目还没被信任:这里该给的是「信任」,不是「取消信任」。
@@ -638,7 +646,10 @@ mod tests {
 
         // 用户级的那一台:项目信任与它无关,一个都不给。
         let global = detail(McpState::Connected, Auth::None);
-        assert_eq!(panel.actions(&global), vec![Action::Disable]);
+        assert_eq!(
+            panel.actions(&global),
+            vec![Action::Reconnect, Action::Disable]
+        );
     }
 
     /// 认证在跑:第一下 Esc 是叫停,面板留着;第二下才收起。叫不停的一下就收起。
