@@ -328,6 +328,71 @@ pub fn offset_at_cell(
     Some(offset_at(&moment.input, row, col, rect.w))
 }
 
+/// The selected bytes when both ends cover rendered composer text or its row padding.
+pub fn selection_range(
+    moment: &crate::moment::Moment,
+    rect: crate::frame::Rect,
+    selection: crate::moment::Selection,
+) -> Option<std::ops::Range<usize>> {
+    use unicode_segmentation::UnicodeSegmentation;
+
+    if selection.is_empty() || moment.secret.is_some() {
+        return None;
+    }
+    let body = body_width(rect.w);
+    if moment
+        .input
+        .split('\n')
+        .flat_map(|line| line.graphemes(true))
+        .any(|g| width::str_width(g) > body)
+    {
+        return None;
+    }
+    let (rows, (caret_row, _), starts) = lay(&moment.input, moment.caret, body);
+    let room = typed_room(rect.h);
+    let first = caret_row.saturating_sub(room.saturating_sub(1));
+    let shown = room.min(rows.len().saturating_sub(first)).max(1);
+    let text_top = rect.y + RULE as u16;
+    let text_bottom = text_top + shown as u16;
+    let text_left = rect.x + PROMPT as u16;
+    let valid =
+        |(x, y): (u16, u16)| x >= text_left && x < rect.right() && y >= text_top && y < text_bottom;
+    if !valid(selection.anchor) || !valid(selection.head) {
+        return None;
+    }
+
+    let (start, end) =
+        if (selection.anchor.1, selection.anchor.0) <= (selection.head.1, selection.head.0) {
+            (selection.anchor, selection.head)
+        } else {
+            (selection.head, selection.anchor)
+        };
+    let offset = |(x, y): (u16, u16), after: bool| {
+        let row = first + usize::from(y - text_top);
+        let col = usize::from(x - text_left);
+        let line = &rows[row];
+        let at = starts[row] + width::take_width(line, col).len();
+        if !after || col >= width::str_width(line) {
+            return at;
+        }
+        line[at - starts[row]..]
+            .graphemes(true)
+            .next()
+            .map_or(at, |g| at + g.len())
+    };
+    let mut range = offset(start, false)..offset(end, true);
+    if range.is_empty() {
+        return None;
+    }
+    for marker in crate::attach::marker_spans(&moment.input) {
+        if marker.start < range.end && range.start < marker.end {
+            range.start = range.start.min(marker.start);
+            range.end = range.end.max(marker.end);
+        }
+    }
+    Some(range)
+}
+
 /// The cells inside the prompt. One definition, because `render`, `caret` and
 /// every caller that moves by rows must measure the same field.
 pub fn body_width(width: u16) -> usize {
@@ -1076,6 +1141,77 @@ mod tests {
             "clicked the top visible row and got {:?}",
             &text[hit..hit + 8.min(text.len() - hit)]
         );
+    }
+
+    #[test]
+    fn a_composer_selection_is_a_half_open_text_range() {
+        let rect = Rect::new(0, 5, 30, 3);
+        let m = Moment::default().typing("ab中cd");
+        let forward = crate::moment::Selection {
+            anchor: (3, 6), // `b`
+            head: (4, 6),   // first cell of `中`
+        };
+        let backward = crate::moment::Selection {
+            anchor: forward.head,
+            head: forward.anchor,
+        };
+        for selection in [forward, backward] {
+            let range = selection_range(&m, rect, selection).expect("inside the composer");
+            assert_eq!(&m.input[range], "b中");
+        }
+        let second_cell = crate::moment::Selection {
+            anchor: (4, 6),
+            head: (5, 6),
+        };
+        let range = selection_range(&m, rect, second_cell).expect("wide character");
+        assert_eq!(&m.input[range], "中");
+
+        let multiline = Moment::default().typing("one\ntwo");
+        let multiline_rect = Rect::new(0, 5, 30, 4);
+        let line_padding = crate::moment::Selection {
+            anchor: (2, 6),
+            head: (20, 6),
+        };
+        let range = selection_range(&multiline, multiline_rect, line_padding).expect("first line");
+        assert_eq!(
+            &multiline.input[range], "one",
+            "padding does not select newline"
+        );
+
+        let crossing = crate::moment::Selection {
+            anchor: forward.anchor,
+            head: (4, 4),
+        };
+        assert_eq!(selection_range(&m, rect, crossing), None);
+
+        for decoration in [
+            crate::moment::Selection {
+                anchor: (0, 6),
+                head: (1, 6),
+            },
+            crate::moment::Selection {
+                anchor: (2, 5),
+                head: (3, 5),
+            },
+        ] {
+            assert_eq!(selection_range(&m, rect, decoration), None);
+        }
+
+        let narrow = Rect::new(0, 5, (PROMPT + 1) as u16, 4);
+        let hidden = Moment::default().typing("中");
+        let overwide = crate::moment::Selection {
+            anchor: (PROMPT as u16, 6),
+            head: (PROMPT as u16, 7),
+        };
+        assert_eq!(selection_range(&hidden, narrow, overwide), None);
+
+        let marker = Moment::default().typing("a [Image #1] b");
+        let inside_marker = crate::moment::Selection {
+            anchor: (5, 6),
+            head: (6, 6),
+        };
+        let range = selection_range(&marker, rect, inside_marker).expect("marker selection");
+        assert_eq!(&marker.input[range], "[Image #1]");
     }
 
     #[test]

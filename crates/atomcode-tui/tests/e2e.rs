@@ -3812,6 +3812,103 @@ fn right_click_composer(s: &Session) {
 }
 
 #[tokio::test]
+async fn delete_removes_only_the_composer_selection() {
+    let dir = scratch("delete-composer-selection");
+    let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    let task = s.open().await;
+
+    s.term.type_text("alpha beta gamma");
+    s.quiet().await;
+    let field = s
+        .term
+        .last()
+        .expect("a frame")
+        .part("input")
+        .expect("the composer")
+        .rect;
+    let row = field.y + 1;
+    s.term
+        .pointer(atomcode_tui::surface::Click::Press, field.x, row);
+    s.term
+        .pointer(atomcode_tui::surface::Click::Drag, field.x + 1, row);
+    s.term
+        .pointer(atomcode_tui::surface::Click::Release, field.x + 1, row);
+    s.term.press(KeyPress::plain(Key::Delete));
+    s.quiet().await;
+    assert!(
+        composer_text(&s).contains("alpha beta gamma"),
+        "a prompt-only selection deleted draft text:\n{}",
+        composer_text(&s)
+    );
+
+    let start = field.x + 2 + "alpha ".len() as u16;
+    let end = start + "beta".len() as u16 - 1;
+    s.term
+        .pointer(atomcode_tui::surface::Click::Press, start, row);
+    s.term.pointer(atomcode_tui::surface::Click::Drag, end, row);
+    s.term
+        .pointer(atomcode_tui::surface::Click::Release, end, row);
+    s.quiet().await;
+
+    s.term.press(KeyPress::plain(Key::Delete));
+    s.quiet().await;
+    let input = composer_text(&s);
+    assert!(
+        input.contains("alpha  gamma"),
+        "selected text remained:\n{input}"
+    );
+    assert!(
+        !input.contains("beta"),
+        "Delete removed the wrong text:\n{input}"
+    );
+
+    let start = field.x + 2 + "alpha  ".len() as u16;
+    let end = start + "gamma".len() as u16 - 1;
+    s.term
+        .pointer(atomcode_tui::surface::Click::Press, start, row);
+    s.term.pointer(atomcode_tui::surface::Click::Drag, end, row);
+    s.term
+        .pointer(atomcode_tui::surface::Click::Release, end, row);
+    s.term.press(KeyPress::plain(Key::Backspace));
+    s.quiet().await;
+    let input = composer_text(&s);
+    assert!(
+        input.contains("alpha  "),
+        "unselected text was lost:\n{input}"
+    );
+    assert!(
+        !input.contains("gamma"),
+        "Backspace left selected text:\n{input}"
+    );
+
+    s.term.press(KeyPress::ctrl('a'));
+    s.term.press(KeyPress::ctrl('k'));
+    s.term.type_text("a [Image #1] b");
+    s.quiet().await;
+    let marker_start = field.x + 2 + 3;
+    s.term
+        .pointer(atomcode_tui::surface::Click::Press, marker_start, row);
+    s.term
+        .pointer(atomcode_tui::surface::Click::Drag, marker_start + 1, row);
+    s.term
+        .pointer(atomcode_tui::surface::Click::Release, marker_start + 1, row);
+    s.term.press(KeyPress::plain(Key::Delete));
+    s.quiet().await;
+    let input = composer_text(&s);
+    assert!(
+        input.contains("a  b"),
+        "the whole marker was not removed:\n{input}"
+    );
+    assert!(
+        !input.contains("Image"),
+        "a broken marker remained:\n{input}"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+#[tokio::test]
 async fn right_click_on_the_composer_opens_a_menu_that_does_what_it_says() {
     // The path a person takes: type something, right-click, pick "复制全文",
     // and find the words on the clipboard. Nothing here is a unit test of the

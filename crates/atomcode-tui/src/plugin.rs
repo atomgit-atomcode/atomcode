@@ -6962,6 +6962,17 @@ impl Tui {
         if !matches!(action, Action::Escape) {
             m.disarm_escape();
         }
+        let deleting = matches!(action, Action::Backspace | Action::DeleteForward);
+        let had_selection = deleting && m.selection.is_some_and(|selection| !selection.is_empty());
+        let selected_input = if deleting && m.stream_selection.is_none() {
+            self.host.field_rect().and_then(|rect| {
+                m.selection.and_then(|selection| {
+                    crate::modules::input::selection_range(&m, rect, selection)
+                })
+            })
+        } else {
+            None
+        };
         // A highlight is a rectangle of screen cells. Anything that repaints
         // those cells with different text leaves it pointing at the wrong
         // words, so it is dropped by everything except the gestures that are
@@ -7207,7 +7218,10 @@ impl Tui {
                 m.caret = at + c.len_utf8();
             }
             Action::Backspace => {
-                if m.caret > 0 {
+                if let Some(range) = selected_input {
+                    m.caret = range.start;
+                    m.input.replace_range(range, "");
+                } else if !had_selection && m.caret > 0 {
                     // A whole `[Image #N]` deletes as one chip: the caret sitting
                     // just past it (`caret == end`) — or, defensively, inside it —
                     // removes the marker, and since the text no longer mentions it,
@@ -7229,17 +7243,22 @@ impl Tui {
                 }
             }
             Action::DeleteForward => {
-                // The character the caret is ON, which is the one after it in
-                // byte order. Walk to the next boundary rather than assuming
-                // one byte: a `中` is three.
-                let at = m.caret.min(m.input.len());
-                if at < m.input.len() {
-                    let mut end = at + 1;
-                    while end < m.input.len() && !m.input.is_char_boundary(end) {
-                        end += 1;
+                if let Some(range) = selected_input {
+                    m.caret = range.start;
+                    m.input.replace_range(range, "");
+                } else if !had_selection {
+                    // The character the caret is ON, which is the one after it in
+                    // byte order. Walk to the next boundary rather than assuming
+                    // one byte: a `中` is three.
+                    let at = m.caret.min(m.input.len());
+                    if at < m.input.len() {
+                        let mut end = at + 1;
+                        while end < m.input.len() && !m.input.is_char_boundary(end) {
+                            end += 1;
+                        }
+                        m.input.replace_range(at..end, "");
+                        m.caret = at;
                     }
-                    m.input.replace_range(at..end, "");
-                    m.caret = at;
                 }
             }
             Action::DeleteToEnd => {
