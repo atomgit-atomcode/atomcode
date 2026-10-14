@@ -7344,6 +7344,35 @@ async fn a_refused_submit_hands_the_words_back_and_says_why_in_words() {
 
 const SHELL_ROW_LAYER: &str = "[[insert]]\nname = \"tui-shell\"\n";
 
+#[tokio::test]
+async fn a_hook_rejected_prompt_returns_to_the_composer_without_overwriting_a_draft() {
+    let dir = scratch("hook-refused");
+    let (s, agent) = start_with_agent_events(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    let task = s.open().await;
+    s.term.type_line("被 hook 拒绝的输入 h9k");
+    s.quiet().await;
+    agent
+        .send(atomcode_kernel::event::AgentEvent::TurnComplete {
+            turn: None,
+            reason: atomcode_kernel::event::StopReason::PromptRejected,
+        })
+        .unwrap();
+    s.quiet().await;
+    assert!(composer_text(&s).contains("h9k"));
+    s.term.type_text(" 我正在补充的新草稿");
+    s.quiet().await;
+    let draft = composer_text(&s);
+    agent
+        .send(atomcode_kernel::event::AgentEvent::TurnComplete {
+            turn: None,
+            reason: atomcode_kernel::event::StopReason::PromptRejected,
+        })
+        .unwrap();
+    s.quiet().await;
+    assert_eq!(composer_text(&s), draft);
+    task.abort();
+}
+
 /// 把假 shell 挂上去的那一行 —— 和启动器那一行同形(`atomcode::tui_shell`)。
 struct ShellPanelRow(Arc<dyn atomcode_tui::shell::Shell>);
 

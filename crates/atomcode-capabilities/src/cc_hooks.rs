@@ -399,7 +399,16 @@ fn plugin_hook_command(hook: &HookConfig) -> Result<tokio::process::Command, Str
     let Some(root) = &hook.plugin_root else {
         return Ok(shell_command(&hook.command));
     };
-    let text = hook.command.trim();
+    // CC plugins sometimes wrap a script entry point in this Node expression
+    // solely to normalize Windows separators. Recognize the exact wrapper,
+    // never evaluate JavaScript, and send the extracted path through the same
+    // canonicalization and containment checks as an ordinary script command.
+    let original = hook.command.trim();
+    let normalized = original
+        .strip_prefix("node -e \"require(require('path').join(process.env.CLAUDE_PLUGIN_ROOT.split(String.fromCharCode(92)).join('/'), '")
+        .and_then(|rest| rest.strip_suffix("'))\""))
+        .map(|path| format!("node \"${{CLAUDE_PLUGIN_ROOT}}/{path}\""));
+    let text = normalized.as_deref().unwrap_or(original);
     let stripped = text
         .replace("${CLAUDE_PLUGIN_ROOT}", "")
         .replace("$CLAUDE_PLUGIN_ROOT", "")
@@ -1699,6 +1708,32 @@ mod tests {
 
     fn plugin_config(root: &Path, command: &str) -> HookConfig {
         HookConfig::from_plugin_spec("PreToolUse", None, command.into(), None, root.into()).unwrap()
+    }
+
+    #[test]
+    fn node_path_wrapper_is_a_checked_script_entry_point() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("check.js"), "").unwrap();
+        let wrapper = |path: &str| {
+            format!("node -e \"require(require('path').join(process.env.CLAUDE_PLUGIN_ROOT.split(String.fromCharCode(92)).join('/'), '{path}'))\"")
+        };
+        let command =
+            plugin_hook_command(&plugin_config(root.path(), &wrapper("check.js"))).unwrap();
+        let args: Vec<_> = command.as_std().get_args().collect();
+        assert_eq!(
+            args,
+            [std::fs::canonicalize(root.path().join("check.js"))
+                .unwrap()
+                .as_os_str()]
+        );
+        for path in ["../check.js", "check.js');evil('//", "missing.js"] {
+            assert!(plugin_hook_command(&plugin_config(root.path(), &wrapper(path))).is_err());
+        }
+        assert!(plugin_hook_command(&plugin_config(
+            root.path(),
+            "node -e \"console.log('anything')\""
+        ))
+        .is_err());
     }
 
     #[test]

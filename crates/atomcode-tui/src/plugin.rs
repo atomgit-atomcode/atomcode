@@ -6545,6 +6545,21 @@ impl Tui {
                 if matches!(event, AgentEvent::TurnComplete { .. }) {
                     {
                         let mut m = self.host.moment.write().expect("moment poisoned");
+                        if matches!(
+                            event,
+                            AgentEvent::TurnComplete {
+                                reason: atomcode_kernel::event::StopReason::PromptRejected,
+                                ..
+                            }
+                        ) && m.input.is_empty()
+                        {
+                            if let Some(sent) = m.last_sent.clone() {
+                                m.input = sent;
+                                m.caret = m.input.len();
+                                m.history_at = None;
+                                m.draft.clear();
+                            }
+                        }
                         m.turn_open = false;
                         if let Some(retract) = m.retract.as_mut() {
                             retract.ended = true;
@@ -6590,6 +6605,13 @@ impl Tui {
                 // the person's stop; this covers every other way a turn ends.
                 let _ = self.host.stop_compacting();
                 self.set_activity(Activity::Idle)
+                    | matches!(
+                        event,
+                        AgentEvent::TurnComplete {
+                            reason: atomcode_kernel::event::StopReason::PromptRejected,
+                            ..
+                        }
+                    )
             }
             // A summary is being written and the request waits on it. Only the
             // slow tier announces this (a cheap fold is instant), so this is the
