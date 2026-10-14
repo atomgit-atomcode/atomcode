@@ -632,7 +632,8 @@ async fn sync_stage_and_apply_if_newer() {
         while let Some(ev) = rx.recv().await {
             match ev {
                 UpgradeEvent::ManifestFetched { version } => {
-                    eprintln!("✨ New version available: {}", version);
+                    // Pre-TUI output must also work in Windows consoles without emoji fonts.
+                    eprintln!("[update] New version available: {}", version);
                 }
                 UpgradeEvent::Downloading { bytes, total } => {
                     let pct = if total == 0 {
@@ -652,7 +653,7 @@ async fn sync_stage_and_apply_if_newer() {
                     }
                 }
                 UpgradeEvent::Verifying => {
-                    eprintln!("\n✓ Verifying sha256");
+                    eprintln!("\n[update] Verifying sha256");
                 }
                 _ => {}
             }
@@ -675,7 +676,7 @@ async fn sync_stage_and_apply_if_newer() {
             // binary on this same invocation.
             match self_update::apply_pending_upgrade() {
                 Ok(Some(applied)) => {
-                    eprintln!("✓ Upgrading to {}...", applied.version);
+                    eprintln!("[update] Upgrading to {}...", applied.version);
                     // Save the CURRENT version (before upgrade) so TUI can show "Upgraded old → new"
                     std::env::set_var(UPGRADED_FROM_ENV, &current);
                     match self_update::re_exec_self(Some(&applied.exe)) {
