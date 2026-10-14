@@ -992,8 +992,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             let mut header = SessionHeader::new(&id);
             header.created_at = u64::try_from(now).unwrap_or(0);
             header.cwd = Some(working_dir);
-            header.context =
-                Some(SessionContextHook::new(&cfg.working_dir, cfg.dirs.user()).block(None));
+            header.context = Some(session_context_hook.block(None));
             if !stage_fresh {
                 manager
                     .create_event_session(&lease, &header, &meta)
@@ -1084,9 +1083,15 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     if let Some(b) = &session {
         let wd = cfg.working_dir.to_string_lossy().into_owned();
         let snapshot_hook = Arc::new(
-            SnapshotHook::new(b.manager.clone(), &b.id, &wd, &cfg.dirs)
-                .with_lease(b.lease.clone())
-                .with_model_attribution(&cfg.provider_name, &cfg.model),
+            SnapshotHook::new_with_context(
+                b.manager.clone(),
+                &b.id,
+                &wd,
+                &cfg.dirs,
+                Some(&session_context_hook),
+            )
+            .with_lease(b.lease.clone())
+            .with_model_attribution(&cfg.provider_name, &cfg.model),
         );
         snapshot_persistence_status = Some(snapshot_hook.persistence_status());
         snapshot_hook_handle = Some(snapshot_hook);

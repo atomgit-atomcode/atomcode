@@ -204,6 +204,17 @@ impl SnapshotHook {
         working_dir: impl Into<String>,
         dirs: &crate::ProductDirs,
     ) -> Self {
+        Self::new_with_context(mgr, session_id, working_dir, dirs, None)
+    }
+
+    /// Reuse the preparation's Git probe without retaining another state owner.
+    pub fn new_with_context(
+        mgr: Arc<SessionManager>,
+        session_id: impl Into<String>,
+        working_dir: impl Into<String>,
+        dirs: &crate::ProductDirs,
+        context: Option<&super::SessionContextHook>,
+    ) -> Self {
         let session_id = session_id.into();
         let working_dir = working_dir.into();
         // Code Rewind is on unless ATOMCODE_CODE_REWIND turns it off: we
@@ -211,11 +222,20 @@ impl SnapshotHook {
         // whose store lives under <user tree>/rewind/<bucket>/<session_id> —
         // NOT inside the worktree or on a hard-coded C: path.
         let (checkpoint, unavailable) = if crate::session::rewind::code_rewind_enabled() {
-            match WorkspaceCheckpoint::for_session(
-                std::path::Path::new(&working_dir),
-                &session_id,
-                dirs,
-            ) {
+            let checkpoint = match context {
+                Some(context) => context
+                    .worktree_root_for(std::path::Path::new(&working_dir))
+                    .map_err(|message| WorkspaceCheckpointError::Unsupported(message.into()))
+                    .and_then(|root| {
+                        WorkspaceCheckpoint::for_session_root(root, &session_id, dirs)
+                    }),
+                None => WorkspaceCheckpoint::for_session(
+                    std::path::Path::new(&working_dir),
+                    &session_id,
+                    dirs,
+                ),
+            };
+            match checkpoint {
                 Ok(cp) => (Some(Arc::new(cp)), None),
                 Err(e) => (
                     None,

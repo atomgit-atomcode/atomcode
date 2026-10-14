@@ -330,7 +330,16 @@ impl WorkspaceCheckpoint {
                 source,
             })?;
         let worktree = git_worktree_root(&requested)?;
-        let bucket = super::SessionManager::project_hash(&worktree, dirs);
+        Self::for_session_root(&worktree, session_id, dirs)
+    }
+
+    /// The root has already been discovered by the preparation's context hook.
+    pub(crate) fn for_session_root(
+        worktree: &Path,
+        session_id: &str,
+        dirs: &crate::ProductDirs,
+    ) -> Result<Self, WorkspaceCheckpointError> {
+        let bucket = super::SessionManager::project_hash(worktree, dirs);
         let safe_session = session_id
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'));
@@ -338,7 +347,7 @@ impl WorkspaceCheckpoint {
             return Err(WorkspaceCheckpointError::InvalidPath(session_id.into()));
         }
         let git_dir = dirs.user().join("rewind").join(bucket).join(session_id);
-        Self::with_store(worktree, git_dir)
+        Self::with_store_root(worktree.to_path_buf(), git_dir)
     }
 
     /// Open an already-existing v1 store only for crash recovery. This never
@@ -442,7 +451,13 @@ impl WorkspaceCheckpoint {
                 source,
             })?;
         ensure_git_worktree(&worktree)?;
-        let git_dir = git_dir.into();
+        Self::with_store_root(worktree, git_dir.into())
+    }
+
+    fn with_store_root(
+        worktree: PathBuf,
+        git_dir: PathBuf,
+    ) -> Result<Self, WorkspaceCheckpointError> {
         if git_dir.starts_with(&worktree) {
             return Err(WorkspaceCheckpointError::InvalidPath(
                 git_dir.display().to_string(),
@@ -899,9 +914,21 @@ impl WorkspaceCheckpoint {
                     source,
                 })?;
             checked(output, "initialize rewind store")?;
-            self.run(["config", "core.autocrlf", "false"])?;
-            self.run(["config", "core.filemode", "true"])?;
-            self.run(["config", "core.symlinks", "true"])?;
+            // Preserve git init's generated fields. Git uses the last value for
+            // these scalar settings, so this also overrides platform defaults.
+            let config = self.git_dir.join("config");
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&config)
+                .and_then(|mut file| {
+                    file.write_all(
+                        b"\n[core]\n\tautocrlf = false\n\tfilemode = true\n\tsymlinks = true\n",
+                    )
+                })
+                .map_err(|source| WorkspaceCheckpointError::Io {
+                    path: config,
+                    source,
+                })?;
         }
         self.write_alternates()?;
         let marker = self.git_dir.join("atomcode-rewind-version");
@@ -1522,6 +1549,20 @@ mod tests {
         let checkpoint =
             WorkspaceCheckpoint::with_store(worktree.path(), store.path().join("git")).unwrap();
         (worktree, store, checkpoint)
+    }
+
+    #[test]
+    fn generated_rewind_config_preserves_bare_and_sets_workspace_semantics() {
+        let (_worktree, _store, checkpoint) = fixture();
+        for (key, expected) in [
+            ("core.bare", "true"),
+            ("core.autocrlf", "false"),
+            ("core.filemode", "true"),
+            ("core.symlinks", "true"),
+        ] {
+            let output = checkpoint.run(["config", "--get", key]).unwrap();
+            assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), expected);
+        }
     }
 
     #[test]

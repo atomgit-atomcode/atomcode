@@ -39,6 +39,7 @@ pub struct SessionContextHook {
     working_dir: PathBuf,
     /// The user tree (`~/.atomcode`) — the GLOBAL instructions tier's base.
     home: PathBuf,
+    worktree: std::sync::OnceLock<Result<PathBuf, String>>,
 }
 
 impl SessionContextHook {
@@ -48,6 +49,7 @@ impl SessionContextHook {
         Self {
             working_dir: working_dir.into(),
             home: home.into(),
+            worktree: std::sync::OnceLock::new(),
         }
     }
 
@@ -135,20 +137,23 @@ impl SessionContextHook {
     /// `Some(block)` when `working_dir` is inside a git work tree, else `None`. A
     /// session-start snapshot (NOT live) — `git status --short` capped at 20 lines.
     fn git_snapshot(&self) -> Option<String> {
-        if self.git(&["rev-parse", "--is-inside-work-tree"])?.trim() != "true" {
-            return None;
-        }
-        let branch = self
-            .git(&["branch", "--show-current"])
+        self.worktree_root().ok()?;
+        let (branch, head, raw) = std::thread::scope(|scope| {
+            let branch = scope.spawn(|| self.git(&["branch", "--show-current"]));
+            let head = scope.spawn(|| self.git(&["log", "-1", "--format=%h %s"]));
+            let status = scope.spawn(|| self.git(&["status", "--short"]));
+            (
+                branch.join().expect("branch probe panicked"),
+                head.join().expect("HEAD probe panicked"),
+                status.join().expect("status probe panicked"),
+            )
+        });
+        let branch = branch
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "(detached HEAD)".into());
-        let head = self
-            .git(&["log", "-1", "--format=%h %s"])
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        let raw = self.git(&["status", "--short"]).unwrap_or_default();
+        let head = head.unwrap_or_default().trim().to_string();
+        let raw = raw.unwrap_or_default();
         let mut lines: Vec<&str> = raw.lines().collect();
         let status = if lines.len() > 20 {
             let extra = lines.len() - 20;
@@ -167,6 +172,38 @@ impl SessionContextHook {
              Branch: {branch}\nHEAD: {head}\n{status}\n\
              (This is a session-start snapshot — run `git status` for live state.)"
         ))
+    }
+
+    /// A preparation-local probe shared by the context and workspace checkpoint.
+    /// A new hook is required after changing directories or rebuilding a session.
+    pub(crate) fn worktree_root(&self) -> Result<&std::path::Path, &str> {
+        self.worktree
+            .get_or_init(|| {
+                let output = self
+                    .git(&["rev-parse", "--is-inside-work-tree", "--show-toplevel"])
+                    .ok_or_else(|| "code rewind requires a Git worktree".to_string())?;
+                let (inside, root) = output
+                    .split_once('\n')
+                    .ok_or_else(|| "Git returned no worktree root".to_string())?;
+                if inside.trim() != "true" {
+                    return Err("code rewind requires a Git worktree".into());
+                }
+                std::fs::canonicalize(root.trim()).map_err(|e| e.to_string())
+            })
+            .as_deref()
+            .map_err(String::as_str)
+    }
+
+    pub(crate) fn worktree_root_for(
+        &self,
+        working_dir: &std::path::Path,
+    ) -> Result<&std::path::Path, String> {
+        let expected = std::fs::canonicalize(working_dir).map_err(|e| e.to_string())?;
+        let actual = std::fs::canonicalize(&self.working_dir).map_err(|e| e.to_string())?;
+        if expected != actual {
+            return Err("session context belongs to a different working directory".into());
+        }
+        self.worktree_root().map_err(str::to_owned)
     }
 
     fn git(&self, args: &[&str]) -> Option<String> {
@@ -263,6 +300,79 @@ mod tests {
                 .output()
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn a_nested_directory_shares_its_root_with_rewind() {
+        let repo = tempfile::tempdir().unwrap();
+        git_init(repo.path());
+        let nested = repo.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let hook = SessionContextHook::new(&nested, repo.path().join("home"));
+        assert_eq!(
+            hook.worktree_root().unwrap(),
+            std::fs::canonicalize(repo.path()).unwrap()
+        );
+        assert!(hook.block(None).contains("=== GIT STATUS"));
+        let root = hook.worktree_root_for(&nested).unwrap();
+        let dirs = crate::ProductDirs::new(repo.path().join("product"), ".startup-probe");
+        let checkpoint =
+            super::super::WorkspaceCheckpoint::for_session_root(root, "probe", &dirs).unwrap();
+        assert_eq!(checkpoint.worktree(), root);
+        assert!(hook.worktree_root_for(repo.path()).is_err());
+    }
+
+    #[test]
+    fn a_linked_worktree_uses_its_own_root_and_restores_files() {
+        let repo = tempfile::tempdir().unwrap();
+        let linked_parent = tempfile::tempdir().unwrap();
+        let linked = linked_parent.path().join("linked");
+        git_init(repo.path());
+        for args in [
+            vec!["commit", "--allow-empty", "-qm", "initial"],
+            vec![
+                "worktree",
+                "add",
+                "-b",
+                "startup-linked",
+                linked.to_str().unwrap(),
+            ],
+        ] {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let hook = SessionContextHook::new(&linked, repo.path().join("home"));
+        let root = hook.worktree_root_for(&linked).unwrap();
+        assert_eq!(root, std::fs::canonicalize(&linked).unwrap());
+        assert!(hook.block(None).contains("=== GIT STATUS"));
+        let dirs = crate::ProductDirs::new(linked_parent.path().join("product"), ".startup-probe");
+        let checkpoint =
+            super::super::WorkspaceCheckpoint::for_session_root(root, "linked", &dirs).unwrap();
+        std::fs::write(linked.join("example.txt"), "before").unwrap();
+        let before = checkpoint.capture().unwrap().unwrap();
+        std::fs::write(linked.join("example.txt"), "after").unwrap();
+        let after = checkpoint.capture().unwrap().unwrap();
+        checkpoint.restore(&before, &after).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(linked.join("example.txt")).unwrap(),
+            "before"
+        );
+    }
+
+    #[test]
+    fn a_non_repository_has_no_git_context_or_checkpoint_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let hook = SessionContextHook::new(dir.path(), dir.path().join("home"));
+        assert!(hook.worktree_root().is_err());
+        assert!(!hook.block(None).contains("=== GIT STATUS"));
     }
 
     #[test]
