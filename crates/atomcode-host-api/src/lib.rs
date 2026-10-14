@@ -1186,6 +1186,8 @@ pub struct McpServerDetail {
 pub enum McpAction {
     /// Reconnect only this server, keeping the current session.
     Reconnect,
+    /// Cancel the current reconnect of this server, without cancelling a turn.
+    CancelReconnect,
     /// Trust this project, so its `.mcp.json` servers may connect at all.
     Trust,
     /// Withdraw that trust. The project's tools come off the session first.

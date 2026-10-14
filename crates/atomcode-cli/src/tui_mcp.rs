@@ -68,6 +68,7 @@ impl Plugin for McpRow {
                 ctx: ctx.clone(),
                 login: Arc::new(sign_in_by_browser),
                 signing_in: std::sync::Mutex::new(None),
+                reconnecting: std::sync::Mutex::new(None),
             }))
             .map_err(|e| e.to_string())?;
         Ok(())
@@ -89,6 +90,15 @@ struct McpPort {
     /// a browser then gives up instead of holding a thread for a tab nobody
     /// will finish.
     signing_in: std::sync::Mutex<Option<Arc<AtomicBool>>>,
+    reconnecting: std::sync::Mutex<Option<ReconnectLink>>,
+}
+
+type ReconnectLink = (Arc<dyn HostControl>, String, String);
+struct ReconnectPortGuard<'a>(&'a std::sync::Mutex<Option<ReconnectLink>>);
+impl Drop for ReconnectPortGuard<'_> {
+    fn drop(&mut self) {
+        self.0.lock().expect("reconnect poisoned").take();
+    }
 }
 
 impl McpPort {
@@ -184,6 +194,22 @@ impl McpPort {
 impl Mcp for McpPort {
     fn cancel(&self) {
         self.raise_stop();
+        let reconnect = self
+            .reconnecting
+            .lock()
+            .expect("reconnect poisoned")
+            .clone();
+        if let Some((control, session, server)) = reconnect {
+            tokio::spawn(async move {
+                let _ = control
+                    .call(HostCommand::McpAct {
+                        session,
+                        server,
+                        action: McpAction::CancelReconnect,
+                    })
+                    .await;
+            });
+        }
     }
 
     async fn list(&self) -> Result<McpView, String> {
@@ -223,15 +249,24 @@ impl Mcp for McpPort {
             )
             .await;
         };
-        listed(
-            control
-                .call(HostCommand::McpAct {
-                    session,
-                    server: server.to_string(),
-                    action,
-                })
-                .await,
-        )
+        let _reconnect_guard = if action == McpAction::Reconnect {
+            let mut slot = self.reconnecting.lock().expect("reconnect poisoned");
+            if slot.is_some() {
+                return Err("A server reconnect is already being managed".into());
+            }
+            *slot = Some((control.clone(), session.clone(), server.into()));
+            Some(ReconnectPortGuard(&self.reconnecting))
+        } else {
+            None
+        };
+        let result = control
+            .call(HostCommand::McpAct {
+                session,
+                server: server.into(),
+                action,
+            })
+            .await;
+        listed(result)
     }
 }
 
@@ -735,6 +770,50 @@ mod tests {
                 reason: "a turn is running".into(),
             }))
         );
+    }
+
+    struct ReconnectCancelHost(tokio::sync::mpsc::UnboundedSender<HostCommand>);
+    #[async_trait]
+    impl HostControl for ReconnectCancelHost {
+        async fn call(&self, command: HostCommand) -> Result<HostReply, HostError> {
+            self.0.send(command).unwrap();
+            Ok(HostReply::Done)
+        }
+        fn subscribe(&self) -> tokio::sync::mpsc::UnboundedReceiver<atomcode_host_api::HostEvent> {
+            tokio::sync::mpsc::unbounded_channel().1
+        }
+    }
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn panel_cancel_addresses_only_the_captured_server_reconnect() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = atomcode_plexus::App::new(
+            atomcode_plexus::PluginRegistry::new(),
+            atomcode_plexus::ConfigTree::default(),
+        );
+        let port = McpPort {
+            ctx: app.context(),
+            login: Arc::new(sign_in_by_browser),
+            signing_in: std::sync::Mutex::new(None),
+            reconnecting: std::sync::Mutex::new(Some((
+                Arc::new(ReconnectCancelHost(tx)),
+                "captured-session".into(),
+                "chosen".into(),
+            ))),
+        };
+        port.cancel();
+        let command = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(command, HostCommand::McpAct { session, server, action: McpAction::CancelReconnect } if session == "captured-session" && server == "chosen")
+        );
+        // Finishing or dropping the request clears its cancellation target.
+        drop(ReconnectPortGuard(&port.reconnecting));
+        assert!(port.reconnecting.lock().unwrap().is_none());
+        port.cancel();
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err());
     }
 
     /// A host that records what it was asked, and answers `Context` with a

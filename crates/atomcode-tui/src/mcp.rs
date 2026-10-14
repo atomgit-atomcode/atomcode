@@ -225,7 +225,7 @@ impl Busy {
         Self {
             what: action.about(),
             phase: None,
-            cancellable: action == Action::Login,
+            cancellable: matches!(action, Action::Login | Action::Reconnect),
             cancelling: false,
         }
     }
@@ -504,7 +504,7 @@ pub trait Mcp: Send + Sync {
     /// 发生了的事(与 `/toolbox` 的 `switch` 同一个道理)。
     async fn act(&self, server: &str, action: Action) -> Result<McpView, String>;
 
-    /// 叫停正在跑的认证。停下来的那一趟 `act` 自己回答(一个错误,说它被取消了);
+    /// 叫停正在跑的认证或单服务器重连。该趟 `act` 自己回答取消结果;
     /// 没有在跑的就什么也不做。
     fn cancel(&self) {}
 }
@@ -670,6 +670,11 @@ mod tests {
             Step::Close,
             "a second Esc never leaves a person shut in a panel that will not answer"
         );
+
+        let mut reconnect = Panel::new();
+        reconnect.busy = Some(Busy::of(Action::Reconnect));
+        assert_eq!(key(&view, &mut reconnect, press(Key::Esc)), Step::Cancel);
+        assert!(reconnect.busy.as_ref().unwrap().cancelling);
 
         // Nothing to stop: one Esc puts it away, as it always did.
         let mut quick = Panel::new();

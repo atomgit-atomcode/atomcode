@@ -1430,6 +1430,57 @@ pub(crate) struct McpPublication {
     pub(crate) prompts_slot: Arc<RwLock<Option<Arc<atomcode_harness::seams::PromptRegistry>>>>,
 }
 
+impl McpPublication {
+    pub(crate) fn reconnect_state(&self) -> Self {
+        Self {
+            registry: self.registry.clone(),
+            connect_rx: None,
+            tool_names: self.tool_names.clone(),
+            publish_lock: self.publish_lock.clone(),
+            publication_enabled: self.publication_enabled.clone(),
+            discovery_jobs: self.discovery_jobs.clone(),
+            catalog_ready: self.catalog_ready.clone(),
+            toolbox_slot: self.toolbox_slot.clone(),
+            prompts_slot: self.prompts_slot.clone(),
+        }
+    }
+}
+
+pub(crate) async fn cancel_mcp_reconnect(publication: &McpPublication, server: &str) {
+    let _guard = publication.publish_lock.lock().await;
+    let toolbox = publication
+        .toolbox_slot
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    {
+        let aliases = publication.registry.tool_aliases_for_server(server);
+        let mut names = publication
+            .tool_names
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        names.retain(|name| {
+            if aliases.contains(name) {
+                if let Some(toolbox) = &toolbox {
+                    toolbox.unregister(name);
+                }
+                false
+            } else {
+                true
+            }
+        });
+        if let Some(prompts) = publication
+            .prompts_slot
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            crate::mcp_instructions::project(prompts, &publication.registry, &names);
+        }
+    }
+    publication.registry.cancel_reconnect(server).await;
+}
+
 /// What `mcp-telemetry` needs: the second stream of connection events, and the
 /// meter to report them through.
 pub(crate) struct McpConnectMeter {

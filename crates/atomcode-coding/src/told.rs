@@ -127,6 +127,7 @@ pub(crate) fn mcp_acted(server: &str, action: McpAction) -> String {
         McpAction::Untrust => "The person revoked trust in this project's MCP servers; their \
              tools are no longer available."
             .to_string(),
+        McpAction::CancelReconnect => format!("The person cancelled reconnection of MCP server `{server}`."),
         McpAction::Reconnect => format!(
             "The person reconnected MCP server `{server}`; its connection and tool catalog have been refreshed."
         ),

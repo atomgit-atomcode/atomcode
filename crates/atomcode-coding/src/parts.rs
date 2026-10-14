@@ -1563,10 +1563,9 @@ impl CodingParts {
         }
     }
 
-    pub(crate) async fn reconnect_mcp_server(
+    pub(crate) fn mcp_reconnect_publication(
         &self,
-        config: atomcode_capabilities::mcp::McpServerConfig,
-    ) -> Result<(), String> {
+    ) -> Result<crate::host_rows::McpPublication, String> {
         if !*self.mcp_catalog_ready.borrow()
             || self
                 .mcp_discovery_jobs
@@ -1578,21 +1577,17 @@ impl CodingParts {
             );
         }
         let registry = self.mcp_registry.clone().ok_or("MCP is not enabled")?;
-        crate::host_rows::reconnect_mcp_server(
-            crate::host_rows::McpPublication {
-                registry,
-                connect_rx: None,
-                tool_names: self.mcp_tool_names.clone(),
-                publish_lock: self.mcp_publish_lock.clone(),
-                publication_enabled: self.mcp_publication_enabled.clone(),
-                discovery_jobs: self.mcp_discovery_jobs.clone(),
-                catalog_ready: self.mcp_catalog_ready.clone(),
-                toolbox_slot: self.mcp_toolbox.clone(),
-                prompts_slot: self.mcp_prompts.clone(),
-            },
-            config,
-        )
-        .await
+        Ok(crate::host_rows::McpPublication {
+            registry,
+            connect_rx: None,
+            tool_names: self.mcp_tool_names.clone(),
+            publish_lock: self.mcp_publish_lock.clone(),
+            publication_enabled: self.mcp_publication_enabled.clone(),
+            discovery_jobs: self.mcp_discovery_jobs.clone(),
+            catalog_ready: self.mcp_catalog_ready.clone(),
+            toolbox_slot: self.mcp_toolbox.clone(),
+            prompts_slot: self.mcp_prompts.clone(),
+        })
     }
 
     pub(crate) async fn mcp_statuses(
@@ -1773,6 +1768,8 @@ pub async fn mcp_row_facts_in(
 pub enum McpAction {
     /// Reconnect only this server, keeping the current session.
     Reconnect,
+    /// Cancel the current reconnect of this server, without cancelling a turn.
+    CancelReconnect,
     Trust,
     Untrust,
     Logout,
@@ -1792,7 +1789,10 @@ impl McpAction {
     /// in-place switch: it holds this server's tools back through the person's
     /// switches. Reconnect also acts in place, but requires an idle session.
     pub fn rebuilds(self) -> bool {
-        !matches!(self, Self::Disable | Self::Reconnect)
+        !matches!(
+            self,
+            Self::Disable | Self::Reconnect | Self::CancelReconnect
+        )
     }
 }
 

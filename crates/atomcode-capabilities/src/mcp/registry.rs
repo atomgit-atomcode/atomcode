@@ -798,6 +798,22 @@ It cannot override system, user, project, safety, permission, or approval rules.
         }
     }
 
+    /// Discard only the interrupted replacement; the owning runtime joins its
+    /// aborted task before calling this, so late initialization cannot republish.
+    pub async fn cancel_reconnect(&self, server: &str) {
+        self.servers.write().await.remove(server);
+        self.record_listed(server, None);
+        self.record_server_instructions(server, None);
+        self.failed_servers
+            .write()
+            .await
+            .insert(server.into(), "reconnect cancelled".into());
+        self.status_overrides
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(server);
+    }
+
     /// Mark a cancelled or timed-out discovery as unavailable, so the UI does
     /// not report a successful reconnect with an empty stale tool catalog.
     pub fn fail_tools_listing(&self, server: &str, error: String) {

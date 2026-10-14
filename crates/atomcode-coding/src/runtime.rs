@@ -1286,6 +1286,73 @@ async fn mcp_rows_of(runtime: &RuntimeResources) -> Result<Vec<crate::parts::Mcp
     }
 }
 
+fn prepare_mcp_reconnect(
+    runtime: &RuntimeResources,
+    server: &str,
+) -> Result<
+    (
+        crate::host_rows::McpPublication,
+        atomcode_capabilities::mcp::McpServerConfig,
+    ),
+    String,
+> {
+    use atomcode_capabilities::mcp::McpConfigSource;
+    let storage = crate::parts::mcp_storage(&runtime.config, &runtime.prepare);
+    let mut configs = storage
+        .load_including_disabled()
+        .map_err(|e| format!("{e:#}"))?;
+    configs.extend(runtime.prepare.extra_mcp_servers.clone());
+    let config = configs
+        .into_iter()
+        .rev()
+        .find(|config| config.name == server)
+        .ok_or_else(|| format!("MCP server '{server}' is not configured"))?;
+    if config.disabled {
+        return Err(format!(
+            "MCP server '{server}' is disabled; enable it first"
+        ));
+    }
+    if config.source == McpConfigSource::Project
+        && !atomcode_capabilities::mcp::trust::is_project_trusted(
+            &runtime.config.working_dir,
+            runtime.config.dirs.user(),
+        )
+    {
+        return Err(atomcode_capabilities::mcp::trust::PROJECT_NOT_TRUSTED.to_string());
+    }
+    Ok((runtime.parts.mcp_reconnect_publication()?, config))
+}
+
+struct PendingMcpReconnect {
+    task: tokio::task::JoinHandle<Result<(), String>>,
+    publication: crate::host_rows::McpPublication,
+    server: String,
+    generation: u64,
+    phase: RuntimePhase,
+    flag: Arc<std::sync::atomic::AtomicBool>,
+    done: Option<oneshot::Sender<Result<(), RuntimeError>>>,
+}
+impl Drop for PendingMcpReconnect {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
+        self.task.abort();
+        if let Some(done) = self.done.take() {
+            let _ = done.send(Err(RuntimeError::Cancelled));
+        }
+    }
+}
+impl PendingMcpReconnect {
+    async fn cancel(mut self) -> RuntimePhase {
+        self.task.abort();
+        let _ = (&mut self.task).await;
+        crate::host_rows::cancel_mcp_reconnect(&self.publication, &self.server).await;
+        if let Some(done) = self.done.take() {
+            let _ = done.send(Err(RuntimeError::Cancelled));
+        }
+        self.phase
+    }
+}
+
 /// Run one panel action against the live tree: the six things a person can do to
 /// a configured MCP server (`docs/mcp-panel-design.md` §5.2), bar signing in.
 ///
@@ -1318,32 +1385,8 @@ async fn apply_mcp_action(
     use crate::parts::McpAction;
 
     match action {
-        McpAction::Reconnect => {
-            use atomcode_capabilities::mcp::McpConfigSource;
-            let storage = crate::parts::mcp_storage(&runtime.config, &runtime.prepare);
-            let mut configs = storage
-                .load_including_disabled()
-                .map_err(|e| format!("{e:#}"))?;
-            configs.extend(runtime.prepare.extra_mcp_servers.clone());
-            let config = configs
-                .into_iter()
-                .rev()
-                .find(|config| config.name == server)
-                .ok_or_else(|| format!("MCP server '{server}' is not configured"))?;
-            if config.disabled {
-                return Err(format!(
-                    "MCP server '{server}' is disabled; enable it first"
-                ));
-            }
-            if config.source == McpConfigSource::Project
-                && !atomcode_capabilities::mcp::trust::is_project_trusted(
-                    &runtime.config.working_dir,
-                    runtime.config.dirs.user(),
-                )
-            {
-                return Err(atomcode_capabilities::mcp::trust::PROJECT_NOT_TRUSTED.to_string());
-            }
-            runtime.parts.reconnect_mcp_server(config).await
+        McpAction::Reconnect | McpAction::CancelReconnect => {
+            Err("reconnect must run as an owned cancellable task".into())
         }
         McpAction::Trust => atomcode_capabilities::mcp::trust::trust_project(
             &runtime.config.working_dir,
@@ -1729,6 +1772,7 @@ pub struct CodingRuntimeHandle {
     /// token here when it handles the cancel, so a stop is only ever held
     /// against the work it was meant for.
     stop: Arc<Mutex<CancellationToken>>,
+    mcp_reconnecting: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Clone, Debug)]
@@ -1772,7 +1816,20 @@ impl CodingRuntimeHandle {
     /// authoritative runtime phase. Drivers use this before entering UI states
     /// that assume the command reached the runtime owner.
     pub fn accepts(&self, command: &DriverCommand) -> bool {
-        !self.is_stopped() && runtime_phase_accepts_command(self.status().phase, command)
+        !self.is_stopped() && self.accepts_in_phase(self.status().phase, command)
+    }
+
+    fn accepts_in_phase(&self, phase: RuntimePhase, command: &DriverCommand) -> bool {
+        if self.mcp_reconnecting.load(Ordering::Acquire) {
+            return matches!(
+                command,
+                DriverCommand::Cancel
+                    | DriverCommand::Shutdown
+                    | DriverCommand::Respond { .. }
+                    | DriverCommand::RefreshContextStats
+            );
+        }
+        runtime_phase_accepts_command(phase, command)
     }
 
     /// Request manual conversation compaction from the current kernel agent.
@@ -1791,9 +1848,7 @@ impl CodingRuntimeHandle {
 
     pub fn dispatch(&self, command: DriverCommand) -> Result<(), RuntimeUnavailable> {
         let state = self.state.load(Ordering::Acquire);
-        if self.is_stopped()
-            || !runtime_phase_accepts_command(runtime_status(state).phase, &command)
-        {
+        if self.is_stopped() || !self.accepts_in_phase(runtime_status(state).phase, &command) {
             return Err(RuntimeUnavailable);
         }
         let generation = runtime_state_generation(state);
@@ -3252,6 +3307,7 @@ pub struct CodingRuntimeControlReceiver {
     terminal_tx: watch::Sender<Option<RuntimeExit>>,
     /// The other end of [`CodingRuntimeHandle::stop`].
     stop: Arc<Mutex<CancellationToken>>,
+    mcp_reconnecting: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl CodingRuntimeControlReceiver {
@@ -3588,6 +3644,7 @@ pub fn coding_runtime_control_channel() -> (CodingRuntimeHandle, CodingRuntimeCo
     let state = Arc::new(AtomicU64::new(runtime_state(0, true)));
     let provider_unavailable_reason = Arc::new(AtomicU8::new(0));
     let stop = Arc::new(Mutex::new(CancellationToken::new()));
+    let mcp_reconnecting = Arc::new(std::sync::atomic::AtomicBool::new(false));
     (
         CodingRuntimeHandle {
             tx,
@@ -3595,6 +3652,7 @@ pub fn coding_runtime_control_channel() -> (CodingRuntimeHandle, CodingRuntimeCo
             provider_unavailable_reason: Arc::clone(&provider_unavailable_reason),
             terminal,
             stop: Arc::clone(&stop),
+            mcp_reconnecting: mcp_reconnecting.clone(),
         },
         CodingRuntimeControlReceiver {
             rx,
@@ -3602,6 +3660,7 @@ pub fn coding_runtime_control_channel() -> (CodingRuntimeHandle, CodingRuntimeCo
             provider_unavailable_reason,
             terminal_tx,
             stop,
+            mcp_reconnecting,
         },
     )
 }
@@ -3956,6 +4015,7 @@ fn spawn_runtime_owner_with_optional_agent(
         let mut observed_tokens = None;
         let mut controls_open = true;
         let mut compaction_suspended = false;
+        let mut pending_mcp_reconnect: Option<PendingMcpReconnect> = None;
         let mut agent_available = matches!(initial_phase, RuntimePhase::Ready);
         let mut provider_unavailable_reason = initial_unavailable_reason;
         let mut compactions = CompactionTracker::default();
@@ -4022,6 +4082,11 @@ fn spawn_runtime_owner_with_optional_agent(
             if agent.is_none() {
                 runtime_event_tx.withdraw_unclaimed();
             }
+            if persistence_failure.is_some() {
+                if let Some(pending) = pending_mcp_reconnect.take() {
+                    pending.cancel().await;
+                }
+            }
             tokio::select! {
                 biased;
                 team_event = team_event_rx.recv() => {
@@ -4045,6 +4110,7 @@ fn spawn_runtime_owner_with_optional_agent(
                 }
                 management = owner_rx.recv() => match management {
                     Some(OwnerControl::SuspendCompaction { done }) => {
+                        if let Some(pending) = pending_mcp_reconnect.take() { pending.cancel().await; }
                         if !compaction_suspended {
                             generation = generation.wrapping_add(1);
                             event_generation.store(generation, Ordering::Release);
@@ -4075,6 +4141,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         let _ = done.send(());
                     }
                     Some(OwnerControl::Stop { done }) => {
+                        if let Some(pending) = pending_mcp_reconnect.take() { pending.cancel().await; }
                         if !compaction_suspended {
                             generation = generation.wrapping_add(1);
                             event_generation.store(generation, Ordering::Release);
@@ -4133,6 +4200,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         let _ = done.send(());
                     }
                     Some(OwnerControl::Replace { agent: replacement, done }) => {
+                        if let Some(pending) = pending_mcp_reconnect.take() { pending.cancel().await; }
                         if persistence_failure.is_some() {
                             agent = None;
                             agent_available = false;
@@ -4222,6 +4290,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         let _ = done.send(());
                     }
                     Some(OwnerControl::Shutdown { done }) => {
+                        if let Some(pending) = pending_mcp_reconnect.take() { pending.cancel().await; }
                         if !compaction_suspended {
                             generation = generation.wrapping_add(1);
                             event_generation.store(generation, Ordering::Release);
@@ -4294,7 +4363,7 @@ fn spawn_runtime_owner_with_optional_agent(
                     }
                     None => break,
                 },
-                wakeup = wakeup_rx.recv(), if native_protocol => {
+                wakeup = wakeup_rx.recv(), if native_protocol && pending_mcp_reconnect.is_none() => {
                     if let Some(wakeup) = wakeup {
                         if loop_state.as_ref().is_some_and(|state| state.active) {
                             if let Some(state) = loop_state.as_mut() {
@@ -4533,6 +4602,29 @@ fn spawn_runtime_owner_with_optional_agent(
                         }
                     }
                 }
+                result = async { (&mut pending_mcp_reconnect.as_mut().expect("reconnect present").task).await }, if pending_mcp_reconnect.is_some() => {
+                    let mut pending = pending_mcp_reconnect.take().expect("reconnect present");
+                    if pending.generation == generation && persistence_failure.is_none() && agent_available && active_turn.is_none() {
+                        controls.state.store(runtime_phase_state(generation, pending.phase), Ordering::Release);
+                    }
+                    let outcome = if pending.generation != generation || persistence_failure.is_some() || !agent_available || active_turn.is_some() {
+                        crate::host_rows::cancel_mcp_reconnect(&pending.publication, &pending.server).await;
+                        Err(RuntimeError::Cancelled)
+                    } else {
+                        match result {
+                            Ok(Ok(())) => {
+                                if let Some(runtime) = resources.as_ref() { tell(runtime, Some(crate::told::mcp_acted(&pending.server, crate::parts::McpAction::Reconnect))); }
+                                Ok(())
+                            }
+                            Ok(Err(error)) => Err(RuntimeError::ReconfigureFailed(error)),
+                            Err(error) => {
+                                crate::host_rows::cancel_mcp_reconnect(&pending.publication, &pending.server).await;
+                                Err(RuntimeError::ReconfigureFailed(format!("MCP reconnect task failed: {error}")))
+                            }
+                        }
+                    };
+                    if let Some(done) = pending.done.take() { let _ = done.send(outcome); }
+                }
                 control = controls.recv(), if controls_open => match control {
                     Some(control)
                         if persistence_failure.is_some()
@@ -4543,6 +4635,17 @@ fn spawn_runtime_owner_with_optional_agent(
                             &runtime_event_tx,
                             CompactionInterruption::RuntimeUnavailable,
                         );
+                    }
+                    Some(control) if pending_mcp_reconnect.is_some() && !matches!(&control,
+                        CodingRuntimeControl::Cancel { .. } | CodingRuntimeControl::Shutdown { .. }
+                        | CodingRuntimeControl::Respond { .. }
+                        | CodingRuntimeControl::McpAct { action: crate::parts::McpAction::CancelReconnect, .. }
+                        | CodingRuntimeControl::Mode { .. } | CodingRuntimeControl::McpStatus { .. }
+                        | CodingRuntimeControl::McpRows { .. } | CodingRuntimeControl::McpDetail { .. }
+                        | CodingRuntimeControl::ToolCatalog { .. } | CodingRuntimeControl::ContextStats { .. }
+                        | CodingRuntimeControl::Usage { .. } | CodingRuntimeControl::Snapshot { .. }
+                        | CodingRuntimeControl::PendingPolicyIntervention { .. }) => {
+                        reject_runtime_control_with_error(control, &runtime_event_tx, CompactionInterruption::RuntimeUnavailable, RuntimeError::Busy);
                     }
                     Some(CodingRuntimeControl::Compact { generation: request_generation, focus }) => {
                         let trigger = CompactTrigger::Manual { focus: focus.clone() };
@@ -5416,6 +5519,12 @@ fn spawn_runtime_owner_with_optional_agent(
                     }) => {
                         // Whatever the stop reached (or did not), it is answered
                         // from here on; a fresh one waits for the next.
+                        if request_generation == generation {
+                            if let Some(pending) = pending_mcp_reconnect.take() {
+                                let phase = pending.cancel().await;
+                                controls.state.store(runtime_phase_state(generation, phase), Ordering::Release);
+                            }
+                        }
                         controls.stop_handled();
                         if native_protocol
                             && request_generation == generation
@@ -5955,6 +6064,29 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;
                         };
+                        if action == crate::parts::McpAction::CancelReconnect {
+                            if pending_mcp_reconnect.as_ref().is_some_and(|pending| pending.server == server) {
+                                let phase = pending_mcp_reconnect.take().expect("matching reconnect").cancel().await;
+                                controls.state.store(runtime_phase_state(generation, phase), Ordering::Release);
+                            }
+                            let _ = done.send(Ok(()));
+                            continue;
+                        }
+                        if action == crate::parts::McpAction::Reconnect {
+                            if !agent_available { let _ = done.send(Err(RuntimeError::Unavailable)); continue; }
+                            match prepare_mcp_reconnect(runtime, &server) {
+                                Ok((publication, config)) => {
+                                    let phase = runtime_status(controls.state.load(Ordering::Acquire)).phase;
+                                    controls.mcp_reconnecting.store(true, Ordering::Release);
+                                    controls.state.store(runtime_phase_state(generation, RuntimePhase::Reconfiguring), Ordering::Release);
+                                    let work = publication.reconnect_state();
+                                    let task = tokio::spawn(crate::host_rows::reconnect_mcp_server(work, config));
+                                    pending_mcp_reconnect = Some(PendingMcpReconnect { task, publication, server, generation, phase, flag: controls.mcp_reconnecting.clone(), done: Some(done) });
+                                }
+                                Err(error) => { let _ = done.send(Err(RuntimeError::ReconfigureFailed(error))); }
+                            }
+                            continue;
+                        }
                         let said = crate::told::mcp_acted(&server, action);
                         let outcome =
                             apply_mcp_action(runtime, server, action, &mut mcp_disable_holds).await;
@@ -7952,6 +8084,9 @@ fn spawn_runtime_owner_with_optional_agent(
                         let _ = done.send(Ok(()));
                     }
                     Some(CodingRuntimeControl::Shutdown { generation: request_generation }) => {
+                        if request_generation == generation {
+                            if let Some(pending) = pending_mcp_reconnect.take() { pending.cancel().await; }
+                        }
                         if let Some(task) = next_prompt_task.take() {
                             task.abort();
                         }
@@ -8866,6 +9001,15 @@ fn reject_runtime_control(
     runtime_event_tx: &RuntimeEventEmitter,
     reason: CompactionInterruption,
 ) {
+    reject_runtime_control_with_error(control, runtime_event_tx, reason, RuntimeError::Unavailable);
+}
+
+fn reject_runtime_control_with_error(
+    control: CodingRuntimeControl,
+    runtime_event_tx: &RuntimeEventEmitter,
+    reason: CompactionInterruption,
+    error: RuntimeError,
+) {
     match control {
         CodingRuntimeControl::Compact { focus, .. } => {
             emit_compaction_interrupted(runtime_event_tx, CompactTrigger::Manual { focus }, reason)
@@ -8879,16 +9023,16 @@ fn reject_runtime_control(
             let _ = done.send(None);
         }
         CodingRuntimeControl::Submit { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         // A stopping runtime has no catalog to describe or switch. Fail-closed
         // like every other awaited control.
         CodingRuntimeControl::ToolCatalog { done, .. }
         | CodingRuntimeControl::SwitchTool { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::SideCallProvider { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::Respond { done, .. }
         | CodingRuntimeControl::ResolvePolicyIntervention { done, .. }
@@ -8897,79 +9041,79 @@ fn reject_runtime_control(
         | CodingRuntimeControl::SetMode { done, .. }
         | CodingRuntimeControl::WaitMcpReady { done, .. }
         | CodingRuntimeControl::QueueLocalContext { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::Snapshot { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::ContextStats { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         // A stopping runtime cannot say which mode it is in either — the flags
         // belong to a tree that is being torn down.
         CodingRuntimeControl::Mode { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::McpStatus { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::McpTools { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::ApproveMcpTool { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::McpRows { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::McpDetail { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::McpAct { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::WithdrawMcpTools { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::ReassembleProvider { done, .. }
         | CodingRuntimeControl::DeactivateProvider { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::Reprepare { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::ApplyUndo { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::RewindCatalog { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::UndoTarget { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::WorkspaceChanges { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::Autonomy { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::Usage { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::BeginRewind { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::FinishRewind { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::RestoreSnapshot { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
         CodingRuntimeControl::StartGoal { done, .. }
         | CodingRuntimeControl::StopGoal { done, .. }
         | CodingRuntimeControl::StartLoop { done, .. }
         | CodingRuntimeControl::StopLoop { done, .. } => {
-            let _ = done.send(Err(RuntimeError::Unavailable));
+            let _ = done.send(Err(error));
         }
     }
 }
