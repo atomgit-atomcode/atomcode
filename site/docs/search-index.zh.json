@@ -927,6 +927,11 @@
         "body": "一个 skill 通常是一个目录,里面至少包含一个 SKILL.md : my-skills/ ├── release/ │ └── SKILL.md ├── write-changelog/ │ └── SKILL.md └── debug-flaky-test/ ├── SKILL.md └── references/ └── pattern-library.md SKILL.md 的典型格式: --- name: release description: 发布一个新的 release tag,更新 changelog,并打包 --- ## 何时使用 当用户说\"发布新版本\"、\"出一个 release\"、\"打 tag\" 时使用。 ## 步骤 1. 通过 `git log` 确认上次发布以来的改动 2. 让用户确认 semver 版本号(patch / minor / major) 3. 更新 `CHANGELOG.md` 中新增条目 4. 运行 `pnpm build` 并确保构建通过 5. 创建 git tag `v<version>` 并写上发布说明 6. 运行 `pnpm publish`(或者对应的发布命令) ## 规则 - 版本号必须符合 semver - 不允许绕过测试,任何失败都必须先修复 - 发布失败时,回滚所有本地 tag 和 changelog 改动"
       },
       {
+        "id": "allowed-tools",
+        "heading": "工具预授权：allowed-tools",
+        "body": "allowed-tools 声明调用此 skill 的当前回合可以免去常规审批的工具。它不是排他白名单：未列出的工具仍可调用，继续按现有权限与审批规则处理。 --- name: setup description: 安装 vibekeys-plugin 的 hidapi 依赖 allowed-tools: - Bash(pip3 *) - Bash(pip *) - Bash(python3 -c *) --- 支持 YAML 缩进列表、行内列表（ allowed-tools: [Bash, read_file] ），也支持空格或逗号分隔的单行字符串（ allowed-tools: Bash(pip3 *) read_file ）。括号内的空格保留。工具名和模式复用静态 permissions 规则的匹配语法， Bash 与 bash 、 Read 与 read_file 对应。语法不完整的声明拒绝加载，不会退化成宽泛授权。 通过斜杠命令、 $ 菜单、 /skills 或模型的 use_skill 成功调用后，授权仅作用于调用它的 agent；下一条用户消息（包括运行中的追加消息）、回合结束或取消、会话切换和运行时重建都不会继承旧授权。恢复历史会话也不会重新授予权限。 全局或项目级 deny 仍优先；敏感路径、凭据、plan mode 等安全边界不被绕过。AtomCode 还保留对破坏性 shell 命令的常规审批：skill 的声明不让这类命令免审批。这是在 Claude Code 预授权语义上保留的产品安全限制；用户自己配置的静态 allow 规则仍按原有语义处理。 Bash 预授权不是沙箱。 Shell 命令本身仍可能读写文件或联网；不要把 allowed-tools: Bash 解读为“只能安装依赖”。插件 hook 和 skill 模板中的预执行 shell 片段属于独立执行入口，不受此模型工具调用预授权控制。"
+      },
+      {
         "id": "skill-目录",
         "heading": "Skill 目录",
         "body": "AtomCode 会从若干约定位置加载 skills: 全局 : ~/.atomcode/skills/ 项目级 :当前工作目录及其上级的 .atomcode/skills/ (如有) 项目级会覆盖同名全局 skill,方便你在不同项目用同一个名字定义不同流程。"

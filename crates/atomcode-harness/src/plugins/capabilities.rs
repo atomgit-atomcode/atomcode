@@ -612,12 +612,24 @@ impl crate::commands::CatalogCommand for RunSkill {
     }
 
     async fn run(&self, agent: Arc<crate::agent::Agent>, args: &str) -> Result<String, String> {
+        super::skill_permissions::rules(&self.skill)?;
         let text = self.skill.expand(args.trim(), agent.session_id());
         if text.trim().is_empty() {
             return Err(format!("`{}` 展开之后是空的", self.name));
         }
         let name = self.name.clone();
-        agent.inject(text, InjectionOrigin::Skill { name: name.clone() });
+        agent.inject(
+            text,
+            InjectionOrigin::Skill {
+                name: if self.command {
+                    // A command and a skill can share a name but have different
+                    // permissions. This marker cannot be a valid skill name.
+                    format!("[command] {}", self.skill.name)
+                } else {
+                    self.skill.name.clone()
+                },
+            },
+        );
         agent.send(skill_invocation(&name, args));
         Ok(format!("按 `{name}` 开始"))
     }
@@ -738,11 +750,14 @@ impl ListSkills {
         }
         // Each gets the same task: they are several ways of looking at one
         // thing, not a pipeline.
-        let blocks: Vec<String> = names
+        let skills: Vec<_> = names.iter().filter_map(|name| self.0.get(name)).collect();
+        for skill in &skills {
+            super::skill_permissions::rules(skill)?;
+        }
+        let blocks: Vec<(String, String)> = skills
             .iter()
-            .filter_map(|name| self.0.get(name))
-            .map(|skill| skill.expand(task, agent.session_id()))
-            .filter(|text| !text.trim().is_empty())
+            .map(|skill| (skill.name.clone(), skill.expand(task, agent.session_id())))
+            .filter(|(_, text)| !text.trim().is_empty())
             .collect();
         if blocks.is_empty() {
             return Err("展开之后是空的".into());
@@ -750,11 +765,15 @@ impl ListSkills {
         // One turn, with a rule between them: sent as several the first would
         // be answered before the second was read.
         agent.inject(
-            blocks.join("\n\n---\n\n"),
+            blocks
+                .iter()
+                .map(|(_, text)| text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n---\n\n"),
             InjectionOrigin::Skill {
-                name: names
+                name: blocks
                     .iter()
-                    .map(|name| bare_name(name))
+                    .map(|(name, _)| name.as_str())
                     .collect::<Vec<_>>()
                     .join(" · "),
             },

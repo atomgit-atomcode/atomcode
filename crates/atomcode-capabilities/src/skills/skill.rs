@@ -14,8 +14,8 @@ pub struct Skill {
     pub description: String,
     /// The template body (everything after the frontmatter block).
     pub template: String,
-    /// Tools the specialization MAY auto-approve while this skill is active (metadata;
-    /// the L1 capability does not enforce it — that's an L2 approval-policy concern).
+    /// Tools the host may preauthorize during the invocation's turn. Not an
+    /// exclusive tool list; the host's permission rules and security gates still apply.
     pub allowed_tools: Vec<String>,
     /// If false (`user-invocable: false` in frontmatter), hidden from the `/` menu;
     /// the model can still auto-invoke it. Absent → true.
@@ -217,6 +217,7 @@ struct Frontmatter {
     name: Option<String>,
     description: String,
     allowed_tools: Vec<String>,
+    tools_error: Option<String>,
     /// If false (`user-invocable: false`), hidden from the `/` menu — the model can
     /// still auto-invoke. Absent → true.
     user_invocable: bool,
@@ -228,6 +229,7 @@ impl Default for Frontmatter {
             name: None,
             description: String::new(),
             allowed_tools: Vec::new(),
+            tools_error: None,
             user_invocable: true,
         }
     }
@@ -236,6 +238,105 @@ impl Default for Frontmatter {
 fn fm_value(s: &str) -> String {
     // Strip a surrounding pair of double OR single quotes (production parity).
     s.trim().trim_matches('"').trim_matches('\'').to_string()
+}
+
+fn without_yaml_comment(value: &str) -> &str {
+    let mut quote = None;
+    let mut previous_space = true;
+    for (index, ch) in value.char_indices() {
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            }
+        } else if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+        } else if ch == '#' && previous_space {
+            return value[..index].trim_end();
+        }
+        previous_space = ch.is_whitespace();
+    }
+    value
+}
+
+/// Split a scalar/inline tool list while keeping command patterns and quoted
+/// entries intact. A malformed list must not degrade into a bare `Bash` grant.
+fn tool_list(value: &str) -> Result<Vec<String>, String> {
+    let value = without_yaml_comment(value).trim();
+    let inline_list = value.starts_with('[');
+    let value = if inline_list {
+        value
+            .strip_prefix('[')
+            .and_then(|v| v.strip_suffix(']'))
+            .ok_or("unclosed allowed-tools list")?
+    } else {
+        value
+    };
+    let mut out = Vec::new();
+    let mut token = String::new();
+    let mut depth = 0usize;
+    let mut quote = None;
+    for ch in value.chars() {
+        if let Some(q) = quote {
+            token.push(ch);
+            if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => {
+                quote = Some(ch);
+                token.push(ch);
+            }
+            '(' => {
+                depth += 1;
+                token.push(ch);
+            }
+            ')' => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or("unbalanced allowed-tools pattern")?;
+                token.push(ch);
+            }
+            ch if depth == 0 && (ch == ',' || (!inline_list && ch.is_whitespace())) => {
+                if !token.trim().is_empty() {
+                    out.push(fm_value(&token));
+                    token.clear();
+                } else if inline_list {
+                    return Err("empty allowed-tools list entry".into());
+                }
+            }
+            _ => token.push(ch),
+        }
+    }
+    if quote.is_some() || depth != 0 {
+        return Err("unclosed allowed-tools pattern or quote".into());
+    }
+    if !token.trim().is_empty() {
+        out.push(fm_value(&token));
+    }
+    // A quoted scalar can itself contain a comma/space-delimited list.
+    if !inline_list
+        && out.len() == 1
+        && (value.starts_with('"') || value.starts_with('\''))
+        && out[0] != value
+    {
+        return tool_list(&out[0]);
+    }
+    for entry in &out {
+        let name = entry.split('(').next().unwrap_or_default().trim();
+        if name.is_empty()
+            || name
+                .chars()
+                .any(|ch| ch.is_whitespace() || matches!(ch, '[' | ']' | '\'' | '"'))
+        {
+            return Err("allowed-tools list entries must each name one tool or pattern".into());
+        }
+        if entry.contains('(') && !entry.ends_with(')') {
+            return Err("invalid allowed-tools pattern".into());
+        }
+    }
+    Ok(out)
 }
 
 /// Parse `---`-delimited frontmatter; returns `(Frontmatter, body)`. Absent/unclosed
@@ -252,18 +353,47 @@ fn parse_frontmatter(content: &str) -> (Frontmatter, String) {
     };
     let block = &after_open[..close_pos];
     let body = &after_open[close_pos + skip..];
+    let mut tools_block = false;
     for line in block.lines() {
+        if tools_block && (line.trim().is_empty() || line.trim_start().starts_with('#')) {
+            continue;
+        }
+        if tools_block
+            && (line.starts_with(' ') || line.starts_with('\t') || line.starts_with("- "))
+        {
+            let entry = without_yaml_comment(line).trim();
+            if entry.is_empty() {
+                continue;
+            }
+            if let Some(value) = entry.strip_prefix("- ") {
+                if value.starts_with('[') {
+                    fm.tools_error = Some("nested allowed-tools lists are not tool names".into());
+                    continue;
+                }
+                match tool_list(value) {
+                    Ok(tools) if tools.len() == 1 => fm.allowed_tools.extend(tools),
+                    _ => {
+                        fm.tools_error = Some(
+                            "allowed-tools list entries must each name one tool or pattern".into(),
+                        )
+                    }
+                }
+            } else {
+                fm.tools_error = Some("invalid allowed-tools list entry".into());
+            }
+            continue;
+        }
+        tools_block = false;
         if let Some(v) = line.strip_prefix("name:") {
             fm.name = Some(fm_value(v));
         } else if let Some(v) = line.strip_prefix("description:") {
             fm.description = fm_value(v);
         } else if let Some(v) = line.strip_prefix("allowed-tools:") {
-            // AgentSkills spec is space-delimited; also accept commas (Claude Code compat).
-            fm.allowed_tools = v
-                .split([' ', ','])
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
+            tools_block = without_yaml_comment(v).trim().is_empty();
+            match tool_list(v) {
+                Ok(tools) => fm.allowed_tools = tools,
+                Err(error) => fm.tools_error = Some(error),
+            }
         } else if let Some(v) = line.strip_prefix("user-invocable:") {
             // Mirror core: only the literal `false` hides it; anything else stays true.
             fm.user_invocable = v.trim() != "false";
@@ -382,6 +512,9 @@ fn build_skill(
     namespace: Option<&str>,
 ) -> Result<Skill, String> {
     let (fm, template) = parse_frontmatter(content);
+    if let Some(error) = fm.tools_error {
+        return Err(error);
+    }
     let base = fm.name.as_deref().unwrap_or(default_name);
     validate_skill_name(base)?;
     let name = make_name(base, namespace);
@@ -404,6 +537,42 @@ fn build_skill(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allowed_tools_preserves_lists_and_command_patterns() {
+        for declaration in [
+            "allowed-tools:\n  - Bash(pip3 *)\n  - read_file",
+            "allowed-tools: [\"Bash(pip3 *)\", read_file]",
+            "allowed-tools: Bash(pip3 *) read_file",
+            "allowed-tools: 'Bash(pip3 *), read_file'",
+            "allowed-tools: # commands\n  - Bash(pip3 *) # install\n\n  # verify\n  - read_file",
+            "allowed-tools:\n- Bash(pip3 *)\n- read_file",
+        ] {
+            let (fm, _) = parse_frontmatter(&format!("---\n{declaration}\n---\nbody"));
+            assert!(fm.tools_error.is_none(), "{declaration}");
+            assert_eq!(fm.allowed_tools, ["Bash(pip3 *)", "read_file"]);
+        }
+        let (fm, _) = parse_frontmatter("---\nallowed-tools:\n  - Bash\n---\nbody");
+        assert_eq!(fm.allowed_tools, ["Bash"]);
+    }
+
+    #[test]
+    fn malformed_tool_lists_do_not_become_bare_tool_grants() {
+        for declaration in [
+            "Bash(pip3 *",
+            "[Bash",
+            "\"Bash",
+            "\n  - Bash Read",
+            "[Bash Read]",
+            "[\"Bash Read\"]",
+            "[Bash(pip3 *) read_file]",
+            "[Bash,,Read]",
+        ] {
+            let (fm, _) =
+                parse_frontmatter(&format!("---\nallowed-tools: {declaration}\n---\nbody"));
+            assert!(fm.tools_error.is_some(), "{declaration}");
+        }
+    }
 
     fn skill(template: &str) -> Skill {
         Skill {

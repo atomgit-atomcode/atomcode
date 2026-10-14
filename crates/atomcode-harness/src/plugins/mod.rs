@@ -22,6 +22,7 @@ pub mod registries;
 pub mod self_knowledge;
 pub mod session;
 pub mod session_title;
+pub mod skill_permissions;
 pub mod subagent;
 pub mod team;
 pub mod todo_reminder;
@@ -118,6 +119,7 @@ pub fn catalog() -> PluginRegistry {
         .register(Arc::new(loop_policy::RepeatFusePlugin))
         .register(Arc::new(policy_rows::TodoPlugin))
         .register(Arc::new(policy_rows::PermissionsPlugin))
+        .register(Arc::new(skill_permissions::SkillPermissionsPlugin))
         .register(Arc::new(policy_rows::PlanModePlugin))
         .register(Arc::new(session_title::SessionTitlePlugin))
         .register(Arc::new(session_title::ModelTitlePlugin))

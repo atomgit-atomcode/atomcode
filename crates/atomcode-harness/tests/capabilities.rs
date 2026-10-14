@@ -1133,3 +1133,124 @@ async fn what_a_catalog_row_says_follows_the_language_in_force() {
 fn has_cjk(text: &str) -> bool {
     text.chars().any(|c| matches!(c, '\u{4e00}'..='\u{9fff}'))
 }
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn skill_grants_stay_with_the_calling_agent_and_are_not_restored_from_history() {
+    use async_trait::async_trait;
+    use atomcode_harness::seams::{AgentLoop, AgentLoopSvc, CommandsSvc};
+    use atomcode_kernel::tool::{RiskLevel, Tool, ToolContext, ToolResult};
+    use std::sync::{Arc, Weak};
+
+    struct Probe {
+        calls: Arc<AtomicU32>,
+        child: Weak<atomcode_harness::agent::Agent>,
+        driver: Weak<dyn AgentLoop>,
+    }
+    #[async_trait]
+    impl Tool for Probe {
+        fn name(&self) -> &str {
+            "risky_probe"
+        }
+        fn description(&self) -> &str {
+            "test-only risky probe"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object"})
+        }
+        fn risk(&self, _: &str) -> RiskLevel {
+            RiskLevel::Risky
+        }
+        async fn execute(&self, _: &str, _: &ToolContext) -> ToolResult {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                let child = self.child.upgrade().unwrap();
+                child.send("a different agent's task");
+                self.driver.upgrade().unwrap().drive(&child).await;
+            }
+            ToolResult {
+                call_id: String::new(),
+                content: "executed".into(),
+                is_error: false,
+                images: vec![],
+            }
+        }
+    }
+    let dir = scratch("skill-grant-scope");
+    let skills = dir.join("skills/setup");
+    std::fs::create_dir_all(&skills).unwrap();
+    std::fs::write(skills.join("SKILL.md"), "---\nname: setup\ndescription: setup probe\nallowed-tools: risky_probe\n---\nRun the probe.").unwrap();
+    let extra = format!("[[patch]]\nid = \"skills\"\nconfig = {{ dirs = [{:?}], project_root = {:?}, home = {:?} }}\n", dir.join("skills"), dir, dir.join("empty-home"));
+    let script = r#"
+[[patch]]
+id = "llm"
+name = "llm-replay"
+config = { script = [
+  { calls = [ { name = "risky_probe", args = {} } ] },
+  { calls = [ { name = "risky_probe", args = {} } ] },
+  { text = "child done" },
+  { calls = [ { name = "risky_probe", args = {} } ] },
+  { text = "lead done" },
+  { calls = [ { name = "risky_probe", args = {} } ] },
+  { text = "resumed done" },
+] }
+[[patch]]
+id = "approval"
+config = { mode = "deny-risky" }
+"#;
+    let app = start(tree(&dir, script, &[&extra])).await;
+    let ctx = app.context();
+    let lead = atomcode_harness::create_agent(&app).await.unwrap();
+    let child = atomcode_harness::create_agent(&app).await.unwrap();
+    let driver = ctx.require::<AgentLoopSvc>().unwrap();
+    let calls = Arc::new(AtomicU32::new(0));
+    ctx.require::<ToolsSvc>()
+        .unwrap()
+        .register(Arc::new(Probe {
+            calls: calls.clone(),
+            child: Arc::downgrade(&child),
+            driver: Arc::downgrade(&driver),
+        }))
+        .unwrap();
+    ctx.require::<CommandsSvc>()
+        .unwrap()
+        .find("setup", &lead)
+        .unwrap()
+        .run(lead.clone(), "")
+        .await
+        .unwrap();
+    atomcode_harness::drive(&app, &lead).await.unwrap();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "only the lead's two probes execute"
+    );
+    assert!(child.session().events().iter().any(|e| matches!(
+        e.event,
+        SessionEvent::ToolResultLogged { is_error: true, .. }
+    )));
+    // Restoring model-visible skill content is not a fresh invocation.
+    child.session().restore(lead.session().events());
+    child.send("continue history");
+    atomcode_harness::drive(&app, &child).await.unwrap();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "restored history grants no authority"
+    );
+    assert!(
+        child
+            .session()
+            .events()
+            .iter()
+            .rev()
+            .find_map(|record| {
+                if let SessionEvent::ToolResultLogged { is_error, .. } = &record.event {
+                    Some(*is_error)
+                } else {
+                    None
+                }
+            })
+            .unwrap(),
+        "the resumed probe is refused rather than reusing a success"
+    );
+    ctx.require::<ToolsSvc>().unwrap().unregister("risky_probe");
+}

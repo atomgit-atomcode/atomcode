@@ -965,6 +965,7 @@ impl SkillsHostPlugin {
                      name: <name>   (letters, digits, `-`, `_`; defaults to the directory \
                      or file name)\n\
                      description: <when to use it — this is what gets it chosen>\n\
+                     allowed-tools: [Bash, read_file]  (optional tool preauthorization)\n\
                      ---\n\
                      then the instructions. `$ARGUMENTS` in them is replaced by what the \
                      skill was invoked with. A file whose name is invalid is skipped \

@@ -309,7 +309,11 @@ disabled = true
 [[insert]]
 name = "delegation-bounds"
 
-# No rules by default, so the row is inert until a user writes some.
+# Temporary skill grants, inside the static deny rules and ahead of approval.
+[[insert]]
+name = "skill-permissions"
+
+# No static rules by default, so this row is inert until a user writes some.
 [[insert]]
 name = "permissions"
 
