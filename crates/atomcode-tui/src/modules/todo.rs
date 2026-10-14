@@ -206,6 +206,15 @@ pub(crate) fn plan_text(events: &[atomcode_kernel::session::LoggedEvent]) -> Str
     out
 }
 
+pub(crate) fn plan_count(events: &[atomcode_kernel::session::LoggedEvent]) -> usize {
+    let mut plan = Plan::default();
+    for logged in events {
+        plan.absorb(&logged.event);
+    }
+    plan.fold(&atomcode_kernel::session::undone_turns(events))
+        .len()
+}
+
 /// The calls, folded into a list, leaving out the turns that were taken back.
 fn fold_calls(state: &State, undone: &std::collections::BTreeSet<u64>) -> Vec<TodoItem> {
     let mut items = state.plan.fold(undone);
@@ -262,7 +271,12 @@ impl View for Todo {
         // The window is told what is left once the margin has been taken off the
         // rect — it counts the header itself, so handing it the full height
         // would push one item below the fold to make room for a blank row.
-        let rows = window(items, (vp.rect.h as usize).saturating_sub(margin));
+        let budget = (vp.rect.h as usize).saturating_sub(margin);
+        let rows = if vp.moment.todo_expanded {
+            expanded(items, budget, vp.moment.todo_offset)
+        } else {
+            compact(items, budget)
+        };
         let (completed, in_progress, total) = todo_counts(items);
         let open = total.saturating_sub(completed + in_progress);
         let unicode = vp.moment.caps.unicode;
@@ -306,6 +320,17 @@ impl View for Todo {
                         open,
                     })
                     .into_owned(),
+                    counts,
+                ),
+                El::styled(
+                    format!(
+                        " · {}",
+                        crate::i18n::product::t(if vp.moment.todo_expanded {
+                            crate::i18n::product::Msg::LidCollapseHint
+                        } else {
+                            crate::i18n::product::Msg::LidExpandHint
+                        })
+                    ),
                     counts,
                 ),
             ])
@@ -378,7 +403,16 @@ impl View for Todo {
     /// for here, it arrives and leaves with the panel, from the same predicate
     /// `render` draws from. See `live.rs` for the same bargain.
     fn height(state: &State, moment: &Moment, _: u16) -> Height {
-        let items = shown(state, moment).len();
+        let plan = shown(state, moment);
+        let items = if moment.todo_expanded {
+            plan.len()
+        } else {
+            let open = plan
+                .iter()
+                .filter(|item| item.status != TodoStatus::Completed)
+                .count();
+            open.min(3) + usize::from(open > 3)
+        };
         Height::Hug(if items == 0 {
             0
         } else {
@@ -413,56 +447,48 @@ enum Row {
     },
 }
 
-/// The items that fit in `rows` lines, including the header.
-///
-/// A plan can be longer than the screen, and the host clips from the end — so
-/// without this the one item a person is waiting on could be the one item below
-/// the fold. The window therefore prefers the tail (where the recent work is)
-/// and pulls back only as far as the frontier needs: the in-progress item, else
-/// the first pending one. Items dropped *below* the window get a `+N` row,
-/// because nothing else would say they are there; the ones dropped above do not
-/// need one — they are numbered, so a window starting at `#6` already reads as
-/// "five above the fold" rather than as the whole list.
-fn window(items: &[TodoItem], rows: usize) -> Vec<Row> {
-    let body = rows.saturating_sub(1); // the header
-    let item = |index: usize, item: &TodoItem| Row::Item {
-        index,
-        status: item.status,
-        content: item.content.clone(),
-    };
-
-    if items.len() <= body {
-        return items.iter().enumerate().map(|(i, t)| item(i, t)).collect();
-    }
-    if body == 0 {
-        return Vec::new();
-    }
-
-    let frontier = items
-        .iter()
-        .position(|t| t.status == TodoStatus::InProgress)
-        .or_else(|| items.iter().position(|t| t.status == TodoStatus::Pending))
-        .unwrap_or(items.len() - 1);
-    // The tail by default, pulled back only as far as the frontier needs.
-    let start = (items.len() - body).min(frontier);
-    let mut end = (start + body).min(items.len());
-    let more = items.len() - end > 0 && body > 1;
-    if more {
-        end -= 1; // the row the `+N` marker takes
-    }
-    let mut out: Vec<Row> = items
+fn compact(items: &[TodoItem], rows: usize) -> Vec<Row> {
+    let mut open: Vec<_> = items
         .iter()
         .enumerate()
-        .take(end)
-        .skip(start)
-        .map(|(i, t)| item(i, t))
+        .filter(|(_, item)| item.status != TodoStatus::Completed)
+        .collect();
+    open.sort_by_key(|(_, item)| item.status != TodoStatus::InProgress);
+    let budget = rows.saturating_sub(1);
+    let limit = budget.min(3);
+    let more = open.len() > limit && budget > 1;
+    let visible = if more { limit.min(budget - 1) } else { limit };
+    let mut out: Vec<_> = open
+        .iter()
+        .take(visible)
+        .map(|(index, item)| Row::Item {
+            index: *index,
+            status: item.status,
+            content: item.content.clone(),
+        })
         .collect();
     if more {
         out.push(Row::More {
-            hidden: items.len() - end,
+            hidden: open.len() - visible,
         });
     }
     out
+}
+
+fn expanded(items: &[TodoItem], rows: usize, offset: usize) -> Vec<Row> {
+    let body = rows.saturating_sub(1);
+    let start = offset.min(items.len().saturating_sub(body));
+    items
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(body)
+        .map(|(index, item)| Row::Item {
+            index,
+            status: item.status,
+            content: item.content.clone(),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -533,6 +559,7 @@ mod tests {
     /// What the panel draws for a moment that took some turns back.
     fn drew_undone(state: &State, w: u16, h: u16, undone: &[u64]) -> (Vec<String>, Height) {
         let moment = Moment {
+            todo_expanded: true,
             undone: undone.iter().copied().collect(),
             ..Moment::default()
         };
@@ -553,7 +580,10 @@ mod tests {
     }
 
     fn drew(state: &State, w: u16, h: u16) -> Vec<String> {
-        let moment = Moment::default();
+        let moment = Moment {
+            todo_expanded: true,
+            ..Moment::default()
+        };
         let vp = Viewport::new(Rect::sized(w, h), &moment);
         Todo::render(state, &vp)
             .iter()
@@ -562,7 +592,38 @@ mod tests {
     }
 
     fn asks(state: &State) -> Height {
-        Todo::height(state, &Moment::default(), 80)
+        Todo::height(
+            state,
+            &Moment {
+                todo_expanded: true,
+                ..Moment::default()
+            },
+            80,
+        )
+    }
+
+    #[test]
+    fn a_compact_plan_keeps_three_open_items_with_the_running_one_first() {
+        let state = fold(&[plan(
+            r#"{"todos":[{"content":"done","status":"completed"},{"content":"next","status":"pending"},{"content":"working","status":"in_progress"},{"content":"later","status":"pending"},{"content":"last","status":"pending"}]}"#,
+        )]);
+        let moment = Moment::default();
+        assert_eq!(Todo::height(&state, &moment, 80), Height::Hug(6));
+        let rows = Todo::render(&state, &Viewport::new(Rect::sized(100, 6), &moment));
+        let text: Vec<_> = rows.iter().map(Line::plain).collect();
+        assert!(text[2].contains("#3") && text[2].contains("working"));
+        assert!(text[3].contains("next"));
+        assert!(text[4].contains("later"));
+        assert!(!text
+            .iter()
+            .any(|line| line.contains("done") || line.contains("last")));
+        let expanded = Moment {
+            todo_expanded: true,
+            ..Moment::default()
+        };
+        let full = Todo::render(&state, &Viewport::new(Rect::sized(100, 10), &expanded));
+        assert!(full.iter().any(|line| line.plain().contains("done")));
+        assert!(full.iter().any(|line| line.plain().contains("last")));
     }
 
     #[test]
@@ -856,64 +917,36 @@ mod tests {
             "{starts:?}\n{all:#?}"
         );
 
-        // Pulled to the front, the window hides the tail and says so.
-        let cut = drew(&state, 60, 8);
+        let moment = Moment::default();
+        let cut: Vec<_> = Todo::render(&state, &Viewport::new(Rect::sized(60, 6), &moment))
+            .iter()
+            .map(Line::plain)
+            .collect();
         let more = cut.iter().find(|l| l.contains("更多")).expect("a +N line");
-        let first = cut.iter().find(|l| l.ends_with("task 0")).expect("task 0");
+        let first = cut.iter().find(|l| l.contains("task 0")).expect("task 0");
         assert_eq!(column(more, "+"), column(first, "#"), "{cut:#?}");
     }
 
     #[test]
-    fn a_long_plan_keeps_the_frontier_and_says_what_it_hid() {
-        let build = |frontier: usize| {
-            serde_json::json!({
-                "todos": (0..12)
-                    .map(|i| serde_json::json!({
-                        "content": format!("task {i}"),
-                        "status": if i == frontier { "in_progress" } else { "pending" },
-                    }))
-                    .collect::<Vec<_>>()
-            })
-            .to_string()
-        };
-
-        // Eight rows = header + 6 items + the `+N` marker, and the frontier is
-        // the tenth: the window is the tail, which already contains it, so the
-        // tail is what stays.
-        let state = fold(&[plan(&build(9))]);
-        let lines = drew(&state, 60, 8);
-        assert_eq!(lines.len(), 8, "{lines:#?}");
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("#10") && l.contains("task 9")),
-            "{lines:#?}"
-        );
-        assert!(!lines.iter().any(|l| l.contains("更多")), "{lines:#?}");
-
-        // The frontier is the *first* item: the tail cannot hold it, so the
-        // window is pulled back to the front and the rows it gives up say so.
-        // The margin costs one of the eight rows, which is one item fewer than
-        // the panel without a margin would show — the trade the margin is.
-        let state = fold(&[plan(&build(0))]);
-        let lines = drew(&state, 60, 8);
-        assert_eq!(lines.len(), 8, "{lines:#?}");
-        assert!(
-            lines[2].contains("#1") && lines[2].contains("task 0"),
-            "{lines:#?}"
-        );
-        assert!(lines[7].contains("+7 更多"), "{:?}", lines[7]);
-
-        // Nothing is claimed to be missing when everything fits.
-        let all = drew(&state, 60, 40);
-        assert_eq!(all.len(), 14, "{all:#?}");
-        assert!(!all.iter().any(|l| l.contains("更多")), "{all:#?}");
-
-        // Header only, when that is all there is room for. One row cannot seat
-        // the margin as well, so the margin stands down and the header keeps the
-        // row: at a height that cannot hold both, the words win.
-        let one = drew(&state, 60, 1);
-        assert_eq!(one.len(), 1, "{one:#?}");
-        assert!(one[0].contains("11 待办"), "{:?}", one[0]);
+    fn an_expanded_plan_can_scroll_to_every_item_in_original_order() {
+        let body = serde_json::json!({"todos": (0..12).map(|i| serde_json::json!({
+            "content": format!("task {i}"), "status": if i == 9 {"in_progress"} else {"pending"}
+        })).collect::<Vec<_>>()})
+        .to_string();
+        let state = fold(&[plan(&body)]);
+        for offset in 0..=6 {
+            let moment = Moment {
+                todo_expanded: true,
+                todo_offset: offset,
+                ..Moment::default()
+            };
+            let lines = Todo::render(&state, &Viewport::new(Rect::sized(80, 8), &moment));
+            assert_eq!(lines.len(), 8);
+            assert!(lines[2].plain().contains(&format!("task {offset}")));
+            assert!(lines[7].plain().contains(&format!("task {}", offset + 5)));
+        }
+        let all = drew(&state, 80, 40);
+        assert_eq!(all.len(), 14);
+        assert_eq!(drew(&state, 80, 1).len(), 1);
     }
 }

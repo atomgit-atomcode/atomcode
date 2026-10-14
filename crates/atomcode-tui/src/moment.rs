@@ -847,6 +847,9 @@ pub struct Moment {
     /// a row and stops there; a stored fact (a question waiting, below) can take
     /// the keyboard without being asked for, but a mouse move is not that.
     pub team_keyboard: bool,
+    /// Local disclosure state for the task panel; plans start compact.
+    pub todo_expanded: bool,
+    pub todo_offset: usize,
     /// The settings, **as of the frame this moment was taken for**.
     ///
     /// A snapshot rather than a handle, for the reason [`Moment::rasters`] is

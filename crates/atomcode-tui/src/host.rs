@@ -1386,6 +1386,7 @@ pub struct Hits {
     /// Where the team panel was drawn, so a press or the pointer on a row finds
     /// the agent it switches to.
     team: Option<Rect>,
+    todo: Option<Rect>,
     /// Where the settings panel was drawn, so a press or the pointer on a row
     /// finds the setting it changes.
     ///
@@ -1937,6 +1938,8 @@ impl Host {
         // prompt into — a conversation that never saw either.
         m.interrupted = false;
         m.last_sent = None;
+        m.todo_expanded = false;
+        m.todo_offset = 0;
         m.retract = None;
         // The guess at what to say next was sampled from the conversation being
         // left. Carried across `/resume`, `/clear` or a member switch it sat in the
@@ -1964,6 +1967,43 @@ impl Host {
             .expect("hits poisoned")
             .team
             .is_some_and(|rect| rect.h == 1 && rect.contains(x, y))
+    }
+
+    pub fn toggle_todo_at(&self, x: u16, y: u16) -> bool {
+        let rect = self.hits.lock().expect("hits poisoned").todo;
+        if !rect.is_some_and(|rect| rect.contains(x, y) && y == rect.y + u16::from(rect.h >= 2)) {
+            return false;
+        }
+        let mut moment = self.moment.write().expect("moment poisoned");
+        moment.todo_expanded = !moment.todo_expanded;
+        moment.todo_offset = 0;
+        true
+    }
+
+    pub fn todo_wheel(&self, x: u16, y: u16, by: i32, total: usize) -> bool {
+        let Some(rect) = self.hits.lock().expect("hits poisoned").todo else {
+            return false;
+        };
+        let mut moment = self.moment.write().expect("moment poisoned");
+        if !rect.contains(x, y) || !moment.todo_expanded {
+            return false;
+        }
+        let visible = usize::from(rect.h).saturating_sub(1 + usize::from(rect.h >= 2));
+        moment.todo_offset = moment
+            .todo_offset
+            .saturating_add_signed(by as isize)
+            .min(total.saturating_sub(visible));
+        true
+    }
+
+    pub fn expanded_todo_at(&self, x: u16, y: u16) -> bool {
+        let on_panel = self
+            .hits
+            .lock()
+            .expect("hits poisoned")
+            .todo
+            .is_some_and(|rect| rect.contains(x, y));
+        on_panel && self.moment.read().expect("moment poisoned").todo_expanded
     }
 
     /// Whether the team panel has the keyboard.
@@ -6282,6 +6322,7 @@ impl Host {
                         field: None,
                         ask: None,
                         team: None,
+                        todo: None,
                         settings: None,
                         providers: None,
                         plugins: None,
@@ -6345,6 +6386,9 @@ impl Host {
                         // have to reproduce the tail's split.
                         if id == crate::modules::ask::ID {
                             self.hits.lock().expect("hits poisoned").ask = Some(*tail_rect);
+                        }
+                        if id == crate::modules::todo::ID {
+                            self.hits.lock().expect("hits poisoned").todo = Some(*tail_rect);
                         }
                         // And the same for the settings panel, which rides the
                         // same tail: where it sits depends on how tall the
@@ -6412,6 +6456,9 @@ impl Host {
                     }
                     if id == crate::modules::team::ID {
                         self.hits.lock().expect("hits poisoned").team = Some(rect);
+                    }
+                    if id == crate::modules::todo::ID {
+                        self.hits.lock().expect("hits poisoned").todo = Some(rect);
                     }
                     frame.place(id, rect, lines);
                 }
@@ -7834,12 +7881,19 @@ mod tests {
             let mut m = h.moment.write().expect("moment poisoned");
             m.interrupted = true;
             m.last_sent = Some("fix the parser".into());
+            m.todo_expanded = true;
+            m.todo_offset = 20;
             m.suggestion = Some("接着把登录那条补上".into());
         }
         h.switch_view();
         let m = h.moment.read().expect("moment poisoned");
         assert!(!m.interrupted, "the note does not follow the switch");
         assert_eq!(m.last_sent, None, "nor does the prompt to hand back");
+        assert!(!m.todo_expanded, "the new view starts with a compact plan");
+        assert_eq!(
+            m.todo_offset, 0,
+            "the old plan's scroll position is cleared"
+        );
         assert_eq!(
             m.suggestion, None,
             "nor the guess sampled from the view left"
@@ -9950,6 +10004,21 @@ mod tests {
     /// no tail id resolves, the geometry is the identity, and every assertion
     /// passes against machinery that never ran. This is the fixture the tail
     /// checks have to start from.
+    #[test]
+    fn the_todo_header_toggles_and_its_wheel_is_bounded() {
+        let h = host_with_real_todo();
+        h.hits.lock().unwrap().todo = Some(Rect::new(2, 3, 60, 8));
+        assert!(!h.toggle_todo_at(3, 3), "the margin is not the header");
+        assert!(h.toggle_todo_at(3, 4));
+        assert!(h.moment.read().unwrap().todo_expanded);
+        assert!(h.todo_wheel(3, 6, 100, 20));
+        assert_eq!(h.moment.read().unwrap().todo_offset, 14);
+        assert!(h.todo_wheel(3, 6, -100, 20));
+        assert_eq!(h.moment.read().unwrap().todo_offset, 0);
+        assert!(h.toggle_todo_at(3, 4));
+        assert!(!h.todo_wheel(3, 6, 1, 20));
+    }
+
     fn host_with_real_todo() -> Host {
         let mods = Arc::new(Modules::new());
         mods.add_producer(transcript::Transcript::new()).unwrap();
@@ -10323,6 +10392,7 @@ mod tests {
         // walks: the sum counts rows, the frame decides which ones fit, and an
         // off-by-one shows up at the end of the range rather than the start.
         let h = host_with_the_shipped_tail();
+        h.moment.write().unwrap().todo_expanded = true;
         for i in 0..40 {
             h.absorb(&SessionEvent::AssistantMessage {
                 turn: 1,
@@ -14909,6 +14979,7 @@ mod tests {
         // deliberately taller than the pane so the cap is in force: with a
         // short tail the two walks agree whether or not either caps.
         let h = host_with_the_shipped_tail();
+        h.moment.write().unwrap().todo_expanded = true;
         // One row per fact, so the oldest line is easy to name.
         for i in 0..40 {
             h.absorb(&SessionEvent::AssistantMessage {

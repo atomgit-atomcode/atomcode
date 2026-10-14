@@ -5166,8 +5166,53 @@ async fn the_todo_panel_shows_the_plan_the_model_sent() {
     assert!(panel.contains("待办"), "the header:\n{panel}");
     assert!(panel.contains("1 已完成"), "the patched count:\n{panel}");
     assert!(panel.contains("1 待办"), "{panel}");
-    assert!(panel.contains("#1") && panel.contains("读代码"), "{panel}");
+    assert!(
+        !panel.contains("读代码"),
+        "completed work is hidden: {panel}"
+    );
     assert!(panel.contains("#2") && panel.contains("写面板"), "{panel}");
+    let rect = s.term.last().unwrap().part("todo").unwrap().rect;
+    s.term
+        .pointer(atomcode_tui::surface::Click::Press, rect.x, rect.y + 1);
+    s.quiet().await;
+    let expanded = s
+        .term
+        .last()
+        .unwrap()
+        .part("todo")
+        .unwrap()
+        .lines
+        .iter()
+        .map(|line| line.plain())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        expanded.contains("#1") && expanded.contains("读代码"),
+        "{expanded}"
+    );
+    assert!(
+        expanded.contains("#2") && expanded.contains("写面板"),
+        "{expanded}"
+    );
+    let rect = s.term.last().unwrap().part("todo").unwrap().rect;
+    s.term
+        .pointer(atomcode_tui::surface::Click::Press, rect.x, rect.y + 1);
+    s.quiet().await;
+    let collapsed = s
+        .term
+        .last()
+        .unwrap()
+        .part("todo")
+        .unwrap()
+        .lines
+        .iter()
+        .map(|line| line.plain())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !collapsed.contains("读代码"),
+        "the header collapses again: {collapsed}"
+    );
     assert!(
         !panel.contains("todowrite"),
         "the call is not the plan:\n{panel}"
