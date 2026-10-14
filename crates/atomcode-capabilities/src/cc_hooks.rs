@@ -377,6 +377,148 @@ fn shell_command(command: &str) -> tokio::process::Command {
 /// names its script `./hooks/x.sh` or `"$ATOMCODE_PROJECT_DIR"/hooks/x.sh`.
 /// Variables are the shell's to expand, never substituted into the command
 /// here: a value spliced into a shell line would be parsed as shell.
+/// Avoid Windows' implicit current-directory executable search for interpreters.
+#[cfg(windows)]
+fn plugin_interpreter(name: &str) -> Result<PathBuf, String> {
+    let path = std::env::var_os("PATH").ok_or("interpreter PATH is unavailable")?;
+    for directory in std::env::split_paths(&path).filter(|directory| directory.is_absolute()) {
+        for suffix in [".exe", ".com"] {
+            let candidate = directory.join(format!("{name}{suffix}"));
+            if candidate.is_file() {
+                return std::fs::canonicalize(candidate)
+                    .map_err(|_| "plugin interpreter is unavailable".into());
+            }
+        }
+    }
+    Err("plugin interpreter was not found in an absolute PATH directory".into())
+}
+
+/// Plugin hooks are executable entry points, not arbitrary shell programs.
+/// Keep argument boundaries and execute the exact canonical path we checked.
+fn plugin_hook_command(hook: &HookConfig) -> Result<tokio::process::Command, String> {
+    let Some(root) = &hook.plugin_root else {
+        return Ok(shell_command(&hook.command));
+    };
+    let text = hook.command.trim();
+    let stripped = text
+        .replace("${CLAUDE_PLUGIN_ROOT}", "")
+        .replace("$CLAUDE_PLUGIN_ROOT", "")
+        .replace("${ATOMCODE_PLUGIN_ROOT}", "")
+        .replace("$ATOMCODE_PLUGIN_ROOT", "")
+        .replace("%CLAUDE_PLUGIN_ROOT%", "")
+        .replace("%ATOMCODE_PLUGIN_ROOT%", "");
+    if stripped.chars().any(|ch| {
+        ch.is_control()
+            || matches!(
+                ch,
+                ';' | '|' | '&' | '`' | '$' | '(' | ')' | '>' | '<' | '\n' | '\r' | '%' | '^'
+            )
+    }) {
+        return Err(
+            "plugin hooks require a script entry point; shell expressions are not allowed".into(),
+        );
+    }
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut present = false;
+    for ch in text.chars() {
+        if matches!(ch, '\'' | '"') {
+            if quote == Some(ch) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(ch);
+            } else {
+                word.push(ch);
+            }
+            present = true;
+        } else if ch.is_whitespace() && quote.is_none() {
+            if present {
+                words.push(std::mem::take(&mut word));
+                present = false;
+            }
+        } else {
+            word.push(ch);
+            present = true;
+        }
+    }
+    if quote.is_some() {
+        return Err("unclosed quote in plugin hook".into());
+    }
+    if present {
+        words.push(word);
+    }
+    if words.is_empty() {
+        return Err("empty plugin hook command".into());
+    }
+    let interpreter = match words[0].as_str() {
+        "python" | "python3" | "node" | "sh" | "bash" => Some(words.remove(0)),
+        _ => None,
+    };
+    if words.is_empty() {
+        return Err("plugin hook interpreter requires a script".into());
+    }
+    let mut script = words.remove(0);
+    for prefix in [
+        "${CLAUDE_PLUGIN_ROOT}/",
+        "$CLAUDE_PLUGIN_ROOT/",
+        "${ATOMCODE_PLUGIN_ROOT}/",
+        "$ATOMCODE_PLUGIN_ROOT/",
+        "%CLAUDE_PLUGIN_ROOT%/",
+        "%ATOMCODE_PLUGIN_ROOT%/",
+        "${CLAUDE_PLUGIN_ROOT}\\",
+        "$CLAUDE_PLUGIN_ROOT\\",
+        "${ATOMCODE_PLUGIN_ROOT}\\",
+        "$ATOMCODE_PLUGIN_ROOT\\",
+        "%CLAUDE_PLUGIN_ROOT%\\",
+        "%ATOMCODE_PLUGIN_ROOT%\\",
+    ] {
+        if let Some(relative) = script.strip_prefix(prefix) {
+            script = relative.to_string();
+            break;
+        }
+    }
+    // Normalize separators even when checking Windows manifests on Unix.
+    let relative = script.replace('\\', "/");
+    if relative.is_empty()
+        || relative.starts_with('-')
+        || relative.contains(':')
+        || Path::new(&relative).is_absolute()
+        || Path::new(&relative).components().any(|part| {
+            !matches!(
+                part,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err("plugin hook script must be relative to its plugin directory".into());
+    }
+    let root = std::fs::canonicalize(root).map_err(|_| "plugin directory is unavailable")?;
+    let script = std::fs::canonicalize(root.join(relative))
+        .map_err(|_| "plugin hook script is unavailable")?;
+    if !script.starts_with(&root) || !script.is_file() {
+        return Err("plugin hook script escapes its plugin directory or is not a file".into());
+    }
+    let mut command = if let Some(interpreter) = interpreter {
+        #[cfg(windows)]
+        let interpreter = plugin_interpreter(&interpreter)?;
+        let mut command = tokio::process::Command::new(interpreter);
+        command.arg(&script);
+        command
+    } else {
+        // Batch files are shell programs and cannot use direct argv semantics.
+        if script
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
+        {
+            return Err("plugin batch hooks require a supported script interpreter".into());
+        }
+        tokio::process::Command::new(&script)
+    };
+    command.args(words);
+    Ok(command)
+}
+
 async fn run_command_hook(
     hook: &HookConfig,
     project_dir: &str,
@@ -385,7 +527,20 @@ async fn run_command_hook(
     use std::process::Stdio;
     use tokio::io::AsyncWriteExt;
 
-    let mut cmd = shell_command(&hook.command);
+    let mut cmd = match plugin_hook_command(hook) {
+        Ok(command) => command,
+        Err(reason) => {
+            let reason = format!("plugin hook rejected: {reason}");
+            tracing::warn!("{reason}");
+            // A deliberate rejection, not a missing/failed hook: gate callers
+            // must see the block instead of silently proceeding.
+            return Some((
+                Some(2),
+                serde_json::json!({"decision": "block", "reason": reason}).to_string(),
+                reason,
+            ));
+        }
+    };
     if !project_dir.is_empty() {
         cmd.env("ATOMCODE_PROJECT_DIR", project_dir);
         cmd.env("CLAUDE_PROJECT_DIR", project_dir);
@@ -1540,6 +1695,86 @@ mod tests {
             d.hook_specific.unwrap().permission_decision.as_deref(),
             Some("deny")
         );
+    }
+
+    fn plugin_config(root: &Path, command: &str) -> HookConfig {
+        HookConfig::from_plugin_spec("PreToolUse", None, command.into(), None, root.into()).unwrap()
+    }
+
+    #[test]
+    fn plugin_entry_points_reject_shell_and_escape_paths() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("check.sh"), "exit 0").unwrap();
+        for command in [
+            "",
+            "echo hello",
+            "sh -c 'echo hello'",
+            "check.sh; echo x",
+            "check.sh | sh",
+            "check.sh\necho x",
+            "$(echo x)",
+            "../check.sh",
+            "/tmp/check.sh",
+            "C:\\tmp\\check.sh",
+            "missing.sh",
+            "check.sh > out",
+            "check.sh\0",
+        ] {
+            assert!(
+                plugin_hook_command(&plugin_config(root.path(), command)).is_err(),
+                "{command}"
+            );
+        }
+        for command in [
+            "check.sh",
+            "sh check.sh",
+            "bash \"${CLAUDE_PLUGIN_ROOT}/check.sh\" --verbose",
+            "python3 check.sh 'literal argument'",
+        ] {
+            assert!(
+                plugin_hook_command(&plugin_config(root.path(), command)).is_ok(),
+                "{command}"
+            );
+        }
+        let mut user = plugin_config(root.path(), "echo hello | cat");
+        user.plugin_root = None;
+        assert!(plugin_hook_command(&user).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn plugin_runs_the_checked_script_not_a_project_namesake() {
+        let plugin = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(plugin.path().join("check.sh"), "printf plugin").unwrap();
+        std::fs::write(project.path().join("check.sh"), "printf project").unwrap();
+        let hook = plugin_config(plugin.path(), "sh check.sh");
+        let (code, stdout, _) = run_command_hook(&hook, project.path().to_str().unwrap(), "{}")
+            .await
+            .unwrap();
+        assert_eq!(code, Some(0));
+        assert_eq!(stdout, "plugin");
+        std::os::unix::fs::symlink(
+            project.path().join("check.sh"),
+            plugin.path().join("escape.sh"),
+        )
+        .unwrap();
+        assert!(plugin_hook_command(&plugin_config(plugin.path(), "sh escape.sh")).is_err());
+    }
+
+    #[tokio::test]
+    async fn rejected_plugin_hook_blocks_pretooluse() {
+        let plugin = tempfile::tempdir().unwrap();
+        let cc = CCExternalHooks::new(vec![plugin_config(plugin.path(), "echo unsafe | sh")], "");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let rt = RequestCtx::new(tx, Some(Duration::from_millis(50)));
+        let tool: Arc<dyn Tool> = Arc::new(atomcode_kernel::testkit::EchoTool);
+        let mut call = ToolCall {
+            id: "1".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        };
+        assert!(cc.before(&mut call, &tool, &rt).await.is_deny());
     }
 
     #[tokio::test]
